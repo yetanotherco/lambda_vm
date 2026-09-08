@@ -377,7 +377,15 @@ fn the_assembled_epoch_verifier_runs() {
     // rests on. Its value is differentialled in the spine test; here it only has to
     // be skipped, and skipped by NAME rather than by a literal.
     let program_id_words = 2usize;
-    let mut cursor = 2 + program_id_words;
+    // ★ Then the BLOCK-BINDING SCHEMA — the register boundary vectors, the epoch
+    // label, the public-output halves and the L2G re-commit root. Skipped by NAME
+    // (`epoch_tests::schema_words`) rather than by a literal, for the same reason
+    // the id is: a literal here would start checking `beta of table 0` against a
+    // register slot the moment the schema moves, and would report a pass while
+    // doing it. Its VALUES are the aggregator's subject and are differentialled
+    // there; this gate only has to walk past them and still account for every word.
+    let schema_words = super::epoch_tests::schema_words(&e);
+    let mut cursor = 2 + program_id_words + schema_words;
     let mut checked = 2usize;
     for (i, (h, leg)) in e.tables.iter().zip(&e.legs).enumerate() {
         // The legs publish first: the recomputed composition, then a terminal

@@ -1760,6 +1760,51 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         b.public(id[1]);
     }
 
+    // ---- ★ THE BLOCK-BINDING SCHEMA, published right after the attestation id
+    //
+    // An aggregation node over these wraps sees exactly two things about a child:
+    // its `program_id`, which is an emit-time CONSTANT of the parent, and its
+    // PUBLISHED WORDS. Everything below is arena data that the epoch statement or
+    // Phase A already bound, and every one of them is material a node must CHECK
+    // rather than trust — so without these publishes the cross-wrap bindings are
+    // not weak, they are unbuildable.
+    //
+    // In the batched format these were the CARVED schema, published by the carve
+    // rather than by the program. The carve went with the format, so the program
+    // publishes them.
+    //
+    // Publishing costs no soundness, because each is already bound: the register
+    // vectors through the REGISTER preprocessed commitment DERIVED from them
+    // (`PrepSource::Register`), the label and the output halves through
+    // `absorb_epoch_statement`, and the L2G root through Phase A's absorb.
+    //
+    // ⚠ This order IS [`SchemaLayout`]'s, which the aggregator indexes by. A
+    // field inserted in the middle silently re-binds every field below it, so
+    // append here and extend `SchemaLayout` in the same commit.
+    for cell in reg_init.iter().chain(&reg_fini) {
+        b.public(cell.as_cell());
+    }
+    for half in epoch_label {
+        b.public(half.as_cell());
+    }
+    for half in public_output {
+        b.public(half.as_cell());
+    }
+    // ★ The L2G bookend is the LAST sub-proof — `EpochSession::pairs` proves the
+    // VM tables and then pushes `l2g_air`, and the from-proof reconstruction
+    // rebuilds the AIR list the same way. Asserted rather than assumed: publishing
+    // some other sub-proof's root would bind the aggregator's L2G compare to a
+    // table with nothing to do with the global memory argument, and would still
+    // look like a passing gate.
+    assert_eq!(
+        e.tables[n - 1].shape.index,
+        n - 1,
+        "the L2G bookend is the epoch's last sub-proof"
+    );
+    for half in main_cells[n - 1].lanes_flat() {
+        b.public(half.as_cell());
+    }
+
     // ---- one fork per table ----
     let mut contributions: Vec<super::builder::Ext> = Vec::new();
     for (i, h) in e.tables.iter().enumerate() {
@@ -1890,6 +1935,24 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
 /// pass: wiring ledger entry 7 moved it from 4 to 6.
 pub(super) fn num_epoch_wide_arenas(e: &RealEpoch) -> usize {
     6 + usize::from(!e.page_commitments.is_empty())
+}
+
+/// How many words [`epoch_program`] publishes for the BLOCK-BINDING SCHEMA — the
+/// run that sits between the attestation id and the first sub-proof's block.
+///
+/// Exposed rather than recomputed at each reader for the reason
+/// [`num_epoch_wide_arenas`] is: a gate that walks the published words by index
+/// starts checking the WRONG field when this changes, and reports a pass. The
+/// aggregator's `SchemaLayout` indexes the same run and must agree with this
+/// number field for field.
+///
+/// The order is the emitter's: register INIT, register FINI, the two epoch-label
+/// halves, the public-output halves, then the L2G re-commit root's lanes.
+pub(super) fn schema_words(e: &RealEpoch) -> usize {
+    2 * crate::tables::register::NUM_REGISTER_ADDRESSES
+        + 2
+        + e.statement.public_output_len.div_ceil(4)
+        + super::proof_arena::lanes_per_root()
 }
 
 /// The arenas [`epoch_program`] declares, in the same order.
