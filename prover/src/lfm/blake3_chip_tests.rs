@@ -721,10 +721,9 @@ fn the_merkle_constructions_agree_with_the_host_under_both_hashes() {
         b.public(root[1]);
         let program = compile(b.finish());
 
-        let arena_words: Vec<LfmWord> = leaves
-            .iter()
-            .flat_map(super::proof_arena::commitment_words)
-            .collect();
+        // At THIS program's width (a byte hash, chosen on its builder above),
+        // not the configuration's: under an algebraic pin the two differ.
+        let arena_words: Vec<LfmWord> = super::proof_arena::commitments_to_arena_for(&leaves, hash);
         let exec = execute(&program, &[arena_words], &TestPermutation)
             .unwrap_or_else(|e| panic!("{hash:?}: the tree build must execute: {e:?}"));
         assert_eq!(
