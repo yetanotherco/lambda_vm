@@ -932,6 +932,68 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// Tree-less variant of [`try_expand_leaf_and_tree_row_major_keep`] for the
+/// batched prover: expand the row-major trace to its coset LDE on device and
+/// keep it resident column-major, building NO per-table Merkle tree — the shared
+/// mixed-height MMCS is the one tree, so a per-table row-pair tree here would be
+/// redundant on-device keccak. Returns the `GpuLdeBase` handle (`tree: None`,
+/// `buf` byte-identical to the tree-building path) and the row-major LDE (empty
+/// when `retain_host_lde=false`). `None` = declined (below threshold or not
+/// Goldilocks) so the caller falls back to a host-upload absorb.
+pub(crate) fn try_expand_row_major_keep_no_tree<F, E>(
+    row_major: &[FieldElement<E>],
+    predev: Option<&math_cuda::CudaSlice<u64>>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+) -> Option<(math_cuda::lde::GpuLdeBase, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    // Only the LDE columns are computed on device (no leaf hash / tree build), so
+    // bump only the LDE-call counter.
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_keep_no_tree(
+        raw,
+        predev,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        retain_host_lde,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len(), v.capacity())
+    };
+
+    Some((handle, lde_out))
+}
+
 /// Convert a GPU-built full node buffer (`(2*leaves - 1) * 32` bytes, inner
 /// nodes first, root at offset 0, leaves at the tail) into a host
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
@@ -1126,6 +1188,73 @@ where
     let root = handle.tree.as_ref()?.root;
     let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle, lde_out))
+}
+
+/// Tree-less variant of [`try_expand_leaf_and_tree_ext3_row_major_keep`] for the
+/// batched aux round: expand the row-major ext3 trace to its coset LDE and keep
+/// it resident (slab layout), building NO per-table Merkle tree — the shared
+/// mixed-height MMCS is the tree. The caller absorbs the resident `buf` via
+/// `StreamingMixedMmcs::absorb_ext3_slabs_dev`, which produces the byte-identical
+/// aux leaf as the host row-major absorb. `None` = declined (below threshold or
+/// not Fp3) so the caller falls back to a host-upload absorb.
+pub(crate) fn try_expand_ext3_row_major_keep_no_tree<F, E>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    retain_host_lde: bool,
+) -> Option<(math_cuda::lde::GpuLdeExt3, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m * 3) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    // Only the LDE columns are computed on device (no leaf hash / tree build).
+    GPU_LDE_CALLS.fetch_add((m * 3) as u64, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_keep_no_tree(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        retain_host_lde,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
+        )
+    };
+
+    Some((handle, lde_out))
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
@@ -2007,7 +2136,25 @@ where
     if stream.synchronize().is_err() || raw.len() != rows * cols * 3 {
         return false;
     }
-    let data = u64_to_ext3_vec::<E>(&raw);
+    // `raw` is the row-major ext3 aux buffer `[(row*cols+col)*3+limb]` — exactly
+    // the aux table's row-major `[row*cols+col]` ext3 layout. Reinterpret it in
+    // place as `FieldElement<E>` (E == ext3 = [u64;3]) instead of the per-element
+    // `u64_to_ext3_vec` copy (single-threaded over the whole aux). Byte-identical.
+    let data: Vec<FieldElement<E>> = {
+        let mut v = std::mem::ManuallyDrop::new(raw);
+        debug_assert!(
+            v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+            "aux buffer len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        // SAFETY: E == ext3 (tower checked above); `FieldElement<Ext3>` is [u64; 3].
+        unsafe {
+            Vec::from_raw_parts(
+                v.as_mut_ptr() as *mut FieldElement<E>,
+                v.len() / 3,
+                v.capacity() / 3,
+            )
+        }
+    };
     trace.aux_table = crate::table::Table::new(data, cols);
     trace.num_aux_columns = cols;
     // The declined device LDE attempt can leave kernels enqueued on another
@@ -2086,44 +2233,24 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    h.wait_ready_on(stream).ok()?;
-    let slabs = stream.clone_dtoh(h.buf.as_ref()).ok()?;
-    stream.synchronize().ok()?;
-    let (m, lde) = (h.m, h.lde_size);
-    if slabs.len() != m * lde * 3 {
-        return None;
-    }
-    // Per part: de-interleave the 3 slabs into row-major ext3 and reinterpret
-    // the u64 buffer in place — mirroring `materialize_lde_trace_host` rather
-    // than copying again through `u64_to_ext3_vec`. The row fill is parallel;
-    // this path fires often under VRAM pressure and otherwise dominates the
-    // D2H it follows.
-    let parts = (0..m)
-        .map(|p| {
-            let mut interleaved = vec![0u64; lde * 3];
-            #[cfg(feature = "parallel")]
-            interleaved
-                .par_chunks_exact_mut(3)
-                .enumerate()
-                .for_each(|(r, dst)| {
-                    for (k, d) in dst.iter_mut().enumerate() {
-                        *d = slabs[(p * 3 + k) * lde + r];
-                    }
-                });
-            #[cfg(not(feature = "parallel"))]
-            for (r, dst) in interleaved.chunks_exact_mut(3).enumerate() {
-                for (k, d) in dst.iter_mut().enumerate() {
-                    *d = slabs[(p * 3 + k) * lde + r];
-                }
-            }
+    // De-interleave the 3 ext3 slabs into per-column row-major ext3 ON DEVICE,
+    // then a contiguous D2H + split — the strided per-row gather this used to run
+    // on the host dominated the D2H it follows (~40% of the parts download).
+    let interleaved = math_cuda::deep::download_parts_interleaved(h, stream).ok()?;
+    // Each part is `lde` ext3 elements as `lde*3` interleaved u64s; reinterpret
+    // in place as FieldElement<E> (E == Ext3 = [u64; 3], checked above; each
+    // per-part Vec has len == capacity == lde*3 from the contiguous copy).
+    let parts = interleaved
+        .into_iter()
+        .map(|v| {
+            let mut v = std::mem::ManuallyDrop::new(v);
+            debug_assert!(
+                v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
+                "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
+            );
             // SAFETY: E == Ext3 per the tower check above; FieldElement<Ext3>
-            // is [u64; 3]. `vec![0u64; lde*3]` has len == capacity == lde*3.
+            // is [u64; 3].
             unsafe {
-                let mut v = std::mem::ManuallyDrop::new(interleaved);
-                debug_assert!(
-                    v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3),
-                    "interleaved len/capacity must be a multiple of 3 for Fp3 reinterpret"
-                );
                 Vec::from_raw_parts(
                     v.as_mut_ptr() as *mut FieldElement<E>,
                     v.len() / 3,
@@ -2439,6 +2566,52 @@ where
     out
 }
 
+/// Upload host composition-part columns (`num_parts` ext3 columns of length
+/// `lde_size`) to a device [`math_cuda::lde::GpuLdeExt3`] in the de-interleaved
+/// slab layout `[(p*3 + k) * lde_size + row]` the DEEP kernel reads. Lets the
+/// batched R4, whose parts live in the host `retained_parts`, take the
+/// fully-resident DEEP path (device parts + device inv-denoms) instead of the
+/// host `build_r4_inv_denoms_cpu` batch-inverse. The staging stream is
+/// synchronised, so the returned handle carries no ready event (`ready: None`).
+/// Returns `None` (→ the caller's host DEEP path) on non-ext3, shape mismatch,
+/// or a device error.
+pub(crate) fn upload_composition_parts_dev<E>(
+    parts: &[Vec<FieldElement<E>>],
+    lde_size: usize,
+) -> Option<math_cuda::lde::GpuLdeExt3>
+where
+    E: IsField + 'static,
+{
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let num_parts = parts.len();
+    if num_parts == 0 || lde_size == 0 || parts.iter().any(|p| p.len() != lde_size) {
+        return None;
+    }
+    let mut slab = vec![0u64; num_parts * 3 * lde_size];
+    for (p, col) in parts.iter().enumerate() {
+        // SAFETY: E == ext3 (checked); each element is `[u64; 3]`.
+        let s = unsafe { ext3_slice_to_u64::<E>(col) };
+        for (r, chunk) in s.chunks_exact(3).enumerate() {
+            slab[(p * 3) * lde_size + r] = chunk[0];
+            slab[(p * 3 + 1) * lde_size + r] = chunk[1];
+            slab[(p * 3 + 2) * lde_size + r] = chunk[2];
+        }
+    }
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    let dev = stream.clone_htod(&slab).ok()?;
+    stream.synchronize().ok()?;
+    Some(math_cuda::lde::GpuLdeExt3 {
+        buf: std::sync::Arc::new(dev),
+        m: num_parts,
+        lde_size,
+        tree: None,
+        ready: None,
+    })
+}
+
 /// R4 GPU dispatch: per-row DEEP composition over the full LDE domain.
 /// Reuses the device-resident main + (optional) aux LDE handles from R1
 /// and, when supplied, the device-resident composition-parts LDE handle
@@ -2651,7 +2824,22 @@ where
     };
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     debug_assert_eq!(deep_raw.len(), lde_size * 3);
-    Some(u64_to_ext3_vec::<E>(&deep_raw))
+    // `deep_raw` is the DEEP codeword row-major ext3 (`[row*3+limb]`); reinterpret
+    // in place as `FieldElement<E>` (E == ext3 = [u64;3]) rather than the
+    // per-element `u64_to_ext3_vec` copy. Byte-identical.
+    let out: Vec<FieldElement<E>> = {
+        let mut v = std::mem::ManuallyDrop::new(deep_raw);
+        debug_assert!(v.len().is_multiple_of(3) && v.capacity().is_multiple_of(3));
+        // SAFETY: E == ext3 (TypeId-checked at entry); FieldElement<Ext3> = [u64; 3].
+        unsafe {
+            Vec::from_raw_parts(
+                v.as_mut_ptr() as *mut FieldElement<E>,
+                v.len() / 3,
+                v.capacity() / 3,
+            )
+        }
+    };
+    Some(out)
 }
 
 /// Fully-resident DEEP keeping the codeword on device in FRI order (no D2H).
@@ -3286,6 +3474,163 @@ where
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((final_poly_coeffs, fri_layer_list))
+}
+
+/// GPU drive of the BATCHED FRI commit — the height-combined analogue of
+/// [`fri_commit_gpu_drive`]. Same fold/commit/terminal machinery, but between
+/// each fold and its Merkle commit it injects that layer's DEEP bucket into the
+/// running codeword on the device (`fri_inject_bucket_ext3` =
+/// `fri/batched.rs`'s `inject_bucket`), and it uses the batched terminal floor
+/// [`crate::fri::batched::BatchedFriLayout`]. `combined[h]` is the bucket at
+/// height `h` (`2^h` ext3 elements); `combined[h_max]` is the starting codeword
+/// and is taken.
+///
+/// Result convention — the batched-commit no-silent-fallback policy (see the
+/// `batched/prover.rs` module header): `Ok(None)` = the device path was NOT
+/// selected (wrong field, below the GPU threshold, or a degenerate layout),
+/// reached before any transcript mutation, so the caller builds the layers on
+/// the host; `Ok(Some(_))` = the device produced the commit; `Err(_)` = the
+/// device was selected but a CUDA op failed — a HARD ABORT, never a silent host
+/// fallback, exactly as a device MMCS-commit error aborts.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn try_batched_fri_commit_gpu<F, E, T>(
+    combined: &[Option<Vec<FieldElement<E>>>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    inv_twiddles: &[FieldElement<F>],
+    h_min: usize,
+    h_max: usize,
+) -> Result<
+    Option<(
+        Vec<FieldElement<E>>,
+        Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+    )>,
+    crate::prover::ProvingError,
+>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return Ok(None);
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return Ok(None);
+    }
+    let n0 = 1usize << h_max;
+    if n0 < 2 || n0 < gpu_lde_threshold() || inv_twiddles.len() != n0 / 2 {
+        return Ok(None);
+    }
+    let layout =
+        crate::fri::batched::BatchedFriLayout::new(h_max, h_min, blowup_log, final_poly_log_degree);
+    if layout.total_folds == 0 || layout.terminal_len < 2 {
+        return Ok(None);
+    }
+
+    // Pack inv_twiddles before any transcript mutation.
+    let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
+    for t in inv_twiddles {
+        // SAFETY: F == Goldilocks (checked); FieldElement<Gl> is transparent u64.
+        inv_tw_u64.push(unsafe { *(t.value() as *const _ as *const u64) });
+    }
+
+    // Clone (not take) the starting codeword so a not-selected `Ok(None)` return
+    // leaves `combined` intact for the host build.
+    let start = match combined.get(h_max).and_then(Option::as_ref) {
+        Some(c) if c.len() == n0 => c.clone(),
+        _ => return Ok(None),
+    };
+    // SAFETY: E == Ext3; backing is [u64; 3].
+    let start_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(&start) };
+    // From here on a CUDA failure is a HARD ABORT (`Err`), not a host fallback:
+    // the device path is committed. No transcript has been mutated yet, so the
+    // aborting proof simply stops.
+    let mut state = math_cuda::fri::FriCommitState::new(start_u64, &inv_tw_u64, n0).map_err(|e| {
+        crate::prover::ProvingError::WrongParameter(format!(
+            "batched FRI device init failed: {e:?} — aborting the prove (NO host fallback)"
+        ))
+    })?;
+
+    // Upload every shorter bucket to the device, indexed by height.
+    let mut buckets: Vec<Option<math_cuda::CudaSlice<u64>>> = (0..=h_max).map(|_| None).collect();
+    for h in 1..h_max {
+        if let Some(bucket) = combined.get(h).and_then(Option::as_ref) {
+            let bucket_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(bucket) };
+            let dev = state.stream.clone_htod(bucket_u64).map_err(|e| {
+                crate::prover::ProvingError::WrongParameter(format!(
+                    "batched FRI device bucket upload failed at height {h}: {e:?} — aborting the prove (NO host fallback)"
+                ))
+            })?;
+            buckets[h] = Some(dev);
+        }
+    }
+
+    let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
+        Vec::with_capacity(layout.num_committed);
+
+    // `total_folds` folds: the first `num_committed` commit a layer; the last one
+    // is the terminal fold (no layer, coeffs emitted). Each fold to height `h`
+    // injects `combined[h]`.
+    for fold_idx in 0..layout.total_folds as usize {
+        let beta: FieldElement<E> = transcript.sample_field_element();
+        let beta_ptr = &beta as *const FieldElement<E> as *const u64;
+        // SAFETY: E == Ext3.
+        let beta_raw: [u64; 3] = unsafe { [*beta_ptr, *beta_ptr.add(1), *beta_ptr.add(2)] };
+        let beta_sq = beta.square();
+        let bsq_ptr = &beta_sq as *const FieldElement<E> as *const u64;
+        let beta_sq_raw: [u64; 3] = unsafe { [*bsq_ptr, *bsq_ptr.add(1), *bsq_ptr.add(2)] };
+
+        let inject_h = h_max - fold_idx - 1;
+        let bucket_arg = buckets
+            .get(inject_h)
+            .and_then(Option::as_ref)
+            .map(|b| (beta_sq_raw, b));
+
+        let (evals_u64, evals_dev, dev_tree) = state
+            .fold_inject_commit_layer(beta_raw, bucket_arg, true)
+            .map_err(|e| {
+                crate::prover::ProvingError::WrongParameter(format!(
+                    "batched FRI device fold/commit failed at fold {fold_idx}: {e:?} — \
+                     aborting the prove (NO host fallback)"
+                ))
+            })?;
+
+        if fold_idx < layout.num_committed {
+            let evaluation = evals_u64.map(|v| u64_to_ext3_vec::<E>(&v)).unwrap_or_default();
+            let root = dev_tree.root;
+            let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+            fri_layer_list.push(FriLayer {
+                evaluation,
+                merkle_tree,
+                gpu_tree: Some(dev_tree),
+                gpu_evals: None,
+            });
+            let _ = evals_dev;
+            transcript.append_bytes(&root);
+        } else {
+            // Terminal fold: emit the low-degree coefficients.
+            let terminal = u64_to_ext3_vec::<E>(&evals_u64.expect("terminal fold drains to host"));
+            let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+            let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+                &terminal,
+                &terminal_offset,
+                layout.effective_k,
+            );
+            for c in &final_poly_coeffs {
+                transcript.append_field_element(c);
+            }
+            GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some((final_poly_coeffs, fri_layer_list)));
+        }
+    }
+    // total_folds >= 1 guarantees the terminal branch above returned.
+    unreachable!("batched FRI drive: terminal fold not reached")
 }
 
 /// GPU FRI query phase: gather each layer's paths on device instead of walking

@@ -202,6 +202,16 @@ pub struct Backend {
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
+    // Mixed-height MMCS (batched commitments). The per-leaf sponge is kept in
+    // device memory and matrices are absorbed into it one at a time, so a height
+    // group never needs all its LDEs resident — see `kernels/keccak.cu`.
+    pub mmcs_states_init: CudaFunction,
+    pub mmcs_absorb_row_pair_row_major: CudaFunction,
+    pub mmcs_absorb_row_pair_col_major: CudaFunction,
+    pub mmcs_absorb_row_pair_ext3_slabs: CudaFunction,
+    pub mmcs_absorb_row_pair_ext3_row_major: CudaFunction,
+    pub mmcs_states_finalize: CudaFunction,
+    pub keccak_mmcs_level: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -217,9 +227,11 @@ pub struct Backend {
     // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
     pub bit_reverse_ext3_kernel: CudaFunction,
+    pub interleave_ext3_slabs: CudaFunction,
 
     // fri.cubin
     pub fri_fold_ext3: CudaFunction,
+    pub fri_inject_bucket_ext3: CudaFunction,
     pub gather_ext3_at: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
@@ -438,6 +450,17 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            mmcs_states_init: keccak.load_function("mmcs_states_init")?,
+            mmcs_absorb_row_pair_row_major: keccak
+                .load_function("mmcs_absorb_row_pair_row_major")?,
+            mmcs_absorb_row_pair_col_major: keccak
+                .load_function("mmcs_absorb_row_pair_col_major")?,
+            mmcs_absorb_row_pair_ext3_slabs: keccak
+                .load_function("mmcs_absorb_row_pair_ext3_slabs")?,
+            mmcs_absorb_row_pair_ext3_row_major: keccak
+                .load_function("mmcs_absorb_row_pair_ext3_row_major")?,
+            mmcs_states_finalize: keccak.load_function("mmcs_states_finalize")?,
+            keccak_mmcs_level: keccak.load_function("keccak_mmcs_level")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
@@ -451,7 +474,9 @@ impl Backend {
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
+            interleave_ext3_slabs: deep.load_function("interleave_ext3_slabs")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
+            fri_inject_bucket_ext3: fri.load_function("fri_inject_bucket_ext3")?,
             gather_ext3_at: fri.load_function("gather_ext3_at")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
             compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,

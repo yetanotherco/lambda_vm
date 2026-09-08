@@ -263,9 +263,17 @@ pub trait IsStarkVerifier<
         })
     }
 
+    /// The three proof-derived inputs are passed as plain data rather than read
+    /// off a `StarkProofView`, because the batched epoch verifier
+    /// ([`crate::batched::verifier`]) has to run this identical check against a
+    /// proof that has no such view. One constraint check, two callers.
+    #[allow(clippy::too_many_arguments)]
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        trace_length: usize,
+        bus_table_contribution: Option<FieldElement<FieldExtension>>,
+        ood_current_row: &[FieldElement<FieldExtension>],
+        composition_parts_ood: &[FieldElement<FieldExtension>],
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -280,11 +288,10 @@ pub trait IsStarkVerifier<
         crate::profile_markers::step_marker::<
             { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
         >();
-        let trace_length = proof.trace_length();
         // Owned `BusPublicInputs` (just the table contribution L — one field
         // element) reconstructed for the AIR boundary call.
-        let bus_public_inputs = proof
-            .bus_table_contribution()
+        let bus_public_inputs = bus_table_contribution
+            .clone()
             .map(BusPublicInputs::from_contribution);
 
         let boundary_constraints = air.boundary_constraints(
@@ -309,8 +316,7 @@ pub trait IsStarkVerifier<
             .collect();
 
         let main_trace_width = air.trace_layout().0;
-        let trace_ood_evaluations = proof.trace_ood_evaluations();
-        let ood_row = trace_ood_evaluations.get_row(0);
+        let ood_row = ood_current_row;
 
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
@@ -352,8 +358,8 @@ pub trait IsStarkVerifier<
         // aux count; reject instead of underflowing. The current-row block keeps
         // the full trace width even under g·z pruning, so this still yields the
         // main width.
-        let num_main_trace_columns = match trace_ood_evaluations
-            .width()
+        let num_main_trace_columns = match ood_current_row
+            .len()
             .checked_sub(air.num_auxiliary_rap_columns())
         {
             Some(n) => n,
@@ -370,7 +376,7 @@ pub trait IsStarkVerifier<
                 Vec::new()
             };
 
-        let logup_table_offset = match proof.bus_table_contribution() {
+        let logup_table_offset = match bus_table_contribution {
             Some(contribution) => {
                 let n = FieldElement::<Field>::from(trace_length as u64);
                 match n.inv() {
@@ -418,8 +424,7 @@ pub trait IsStarkVerifier<
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
 
-        let composition_poly_claimed_ood_evaluation = proof
-            .composition_poly_parts_ood_evaluation()
+        let composition_poly_claimed_ood_evaluation = composition_parts_ood
             .iter()
             .rev()
             .fold(FieldElement::zero(), |acc, coeff| {
@@ -836,9 +841,33 @@ pub trait IsStarkVerifier<
     /// elsewhere), not from `proof.trace_ood_evaluations()` which now carries
     /// only the current-row block. Pruned positions are zero in both the grid
     /// and `trace_term_coeffs`, so next rows sum only the window columns.
+    /// The per-proof invariant terms, from a `StarkProofView`.
+    ///
+    /// A thin delegate to [`Self::query_invariant_deep_terms_from_parts`], kept
+    /// at this name and signature because it is public API with callers outside
+    /// this crate (`prover/src/lfm/`'s constraint and join oracles). The batched
+    /// epoch verifier calls the slice-taking form instead — one OOD walk, two
+    /// entry points, rather than a second copy of it.
     fn compute_query_invariant_deep_terms(
         challenges: &Challenges<FieldExtension>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
+    ) -> Option<QueryInvariantDeepTerms<FieldExtension>> {
+        Self::query_invariant_deep_terms_from_parts(
+            challenges,
+            proof.composition_poly_parts_ood_evaluation(),
+            ood_full,
+            next_row_cols,
+            step_size,
+        )
+    }
+
+    /// `composition_parts_ood` is the proof's `Hᵢ(z^N)` values.
+    fn query_invariant_deep_terms_from_parts(
+        challenges: &Challenges<FieldExtension>,
+        composition_parts_ood: &[FieldElement<FieldExtension>],
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
@@ -874,7 +903,6 @@ pub trait IsStarkVerifier<
             ood_row_sum.push(sum);
         }
 
-        let composition_parts_ood = proof.composition_poly_parts_ood_evaluation();
         let number_of_parts = composition_parts_ood.len();
         let z_pow = challenges.z.pow(number_of_parts);
 
@@ -1710,7 +1738,10 @@ pub trait IsStarkVerifier<
 
         if !Self::step_2_verify_claimed_composition_polynomial(
             air,
-            proof,
+            proof.trace_length(),
+            proof.bus_table_contribution(),
+            proof.trace_ood_evaluations().get_row(0),
+            proof.composition_poly_parts_ood_evaluation(),
             public_inputs,
             &domain,
             &challenges,

@@ -294,12 +294,18 @@ impl PartialEq for ResidentAux {
 }
 impl Eq for ResidentAux {}
 
-/// Main trace input for the resident aux build: either a host column-major
-/// buffer to upload, or an already-resident device buffer (from the R1 main
-/// LDE) to read in place. The device form skips the ~3 GB main re-upload.
+/// Main trace input for the resident aux build: a host column-major buffer to
+/// upload, a host row-major buffer to upload then transpose to column-major on
+/// device (no host transpose), or an already-resident device buffer (from the R1
+/// main LDE) to read in place. The device form skips the ~3 GB main re-upload.
 #[derive(Clone, Copy)]
 pub enum ResidentMain<'a> {
+    /// Column-major host buffer (`num_cols * num_rows`), uploaded as-is.
     Host(&'a [u64]),
+    /// Row-major host buffer (`num_rows * num_cols`, the trace table's native
+    /// layout) uploaded contiguously then transposed to column-major on device.
+    /// The `usize` is the column count. Skips the host row→col transpose.
+    HostRowMajor(&'a [u64], usize),
     Dev(&'a CudaSlice<u64>),
 }
 
@@ -335,10 +341,26 @@ pub fn logup_aux_resident(
     let uploaded: Option<CudaSlice<u64>> = match main {
         ResidentMain::Dev(_) => None,
         ResidentMain::Host(h) => Some(stream.clone_htod(h)?),
+        ResidentMain::HostRowMajor(h, cols) => {
+            // Upload the row-major trace (contiguous — no host transpose) then
+            // transpose it to the column-major layout the fingerprint kernel
+            // reads, on device. The row-major staging buffer frees stream-ordered
+            // after the transpose reads it (same stream), so dropping it here is
+            // safe.
+            let row_dev = stream.clone_htod(h)?;
+            Some(crate::lde::launch_row_to_col_major(
+                stream,
+                be,
+                &row_dev,
+                num_rows,
+                cols,
+                num_rows as u64,
+            )?)
+        }
     };
     let main_dev: &CudaSlice<u64> = match (main, &uploaded) {
         (ResidentMain::Dev(d), _) => d,
-        (ResidentMain::Host(_), Some(up)) => up,
+        (ResidentMain::Host(_) | ResidentMain::HostRowMajor(_, _), Some(up)) => up,
         _ => unreachable!(),
     };
     let main_len = main_dev.len();

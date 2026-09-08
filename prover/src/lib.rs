@@ -38,7 +38,7 @@ use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::Verifier;
 
 use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
@@ -65,7 +65,6 @@ use crate::test_utils::{
 // fixed at guest build time (`recursion::Preset`).
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
-use stark::proof::stark::MultiProof;
 use stark::proof::view::{MultiProofView, ProofViewSource};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
@@ -161,8 +160,10 @@ impl TableCounts {
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VmProof {
-    /// The multi-table STARK proof.
-    pub proof: MultiProof<F, E, ()>,
+    /// The multi-table STARK proof — the batched (multi-merkle-tree) proof: one
+    /// shared tree over all tables, device-resident on GPU. (Cutover from the
+    /// per-table `MultiProof`; recursion/continuation still use per-table.)
+    pub proof: stark::batched::proof::BatchedMultiProof<F, E, ()>,
     /// Run-length encoded runtime page ranges.
     /// These are zero-initialized pages accessed during execution but not
     /// covered by ELF segments (stack, heap, etc.).
@@ -403,8 +404,16 @@ pub fn verify_recursion_blob<'a>(
     let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let elf_digest = statement::elf_digest(inner_elf);
 
+    // The batched verifier reads an owned proof; deserialize the archived one
+    // (recursion host path — the guest cutover to a batched verifier is a
+    // separate effort, so this materializes the proof rather than verifying it
+    // zero-copy in-place).
+    let owned_proof: stark::batched::proof::BatchedMultiProof<F, E, ()> =
+        rkyv::deserialize::<_, RkyvError>(&archived.vm_proof.proof).map_err(|e| {
+            Error::Execution(format!("rkyv deserialize batched proof failed: {e}"))
+        })?;
     let ok = verify_proof_parts(
-        MultiProofView::Archived(&archived.vm_proof.proof),
+        &owned_proof,
         &table_counts,
         &runtime_page_ranges,
         num_private_input_pages,
@@ -1217,11 +1226,14 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
+    // Cutover: the VM proves with the batched (multi-merkle-tree) prover,
+    // device-resident on GPU. RecomputeLde fits any block's VRAM.
+    let (proof, _stats) = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
+        stark::residency_mode::ResidencyMode::RecomputeLde,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     #[cfg(feature = "instruments")]
@@ -1258,6 +1270,429 @@ pub fn prove_with_options_and_inputs(
         public_output: traces.public_output_bytes.clone(),
         num_private_input_pages,
     })
+}
+
+/// CPU structural comparison (see MEASUREMENT-PLAN.md): time JUST the batched
+/// `multi_prove_batched` prove step over the VM's real tables. Paired with
+/// [`time_per_table_prove`] on the SAME block, run non-cuda so BOTH are pure CPU,
+/// this isolates the multi-merkle-tree's structural cost from GPU optimization
+/// (the GPU comparison was confounded — per-table is device-resident, batched is
+/// not). `Retain` matches the per-table path's single-prove residency. NOT part
+/// of the shipping pipeline.
+pub fn time_batched_prove(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<std::time::Duration, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    // `LAMBDA_BATCHED_RESIDENCY=recompute` exercises the device-resident R2/R4
+    // paths (they engage only under RecomputeLde, where `materialize_ldes`
+    // recomputes on the GPU and attaches the handles); default Retain keeps every
+    // LDE host-resident (the small-block path).
+    let residency = match std::env::var("LAMBDA_BATCHED_RESIDENCY").as_deref() {
+        Ok("recompute") => stark::residency_mode::ResidencyMode::RecomputeLde,
+        _ => stark::residency_mode::ResidencyMode::Retain,
+    };
+    let t = std::time::Instant::now();
+    let _ = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+        residency,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    Ok(t.elapsed())
+}
+
+/// CPU structural comparison: time JUST the per-table `Prover::multi_prove` over
+/// the same tables. See [`time_batched_prove`].
+pub fn time_per_table_prove(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<std::time::Duration, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    let t = std::time::Instant::now();
+    let _ = Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    Ok(t.elapsed())
+}
+
+/// Serialized proof SIZE (rkyv bytes) of the batched (multi-merkle-tree) prover —
+/// the structural payoff: one shared authentication path per query instead of one
+/// per table. Compare against [`size_per_table_prove`] on the same block. Setup
+/// mirrors [`time_batched_prove`] (Retain residency; the proof is
+/// residency-independent).
+pub fn size_batched_prove(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<usize, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    // RecomputeLde (not Retain): the proof is byte-identical either way
+    // (`residency_mode_does_not_move_any_batched_root`), and RecomputeLde fits any
+    // block's memory — Retain OOMs on bigger blocks.
+    let (proof, _stats) = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+        stark::residency_mode::ResidencyMode::RecomputeLde,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        .map_err(|e| Error::Prover(format!("batched proof serialize: {e}")))?;
+    Ok(bytes.len())
+}
+
+/// Serialized proof SIZE (rkyv bytes) of the per-table prover, for the size
+/// comparison against [`size_batched_prove`].
+pub fn size_per_table_prove(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<usize, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    let proof = Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        .map_err(|e| Error::Prover(format!("per-table proof serialize: {e}")))?;
+    Ok(bytes.len())
+}
+
+/// PROVE then VERIFY a real block with the batched (multi-merkle-tree) prover —
+/// the e2e roundtrip with the DEVICE paths engaged (RecomputeLde: device R2
+/// constraint eval, R4 DEEP, device-gather openings). Confirms the
+/// device-resident prover produces a proof the batched verifier accepts on a
+/// REAL block (the bench only times/sizes; this closes the correctness loop at
+/// scale). Returns whether verification passed.
+pub fn prove_and_verify_batched_block(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<bool, Error> {
+    let proof_options =
+        GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let max_rows = MaxRowsConfig::default();
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, &max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let public_output_bytes = traces.public_output_bytes.clone();
+    let fri_final = proof_options.fri_final_poly_log_degree;
+
+    // Prove (device paths, RecomputeLde).
+    let mut prover_transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut prover_transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        fri_final,
+    );
+    let (proof, _stats) = stark::batched::prover::multi_prove_batched::<F, E, (), Prover<F, E, ()>>(
+        airs.air_trace_pairs(&mut traces),
+        &mut prover_transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+        stark::residency_mode::ResidencyMode::RecomputeLde,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    // WIRE roundtrip: serialize the proof and read it back, so verification runs
+    // against the deserialized proof exactly as a consumer off the wire would —
+    // the batched proof is a complete, transportable artifact, not just an
+    // in-memory value.
+    let proof_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        .map_err(|e| Error::Prover(format!("batched proof serialize: {e}")))?;
+    let proof: stark::batched::proof::BatchedMultiProof<F, E, ()> =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&proof_bytes)
+            .map_err(|e| Error::Prover(format!("batched proof deserialize: {e}")))?;
+
+    // Verify against a fresh transcript bound to the SAME statement.
+    let air_refs = airs.air_refs();
+    let mut vtranscript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut vtranscript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        fri_final,
+    );
+    // Bus balance: replay the batched transcript for the LogUp (z, alpha), then
+    // recompute the COMMIT bus offset from the public output (same as the VM's
+    // per-table verify, over the batched challenge replay).
+    let mut replay_t = vtranscript.clone();
+    let challenges =
+        match stark::batched::verifier::replay_epoch_transcript::<F, E, (), _>(
+            &air_refs,
+            &proof,
+            &mut replay_t,
+        ) {
+            Some((_shape, _fri, ch)) => ch,
+            None => return Ok(false),
+        };
+    let expected_bus_balance = if challenges.lookup.len() >= 2 {
+        compute_commit_bus_offset(&public_output_bytes, 0, &challenges.lookup[0], &challenges.lookup[1])
+            .ok_or_else(|| Error::Prover("bus offset computation failed".to_string()))?
+    } else {
+        FieldElement::<E>::zero()
+    };
+    Ok(stark::batched::verifier::multi_verify_batched::<F, E, (), Verifier<F, E, ()>, _>(
+        &air_refs,
+        &proof,
+        &mut vtranscript,
+        &expected_bus_balance,
+    ))
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.
@@ -1329,7 +1764,7 @@ pub(crate) fn verify_prepared(
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
     verify_proof_parts(
-        MultiProofView::Owned(&vm_proof.proof),
+        &vm_proof.proof,
         &vm_proof.table_counts,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
@@ -1350,7 +1785,7 @@ pub(crate) fn verify_prepared(
 /// duplicated verification logic, and no repeated `Elf::load`/digest.
 #[allow(clippy::too_many_arguments)]
 fn verify_proof_parts(
-    proofs: MultiProofView<'_, F, E, ()>,
+    proof: &stark::batched::proof::BatchedMultiProof<F, E, ()>,
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     num_private_input_pages: usize,
@@ -1381,23 +1816,25 @@ fn verify_proof_parts(
     // here makes the rejection happen before the configs are allocated — the
     // `expected_proof_count` check below runs too late to stop a `count: u64::MAX`
     // range from exhausting memory first.
+    let num_tables = proof.tables.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         program,
         runtime_page_ranges,
         num_private_input_pages,
-        proofs.len(),
+        num_tables,
     )?;
 
-    // Cross-check: table_counts must match the number of sub-proofs.
-    // FIXED_TABLE_COUNT always-present tables, plus page tables.
+    // Cross-check: table_counts must match the number of per-table sub-proofs
+    // the batched proof carries. FIXED_TABLE_COUNT always-present tables, plus
+    // page tables.
     let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected_proof_count != proofs.len() {
+    if expected_proof_count != num_tables {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} tables",
             table_counts.total(),
             page_configs.len(),
             expected_proof_count,
-            proofs.len(),
+            num_tables,
         )));
     }
 
@@ -1434,31 +1871,42 @@ fn verify_proof_parts(
         proof_options.fri_final_poly_log_degree,
     );
 
-    // Fork the post-absorb state: the replay helper advances through Phase A
-    // independently of the multi_verify transcript, but both must start from
-    // the same statement-bound state.
+    // Fork the post-absorb state: the batched transcript replay recovers the
+    // LogUp (z, alpha) independently of the multi_verify transcript, but both
+    // must start from the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
-    let expected_bus_balance = match compute_expected_commit_bus_balance_view(
+    let challenges = match stark::batched::verifier::replay_epoch_transcript::<F, E, (), _>(
         &air_refs,
-        proofs,
-        public_output,
-        // Monolithic proof: commits are indexed from 0.
-        0,
+        proof,
         &mut transcript_for_replay,
     ) {
-        Some(balance) => balance,
+        Some((_shape, _fri, ch)) => ch,
         None => return Ok(false),
+    };
+    // Recompute the COMMIT output bus offset from the public output, over the
+    // batched (z, alpha). A tampered public output makes it diverge from the
+    // proof's bus total and verification rejects.
+    let expected_bus_balance = if challenges.lookup.len() >= 2 {
+        match compute_commit_bus_offset(public_output, 0, &challenges.lookup[0], &challenges.lookup[1])
+        {
+            Some(balance) => balance,
+            None => return Ok(false),
+        }
+    } else {
+        FieldElement::<E>::zero()
     };
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(Verifier::multi_verify_views(
-        &air_refs,
-        proofs,
-        &mut transcript,
-        &expected_bus_balance,
-    ))
+    Ok(
+        stark::batched::verifier::multi_verify_batched::<F, E, (), Verifier<F, E, ()>, _>(
+            &air_refs,
+            proof,
+            &mut transcript,
+            &expected_bus_balance,
+        ),
+    )
 }
 
 /// Prove and verify in one call (convenience).
