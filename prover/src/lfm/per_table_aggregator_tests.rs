@@ -507,12 +507,34 @@ fn the_aggregation_publish_profile_drops_only_diagnostics() {
         agg[..head],
         "the binding head must not move with the profile"
     );
-    // ---- the tail: the bus total, which both profiles still publish last.
-    assert_eq!(
-        diag[diag.len() - 1],
-        agg[agg.len() - 1],
-        "the closure's total ends the list under either profile"
-    );
+    // ---- the tail: the closure's total, which both profiles publish LAST.
+    //
+    // ⚠ Against PRODUCTION'S OWN TARGET, one profile at a time — never by
+    // comparing the two lists' last entries to each other. A published word is
+    // an `(index, value)` pair, and the two indices cannot be equal: making the
+    // lists different lengths is the entire point of R2. That was this
+    // assertion's first form, and it failed on box A with the four field
+    // elements matching exactly and only the indices differing (307 against
+    // 144) — the emitter doing precisely what it should, caught by a test
+    // asserting something it never meant.
+    //
+    // The oracle here is also stronger than the one it replaces: production's
+    // COMMIT-bus balance, rather than "the other profile agrees with me".
+    for (label, words) in [("Diagnostic", &diag), ("Aggregation", &agg)] {
+        let (index, word) = words.last().expect("a profile publishes words");
+        assert_eq!(
+            *index as usize,
+            words.len() - 1,
+            "{label}: publish indices auto-increment, so the last word's index \
+             is len-1"
+        );
+        assert_eq!(
+            super::word::word_as_ext(word).expect("the bus total is ext"),
+            e.expected_bus_balance,
+            "{label}: the closure's total must end the list and reach \
+             production's own COMMIT-bus target"
+        );
+    }
     assert_eq!(agg.len(), head + 1, "Aggregation is the head and the total");
 
     // ---- what was dropped, from the epoch's own shapes rather than from a
