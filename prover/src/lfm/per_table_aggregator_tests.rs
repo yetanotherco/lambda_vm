@@ -1353,7 +1353,9 @@ fn a_zero_bit_query_draw_consumes_what_the_host_does() {
 /// and the layout that describes it is `SchemaLayout::node`. Nothing about the
 /// level appears here — which is what "the same emitter serves every level"
 /// means operationally.
+#[allow(clippy::too_many_arguments)]
 fn prove_node_as_child(
+    label: &str,
     children: &[RealChild],
     layouts: &[super::per_table_aggregator::SchemaLayout],
     labels: &[&[u64]],
@@ -1375,6 +1377,16 @@ fn prove_node_as_child(
         super::registry::build_artifacts_with_hasher(&program, opts, crate::hash_pin::BLOCK_HASHER);
     let proved = super::proof::lfm_prove(&program, &artifacts, &arenas, opts)
         .expect("an aggregation node must prove");
+    // ★ PER-LEVEL marks, so flatness is a WITHIN-RUN comparison. One gate's peak
+    // against another's cannot settle it: the leaf gate runs at
+    // FIXTURE_EPOCH_LOG2 and this one at FIXTURE_EPOCH_LOG2 - 1, so their nodes
+    // sit over different-sized epochs. Only levels measured inside ONE run are
+    // comparable, and this is what makes that comparison possible.
+    println!(
+        "   RSS high-water AFTER proving {label}: {:?} GiB ({} instructions)",
+        super::wrap_tests::peak_rss_gib(),
+        program.instrs.len(),
+    );
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
     (real_child(artifacts, opts.clone(), &proved), layout)
@@ -1489,8 +1501,15 @@ fn the_inner_node_verifies_two_leaf_nodes() {
             label_of(leaf * FAN_IN),
             label_of(leaf * FAN_IN + FAN_IN - 1),
         );
-        let (child, layout) =
-            prove_node_as_child(&wraps, &wrap_layouts, &refs, range, out_halves, &wrap_opts);
+        let (child, layout) = prove_node_as_child(
+            &format!("leaf {leaf} (level 1)"),
+            &wraps,
+            &wrap_layouts,
+            &refs,
+            range,
+            out_halves,
+            &wrap_opts,
+        );
         println!(
             "   leaf {leaf}: {} published words, {} sub-proofs",
             child.public_words.len(),
@@ -1510,8 +1529,15 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     let range = (leaf_labels[0][0], leaf_labels[FAN_IN - 1][1]);
     let out_halves = leaf_layouts[FAN_IN - 1].out_halves;
     let t = Instant::now();
-    let (inner_node, inner_layout) =
-        prove_node_as_child(&leaves, &leaf_layouts, &refs, range, out_halves, &wrap_opts);
+    let (inner_node, inner_layout) = prove_node_as_child(
+        "the INNER node (level 2)",
+        &leaves,
+        &leaf_layouts,
+        &refs,
+        range,
+        out_halves,
+        &wrap_opts,
+    );
     println!(
         "\n★ INNER NODE PROVED AND VERIFIED (a node over {FAN_IN} NODE proofs)\n   \
          prove+harvest {:.1}s\n   {} published words, {} sub-proofs\n   \
