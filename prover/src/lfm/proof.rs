@@ -244,13 +244,12 @@ pub fn lfm_verify(
 ///
 /// It does not check `prep_root`. The LFM machine proves and verifies a
 /// per-table [`MultiProof`], whose openings are authenticated against the
-/// per-slot `roots`; the batched preprocessed round is a commitment to the same
-/// matrices that only a verifier reading a `BatchedMultiProof` can use
-/// (`stark::batched::verifier`). Until the machine switches paths, this is
-/// plumbing ahead of its consumer, and saying otherwise would overstate what a
-/// passing verification means.
+/// per-slot `roots`; `prep_root` is a second commitment over those same
+/// preprocessed matrices, gathered into one multi-matrix round, and nothing
+/// reads it. It is plumbing with no consumer, and saying otherwise would
+/// overstate what a passing verification means.
 ///
-/// The shape that consumer will need is [`LfmArtifacts::prep_round_shape`].
+/// The shape it commits to is [`LfmArtifacts::prep_round_shape`].
 pub fn verify_against_artifacts(
     artifacts: &LfmArtifacts,
     proof: &MultiProof<F, E, ()>,
