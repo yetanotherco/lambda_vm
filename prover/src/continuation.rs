@@ -175,6 +175,11 @@ pub(crate) fn l2g_global_air(
         1,
         EmptyConstraints,
     )
+    // Named so the global prove is identifiable in a table walk and in a device
+    // abort. Unnamed, `IsAIR::name()` falls back to "unknown" (`lookup.rs:1073`),
+    // and the overlapped global prove's walk line is then indistinguishable from
+    // an epoch's — which cost a wrong epoch index and a dead-end diagnosis.
+    .with_name("L2G_GLOBAL")
 }
 
 /// Local-to-global AIR on the epoch-local Memory bus (used inside an epoch proof).
@@ -227,6 +232,9 @@ pub(crate) fn global_memory_air(
     config: &PageConfig,
     preprocessed: Option<Commitment>,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
+    // Named for the same reason as `l2g_global_air`: an unnamed AIR prints as
+    // "unknown" in every walk line and device diagnostic. `with_preprocessed`
+    // below takes `self` by value and preserves the name.
     let air = AirWithBuses::new(
         global_memory::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -235,7 +243,8 @@ pub(crate) fn global_memory_air(
         opts,
         1,
         EmptyConstraints,
-    );
+    )
+    .with_name("GLOBAL_MEMORY");
     if config.is_private_input {
         // OFFSET only — see the matching branch in `VmAirs::new`. INIT stays a
         // main-trace column (it is the private input); OFFSET must be committed or

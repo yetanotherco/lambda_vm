@@ -300,10 +300,28 @@ fn commit_set_line(set: Option<&CommitDeviceSet>) -> String {
     }
 }
 
+/// What the admission machinery BELIEVED it had spent, for the diagnostic:
+/// the bytes summed over every live `VramGate` and how many gates are live.
+///
+/// Printed beside the live free VRAM so an abort reports belief and truth on
+/// the same line. Two live gates means an epoch prove and `continuation.rs`'s
+/// overlapped global prove are each admitting against the same process-wide
+/// budget with no knowledge of one another, so the believed total can exceed
+/// the budget by a whole gate's worth.
+fn gate_belief_line() -> String {
+    let bytes = crate::prover::VRAM_GATE_ADMITTED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let gates = crate::prover::VRAM_GATE_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "admission believed {:.2} GiB spent across {gates} live gate(s)",
+        gib(bytes)
+    )
+}
+
 /// The diagnostic every abort and every test-only fallback prints: the stage
 /// and shape, the device set term by term (`set_line`, already formatted by
 /// the stage — [`commit_set_line`] for the commits), the admission budget,
-/// the live free/total VRAM and the mempool posture.
+/// what the admission believed it had spent ([`gate_belief_line`]), the live
+/// free/total VRAM and the mempool posture.
 fn device_path_diagnostic(
     shape: &DispatchShape<'_>,
     set_line: &str,
@@ -325,8 +343,9 @@ fn device_path_diagnostic(
         DevicePathFailure::DeviceError(e) => format!("device error after admission: {e}"),
     };
     format!(
-        "table {table}: {what}: rows {n} x {base_cols} base cols @ blowup {blowup} (LDE {}); {reason}{set_line}; {}",
+        "table {table}: {what}: rows {n} x {base_cols} base cols @ blowup {blowup} (LDE {}); {reason}{set_line}; {}; {}",
         n.saturating_mul(*blowup),
+        gate_belief_line(),
         device_path_status()
     )
 }

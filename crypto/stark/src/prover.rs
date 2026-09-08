@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
@@ -738,6 +739,28 @@ struct VramGate {
     budget: u64,
 }
 
+/// Diagnostic mirror of the bytes every live [`VramGate`] has admitted, summed
+/// across gates. A gate is built per prove, and `continuation.rs`'s "Global
+/// prove, overlapped" runs a SECOND prove while the tail epochs are still
+/// proving, so two gates can be live at once — each admitting against the same
+/// process-wide budget without knowing the other exists.
+///
+/// Read only on the device-abort path ([`gpu_lde::device_path_diagnostic`]),
+/// where it reports what the admission machinery BELIEVED it had spent at the
+/// instant the card refused an allocation. Belief beside truth is the one
+/// reading that separates "the device-set model under-counts one table" from
+/// "two accountings disagree about the same card".
+///
+/// ⚠ Diagnostic only. Nothing reads this to make a decision, and nothing may:
+/// it is a lock-free sum over gates that acquire and release concurrently, so
+/// it is exact only when quiescent and skewed by in-flight admissions
+/// otherwise. That is fine for a message printed while aborting.
+pub(crate) static VRAM_GATE_ADMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`VramGate`]s are alive. Two means an epoch prove and the
+/// overlapped global prove are admitting against the same card independently.
+pub(crate) static VRAM_GATE_LIVE: AtomicU64 = AtomicU64::new(0);
+
 struct VramPermit<'a> {
     gate: &'a VramGate,
     bytes: u64,
@@ -745,6 +768,7 @@ struct VramPermit<'a> {
 
 impl VramGate {
     fn new(budget: u64) -> Self {
+        VRAM_GATE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             used: std::sync::Mutex::new(0),
             freed: std::sync::Condvar::new(),
@@ -757,6 +781,7 @@ impl VramGate {
         loop {
             if *used == 0 || used.saturating_add(bytes) <= self.budget {
                 *used = used.saturating_add(bytes);
+                VRAM_GATE_ADMITTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
                 return VramPermit { gate: self, bytes };
             }
             used = self.freed.wait(used).unwrap();
@@ -769,7 +794,14 @@ impl Drop for VramPermit<'_> {
         let mut used = self.gate.used.lock().unwrap();
         *used = used.saturating_sub(self.bytes);
         drop(used);
+        VRAM_GATE_ADMITTED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
         self.gate.freed.notify_all();
+    }
+}
+
+impl Drop for VramGate {
+    fn drop(&mut self) {
+        VRAM_GATE_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
