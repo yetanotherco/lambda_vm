@@ -3722,16 +3722,12 @@ use super::programs::l2g_binding_program;
 /// loud — the same discipline `R1F_SHAPE` uses.
 const R1G_EPOCHS: usize = 2;
 
-/// The `i`-th 32-byte root in a program's published words.
+/// The `i`-th 32-byte root in a program's published words, at the root's own
+/// width — the L2G binding follows the configuration, so a root is
+/// `words_per_root()` words: two byte words or one algebraic word.
 fn published_root(public: &[(u32, LfmWord)], i: usize) -> [u8; 32] {
-    use math::field::traits::IsPrimeField;
-    let mut out = [0u8; 32];
-    for h in 0..8 {
-        let lane = public[2 * i + h / 4].1[h % 4];
-        let half = crate::tables::types::GoldilocksField::canonical(lane.value()) as u32;
-        out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
-    }
-    out
+    let w = super::proof_arena::words_per_root();
+    digest_bytes(&public[w * i..w * (i + 1)])
 }
 
 fn l2g_arenas(

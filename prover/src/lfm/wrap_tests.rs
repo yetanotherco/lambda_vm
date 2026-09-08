@@ -1977,19 +1977,17 @@ fn the_fixture_continuation_epoch_wraps_batched_from_proofs() {
         "the carved wrap of the final epoch must verify"
     );
 
-    // The published-word schema's aggregator-facing check: the last 8 words
-    // are the carved L2G root, byte-equal to the bundle's claimed root.
+    // The published-word schema's aggregator-facing check: the last
+    // `lanes_per_root()` words are the carved L2G root — eight byte halves on a
+    // byte hash, four felts on an algebraic one — equal to the bundle's claimed
+    // root as the host publishes it.
     let root = bundle.epoch_view(n - 1).l2g_root();
-    let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - 8..]
+    let lanes = super::proof_arena::lanes_per_root();
+    let published_root: Vec<FE> = proved.public_words[proved.public_words.len() - lanes..]
         .iter()
-        .map(|w| super::word::word_as_base(&w.1).expect("a root half is a base word"))
+        .map(|w| super::word::word_as_base(&w.1).expect("a root lane is a base word"))
         .collect();
-    let expected_root: Vec<FE> = root
-        .chunks(4)
-        .map(|c: &[u8]| {
-            FE::from(u32::from_le_bytes(c.try_into().expect("a root is 32 bytes")) as u64)
-        })
-        .collect();
+    let expected_root: Vec<FE> = super::proof_arena::commitment_lanes(&root);
     assert_eq!(
         published_root, expected_root,
         "the wrap must publish the carved L2G root it verified under"

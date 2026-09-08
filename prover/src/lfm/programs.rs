@@ -948,24 +948,22 @@ pub fn l2g_binding_program_source(num_epochs: usize) -> LfmProgramSource {
 
     assert!(num_epochs > 0, "a continuation has at least one epoch");
 
-    let words = 2 * num_epochs as u32;
-    let mut b = LfmBuilder::new();
+    // The L2G roots are the block path's own commitments, so this program
+    // follows the configuration and reads each root at the DIGEST's width —
+    // two words on a byte hash, one on an algebraic one — never a literal two.
+    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::production());
+    let dw = edsl::digest_words(&b);
+    let words = dw * num_epochs as u32;
     let epoch_arena = b.declare_arena(words);
     let global_arena = b.declare_arena(words);
 
     for i in 0..num_epochs as u32 {
-        let epoch = [
-            b.hint_word(epoch_arena, 2 * i),
-            b.hint_word(epoch_arena, 2 * i + 1),
-        ];
-        let global = [
-            b.hint_word(global_arena, 2 * i),
-            b.hint_word(global_arena, 2 * i + 1),
-        ];
-        edsl::assert_word_eq(&mut b, epoch[0], global[0]);
-        edsl::assert_word_eq(&mut b, epoch[1], global[1]);
-        b.public(epoch[0]);
-        b.public(epoch[1]);
+        let epoch = edsl::hint_digest(&mut b, epoch_arena, dw * i);
+        let global = edsl::hint_digest(&mut b, global_arena, dw * i);
+        for (e, g) in epoch.cells().iter().zip(global.cells()) {
+            edsl::assert_word_eq(&mut b, *e, *g);
+            b.public(*e);
+        }
     }
     b.finish()
 }

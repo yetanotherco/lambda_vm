@@ -1053,11 +1053,10 @@ fn no_tampered_fri_value_can_pass() {
     let stride = h.shape.query_words(dw);
     // (label, arena, word) — arena order is the driver's: deep, roots, zetas,
     // coeffs, queries.
-    let bump: Vec<(&str, usize, usize)> = vec![
+    let mut bump: Vec<(&str, usize, usize)> = vec![
         ("query index", 0, 0),
         ("layer 0 root", 1, 0),
-        ("layer 0 root, second word", 1, 1),
-        ("layer 2 root", 1, 2 * (c - 1)),
+        ("layer 2 root", 1, dw * (c - 1)),
         ("zeta_0 (the DEEP fold's challenge)", 2, 0),
         ("zeta_C (the uncommitted final fold)", 2, c),
         ("terminal coefficient 0", 3, 0),
@@ -1071,6 +1070,10 @@ fn no_tampered_fri_value_can_pass() {
         ),
         ("second query's layer 0 evaluation", 4, stride),
     ];
+    if dw == 2 {
+        // Only a byte digest has a second word to move; an algebraic root is one.
+        bump.push(("layer 0 root, second word", 1, 1));
+    }
     for (label, arena, word) in bump {
         let mut tampered = honest.clone();
         tampered[arena][word][0] += FE::one();
