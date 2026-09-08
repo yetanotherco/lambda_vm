@@ -262,8 +262,7 @@ pub fn declare_leg_arenas(b: &mut LfmBuilder, child: &ChildShape<'_>) -> LegAren
                 aux_root: c.has_aux_root.then(|| b.declare_arena(per_root)),
                 contribution: c.has_contribution.then(|| b.declare_arena(1)),
                 composition_root: b.declare_arena(per_root),
-                ood_current: b
-                    .declare_arena((c.ood_current_dims.0 * c.ood_current_dims.1) as u32),
+                ood_current: b.declare_arena((c.ood_current_dims.0 * c.ood_current_dims.1) as u32),
                 ood_next: b.declare_arena((c.ood_next_dims.0 * c.ood_next_dims.1) as u32),
                 parts: b.declare_arena(c.num_parts as u32),
                 fri_roots: b.declare_arena(per_root * c.fri.num_committed() as u32),

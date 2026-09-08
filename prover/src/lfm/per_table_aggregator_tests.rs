@@ -541,3 +541,185 @@ fn the_aggregation_publish_profile_drops_only_diagnostics() {
         100.0 * agg_instrs as f64 / diag_instrs as f64,
     );
 }
+
+// ===================== the node's cost instrument =========================
+
+/// A root of zeroes, standing in for a child's `program_id` where only the
+/// LENGTH of the constant matters — the statement absorbs 32 bytes whatever
+/// they are.
+const ZERO_ROOT: stark::config::Commitment = [0u8; 32];
+
+/// The leg's per-published-word part, and NOTHING else: hint the words under
+/// the canonicity guard, absorb them as the statement, squeeze the pair, and
+/// recompute the `LfmPublic` balance.
+///
+/// Phase A runs over ZERO tables, so the squeeze that forces the statement's
+/// segment to pack and hash is present and the per-sub-proof verification is
+/// not. Everything that is not a function of `count` is therefore a fixed
+/// overhead common to every point below, and cancels in the marginals.
+fn publics_only_program(count: usize) -> LfmProgram {
+    use super::per_table_aggregator::{emit_lfm_statement, emit_public_balance, hint_public_words};
+    use super::statement_replay::replay_phase_a;
+
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(8 * count as u32);
+    let words = hint_public_words(&mut b, arena, count);
+    let mut t = TranscriptReplay::new(&[]);
+    emit_lfm_statement(&mut t, &ZERO_ROOT, &words, 8);
+    let (z, alpha) = replay_phase_a(&mut t, &mut b, &[]);
+    let target = emit_public_balance(&mut b, &words, z, alpha);
+    b.public(target.as_cell());
+    compile(b.finish())
+}
+
+/// The binding legs over `children` children, and nothing else — the words are
+/// hinted (the leg would have hinted them anyway) and the delta against the
+/// same program without the bindings is the bindings' whole cost.
+fn bindings_only_program(children: usize, with_bindings: bool) -> (LfmProgram, usize) {
+    use super::per_table_aggregator::{
+        LegCells, SchemaLayout, emit_chain_bindings, hint_public_words,
+    };
+    use super::statement_replay::replay_phase_a;
+
+    // A block-final epoch's output length; the schema's only variable term.
+    const OUT_HALVES: usize = 8;
+    let layout = SchemaLayout::new(OUT_HALVES);
+    let words = layout.total();
+
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut legs = Vec::with_capacity(children);
+    for _ in 0..children {
+        let arena = b.declare_arena(8 * words as u32);
+        let publics = hint_public_words(&mut b, arena, words);
+        let mut t = TranscriptReplay::new(&[]);
+        t.append_const_bytes(&ZERO_ROOT[..]);
+        let (z, alpha) = replay_phase_a(&mut t, &mut b, &[]);
+        legs.push(LegCells {
+            publics,
+            z_alpha: (z, alpha),
+        });
+    }
+    if with_bindings {
+        let layouts: Vec<SchemaLayout> = (0..children)
+            .map(|_| SchemaLayout::new(OUT_HALVES))
+            .collect();
+        let labels: Vec<u64> = (0..children as u64).collect();
+        emit_chain_bindings(&mut b, &legs, &layouts, &labels);
+    }
+    (compile(b.finish()), words)
+}
+
+/// ★ THE NODE'S COST, in the three units that decide the fan-in.
+///
+/// # What this measures and why in this order
+///
+/// Lane C narrowed the fan-in question to the binding legs, and did so under the
+/// BATCHED assumption that a child publishes ~285 words. Under the per-table
+/// format the diagnostic wrap publishes 10,507, and the leg pays LINEARLY per
+/// published word — eight hints, four canonicity guards, four recombinations,
+/// thirty-six bytes of statement absorb and one extension-field inverse. So the
+/// term that actually grew is the per-word one, and it is measured FIRST.
+///
+/// The three quantities, all emission-only:
+///
+/// (a) the per-published-word marginal, at several counts so LINEARITY is
+///     checked rather than assumed — the statement's sponge absorbs in
+///     rate-sized blocks, so the hash term is a step function whose average is
+///     linear, and a two-point fit would hide that;
+/// (b) the binding legs, as the delta between a node with and without them;
+/// (c) F(1) and F(2), which follow from (a) rather than needing a second
+///     emission: this leg is `per_table_census_tests::tenant_node_program` plus
+///     the statement, the balance and the bindings. The balance is pure field
+///     arithmetic and hashes NOTHING, so in COMPRESSIONS the only term this leg
+///     adds to C's is the statement's — which is exactly (a)'s hash column.
+///
+/// ⚠ C's F(1) = 2,886 / F(2) = 5,771 are COMPRESSIONS (`wrap_tests::hash_ops`
+/// over a glue delta), not cells. Quoting them against a cell figure would be
+/// comparing two different measurements that happen to be numbers.
+#[test]
+#[ignore = "emission instrument: run explicitly, prints the node cost model"]
+fn the_node_cost_model_is_measured() {
+    use super::per_table_aggregator::SchemaLayout;
+
+    let hash = super::edsl::WrapHash::production();
+    let census = |p: &LfmProgram| -> (usize, usize, u64) {
+        let (main, aux) =
+            super::airs::lfm_cell_counts_with_hasher(p, crate::hash_pin::BLOCK_HASHER);
+        (
+            p.instrs.len(),
+            super::wrap_tests::hash_ops(p, hash),
+            main + 3 * aux,
+        )
+    };
+
+    // ---- (a) the per-published-word marginal.
+    const OUT_HALVES: usize = 8;
+    let aggregation_words = SchemaLayout::new(OUT_HALVES).total();
+    // The measured diagnostic count at q=110, plus the schema this branch adds.
+    let diagnostic_words = 10_507 + SchemaLayout::new(OUT_HALVES).schema_words();
+    let points = [0, 64, 128, 256, 512, aggregation_words, diagnostic_words];
+    println!(
+        "\n★ (a) THE PER-PUBLISHED-WORD BILL, at {hash:?}\n   \
+         {:>8}  {:>12}  {:>12}  {:>14}  {:>10}",
+        "words", "instrs", "hash ops", "cells", "cells/word"
+    );
+    let mut base = (0usize, 0usize, 0u64);
+    for (i, &count) in points.iter().enumerate() {
+        let (instrs, ops, cells) = census(&publics_only_program(count));
+        if i == 0 {
+            base = (instrs, ops, cells);
+        }
+        let per_word = if count > 0 {
+            (cells - base.2) as f64 / count as f64
+        } else {
+            0.0
+        };
+        println!("   {count:>8}  {instrs:>12}  {ops:>12}  {cells:>14}  {per_word:>10.2}");
+    }
+    // Linearity, asserted rather than eyeballed: the marginal between the two
+    // largest sampled points must agree with the marginal between the two
+    // smallest to within the sponge's rate-sized step.
+    let cells_at = |n: usize| census(&publics_only_program(n)).2;
+    let (c64, c512) = (cells_at(64), cells_at(512));
+    let low = (c64 - base.2) as f64 / 64.0;
+    let high = (c512 - c64) as f64 / (512.0 - 64.0);
+    let drift = (high - low).abs() / low;
+    println!(
+        "   marginal 0->64 {low:.2} cells/word, 64->512 {high:.2} cells/word \
+         ({:+.1}%)",
+        100.0 * (high - low) / low
+    );
+    assert!(
+        drift < 0.25,
+        "the per-word bill must be linear to within the sponge's step, got \
+         {low:.2} then {high:.2} cells/word"
+    );
+
+    // ---- (b) the binding legs.
+    println!(
+        "\n★ (b) THE BINDING LEGS (schema = {aggregation_words} words/child)\n   \
+         {:>8}  {:>12}  {:>12}  {:>14}",
+        "children", "Δinstrs", "Δhash ops", "Δcells"
+    );
+    for children in [2usize, 3] {
+        let (with, _) = bindings_only_program(children, true);
+        let (without, _) = bindings_only_program(children, false);
+        let (wi, wo_ops, wc) = census(&with);
+        let (bi, bo_ops, bc) = census(&without);
+        println!(
+            "   {children:>8}  {:>12}  {:>12}  {:>14}",
+            wi - bi,
+            wo_ops as i64 - bo_ops as i64,
+            wc - bc
+        );
+    }
+
+    // ---- (c) what a leaf node costs, composed.
+    println!(
+        "\n★ (c) LEAF NODE = fan-in × (C's F + the statement) + the bindings.\n   \
+         C measured F(1) = 2,886 and F(2) = 5,771 COMPRESSIONS at production \
+         heights; the columns above are what this leg adds on top, per child.\n   \
+         A child publishing {aggregation_words} words instead of {diagnostic_words} \
+         is the whole lever."
+    );
+}
