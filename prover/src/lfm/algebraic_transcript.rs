@@ -557,23 +557,17 @@ mod tests {
     /// ★★★ **THE PHASE A GATE** — the absorbs between the statement and the
     /// first challenge, which is where the spine's `z` diverges.
     ///
-    /// `the_batched_epoch_challenge_spine_matches_production` under an algebraic
-    /// pin executes cleanly and then disagrees about the shared LogUp `z`. That
-    /// challenge is drawn after exactly two things: the statement absorb, which
-    /// its own gate covers, and Phase A. This is Phase A, beside the spine
-    /// rather than instrumented inside it — an instrument inside it perturbs the
-    /// program and produced a `DivByZero` of its own when tried.
+    /// The shared LogUp `z` is drawn after exactly two things: the statement
+    /// absorb, which its own gate covers, and Phase A. This is Phase A, beside
+    /// the spine rather than instrumented inside it — an instrument inside it
+    /// perturbs the program and produced a `DivByZero` of its own when tried.
     ///
-    /// The host side is `crypto/stark/src/batched/verifier.rs:127-151` driven
-    /// through its OWN `absorb_shape_histogram`, not a restatement of it: the
-    /// histogram, then every preprocessed root from the AIR set, then the carved
-    /// root when the shape has one, then the single batched main root, then the
-    /// pair. Synthetic roots, because what is under test is the SEQUENCE and the
-    /// encoding, and controlling both sides is what makes a disagreement
-    /// attributable.
+    /// The sequence is every preprocessed root from the AIR set, then the main
+    /// root, then the pair. Synthetic roots, because what is under test is the
+    /// SEQUENCE and the ENCODING, and controlling both sides is what makes a
+    /// disagreement attributable.
     #[test]
     fn phase_a_absorbs_derive_the_hosts_shared_pair() {
-        use crate::lfm::batched_epoch::emit_shape_histogram;
         use crate::lfm::builder::LfmBuilder;
         use crate::lfm::compiler::compile;
         use crate::lfm::edsl::WrapHash;
@@ -581,12 +575,7 @@ mod tests {
         use crate::lfm::proof::lfm_prove_with_hasher;
         use crate::lfm::registry::build_artifacts_with_hasher;
         use crate::lfm::transcript_replay::TranscriptReplay;
-        use stark::fri::batched::absorb_shape_histogram;
 
-        // A histogram with repeated and distinct heights, and widths that are
-        // not a function of them — a transposed pair has to move the transcript.
-        let heights: Vec<usize> = vec![10, 10, 8, 8, 5];
-        let widths: Vec<usize> = vec![4, 7, 2, 3, 1];
         // Two preprocessed roots and one main root, distinct and non-canonical
         // in their high bytes so a reduction would show.
         let root_at =
@@ -595,24 +584,22 @@ mod tests {
         let main = root_at(0x33);
 
         for hasher in ALGEBRAIC {
-            // HOST: production's own histogram helper, then the roots.
+            // HOST: the roots, through the production transcript object.
             let mut host = AlgebraicTranscript::with_seed(hasher, SEED);
-            absorb_shape_histogram::<GoldilocksExtension, _>(&mut host, &heights, &widths);
             for p in &preps {
                 host.append_bytes(p);
             }
             host.append_bytes(&main);
             let want = host.sample_field_element();
 
-            // MACHINE: the emitter's own histogram, then the roots as program
-            // constants — `RootCells::constant`'s provenance, which is what a
-            // preprocessed root from the AIR set is.
+            // MACHINE: the roots as program constants —
+            // `RootCells::constant`'s provenance, which is what a preprocessed
+            // root from the AIR set is.
             let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Algebraic);
             let mut t = TranscriptReplay::new(SEED);
-            emit_shape_histogram(&mut t, &heights, &widths);
             // ⚠ BOTH production constructions, on the same host call. A
-            // preprocessed root reaches the transcript one of two ways
-            // (`batched_epoch.rs:338-341`): program TEXT goes through
+            // preprocessed root reaches the transcript one of two ways: program
+            // TEXT goes through
             // `append_const_bytes` as literal bytes, proof-carried cells through
             // `RootCells::absorb`. Under a byte hash those are the same 32
             // bytes; under an algebraic one they are a byte cellification and a
@@ -636,8 +623,8 @@ mod tests {
             assert_eq!(
                 [got[0], got[1], got[2]],
                 *want.value(),
-                "{hasher:?}: Phase A must derive the host's shared pair — the histogram's \
-                 1 + 2n calls, then one call per root, then the pair"
+                "{hasher:?}: Phase A must derive the host's shared pair — one call per \
+                 root, then the pair"
             );
         }
     }

@@ -18,8 +18,6 @@
 pub mod airs;
 pub mod algebraic_commit;
 pub mod algebraic_transcript;
-pub mod batched_epoch;
-pub mod batched_epoch_verify;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
@@ -77,8 +75,6 @@ pub use transcript_replay::{Candidate, TranscriptReplay};
 pub use validator::{LfmViolation, validate};
 pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 
-#[cfg(test)]
-mod aggregator_tests;
 // The algebraic `StarkHash` configurations this differential drives the host
 // with are `#[cfg(not(feature = "cuda"))]` — inexpressible under cuda, by
 // design — so the gate follows them rather than failing to compile there.
@@ -100,8 +96,6 @@ mod epoch_verify_tests;
 mod framework_probe;
 #[cfg(test)]
 mod fri_tests;
-#[cfg(all(test, not(feature = "cuda")))]
-mod group_leaf_tests;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]
@@ -114,6 +108,8 @@ mod leaf_tests;
 mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
+#[cfg(test)]
+mod per_table_aggregator_tests;
 #[cfg(test)]
 mod per_table_census_tests;
 #[cfg(test)]

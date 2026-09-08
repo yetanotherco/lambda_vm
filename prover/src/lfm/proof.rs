@@ -9,9 +9,6 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
-use stark::batched::proof::BatchedMultiProof;
-use stark::batched::prover::multi_prove_batched;
-use stark::batched::verifier::{multi_verify_batched, replay_epoch_transcript};
 use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
@@ -247,13 +244,12 @@ pub fn lfm_verify(
 ///
 /// It does not check `prep_root`. The LFM machine proves and verifies a
 /// per-table [`MultiProof`], whose openings are authenticated against the
-/// per-slot `roots`; the batched preprocessed round is a commitment to the same
-/// matrices that only a verifier reading a `BatchedMultiProof` can use
-/// (`stark::batched::verifier`). Until the machine switches paths, this is
-/// plumbing ahead of its consumer, and saying otherwise would overstate what a
-/// passing verification means.
+/// per-slot `roots`; `prep_root` is a second commitment over those same
+/// preprocessed matrices, gathered into one multi-matrix round, and nothing
+/// reads it. It is plumbing with no consumer, and saying otherwise would
+/// overstate what a passing verification means.
 ///
-/// The shape that consumer will need is [`LfmArtifacts::prep_round_shape`].
+/// The shape it commits to is [`LfmArtifacts::prep_round_shape`].
 pub fn verify_against_artifacts(
     artifacts: &LfmArtifacts,
     proof: &MultiProof<F, E, ()>,
@@ -428,80 +424,8 @@ fn expected_public_balance(
 }
 
 // ===========================================================================
-// The batched path (M-7)
+// Presets
 // ===========================================================================
-//
-// The per-table entry points above stay the default everywhere: `lfm_prove` /
-// `lfm_verify` go through `multi_prove` / `multi_verify_views` under keccak, and
-// nothing below changes that. These are siblings, not a mode switch, because a
-// batched epoch proof is a DIFFERENT wire type (`BatchedMultiProof`) rather than
-// the same proof verified differently — an `Option` on the existing signatures
-// would have been a lie about what varies.
-
-/// Proves an LFM program as ONE batched epoch.
-///
-/// Preprocessed binding is per table: the prover builds each preprocessed
-/// chip's own tree and fails unless its root equals the AIR's supplied one —
-/// which for this machine is `artifacts.roots[slot]`, so a stale registry
-/// entry fails the prove with the per-table path's own error.
-pub fn lfm_prove_batched(
-    program: &LfmProgram,
-    artifacts: &LfmArtifacts,
-    arenas: &[Vec<LfmWord>],
-    options: &ProofOptions,
-) -> Result<BatchedLfmProof, LfmProveError> {
-    let hasher = artifacts.hasher;
-    let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
-    let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
-
-    let airs = LfmAirs::new_chunked(
-        &artifacts.roots,
-        &artifacts.blake3_chunk_roots,
-        options,
-        artifacts.keccak_rnd_chunks,
-        hasher,
-        artifacts.chip_set,
-    );
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
-    absorb_lfm_statement(
-        &mut transcript,
-        &artifacts.program_id,
-        &exec.public_words,
-        options.fri_final_poly_log_degree,
-    );
-
-    let (proof, _stats) = multi_prove_batched::<
-        F,
-        E,
-        (),
-        crate::hash_pin::BlockStarkHash,
-        crate::hash_pin::BlockProver<F, E, ()>,
-    >(
-        airs.air_trace_pairs(&mut traces),
-        &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        crate::auto_storage::decide_lfm(),
-        decide_lfm_residency(),
-    )
-    .map_err(LfmProveError::Prover)?;
-
-    Ok(BatchedLfmProof {
-        proof,
-        public_words: exec.public_words,
-    })
-}
-
-/// An LFM epoch proved through the batched commitment path.
-///
-/// Carries the rkyv wire derives because this IS a shipping artifact: the
-/// aggregation layer consumes batched-format wraps as serialized inputs, and
-/// a block's wrap set travels between processes and machines as bytes. The
-/// round trip is gated by `a_batched_lfm_proof_round_trips_the_wire`.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct BatchedLfmProof {
-    pub proof: BatchedMultiProof<F, E, ()>,
-    pub public_words: Vec<(u32, LfmWord)>,
-}
 
 /// The wrap layer's options when the wrap feeds the AGGREGATOR: blowup 4
 /// (110 queries at the 128-bit Johnson-bound target) with the FRI terminal at
@@ -520,102 +444,4 @@ pub fn aggregation_wrap_options() -> ProofOptions {
         .expect("blowup=4 is valid");
     opts.fri_final_poly_log_degree = 8;
     opts
-}
-
-/// [`lfm_verify`] for a batched epoch proof.
-///
-/// `Err` = registry miss (the hard, no-fallback path, same as `lfm_verify`).
-/// `Ok(false)` = invalid proof, claimed-public mismatch, **or a preprocessed
-/// round this program's pin does not cover** — see [`verify_against_batched`],
-/// which is where that last case is decided and why it is currently the
-/// answer for every real LFM epoch.
-pub fn lfm_verify_batched(
-    kind: LfmProgramKind,
-    proof: &BatchedMultiProof<F, E, ()>,
-    claimed_public: &[(u32, LfmWord)],
-    options: &ProofOptions,
-) -> Result<bool, LfmRegistryError> {
-    let entry = resolve(kind, options.blowup_factor)?;
-    Ok(verify_against_batched(
-        &entry.artifacts(),
-        proof,
-        claimed_public,
-        options,
-    ))
-}
-
-/// Verifies a batched epoch against supplied artifacts — a COMPLETE
-/// verification.
-///
-/// # The preprocessed binding, and why the old refusal is gone
-///
-/// Preprocessed chips are bound PER TABLE inside the batched proof: each
-/// root is the AIR's own supplied value (`artifacts.roots[slot]`, and the
-/// production pins for `KECCAK_RC`/`BITWISE`), absorbed by both sides from
-/// the AIR set and authenticated per query at the reduced per-table index.
-/// That covers every preprocessed AIR — including the two the old fused
-/// round's `PREP_ROUND_SLOTS` did not — so the round-coverage refusal this
-/// function used to return has no cause left. The old refusal test flipped
-/// deliberately, exactly as its own doc mandated.
-pub fn verify_against_batched(
-    artifacts: &LfmArtifacts,
-    proof: &BatchedMultiProof<F, E, ()>,
-    claimed_public: &[(u32, LfmWord)],
-    options: &ProofOptions,
-) -> bool {
-    // The chunk count and the mask must agree, same rule as `verify_against`:
-    // with the keccak family present zero chunks would drop KECCAK_RND from a
-    // set that still contains LFM_KECCAK's sends; with the family absent, zero
-    // is the only correct count.
-    if artifacts.chip_set.keccak != (artifacts.keccak_rnd_chunks > 0) {
-        return false;
-    }
-    let airs = LfmAirs::new_chunked(
-        &artifacts.roots,
-        &artifacts.blake3_chunk_roots,
-        options,
-        artifacts.keccak_rnd_chunks,
-        artifacts.hasher,
-        artifacts.chip_set,
-    );
-    let refs = airs.air_refs();
-    if refs.len()
-        != artifacts
-            .chip_set
-            .num_airs(artifacts.keccak_rnd_chunks, artifacts.blake3_chunks())
-    {
-        return false;
-    }
-
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
-    absorb_lfm_statement(
-        &mut transcript,
-        &artifacts.program_id,
-        claimed_public,
-        options.fri_final_poly_log_degree,
-    );
-    // The batched transcript draws the shared LogUp challenges itself, after the
-    // shape histogram and the prep/main roots, so they are recovered by
-    // replaying the EPOCH on a fork — not by the per-table Phase A walk, which
-    // absorbs per-table roots this path never sends. `LOGUP_NUM_CHALLENGES == 2`
-    // and they are `(z, alpha)`, the same pair the per-table path samples.
-    let mut replay = transcript.clone();
-    let Some((_, _, challenges)) = replay_epoch_transcript(&refs, proof, &mut replay) else {
-        return false;
-    };
-    let [z, alpha] = challenges.lookup.as_slice() else {
-        return false;
-    };
-    let Some(expected) = expected_public_balance(claimed_public, z, alpha) else {
-        return false;
-    };
-
-    multi_verify_batched::<
-        F,
-        E,
-        (),
-        crate::hash_pin::BlockStarkHash,
-        crate::hash_pin::BlockVerifier<F, E, ()>,
-        _,
-    >(&refs, proof, &mut transcript, &expected)
 }

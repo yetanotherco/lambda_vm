@@ -1,21 +1,20 @@
-//! The epoch's committed shape — which table contributes a matrix to which
-//! batched round, at what height and width.
+//! A round's committed shape — which table contributes a matrix to it, at what
+//! height and width.
 //!
 //! Every number here is derived from the AIR set and the per-table trace
-//! lengths, never read out of a proof. That is what lets the verifier rebuild
-//! the shape it must pass to [`crate::fri::mmcs::MixedMmcs::verify_batch`] and
-//! to [`crate::fri::batched::absorb_shape_histogram`] instead of trusting the
-//! prover's word for it (`fri/mmcs.rs`, "Width binding").
+//! lengths, never read out of a proof. That is what lets a verifier rebuild the
+//! shape it must pass to [`crate::fri::mmcs::MixedMmcs::verify_batch`] instead
+//! of trusting the prover's word for it (`fri/mmcs.rs`, "Width binding").
 //!
-//! # Why one type and not four lists
+//! # Why one type and not a list per round
 //!
-//! Four rounds are batched (preprocessed, main, aux, composition parts) and each
-//! has a DIFFERENT participation list: only preprocessed tables contribute a
-//! preprocessed matrix, only tables with a RAP contribute an aux matrix. The
-//! index a matrix has inside its round is therefore NOT its table index, and the
-//! two are easy to confuse — a confusion that shows up as an opening
-//! authenticated at the wrong leaf rather than as a compile error. [`RoundShape`]
-//! keeps the mapping in one place so both sides read it from the same code.
+//! Each round (preprocessed, main, aux, composition parts) has a DIFFERENT
+//! participation list: only preprocessed tables contribute a preprocessed
+//! matrix, only tables with a RAP contribute an aux matrix. The index a matrix
+//! has inside its round is therefore NOT its table index, and the two are easy
+//! to confuse — a confusion that shows up as an opening authenticated at the
+//! wrong leaf rather than as a compile error. [`RoundShape`] keeps the mapping
+//! in one place so every reader takes it from the same code.
 
 use crate::config::Commitment;
 use crate::traits::AIR;
@@ -25,30 +24,28 @@ use crate::traits::AIR;
 ///
 /// # Why the widths travel with the root
 ///
-/// Under the per-table scheme a group's width is implied by its own root plus
-/// its AIR. Under one batched tree the widths decide how each leaf is *parsed*,
-/// so a comparison of roots alone is only equivalent to the per-table
-/// comparisons it replaces if the parse is pinned too (MMCS-PLAN §3.1 item 3,
-/// §3.3's closing warning). They are carried here rather than derived at the
+/// Under a per-slot scheme a group's width is implied by its own root plus its
+/// AIR. Under one tree over several matrices the widths decide how each leaf is
+/// *parsed*, so a comparison of roots alone is only equivalent to the per-slot
+/// comparisons it replaces if the parse is pinned too. They are carried here
+/// rather than derived at the
 /// comparison site so that a caller holding entry A but an AIR set built for
 /// entry B is rejected as a width disagreement rather than as an unexplained
 /// root mismatch.
 ///
-/// # The two sides dispose of `None` differently, on purpose
+/// # Absence means different things to a producer and a checker
 ///
-/// Both [`crate::batched::prover::multi_prove_batched`] and
-/// [`crate::batched::verifier::multi_verify_batched`] take this as an `Option`,
-/// and they do NOT mean the same thing by the absence:
+/// Held as an `Option`, and the two sides do NOT mean the same thing by the
+/// absence:
 ///
-/// - **Prover — permissive.** `None` is how the root is generated in the first
+/// - **Producer — permissive.** `None` is how the root is generated in the first
 ///   place (registry regeneration has nothing to compare against yet). Supplying
-///   it buys a fail-fast: a stale preprocessed constant is caught at prove time
-///   rather than by every future verifier.
-/// - **Verifier — fails closed.** `None` is accepted only for an epoch whose AIR
-///   set has no preprocessed table at all. An epoch that HAS a preprocessed
-///   round and no pinned root is rejected, because the only root left to check
-///   against would be the proof's own — which the prover chose along with the
-///   matrices it commits.
+///   it buys a fail-fast: a stale preprocessed constant is caught at build time
+///   rather than by every future checker.
+/// - **Checker — fails closed.** `None` is accepted only for an AIR set with no
+///   preprocessed table at all. A set that HAS a preprocessed round and no
+///   pinned root is rejected, because the only root left to check against would
+///   be the one whoever built the matrices chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PinnedPrep<'a> {
     pub root: &'a Commitment,
@@ -353,17 +350,13 @@ impl EpochShape {
         self.heights.iter().copied().max().unwrap_or(0)
     }
 
-    /// The widths the round-4 shape histogram binds: one per table, in table
-    /// order, summing every matrix that table contributes across all four rounds.
+    /// One width per table, in table order, summing every matrix that table
+    /// contributes across all four rounds.
     ///
-    /// Summing rather than listing per round is deliberate. The histogram's job
-    /// is to make two epochs with different shapes produce different challenges,
-    /// and `absorb_shape_histogram` takes one `(height, width)` pair per entry.
-    /// A table's total committed width moves whenever ANY of its four matrices
-    /// changes width, so the sum separates exactly the epochs the four separate
-    /// lists would — while staying one entry per table, which is what keeps the
-    /// prover's and the verifier's histograms the same length without either
-    /// having to agree on a round ordering.
+    /// Summing rather than listing per round is deliberate: a table's total
+    /// committed width moves whenever ANY of its four matrices changes width, so
+    /// the sum separates exactly the shapes four separate lists would, while
+    /// staying one entry per table and needing no agreed round ordering.
     pub fn total_widths(&self) -> Vec<usize> {
         let mut widths = vec![0usize; self.heights.len()];
         for round in [&self.prep, &self.main, &self.aux, &self.parts] {

@@ -2032,13 +2032,10 @@ pub trait IsStarkProver<
     /// The evaluations of the composition-polynomial parts over the LDE domain,
     /// and nothing else — no commitment.
     ///
-    /// This is the half of round 2 that the batched path shares with the
-    /// per-table one. Round 2 commits each table's parts to its own Merkle tree;
-    /// [`crate::batched::prover::multi_prove_batched`] streams every table's
-    /// parts into one mixed-height MMCS instead. Both need the same parts, and
-    /// the arm selection (`number_of_parts` 1 / 2 / d>2, the device paths and
-    /// their fallbacks) is intricate enough that a second copy would drift — so
-    /// there is one function, and the commitment is what differs.
+    /// Split out of round 2's commitment step. The arm selection
+    /// (`number_of_parts` 1 / 2 / d>2, the device paths and their fallbacks) is
+    /// intricate enough that a second copy of it would drift, so producing the
+    /// parts and committing them are separate functions.
     #[allow(clippy::too_many_arguments)]
     fn compute_composition_parts(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,

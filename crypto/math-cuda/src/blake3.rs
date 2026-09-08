@@ -42,9 +42,7 @@
 //!
 //! All seven leaf kernels, both tree compressors and the wrapper twins are
 //! here; the device-side launchers (`launch_*`) are what the dispatch sites in
-//! [`crate::lde`] and [`crate::fri`] call. The streaming mixed-MMCS builder
-//! ([`crate::mmcs`]) has no BLAKE3 twin: it has no production caller on any
-//! hash yet.
+//! [`crate::lde`] and [`crate::fri`] call.
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
