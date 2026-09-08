@@ -53,7 +53,7 @@ void *memcpy(void dest[restrict count], const void src[restrict count], size_t c
 That is to say,
 - `A0` contains the address of the first byte to write,
 - `A1` contains the address of the first byte to read, and
-- `A2` contains `count`.
+- `A2` contains `count`; the number of bytes to copy.
 
 @dma:c:read_dst, @dma:c:read_src and @dma:c:read_count read these three registers.
 Each of them writes back the value that was read, so the copy leaves the registers untouched;
