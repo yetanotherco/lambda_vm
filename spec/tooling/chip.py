@@ -46,7 +46,7 @@ reporter = ErrorReporter("unknown")
 
 
 def assert_no_unexpected(data: dict, possible_keys: Iterable[str]):
-    for key in data.keys():
+    for key in data:
         reporter.asserts(key in possible_keys, f"Unexpected key: {key!r}")
 
 
@@ -543,7 +543,7 @@ def iters_of(obj: dict, config, name=None) -> list[Iter]:
 class TypeConfig:
     label: str
     subtypes: list[Type]
-    scalar_type: Optional[Range | Opaque]
+    scalar_type: Range | Opaque | None
     desc: str
     preprocessed: bool
 
@@ -921,9 +921,9 @@ class ArithConstraint:
 @dataclass
 class Signature:
     tag: str
-    condition: Optional[Type]
+    condition: Type | None
     input: list[Type]
-    output: Optional[Type]
+    output: Type | None
 
     def matches(self, other: Self) -> bool:
         if not isinstance(other, type(self)):
@@ -950,8 +950,8 @@ class InteractionLike:
     tag: str
     desc: str
     input: list[Expr]
-    output: Optional[Expr]
-    conditional: Optional[Expr]
+    output: Expr | None
+    conditional: Expr | None
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
@@ -1145,7 +1145,7 @@ class Chip:
         values: dict[str, Type],
     ):
         reporter.asserts(
-            set(values.keys()) <= set(v.name for v in self.concrete_vars),
+            set(values.keys()) <= {v.name for v in self.concrete_vars},
             f"Passing unrecognized variable to `check_assignment` of chip {self.name!r}",
         )
         env = Environment(self.config, {}, {})
@@ -1173,7 +1173,7 @@ class Chip:
 def build_signature(config: Config, data: dict) -> Signature:
     assert_no_unexpected(data, {"tag", "kind", "input", "output", "cond"})
     Sig: type[Signature]
-    cond: Optional[Type] = None
+    cond: Type | None = None
     match data["kind"]:
         case "template":
             if "cond" in data:
