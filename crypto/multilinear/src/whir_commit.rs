@@ -9,7 +9,7 @@ use crypto::merkle_tree::{
 use math::{
     field::{
         element::FieldElement,
-        traits::{IsFFTField, IsField, IsPrimeField},
+        traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
     },
     traits::AsBytes,
 };
@@ -158,12 +158,16 @@ where
 /// The verifier's local mirror of [`fold_codeword_k`](crate::whir::fold_codeword_k):
 /// it never sees the whole codeword, only this block, and must reach the same
 /// value the prover would have.
-pub fn fold_coset<F: IsFFTField + IsPrimeField>(
-    values: &[FieldElement<F>],
+pub fn fold_coset<F, E>(
+    values: &[FieldElement<E>],
     domain: &Domain<F>,
     index: usize,
-    alphas: &[FieldElement<F>],
-) -> Result<FieldElement<F>, Error> {
+    alphas: &[FieldElement<E>],
+) -> Result<FieldElement<E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+{
     if values.len() != 1usize << alphas.len() {
         return Err(Error::CodewordTooShort {
             coefficients: values.len(),
@@ -195,8 +199,9 @@ pub fn fold_coset<F: IsFFTField + IsPrimeField>(
         let mut x = base;
         for t in 0..half {
             let (a, b) = (&current[t], &current[t + half]);
-            let even = (a + b) * &two_inv;
-            let odd = (a - b) * &two_inv * x.inv().expect("domain elements are nonzero");
+            let even = &two_inv * (a + b);
+            let x_inv = x.inv().expect("domain elements are nonzero");
+            let odd = (&two_inv * x_inv) * (a - b);
             next.push(even + alpha * odd);
             x *= &eta;
         }

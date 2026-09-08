@@ -8,7 +8,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{
     field::{
         element::FieldElement,
-        traits::{IsFFTField, IsField, IsPrimeField},
+        traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
     },
     traits::AsBytes,
 };
@@ -40,11 +40,11 @@ pub struct RoundCommitments<'a> {
 
 /// The openings one round sends.
 #[derive(Clone, Debug)]
-pub struct RoundProof<F: IsField> {
+pub struct RoundProof<E: IsField> {
     /// Per query: the block of the current codeword that folds onto the query.
-    pub current: Vec<CosetOpening<F>>,
+    pub current: Vec<CosetOpening<E>>,
     /// Per query: the successor block holding the folded value.
-    pub next: Vec<CosetOpening<F>>,
+    pub next: Vec<CosetOpening<E>>,
 }
 
 /// Draws the query positions. Both sides run this on the same transcript.
@@ -65,16 +65,16 @@ where
 ///
 /// `current` and `next` must already be committed, and `next` must be the fold
 /// of `current` by `alphas` — [`verify`] is what checks that claim.
-pub fn prove<F, T>(
-    current: &CodewordCommitment<F>,
-    next: &CodewordCommitment<F>,
+pub fn prove<E, T>(
+    current: &CodewordCommitment<E>,
+    next: &CodewordCommitment<E>,
     config: &RoundConfig,
     transcript: &mut T,
-) -> Result<RoundProof<F>, Error>
+) -> Result<RoundProof<E>, Error>
 where
-    F: IsField,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
 {
     let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
 
@@ -96,18 +96,19 @@ where
 ///
 /// Re-derives the queries from the transcript, so the prover could not have
 /// chosen them.
-pub fn verify<F, T>(
-    proof: &RoundProof<F>,
+pub fn verify<F, E, T>(
+    proof: &RoundProof<E>,
     commitments: RoundCommitments<'_>,
     domain: &Domain<F>,
-    alphas: &[FieldElement<F>],
+    alphas: &[FieldElement<E>],
     config: &RoundConfig,
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + 'static,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
 {
     if alphas.len() != config.log_folding {
         return Err(Error::VariableCountMismatch {
@@ -130,15 +131,15 @@ where
         .zip(proof.current.iter().zip(&proof.next))
         .enumerate()
     {
-        if !crate::whir_commit::verify_opening::<F>(commitments.current_root, q, cur) {
+        if !crate::whir_commit::verify_opening::<E>(commitments.current_root, q, cur) {
             return Err(Error::OpeningRejected { query: i });
         }
         let (leaf, slot) = leaf_and_slot(q, commitments.next_num_leaves);
-        if !crate::whir_commit::verify_opening::<F>(commitments.next_root, leaf, nxt) {
+        if !crate::whir_commit::verify_opening::<E>(commitments.next_root, leaf, nxt) {
             return Err(Error::OpeningRejected { query: i });
         }
 
-        let folded = fold_coset(&cur.values, domain, q, alphas)?;
+        let folded = fold_coset::<F, E>(&cur.values, domain, q, alphas)?;
         let claimed = nxt.values.get(slot).ok_or(Error::QueryOutOfRange {
             index: slot,
             bound: nxt.values.len(),
@@ -201,7 +202,7 @@ mod tests {
     }
 
     fn run(fx: &Fixture, proof: &RoundProof<F>) -> Result<(), Error> {
-        verify(
+        verify::<F, F, _>(
             proof,
             RoundCommitments {
                 current_root: &fx.current.root(),
@@ -299,7 +300,7 @@ mod tests {
         run(&fx, &proof).unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
-        let result = verify(
+        let result = verify::<F, F, _>(
             &proof,
             RoundCommitments {
                 current_root: &fx.current.root(),

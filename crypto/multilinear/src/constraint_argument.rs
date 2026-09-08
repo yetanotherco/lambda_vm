@@ -8,7 +8,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{
     field::{
         element::FieldElement,
-        traits::{IsFFTField, IsPrimeField},
+        traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
     },
     traits::AsBytes,
 };
@@ -23,21 +23,21 @@ use crate::{
 };
 
 /// A committed trace, ready to be argued about.
-pub struct CommittedTrace<F: IsFFTField + IsPrimeField>
+pub struct CommittedTrace<F: IsFFTField + IsPrimeField + IsSubFieldOf<E>, E: IsField>
 where
-    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
 {
-    columns: Vec<Mle<F>>,
-    commitments: Vec<crate::whir_commit::CodewordCommitment<F>>,
+    columns: Vec<Mle<E>>,
+    commitments: Vec<crate::whir_commit::CodewordCommitment<E>>,
     domain: crate::whir::Domain<F>,
 }
 
-impl<F: IsFFTField + IsPrimeField> CommittedTrace<F>
+impl<F: IsFFTField + IsPrimeField + IsSubFieldOf<E>, E: IsField> CommittedTrace<F, E>
 where
-    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
 {
     /// Commits every column. All must agree on height.
-    pub fn commit(columns: Vec<Mle<F>>, config: &EvalConfig) -> Result<Self, Error> {
+    pub fn commit(columns: Vec<Mle<E>>, config: &EvalConfig) -> Result<Self, Error> {
         let num_vars = columns.first().map(|c| c.num_vars()).unwrap_or(0);
         let mut commitments = Vec::with_capacity(columns.len());
         let mut domain = None;
@@ -48,7 +48,7 @@ where
                     got: column.num_vars(),
                 });
             }
-            let (commitment, d) = whir_eval::commit(column, config)?;
+            let (commitment, d) = whir_eval::commit::<F, E>(column, config)?;
             commitments.push(commitment);
             domain = Some(d);
         }
@@ -82,30 +82,31 @@ pub struct TraceClaim<'a, F: IsFFTField + IsPrimeField> {
 
 /// A proof that the committed columns satisfy the constraint.
 #[derive(Clone, Debug)]
-pub struct ConstraintProof<F: IsFFTField + IsPrimeField> {
-    pub zerocheck: ZeroCheckProof<F>,
+pub struct ConstraintProof<E: IsField> {
+    pub zerocheck: ZeroCheckProof<E>,
     /// Each column's value at the zerocheck point.
-    pub column_values: Vec<FieldElement<F>>,
+    pub column_values: Vec<FieldElement<E>>,
     /// One evaluation proof per column, in the same order.
-    pub column_proofs: Vec<EvalProof<F>>,
+    pub column_proofs: Vec<EvalProof<E>>,
 }
 
 /// Proves that `combine` applied to the committed columns vanishes on every row.
 ///
 /// `combine` and `degree` describe the constraint and must match what the
 /// verifier is given.
-pub fn prove<F, T, C>(
-    trace: &CommittedTrace<F>,
+pub fn prove<F, E, T, C>(
+    trace: &CommittedTrace<F, E>,
     combine: C,
     degree: usize,
     config: &EvalConfig,
     transcript: &mut T,
-) -> Result<ConstraintProof<F>, Error>
+) -> Result<ConstraintProof<E>, Error>
 where
-    F: IsFFTField + IsPrimeField,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
-    C: Fn(&[FieldElement<F>]) -> FieldElement<F>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    C: Fn(&[FieldElement<E>]) -> FieldElement<E>,
 {
     for root in trace.roots() {
         transcript.append_bytes(&root);
@@ -121,7 +122,7 @@ where
     let mut column_proofs = Vec::with_capacity(trace.columns.len());
     for (column, commitment) in trace.columns.iter().zip(&trace.commitments) {
         let value = column.evaluate(&point)?;
-        let proof = whir_eval::prove(
+        let proof = whir_eval::prove::<F, E, T>(
             column,
             &point,
             commitment,
@@ -144,8 +145,8 @@ where
 ///
 /// `combine` and `degree` must be the ones the prover used; they are the
 /// statement, not part of the proof.
-pub fn verify<F, T, C>(
-    proof: &ConstraintProof<F>,
+pub fn verify<F, E, T, C>(
+    proof: &ConstraintProof<E>,
     claim_shape: TraceClaim<'_, F>,
     combine: C,
     degree: usize,
@@ -153,10 +154,11 @@ pub fn verify<F, T, C>(
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + 'static,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
-    C: Fn(&[FieldElement<F>]) -> FieldElement<F>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    C: Fn(&[FieldElement<E>]) -> FieldElement<E>,
 {
     let roots = claim_shape.roots;
     if proof.column_values.len() != roots.len() || proof.column_proofs.len() != roots.len() {
@@ -182,7 +184,7 @@ where
         .zip(roots)
         .enumerate()
     {
-        whir_eval::verify(
+        whir_eval::verify::<F, E, T>(
             eval_proof,
             root,
             &claim.point,
@@ -242,7 +244,7 @@ mod tests {
 
     fn run(columns: Vec<Mle<F>>) -> Result<(), Error> {
         let num_vars = columns[0].num_vars();
-        let trace = CommittedTrace::commit(columns, &config()).unwrap();
+        let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let proof = prove(&trace, constraint, 2, &config(), &mut transcript())?;
 
         verify(
@@ -282,7 +284,7 @@ mod tests {
     fn a_forged_column_value_is_rejected() {
         let columns = satisfying(3);
         let num_vars = 3;
-        let trace = CommittedTrace::commit(columns, &config()).unwrap();
+        let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let mut proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
 
         // Claim a different value for one column, leaving everything else.
@@ -307,7 +309,7 @@ mod tests {
     #[test]
     fn verifying_a_different_constraint_is_rejected() {
         let columns = satisfying(3);
-        let trace = CommittedTrace::commit(columns, &config()).unwrap();
+        let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
 
         // `a·b + c` instead of `a·b − c`: same degree, same columns.
@@ -333,7 +335,7 @@ mod tests {
     #[test]
     fn a_proof_replayed_under_another_transcript_is_rejected() {
         let columns = satisfying(3);
-        let trace = CommittedTrace::commit(columns, &config()).unwrap();
+        let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
@@ -357,7 +359,7 @@ mod tests {
     #[test]
     fn a_proof_missing_a_column_is_rejected() {
         let columns = satisfying(3);
-        let trace = CommittedTrace::commit(columns, &config()).unwrap();
+        let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let mut proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
         proof.column_values.pop();
 
@@ -379,9 +381,101 @@ mod tests {
 
     #[test]
     fn columns_of_differing_heights_are_rejected() {
-        let err = CommittedTrace::commit(vec![mle(&[1, 2]), mle(&[1, 2, 3, 4])], &config())
+        let err = CommittedTrace::<F, F>::commit(vec![mle(&[1, 2]), mle(&[1, 2, 3, 4])], &config())
             .err()
             .unwrap();
         assert!(matches!(err, Error::VariableCountMismatch { .. }));
+    }
+
+    /// The field tower in use: a base-field evaluation domain with
+    /// extension-valued columns, which is the shape a real trace has.
+    #[test]
+    fn the_argument_runs_over_a_field_tower() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+        type ExtE = FieldElement<Ext>;
+
+        let num_vars = 3;
+        let size = 1usize << num_vars;
+        let a: Vec<ExtE> = (0..size as u64).map(|i| ExtE::from(i * 3 + 1)).collect();
+        let b: Vec<ExtE> = (0..size as u64).map(|i| ExtE::from(i * 5 + 2)).collect();
+        let c: Vec<ExtE> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+        let columns = vec![
+            Mle::new(a).unwrap(),
+            Mle::new(b).unwrap(),
+            Mle::new(c).unwrap(),
+        ];
+
+        let cfg = EvalConfig {
+            log_blowup: 2,
+            num_queries: 3,
+        };
+        // Domain in Goldilocks, values in its degree-3 extension.
+        let trace = CommittedTrace::<F, Ext>::commit(columns, &cfg).unwrap();
+        let roots = trace.roots();
+        let constraint = |v: &[ExtE]| v[0] * v[1] - v[2];
+
+        let mut prover_t = DefaultTranscript::<Ext>::new(b"tower");
+        let proof = prove::<F, Ext, _, _>(&trace, constraint, 2, &cfg, &mut prover_t).unwrap();
+
+        let mut verifier_t = DefaultTranscript::<Ext>::new(b"tower");
+        verify::<F, Ext, _, _>(
+            &proof,
+            TraceClaim {
+                roots: &roots,
+                domain: trace.domain(),
+                num_vars,
+            },
+            constraint,
+            2,
+            &cfg,
+            &mut verifier_t,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_broken_row_over_the_tower_is_rejected() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+        type ExtE = FieldElement<Ext>;
+
+        let num_vars = 3;
+        let size = 1usize << num_vars;
+        let a: Vec<ExtE> = (0..size as u64).map(|i| ExtE::from(i * 3 + 1)).collect();
+        let b: Vec<ExtE> = (0..size as u64).map(|i| ExtE::from(i * 5 + 2)).collect();
+        let mut c: Vec<ExtE> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+        c[4] += ExtE::one();
+        let columns = vec![
+            Mle::new(a).unwrap(),
+            Mle::new(b).unwrap(),
+            Mle::new(c).unwrap(),
+        ];
+
+        let cfg = EvalConfig {
+            log_blowup: 2,
+            num_queries: 3,
+        };
+        let trace = CommittedTrace::<F, Ext>::commit(columns, &cfg).unwrap();
+        let roots = trace.roots();
+        let constraint = |v: &[ExtE]| v[0] * v[1] - v[2];
+
+        let mut prover_t = DefaultTranscript::<Ext>::new(b"tower");
+        let proof = prove::<F, Ext, _, _>(&trace, constraint, 2, &cfg, &mut prover_t).unwrap();
+
+        let mut verifier_t = DefaultTranscript::<Ext>::new(b"tower");
+        assert!(
+            verify::<F, Ext, _, _>(
+                &proof,
+                TraceClaim {
+                    roots: &roots,
+                    domain: trace.domain(),
+                    num_vars,
+                },
+                constraint,
+                2,
+                &cfg,
+                &mut verifier_t,
+            )
+            .is_err()
+        );
     }
 }

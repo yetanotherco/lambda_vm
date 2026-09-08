@@ -10,7 +10,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{
     field::{
         element::FieldElement,
-        traits::{IsFFTField, IsField, IsPrimeField},
+        traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
     },
     traits::AsBytes,
 };
@@ -37,24 +37,25 @@ pub struct EvalConfig {
 
 /// A proof that a committed polynomial takes a claimed value at a point.
 #[derive(Clone, Debug)]
-pub struct EvalProof<F: IsField> {
-    pub sumcheck: SumcheckProof<F>,
+pub struct EvalProof<E: IsField> {
+    pub sumcheck: SumcheckProof<E>,
     /// The constant the codeword folds to — the prover's claim for `f(α)`.
-    pub final_value: FieldElement<F>,
-    pub openings: Vec<CosetOpening<F>>,
+    pub final_value: FieldElement<E>,
+    pub openings: Vec<CosetOpening<E>>,
 }
 
 /// Commits to `f`, ready to answer evaluation claims.
-pub fn commit<F>(
-    f: &Mle<F>,
+pub fn commit<F, E>(
+    f: &Mle<E>,
     config: &EvalConfig,
-) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
+) -> Result<(CodewordCommitment<E>, Domain<F>), Error>
 where
-    F: IsFFTField + IsPrimeField,
-    FieldElement<F>: AsBytes + Sync + Send,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
 {
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
-    let codeword = encode(&lift_coefficients(f), &domain)?;
+    let codeword = encode::<F, E>(&lift_coefficients(f), &domain)?;
     // One block per fold target: folding all the way leaves `2^log_blowup`.
     let commitment = CodewordCommitment::new(&codeword, f.num_vars())?;
     Ok((commitment, domain))
@@ -73,23 +74,24 @@ fn eq_weighted<F: IsField>(
 ///
 /// The caller must have absorbed the commitment root and `z` into `transcript`
 /// already; both sides must do the same.
-pub fn prove<F, T>(
-    f: &Mle<F>,
-    z: &[FieldElement<F>],
-    commitment: &CodewordCommitment<F>,
+pub fn prove<F, E, T>(
+    f: &Mle<E>,
+    z: &[FieldElement<E>],
+    commitment: &CodewordCommitment<E>,
     domain: &Domain<F>,
     config: &EvalConfig,
     transcript: &mut T,
-) -> Result<EvalProof<F>, Error>
+) -> Result<EvalProof<E>, Error>
 where
-    F: IsFFTField + IsPrimeField,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
 {
     let (sumcheck, alphas) = sumcheck::prove(eq_weighted(f, z)?, transcript)?;
 
-    let codeword = encode(&lift_coefficients(f), domain)?;
-    let (folded, _) = fold_codeword_k(&codeword, domain, &alphas)?;
+    let codeword = encode::<F, E>(&lift_coefficients(f), domain)?;
+    let (folded, _) = fold_codeword_k::<F, E>(&codeword, domain, &alphas)?;
     let final_value = folded[0].clone();
     transcript.append_field_element(&final_value);
 
@@ -117,19 +119,20 @@ where
 }
 
 /// Verifies `f(z) = y` against a commitment.
-pub fn verify<F, T>(
-    proof: &EvalProof<F>,
+pub fn verify<F, E, T>(
+    proof: &EvalProof<E>,
     root: &Commitment,
-    z: &[FieldElement<F>],
-    y: FieldElement<F>,
+    z: &[FieldElement<E>],
+    y: FieldElement<E>,
     domain: &Domain<F>,
     config: &EvalConfig,
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + 'static,
-    FieldElement<F>: AsBytes + Sync + Send,
-    T: IsTranscript<F>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
 {
     let num_vars = z.len();
     // `eq` raises the degree of the plain `f` term to two.
@@ -161,10 +164,10 @@ where
     let queries = sample_queries(transcript, config.num_queries, num_leaves);
 
     for (i, (&q, opening)) in queries.iter().zip(&proof.openings).enumerate() {
-        if !verify_opening::<F>(root, q, opening) {
+        if !verify_opening::<E>(root, q, opening) {
             return Err(Error::OpeningRejected { query: i });
         }
-        if fold_coset(&opening.values, domain, q, alphas)? != proof.final_value {
+        if fold_coset::<F, E>(&opening.values, domain, q, alphas)? != proof.final_value {
             return Err(Error::FoldInconsistent { query: i });
         }
     }
@@ -230,10 +233,12 @@ mod tests {
             let z = point(num_vars);
             let y = f.evaluate(&z).unwrap();
 
-            let (commitment, domain) = commit(&f, &config()).unwrap();
-            let proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+            let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+            let proof =
+                prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript())
+                    .unwrap();
 
-            verify(
+            verify::<F, F, _>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -255,10 +260,11 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit(&f, &config()).unwrap();
-        let proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let proof =
+            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
 
-        let err = verify(
+        let err = verify::<F, F, _>(
             &proof,
             &commitment.root(),
             &z,
@@ -277,11 +283,12 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit(&f, &config()).unwrap();
-        let mut proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let mut proof =
+            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
         proof.final_value += FE::one();
 
-        let err = verify(
+        let err = verify::<F, F, _>(
             &proof,
             &commitment.root(),
             &z,
@@ -300,11 +307,12 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit(&f, &config()).unwrap();
-        let mut proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let mut proof =
+            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
         proof.openings[0].values[0] += FE::one();
 
-        let err = verify(
+        let err = verify::<F, F, _>(
             &proof,
             &commitment.root(),
             &z,
@@ -324,11 +332,12 @@ mod tests {
         let g = pseudo_mle(3, 29);
         let z = point(3);
 
-        let (f_commitment, domain) = commit(&f, &config()).unwrap();
+        let (f_commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
         // Argue g's evaluation while presenting f's commitment.
-        let proof = prove(&g, &z, &f_commitment, &domain, &config(), &mut transcript()).unwrap();
+        let proof =
+            prove::<F, F, _>(&g, &z, &f_commitment, &domain, &config(), &mut transcript()).unwrap();
 
-        let err = verify(
+        let err = verify::<F, F, _>(
             &proof,
             &f_commitment.root(),
             &z,
@@ -347,12 +356,13 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit(&f, &config()).unwrap();
-        let proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let proof =
+            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(
-            verify(
+            verify::<F, F, _>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -371,11 +381,12 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit(&f, &config()).unwrap();
-        let mut proof = prove(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let mut proof =
+            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
         proof.openings.pop();
 
-        let err = verify(
+        let err = verify::<F, F, _>(
             &proof,
             &commitment.root(),
             &z,
@@ -392,7 +403,7 @@ mod tests {
     fn the_commitment_has_one_block_per_fold_target() {
         let f = pseudo_mle(4, 41);
         let cfg = config();
-        let (commitment, domain) = commit(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F, F>(&f, &cfg).unwrap();
         assert_eq!(commitment.num_leaves(), 1 << cfg.log_blowup);
         assert_eq!(domain.log_size(), 4 + cfg.log_blowup);
     }

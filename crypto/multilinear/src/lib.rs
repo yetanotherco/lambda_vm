@@ -2,7 +2,7 @@
 //! Boolean hypercube, sumcheck, zerocheck, LogUp-GKR, stacking and WHIR.
 //!
 //! Not wired into the prover. The codeword domain is a two-adic subgroup of the
-//! base field, so extension-valued columns need the field tower generalized.
+//! base field; codeword values live in the extension.
 
 pub mod constraint_argument;
 pub mod eq;

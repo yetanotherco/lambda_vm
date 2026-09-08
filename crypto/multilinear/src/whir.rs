@@ -1,12 +1,16 @@
 //! Encoding a multilinear as a Reed-Solomon codeword, and folding it.
 //!
+//! The domain is a two-adic subgroup, so it lives in the base field `F`, while
+//! codeword values live in `E`. Mixed products keep the base element on the
+//! left, which is the only direction the field tower implements.
+//!
 //! The identity everything rests on: folding the codeword with `α` encodes the
 //! polynomial with one variable fixed to `α`. [`lift_coefficients`] reverses the
 //! coefficient index so that variable is the *first*, matching sumcheck.
 
 use math::field::{
     element::FieldElement,
-    traits::{IsFFTField, IsField, IsPrimeField},
+    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 
 use crate::{Error, mle::Mle};
@@ -112,10 +116,14 @@ fn reverse_bits(index: usize, width: usize) -> usize {
 ///
 /// Naive Horner per point: this is the reference, not the fast path. A real
 /// prover runs an NTT here.
-pub fn encode<F: IsFFTField + IsPrimeField>(
-    coeffs: &[FieldElement<F>],
+pub fn encode<F, E>(
+    coeffs: &[FieldElement<E>],
     domain: &Domain<F>,
-) -> Result<Vec<FieldElement<F>>, Error> {
+) -> Result<Vec<FieldElement<E>>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+{
     if coeffs.len() > domain.size() {
         return Err(Error::CodewordTooShort {
             coefficients: coeffs.len(),
@@ -128,18 +136,22 @@ pub fn encode<F: IsFFTField + IsPrimeField>(
         .map(|x| {
             coeffs
                 .iter()
-                .rfold(FieldElement::<F>::zero(), |acc, c| acc * x + c)
+                .rfold(FieldElement::<E>::zero(), |acc, c| x * acc + c)
         })
         .collect())
 }
 
 /// Folds a codeword once: `F_α = F₀ + α·F₁`, recovering the halves from `F(x)`
 /// and `F(−x)`. `−x` is half a period away, so `j` pairs with `j + N/2`.
-pub fn fold_codeword<F: IsFFTField + IsPrimeField>(
-    codeword: &[FieldElement<F>],
+pub fn fold_codeword<F, E>(
+    codeword: &[FieldElement<E>],
     domain: &Domain<F>,
-    alpha: &FieldElement<F>,
-) -> Result<Vec<FieldElement<F>>, Error> {
+    alpha: &FieldElement<E>,
+) -> Result<Vec<FieldElement<E>>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+{
     if codeword.len() != domain.size() {
         return Err(Error::CodewordTooShort {
             coefficients: codeword.len(),
@@ -158,8 +170,9 @@ pub fn fold_codeword<F: IsFFTField + IsPrimeField>(
     let mut out = Vec::with_capacity(half);
     for j in 0..half {
         let (a, b) = (&codeword[j], &codeword[j + half]);
-        let even = (a + b) * &two_inv;
-        let odd = (a - b) * &two_inv * x.inv().expect("domain elements are nonzero");
+        let even = &two_inv * (a + b);
+        let x_inv = x.inv().expect("domain elements are nonzero");
+        let odd = (&two_inv * x_inv) * (a - b);
         out.push(even + alpha * odd);
         x *= domain.generator();
     }
@@ -167,11 +180,15 @@ pub fn fold_codeword<F: IsFFTField + IsPrimeField>(
 }
 
 /// Folds `k` times, squaring the domain at each step.
-pub fn fold_codeword_k<F: IsFFTField + IsPrimeField>(
-    codeword: &[FieldElement<F>],
+pub fn fold_codeword_k<F, E>(
+    codeword: &[FieldElement<E>],
     domain: &Domain<F>,
-    alphas: &[FieldElement<F>],
-) -> Result<(Vec<FieldElement<F>>, Domain<F>), Error> {
+    alphas: &[FieldElement<E>],
+) -> Result<(Vec<FieldElement<E>>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+{
     let mut current = codeword.to_vec();
     let mut current_domain = domain.clone();
     for alpha in alphas {

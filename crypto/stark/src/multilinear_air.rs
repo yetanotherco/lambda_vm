@@ -3,7 +3,7 @@
 //! domains as [`Selector`]s.
 //!
 //! Not sound on its own: nothing yet forces a rotated factor to be the shift of
-//! the column it claims to shift. Values are all lifted to the extension field.
+//! the column it claims to shift.
 
 use math::field::{
     element::FieldElement,
@@ -851,59 +851,6 @@ mod tests {
     // The whole argument over a real captured AIR.
     // ---------------------------------------------------------------
 
-    /// The same Fibonacci set, captured with the extension set to the base
-    /// field.
-    ///
-    /// WHIR's evaluation domain is a two-adic subgroup, so it lives in the base
-    /// field; a codeword whose *values* are extension elements needs `encode`
-    /// and `fold_codeword` generalized over a field tower. That generalization
-    /// is the outstanding base/extension work, so the end-to-end test below
-    /// runs where both coincide. Nothing about the argument changes — only how
-    /// wide the arithmetic is.
-    fn fib_program_base() -> (ConstraintProgram<Fp, Fp>, Vec<ConstraintMeta>) {
-        struct FibBase;
-        impl ConstraintSet<Fp, Fp> for FibBase {
-            fn max_degree(&self) -> usize {
-                1
-            }
-            fn eval<B: ConstraintBuilder<Fp, Fp>>(&self, b: &mut B) {
-                let s0_0 = b.main(0, 0);
-                let s0_1 = b.main(0, 1);
-                let s1_0 = b.main(1, 0);
-                let s1_1 = b.main(1, 1);
-                b.emit_base_rows(
-                    0,
-                    RowDomain::except_last(1),
-                    s1_0.clone() - s0_0 - s0_1.clone(),
-                );
-                b.emit_base_rows(1, RowDomain::except_last(1), s1_1 - s0_1 - s1_0);
-            }
-        }
-
-        let mut cb = CaptureBuilder::<Fp, Fp>::new();
-        FibBase.eval(&mut cb);
-        let meta = vec![
-            ConstraintMeta::base(0).with_end_exemptions(1),
-            ConstraintMeta::base(1).with_end_exemptions(1),
-        ];
-        (cb.finish(2).0, meta)
-    }
-
-    type FpE = FieldElement<Fp>;
-
-    fn fib_columns_base(num_vars: usize) -> [Vec<FpE>; 2] {
-        let size = 1usize << num_vars;
-        let mut c0 = vec![FpE::one()];
-        let mut c1 = vec![FpE::one()];
-        for i in 1..size {
-            let next0 = c0[i - 1] + c1[i - 1];
-            let next1 = c1[i - 1] + next0;
-            c0.push(next0);
-            c1.push(next1);
-        }
-        [c0, c1]
-    }
-
     /// Runs the full argument over the captured AIR and returns the verdict.
     ///
     /// **Caveat, and it is not small.** The `next`-step read is committed as its
@@ -911,20 +858,20 @@ mod tests {
     /// column it claims to shift — a prover free to choose both could satisfy
     /// this with unrelated tables. Closing that needs the rotation kernel
     /// (`multilinear::eq::rot_eval`) wired as its own argument.
-    fn argue_fib(columns: &[Vec<FpE>; 2], num_vars: usize) -> Result<(), multilinear::Error> {
+    fn argue_fib(columns: &[Vec<ExtE>; 2], num_vars: usize) -> Result<(), multilinear::Error> {
         use multilinear::{
             constraint_argument::{self, CommittedTrace, TraceClaim},
             whir_eval::EvalConfig,
         };
 
-        let (prog, meta) = fib_program_base();
+        let (prog, meta) = fib_program();
         let leaves = TraceLeaves::build(
             &prog,
             num_vars,
             |col| columns[col as usize].clone(),
             |_| unreachable!("no aux reads"),
         )?;
-        let poly = IrPolynomial::new(&prog, leaves, Uniforms::default(), FpE::from(5), &meta)?;
+        let poly = IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta)?;
         let degree = poly.degree();
         let factors = poly.polys().to_vec();
         let shape = poly.shape().clone();
@@ -933,27 +880,28 @@ mod tests {
             log_blowup: 2,
             num_queries: 3,
         };
-        let trace = CommittedTrace::commit(factors, &config)?;
+        // Domain in the base field, columns in the degree-3 extension.
+        let trace = CommittedTrace::<Fp, Ext>::commit(factors, &config)?;
         let roots = trace.roots();
 
-        let mut prover_transcript = DefaultTranscript::<Fp>::new(b"air-argument");
-        let proof = constraint_argument::prove(
+        let mut prover_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
+        let proof = constraint_argument::prove::<Fp, Ext, _, _>(
             &trace,
-            |v: &[FpE]| shape.combine(v),
+            |v: &[ExtE]| shape.combine(v),
             degree,
             &config,
             &mut prover_transcript,
         )?;
 
-        let mut verifier_transcript = DefaultTranscript::<Fp>::new(b"air-argument");
-        constraint_argument::verify(
+        let mut verifier_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
+        constraint_argument::verify::<Fp, Ext, _, _>(
             &proof,
             TraceClaim {
                 roots: &roots,
                 domain: trace.domain(),
                 num_vars,
             },
-            |v: &[FpE]| shape.combine(v),
+            |v: &[ExtE]| shape.combine(v),
             degree,
             &config,
             &mut verifier_transcript,
@@ -966,15 +914,15 @@ mod tests {
     #[test]
     fn a_real_air_argues_end_to_end_against_commitments() {
         let num_vars = 4;
-        let columns = fib_columns_base(num_vars);
+        let columns = fib_columns(num_vars);
         argue_fib(&columns, num_vars).unwrap();
     }
 
     #[test]
     fn a_real_air_with_a_broken_row_is_rejected_end_to_end() {
         let num_vars = 4;
-        let mut columns = fib_columns_base(num_vars);
-        columns[1][6] += FpE::one();
+        let mut columns = fib_columns(num_vars);
+        columns[1][6] += ExtE::one();
         assert!(argue_fib(&columns, num_vars).is_err());
     }
 }
