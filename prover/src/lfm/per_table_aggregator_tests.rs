@@ -1185,12 +1185,48 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     );
 
     // ---- the node's own proof, so the level above has something to verify.
+    //
+    // ⚠ THREE marks, not one. The mark above is taken BEFORE
+    // `build_artifacts_with_hasher`, which is not a bookkeeping call: it runs
+    // `lde_columns` + `commit_lde_columns` over every chip group and builds the
+    // prep round — a full commitment pass over the whole program. So a single
+    // "before the prove" mark brackets the artifact build and the prove TOGETHER
+    // and cannot say which of them costs what. These split it.
+    let t = Instant::now();
     let artifacts =
         build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    println!(
+        "   RSS high-water AFTER build_artifacts ({:.1}s): {:?} GiB",
+        t.elapsed().as_secs_f64(),
+        super::wrap_tests::peak_rss_gib()
+    );
     let t = Instant::now();
     let proved =
         lfm_prove(&program, &artifacts, &arenas, &wrap_opts).expect("★ THE LEAF NODE MUST PROVE");
     let prove_secs = t.elapsed().as_secs_f64();
+    println!(
+        "   RSS high-water AFTER lfm_prove: {:?} GiB",
+        super::wrap_tests::peak_rss_gib()
+    );
+    // ★ The census beside the measurement, so the two are never quoted apart.
+    // The empty LFM machine costs 26,482,828 base-field-equivalent cells — the
+    // 0-word row of `the_node_cost_model_is_measured` — so at fixture scale most
+    // of a node's census is the machine's padding FLOOR rather than its
+    // verification work, and a fixture node sits on a different part of the curve
+    // from a production one.
+    {
+        let (main, aux) =
+            super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+        let cells = main + 3 * aux;
+        const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+        println!(
+            "   node census: {cells} cells, of which {} are the empty machine's \
+             floor ({:.0}%) and {} are verification work",
+            EMPTY_MACHINE_CELLS,
+            100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+            cells.saturating_sub(EMPTY_MACHINE_CELLS),
+        );
+    }
     let t = Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
