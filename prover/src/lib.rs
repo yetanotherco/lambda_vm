@@ -29,6 +29,17 @@ pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
 
+// The lib's test harness runs the allocator the shipped binary runs
+// (`bin/cli/src/main.rs` installs the same one), so every host-memory number a
+// `cargo test --lib` measurement produces is a production-allocator number.
+// Under the platform allocator the same proves read up to 13 GiB higher at the
+// wrap's q=41 rung: glibc kept freed arena chunks resident, and the run
+// measured the allocator, not the prover. Integration tests are separate
+// crates and install their own (`tests/calibration.rs` already does).
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::fmt;
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
