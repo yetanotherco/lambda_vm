@@ -306,7 +306,16 @@ test-rust: compile-programs-rust
 # tooling/ethrex-fixtures/README.md carries what the workload costs and how to pick
 # the epoch size; the converter's README covers converting a cache by hand.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
-ETHREX_REAL_BLOCK := 25368371
+ETHREX_REAL_BLOCK := 25453112
+# WHY THIS BLOCK: 25368371 was the pre-bump default, and under Amsterdam its
+# transactions lose so much gas to the new state-gas model that the workload drops
+# to 20.36M cycles against the 30.50M the retired fixture cost on today's guest. A
+# screen of twelve real mainnet blocks (our two release caches plus ethrex's curated
+# zkevm_bench corpus) put this one closest: 37.14M cycles, +22% against that target,
+# where 25368371 is -33% and the next candidate up (25087308) is +197%. Reverts are
+# not a selection criterion — every pre-Amsterdam block loses 26-50% of its
+# transactions to the fork, which is a property of the fork and not of the block.
+#
 # The fixture is GENERATED from the cache below, not fetched. ethrex 25's guest
 # decodes only the Amsterdam schema (`0x1501`) and mainnet has no Amsterdam fork,
 # so no hosted artifact for this block can be valid: the release's rkyv one now
@@ -323,8 +332,8 @@ ETHREX_REAL_BLOCK_FIXTURE_SHA256 :=
 # The block's source cache: an ethrex-replay dump, fork-independent, still the one
 # hosted in bench-fixtures-v1. Only the fixture rebuild reads it; converter TESTS
 # use a different, upstream-pinned cache (below).
-ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
-ETHREX_REAL_BLOCK_CACHE_SHA256 := 7aa88a5f7c5755b7575870f95e6c5c26186947f5e9e0d52199148c74e2a2736b
+ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25453112.json
+ETHREX_REAL_BLOCK_CACHE_SHA256 := 20ffbbc1b051df9dfa6285f0ea7bd3f6d054db883aba92230ea20350f1b1d4ad
 
 ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin

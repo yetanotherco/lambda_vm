@@ -56,7 +56,7 @@ fn test_ethrex_empty_block() {
     run_fixture("ethrex_empty_block.bin");
 }
 
-const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
+const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25453112.bin";
 
 /// Host-only acceptance gate for the real SSZ stateless fixture produced by
 /// `tooling/ethrex-block-converter`.
