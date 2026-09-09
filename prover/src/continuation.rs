@@ -1427,11 +1427,11 @@ pub fn prove_continuation(
     // page-base set is shipped (see `touched_page_bases`).
     //
     // The producer publishes each epoch's boundary (an `Arc` share of the one it
-    // sends to the epoch prover) on this dedicated channel, in epoch order. The
-    // global-prove thread drains it until the producer hangs up (last epoch
-    // prepared) — the global proof depends only on these execution artifacts,
-    // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
-    // of serializing after them. Proof bytes are unchanged — only the schedule.
+    // sends to the epoch prover) on this dedicated channel, in epoch order. It
+    // is unbounded, so the producer never blocks on it and the epoch pipeline's
+    // own bounded channels stay the only backpressure; it is drained once, after
+    // the epoch scope joins, and the global proof is proven from it THERE — see
+    // the ★ note at the drain site for why that is deliberately not overlapped.
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
     // Three-stage epoch pipeline: a producer thread runs the
@@ -1643,11 +1643,6 @@ pub fn prove_continuation(
         }
     };
 
-    // The global prove's result, produced by its own scoped thread. `None` only
-    // if that thread never ran to completion (a panic — surfaced by the scope).
-    type GlobalResult = (MultiProof<F, E, ()>, Vec<u64>, usize);
-    let global_result: std::sync::Mutex<Option<Result<GlobalResult, Error>>> =
-        std::sync::Mutex::new(None);
     let mut results = std::thread::scope(|scope| -> Result<Vec<EpochResult>, Error> {
         let elf_ref = &elf;
         let producer = scope.spawn(move || {
@@ -1789,44 +1784,6 @@ pub fn prove_continuation(
         }
         drop(tx);
 
-        // Global prove, overlapped: drain the boundary channel until the
-        // producer hangs up (last epoch prepared), then prove the cross-epoch
-        // global memory argument WHILE the tail epochs are still proving. The
-        // global proof consumes only execution artifacts (boundaries, ELF,
-        // genesis pages) — never an epoch proof — so this is pure schedule.
-        let global_result_ref = &global_result;
-        let init_page_data_ref = &init_page_data;
-        scope.spawn(move || {
-            let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
-            while let Ok(b) = boundary_rx.recv() {
-                all.push(b);
-            }
-            // An epoch already failed: its error wins and the bundle is never
-            // assembled — skip the (whole-prove-sized) global prove.
-            if first_err_ref.lock().unwrap().is_some() {
-                return;
-            }
-            let run = || -> Result<GlobalResult, Error> {
-                #[cfg(feature = "instruments")]
-                let __sp = stark::instruments::span("prove_global");
-                let num_private_input_pages = page::private_input_page_count(private_inputs);
-                // SINGLE source of truth: the same page-base list drives the
-                // committed GLOBAL_MEMORY tables and is shipped in the bundle,
-                // so the two can never diverge in set or order.
-                let touched = touched_page_bases(&all);
-                let global = prove_global(
-                    &all,
-                    elf_bytes,
-                    init_page_data_ref,
-                    &touched,
-                    num_private_input_pages,
-                    opts,
-                )?;
-                Ok((global, touched, num_private_input_pages))
-            };
-            *global_result_ref.lock().unwrap() = Some(run());
-        });
-
         // Prove epochs as the builders hand them over. Builders can finish
         // out of index order, so results are re-ordered by epoch index before
         // the bundle is assembled — proof bytes are identical to the
@@ -1850,13 +1807,44 @@ pub fn prove_continuation(
         epochs.push(epoch);
     }
 
-    // One global LogUp over all the (kept) local-to-global tables — proven
-    // concurrently by the scoped thread above; collect its result here. The
-    // scope guarantees the thread finished, so `None` is unreachable.
-    let (global, touched_page_bases, num_private_input_pages) =
-        global_result.into_inner().unwrap().ok_or_else(|| {
-            Error::ContinuationInvariant("global prove thread produced no result".to_string())
-        })??;
+    // One global LogUp over all the (kept) local-to-global tables. The scope
+    // above has joined, so every epoch prove has finished and released its
+    // device memory before this one starts.
+    //
+    // ★ Deliberately NOT overlapped with the epoch proves, though nothing in the
+    // ARGUMENT forbids it: this is a second `stark::prover::multi_prove`, and
+    // each `multi_prove` builds its OWN `VramGate` from the whole device budget
+    // (80% of total). Two running at once therefore put 2x the card's admission
+    // budget on one GPU with nothing summing them, and each additionally holds
+    // its round-1 working set — every table's LDE, trace snapshot and Merkle
+    // tree stay device-resident from its commit until its own rounds task ends —
+    // which no gate counts at all. Measured on an RTX 5090 (31.40 GiB): the
+    // overlap window opened about `builders + 2` epochs before the end, and
+    // inside it the card ran out with tables from BOTH proves aborting in the
+    // same instant (`gpu_lde::refuse_host_recovery`).
+    //
+    // The cost of serialising is this proof's own wall time, which the overlap
+    // used to hide behind the tail epochs. It changes no proof bytes: the global
+    // proof consumes only execution artifacts (boundaries, ELF, genesis pages),
+    // never an epoch proof, so the schedule was always free to choose.
+    let all: Vec<Arc<Vec<CellBoundary>>> = boundary_rx.try_iter().collect();
+    let num_private_input_pages = page::private_input_page_count(private_inputs);
+    // SINGLE source of truth: the same page-base list drives the committed
+    // GLOBAL_MEMORY tables and is shipped in the bundle, so the two can never
+    // diverge in set or order.
+    let touched_page_bases = touched_page_bases(&all);
+    let global = {
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("prove_global");
+        prove_global(
+            &all,
+            elf_bytes,
+            &init_page_data,
+            &touched_page_bases,
+            num_private_input_pages,
+            opts,
+        )?
+    };
 
     // Same timeline output as the monolithic path (prover/src/lib.rs): print
     // the wall-clock span tree and honor LAMBDA_VM_TIMELINE_JSON. Without this,
