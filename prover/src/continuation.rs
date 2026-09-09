@@ -1508,6 +1508,9 @@ pub fn prove_continuation(
                 // test's first placement did, and the test caught it).
                 #[cfg(test)]
                 if index == test_fault::FAIL_INDEX && private_inputs == test_fault::PANIC_MAGIC {
+                    // Stamp before panicking: everything after this instant is
+                    // the shutdown path the guard exists to bound.
+                    test_fault::record_panic_fired();
                     panic!("injected prover panic (test)");
                 }
                 prove_epoch(
@@ -2144,11 +2147,55 @@ pub fn prove_and_verify_continuation(
 /// exactly [`MAGIC`]. Constants only — concurrent tests can never trip it.
 #[cfg(test)]
 pub(crate) mod test_fault {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
     pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
     /// Same index, but the PROVER thread panics instead of returning `Err`:
     /// the shutdown path a loud device abort takes.
     pub(crate) const PANIC_MAGIC: &[u8] = b"__inject_pipeline_panic__";
     pub(crate) const FAIL_INDEX: u64 = 3;
+
+    /// The split timer for `test_prover_panic_mid_pipeline_returns_err`.
+    ///
+    /// Its budget covers the WHOLE `prove_continuation` call — setup, the
+    /// proving that runs before the injection fires, and only then the
+    /// shutdown — so a pass at 9 s and a pass at 250 s print the same `ok`.
+    /// That single number cannot separate "contention made an honest run slow"
+    /// from "the shutdown path itself degrades under contention", which are a
+    /// scheduling fact and a defect in the guard respectively. [`start_clock`]
+    /// is called by the test before it spawns and [`record_panic_fired`] by the
+    /// injection arm, so the test reports time-to-panic and time-in-shutdown
+    /// separately and one loaded run settles it.
+    ///
+    /// The trigger stays stateless: the panic arm still fires on the private
+    /// input alone and these only observe it. Written by that one arm, read by
+    /// that one test.
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    static PANIC_FIRED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+    /// Start (or re-read) the reference instant both halves are measured from.
+    pub(crate) fn start_clock() -> Instant {
+        *CLOCK.get_or_init(Instant::now)
+    }
+
+    /// Record that the injected panic is about to fire. Called from the
+    /// injection arm; a no-op if no test started the clock.
+    pub(crate) fn record_panic_fired() {
+        if let Some(t0) = CLOCK.get() {
+            PANIC_FIRED_NANOS.store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Time from [`start_clock`] to the injected panic, or `None` if it never
+    /// fired — which is itself the diagnosis when the budget expires.
+    pub(crate) fn panic_fired_after() -> Option<Duration> {
+        match PANIC_FIRED_NANOS.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(Duration::from_nanos(n)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2304,10 +2351,26 @@ mod tests {
     // builders stopped on their dead sender and the producer blocked forever
     // on the build channel — and a real prove slept for 21 minutes. It must
     // surface as `Err` carrying the panic's own message.
+    //
+    // The budget covers the WHOLE call, so a pass alone does not say whether the
+    // guard is healthy. On success this prints, greppable as `[panic-shutdown]`:
+    //
+    //   [panic-shutdown] total 9.87s = to-panic 8.12s + shutdown 1.75s
+    //                    (3.3% of the 300s budget) OK
+    //
+    // `to-panic` is honest proving work and scales with load; `shutdown` is the
+    // path this guard exists to bound and should stay small whatever the load.
+    // A large `to-panic` with a small `shutdown` is a slow box; a large
+    // `shutdown` is this guard degrading, which is a defect and not a budget
+    // problem. ⚠ libtest captures a PASSING test's output — run the suite with
+    // `-- --show-output` to see these lines without the interleaving that
+    // `--nocapture` produces.
     #[test]
     fn test_prover_panic_mid_pipeline_returns_err() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let started = test_fault::start_clock();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let r = prove_continuation(
@@ -2318,14 +2381,50 @@ mod tests {
             );
             let _ = done_tx.send(r.map(|_| ()));
         });
-        let result = done_rx
-            .recv_timeout(std::time::Duration::from_secs(300))
-            .expect("prove_continuation wedged: a prover panic did not shut the pipeline down");
+        let result = done_rx.recv_timeout(BUDGET).unwrap_or_else(|_| {
+            // Name which half ran out. The injection either fired (so the
+            // shutdown is what did not finish — the wedge this guards) or it
+            // did not (so the prove never reached epoch 3 inside the budget,
+            // which is contention, not a wedge).
+            match test_fault::panic_fired_after() {
+                Some(t) => panic!(
+                    "prove_continuation wedged: the injected panic fired {:.2}s in and the \
+                     shutdown had not completed {:.2}s later, at the {}s budget",
+                    t.as_secs_f64(),
+                    BUDGET.saturating_sub(t).as_secs_f64(),
+                    BUDGET.as_secs()
+                ),
+                None => panic!(
+                    "prove_continuation did not reach the injection within the {}s budget: the \
+                     prove was still doing honest work, so this is contention, NOT the wedge",
+                    BUDGET.as_secs()
+                ),
+            }
+        });
+        let total = started.elapsed();
         let err = result.expect_err("the injected panic must surface as Err");
         assert!(
             format!("{err:?}").contains("injected prover panic"),
             "unexpected error: {err:?}"
         );
+
+        let pct = 100.0 * total.as_secs_f64() / BUDGET.as_secs_f64();
+        match test_fault::panic_fired_after() {
+            Some(to_panic) => println!(
+                "[panic-shutdown] total {:.2}s = to-panic {:.2}s + shutdown {:.2}s \
+                 ({pct:.1}% of the {}s budget) {}",
+                total.as_secs_f64(),
+                to_panic.as_secs_f64(),
+                total.saturating_sub(to_panic).as_secs_f64(),
+                BUDGET.as_secs(),
+                if pct >= 50.0 { "MARGINAL" } else { "OK" }
+            ),
+            None => println!(
+                "[panic-shutdown] total {total:?} ({pct:.1}% of the {}s budget) but the \
+                 injection never stamped — the split is unavailable, treat with suspicion",
+                BUDGET.as_secs()
+            ),
+        }
     }
 
     // The pipeline's error path: a mid-run failure with several epochs still
