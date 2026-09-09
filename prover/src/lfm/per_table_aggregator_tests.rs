@@ -1995,14 +1995,21 @@ fn the_production_leaf_node_measures() {
 fn the_tree_shape_matches_the_epoch_count() {
     use super::per_table_aggregator::{tree_node_count, tree_shape};
 
-    // The real block, both postures. ⓘ Epoch counts are `ceil(cycles / 2^k)` for
-    // 74,819,518 cycles; they are written out so a changed constant fails here
-    // rather than silently re-shaping the tree.
+    // The real block, both postures. Epoch counts are `ceil(cycles / 2^k)` for
+    // block 25368371's **39,631,559** cycles, re-measured 2026-09-07.
+    //
+    // ⚠ NOT 74,819,518. That figure is the JULY prebuilt guest; thin-LTO and the
+    // accelerators made it ~47% cheaper at identical work — same block, same
+    // keccak 10,478, same ECSM 116. The stale figure still sits in a table in
+    // `real_block_benchmark_selection.md`, with the correction in an addendum
+    // BELOW it saying in terms that every epochs-per-block number derived from
+    // 74.8M is stale. Reading the table row and stopping gives 18/36 epochs and
+    // a tree two levels too deep.
     for (epochs, fan_in, levels, nodes) in [
-        (18usize, 2usize, 5usize, 20usize), // 2^22: 18 -> 9 -> 5 -> 3 -> 2 -> 1
-        (18, 3, 3, 9),                      // 2^22: 18 -> 6 -> 2 -> 1
-        (36, 2, 6, 38),                     // 2^21: 36 -> 18 -> 9 -> 5 -> 3 -> 2 -> 1
-        (36, 3, 4, 19),                     // 2^21: 36 -> 12 -> 4 -> 2 -> 1
+        (10usize, 2usize, 4usize, 11usize), // 2^22: 10 -> 5 -> 3 -> 2 -> 1
+        (10, 3, 3, 7),                      // 2^22: 10 -> 4 -> 2 -> 1
+        (19, 2, 5, 21),                     // 2^21: 19 -> 10 -> 5 -> 3 -> 2 -> 1
+        (19, 3, 3, 11),                     // 2^21: 19 -> 7 -> 3 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -2037,4 +2044,14 @@ fn the_tree_shape_matches_the_epoch_count() {
     // A degenerate block is a legal shape, not an error: one epoch is already
     // the root and the interior is empty.
     assert!(tree_shape(1, 2).is_empty(), "one epoch needs no interior");
+
+    // ★ The leftover rule is EXERCISED, not merely permitted. 19 at fan-in 2
+    // leaves one over at three levels (19, 5 and 3); a shape that never produced
+    // a short node would pass every assertion above while testing nothing about
+    // wrap-versus-carry.
+    let short: usize = tree_shape(19, 2)
+        .iter()
+        .filter(|l| l.arities.iter().any(|a| *a < 2))
+        .count();
+    assert_eq!(short, 3, "19 at fan-in 2 must exercise the leftover rule");
 }
