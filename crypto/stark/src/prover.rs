@@ -2283,11 +2283,11 @@ pub trait IsStarkProver<
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let security_bits = air.context().proof_options.grinding_factor;
+        let grinding_factor = air.context().proof_options.grinding_factor;
         let mut nonce = None;
-        if security_bits > 0 {
+        if grinding_factor > 0 {
             let nonce_value =
-                grinding::generate_nonce_maybe_gpu(&transcript.state(), security_bits)
+                grinding::generate_nonce_maybe_gpu(&transcript.state(), grinding_factor)
                     .expect("nonce not found");
             transcript.append_bytes(&nonce_value.to_be_bytes());
             nonce = Some(nonce_value);
