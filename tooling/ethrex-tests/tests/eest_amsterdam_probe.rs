@@ -1,5 +1,7 @@
-//! Throwaway probe (untracked): do the upstream EEST Amsterdam benchmark
-//! fixtures execute on the guest this branch pins?
+//! Probe: do the upstream EEST Amsterdam benchmark fixtures execute on the
+//! guest this rev pins? Committed as the measuring tool for adding an EEST
+//! workload alongside the real-mix one; its inputs are not committed, so on a
+//! plain checkout it skips (see below) and costs CI nothing.
 //!
 //! Inputs are `statelessInputBytes` lifted verbatim out of
 //! `tests-zkevm-benchmark@v0.8.2` blockchain tests, so nothing is rebuilt host

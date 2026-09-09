@@ -978,7 +978,7 @@ jobs:
             if (!realTime) {
               body += `\n> 🧱 **No prover measurement — the real-block fixture was not available.** `;
               body += `\`/bench\` proves only the real block, so nothing was measured this run. `;
-              body += `Check that \`ETHREX_REAL_BLOCK_FIXTURE_URL\` is set in the Makefile and that the artifact is reachable; the run log carries the warning.\n`;
+              body += `Check that \`ETHREX_REAL_BLOCK_CACHE_URL\` is set in the Makefile and that the replay cache is reachable; the fixture is generated from it, and the run log carries the warning.\n`;
             }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;

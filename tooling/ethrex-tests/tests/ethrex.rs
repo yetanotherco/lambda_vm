@@ -59,7 +59,9 @@ fn test_ethrex_empty_block() {
 const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25453112.bin";
 
 /// Host-only acceptance gate for the real SSZ stateless fixture produced by
-/// `tooling/ethrex-block-converter`.
+/// `tooling/ethrex-fixtures --bin real_block`. The fixture name is pinned here
+/// as well as in the Makefile, so repointing the block needs both edits; a
+/// missed one fails loudly on the missing file rather than proving less.
 #[test]
 fn test_ethrex_real_block_native() {
     let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();

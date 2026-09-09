@@ -327,7 +327,6 @@ ETHREX_REAL_BLOCK := 25453112
 # there. Read the caveat in tooling/ethrex-fixtures/README.md before quoting
 # numbers: Amsterdam's gas model (EIP-8037 state gas, cold access 2600 -> 3000)
 # makes 10 of this block's Osaka-era transactions run out of gas.
-ETHREX_REAL_BLOCK_FIXTURE_URL :=
 ETHREX_REAL_BLOCK_FIXTURE_SHA256 :=
 # The block's source cache: an ethrex-replay dump, fork-independent, still the one
 # hosted in bench-fixtures-v1. Only the fixture rebuild reads it; converter TESTS
@@ -416,6 +415,10 @@ ethrex-real-block-cache:
 # scripts/bench_abba.sh, scripts/perf_diff.sh and
 # .github/workflows/benchmark-pr.yml read the fixture path from here instead of
 # hardcoding it, so repointing the block above moves every benchmark at once.
+# One consumer is NOT wired through here: `REAL_BLOCK_FIXTURE` in
+# tooling/ethrex-tests/tests/ethrex.rs is a const, because a glob would happily
+# pick up a stale fixture from an earlier block and pass. Repointing the block
+# means editing it too; it fails on the missing file, loudly.
 # `-s` on the caller's side keeps the output clean.
 print-real-block-fixture:
 	@echo $(ETHREX_REAL_BLOCK_FIXTURE)
