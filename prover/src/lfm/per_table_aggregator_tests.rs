@@ -1740,6 +1740,24 @@ fn the_production_leaf_node_measures() {
     use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
+    // ⛔ THE DEVICE, ASSERTED IN-PROCESS. `cfg!` rather than `#[cfg]` so the body
+    // below still compiles — and is still linted — on the non-cuda passes.
+    //
+    // A GPU box ran this for 34 minutes on the CPU because a wrapper script
+    // omitted `--features cuda`, and every line of output was perfectly legible.
+    // ⚠ The host-memory figure is not merely irrelevant on the CPU path, it is
+    // BIASED IN THE DIRECTION THAT MATTERS: the LDE and commit buffers live in
+    // host RAM instead of the card's 32 GiB, so a CPU peak OVERSTATES the host
+    // number the 120.6 GiB feasibility question turns on. Reading a red off it
+    // would be a false negative on the tree.
+    if !cfg!(feature = "cuda") {
+        panic!(
+            "the production node measurement requires `--features cuda`. Without it \
+             this proves on the CPU and answers a different question — and its host \
+             peak is biased HIGH, so a red result would be an artefact of the build \
+             rather than a fact about the tree"
+        );
+    }
     for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
         assert!(
             std::env::var(var).is_ok(),
@@ -1905,12 +1923,37 @@ fn the_production_leaf_node_measures() {
         build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     println!("   build_artifacts: {:.1}s", t.elapsed().as_secs_f64());
     mark("after build_artifacts");
+    // Counters reset HERE, not at the top: the base prove and the wraps have
+    // their own device traffic, and what must be proven is that THE NODE reached
+    // the card — a non-zero total from an earlier phase would satisfy a weaker
+    // check while the node itself ran on the host.
+    #[cfg(feature = "cuda")]
+    stark::gpu_lde::reset_all_gpu_call_counters();
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
         .expect("★ THE PRODUCTION LEAF NODE MUST PROVE");
     let prove_secs = t.elapsed().as_secs_f64();
     println!("   lfm_prove: {prove_secs:.1}s");
     mark("after lfm_prove");
+    #[cfg(feature = "cuda")]
+    {
+        use stark::gpu_lde as g;
+        let calls = [
+            ("lde", g::gpu_lde_calls()),
+            ("leaf_hash", g::gpu_leaf_hash_calls()),
+            ("merkle_tree", g::gpu_merkle_tree_calls()),
+            ("composition", g::gpu_composition_calls()),
+            ("fri", g::gpu_fri_calls()),
+        ];
+        let total: u64 = calls.iter().map(|(_, n)| *n).sum();
+        println!("   GPU dispatches during the NODE prove: {calls:?} (total {total})");
+        assert!(
+            total > 0,
+            "the node prove reached the device ZERO times — it ran on the host \
+             even though cuda is compiled in, so the host peak above is not the \
+             production figure"
+        );
+    }
     let t = Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
