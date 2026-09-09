@@ -34,10 +34,10 @@ from keccak_ref import RHO, RC
 # --------------------------------------------------------------------------
 # byte<->column helpers mirroring keccak_rnd.rs::cols
 # --------------------------------------------------------------------------
-def cxz_right_bit_for_byte(b):        # rs:126-132
+def cxz_right_bit_for_byte(b):        # cols::cxz_right_bit_for_byte
     return (b // 2 + 3) % 4 if b % 2 == 0 else None
 
-def pi_src(X, Y, z):                   # rs:161-174
+def pi_src(X, Y, z):                   # cols::pi_src_cols
     sx = (X + 3 * Y) % 5
     sy = X
     rbc = RHO[sx][sy] // 16
@@ -111,7 +111,7 @@ def build_circuit(round_idx, tag, bug=None):
         C.append(ULE(field_expr16, BitVecVal(255, 16)))
         return Extract(7, 0, field_expr16)
 
-    # === theta: Cxz XOR chain === rs:539-588
+    # === theta: Cxz XOR chain === banner "Theta: Cxz chain BYTE_ALU[XOR] (160)"
     for x in range(5):
         for b in range(8):
             C.append(cxz[(x, 0, b)] == start[(x, 0, b)] ^ start[(x, 1, b)])
@@ -120,7 +120,9 @@ def build_circuit(round_idx, tag, bug=None):
             for b in range(8):
                 C.append(cxz[(x, s, b)] == cxz[(x, s - 1, b)] ^ start[(x, yy, b)])
 
-    # === theta: HWSL rotate-C-by-1 === rs:593-631  (+ eval IS_BIT rs:914-924)
+    # === theta: HWSL rotate-C-by-1 === KeccakRndConstraints::eval, group (2)
+    # (the theta shift identity; group (1) is the IS_BIT on the carry). #889
+    # deleted the BusId::Hwsl sender this used to name.
     for x in range(5):
         for hw in range(4):
             inp = hw16(cxz[(x, 3, 2 * hw)], cxz[(x, 3, 2 * hw + 1)])
@@ -132,14 +134,14 @@ def build_circuit(round_idx, tag, bug=None):
             # only the IS_BIT eval constraint below survives (carry forgeable).
             C.append(Or(cxzR[(x, hw)] == 0, cxzR[(x, hw)] == 1))          # IS_BIT (redundant)
 
-    def rotated_c(xp, b):              # rs:322-329 / 663-672
+    def rotated_c(xp, b):              # banner "Theta: Dxz BYTE_ALU[XOR] (40)"
         hw = cxz_right_bit_for_byte(b)
         expr = ZeroExt(8, cxzL[(xp, b)])
         if hw is not None:
             expr = expr + ZeroExt(8, cxzR[(xp, hw)])
         return byte_op_operand(expr)
 
-    # === theta: Dxz XOR === rs:661-690
+    # === theta: Dxz XOR === banner "Theta: Dxz BYTE_ALU[XOR] (40)"
     for x in range(5):
         for b in range(8):
             cm1 = cxz[((x + 4) % 5, 3, b)]
@@ -149,13 +151,14 @@ def build_circuit(round_idx, tag, bug=None):
                 rc1 = rotated_c((x + 1) % 5, b)
             C.append(dxz[(x, b)] == cm1 ^ rc1)
 
-    # === theta final XOR === rs:694-717
+    # === theta final XOR === banner "Theta final: BYTE_ALU[XOR] (200)"
     for x in range(5):
         for y in range(5):
             for b in range(8):
                 C.append(theta[(x, y, b)] == start[(x, y, b)] ^ dxz[(x, b)])
 
-    # === rho: HWSL === rs:723-766
+    # === rho: HWSL === KeccakRndConstraints::eval, group (3) (the rho shift
+    # identity; #889 deleted the BusId::Hwsl sender this used to name)
     rho_tbl = [[RHO[x][y] for y in range(5)] for x in range(5)]
     if bug == "rho_swap":
         rho_tbl[1][0], rho_tbl[2][0] = rho_tbl[2][0], rho_tbl[1][0]
@@ -175,11 +178,12 @@ def build_circuit(round_idx, tag, bug=None):
                     right16 = LShR(inp, 16 - rnc)
                     C.append(hw16(rotR[(x, y, 2 * hw)], rotR[(x, y, 2 * hw + 1)]) == right16)
 
-    def pi(X, Y, z):                   # rs:793-795 virtual pi
+    def pi(X, Y, z):                   # cols::pi_src_cols (pi is spec-virtual)
         sx, sy, l, r = pi_src(X, Y, z)
         return byte_op_operand(ZeroExt(8, rotL[(sx, sy, l)]) + ZeroExt(8, rotR[(sx, sy, r)]))
 
-    # === chi: AND then XOR === rs:796-870
+    # === chi: AND then XOR === banners "Chi: BYTE_ALU[AND] (200)" +
+    # "Chi: BYTE_ALU[XOR] (200)"
     for x in range(5):
         for y in range(5):
             for b in range(8):
@@ -196,7 +200,8 @@ def build_circuit(round_idx, tag, bug=None):
                     C.append(chA[(x, y, b)] == ((BitVecVal(255, 8) - p1) & p2))
                 C.append(chi[(x, y, b)] == p0 ^ chA[(x, y, b)])
 
-    # === iota === rs:872-894  (rc pinned by KeccakRc contract rs:518-535)
+    # === iota === banner "Iota: BYTE_ALU[XOR] (8)" (rc pinned by the KeccakRc
+    # sender in banner "IO group (3)")
     rc_round = (round_idx + 1) % 24 if bug == "iota_wrong_rc" else round_idx
     rc_bytes = [(RC[rc_round] >> (8 * b)) & 0xFF for b in range(8)]
     for b in range(8):
@@ -206,7 +211,7 @@ def build_circuit(round_idx, tag, bug=None):
         else:
             C.append(iota[b] == chi[(0, 0, b)] ^ rc[b])
 
-    def out_byte(x, y, b):             # rs:496-509 handoff
+    def out_byte(x, y, b):             # KECCAK bus send, banner "IO group (3)"
         return iota[b] if (x == 0 and y == 0) else chi[(x, y, b)]
 
     return C, out_byte, start

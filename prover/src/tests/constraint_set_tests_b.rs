@@ -65,6 +65,10 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
         assert_eq!(m.kind, RootKind::Base, "[{label}] meta kind {i}");
+        // See the same assertion in constraint_set_tests_a.rs: the row domain is
+        // invisible to the IR digests and legal for the prover, so this is the only
+        // place a silent end-of-trace exemption gets caught.
+        assert_eq!(m.end_exemptions, 0, "[{label}] meta end_exemptions {i}");
     }
 
     // --- capture once; tree-measured degree <= the table's declared max ---

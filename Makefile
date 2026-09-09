@@ -9,7 +9,7 @@ bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
 print-real-block-fixture-url \
-test-ethrex-real-block-converter regen-real-block-fixture
+test-ethrex-real-block-converter regen-real-block-fixture verify-keccak
 
 UNAME := $(shell uname)
 
@@ -639,6 +639,21 @@ lint:
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
+
+# The solver-free half of formal_verification/keccak: the FIPS-202 reference
+# anchors, the concrete mirror of the round wiring, the combinatorial premises,
+# the range-check necessity results and the full-chip forgery witness. Seconds,
+# no solver, so CI runs it on every PR that touches the directory. The QF-BV gate
+# itself (z3_parallel.py, tamper_test.py) needs z3 and ~3 min and stays manual —
+# see formal_verification/keccak/README.md.
+verify-keccak:
+	cd formal_verification/keccak && \
+	python3 test_ref.py && \
+	python3 test_dataflow.py && \
+	python3 combinatorics.py && \
+	python3 necessity_theta.py && \
+	python3 necessity_rho.py && \
+	python3 witness_fullchip.py
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

@@ -2,7 +2,8 @@
 import hashlib
 from keccak_ref import RC, RHO, sha3_256
 
-# Repo constants (from executor/src/vm/instruction/execution.rs:646-680), pasted
+# Repo constants (KECCAK_RC / KECCAK_RHO in
+# executor/src/vm/instruction/execution.rs), pasted
 # here ONLY to cross-check my spec-generated values. Correctness is anchored to
 # FIPS-202 (my generators) + hashlib, not to these.
 REPO_RC = [
