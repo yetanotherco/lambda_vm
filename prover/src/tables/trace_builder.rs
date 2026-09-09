@@ -1082,8 +1082,13 @@ fn collect_memmove_ops(
     let mut deferred_writes = Vec::new();
 
     while remaining != 0 {
-        let width =
-            executor::vm::instruction::execution::memmove_row_width(src, dst, offset, remaining);
+        let width = executor::vm::instruction::execution::memmove_row_width(
+            src,
+            dst,
+            offset,
+            remaining,
+            to_commit_domain,
+        );
         let source_addr = src.wrapping_add(offset);
         let destination_addr = dst.wrapping_add(offset);
         let (value, old_timestamps) = memory_state.read_bytes(source_addr, width as usize);
@@ -1184,8 +1189,14 @@ fn replay_memmove_for_sizing(
 
 /// Test hook for the schedule, so the MEMMOVE unit tests can pin it.
 #[cfg(test)]
-pub fn memmove_row_width_for_test(src: u64, dst: u64, offset: u64, remaining: u64) -> u8 {
-    executor::vm::instruction::execution::memmove_row_width(src, dst, offset, remaining)
+pub fn memmove_row_width_for_test(
+    src: u64,
+    dst: u64,
+    offset: u64,
+    remaining: u64,
+    to_commit: bool,
+) -> u8 {
+    executor::vm::instruction::execution::memmove_row_width(src, dst, offset, remaining, to_commit)
 }
 
 /// Collects the memory operations for a `Hint` ecall.

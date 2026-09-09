@@ -938,10 +938,15 @@ impl VmAirs {
 // Bus Balance Target: Verifier-Computed COMMIT Output Bus
 // =============================================================================
 
-/// Compute the bus balance offset for the COMMIT[index, value] bus.
+/// Compute the bus balance offset for the COMMIT bus.
 ///
-/// For each public output byte at index `i` with value `v`:
-///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
+/// The MEMMOVE chip commits eight bytes per row, so each tuple is
+/// `[index, value[0..8]]` and the tail rows send one byte with the seven unused
+/// lanes zeroed. The schedule is a function of the global index alone — eight
+/// bytes while eight remain, then one per remaining byte — so the verifier can
+/// rebuild every tuple from `public_output` without knowing the guest buffer the
+/// bytes were read from:
+///   `fingerprint = z - (BusId::Commit·α^0 + index·α^1 + Σ_k value_k·α^(k+2))`
 ///   `term = +1 / fingerprint`
 ///
 /// Returns `Some(Σ term)` — the positive receiver contribution that is no
@@ -959,22 +964,36 @@ pub(crate) fn compute_commit_bus_offset(
     }
 
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
-    let alpha_sq = alpha * alpha;
+    // α^1 carries the index; α^2..α^9 carry the eight lanes.
+    let mut powers = Vec::with_capacity(9);
+    let mut power = *alpha;
+    for _ in 0..9 {
+        powers.push(power);
+        power = &power * alpha;
+    }
 
-    // fingerprint_i = z - (BusId::Commit + (start_index + i)·α + value_i·α²).
-    // `start_index` is the carried x254: 0 for a monolithic proof or the first
-    // epoch, nonzero for a continuation epoch whose commits continue a prior one.
-    let mut fingerprints: Vec<FieldElement<E>> = public_output
-        .iter()
+    let fingerprint = |offset: usize, lanes: &[u8]| {
+        let index = start_index + offset as u64;
+        let mut combination = bus_id + (FieldElement::<E>::from(index) * &powers[0]);
+        for (lane, &value) in lanes.iter().enumerate() {
+            combination += FieldElement::<E>::from(value as u64) * &powers[lane + 1];
+        }
+        z - combination
+    };
+
+    // `chunks_exact(8)` are the wide rows; its remainder is one tail row per byte.
+    let chunks = public_output.chunks_exact(8);
+    let tail = chunks.remainder();
+    let mut fingerprints: Vec<FieldElement<E>> = chunks
         .enumerate()
-        .map(|(i, &value)| {
-            let global_index = start_index + i as u64;
-            let linear_combination = bus_id
-                + (FieldElement::<E>::from(global_index) * alpha)
-                + (FieldElement::<E>::from(value as u64) * alpha_sq);
-            z - linear_combination
-        })
+        .map(|(block, lanes)| fingerprint(block * 8, lanes))
         .collect();
+    let tail_start = public_output.len() - tail.len();
+    fingerprints.extend(
+        tail.iter()
+            .enumerate()
+            .map(|(byte, &value)| fingerprint(tail_start + byte, &[value])),
+    );
 
     // Batch inversion: 1 inversion + O(3N) muls instead of N field inversions.
     // `Err` iff some fingerprint is zero (a collision) — treat as failure.

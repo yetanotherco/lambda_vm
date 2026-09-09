@@ -84,13 +84,13 @@ fn dma_row_helpers_match_the_chunk_loop() {
             let mut remaining = count;
             let mut offset = 0u64;
             while remaining != 0 {
-                let width = u64::from(memmove_row_width(src, dst, offset, remaining));
+                let width = u64::from(memmove_row_width(src, dst, offset, remaining, false));
                 remaining -= width;
                 offset += width;
                 chunks += 1;
             }
             assert_eq!(
-                memmove_trace_rows(src, dst, count),
+                memmove_trace_rows(src, dst, count, false),
                 chunks + 1,
                 "src {src}, dst {dst}, count {count}: the terminal row is always emitted"
             );

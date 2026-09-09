@@ -144,9 +144,11 @@ fn memmove_terminal_row_may_wrap_unused_successor_columns() {
 #[test]
 fn memmove_bus_interactions_count() {
     use crate::tables::memmove::bus_interactions;
-    // 23 on the DMA table this replaces, plus the CommitDefer receive and the eight
-    // gated COMMIT-domain lane sends.
-    assert_eq!(bus_interactions().len(), 32);
+    // 23 on the DMA table this replaces, plus the CommitDefer receive and the two
+    // COMMIT-domain sends — one wide row of eight bytes, one tail row of one. The
+    // aux column count is `ceil(interactions / 2)`, so those two cost 1 aux column
+    // where the eight per-byte lanes they replace cost 4.
+    assert_eq!(bus_interactions().len(), 26);
 }
 
 #[test]

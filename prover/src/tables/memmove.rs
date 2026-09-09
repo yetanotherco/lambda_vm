@@ -602,32 +602,42 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }),
     ];
 
-    // 25-32. Write the destination in the COMMIT domain: one `(index, value)` pair
-    // per byte moved. `dst` is the running global byte index there.
-    for (k, &value_column) in cols::VALUE.iter().enumerate() {
-        let lane_mult = if k == 0 {
-            Multiplicity::Column(cols::MU_COM)
-        } else {
-            Multiplicity::Column(cols::MU_COM_WIDE)
-        };
-        interactions.push(BusInteraction::sender(
-            BusId::Commit,
-            lane_mult,
-            vec![
-                BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::DST_0,
-                    },
-                    LinearTerm::Constant(k as i64),
-                ]),
-                BusValue::Packed {
-                    start_column: value_column,
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
+    // 25-26. Write the destination in the COMMIT domain eight bytes at a time: one
+    // tuple per row rather than one per byte. A tail row sends the same arity with its
+    // seven unused lanes zeroed, so the verifier rebuilds both shapes from
+    // `public_output` alone — which is why a commit row's width follows from the global
+    // index and never from the guest buffer it reads.
+    let commit_index = || BusValue::Packed {
+        start_column: cols::DST_0,
+        packing: Packing::Direct,
+    };
+    interactions.push(BusInteraction::sender(
+        BusId::Commit,
+        Multiplicity::Column(cols::MU_COM_WIDE),
+        {
+            let mut tuple = Vec::with_capacity(9);
+            tuple.push(commit_index());
+            tuple.extend(cols::VALUE.iter().map(|&column| BusValue::Packed {
+                start_column: column,
+                packing: Packing::Direct,
+            }));
+            tuple
+        },
+    ));
+    interactions.push(BusInteraction::sender(
+        BusId::Commit,
+        Multiplicity::Diff(cols::MU_COM, cols::MU_COM_WIDE),
+        {
+            let mut tuple = Vec::with_capacity(9);
+            tuple.push(commit_index());
+            tuple.push(BusValue::Packed {
+                start_column: cols::VALUE_0,
+                packing: Packing::Direct,
+            });
+            tuple.extend((1..8).map(|_| BusValue::constant(0)));
+            tuple
+        },
+    ));
 
     interactions
 }
@@ -825,11 +835,14 @@ mod tests {
     fn the_schedule_aligns_both_ends_or_neither() {
         use super::super::trace_builder::memmove_row_width_for_test as w;
         // Matched residues (both 5 mod 8): one-byte rows until alignment, then wide.
-        assert_eq!(w(0x1005, 0x2005, 0, 24), 1);
-        assert_eq!(w(0x1005, 0x2005, 3, 21), 8);
+        assert_eq!(w(0x1005, 0x2005, 0, 24, false), 1);
+        assert_eq!(w(0x1005, 0x2005, 3, 21, false), 8);
         // Mismatched: aligning `dst` would misalign `src`, so do not split at all.
-        assert_eq!(w(0x1002, 0x2005, 0, 24), 8);
+        assert_eq!(w(0x1002, 0x2005, 0, 24, false), 8);
         // A short remainder always falls back to one byte a row.
-        assert_eq!(w(0x1000, 0x2000, 16, 5), 1);
+        assert_eq!(w(0x1000, 0x2000, 16, 5, false), 1);
+        // A commit row ignores both residues: its width has to follow from the index.
+        assert_eq!(w(0x1002, 0x2005, 0, 24, true), 8);
+        assert_eq!(w(0x1005, 0x2005, 0, 24, true), 8);
     }
 }

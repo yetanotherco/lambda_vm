@@ -69,9 +69,15 @@ pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 /// Width of one MEMMOVE row: one byte until `dst` reaches eight-alignment, then
 /// eight while at least eight bytes remain, then one per remaining byte. Keeping
 /// the body aligned is what lets those rows take the `MEMW_A` fast path.
-pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64) -> u8 {
+pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64, to_commit: bool) -> u8 {
     if remaining < 8 {
         return 1;
+    }
+    // A commit row's width has to follow from the global byte index alone: the verifier
+    // rebuilds the COMMIT tuples out of `public_output`, and it knows the index, not the
+    // guest buffer the bytes were read from. Eight until fewer than eight remain.
+    if to_commit {
+        return 8;
     }
     // Only split when the two ends share a residue mod 8. Aligning `dst` alone
     // pushes `src` out of alignment on every call whose residues differ — 59% of
@@ -93,12 +99,12 @@ pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64) -> u8 
 /// alignment, not on `count` alone. Every consumer that needs a row count (the
 /// trace builder, the sizing pass, the CLI's accelerator report) goes through this
 /// function, so none of them can drift from the trace the prover actually builds.
-pub fn memmove_trace_rows(src: u64, dst: u64, count: u64) -> u64 {
+pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u64 {
     let mut rows = 1;
     let mut offset = 0u64;
     let mut remaining = count;
     while remaining != 0 {
-        let width = u64::from(memmove_row_width(src, dst, offset, remaining));
+        let width = u64::from(memmove_row_width(src, dst, offset, remaining, to_commit));
         offset += width;
         remaining -= width;
         rows += 1;
@@ -667,7 +673,7 @@ impl Instruction {
                         for (i, &byte) in bytes[..n as usize].iter().enumerate() {
                             memory.store_byte(dst + i as u64, byte);
                         }
-                        src2_val = memmove_trace_rows(src, dst, n);
+                        src2_val = memmove_trace_rows(src, dst, n, false);
                         dst_val = n;
                     }
                     SyscallNumbers::DmaMemset => {
@@ -692,7 +698,7 @@ impl Instruction {
                             let byte = memory.load_byte(src + i);
                             memory.store_byte(dst + i, byte);
                         }
-                        src2_val = memmove_trace_rows(src, dst, n);
+                        src2_val = memmove_trace_rows(src, dst, n, false);
                         dst_val = n;
                     }
                     SyscallNumbers::Hint => {

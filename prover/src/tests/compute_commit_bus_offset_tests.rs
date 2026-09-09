@@ -3,6 +3,10 @@
 //! Pins the three behaviours the verify-path helper must preserve:
 //! empty input short-circuit, success-path equivalence with a naive
 //! per-element-inverse reference, and the zero-fingerprint failure path.
+//!
+//! A commit under eight bytes is all tail rows, and a tail tuple is
+//! `[index, value, 0, 0, 0, 0, 0, 0, 0]` — numerically the old per-byte
+//! fingerprint, so the short cases pin the two models against each other.
 
 use math::field::element::FieldElement;
 
@@ -11,9 +15,10 @@ use crate::tables::types::{BusId, GoldilocksExtension};
 
 type E = GoldilocksExtension;
 
-/// Reference implementation: one `inv()` per fingerprint, then sum.
-/// Mirrors the original loop bit-for-bit modulo addition order, so any
-/// future refactor of the batched routine must remain equivalent to this.
+/// Reference implementation: one `inv()` per fingerprint, then sum, walking the
+/// row schedule the MEMMOVE chip emits for a commit — eight bytes while eight
+/// remain, then one per remaining byte. Any future refactor of the batched
+/// routine must stay equivalent to this.
 fn naive_offset(
     public_output: &[u8],
     start_index: u64,
@@ -21,14 +26,23 @@ fn naive_offset(
     alpha: &FieldElement<E>,
 ) -> Option<FieldElement<E>> {
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
-    let alpha_sq = alpha * alpha;
+    let mut powers = Vec::with_capacity(9);
+    let mut power = *alpha;
+    for _ in 0..9 {
+        powers.push(power);
+        power = &power * alpha;
+    }
+
     let mut total = FieldElement::<E>::zero();
-    for (i, &value) in public_output.iter().enumerate() {
-        let lc = bus_id
-            + (FieldElement::<E>::from(start_index + i as u64) * alpha)
-            + (FieldElement::<E>::from(value as u64) * alpha_sq);
-        let fingerprint = z - lc;
-        total += fingerprint.inv().ok()?;
+    let mut i = 0usize;
+    while i < public_output.len() {
+        let width = if public_output.len() - i >= 8 { 8 } else { 1 };
+        let mut lc = bus_id + (FieldElement::<E>::from(start_index + i as u64) * &powers[0]);
+        for lane in 0..width {
+            lc += FieldElement::<E>::from(public_output[i + lane] as u64) * &powers[lane + 1];
+        }
+        total += (z - lc).inv().ok()?;
+        i += width;
     }
     Some(total)
 }
