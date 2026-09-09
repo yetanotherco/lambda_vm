@@ -169,9 +169,13 @@ memmove:
 // so every step observes the previous step's write and the seed propagates across the
 // range. The ecall number is what selects the order; the guest never chooses it.
 //
-// `a1` therefore carries a source address here, not the fill byte. Fills shorter than
-// sixteen bytes take a plain store loop: they cannot amortise the seed, and below eight
-// bytes there is nothing left to propagate.
+// `a1` therefore carries a source address here, not the fill byte, and it is only ever
+// read by the `sb`s that lay down the seed. `sb` writes the low byte of its source, so
+// C's `(unsigned char)c` truncation comes for free and needs no masking of its own --
+// a wide or negative `int` fill lands as the right byte either way.
+//
+// Fills shorter than sixteen bytes take a plain store loop: they cannot amortise the
+// seed, and below eight bytes there is nothing left to propagate.
 // ---------------------------------------------------------------------------
 
 global_asm!(
@@ -182,7 +186,6 @@ global_asm!(
     .type memset,@function
 memset:
     mv t0, a0
-    andi a1, a1, 255
     beqz a2, .Ldma_memset_done
     li t2, 16
     bltu a2, t2, .Ldma_memset_bytewise

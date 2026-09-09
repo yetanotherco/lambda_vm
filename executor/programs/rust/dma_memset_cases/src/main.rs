@@ -38,14 +38,14 @@ pub fn main() {
     assert!(buffer[..100].iter().all(|&byte| byte == 0));
     assert!(buffer[100..].iter().all(|&byte| byte == 0xA5));
 
-    // The guest stub masks the fill to its low byte, matching C's
-    // `memset(void*, int, size_t)` writing `(unsigned char)c`.
+    // The seeding `sb` writes the low byte of its source register, so a wide fill
+    // truncates as C's `memset(void*, int, size_t)` requires: `(unsigned char)c`.
     buffer.fill(0);
     dma_set(buffer.as_mut_ptr(), 0x1FF, 64);
     assert!(buffer[..64].iter().all(|&byte| byte == 0xFF));
 
-    // A negative int sign-extends to 0xFFFF_FFFF_FFFF_FFFF under lp64; the
-    // `andi` is what keeps the executor from rejecting it as a wide fill.
+    // A negative int sign-extends to 0xFFFF_FFFF_FFFF_FFFF under lp64, and `sb`
+    // takes its low byte, so the fill is 0xFF.
     buffer.fill(0);
     dma_set(buffer.as_mut_ptr(), -1, 32);
     assert!(buffer[..32].iter().all(|&byte| byte == 0xFF));
