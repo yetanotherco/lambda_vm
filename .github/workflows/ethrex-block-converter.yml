@@ -7,14 +7,15 @@ name: ethrex block-converter tests
 # network download plus a cold build of ~335 packages (blst, c-kzg and secp256k1-sys
 # C builds, malachite, ark-ff/asm).
 #
-# It fires on the things that can actually invalidate it: the converter, the ethrex
-# host-reference tests, and the Makefile (which holds the block pin, the fixture URL
-# and its sha256).
+# It fires on the things that can actually invalidate it: the fixture generator, the
+# converter, the ethrex host-reference tests, and the Makefile (which holds the block
+# pin, the cache URL and its sha256).
 on:
   workflow_dispatch:
   pull_request:
     branches: ["**"]
     paths:
+      - 'tooling/ethrex-fixtures/**'
       - 'tooling/ethrex-block-converter/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
@@ -22,6 +23,7 @@ on:
   push:
     branches: ["main"]
     paths:
+      - 'tooling/ethrex-fixtures/**'
       - 'tooling/ethrex-block-converter/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
@@ -81,6 +83,7 @@ jobs:
           shared-key: "lambda-vm-real-block-usable"
           cache-all-crates: "true"
           workspaces: |
+            tooling/ethrex-fixtures -> target
             tooling/ethrex-tests -> target
 
       # Built from the block's replay cache, not downloaded: ethrex 25's guest decodes
