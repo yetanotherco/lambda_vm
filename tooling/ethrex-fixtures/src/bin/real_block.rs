@@ -196,23 +196,39 @@ fn build_stateless_input(
 /// Walk an embedded witness trie and return every `(32-byte key, value)` leaf it
 /// still holds. Pruned subtrees appear as `NodeRef::Hash` and are skipped: they
 /// are the proof siblings, which no transaction in the block reads.
-fn collect_leaves(node: &Node, path: Nibbles, out: &mut Vec<(H256, Vec<u8>)>) {
-    let descend = |child: &NodeRef, path: Nibbles, out: &mut Vec<(H256, Vec<u8>)>| {
+///
+/// Returns the number of leaves that could NOT be turned into a 32-byte key. In
+/// a hashed trie there is no such thing, so a non-zero count means a malformed
+/// witness node — and the caller must refuse to build on it. Dropping one
+/// silently loses an account or a storage slot, the transaction that reads it
+/// then sees zero and reverts, and the fixture ends up carrying less work than
+/// the block it claims to reproduce with the revert count as its only symptom.
+/// The installed-vs-collected counts cannot catch it: both are derived from this
+/// function's output, so they agree by construction.
+fn collect_leaves(node: &Node, path: Nibbles, out: &mut Vec<(H256, Vec<u8>)>) -> usize {
+    let descend = |child: &NodeRef, path: Nibbles, out: &mut Vec<(H256, Vec<u8>)>| -> usize {
         if let NodeRef::Node(child, _) = child {
-            collect_leaves(child, path, out);
+            collect_leaves(child, path, out)
+        } else {
+            0
         }
     };
     match node {
         Node::Branch(branch) => {
+            let mut unusable = 0;
             for (i, child) in branch.choices.iter().enumerate() {
-                descend(child, path.append_new(i as u8), out);
+                unusable += descend(child, path.append_new(i as u8), out);
             }
+            unusable
         }
         Node::Extension(ext) => descend(&ext.child, path.concat(&ext.prefix), out),
         Node::Leaf(leaf) => {
             let bytes = path.concat(&leaf.partial).to_bytes();
             if bytes.len() == 32 {
                 out.push((H256::from_slice(&bytes), leaf.value.clone()));
+                0
+            } else {
+                1
             }
         }
     }
@@ -283,8 +299,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     genesis.timestamp = real_block.header.timestamp.saturating_sub(12);
 
     let mut accounts = Vec::new();
+    let mut unusable_leaves = 0usize;
     if let Some(root) = &witness.state_trie_root {
-        collect_leaves(root, Nibbles::default(), &mut accounts);
+        unusable_leaves += collect_leaves(root, Nibbles::default(), &mut accounts);
     }
 
     let mut store = Store::new(".ethrex-real-block-tmp", EngineType::InMemory)?;
@@ -312,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("decode account {hashed_address:#x}: {e:?}"))?;
         if let Some(storage_root) = witness.storage_trie_roots.get(hashed_address) {
             let mut leaves = Vec::new();
-            collect_leaves(storage_root, Nibbles::default(), &mut leaves);
+            unusable_leaves += collect_leaves(storage_root, Nibbles::default(), &mut leaves);
             let mut storage_trie = store.open_direct_storage_trie(
                 *hashed_address,
                 *ethrex_common::constants::EMPTY_TRIE_HASH,
@@ -336,6 +353,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         installed_accounts += 1;
     }
     let installed_root = state_trie.hash(&NativeCrypto)?;
+    if unusable_leaves > 0 {
+        return Err(format!(
+            "{unusable_leaves} witness leaf/leaves did not yield a 32-byte trie key, so \
+             that much of the block's pre-state was never installed. The transactions \
+             reading it would see zero and revert, shrinking the workload silently."
+        )
+        .into());
+    }
 
     // Build at the real height, not at #1. The seeded accounts hold the block's
     // own pre-state, but a contract that stores a block number and compares it
@@ -442,6 +467,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let block = result.payload;
     let included = block.body.transactions.len();
+    // The tx mix is the whole reason this fixture exists, so a builder that applied
+    // fewer than all of them has produced a smaller workload than the block it claims
+    // to reproduce -- and every guard below still passes, because a block with fewer
+    // transactions is a perfectly valid block. The screen sets the escape: surveying
+    // candidate blocks needs the partial ones reported, not refused.
+    if included != total_txs && std::env::var_os("REAL_BLOCK_ALLOW_DROPS").is_none() {
+        return Err(format!(
+            "the payload builder applied only {included} of {total_txs} transactions; \
+             rejected: {rejected:?}. Set REAL_BLOCK_ALLOW_DROPS=1 to write the fixture \
+             anyway."
+        )
+        .into());
+    }
 
     // --- 4. witness -> SSZ -> native validation ----------------------------
     let witness = blockchain

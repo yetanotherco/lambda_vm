@@ -69,7 +69,17 @@ block 25368371 it reverts 2 transactions where Amsterdam reverts 12.
 Every pre-Amsterdam block loses transactions this way. A screen of twelve real
 mainnet blocks (both of our release caches plus ethrex's curated zkevm_bench
 corpus) put the revert share between 26% and 50% with no exceptions, so it is not
-a criterion for picking one. What the screen was for is weight: the retired
+a criterion for picking one.
+
+Reverting is separate from being *dropped*: a reverted transaction was applied and
+paid for its gas, while a dropped one never entered the block. This block applies
+all 38 of its transactions, and the generator refuses to write a fixture that
+applies fewer, because every other guard would still pass — a block with fewer
+transactions is a valid block, so the loss would show up only as a smaller
+benchmark. Screening candidate blocks does need the partial ones, so pass
+`REAL_BLOCK_ALLOW_DROPS=1` for that; note also that the generator is not universal
+(block 25087563 fails with `StateRootMismatch`), which is why screening is a
+required step before pinning a different block. What the screen was for is weight: the retired
 fixture cost 30.50M cycles on today's guest, and this block rebuilds to 37.14M
 (+22%), the closest of the twelve — 25368371 comes in at -33% and the next
 candidate up, 25087308, at +197%. Several blocks end up consuming *more* gas than
