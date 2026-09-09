@@ -1790,14 +1790,45 @@ fn the_production_leaf_node_measures() {
     // separately-written tree-builder would carry. The deserialise path is
     // production's own (`bin/cli/src/main.rs:877-886`).
     //
-    // ⇒ First run with `A_BUNDLE` set proves and saves; every later run loads.
-    // The pair of numbers is the measurement: the difference between them IS the
-    // base residue, and therefore how much of any high peak belongs to this
-    // harness rather than to the tree.
+    // ⇒ The pair of numbers is the measurement: the difference between a PROVED
+    // base and a LOADED one IS the base residue, and therefore how much of any
+    // high peak belongs to this harness rather than to the tree.
+    //
+    // ⛔ THE MODE IS NAMED BY THE CALLER, NOT READ OFF THE DISK. Cache-if-present
+    // made this harness choose its own experiment: a relaunch with `A_BUNDLE`
+    // still exported loaded a bundle an earlier run had saved, the base "proved"
+    // in 1.4 s, `prove_continuation` never ran, and the run answered the CONTROL
+    // having been launched as the TEST. Every line was legible and the pass real.
+    // ⇒ `prove` with the file present is a refusal, not a silent load; `load`
+    // without it is a refusal, not a silent 20-minute prove.
     let bundle_path = std::env::var("A_BUNDLE").ok();
-    let cached = bundle_path
-        .as_deref()
-        .is_some_and(|p| std::path::Path::new(p).exists());
+    let cached = match (&bundle_path, std::env::var("A_BUNDLE_MODE").ok().as_deref()) {
+        (None, _) => false,
+        (Some(_), None) => panic!(
+            "A_BUNDLE is set but A_BUNDLE_MODE is not. Name the experiment — \
+             `prove` (prove the base and save it) or `load` (load a saved base) — \
+             so the harness cannot pick one from filesystem state"
+        ),
+        (Some(p), Some("load")) => {
+            assert!(
+                std::path::Path::new(p).exists(),
+                "A_BUNDLE_MODE=load but {p} does not exist: this would silently \
+                 become a full base prove, i.e. a different experiment"
+            );
+            true
+        }
+        (Some(p), Some("prove")) => {
+            assert!(
+                !std::path::Path::new(p).exists(),
+                "A_BUNDLE_MODE=prove but {p} already exists: refusing to overwrite \
+                 a saved base, and refusing to silently load it instead"
+            );
+            false
+        }
+        (Some(_), Some(other)) => {
+            panic!("A_BUNDLE_MODE must be `prove` or `load`, got `{other}`")
+        }
+    };
     let t = Instant::now();
     let bundle = if cached {
         let p = bundle_path.as_deref().expect("cached implies a path");
