@@ -14,6 +14,11 @@ rkyv-encoded) for the ethrex commit pinned (as `rev`) in
 `executor/programs/rust/ethrex/Cargo.toml`. The guest reads it via
 `get_private_input()` and runs ethrex's `execution_program`.
 
+Both the fixtures and those instruction counts are therefore a function of that pin: the
+counts above were measured at `156cb8d6` and have not been re-measured since the
+`797df554` bump, which regenerated both fixtures. Treat them as an order of magnitude,
+and re-run the benchmark for real numbers.
+
 The timing window is **single-shot end-to-end prove** (ELF load + execution +
 trace build + AIR construction + STARK prove); it **excludes** verification.
 
@@ -41,6 +46,8 @@ Output (example):
   ethrex empty block             11.549s          183931
   ethrex 1 tx                    47.302s         4392951
 ```
+
+(Example output, taken at ethrex `156cb8d6` — see the note above.)
 
 With `--report-dir DIR` it also writes:
 - `DIR/ethrex_summary.md` — markdown table

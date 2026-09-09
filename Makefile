@@ -307,8 +307,12 @@ test-rust: compile-programs-rust
 # measured cost.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
 ETHREX_REAL_BLOCK := 25368371
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 61eba49b6b254f4a05def5a47b08a21ae3eee56f0d37bcd7b3a24b0cc1e4a300
+# The asset name carries the ethrex rev because the bytes are a function of it: the
+# archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
+# Uploading under a new name rather than replacing the old one keeps `main` — which still
+# expects the pre-bump sha256 — fetching its own artifact while this branch is open.
+ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_797df554.bin
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
 # The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
 # reads it — the converter's TESTS use a different, upstream-pinned cache (below).
 ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
@@ -433,7 +437,7 @@ ethrex-real-block-converter-cache: $(ETHREX_CONVERTER_CACHE)
 # network-rejection guard, and the reproducibility digest. Runs on changes to the
 # converter (see .github/workflows/ethrex-block-converter.yml), not on every PR.
 test-ethrex-real-block-converter: $(ETHREX_CONVERTER_CACHE)
-	cd tooling/ethrex-block-converter && cargo test --release
+	cd tooling/ethrex-block-converter && cargo test --locked --release
 
 # Manual regeneration of the BENCHMARK fixture (not the converter's test block):
 # fetches that block's own cache and re-converts it, overwriting the fixture in
@@ -459,7 +463,7 @@ test-ethrex: compile-programs-rust ethrex-real-block-fixture
 # otherwise fail on a clean checkout. The committed synthetic fixtures and
 # `no_kzg_backend_linked` still run.
 test-ethrex-offline: compile-programs-rust
-	cd tooling/ethrex-tests && cargo test --release -- --include-ignored --skip test_ethrex_real_block
+	cd tooling/ethrex-tests && cargo test --locked --release -- --include-ignored --skip test_ethrex_real_block
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
@@ -499,7 +503,8 @@ regen-ethrex-fixtures:
 	cd tooling/ethrex-fixtures && \
 		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
 		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
-		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin && \
+		cargo run --release -- 4  ../../executor/tests/ethrex_bench_4.bin distinct
 	$(MAKE) update-ethrex-fixture-checksums
 
 update-ethrex-fixture-checksums:
@@ -530,9 +535,13 @@ test-syscalls:
 # exercises the implementation that actually ships; the debug run is kept because
 # its magnitude debug_asserts turn a contract violation into a loud panic instead
 # of a silently wrong value.
+# `--locked` because this is the only target that builds that workspace: without it
+# cargo re-resolves and REWRITES the committed lock on a manifest/lock mismatch, so
+# the job passes while the lock describes a different build than the one that ran.
+# That is how the ethrex rev bump left this lock a rev behind the manifest.
 test-ethrex-crypto:
-	cd crypto/ethrex-crypto && cargo test
-	cd crypto/ethrex-crypto && cargo test --release
+	cd crypto/ethrex-crypto && cargo test --locked
+	cd crypto/ethrex-crypto && cargo test --locked --release
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
