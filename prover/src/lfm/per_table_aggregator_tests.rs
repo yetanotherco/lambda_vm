@@ -1675,3 +1675,195 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
         COLS
     );
 }
+
+/// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
+///
+/// Everything measured so far is FIXTURE scale, where a node's children are
+/// wraps of 2^3-cycle epochs. This drives the same construction from a REAL
+/// block, so the wrap proofs the node verifies have production-depth Merkle
+/// trees. It is a MEASUREMENT, not a gate: the tamper arms and the `(z, α)`
+/// differential are covered at fixture scale by
+/// [`the_leaf_node_verifies_and_binds_two_wraps`] and are not repeated here,
+/// because what changes with scale is cost and nothing else.
+///
+/// ```text
+/// LFM_CENSUS_ELF=/path/to/ethrex.elf \
+/// LFM_CENSUS_INPUT=/path/to/block.bin \
+/// LFM_CENSUS_EPOCH_LOG2=22 LAMBDA_VM_MAX_ROWS_LOG2=22 \
+/// cargo test --release -p lambda-vm-prover --lib \
+///   lfm::per_table_aggregator_tests::the_production_leaf_node_measures -- \
+///   --ignored --exact --nocapture
+/// ```
+///
+/// ⚠ Per-phase RSS marks, not one figure. `peak_rss_gib` is `VmHWM`, a PROCESS
+/// high-water mark that only rises, so a single number spans the base prove, the
+/// wrap proves and the node alike — the trap that made a 40.6 GiB reading look
+/// like a node's cost when the node's own share was a different number. Every
+/// phase boundary is marked, and the node's own artifacts+prove is the delta
+/// from the last mark before it.
+#[test]
+#[ignore = "box tier, production scale: needs LFM_CENSUS_ELF and LFM_CENSUS_INPUT"]
+fn the_production_leaf_node_measures() {
+    use super::epoch_tests::{EpochInputs, Publishes};
+    use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::proof::lfm_prove;
+    use super::registry::build_artifacts_with_hasher;
+    use std::time::Instant;
+
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this measures the PRODUCTION node, and \
+             silently falling back to the fixture would report a fixture number \
+             under a production name"
+        );
+    }
+    let inputs = EpochInputs::from_env();
+    let inner = crate::recursion::Preset::Blowup4.options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    println!(
+        "★ PRODUCTION LEAF NODE: guest {}, {} input bytes, 2^{} cycles/epoch, \
+         inner blowup {} / {} q, wrap blowup {} / {} q",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        wrap_opts.blowup_factor,
+        wrap_opts.fri_number_of_queries,
+    );
+
+    // ---- the base layer: a real chained bundle, so the register seam is real.
+    let t = Instant::now();
+    let bundle = crate::continuation::prove_continuation(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+        &inner,
+    )
+    .expect("the block must prove");
+    assert!(
+        bundle.num_epochs() >= FAN_IN,
+        "a fan-in-{FAN_IN} leaf needs {FAN_IN} epochs, the block has {}",
+        bundle.num_epochs()
+    );
+    println!(
+        "   base: {} epochs in {:.1}s\n   RSS high-water AFTER the base: {:?} GiB",
+        bundle.num_epochs(),
+        t.elapsed().as_secs_f64(),
+        super::wrap_tests::peak_rss_gib(),
+    );
+
+    // ---- the children.
+    let mut children = Vec::with_capacity(FAN_IN);
+    let mut layouts = Vec::with_capacity(FAN_IN);
+    let mut labels: Vec<[u64; 1]> = Vec::with_capacity(FAN_IN);
+    let mut out_halves = 0usize;
+    for k in 0..FAN_IN {
+        let t = Instant::now();
+        let e = super::epoch_tests::real_epoch_from_continuation(
+            &inner,
+            &inputs.elf_bytes,
+            &bundle,
+            k,
+            None,
+        )
+        .expect("every epoch must reconstruct from proofs alone");
+        out_halves = e.statement.public_output_len.div_ceil(4);
+        let shapes: Vec<&super::epoch::TableChallengeShape> =
+            e.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("inner epoch {k}"), &shapes);
+        let program =
+            super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+            .expect("the epoch wrap must prove");
+        let layout = SchemaLayout::wrap(out_halves);
+        layout.assert_covers(proved.public_words.len());
+        layouts.push(layout);
+        labels.push([crate::tables::local_to_global::epoch_label(k as u64)]);
+        let child = real_child(artifacts, wrap_opts.clone(), &proved);
+        println!(
+            "   wrap {k}: {:.1}s, {} published words, {} sub-proofs\n   \
+             RSS high-water AFTER wrap {k}: {:?} GiB",
+            t.elapsed().as_secs_f64(),
+            child.public_words.len(),
+            child.tables.len(),
+            super::wrap_tests::peak_rss_gib(),
+        );
+        children.push(child);
+    }
+
+    // ---- the node.
+    for (k, c) in children.iter().enumerate() {
+        let shapes: Vec<&super::epoch::TableChallengeShape> =
+            c.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("child {k} (a wrap proof)"), &shapes);
+    }
+    let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+    let range = (labels[0][0], labels[FAN_IN - 1][0]);
+    let t = Instant::now();
+    let program = node_program(
+        &children,
+        &layouts,
+        &label_refs,
+        range,
+        super::per_table_aggregator::NodePublishSet::Aggregation,
+    );
+    let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
+    let (main, aux) =
+        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+    let cells = main + 3 * aux;
+    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+    println!(
+        "\n★ NODE CENSUS: {cells} cells ({} instructions), floor {EMPTY_MACHINE_CELLS} \
+         ({:.1}%), verification work {}\n   emitted in {:.1}s\n   \
+         RSS high-water BEFORE build_artifacts: {:?} GiB",
+        program.instrs.len(),
+        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+        cells.saturating_sub(EMPTY_MACHINE_CELLS),
+        t.elapsed().as_secs_f64(),
+        super::wrap_tests::peak_rss_gib(),
+    );
+
+    let t = Instant::now();
+    let artifacts =
+        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    println!(
+        "   RSS high-water AFTER build_artifacts ({:.1}s): {:?} GiB",
+        t.elapsed().as_secs_f64(),
+        super::wrap_tests::peak_rss_gib()
+    );
+    let t = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+        .expect("★ THE PRODUCTION LEAF NODE MUST PROVE");
+    let prove_secs = t.elapsed().as_secs_f64();
+    println!(
+        "   RSS high-water AFTER lfm_prove ({prove_secs:.1}s): {:?} GiB",
+        super::wrap_tests::peak_rss_gib()
+    );
+    let t = Instant::now();
+    assert!(
+        super::proof::verify_against_artifacts(
+            &artifacts,
+            &proved.proof,
+            &proved.public_words,
+            &wrap_opts
+        ),
+        "the production leaf node's proof must verify"
+    );
+    let node_layout = SchemaLayout::node(out_halves);
+    node_layout.assert_covers(proved.public_words.len());
+    println!(
+        "\n★★★ PRODUCTION LEAF NODE PROVED AND VERIFIED\n   prove {prove_secs:.1}s\n   \
+         verify {:.2}s\n   {} published words, {} sub-proofs\n   \
+         PROCESS peak RSS {:?} GiB (spans the base and the wraps too — read the \
+         per-phase marks above for the node's own share)",
+        t.elapsed().as_secs_f64(),
+        proved.public_words.len(),
+        proved.proof.proofs.len(),
+        super::wrap_tests::peak_rss_gib(),
+    );
+}
