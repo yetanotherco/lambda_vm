@@ -1700,10 +1700,21 @@ fn rss_marks() -> (Option<f64>, Option<f64>) {
 }
 
 /// One labelled mark: `live` is what the next phase carries in, `high-water` is
-/// what the process has ever held.
+/// what the process has ever held, `t` is the wall clock the sampler shares.
+///
+/// ⚠ `t` is UNIX-epoch seconds, not elapsed. An external VRAM sampler
+/// (`nvidia-smi` at 10 Hz) has no view of this process's phases, so a shared
+/// clock is the only thing that lets its trace be sliced to the NODE window —
+/// without it a whole-run GPU peak gets attributed to whichever phase the reader
+/// assumes, which is the same masking that made a process high-water read as one
+/// tree level's cost.
 fn mark(label: &str) {
     let (rss, hwm) = rss_marks();
-    println!("   MARK {label}: live {rss:?} GiB / high-water {hwm:?} GiB");
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    println!("   MARK {label}: live {rss:?} GiB / high-water {hwm:?} GiB / t={t:.1}");
 }
 
 /// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
@@ -1766,12 +1777,36 @@ fn the_production_leaf_node_measures() {
              under a production name"
         );
     }
+
+    // ★ FAN-IN IS AN INPUT, because it is the decision this run exists to make.
+    //
+    // The tree's shape at 19 epochs is 5 levels / 21 nodes at fan-in 2 and
+    // 3 levels / 11 nodes at fan-in 3, so the choice is worth a factor of two in
+    // total tree work — and the old argument against fan-in 3 was a VRAM argument
+    // that turned out to be about concurrency, not size. What remains is a HOST
+    // argument (`L_children` and the node's own `W` both grow with a third leg)
+    // and a CARD argument (a third leg's rows may cross a padding step), and both
+    // are measurements. `FAN_IN` stays the default so the const remains the one
+    // place the tree's shape comes from.
+    let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
+        Err(_) => FAN_IN,
+    };
+    assert!(
+        (2..=4).contains(&fan_in),
+        "LFM_CENSUS_FAN_IN must be in 2..=4, got {fan_in}: one child is not an \
+         aggregation, and nothing above four has been costed on either the host \
+         or the card"
+    );
+
     let inputs = EpochInputs::from_env();
     let inner = crate::recursion::Preset::Blowup4.options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     println!(
-        "★ PRODUCTION LEAF NODE: guest {}, {} input bytes, 2^{} cycles/epoch, \
-         inner blowup {} / {} q, wrap blowup {} / {} q",
+        "★ PRODUCTION LEAF NODE: FAN-IN {fan_in} · guest {}, {} input bytes, \
+         2^{} cycles/epoch, inner blowup {} / {} q, wrap blowup {} / {} q",
         inputs.label,
         inputs.private_input.len(),
         inputs.epoch_log2,
@@ -1862,23 +1897,30 @@ fn the_production_leaf_node_measures() {
         }
     );
     assert!(
-        bundle.num_epochs() >= FAN_IN,
-        "a fan-in-{FAN_IN} leaf needs {FAN_IN} epochs, the block has {}",
+        bundle.num_epochs() >= fan_in,
+        "a fan-in-{fan_in} leaf needs {fan_in} epochs, the block has {}",
         bundle.num_epochs()
     );
     println!(
-        "   base: {} epochs in {:.1}s\n   RSS high-water AFTER the base: {:?} GiB",
+        "   base: {} epochs in {:.1}s",
         bundle.num_epochs(),
         t.elapsed().as_secs_f64(),
-        super::wrap_tests::peak_rss_gib(),
     );
+    // ★ `L` DECOMPOSED, because only part of it scales with fan-in.
+    //
+    // The live figure here is the BUNDLE's residency, and that is the same at
+    // every fan-in; each child then adds its own term on top. Predicting a
+    // fan-in-3 carry-in by scaling the whole of `L` therefore over-predicts, by
+    // exactly this number's worth. Measuring the two apart is what makes the
+    // next fan-in's carry-in a derivation rather than a guess.
+    mark("AFTER the base, BEFORE any child (this live figure is L_bundle)");
 
     // ---- the children.
-    let mut children = Vec::with_capacity(FAN_IN);
-    let mut layouts = Vec::with_capacity(FAN_IN);
-    let mut labels: Vec<[u64; 1]> = Vec::with_capacity(FAN_IN);
+    let mut children = Vec::with_capacity(fan_in);
+    let mut layouts = Vec::with_capacity(fan_in);
+    let mut labels: Vec<[u64; 1]> = Vec::with_capacity(fan_in);
     let mut out_halves = 0usize;
-    for k in 0..FAN_IN {
+    for k in 0..fan_in {
         let t = Instant::now();
         let e = super::epoch_tests::real_epoch_from_continuation(
             &inner,
@@ -1905,14 +1947,16 @@ fn the_production_leaf_node_measures() {
         labels.push([crate::tables::local_to_global::epoch_label(k as u64)]);
         let child = real_child(artifacts, wrap_opts.clone(), &proved);
         println!(
-            "   wrap {k}: {:.1}s, {} published words, {} sub-proofs\n   \
-             RSS high-water AFTER wrap {k}: {:?} GiB",
+            "   wrap {k}: {:.1}s, {} published words, {} sub-proofs",
             t.elapsed().as_secs_f64(),
             child.public_words.len(),
             child.tables.len(),
-            super::wrap_tests::peak_rss_gib(),
         );
         children.push(child);
+        // Live, not only the high-water: the per-child residency term is the
+        // difference between consecutive live marks, and a high-water cannot
+        // show a difference a later phase has already exceeded.
+        mark(&format!("AFTER wrap {k} (L_bundle + {} children)", k + 1));
     }
 
     // ---- the node.
@@ -1921,8 +1965,29 @@ fn the_production_leaf_node_measures() {
             c.tables.iter().map(|h| &h.shape).collect();
         assert_samplable(&format!("child {k} (a wrap proof)"), &shapes);
     }
+    // ★ THE PER-LEG WORK, ITEMISED — the only way to say what a third leg adds.
+    //
+    // A leg's cost is set by its child's sub-proof GEOMETRY, not by the child's
+    // published words: per sub-proof it forks one Phase A, walks `num_queries`
+    // Merkle paths of `log2_trace + log2_blowup` levels apiece, and closes a bus.
+    // The census ratio alone cannot say which of those grew, so a fan-in change
+    // that moved one term would be indistinguishable from one that moved another.
+    println!("   child 0 sub-proof geometry — LDE = 2^(trace+blowup), the walk depth:");
+    for (i, h) in children[0].tables.iter().enumerate() {
+        let sh = &h.shape;
+        println!(
+            "     {i:>3}: 2^{}+2^{} lde, {} queries, {} parts, aux {}, contrib {}",
+            sh.log2_trace_length,
+            sh.log2_blowup,
+            sh.num_queries,
+            sh.num_parts,
+            sh.has_aux_root,
+            sh.has_contribution,
+        );
+    }
+
     let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
-    let range = (labels[0][0], labels[FAN_IN - 1][0]);
+    let range = (labels[0][0], labels[fan_in - 1][0]);
     let t = Instant::now();
     let program = node_program(
         &children,
@@ -1943,6 +2008,46 @@ fn the_production_leaf_node_measures() {
         100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
         cells.saturating_sub(EMPTY_MACHINE_CELLS),
         t.elapsed().as_secs_f64(),
+    );
+
+    // ★★ THE PADDING STEP — the term a census RATIO cannot show.
+    //
+    // `rows` is `real_rows.next_power_of_two()`, so `headroom` is each chip's
+    // distance to its next DOUBLING and `cliff_cost` is what crossing it adds.
+    // Raising fan-in multiplies the workload by `(n+1)/n`, and every `at_risk`
+    // chip with less headroom than that doubles its LDE, its snapshot and its
+    // tree at once. ⇒ In the CARD's terms growth is a STEP function of fan-in,
+    // not the smooth ratio the census reports, and this panel is the only thing
+    // that says which chips are standing near an edge. The wrap paid five
+    // simultaneous doublings once for want of exactly this reading (#903).
+    let panel = super::airs::lfm_chip_census_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+    println!("   chip panel — rows real/committed, headroom to the next doubling:");
+    for c in &panel {
+        println!(
+            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+            c.name,
+            c.real_rows,
+            c.rows,
+            100.0 * c.headroom(),
+            if c.at_risk() { "AT RISK" } else { "fixed  " },
+            c.cliff_cost(),
+        );
+    }
+    let step = (fan_in + 1) as f64 / fan_in as f64;
+    let stepping: Vec<&str> = panel
+        .iter()
+        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+        .map(|c| c.name)
+        .collect();
+    let exposed: u64 = panel
+        .iter()
+        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+        .map(|c| c.cliff_cost())
+        .sum();
+    println!(
+        "   ⇒ fan-in {} would multiply the workload by {step:.3}×. Chips that would \
+         STEP: {stepping:?}, adding {exposed} cells ON TOP OF the ratio",
+        fan_in + 1,
     );
     // ★ THE mark the whole prediction turns on: `live` here is `L`, what the
     // node carries in. The node's own working set is what it adds to THAT, not
@@ -2012,10 +2117,17 @@ fn the_production_leaf_node_measures() {
 /// ★ THE TREE'S SHAPE COMES FROM THE EPOCH COUNT, not a constant.
 ///
 /// Pure arithmetic — no proving, so it runs on every suite. It exists because
-/// the shape was twice planned against a number that was not the block's: the
-/// brief's "10 epochs of 2^22" rests on 39.6M cycles, and block 25368371 is
-/// **74,819,518** — 18 epochs at 2^22, 36 at 2^21. A tree built to a constant
-/// answers whichever question that constant came from.
+/// the shape was twice planned against a number that was not the block's, and
+/// once in each direction. Block 25368371 is **39,631,559** cycles: 10 epochs at
+/// 2^22, **19 at 2^21**. The retired **74,819,518** — the July prebuilt guest,
+/// ~47% dearer at identical work — gives 18 and 36 instead, i.e. a tree a whole
+/// level too deep. A tree built to a constant answers whichever question that
+/// constant came from.
+///
+/// ⚠ **2^21 is the posture of record.** 2^22 does not fit a 32 GiB card at
+/// blowup 4 — the resident per-table LDE + snapshot + tree roughly doubles from
+/// 2^21 while the card does not, and it fails even at one table in flight. The
+/// 2^22 rows below are kept as a CONTROL on the arithmetic, not as a posture.
 ///
 /// The arities are asserted rather than the level count alone, because the
 /// LEFTOVER RULE is the design decision: every node takes `1..=fan_in` children
