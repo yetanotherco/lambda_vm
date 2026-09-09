@@ -11,16 +11,19 @@ opposite — a block that actually looks like Ethereum.
 
 Figures below are for the **current default** real block, mainnet 25368371; a
 repoint replaces them (see [Adopting a different block](#adopting-a-different-block)).
-All are measured.
+All are measured. Everything downstream of the archive layout — serialized size, cycles
+and the accelerator counts — also moves with the pinned ethrex rev, so each column says
+which rev it was taken at; the synthetic column has not been re-measured since the
+`797df554` bump.
 
-| | `ethrex_bench_20.bin` (synthetic) | `ethrex_mainnet_25368371.bin` (real, default) |
+| | `ethrex_bench_20.bin` (synthetic, `4f658c2b`) | `ethrex_mainnet_25368371.bin` (real, default, `797df554`) |
 |---|---|---|
 | gas used | 420,000 | **2,428,684** |
 | transactions | 20 (all plain transfers) | 29 (real mix) |
-| serialized size | 32,766 B | 1,110,156 B |
-| cycles | 8,734,622 | **50,781,557** |
-| keccak / ecsm calls | 411 / 80 | **10,478** / 116 |
-| keccaks per ECSM call | 5.1 | **90** |
+| serialized size | 32,766 B | 1,110,183 B |
+| cycles | 8,734,622 | **30,498,818** |
+| keccak / ecsm calls | 411 / 80 | **10,659** / 116 |
+| keccaks per ECSM call | 5.1 | **92** |
 
 The last row counts keccaks per **ECSM call**, which is the ratio of the two rows
 above it. One ecrecover issues four ECSM ecalls — `lincomb2_with_oracle` in
@@ -88,7 +91,9 @@ Artifacts live in the **[`bench-fixtures-v1`][release]** release on
 
 | asset | sha256 | read by |
 |---|---|---|
-| `ethrex_mainnet_25368371_4f658c2b.bin` | `0a301731…` | every benchmark (**current default**) |
+| `ethrex_mainnet_25368371_797df554.bin` | `573004e6…` | every benchmark (**current default**) |
+| `ethrex_mainnet_25368371.bin` | `61eba49b…` | superseded; `main` still fetches this one |
+| `ethrex_mainnet_25368371_4f658c2b.bin` | `0a301731…` | superseded (intermediate rev, unused) |
 | `cache_mainnet_25368371.json` | `7aa88a5f…` | `regen-real-block-fixture` |
 | `ethrex_mainnet_25453112.bin` | `0298663d…` | alternate candidate |
 | `cache_mainnet_25453112.json` | `20ffbbc1…` | alternate candidate |
@@ -136,15 +141,17 @@ cargo run --release -- <cache.json> <output_path>
 Output is deterministic for a given cache file:
 
 ```text
-wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110165 bytes): 1 block(s) \
+wrote ../../executor/tests/ethrex_mainnet_25368371.bin (1110183 bytes): 1 block(s) \
   from mainnet starting at #25368371, 29 transaction(s), 2428684 gas
 ```
 
-Verified at the current ethrex rev: regenerating from the hosted cache reproduces
-`0a301731…` byte for byte, and the result passes `test_ethrex_real_block_native` —
-which is what proves the hosted cache and the fixture the Makefile expects describe
-the same block. (Byte count and digest are both rev-dependent: the `4f658c2b` bump
-moved them from 1,110,156 B / `61eba49b…`, the bytes still hosted in the release.)
+Verified at the current ethrex rev (`797df554`): regenerating from the hosted cache
+reproduces `573004e6…` byte for byte, and the result passes
+`test_ethrex_real_block_native` — which is what proves the hosted cache and the fixture
+the Makefile expects describe the same block. Byte count and digest are both
+rev-dependent; this block has one archive per rev it has been pinned at
+(1,110,156 B / `61eba49b…`, then 1,110,165 B / `0a301731…`, now this one), which is why
+the release assets carry the rev in their names.
 
 The converter's `conversion_is_reproducible` test enforces the same property, but
 against its own pinned block rather than this one — see [Validation](#validation).
@@ -354,8 +361,9 @@ repointed ~1 MB fixture cannot become committable by accident.
 ### Measured cost of candidate blocks
 
 Cost is a property of the block, so it changes with the repoint. All figures are
-measured, never derived from gas — **cycles per gas is not constant** (20.9 for the
-current default), so sizing a candidate from its gas mispredicts cost.
+measured, never derived from gas — **cycles per gas is not constant** (12.6 for the
+current default at `797df554`; it was 20.9 at `4f658c2b`), so sizing a candidate from its
+gas mispredicts cost.
 
 **Current default — main-vintage (merge `fdb92f67`, main @ `9ccdaf2`):**
 
@@ -363,9 +371,14 @@ These figures were measured on the pre-bump fixture (`61eba49b…`, 1,110,156 B)
 left as measured rather than restamped. The ethrex `4f658c2b` bump changed the fixture
 bytes, so they are a baseline for a workload that no longer exists byte-for-byte.
 
-Post-bump CPU counterparts, measured ABBA on `vm-benchmarks-1` at the same epoch 2^22:
-**45,074,552 cycles** (−11.24%), **142.37 s** CPU prove (−10.87%), **936.7 MB** proof
-(−12.22%), peak RSS flat at ~48 GB. The GPU column has no post-bump counterpart yet.
+Counterparts at the intermediate `4f658c2b` rev, measured ABBA on `vm-benchmarks-1` at
+the same epoch 2^22: **45,074,552 cycles** (−11.24%), **142.37 s** CPU prove (−10.87%),
+**936.7 MB** proof (−12.22%), peak RSS flat at ~48 GB.
+
+At the currently pinned `797df554` only the cycle count has been re-measured —
+**30,498,818 cycles**, 10,659 keccak, 116 ecsm. Prove time, proof size and the GPU column
+have no counterpart at this rev yet; re-run `/bench` rather than reading the rows below
+as current.
 
 | block | gas | cycles | GPU prove (RTX 5090) | CPU prove | proof | fixture |
 |---|---|---|---|---|---|---|
@@ -468,17 +481,15 @@ first run after a repoint reports one-sided numbers until main republishes.
 
 ## Why the JSON and not ethrex-replay's own `.bin`
 
-`ethrex-replay` can already emit a rkyv `ProgramInput`, but it tracks ethrex
-`main` while we pin a branch off it, and the type has diverged between the two
-before: against the previously pinned rev (`156cb8d6…`) `main` carried an extra
-`fee_configs` field and had moved the type from `l1::` to `input::`, so replay's
-binary would not deserialize in our guest at all.
+`ethrex-replay` can already emit a rkyv `ProgramInput`, but the type has diverged from
+what our guest expects before: back when we pinned a branch off `main` (`156cb8d6…`)
+`main` carried an extra `fee_configs` field and had moved the type from `l1::` to
+`input::`, so replay's binary would not deserialize in our guest at all.
 
-At the currently pinned rev (`4f658c2b…`, rebased onto recent `main`) the
-`ProgramInput` definition matches `main`'s again, and that gap has closed for
-now. What has not closed: replay resolves rkyv itself from ethrex's `^0.8.10`
-rather than our exact `=0.8.16`, `main` has no `lambdavm` feature to build the
-guest side against, and the next bump can reopen the type gap without warning.
+We now pin `main` directly (`797df554…`), so that particular gap is closed by
+construction. What has not closed: replay resolves rkyv itself from ethrex's `^0.8.10`
+rather than our exact `=0.8.16`, and the next bump can reopen the type gap without
+warning.
 
 The cache JSON carries only `blocks` + `witness` + `network` as plain serde, so
 it survives that drift. This tool re-reads it with **our** pinned ethrex types
@@ -515,7 +526,7 @@ exercised via the guest's own trait dispatch. Stateless re-execution ends in a
 post-state-root check, so any divergence from consensus fails here.
 
 **It does not screen KZG.** Declaring `ethrex-guest-program` with
-`default-features = false, features = ["lambdavm"]` is necessary but not
+`default-features = false` (and no features, as the guest does) is necessary but not
 sufficient: the `ethrex-config` dependency (used only for
 `Network::get_genesis()`) pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
 propagates down to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
