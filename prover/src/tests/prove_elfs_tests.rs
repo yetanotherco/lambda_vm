@@ -64,7 +64,7 @@ fn memw_chunk_rows(
 /// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
-fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
@@ -89,7 +89,9 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
     {
         Ok(proof) => proof,
-        Err(_) => return false,
+        // Panic rather than return false: `false` is reserved for "the verifier
+        // rejected", so a negative test cannot pass because proving fell over.
+        Err(e) => panic!("prover failed, which is not a verifier rejection: {e:?}"),
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
@@ -2810,10 +2812,12 @@ fn test_verify_rejects_zero_cpu_count() {
 /// Verify rejects a `table_counts` that under-reports a table the proof carries:
 /// the counts drive the AIR set, so they must match the sub-proof count.
 ///
-/// MEMW_A rather than MEMW because `sub` reaches no MEMW rows at all, and a
-/// count that is already zero is not something to tamper with.
+/// Named for the invariant rather than the table: it zeroes MEMW_A because `sub`
+/// reaches no MEMW rows at all and a count already at zero is not something to
+/// tamper with, and a name tied to one table goes stale the moment that choice
+/// changes.
 #[test]
-fn test_verify_rejects_zero_memw_count() {
+fn test_verify_rejects_undercounted_table_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 

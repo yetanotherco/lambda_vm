@@ -6,67 +6,14 @@
 //! chip is absent and the proof still verifies, and a chip whose operations
 //! *did* run cannot be dropped, because the LogUp bus no longer balances.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use stark::proof::options::ProofOptions;
-use stark::proof::view::StarkProofView;
-use stark::verifier::{IsStarkVerifier, Verifier};
 
 use executor::elf::Elf;
 
 use crate::VmAirs;
 use crate::tables::trace_builder::Traces;
-use crate::test_utils::{E, F, multi_prove_ram, run_asm_elf};
-
-/// Prove and verify `traces` with the AIR set that its own table counts
-/// describe, so an absent chip is absent on both sides — exactly how the
-/// production prover and verifier reconstruct the shape.
-fn prove_and_verify(elf: &Elf, traces: &mut Traces) -> bool {
-    let proof_options = ProofOptions::default_test_options();
-    let table_counts = traces.table_counts();
-    let airs = VmAirs::new(
-        elf,
-        &proof_options,
-        true,
-        &traces.page_configs,
-        &table_counts,
-        None,
-        true,
-        None,
-        None,
-        None,
-    );
-
-    let multi_proof = match multi_prove_ram(
-        airs.air_trace_pairs(traces),
-        &mut DefaultTranscript::<E>::new(&[]),
-    ) {
-        Ok(proof) => proof,
-        Err(_) => return false,
-    };
-    let views: Vec<StarkProofView<F, E, ()>> = multi_proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
-
-    let expected_bus_balance = match crate::compute_expected_commit_bus_balance_view(
-        &airs.air_refs(),
-        &views,
-        &traces.public_output_bytes,
-        0,
-        &mut DefaultTranscript::<E>::new(&[]),
-    ) {
-        Some(balance) => balance,
-        None => return false,
-    };
-
-    Verifier::multi_verify_views(
-        &airs.air_refs(),
-        &views,
-        &mut DefaultTranscript::<E>::new(&[]),
-        &expected_bus_balance,
-    )
-}
+use crate::test_utils::run_asm_elf;
+use crate::tests::prove_elfs_tests::prove_and_verify_vm_minimal;
 
 /// The premise `TableCounts::validate` now leans on: a chip influences the run
 /// only through its bus interactions, so an absent chip is caught by the
@@ -74,11 +21,41 @@ fn prove_and_verify(elf: &Elf, traces: &mut Traces) -> bool {
 /// (`Verifier::multi_verify` filters on `has_trace_interaction`), so adding one
 /// would let a prover drop it unnoticed. Nothing in the AIR set may be in that
 /// position.
+///
+/// Declaring interactions is necessary but not sufficient: a chip whose bus
+/// footprint cancelled against itself would contribute zero however many rows it
+/// carried, and dropping it would also go unnoticed. No chip is built that way —
+/// each one receives its dispatch and sends its own lookups — but this test does
+/// not prove that part, and there is no cheap structural check that would.
 #[test]
 fn every_table_participates_in_the_bus() {
     let (elf, logs, _instructions) = run_asm_elf("test_mul_8");
     let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
-    let table_counts = traces.table_counts();
+    // One chunk of every table, not the counts this program happens to produce:
+    // a zero count builds no AIR, so driving the set off a single program would
+    // leave the very tables this change makes droppable out of the check.
+    let table_counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
+    };
     let airs = VmAirs::new(
         &elf,
         &ProofOptions::default_test_options(),
@@ -123,7 +100,7 @@ fn a_run_without_multiplication_omits_the_mul_table() {
     );
 
     assert!(
-        prove_and_verify(&elf, &mut traces),
+        prove_and_verify_vm_minimal(&elf, &mut traces),
         "a proof without the unused chips must still verify"
     );
 }
@@ -145,7 +122,7 @@ fn omitting_a_table_whose_ops_ran_fails_the_bus_balance() {
     );
 
     assert!(
-        prove_and_verify(&elf, &mut traces),
+        prove_and_verify_vm_minimal(&elf, &mut traces),
         "the honest proof must verify first, or the negative below proves nothing"
     );
 
@@ -157,7 +134,7 @@ fn omitting_a_table_whose_ops_ran_fails_the_bus_balance() {
     );
 
     assert!(
-        !prove_and_verify(&elf, &mut traces),
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
         "dropping MUL while the CPU still sends MUL requests must not verify"
     );
 }
@@ -212,7 +189,7 @@ fn a_run_without_accelerators_omits_all_six() {
     assert!(counts.validate().is_ok());
 
     assert!(
-        prove_and_verify(&elf, &mut traces),
+        prove_and_verify_vm_minimal(&elf, &mut traces),
         "a proof without any accelerator table must still verify"
     );
 }
@@ -227,13 +204,11 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
         .parent()
         .expect("workspace root")
         .to_path_buf();
+    // Hard failure, not a skip: this is the only negative test covering the
+    // accelerator direction, so a missing artifact has to be loud.
     let elf_bytes =
-        match std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf")) {
-            Ok(bytes) => bytes,
-            // Built by `make compile-programs-rust`; skip rather than fail when the
-            // artifact is absent, matching the other guest-ELF tests.
-            Err(_) => return,
-        };
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("need hint_min.elf — run `make compile-programs-rust`");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
     let executor = executor::vm::execution::Executor::new(&elf, Vec::new()).expect("executor");
     let result = executor.run().expect("execution");
@@ -245,7 +220,7 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
     );
 
     assert!(
-        prove_and_verify(&elf, &mut traces),
+        prove_and_verify_vm_minimal(&elf, &mut traces),
         "the honest proof must verify first, or the negative below proves nothing"
     );
 
@@ -253,7 +228,7 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
     assert_eq!(traces.table_counts().hint, 0);
 
     assert!(
-        !prove_and_verify(&elf, &mut traces),
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
         "dropping HINT while the CPU still sends its ecall must not verify"
     );
 }
