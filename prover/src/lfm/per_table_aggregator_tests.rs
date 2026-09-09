@@ -1819,31 +1819,28 @@ fn the_production_leaf_node_measures() {
     const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
     println!(
         "\n★ NODE CENSUS: {cells} cells ({} instructions), floor {EMPTY_MACHINE_CELLS} \
-         ({:.1}%), verification work {}\n   emitted in {:.1}s\n   \
-         RSS high-water BEFORE build_artifacts: {:?} GiB",
+         ({:.1}%), verification work {}\n   emitted in {:.1}s",
         program.instrs.len(),
         100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
         cells.saturating_sub(EMPTY_MACHINE_CELLS),
         t.elapsed().as_secs_f64(),
-        super::wrap_tests::peak_rss_gib(),
     );
+    // ★ THE mark the whole prediction turns on: `live` here is `L`, what the
+    // node carries in. The node's own working set is what it adds to THAT, not
+    // to the high-water mark an earlier phase may already have set.
+    mark("BEFORE build_artifacts (this live figure IS L)");
 
     let t = Instant::now();
     let artifacts =
         build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-    println!(
-        "   RSS high-water AFTER build_artifacts ({:.1}s): {:?} GiB",
-        t.elapsed().as_secs_f64(),
-        super::wrap_tests::peak_rss_gib()
-    );
+    println!("   build_artifacts: {:.1}s", t.elapsed().as_secs_f64());
+    mark("after build_artifacts");
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
         .expect("★ THE PRODUCTION LEAF NODE MUST PROVE");
     let prove_secs = t.elapsed().as_secs_f64();
-    println!(
-        "   RSS high-water AFTER lfm_prove ({prove_secs:.1}s): {:?} GiB",
-        super::wrap_tests::peak_rss_gib()
-    );
+    println!("   lfm_prove: {prove_secs:.1}s");
+    mark("after lfm_prove");
     let t = Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
