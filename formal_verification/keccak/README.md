@@ -64,6 +64,19 @@ Each helper lookup is modeled by its contract, not its implementation:
 | 32-bit / word recomposition lookups | a wide value equals the range-checked recomposition of its limbs (`word = Σ limb_i · 2^{8i}`), each limb a byte. Not exercised by keccak_rnd; listed because the template's next targets (e.g. 32-bit-lane hashes) need it. |
 | `KeccakRc(round, rc[8])` | `rc` = little-endian bytes of `KECCAK_RC[round]`, for `round ∈ [0, 24)`. The committed table also carries padding rows `24..31` with `rc = 0`, which this contract does **not** cover: the gate assumes they are unreachable, which holds by the bus topology (`keccak.rs` supplies the round endpoints as constants and chains `ROUND+1`) but is a cross-row property outside what QF-BV checks here. Pinning those rows to row 0 instead of zero would remove the assumption. |
 
+**Where the contracts are enforced, and what does not check them.** Every window
+the necessity model uses — `[0, 255]` for a range-checked byte, `[0, 1]` for the θ
+carry, and the `[0, 255]` operand range that decides the byte split — is the
+contract of a *receiver* in `prover/src/tables/bitwise.rs` (the `AreBytes` receiver
+and the `ByteAlu` ones), byte-shaped because that table is enumerated over
+`256 · 256 · 16` rows. **No gate connects the two.** This directory's workflow
+filters on `formal_verification/**` and the `Makefile`, not on `prover/`;
+`test_keccak_rnd_air_structure_is_pinned` digests KECCAK_RND's own senders, not the
+receivers it sends to; and the model's own control says a widened receiver would
+free the byte split. A change to those receivers is a change to the premises of
+everything below, and nothing here will say so — re-run this directory by hand when
+`bitwise.rs` changes shape.
+
 ## Mandatory discipline (do not skip any of these)
 
 1. **Negative controls are not optional.** "UNSAT = verified" is meaningless unless
@@ -112,34 +125,49 @@ Each helper lookup is modeled by its contract, not its implementation:
    full-size solution for *every* `left` and no argument about small `d` means
    anything. With both intervals in hand, `surviving_deviation` sweeps **all
    2¹⁶ input halfwords** against them and returns either "pinned" or the first
-   survivor — and asserts the honest pair lies inside the modelled intervals,
-   which is what catches a window modelled wrongly. The "both dropped" row is
+   survivor. Per input it asserts two things about the HONEST pair, without
+   which a "pinned" verdict says nothing: that it lies inside the modelled
+   intervals — a window modelled wrongly — and that it satisfies the **shipped
+   identity**, which is the only thing tying `honest_shift` to the chip, since
+   `identity_holds` is otherwise evaluated on forged values only. Corrupt
+   `honest_shift` into a sum-preserving but wrong decomposition and that is what
+   fires. `combinatorics.py` cannot help there: at its saturating input such a
+   corruption is byte-identical to the honest decomposition on all 25 lanes. The "both dropped" row is
    the one configuration with no per-column window at all (the operand bounds
    only the *sum* of two unchecked columns), so it is decided by an explicit
-   witness instead — and only ρ's is carried up to a complete row
-   (`witness_fullchip.py`), because ρ's is the claim this directory makes about
-   the *shipped* chip: a check the QF-BV gate treats as redundant is
-   load-bearing. θ's "both dropped" witness stays at four halfwords on purpose —
-   it bounds what θ could ever save, and an error in it would only keep a
-   redundant constraint, never license dropping a live one.
+   witness instead: θ's is the four-halfword forgery in `necessity_theta.py`,
+   ρ's the cyclic-system construction in `necessity_rho.py` that reaches an
+   arbitrary target on all 25 lanes. **Neither of those is what is carried up to
+   a complete row.** `witness_fullchip.py` builds configuration **C** — ρ with
+   `rot_left`'s check dropped — because that is the claim this directory makes
+   about the *shipped* chip: a check the QF-BV gate treats as redundant is
+   load-bearing on its own. The two "both dropped" rows only bound what could
+   ever be saved, and an error in either would keep a redundant constraint
+   rather than license dropping a live one, so they stay at lane scale on
+   purpose.
 
    **That sweep decides the packed halfword, which is only half the question.**
    The identity reads a byte pair as `lo + 256·hi` and nothing else, so
    `(lo + 256k, hi − k)` satisfies it exactly at an honest packed value — a
    redistribution no sweep over `d` can see, while χ and Dxz read the two bytes
-   *separately*. The split is pinned by a second argument: where the pair keeps
-   its range checks, by their width (`checked_split_is_unique`, and 256 admitted
-   values is exactly the packing radix — a check one bit wider would not pin the
-   split, which is the control the boards run); where it does not, by the single
-   operand byte that reads each half (`surviving_byte_split`, read-once again),
-   whose sum moves by `256k` and was already a byte, so `k = 0`. That the split
-   moves in integer steps of 256 at all is the axis's own version of the
-   integrality step (`split_form_is_exact`): over the field `256` is invertible,
-   so the redistributions are the whole field until the operand windows on *both*
-   bytes keep `lo + 256·hi` below `p`. The negative
-   control for that one is the "both dropped" configuration itself: with nothing
-   checking the companion either, it absorbs the `256k` and the split is as free
-   as the packed value.
+   *separately*. The split is pinned by a second argument, in three steps, each
+   with its own control. That the redistribution moves in integer steps of
+   `256` at all is the axis's version of the integrality step
+   (`split_form_is_exact`): over the field `256` is invertible, so the freedom
+   is the whole field until the operand windows on *both* bytes keep
+   `lo + 256·hi` below `p` — hand it a companion with no window and it reports
+   `False`. Where the pair keeps its range checks, its split is pinned by their
+   width (`checked_split_is_unique`; 256 admitted values is exactly the packing
+   radix, and one bit wider it stops pinning). Where it does not, the pinning
+   comes from the operand byte that reads each half (read-once again), whose
+   value moves by a full `256` — so `surviving_byte_split` sweeps the operand's
+   range and asks whether a step of 256 can stay inside it. **That width is the
+   whole content of the result, and it does not live in this directory**: it is
+   the `AreBytes` and `ByteAlu` receivers in `prover/src/tables/bitwise.rs`. A
+   256-value table cannot absorb the step; the control passes a 16-bit table
+   and gets a survivor at the first value. The companion summand is
+   deliberately not a parameter there — it enters only through the honest
+   operand value, which the lookup already confines.
 
    **The two implied halves are not the same kind of saving.** ρ's is 100
    `AreBytes` sends. θ's is 20 *polynomial* constraints (`IS_BIT`, μ-gated,
