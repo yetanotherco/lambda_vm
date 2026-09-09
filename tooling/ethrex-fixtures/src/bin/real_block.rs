@@ -34,7 +34,7 @@ use ethrex_common::types::stateless_ssz::{
     STATELESS_INPUT_SCHEMA_ID, SszExecutionWitness, SszPublicKeys, SszStatelessInput,
 };
 use ethrex_common::types::{AccountState, Block, ELASTICITY_MULTIPLIER, Genesis};
-use ethrex_common::{Address, H256, U256};
+use ethrex_common::H256;
 use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
 use ethrex_guest_program::l1::run_stateless_guest;
 use ethrex_rlp::decode::RLPDecode;
