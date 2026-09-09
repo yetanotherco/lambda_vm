@@ -10,9 +10,17 @@
 /// write_register=false, so src/dst are unconstrained):
 /// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
 /// - `src2_val` = Commit: buf_addr (x11); Keccak: state_addr; ECSM: addr_xG;
-///   Hint: input addr; DMA memcpy: src. 0 for every other syscall.
+///   Hint: input addr; DMA memcpy and DMA memset: the number of MEMMOVE rows the
+///   call produces. 0 for every other syscall.
 /// - `dst_val` = Commit: count (x12); ECSM: addr_k; Hint: output addr;
-///   DMA memcpy: byte count. 0 for every other syscall, Keccak included.
+///   DMA memcpy and DMA memset: byte count. 0 for every other syscall, Keccak
+///   included.
+///
+/// The row count is carried rather than recomputed downstream because it is not a
+/// function of the byte count: a row is eight bytes or one, and the schedule reads
+/// `src % 8` and `dst % 8` to decide. The executor is the only place that holds
+/// `src`, `dst` and `count` at once, so it derives the count there and the CLI's
+/// accelerator report just sums it.
 #[derive(Debug, Clone)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
