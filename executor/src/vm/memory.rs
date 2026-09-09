@@ -42,15 +42,21 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
-/// Maximum size of the private input memory region (in bytes).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
+/// Maximum size of the private input memory region (in bytes). 512 MiB so a
+/// real proof (e.g. a continuation bundle) fits as private input.
+pub const MAX_PRIVATE_INPUT_SIZE: u64 = 512 * 1024 * 1024;
 /// Fixed high address where private input is mapped. Guest programs can read
 /// directly from this address (ZisK-style memory-mapped input).
 /// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
 /// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+/// Size in bytes of the private input's wire-format length prefix (the `u32` LE
+/// written at `PRIVATE_INPUT_START_INDEX` by [`Memory::store_private_inputs`]; the
+/// data follows at `+ PRIVATE_INPUT_LENGTH_PREFIX_BYTES`). Single source of truth
+/// for every page-span computation over the private-input region.
+pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
     /// Bytes committed to public output via `commit_public_output`. The
@@ -78,6 +84,18 @@ impl Memory {
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         entry[(address % 4) as usize] = value;
+    }
+
+    /// Iterate over all stored bytes as `(address, value)` pairs. Cells are
+    /// stored as 4-byte words; each word expands into its four byte addresses.
+    /// Used to snapshot memory at an epoch boundary.
+    pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.cells.iter().flat_map(|(&addr, bytes)| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(move |(i, &b)| (addr + i as u64, b))
+        })
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
@@ -217,7 +235,10 @@ impl Memory {
         let len_u32 =
             u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
         self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
-        self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
+        self.set_bytes_aligned(
+            PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
+            &inputs,
+        )?;
         Ok(())
     }
 
@@ -271,4 +292,39 @@ pub enum MemoryError {
     AddressOverflow,
     #[error("Failed to allocate memory for load_bytes")]
     AllocationFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The wire-format writer and every private-input page-span computation assume the
+    // length prefix is exactly a 4-byte LE `u32`; pin that so a change to the constant
+    // is caught rather than silently drifting from the page math.
+    #[test]
+    fn private_input_length_prefix_is_a_le_u32() {
+        assert_eq!(PRIVATE_INPUT_LENGTH_PREFIX_BYTES, 4);
+        assert_eq!(PRIVATE_INPUT_LENGTH_PREFIX_BYTES, size_of::<u32>());
+    }
+
+    // `store_private_inputs` must write a LE length prefix at the region base and the data
+    // immediately after it, at `+ PRIVATE_INPUT_LENGTH_PREFIX_BYTES`.
+    #[test]
+    fn store_private_inputs_writes_le_length_prefix_then_data() {
+        let mut memory = Memory::default();
+        let inputs = vec![0xAAu8, 0xBB, 0xCC];
+        memory.store_private_inputs(inputs.clone()).unwrap();
+
+        assert_eq!(
+            memory.load_word(PRIVATE_INPUT_START_INDEX).unwrap(),
+            inputs.len() as u32
+        );
+        let data = memory
+            .load_bytes(
+                PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
+                inputs.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(data, inputs);
+    }
 }

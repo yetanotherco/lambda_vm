@@ -9,7 +9,15 @@ pub trait IsTranscript<F: IsField> {
     fn append_field_element(&mut self, element: &FieldElement<F>);
     /// Appends a bytes to the transcript.
     fn append_bytes(&mut self, new_bytes: &[u8]);
-    /// Returns the inner state of the transcript that fully determines its outputs.
+    /// Returns a digest of everything absorbed so far (the sponge state).
+    ///
+    /// This binds the absorbed input stream, but it does NOT capture any
+    /// buffered squeeze output an implementation may hold (see
+    /// `DefaultTranscript`'s duplex output buffer): two transcripts with equal
+    /// `state()` produce identical future samples only if they also share the
+    /// same absorb/sample history. Prover and verifier stay synchronized
+    /// because they perform the same sequence of calls, not because `state()`
+    /// alone determines outputs.
     fn state(&self) -> [u8; 32];
     /// Returns a random field element.
     fn sample_field_element(&mut self) -> FieldElement<F>;

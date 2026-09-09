@@ -1,0 +1,185 @@
+name: Bench ABBA tiebreaker
+
+# Drift-free paired (A/B/B/A) prover benchmark for resolving the small deltas /bench
+# cannot confirm. It proves the SAME real block /bench does, so a 3-10% reading there
+# escalates to a paired test of the same workload rather than a different one. It
+# OCCUPIES THE SINGLE BENCH SERVER FOR OVER AN HOUR, so it NEVER auto-triggers -- it
+# runs only on an explicit `/bench-abba` comment on a PR.
+#
+# Syntax: "/bench-abba [N]", where N is the pair count (default 12).
+#
+# Resolution, from the paired t-test (resolvable 95% delta = t* x sd / sqrt(N)). The
+# pair-delta sd on this runner is NOT yet measured; the two columns bracket it between
+# 1.0% (the GPU box's measured 0.64% plus margin) and 2.0% (sqrt(2) x this runner's
+# measured 1.43% single-run CV):
+#
+#   pairs   wall      resolves (sd 2.0% / sd 1.0%)
+#    8      ~50 min    1.7% / 0.8%
+#   12      ~72 min    1.3% / 0.6%   <- default
+#   20      ~1h55m     0.9% / 0.5%
+#   32      ~3h        0.7% / 0.4%
+#
+# Wall is 2 x 158.8 s per pair (the runner's measured prove at epoch 2^22) plus ~8 min
+# of setup. The FIRST run measures the sd — it is the `sd` field of the paired-t line
+# in the result comment — and this table should be re-pinned to it then.
+on:
+  issue_comment:
+    types: [created]
+
+env:
+  # The epoch /bench proves this block at, so the tiebreaker resolves the same
+  # configuration and not just the same block. Memory picks it: this runner peaks at
+  # ~52 GB here against its >=64 GiB floor. See benchmark-pr.yml's REAL_BLOCK_EPOCH_LOG2.
+  ABBA_REAL_EPOCH_LOG2: "22"
+
+concurrency:
+  # See bench-verify.yml. The single self-hosted bench runner serializes across PRs.
+  group: ${{ startsWith(github.event.comment.body, '/bench-abba') && format('bench-abba-{0}', github.event.issue.number) || format('bench-abba-ignore-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  abba:
+    # Manual-only: a "/bench-abba" comment on a PR, from a repo member. Never auto.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/bench-abba') &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: [self-hosted, bench]
+    # Hang guardrail, not expected duration: a real-block pair is 2 x 158.8 s = ~5.3 min,
+    # so the default 12 pairs runs ~72 min and the 40-pair clamp ~3.7 hr, plus up to
+    # ~30 min of two-sided build on a cold cache.
+    timeout-minutes: 360
+    steps:
+      - name: Resolve PR head + bench config
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # The runner is persistent self-hosted: drop the previous run's logs so
+          # the always() result comment never tails a stale /tmp/abba_out.txt.
+          rm -f /tmp/abba_out.txt /tmp/abba_result.txt
+          # Resolve the head SHA (not the branch name): pinning the commit works for
+          # fork PRs too (the branch lives in the fork, not origin/) and avoids a
+          # force-push race mid-run.
+          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # Everything after "/bench-abba" on its line. The only token is an optional
+          # pair count; the workload is fixed to the real block.
+          ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -n 's|^/bench-abba||p' | head -n1)
+          PAIRS=12
+          set -f  # tokens must not glob-expand against the runner's CWD
+          for tok in $ARGS; do
+            case "$tok" in
+              [0-9]*) PAIRS="$tok" ;;
+              *)      echo "::warning::ignoring unrecognized token '$tok'" ;;
+            esac
+          done
+          # Digits-only + clamp, so one comment cannot monopolize the single bench
+          # server: 40 pairs is already ~3.7 hr of it.
+          case "$PAIRS" in
+            ''|*[!0-9]*) echo "::warning::invalid pair count '$PAIRS'; using 12"; PAIRS=12 ;;
+          esac
+          if [ "$PAIRS" -lt 2 ] || [ "$PAIRS" -gt 40 ]; then
+            echo "::warning::pair count $PAIRS out of range [2,40]; using 12"
+            PAIRS=12
+          fi
+          # Even is ideal so the AB/BA orders balance; round an odd request up by one.
+          if [ "$((PAIRS % 2))" -ne 0 ]; then
+            PAIRS=$((PAIRS + 1))
+            echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
+          fi
+          # The block's identity lives in the Makefile; this job never names one.
+          WORKLOAD="ethrex real block, continuations"
+          {
+            echo "pairs=$PAIRS"
+            echo "workload=$WORKLOAD"
+          } >> "$GITHUB_OUTPUT"
+          echo "Using $PAIRS A/B/B/A pairs on $WORKLOAD at epoch 2^$ABBA_REAL_EPOCH_LOG2"
+
+      - name: Acknowledge (react + occupancy notice)
+        uses: actions/github-script@v7
+        env:
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+          WORKLOAD: ${{ steps.cfg.outputs.workload }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+              // A pair is TWO proves at the runner's measured 158.8 s, so ~5.3 min/pair,
+              // plus ~8 min of checkout, two-sided build and fixture fetch.
+              body: `⏳ **ABBA tiebreaker started** on the bench server: ${process.env.PAIRS} pairs of ${process.env.WORKLOAD} — a pair is 2 proves at ~158.8 s, so roughly ${Math.round(8 + Number(process.env.PAIRS) * 5.3)} min. Pass a smaller pair count for a quicker, coarser run. The bench server is occupied until it finishes.`
+            });
+
+      - name: Checkout (full history for ref resolution)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR head commit (works for fork PRs)
+        env:
+          PR_NUM: ${{ github.event.issue.number }}
+        run: git fetch origin "pull/$PR_NUM/head" --quiet
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run ABBA tiebreaker
+        id: run
+        env:
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+          # WORKLOAD=real is bench_abba.sh's own default; pinned here so the workload
+          # this job measures is stated in the job rather than inherited. The epoch is
+          # NOT the script's default (2^20, laptop-safe) — it is the runner's tier, the
+          # same one /bench proves at.
+          WORKLOAD: real
+          EPOCH_SIZE_LOG2: ${{ env.ABBA_REAL_EPOCH_LOG2 }}
+        run: |
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
+          set -o pipefail
+          # bench_abba.sh builds the cli at both refs (isolated worktree), runs the
+          # interleaved pairs, and prints the paired-t CI + exact Wilcoxon test.
+          # Pass the head SHA (pinned above) so fork PRs resolve.
+          scripts/bench_abba.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/abba_out.txt
+          sed -n '/=== ABBA paired result/,$p' /tmp/abba_out.txt > /tmp/abba_result.txt
+
+      - name: Post result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+          OUTCOME: ${{ steps.run.outcome }}
+          WORKLOAD: ${{ steps.cfg.outputs.workload }}
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+            const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
+            const workload = process.env.WORKLOAD || 'ethrex';
+            let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs, ${workload})\n\n`;
+            if (process.env.OUTCOME === 'success') {
+              const res = read('/tmp/abba_result.txt') || read('/tmp/abba_out.txt');
+              body += '```\n' + res + '\n```\n';
+              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. - = PR faster. ';
+              body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+            } else {
+              const tail = read('/tmp/abba_out.txt').split('\n').slice(-30).join('\n');
+              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body
+            });

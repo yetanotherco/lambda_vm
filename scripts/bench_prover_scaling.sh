@@ -75,9 +75,6 @@ parse_run() {
     /^  AIR construction/    { v = secs(); if (v) print "t_air="         v }
     /^  Pre-pass/            { v = secs(); if (v) print "t_prepass="     v }
     /^  Round 1 /            { v = secs(); if (v) print "t_round1="      v }
-    /Main trace commits/     { v = secs(); if (v) print "t_main_commits="v }
-    /Aux trace build/        { v = secs(); if (v) print "t_aux_build="   v }
-    /Aux trace commit/       { v = secs(); if (v) print "t_aux_commit="  v }
     /Rounds 2/               { v = secs(); if (v) print "t_rounds24="    v }
     /Main expand_columns_to_lde/{ v = secs(); if (v) print "t_main_lde=" v }
     /Aux expand_columns_to_lde/ { v = secs(); if (v) print "t_aux_lde="  v }
@@ -91,8 +88,12 @@ parse_run() {
     /After AIR/              { print "h_air="          $(NF-1) }
     /After pool alloc/       { print "h_pool_alloc="   $(NF-1) }
     /After main commits/     { print "h_main_commits=" $(NF-1) }
-    /After aux build/        { print "h_aux_build="    $(NF-1) }
-    /After aux commit/       { print "h_aux_commit="   $(NF-1) }
+    # No "After aux build"/"After aux commit" rows: aux build and aux commit are
+    # fused into the per-table scheduler, so with k tables in flight there is no
+    # single moment at which either has finished, and the prover no longer takes
+    # those snapshots. "Aux trace build"/"Aux trace commit" timing rows are gone
+    # for the same reason. "After main commits" and "Peak heap" still bracket
+    # the fused region.
     ' "$stderr"
 
     grep -o 'Peak heap: [0-9]*' "$stdout" | awk '{print "peak=" $3}'
@@ -185,11 +186,8 @@ print_row "Trace build"            t_trace_build s
 print_row "AIR construction"       t_air         s
 print_row "Pre-pass"               t_prepass     s
 print_row "Round 1"                t_round1      s
-print_row "  Main trace commits"   t_main_commits s
 print_row "    Main LDE"           t_main_lde    s
 print_row "    Main Merkle"        t_main_merkle s
-print_row "  Aux trace build"      t_aux_build   s
-print_row "  Aux trace commit"     t_aux_commit  s
 print_row "    Aux LDE"            t_aux_lde     s
 print_row "    Aux Merkle"         t_aux_merkle  s
 print_row "Rounds 2-4"             t_rounds24    s
@@ -206,8 +204,6 @@ if [[ "$MODE" == "heap" ]]; then
     print_row "After AIR construction" h_air          mb
     print_row "After pool alloc"       h_pool_alloc   mb
     print_row "After main commits"     h_main_commits mb
-    print_row "After aux build"        h_aux_build    mb
-    print_row "After aux commit"       h_aux_commit   mb
     print_row "Peak heap"              peak           mb
 fi
 
@@ -270,8 +266,6 @@ if [[ "$MODE" == "heap" ]]; then
     regress "After AIR construction" h_air          mb
     regress "After pool alloc"       h_pool_alloc   mb
     regress "After main commits"     h_main_commits mb
-    regress "After aux build"        h_aux_build    mb
-    regress "After aux commit"       h_aux_commit   mb
     regress "Peak heap"              peak           mb
 fi
 

@@ -298,7 +298,11 @@ pub trait IsPrimeField: IsField {
 
 /// This trait is necessary for sampling a random field element with a uniform distribution.
 pub trait HasDefaultTranscript: IsField {
-    /// This function should truncates the sampled bits to the quantity required to represent the order of the base field
-    /// and returns a field element.
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self>;
+    /// Sample a uniform field element by pulling 64-bit candidates from `next_u64`
+    /// — a transcript squeeze stream — and rejection-sampling each field
+    /// coordinate into its canonical range. Rejection (rather than modular
+    /// reduction) keeps the distribution exactly uniform. The caller feeds bytes
+    /// straight from the Fiat-Shamir sponge, so no separate CSPRNG keystream is
+    /// generated (see `DefaultTranscript`).
+    fn sample_field_element_from(next_u64: impl FnMut() -> u64) -> FieldElement<Self>;
 }

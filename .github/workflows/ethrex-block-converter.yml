@@ -1,0 +1,113 @@
+name: ethrex block-converter tests
+
+# Validation for the real-block benchmark fixture and the converter that produces
+# it. Deliberately NOT part of the required PR gate (pr_main.yaml): the fixture is a
+# benchmark input, not a correctness input — no product code reads it — so it needs
+# to be right when it changes, not on every PR. Running it there cost every PR a
+# network download plus a cold build of ~335 packages (blst, c-kzg and secp256k1-sys
+# C builds, malachite, ark-ff/asm).
+#
+# It fires on the things that can actually invalidate it: the converter, the ethrex
+# host-reference tests, and the Makefile (which holds the block pin, the fixture URL
+# and its sha256).
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["**"]
+    paths:
+      - 'tooling/ethrex-block-converter/**'
+      - 'tooling/ethrex-tests/**'
+      - 'Makefile'
+      - '.github/workflows/ethrex-block-converter.yml'
+  push:
+    branches: ["main"]
+    paths:
+      - 'tooling/ethrex-block-converter/**'
+      - 'tooling/ethrex-tests/**'
+      - 'Makefile'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  converter:
+    name: Block converter tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Own key, not pr_main.yaml's "lambda-vm-test": a shared key across jobs
+          # that build different crate sets causes recompilation on both sides.
+          shared-key: "lambda-vm-ethrex-block-converter"
+          cache-all-crates: "true"
+          # Detached workspace (own Cargo.lock, own target dir), so the default
+          # `. -> target` would miss it and rebuild the ethrex tree every run.
+          workspaces: |
+            tooling/ethrex-block-converter -> target
+
+      # Downloads the pinned ethrex-replay cache (the converter's test input) and
+      # runs the crate's tests: host-side parity through the guest's own
+      # `LambdaVmEcsmCrypto`, the unmappable-network rejection, and the
+      # reproducibility digest. Note these do NOT screen KZG — this crate's graph
+      # links c-kzg via ethrex-config, so point evaluation (0x0a) resolves here and
+      # to nothing in the guest. The block-usability job below is what covers that.
+      - name: Run converter tests
+        run: make test-ethrex-real-block-converter
+
+  block-usable:
+    name: Real-block usability screen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-real-block-usable"
+          cache-all-crates: "true"
+          workspaces: |
+            tooling/ethrex-tests -> target
+
+      # Fetch-and-verify, not build: no converter, no ethrex-replay cache, no rev pin.
+      # The guard covers the window after a repoint but before the new artifact is
+      # uploaded: the screen below is its only consumer, and failing the job on an
+      # unset URL would block PRs on an upload nobody in the PR can perform.
+      - name: Fetch real-block fixture
+        id: fixture
+        run: |
+          if [ -z "$(make -s print-real-block-fixture-url)" ]; then
+            echo "::warning::ETHREX_REAL_BLOCK_FIXTURE_URL is unset — skipping the real-block usability screen. Set it in the Makefile once the .bin is hosted."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          make ethrex-real-block-fixture
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      # `test_ethrex_real_block_native` is the screen that makes a block USABLE rather
+      # than merely realistic: this crate links no KZG backend (pinned by
+      # `no_kzg_backend_linked`, which runs in pr_main.yaml), so a block calling point
+      # evaluation (0x0a) diverges from consensus and fails here instead of silently
+      # passing and then failing in the guest.
+      #
+      # `test_ethrex_real_block_vm` stays excluded: it drives the block through the
+      # guest ELF, needs the RV64 toolchain, and its runtime is unmeasured.
+      - name: Screen the block against the guest's precompile surface
+        if: steps.fixture.outputs.present == 'true'
+        run: |
+          cd tooling/ethrex-tests && \
+            cargo test --release test_ethrex_real_block_native -- --include-ignored

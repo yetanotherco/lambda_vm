@@ -168,6 +168,32 @@ where
         })
     }
 
+    /// True when this tree carries only its root (the nodes live elsewhere,
+    /// e.g. device-resident): openings must not walk this tree.
+    pub fn is_root_only(&self) -> bool {
+        #[cfg(feature = "disk-spill")]
+        {
+            self.nodes.is_empty() && self.mmap_backing.is_none()
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        {
+            self.nodes.is_empty()
+        }
+    }
+
+    /// Create a root only Merkle tree placeholder: stores the commitment root
+    /// but no nodes. Used when paths are gathered from a device resident copy
+    /// (GPU) instead of this host tree, so the host nodes are never built.
+    /// [`get_proof_by_pos`](Self::get_proof_by_pos) must NOT be called on it.
+    pub fn from_root(root: B::Node) -> Self {
+        MerkleTree {
+            root,
+            nodes: Vec::new(),
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        }
+    }
+
     /// Create a Merkle tree from pre-hashed leaf nodes.
     ///
     /// This skips the `hash_leaves` step, useful when leaves have already been
@@ -240,7 +266,14 @@ where
     /// Returns a Merkle proof for the element/s at position pos
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
+    ///
+    /// Returns `None` on a root-only tree ([`from_root`](Self::from_root)):
+    /// its nodes live elsewhere (e.g. device-resident), so a host path would
+    /// be a silently-empty bogus proof rather than an inclusion witness.
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
+        if self.is_root_only() {
+            return None;
+        }
         let pos = pos + self.node_count() / 2;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;

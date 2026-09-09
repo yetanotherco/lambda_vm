@@ -43,16 +43,14 @@
 //! - `count_decr_carry_0`: SUB template carry_0 for count_decr + 1 = count (degree 2)
 //! - `count_decr_carry_1`: SUB template carry_1 for count_decr + 1 = count (degree 2)
 //!
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{AddConstraint, AddOperand};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
+
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices for COMMIT table
@@ -164,32 +162,29 @@ pub fn generate_commit_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Timestamp (DWordWL)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // Index (BaseField)
-        data[base + cols::INDEX] = FE::from(op.index);
+        table.set_u64(row_idx, cols::INDEX, op.index);
 
         // Address (DWordWL)
-        data[base + cols::ADDRESS_0] = FE::from(op.address & 0xFFFF_FFFF);
-        data[base + cols::ADDRESS_1] = FE::from(op.address >> 32);
+        table.set_dword_wl(row_idx, cols::ADDRESS_0, op.address);
 
         // address_incr = address + 1 (DWordHL: 4 halfwords)
         let address_incr = op.address.wrapping_add(1);
-        data[base + cols::ADDRESS_INCR_0] = FE::from(address_incr & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_1] = FE::from((address_incr >> 16) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_2] = FE::from((address_incr >> 32) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_3] = FE::from((address_incr >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::ADDRESS_INCR_0, address_incr);
 
         // Count (DWordWL)
-        data[base + cols::COUNT_0] = FE::from(op.count & 0xFFFF_FFFF);
-        data[base + cols::COUNT_1] = FE::from(op.count >> 32);
+        table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
 
         // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
         let count_decr = if op.count == 0 {
@@ -197,37 +192,33 @@ pub fn generate_commit_trace(
         } else {
             op.count - 1
         };
-        data[base + cols::COUNT_DECR_0] = FE::from(count_decr & 0xFFFF);
-        data[base + cols::COUNT_DECR_1] = FE::from((count_decr >> 16) & 0xFFFF);
-        data[base + cols::COUNT_DECR_2] = FE::from((count_decr >> 32) & 0xFFFF);
-        data[base + cols::COUNT_DECR_3] = FE::from((count_decr >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::COUNT_DECR_0, count_decr);
 
         // Control bits
-        data[base + cols::FIRST] = FE::from(op.first as u64);
-        data[base + cols::END] = FE::from(op.end as u64);
+        table.set_bool(row_idx, cols::FIRST, op.first);
+        table.set_bool(row_idx, cols::END, op.end);
 
         // Value
-        data[base + cols::VALUE] = FE::from(op.value as u64);
+        table.set_byte(row_idx, cols::VALUE, op.value);
 
         // mu = 1 for all real rows (first, middle, and end rows)
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows: spec requires count=1 and address_incr=[1,0,0,0] so
     // the unconditional ADD/SUB templates have valid carry values.
     // count=1 → count_decr=0 (all halfwords zero), address=0 → address_incr=1.
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
         // count = 1 (low word)
-        data[base + cols::COUNT_0] = FE::one();
+        table.set_fe(row_idx, cols::COUNT_0, FE::one());
         // address_incr halfword 0 = 1 (address=0, so address+1 = 1)
-        data[base + cols::ADDRESS_INCR_0] = FE::one();
+        table.set_fe(row_idx, cols::ADDRESS_INCR_0, FE::one());
         // All other fields remain zero: timestamp=0, address=0, count_1=0,
         // count_decr=[0,0,0,0], first=0, end=0, value=0, mu=0,
         // address_incr_1..3=0
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -733,128 +724,49 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// Creates all constraints for the COMMIT table (8 total).
-///
-/// Returns constraint objects and the next available constraint index.
-///
-/// Constraints 0-2: IS_BIT for first, end, mu
-/// Constraint 3: (first + end) * (1 - mu) = 0
-/// Constraints 4-5: ADD template for address + 1 = address_incr (unconditional)
-/// Constraints 6-7: SUB template for count_decr + 1 = count (unconditional)
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(8);
-    let mut idx = constraint_idx_start;
+/// The COMMIT table's 8 transition constraints as a single [`ConstraintSet`]:
+/// - idx 0-2: `IS_BIT` on `first`, `end`, `μ`;
+/// - idx 3:   `(first + end)·(1 − μ) = 0` (first/end ⇒ μ);
+/// - idx 4,5: `ADD` pair `address + 1 = address_incr` (unconditional);
+/// - idx 6,7: `ADD` pair `count_decr + 1 = count` (unconditional).
+#[derive(Clone, Copy)]
+pub struct CommitConstraints;
 
-    // 0-2: IS_BIT for first, end, mu
-    let (is_bit_constraints, next) = crate::constraints::templates::new_is_bit_constraints(
-        &[cols::FIRST, cols::END, cols::MU],
-        idx,
-    );
-    for c in is_bit_constraints {
-        constraints.push(c.boxed());
-    }
-    idx = next;
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0-2: IS_BIT for first, end, mu
+        emit_is_bit(b, 0, cols::FIRST, None);
+        emit_is_bit(b, 1, cols::END, None);
+        emit_is_bit(b, 2, cols::MU, None);
 
-    // 3: (first + end) * (1 - mu) = 0
-    constraints.push(
-        (CommitConstraint {
-            kind: CommitConstraintKind::FirstOrEndImpliesMu,
-            constraint_idx: idx,
-        })
-        .boxed(),
-    );
-    idx += 1;
+        // idx 3: (first + end) * (1 - mu)
+        let one = b.one();
+        let first = b.main(0, cols::FIRST);
+        let end = b.main(0, cols::END);
+        let mu = b.main(0, cols::MU);
+        b.emit_base(3, (first + end) * (one - mu));
 
-    // 4-5: ADD template for address + 1 = address_incr (unconditional, degree 2)
-    // lhs = address (DWordWL), rhs = 1, sum = address_incr (DWordHL → DWordWL)
-    let (add_c0, add_c1) = AddConstraint::new_pair(
-        vec![], // unconditional
-        AddOperand::dword(cols::ADDRESS_0),
-        AddOperand::constant(1),
-        AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
-        idx,
-    );
-    constraints.push(add_c0.boxed());
-    constraints.push(add_c1.boxed());
-    idx += 2;
+        // idx 4,5: ADD template for address + 1 = address_incr (unconditional)
+        emit_add_pair(
+            b,
+            4,
+            &[],
+            &AddOperand::dword(cols::ADDRESS_0),
+            &AddOperand::constant(1),
+            &AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
+        );
 
-    // 6-7: SUB template for count - 1 = count_decr (unconditional, degree 2)
-    // Expressed as ADD: count_decr + 1 = count
-    // lhs = count_decr (DWordHL → DWordWL), rhs = 1, sum = count (DWordWL)
-    let (sub_c0, sub_c1) = AddConstraint::new_pair(
-        vec![], // unconditional
-        AddOperand::from_dword_hl(cols::COUNT_DECR_0),
-        AddOperand::constant(1),
-        AddOperand::dword(cols::COUNT_0),
-        idx,
-    );
-    constraints.push(sub_c0.boxed());
-    constraints.push(sub_c1.boxed());
-    idx += 2;
-
-    (constraints, idx)
-}
-
-/// The kind of COMMIT-specific constraint (not covered by templates).
-#[derive(Debug, Clone, Copy)]
-enum CommitConstraintKind {
-    /// (first + end) * (1 - mu) = 0
-    FirstOrEndImpliesMu,
-}
-
-/// A constraint for the COMMIT table.
-struct CommitConstraint {
-    kind: CommitConstraintKind,
-    constraint_idx: usize,
-}
-
-impl CommitConstraint {
-    fn compute<F, E>(
-        &self,
-        step: &stark::table::TableView<F, E>,
-    ) -> math::field::element::FieldElement<F>
-    where
-        F: math::field::traits::IsSubFieldOf<E>,
-        E: math::field::traits::IsField,
-    {
-        let one = math::field::element::FieldElement::<F>::one();
-
-        match self.kind {
-            CommitConstraintKind::FirstOrEndImpliesMu => {
-                let first = step.get_main_evaluation_element(0, cols::FIRST).clone();
-                let end = step.get_main_evaluation_element(0, cols::END).clone();
-                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                // (first + end) * (1 - mu) = 0
-                (first + end) * (one - mu)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
+        // idx 6,7: SUB via ADD: count_decr + 1 = count (unconditional)
+        emit_add_pair(
+            b,
+            6,
+            &[],
+            &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
+            &AddOperand::constant(1),
+            &AddOperand::dword(cols::COUNT_0),
+        );
     }
 }

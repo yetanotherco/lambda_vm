@@ -2,6 +2,7 @@
 //!
 //! These tests verify that the prover and verifier work correctly for legitimate use cases.
 
+use crate::constraints::builder::EmptyConstraints;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::{
@@ -427,12 +428,12 @@ fn test_bus_value_features() {
             )],
         };
         let proof_options = ProofOptions::default_test_options();
-        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
             5,
             build_data,
             &proof_options,
             1,
-            vec![],
+            EmptyConstraints,
         )
     };
 
@@ -456,12 +457,12 @@ fn test_bus_value_features() {
             )],
         };
         let proof_options = ProofOptions::default_test_options();
-        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
             5,
             build_data,
             &proof_options,
             1,
-            vec![],
+            EmptyConstraints,
         )
     };
 

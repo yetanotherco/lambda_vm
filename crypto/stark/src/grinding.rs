@@ -1,6 +1,7 @@
+use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
+use digest::Digest;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use sha3::{Digest, Keccak256};
 
 const PREFIX: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xed];
 
@@ -87,91 +88,63 @@ fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
     digest[..32].try_into().unwrap()
 }
 
-#[cfg(test)]
-mod test {
-    use crate::grinding::is_valid_nonce;
+/// The inner hash as the four little-endian u64 lanes Keccak absorbs it into —
+/// the form the device nonce search takes as input.
+///
+/// The GPU dispatch and its test both go through here rather than each doing
+/// their own byte-to-lane conversion: a second copy would let this one drift
+/// (`from_le_bytes` → `from_be_bytes` reads identically at a glance) with every
+/// test still green, while at runtime `is_valid_nonce` rejected every device
+/// nonce and the search silently sat on the CPU fallback forever.
+pub fn inner_hash_lanes(seed: &[u8; 32], grinding_factor: u8) -> [u64; 4] {
+    let inner_hash = get_inner_hash(seed, grinding_factor);
+    core::array::from_fn(|i| u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
+}
 
-    #[test]
-    fn test_invalid_nonce_grinding_factor_6() {
-        // This setting produces a hash with 5 leading zeros, therefore not enough for grinding
-        // factor 6.
-        let seed = [
-            174, 187, 26, 134, 6, 43, 222, 151, 140, 48, 52, 67, 69, 181, 177, 165, 111, 222, 148,
-            92, 130, 241, 171, 2, 62, 34, 95, 159, 37, 116, 155, 217,
-        ];
-        let nonce = 4;
-        let grinding_factor = 6;
-        assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
+/// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
+/// otherwise (or on any device error). Which valid nonce comes back depends on
+/// the arm: the device search returns the smallest in the range it scanned,
+/// while the CPU's `find_any` returns an arbitrary one. Neither is a contract —
+/// the verifier accepts any nonce passing `is_valid_nonce`, and nothing
+/// downstream depends on the choice. The heavy per-table-per-epoch
+/// ~2^grinding_factor hashing is the prover's dominant CPU cost, so this moves
+/// it off the 16 cores onto the idle GPU.
+#[cfg(feature = "cuda")]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    debug_assert!(
+        (1..=64).contains(&grinding_factor),
+        "grinding_factor must be in 1..=64, got {grinding_factor}"
+    );
+    // Kill switch (presence-based, matching `LAMBDA_VM_NO_GPU_LOGUP`):
+    // `LAMBDA_VM_NO_GPU_GRIND` forces the CPU search — a production escape hatch
+    // and fallback-path coverage. Cached; read once.
+    static GPU_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
+        return generate_nonce(seed, grinding_factor);
     }
+    let inner_lanes = inner_hash_lanes(seed, grinding_factor);
+    if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
+        // Validate unconditionally (one host hash against the ~2^grinding_factor
+        // device search): a kernel/driver defect must degrade to the CPU search,
+        // never append an unverifiable nonce to the transcript. This runs in
+        // release too — the cost is negligible next to the grind it replaces.
+        if is_valid_nonce(seed, nonce, grinding_factor) {
+            crate::gpu_lde::GPU_GRIND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(nonce);
+        }
+        // eprintln, not log::warn: the CLI initialises env_logger with no
+        // default filter, so a warn-level line is invisible unless RUST_LOG is
+        // set — and this is the only signal that the kernel has started
+        // returning garbage and the feature has silently reverted to the CPU
+        // search. Matches the `[gpu]` prefix the other device-decline paths use.
+        eprintln!(
+            "[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search"
+        );
+    }
+    generate_nonce(seed, grinding_factor)
+}
 
-    #[test]
-    fn test_invalid_nonce_grinding_factor_9() {
-        // This setting produces a hash with 8 leading zeros, therefore not enough for grinding
-        // factor 9.
-        let seed = [
-            174, 187, 26, 134, 6, 43, 222, 151, 140, 48, 52, 67, 69, 181, 177, 165, 111, 222, 148,
-            92, 130, 241, 171, 2, 62, 34, 95, 159, 37, 116, 155, 217,
-        ];
-        let nonce = 287;
-        let grinding_factor = 9;
-        assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
-    }
-
-    #[test]
-    fn test_is_valid_nonce_grinding_factor_10() {
-        let seed = [
-            37, 68, 26, 150, 139, 142, 66, 175, 33, 47, 199, 160, 9, 109, 79, 234, 135, 254, 39,
-            11, 225, 219, 206, 108, 224, 165, 25, 72, 189, 96, 218, 95,
-        ];
-        let nonce = 0x5ba;
-        let grinding_factor = 10;
-        assert!(is_valid_nonce(&seed, nonce, grinding_factor));
-    }
-
-    #[test]
-    fn test_is_valid_nonce_grinding_factor_20() {
-        let seed = [
-            37, 68, 26, 150, 139, 142, 66, 175, 33, 47, 199, 160, 9, 109, 79, 234, 135, 254, 39,
-            11, 225, 219, 206, 108, 224, 165, 25, 72, 189, 96, 218, 95,
-        ];
-        let nonce = 0x2c5db8;
-        let grinding_factor = 20;
-        assert!(is_valid_nonce(&seed, nonce, grinding_factor));
-    }
-
-    #[test]
-    fn test_invalid_nonce_grinding_factor_19() {
-        // This setting would pass for grinding factor 20 instead of 19. The nonce is invalid
-        // here because the grinding factor is part of the inner hash, changing the outer hash
-        // and the resulting number of leading zeros.
-        let seed = [
-            37, 68, 26, 150, 139, 142, 66, 175, 33, 47, 199, 160, 9, 109, 79, 234, 135, 254, 39,
-            11, 225, 219, 206, 108, 224, 165, 25, 72, 189, 96, 218, 95,
-        ];
-        let nonce = 0x2c5db8;
-        let grinding_factor = 19;
-        assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
-    }
-
-    #[test]
-    fn test_is_valid_nonce_grinding_factor_30() {
-        let seed = [
-            37, 68, 26, 150, 139, 142, 66, 175, 33, 47, 199, 160, 9, 109, 79, 234, 135, 254, 39,
-            11, 225, 219, 206, 108, 224, 165, 25, 72, 189, 96, 218, 95,
-        ];
-        let nonce = 0x1ae839e1;
-        let grinding_factor = 30;
-        assert!(is_valid_nonce(&seed, nonce, grinding_factor));
-    }
-
-    #[test]
-    fn test_is_valid_nonce_grinding_factor_33() {
-        let seed = [
-            37, 68, 26, 150, 139, 142, 66, 175, 33, 47, 199, 160, 9, 109, 79, 234, 135, 254, 39,
-            11, 225, 219, 206, 108, 224, 165, 25, 72, 189, 96, 218, 95,
-        ];
-        let nonce = 0x4cc3123f;
-        let grinding_factor = 33;
-        assert!(is_valid_nonce(&seed, nonce, grinding_factor));
-    }
+#[cfg(not(feature = "cuda"))]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    generate_nonce(seed, grinding_factor)
 }

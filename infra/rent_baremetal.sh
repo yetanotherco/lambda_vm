@@ -8,6 +8,7 @@
 #   SCW_TYPE              default: EM-I320E-NVME
 #   PROVISION_FILE        default: <repo>/infra/provision.sh
 #   READY_TIMEOUT         default: 1800 (seconds)
+#   LLVM_VERSION          default: 21
 #
 # Requires: scw, jq, ssh.
 # To delete the server when done: scw baremetal server delete <id> zone=<zone>
@@ -28,6 +29,7 @@ SCW_OS_ID="${SCW_OS_ID:-83640d93-a0b8-45ad-9c9f-30cae48380a4}"  # Debian
 SCW_PROJECT_ID="${SCW_PROJECT_ID:-946cfb34-d351-48c4-8566-127e7727e15f}"
 PROVISION_FILE="${PROVISION_FILE:-$SCRIPT_DIR/provision.sh}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
+LLVM_VERSION="${LLVM_VERSION:-21}"
 
 err() { echo -e "${RED}error:${NC} $*" >&2; }
 info() { echo -e "${BOLD}$*${NC}"; }
@@ -180,7 +182,7 @@ info "Wiping any stale known_hosts entry for $PUBLIC_IP (Scaleway recycles IPs).
 ssh-keygen -R "$PUBLIC_IP" >/dev/null 2>&1 || true
 
 info "Handing off to provision_server.sh (Ctrl+C to skip and provision later)..."
-PROVISION_FILE="$PROVISION_FILE" SSH_USER=root "$SCRIPT_DIR/provision_server.sh" "$PUBLIC_IP"
+PROVISION_FILE="$PROVISION_FILE" SSH_USER=root LLVM_VERSION="$LLVM_VERSION" "$SCRIPT_DIR/provision_server.sh" "$PUBLIC_IP"
 
 echo
 echo "To delete the server:"

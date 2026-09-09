@@ -285,3 +285,193 @@ extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
     // Store back to the remapped row.
     x[row] = tile[threadIdx.x];
 }
+
+// ============================================================================
+// ROW-MAJOR BATCHED KERNELS
+//
+// Data layout: data[row * m + col] for n rows and m columns.
+// threadIdx.x = column index → consecutive threads access consecutive columns
+// of the same row → coalesced global memory access.
+// Twiddle factors depend only on the butterfly position, not the column →
+// one twiddle load is broadcast across the entire warp.
+// ============================================================================
+
+// Bit-reverse permute rows: swap row `row` with row `br(row)`.
+// Grid: gridDim.x = ceil(m / 256), gridDim.y = min(n, 65535).
+// Grid-stride loop over rows so a capped gridDim.y covers all n rows.
+extern "C" __global__ void bit_reverse_row_major(uint64_t *data,
+                                                  uint64_t n,
+                                                  uint64_t log_n,
+                                                  uint64_t m)
+{
+    uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= m) return;
+    for (uint64_t row = blockIdx.y; row < n; row += gridDim.y) {
+        uint64_t rev = __brevll(row) >> (64 - log_n);
+        if (row < rev) {
+            uint64_t tmp          = data[row * m + col];
+            data[row * m + col]   = data[rev * m + col];
+            data[rev * m + col]   = tmp;
+        }
+    }
+}
+
+// One DIT butterfly level on row-major data.
+// Grid: gridDim.x = ceil(m / blockDim.x), gridDim.y = min(ceil(n/2 / blockDim.y), 65535).
+// blockDim.x covers columns (coalescing), blockDim.y covers butterfly pairs.
+// Grid-stride loop over butterfly-pair tiles so capped gridDim.y covers all n/2 pairs.
+extern "C" __global__ void ntt_dit_level_row_major(uint64_t *data,
+                                                    const uint64_t *tw,
+                                                    uint64_t n,
+                                                    uint64_t log_n,
+                                                    uint64_t level,
+                                                    uint64_t m)
+{
+    uint64_t col    = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n_half = n >> 1;
+    if (col >= m) return;
+
+    uint64_t half       = 1ULL << level;
+    uint64_t block_size = half << 1;
+
+    for (uint64_t bfly_base = blockIdx.y * blockDim.y;
+         bfly_base < n_half;
+         bfly_base += (uint64_t)gridDim.y * blockDim.y) {
+        uint64_t butterfly = bfly_base + threadIdx.y;
+        if (butterfly >= n_half) break;
+
+        uint64_t block_idx = butterfly >> level;
+        uint64_t k         = butterfly & (half - 1);
+        uint64_t i0        = block_idx * block_size + k;
+        uint64_t i1        = i0 + half;
+
+        // Same twiddle for all columns at this butterfly position (broadcast).
+        uint64_t w = tw[k << (log_n - level - 1)];
+
+        uint64_t u = data[i0 * m + col];
+        uint64_t v = mul(w, data[i1 * m + col]);
+        data[i0 * m + col] = add(u, v);
+        data[i1 * m + col] = sub(u, v);
+    }
+}
+
+// Pointwise multiply row-major: data[row * m + col] *= weights[row].
+// One weight per row, broadcast across all m columns.
+// Grid: gridDim.x = ceil(m / 256), gridDim.y = min(n, 65535).
+// Grid-stride loop over rows.
+extern "C" __global__ void pointwise_mul_row_major(uint64_t *data,
+                                                    const uint64_t *weights,
+                                                    uint64_t n,
+                                                    uint64_t m)
+{
+    uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= m) return;
+    for (uint64_t row = blockIdx.y; row < n; row += gridDim.y)
+        data[row * m + col] = mul(data[row * m + col], weights[row]);
+}
+
+// ── Row-major → column-major transpose (for GpuLdeBase handle) ───────────────
+//
+// Converts the row-major LDE output to the column-major layout that downstream
+// GPU kernels (DEEP, barycentric) require for the device handle.
+//
+// src[r * cols + c]  →  dst[c * out_stride + r]
+//
+// Grid: gridDim.x = ceil(cols/32), gridDim.y = min(ceil(rows/32), 65535).
+// Grid-strides over row tiles so all rows are covered when rows > 65535*32.
+
+#define MTILE 32
+#define MTILE_P (MTILE + 1)
+
+extern "C" __global__ void matrix_transpose_strided(
+    const uint64_t *__restrict__ src,
+    uint64_t *__restrict__ dst,
+    uint32_t rows,
+    uint32_t cols,
+    uint64_t out_stride)
+{
+    __shared__ uint64_t tile[MTILE][MTILE_P];
+
+    for (uint32_t row_base = blockIdx.y * MTILE; row_base < rows;
+         row_base += gridDim.y * MTILE) {
+        uint32_t x = blockIdx.x * MTILE + threadIdx.x;
+        uint32_t y = row_base + threadIdx.y;
+
+        if (x < cols && y < rows)
+            tile[threadIdx.y][threadIdx.x] = src[(uint64_t)y * cols + x];
+
+        __syncthreads();
+
+        uint32_t tx = row_base + threadIdx.x;
+        uint32_t ty = blockIdx.x * MTILE + threadIdx.y;
+
+        if (tx < rows && ty < cols)
+            dst[(uint64_t)ty * out_stride + tx] = tile[threadIdx.x][threadIdx.y];
+
+        __syncthreads();
+    }
+}
+
+// First-8-levels fused DIT on row-major data: one block stages 256 consecutive
+// rows x blockDim.x columns in shmem and runs levels 0..min(8,log_n) with
+// __syncthreads between levels (row-major analog of ntt_dit_8_levels_batched
+// with base_step == 0, whose twiddle math this reuses verbatim). Grid:
+// x = column tiles, y = n/256 row blocks. Requires n >= 256. Shmem tile is
+// padded (pitch = T+1) to break bank conflicts on the butterfly accesses.
+extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
+                                                      const uint64_t *tw,
+                                                      uint64_t n,
+                                                      uint64_t log_n,
+                                                      uint64_t m)
+{
+    extern __shared__ uint64_t tile[];
+    uint32_t T = blockDim.x;
+    uint32_t pitch = T + 1;
+    uint64_t col = (uint64_t)blockIdx.x * T + threadIdx.x;
+    bool live = col < m;
+
+    uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n);
+    uint32_t remaining_high_bits = (uint32_t)(log_n - 1);
+    uint32_t high_mask = (1u << remaining_high_bits) - 1u;
+
+    // Grid-stride over 256-row blocks: gridDim.y caps at 65535, so lde sizes
+    // >= 2^24 need more than one row block per y-slot. The trip count is
+    // uniform across the block, keeping every __syncthreads converged.
+    for (uint64_t rb = blockIdx.y; rb < (n >> 8); rb += gridDim.y) {
+        uint64_t row_base = rb * 256;
+
+        for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+            if (live) tile[r * pitch + threadIdx.x] = data[(row_base + r) * m + col];
+        }
+        __syncthreads();
+
+        for (uint32_t loc_step = 0; loc_step < n_loc_steps; ++loc_step) {
+            for (uint32_t i = threadIdx.y; i < 128; i += blockDim.y) {
+                uint32_t half    = 1u << loc_step;
+                uint32_t grp     = i >> loc_step;
+                uint32_t grp_pos = i & (half - 1);
+                uint32_t idx1 = (grp << (loc_step + 1)) + grp_pos;
+                uint32_t idx2 = idx1 + half;
+
+                uint32_t gs  = loc_step;
+                uint32_t ggp = ((uint32_t)rb << 7) + i;
+                ggp = (ggp & high_mask) + (ggp >> remaining_high_bits);
+                ggp = ggp & ((1u << gs) - 1u);
+                uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
+
+                if (live) {
+                    uint64_t u = tile[idx1 * pitch + threadIdx.x];
+                    uint64_t v = mul(tile[idx2 * pitch + threadIdx.x], factor);
+                    tile[idx1 * pitch + threadIdx.x] = add(u, v);
+                    tile[idx2 * pitch + threadIdx.x] = sub(u, v);
+                }
+            }
+            __syncthreads();
+        }
+
+        for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
+            if (live) data[(row_base + r) * m + col] = tile[r * pitch + threadIdx.x];
+        }
+        __syncthreads();
+    }
+}

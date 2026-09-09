@@ -1,6 +1,8 @@
 const EI_NIDENT: usize = 16;
 // Section header types
 const SHT_SYMTAB: u32 = 2;
+// Section is loaded into memory at runtime (excludes .debug_* et al.)
+const SHF_ALLOC: u64 = 0x2;
 // Symbol types (lower 4 bits of st_info)
 const STT_FUNC: u8 = 2;
 // Section header size for 64-bit ELF
@@ -246,6 +248,8 @@ pub enum ElfError {
     UnalignedVAddr,
     #[error("Program Header address is too large")]
     AddrTooLarge,
+    #[error("Program Header overlaps the reserved private-input region")]
+    SegmentInPrivateInputRegion,
     #[error("Program Header offset is invalid")]
     InvalidOffset,
     #[error("Executable Header size is invalid")]
@@ -290,6 +294,33 @@ impl Elf {
             if !program_header.p_vaddr.is_multiple_of(WORD_SIZE) {
                 return Err(ElfError::UnalignedVAddr);
             }
+            // Reject any loadable segment that reaches at or above `PRIVATE_INPUT_START_INDEX`
+            // — the base of the reserved high-memory private-input area. Genesis for pages in
+            // that area is prover-committed and NOT recomputed from the ELF (so private input
+            // stays private); ELF data placed there would have an unbound, prover-forgeable
+            // genesis. The verifier can classify any page from the base up to the maximum
+            // private-input page count as private — a span that slightly exceeds
+            // `MAX_PRIVATE_INPUT_SIZE` because the length prefix pushes an honest max-size
+            // input onto one more page (the page-count bound is that tight span, with no
+            // extra slack), so we reserve the whole high area rather than exactly
+            // `[base, base+MAX)`. Nothing legitimate loads
+            // here: ELF code/data live at low addresses, and the stack (`STACK_TOP`) and
+            // private input are runtime regions written outside `load_program`, so this does
+            // not affect them. Turns "the private-input area holds only private input" from a
+            // convention into an enforced invariant.
+            if program_header.p_memsz > 0 {
+                use crate::vm::memory::PRIVATE_INPUT_START_INDEX;
+                // `checked_add` (not saturating): an overflowing `p_vaddr + p_memsz` is a
+                // malformed segment and is rejected explicitly as `AddrTooLarge`, rather than
+                // saturating to `u64::MAX` and being reported under the wrong error.
+                let seg_end = program_header
+                    .p_vaddr
+                    .checked_add(program_header.p_memsz)
+                    .ok_or(ElfError::AddrTooLarge)?;
+                if seg_end > PRIVATE_INPUT_START_INDEX {
+                    return Err(ElfError::SegmentInPrivateInputRegion);
+                }
+            }
             let mut values = Vec::new();
             for i in (0..program_header.p_memsz).step_by(WORD_SIZE as usize) {
                 let word = if i < program_header.p_filesz {
@@ -298,7 +329,17 @@ impl Elf {
                     let len = remaining.min(WORD_SIZE);
                     let mut word = 0u32;
                     for j in 0..len {
-                        let offset = (program_header.p_offset + i + j) as usize;
+                        // `checked_add` (not plain `+`): `p_offset` is an unbounded file
+                        // offset, so `p_offset + i + j` could overflow — which would panic in
+                        // debug and silently wrap in release. In practice the monotonic
+                        // bounds check (`input.get` below) fires first, but don't rely on
+                        // evaluation order: reject an overflow explicitly.
+                        let offset = program_header
+                            .p_offset
+                            .checked_add(i)
+                            .and_then(|o| o.checked_add(j))
+                            .ok_or(ElfError::InvalidOffset)?
+                            as usize;
                         let byte = input.get(offset).ok_or(ElfError::InvalidOffset)?;
                         word |= (*byte as u32)
                             .checked_shl((j as u32).checked_mul(8).ok_or(ElfError::InvalidProgram)?)
@@ -370,11 +411,14 @@ impl SymbolTable {
             return Ok(Self::default());
         }
 
-        // Find .symtab section
+        // Find .symtab, and record which sections are SHF_ALLOC (loaded at
+        // runtime) — debug sections reuse .text addresses for local labels.
         let mut symtab_offset = 0usize;
         let mut symtab_size = 0usize;
         let mut strtab_index = 0u32;
+        let mut section_is_alloc = vec![false; sh_num];
 
+        #[allow(clippy::needless_range_loop)] // `i` also drives the offset arithmetic below
         for i in 0..sh_num {
             let offset = sh_offset
                 .checked_add(i.checked_mul(sh_entsize).ok_or(ElfError::InvalidProgram)?)
@@ -390,8 +434,15 @@ impl SymbolTable {
                     .try_into()
                     .map_err(|_| ElfError::Casting)?,
             );
+            // sh_flags is at offset 8
+            let sh_flags = u64::from_le_bytes(
+                input[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| ElfError::Casting)?,
+            );
+            section_is_alloc[i] = sh_flags & SHF_ALLOC != 0;
 
-            if sh_type == SHT_SYMTAB {
+            if sh_type == SHT_SYMTAB && symtab_offset == 0 {
                 // sh_offset at offset 24, sh_size at offset 32, sh_link at offset 40
                 symtab_offset = u64::from_le_bytes(
                     input[offset + 24..offset + 32]
@@ -408,7 +459,6 @@ impl SymbolTable {
                         .try_into()
                         .map_err(|_| ElfError::Casting)?,
                 );
-                break;
             }
         }
 
@@ -469,6 +519,11 @@ impl SymbolTable {
                     .map_err(|_| ElfError::Casting)?,
             ) as usize;
             let st_info = input[sym_offset + 4];
+            let st_shndx = u16::from_le_bytes(
+                input[sym_offset + 6..sym_offset + 8]
+                    .try_into()
+                    .map_err(|_| ElfError::Casting)?,
+            ) as usize;
             let st_value = u64::from_le_bytes(
                 input[sym_offset + 8..sym_offset + 16]
                     .try_into()
@@ -479,6 +534,13 @@ impl SymbolTable {
                     .try_into()
                     .map_err(|_| ElfError::Casting)?,
             );
+
+            // Reject symbols outside a loaded (SHF_ALLOC) section: debug
+            // sections carry local labels (e.g. `.L0`) that reuse a real
+            // .text address as a debug-info anchor, not a function boundary.
+            if !section_is_alloc.get(st_shndx).copied().unwrap_or(false) {
+                continue;
+            }
 
             // Check if this is a function (STT_FUNC) or a NOTYPE symbol (common in ASM programs)
             // Filter out other types like STT_OBJECT, STT_SECTION, etc.
@@ -512,8 +574,9 @@ impl SymbolTable {
 
             let name = String::from_utf8_lossy(&input[name_offset..name_end]).to_string();
 
-            // Filter out special symbols (mapping symbols like $x, $d, $t)
-            if !name.is_empty() && !name.starts_with('$') {
+            // Filter out mapping symbols ($x, $d, $t) and compiler-local
+            // labels (.L0, .LBB3_2, ...) reused across unrelated addresses.
+            if !name.is_empty() && !name.starts_with('$') && !name.starts_with('.') {
                 functions.push(FunctionSymbol {
                     name,
                     address: st_value,
@@ -548,6 +611,30 @@ impl SymbolTable {
         }
     }
 
+    /// Like [`Self::lookup`], but also returns the exclusive upper bound of the
+    /// addresses that resolve to the returned function — its size-end, capped
+    /// at the next symbol's start so overlapping/nested symbols are respected.
+    /// Every address in `[func.address, end)` resolves to `func` via `lookup`,
+    /// so callers can cache the range and skip re-running `lookup` inside it.
+    pub fn lookup_range(&self, address: u64) -> Option<(&FunctionSymbol, u64)> {
+        let idx = match self.functions.binary_search_by_key(&address, |f| f.address) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let func = &self.functions[idx];
+        let size_end = if func.size == 0 {
+            u64::MAX
+        } else {
+            func.address + func.size
+        };
+        if address >= size_end {
+            return None;
+        }
+        let next_start = self.functions.get(idx + 1).map_or(u64::MAX, |f| f.address);
+        Some((func, size_end.min(next_start)))
+    }
+
     /// Check if the symbol table is empty
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty()
@@ -556,5 +643,103 @@ impl SymbolTable {
     /// Get the number of functions in the symbol table
     pub fn len(&self) -> usize {
         self.functions.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
+
+    /// Build a minimal valid RISC-V ET_EXEC ELF with a single PT_LOAD segment at
+    /// `p_vaddr` of `p_memsz` bytes (all BSS: `p_filesz = 0`). Enough for `Elf::load`,
+    /// which only parses the executable header + program headers.
+    fn minimal_elf_with_segment(p_vaddr: u64, p_memsz: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; EXECUTABLE_HEADER_SIZE + PROGRAM_HEADER_SIZE];
+        // e_ident
+        buf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        buf[4] = ELF_64_BIT;
+        buf[5] = ELF_LITTLE_ENDIAN;
+        buf[6] = ELF_CURRENT_VERSION;
+        buf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        buf[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[24..32].copy_from_slice(&0x10000u64.to_le_bytes()); // e_entry (word-aligned)
+        buf[32..40].copy_from_slice(&(EXECUTABLE_HEADER_SIZE as u64).to_le_bytes()); // e_phoff
+        buf[52..54].copy_from_slice(&(EXECUTABLE_HEADER_SIZE as u16).to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&(PROGRAM_HEADER_SIZE as u16).to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // single program header
+        let ph = EXECUTABLE_HEADER_SIZE;
+        buf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        buf[ph + 4..ph + 8].copy_from_slice(&PF_X.to_le_bytes());
+        buf[ph + 16..ph + 24].copy_from_slice(&p_vaddr.to_le_bytes()); // p_vaddr
+        buf[ph + 40..ph + 48].copy_from_slice(&p_memsz.to_le_bytes()); // p_memsz
+        buf
+    }
+
+    #[test]
+    fn rejects_segment_inside_private_input_region() {
+        // An ELF data segment placed inside the reserved region would get a prover-chosen,
+        // ELF-unbound genesis (private-input pages are non-preprocessed) — must be rejected.
+        let elf = minimal_elf_with_segment(PRIVATE_INPUT_START_INDEX, 4);
+        assert!(matches!(
+            Elf::load(&elf),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
+    }
+
+    #[test]
+    fn rejects_segment_with_overflowing_vaddr_span() {
+        // p_vaddr + p_memsz overflows u64 → rejected explicitly as AddrTooLarge (not
+        // saturated to u64::MAX and mis-reported, and no panic/wrap).
+        let elf = minimal_elf_with_segment(0xFFFF_FFFF_FFFF_F000, 0x2000);
+        assert!(matches!(Elf::load(&elf), Err(ElfError::AddrTooLarge)));
+    }
+
+    #[test]
+    fn rejects_segment_straddling_region_start() {
+        // Ends 4 bytes into the region → overlaps → rejected.
+        let elf = minimal_elf_with_segment(PRIVATE_INPUT_START_INDEX - 4, 8);
+        assert!(matches!(
+            Elf::load(&elf),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
+    }
+
+    #[test]
+    fn accepts_segment_below_region() {
+        assert!(Elf::load(&minimal_elf_with_segment(0x10000, 4)).is_ok());
+    }
+
+    #[test]
+    fn accepts_segment_ending_exactly_at_region_start() {
+        // seg_end == PRIVATE_INPUT_START_INDEX (exclusive) → no overlap → accepted.
+        let elf = minimal_elf_with_segment(PRIVATE_INPUT_START_INDEX - 4, 4);
+        assert!(Elf::load(&elf).is_ok());
+    }
+
+    #[test]
+    fn rejects_segment_at_max_size_boundary() {
+        // The `[base, base+MAX)` byte cap ends here, but an honest max-size input (plus its
+        // 4-byte length prefix) spills onto this page, so the verifier can classify it private.
+        // It must therefore be rejected too — the reservation covers the full classifiable
+        // span, not just `[base, base+MAX)`.
+        let boundary = PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE;
+        assert!(matches!(
+            Elf::load(&minimal_elf_with_segment(boundary, 4)),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
+    }
+
+    #[test]
+    fn rejects_segment_far_above_region() {
+        // Any segment reaching at/above the private-input base is rejected — nothing
+        // legitimate loads that high (ELF is low; stack/private input are runtime).
+        let high = PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE + (16 << 20);
+        assert!(matches!(
+            Elf::load(&minimal_elf_with_segment(high, 4)),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
     }
 }
