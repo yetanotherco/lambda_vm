@@ -322,12 +322,24 @@ ETHREX_REAL_BLOCK := 25453112
 # runs 496 cycles and commits `successful_validation = 0` instead of failing.
 # `tooling/ethrex-fixtures --bin real_block` rebuilds the block's real
 # transactions and real pre-state as an Amsterdam block and validates the result
-# through the guest before writing it, so a stale or wrong-fork fixture cannot
-# reach a benchmark. Nothing to publish, and it works offline once the cache is
-# there. Read the caveat in tooling/ethrex-fixtures/README.md before quoting
-# numbers: Amsterdam's gas model (EIP-8037 state gas, cold access 2600 -> 3000)
-# makes 10 of this block's Osaka-era transactions run out of gas.
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 :=
+# through the guest before writing it. Nothing to publish, and it works offline
+# once the cache is there. Read the caveat in tooling/ethrex-fixtures/README.md
+# before quoting numbers: Amsterdam's gas model (EIP-8037 state gas, cold access
+# 2600 -> 3000) makes 10 of this block's Osaka-era transactions run out of gas.
+#
+# The digest below is what keeps a stale fixture out of a benchmark. Generating
+# validates the block, but generation only happens when the file is MISSING (see
+# the rule), and the bench runner is persistent -- so without this, a fixture
+# built before a rev bump survives it and every benchmark keeps proving the old
+# workload. The minimum-cycle floor in bench_abba.sh cannot see that either: a
+# stale fixture still runs tens of millions of cycles, and both sides of an A/B
+# read the same file, so the delta looks healthy while the absolute numbers
+# belong to the wrong block. Verified byte-identical on macOS arm64 and on the
+# Linux x86-64 runner, which is what makes pinning it safe. Repointing the block
+# or moving the ethrex rev changes it: run `make regen-real-block-fixture`, take
+# the new digest, and paste it here. Leaving it empty disables the check and says
+# so out loud.
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 08a52e10c2f89870dade14f7b0dfe01625e57416afbff664ad31fcd067233eea
 # The block's source cache: an ethrex-replay dump, fork-independent, still the one
 # hosted in bench-fixtures-v1. Only the fixture rebuild reads it; converter TESTS
 # use a different, upstream-pinned cache (below).
@@ -395,10 +407,33 @@ endef
 # A file rule, unlike the fetched artifacts above: those are phony so their digest
 # is re-checked on every invocation, which is how a stale download is caught. This
 # one is BUILT from the cache (whose digest IS re-checked) by a deterministic
-# generator that validates the block through the guest before writing, so the file
-# existing is proof enough and rebuilding it on every benchmark would just add a
-# cargo build to the critical path.
+# generator, so its digest is re-checked here the same way -- hashing 549 KB costs
+# nothing, and only a MISMATCH pays for a rebuild, which is what keeps a cargo
+# build off every benchmark's critical path.
 ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
+	@set -e; \
+	want="$(ETHREX_REAL_BLOCK_FIXTURE_SHA256)"; \
+	if [ -z "$$want" ]; then \
+		echo "::warning::ETHREX_REAL_BLOCK_FIXTURE_SHA256 is unset - the fixture is not being verified."; \
+		exit 0; \
+	fi; \
+	if command -v sha256sum >/dev/null 2>&1; then shacmd="sha256sum"; \
+	elif command -v shasum >/dev/null 2>&1; then shacmd="shasum -a 256"; \
+	else echo "fixture: missing sha256sum or shasum for checksum verification" >&2; exit 1; fi; \
+	sha_of() { $$shacmd "$$1" | awk '{print $$1}'; }; \
+	if [ "$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")" = "$$want" ]; then exit 0; fi; \
+	echo "fixture $(ETHREX_REAL_BLOCK_FIXTURE) does not match $$want - regenerating."; \
+	$(MAKE) regen-real-block-fixture; \
+	got="$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")"; \
+	if [ "$$got" != "$$want" ]; then \
+		echo "ERROR: the freshly generated fixture is $$got, not the pinned $$want." >&2; \
+		echo "  The generator is deterministic, so this means its inputs or its output" >&2; \
+		echo "  format moved: the ethrex rev, the cache, or the generator itself. If that" >&2; \
+		echo "  was intended, re-baseline ETHREX_REAL_BLOCK_FIXTURE_SHA256 in the Makefile" >&2; \
+		echo "  and re-measure -- the workload is no longer the one every recorded number" >&2; \
+		echo "  was taken against." >&2; \
+		exit 1; \
+	fi
 
 # No prerequisites on purpose. `ethrex-real-block-cache` is phony (so its digest is
 # re-checked on every call), and a phony prerequisite always reads as newer than its
