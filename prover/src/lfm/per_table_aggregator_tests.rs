@@ -1764,14 +1764,54 @@ fn the_production_leaf_node_measures() {
     );
 
     // ---- the base layer: a real chained bundle, so the register seam is real.
+    //
+    // ★ CACHED, and the cache is not a convenience — it is what separates the
+    // two `L`s. Proving the base in-process leaves its residue live when the node
+    // runs, so the node's measured carry-in is `L_children + L_base_residue`; a
+    // run that LOADS the bundle carries in `L_children` alone, which is what any
+    // separately-written tree-builder would carry. The deserialise path is
+    // production's own (`bin/cli/src/main.rs:877-886`).
+    //
+    // ⇒ First run with `A_BUNDLE` set proves and saves; every later run loads.
+    // The pair of numbers is the measurement: the difference between them IS the
+    // base residue, and therefore how much of any high peak belongs to this
+    // harness rather than to the tree.
+    let bundle_path = std::env::var("A_BUNDLE").ok();
+    let cached = bundle_path
+        .as_deref()
+        .is_some_and(|p| std::path::Path::new(p).exists());
     let t = Instant::now();
-    let bundle = crate::continuation::prove_continuation(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
-    .expect("the block must prove");
+    let bundle = if cached {
+        let p = bundle_path.as_deref().expect("cached implies a path");
+        let bytes = std::fs::read(p).expect("the cached bundle must read");
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(&bytes);
+        rkyv::from_bytes::<crate::continuation::ContinuationProof, rkyv::rancor::Error>(&aligned)
+            .expect("the cached bundle must deserialize")
+    } else {
+        let b = crate::continuation::prove_continuation(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+        .expect("the block must prove");
+        if let Some(p) = bundle_path.as_deref() {
+            let bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&b).expect("the bundle must serialize");
+            std::fs::write(p, &bytes).expect("the bundle must persist");
+        }
+        b
+    };
+    println!(
+        "   base: {} — a LOADED bundle carries in L_children alone; a PROVED one \
+         also carries the base's residue",
+        if cached {
+            "LOADED from cache"
+        } else {
+            "PROVED in-process"
+        }
+    );
     assert!(
         bundle.num_epochs() >= FAN_IN,
         "a fan-in-{FAN_IN} leaf needs {FAN_IN} epochs, the block has {}",
