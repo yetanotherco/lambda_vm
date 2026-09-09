@@ -190,22 +190,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bitcoin-io"
-version = "0.1.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11301df0b06f22dea7bb1916403fdd88a371031e495c49b8f96931b28189e175"
-
-[[package]]
-name = "bitcoin_hashes"
-version = "0.14.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9901a56e133a1fc86eeb1113e2591f45f4682451ca893bff494d2f88918e3f"
-dependencies = [
- "bitcoin-io",
- "hex-conservative",
-]
-
-[[package]]
 name = "bitvec"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -224,19 +208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "bls12_381"
-version = "0.8.0"
-source = "git+https://github.com/lambdaclass/bls12_381?branch=expose-affine-constructors#78cad0378b17fc3157b83f514be192bf46edf9a1"
-dependencies = [
- "digest",
- "ff",
- "group",
- "pairing",
- "rand_core 0.6.4",
- "subtle",
 ]
 
 [[package]]
@@ -697,8 +668,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -712,6 +683,10 @@ dependencies = [
  "indexmap 2.14.0",
  "lazy_static",
  "libc",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
  "lru",
  "once_cell",
  "rkyv",
@@ -725,17 +700,16 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "ark-bn254",
  "ark-ec",
  "ark-ff",
- "bls12_381",
  "ethereum-types",
- "ff",
  "hex-literal",
  "k256",
+ "malachite",
  "num-bigint",
  "p256",
  "ripemd",
@@ -746,8 +720,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -757,8 +731,6 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-vm",
  "hex",
- "k256",
- "lambda-vm-syscalls",
  "rkyv",
  "serde",
  "serde_with",
@@ -767,8 +739,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -777,7 +749,6 @@ dependencies = [
  "k256",
  "lambdaworks-crypto",
  "rkyv",
- "secp256k1",
  "serde",
  "serde_with",
  "thiserror 2.0.18",
@@ -786,14 +757,15 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "derive_more",
  "ethrex-common",
  "ethrex-crypto",
  "ethrex-rlp",
+ "libssz",
  "malachite",
  "rustc-hash",
  "serde",
@@ -803,8 +775,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -813,8 +785,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "anyhow",
  "bytes",
@@ -822,18 +794,19 @@ dependencies = [
  "ethereum-types",
  "ethrex-crypto",
  "ethrex-rlp",
- "lazy_static",
+ "hashbrown 0.15.5",
  "rayon",
  "rkyv",
  "rustc-hash",
  "serde",
+ "spin",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ethrex-vm"
-version = "13.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=156cb8d6a3974f411d71622eecd1b249ee37ff1c#156cb8d6a3974f411d71622eecd1b249ee37ff1c"
+version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
 dependencies = [
  "bytes",
  "derive_more",
@@ -854,7 +827,6 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
- "bitvec",
  "rand_core 0.6.4",
  "subtle",
 ]
@@ -1016,15 +988,6 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
-name = "hex-conservative"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fda06d18ac606267c40c04e41b9947729bf8b9efe74bd4e82b61a5f26a510b9f"
-dependencies = [
- "arrayvec",
-]
 
 [[package]]
 name = "hex-literal"
@@ -1283,6 +1246,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libssz"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "libssz-derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ddfb5c969c28a4a54043e630f80c723352637bd1020f256ee3ac7a8814922b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "libssz-merkle"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
+dependencies = [
+ "libssz",
+ "sha2",
+]
+
+[[package]]
+name = "libssz-types"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "747273ab2d923e82ed147091fe0fb3e602dd2012c872cdad5efe69e27c3b4099"
+dependencies = [
+ "libssz",
+ "libssz-merkle",
+ "smallvec",
+]
+
+[[package]]
 name = "log"
 version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,15 +1429,6 @@ dependencies = [
  "elliptic-curve",
  "primeorder",
  "sha2",
-]
-
-[[package]]
-name = "pairing"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
-dependencies = [
- "group",
 ]
 
 [[package]]
@@ -1860,26 +1855,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "secp256k1"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b50c5943d326858130af85e049f2661ba3c78b26589b8ab98e65e80ae44a1252"
-dependencies = [
- "bitcoin_hashes",
- "rand 0.8.6",
- "secp256k1-sys",
-]
-
-[[package]]
-name = "secp256k1-sys"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2002,6 +1977,18 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spki"
