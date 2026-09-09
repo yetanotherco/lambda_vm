@@ -7,8 +7,9 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
-# so the generated ProgramInput rkyv layout matches what the guest deserializes.
+# Pinned to the SAME ethrex rev as the guest so the generated ProgramInput rkyv
+# layout matches what the guest deserializes. Re-pin all five manifests together
+# with scripts/set_ethrex_rev.sh.
 ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-blockchain" }
 ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-storage" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-common" }
