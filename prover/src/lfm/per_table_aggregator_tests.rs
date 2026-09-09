@@ -1977,3 +1977,64 @@ fn the_production_leaf_node_measures() {
         super::wrap_tests::peak_rss_gib(),
     );
 }
+
+/// ★ THE TREE'S SHAPE COMES FROM THE EPOCH COUNT, not a constant.
+///
+/// Pure arithmetic — no proving, so it runs on every suite. It exists because
+/// the shape was twice planned against a number that was not the block's: the
+/// brief's "10 epochs of 2^22" rests on 39.6M cycles, and block 25368371 is
+/// **74,819,518** — 18 epochs at 2^22, 36 at 2^21. A tree built to a constant
+/// answers whichever question that constant came from.
+///
+/// The arities are asserted rather than the level count alone, because the
+/// LEFTOVER RULE is the design decision: every node takes `1..=fan_in` children
+/// and an odd level ends in a short node rather than carrying a proof upward to
+/// a parent with mixed-shape children. Asserting only the depth would pass under
+/// either rule.
+#[test]
+fn the_tree_shape_matches_the_epoch_count() {
+    use super::per_table_aggregator::{tree_node_count, tree_shape};
+
+    // The real block, both postures. ⓘ Epoch counts are `ceil(cycles / 2^k)` for
+    // 74,819,518 cycles; they are written out so a changed constant fails here
+    // rather than silently re-shaping the tree.
+    for (epochs, fan_in, levels, nodes) in [
+        (18usize, 2usize, 5usize, 20usize), // 2^22: 18 -> 9 -> 5 -> 3 -> 2 -> 1
+        (18, 3, 3, 9),                      // 2^22: 18 -> 6 -> 2 -> 1
+        (36, 2, 6, 38),                     // 2^21: 36 -> 18 -> 9 -> 5 -> 3 -> 2 -> 1
+        (36, 3, 4, 19),                     // 2^21: 36 -> 12 -> 4 -> 2 -> 1
+    ] {
+        let shape = tree_shape(epochs, fan_in);
+        assert_eq!(
+            shape.len(),
+            levels,
+            "levels at {epochs} epochs, fan-in {fan_in}"
+        );
+        assert_eq!(
+            tree_node_count(&shape),
+            nodes,
+            "aggregator proofs at {epochs} epochs, fan-in {fan_in}"
+        );
+        // Every node takes 1..=fan_in, and each level consumes exactly what the
+        // one below produced — the invariant a carried leftover would break.
+        let mut below = epochs;
+        for (i, level) in shape.iter().enumerate() {
+            assert!(
+                level.arities.iter().all(|a| (1..=fan_in).contains(a)),
+                "level {i} has an arity outside 1..={fan_in}: {:?}",
+                level.arities
+            );
+            assert_eq!(
+                level.arities.iter().sum::<usize>(),
+                below,
+                "level {i} must consume exactly the {below} proofs beneath it"
+            );
+            below = level.nodes();
+        }
+        assert_eq!(below, 1, "the tree must close to a single root proof");
+    }
+
+    // A degenerate block is a legal shape, not an error: one epoch is already
+    // the root and the interior is empty.
+    assert!(tree_shape(1, 2).is_empty(), "one epoch needs no interior");
+}

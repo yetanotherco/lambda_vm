@@ -872,3 +872,66 @@ pub fn emit_node(b: &mut LfmBuilder, inputs: &NodeInputs<'_>) {
         }
     }
 }
+
+// ============================ the tree's shape ============================
+
+/// One level of the tree: how many proofs it consumes and how they group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Level {
+    /// Children per node, in order. Every entry is `1..=fan_in`.
+    pub arities: Vec<usize>,
+}
+
+impl Level {
+    /// Proofs this level produces — one per node.
+    pub fn nodes(&self) -> usize {
+        self.arities.len()
+    }
+}
+
+/// The whole tree's shape, derived from the epoch count and an arity.
+///
+/// # The leftover rule: WRAP, do not carry
+///
+/// A level with an odd count leaves one proof over. Two ways, and the choice
+/// changes the PROGRAM SET rather than the code:
+///
+/// - **carry** it up unwrapped ⇒ its parent has children from two different
+///   levels, so two different `program_id`s and two different shapes. A node
+///   embeds each child's id as an emit-time constant, so every such parent is a
+///   distinct program — and the VERIFIER must emit each one too.
+/// - **wrap** it in an arity-1 node ⇒ one extra proof per odd level, and every
+///   parent's children stay homogeneous: one program per `(level, arity)`.
+///
+/// ⇒ This wraps. Program-set growth lands on both sides of the protocol and is
+/// combinatorial; the extra proofs are bounded and countable (three at 36
+/// epochs, fan-in 2). ⚠ Revisit if a node prove is ever measured to dominate
+/// program emission — the trade is real, and it is recorded rather than assumed.
+///
+/// ⓘ The ROOT is not described here. It takes `fan_in + 1` children — the global
+/// wrap is the extra — performs the L2G compare and the attestation fold, and
+/// publishes the block artifact's schema rather than the node schema. This
+/// function describes the interior.
+pub fn tree_shape(epochs: usize, fan_in: usize) -> Vec<Level> {
+    assert!(epochs >= 1, "a block has at least one epoch");
+    assert!(fan_in >= 2, "a tree needs an arity of at least two");
+    let mut levels = Vec::new();
+    let mut n = epochs;
+    while n > 1 {
+        let mut arities = Vec::with_capacity(n.div_ceil(fan_in));
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(fan_in);
+            arities.push(take);
+            left -= take;
+        }
+        n = arities.len();
+        levels.push(Level { arities });
+    }
+    levels
+}
+
+/// Total aggregator proofs the interior costs — one per node, every level.
+pub fn tree_node_count(shape: &[Level]) -> usize {
+    shape.iter().map(Level::nodes).sum()
+}
