@@ -791,16 +791,32 @@ mod keccak_tests {
     /// keeps the counts**. The concrete case: changing the first `BusValue` of the
     /// "Rho: ARE_BYTES range checks on rot_left + rot_right" pair from
     /// `cols::rot_left` to `cols::rot_right` leaves 1031/1480/140 untouched, is
-    /// still satisfied by every honest trace (so prove+verify passes), and makes
-    /// the ρ output forgeable.
+    /// satisfied by every honest trace, and makes the ρ output forgeable.
     ///
-    /// Nothing else in the tree would object. In particular the QF-BV gate in
-    /// `formal_verification/keccak/` cannot: it carries byte-ness as the *width* of
-    /// its bitvectors, so it prints `VERIFIED` either way — see its README,
-    /// discipline 1. `witness_fullchip.py` there exhibits the forgery as a
-    /// complete, reachable round with zero constraint violations, every lookup
-    /// matching, and one to three output lanes differing from FIPS-202 — exactly
-    /// the lanes χ can reach from the forged source.
+    /// It does not survive a full prove, and this test does not claim otherwise:
+    /// `AreBytes` demand is recorded from the trace builder's operation list by
+    /// `bitwise::update_multiplicities`, independently of `bus_interactions()`, so
+    /// the sends move to `(rot_right, rot_right)` while the demand stays
+    /// `(rot_left, rot_right)` and the LogUp bus stops balancing. What this test
+    /// buys is the difference between 0.01 s naming the wiring and ~13 minutes of
+    /// `LogUp bus does not balance` in the prove tests.
+    ///
+    /// The QF-BV gate in `formal_verification/keccak/` cannot object at all: it
+    /// carries byte-ness as the *width* of its bitvectors, so it prints `VERIFIED`
+    /// either way — see its README, discipline 1. `witness_fullchip.py` there
+    /// exhibits the forgery as a complete, reachable round with zero constraint
+    /// violations, every lookup matching, and one to three output lanes differing
+    /// from FIPS-202 — exactly the lanes χ can reach from the forged source.
+    ///
+    /// What these digests do NOT cover is the row DOMAIN of each emit:
+    /// `CaptureBuilder::emit_base_rows` ignores its `RowDomain`, `ConstraintProgram`
+    /// has no field for it, and `meta()` is read here only through `.len()`, so
+    /// switching an emit to `RowDomain::except_last(n)` — a constraint turned off on
+    /// the last rows, which `prover.rs` supports and will happily prove — leaves
+    /// both digests byte-identical. That class is caught by
+    /// `assert_eq!(m.end_exemptions, 0)` in the shared meta loops of
+    /// `constraint_set_tests_{a,b}.rs`, which covers all 27 tables rather than this
+    /// one.
     ///
     /// A failure here is not necessarily a bug: it means the round's wiring or its
     /// constraint bodies changed. Re-run `formal_verification/keccak/` in full
