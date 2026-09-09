@@ -2352,22 +2352,53 @@ mod tests {
     // on the build channel — and a real prove slept for 21 minutes. It must
     // surface as `Err` carrying the panic's own message.
     //
-    // The budget covers the WHOLE call, so a pass alone does not say whether the
-    // guard is healthy. On success this prints, greppable as `[panic-shutdown]`:
+    // ★ TWO bounds, each over the thing it actually guards, because the call
+    // contains two unrelated quantities. Up to the injection is honest proving
+    // work that scales with machine load; after it is the shutdown, which is
+    // the ONLY part this test exists to bound. A single bound over their sum
+    // fires on whichever grows, so it cannot say which did — and a bound loose
+    // enough for the proving half under load is a slack bound on the shutdown.
     //
-    //   [panic-shutdown] total 9.87s = to-panic 8.12s + shutdown 1.75s
-    //                    (3.3% of the 300s budget) OK
+    // Measured (laptop, isolated, one sample): to-panic 16.74 s, shutdown
+    // 0.11 s. The shutdown is 0.7% of the elapsed time, so:
     //
-    // `to-panic` is honest proving work and scales with load; `shutdown` is the
-    // path this guard exists to bound and should stay small whatever the load.
-    // A large `to-panic` with a small `shutdown` is a slow box; a large
-    // `shutdown` is this guard degrading, which is a defect and not a budget
-    // problem. ⚠ libtest captures a PASSING test's output — run the suite with
+    // - PROVE_BUDGET bounds honest work and must clear a loaded box. 1800 s,
+    //   the value the sibling `test_prove_error_mid_pipeline_returns_err` below
+    //   already carries for this same failure mode, chosen there against the
+    //   measurement that the old 300 s "fired while the test was still making
+    //   progress" inside the full `--lib` suite.
+    // - SHUTDOWN_BUDGET bounds the wedge. 30 s is ~270x the observed 0.11 s and
+    //   ~8x a contention-scaled estimate of it (0.11 s x the ~32x available on
+    //   a 32-core box, doubled again for the 41% run-to-run spread seen there),
+    //   while being 10x TIGHTER than the 300 s it replaces. The wedge it
+    //   catches is unbounded — it slept 21 minutes under the CLI — so any
+    //   finite bound catches it and the only cost of tightening is the risk of
+    //   firing on an honest shutdown, which the margin above covers.
+    //
+    // ⇒ Contention can no longer expire the guard, and the guard is an order of
+    // magnitude more sensitive than before. If a loaded run ever reports a
+    // shutdown above a few seconds, raise SHUTDOWN_BUDGET from that measurement
+    // rather than from this comment.
+    //
+    // On success this prints, greppable as `[panic-shutdown]`:
+    //
+    //   [panic-shutdown] total 16.85s = to-panic 16.74s + shutdown 0.11s
+    //                    (0.4% of the 30s shutdown budget) OK
+    //
+    // ⚠ libtest captures a PASSING test's output — run the suite with
     // `-- --show-output` to see these lines without the interleaving that
     // `--nocapture` produces.
     #[test]
     fn test_prover_panic_mid_pipeline_returns_err() {
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+        /// Honest proving up to the injection. Scales with machine load.
+        const PROVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1800);
+        /// From the injection to `prove_continuation` returning: the wedge.
+        const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+        /// Poll grain. The stamp lands on the prover thread, so the only way to
+        /// see it is to look; 100 ms is far below either budget and costs
+        /// nothing next to a prove.
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let started = test_fault::start_clock();
@@ -2381,26 +2412,47 @@ mod tests {
             );
             let _ = done_tx.send(r.map(|_| ()));
         });
-        let result = done_rx.recv_timeout(BUDGET).unwrap_or_else(|_| {
-            // Name which half ran out. The injection either fired (so the
-            // shutdown is what did not finish — the wedge this guards) or it
-            // did not (so the prove never reached epoch 3 inside the budget,
-            // which is contention, not a wedge).
-            match test_fault::panic_fired_after() {
-                Some(t) => panic!(
-                    "prove_continuation wedged: the injected panic fired {:.2}s in and the \
-                     shutdown had not completed {:.2}s later, at the {}s budget",
-                    t.as_secs_f64(),
-                    BUDGET.saturating_sub(t).as_secs_f64(),
-                    BUDGET.as_secs()
+
+        // Whichever budget applies depends on whether the injection has stamped
+        // yet, so the wait is sliced and re-decides each time.
+        let result = loop {
+            match done_rx.recv_timeout(SLICE) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "the prover thread dropped its sender without a result: \
+                     `prove_continuation` panicked instead of returning Err"
                 ),
-                None => panic!(
-                    "prove_continuation did not reach the injection within the {}s budget: the \
-                     prove was still doing honest work, so this is contention, NOT the wedge",
-                    BUDGET.as_secs()
-                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-        });
+            match test_fault::panic_fired_after() {
+                // Stamped: the shutdown is running and IS what this bounds.
+                Some(fired) => {
+                    let in_shutdown = started.elapsed().saturating_sub(fired);
+                    assert!(
+                        in_shutdown <= SHUTDOWN_BUDGET,
+                        "prove_continuation WEDGED: the injected panic fired {:.2}s in and the \
+                         shutdown has not completed {:.2}s later (budget {}s). This is the \
+                         regression this test exists to catch, not a slow box.",
+                        fired.as_secs_f64(),
+                        in_shutdown.as_secs_f64(),
+                        SHUTDOWN_BUDGET.as_secs()
+                    );
+                }
+                // Not stamped: still honest proving, which load can stretch.
+                None => {
+                    let elapsed = started.elapsed();
+                    assert!(
+                        elapsed <= PROVE_BUDGET,
+                        "prove_continuation did not reach the injection at epoch {} within \
+                         {:.0}s: the prove was still doing honest work, so this is contention \
+                         or a hang BEFORE the guard, not the shutdown wedge.",
+                        test_fault::FAIL_INDEX,
+                        PROVE_BUDGET.as_secs_f64()
+                    );
+                }
+            }
+        };
+
         let total = started.elapsed();
         let err = result.expect_err("the injected panic must surface as Err");
         assert!(
@@ -2408,21 +2460,26 @@ mod tests {
             "unexpected error: {err:?}"
         );
 
-        let pct = 100.0 * total.as_secs_f64() / BUDGET.as_secs_f64();
         match test_fault::panic_fired_after() {
-            Some(to_panic) => println!(
-                "[panic-shutdown] total {:.2}s = to-panic {:.2}s + shutdown {:.2}s \
-                 ({pct:.1}% of the {}s budget) {}",
-                total.as_secs_f64(),
-                to_panic.as_secs_f64(),
-                total.saturating_sub(to_panic).as_secs_f64(),
-                BUDGET.as_secs(),
-                if pct >= 50.0 { "MARGINAL" } else { "OK" }
-            ),
-            None => println!(
-                "[panic-shutdown] total {total:?} ({pct:.1}% of the {}s budget) but the \
-                 injection never stamped — the split is unavailable, treat with suspicion",
-                BUDGET.as_secs()
+            Some(to_panic) => {
+                let shutdown = total.saturating_sub(to_panic);
+                let pct = 100.0 * shutdown.as_secs_f64() / SHUTDOWN_BUDGET.as_secs_f64();
+                println!(
+                    "[panic-shutdown] total {:.2}s = to-panic {:.2}s + shutdown {:.2}s \
+                     ({pct:.1}% of the {}s shutdown budget) {}",
+                    total.as_secs_f64(),
+                    to_panic.as_secs_f64(),
+                    shutdown.as_secs_f64(),
+                    SHUTDOWN_BUDGET.as_secs(),
+                    if pct >= 50.0 { "MARGINAL" } else { "OK" }
+                );
+            }
+            // The Err arrived carrying the injected message, so the injection
+            // did run; an unstamped clock here means the stamp itself is broken.
+            None => panic!(
+                "the injected panic surfaced but never stamped the clock after {:.2}s — \
+                 the split timer is broken, not the pipeline",
+                total.as_secs_f64()
             ),
         }
     }
