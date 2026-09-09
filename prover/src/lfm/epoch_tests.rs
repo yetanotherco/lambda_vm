@@ -1492,7 +1492,48 @@ fn epoch_challenge_program(e: &RealEpoch) -> LfmProgram {
 /// arenas and emits no verification, so the spine test's own arena-word count is
 /// untouched.
 pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
-    epoch_program_with(e, with_legs, false)
+    epoch_program_with(e, with_legs, false, Publishes::Diagnostic)
+}
+
+/// Which words [`epoch_program`] publishes.
+///
+/// The wrap's published words are the ONLY thing an aggregation node can read
+/// about it, and a node pays for every one of them: eight hinted halves, four
+/// canonicity guards, four recombinations, thirty-six bytes of statement absorb
+/// and one extension-field inverse in the `LfmPublic` balance — per word, per
+/// child. So what a wrap publishes is the size of the layer above it.
+///
+/// At the production posture the diagnostic set is 10,507 words, of which the
+/// binding set is ≈80. The other ~10,400 have no consumer above: `composition`
+/// is already asserted equal to the claimed Horner INSIDE
+/// `epoch_verify::emit_table_verification`, the DEEP invariants are documented
+/// as exposed for tests, and β/z/γ/ζ/ι are challenges the machine derives for
+/// itself. They are an oracle for this crate's differentials, not a binding, and
+/// a node that hinted them would be paying to re-read numbers it could recompute.
+///
+/// ⚠ [`Publishes::Diagnostic`] is the DEFAULT and every existing gate keeps
+/// exactly the words it had. Dropping the differential surface is a choice made
+/// per emission by the aggregator, never a global one: the differentials against
+/// production's own replay are how this machine is known to derive production's
+/// challenges, and a preset that quietly removed them everywhere would trade the
+/// evidence for the saving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Publishes {
+    /// The shared pair, the attestation id, the block-binding schema, then every
+    /// per-sub-proof diagnostic, then the bus total.
+    Diagnostic,
+    /// The shared pair, the attestation id, the block-binding schema and the bus
+    /// total — nothing per sub-proof. What a wrap feeding an aggregator emits.
+    Aggregation,
+}
+
+/// [`epoch_program`] with the publish set named — the aggregation lever.
+pub(super) fn epoch_program_publishing(
+    e: &RealEpoch,
+    with_legs: bool,
+    publishes: Publishes,
+) -> LfmProgram {
+    epoch_program_with(e, with_legs, false, publishes)
 }
 
 /// The epoch program, optionally with the DECODE cell SPLIT — a deliberately
@@ -1509,7 +1550,12 @@ pub(super) fn epoch_program(e: &RealEpoch, with_legs: bool) -> LfmProgram {
 /// [`the_assembled_verifier_declares_exactly_the_shape_words`] is what refuses it.
 ///
 /// The extra arena is declared LAST so no existing arena index moves.
-fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> LfmProgram {
+fn epoch_program_with(
+    e: &RealEpoch,
+    with_legs: bool,
+    split_decode: bool,
+    publishes: Publishes,
+) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -1760,6 +1806,51 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
         b.public(id[1]);
     }
 
+    // ---- ★ THE BLOCK-BINDING SCHEMA, published right after the attestation id
+    //
+    // An aggregation node over these wraps sees exactly two things about a child:
+    // its `program_id`, which is an emit-time CONSTANT of the parent, and its
+    // PUBLISHED WORDS. Everything below is arena data that the epoch statement or
+    // Phase A already bound, and every one of them is material a node must CHECK
+    // rather than trust — so without these publishes the cross-wrap bindings are
+    // not weak, they are unbuildable.
+    //
+    // In the batched format these were the CARVED schema, published by the carve
+    // rather than by the program. The carve went with the format, so the program
+    // publishes them.
+    //
+    // Publishing costs no soundness, because each is already bound: the register
+    // vectors through the REGISTER preprocessed commitment DERIVED from them
+    // (`PrepSource::Register`), the label and the output halves through
+    // `absorb_epoch_statement`, and the L2G root through Phase A's absorb.
+    //
+    // ⚠ This order IS [`SchemaLayout`]'s, which the aggregator indexes by. A
+    // field inserted in the middle silently re-binds every field below it, so
+    // append here and extend `SchemaLayout` in the same commit.
+    for cell in reg_init.iter().chain(&reg_fini) {
+        b.public(cell.as_cell());
+    }
+    for half in epoch_label {
+        b.public(half.as_cell());
+    }
+    for half in public_output {
+        b.public(half.as_cell());
+    }
+    // ★ The L2G bookend is the LAST sub-proof — `EpochSession::pairs` proves the
+    // VM tables and then pushes `l2g_air`, and the from-proof reconstruction
+    // rebuilds the AIR list the same way. Asserted rather than assumed: publishing
+    // some other sub-proof's root would bind the aggregator's L2G compare to a
+    // table with nothing to do with the global memory argument, and would still
+    // look like a passing gate.
+    assert_eq!(
+        e.tables[n - 1].shape.index,
+        n - 1,
+        "the L2G bookend is the epoch's last sub-proof"
+    );
+    for half in main_cells[n - 1].lanes_flat() {
+        b.public(half.as_cell());
+    }
+
     // ---- one fork per table ----
     let mut contributions: Vec<super::builder::Ext> = Vec::new();
     for (i, h) in e.tables.iter().enumerate() {
@@ -1831,20 +1922,26 @@ fn epoch_program_with(e: &RealEpoch, with_legs: bool, split_decode: bool) -> Lfm
                 },
                 leg_arenas,
             );
-            b.public(out.composition.as_cell());
-            for v in &out.fri_terminal {
-                b.public(v.as_cell());
+            if publishes == Publishes::Diagnostic {
+                b.public(out.composition.as_cell());
+                for v in &out.fri_terminal {
+                    b.public(v.as_cell());
+                }
             }
         }
-        b.public(ch.beta.as_cell());
-        b.public(ch.z.as_cell());
-        b.public(ch.gamma.as_cell());
-        for zeta in &ch.zetas {
-            b.public(zeta.as_cell());
-        }
-        for bits in &ch.iota_bits {
-            let felt = edsl::bits_to_felt(&mut b, bits);
-            b.public(felt.as_cell());
+        if publishes == Publishes::Diagnostic {
+            b.public(ch.beta.as_cell());
+            b.public(ch.z.as_cell());
+            b.public(ch.gamma.as_cell());
+            for zeta in &ch.zetas {
+                b.public(zeta.as_cell());
+            }
+            for bits in &ch.iota_bits {
+                // The recombination is emitted only to be published; under
+                // `Aggregation` it is dead work, so it goes with the publish.
+                let felt = edsl::bits_to_felt(&mut b, bits);
+                b.public(felt.as_cell());
+            }
         }
     }
 
@@ -1890,6 +1987,24 @@ fn epoch_arenas(e: &RealEpoch) -> Vec<Vec<LfmWord>> {
 /// pass: wiring ledger entry 7 moved it from 4 to 6.
 pub(super) fn num_epoch_wide_arenas(e: &RealEpoch) -> usize {
     6 + usize::from(!e.page_commitments.is_empty())
+}
+
+/// How many words [`epoch_program`] publishes for the BLOCK-BINDING SCHEMA — the
+/// run that sits between the attestation id and the first sub-proof's block.
+///
+/// Exposed rather than recomputed at each reader for the reason
+/// [`num_epoch_wide_arenas`] is: a gate that walks the published words by index
+/// starts checking the WRONG field when this changes, and reports a pass. The
+/// aggregator's `SchemaLayout` indexes the same run and must agree with this
+/// number field for field.
+///
+/// The order is the emitter's: register INIT, register FINI, the two epoch-label
+/// halves, the public-output halves, then the L2G re-commit root's lanes.
+pub(super) fn schema_words(e: &RealEpoch) -> usize {
+    2 * crate::tables::register::NUM_REGISTER_ADDRESSES
+        + 2
+        + e.statement.public_output_len.div_ceil(4)
+        + super::proof_arena::lanes_per_root()
 }
 
 /// The arenas [`epoch_program`] declares, in the same order.
@@ -2039,7 +2154,19 @@ fn the_epoch_challenge_spine_matches_production() {
          `program_id_from_digest` over the same inputs"
     );
 
-    let mut cursor = 4usize;
+    // The pair, the two attestation-id words, then the BLOCK-BINDING SCHEMA —
+    // skipped by NAME, never by a literal.
+    //
+    // ⚠ `epoch_challenge_program` is `epoch_program(e, false)`, the SAME emitter
+    // with the legs off — the doc on `epoch_program` says so, and says why: a
+    // second copy of the spine would be a place for the assembled verifier's
+    // Fiat-Shamir to drift from the one this test checks. So every publish the
+    // assembled verifier gained, this spine gained too. A literal 4 here read
+    // register INIT slot 0 as `beta of table 0`, and since x0 is hard-wired zero
+    // the failure printed an all-zero challenge — which reads like a challenge
+    // that was never derived rather than like a cursor pointing at the wrong
+    // field.
+    let mut cursor = 4 + schema_words(&e);
     let mut multi_row_ood = 0;
     for (i, h) in e.tables.iter().enumerate() {
         assert_eq!(pub_ext(cursor), h.beta, "beta of table {i}");
@@ -2295,7 +2422,7 @@ fn the_assembled_verifier_declares_exactly_the_shape_words() {
 
     // Positive control on the guard itself: the split-cell control program DOES
     // declare a surplus word, and this is the comparison that sees it.
-    let split = epoch_program_with(&e, false, true);
+    let split = epoch_program_with(&e, false, true, Publishes::Diagnostic);
     let split_declared: usize = split.arena_schema.lens.iter().map(|l| *l as usize).sum();
     assert_eq!(
         split_declared,
@@ -2345,7 +2472,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     );
 
     // ---- (a) the SPLIT program: the forgery runs and publishes the forged id.
-    let split = epoch_program_with(&e, false, true);
+    let split = epoch_program_with(&e, false, true, Publishes::Diagnostic);
     let mut split_arenas = honest.clone();
     split_arenas.push(super::proof_arena::commitments_to_arena(&[substituted]));
     let exec = execute(&split, &split_arenas, &crate::hash_pin::BLOCK_HASHER).expect(

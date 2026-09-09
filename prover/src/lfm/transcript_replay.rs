@@ -786,10 +786,41 @@ impl TranscriptReplay {
     /// `nbits ≤ 32` keeps the answer inside the candidate's low half. The bound
     /// is real rather than defensive: FRI query indices are bounded by the LDE
     /// domain, which is ≤ 2^25 here.
+    ///
+    /// ## `nbits = 0` is legal, and it still CONSUMES
+    ///
+    /// A one-row trace at blowup 2 has a two-leaf LDE, so `sample_query_indexes`
+    /// calls `sample_u64(domain_size >> 1)` = `sample_u64(1)`: one pair, one
+    /// index, and that index is 0. Production does not skip the draw for it.
+    ///
+    /// - `DefaultTranscript::sample_u64` computes
+    ///   `threshold = 1u64.wrapping_neg() % 1 = 0`, so the loop calls
+    ///   `next_sample_u64()` ONCE — advancing `out_pos` by eight — and returns
+    ///   `candidate % 1 = 0`.
+    /// - `AlgebraicTranscript::sample_u64`, the PINNED path, squeezes a cell and
+    ///   then masks: `squeeze_cell()`, then `canonical(c[0]) & (upper_bound − 1)`.
+    ///   The squeeze happens first and unconditionally; `& 0` is what yields 0.
+    ///
+    /// So an emitter that skipped the draw would be one squeeze short of the host
+    /// for that table, and every challenge after it in that fork would diverge.
+    /// Both arms below already consume BEFORE reading `nbits` —
+    /// `SpongeVar::squeeze_bits` calls `squeeze_cell` first, and the byte arm
+    /// calls `next_candidate` first — so zero bits needs no special case beyond
+    /// letting it through. The resulting `bit_dec(_, 0)` is a well-formed row
+    /// that exposes no bits; it is left unspecial-cased on purpose, because the
+    /// smallest correct change is the right one in a Fiat–Shamir file.
+    ///
+    /// ⚠ A desync here is INVISIBLE to a value differential on the table itself:
+    /// every index is 0 whether the draw happened or not, and `iota_bits` is the
+    /// last thing `epoch::emit_table_challenges` samples, so nothing downstream
+    /// in that fork would disagree either. The gate that holds this is
+    /// `per_table_aggregator_tests::a_zero_bit_query_draw_consumes_what_the_host_does`,
+    /// which samples an extension element AFTER the zero-bit draw on both sides —
+    /// the only place the missing squeeze shows up.
     pub fn sample_u64_pow2(&mut self, b: &mut LfmBuilder, nbits: usize) -> Vec<Bit> {
         assert!(
-            (1..=32).contains(&nbits),
-            "sample_u64_pow2: nbits must be in 1..=32, got {nbits} — above 32 the \
+            nbits <= 32,
+            "sample_u64_pow2: nbits must be at most 32, got {nbits} — above 32 the \
              answer would span both halves of the candidate"
         );
         let Some(h) = b.wrap_hash().byte_hash() else {

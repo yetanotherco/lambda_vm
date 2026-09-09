@@ -1510,8 +1510,17 @@ fn transcript_replay_cell_counts() {
 
 // ------------------------- emitter-contract guards -------------------------
 
+/// The UPPER bound only. There is no lower bound any more: `nbits = 0` is legal
+/// (a one-row trace at blowup 2 has a two-leaf LDE, one query index, and that
+/// index is 0), and that the emitter still CONSUMES a draw for it is pinned by
+/// `per_table_aggregator_tests::a_zero_bit_query_draw_consumes_what_the_host_does`.
+///
+/// ⚠ The expected string names "at most 32" deliberately. A substring loose
+/// enough to match any assert in this function would pass on a reintroduced
+/// lower bound as readily as on this one, which is the failure mode this test
+/// exists to catch.
 #[test]
-#[should_panic(expected = "nbits must be in 1..=32")]
+#[should_panic(expected = "nbits must be at most 32")]
 fn sample_u64_pow2_rejects_more_than_32_bits() {
     use super::transcript_replay::TranscriptReplay;
     let mut b = super::builder::LfmBuilder::new();
