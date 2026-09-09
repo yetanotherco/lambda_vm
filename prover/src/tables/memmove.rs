@@ -43,7 +43,7 @@
 //! therefore walk one-byte rows until `dst` is eight-aligned and take eight-byte rows
 //! through the body, which keeps those rows in MEMW_A rather than MEMW.
 //!
-//! ## Columns (38)
+//! ## Columns (39)
 //!
 //! - `timestamp` DWordWL (2), `src` DWordWL (2), `src_incr` DWordHL (4)
 //! - `dst` DWordWL (2) — for `commit` this is the COMMIT-domain address, i.e. the
@@ -53,8 +53,9 @@
 //! - `is_set`, `is_commit` — the decoded functionality
 //! - `lt8` — `count < 8`, pinned by the ALU
 //! - `f_ncommit = first * (1 - is_commit)`, `mu_ram = (mu - end) * (1 - is_commit)`,
-//!   `mu_com = (mu - end) * is_commit` — multiplicities are strictly linear in this
-//!   framework, so each op-specific gate needs a column and a degree-2 constraint.
+//!   `mu_com = (mu - end) * is_commit`, `mu_com_wide = mu_com * (1 - tail)` —
+//!   multiplicities are strictly linear in this framework, so each op-specific gate
+//!   needs a column and a degree-2 constraint.
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
