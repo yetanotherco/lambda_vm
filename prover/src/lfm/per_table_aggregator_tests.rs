@@ -1676,6 +1676,36 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
     );
 }
 
+/// Both memory numbers at once — `(VmRSS, VmHWM)` in GiB, live and high-water.
+///
+/// ⚠ `VmHWM` alone cannot see a TROUGH, and the trough is half the model. A
+/// high-water mark only rises, so a mark taken after a phase reports the largest
+/// the process has EVER been, not what that phase left resident. That difference
+/// decides whether the next phase's peak is `live + its own working set` or is
+/// hidden under an earlier phase's mark entirely — and on this workload the two
+/// diverge hard: box A measured `VmHWM` static at 72.50 GiB while `VmRSS`
+/// oscillated between 19.98 and 58.13.
+///
+/// A `ps` sample of the LIVE figure once reached this lane as if it were a
+/// high-water mark, and every derivation built on it was wrong by the gap
+/// between them. Both are printed so that cannot recur.
+fn rss_marks() -> (Option<f64>, Option<f64>) {
+    let read = |key: &str| -> Option<f64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with(key))?;
+        let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb / (1024.0 * 1024.0))
+    };
+    (read("VmRSS:"), read("VmHWM:"))
+}
+
+/// One labelled mark: `live` is what the next phase carries in, `high-water` is
+/// what the process has ever held.
+fn mark(label: &str) {
+    let (rss, hwm) = rss_marks();
+    println!("   MARK {label}: live {rss:?} GiB / high-water {hwm:?} GiB");
+}
+
 /// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
 ///
 /// Everything measured so far is FIXTURE scale, where a node's children are
