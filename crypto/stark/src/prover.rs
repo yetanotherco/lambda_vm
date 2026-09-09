@@ -724,18 +724,58 @@ pub fn storage_estimate_parallelism() -> usize {
     }
 }
 
-/// Byte-budget admission gate for concurrently proven tables. `acquire`
-/// blocks until the requested bytes fit under the budget, releasing on
-/// permit drop. An oversized request is admitted alone (when nothing else
-/// holds bytes), so tables larger than the whole budget still prove.
+/// Byte-budget admission gate for concurrently proven tables — **one per
+/// process**. `acquire` blocks until the requested bytes fit under the budget,
+/// releasing on permit drop.
 ///
 /// Only OS driver threads block here (see `run_admitted`) — never rayon
-/// workers, whose pool the admitted tables use internally and which a
-/// blocked worker would starve.
+/// workers, whose pool the admitted tables use internally and which a blocked
+/// worker would starve.
+///
+/// # ★ Why the gate is process-wide and not per-`multi_prove`
+///
+/// There is one card, so there is one budget. A gate built per `multi_prove`
+/// bounds only the tables of THAT call, and the prover has run two calls at
+/// once: the continuation used to prove the cross-epoch global memory argument
+/// on its own scoped thread so it would overlap the tail epochs. Each call
+/// built its own gate from the whole device budget, so the enforced ceiling on
+/// the card was twice the budget with nothing summing the two halves.
+///
+/// Measured on an RTX 5090 (32,607 MiB, 31.40 GiB driver-visible), block
+/// 25368371 at 2^21 / blowup 4, 2026-09-09: the same configuration aborted on
+/// one run and finished on the next at a peak of 32,056 MiB = 98.3% of the
+/// card. In the run that finished, the overlap landed on epoch 15 — one of the
+/// LIGHTEST epochs, rounds walk sum 38.97 against a 19-epoch mean of 42.74 —
+/// and still added 10,356 MiB over that epoch's solo peak. Had it landed on
+/// epoch 6 instead, the same addition puts the card at 116% of itself.
+///
+/// Serialising the two proves removed that particular pair, and this gate is
+/// what makes the overrun unrepresentable rather than merely absent: any
+/// future overlap is bounded by construction instead of by whoever remembers
+/// the coupling.
+///
+/// # An oversized request, and why it announces itself
+///
+/// A request larger than the whole budget is admitted ALONE, which is what
+/// lets a table bigger than the budget prove at all. Shared, "alone" means the
+/// whole process is idle — so such a waiter registers in `draining` and
+/// ordinary requests queue behind it. Without that, a steady stream of small
+/// tables from a sibling prove could hold `used > 0` indefinitely and the
+/// oversized table would never start. `run_admitted` acquires exactly once per
+/// table and holds nothing else while it waits, so the queue always drains.
 struct VramGate {
-    used: std::sync::Mutex<u64>,
+    state: std::sync::Mutex<GateState>,
     freed: std::sync::Condvar,
     budget: u64,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// Bytes admitted and not yet released.
+    used: u64,
+    /// Oversized requests waiting for the process to drain. While this is
+    /// non-zero, no ordinary request is admitted, so `used` reaches 0.
+    draining: usize,
 }
 
 struct VramPermit<'a> {
@@ -743,32 +783,69 @@ struct VramPermit<'a> {
     bytes: u64,
 }
 
+/// The process's gate. The budget is [`Backend::vram_sched_budget_bytes`] —
+/// deliberately NOT the dispatch layer's admission ceiling; the doc on
+/// `math_cuda::device::detect_vram_sched_budget_bytes` carries the reason the
+/// two numbers must stay apart. `u64::MAX` on non-cuda builds and whenever the
+/// budget cannot be queried, which makes the gate inert and leaves concurrency
+/// bounded by `k` alone.
+fn vram_gate() -> &'static VramGate {
+    static GATE: std::sync::OnceLock<VramGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        // Both arms read a process constant: `backend()` caches the `Backend`
+        // in a `OnceLock` and the budget is detected once inside it, so the
+        // gate's budget is the same number every caller would have computed.
+        #[cfg(feature = "cuda")]
+        let budget = math_cuda::device::backend()
+            .map(|b| b.vram_sched_budget_bytes())
+            .unwrap_or(u64::MAX);
+        #[cfg(not(feature = "cuda"))]
+        let budget = u64::MAX;
+        VramGate::new(budget)
+    })
+}
+
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
-            used: std::sync::Mutex::new(0),
+            state: std::sync::Mutex::new(GateState::default()),
             freed: std::sync::Condvar::new(),
             budget,
         }
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
-        let mut used = self.used.lock().unwrap();
+        let oversized = bytes > self.budget;
+        let mut state = self.state.lock().unwrap();
+        if oversized {
+            state.draining += 1;
+        }
         loop {
-            if *used == 0 || used.saturating_add(bytes) <= self.budget {
-                *used = used.saturating_add(bytes);
+            let admissible = if oversized {
+                // It cannot fit beside anything, so it waits for an idle card.
+                state.used == 0
+            } else {
+                // Queue behind any oversized waiter so that waiter is
+                // guaranteed to see an idle card.
+                state.draining == 0 && state.used.saturating_add(bytes) <= self.budget
+            };
+            if admissible {
+                state.used = state.used.saturating_add(bytes);
+                if oversized {
+                    state.draining -= 1;
+                }
                 return VramPermit { gate: self, bytes };
             }
-            used = self.freed.wait(used).unwrap();
+            state = self.freed.wait(state).unwrap();
         }
     }
 }
 
 impl Drop for VramPermit<'_> {
     fn drop(&mut self) {
-        let mut used = self.gate.used.lock().unwrap();
-        *used = used.saturating_sub(self.bytes);
-        drop(used);
+        let mut state = self.gate.state.lock().unwrap();
+        state.used = state.used.saturating_sub(self.bytes);
+        drop(state);
         self.gate.freed.notify_all();
     }
 }
@@ -3791,18 +3868,6 @@ pub trait IsStarkProver<
 
         let k = table_parallelism(num_airs);
 
-        // VRAM budgeted admission. The budget caps the summed device working set
-        // of the tables proved concurrently so large blocks don't exhaust VRAM.
-        // It is an extra ceiling on top of `k` (it never raises concurrency). On
-        // non-cuda builds, or when the budget can't be queried, it is `u64::MAX`
-        // and the gate is inert — concurrency is then bounded by `k` alone.
-        #[cfg(feature = "cuda")]
-        let vram_budget = math_cuda::device::backend()
-            .map(|b| b.vram_budget_bytes())
-            .unwrap_or(u64::MAX);
-        #[cfg(not(feature = "cuda"))]
-        let vram_budget = u64::MAX;
-
         // NOTE: an earlier revision published prove-wide pinned-staging size
         // hints here so worker slabs allocated once at final size. Measured on
         // a 5090 it BACKFIRED: every worker slot then pays a max-size
@@ -3811,7 +3876,13 @@ pub trait IsStarkProver<
         // don't re-add pre-sizing without a shared-slab design that bounds the
         // number of allocations.
 
-        let vram_gate = VramGate::new(vram_budget);
+        // VRAM budgeted admission. The budget caps the summed device working
+        // set of the tables proved concurrently so large blocks don't exhaust
+        // VRAM. It is an extra ceiling on top of `k` (it never raises
+        // concurrency). ★ The gate is the PROCESS's, not this call's: there is
+        // one card, and two `multi_prove` calls have run at once — see
+        // [`VramGate`] for the measurement that cost.
+        let vram_gate = vram_gate();
 
         // The shapes the AIR and the domain fix, read once: the device-set
         // estimates the gate admits against derive from them
@@ -3915,7 +3986,7 @@ pub trait IsStarkProver<
         let main_results = run_admitted(
             &main_walk_order,
             &main_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             |idx| table_names[idx].clone(),
             |idx| {
@@ -4470,7 +4541,7 @@ pub trait IsStarkProver<
         let table_results = run_admitted(
             &peak_order,
             &peak_estimates,
-            &vram_gate,
+            vram_gate,
             k,
             |idx| table_names[idx].clone(),
             |idx| {
@@ -4487,7 +4558,7 @@ pub trait IsStarkProver<
             let aux_outs = run_admitted(
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 |idx| table_names[idx].clone(),
                 aux_stage,
@@ -4516,7 +4587,7 @@ pub trait IsStarkProver<
             run_admitted(
                 &peak_order,
                 &peak_estimates,
-                &vram_gate,
+                vram_gate,
                 k,
                 |idx| table_names[idx].clone(),
                 |idx| {
@@ -5256,6 +5327,107 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod vram_gate_tests {
+    use super::VramGate;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The sum of the permits alive at once never exceeds the budget. This is
+    /// the property the per-`multi_prove` gate could not offer once two calls
+    /// ran at once: each bounded its own half and nothing bounded the card.
+    #[test]
+    fn the_admitted_sum_stays_under_budget() {
+        let gate = VramGate::new(100);
+        let a = gate.acquire(60);
+        {
+            let _b = gate.acquire(40);
+            assert_eq!(gate.state.lock().unwrap().used, 100);
+        }
+        assert_eq!(gate.state.lock().unwrap().used, 60);
+        drop(a);
+        assert_eq!(gate.state.lock().unwrap().used, 0);
+    }
+
+    /// A request larger than the whole budget still proves: it is admitted
+    /// alone once the card is idle.
+    #[test]
+    fn an_oversized_request_is_admitted_alone() {
+        let gate = VramGate::new(100);
+        let big = gate.acquire(250);
+        assert_eq!(gate.state.lock().unwrap().used, 250);
+        drop(big);
+        assert_eq!(gate.state.lock().unwrap().used, 0);
+    }
+
+    /// ★ The reason the oversized waiter announces itself. Shared across
+    /// proves, "alone" means an idle process, so a steady stream of small
+    /// tables from a sibling would starve it forever. While it waits, ordinary
+    /// requests queue behind it — so the small table below is NOT admitted
+    /// even though it fits, and the oversized one gets its turn.
+    #[test]
+    fn a_draining_waiter_is_not_starved_by_small_requests() {
+        let gate = Arc::new(VramGate::new(100));
+        // Something in flight, so the oversized request has to wait.
+        let held = gate.acquire(10);
+
+        let g = Arc::clone(&gate);
+        let oversized = std::thread::spawn(move || {
+            let permit = g.acquire(250);
+            let used = permit.gate.state.lock().unwrap().used;
+            drop(permit);
+            used
+        });
+
+        // Wait for it to register, rather than racing it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.state.lock().unwrap().draining == 0 {
+            assert!(Instant::now() < deadline, "the waiter never registered");
+            std::thread::yield_now();
+        }
+
+        // A small request that FITS (10 + 20 <= 100) is refused while the
+        // drain is pending: without this the oversized waiter never starts.
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let g = Arc::clone(&gate);
+        let flag = Arc::clone(&admitted);
+        let small = std::thread::spawn(move || {
+            let permit = g.acquire(20);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(permit);
+        });
+        std::thread::yield_now();
+        assert_eq!(
+            gate.state.lock().unwrap().used,
+            10,
+            "a small request jumped the drain"
+        );
+        assert!(
+            !admitted.load(std::sync::atomic::Ordering::SeqCst),
+            "a small request jumped the drain"
+        );
+
+        drop(held);
+        // The oversized request had the card to itself.
+        assert_eq!(oversized.join().unwrap(), 250);
+        // And the small one is not lost — it runs once the drain clears.
+        small.join().unwrap();
+        assert!(admitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(gate.state.lock().unwrap().used, 0);
+    }
+
+    /// An unqueryable budget (`u64::MAX`) leaves the gate inert, so a non-cuda
+    /// build's concurrency is bounded by `k` alone.
+    #[test]
+    fn an_unset_budget_makes_the_gate_inert() {
+        let gate = VramGate::new(u64::MAX);
+        let _a = gate.acquire(u64::MAX / 2);
+        let _b = gate.acquire(u64::MAX / 2);
+        let _c = gate.acquire(u64::MAX / 2);
+        assert_eq!(gate.state.lock().unwrap().draining, 0);
     }
 }
 

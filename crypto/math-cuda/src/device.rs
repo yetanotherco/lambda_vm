@@ -163,6 +163,11 @@ pub struct Backend {
     /// VRAM budget (bytes) for table-session admission control. See
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
+    /// VRAM budget (bytes) the per-table SCHEDULER throttles its summed
+    /// working set against. Deliberately a SEPARATE, smaller number than
+    /// `vram_budget_bytes` — see [`detect_vram_sched_budget_bytes`] for why
+    /// re-merging the two breaks large epochs.
+    vram_sched_budget_bytes: u64,
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
@@ -389,7 +394,26 @@ fn retain_default_mempool(ctx: &CudaContext) {
     );
 }
 
-/// Device VRAM budget in bytes for table session admission control.
+/// Total device memory in bytes, or `None` when the query fails.
+fn device_total_bytes(ctx: &CudaContext) -> Option<u64> {
+    use cudarc::driver::sys;
+    // SAFETY: raw driver query writing into two stack slots. The caller's
+    // context is already current (it was just created in `init`). Any error
+    // falls through to `None`, which the callers turn into the
+    // budgeting-disabled sentinel.
+    unsafe {
+        let _ = ctx;
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+            .result()
+            .ok()?;
+        Some(total as u64)
+    }
+}
+
+/// Device VRAM budget in bytes for table session admission control: the
+/// ceiling [`crate::device`]'s callers ask ONE allocation against.
 ///
 /// LAMBDA_VM_VRAM_BUDGET_MB overrides it (used to force the throttle in tests).
 /// Otherwise it is 80% of total device memory, leaving headroom for the
@@ -402,22 +426,56 @@ fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
     {
         return mb.saturating_mul(1024 * 1024);
     }
-    use cudarc::driver::sys;
-    // SAFETY: raw driver query writing into two stack slots. The caller's
-    // context is already current (it was just created in `init`). Any error
-    // falls through to the budgeting-disabled sentinel.
-    unsafe {
-        let _ = ctx;
-        let mut free: usize = 0;
-        let mut total: usize = 0;
-        if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
-            .result()
-            .is_err()
-        {
-            return u64::MAX;
-        }
+    match device_total_bytes(ctx) {
         // 80% of total, computed to avoid intermediate overflow.
-        (total as u64) / 5 * 4
+        Some(total) => total / 5 * 4,
+        None => u64::MAX,
+    }
+}
+
+/// The env override for [`detect_vram_sched_budget_bytes`].
+pub const VRAM_SCHED_ENV: &str = "LAMBDA_VM_VRAM_SCHED_MB";
+
+/// The scheduler's share of total device memory, in twentieths: 65%.
+const VRAM_SCHED_NUMERATOR: u64 = 13;
+const VRAM_SCHED_DENOMINATOR: u64 = 20;
+
+/// Device VRAM budget in bytes the per-table SCHEDULER throttles the SUMMED
+/// working set of concurrently proven tables against
+/// (`stark::prover::VramGate`).
+///
+/// LAMBDA_VM_VRAM_SCHED_MB overrides it; otherwise 65% of total device memory.
+/// `u64::MAX` on a query failure, which makes the throttle inert.
+///
+/// # ⛔ Why this is NOT [`detect_vram_budget_bytes`]
+///
+/// The two numbers answer different questions and were measured apart:
+///
+/// - the ADMISSION ceiling (80%) asks whether ONE table fits the card at all.
+///   It is also, in the dispatch layer, what decides whether a table is
+///   device-only, so a table above it is DECLINED — and a declined device-only
+///   table aborts the prove rather than falling back to the host;
+/// - this SCHEDULER budget (65%) bounds the SUM of the tables in flight. It
+///   must leave room for what no per-table estimate carries: the ~15% of the
+///   card that is resident between epochs (measured 4,528–6,392 MiB of 32,607
+///   on an RTX 5090, 2026-09-09), and the round-1 commits that stay device-
+///   resident past their own admission.
+///
+/// ⚠ They were ONE number, and that coupling is a trap: lowering it far enough
+/// to bound the sum also lowers the ceiling below the largest single table, at
+/// which point that table is declined and the prove aborts. On the measured
+/// block the largest table at 2^22 sizes at ~18.3 GiB, so a coupled budget
+/// under ~19 GiB makes 2^22 unprovable — while the sum needs bounding at about
+/// 20.5 GiB. There is no single value that does both. Keep them apart.
+fn detect_vram_sched_budget_bytes(ctx: &CudaContext) -> u64 {
+    if let Ok(mb) = std::env::var(VRAM_SCHED_ENV)
+        && let Ok(mb) = mb.parse::<u64>()
+    {
+        return mb.saturating_mul(1024 * 1024);
+    }
+    match device_total_bytes(ctx) {
+        Some(total) => total / VRAM_SCHED_DENOMINATOR * VRAM_SCHED_NUMERATOR,
+        None => u64::MAX,
     }
 }
 
@@ -504,6 +562,7 @@ impl Backend {
         let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
 
         let vram_budget_bytes = detect_vram_budget_bytes(&ctx);
+        let vram_sched_budget_bytes = detect_vram_sched_budget_bytes(&ctx);
 
         Ok(Self {
             vector_add_u64: arith.load_function("vector_add_u64")?,
@@ -624,6 +683,7 @@ impl Backend {
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
+            vram_sched_budget_bytes,
         })
     }
 
@@ -631,6 +691,14 @@ impl Backend {
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
+    }
+
+    /// VRAM budget in bytes for the per-table scheduler's summed working set.
+    /// `u64::MAX` when budgeting is disabled (query failed). This is NOT
+    /// [`Backend::vram_budget_bytes`] — see
+    /// [`detect_vram_sched_budget_bytes`] for why the two must stay apart.
+    pub fn vram_sched_budget_bytes(&self) -> u64 {
+        self.vram_sched_budget_bytes
     }
 
     /// Live `(free, total)` device memory in bytes, for diagnostics — the
