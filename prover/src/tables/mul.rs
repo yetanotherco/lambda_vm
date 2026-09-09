@@ -25,24 +25,27 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for sign extraction)
-//! - Sender: IS_HALF (×8 for lo/hi range checks)
+//! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
 //! - Sender: IS_B20 (×4 for carry range checks)
-//! - Receiver: MUL (×2 for lo and hi results)
+//! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
+//!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
+
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::trace::TraceTable;
 
 use std::collections::HashMap;
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
-use stark::trace::TraceTable;
-
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
+    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
+
+/// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
+/// range-check sends so they fire once per row-instance.
+fn row_mult() -> Multiplicity {
+    Multiplicity::Sum(cols::MU_LO, cols::MU_HI)
+}
 
 // =========================================================================
 // Column indices for MUL table
@@ -112,10 +115,11 @@ pub mod cols {
     /// raw_product[3]: Intermediate convolution value
     pub const RAW_PRODUCT_3: usize = 23;
 
-    // Multiplicity columns
-    /// μ_lo: multiplicity for lo result lookups
+    // Multiplicity columns. All MUL lookups (CPU MUL/MULH dispatch and dvrm's
+    // internal `d*q` consistency checks) go through the unified `ALU` bus.
+    /// μ_lo: `ALU` bus multiplicity for lo result lookups
     pub const MU_LO: usize = 24;
-    /// μ_hi: multiplicity for hi result lookups
+    /// μ_hi: `ALU` bus multiplicity for hi result lookups
     pub const MU_HI: usize = 25;
 
     /// Total number of columns
@@ -135,6 +139,10 @@ const SIGN_FILL: u64 = 0xFFFF;
 
 /// A single MUL operation to be added to the trace.
 ///
+/// Every operation is dispatched on the unified `ALU` bus (CPU MUL/MULH and
+/// dvrm's internal `d*q` consistency checks); the lo/hi half is selected by
+/// the sender's `flags` byte at lookup time.
+///
 /// Derives Hash and Eq for HashMap-based deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MulOperation {
@@ -148,12 +156,12 @@ pub struct MulOperation {
     pub rhs_signed: bool,
 }
 
-/// Multiplicities for a MUL operation (separate for lo and hi lookups).
+/// Multiplicities for a MUL operation, split by lo/hi result lookup.
 #[derive(Debug, Clone, Default)]
 pub struct MulMultiplicities {
-    /// Count of lookups requesting lo result
+    /// `ALU` bus count requesting lo result
     pub mu_lo: u64,
-    /// Count of lookups requesting hi result
+    /// `ALU` bus count requesting hi result
     pub mu_hi: u64,
 }
 
@@ -297,57 +305,48 @@ pub fn generate_mul_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Compute product
         let (lo, hi) = op.compute_product();
 
         // Fill lhs as DWordHL (4 halfwords)
-        data[base + cols::LHS_0] = FE::from(op.lhs & 0xFFFF);
-        data[base + cols::LHS_1] = FE::from((op.lhs >> 16) & 0xFFFF);
-        data[base + cols::LHS_2] = FE::from((op.lhs >> 32) & 0xFFFF);
-        data[base + cols::LHS_3] = FE::from((op.lhs >> 48) & 0xFFFF);
-        data[base + cols::LHS_SIGNED] = FE::from(op.lhs_signed as u64);
+        table.set_dword_hl(row_idx, cols::LHS_0, op.lhs);
+        table.set_bool(row_idx, cols::LHS_SIGNED, op.lhs_signed);
 
         // Fill rhs as DWordHL (4 halfwords)
-        data[base + cols::RHS_0] = FE::from(op.rhs & 0xFFFF);
-        data[base + cols::RHS_1] = FE::from((op.rhs >> 16) & 0xFFFF);
-        data[base + cols::RHS_2] = FE::from((op.rhs >> 32) & 0xFFFF);
-        data[base + cols::RHS_3] = FE::from((op.rhs >> 48) & 0xFFFF);
-        data[base + cols::RHS_SIGNED] = FE::from(op.rhs_signed as u64);
+        table.set_dword_hl(row_idx, cols::RHS_0, op.rhs);
+        table.set_bool(row_idx, cols::RHS_SIGNED, op.rhs_signed);
 
         // Fill lo as DWordHL (4 halfwords)
-        data[base + cols::LO_0] = FE::from(lo & 0xFFFF);
-        data[base + cols::LO_1] = FE::from((lo >> 16) & 0xFFFF);
-        data[base + cols::LO_2] = FE::from((lo >> 32) & 0xFFFF);
-        data[base + cols::LO_3] = FE::from((lo >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::LO_0, lo);
 
         // Fill hi as DWordHL (4 halfwords)
-        data[base + cols::HI_0] = FE::from(hi & 0xFFFF);
-        data[base + cols::HI_1] = FE::from((hi >> 16) & 0xFFFF);
-        data[base + cols::HI_2] = FE::from((hi >> 32) & 0xFFFF);
-        data[base + cols::HI_3] = FE::from((hi >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::HI_0, hi);
 
         // Fill auxiliary columns
-        data[base + cols::LHS_IS_NEGATIVE] = FE::from(op.lhs_is_negative() as u64);
-        data[base + cols::RHS_IS_NEGATIVE] = FE::from(op.rhs_is_negative() as u64);
+        table.set_bool(row_idx, cols::LHS_IS_NEGATIVE, op.lhs_is_negative());
+        table.set_bool(row_idx, cols::RHS_IS_NEGATIVE, op.rhs_is_negative());
 
         // Fill raw_product columns
         let raw = op.compute_raw_products();
-        data[base + cols::RAW_PRODUCT_0] = FE::from(raw[0]);
-        data[base + cols::RAW_PRODUCT_1] = FE::from(raw[1]);
-        data[base + cols::RAW_PRODUCT_2] = FE::from(raw[2]);
-        data[base + cols::RAW_PRODUCT_3] = FE::from(raw[3]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_0, raw[0]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_1, raw[1]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_2, raw[2]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_3, raw[3]);
 
-        // Fill multiplicities
-        data[base + cols::MU_LO] = FE::from(multiplicities.mu_lo);
-        data[base + cols::MU_HI] = FE::from(multiplicities.mu_hi);
+        // Fill multiplicities (ALU bus, lo/hi)
+        table.set_u64(row_idx, cols::MU_LO, multiplicities.mu_lo);
+        table.set_u64(row_idx, cols::MU_HI, multiplicities.mu_hi);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -358,7 +357,7 @@ pub fn generate_mul_trace(
 ///
 /// The MUL table:
 /// - **Sends** MSB16 lookups for sign bit extraction (×2)
-/// - **Sends** IS_HALF lookups for lo/hi range checks (×8)
+/// - **Sends** IS_HALF lookups for lhs/rhs input and lo/hi output range checks (×16)
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -400,12 +399,37 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
+    // IS_HALF lookups for lhs/rhs INPUT range checks (multiplicity: mu_lo + mu_hi).
+    // The bus binds only the packed 32-bit words, so without these the input
+    // half-limbs are free (non-canonical halves re-packing to the same word).
+    // -------------------------------------------------------------------------
+    for col in [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // -------------------------------------------------------------------------
     // IS_HALF lookups for lo range checks (multiplicity: mu_lo + mu_hi)
     // -------------------------------------------------------------------------
     for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -419,7 +443,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     for col in [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+            row_mult(),
             vec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
@@ -429,7 +453,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)
-    // Carries are virtual columns computed as linear combinations:
+    // Carries are virtual (computed inline) as linear combinations:
     //   carry[0] = 2^-32 * (raw_product[0] - res[0])
     //   carry[i] = 2^-32 * (raw_product[i] + carry[i-1] - res[i])
     // where res = [lo_word0, lo_word1, hi_word0, hi_word1]
@@ -438,7 +462,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -459,7 +483,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * lo[0] - 2^-48 * lo[1] - 2^-32 * lo[2] - 2^-16 * lo[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -493,7 +517,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-32 * hi[0] - 2^-16 * hi[1]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -539,7 +563,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //          - 2^-64 * hi[0] - 2^-48 * hi[1] - 2^-32 * hi[2] - 2^-16 * hi[3]
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        row_mult(),
         vec![BusValue::linear(vec![
             LinearTerm::ColumnUnsigned {
                 coefficient: INV_2_32,
@@ -593,78 +617,62 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MUL receiver for lo result
+    // ALU receivers: every MUL lookup arrives here — CPU
+    // MUL/MULH/MULHSU/MULHU dispatch and dvrm's internal `d*q` consistency.
+    // ALU[lhs, rhs, flags, result] where flags =
+    //   opsel(MUL) + 32*lhs_signed + 64*rhs_signed (+128 for the hi result).
     // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, lo, 0] per spec MUL-C7
+    let mul_flags = |hi: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Constant(alu_op::MUL as i64 + hi),
+            LinearTerm::Column {
+                coefficient: 32,
+                column: cols::LHS_SIGNED,
+            },
+            LinearTerm::Column {
+                coefficient: 64,
+                column: cols::RHS_SIGNED,
+            },
+        ])
+    };
+    // ALU lo (muldiv bit 7 = 0)
     interactions.push(BusInteraction::receiver(
-        BusId::Mul,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_LO),
         vec![
-            // lhs as DWordHL (4 halfwords -> 2 words)
             BusValue::Packed {
                 start_column: cols::LHS_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
             BusValue::Packed {
                 start_column: cols::RHS_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // lo as DWordHL (result)
+            mul_flags(0),
             BusValue::Packed {
                 start_column: cols::LO_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 0 (lo)
-            BusValue::constant(0),
         ],
     ));
-
-    // -------------------------------------------------------------------------
-    // MUL receiver for hi result
-    // -------------------------------------------------------------------------
-    // MUL[lhs, lhs_signed, rhs, rhs_signed, hi, 1] per spec MUL-C8
+    // ALU hi (muldiv bit 7 = 1 => +128)
     interactions.push(BusInteraction::receiver(
-        BusId::Mul,
+        BusId::Alu,
         Multiplicity::Column(cols::MU_HI),
         vec![
-            // lhs as DWordHL
             BusValue::Packed {
                 start_column: cols::LHS_0,
                 packing: Packing::DWordHL,
             },
-            // lhs_signed
-            BusValue::Packed {
-                start_column: cols::LHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // rhs as DWordHL
             BusValue::Packed {
                 start_column: cols::RHS_0,
                 packing: Packing::DWordHL,
             },
-            // rhs_signed
-            BusValue::Packed {
-                start_column: cols::RHS_SIGNED,
-                packing: Packing::Direct,
-            },
-            // hi as DWordHL (result)
+            mul_flags(128),
             BusValue::Packed {
                 start_column: cols::HI_0,
                 packing: Packing::DWordHL,
             },
-            // muldiv_selector = 1 (hi)
-            BusValue::constant(1),
         ],
     ));
 
@@ -672,143 +680,101 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..8:
+//   0: SignedIsBit(LHS_SIGNED)  1: SignedIsBit(RHS_SIGNED)
+//   2: LhsSign                  3: RhsSign
+//   4..8: RawProduct(0..4)
 
-/// MUL table constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum MulConstraintKind {
-    /// SIGN constraint for lhs: (1 - lhs_signed) * lhs_is_negative = 0
-    LhsSign,
-    /// SIGN constraint for rhs: (1 - rhs_signed) * rhs_is_negative = 0
-    RhsSign,
-    /// Raw product convolution formula for index i
-    RawProduct(usize),
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// MUL table constraint.
-pub struct MulConstraint {
-    constraint_idx: usize,
-    kind: MulConstraintKind,
-}
+/// MUL table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the MUL layout is fixed via `cols`).
+#[derive(Clone, Copy)]
+pub struct MulConstraints;
 
-impl MulConstraint {
-    /// Create a new MUL constraint.
-    pub fn new(kind: MulConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
+impl MulConstraints {
+    /// `x · (1 − x)` IS_BIT check for a sign-flag column.
+    fn signed_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        col: usize,
+    ) -> B::Expr {
+        let x = b.main(0, col);
+        let one = b.one();
+        x.clone() * (one - x)
     }
 
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self.kind {
-            MulConstraintKind::LhsSign => {
-                // (1 - lhs_signed) * lhs_is_negative = 0
-                let lhs_signed = step
-                    .get_main_evaluation_element(0, cols::LHS_SIGNED)
-                    .clone();
-                let lhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &lhs_signed) * &lhs_is_neg
-            }
-            MulConstraintKind::RhsSign => {
-                // (1 - rhs_signed) * rhs_is_negative = 0
-                let rhs_signed = step
-                    .get_main_evaluation_element(0, cols::RHS_SIGNED)
-                    .clone();
-                let rhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &rhs_signed) * &rhs_is_neg
-            }
-            MulConstraintKind::RawProduct(i) => {
-                // raw_product[i] = convolution formula
-                // This requires computing the sign-extended values and convolution
-                self.compute_raw_product_constraint(i, step)
-            }
-        }
-    }
-
-    /// Compute raw_product constraint for index i.
-    ///
-    /// raw_product[i] = Σ_k=0^1 2^(16k) × Σ_j=0^(2i+k) lhs_ext[j] × rhs_ext[2i+k-j]
-    fn compute_raw_product_constraint<F, E>(
-        &self,
+    /// `raw_product[i] − Σ_k 2^(16k)·Σ_j lhs_ext[j]·rhs_ext[idx−j]` (idx = 2i+k).
+    fn raw_product<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
         i: usize,
-        step: &TableView<F, E>,
-    ) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        // Get lhs halfwords
-        let lhs: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::LHS_0).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_1).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_2).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_3).clone(),
+    ) -> B::Expr {
+        let lhs = [
+            b.main(0, cols::LHS_0),
+            b.main(0, cols::LHS_1),
+            b.main(0, cols::LHS_2),
+            b.main(0, cols::LHS_3),
+        ];
+        let rhs = [
+            b.main(0, cols::RHS_0),
+            b.main(0, cols::RHS_1),
+            b.main(0, cols::RHS_2),
+            b.main(0, cols::RHS_3),
+        ];
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+
+        // Sign-extended values: [0..4] = halfwords, [4..8] = sign_fill * is_neg.
+        // Known redundancy: the two sign-fill products are rebuilt in each of
+        // the four raw_product constraints. Hoisting them was tried and showed
+        // no measurable speedup (ABBA), so the body keeps the declarative form.
+        let sign_fill = b.const_base(SIGN_FILL);
+        let lhs_hi = sign_fill.clone() * lhs_is_neg;
+        let rhs_hi = sign_fill * rhs_is_neg;
+        let lhs_ext: [B::Expr; 8] = [
+            lhs[0].clone(),
+            lhs[1].clone(),
+            lhs[2].clone(),
+            lhs[3].clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi,
+        ];
+        let rhs_ext: [B::Expr; 8] = [
+            rhs[0].clone(),
+            rhs[1].clone(),
+            rhs[2].clone(),
+            rhs[3].clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi,
         ];
 
-        // Get rhs halfwords
-        let rhs: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::RHS_0).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_1).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_2).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_3).clone(),
-        ];
-
-        // Get sign bits
-        let lhs_is_neg = step
-            .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
-            .clone();
-        let rhs_is_neg = step
-            .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
-            .clone();
-
-        // Build sign-extended values
-        let sign_fill = FieldElement::<F>::from(SIGN_FILL);
-        let mut lhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-        let mut rhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-
-        lhs_ext[..4].clone_from_slice(&lhs);
-        rhs_ext[..4].clone_from_slice(&rhs);
-        for j in 4..8 {
-            lhs_ext[j] = &sign_fill * &lhs_is_neg;
-            rhs_ext[j] = &sign_fill * &rhs_is_neg;
-        }
-
-        // Compute convolution sum
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let mut sum = FieldElement::<F>::zero();
-
-        for k in 0..=1u32 {
-            let idx = 2 * i + k as usize;
+        // Convolution sum.
+        let shift_16 = b.const_base(SHIFT_16);
+        let mut sum = b.zero();
+        for k in 0..=1usize {
+            let idx = 2 * i + k;
             if idx < 8 {
-                let mut inner_sum = FieldElement::<F>::zero();
+                let mut inner_sum = b.zero();
                 for j in 0..=idx {
                     if j < 8 && (idx - j) < 8 {
-                        inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                        inner_sum = inner_sum + lhs_ext[j].clone() * rhs_ext[idx - j].clone();
                     }
                 }
-                // Multiply by 2^(16*k)
                 if k == 0 {
-                    sum = &sum + &inner_sum;
+                    sum = sum + inner_sum;
                 } else {
-                    sum = &sum + &(&inner_sum * &shift_16);
+                    sum = sum + inner_sum * shift_16.clone();
                 }
             }
         }
 
-        // Constraint: raw_product[i] - sum = 0
         let raw_col = match i {
             0 => cols::RAW_PRODUCT_0,
             1 => cols::RAW_PRODUCT_1,
@@ -816,57 +782,37 @@ impl MulConstraint {
             3 => cols::RAW_PRODUCT_3,
             _ => unreachable!(),
         };
-        let raw_product = step.get_main_evaluation_element(0, raw_col).clone();
-
+        let raw_product = b.main(0, raw_col);
         raw_product - sum
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // (1 - signed) * is_negative is degree 2
-            MulConstraintKind::LhsSign | MulConstraintKind::RhsSign => 2,
-            // Raw product: lhs_ext[j] * rhs_ext[idx-j] where each may involve
-            // sign_fill * is_negative (degree 1), so product is degree 2
-            // But we're summing many degree-2 terms, still degree 2
-            MulConstraintKind::RawProduct(_) => 2,
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
+        let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);
+        b.emit_base(0, is_bit_lhs);
+        let is_bit_rhs = Self::signed_is_bit(b, cols::RHS_SIGNED);
+        b.emit_base(1, is_bit_rhs);
+
+        // idx 2: LhsSign: (1 - lhs_signed) * lhs_is_negative
+        let lhs_signed = b.main(0, cols::LHS_SIGNED);
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(2, (one - lhs_signed) * lhs_is_neg);
+
+        // idx 3: RhsSign: (1 - rhs_signed) * rhs_is_negative
+        let rhs_signed = b.main(0, cols::RHS_SIGNED);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
+
+        // idx 4..8: raw_product convolution for i = 0..4.
+        for i in 0..4 {
+            let root = Self::raw_product(b, i);
+            b.emit_base(4 + i, root);
         }
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the MUL table.
-///
-/// Returns: (constraints, next_constraint_idx)
-pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut constraints = Vec::new();
-
-    // SIGN constraints
-    constraints.push(MulConstraint::new(MulConstraintKind::LhsSign, idx));
-    idx += 1;
-    constraints.push(MulConstraint::new(MulConstraintKind::RhsSign, idx));
-    idx += 1;
-
-    // Raw product constraints for i in 0..4
-    for i in 0..4 {
-        constraints.push(MulConstraint::new(MulConstraintKind::RawProduct(i), idx));
-        idx += 1;
-    }
-
-    (constraints, idx)
 }
 
 // =========================================================================

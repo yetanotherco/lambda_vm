@@ -55,8 +55,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Feature                     | Description                       | Status       |
 |---------------------------- |-----------------------------------|--------------|
 | Fields                      | Improve field performance using assembly | Planned |
-| GPU-Fast-Fourier transform      | Implement GPU version of FFT | Planned |
-| GPU-Merkle tree                 | Implement GPU version for Merkle trees | Planned |
+| GPU-Fast-Fourier transform      | Implement GPU version of FFT | Done |
+| GPU-Merkle tree                 | Implement GPU version for Merkle trees | Done |
 | Parallel trace generation   | Use GPU for fast trace generation | Planned |
-| GPU-FRI | Perform FRI on GPU | Planned |
+| GPU-FRI | Perform FRI on GPU | Done |
   

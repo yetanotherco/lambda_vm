@@ -10,7 +10,8 @@
 #
 # Prerequisites:
 #   - Lambda VM CLI build dependencies available
-#   - Sysroot present at /opt/lambda-vm-sysroot (run `make prepare-sysroot` first)
+#   - RISC-V sysroot: auto-provisioned by the guest ELF build (the .elf rules depend on
+#     `make prepare-sysroot`). Override the location with SYSROOT_DIR (default /opt/lambda-vm-sysroot).
 #   - Rust stable + nightly-2026-02-01 installed
 
 set -euo pipefail
@@ -32,6 +33,12 @@ NC='\033[0m'
 BLOCKS=(
     "ethrex empty block|ethrex_empty_block.bin"
     "ethrex 1 tx|ethrex_simple_tx.bin"
+    # ethrex_10_transfers.bin is 6.8M cycles (measured), NOT the ~42M this comment
+    # used to claim: that figure — and the "OOMs ~36 GB, software ecrecover
+    # dominates at ~4M cycles/transfer" reasoning built on it — predates ecrecover
+    # becoming an ECSM accelerator, which cut it ~6x. It is no longer too heavy to
+    # prove. Left out only because the two blocks above already cover the cheap
+    # end; add it if a mid-size point is wanted.
 )
 
 # --- Parse args -------------------------------------------------------------

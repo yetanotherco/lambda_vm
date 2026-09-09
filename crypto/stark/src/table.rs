@@ -1,4 +1,3 @@
-use crate::frame::Frame;
 #[cfg(feature = "disk-spill")]
 use crypto::mmap_util::spill_slice_to_mmap;
 use math::field::{
@@ -15,7 +14,7 @@ use rayon::prelude::*;
 /// Access goes through pointer arithmetic on the mmap, matching the
 /// original `data[row * width + col]` layout.
 #[cfg(feature = "disk-spill")]
-struct TableMmapBacking {
+pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
     /// Number of columns per row.
     width: usize,
@@ -44,16 +43,27 @@ impl std::fmt::Debug for TableMmapBacking {
 #[derive(Default, Debug, serde::Deserialize)]
 #[cfg_attr(
     not(feature = "disk-spill"),
-    derive(serde::Serialize, Clone, PartialEq, Eq)
+    derive(
+        Clone,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
 )]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
-    pub data: Vec<FieldElement<F>>,
+    /// Row-major backing store. Crate-private: external callers must go through
+    /// the spill-safe accessors (`get`/`get_row`/`set`) rather than indexing the
+    /// raw buffer, which bypasses the disk-spill mmap backing.
+    pub(crate) data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
     #[cfg(feature = "disk-spill")]
     #[serde(skip)]
-    mmap_backing: Option<TableMmapBacking>,
+    pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
 
 #[cfg(feature = "disk-spill")]
@@ -93,6 +103,137 @@ where
             }
         }
         seq.end()
+    }
+}
+
+// Manual rkyv impl under disk-spill: the derive can't handle `mmap_backing`,
+// and serialization must read through `row_major_data()` so a spilled table
+// archives its mmap contents (deserializing always yields an unspilled table).
+// The archived layout matches what the derive generates without disk-spill, so
+// both configurations produce byte-identical archives.
+#[cfg(feature = "disk-spill")]
+mod archived_table {
+    use super::{FieldElement, IsField, Table};
+    use math::field::element::ArchivedFieldElement;
+    use rkyv::rancor::Fallible;
+    use rkyv::ser::{Allocator, Writer};
+    use rkyv::vec::{ArchivedVec, VecResolver};
+    use rkyv::{Archive, Deserialize, Place, Portable, Serialize};
+
+    #[derive(Portable, rkyv::bytecheck::CheckBytes)]
+    #[bytecheck(crate = rkyv::bytecheck)]
+    #[repr(C)]
+    pub struct ArchivedTable<F: IsField>
+    where
+        F::BaseType: Archive,
+    {
+        pub data: ArchivedVec<ArchivedFieldElement<F>>,
+        pub width: rkyv::primitive::ArchivedUsize,
+        pub height: rkyv::primitive::ArchivedUsize,
+    }
+
+    pub struct TableResolver {
+        data: VecResolver,
+    }
+
+    impl<F: IsField> Archive for Table<F>
+    where
+        F::BaseType: Archive,
+    {
+        type Archived = ArchivedTable<F>;
+        type Resolver = TableResolver;
+
+        fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+            rkyv::munge::munge!(let ArchivedTable { data, width, height } = out);
+            ArchivedVec::resolve_from_len(self.width * self.height, resolver.data, data);
+            self.width.resolve((), width);
+            self.height.resolve((), height);
+        }
+    }
+
+    impl<F: IsField, S> Serialize<S> for Table<F>
+    where
+        F::BaseType: Archive,
+        FieldElement<F>: Serialize<S>,
+        S: Fallible + Allocator + Writer + ?Sized,
+    {
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            Ok(TableResolver {
+                data: ArchivedVec::serialize_from_slice(self.row_major_data(), serializer)?,
+            })
+        }
+    }
+
+    impl<F: IsField, D> Deserialize<Table<F>, D> for ArchivedTable<F>
+    where
+        F::BaseType: Archive,
+        ArchivedFieldElement<F>: Deserialize<FieldElement<F>, D>,
+        D: Fallible + ?Sized,
+    {
+        fn deserialize(&self, deserializer: &mut D) -> Result<Table<F>, D::Error> {
+            // Element-by-element rather than `self.data.deserialize(...)`:
+            // `ArchivedVec`'s blanket `Deserialize` impl needs a
+            // `DeserializeUnsized` bound this crate doesn't otherwise use,
+            // while the per-element bound below is already satisfied.
+            let data = self
+                .data
+                .iter()
+                .map(|elem| elem.deserialize(deserializer))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Table {
+                data,
+                width: self.width.to_native() as usize,
+                height: self.height.to_native() as usize,
+                mmap_backing: None,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+pub use archived_table::ArchivedTable;
+
+/// Read API over an rkyv-archived [`Table`], used by the verifier to consume
+/// the out-of-domain evaluations straight from the proof buffer. On
+/// little-endian targets the element data is viewed in place with no copy.
+#[cfg(target_endian = "little")]
+impl<F: IsField> ArchivedTable<F>
+where
+    F::BaseType: math::field::element::NativeArchived,
+{
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width.to_native() as usize
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.height.to_native() as usize
+    }
+
+    /// Full row-major element data, viewed in place.
+    #[inline]
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        math::field::element::ArchivedFieldElement::slice_as_native(self.data.as_slice())
+    }
+
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. A malformed archive can
+    /// advertise dimensions that disagree with the data length; callers must
+    /// reject such tables before row access.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width()
+            .checked_mul(self.height())
+            .is_some_and(|n| n == self.data.len())
+    }
+
+    /// Row `row_idx` as a native field-element slice (no copy).
+    #[inline]
+    pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
+        let width = self.width();
+        let start = row_idx * width;
+        &self.row_major_data()[start..start + width]
     }
 }
 
@@ -221,6 +362,34 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
+    /// Full row-major data as a contiguous slice, reading the mmap when spilled.
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            // SAFETY: same contract as get_row — spill_to_disk writes row-major and
+            // FieldElement<F> is #[repr(transparent)] over F::BaseType: SpillSafe.
+            return unsafe {
+                std::slice::from_raw_parts(
+                    backing.mmap.as_ptr() as *const FieldElement<F>,
+                    backing.height * backing.width,
+                )
+            };
+        }
+        &self.data
+    }
+
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. Owned counterpart to
+    /// `ArchivedTable::dimensions_consistent`, reading the length through
+    /// `row_major_data()` so a disk-spilled table (whose `data` Vec is emptied)
+    /// reports its true mmap-backed length.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width
+            .checked_mul(self.height)
+            .is_some_and(|n| n == self.row_major_data().len())
+    }
+
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -338,31 +507,6 @@ impl<F: IsField> Table<F> {
 
     #[cfg(all(feature = "disk-spill", not(unix)))]
     pub fn advise_drop_cache(&self) {}
-
-    /// Given a step size, converts the given table into a `Frame`.
-    /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
-    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
-        debug_assert!(self.height.is_multiple_of(step_size));
-        let steps = (0..self.height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
-    }
 }
 
 /// A view of a contiguous subset of rows of a table.
@@ -394,124 +538,5 @@ where
 
     pub fn get_aux_evaluation_element(&self, row: usize, col: usize) -> &FieldElement<E> {
         &self.aux_data[row][col]
-    }
-}
-
-#[cfg(all(test, feature = "disk-spill"))]
-mod disk_spill_tests {
-    use super::*;
-    use math::field::goldilocks::GoldilocksField;
-
-    type F = GoldilocksField;
-
-    #[test]
-    fn test_table_spill_roundtrip() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let mut table = Table::new(data.clone(), width);
-        assert!(table.mmap_backing.is_none());
-
-        // Snapshot values before spill
-        let pre_spill: Vec<Vec<FieldElement<F>>> = (0..height)
-            .map(|r| (0..width).map(|c| *table.get(r, c)).collect())
-            .collect();
-
-        table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.mmap_backing.is_some());
-        assert!(
-            table.data.is_empty(),
-            "heap data should be freed after spill"
-        );
-
-        // Verify get() returns the same values
-        for (r, pre_row) in pre_spill.iter().enumerate() {
-            for (c, pre_val) in pre_row.iter().enumerate() {
-                assert_eq!(table.get(r, c), pre_val, "mismatch at ({r}, {c})");
-            }
-        }
-
-        // Verify get_row() returns the same values
-        for (r, pre_row) in pre_spill.iter().enumerate() {
-            let row = table.get_row(r);
-            assert_eq!(row.len(), width);
-            for (c, pre_val) in pre_row.iter().enumerate() {
-                assert_eq!(&row[c], pre_val, "get_row mismatch at ({r}, {c})");
-            }
-        }
-    }
-
-    #[test]
-    fn test_table_spill_empty_is_noop() {
-        let mut table = Table::<F>::new(Vec::new(), 0);
-        table
-            .spill_to_disk()
-            .expect("spill_to_disk on empty table failed");
-        assert!(table.mmap_backing.is_none());
-    }
-
-    #[test]
-    fn test_table_spill_idempotent() {
-        let data: Vec<FieldElement<F>> =
-            (0..16).map(|i| FieldElement::<F>::from(i as u64)).collect();
-        let mut table = Table::new(data, 4);
-
-        table.spill_to_disk().expect("first spill failed");
-        assert!(table.mmap_backing.is_some());
-
-        table.spill_to_disk().expect("second spill should be no-op");
-        assert!(table.mmap_backing.is_some());
-
-        // Still readable
-        assert_eq!(table.get(0, 0), &FieldElement::<F>::from(0u64));
-        assert_eq!(table.get(3, 3), &FieldElement::<F>::from(15u64));
-    }
-
-    #[test]
-    fn test_clone_spilled_table_materializes_to_heap() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let mut table = Table::new(data, width);
-        table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.mmap_backing.is_some());
-
-        let cloned = table.clone();
-        assert!(cloned.mmap_backing.is_none(), "clone should not be spilled");
-        assert_eq!(cloned.width, width);
-        assert_eq!(cloned.height, height);
-        assert_eq!(cloned, table, "clone must equal source element-wise");
-    }
-
-    #[test]
-    fn test_serialize_spilled_table_matches_unspilled() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let unspilled = Table::new(data.clone(), width);
-        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
-
-        let mut spilled = Table::new(data, width);
-        spilled.spill_to_disk().expect("spill_to_disk failed");
-        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
-
-        assert_eq!(
-            spilled_bytes, unspilled_bytes,
-            "spilled and unspilled tables must serialize to identical bytes"
-        );
-
-        let restored: Table<F> =
-            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(restored.mmap_backing.is_none());
-        assert_eq!(restored, unspilled);
     }
 }

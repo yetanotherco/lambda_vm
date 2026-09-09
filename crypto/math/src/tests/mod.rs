@@ -9,3 +9,4 @@ pub mod field_element_tests;
 pub mod goldilocks_tests;
 pub mod polynomial_tests;
 pub mod test_fields_tests;
+pub mod two_half_fft_tests;

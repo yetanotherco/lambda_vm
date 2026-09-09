@@ -113,3 +113,20 @@ extern "C" __global__ void deep_composition_ext3_row(
     deep_out[out_idx + 1] = result.b;
     deep_out[out_idx + 2] = result.c;
 }
+
+// Out-of-place bit-reverse permutation of an interleaved ext3 codeword:
+// out[i] = in[bitrev_log_n(i)]. Puts the DEEP codeword in FRI order without
+// leaving the device.
+extern "C" __global__ void bit_reverse_ext3_interleaved(
+    const uint64_t *__restrict__ in,
+    uint64_t *__restrict__ out,
+    uint64_t n,
+    uint32_t log_n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t j = __brevll(i) >> (64 - log_n);
+        out[i * 3 + 0] = in[j * 3 + 0];
+        out[i * 3 + 1] = in[j * 3 + 1];
+        out[i * 3 + 2] = in[j * 3 + 2];
+    }
+}

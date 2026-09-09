@@ -20,30 +20,30 @@
 //!
 //! ## Bus Interactions (20)
 //! - 1 IS_HALF[base_address[0] + mask] (range check: address span fits in 16 bits)
-//! - 1 LT[old_timestamp, timestamp, 0] → 1
+//! - 1 ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
 //!
-//! ## Constraints (4 total)
+//! ## Constraints (8 total)
 //! - IS_BIT<μ_sum> (1)
 //! - w2 => μ_sum (1)
 //! - IS_BIT<μ_read> (1)
 //! - IS_BIT<μ_write> (1)
+//! - IS_BIT<write2>, IS_BIT<write4>, IS_BIT<write8> (3)
+//! - IS_BIT<w2> (width sum is a bit) (1)
 //!
 //! ## Assumptions (caller's responsibility, not enforced here)
 //! - IS_HALF[base_address[i]] for i ∈ [0, 1]
 //! - IS_WORD[base_address[2]]
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
 use super::memw::MemwOperation;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::constraints::templates::IsBitConstraint;
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use crate::constraints::templates::emit_is_bit;
 
 /// Maximum number of rows per MEMW_A table chunk.
 pub const MAX_ROWS: usize = super::max_rows::MEMW_A;
@@ -94,51 +94,41 @@ pub fn generate_memw_aligned_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
+        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
 
-        data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
-
-        // Decompose base_address as DWordWHH:
-        // base_address[0] = low half (bits 0-15)
-        // base_address[1] = mid half (bits 16-31)
-        // base_address[2] = high word (bits 32-63)
-        let addr = op.base_address;
-        let addr_low_half = addr & 0xFFFF;
-        let addr_mid_half = (addr >> 16) & 0xFFFF;
-        let addr_high_word = addr >> 32;
-
-        data[base + cols::BASE_ADDRESS[0]] = FE::from(addr_low_half);
-        data[base + cols::BASE_ADDRESS[1]] = FE::from(addr_mid_half);
-        data[base + cols::BASE_ADDRESS[2]] = FE::from(addr_high_word);
+        table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address);
 
         for i in 0..8 {
-            data[base + cols::VALUE[i]] = FE::from(op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
         }
 
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         let (w2, w4, w8) = op.write_flags();
-        data[base + cols::WRITE2] = FE::from(w2 as u64);
-        data[base + cols::WRITE4] = FE::from(w4 as u64);
-        data[base + cols::WRITE8] = FE::from(w8 as u64);
+        table.set_bool(row_idx, cols::WRITE2, w2);
+        table.set_bool(row_idx, cols::WRITE4, w4);
+        table.set_bool(row_idx, cols::WRITE8, w8);
 
         for i in 0..8 {
-            data[base + cols::OLD[i]] = FE::from(op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
         }
 
         // Single old_timestamp (from old_timestamp[0], verified equal for all bytes)
-        data[base + cols::OLD_TIMESTAMP_0] = FE::from(op.old_timestamp[0] & 0xFFFF_FFFF);
-        data[base + cols::OLD_TIMESTAMP_1] = FE::from(op.old_timestamp[0] >> 32);
+        table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp[0]);
 
-        data[base + cols::MU_READ] = FE::from(op.is_read as u64);
-        data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
+        table.set_bool(row_idx, cols::MU_READ, op.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -180,10 +170,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT[old_timestamp, timestamp, 0] → 1 with μ_sum
+    // ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts.
+    // (Every LT lookup goes through the unified ALU bus with
+    // signed=0/invert=0; there is no dedicated `Lt` bus.)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::Lt,
+        BusId::Alu,
         mu_sum.clone(),
         vec![
             BusValue::Packed {
@@ -194,8 +186,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
             BusValue::constant(1),
+            BusValue::constant(0),
         ],
     ));
 
@@ -655,79 +648,53 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints (4 total)
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// MEMW_A constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum MemwAlignedConstraintKind {
-    /// IS_BIT<μ_sum>: multiplicity sum is 0 or 1
-    MuSumIsBit,
-    /// w2 => μ_sum: if accessing 2+ bytes, must be active row
-    W2ImpliesMuSum,
+/// `μ_sum = μ_read + μ_write` as a builder expression.
+fn mu_sum_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE)
 }
 
-pub struct MemwAlignedConstraint {
-    constraint_idx: usize,
-    kind: MemwAlignedConstraintKind,
+/// `w2 = write2 + write4 + write8` as a builder expression.
+fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::WRITE2) + b.main(0, cols::WRITE4) + b.main(0, cols::WRITE8)
 }
 
-impl MemwAlignedConstraint {
-    pub fn new(kind: MemwAlignedConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
+/// The MEMW_A table's 8 transition constraints as a single [`ConstraintSet`]:
+/// - idx 0:   `IS_BIT<μ_sum>`;
+/// - idx 1:   `w2 ⇒ μ_sum` (`w2·(1 − μ_sum)`);
+/// - idx 2,3: `IS_BIT` on `μ_read`, `μ_write`;
+/// - idx 4-6: `IS_BIT` on `write2`, `write4`, `write8`;
+/// - idx 7:   `IS_BIT<w2>` (width sum is a bit).
+#[derive(Clone, Copy)]
+pub struct MemwAlignedConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwAlignedConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum)
+        let one = b.one();
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(0, mu_sum.clone() * (one - mu_sum));
+
+        // idx 1: w2 ⇒ μ_sum = w2 * (1 - μ_sum)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(1, w2 * (one - mu_sum));
+
+        // idx 2,3: IS_BIT<μ_read>, IS_BIT<μ_write>
+        emit_is_bit(b, 2, cols::MU_READ, None);
+        emit_is_bit(b, 3, cols::MU_WRITE, None);
+
+        // idx 4-6: IS_BIT on the width flags
+        emit_is_bit(b, 4, cols::WRITE2, None);
+        emit_is_bit(b, 5, cols::WRITE4, None);
+        emit_is_bit(b, 6, cols::WRITE8, None);
+
+        // idx 7: IS_BIT<w2> = w2 * (1 - w2)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        b.emit_base(7, w2.clone() * (one - w2));
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let mu_read = step.get_main_evaluation_element(0, cols::MU_READ).clone();
-        let mu_write = step.get_main_evaluation_element(0, cols::MU_WRITE).clone();
-        let mu_sum = &mu_read + &mu_write;
-
-        match self.kind {
-            MemwAlignedConstraintKind::MuSumIsBit => &mu_sum * (&one - &mu_sum),
-            MemwAlignedConstraintKind::W2ImpliesMuSum => {
-                let write2 = step.get_main_evaluation_element(0, cols::WRITE2).clone();
-                let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-                let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-                let w2 = write2 + write4 + write8;
-                &w2 * (&one - &mu_sum)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the MEMW_A table (4 total).
-pub fn constraints()
--> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    vec![
-        MemwAlignedConstraint::new(MemwAlignedConstraintKind::MuSumIsBit, 0).boxed(),
-        MemwAlignedConstraint::new(MemwAlignedConstraintKind::W2ImpliesMuSum, 1).boxed(),
-        IsBitConstraint::unconditional(cols::MU_READ, 2).boxed(),
-        IsBitConstraint::unconditional(cols::MU_WRITE, 3).boxed(),
-    ]
 }

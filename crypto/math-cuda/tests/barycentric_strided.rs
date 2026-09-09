@@ -46,9 +46,13 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
     let lde_dev = stream.clone_htod(&lde_flat).unwrap();
     stream.synchronize().unwrap();
     let handle = GpuLdeBase {
+        ready: None,
         buf: Arc::new(lde_dev),
         m: num_cols,
         lde_size,
+        tree: None,
+        trace_dev: None,
+        trace_rows: 0,
     };
 
     // Pre-strided buffer for non-strided reference: trace-size picks of each col.
@@ -102,9 +106,11 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
     let lde_dev = stream.clone_htod(&lde_flat).unwrap();
     stream.synchronize().unwrap();
     let handle = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(lde_dev),
         m: num_cols,
         lde_size,
+        tree: None,
     };
 
     // Pre-strided buffer for non-strided reference.

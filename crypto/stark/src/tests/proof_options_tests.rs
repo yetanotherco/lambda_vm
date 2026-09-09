@@ -122,4 +122,19 @@ fn test_options_unchanged() {
     assert_eq!(opts.blowup_factor, 2);
     assert_eq!(opts.fri_number_of_queries, 3);
     assert_eq!(opts.grinding_factor, 1);
+    assert_eq!(opts.fri_final_poly_log_degree, 7);
+}
+
+#[test]
+fn with_blowup_sets_default_final_poly_log_degree() {
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("valid blowup");
+    assert_eq!(opts.fri_final_poly_log_degree, 7);
+}
+
+#[test]
+fn default_test_options_sets_final_poly_log_degree() {
+    assert_eq!(
+        ProofOptions::default_test_options().fri_final_poly_log_degree,
+        7
+    );
 }

@@ -13,6 +13,8 @@ log() { printf '\n=== %s ===\n' "$*"; }
 log "apt update + upgrade"
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+LLVM_VERSION="${LLVM_VERSION:-21}"
+LLVM_GPG_FINGERPRINT="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
 
 # Scaleway baremetal Debian ships grub-cloud-amd64; its postinst (fired as a
 # trigger by initramfs-tools / shim-signed / kernel upgrades) runs grub-install
@@ -24,11 +26,46 @@ apt-get update -y
 apt-get upgrade "${APT_OPTS[@]}"
 
 # --- 2. apt packages ---------------------------------------------------------
-log "apt install base packages + clang/lld/llvm + xz-utils"
+log "apt install base packages + xz-utils"
 apt-get install "${APT_OPTS[@]}" \
     ca-certificates curl wget gnupg vim git zip unzip openssl libssl-dev jq \
-    build-essential rsyslog htop rsync pkg-config locales ufw \
-    clang lld llvm xz-utils
+    build-essential rsyslog htop rsync pkg-config locales ufw xz-utils
+
+# Debian's default clang can lag behind RISC-V ISA attribute syntax emitted by
+# the checked-in assembly fixtures. Use a pinned apt.llvm.org toolchain.
+log "LLVM $LLVM_VERSION toolchain from apt.llvm.org"
+. /etc/os-release
+LLVM_CODENAME="${VERSION_CODENAME:-}"
+if [ -z "$LLVM_CODENAME" ]; then
+    echo "ERROR: could not determine Debian/Ubuntu codename from /etc/os-release" >&2
+    exit 1
+fi
+install -d -m 0755 /etc/apt/keyrings
+wget -qO /etc/apt/keyrings/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+if ! LLVM_ACTUAL_FINGERPRINT="$(gpg --show-keys --with-colons /etc/apt/keyrings/apt.llvm.org.asc 2>/dev/null \
+    | awk -F: '/^fpr:/ { print $10; exit }')"; then
+    echo "ERROR: could not read apt.llvm.org GPG key fingerprint" >&2
+    exit 1
+fi
+if [ "$LLVM_ACTUAL_FINGERPRINT" != "$LLVM_GPG_FINGERPRINT" ]; then
+    echo "ERROR: apt.llvm.org GPG key fingerprint mismatch (got $LLVM_ACTUAL_FINGERPRINT, expected $LLVM_GPG_FINGERPRINT)" >&2
+    exit 1
+fi
+chmod 0644 /etc/apt/keyrings/apt.llvm.org.asc
+cat > /etc/apt/sources.list.d/apt.llvm.org.list <<EOF
+deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/$LLVM_CODENAME/ llvm-toolchain-$LLVM_CODENAME-$LLVM_VERSION main
+EOF
+apt-get update -y
+apt-get install "${APT_OPTS[@]}" "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION"
+for tool in clang clang++ lld ld.lld llvm-ar llvm-ranlib; do
+    versioned="/usr/bin/$tool-$LLVM_VERSION"
+    if [ ! -x "$versioned" ]; then
+        echo "ERROR: expected $versioned after installing LLVM $LLVM_VERSION" >&2
+        exit 1
+    fi
+    ln -sf "$versioned" "/usr/local/bin/$tool"
+done
+clang --version | head -n 1
 
 # --- 3. users: admin (sudo) + app (no sudo) ----------------------------------
 log "users: admin (sudo) + app (no sudo)"
@@ -112,14 +149,30 @@ grep -qxF "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null \
 APP_CLAUDE
 
 # --- 8. lambda-vm sysroot (rv64im) ------------------------------------------
+# Guard on include/stdlib.h and re-extract from scratch so a partial/interrupted extract
+# self-heals on re-run; a bare `[ ! -d ]` guard left a headerless sysroot that broke
+# guest C dependencies.
 SYSROOT_DIR=/opt/lambda-vm-sysroot
 SYSROOT_URL=https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
-if [ ! -d "$SYSROOT_DIR" ]; then
-    log "downloading sysroot to $SYSROOT_DIR"
-    curl -L "$SYSROOT_URL" -o /tmp/sysroot.tar.gz
+SYSROOT_SHA256=420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7
+if [ -f "$SYSROOT_DIR/include/stdlib.h" ] && [ -d "$SYSROOT_DIR/lib" ]; then
+    log "sysroot already present at $SYSROOT_DIR"
+else
+    log "provisioning sysroot at $SYSROOT_DIR"
+    sysroot_tmp_dir=$(mktemp -d /tmp/lambda-vm-sysroot.XXXXXX)
+    sysroot_tarball="$sysroot_tmp_dir/lambda-vm-sysroot-rv64im.tar.gz"
+    cleanup_sysroot_tmp() { rm -rf "$sysroot_tmp_dir"; }
+    trap cleanup_sysroot_tmp EXIT
+
+    curl -fL --proto '=https' "$SYSROOT_URL" -o "$sysroot_tarball"
+    printf '%s  %s\n' "$SYSROOT_SHA256" "$sysroot_tarball" | sha256sum -c -
+
+    rm -rf "$SYSROOT_DIR"
     mkdir -p /opt
-    tar -xzf /tmp/sysroot.tar.gz -C /opt
-    rm /tmp/sysroot.tar.gz
+    tar -xzf "$sysroot_tarball" -C /opt --no-same-owner \
+        || { rm -rf "$SYSROOT_DIR"; exit 1; }
+    rm -rf "$sysroot_tmp_dir"
+    trap - EXIT
 fi
 
 # --- 9. Clone lambda_vm (as app, public repo over HTTPS) ---------------------
@@ -130,15 +183,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 10. ethrex test fixture ------------------------------------------------
-ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
-ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
-if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
-    log "downloading ethrex_hoodi.bin"
-    sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
-fi
-
-# --- 11. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 10. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -146,7 +191,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 12. /etc/environment + locale ------------------------------------------
+# --- 11. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -157,7 +202,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 13. sshd hardening (last; reload won't drop existing session) ----------
+# --- 12. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no

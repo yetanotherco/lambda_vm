@@ -42,7 +42,9 @@ pub(crate) fn compute_coset_twiddles_inv<F: IsFFTField>(
     let order = domain_size.trailing_zeros() as u64;
     let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset).unwrap();
     in_place_bit_reverse_permute(&mut points);
-    FieldElement::inplace_batch_inverse(&mut points).unwrap();
+    // Sequential: called from `Domain::fri_inv_twiddles`'s OnceLock init —
+    // parallel inversion inside a lazy-init cell can deadlock the rayon pool.
+    FieldElement::inplace_batch_inverse_sequential(&mut points).unwrap();
     points
 }
 

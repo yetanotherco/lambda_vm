@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "zro": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Zro gateway",
+      "options": {
+        "baseURL": "https://inference.moonmath.ai/v1",
+        "apiKey": "{env:ZRO_API_KEY}"
+      },
+      "models": {
+        "minimax-m3": {
+          "name": "MiniMax M3"
+        }
+      }
+    }
+  }
+}

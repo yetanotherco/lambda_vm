@@ -41,7 +41,7 @@ cargo run -p cli --release -- execute <PROGRAM.elf> [--private-input <FILE>] [--
 |---|---|
 | `--private-input <FILE>` | Pass private input bytes to the guest (read via `get_private_input()`). |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output. See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
-| `--cycles` | Count instructions during execution and print the dynamic instruction count. |
+| `--cycles` | Count instructions during execution and print the dynamic instruction count. Also reports `Keccak calls` / `Ecsm calls` (accelerator syscall invocations). Combined with `--flamegraph`, the accelerator lines are omitted (the flamegraph path exposes no per-log data). |
 
 ### Prove
 
@@ -57,8 +57,10 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--private-input <FILE>` | Pass private input bytes to the guest. |
 | `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. [default: 2] |
 | `--time` | Print total proving time. |
-| `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
-| `--elements` | Build traces and print main-trace and aux-trace field element counts. |
+| `--cycles` | Run one extra execution outside the timer and print the dynamic instruction count. Also supported with `--continuations`. |
+| `--elements` | Build traces and print main-trace and aux-trace field element counts. Monolithic proving only; conflicts with `--continuations`. |
+| `--continuations` | Prove as a continuation bundle split into fixed-size epochs. |
+| `--epoch-size-log2 <N>` | Continuation epoch size as `2^N` cycles. Requires `--continuations`. Defaults to `20`; values below `18` are rejected. |
 
 ### Verify
 
@@ -72,8 +74,10 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 |---|---|
 | `--blowup <N>` | FRI blowup factor used during proving. Must match. [default: 2] |
 | `--time` | Print verification time. |
+| `--continuations` | Verify a continuation proof bundle produced by `prove --continuations`. |
 
-Returns exit code `0` on successful verification, `1` on failure.
+Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
+match the value used during proving.
 
 ### Count Elements
 
@@ -96,9 +100,32 @@ cargo run -p cli --release -- execute executor/program_artifacts/asm/add.elf
 cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
 cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
 
+# Generate and verify a continuation proof
+cargo run -p cli --release -- prove program.elf -o /tmp/cont.bin --continuations --epoch-size-log2 20
+cargo run -p cli --release -- verify /tmp/cont.bin program.elf --continuations
+
+# Generate a continuation proof and print total dynamic instruction count
+cargo run -p cli --release -- prove program.elf -o /tmp/cont.bin --continuations --cycles
+
 # Prove with private input and print metrics
 cargo run -p cli --release -- prove program.elf -o /tmp/proof.bin --private-input input.bin --time --cycles
 ```
+
+For continuation proofs, `--epoch-size-log2` is the power in `2^N` cycles. Larger
+values reduce epoch count and fixed per-epoch overhead, but increase peak memory.
+As rough ethrex 10-transfer distinct-account reference points from a local sweep:
+`19` used about 6.9 GB peak heap, `20` about 9.5 GB, `21` about 15.8 GB, and `22`
+about 26.8 GB. For a new workload, use the highest value the machine can run
+without swapping.
+
+Continuation proof bundles are self-contained for standalone verification: the
+verifier needs only the proof file and the ELF. When `--private-input` is used,
+the serialized proof does **not** include the raw private input bytes — it
+carries only the private-input page count; the private genesis lives in
+committed, bus-enforced columns the verifier never recomputes (see
+`docs/continuations_design.md` §3.6). This is not a zero-knowledge guarantee,
+though: committed columns are still opened at STARK query positions, so do not
+treat proof files as cryptographically hiding the private input.
 
 ## Guest Program Flamegraphs
 

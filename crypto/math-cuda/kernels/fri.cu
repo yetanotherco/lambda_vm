@@ -59,3 +59,20 @@ extern "C" __global__ void fri_update_twiddles(
     uint64_t old = tw_in[2 * j];
     tw_out[j] = goldilocks::mul(old, old);
 }
+
+// Gather interleaved ext3 elements at arbitrary positions: one thread per
+// query copies evals[positions[i]] (3 u64) into out[i]. Serves the FRI query
+// phase's symmetric-eval reads off the resident layer buffers.
+extern "C" __global__ void gather_ext3_at(
+    const uint64_t *evals,
+    const uint32_t *positions,
+    uint64_t q,
+    uint64_t *out
+) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= q) return;
+    uint64_t p = positions[i];
+    out[i * 3]     = evals[p * 3];
+    out[i * 3 + 1] = evals[p * 3 + 1];
+    out[i * 3 + 2] = evals[p * 3 + 2];
+}
