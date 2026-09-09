@@ -183,8 +183,13 @@ def surviving_deviation(rnc, left_bounds, right_bounds):
     Complete, not sampled: the identity's solution set is exactly
     `(L - 2**16*d, R + d)` over `d`, `difference_form_is_exact` keeps `d` an
     integer, and `left_bounds` caps `|d|`, so the `d` range below is exhaustive.
-    Also asserts the HONEST pair lies inside the bounds, which catches a window
-    modelled wrongly (the failure that would make a `None` here meaningless).
+
+    Two properties of the HONEST pair are asserted per input, because a `None`
+    from this sweep means nothing without them. It has to lie inside the modelled
+    bounds -- the failure that would make the window a fiction -- and it has to
+    satisfy the shipped identity, which is what ties `honest_shift` to the chip:
+    without it a corrupted decomposition still reports every configuration
+    pinned, since `identity_holds` would only ever see the forged values.
     """
     lo_l, hi_l = left_bounds
     lo_r, hi_r = right_bounds
@@ -194,6 +199,10 @@ def surviving_deviation(rnc, left_bounds, right_bounds):
         assert lo_l <= left <= hi_l and lo_r <= right <= hi_r, (
             f"the honest pair for in={in_hw:#06x} falls outside the modelled "
             f"bounds left={left_bounds} right={right_bounds}"
+        )
+        assert identity_holds(in_hw, rnc, left, right), (
+            f"honest_shift does not satisfy the shipped identity at "
+            f"in={in_hw:#06x}, rnc={rnc}: left={left} right={right}"
         )
         for d in range(-dmax, dmax + 1):
             if d == 0:
@@ -241,35 +250,37 @@ def split_form_is_exact(companion):
     return span + 256 * span < P // 2
 
 
-def surviving_byte_split(companion, companion_moves=(0,)):
+def surviving_byte_split(operand=BYTE):
     """Is the split of an UNCHECKED pair pinned by the operand bytes reading it?
 
-    The pair's packed value is pinned (`surviving_deviation`), each of its bytes
-    is read by exactly ONE ByteAlu operand byte (read-once, combinatorics
-    sections 3 and 6) alongside a summand in `companion`, and those windows are
-    what make `k` an integer in the first place (`split_form_is_exact`).
-    Redistributing the pair
-    by `k` moves that operand sum by `256*k`, so the sweep below asks, over every
-    (byte, companion) pair an honest row can present -- their sum is a byte,
-    since the honest row passes the operand lookup -- whether the moved sum is a
-    byte too.
+    A pinned packed value leaves exactly one degree of freedom, `k` in
+    `(lo + 256*k, hi - k)`, an integer by `split_form_is_exact`. Each byte of the
+    pair is read by exactly ONE operand byte (read-once, combinatorics sections 3
+    and 6) whose value therefore moves by `256*k`, and whose honest value is
+    already inside the operand's range because the honest row passes that lookup.
 
-    `companion_moves` is what that summand may do ITSELF, and it is the whole
-    reason the answer is configuration-dependent: `(0,)` when the checked side
-    pinned it to its honest value (`checked_split_is_unique`), and +/-256 when
-    nothing checks it either -- the "both dropped" configuration, where the
-    redistribution is absorbed and the split is as free as the packed value.
+    So the question is entirely about the operand TABLE, and the sweep below is
+    over every value it admits: can a step of a full 256 stay inside? That width
+    is the contingent quantity, and it lives in `prover/src/tables/bitwise.rs`
+    (the `AreBytes` receiver and the `ByteAlu` ones), not in this directory: 256
+    admitted values cannot absorb a step of 256, a 16-bit table absorbs it at the
+    first value. Pass a wider `operand` and the sweep hands back a survivor --
+    that is the control both boards run, and it is the only sensitivity the
+    result has.
 
-    Returns None when the split is pinned, else `(byte, companion, k, move)`.
-    With `companion_moves = (0,)` the two non-zero `k` are exhaustive: a survivor
-    needs both sums inside [0, 255], so it needs `|256*k| <= 255`.
+    The companion summand is deliberately NOT a parameter: it enters only through
+    the honest operand value, which the lookup already confines, so quantifying
+    over it would change no answer. What the companion decides is the INTEGRALITY
+    step, and that is `split_form_is_exact`'s argument, not this one.
+
+    Returns None when the split is pinned, else the first `(value, k)`. The two
+    non-zero `k` are exhaustive whenever the operand admits fewer than 256 steps:
+    a survivor needs `|256*k|` to fit inside the range, so `|k| >= 2` fits only
+    where `|k| = 1` already did.
     """
-    for byte in range(256):
-        for other in range(companion[0], companion[1] + 1):
-            if not is_byte(byte + other):
-                continue
-            for k in (-1, 1):
-                for move in companion_moves:
-                    if is_byte(byte + 256 * k + other + move):
-                        return byte, other, k, move
+    lo, hi = operand
+    for value in range(lo, hi + 1):
+        for k in (-1, 1):
+            if lo <= value + 256 * k <= hi:
+                return value, k
     return None

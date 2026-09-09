@@ -37,7 +37,8 @@ from field_model import (P, THETA_RNC, BYTE, BIT, NO_CARRY, as_field,
                          difference_form_is_exact, operand_summand_window,
                          packed_pair_bounds, surviving_deviation,
                          checked_split_is_unique, split_form_is_exact,
-                         surviving_byte_split, theta_operand_bytes, is_byte)
+                         surviving_byte_split, theta_operand_bytes, is_byte,
+                         MASK16)
 
 premises(verbose=False)
 
@@ -97,11 +98,15 @@ check(split_form_is_exact(BIT),
       "the Dxz operand windows keep lo + 256*hi below p -> the split moves in integer steps of 256")
 check(not split_form_is_exact((0, P // 4)),
       "control: with an unbounded companion it does not, and k is back over the whole field")
-split = surviving_byte_split(BIT)
+split = surviving_byte_split(BYTE)
 check(split is None,
-      "B: redistributing Cxz_left by k moves its rotated_C byte by 256k -> no "
-      "(Cxz_left byte, carry, k != 0) leaves that operand a byte"
+      "B: redistributing Cxz_left by k moves its rotated_C byte by 256k, and the "
+      "ByteAlu table's 256 values cannot absorb a step of 256"
       f"{'' if split is None else f' — SURVIVOR {split}'}")
+wide = surviving_byte_split((0, MASK16))
+check(wide is not None,
+      f"control: widen that table to 16 bits (bitwise.rs) and the same step fits — "
+      f"survivor (operand value, k) = {wide}")
 print("       C drops IS_BIT instead, and Cxz_right is a single column: no split to pin.")
 
 print("\n=== the parity argument behind B, spelled out ===")
@@ -132,11 +137,6 @@ print(f"       honest  rotated_C = {hon_out}")
 print(f"       FORGED  rotated_C = {frg_out}")
 print(f"       forged Cxz_left (as field elements) = {[as_field(v) for v in frg_left[:2]]}...")
 print(f"       forged Cxz_right = {frg_right}")
-
-split_d = surviving_byte_split(BIT, companion_moves=(-256, 256))
-check(split_d is not None,
-      f"and the byte SPLIT of Cxz_left is free too, since an unchecked carry absorbs the "
-      f"redistribution: survivor (byte, carry, k, move) = {split_d}")
 
 # generality: the four carries form a cycle, so an arbitrary target is reachable
 det = (2**16) ** 4 - 1

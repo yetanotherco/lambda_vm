@@ -37,7 +37,8 @@ from field_model import (P, BYTE, as_field, honest_shift, identity_holds,
                          deviate, difference_form_is_exact, operand_summand_window,
                          packed_pair_bounds, rho_pi_offsets, rho_operand_bytes,
                          surviving_deviation, checked_split_is_unique,
-                         split_form_is_exact, surviving_byte_split, is_byte)
+                         split_form_is_exact, surviving_byte_split, is_byte,
+                         MASK16)
 
 premises(verbose=False)
 
@@ -86,9 +87,13 @@ check(not split_form_is_exact((0, P // 4)),
       "control: with an unbounded companion it does not, and k is back over the whole field")
 split = surviving_byte_split(BYTE)
 check(split is None,
-      "B: redistributing rot_right by k moves its pi operand byte by 256k -> no "
-      "(rot_right byte, rot_left byte, k != 0) leaves that operand a byte"
+      "B: redistributing rot_right by k moves its pi operand byte by 256k, and the "
+      "ByteAlu table's 256 values cannot absorb a step of 256"
       f"{'' if split is None else f' — SURVIVOR {split}'}")
+wide = surviving_byte_split((0, MASK16))
+check(wide is not None,
+      f"control: widen that table to 16 bits (bitwise.rs) and the same step fits — "
+      f"survivor (operand value, k) = {wide}")
 
 print("\n=== C: rot_left's check dropped — the sweep already says forgeable ===")
 surv_c = {rnc: surviving_deviation(rnc, OPERAND_ONLY, CHECKED) for rnc in RNCS}
@@ -158,10 +163,6 @@ for (sx, sy) in LANES:
     okid = all(identity_holds(in_hws[j], rnc, L[j], R[j]) for j in range(4))
     hits = [(L[(h + A) % 4] + R[(h + A - 1) % 4]) % P for h in range(4)] == [q % P for q in Q]
     free += okid and hits
-split_d = surviving_byte_split(BYTE, companion_moves=(-256, 256))
-check(split_d is not None,
-      f"and so is the byte SPLIT, since the companion rot_left byte can now absorb the "
-      f"redistribution: survivor (byte, companion, k, move) = {split_d}")
 check(free == 25, f"the forged pi halfwords equal the ARBITRARY target on {free}/25 lanes "
                   f"(det = 1 - 2**64 = {(1 - 2**64) % P} mod p, invertible). Per-byte\n"
                   f"                   realizability is the construction exhibited in C.")

@@ -12,7 +12,8 @@ intersection of two windows instead.
 the checks below cannot be skipped by forgetting to run this file first.
 """
 from keccak_ref import RHO
-from field_model import honest_shift, rho_pi_offsets, theta_carry_source
+from field_model import (honest_shift, identity_holds, rho_pi_offsets,
+                         theta_carry_source)
 
 
 def premises(verbose=True):
@@ -74,14 +75,28 @@ def premises(verbose=True):
     # Read through honest_shift rather than open-coded shifts, so this premise and
     # the necessity boards cannot disagree about what the decomposition is.
     unsaturated = []
+    wrong = []
     for x in range(5):
         for y in range(5):
-            left, right = honest_shift(0xFFFF, RHO[x][y] % 16)
+            rnc = RHO[x][y] % 16
+            left, right = honest_shift(0xFFFF, rnc)
             if left + right != 0xFFFF:
                 unsaturated.append((x, y, left, right))
+            if not identity_holds(0xFFFF, rnc, left, right):
+                wrong.append((x, y, left, right))
     check(not unsaturated,
           "left + right = 0xFFFF for all 25 lanes -> pi = 0xFF..FF, the saturation config C needs"
           f"{'' if not unsaturated else f' — {unsaturated[:2]}'}")
+    # The sum above is invariant under swapping the two halves and under ignoring
+    # rnc, so on its own it does not tie honest_shift to the chip. Nor can the
+    # identity below do it from HERE: at the saturating input a sum-preserving
+    # corruption of honest_shift is byte-identical to the honest one on all 25
+    # lanes, so this rules out only corruptions that also break the identity at
+    # 0xFFFF. What ties honest_shift to the chip over every input is the per-input
+    # assertion inside surviving_deviation.
+    check(not wrong,
+          "and that decomposition satisfies the SHIPPED identity on all 25 lanes"
+          f"{'' if not wrong else f' — {wrong[:2]}'}")
 
     say("\n=== (6) the theta analogue: every Cxz_right carry column is read EXACTLY once ===")
     # cols::cxz_right_bit_for_byte sends the carry of halfword h-1 to the LOW byte
