@@ -25,9 +25,9 @@ desc = "address to which the `x`-coordinate of result point `R` is to be written
 pad = 0
 
 [[variables.input]]
-name = "is_affine"
+name = "is_full_point"
 type = "Bit"
-desc = "whether the _affine_ (1) or the _`x`-only_ (0) variant of the ECALL is served"
+desc = "whether the _full-point_ (1) or the _`x`-only_ (0) variant of the ECALL is served"
 pad = 0
 
 [[variables.output]]
@@ -39,7 +39,7 @@ pad = 0
 [[variables.output]]
 name = "yR"
 type = "U256BL"
-desc = "$(#`k` times #`G`)_y$; only written to memory when $#`is_affine` = 1$"
+desc = "$(#`k` times #`G`)_y$; only written to memory when $#`is_full_point` = 1$"
 pad = 0
 
 [[variables.auxiliary]]
@@ -75,7 +75,7 @@ pad = 0
 [[variables.auxiliary]]
 name = "yG"
 type = "U256BL"
-desc = "$y_G$; read from memory when $#`is_affine` = 1$, a free witness otherwise"
+desc = "$y_G$; read from memory when $#`is_full_point` = 1$, a free witness otherwise"
 pad = 0
 
 [[variables.auxiliary]]
@@ -347,7 +347,7 @@ iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:read_xG"
 
-# Load yG from memory (affine variant only)
+# Load yG from memory (full-point variant only)
 
 [[constraint_groups]]
 name = "read_yG"
@@ -358,7 +358,7 @@ tag = "ADD"
 input = [["cast", ["idx", "addr_xG", 0], "DWordWL"], ["cast", ["+", 32, ["*", 8, "i"]], "DWordWL"]]
 output = ["cast", ["idx", "addr_yG", "i"], "DWordWL"]
 iter = ["i", 0, 3]
-cond = "is_affine"
+cond = "is_full_point"
 ref = "ec:c:extrapolate_addr_yG"
 
 [[constraints.read_yG]]
@@ -366,7 +366,7 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "addr_yG", "i"], "j"]]
 iters = [["i", 0, 3], ["j", 0, 3]]
-multiplicity = "is_affine"
+multiplicity = "is_full_point"
 ref = "ec:c:range_addr_yG"
 
 [[constraints.read_yG]]
@@ -399,7 +399,7 @@ output = ["arr",
     ["idx", "yG", ["+", ["*", 8, "i"], 7]],
 ]
 iter = ["i", 0, 3]
-multiplicity = "is_affine"
+multiplicity = "is_full_point"
 ref = "ec:c:read_yG"
 
 # Range check xG
@@ -801,7 +801,7 @@ iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:write_xR"
 
-# Write yR to memory (affine variant only)
+# Write yR to memory (full-point variant only)
 
 [[constraint_groups]]
 name = "write_yR"
@@ -812,7 +812,7 @@ tag = "ADD"
 input = [["cast", ["idx", "addr_xR", 0], "DWordWL"], ["cast", ["+", 32, ["*", 8, "i"]], "DWordWL"]]
 output = ["cast", ["idx", "addr_yR", "i"], "DWordWL"]
 iter = ["i", 0, 3]
-cond = "is_affine"
+cond = "is_full_point"
 ref = "ec:c:extrapolate_addr_yR"
 
 [[constraints.write_yR]]
@@ -820,7 +820,7 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", "addr_yR", "i"], "j"]]
 iters = [["i", 0, 3], ["j", 0, 3]]
-multiplicity = "is_affine"
+multiplicity = "is_full_point"
 ref = "ec:c:range_addr_yR"
 
 [[constraints.write_yR]]
@@ -843,7 +843,7 @@ input = [
     0, 0, 1
 ]
 iter = ["i", 0, 3]
-multiplicity = "is_affine"
+multiplicity = "is_full_point"
 ref = "ec:c:write_yR"
 
 
@@ -859,19 +859,19 @@ ref = "ec:c:mu_isbit"
 [[constraints.ecall]]
 kind = "template"
 tag = "IS_BIT"
-input = ["is_affine"]
-ref = "ec:c:is_affine_isbit"
+input = ["is_full_point"]
+ref = "ec:c:is_full_point_isbit"
 
 [[constraints.ecall]]
 kind = "arith"
-constraint = "$#`is_affine` != 0 => #`μ` != 0$"
-poly = ["*", "is_affine", ["not", "μ"]]
-ref = "ec:c:is_affine_implies_mu"
+constraint = "$#`is_full_point` != 0 => #`μ` != 0$"
+poly = ["*", "is_full_point", ["not", "μ"]]
+ref = "ec:c:is_full_point_implies_mu"
 
 [[constraints.ecall]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["arr", ["-", ["^", 2, 32], 11, ["*", 2, "id"], "is_affine"], ["-", ["^", 2, 32], 1]]]
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 11, ["*", 2, "id"], "is_full_point"], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "μ"]
 ref = "ec:c:receive_ecall"
 
