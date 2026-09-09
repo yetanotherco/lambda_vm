@@ -61,6 +61,12 @@ where
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
         assert_eq!(m.kind, RootKind::Base, "[{label}] meta kind {i}");
+        // The row DOMAIN of an emit is invisible everywhere else: `CaptureBuilder`
+        // ignores it, so no IR digest can see it, and `prover.rs` supports it, so a
+        // proof over an exempted row verifies. Every VM table wants the constraint
+        // on every row; an exemption here is a constraint silently switched off on
+        // the last rows, which is a soundness change, not a refactor.
+        assert_eq!(m.end_exemptions, 0, "[{label}] meta end_exemptions {i}");
     }
 
     // --- capture once; tree-measured degree <= the table's declared max ---
