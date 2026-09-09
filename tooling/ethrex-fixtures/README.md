@@ -98,12 +98,13 @@ calls, 164 ECSM calls. Fixture: 549,144 bytes.
 ### Choosing the epoch size, and what the workload costs
 
 Measured on the bench runner (`vm-benchmarks-1`, which is also the CI
-self-hosted `bench` runner: 96 cores / 125 GB, idle) on 2026-09-08, with the
-guest ELF at ethrex `2cb18b0b`:
+self-hosted `bench` runner: 96 cores / 125 GB) with the guest ELF at ethrex
+`2cb18b0b`, over 14 proves across two sittings:
 
 | | mean | sd | CV | peak RSS | proof | verify |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| epoch 2^22, 5 proves | **125.17 s** | 0.71 s | 0.57 % | 43.00 GiB | 790 MB | 12.0 s |
+| epoch 2^22, 14 proves | **125.33 s** | 1.58 s | 1.26 % | 44.8 GiB | 790 MB | 12.0 s |
+| of those, the 5 that got the most CPU | 124.47 s | 0.43 s | 0.34 % | | | |
 
 2^22 is what `/bench`, `/bench-abba` and the GPU bench pin. The epoch trade-off
 itself was swept on the previous block (2^21 costs +13.7 % of wall to save
@@ -112,9 +113,14 @@ than by the block, so that shape carries over even though the seconds do not.
 2^23 would take this workload past 50 GiB against the runner's 64 GiB floor,
 which is why memory and not speed picks the default.
 
-With that sd, a two-sided 95 % comparison resolves ~2.00 % at three runs per
-side, ~1.00 % at five and ~0.58 % at ten — which is why a sub-2 % claim needs
-`/bench N` or the ABBA tiebreaker rather than a re-read of a three-run table.
+The two rows are the same binary on the same block; what separates them is how
+much of the shared box each prove got. Wall time here is a function of CPU share,
+not of the prover, so quote a spread only together with the condition it was
+measured under — `scripts/bench_abba.sh` records the CPU share of every prove and
+flags a contended batch, and its comments carry the measurement. A two-sided 95 %
+comparison resolves ~0.6 % at three runs per side on a quiet box and ~2.0 % on a
+busy one, which is why a sub-2 % claim needs `/bench N` or the ABBA tiebreaker
+rather than a re-read of a three-run table.
 
 Continuations are not optional here: monolithic proving costs ~4.9 GB of peak
 heap per million cycles on this family, so 37.14M cycles would need ~182 GB.

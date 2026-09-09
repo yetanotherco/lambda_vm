@@ -9,24 +9,29 @@ name: Bench ABBA tiebreaker
 # Syntax: "/bench-abba [N]", where N is the pair count (default 12).
 #
 # Resolution, from the paired t-test (resolvable 95% delta = t* x sd / sqrt(N)). The
-# pair-delta sd on this runner is NOT yet measured; the two columns bracket it between
-# 0.6% and 0.81% (sqrt(2) x this runner's measured 0.57% single-run CV, from the
-# 5-prove baseline in tooling/ethrex-fixtures/README.md):
+# two columns are not a guess bracketing an unknown: they are the same runner under
+# two conditions, because its variance is contention and not prover jitter. Over a
+# 14-prove baseline (tooling/ethrex-fixtures/README.md) wall time and the share of CPU
+# a prove actually got correlate at -0.98, perfectly monotonic, so the single-run CV is
+# 0.34% across the proves that got the most CPU and 1.26% across all of them. sd of a
+# pair delta is sqrt(2) x that:
 #
-#   pairs   wall      resolves (sd 0.81% / sd 0.6%)
-#    8      ~41 min    0.67% / 0.50%
-#   12      ~58 min    0.51% / 0.38%   <- default
-#   20      ~1h31m     0.38% / 0.28%
-#   32      ~2h22m     0.29% / 0.22%
+#   pairs   wall      resolves (quiet box, sd 0.49% / shared, sd 1.78%)
+#    8      ~41 min    0.34% / 1.24%
+#   12      ~58 min    0.28% / 1.01%   <- default
+#   20      ~1h31m     0.21% / 0.78%
+#   32      ~2h22m     0.16% / 0.62%
 #
-# Wall is 2 x 125.17 s per pair (the runner's measured prove at epoch 2^22) plus ~8 min
-# of setup. The FIRST run measures the sd — it is the `sd` field of the paired-t line
-# in the result comment — and this table should be re-pinned to it then.
+# Wall is 2 x ~125 s per pair (the runner's measured prove at epoch 2^22) plus ~8 min of
+# setup. Read the column the run earned, not the one you want: the script prints an
+# exclusivity line reporting the CPU share of every prove and flagging any that came in
+# under 90% of the batch's best. A flagged batch belongs in the right-hand column.
 #
-# Both columns tightened when the workload was rebuilt for ethrex 25: the single-run
-# CV fell from 1.43% to 0.57%, so 12 pairs now resolve ~0.5% where they used to resolve
-# ~1.3%. Numbers from before that bump measured a different fixture (block 25368371 as
-# an rkyv ProgramInput) and are not comparable.
+# The rebuild for ethrex 25 did tighten this, but not as far as first recorded: a
+# 5-prove baseline put the CV at 0.57%, and its 95% interval was [0.34%, 1.64%] — wide
+# enough that the point estimate was not worth pinning a table to, which is what the
+# 14-prove follow-up then showed. Numbers from before the bump measured a different
+# fixture (block 25368371 as an rkyv ProgramInput) and are not comparable.
 on:
   issue_comment:
     types: [created]
@@ -34,7 +39,7 @@ on:
 env:
   # The epoch /bench proves this block at, so the tiebreaker resolves the same
   # configuration and not just the same block. Memory picks it: this runner peaks at
-  # 43.00 GiB here against its >=64 GiB floor, and 2^23 would take that past 50 GiB
+  # 44.81 GiB here against its >=64 GiB floor, and 2^23 would take that past 50 GiB
   # for ~7% of wall. See benchmark-pr.yml's REAL_BLOCK_EPOCH_LOG2.
   ABBA_REAL_EPOCH_LOG2: "22"
 

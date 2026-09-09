@@ -242,11 +242,31 @@ else
 fi
 
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
+# Every prove also records the share of CPU it actually got. On a shared box that
+# is the difference between a number and a coincidence: measured on the bench
+# runner, wall time and CPU share correlate at -0.98 across a ten-prove sweep,
+# perfectly monotonic, and a colleague's job landing mid-sweep cost 47 of 75 cores
+# and +73% of wall. So the spread this script reports is a property of how
+# exclusive the box was, not of the prover -- gated to the runs that got the most
+# CPU, the same sweep's CV falls from 1.54% to 0.34%. The ABBA pairing cancels most
+# of it (both sides meet the same neighbours), which is why this flags rather than
+# discards; a flagged batch is one whose spread should not be read as prover noise.
+CPU_SHARES="$WORK/cpu_shares.txt"; : > "$CPU_SHARES"
+TIME_BIN=""
+if /usr/bin/time -f %P true >/dev/null 2>&1; then TIME_BIN=/usr/bin/time; fi
+
 run_prove() {  # $1=binary -> echoes proving time (s)
-  local out t
+  local out t share tf
+  tf="$(mktemp)"
   # shellcheck disable=SC2086  # CONT_ARGS is intentionally word-split (0 or 2 args)
-  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
-  rm -f "$PROOF"
+  if [ -n "$TIME_BIN" ]; then
+    out="$($TIME_BIN -f '%P' -o "$tf" "$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
+  else
+    out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
+  fi
+  share="$(tr -d '%' < "$tf" | tr -d '[:space:]')"
+  rm -f "$tf" "$PROOF"
+  case "$share" in ''|*[!0-9]*) : ;; *) echo "$share" >> "$CPU_SHARES" ;; esac
   t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
   if [ -z "$t" ]; then
     echo "ERROR: could not parse 'Proving time' from cli output:" >&2
@@ -268,6 +288,29 @@ for i in $(seq 1 "$N_PAIRS"); do
   printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
     "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
 done
+
+# Exclusivity report. Self-calibrating: the best prove of this batch defines what
+# the box can give, so a run well under it met a neighbour. No box-specific
+# constant, which matters because this script also runs on rented 16-32 core GPU
+# hosts where an absolute percentage means nothing.
+if [ -s "$CPU_SHARES" ]; then
+  awk '
+    { n++; s[n]=$1; if ($1>mx) mx=$1; if (mn==0 || $1<mn) mn=$1 }
+    END {
+      if (n < 2 || mx == 0) exit 0
+      floor = 0.90 * mx
+      for (i=1;i<=n;i++) if (s[i] < floor) bad++
+      printf "==> Exclusivity: CPU share %d%%-%d%% of %d proves", mn, mx, n
+      if (bad) {
+        printf ", %d below 90%% of the best\n", bad
+        printf "    Something else was on the box. The pairing absorbs most of it, but do\n"
+        printf "    not read this batch spread as prover noise, and re-run on a quiet box\n"
+        printf "    before quoting a resolvable delta.\n"
+      } else {
+        printf ", all within 10%% of the best\n"
+      }
+    }' "$CPU_SHARES"
+fi
 
 # --- 4. Paired t-test + robust median/Wilcoxon ---
 python3 - "$WORK/pairs.csv" <<'PY'

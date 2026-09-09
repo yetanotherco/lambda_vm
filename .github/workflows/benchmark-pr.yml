@@ -99,7 +99,7 @@ env:
   # predating that fix fails at write time rather than mismeasuring.
   #
   # Epoch 2^22, measured on THIS runner on 2026-09-08 (box idle): mean 125.17 s over
-  # 5 proves, sd 0.71 s, CV 0.57%, 43.00 GiB peak RSS, 790 MB bundle; verifying one
+  # 14 proves, sd 1.58 s, CV 1.26%, 44.81 GiB peak RSS, 790 MB bundle; verifying one
   # bundle is 12.0 s.
   #
   # Memory, not speed, is what picks 2^22. The epoch trade-off was swept on the
