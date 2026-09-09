@@ -144,11 +144,14 @@ fn memmove_terminal_row_may_wrap_unused_successor_columns() {
 #[test]
 fn memmove_bus_interactions_count() {
     use crate::tables::memmove::bus_interactions;
-    // 23 on the DMA table this replaces, plus the CommitDefer receive and the two
-    // COMMIT-domain sends — one wide row of eight bytes, one tail row of one. The
-    // aux column count is `ceil(interactions / 2)`, so those two cost 1 aux column
-    // where the eight per-byte lanes they replace cost 4.
-    assert_eq!(bus_interactions().len(), 26);
+    // 23 on the DMA table this replaces, plus the CommitDefer receive and eight
+    // COMMIT-domain sends — one `(index, value)` pair per byte, lane 0 at `mu_com`
+    // and lanes 1..7 at `mu_com_wide`. One tuple per row would be two sends and
+    // three fewer aux columns (the count is `ceil(interactions / 2)`), but it would
+    // make the verifier's rebuild depend on the prover's row schedule, which
+    // restarts at every commit ECALL while the verifier sees only the concatenated
+    // `public_output`. Per-byte pairs are what make the two sides agree.
+    assert_eq!(bus_interactions().len(), 32);
 }
 
 #[test]
@@ -198,4 +201,75 @@ fn memmove_padding_row_cannot_claim_first_or_end() {
         !validate_busless(&air, &forge_end),
         "a padding row (mu = 0) must not claim to be a copy's terminal row"
     );
+}
+
+/// Pins the shape of the COMMIT-domain sends: eight `(index, value)` pairs, one per
+/// byte, indexed off `dst` — not one eight-lane tuple per row.
+///
+/// The verifier rebuilds this bus from `public_output` alone and never learns where
+/// one commit ECALL ended and the next began. Per-byte pairs are what make its
+/// rebuild independent of the prover's row schedule, which restarts at every ECALL;
+/// `test_prover_tuples_are_independent_of_the_ecall_split` is the arithmetic half of
+/// the same argument, and this is the half that keeps it anchored to the real chip.
+#[test]
+fn memmove_commit_sends_one_pair_per_byte() {
+    use crate::tables::memmove::bus_interactions;
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusValue, LinearTerm, Multiplicity, Packing};
+
+    let commit_sends: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|interaction| interaction.bus_id == BusId::Commit as u64)
+        .collect();
+
+    assert_eq!(commit_sends.len(), 8, "one COMMIT send per byte lane");
+
+    for (lane, interaction) in commit_sends.iter().enumerate() {
+        assert!(interaction.is_sender, "lane {lane} must send");
+
+        // Lane 0 rides every copying row; lanes 1..7 only an eight-byte row, so a
+        // one-byte row sends no spurious `(index, 0)` pairs.
+        let expected_multiplicity = if lane == 0 {
+            cols::MU_COM
+        } else {
+            cols::MU_COM_WIDE
+        };
+        assert!(
+            matches!(interaction.multiplicity, Multiplicity::Column(column) if column == expected_multiplicity),
+            "lane {lane} has the wrong multiplicity"
+        );
+
+        assert_eq!(
+            interaction.values.len(),
+            2,
+            "lane {lane} is an (index, value) pair"
+        );
+
+        match &interaction.values[0] {
+            BusValue::Linear(terms) => {
+                assert!(
+                    matches!(
+                        terms.as_slice(),
+                        [
+                            LinearTerm::Column { coefficient: 1, column },
+                            LinearTerm::Constant(offset),
+                        ] if *column == cols::DST_0 && *offset == lane as i64
+                    ),
+                    "lane {lane} must be indexed at dst + {lane}"
+                );
+            }
+            _ => panic!("lane {lane}'s index must be a linear combination"),
+        }
+
+        assert!(
+            matches!(
+                interaction.values[1],
+                BusValue::Packed {
+                    start_column,
+                    packing: Packing::Direct,
+                } if start_column == cols::VALUE[lane]
+            ),
+            "lane {lane} must carry value[{lane}]"
+        );
+    }
 }

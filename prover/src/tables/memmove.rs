@@ -602,42 +602,50 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }),
     ];
 
-    // 25-26. Write the destination in the COMMIT domain eight bytes at a time: one
-    // tuple per row rather than one per byte. A tail row sends the same arity with its
-    // seven unused lanes zeroed, so the verifier rebuilds both shapes from
-    // `public_output` alone — which is why a commit row's width follows from the global
-    // index and never from the guest buffer it reads.
-    let commit_index = || BusValue::Packed {
-        start_column: cols::DST_0,
-        packing: Packing::Direct,
+    // 25-32. Write the destination in the COMMIT domain, one `(index, value)` pair per
+    // byte. A row still carries eight bytes, but it sends them as eight separate pairs
+    // at `dst`, `dst + 1`, ..., rather than as one eight-lane tuple.
+    //
+    // The arity is what matters here, not the row width. The verifier rebuilds this bus
+    // from `public_output` alone, and it does not know where one commit ECALL ended and
+    // the next began — it sees only the concatenation. With one tuple per row the
+    // verifier would have to reproduce the prover's row schedule exactly, which it
+    // cannot: the schedule restarts at every ECALL, so a guest committing 4 bytes and
+    // then 4 more sends eight one-byte rows where the verifier, chunking the eight
+    // bytes it sees, would expect a single eight-byte row. An honest proof would be
+    // rejected. Addressing every byte by its own global index removes the grouping, and
+    // with it anything for the two sides to disagree about.
+    //
+    // Lane 0 is sent whenever the row copies (`mu_com`); lanes 1..7 only on an
+    // eight-byte row (`mu_com_wide`), so a one-byte row does not send seven spurious
+    // `(index, 0)` pairs.
+    let commit_pair = |lane: usize| {
+        vec![
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::DST_0,
+                },
+                LinearTerm::Constant(lane as i64),
+            ]),
+            BusValue::Packed {
+                start_column: cols::VALUE[lane],
+                packing: Packing::Direct,
+            },
+        ]
     };
     interactions.push(BusInteraction::sender(
         BusId::Commit,
-        Multiplicity::Column(cols::MU_COM_WIDE),
-        {
-            let mut tuple = Vec::with_capacity(9);
-            tuple.push(commit_index());
-            tuple.extend(cols::VALUE.iter().map(|&column| BusValue::Packed {
-                start_column: column,
-                packing: Packing::Direct,
-            }));
-            tuple
-        },
+        Multiplicity::Column(cols::MU_COM),
+        commit_pair(0),
     ));
-    interactions.push(BusInteraction::sender(
-        BusId::Commit,
-        Multiplicity::Diff(cols::MU_COM, cols::MU_COM_WIDE),
-        {
-            let mut tuple = Vec::with_capacity(9);
-            tuple.push(commit_index());
-            tuple.push(BusValue::Packed {
-                start_column: cols::VALUE_0,
-                packing: Packing::Direct,
-            });
-            tuple.extend((1..8).map(|_| BusValue::constant(0)));
-            tuple
-        },
-    ));
+    for lane in 1..8 {
+        interactions.push(BusInteraction::sender(
+            BusId::Commit,
+            Multiplicity::Column(cols::MU_COM_WIDE),
+            commit_pair(lane),
+        ));
+    }
 
     interactions
 }
