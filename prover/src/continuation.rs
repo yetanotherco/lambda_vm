@@ -1958,6 +1958,39 @@ mod tests {
     }
 
     // A memory-heavy multi-epoch continuation. `all_loadstore_32` is ~34 cycles, so
+    // `epoch_size_log2 = 3` (8 cycles) yields several intermediate epochs (each an
+    // exact power-of-two cycle count → no CPU padding rows) plus a final epoch.
+    #[test]
+    fn test_prove_and_verify_continuation() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let epoch_size_log2 = 3;
+        let epoch_size = 8;
+        // Guard against silent degradation: the program must be longer than one
+        // epoch, otherwise this collapses to a single final epoch and stops testing
+        // the cross-epoch (intermediate-epoch) path.
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
+        assert!(
+            total > epoch_size,
+            "program too short ({total} cycles) to exercise intermediate epochs"
+        );
+        assert!(
+            prove_and_verify_continuation(
+                &elf_bytes,
+                &[],
+                epoch_size_log2,
+                &ProofOptions::default_test_options()
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     /// Each epoch drops the chips it never reaches, and it decides that on its
     /// own: a table missing from one epoch still shows up in another that does
     /// use it. The skip is not a property of the run, it is a property of the
@@ -2055,39 +2088,6 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a bundle whose epochs carry different table sets must still verify"
-        );
-    }
-
-    // `epoch_size_log2 = 3` (8 cycles) yields several intermediate epochs (each an
-    // exact power-of-two cycle count → no CPU padding rows) plus a final epoch.
-    #[test]
-    fn test_prove_and_verify_continuation() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let epoch_size_log2 = 3;
-        let epoch_size = 8;
-        // Guard against silent degradation: the program must be longer than one
-        // epoch, otherwise this collapses to a single final epoch and stops testing
-        // the cross-epoch (intermediate-epoch) path.
-        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
-            .unwrap()
-            .run()
-            .unwrap()
-            .logs
-            .len();
-        assert!(
-            total > epoch_size,
-            "program too short ({total} cycles) to exercise intermediate epochs"
-        );
-        assert!(
-            prove_and_verify_continuation(
-                &elf_bytes,
-                &[],
-                epoch_size_log2,
-                &ProofOptions::default_test_options()
-            )
-            .unwrap()
-            .is_some()
         );
     }
 
