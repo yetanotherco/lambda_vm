@@ -23,12 +23,12 @@ The number of registers was chosen as a tradeoff between the versatility of havi
 and the extra cost in committed columns and decoding logic that grows with $N$.
 #rj[Register index for `ZERO` = $0$ and `PC` = $1$ and gp register `Ri` = $i + 2$]
 
-Each argument to the FMA constraint has either of the two following forms:
-- `imm_0 * reg + imm_1`
-- `MEM[imm_0 * reg + imm_1]`
+Each argument to the `FMA` constraint has either of the two following forms:
+- $#`imm`_0 dot #`reg` + #`imm`_1$
+- $#`MEM[`#`imm`_0 dot #`reg` + #`imm`_1#`]`$
 where each immediate is a base field element, encoded in the instruction for a specific argument,
 and `MEM[...]` reads memory.
-The `o` argument to the instruction obtains its register values from the _future_ state.
+The `o` argument to the instruction obtains its register value from the _future_ state.
 That is, the state from which the next instruction will get its input register values.
 The `ZERO` register of the future state contains a bit (as a base field element) that indicates whether or not
 the `o` value was zero for the current instruction.
@@ -37,13 +37,13 @@ Every other register can hold an arbitrary extension field element.
 
 == Register hints
 
-Each register (other than `ZERO` and `PC`) in the current state can be marked as _hinted_ in an instruction.
+Each general-purpose register in the current state can be marked as _hinted_ in an instruction.
 This means that its value from the current instruction onward can get a new value
 that is independent from the previous value, except as constrained by the instruction.
-Additionally, the _output_ can be marked as hinted, meaning that the register used in the `o` argument
-whether wrapped in a `MEM[]` lookup or not, will change in the future state, and as such in the `o` argument too.
+Additionally, the _output_ can be marked as hinted, meaning that the register used in the `o` argument ---
+whether wrapped in a `MEM[]` lookup or not --- will change in the future state, and as such in the `o` argument too.
 Output hinting is commonly used to assign the result of a computation: `FMA X == X * X, hint out` would
-compute `X * X` and re-assign it to `X` in the future state.
+compute $#`X` dot #`X`$ and assign the result to `X` in the future state.
 The output hint, in contradiction with the input hints, does allow `PC` to be hinted, so as to enable
 causal jumps and control flow in the program.
 Any register that is not hinted will have the same value in the future state as in the current state,
@@ -84,8 +84,8 @@ We note that this may be insufficient for the execution/prover side of the progr
 as this provides no information on _which_ value exactly should be hinted,
 but leave this as an implementation detail to be decided upon based on practical experience.
 
-We label the instruction with an `FMA` mnemonic, even though that is the only possible "real" instruction,
-in order to allow program listings to include other mnemonics to indicate pseudoinstructions that
+We label the instruction with an `FMA` mnemonic --- even though that is the only possible "real" instruction ---
+to allow program listings to include other mnemonics to indicate pseudoinstructions that
 map more specialized semantics onto the FMA functionality.
 Next, we suggest some potential pseudoinstructions along with their translation.
 This list is meant as an example, rather than an exhaustive enumeration;
@@ -196,12 +196,12 @@ We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
 - $!#`hint_input`'_r and !#`hint_output` => #`registers`'_r = #`registers`_r$, `r` could not have been hinted,
   since it was not input-hinted in the next row, and there was no output hint, so the next `r` should remain the same.
-- $!#`hint_input`'_r and f_r(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers_r`$
+- $!#`hint_input`'_r and f_(r)(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers`_r$
   `r` was not input-hinted in the next row, and it was not the output register, so it once again stays the same.
 
-This is equivalent to the logical statement $!#`hint_input`'_r and not (#`hint_output` and f_r(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
-Naturally, the PC gets an exception since if it is not (output-)hinted, we need $#`pc`' = #`pc` + 1$,
-and the $#`ZERO`'$ register purely depends on $#`args`_0$ and not on `ZERO`.
+Together, these constraints are logically equivalent to $!#`hint_input`'_r and not (#`hint_output` and f_(r)(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
+Naturally, the `PC` and `ZERO` registers are exceptions since we need $#`pc`' = #`pc` + 1$ if it is not (output-)hinted,
+and $#`ZERO`'$ purely depends on $#`args`_0$ and not on `ZERO`.
 
 #render_constraint_table(chip, config, groups: "transition")
 
