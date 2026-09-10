@@ -35,6 +35,7 @@ pub mod epoch_verify;
 pub mod executor;
 pub mod fixture;
 pub mod fri;
+pub mod global_split;
 pub mod hash;
 pub mod instr;
 pub mod keccak_adapter;
