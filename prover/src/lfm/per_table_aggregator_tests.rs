@@ -2410,3 +2410,562 @@ fn the_tree_shape_matches_the_epoch_count() {
         .count();
     assert_eq!(short, 3, "19 at fan-in 2 must exercise the leftover rule");
 }
+
+// ======================= the production tree driver =======================
+
+/// A 100 Hz `VmRSS` sampler with an ARGMAX TIMESTAMP.
+///
+/// ⛔ WHY NOT `VmHWM`. A high-water only rises, so it cannot see a peak BELOW
+/// itself and cannot say WHEN its own peak happened. That is what struck the
+/// 37.169 GiB "the tree does not grow per level": three reads of one monotone
+/// counter, in a process that had already proved a base and four wraps, with no
+/// mark before the first level — a whole-process bound that priced no level in
+/// it, level 1 included, and being a within-run comparison did not rescue it.
+///
+/// ⇒ A sampled max carries an argmax `t`, which buys two things a high-water
+/// cannot: a level's peak is the max inside ITS OWN window rather than the
+/// process's, and the host peak can be checked for SIMULTANEITY against an
+/// external device trace. Non-simultaneous maxima must not be summed.
+struct HostSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<(f64, f64)>>,
+}
+
+impl HostSampler {
+    fn start() -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let (mut peak, mut at) = (0.0f64, unix_now());
+            while !flag.load(Ordering::Relaxed) {
+                if let (Some(rss), _) = rss_marks()
+                    && rss > peak
+                {
+                    peak = rss;
+                    at = unix_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            (peak, at)
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// `(peak GiB, argmax UNIX seconds)` over this sampler's window.
+    fn stop(mut self) -> (f64, f64) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .take()
+            .expect("a sampler is stopped once")
+            .join()
+            .expect("the sampler thread must not panic")
+    }
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// The cgroup memory ceiling, trying **v2 then v1**, or `None` with the reason.
+///
+/// ⚠ A sampler hard-coded to one layout reads NOTHING on the other box and
+/// reports no error, so a percentage-of-ceiling silently becomes a percentage of
+/// zero — or of a default nobody chose. Both paths are tried and a miss is
+/// LOUD; the caller must not print a percentage without a ceiling.
+fn cgroup_limit_gib() -> Result<f64, String> {
+    const PATHS: [&str; 2] = [
+        "/sys/fs/cgroup/memory.max",                   // v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1
+    ];
+    let mut tried = Vec::new();
+    for p in PATHS {
+        match std::fs::read_to_string(p) {
+            Ok(s) if s.trim() == "max" => tried.push(format!("{p}=max (unlimited)")),
+            Ok(s) => match s.trim().parse::<u64>() {
+                Ok(b) => return Ok(b as f64 / (1024.0 * 1024.0 * 1024.0)),
+                Err(e) => tried.push(format!("{p} unparsable: {e}")),
+            },
+            Err(e) => tried.push(format!("{p}: {e}")),
+        }
+    }
+    Err(tried.join("; "))
+}
+
+/// Print the census and the chip padding panel for one node program.
+///
+/// The panel is a FORWARD instrument, not a diagnostic: printed from the working
+/// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
+/// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
+/// usable. Print it at EVERY level.
+fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
+    const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
+    let (main, aux) =
+        super::airs::lfm_cell_counts_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
+    let cells = main + 3 * aux;
+    println!(
+        "   ★ CENSUS {label}: {cells} cells ({} instructions), floor {:.1}%",
+        program.instrs.len(),
+        100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
+    );
+    let panel = super::airs::lfm_chip_census_with_hasher(program, crate::hash_pin::BLOCK_HASHER);
+    let step = (fan_in + 1) as f64 / fan_in as f64;
+    for c in &panel {
+        println!(
+            "     {:<14} {:>10}/{:>10}  headroom {:>5.1}%  {}  cliff +{} cells",
+            c.name,
+            c.real_rows,
+            c.rows,
+            100.0 * c.headroom(),
+            if c.at_risk() { "AT RISK" } else { "fixed  " },
+            c.cliff_cost(),
+        );
+    }
+    let stepping: Vec<&str> = panel
+        .iter()
+        .filter(|c| c.at_risk() && c.real_rows as f64 * step > c.rows as f64)
+        .map(|c| c.name)
+        .collect();
+    println!("     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}");
+    (cells, program.instrs.len())
+}
+
+/// The child index range each node of a level consumes, in order.
+///
+/// Extracted from the driver rather than written inline because it is the one
+/// piece of the tree that is pure arithmetic and can therefore be WRONG for
+/// free: an off-by-one here mis-groups children and the driver only notices at
+/// its consumption assert, which is twenty-odd minutes of wraps into a box run.
+/// [`the_level_groups_tile_every_child`] pins it in milliseconds.
+fn level_groups(arities: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut cursor = 0usize;
+    arities
+        .iter()
+        .map(|a| {
+            let r = cursor..cursor + a;
+            cursor += a;
+            r
+        })
+        .collect()
+}
+
+/// ★ The driver's grouping tiles its children exactly, at every level and every
+/// shape — no gap, no overlap, nothing left over.
+///
+/// Pure arithmetic, so it runs on every suite. The driver asserts the same
+/// invariant at runtime, but discovering it there costs a base prove and 19 wrap
+/// proves first.
+#[test]
+fn the_level_groups_tile_every_child() {
+    use super::per_table_aggregator::tree_shape;
+
+    for epochs in [1usize, 2, 3, 5, 10, 19, 36, 64, 97] {
+        for fan_in in [2usize, 3, 4] {
+            let mut n = epochs;
+            for (li, level) in tree_shape(epochs, fan_in).iter().enumerate() {
+                let groups = level_groups(&level.arities);
+                assert_eq!(
+                    groups.len(),
+                    level.arities.len(),
+                    "{epochs}@{fan_in} level {li}: one group per node"
+                );
+                let mut expect = 0usize;
+                for g in &groups {
+                    assert_eq!(g.start, expect, "{epochs}@{fan_in} level {li}: no gap");
+                    assert!(!g.is_empty(), "{epochs}@{fan_in} level {li}: no empty node");
+                    expect = g.end;
+                }
+                assert_eq!(
+                    expect, n,
+                    "{epochs}@{fan_in} level {li}: the groups must consume every \
+                     one of the {n} children and no more"
+                );
+                n = level.arities.len();
+            }
+            assert_eq!(n, 1, "{epochs}@{fan_in}: the interior must close to one");
+        }
+    }
+}
+
+/// ★★★ THE PRODUCTION TREE — every level, from 19 epoch wraps to one proof.
+///
+/// # What this is, and what it is NOT
+///
+/// It composes the tree's **INTERIOR**: levels 1..k of `emit_node`, closing to a
+/// single level-k node. ⛔ It is **not** the block-artifact ROOT, which takes
+/// `fan_in + 1` children (the global wrap is the extra), performs the L2G
+/// compare and the attestation join, and publishes a schema variable-length in
+/// the block's page count — see `tree_shape`'s own doc. Closing the interior
+/// binds the epoch proofs to each other; it does not by itself make an artifact
+/// about the BLOCK. The two are not the same finish line and this one must not
+/// be reported as the other.
+///
+/// # One arm per process
+///
+/// `LFM_TREE_LEVELS` names which levels THIS process proves — `all`, `N`, or
+/// `lo-hi`, where level 0 is the epoch wraps. Levels below `lo` are LOADED from
+/// `A_CACHE_DIR`; levels in `[lo, hi]` are PROVED; nothing above `hi` runs. The
+/// base follows `lo`: proved when `lo == 0`, loaded otherwise.
+///
+/// ⛔ The RANGE is the experiment's name, so `A_BUNDLE_MODE` is REFUSED here
+/// rather than ignored — a caller who exports a mode that has no effect believes
+/// they set something. Naming the mode is what stops a harness picking its own
+/// experiment off the filesystem.
+///
+/// ⚠ Only the PROVES are skippable, not the harvest chain: a level-k node's
+/// program is a function of its children's shapes, so an arm at level k still
+/// re-emits and re-harvests everything below it. That cost is measured and
+/// printed rather than assumed — if it is minutes, per-level arms are not cheap
+/// and the answer is a second cache layer, which is a build.
+///
+/// ```text
+/// LFM_CENSUS_ELF=… LFM_CENSUS_INPUT=… LFM_CENSUS_EPOCH_LOG2=21 \
+/// LAMBDA_VM_MAX_ROWS_LOG2=21 LAMBDA_VM_MEMPOOL_RELEASE_MB=0 \
+/// A_CACHE_DIR=/root/a_tree LFM_TREE_LEVELS=all \
+/// cargo test --release -p lambda-vm-prover --features cuda --lib \
+///   lfm::per_table_aggregator_tests::the_production_tree_composes_to_a_root -- \
+///   --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "box tier, production scale: composes the whole interior tree"]
+fn the_production_tree_composes_to_a_root() {
+    use super::epoch_tests::{EpochInputs, Publishes};
+    use super::per_table_aggregator::{FAN_IN, SchemaLayout, tree_node_count, tree_shape};
+    use super::proof::lfm_prove;
+    use super::registry::build_artifacts_with_hasher;
+    use std::time::Instant;
+
+    // ⛔ THE DEVICE, ASSERTED IN-PROCESS — see the leaf measurement's own note.
+    // A CPU run completes, reads legibly, and biases every host figure the wrong
+    // way, so a red would be an artefact of the build rather than a fact.
+    if !cfg!(feature = "cuda") {
+        panic!(
+            "the production tree requires `--features cuda`. Without it this \
+             proves on the CPU and answers a different question"
+        );
+    }
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this composes the PRODUCTION tree, and a \
+             silent fixture fallback would report a fixture number under a \
+             production name"
+        );
+    }
+    assert!(
+        std::env::var("A_BUNDLE_MODE").is_err(),
+        "A_BUNDLE_MODE is set, and this test does NOT consult it — the level \
+         range names the experiment. Unset it and use LFM_TREE_LEVELS (`all`, \
+         `N`, or `lo-hi`); a mode that silently has no effect is worse than none"
+    );
+
+    let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
+        Err(_) => FAN_IN,
+    };
+    assert!(
+        (2..=4).contains(&fan_in),
+        "LFM_CENSUS_FAN_IN must be in 2..=4, got {fan_in}"
+    );
+
+    let spec = std::env::var("LFM_TREE_LEVELS").unwrap_or_else(|_| "all".to_string());
+    let (lo, hi_req): (usize, Option<usize>) = match spec.as_str() {
+        "all" => (0, None),
+        s => match s.split_once('-') {
+            Some((a, b)) => (
+                a.parse().expect("LFM_TREE_LEVELS lo must be an integer"),
+                Some(b.parse().expect("LFM_TREE_LEVELS hi must be an integer")),
+            ),
+            None => {
+                let n = s
+                    .parse()
+                    .expect("LFM_TREE_LEVELS must be `all`, `N` or `lo-hi`");
+                (n, Some(n))
+            }
+        },
+    };
+    let cache_dir = std::env::var("A_CACHE_DIR").ok();
+    assert!(
+        lo == 0 || cache_dir.is_some(),
+        "LFM_TREE_LEVELS starts at {lo}, so levels below it must be LOADED — but \
+         A_CACHE_DIR is unset. Proving them instead would silently make this a \
+         different (and much longer) experiment"
+    );
+    // Levels below `lo` load; levels in the range prove, and save when a cache
+    // directory exists. `CacheMode::Prove` refuses an existing file, so a re-run
+    // over a populated directory is a refusal rather than an overwrite.
+    let stage_mode = |level: usize| -> CacheMode {
+        if level < lo {
+            CacheMode::Load
+        } else if cache_dir.is_some() {
+            CacheMode::Prove
+        } else {
+            CacheMode::Off
+        }
+    };
+
+    let inputs = EpochInputs::from_env();
+    let inner = crate::recursion::Preset::Blowup4.options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let ceiling = cgroup_limit_gib();
+    println!(
+        "★★★ PRODUCTION TREE (INTERIOR ONLY — not the block-artifact root)\n   \
+         guest {}, {} input bytes, 2^{} cycles/epoch, fan-in {fan_in}\n   \
+         inner blowup {} / {} q · wrap blowup {} / {} q\n   \
+         levels: prove {lo}..={} · cache {}\n   cgroup ceiling: {}",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        wrap_opts.blowup_factor,
+        wrap_opts.fri_number_of_queries,
+        match hi_req {
+            Some(h) => h.to_string(),
+            None => "top".to_string(),
+        },
+        cache_dir.as_deref().unwrap_or("<none>"),
+        match &ceiling {
+            Ok(g) => format!("{g:.2} GiB"),
+            Err(why) => format!("UNKNOWN — {why}"),
+        },
+    );
+
+    let whole_run = HostSampler::start();
+    let t_all = Instant::now();
+
+    // ---- the base. It is needed by EVERY arm: a level-k node's program is a
+    // function of its children's shapes, so even a top-level arm re-derives the
+    // whole chain from the epochs. Only the PROVES are skippable.
+    let t = Instant::now();
+    let bundle = cached_bundle(
+        if lo == 0 {
+            stage_mode(0)
+        } else {
+            CacheMode::Load
+        },
+        stage_path(cache_dir.as_deref(), "bundle"),
+        || {
+            crate::continuation::prove_continuation(
+                &inputs.elf_bytes,
+                &inputs.private_input,
+                inputs.epoch_log2,
+                &inner,
+            )
+            .expect("the block must prove")
+        },
+    );
+    println!(
+        "   base: {} epochs in {:.1}s",
+        bundle.num_epochs(),
+        t.elapsed().as_secs_f64()
+    );
+    mark("AFTER the base (this live figure is L_bundle)");
+
+    let shape = tree_shape(bundle.num_epochs(), fan_in);
+    let top = shape.len();
+    let hi = hi_req.unwrap_or(top).min(top);
+    assert!(
+        lo <= hi,
+        "LFM_TREE_LEVELS {lo}-{hi} is empty; the tree has {top} node levels"
+    );
+    println!(
+        "   ★ SHAPE from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
+        bundle.num_epochs(),
+        tree_node_count(&shape),
+    );
+    for (i, level) in shape.iter().enumerate() {
+        let short = level.arities.iter().filter(|a| **a < fan_in).count();
+        println!(
+            "     level {}: {} nodes ({short} short)",
+            i + 1,
+            level.arities.len()
+        );
+    }
+
+    // ---- level 0: one wrap per epoch.
+    let t_level = Instant::now();
+    // ★ THREE PARALLEL VECTORS, not a vector of structs, because `node_program`
+    // and `prove_node_as_child` take `&[RealChild]` and `&[SchemaLayout]` — a
+    // contiguous slice of each is exactly what a node's child group is, and
+    // keeping them parallel means a group is a subslice rather than a clone of
+    // every child's harvest. The label run is what distinguishes the levels and
+    // nothing else does: a wrap carries ONE epoch label, a node carries the
+    // FIRST and LAST of its subtree, and a parent's range runs from the first
+    // child's first to the last child's last — which is why contiguity across
+    // siblings falls out of the pins rather than needing a check of its own.
+    let mut children: Vec<RealChild> = Vec::with_capacity(bundle.num_epochs());
+    let mut layouts: Vec<SchemaLayout> = Vec::with_capacity(bundle.num_epochs());
+    let mut labels: Vec<Vec<u64>> = Vec::with_capacity(bundle.num_epochs());
+    for k in 0..bundle.num_epochs() {
+        let e = super::epoch_tests::real_epoch_from_continuation(
+            &inner,
+            &inputs.elf_bytes,
+            &bundle,
+            k,
+            None,
+        )
+        .expect("every epoch must reconstruct from proofs alone");
+        let out_halves = e.statement.public_output_len.div_ceil(4);
+        if k == 0 {
+            // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation fold
+            // is already emitted inside every wrap at this page count, and the
+            // fold's hashed length is linear in it — so this one number is the
+            // main cost driver of the root that does not yet exist.
+            let shape = super::programs::ProgramIdShape {
+                num_pages: e.num_pages(),
+            };
+            println!(
+                "   ★ BLOCK FACTS: {} touched pages ⇒ attestation fold hashes {} \
+                 bytes; epoch public output {} halves",
+                shape.num_pages,
+                shape.byte_len(),
+                out_halves,
+            );
+        }
+        let shapes: Vec<&super::epoch::TableChallengeShape> =
+            e.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("inner epoch {k}"), &shapes);
+        let program =
+            super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let proved = cached_stage(
+            stage_mode(0),
+            stage_path(cache_dir.as_deref(), &format!("wrap-{k}")),
+            &format!("wrap {k}"),
+            || {
+                lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                    .expect("the epoch wrap must prove")
+            },
+        );
+        let layout = SchemaLayout::wrap(out_halves);
+        layout.assert_covers(proved.public_words.len());
+        children.push(real_child(artifacts, wrap_opts.clone(), &proved));
+        layouts.push(layout);
+        labels.push(vec![crate::tables::local_to_global::epoch_label(k as u64)]);
+    }
+    println!(
+        "   level 0: {} wraps in {:.1}s",
+        children.len(),
+        t_level.elapsed().as_secs_f64()
+    );
+
+    // ---- levels 1..=hi.
+    let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
+    for (li, level) in shape.iter().enumerate().take(hi) {
+        let level_no = li + 1;
+        let t_level = Instant::now();
+        let (mut next, mut next_layouts, mut next_labels) = (
+            Vec::with_capacity(level.arities.len()),
+            Vec::with_capacity(level.arities.len()),
+            Vec::with_capacity(level.arities.len()),
+        );
+        let groups = level_groups(&level.arities);
+        for (j, g) in groups.iter().enumerate() {
+            let arity = &g.len();
+            let kids = &children[g.clone()];
+            let kid_layouts = &layouts[g.clone()];
+            let kid_labels = &labels[g.clone()];
+            let label = format!("L{level_no}N{j} (arity {arity})");
+
+            let label_refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
+            let range = (
+                kid_labels[0][0],
+                *kid_labels[arity - 1].last().expect("a label run"),
+            );
+            let out_halves = kid_layouts[arity - 1].out_halves;
+
+            let program = node_program(
+                kids,
+                kid_layouts,
+                &label_refs,
+                range,
+                super::per_table_aggregator::NodePublishSet::Aggregation,
+            );
+            let (cells, instrs) = census_and_panel(&program, &label, fan_in);
+
+            let sampler = HostSampler::start();
+            let t_node = Instant::now();
+            let (child, layout) = prove_node_as_child(
+                &label,
+                kids,
+                kid_layouts,
+                &label_refs,
+                range,
+                out_halves,
+                &wrap_opts,
+                stage_mode(level_no),
+                stage_path(cache_dir.as_deref(), &format!("node-{level_no}-{j}")),
+            );
+            let wall = t_node.elapsed().as_secs_f64();
+            let (peak, at) = sampler.stop();
+            println!(
+                "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s",
+                match &ceiling {
+                    Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                    Err(_) => String::new(),
+                },
+            );
+            report.push((level_no, *arity, cells, instrs, peak, at, wall));
+            next.push(child);
+            next_layouts.push(layout);
+            next_labels.push(vec![range.0, range.1]);
+        }
+        assert_eq!(
+            groups.last().map(|g| g.end).unwrap_or(0),
+            children.len(),
+            "every child must be consumed"
+        );
+        // ★ The level below goes, and the trough is the point: a tree-builder at
+        // level k holds level k-1 and nothing under it. Only a live sample can
+        // show a release; a high-water cannot.
+        children = next;
+        layouts = next_layouts;
+        labels = next_labels;
+        mark(&format!("AFTER level {level_no}, its children released"));
+        println!(
+            "   level {level_no}: {} nodes in {:.1}s",
+            children.len(),
+            t_level.elapsed().as_secs_f64()
+        );
+    }
+
+    let (run_peak, run_at) = whole_run.stop();
+    println!(
+        "\n★★★ TREE COMPOSED — {} proof(s) at level {hi}",
+        children.len()
+    );
+    if hi == top {
+        assert_eq!(
+            children.len(),
+            1,
+            "the interior must close to exactly one proof"
+        );
+    }
+    println!("\nlevel arity        cells  instructions  host GiB   argmax t    wall s");
+    for (l, a, cells, instrs, peak, at, wall) in &report {
+        println!("{l:>5} {a:>5} {cells:>12} {instrs:>13} {peak:>9.3} {at:>10.1} {wall:>9.1}");
+    }
+    println!(
+        "\nWHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
+        t_all.elapsed().as_secs_f64()
+    );
+    match &ceiling {
+        Ok(g) => println!(
+            "           = {:.1}% of the {g:.2} GiB cgroup ceiling",
+            100.0 * run_peak / g
+        ),
+        Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
+    }
+}

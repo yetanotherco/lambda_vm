@@ -643,6 +643,17 @@ pub(super) struct RealEpoch {
     pub(super) expected_bus_balance: FEE,
 }
 
+impl RealEpoch {
+    /// Pages this epoch touched. The attestation fold already emitted in every
+    /// wrap hashes `TAG + 32 + 8 + 32 + 8 + 40 * num_pages` bytes, so this count
+    /// is linear in the fold's cost — and it is the main cost driver of the
+    /// block-artifact root, which does not exist yet. Exposed so a production run
+    /// can report it for free rather than a later lane guessing at it.
+    pub(super) fn num_pages(&self) -> usize {
+        self.page_commitments.len()
+    }
+}
+
 pub(super) fn real_epoch() -> RealEpoch {
     real_epoch_with(super::proof_fixture::fixture_options())
 }
