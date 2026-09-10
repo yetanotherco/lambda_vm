@@ -117,28 +117,38 @@ pub struct TableCounts {
 }
 
 impl TableCounts {
-    /// Sum of all chunk counts across the split tables.
-    pub fn total(&self) -> usize {
-        self.cpu
-            + self.lt
-            + self.memw
-            + self.memw_aligned
-            + self.load
-            + self.mul
-            + self.dvrm
-            + self.shift
-            + self.branch
-            + self.memw_register
-            + self.eq
-            + self.bytewise
-            + self.store
-            + self.cpu32
-            + self.keccak
-            + self.keccak_rnd
-            + self.ecsm
-            + self.ecdas
-            + self.hint
-            + self.commit
+    /// Sum of all chunk counts across the split tables, or `None` if they
+    /// overflow.
+    ///
+    /// The counts are prover-supplied and release builds wrap on overflow, so a
+    /// plain sum is not enough: the sub-proof cross-check compares only this
+    /// total, and a wrapped one lets a single astronomically large field pass it
+    /// and reach `VmAirs::new`, which sizes a `Vec` from that field directly.
+    pub fn total(&self) -> Option<usize> {
+        [
+            self.cpu,
+            self.lt,
+            self.memw,
+            self.memw_aligned,
+            self.load,
+            self.mul,
+            self.dvrm,
+            self.shift,
+            self.branch,
+            self.memw_register,
+            self.eq,
+            self.bytewise,
+            self.store,
+            self.cpu32,
+            self.keccak,
+            self.keccak_rnd,
+            self.ecsm,
+            self.ecdas,
+            self.hint,
+            self.commit,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
 
     /// Validate that the structurally-required tables have at least one chunk.
@@ -1456,11 +1466,19 @@ fn verify_proof_parts(
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
-    let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    let Some(expected_proof_count) = table_counts
+        .total()
+        .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
+        .and_then(|t| t.checked_add(page_configs.len()))
+    else {
+        return Err(Error::InvalidTableCounts(
+            "declared table counts overflow usize".to_string(),
+        ));
+    };
     if expected_proof_count != proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
-            table_counts.total(),
+            expected_proof_count - FIXED_TABLE_COUNT - page_configs.len(),
             page_configs.len(),
             expected_proof_count,
             proofs.len(),

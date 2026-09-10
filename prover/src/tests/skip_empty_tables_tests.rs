@@ -163,6 +163,41 @@ fn validate_still_requires_cpu_and_the_register_file() {
     );
 }
 
+/// The counts ride in the proof, so they are the prover's to choose, and the
+/// sub-proof cross-check compares only their sum. A plain `+` wraps silently in
+/// release (the workspace sets no `overflow-checks`), so an attacker can park
+/// one field near `usize::MAX`, pick a second to carry the sum around to
+/// whatever `proofs.len()` is, and pass that check with the huge field intact —
+/// straight into `VmAirs::new`, which sizes a `Vec` from it.
+#[test]
+fn counts_that_wrap_have_no_total() {
+    let (elf, logs, _instructions) = run_asm_elf("test_mul_8");
+    let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    let honest = traces.table_counts();
+    let honest_total = honest.total().expect("an honest run has a total");
+
+    let mut wrapped = honest.clone();
+    wrapped.mul += usize::MAX - honest_total;
+    assert!(
+        wrapped.validate().is_ok(),
+        "validate looks at two fields, not at the sum"
+    );
+    assert_eq!(
+        wrapped.total(),
+        Some(usize::MAX),
+        "one below the wrap still totals"
+    );
+
+    // One more takes the *sum* past the end, not the field: `mul` itself stays
+    // below `usize::MAX` because the other counts hold the difference.
+    wrapped.mul += 1;
+    assert_eq!(
+        wrapped.total(),
+        None,
+        "a wrapped sum must not be reported as a small one"
+    );
+}
+
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
 /// ecall now carries none of the six.

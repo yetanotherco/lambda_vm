@@ -803,7 +803,15 @@ fn verify_epoch(
         FIXED_TABLE_COUNT - 1
     };
     let proof = epoch.proof();
-    let expected_proof_count = table_counts.total() + fixed_tables + 1;
+    // Checked: the counts are prover-supplied and a wrapped sum would let one
+    // field stay huge and still match `proof.len()`.
+    let Some(expected_proof_count) = table_counts
+        .total()
+        .and_then(|t| t.checked_add(fixed_tables))
+        .and_then(|t| t.checked_add(1))
+    else {
+        return Ok(false);
+    };
     if expected_proof_count != proof.len() {
         return Ok(false);
     }
