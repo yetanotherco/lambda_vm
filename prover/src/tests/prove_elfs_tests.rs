@@ -65,6 +65,42 @@ fn memw_chunk_rows(
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+    weigh_the_bus(elf, traces, false).accepted
+}
+
+/// What the verifier did with a proof, split so a negative test can name the
+/// check that rejected it instead of just observing that something did.
+///
+/// `multi_verify_views` returns `false` from about ten places — the
+/// bus_public_inputs presence symmetry, a missing `public_inputs()`, any
+/// table's rounds 2-4 — so a bare `assert!(!verified)` cannot tell "the bus
+/// balance caught the forgery" from "the forged proof fell over somewhere
+/// else". `target_moved` is what separates them.
+pub(crate) struct BusOutcome {
+    /// `multi_verify_views` against the target the verifier computes itself.
+    pub accepted: bool,
+    /// Σ `table_contribution` over the tables the bus sums, exactly as the
+    /// verifier computes it.
+    pub contribution_sum: FieldElement<E>,
+    /// The target that sum has to match.
+    pub target: FieldElement<E>,
+    /// The same proof re-verified with the target moved to `contribution_sum`.
+    /// When this is true and `accepted` is false, every other check passed and
+    /// the balance is the *only* reason for the rejection.
+    pub accepted_with_target_moved: bool,
+    /// Per-table contribution, for the tables the sum above ranges over. A
+    /// table that contributes zero is one the bus cannot notice the absence of.
+    pub per_table: Vec<(String, FieldElement<E>)>,
+}
+
+/// Prove and verify as `prove_and_verify_vm_minimal`, and weigh the bus while
+/// at it. `recheck_with_moved_target` costs a second full verification, so the
+/// plain wrapper above leaves it off.
+pub(crate) fn weigh_the_bus(
+    elf: &Elf,
+    traces: &mut Traces,
+    recheck_with_moved_target: bool,
+) -> BusOutcome {
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
@@ -111,12 +147,42 @@ pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> boo
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify_views(
-        &airs.air_refs(),
+    let air_refs = airs.air_refs();
+    let accepted = Verifier::multi_verify_views(
+        &air_refs,
         &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
-    )
+    );
+
+    // The verifier's own sum, recomputed here so a test can compare it against
+    // the target instead of guessing why a proof was rejected.
+    let mut contribution_sum = FieldElement::<E>::zero();
+    let mut per_table = Vec::new();
+    for (air, view) in air_refs.iter().zip(views.iter()) {
+        if air.has_trace_interaction()
+            && let Some(contribution) = view.bus_table_contribution()
+        {
+            contribution_sum += contribution;
+            per_table.push((air.name().to_string(), contribution));
+        }
+    }
+
+    let accepted_with_target_moved = recheck_with_moved_target
+        && Verifier::multi_verify_views(
+            &air_refs,
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &contribution_sum,
+        );
+
+    BusOutcome {
+        accepted,
+        contribution_sum,
+        target: expected_bus_balance,
+        accepted_with_target_moved,
+        per_table,
+    }
 }
 
 /// Like [`crate::prove_with_options_and_inputs`] but trims the bitwise table to the
