@@ -144,6 +144,34 @@ where
         })
     }
 
+    /// The same, with the codeword and the tree both already computed — a
+    /// device commit. The nodes carry no proof of their own correctness, so the
+    /// caller answers for the layout: `2*num_leaves - 1` nodes, root first,
+    /// leaves last.
+    pub fn from_precomputed(
+        codeword: Vec<FieldElement<F>>,
+        nodes: Vec<Commitment>,
+        log_folding: usize,
+    ) -> Result<Self, Error> {
+        if !codeword.len().is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(codeword.len()));
+        }
+        let log_domain_size = codeword.len().trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
+        let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
+        Ok(Self {
+            tree,
+            codeword,
+            log_folding,
+            log_domain_size,
+        })
+    }
+
     pub fn root(&self) -> Commitment {
         self.tree.root
     }

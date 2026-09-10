@@ -10,6 +10,7 @@ pub mod claim_reduce;
 pub mod constraint_argument;
 pub mod eq;
 pub mod gkr;
+pub mod gpu;
 pub mod logup;
 pub mod mle;
 pub mod poly;

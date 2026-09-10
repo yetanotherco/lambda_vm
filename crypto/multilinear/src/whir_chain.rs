@@ -350,14 +350,19 @@ pub fn commit<F>(
     config: &ChainConfig,
 ) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
 where
-    F: IsFFTField + IsPrimeField + Send + Sync,
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let schedule = config.schedule(f.num_vars());
     let first = schedule.first().copied().unwrap_or(0);
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
-    let commitment =
-        CodewordCommitment::from_codeword(encode::<F, F>(&lift_coefficients(f), &domain)?, first)?;
+    let commitment = match crate::gpu::commit_codeword(f.evals(), config.log_blowup, first) {
+        Some((codeword, nodes)) => CodewordCommitment::from_precomputed(codeword, nodes, first)?,
+        None => CodewordCommitment::from_codeword(
+            encode::<F, F>(&lift_coefficients(f), &domain)?,
+            first,
+        )?,
+    };
     Ok((commitment, domain))
 }
 

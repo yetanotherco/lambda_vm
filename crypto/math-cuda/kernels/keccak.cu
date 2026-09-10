@@ -207,6 +207,29 @@ extern "C" __global__ void grind_search(const uint64_t *inner_lanes,
 // `c` is the contiguous slab `[c*col_stride .. c*col_stride + num_rows]`. The
 // remaining `col_stride - num_rows` entries (if any) are ignored.
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ void hash_base_row(const uint64_t *columns_base_ptr,
+                                              uint64_t col_stride,
+                                              uint64_t num_cols,
+                                              uint64_t row,
+                                              uint8_t *out32) {
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        uint64_t v = columns_base_ptr[c * col_stride + row];
+        // Canonicalise to match `canonical_u64().to_be_bytes()` on host.
+        uint64_t canon = goldilocks::canonical(v);
+        // The on-disk leaf bytes are canon.to_be_bytes(). Keccak reads those
+        // as a LE lane, which equals bswap64(canon).
+        uint64_t lane = bswap64(canon);
+        absorb_lane(st, rate_pos, lane);
+    }
+
+    finalize_keccak256(st, rate_pos, out32);
+}
+
 extern "C" __global__ void keccak256_leaves_base_batched(
     const uint64_t *columns_base_ptr,
     uint64_t col_stride,
@@ -220,23 +243,29 @@ extern "C" __global__ void keccak256_leaves_base_batched(
     // Bit-reverse the row index so we read columns at `br` but write the hashed
     // leaf at `tid` — matching the CPU per-row `commit_bit_reversed(.., 1)`.
     uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    hash_base_row(columns_base_ptr, col_stride, num_cols, br,
+                  hashed_leaves_out + tid * 32);
+}
 
-    uint64_t st[25];
-    #pragma unroll
-    for (int i = 0; i < 25; ++i) st[i] = 0;
+// ---------------------------------------------------------------------------
+// Goldilocks BASE-FIELD strided-coset leaf hashing.
+//
+// Leaf `j` hashes `codeword[j + t * num_leaves]` for `t` in `[0, block)`, in
+// coset order — the fold block a WHIR query opens. Rows are read in natural
+// order, not bit-reversed: the codeword's own index order is what the fold
+// pairs, so there is no permutation between the two.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_coset(
+    const uint64_t *codeword,
+    uint64_t num_leaves,
+    uint64_t block,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
 
-    uint32_t rate_pos = 0;
-    for (uint64_t c = 0; c < num_cols; ++c) {
-        uint64_t v = columns_base_ptr[c * col_stride + br];
-        // Canonicalise to match `canonical_u64().to_be_bytes()` on host.
-        uint64_t canon = goldilocks::canonical(v);
-        // The on-disk leaf bytes are canon.to_be_bytes(). Keccak reads those
-        // as a LE lane, which equals bswap64(canon).
-        uint64_t lane = bswap64(canon);
-        absorb_lane(st, rate_pos, lane);
-    }
-
-    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+    // A coset is a stride of `num_leaves`, which is exactly `block` slabs of
+    // that stride read at the same offset.
+    hash_base_row(codeword, num_leaves, block, tid, hashed_leaves_out + tid * 32);
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ pub mod logup;
 pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
+pub mod whir;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

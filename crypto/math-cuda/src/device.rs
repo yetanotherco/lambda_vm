@@ -174,6 +174,7 @@ pub struct Backend {
 
     // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
+    pub mobius_level: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
     pub pointwise_mul: CudaFunction,
@@ -194,6 +195,7 @@ pub struct Backend {
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_base_coset: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub grind_search: CudaFunction,
@@ -410,6 +412,7 @@ impl Backend {
             ext3_add: arith.load_function("ext3_add_kernel")?,
             ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
+            mobius_level: ntt.load_function("mobius_level")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
             pointwise_mul: ntt.load_function("pointwise_mul")?,
@@ -429,6 +432,7 @@ impl Backend {
             keccak256_leaves_base_row_major_row_pair_range: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,

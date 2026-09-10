@@ -183,7 +183,7 @@ where
 /// [`CommittedTables`], which commits every one of them together.
 pub struct CommittedTable<'a, F, E>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -194,7 +194,7 @@ where
 
 impl<'a, F, E> CommittedTable<'a, F, E>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -298,7 +298,7 @@ where
 /// [`Claimed::PerColumn`]: multilinear::stacked_eval::Claimed::PerColumn
 pub struct CommittedTables<'a, F, E>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -361,7 +361,7 @@ pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError
 
 impl<'a, F, E> CommittedTables<'a, F, E>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -514,7 +514,7 @@ pub fn prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<(TableProof<E>, Vec<FieldElement<E>>), MlError>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -711,7 +711,7 @@ pub fn multi_prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<MultiProof<F, E>, MlError>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,

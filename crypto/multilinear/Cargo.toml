@@ -24,8 +24,10 @@ rkyv = { version = "0.8.10", default-features = false, features = [
     "pointer_width_64",
 ] }
 rayon = { version = "1.8.0", optional = true }
+# The device path for committing and folding — only linked when `cuda` is on.
+math-cuda = { path = "../math-cuda", optional = true }
 
 [features]
 parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
-# The grind on device. The kernels this path calls live behind `crypto/cuda`.
-cuda = ["crypto/cuda"]
+# The device path: the grind through `crypto`, the kernels through `math-cuda`.
+cuda = ["crypto/cuda", "dep:math-cuda"]

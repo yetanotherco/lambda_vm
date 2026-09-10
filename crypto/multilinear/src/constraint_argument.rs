@@ -265,8 +265,10 @@ impl<F: IsField, E: IsField> TraceData<F, E> {
     }
 }
 
-impl<F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync>
-    CommittedTrace<F, E>
+impl<
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync,
+> CommittedTrace<F, E>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -449,7 +451,7 @@ pub fn prove_statements<F, E, T>(
     transcript: &mut T,
 ) -> Result<ConstraintProof<F, E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -484,7 +486,7 @@ pub fn prove_core<F, E, T>(
     transcript: &mut T,
 ) -> Result<(ConstraintCore<E>, Vec<FieldElement<E>>), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -638,7 +640,7 @@ pub fn prove<F, E, T, C>(
     transcript: &mut T,
 ) -> Result<ConstraintProof<F, E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,

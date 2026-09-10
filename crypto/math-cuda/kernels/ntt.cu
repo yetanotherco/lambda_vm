@@ -30,6 +30,24 @@ extern "C" __global__ void bit_reverse_permute(uint64_t *x,
     }
 }
 
+/// One level of the Möbius transform that turns a multilinear's hypercube
+/// evaluations into its monomial coefficients: every index whose `stride` bit
+/// is set loses its partner below. `n/2` threads; the level's blocks are
+/// independent, so nothing crosses a block boundary.
+extern "C" __global__ void mobius_level(uint64_t *x,
+                                        uint64_t half,
+                                        uint64_t stride) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= half) return;
+
+    // Spread `tid` over the indices that have the stride bit set: the low
+    // `log2(stride)` bits stay, the rest move up one.
+    uint64_t low = tid & (stride - 1);
+    uint64_t high = tid - low;
+    uint64_t i = (high << 1) | stride | low;
+    x[i] = sub(x[i], x[i ^ stride]);
+}
+
 /// Pointwise multiply: x[i] *= w[i]. Used for coset scaling (w = g^i weights).
 extern "C" __global__ void pointwise_mul(uint64_t *x,
                                          const uint64_t *w,

@@ -914,6 +914,7 @@ dependencies = [
  "cudarc",
  "libloading 0.8.9",
  "math",
+ "multilinear",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
@@ -942,6 +943,7 @@ version = "0.1.0"
 dependencies = [
  "crypto",
  "math",
+ "math-cuda",
  "rayon",
  "rkyv",
  "serde",

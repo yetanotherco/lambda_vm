@@ -54,7 +54,7 @@ where
     domain: Domain<F>,
 }
 
-impl<F: IsFFTField + IsPrimeField + Send + Sync> StackedCommitment<F>
+impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static> StackedCommitment<F>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
