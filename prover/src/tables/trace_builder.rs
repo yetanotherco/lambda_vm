@@ -697,9 +697,11 @@ fn collect_ops_from_cpu(
             memmove_ops.extend(rows);
         }
 
-        // DMA memset: authenticate x10/x11/x12, then write every destination byte
-        // at T+1. There is no source phase — every byte written is the same
-        // constant, so no snapshot is needed and overlap cannot arise.
+        // DMA memset: authenticate x10/x11/x12, then run the copy primitive with the
+        // read/write order inverted — write at T+1, read at T+2. There IS a source
+        // phase, and the self-overlap is the point: the stub seeds eight bytes and
+        // calls with `dst = src + 8`, so each row's read observes the write eight
+        // bytes back and the seed propagates. That is what constraints 32/33 pin.
         if op.ecall_dma_memset {
             // memset is a memmove call whose only distinguishing feature is the
             // inverted timestamp order; the stub already seeded the first eight

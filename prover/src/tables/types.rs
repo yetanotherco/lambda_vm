@@ -375,8 +375,8 @@ pub enum BusId {
     /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_commit)` to the next
     /// row and receives `(timestamp, src, dst, count, is_set, is_commit)` from the
     /// previous one. The functionality selectors travel inside the tuple, so a chain
-    /// cannot change operation half way through it — the guarantee the three separate
-    /// the removed DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
+    /// cannot change operation half way through it — the guarantee that the three
+    /// removed DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
     MemmoveNext = 33,
     /// COMMIT → MEMMOVE hand-off: COMMIT keeps the `sys_write` ecall number and the
     /// register-254 update, and defers its byte loop here as

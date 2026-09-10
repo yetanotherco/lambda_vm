@@ -28,10 +28,9 @@
 //! - `value`: Byte — the byte being committed
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
-//! ## Bus Interactions (18 total)
+//! ## Bus Interactions (15 total)
 //! - **Receiver**: Ecall bus — receives `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` from CPU (mult = first)
-//! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
-//! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
+//! - **Sender**: CommitDefer bus — hands the byte loop to MEMMOVE (mult = first)
 //! - **Sender**: IsHalfword bus — range checks for count_decr halfwords (×4, mult = mu)
 //! - **Sender**: IsHalfword bus — range checks for address_incr halfwords (×4, mult = mu)
 //! - **Sender**: Zero bus — end detection via count_decr (mult = mu)
@@ -39,8 +38,11 @@
 //! - **Sender**: Memw bus — read x11 register (buf_addr) at ts (mult = first)
 //! - **Sender**: Memw bus — read x12 register (count) at ts (mult = first)
 //! - **Sender**: Memw bus — read+write x254 commit index at ts (mult = first)
-//! - **Sender**: Memw bus — read memory byte at ts (mult = mu - end)
-//! - **Sender**: Commit bus — sends committed `(index, value)` pairs (mult = mu - end)
+//!
+//! The per-byte `Memw` read and the `Commit` `(index, value)` sender are gone: both
+//! moved to MEMMOVE, which sends the committed bytes itself. `CommitNextByte` is
+//! retired (bus id 20 is now a reserved hole). The count is pinned by
+//! `commit_tests::test_bus_interactions_count`.
 //!
 //! ## Constraints (8 total)
 //! - `range_first`: first * (1 - first) = 0 (degree 2)
@@ -137,8 +139,8 @@ pub mod cols {
 
 /// A single row in the COMMIT table.
 ///
-/// Each row represents one byte being committed from a buffer. Rows are linked
-/// via the CommitNextByte bus to form a chain for each commit ECALL.
+/// One row per commit ECALL. It accepts the syscall number, reads the operands and
+/// advances the committed-length register; MEMMOVE walks the buffer.
 #[derive(Debug, Clone)]
 pub struct CommitOperation {
     /// Timestamp of the originating ECALL
@@ -234,16 +236,15 @@ pub fn generate_commit_trace(
 // Bus interactions
 // =========================================================================
 
-/// Creates all bus interactions for the COMMIT table (18 total).
+/// Creates all bus interactions for the COMMIT table (15 total).
 ///
 /// The COMMIT table:
 /// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` (mult = first)
-/// - **Sends** to CommitNextByte with `[timestamp, index + 1, address_incr, count_decr]` (mult = mu - end)
-/// - **Receives** from CommitNextByte with `[timestamp, index, address, count]` (mult = mu - first)
+/// - **Sends** to CommitDefer, handing the byte loop to MEMMOVE (mult = first)
 /// - **Sends** to IsHalfword for count_decr range checks (×4, mult = mu)
 /// - **Sends** to IsHalfword for address_incr range checks (×4, mult = mu)
 /// - **Sends** to Zero for end detection (mult = mu)
-/// - **Sends** to Memw for register/memory accesses (×5, mult varies)
+/// - **Sends** to Memw for register accesses (×4, mult = first)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
         // 1. Receive ECALL from CPU (mult = first)
