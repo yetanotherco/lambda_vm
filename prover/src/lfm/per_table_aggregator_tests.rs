@@ -204,6 +204,36 @@ struct GlobalTableArenas {
 /// order) — the byte-compare material the aggregator binds against the five
 /// wraps' published carved roots.
 pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
+    // The whole table set, closing against zero — the standalone wrap. A SLICE of
+    // it closes against its own published partial instead; see
+    // [`global_slice_program`].
+    global_slice_program(
+        g,
+        &super::global_split::SlicePartition::even(g.tables.len(), 1),
+        0,
+    )
+}
+
+/// One SLICE of the global wrap: the same statement and the same Phase A, but
+/// full verification legs for `partition.slice(i)` ONLY, publishing that range's
+/// PARTIAL bus sum instead of closing against zero.
+///
+/// ⛔ WHY A SLICE IS NOT A SUB-PROOF. The global proof is one `MultiProof` whose
+/// bus balances over ALL its tables, and [`super::epoch::fork_table`] uses
+/// `num_tables` as a domain separator — so a slice must replay the FULL Phase A
+/// and fork each of its tables at its TRUE index within the TRUE `num_tables`.
+/// Only the WALKS are divided, which is exactly the expensive half: `LFM_HASH` is
+/// `queries x Merkle depth` per table, and depth is what a slice stops paying for
+/// tables it does not verify.
+///
+/// ⇒ At `k = 1` this IS the standalone wrap, target zero, which is why
+/// [`global_verifier_program`] is defined as this and the existing gate covers
+/// both paths rather than only one.
+pub(super) fn global_slice_program(
+    g: &RealGlobal,
+    partition: &super::global_split::SlicePartition,
+    slice: usize,
+) -> LfmProgram {
     use super::epoch::{TableAbsorbs, fork_table};
     use super::statement_replay::{PhaseAPreprocessed, PhaseATable, replay_phase_a};
 
@@ -298,7 +328,14 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
 
     // ---- one fork per table, with the full verification legs ----
     let mut contributions: Vec<Ext> = Vec::new();
+    let (slice_lo, slice_hi) = partition.slice(slice);
     for (i, h) in g.tables.iter().enumerate() {
+        // ⚠ The loop still WALKS the full table list, because Phase A and the
+        // fork's domain separator are defined over all of it — only the
+        // verification legs are restricted.
+        if i < slice_lo || i >= slice_hi {
+            continue;
+        }
         let a = &per_table[i];
         let aux = a.aux_root.map(|id| RootCells::hint(&mut b, id, 0));
         let contribution = a.contribution.map(|id| b.hint_word(id, 0).as_ext());
@@ -359,12 +396,37 @@ pub(super) fn global_verifier_program(g: &RealGlobal) -> LfmProgram {
     }
 
     // ---- the closure: the global bus balances to ZERO ----
-    let shape = super::logup::LogUpShape {
-        num_contributing_tables: contributions.len(),
-        num_output_bytes: 0,
-    };
-    let target = b.ext_const(&FEE::zero());
-    super::logup::emit_bus_closure(&mut b, &shape, &contributions, target);
+    // ★ THE ONE PLACE A SLICE DIFFERS FROM THE WHOLE.
+    //
+    // Over EVERY table the bus balances to zero, and that is asserted here. Over a
+    // PROPER SLICE it balances to a partial only the parent can check, so the
+    // partial is summed and PUBLISHED — and the parent then pins the partition,
+    // asserts every slice agreed on `(z, alpha)`, sums the partials and asserts
+    // zero.
+    //
+    // ⛔ THE SLICE ARM DELIBERATELY HAS NO LOCAL ASSERT. Closing the slice against
+    // its own sum would emit `assert_eq(total, total)` — a check that cannot fail,
+    // which is worse than no check because it produces evidence. What BINDS the
+    // partial is that the published word IS this sum by construction: the slice's
+    // own proof makes `sum over its tables == P_i`, so a prover cannot choose
+    // `P_i` freely, and the only real assert belongs to the parent.
+    if partition.k() == 1 {
+        let shape = super::logup::LogUpShape {
+            num_contributing_tables: contributions.len(),
+            num_output_bytes: 0,
+        };
+        let target = b.ext_const(&FEE::zero());
+        super::logup::emit_bus_closure(&mut b, &shape, &contributions, target);
+    } else {
+        let mut total = match contributions.first() {
+            Some(first) => *first,
+            None => b.ext_const(&FEE::zero()),
+        };
+        for c in contributions.iter().skip(1) {
+            total = b.eadd(total, *c);
+        }
+        b.public(total.as_cell());
+    }
 
     compile(b.finish())
 }
