@@ -144,13 +144,125 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    data: TraceData<F, E>,
+    stacked: StackedCommitment<F>,
+}
+
+/// A table's factors: its columns, the public tables, and what each factor
+/// reads.
+///
+/// Says nothing about where the columns are committed, which is the point:
+/// several tables can share one commitment, and then no single table owns it.
+#[derive(Clone, Debug)]
+pub struct TraceData<F: IsField, E: IsField> {
     columns: Vec<Mle<F>>,
     /// The public factors' tables, in the order they appear in `kinds`. Held
     /// because they are few — selectors and the like — while the shifted views
     /// are rebuilt on demand rather than kept for the whole proof.
     public: Vec<Mle<E>>,
     kinds: Vec<FactorKind>,
-    stacked: StackedCommitment<F>,
+}
+
+impl<F: IsField, E: IsField> TraceData<F, E> {
+    /// Checks the shapes agree and that `kinds` asks for exactly the public
+    /// tables given.
+    pub fn new(
+        columns: Vec<Mle<F>>,
+        kinds: Vec<FactorKind>,
+        public: Vec<Mle<E>>,
+    ) -> Result<Self, Error> {
+        let num_vars = columns.first().map(Mle::num_vars).unwrap_or(0);
+        for got in columns
+            .iter()
+            .map(Mle::num_vars)
+            .chain(public.iter().map(Mle::num_vars))
+        {
+            if got != num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: num_vars,
+                    got,
+                });
+            }
+        }
+        if columns.is_empty() {
+            return Err(Error::EmptyPolynomial);
+        }
+        let wanted = kinds.iter().filter(|k| k.source().is_none()).count();
+        if public.len() != wanted {
+            return Err(Error::QueryCountMismatch {
+                expected: wanted,
+                got: public.len(),
+            });
+        }
+        Ok(Self {
+            columns,
+            public,
+            kinds,
+        })
+    }
+
+    pub fn columns(&self) -> &[Mle<F>] {
+        &self.columns
+    }
+
+    pub fn kinds(&self) -> &[FactorKind] {
+        &self.kinds
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.columns.first().map(Mle::num_vars).unwrap_or(0)
+    }
+
+    /// The factors the sumcheck runs over: each committed column shifted by
+    /// its offset, and the public tables as they are.
+    ///
+    /// Materialized on each call rather than stored. The sumcheck has to own
+    /// and fold them anyway, so a second copy kept for the whole proof would be
+    /// one more resident copy of the trace and nothing else.
+    pub fn factors(&self) -> Result<Vec<Mle<E>>, Error>
+    where
+        F: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
+    {
+        // Which public table each public factor takes, resolved up front so the
+        // factors can be built out of order.
+        let mut public_at = Vec::with_capacity(self.kinds.len());
+        let mut seen = 0usize;
+        for kind in &self.kinds {
+            public_at.push(seen);
+            if kind.source().is_none() {
+                seen += 1;
+            }
+        }
+
+        // One lift of the whole trace into the extension, which is the biggest
+        // allocation the argument makes after the codeword.
+        let build = |(kind, at): (&FactorKind, &usize)| -> Result<Mle<E>, Error> {
+            match kind {
+                // The sumcheck's factors share a field, so a base view is
+                // lifted for it. The codeword is what stays base.
+                FactorKind::Committed(s) => {
+                    let view = claim_reduce::materialize(&self.columns, s)?;
+                    Mle::new(
+                        view.evals()
+                            .iter()
+                            .map(|v| v.clone().to_extension::<E>())
+                            .collect(),
+                    )
+                }
+                FactorKind::Public => self.public.get(*at).cloned().ok_or(Error::EmptyPolynomial),
+            }
+        };
+        #[cfg(feature = "parallel")]
+        return self
+            .kinds
+            .par_iter()
+            .zip(public_at.par_iter())
+            .map(build)
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        return self.kinds.iter().zip(public_at.iter()).map(build).collect();
+    }
 }
 
 impl<F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync>
@@ -218,21 +330,15 @@ where
         config: &ChainConfig,
     ) -> Result<Self, Error> {
         let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
-
-        let wanted = kinds.iter().filter(|k| k.source().is_none()).count();
-        if public.len() != wanted {
-            return Err(Error::QueryCountMismatch {
-                expected: wanted,
-                got: public.len(),
-            });
-        }
-
         Ok(Self {
-            columns,
-            public,
-            kinds,
+            data: TraceData::new(columns, kinds, public)?,
             stacked,
         })
+    }
+
+    /// The factors, without the commitment.
+    pub fn data(&self) -> &TraceData<F, E> {
+        &self.data
     }
 
     /// One root per stacked polynomial, not per column.
@@ -249,11 +355,11 @@ where
     }
 
     pub fn num_vars(&self) -> usize {
-        self.columns.first().map(|c| c.num_vars()).unwrap_or(0)
+        self.data.columns.first().map(|c| c.num_vars()).unwrap_or(0)
     }
 
     pub fn kinds(&self) -> &[FactorKind] {
-        &self.kinds
+        &self.data.kinds
     }
 
     /// The factors the sumcheck runs over: each committed column shifted by its
@@ -263,48 +369,11 @@ where
     /// and fold them anyway, so a second copy kept for the whole proof would be
     /// one more resident copy of the trace and nothing else.
     pub fn factors(&self) -> Result<Vec<Mle<E>>, Error> {
-        // Which public table each public factor takes, resolved up front so the
-        // factors can be built out of order.
-        let mut public_at = Vec::with_capacity(self.kinds.len());
-        let mut seen = 0usize;
-        for kind in &self.kinds {
-            public_at.push(seen);
-            if kind.source().is_none() {
-                seen += 1;
-            }
-        }
-
-        // One lift of the whole trace into the extension, which is the biggest
-        // allocation the argument makes after the codeword.
-        let build = |(kind, at): (&FactorKind, &usize)| -> Result<Mle<E>, Error> {
-            match kind {
-                // The sumcheck's factors share a field, so a base view is
-                // lifted for it. The codeword is what stays base.
-                FactorKind::Committed(s) => {
-                    let view = claim_reduce::materialize(&self.columns, s)?;
-                    Mle::new(
-                        view.evals()
-                            .iter()
-                            .map(|v| v.clone().to_extension::<E>())
-                            .collect(),
-                    )
-                }
-                FactorKind::Public => self.public.get(*at).cloned().ok_or(Error::EmptyPolynomial),
-            }
-        };
-        #[cfg(feature = "parallel")]
-        return self
-            .kinds
-            .par_iter()
-            .zip(public_at.par_iter())
-            .map(build)
-            .collect();
-        #[cfg(not(feature = "parallel"))]
-        return self.kinds.iter().zip(public_at.iter()).map(build).collect();
+        self.data.factors()
     }
 
     pub fn columns(&self) -> &[Mle<F>] {
-        &self.columns
+        &self.data.columns
     }
 }
 
@@ -386,7 +455,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
-    let (core, reduced_point) = prove_core::<F, E, T>(trace, weights, rules, claims, transcript)?;
+    let (core, reduced_point) =
+        prove_core::<F, E, T>(&trace.data, weights, rules, claims, transcript)?;
 
     // Every column's value at one shared point, so the whole trace is settled
     // against the stack in one go.
@@ -407,7 +477,7 @@ where
 /// settling several tables against one commitment collects before opening it
 /// once.
 pub fn prove_core<F, E, T>(
-    trace: &CommittedTrace<F, E>,
+    trace: &TraceData<F, E>,
     weights: Vec<Mle<E>>,
     rules: Vec<Rule<'_, E>>,
     claims: &[FieldElement<E>],
@@ -582,7 +652,7 @@ where
         .map(|_| transcript.sample_field_element())
         .collect();
 
-    let weight = trace.kinds.len();
+    let weight = trace.kinds().len();
     let rule = Rule::new(degree + 1, move |v: &[FieldElement<E>]| {
         &v[weight] * combine(&v[..weight])
     });
