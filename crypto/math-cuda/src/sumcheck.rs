@@ -40,11 +40,17 @@ const MAX_THREADS: u64 = 1 << 20;
 /// are halves of buffers the fraction tree already holds.
 pub struct SumcheckSession {
     stream: Arc<CudaStream>,
-    /// One device address per factor.
+    /// One device address per factor, and the same list on the host so a
+    /// bound factor can be read back without owning its buffer.
     factor_ptrs: CudaSlice<u64>,
-    /// The upload, when this session made one. A session over borrowed device
-    /// factors leaves it empty and the caller owns them.
-    owned: Option<CudaSlice<u64>>,
+    addresses: Vec<u64>,
+    /// The buffers the factors point into, kept alive for the session's
+    /// lifetime. A session built by uploading owns one; a session over a
+    /// fraction tree's layer shares the tree's.
+    held: Vec<Arc<CudaSlice<u64>>>,
+    /// True when `held[0]` is this session's own upload, laid out as `width`
+    /// slabs of `stride` — the only shape [`download`](Self::download) knows.
+    uploaded: bool,
     stride: usize,
     width: usize,
     /// Cube indices left. Halves with every fold.
@@ -107,13 +113,7 @@ impl SumcheckSession {
         };
         let factor_ptrs = stream.clone_htod(&addresses)?;
 
-        // The slot file is per thread, so it is the grid that gives way.
-        let per_thread = num_slots as u64 * 3 * 8;
-        let threads = (SLOT_BUDGET_BYTES / per_thread)
-            .min(MAX_THREADS)
-            .max(BLOCK_DIM as u64);
-        let grid = ((threads / BLOCK_DIM as u64) as u32).max(1);
-        let num_threads = grid as u64 * BLOCK_DIM as u64;
+        let (grid, num_threads) = grid_for(num_slots);
 
         let nodes_dev = stream.clone_htod(nodes)?;
         // A program with no constants still needs an allocation to point at.
@@ -128,10 +128,70 @@ impl SumcheckSession {
         Ok(Self {
             stream,
             factor_ptrs,
-            owned: Some(buffer),
+            addresses,
+            held: vec![Arc::new(buffer)],
+            uploaded: true,
             stride,
             width,
             len: stride,
+            nodes: nodes_dev,
+            num_nodes: nodes.len() / 2,
+            consts: consts_dev,
+            root_slot,
+            slots,
+            partials,
+            grid,
+        })
+    }
+
+    /// A session over factors that already live on device.
+    ///
+    /// `addresses` is one device pointer per factor, `len` the cube they span,
+    /// and `held` the allocations they point into — kept alive here, because
+    /// the kernels only see addresses. The rounds fold those buffers in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_device(
+        stream: Arc<CudaStream>,
+        addresses: &[u64],
+        len: usize,
+        held: Vec<Arc<CudaSlice<u64>>>,
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+    ) -> Result<Self> {
+        assert!(!addresses.is_empty(), "a sumcheck needs a factor");
+        assert!(len.is_power_of_two(), "the cube is a power of two");
+        assert!(nodes.len().is_multiple_of(2), "two u64 per step");
+        assert!(
+            consts.len().is_multiple_of(3),
+            "three u64 per ext3 constant"
+        );
+        assert!(num_slots > 0, "a program writes at least one slot");
+
+        let be = backend()?;
+        let width = addresses.len();
+        let (grid, num_threads) = grid_for(num_slots);
+        let factor_ptrs = stream.clone_htod(addresses)?;
+        let nodes_dev = stream.clone_htod(nodes)?;
+        let consts_dev = stream.clone_htod(if consts.is_empty() {
+            &[0u64][..]
+        } else {
+            consts
+        })?;
+        let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
+        let partials = stream.alloc_zeros::<u64>(MAX_NODES * grid as usize * 3)?;
+        let _ = be;
+
+        Ok(Self {
+            stream,
+            factor_ptrs,
+            addresses: addresses.to_vec(),
+            held,
+            uploaded: false,
+            stride: len,
+            width,
+            len,
             nodes: nodes_dev,
             num_nodes: nodes.len() / 2,
             consts: consts_dev,
@@ -234,13 +294,40 @@ impl SumcheckSession {
         Ok(())
     }
 
+    /// What each factor has been bound to, once every variable is gone.
+    ///
+    /// Reads the factors where they lie rather than through their buffers: a
+    /// session over a fraction tree's layer does not own them, and three u64
+    /// per factor is not worth a view for.
+    pub fn bound_values(&self) -> Result<Vec<[u64; 3]>> {
+        assert_eq!(self.len, 1, "a factor is bound once every variable is");
+        self.stream.synchronize()?;
+        let mut out = Vec::with_capacity(self.addresses.len());
+        for address in &self.addresses {
+            let mut value = [0u64; 3];
+            // SAFETY: the address is a factor's base, which holds at least one
+            // ext3 element, and the stream is idle (synchronized above).
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    value.as_mut_ptr() as *mut core::ffi::c_void,
+                    *address,
+                    24,
+                )
+                .result()?;
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     /// Every factor's remaining values, interleaved as three u64 per element —
     /// what the host needs to carry on where the device stopped.
     pub fn download(&self) -> Result<Vec<Vec<u64>>> {
-        let factors = self
-            .owned
-            .as_ref()
-            .expect("a session over borrowed factors does not own them");
+        assert!(
+            self.uploaded,
+            "only a session that uploaded its factors knows their layout"
+        );
+        let factors = &self.held[0];
         let mut out = Vec::with_capacity(self.width);
         for k in 0..self.width {
             let at = k * self.stride * 3;
@@ -252,6 +339,17 @@ impl SumcheckSession {
         self.stream.synchronize()?;
         Ok(out)
     }
+}
+
+/// The launch shape for a program of `num_slots` live values: the slot file is
+/// per thread, so it is the grid that gives way to a wider program.
+fn grid_for(num_slots: usize) -> (u32, u64) {
+    let per_thread = num_slots as u64 * 3 * 8;
+    let threads = (SLOT_BUDGET_BYTES / per_thread.max(1))
+        .min(MAX_THREADS)
+        .max(BLOCK_DIM as u64);
+    let grid = ((threads / BLOCK_DIM as u64) as u32).max(1);
+    (grid, grid as u64 * BLOCK_DIM as u64)
 }
 
 /// Sums the per-block partials of each interpolation node.

@@ -12,6 +12,7 @@ pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;

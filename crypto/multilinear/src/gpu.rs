@@ -16,6 +16,8 @@ static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 static SUMCHECK_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// Multilinear evaluations bound on device.
 static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Fraction trees built and kept on device.
+static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -33,11 +35,16 @@ pub fn evaluate_calls() -> u64 {
     EVALUATE_CALLS.load(Ordering::Relaxed)
 }
 
+pub fn tree_calls() -> u64 {
+    TREE_CALLS.load(Ordering::Relaxed)
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
+    TREE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and the factors the
@@ -313,14 +320,13 @@ pub(crate) fn prove_sumcheck<E>(
     polys: &[crate::mle::Mle<E>],
     program: &crate::program::Program<E>,
     degree: usize,
-    mut challenge: impl FnMut(
+    challenge: impl FnMut(
         &[math::field::element::FieldElement<E>],
     ) -> math::field::element::FieldElement<E>,
 ) -> Option<Result<SumcheckRounds<E>, crate::Error>>
 where
     E: math::field::traits::IsField + 'static,
 {
-    use math::field::element::FieldElement;
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
 
     if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() {
@@ -369,47 +375,96 @@ where
     )
     .ok()?;
 
-    // The interpolation nodes are `1..=degree`: `g(0)` is not sent, the claim
-    // carried into the round fixes it.
-    let mut t = Vec::with_capacity(degree * 3);
-    for node in 1..=degree {
-        t.extend_from_slice(&ext3_raw(&FieldElement::<E>::from(node as u64))?);
-    }
-
     // Diagnostic hook: recompute each round on the host from the factors the
-    // device holds and panic on the first disagreement, naming the round. A
+    // device holds and stop at the first disagreement, naming the round. A
     // device round that differs otherwise surfaces as a proof that does not
     // verify, minutes and 55 tables later.
     static XCHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let xcheck = *XCHECK.get_or_init(|| std::env::var_os("LAMBDA_VM_GPU_XCHECK").is_some());
+    let reference = |session: &math_cuda::sumcheck::SumcheckSession| {
+        if !xcheck {
+            return None;
+        }
+        let tables = session.download().expect("the device holds its factors");
+        let factors: Vec<crate::mle::Mle<E>> = tables
+            .iter()
+            .map(|table| {
+                crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            })
+            .collect::<Result<_, _>>()
+            .expect("the device holds power-of-two tables");
+        Some(
+            crate::sumcheck::round_evaluations_for_program(&factors, program, degree)
+                .expect("the host round"),
+        )
+    };
 
-    // Past this point the transcript moves, so a failure is an error and not a
-    // decline.
-    let failed = |stage| Some(Err(crate::Error::DeviceFailed { stage }));
+    let outcome = run_rounds(&mut session, degree, num_vars, challenge, reference);
+    let (rounds, challenges) = match outcome {
+        Ok(rounds) => rounds,
+        Err(error) => return Some(Err(error)),
+    };
+    let Ok(tables) = session.download() else {
+        return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
+    };
+    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = tables
+        .iter()
+        .map(|table| crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect()))
+        .collect();
+    let Ok(folded) = folded else {
+        return Some(Err(crate::Error::DeviceFailed {
+            stage: "folded tables",
+        }));
+    };
+    SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(Ok((rounds, challenges, folded)))
+}
+
+/// The round loop: the device sums over the cube, the host draws the challenge
+/// from what it sent, the device binds it.
+///
+/// Past the first round the transcript has moved, so every failure here is an
+/// error — there is no going back to the host path.
+#[cfg(feature = "cuda")]
+fn run_rounds<E>(
+    session: &mut math_cuda::sumcheck::SumcheckSession,
+    degree: usize,
+    num_vars: usize,
+    mut challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+    mut reference: impl FnMut(
+        &math_cuda::sumcheck::SumcheckSession,
+    ) -> Option<Vec<math::field::element::FieldElement<E>>>,
+) -> Result<
+    (
+        Vec<crate::sumcheck::RoundProof<E>>,
+        Vec<math::field::element::FieldElement<E>>,
+    ),
+    crate::Error,
+>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+
+    // The interpolation nodes are `1..=degree`: `g(0)` is not sent, the claim
+    // carried into the round fixes it.
+    let mut t = Vec::with_capacity(degree * 3);
+    for node in 1..=degree {
+        t.extend_from_slice(&ext3_raw(&FieldElement::<E>::from(node as u64)).ok_or(
+            crate::Error::DeviceFailed {
+                stage: "interpolation node",
+            },
+        )?);
+    }
+
+    let failed = |stage| crate::Error::DeviceFailed { stage };
     let mut rounds = Vec::with_capacity(num_vars);
     let mut challenges = Vec::with_capacity(num_vars);
     for round in 0..num_vars {
-        let expected = if xcheck {
-            let Ok(tables) = session.download() else {
-                return failed("cross-check download");
-            };
-            let factors: Vec<crate::mle::Mle<E>> = tables
-                .iter()
-                .map(|table| {
-                    crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect())
-                })
-                .collect::<Result<_, _>>()
-                .expect("the device holds power-of-two tables");
-            Some(
-                crate::sumcheck::round_evaluations_for_program(&factors, program, degree)
-                    .expect("the host round"),
-            )
-        } else {
-            None
-        };
-        let Ok(sums) = session.round(&t) else {
-            return failed("round");
-        };
+        let expected = reference(session);
+        let sums = session.round(&t).map_err(|_| failed("round"))?;
         let evaluations: Vec<FieldElement<E>> =
             sums.chunks_exact(3).map(ext3_from_raw::<E>).collect();
         if let Some(expected) = expected {
@@ -419,28 +474,13 @@ where
             );
         }
         let r = challenge(&evaluations);
-        let Some(raw) = ext3_raw(&r) else {
-            return failed("challenge");
-        };
-        if session.fold(&raw).is_err() {
-            return failed("fold");
-        }
+        let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
+        session.fold(&raw).map_err(|_| failed("fold"))?;
         rounds.push(crate::sumcheck::RoundProof { evaluations });
         challenges.push(r);
         SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
     }
-    let Ok(tables) = session.download() else {
-        return failed("download");
-    };
-    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = tables
-        .iter()
-        .map(|table| crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect()))
-        .collect();
-    let Ok(folded) = folded else {
-        return failed("folded tables");
-    };
-    SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(Ok((rounds, challenges, folded)))
+    Ok((rounds, challenges))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -806,5 +846,194 @@ mod tests {
         let root = b.var(0);
         let program = b.finish(root).unwrap();
         assert!(lower(&program).is_none());
+    }
+}
+
+/// Input-layer size below which the host tree wins: the levels are a launch
+/// each and the fold is a pass a few cores finish in microseconds.
+#[cfg(feature = "cuda")]
+const TREE_THRESHOLD: usize = 1 << 14;
+
+/// A LogUp fraction tree the device holds, layers and all.
+#[cfg(feature = "cuda")]
+pub struct DeviceTree(math_cuda::gkr::DeviceFractionTree);
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for DeviceTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceTree")
+            .field("layers", &self.0.num_layers())
+            .finish()
+    }
+}
+
+/// A device tree the build declined to make. Never constructed.
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+pub struct DeviceTree(std::convert::Infallible);
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceTree {
+    pub(crate) fn num_layers(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn output<E>(
+        &self,
+    ) -> Result<
+        (
+            math::field::element::FieldElement<E>,
+            math::field::element::FieldElement<E>,
+        ),
+        crate::Error,
+    >
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn prove_layer<E>(
+        &self,
+        _layer: usize,
+        _point: &[math::field::element::FieldElement<E>],
+        _program: &crate::program::Program<E>,
+        _degree: usize,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+/// What a layer's sumcheck leaves: the rounds, the point, and the four values
+/// the layer reduces to.
+pub type LayerRounds<E> = (
+    Vec<crate::sumcheck::RoundProof<E>>,
+    Vec<math::field::element::FieldElement<E>>,
+    [math::field::element::FieldElement<E>; 4],
+);
+
+/// Builds the tree on device from an input layer, folding every level there.
+#[cfg(feature = "cuda")]
+pub(crate) fn build_tree<E>(p: &crate::mle::Mle<E>, q: &crate::mle::Mle<E>) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() {
+        return None;
+    }
+    if p.len() < TREE_THRESHOLD || p.len() != q.len() {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GKR").is_some()) {
+        return None;
+    }
+    // SAFETY: `E == Ext3`, three transparent `u64` limbs per element.
+    let raw = |table: &crate::mle::Mle<E>| unsafe {
+        core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
+    };
+    let tree = math_cuda::gkr::DeviceFractionTree::build(raw(p), raw(q)).ok()?;
+    TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(DeviceTree(tree))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn build_tree<E>(_p: &crate::mle::Mle<E>, _q: &crate::mle::Mle<E>) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    pub(crate) fn num_layers(&self) -> usize {
+        self.0.num_layers()
+    }
+
+    /// The output fraction, which is what says whether the bus balances.
+    pub(crate) fn output<E>(
+        &self,
+    ) -> Result<
+        (
+            math::field::element::FieldElement<E>,
+            math::field::element::FieldElement<E>,
+        ),
+        crate::Error,
+    >
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let (p, q) = self.0.output().map_err(|_| crate::Error::DeviceFailed {
+            stage: "tree output",
+        })?;
+        Ok((ext3_from_raw::<E>(&p), ext3_from_raw::<E>(&q)))
+    }
+
+    /// One layer's sumcheck, folded in place: the rounds, the point they drew,
+    /// and the four values the fold leaves behind.
+    ///
+    /// The layer is spent afterwards, which is what makes the halves usable as
+    /// factors without copying them: GKR reads each layer once.
+    pub(crate) fn prove_layer<E>(
+        &self,
+        layer: usize,
+        point: &[math::field::element::FieldElement<E>],
+        program: &crate::program::Program<E>,
+        degree: usize,
+        challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Option<Result<LayerRounds<E>, crate::Error>>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let lowered = lower(program)?;
+        let mut raw_point = Vec::with_capacity(point.len() * 3);
+        for coordinate in point {
+            raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+        }
+        let num_vars = self.0.layer_num_vars(layer).checked_sub(1)?;
+        let session = self.0.layer_sumcheck(
+            layer,
+            &raw_point,
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+        );
+        let Ok(mut session) = session else {
+            return None;
+        };
+
+        // Past here the transcript moves: the host path is no longer an option.
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let outcome = run_rounds(&mut session, degree, num_vars, challenge, |_| None);
+        let (rounds, challenges) = match outcome {
+            Ok(rounds) => rounds,
+            Err(error) => return Some(Err(error)),
+        };
+        let Ok(bound) = session.bound_values() else {
+            return Some(Err(failed("layer values")));
+        };
+        // Factor 0 is the weight; the four the layer reduces to follow.
+        if bound.len() != 5 {
+            return Some(Err(failed("layer factors")));
+        }
+        let value = |k: usize| ext3_from_raw::<E>(&bound[k]);
+        SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+        Some(Ok((
+            rounds,
+            challenges,
+            [value(1), value(2), value(3), value(4)],
+        )))
     }
 }

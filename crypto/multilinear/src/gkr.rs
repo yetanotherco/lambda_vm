@@ -74,35 +74,69 @@ impl<F: IsField + 'static> FractionLayer<F> {
 /// The whole tree, from the input layer down to the single output fraction.
 ///
 /// `layers[0]` is the output (zero variables); the last entry is the input.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FractionTree<F: IsField> {
+    /// Empty when the tree lives on a device, which holds every layer.
     layers: Vec<FractionLayer<F>>,
+    device: Option<crate::gpu::DeviceTree>,
+    num_layers: usize,
+    output: (FieldElement<F>, FieldElement<F>),
 }
 
 impl<F: IsField + 'static> FractionTree<F> {
     /// Builds every layer by repeated folding.
-    pub fn build(input: FractionLayer<F>) -> Result<Self, Error> {
+    ///
+    /// On a device the layers stay there: the tree is the biggest thing a
+    /// table's argument holds, and GKR reads every level of it.
+    pub fn build(input: FractionLayer<F>) -> Result<Self, Error>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        if let Some(device) = crate::gpu::build_tree(&input.p, &input.q) {
+            let num_layers = device.num_layers();
+            let output = device.output()?;
+            return Ok(Self {
+                layers: Vec::new(),
+                device: Some(device),
+                num_layers,
+                output,
+            });
+        }
+
         let mut layers = vec![input];
         while layers.last().expect("non-empty").num_vars() > 0 {
             let next = layers.last().expect("non-empty").fold()?;
             layers.push(next);
         }
         layers.reverse();
-        Ok(Self { layers })
+        let top = &layers[0];
+        let output = (top.p.evals()[0].clone(), top.q.evals()[0].clone());
+        let num_layers = layers.len();
+        Ok(Self {
+            layers,
+            device: None,
+            num_layers,
+            output,
+        })
     }
 
     /// The output fraction `(p, q)`. The bus balances when `p` is zero.
     pub fn output(&self) -> (FieldElement<F>, FieldElement<F>) {
-        let top = &self.layers[0];
-        (top.p.evals()[0].clone(), top.q.evals()[0].clone())
+        self.output.clone()
     }
 
     pub fn num_layers(&self) -> usize {
-        self.layers.len()
+        self.num_layers
     }
 
+    /// The layer, for a tree that kept them here.
     pub fn layer(&self, i: usize) -> &FractionLayer<F> {
         &self.layers[i]
+    }
+
+    /// The device holding every layer, when one does.
+    pub fn device(&self) -> Option<&crate::gpu::DeviceTree> {
+        self.device.as_ref()
     }
 
     pub fn input_layer(&self) -> &FractionLayer<F> {
@@ -169,14 +203,16 @@ impl<F: IsField + 'static> LayerRelation<F> {
     }
 }
 
+/// `eq` times a product of two layer values.
+const LAYER_DEGREE: usize = 3;
+
 impl<F: IsField + 'static> SumcheckPolynomial<F> for LayerRelation<F> {
     fn num_vars(&self) -> usize {
         self.polys[Self::EQ].num_vars()
     }
 
     fn degree(&self) -> usize {
-        // eq times a product of two layer values.
-        3
+        LAYER_DEGREE
     }
 
     fn polys(&self) -> &[Mle<F>] {
@@ -291,9 +327,43 @@ where
     let (mut p_claim, mut q_claim) = tree.output();
 
     for i in 0..tree.num_layers() - 1 {
-        let next = tree.layer(i + 1);
-        let lambda = transcript.sample_field_element();
+        let lambda: FieldElement<F> = transcript.sample_field_element();
 
+        // A tree the device holds proves its layer where it lies: the halves
+        // are the sumcheck's factors in place, and what the fold leaves behind
+        // is the four values below.
+        if let Some(device) = tree.device() {
+            let program = LayerRelation::program_for(&lambda)?;
+            let attempt = device.prove_layer(i + 1, &point, &program, LAYER_DEGREE, |sent| {
+                for value in sent {
+                    transcript.append_field_element(value);
+                }
+                transcript.sample_field_element()
+            });
+            if let Some(outcome) = attempt {
+                let (rounds, z, [p_lo, p_hi, q_lo, q_hi]) = outcome?;
+                for v in [&p_lo, &p_hi, &q_lo, &q_hi] {
+                    transcript.append_field_element(v);
+                }
+                let c = transcript.sample_field_element();
+                p_claim = combine_halves(&p_lo, &p_hi, &c);
+                q_claim = combine_halves(&q_lo, &q_hi, &c);
+                point = std::iter::once(c).chain(z).collect();
+                layers.push(LayerProof {
+                    sumcheck: SumcheckProof { rounds },
+                    p_lo,
+                    p_hi,
+                    q_lo,
+                    q_hi,
+                });
+                continue;
+            }
+            return Err(Error::DeviceFailed {
+                stage: "layer sumcheck",
+            });
+        }
+
+        let next = tree.layer(i + 1);
         let mut relation = LayerRelation::new(next, &point, lambda)?;
         let half_vars = relation.num_vars();
         let (rounds, z) = sumcheck::prove_rounds(&mut relation, half_vars, transcript)?;
