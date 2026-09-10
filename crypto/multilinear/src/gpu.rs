@@ -451,141 +451,6 @@ where
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::program::Builder;
-    use math::field::element::FieldElement;
-    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
-    use math::field::goldilocks::GoldilocksField as Gl;
-
-    type FE = FieldElement<Ext3>;
-
-    /// The kernel's walk, in Rust: the same slot file, the same node encoding.
-    ///
-    /// This is what pins the lowering without a device — a slot freed too early
-    /// or an operand read from the wrong class shows up here as a wrong value,
-    /// not as a proof that does not verify an hour later.
-    fn run_lowered(lowered: &Lowered, values: &[FE]) -> FE {
-        let mut slots = vec![FE::zero(); lowered.num_slots];
-        for node in lowered.nodes.chunks_exact(2) {
-            let op = (node[0] & 0xFFFF_FFFF) as u32;
-            let a = (node[0] >> 32) as u32 as usize;
-            let b = (node[1] & 0xFFFF_FFFF) as u32 as usize;
-            let res = (node[1] >> 32) as u32 as usize;
-            slots[res] = match op {
-                op::FIXED => ext3_from_raw::<Ext3>(&lowered.consts[a * 3..a * 3 + 3]),
-                op::VAR => values[a],
-                op::ADD => slots[a] + slots[b],
-                op::SUB => slots[a] - slots[b],
-                op::MUL => slots[a] * slots[b],
-                op::NEG => -slots[a],
-                _ => panic!("unknown op {op}"),
-            };
-        }
-        slots[lowered.root_slot as usize]
-    }
-
-    fn values(n: usize) -> Vec<FE> {
-        (0..n as u64)
-            .map(|i| {
-                FE::new([
-                    FieldElement::<Gl>::from(i * 31 + 7),
-                    FieldElement::<Gl>::from(i * 17 + 2),
-                    FieldElement::<Gl>::from(i + 5),
-                ])
-            })
-            .collect()
-    }
-
-    /// Every op, a constant, and a chain long enough that slots have to be
-    /// recycled.
-    fn sample_program() -> crate::program::Program<Ext3> {
-        let mut b = Builder::<Ext3>::new();
-        let mut acc = b.var(0);
-        for slot in 1..6 {
-            let v = b.var(slot);
-            let doubled = b.add(v, v);
-            let scaled = b.mul(doubled, acc);
-            let shifted = b.sub(scaled, v);
-            acc = b.neg(shifted);
-        }
-        let seven = b.fixed(FE::from(7u64));
-        let root = b.add(acc, seven);
-        b.finish(root).unwrap()
-    }
-
-    #[test]
-    fn the_lowered_program_computes_what_the_program_does() {
-        let program = sample_program();
-        let lowered = lower(&program).expect("lowers");
-        let v = values(6);
-        let mut scratch = Vec::new();
-        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
-    }
-
-    /// A value read twice in the step that kills it — `x·x` — must not free its
-    /// slot twice, or two later values are handed the same one and the second
-    /// clobbers the first. Squarings are everywhere in a real constraint
-    /// program, so this is the shape that matters.
-    #[test]
-    fn a_value_read_twice_frees_its_slot_once() {
-        let mut b = Builder::<Ext3>::new();
-        let mut acc = b.var(0);
-        // Each square kills its operand, and the sums below keep enough values
-        // live that a doubly-freed slot gets reused while it is still needed.
-        let mut squares = Vec::new();
-        for slot in 1..8 {
-            let v = b.var(slot);
-            let squared = b.mul(v, v);
-            let with_acc = b.add(squared, acc);
-            squares.push(with_acc);
-            acc = b.mul(with_acc, with_acc);
-        }
-        squares.push(acc);
-        let root = b.sum(&squares);
-        let program = b.finish(root).unwrap();
-
-        let lowered = lower(&program).expect("lowers");
-        let v = values(8);
-        let mut scratch = Vec::new();
-        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
-    }
-
-    /// The point of the slot file: a long chain of dead intermediates does not
-    /// widen it.
-    #[test]
-    fn slots_are_reused_once_a_value_is_dead() {
-        let lowered = lower(&sample_program()).expect("lowers");
-        assert!(
-            lowered.num_slots < lowered.nodes.len() / 2,
-            "{} slots for {} steps is no reuse at all",
-            lowered.num_slots,
-            lowered.nodes.len() / 2
-        );
-    }
-
-    /// A program wider than the slot file declines rather than asking a device
-    /// for scratch it cannot have.
-    #[test]
-    fn a_program_past_the_slot_ceiling_declines() {
-        let mut b = Builder::<Ext3>::new();
-        // Every value stays live to the end, so the slots cannot be recycled.
-        let terms: Vec<u32> = (0..=MAX_SLOTS).map(|slot| b.var(slot)).collect();
-        let root = b.sum(&terms);
-        let program = b.finish(root).unwrap();
-        assert!(lower(&program).is_none());
-    }
-
-    #[test]
-    fn a_field_the_kernel_does_not_cover_declines() {
-        let mut b = Builder::<Gl>::new();
-        let root = b.var(0);
-        let program = b.finish(root).unwrap();
-        assert!(lower(&program).is_none());
-    }
-}
-
 /// Codeword size below which the host fold wins: one launch per level plus the
 /// round trip, against a pass a few cores finish in microseconds.
 #[cfg(feature = "cuda")]
@@ -733,4 +598,139 @@ where
     F: math::field::traits::IsField + 'static,
 {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::Builder;
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type FE = FieldElement<Ext3>;
+
+    /// The kernel's walk, in Rust: the same slot file, the same node encoding.
+    ///
+    /// This is what pins the lowering without a device — a slot freed too early
+    /// or an operand read from the wrong class shows up here as a wrong value,
+    /// not as a proof that does not verify an hour later.
+    fn run_lowered(lowered: &Lowered, values: &[FE]) -> FE {
+        let mut slots = vec![FE::zero(); lowered.num_slots];
+        for node in lowered.nodes.chunks_exact(2) {
+            let op = (node[0] & 0xFFFF_FFFF) as u32;
+            let a = (node[0] >> 32) as u32 as usize;
+            let b = (node[1] & 0xFFFF_FFFF) as u32 as usize;
+            let res = (node[1] >> 32) as u32 as usize;
+            slots[res] = match op {
+                op::FIXED => ext3_from_raw::<Ext3>(&lowered.consts[a * 3..a * 3 + 3]),
+                op::VAR => values[a],
+                op::ADD => slots[a] + slots[b],
+                op::SUB => slots[a] - slots[b],
+                op::MUL => slots[a] * slots[b],
+                op::NEG => -slots[a],
+                _ => panic!("unknown op {op}"),
+            };
+        }
+        slots[lowered.root_slot as usize]
+    }
+
+    fn values(n: usize) -> Vec<FE> {
+        (0..n as u64)
+            .map(|i| {
+                FE::new([
+                    FieldElement::<Gl>::from(i * 31 + 7),
+                    FieldElement::<Gl>::from(i * 17 + 2),
+                    FieldElement::<Gl>::from(i + 5),
+                ])
+            })
+            .collect()
+    }
+
+    /// Every op, a constant, and a chain long enough that slots have to be
+    /// recycled.
+    fn sample_program() -> crate::program::Program<Ext3> {
+        let mut b = Builder::<Ext3>::new();
+        let mut acc = b.var(0);
+        for slot in 1..6 {
+            let v = b.var(slot);
+            let doubled = b.add(v, v);
+            let scaled = b.mul(doubled, acc);
+            let shifted = b.sub(scaled, v);
+            acc = b.neg(shifted);
+        }
+        let seven = b.fixed(FE::from(7u64));
+        let root = b.add(acc, seven);
+        b.finish(root).unwrap()
+    }
+
+    #[test]
+    fn the_lowered_program_computes_what_the_program_does() {
+        let program = sample_program();
+        let lowered = lower(&program).expect("lowers");
+        let v = values(6);
+        let mut scratch = Vec::new();
+        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
+    }
+
+    /// A value read twice in the step that kills it — `x·x` — must not free its
+    /// slot twice, or two later values are handed the same one and the second
+    /// clobbers the first. Squarings are everywhere in a real constraint
+    /// program, so this is the shape that matters.
+    #[test]
+    fn a_value_read_twice_frees_its_slot_once() {
+        let mut b = Builder::<Ext3>::new();
+        let mut acc = b.var(0);
+        // Each square kills its operand, and the sums below keep enough values
+        // live that a doubly-freed slot gets reused while it is still needed.
+        let mut squares = Vec::new();
+        for slot in 1..8 {
+            let v = b.var(slot);
+            let squared = b.mul(v, v);
+            let with_acc = b.add(squared, acc);
+            squares.push(with_acc);
+            acc = b.mul(with_acc, with_acc);
+        }
+        squares.push(acc);
+        let root = b.sum(&squares);
+        let program = b.finish(root).unwrap();
+
+        let lowered = lower(&program).expect("lowers");
+        let v = values(8);
+        let mut scratch = Vec::new();
+        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
+    }
+
+    /// The point of the slot file: a long chain of dead intermediates does not
+    /// widen it.
+    #[test]
+    fn slots_are_reused_once_a_value_is_dead() {
+        let lowered = lower(&sample_program()).expect("lowers");
+        assert!(
+            lowered.num_slots < lowered.nodes.len() / 2,
+            "{} slots for {} steps is no reuse at all",
+            lowered.num_slots,
+            lowered.nodes.len() / 2
+        );
+    }
+
+    /// A program wider than the slot file declines rather than asking a device
+    /// for scratch it cannot have.
+    #[test]
+    fn a_program_past_the_slot_ceiling_declines() {
+        let mut b = Builder::<Ext3>::new();
+        // Every value stays live to the end, so the slots cannot be recycled.
+        let terms: Vec<u32> = (0..=MAX_SLOTS).map(|slot| b.var(slot)).collect();
+        let root = b.sum(&terms);
+        let program = b.finish(root).unwrap();
+        assert!(lower(&program).is_none());
+    }
+
+    #[test]
+    fn a_field_the_kernel_does_not_cover_declines() {
+        let mut b = Builder::<Gl>::new();
+        let root = b.var(0);
+        let program = b.finish(root).unwrap();
+        assert!(lower(&program).is_none());
+    }
 }

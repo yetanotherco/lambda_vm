@@ -169,19 +169,18 @@ pub fn fold_codeword_base(
     }
     drop(input);
 
-    for level in 1..levels {
+    for (level, g_inv) in g_invs.iter().enumerate().skip(1) {
         half /= 2;
         // SAFETY: as above.
         let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
         let half_arg = half as u64;
-        let g_inv = g_invs[level];
         unsafe {
             stream
                 .launch_builder(&be.whir_fold_ext3)
                 .arg(&current)
                 .arg(&half_arg)
                 .arg(&two_inv)
-                .arg(&g_inv)
+                .arg(g_inv)
                 .arg(&alpha.slice(level * 3..level * 3 + 3))
                 .arg(&mut next)
                 .launch(LaunchConfig::for_num_elems(half as u32))?;
@@ -218,18 +217,17 @@ pub fn fold_codeword_ext3(
     let alpha = stream.clone_htod(alphas)?;
     let mut current = stream.clone_htod(codeword)?;
 
-    for level in 0..levels {
+    for (level, g_inv) in g_invs.iter().enumerate() {
         // SAFETY: the kernel writes every element of the half it produces.
         let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
         let half_arg = half as u64;
-        let g_inv = g_invs[level];
         unsafe {
             stream
                 .launch_builder(&be.whir_fold_ext3)
                 .arg(&current)
                 .arg(&half_arg)
                 .arg(&two_inv)
-                .arg(&g_inv)
+                .arg(g_inv)
                 .arg(&alpha.slice(level * 3..level * 3 + 3))
                 .arg(&mut next)
                 .launch(LaunchConfig::for_num_elems(half as u32))?;
