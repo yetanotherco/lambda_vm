@@ -92,19 +92,27 @@ economics. For workloads whose gas limits were computed for Amsterdam, use the
 EEST benchmark fixtures; `ETHREX_BENCH_WORKLOAD_AFTER_BUMP.md` in the repository
 root has both sets measured side by side.
 
-Measured on the guest ELF at ethrex `2cb18b0b`: 37,137,386 cycles, 6,003 keccak
-calls, 164 ECSM calls. Fixture: 549,144 bytes. The pin has since moved to
-`8effcb06`, which declares 26.0.0 and whose tree is byte-identical in every crate
-this repo compiles, so the counts carry — and the fixture regenerates to the same
-digest at both.
+Measured on the guest ELF at ethrex `8effcb06`: **37,137,748 cycles**, 6,003
+keccak calls, 164 ECSM calls. Fixture: 549,144 bytes.
 
-**Pin the ELF whenever you quote a cycle count.** Those three counts are
+**Pin the ELF whenever you quote a cycle count.** The three counts are
 deterministic for a given ELF and input, and they move with anything that changes
-the guest: the ethrex rev, guest optimisation flags, and the **clang major
-version** by around 2 %. The guest embeds C (`secp256k1-sys`) and the Makefile
-pins target flags but not the compiler, so `cc` picks up whatever `clang` is on
-PATH — two boxes with different clang majors report different counts for the same
-commit. A count without its ELF is not comparable to anything.
+the guest — including changes that touch none of the source it compiles. Moving
+the pin from `2cb18b0b` to `8effcb06` cost **+362 cycles, 0.001 %**, with keccak
+and ECSM identical, and that was the whole difference: no `.rs` file in the
+guest's dependency graph differs between the two revs and no crates.io dependency
+moved, so what shifted is the version metadata the ethrex crates carry. Immaterial
+next to the ~1 % this workload can resolve, but it does mean an exact count
+belongs to an exact rev.
+
+The compiler is not pinned either — the guest embeds C (`secp256k1-sys`) and the
+Makefile pins target flags but not `cc` — so in principle two boxes with different
+clang majors can disagree. In practice the effect is small and not well
+characterised: the one figure recorded in this repo is 0.13 % on a different
+block, while this block came out at exactly 37,137,386 on both macOS/arm64 and the
+Linux x86-64 runner at the previous pin, from ELF binaries that were themselves
+different. Quote the rev; do not assume the machine matters, and do not assume it
+does not.
 
 ### Choosing the epoch size, and what the workload costs
 

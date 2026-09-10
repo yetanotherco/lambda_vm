@@ -70,7 +70,7 @@ env:
   ELF: executor/program_artifacts/rust/ethrex.elf
   # The workload: a real Ethereum block. WHICH block lives in
   # the Makefile and nowhere else — nothing in this file names one, so a repoint
-  # moves this job without editing it. At the current default that is 37,137,386
+  # moves this job without editing it. At the current default that is 37,137,748
   # cycles, 6,003 keccak calls and 164 ecsm calls: 13.6x the work of the synthetic
   # block (ethrex_bench_4, 2,727,681 cycles) with a keccak:ecrecover mix of 37:1
   # against its 13:1. That is the whole point — a prover change can move the
