@@ -775,6 +775,72 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
         fold_shape,
         publishes,
     } = *inputs;
+
+    // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
+    // Every child's arenas are declared before any leg is emitted, exactly as a
+    // node does it; putting the global wrap last keeps the interior children's
+    // arena indices identical to what they would be under `emit_node`, so a
+    // reader comparing the two programs is comparing like with like.
+    let interior_legs: Vec<LegCells> = interior
+        .iter()
+        .map(|child| emit_child_leg(b, child))
+        .collect();
+    let global_leg = emit_child_leg(b, global);
+
+    emit_root_checks_and_publishes(
+        b,
+        &RootLegs {
+            interior: &interior_legs,
+            interior_layouts,
+            labels,
+            label_range,
+            global: &global_leg,
+            global_child_layout,
+            fold_shape,
+            publishes,
+        },
+    );
+}
+
+/// The root's children as VERIFIED LEGS — published words plus the pair each
+/// leg derived, which is everything the root's own checks read.
+pub(super) struct RootLegs<'a> {
+    pub interior: &'a [LegCells],
+    pub interior_layouts: &'a [SchemaLayout],
+    pub labels: &'a [&'a [u64]],
+    pub label_range: (u64, u64),
+    pub global: &'a LegCells,
+    pub global_child_layout: &'a GlobalLayout,
+    pub fold_shape: &'a FoldShape,
+    pub publishes: RootPublishSet,
+}
+
+/// The root's whole contribution over legs that have already verified: the
+/// length pins, the cross-child bindings, the L2G compare, the published claim.
+///
+/// ⛔ Split out from [`emit_block_root`] so a gate can drive it over a FIXTURE
+/// of published words rather than over `fan_in + 1` real child proofs. The L2G
+/// compare can only be tested by MOVING a single root word and watching the
+/// compare fail, and a gate that needed three production proofs to do that is
+/// not a gate anybody runs. ⇒ It is the SAME code path, not a second spelling of
+/// it — exactly as `global_parent::emit_parent_checks_and_publishes` is.
+///
+/// ⚠ AND THE LENGTH PINS MOVED HERE, out of [`emit_block_root`], so the fixture
+/// drives them too. `declare_leg_arenas` sizes the publics arena from
+/// `ChildShape::num_public_words` and [`emit_leg`] hints exactly that many, so
+/// `leg.publics.len()` IS that count. The check is the same check, in the one
+/// place both callers reach, rather than a copy in each.
+pub(super) fn emit_root_checks_and_publishes(b: &mut LfmBuilder, legs: &RootLegs<'_>) {
+    let RootLegs {
+        interior,
+        interior_layouts,
+        labels,
+        label_range,
+        global,
+        global_child_layout,
+        fold_shape,
+        publishes,
+    } = *legs;
     assert!(
         !interior.is_empty(),
         "the root aggregates at least one interior child"
@@ -789,32 +855,21 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
         labels.len(),
         "one label run per interior child"
     );
-    for (child, layout) in interior.iter().zip(interior_layouts) {
-        layout.assert_covers(child.num_public_words);
+    for (leg, layout) in interior.iter().zip(interior_layouts) {
+        layout.assert_covers(leg.publics.len());
     }
-    assert_global_child_is_bound_only_by_l2g(global_child_layout, global.num_public_words);
+    assert_global_child_is_bound_only_by_l2g(global_child_layout, global.publics.len());
 
-    // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
-    // Every child's arenas are declared before any leg is emitted, exactly as a
-    // node does it; putting the global wrap last keeps the interior children's
-    // arena indices identical to what they would be under `emit_node`, so a
-    // reader comparing the two programs is comparing like with like.
-    let interior_legs: Vec<LegCells> = interior
-        .iter()
-        .map(|child| emit_child_leg(b, child))
-        .collect();
-    let global_leg = emit_child_leg(b, global);
-
-    super::per_table_aggregator::emit_chain_bindings(b, &interior_legs, interior_layouts, labels);
+    super::per_table_aggregator::emit_chain_bindings(b, interior, interior_layouts, labels);
     emit_l2g_compare(
         b,
-        &interior_legs,
+        interior,
         interior_layouts,
-        &global_leg,
+        global,
         global_child_layout,
         fold_shape,
     );
-    emit_root_publishes(b, &interior_legs, interior_layouts, label_range, publishes);
+    emit_root_publishes(b, interior, interior_layouts, label_range, publishes);
 }
 
 /// The block artifact's claim.
@@ -897,5 +952,108 @@ pub fn root_schema_words(num_reg: usize, out_halves: usize, publishes: RootPubli
     match publishes {
         RootPublishSet::AssertOnly => base,
         RootPublishSet::WithFold => base + super::proof_arena::lanes_per_root(),
+    }
+}
+
+// ============ the artifact's VALUE, across proving strategies ============
+
+/// One posture's artifact: how the block was proved, and the words the root
+/// published for it.
+pub struct ArtifactUnderPosture {
+    /// The PROVING STRATEGY, named — epoch size, fan-in, root option. Anything
+    /// that is a property of how we proved the block rather than of the block.
+    pub posture: String,
+    /// The root's published words, in publish order.
+    pub words: Vec<(u32, super::word::LfmWord)>,
+}
+
+/// Why the two-posture byte-identity check cannot run over `runs`, or `None`
+/// when it can.
+///
+/// # What the check is for
+///
+/// The campaign's rule is that an artifact's schema AND VALUE may depend on the
+/// BLOCK, never on the proving strategy. [`root_schema_words`] pins the WIDTH by
+/// its signature — it takes no epoch count and no arity, and
+/// `the_artifact_width_is_independent_of_the_proving_strategy` makes adding one a
+/// failure. **The VALUE is not pinned by any of that.** Only proving ONE block at
+/// TWO postures and comparing the published bytes pins it, and that is the check
+/// this function performs.
+///
+/// # ⛔ Why it returns a REASON rather than quietly doing nothing
+///
+/// A second posture means a second epoch size or a second fan-in, and at this
+/// encoding neither is available: the wrap of a multi-chunk epoch at 2^22 does
+/// not fit the card at any admission ceiling, and the fan-in-3 node aborted at
+/// 97.4% of it. ⇒ The honest outcome today is a **NAMED REFUSAL**.
+///
+/// It is not a skip, and it is emphatically not a pass on one posture. A run
+/// that compared a posture against itself would report *identical* from a check
+/// that cannot fail — which is worse than having no check at all, because it
+/// produces evidence. Naming the refusal is what keeps the gap in the claim
+/// ladder visible when the artifact is finally reported.
+pub fn why_posture_identity_cannot_run(runs: &[ArtifactUnderPosture]) -> Option<String> {
+    let mut distinct: Vec<&str> = Vec::new();
+    for r in runs {
+        if !distinct.contains(&r.posture.as_str()) {
+            distinct.push(&r.posture);
+        }
+    }
+    if distinct.len() >= 2 {
+        return None;
+    }
+    Some(format!(
+        "THE TWO-POSTURE BYTE-IDENTITY CHECK CANNOT RUN, and is therefore NOT \
+         PERFORMED: it needs the same block proved at TWO DISTINCT postures and \
+         it was given {} ({}). A second posture means a second epoch size or a \
+         second fan-in, and at this encoding neither is available. ⛔ This is a \
+         REFUSAL BY NAME, not a skip: comparing one posture against itself would \
+         report `identical` from a check that cannot fail, which is worse than \
+         no check because it produces evidence. The artifact's WIDTH is pinned \
+         independently, by `root_schema_words`' signature; its VALUE is not, and \
+         that gap belongs in the claim rather than in a green test",
+        match distinct.len() {
+            0 => "NONE".to_string(),
+            n => format!("{n}"),
+        },
+        if distinct.is_empty() {
+            "no runs at all".to_string()
+        } else {
+            distinct.join(", ")
+        },
+    ))
+}
+
+/// Assert one block's artifact is byte-identical at every posture it was proved
+/// at — refusing, by name, when there are not two distinct postures to compare.
+///
+/// See [`why_posture_identity_cannot_run`] for what the check is and why the
+/// refusal is the honest outcome at this encoding.
+pub fn assert_artifact_is_posture_independent(runs: &[ArtifactUnderPosture]) {
+    if let Some(why) = why_posture_identity_cannot_run(runs) {
+        panic!("{why}");
+    }
+    let first = &runs[0];
+    for other in &runs[1..] {
+        assert_eq!(
+            first.words.len(),
+            other.words.len(),
+            "the artifact is {} words at posture `{}` and {} at posture `{}`: its \
+             WIDTH moved with the proving strategy, which `root_schema_words`' \
+             signature is supposed to make impossible",
+            first.words.len(),
+            first.posture,
+            other.words.len(),
+            other.posture,
+        );
+        for (i, (a, c)) in first.words.iter().zip(&other.words).enumerate() {
+            assert_eq!(
+                a, c,
+                "artifact word {i} differs between posture `{}` and posture `{}`: \
+                 two honest provers emitted DIFFERENT BYTES for the same block, so \
+                 the artifact carries a value that depends on how it was proved",
+                first.posture, other.posture,
+            );
+        }
     }
 }
