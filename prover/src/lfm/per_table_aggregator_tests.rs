@@ -2990,8 +2990,27 @@ fn the_production_tree_composes_to_a_root() {
     let arenas = global_arena_words(&g);
     let artifacts =
         build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    // ⛔ THE GLOBAL WRAP NEEDS ITS OWN MODE, and it is NOT cache-if-present.
+    //
+    // Every other level-0 stage shares one mode, which is right: the bundle and
+    // the 19 wraps are produced together. The global wrap is not — it was added
+    // to the driver after a cache had already been built, so a populated cache
+    // can legitimately hold every wrap and lack this one. Loading the wraps while
+    // proving this stage is therefore a real, nameable experiment, and the only
+    // alternatives were both wrong: `all` refuses at the bundle (Prove mode, file
+    // exists) and a load-everything arm refuses here.
+    // ⇒ `LFM_TREE_GLOBAL_MODE=prove|load` NAMES it. Unset, it follows level 0, so
+    // a fresh `all` proves it and a sizing arm loads it, exactly as before. What
+    // it must never become is "prove it if it happens to be missing" — that is
+    // the harness picking its own experiment off the disk.
+    let global_mode = match std::env::var("LFM_TREE_GLOBAL_MODE").ok().as_deref() {
+        None => stage_mode(0),
+        Some("prove") => CacheMode::Prove,
+        Some("load") => CacheMode::Load,
+        Some(other) => panic!("LFM_TREE_GLOBAL_MODE must be `prove` or `load`, got `{other}`"),
+    };
     let proved = cached_stage(
-        stage_mode(0),
+        global_mode,
         stage_path(cache_dir.as_deref(), "global-wrap"),
         "the GLOBAL wrap (the root's extra child)",
         || {
