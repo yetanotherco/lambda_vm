@@ -198,7 +198,18 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
-            keccak_rnd: rows,
+            // NOT flattened to `rows`. The uniform knob is a SHAPE choice —
+            // it exists to make tables taller and cut the sub-proof count —
+            // but KECCAK_RND's cap is a DEVICE budget, and raising it past
+            // that budget is the one thing it cannot survive: at a 2^22 epoch
+            // an uncapped KECCAK_RND is 2^17 rows and 11.17 GiB of round-2-to-4
+            // incremental, against 5.68 GiB capped. `LAMBDA_VM_MAX_ROWS_LOG2=21`
+            // would otherwise give it 87,381 permutations per chunk, more than a
+            // 2^22 epoch contains, and the cap would be silently inert in every
+            // run that sets the knob — which is every campaign run.
+            //
+            // The knob still LOWERS it: `min` keeps a small-cap posture small.
+            keccak_rnd: rows.min(max_rows::KECCAK_RND),
         }
     }
 
