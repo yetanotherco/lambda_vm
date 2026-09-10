@@ -18,6 +18,7 @@ pub mod continuation;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
@@ -30,6 +31,7 @@ pub mod test_utils;
 pub mod tests;
 
 use std::fmt;
+use std::sync::Arc;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -498,7 +500,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Type alias for AIR-trace-public-inputs triples used in multi-table proving.
-type AirTracePair<'a> = (
+pub type AirTracePair<'a> = (
     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     &'a mut stark::trace::TraceTable<F, E>,
     &'a (),
@@ -730,9 +732,10 @@ impl VmAirs {
             // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
-            Box::new(create_bitwise_air(proof_options).with_preprocessed(
+            Box::new(create_bitwise_air(proof_options).with_preprocessed_columns(
                 bitwise::preprocessed_commitment(proof_options),
                 bitwise::NUM_PRECOMPUTED_COLS,
+                Arc::new(bitwise::preprocessed_columns),
             ))
         };
         let lts: Vec<_> = (0..table_counts.lt)
@@ -767,10 +770,17 @@ impl VmAirs {
             decode::commitment_from_elf(elf, proof_options)
                 .expect("Failed to compute decode commitment")
         });
-        let decode: VmAir = Box::new(
-            create_decode_air(proof_options)
-                .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS),
-        );
+        let decode: VmAir = {
+            // The instruction map, decoded once here rather than on every call:
+            // only the multilinear verifier asks, but it asks per proof.
+            let instructions = decode::instructions_from_elf(elf)
+                .expect("the decode commitment above already decoded this ELF");
+            Box::new(create_decode_air(proof_options).with_preprocessed_columns(
+                decode_root,
+                decode::NUM_PRECOMPUTED_COLS,
+                Arc::new(move || decode::preprocessed_columns(&instructions)),
+            ))
+        };
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| {
                 Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
@@ -791,10 +801,13 @@ impl VmAirs {
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
         let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
-        let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
-            tables::keccak_rc::NUM_PRECOMPUTED_COLS,
-        ));
+        let keccak_rc: VmAir = Box::new(
+            create_keccak_rc_air(proof_options).with_preprocessed_columns(
+                tables::keccak_rc::preprocessed_commitment(proof_options),
+                tables::keccak_rc::NUM_PRECOMPUTED_COLS,
+                Arc::new(tables::keccak_rc::preprocessed_columns),
+            ),
+        );
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let hint: VmAir = Box::new(create_hint_air(proof_options));
@@ -808,10 +821,14 @@ impl VmAirs {
                 let register_init = register_init
                     .map(<[u32]>::to_vec)
                     .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-                Box::new(create_register_air(proof_options).with_preprocessed(
-                    register::preprocessed_commitment(proof_options, &register_init),
-                    register::NUM_PREPROCESSED_COLS,
-                ))
+                let commitment = register::preprocessed_commitment(proof_options, &register_init);
+                Box::new(
+                    create_register_air(proof_options).with_preprocessed_columns(
+                        commitment,
+                        register::NUM_PREPROCESSED_COLS,
+                        Arc::new(move || register::preprocessed_columns(&register_init)),
+                    ),
+                )
             };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
@@ -840,15 +857,19 @@ impl VmAirs {
                     // Committing OFFSET alone publishes nothing: it is the dense
                     // `0..page_size-1` enumeration, byte-identical for every page
                     // regardless of program or input.
-                    Box::new(air.with_preprocessed(
+                    Box::new(air.with_preprocessed_columns(
                         page::private_page_preprocessed_commitment(proof_options),
                         page::NUM_PREPROCESSED_COLS_PRIVATE,
+                        Arc::new(|| vec![page::offset_column()]),
                     ))
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
-                    Box::new(
-                        air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS),
-                    )
+                    let config = config.clone();
+                    Box::new(air.with_preprocessed_columns(
+                        zero_init_commitment,
+                        page::NUM_PREPROCESSED_COLS,
+                        Arc::new(move || page::preprocessed_columns(&config)),
+                    ))
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
@@ -861,7 +882,12 @@ impl VmAirs {
                         .unwrap_or_else(|| {
                             page::compute_precomputed_commitment(config, proof_options)
                         });
-                    Box::new(air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS))
+                    let config = config.clone();
+                    Box::new(air.with_preprocessed_columns(
+                        commitment,
+                        page::NUM_PREPROCESSED_COLS,
+                        Arc::new(move || page::preprocessed_columns(&config)),
+                    ))
                 }
             })
             .collect();

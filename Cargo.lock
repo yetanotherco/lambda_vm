@@ -811,6 +811,7 @@ dependencies = [
  "log",
  "math",
  "math-cuda",
+ "multilinear",
  "rayon",
  "rkyv",
  "serde",
@@ -941,6 +942,8 @@ dependencies = [
  "crypto",
  "math",
  "rayon",
+ "rkyv",
+ "serde",
  "thiserror",
 ]
 
