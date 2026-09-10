@@ -397,7 +397,7 @@ where
     // against the stack in one go.
     let columns = stacked_eval::prove::<F, E, T>(
         &trace.stacked,
-        &reduced_point,
+        &stacked_eval::Claimed::Shared(&reduced_point),
         &reduce.column_values,
         config,
         transcript,
@@ -467,7 +467,7 @@ where
         &proof.columns,
         claim_shape.layout,
         roots,
-        &reduced.point,
+        &stacked_eval::Claimed::Shared(&reduced.point),
         &reduced.column_values,
         claim_shape.domain,
         config,

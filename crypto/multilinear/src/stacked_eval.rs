@@ -37,7 +37,7 @@ use crate::{
     Error, challenge_powers,
     eq::{eq_eval, eq_evals},
     mle::Mle,
-    stacking::StackedLayout,
+    stacking::{Placement, StackedLayout},
     whir::Domain,
     whir_chain::{self, ChainConfig, ChainProof},
     whir_commit::{CodewordCommitment, Commitment},
@@ -119,86 +119,102 @@ impl<F: IsField, E: IsField> StackedProof<F, E> {
     }
 }
 
-/// The columns one stacked polynomial holds: `(column index, slot)`, plus the
-/// height they share.
+/// Where each column is claimed.
 ///
-/// Errors if they do not share it: the weight only factors when they do.
-fn columns_in(layout: &StackedLayout, poly: usize) -> Result<(usize, Vec<(usize, usize)>), Error> {
-    let mut num_vars = None;
-    let mut slots = Vec::new();
-    for (column, place) in layout.placements().iter().enumerate() {
-        if place.poly != poly {
-            continue;
-        }
-        match num_vars {
-            None => num_vars = Some(place.num_vars),
-            Some(m) if m != place.num_vars => {
-                return Err(Error::VariableCountMismatch {
-                    expected: m,
-                    got: place.num_vars,
-                });
-            }
-            _ => {}
-        }
-        slots.push((column, place.offset >> place.num_vars));
-    }
-    Ok((num_vars.unwrap_or(layout.n_stack()), slots))
+/// One table's sumcheck leaves every one of its columns at the **same** point,
+/// which is [`Shared`](Self::Shared). Stacking several tables into one
+/// commitment does not: each settles at its own, and the weight stops
+/// factoring into slots times a single `eq`.
+#[derive(Clone, Copy, Debug)]
+pub enum Claimed<'a, E: IsField> {
+    Shared(&'a [FieldElement<E>]),
+    PerColumn(&'a [Vec<FieldElement<E>>]),
 }
 
-/// `Σ_i gamma^i·eq(prefix_i ‖ point, ·)` as a table, built as the tensor of the
-/// slot weights and `eq(point, ·)`.
+impl<E: IsField> Claimed<'_, E> {
+    fn point(&self, column: usize) -> Result<&[FieldElement<E>], Error> {
+        match self {
+            Self::Shared(point) => Ok(point),
+            Self::PerColumn(points) => {
+                points
+                    .get(column)
+                    .map(Vec::as_slice)
+                    .ok_or(Error::UnknownPolynomial {
+                        index: column,
+                        len: points.len(),
+                    })
+            }
+        }
+    }
+}
+
+/// The columns one stacked polynomial holds, as `(column index, placement)`.
+fn columns_in(layout: &StackedLayout, poly: usize) -> impl Iterator<Item = (usize, &Placement)> {
+    layout
+        .placements()
+        .iter()
+        .enumerate()
+        .filter(move |(_, place)| place.poly == poly)
+}
+
+/// `Σ_i gamma^i·eq(prefix_i ‖ point_i, ·)` as a table.
+///
+/// Each column owns a contiguous subcube of the stack, so its share of the
+/// weight is written straight into that range and the gaps stay zero. Columns
+/// of different heights cost nothing extra here — the range is just shorter.
 fn weight_table<E: IsField>(
     layout: &StackedLayout,
     poly: usize,
-    point: &[FieldElement<E>],
+    points: &Claimed<'_, E>,
     weights: &[FieldElement<E>],
-) -> Result<Mle<E>, Error> {
-    let (num_vars, slots) = columns_in(layout, poly)?;
-    if point.len() != num_vars {
-        return Err(Error::VariableCountMismatch {
-            expected: num_vars,
-            got: point.len(),
-        });
-    }
-    // On the cube `eq(prefix_i, ·)` is the indicator of slot `i`, so the high
-    // half of the weight is just the batching coefficient in that slot.
-    let mut slot_weight = vec![FieldElement::<E>::zero(); 1usize << (layout.n_stack() - num_vars)];
-    for (column, slot) in slots {
-        slot_weight[slot] = weights[column].clone();
-    }
-
-    let eq_low = eq_evals(point);
-    let mut table = Vec::with_capacity(1usize << layout.n_stack());
-    for w in &slot_weight {
-        table.extend(eq_low.iter().map(|e| w * e));
+) -> Result<Mle<E>, Error>
+where
+    FieldElement<E>: Send + Sync,
+{
+    let mut table = vec![FieldElement::<E>::zero(); 1usize << layout.n_stack()];
+    for (column, place) in columns_in(layout, poly) {
+        let point = points.point(column)?;
+        if point.len() != place.num_vars {
+            return Err(Error::VariableCountMismatch {
+                expected: place.num_vars,
+                got: point.len(),
+            });
+        }
+        let eq = eq_evals(point);
+        let weight = &weights[column];
+        for (slot, e) in table[place.offset..place.offset + eq.len()]
+            .iter_mut()
+            .zip(&eq)
+        {
+            *slot = weight * e;
+        }
     }
     Mle::new(table)
 }
 
 /// The same weight at an arbitrary point, in closed form.
+///
+/// A column's prefix picks its subcube out of the stack, so its term is the
+/// prefix indicator at the high variables times `eq(point_i, ·)` at the low
+/// ones — and how many are "high" is the column's own business, which is what
+/// lets heights differ.
 fn weight_at<E: IsField>(
     layout: &StackedLayout,
     poly: usize,
-    point: &[FieldElement<E>],
+    points: &Claimed<'_, E>,
     weights: &[FieldElement<E>],
     at: &[FieldElement<E>],
 ) -> Result<FieldElement<E>, Error> {
-    let (num_vars, slots) = columns_in(layout, poly)?;
     if at.len() != layout.n_stack() {
         return Err(Error::VariableCountMismatch {
             expected: layout.n_stack(),
             got: at.len(),
         });
     }
-    let (high, low) = at.split_at(layout.n_stack() - num_vars);
-
-    let mut prefix = FieldElement::<E>::zero();
-    for (column, _) in slots {
-        let bits = layout
-            .placement(column)
-            .expect("column came from this layout")
-            .prefix_bits();
-        let corner: Vec<FieldElement<E>> = bits
+    let mut total = FieldElement::<E>::zero();
+    for (column, place) in columns_in(layout, poly) {
+        let corner: Vec<FieldElement<E>> = place
+            .prefix_bits()
             .into_iter()
             .map(|b| {
                 if b {
@@ -208,9 +224,10 @@ fn weight_at<E: IsField>(
                 }
             })
             .collect();
-        prefix += &weights[column] * eq_eval(&corner, high)?;
+        let (high, low) = at.split_at(corner.len());
+        total += &weights[column] * eq_eval(&corner, high)? * eq_eval(points.point(column)?, low)?;
     }
-    Ok(prefix * eq_eval(point, low)?)
+    Ok(total)
 }
 
 /// The claimed sum for one stacked polynomial: its columns' values, batched.
@@ -220,12 +237,11 @@ fn claimed<E: IsField>(
     values: &[FieldElement<E>],
     weights: &[FieldElement<E>],
 ) -> Result<FieldElement<E>, Error> {
-    let (_, slots) = columns_in(layout, poly)?;
-    Ok(slots
-        .into_iter()
-        .fold(FieldElement::<E>::zero(), |acc, (column, _)| {
+    Ok(
+        columns_in(layout, poly).fold(FieldElement::<E>::zero(), |acc, (column, _)| {
             acc + &weights[column] * &values[column]
-        }))
+        }),
+    )
 }
 
 /// Proves that every column takes its claimed value at the shared `point`.
@@ -234,7 +250,7 @@ fn claimed<E: IsField>(
 /// pick them after seeing it.
 pub fn prove<F, E, T>(
     stacked: &StackedCommitment<F>,
-    point: &[FieldElement<E>],
+    point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
     config: &ChainConfig,
     transcript: &mut T,
@@ -282,7 +298,7 @@ pub fn verify<F, E, T>(
     proof: &StackedProof<F, E>,
     layout: &StackedLayout,
     roots: &[Commitment],
-    point: &[FieldElement<E>],
+    point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
     domain: &Domain<F>,
     config: &ChainConfig,
@@ -386,13 +402,19 @@ mod tests {
     ) -> Result<usize, Error> {
         let stacked = StackedCommitment::<F>::commit(layout, columns, &config())?;
         let roots = stacked.roots();
-        let proof = prove(&stacked, at, claimed, &config(), &mut transcript())?;
+        let proof = prove(
+            &stacked,
+            &Claimed::Shared(at),
+            claimed,
+            &config(),
+            &mut transcript(),
+        )?;
 
         verify(
             &proof,
             stacked.layout(),
             &roots,
-            at,
+            &Claimed::Shared(at),
             claimed,
             stacked.domain(),
             &config(),
@@ -482,11 +504,11 @@ mod tests {
         let at = point(num_vars);
         let weights: Vec<FE> = (0..3).map(|i| FE::from(3 + i as u64)).collect();
 
-        let table = weight_table(&layout, 0, &at, &weights).unwrap();
+        let table = weight_table(&layout, 0, &Claimed::Shared(&at), &weights).unwrap();
         let off_cube: Vec<FE> = (0..n_stack).map(|i| FE::from(31 + i as u64)).collect();
         assert_eq!(
             table.evaluate(&off_cube).unwrap(),
-            weight_at(&layout, 0, &at, &weights, &off_cube).unwrap()
+            weight_at(&layout, 0, &Claimed::Shared(&at), &weights, &off_cube).unwrap()
         );
     }
 
@@ -499,7 +521,7 @@ mod tests {
         let weights: Vec<FE> = (0..3).map(|i| FE::from(3 + i as u64)).collect();
 
         let stacked = layout.stack(&columns).unwrap();
-        let table = weight_table(&layout, 0, &at, &weights).unwrap();
+        let table = weight_table(&layout, 0, &Claimed::Shared(&at), &weights).unwrap();
         // Σ_x w(x)·stacked(x) must be the batched column values.
         let summed = table
             .evals()
@@ -518,7 +540,7 @@ mod tests {
         let layout = StackedLayout::build(&[3, 2], 5).unwrap();
         let weights = [FE::one(), FE::one()];
         assert!(matches!(
-            weight_table(&layout, 0, &point(3), &weights).err(),
+            weight_table(&layout, 0, &Claimed::Shared(&point(3)), &weights).err(),
             Some(Error::VariableCountMismatch { .. })
         ));
     }
@@ -532,7 +554,14 @@ mod tests {
 
         let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
         assert!(matches!(
-            prove(&stacked, &at, &claimed[..3], &config(), &mut transcript()).err(),
+            prove(
+                &stacked,
+                &Claimed::Shared(&at),
+                &claimed[..3],
+                &config(),
+                &mut transcript()
+            )
+            .err(),
             Some(Error::QueryCountMismatch {
                 expected: 4,
                 got: 3
@@ -549,7 +578,14 @@ mod tests {
 
         let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
         let roots = stacked.roots();
-        let proof = prove(&stacked, &at, &claimed, &config(), &mut transcript()).unwrap();
+        let proof = prove(
+            &stacked,
+            &Claimed::Shared(&at),
+            &claimed,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(
@@ -557,7 +593,7 @@ mod tests {
                 &proof,
                 stacked.layout(),
                 &roots,
-                &at,
+                &Claimed::Shared(&at),
                 &claimed,
                 stacked.domain(),
                 &config(),
@@ -599,10 +635,60 @@ mod tests {
         assert_eq!(roots.len(), 1);
 
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
-        let proof = prove::<F, Ext, _>(&stacked, &at, &claimed, &config(), &mut prover).unwrap();
+        let proof = prove::<F, Ext, _>(
+            &stacked,
+            &Claimed::Shared(&at),
+            &claimed,
+            &config(),
+            &mut prover,
+        )
+        .unwrap();
 
         let mut verifier = DefaultTranscript::<Ext>::new(b"tower");
         verify::<F, Ext, _>(
+            &proof,
+            stacked.layout(),
+            &roots,
+            &Claimed::Shared(&at),
+            &claimed,
+            stacked.domain(),
+            &config(),
+            &mut verifier,
+        )
+        .unwrap();
+    }
+
+    /// Columns of **different heights**, each claimed at **its own point**,
+    /// settled against one commitment.
+    ///
+    /// This is what stacking separate tables together needs and what a shared
+    /// point cannot express: their sumchecks end wherever they end. The
+    /// weight stops factoring into slots times a single `eq`, so the check
+    /// that it still describes the same claim is the whole point of the test.
+    #[test]
+    fn columns_of_different_heights_settle_at_their_own_points() {
+        let columns = vec![column(3, 7), column(1, 11), column(2, 13)];
+        let n_stack = 4;
+        let layout = StackedLayout::build(&[3, 1, 2], n_stack).unwrap();
+
+        // A point per column, each of that column's own width.
+        let points: Vec<Vec<FE>> = vec![
+            vec![FE::from(2), FE::from(3), FE::from(5)],
+            vec![FE::from(7)],
+            vec![FE::from(11), FE::from(13)],
+        ];
+        let claimed: Vec<FE> = columns
+            .iter()
+            .zip(&points)
+            .map(|(c, p)| c.evaluate(p).unwrap())
+            .collect();
+
+        let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
+        let roots = stacked.roots();
+        let at = Claimed::PerColumn(&points);
+
+        let proof = prove(&stacked, &at, &claimed, &config(), &mut transcript()).unwrap();
+        verify(
             &proof,
             stacked.layout(),
             &roots,
@@ -610,8 +696,27 @@ mod tests {
             &claimed,
             stacked.domain(),
             &config(),
-            &mut verifier,
+            &mut transcript(),
         )
         .unwrap();
+
+        // And a wrong value for one column is rejected, so the per-point
+        // weight is really tying each claim to its own column.
+        let mut tampered = claimed.clone();
+        tampered[1] += FE::one();
+        let proof = prove(&stacked, &at, &tampered, &config(), &mut transcript()).unwrap();
+        assert!(
+            verify(
+                &proof,
+                stacked.layout(),
+                &roots,
+                &at,
+                &tampered,
+                stacked.domain(),
+                &config(),
+                &mut transcript(),
+            )
+            .is_err()
+        );
     }
 }
