@@ -13,7 +13,8 @@ Sub-proof count per epoch (`prover/src/continuation.rs`, verified earlier this
 phase):
 
 ```
-T_epoch = table_counts.total()              # 14 split-table families, chunked
+T_epoch = table_counts.total()              # 15 split-table families, chunked
+                                            # (KECCAK_RND is one of them)
         + (10 if final_epoch else 9)        # FIXED_TABLE_COUNT, minus HALT
                                             # on intermediate epochs
         + page_configs.len()                # one PAGE AIR per touched page

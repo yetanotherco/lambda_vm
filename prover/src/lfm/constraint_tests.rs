@@ -25,7 +25,9 @@ use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
-use crate::test_utils::{NUM_PRODUCTION_AIRS, production_airs};
+use crate::test_utils::{
+    ALWAYS_ON_FINAL, CHUNKED_FAMILIES, NUM_PRODUCTION_AIRS, always_on_intermediate, production_airs,
+};
 
 use super::builder::LfmBuilder;
 use super::compiler::compile;
@@ -1476,9 +1478,10 @@ fn quotient_rows(artifact: &ConstraintArtifact, log2_trace_length: u32) -> usize
 ///
 /// The composition is `others/lfm-constraint-lowering-design.md` §8.2.2's, which
 /// `tests::constraint_artifact_tests::continuation_epoch_constraint_leg` derives
-/// from the real epoch shape and pins against a measured 24/25 sub-proof count:
-/// 14 split-table families at one chunk each, plus the nine fixed tables an
-/// intermediate epoch carries (all ten on the final one), plus one L2G_MEMORY.
+/// from the real epoch shape and pins against a measured 25/26 sub-proof count:
+/// 15 split-table families at one chunk each (KECCAK_RND is one of them), plus
+/// the nine always-on tables an intermediate epoch carries (all ten on the final
+/// one), plus one L2G_MEMORY.
 /// PAGE does not appear — epochs pass `page_configs = &[]`.
 ///
 /// ### What this instrument cannot see
@@ -1493,31 +1496,10 @@ fn continuation_epoch_constraint_leg_cost() {
     /// Trace length assumed for the zerofier's squaring chain.
     const LOG2_TRACE_LENGTH: u32 = 20;
 
-    /// The 14 chunked split-table families.
-    const SPLIT_FAMILIES: &[&str] = &[
-        "CPU", "LT", "SHIFT", "EQ", "BYTEWISE", "STORE", "CPU32", "MEMW", "MEMW_A", "MEMW_R",
-        "LOAD", "MUL", "DVRM", "BRANCH",
-    ];
-    /// The always-one tables, which contribute exactly one sub-proof each
-    /// regardless of `TableCounts`. HALT is last: an intermediate epoch drops
-    /// it. KECCAK_RND is NOT here — it is chunked, and its count is in
-    /// `TableCounts`.
-    ///
-    /// ⚠ This list is nine and `FIXED_TABLE_COUNT` is ten: HINT is in the
-    /// constant's set and has never been in this one. Pre-existing, not
-    /// introduced by the chunking change, and left alone because adding it
-    /// moves what this cost table partitions.
-    const FIXED: &[&str] = &[
-        "BITWISE",
-        "DECODE",
-        "COMMIT",
-        "KECCAK",
-        "KECCAK_RC",
-        "REGISTER",
-        "ECSM",
-        "ECDAS",
-        "HALT",
-    ];
+    // The partition is `test_utils`': `CHUNKED_FAMILIES` (fifteen, KECCAK_RND
+    // among them) and `ALWAYS_ON_FINAL` (ten, HALT last). This suite kept its
+    // own copies, which is how HINT came to be missing from the always-on side
+    // here while the constant counted it.
 
     let opts = options();
     let airs = production_airs(&opts);
@@ -1541,48 +1523,70 @@ fn continuation_epoch_constraint_leg_cost() {
         labels.iter().map(|l| pick(&cost[l])).sum()
     };
 
-    let families = sum(SPLIT_FAMILIES, |c| c.0);
-    let fixed_no_halt = sum(&FIXED[..9], |c| c.0);
+    let intermediate_fixed = always_on_intermediate();
+    let families = sum(&CHUNKED_FAMILIES, |c| c.0);
+    let fixed_no_halt = sum(intermediate_fixed, |c| c.0);
     let halt = cost["HALT"].0;
     let l2g = cost["L2G_MEMORY"].0;
 
-    let families_unfused = sum(SPLIT_FAMILIES, |c| c.1);
-    let fixed_unfused = sum(&FIXED[..9], |c| c.1);
+    let families_unfused = sum(&CHUNKED_FAMILIES, |c| c.1);
+    let fixed_unfused = sum(intermediate_fixed, |c| c.1);
     let l2g_unfused = cost["L2G_MEMORY"].1;
 
     let recombination =
-        sum(SPLIT_FAMILIES, |c| c.2) + sum(&FIXED[..9], |c| c.2) + cost["L2G_MEMORY"].2;
+        sum(&CHUNKED_FAMILIES, |c| c.2) + sum(intermediate_fixed, |c| c.2) + cost["L2G_MEMORY"].2;
 
     let intermediate = families + fixed_no_halt + l2g;
     let final_leg = intermediate + halt;
     let final_total = final_leg + recombination + cost["HALT"].2;
     let design_intermediate = families_unfused + fixed_unfused + l2g_unfused;
 
+    let n_families = CHUNKED_FAMILIES.len();
+    let n_fixed = intermediate_fixed.len();
+    let n_intermediate = n_families + n_fixed + 1;
+    let n_final = n_families + ALWAYS_ON_FINAL.len() + 1;
+    let intermediate_total = intermediate + recombination;
+
     println!(
-        "\ncontinuation epoch, constraint leg (minimum shape, 25 sub-proofs)\n\
-         \x20 14 split families        {families:>7}  (unfused {families_unfused})\n\
-         \x20  9 fixed, no HALT        {fixed_no_halt:>7}  (unfused {fixed_unfused})\n\
+        "\ncontinuation epoch, constraint leg (minimum shape, {n_intermediate} sub-proofs)\n\
+         \x20 {n_families} split families        {families:>7}  (unfused {families_unfused})\n\
+         \x20  {n_fixed} fixed, no HALT        {fixed_no_halt:>7}  (unfused {fixed_unfused})\n\
          \x20  1 L2G_MEMORY            {l2g:>7}  (unfused {l2g_unfused})\n\
          \x20 INTERMEDIATE leg         {intermediate:>7}  vs the design's {design_intermediate}\n\
          \x20 + recombination @ log2(N) = {LOG2_TRACE_LENGTH}  {recombination:>7}  \
          (zerofier, beta-fold, one division, claimed-parts Horner, assert)\n\
-         \x20 INTERMEDIATE total       {:>7}  over 25 sub-proofs\n\
+         \x20 INTERMEDIATE total       {intermediate_total:>7}  over {n_intermediate} sub-proofs\n\
          \x20 FINAL epoch (+HALT)      {final_leg:>7} leg, {final_total} total, \
-         over 25 sub-proofs",
-        intermediate + recombination
+         over {n_final} sub-proofs"
     );
 
     // The design's §8.2.2 arithmetic, reproduced from the emitter's own unfused
     // counts. A mismatch means the epoch composition changed, which is a finding
     // about the epoch, not about this pass.
     //
-    // 63_393 → 62_375 (−1018): attributed in full to KECCAK_RND, which is in
-    // `FIXED`. Main replaced its θ/ρ HWSL lookups with inline μ-gated linear
-    // identities in `KeccakRndConstraints`, netting −1018 constraint arithmetic
-    // rows — the exact same delta the per-AIR census records for KECCAK_RND
-    // (14_016 → 12_998). No other table moved; this is not a blind re-bless.
+    // 63_393 → 62_375 (−1018): attributed in full to KECCAK_RND. Main replaced
+    // its θ/ρ HWSL lookups with inline μ-gated linear identities in
+    // `KeccakRndConstraints`, netting −1018 constraint arithmetic rows — the
+    // exact same delta the per-AIR census records for KECCAK_RND
+    // (14_016 → 12_998). No other table moved; this was not a blind re-bless.
+    //
+    // 62_375 → 62_793 (+418): the PARTITION gained HINT, and nothing else.
+    // KECCAK_RND moved from the always-on side to the families side, which
+    // leaves the multiset it sums over unchanged; HINT has been in
+    // `FIXED_TABLE_COUNT` all along and was in neither of this suite's
+    // hand-written lists, so this leg was understated by exactly its unfused
+    // rows — measured at 418, which is the whole of the +418. Both forms are
+    // asserted: the decomposition says WHY the number moved, and would fail if
+    // any OTHER table had moved with it; the literal is the pin.
     assert_eq!(
-        design_intermediate, 62_375,
+        design_intermediate,
+        62_375 + cost["HINT"].1,
+        "the intermediate leg is no longer the design's 62_375 plus HINT's \
+         unfused rows, so something other than the partition moved — the \
+         literal pin below cannot say which table"
+    );
+    assert_eq!(
+        design_intermediate, 62_793,
         "the design's intermediate-epoch budget no longer reproduces"
     );
     assert!(

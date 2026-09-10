@@ -1056,6 +1056,84 @@ pub const PAGE_TEST_BASE: u64 = 0x1000;
 /// epoch — `l2g_memory_air` debug-asserts `>= 1`.
 pub const EPOCH_TEST_LABEL: u64 = 1;
 
+/// The ALWAYS-ON tables: every table that contributes exactly one sub-proof
+/// regardless of `TableCounts`. One list, for every suite that partitions an
+/// epoch's sub-proofs.
+///
+/// ★ HALT IS THE TAIL, BY CONTRACT. An intermediate continuation epoch drops
+/// exactly that one, so [`always_on_intermediate`] is this list without its
+/// last element — do not reorder it, and never slice it by a literal index.
+///
+/// The width is checked against [`crate::FIXED_TABLE_COUNT`] by the type, which
+/// is the whole point of writing it down once. There were FIVE hand-copied
+/// copies of this set across three suites, and they disagreed with the constant
+/// and with each other: HINT was missing from three of them, and two of those
+/// listed ten entries against a constant of eleven — which is why the
+/// discrepancy read as a stale doc rather than as a table nobody was counting.
+/// Then KECCAK_RND left the set, and the literal `[..9]` one copy used to drop
+/// HALT started including it instead, double-counting HALT in the very leg it
+/// was there to subtract. That one was caught only because the suite pins a
+/// literal budget; the positional census in `lfm::logup_tests` was caught only
+/// because it compares each label against the sub-proof's own trace length.
+///
+/// ⚠ KECCAK_RND IS NOT HERE. It is chunked: its sub-proof count lives in
+/// [`crate::TableCounts::keccak_rnd`], is summed by `TableCounts::total`, and it
+/// belongs to [`CHUNKED_FAMILIES`] below.
+pub static ALWAYS_ON_FINAL: [&str; crate::FIXED_TABLE_COUNT] = [
+    "BITWISE",
+    "DECODE",
+    "COMMIT",
+    "KECCAK",
+    "KECCAK_RC",
+    "REGISTER",
+    "ECSM",
+    "ECDAS",
+    "HINT",
+    "HALT",
+];
+
+/// [`ALWAYS_ON_FINAL`] without HALT — the always-on set an INTERMEDIATE
+/// continuation epoch carries.
+///
+/// Derived from the tail rather than a literal index, and it asserts that the
+/// tail is HALT, because the ordering is the only thing that makes the slice
+/// correct.
+pub fn always_on_intermediate() -> &'static [&'static str] {
+    let (last, rest) = ALWAYS_ON_FINAL
+        .split_last()
+        .expect("the always-on set is non-empty");
+    assert_eq!(
+        *last, "HALT",
+        "HALT must be the tail of ALWAYS_ON_FINAL — the intermediate set is the head"
+    );
+    rest
+}
+
+/// The CHUNKED split-table families: every table whose sub-proof count is read
+/// out of `TableCounts` rather than fixed at one.
+///
+/// Width-checked against [`crate::TableCounts::ABSORBED`] less one: the
+/// statement absorbs one count per family plus `blake3`, which is 0-or-1 and so
+/// not a family. Adding a field to `TableCounts` therefore fails to compile here
+/// until this list names it.
+pub static CHUNKED_FAMILIES: [&str; crate::TableCounts::ABSORBED - 1] = [
+    "CPU",
+    "LT",
+    "SHIFT",
+    "EQ",
+    "BYTEWISE",
+    "STORE",
+    "CPU32",
+    "MEMW",
+    "MEMW_A",
+    "MEMW_R",
+    "LOAD",
+    "MUL",
+    "DVRM",
+    "BRANCH",
+    "KECCAK_RND",
+];
+
 /// Every production table AIR, constructed and boxed behind the common trait
 /// object.
 ///

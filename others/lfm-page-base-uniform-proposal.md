@@ -37,7 +37,7 @@ This reordering follows from the epoch composition measured in the lowering
 design, and I did not draw it myself:
 
 ```
-epoch proof = 14 split families + 9 or 10 fixed + 1 L2G_MEMORY
+epoch proof = 15 split families + 9 or 10 fixed + 1 L2G_MEMORY
 ```
 
 No PAGE (`page_configs = &[]`). No GLOBAL_MEMORY — that lives in the *global*

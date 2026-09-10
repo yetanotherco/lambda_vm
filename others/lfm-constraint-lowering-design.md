@@ -472,10 +472,20 @@ INTERMEDIATE epoch                      63,393 instr over 24 sub-proofs
 FINAL epoch (+HALT)                     64,094 instr over 25 sub-proofs
 ```
 
-**The 24/25 sub-proof count is independently measured** on the LFM fibonacci
-epoch fixture, and the test asserts that this composition reproduces it — so the
-shape is pinned rather than inferred. If the epoch shape changes, the arithmetic
-stops matching and the test fails.
+**The sub-proof count is independently measured** on the LFM fibonacci epoch
+fixture, and the test asserts that this composition reproduces it — so the shape
+is pinned rather than inferred. If the epoch shape changes, the arithmetic stops
+matching and the test fails.
+
+⚠ **The block above is a snapshot; read the counts off the tests.** Two things
+in it have moved since. KECCAK_RND is chunked, so it is a split family and not
+one of the fixed tables — the composition is 15 families and the counts are 25
+intermediate / 26 final. And the `9 fixed` sum omits HINT, which is in
+`FIXED_TABLE_COUNT`: the intermediate leg is 62,793 unfused, not 62,375, of
+which 418 is HINT. `tests::constraint_artifact_tests::continuation_epoch_constraint_leg`
+pins the composition and `lfm::constraint_tests::continuation_epoch_constraint_leg_cost`
+pins the budget, both from `test_utils::CHUNKED_FAMILIES` and
+`test_utils::ALWAYS_ON_FINAL`.
 
 Those 24/25 are the **minimum**: one chunk per family, i.e. an epoch of ≤2^19
 cycles. `continuation_epoch_chunk_counts_measured` drives the real continuation

@@ -1087,9 +1087,23 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // BLAKE3 has since left this list in the other direction: it is no longer
     // always-on but counted in `TableCounts::blake3`, and this epoch does not
     // use it, so it contributes no sub-proof to census.
+    //
+    // ⚠ KECCAK_RND IS SPLICED IN, BETWEEN KECCAK AND KECCAK_RC. That is the slot
+    // `air_refs` puts its chunks in, so the always-on tables after it sit at a
+    // position that MOVES WITH THE CHUNK COUNT — a census of the nine alone
+    // silently compares KECCAK_RC against a KECCAK_RND sub-proof the moment the
+    // table is chunked at all. It is not always-on any more (its count is
+    // `TableCounts::keccak_rnd`), so it is not in the sized array; it is chained
+    // in at its own position, as many entries as the builder produced.
     let census: Vec<(&str, usize, bool)> = {
-        use crate::tables::{ecdas, hint, keccak, keccak_rc};
-        let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); crate::FIXED_TABLE_COUNT - 1] = [
+        use crate::tables::{ecdas, hint, keccak, keccak_rc, keccak_rnd};
+        // The name is `'static` on purpose: tying it to the trace borrow would
+        // keep `traces` immutably borrowed through `census`, which is still live
+        // when the proof is built from `&mut traces`.
+        type Entry<'a> = (&'static str, &'a TraceTable<Gl, Ext3>, RowWitness);
+        /// The always-on tables that precede the KECCAK_RND slot.
+        const BEFORE_RND: usize = 4;
+        let head: [Entry; BEFORE_RND] = [
             ("BITWISE", &traces.bitwise, RowWitness::Populated),
             ("DECODE", &traces.decode, RowWitness::Populated),
             ("COMMIT", &traces.commit, RowWitness::Populated),
@@ -1098,6 +1112,18 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
                 &traces.keccak,
                 RowWitness::GatedOff(&[keccak::cols::MU]),
             ),
+        ];
+        // Chunked: one entry per chunk, none of them always-on. A chunk with no
+        // permutations in it is padding on every bus column, which is the same
+        // witness the unused fixed tables give.
+        let rnd = traces.keccak_rnd.iter().map(|t| -> Entry {
+            (
+                "KECCAK_RND",
+                t,
+                RowWitness::GatedOff(&[keccak_rnd::cols::MU]),
+            )
+        });
+        let tail: [Entry; crate::FIXED_TABLE_COUNT - 1 - BEFORE_RND] = [
             (
                 "KECCAK_RC",
                 &traces.keccak_rc,
@@ -1116,8 +1142,9 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
             ),
             ("REGISTER", &traces.register, RowWitness::Populated),
         ];
-        fixed
-            .into_iter()
+        head.into_iter()
+            .chain(rnd)
+            .chain(tail)
             .map(|(name, t, witness)| {
                 let no_bus_rows = match witness {
                     RowWitness::Blank => {
@@ -1205,19 +1232,22 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         r
     };
     let view = MultiProofView::Owned(&proof);
+    let always_on = crate::FIXED_TABLE_COUNT - 1;
     assert_eq!(
         census.len(),
-        crate::FIXED_TABLE_COUNT - 1,
+        always_on + table_counts.keccak_rnd,
         "the census must name every always-on table an intermediate epoch \
-         carries (all but HALT), or the sub-proof identity below is satisfied \
-         by an undercount on both sides"
+         carries (all but HALT) PLUS one entry per KECCAK_RND chunk, or the \
+         sub-proof identity below is satisfied by an undercount on both sides"
     );
     assert_eq!(
         view.len(),
-        census.len() + table_counts.total() + 1,
-        "an intermediate epoch is {} fixed tables, the chunked families, and \
-         one L2G_MEMORY",
-        crate::FIXED_TABLE_COUNT - 1
+        always_on + table_counts.total() + 1,
+        "an intermediate epoch is {always_on} always-on tables, the chunked \
+         families ({} sub-proofs, KECCAK_RND's {} chunks among them), and one \
+         L2G_MEMORY",
+        table_counts.total(),
+        table_counts.keccak_rnd
     );
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
 
@@ -1331,7 +1361,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
          distinguishing observation on this epoch: {with_rows:?}"
     );
     println!(
-        "\x20 ANSWER: Some(zero), not None. {} zero-row fixed tables {:?}, each \
+        "\x20 ANSWER: Some(zero), not None. {} zero-row tables {:?}, each \
          Some(zero); {} populated, {} of them nonzero.",
         zero_row.len(),
         zero_row,

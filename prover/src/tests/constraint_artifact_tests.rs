@@ -664,6 +664,9 @@ fn epoch_chunk_multiplier() {
             ("BYTEWISE", traces.bytewises.len()),
             ("STORE", traces.stores.len()),
             ("CPU32", traces.cpu32s.len()),
+            // Chunked by whole permutations since the device cap landed on it,
+            // so this is a real chunk count and not always one.
+            ("KECCAK_RND", traces.keccak_rnd.len()),
         ];
 
         let chunked_total: usize = chunked.iter().map(|(l, n)| get(l) * n).sum();
@@ -674,28 +677,23 @@ fn epoch_chunk_multiplier() {
         // PAGE (page_configs is empty there), so this monolithic shape is an
         // upper bound on the page contribution.
         let pages = traces.pages.len();
-        let fixed = get("BITWISE")
-            + get("DECODE")
-            + get("REGISTER")
-            + get("COMMIT")
-            + get("HALT")
-            + get("KECCAK")
-            + get("KECCAK_RND")
-            + get("KECCAK_RC")
-            + get("ECSM")
-            + get("ECDAS");
+        // The always-on set from the ONE list (`test_utils::ALWAYS_ON_FINAL`). A
+        // monolithic proof is the final shape, so HALT is in it; KECCAK_RND is
+        // not, because it is chunked and sits in `chunked` above.
+        let fixed: usize = ALWAYS_ON_FINAL.iter().map(|l| get(l)).sum();
         let page_total = get("PAGE") * pages;
         let epoch_total = chunked_total + fixed + page_total;
 
         let per_air_total: usize = instr.values().sum();
         println!(
             "\n{name}: {} cycles\n  \
-             chunked sub-proofs {chunk_count} (of 14 families) -> {chunked_total} instr\n  \
+             chunked sub-proofs {chunk_count} (of {} families) -> {chunked_total} instr\n  \
              fixed tables                                       -> {fixed} instr\n  \
              {pages} pages x {} instr                                 -> {page_total} instr\n  \
              EPOCH TOTAL {epoch_total} instr   vs per-distinct-AIR {per_air_total}   \
              multiplier {:.2}x",
             logs.len(),
+            CHUNKED_FAMILIES.len(),
             get("PAGE"),
             epoch_total as f64 / per_air_total as f64
         );
@@ -715,12 +713,12 @@ fn epoch_chunk_multiplier() {
 /// carries an L2G_MEMORY sub-proof instead. Its composition is
 ///
 /// ```text
-///   14 split-table families (>= 1 chunk each)
+///   15 split-table families (>= 1 chunk each, KECCAK_RND among them)
 /// + FIXED_TABLE_COUNT       (10 final, 9 intermediate — HALT only on the last)
 /// + 1 L2G_MEMORY
 /// ```
 ///
-/// which gives **24 sub-proofs intermediate, 25 final** — independently measured
+/// which gives **25 sub-proofs intermediate, 26 final** — independently measured
 /// on the LFM fibonacci epoch fixture. This test asserts that arithmetic so the
 /// composition is pinned rather than inferred: if the epoch shape changes, the
 /// count here stops matching the measured one and this fails.
@@ -737,42 +735,18 @@ fn continuation_epoch_constraint_leg() {
         .collect();
     let get = |k: &str| *instr.get(k).unwrap_or_else(|| panic!("no AIR {k}"));
 
-    // The 14 chunked split-table families, at their minimum of one chunk each.
-    let families = [
-        "CPU", "LT", "SHIFT", "MEMW", "MEMW_A", "LOAD", "MUL", "DVRM", "BRANCH", "MEMW_R", "EQ",
-        "BYTEWISE", "STORE", "CPU32",
-    ];
-    // The `FIXED_TABLE_COUNT` always-on tables (`prover/src/lib.rs`): exactly one
-    // sub-proof each REGARDLESS of TableCounts, because a zero-row table still
-    // needs its proof or its constraints drop out of verification. HALT is the
-    // one an intermediate epoch omits.
+    // The chunked split-table families, at their minimum of one chunk each, and
+    // the always-on tables — both from the ONE list each in `test_utils`, whose
+    // widths the compiler checks against `TableCounts::ABSORBED` and
+    // `FIXED_TABLE_COUNT`. They used to be literals here, and the runtime
+    // `assert_eq!` that guarded the second one is now the array's own type.
     //
-    // ⚠ BLAKE3 is deliberately NOT here. It left this list when it became
+    // ⚠ BLAKE3 is in neither. It left the always-on set when it became
     // `TableCounts::blake3`, a 0-or-1 count — a workload that never executes a
     // BLAKE3 syscall carries no BLAKE3 sub-proof at all, so the counts below are
-    // the blake3-free shape and a blake3-using epoch is one higher. HINT was
-    // missing from this list outright, which is why it read 10 while the
-    // constant said 11.
-    let fixed_final = [
-        "BITWISE",
-        "DECODE",
-        "HALT",
-        "COMMIT",
-        "KECCAK",
-        "KECCAK_RND",
-        "KECCAK_RC",
-        "REGISTER",
-        "ECSM",
-        "ECDAS",
-        "HINT",
-    ];
-    // The list is a census OF the constant, so it must not be able to drift from
-    // it silently — the failure this pin previously had.
-    assert_eq!(
-        fixed_final.len(),
-        crate::FIXED_TABLE_COUNT,
-        "the always-on list must name every FIXED_TABLE_COUNT table"
-    );
+    // the blake3-free shape and a blake3-using epoch is one higher.
+    let families = CHUNKED_FAMILIES;
+    let fixed_final = ALWAYS_ON_FINAL;
 
     let families_instr: usize = families.iter().map(|l| get(l)).sum();
     let fixed_final_instr: usize = fixed_final.iter().map(|l| get(l)).sum();
@@ -784,6 +758,8 @@ fn continuation_epoch_constraint_leg() {
 
     let n_intermediate = families.len() + fixed_final.len() - 1 + 1;
     let n_final = families.len() + fixed_final.len() + 1;
+    let n_families = families.len();
+    let n_fixed = fixed_final.len() - 1;
     assert_eq!(
         (n_intermediate, n_final),
         (25, 26),
@@ -793,8 +769,8 @@ fn continuation_epoch_constraint_leg() {
 
     println!(
         "\ncontinuation epoch constraint leg (minimum: one chunk per family)\n  \
-           14 split families      {families_instr}\n  \
-           10 fixed (no HALT)     {fixed_intermediate_instr}\n  \
+           {n_families} split families      {families_instr}\n  \
+           {n_fixed} fixed (no HALT)      {fixed_intermediate_instr}\n  \
            1 L2G_MEMORY           {l2g}\n  \
            INTERMEDIATE epoch     {intermediate} instr over {n_intermediate} sub-proofs\n  \
            FINAL epoch (+HALT)    {final_epoch} instr over {n_final} sub-proofs\n  \
@@ -897,6 +873,9 @@ fn continuation_epoch_chunk_counts_measured() {
             ("BYTEWISE", traces.bytewises.len()),
             ("STORE", traces.stores.len()),
             ("CPU32", traces.cpu32s.len()),
+            // Chunked by whole permutations since the device cap landed on it,
+            // so this is a real chunk count and not always one.
+            ("KECCAK_RND", traces.keccak_rnd.len()),
         ];
 
         // An epoch never builds PAGE — the continuation path passes
@@ -908,25 +887,21 @@ fn continuation_epoch_chunk_counts_measured() {
 
         let families: usize = chunked.iter().map(|(l, n)| get(l) * n).sum();
         let n_chunks: usize = chunked.iter().map(|(_, n)| *n).sum();
-        // Intermediate epoch: 9 fixed tables (no HALT) + 1 L2G_MEMORY.
-        let fixed = get("BITWISE")
-            + get("DECODE")
-            + get("COMMIT")
-            + get("KECCAK")
-            + get("KECCAK_RND")
-            + get("KECCAK_RC")
-            + get("REGISTER")
-            + get("ECSM")
-            + get("ECDAS");
+        // Intermediate epoch: the always-on set less HALT, plus 1 L2G_MEMORY.
+        // KECCAK_RND is not in it — it is chunked, and appears in `chunked`
+        // above with the chunk count the builder actually produced.
+        let always_on = always_on_intermediate();
+        let fixed: usize = always_on.iter().map(|l| get(l)).sum();
         let total = families + fixed + get("L2G_MEMORY");
 
         println!(
             "\n{name}, epoch 0 @ 2^{EPOCH_SIZE_LOG2} cycles\n  \
                {n_chunks} chunked sub-proofs -> {families} instr\n  \
-               9 fixed + L2G_MEMORY          -> {} instr\n  \
+               {} fixed + L2G_MEMORY          -> {} instr\n  \
                EPOCH TOTAL {total} instr over {} sub-proofs",
+            always_on.len(),
             fixed + get("L2G_MEMORY"),
-            n_chunks + 10
+            n_chunks + always_on.len() + 1
         );
         for (l, n) in &chunked {
             if *n > 1 {
