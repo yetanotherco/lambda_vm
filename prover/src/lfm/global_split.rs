@@ -130,7 +130,7 @@ mod tests {
 
     /// ★ Every split tiles exactly, at every `k`, for every table count.
     #[test]
-    fn every_partition_tiles_exactly_once() {
+    fn the_slice_partition_tiles_exactly() {
         for num_tables in 1usize..=40 {
             for k in 1..=num_tables {
                 let p = SlicePartition::even(num_tables, k);
@@ -151,7 +151,7 @@ mod tests {
     /// ⛔ A hand-built partition with a GAP must be refused.
     #[test]
     #[should_panic(expected = "a gap or")]
-    fn a_gap_is_refused() {
+    fn a_slice_partition_with_a_gap_is_rejected() {
         SlicePartition {
             num_tables: 6,
             bounds: vec![(0, 2), (3, 6)],
@@ -165,7 +165,7 @@ mod tests {
     /// left to arithmetic.
     #[test]
     #[should_panic(expected = "a gap or")]
-    fn an_overlap_is_refused() {
+    fn a_slice_partition_with_an_overlap_is_rejected() {
         SlicePartition {
             num_tables: 6,
             bounds: vec![(0, 4), (3, 6)],
@@ -176,7 +176,7 @@ mod tests {
     /// ⛔ And one that stops short, leaving tables verified by nobody.
     #[test]
     #[should_panic(expected = "but the proof has")]
-    fn a_short_cover_is_refused() {
+    fn a_slice_partition_that_stops_short_is_rejected() {
         SlicePartition {
             num_tables: 6,
             bounds: vec![(0, 2), (2, 4)],

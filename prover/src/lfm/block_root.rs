@@ -141,14 +141,34 @@ pub struct GlobalLayout {
 }
 
 impl GlobalLayout {
+    /// `z` and `alpha` — the shared LogUp pair, one published word each, ahead of
+    /// every root.
+    ///
+    /// ⛔ NAMED SO THERE IS STILL EXACTLY ONE DERIVATION OF `2 + epochs × lanes`.
+    /// Every index below is measured from this constant, so a reader that spelled
+    /// the prefix out again — a parent comparing `publics[0]` and `publics[1]` by
+    /// hand, say — would be a second copy of the layout, free to drift from the
+    /// order the emitter actually publishes in.
+    const SHARED_PAIR_WORDS: usize = 2;
+
     /// Words the global wrap publishes: `z`, `alpha`, then the roots.
     pub fn total(&self) -> usize {
-        2 + self.num_epochs * self.lanes_per_root
+        Self::SHARED_PAIR_WORDS + self.num_epochs * self.lanes_per_root
+    }
+
+    /// Index of `z` — the first word the emitter publishes.
+    pub fn z_word(&self) -> usize {
+        0
+    }
+
+    /// Index of `alpha`, immediately after `z`.
+    pub fn alpha_word(&self) -> usize {
+        self.z_word() + 1
     }
 
     /// Index of lane `w` of epoch `k`'s L2G root.
     pub fn l2g_word(&self, k: usize, w: usize) -> usize {
-        2 + k * self.lanes_per_root + w
+        Self::SHARED_PAIR_WORDS + k * self.lanes_per_root + w
     }
 
     /// Every epoch's root, as digests, in epoch order.
@@ -282,16 +302,22 @@ impl GlobalPublishes {
 }
 
 /// Emit the root's L2G COMPARE: the interior children's published folds against
-/// the same folds recomputed over the global wrap's per-epoch roots.
+/// the same folds recomputed over the GLOBAL CHILD's per-epoch roots.
 ///
 /// This is the compare a single-program aggregator did locally and a tree must
-/// defer to the common ancestor of the epoch wraps and the global wrap.
+/// defer to the common ancestor of the epoch wraps and the global proof.
+///
+/// ⚠ "The global child" and not "the global wrap": at `k > 1` the roots come
+/// from a [`super::global_parent`] that REPUBLISHED them, and this function reads
+/// them at the same fixed indices either way. That is what makes the parent's
+/// packing load-bearing rather than cosmetic — see `global_child_layout` on
+/// [`RootInputs`].
 pub fn emit_l2g_compare(
     b: &mut LfmBuilder,
     interior: &[LegCells],
     layouts: &[SchemaLayout],
     global: &LegCells,
-    global_layout: &GlobalLayout,
+    global_child_layout: &GlobalLayout,
     shape: &FoldShape,
 ) {
     assert_eq!(
@@ -299,7 +325,7 @@ pub fn emit_l2g_compare(
         layouts.len(),
         "one layout per interior child"
     );
-    let epochs = global_layout.epoch_digests(b, global);
+    let epochs = global_child_layout.epoch_digests(b, global);
     let recomputed = shape.refold(b, &epochs);
     assert_eq!(
         recomputed.len(),
@@ -343,21 +369,26 @@ pub fn emit_child_leg(b: &mut LfmBuilder, child: &ChildShape<'_>) -> LegCells {
 /// Bind the GLOBAL child, which `emit_chain_bindings` cannot take.
 ///
 /// ⛔ The interior binding pass asserts an attestation id, a register run and a
-/// label pair on EVERY child. The global wrap has none of them: it publishes
-/// `z`, `alpha` and the L2G roots and nothing else. Handing it to the shared pass
-/// would index past its published words. So the global child is bound by the L2G
-/// compare alone — which is the entirety of what it is FOR — and this function
-/// exists to say that explicitly rather than leave it as an omission.
-pub fn assert_global_child_is_bound_only_by_l2g(global_layout: &GlobalLayout, published: usize) {
+/// label pair on EVERY child. The global child has none of them: it publishes
+/// `z`, `alpha` and the L2G roots and nothing else — the unsliced wrap because
+/// that is its whole schema, the `k`-slice parent because that is the prefix it
+/// republished. Handing either to the shared pass would index past its published
+/// words. So the global child is bound by the L2G compare alone — which is the
+/// entirety of what it is FOR — and this function exists to say that explicitly
+/// rather than leave it as an omission.
+pub fn assert_global_child_is_bound_only_by_l2g(
+    global_child_layout: &GlobalLayout,
+    published: usize,
+) {
     assert_eq!(
-        global_layout.total(),
+        global_child_layout.total(),
         published,
-        "the global wrap published {published} words but the layout describes {} \
+        "the global child published {published} words but the layout describes {} \
          (z, alpha, then {} roots x {} lanes) — a mismatch here would silently \
          shift every L2G index the compare reads",
-        global_layout.total(),
-        global_layout.num_epochs,
-        global_layout.lanes_per_root,
+        global_child_layout.total(),
+        global_child_layout.num_epochs,
+        global_child_layout.lanes_per_root,
     );
 }
 
@@ -665,7 +696,30 @@ pub struct RootInputs<'a> {
     /// The first and last epoch label of the whole BLOCK.
     pub label_range: (u64, u64),
     pub global: &'a ChildShape<'a>,
-    pub global_layout: &'a GlobalLayout,
+    /// What the GLOBAL CHILD published — ⛔ named for the CHILD, not for the
+    /// wrap, because at `k > 1` it is not a wrap.
+    ///
+    /// Two different programs land here and publish the same set:
+    ///
+    /// - the UNSLICED global wrap, whose own published words these are;
+    /// - the [`super::global_parent`] over `k` SLICES, whose published words are
+    ///   the prefix it REPUBLISHED from slice 0 after checking every slice
+    ///   agreed on it — the parent asserts its bus sum is zero rather than
+    ///   publishing it, so it publishes exactly `2 + epochs × lanes` too.
+    ///
+    /// ⛔ **THAT EQUALITY IS A COINCIDENCE OF ARITHMETIC AND MUST NOT BE READ AS
+    /// DESIGN.** The type survives unchanged while its MEANING changes
+    /// completely: it stops describing *what the global wrap published* and
+    /// starts describing *what the parent republished*. A field still named
+    /// `global_layout` would have been a wrong name nobody had reason to
+    /// question — which is how one stays in place for six months.
+    ///
+    /// ⇒ And the packing on the parent's side is verified BY TEST rather than by
+    /// reading, because [`emit_l2g_compare`] reads this child's roots at fixed
+    /// indices: a republish in a different order satisfies the length assert and
+    /// hands the compare the right COUNT of wrong words. See
+    /// `global_parent::tests::the_parent_republishes_every_root_at_the_index_the_root_reads`.
+    pub global_child_layout: &'a GlobalLayout,
     pub fold_shape: &'a FoldShape,
     pub publishes: RootPublishSet,
 }
@@ -690,7 +744,7 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
         labels,
         label_range,
         global,
-        global_layout,
+        global_child_layout,
         fold_shape,
         publishes,
     } = *inputs;
@@ -711,7 +765,7 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
     for (child, layout) in interior.iter().zip(interior_layouts) {
         layout.assert_covers(child.num_public_words);
     }
-    assert_global_child_is_bound_only_by_l2g(global_layout, global.num_public_words);
+    assert_global_child_is_bound_only_by_l2g(global_child_layout, global.num_public_words);
 
     // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
     // Every child's arenas are declared before any leg is emitted, exactly as a
@@ -730,7 +784,7 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
         &interior_legs,
         interior_layouts,
         &global_leg,
-        global_layout,
+        global_child_layout,
         fold_shape,
     );
     emit_root_publishes(b, &interior_legs, interior_layouts, label_range, publishes);

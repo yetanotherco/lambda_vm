@@ -1037,7 +1037,7 @@ pub(super) fn root_program(
     labels: &[&[u64]],
     label_range: (u64, u64),
     global: &RealChild,
-    global_layout: &super::block_root::GlobalLayout,
+    global_child_layout: &super::block_root::GlobalLayout,
     fold_shape: &super::block_root::FoldShape,
 ) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -1051,7 +1051,7 @@ pub(super) fn root_program(
             labels,
             label_range,
             global: &g,
-            global_layout,
+            global_child_layout,
             fold_shape,
             publishes: super::block_root::RootPublishSet::default(),
         },
