@@ -48,17 +48,21 @@
 #   WORKLOAD=synthetic to reproduce a number recorded against that fixture.
 #
 #   Sizing at WORKLOAD=real, from the paired t-test (resolvable 95% delta =
-#   t* x sd / sqrt(N)). The pair-delta sd on the bench runner is NOT yet measured; the
-#   two columns bracket it between 1.0% (the GPU box's measured 0.64% plus margin) and
-#   2.0% (sqrt(2) x the runner's measured 1.43% single-run CV):
+#   t* x sd / sqrt(N)). The two columns are the same runner under two conditions, not a
+#   guess bracketing an unknown: its variance is contention, so the single-run CV is
+#   0.34% across the proves that got the most CPU and 1.26% across all of a 14-prove
+#   baseline. sd of a pair delta is sqrt(2) x that. Keep this table in sync with the one
+#   in .github/workflows/bench-abba.yml:
 #
-#     pairs   wall      resolves (sd 2.0% / sd 1.0%)
-#      8      ~50 min    1.7% / 0.8%
-#     12      ~72 min    1.3% / 0.6%   <- workflow default
-#     20      ~1h55m     0.9% / 0.5%
-#     32      ~3h        0.7% / 0.4%
+#     pairs   wall      resolves (quiet box, sd 0.49% / shared, sd 1.78%)
+#      8      ~41 min    0.34% / 1.24%
+#     12      ~58 min    0.28% / 1.01%   <- workflow default
+#     20      ~1h31m     0.21% / 0.78%
+#     32      ~2h22m     0.16% / 0.62%
 #
-#   Wall assumes epoch 2^22 (158.8 s per prove, two per pair) plus ~8 min of setup.
+#   Wall assumes epoch 2^22 (~125 s per prove, two per pair) plus ~8 min of setup. Read
+#   the column the run earned: the exclusivity line printed after the pairs reports the
+#   CPU share of every prove and flags any under 90% of the batch's best.
 #   The first real ABBA run MEASURES that sd — read it off the `sd` field of the
 #   paired-t line printed below — and this table should be re-pinned to it.
 #
