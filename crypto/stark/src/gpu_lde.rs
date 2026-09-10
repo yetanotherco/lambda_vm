@@ -1331,7 +1331,13 @@ where
         base_cols: m,
         blowup: blowup_factor,
     };
-    let set = commit_device_set(n, m, blowup_factor, true);
+    // `snapshot` must track what the commit will actually allocate: the R1
+    // trace snapshot is retained only under `keep_r1_trace_snapshot()`, and
+    // charging `n * m * 8` the commit never allocates makes the ceiling
+    // stricter than the card is. Conservative, so it was never a correctness
+    // bug — but a table declined against bytes that do not exist is an abort
+    // for a reason that is not real.
+    let set = commit_device_set(n, m, blowup_factor, keep_r1_trace_snapshot());
     admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
@@ -1479,7 +1485,13 @@ where
         base_cols: m,
         blowup: blowup_factor,
     };
-    let set = commit_device_set(n, m, blowup_factor, true);
+    // `snapshot` must track what the commit will actually allocate: the R1
+    // trace snapshot is retained only under `keep_r1_trace_snapshot()`, and
+    // charging `n * m * 8` the commit never allocates makes the ceiling
+    // stricter than the card is. Conservative, so it was never a correctness
+    // bug — but a table declined against bytes that do not exist is an abort
+    // for a reason that is not real.
+    let set = commit_device_set(n, m, blowup_factor, keep_r1_trace_snapshot());
     admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
