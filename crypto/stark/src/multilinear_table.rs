@@ -23,11 +23,12 @@ use multilinear::{
     Error as MlError,
     batch::Rule,
     claim_reduce,
-    constraint_argument::{self, CommittedTrace, ConstraintProof, FactorKind, TraceClaim},
+    constraint_argument::{self, ConstraintCore, FactorKind, TraceData},
     eq::{eq_eval, eq_mle},
     gkr::{self, FractionTree, GkrProof},
     logup,
     mle::Mle,
+    stacked_eval::{self, Claimed, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
     whir_chain::ChainConfig,
@@ -65,8 +66,6 @@ where
     /// Main column -> the factor that reads it unshifted.
     slot_of: Vec<usize>,
     kinds: Vec<FactorKind>,
-    stacked: StackedLayout,
-    domain: Domain<F>,
     num_vars: usize,
 }
 
@@ -90,7 +89,6 @@ where
         num_main_columns: usize,
         num_vars: usize,
         uniforms: Uniforms<E>,
-        config: &ChainConfig,
     ) -> Result<Self, MlError> {
         if interactions.is_empty() {
             // A table with no bus is just `constraint_argument::prove`.
@@ -117,19 +115,12 @@ where
             .collect();
         let (shape, kinds) = IrShape::build(program, &leaves, uniforms, roots, &selectors)?;
 
-        let num_columns = leaves.num_columns();
-        let n_stack = constraint_argument::one_stack(num_vars, num_columns);
-        let stacked = StackedLayout::build(&vec![num_vars; num_columns], n_stack)?;
-        let domain = Domain::<F>::new(n_stack + config.log_blowup)?;
-
         Ok(Self {
             shape,
             interactions,
             leaves,
             slot_of,
             kinds,
-            stacked,
-            domain,
             num_vars,
         })
     }
@@ -153,8 +144,6 @@ where
             slot_of: &self.slot_of,
             preprocessed,
             kinds: &self.kinds,
-            layout: &self.stacked,
-            domain: &self.domain,
             num_vars: self.num_vars,
         }
     }
@@ -172,15 +161,6 @@ where
         &self.kinds
     }
 
-    /// Where each column sits in the stack.
-    pub fn stacked(&self) -> &StackedLayout {
-        &self.stacked
-    }
-
-    pub fn domain(&self) -> &Domain<F> {
-        &self.domain
-    }
-
     pub fn num_vars(&self) -> usize {
         self.num_vars
     }
@@ -196,8 +176,11 @@ where
     }
 }
 
-/// A table's committed trace, plus the structure the argument runs over.
-/// A table's committed trace, plus the structure the argument runs over.
+/// One table's structure and its trace, with **no commitment of its own**.
+///
+/// A table used to carry its own, so a proof of N tables paid N openings — and
+/// the opening is almost all of a proof. Here the tables hand their columns to
+/// [`CommittedTables`], which commits every one of them together.
 pub struct CommittedTable<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
@@ -206,8 +189,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     layout: TableLayout<'a, F, E>,
-    trace: CommittedTrace<F, E>,
-    roots: Vec<Commitment>,
+    trace: TraceData<F, E>,
 }
 
 impl<'a, F, E> CommittedTable<'a, F, E>
@@ -217,20 +199,18 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    /// Lays out the factors and commits every main column.
+    /// Lays out the factors and materializes every main column.
     ///
     /// `main_column` returns a column's values by step, `2^num_vars` of them.
     /// Auxiliary columns are never asked for: the only constraints that read
     /// them are the LogUp ones, and the bus replaces those.
-    #[allow(clippy::too_many_arguments)]
-    pub fn commit(
+    pub fn new(
         program: &'a ConstraintProgram<F, E>,
         meta: &[ConstraintMeta],
         interactions: &'a [BusInteraction],
         num_main_columns: usize,
         num_vars: usize,
         uniforms: Uniforms<E>,
-        config: &ChainConfig,
         main_column: impl FnMut(u16) -> Vec<FieldElement<F>>,
     ) -> Result<Self, MlError> {
         let layout = TableLayout::new(
@@ -240,20 +220,18 @@ where
             num_main_columns,
             num_vars,
             uniforms,
-            config,
         )?;
-        Self::from_layout(layout, config, main_column)
+        Self::from_layout(layout, main_column)
     }
 
-    /// Commits against a layout already built — the same one the verifier will
-    /// rebuild, so the statement and the commitment cannot describe different
+    /// The same against a layout already built — the same one the verifier will
+    /// rebuild, so the statement and the trace cannot describe different
     /// tables.
     pub fn from_layout(
         layout: TableLayout<'a, F, E>,
-        config: &ChainConfig,
         mut main_column: impl FnMut(u16) -> Vec<FieldElement<F>>,
     ) -> Result<Self, MlError> {
-        let size = 1usize << layout.num_vars;
+        let size = 1usize << layout.num_vars();
         let mut columns = Vec::with_capacity(layout.num_columns());
         for key in layout.column_keys() {
             assert!(
@@ -267,20 +245,12 @@ where
             columns.push(Mle::new(values)?);
         }
 
-        let trace = CommittedTrace::<F, E>::commit_stacked(
+        let trace = TraceData::new(
             columns,
-            layout.kinds.clone(),
-            layout.shape.public_tables()?,
-            layout.stacked.clone(),
-            config,
+            layout.kinds().to_vec(),
+            layout.shape().public_tables()?,
         )?;
-
-        let roots = trace.roots();
-        Ok(Self {
-            layout,
-            trace,
-            roots,
-        })
+        Ok(Self { layout, trace })
     }
 
     /// The structure alone — what the verifier holds.
@@ -291,14 +261,6 @@ where
     /// This table's statement.
     pub fn statement(&self) -> TableStatement<'_, F, E> {
         self.layout.statement()
-    }
-
-    pub fn roots(&self) -> &[Commitment] {
-        &self.roots
-    }
-
-    pub fn domain(&self) -> &Domain<F> {
-        self.trace.domain()
     }
 
     pub fn kinds(&self) -> &[FactorKind] {
@@ -318,14 +280,131 @@ where
         self.trace.num_vars()
     }
 
-    /// How many columns are committed — main columns only.
+    /// How many columns get committed — main columns only.
     pub fn num_committed_columns(&self) -> usize {
         self.trace.columns().len()
     }
+}
 
-    /// Where each column sits in the stack.
-    pub fn stacked(&self) -> &StackedLayout {
-        self.trace.layout()
+/// Every table's columns, committed **once**.
+///
+/// The opening is almost the whole proof, and a commitment costs one however
+/// many columns it holds, so N tables committing separately pay N times for
+/// what one commitment settles. Here the columns of every table go into one
+/// stack, each keeps the height it has, and one opening answers all of them —
+/// which is what [`Claimed::PerColumn`] exists for, since each table's sumcheck
+/// ends at its own point.
+///
+/// [`Claimed::PerColumn`]: multilinear::stacked_eval::Claimed::PerColumn
+pub struct CommittedTables<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    tables: Vec<CommittedTable<'a, F, E>>,
+    stacked: StackedCommitment<F>,
+    roots: Vec<Commitment>,
+}
+
+/// Where each table's columns start in the global column order.
+///
+/// Both sides derive it from the table shapes alone, so a claim about table
+/// `i`'s column `c` means the same thing to each.
+pub fn column_offsets(widths: &[usize]) -> Vec<usize> {
+    widths
+        .iter()
+        .scan(0usize, |at, w| {
+            let start = *at;
+            *at += w;
+            Some(start)
+        })
+        .collect()
+}
+
+/// How wide one stacked polynomial may get, in variables.
+///
+/// This is the knob between proof size and peak memory, and it is a resource
+/// tradeoff rather than an optimization. Every extra variable halves the number
+/// of polynomials — and so the number of openings, which is nearly all of a
+/// proof — but doubles the biggest single allocation: a polynomial of `n`
+/// variables is encoded over `2^(n + log_blowup)` field elements, and the NTT
+/// wants the coefficients and the codeword alive at once.
+///
+/// 25 puts one codeword at 1 GiB in the base field, which fits alongside the
+/// rest of the prover on a 32 GiB machine. A proof of ethrex 10tx lands in a
+/// handful of polynomials rather than one per table.
+pub const MAX_STACK_VARS: usize = 25;
+
+/// The stack every table's columns share, from their shapes alone.
+///
+/// `shapes` is `(columns, height in variables)` per table, in table order. The
+/// heights differ and that is fine: a column takes the subcube it needs and the
+/// next one starts after it, so stacking wastes less than each table rounding
+/// up to its own power of two.
+///
+/// Columns that do not fit spill into another polynomial — see
+/// [`MAX_STACK_VARS`], which is what stops one proof-sized allocation.
+pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError> {
+    let heights: Vec<usize> = shapes
+        .iter()
+        .flat_map(|&(width, num_vars)| std::iter::repeat_n(num_vars, width))
+        .collect();
+    let cells: usize = heights.iter().map(|&m| 1usize << m).sum();
+    let want = cells.next_power_of_two().trailing_zeros() as usize;
+    // Never narrower than the tallest column, or it would not fit at all.
+    let tallest = heights.iter().copied().max().unwrap_or(0);
+    let n_stack = want.min(MAX_STACK_VARS).max(tallest);
+    StackedLayout::build(&heights, n_stack)
+}
+
+impl<'a, F, E> CommittedTables<'a, F, E>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    /// Commits every table's columns into one stack.
+    pub fn commit(
+        tables: Vec<CommittedTable<'a, F, E>>,
+        config: &ChainConfig,
+    ) -> Result<Self, MlError> {
+        let shapes: Vec<(usize, usize)> = tables
+            .iter()
+            .map(|t| (t.num_committed_columns(), t.num_vars()))
+            .collect();
+        let layout = global_layout(&shapes)?;
+
+        let columns: Vec<Mle<F>> = tables
+            .iter()
+            .flat_map(|t| t.trace.columns().iter().cloned())
+            .collect();
+        let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
+        let roots = stacked.roots();
+        Ok(Self {
+            tables,
+            stacked,
+            roots,
+        })
+    }
+
+    pub fn tables(&self) -> &[CommittedTable<'a, F, E>] {
+        &self.tables
+    }
+
+    /// One root per stacked polynomial, for the whole proof.
+    pub fn roots(&self) -> &[Commitment] {
+        &self.roots
+    }
+
+    pub fn layout(&self) -> &StackedLayout {
+        self.stacked.layout()
+    }
+
+    pub fn domain(&self) -> &Domain<F> {
+        self.stacked.domain()
     }
 }
 
@@ -343,9 +422,6 @@ pub struct TableStatement<'a, F: IsFFTField + IsPrimeField, E: IsField> {
     /// committed; these are what say it committed the right thing.
     pub preprocessed: &'a [Mle<F>],
     pub kinds: &'a [FactorKind],
-    /// Where each column sits in the stack.
-    pub layout: &'a StackedLayout,
-    pub domain: &'a Domain<F>,
     pub num_vars: usize,
 }
 
@@ -371,18 +447,37 @@ impl<F: IsFFTField + IsPrimeField, E: IsField> Copy for TableStatement<'_, F, E>
     rkyv::Deserialize,
 )]
 #[serde(bound = "")]
-pub struct TableProof<F: IsField, E: IsField> {
-    /// One per stacked polynomial. The verifier absorbs these before any
-    /// challenge is drawn, so a prover cannot choose a commitment after seeing
-    /// one - and carrying them here is what makes the proof self-contained.
-    pub roots: Vec<Commitment>,
+pub struct TableProof<E: IsField> {
     pub gkr: GkrProof<E>,
     /// The bus's output fraction. A table's own contribution need not vanish —
     /// the balance is over every table in the proof — so both halves travel and
     /// checking the sum is the caller's. Lying about them yields an input-layer
     /// claim the trace does not answer, so nothing has to be taken on trust.
     pub bus_output: (FieldElement<E>, FieldElement<E>),
-    pub constraint: ConstraintProof<F, E>,
+    /// The table's argument up to its columns' claims. The opening that
+    /// settles them is [`MultiProof::columns`], shared with every other table.
+    pub constraint: ConstraintCore<E>,
+}
+
+/// Every table's argument, and the **one** opening that settles all of them.
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct MultiProof<F: IsField, E: IsField> {
+    /// One per stacked polynomial. The verifier absorbs these before any
+    /// challenge is drawn, so a prover cannot choose a commitment after seeing
+    /// one — and carrying them here is what makes the proof self-contained.
+    pub roots: Vec<Commitment>,
+    pub tables: Vec<TableProof<E>>,
+    /// Every table's columns, at each one's own point, against one stack.
+    pub columns: StackedProof<F, E>,
 }
 
 /// The table's share of the bus, `p/q`.
@@ -404,17 +499,20 @@ fn weights(num_trace_factors: usize) -> (usize, usize) {
 /// Proves the table: its constraints vanish and its bus sums to what the proof
 /// says, in one sumcheck.
 ///
+/// Stops at the claims about the table's columns and hands back the point they
+/// are claimed at; the caller settles every table's claims against the shared
+/// stack in one opening.
+///
 /// `z` and `alpha` are the LogUp challenges, **shared across every table** in a
-/// multi-table proof. The caller must have absorbed every table's commitment
-/// roots and drawn them, identically on both sides.
+/// multi-table proof. The caller must have absorbed the commitment roots and
+/// drawn them, identically on both sides.
 pub fn prove<F, E, T>(
     table: &CommittedTable<'_, F, E>,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
-    config: &ChainConfig,
     transcript: &mut T,
-) -> Result<TableProof<F, E>, MlError>
+) -> Result<(TableProof<E>, Vec<FieldElement<E>>), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -455,7 +553,7 @@ where
         &f[weight_r] * shape.combine(&betas, &f[..weight_r])
     });
 
-    let constraint = constraint_argument::prove_statements(
+    let (constraint, point) = constraint_argument::prove_core::<F, E, T>(
         &table.trace,
         vec![eq_mle(&r)?, eq_mle(&bus.row_point)?],
         vec![zerocheck, bus.numerator, bus.denominator],
@@ -464,33 +562,38 @@ where
             gkr_out.claim.p.clone(),
             gkr_out.claim.q.clone(),
         ],
-        config,
         transcript,
     )?;
 
-    Ok(TableProof {
-        roots: table.roots().to_vec(),
-        gkr: gkr_out.proof,
-        bus_output,
-        constraint,
-    })
+    Ok((
+        TableProof {
+            gkr: gkr_out.proof,
+            bus_output,
+            constraint,
+        },
+        point,
+    ))
 }
+/// What verifying one table leaves for the caller: its share of the bus, and
+/// the claims its columns are left at.
+pub type TableVerdict<E> = (
+    (FieldElement<E>, FieldElement<E>),
+    claim_reduce::ReducedClaim<E>,
+);
 
-/// Verifies the table and returns its bus output, for the caller to sum with
-/// every other table's.
-pub fn verify<F, E, T>(
-    proof: &TableProof<F, E>,
-    statement: TableStatement<'_, F, E>,
+/// Verifies the table and returns its bus output together with the claims its
+/// columns are left at, for the caller to sum and to settle against the shared
+/// stack.
+pub fn verify<E, T>(
+    proof: &TableProof<E>,
+    statement: TableStatement<'_, impl IsFFTField + IsPrimeField + IsSubFieldOf<E>, E>,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
-    config: &ChainConfig,
     transcript: &mut T,
-) -> Result<(FieldElement<E>, FieldElement<E>), MlError>
+) -> Result<TableVerdict<E>, MlError>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync + 'static,
-    FieldElement<F>: AsBytes + Sync + Send,
+    E: IsField + Send + Sync,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
@@ -521,15 +624,11 @@ where
         &f[weight_r] * shape.combine(&betas, &f[..weight_r])
     });
 
-    let reduced = constraint_argument::verify_statements(
+    let reduced = constraint_argument::verify_core(
         &proof.constraint,
-        TraceClaim {
-            roots: &proof.roots,
-            kinds: statement.kinds,
-            layout: statement.layout,
-            domain: statement.domain,
-            num_vars,
-        },
+        statement.kinds,
+        statement.slot_of.len(),
+        num_vars,
         &[zerocheck, bus.numerator, bus.denominator],
         &[
             FieldElement::zero(),
@@ -543,13 +642,12 @@ where
             values.push(eq_eval(&row_point, at)?);
             Ok(values)
         },
-        config,
         transcript,
     )?;
 
     check_preprocessed(statement, &reduced)?;
 
-    Ok(proof.bus_output.clone())
+    Ok((proof.bus_output.clone(), reduced))
 }
 
 /// Checks the table's preprocessed columns against what the proof claims for
@@ -597,18 +695,21 @@ where
     }
     Ok(())
 }
-
-/// Proves every table in one transcript.
+/// Proves every table in one transcript, against one commitment.
 ///
-/// The LogUp challenges are drawn **once**, after every table's roots are
+/// The LogUp challenges are drawn **once**, after the commitment roots are
 /// absorbed: sharing them is what lets one table's send be another's receive,
 /// and absorbing the roots first is what stops a prover from choosing a bus
 /// after seeing them.
+///
+/// Each table's sumcheck leaves its columns claimed at a point of its own.
+/// Those go into **one** opening at the end, which is what makes a proof of
+/// many tables cost about what a proof of one does.
 pub fn multi_prove<F, E, T>(
-    tables: &[&CommittedTable<'_, F, E>],
+    committed: &CommittedTables<'_, F, E>,
     config: &ChainConfig,
     transcript: &mut T,
-) -> Result<Vec<TableProof<F, E>>, MlError>
+) -> Result<MultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -616,34 +717,56 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
-    for table in tables {
-        for root in table.roots() {
-            transcript.append_bytes(root);
-        }
+    for root in committed.roots() {
+        transcript.append_bytes(root);
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
     let beta: FieldElement<E> = transcript.sample_field_element();
 
-    tables
-        .iter()
-        .map(|table| prove(table, &z, &alpha, &beta, config, transcript))
-        .collect()
+    let mut tables = Vec::with_capacity(committed.tables().len());
+    // One point and one claimed value per **column**, in the global column
+    // order the stack was built in.
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    for table in committed.tables() {
+        let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
+        for _ in 0..table.num_committed_columns() {
+            points.push(point.clone());
+        }
+        values.extend(proof.constraint.reduce.column_values.iter().cloned());
+        tables.push(proof);
+    }
+
+    let columns = stacked_eval::prove::<F, E, T>(
+        &committed.stacked,
+        &Claimed::PerColumn(&points),
+        &values,
+        config,
+        transcript,
+    )?;
+
+    Ok(MultiProof {
+        roots: committed.roots().to_vec(),
+        tables,
+        columns,
+    })
 }
 
-/// Verifies every table **and the bus balance across them**.
+/// Verifies every table **and the bus balance across them**, then settles every
+/// column against the one commitment.
 ///
 /// A table's own contribution need not vanish, and neither does the sum: a bus
 /// whose counterparty is the statement rather than another table leaves a
 /// residue, so the caller says what it owes. For this VM that is the COMMIT
 /// bus carrying the program's public output — `expected` is zero exactly when
 /// the program outputs nothing.
-///
-/// Same shape as the univariate `Verifier::multi_verify`, which takes the
-/// expected balance for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn multi_verify<F, E, T>(
-    proofs: &[TableProof<F, E>],
+    proof: &MultiProof<F, E>,
     statements: &[TableStatement<'_, F, E>],
+    layout: &StackedLayout,
+    domain: &Domain<F>,
     expected: &FieldElement<E>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -655,30 +778,44 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
-    if proofs.len() != statements.len() {
+    if proof.tables.len() != statements.len() {
         return Err(MlError::QueryCountMismatch {
             expected: statements.len(),
-            got: proofs.len(),
+            got: proof.tables.len(),
         });
     }
-    for proof in proofs {
-        for root in &proof.roots {
-            transcript.append_bytes(root);
-        }
+    for root in &proof.roots {
+        transcript.append_bytes(root);
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
     let beta: FieldElement<E> = transcript.sample_field_element();
 
     let mut balance = FieldElement::<E>::zero();
-    for (proof, statement) in proofs.iter().zip(statements) {
-        let output = verify(proof, *statement, &z, &alpha, &beta, config, transcript)?;
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    for (table, statement) in proof.tables.iter().zip(statements) {
+        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript)?;
         balance += contribution(&output).ok_or(MlError::BusImbalance)?;
+        for _ in 0..statement.slot_of.len() {
+            points.push(reduced.point.clone());
+        }
+        values.extend(reduced.column_values);
     }
     if balance != *expected {
         return Err(MlError::BusImbalance);
     }
-    Ok(())
+
+    stacked_eval::verify::<F, E, T>(
+        &proof.columns,
+        layout,
+        &proof.roots,
+        &Claimed::PerColumn(&points),
+        &values,
+        domain,
+        config,
+        transcript,
+    )
 }
 
 fn slot(slots: &[usize], column: usize) -> Result<usize, MlError> {
@@ -821,21 +958,20 @@ mod tests {
         ]
     }
 
-    fn commit<'a, CS: ConstraintSet<Fp, Ext>>(
+    fn table<'a, CS: ConstraintSet<Fp, Ext>>(
         air: &'a Air<CS>,
         columns: &[Vec<FE>],
     ) -> Result<CommittedTable<'a, Fp, Ext>, MlError> {
         let num_vars = columns[0].len().trailing_zeros() as usize;
         // The trace goes in as it is: base-field.
         let lifted = columns.to_vec();
-        CommittedTable::commit(
+        CommittedTable::new(
             air.constraint_program(),
             air.constraints_meta(),
             air.bus_interactions(),
             columns.len(),
             num_vars,
             Uniforms::default(),
-            &config(),
             |col| lifted[col as usize].clone(),
         )
     }
@@ -848,33 +984,40 @@ mod tests {
         mul_cols: Vec<Vec<FE>>,
     ) -> Result<(), MlError> {
         let (cpu_air, add_air, mul_air) = airs();
-        let cpu = commit(&cpu_air, &cpu_cols)?;
-        let add = commit(&add_air, &add_cols)?;
-        let mul = commit(&mul_air, &mul_cols)?;
-        let tables = [&cpu, &add, &mul];
+        let committed = CommittedTables::commit(
+            vec![
+                table(&cpu_air, &cpu_cols)?,
+                table(&add_air, &add_cols)?,
+                table(&mul_air, &mul_cols)?,
+            ],
+            &config(),
+        )?;
 
         let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        let proofs = multi_prove(&tables, &config(), &mut prover)?;
+        let proof = multi_prove(&committed, &config(), &mut prover)?;
 
-        for (table, proof) in tables.iter().zip(&proofs) {
+        // Three tables of different heights, and **one** commitment with one
+        // opening for all of them.
+        assert_eq!(proof.roots.len(), 1);
+        assert_eq!(proof.columns.polys.len(), 1);
+        for (table, table_proof) in committed.tables().iter().zip(&proof.tables) {
             // Three statements — the constraint and the bus's two claims — in
-            // one pass over the table's rows, one commitment for the whole
-            // trace and one opening to settle it.
+            // one pass over the table's rows.
             assert_eq!(
-                proof.constraint.core.sumcheck.rounds.len(),
+                table_proof.constraint.sumcheck.rounds.len(),
                 table.num_vars()
             );
-            assert_eq!(proof.constraint.columns.polys.len(), 1);
-            assert_eq!(table.roots().len(), 1);
         }
 
         let statements: Vec<TableStatement<'_, Fp, Ext>> =
-            tables.iter().map(|t| t.statement()).collect();
+            committed.tables().iter().map(|t| t.statement()).collect();
 
         let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
         multi_verify(
-            &proofs,
+            &proof,
             &statements,
+            committed.layout(),
+            committed.domain(),
             &ExtE::zero(),
             &config(),
             &mut verifier,
@@ -941,7 +1084,7 @@ mod tests {
 
         for (air_roots, num_base, aux_width, table, main_width) in [
             {
-                let table = commit(&cpu_air, &cpu_columns()).unwrap();
+                let table = table(&cpu_air, &cpu_columns()).unwrap();
                 let program = cpu_air.constraint_program();
                 (
                     program.roots.len(),
@@ -952,7 +1095,7 @@ mod tests {
                 )
             },
             {
-                let table = commit(&add_air, &add_columns()).unwrap();
+                let table = table(&add_air, &add_columns()).unwrap();
                 let program = add_air.constraint_program();
                 (
                     program.roots.len(),
@@ -963,7 +1106,7 @@ mod tests {
                 )
             },
             {
-                let table = commit(&mul_air, &mul_columns()).unwrap();
+                let table = table(&mul_air, &mul_columns()).unwrap();
                 let program = mul_air.constraint_program();
                 (
                     program.roots.len(),
@@ -983,8 +1126,6 @@ mod tests {
                 "the univariate path commits auxiliary columns"
             );
             assert_eq!(table.num_committed_columns(), main_width);
-            // And all of them ride in one stacked polynomial.
-            assert_eq!(table.roots().len(), 1);
         }
     }
 
@@ -1028,7 +1169,7 @@ mod tests {
             AddConstraints,
         );
         assert_eq!(
-            commit(&air, &add_columns()).err(),
+            table(&air, &add_columns()).err(),
             Some(MlError::EmptyPolynomial)
         );
     }

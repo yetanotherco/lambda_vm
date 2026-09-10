@@ -250,7 +250,7 @@ fn whir_against_fri() {
 fn phases() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::multilinear_air::Uniforms;
-    use stark::multilinear_table::{self, CommittedTable, TableLayout};
+    use stark::multilinear_table::{self, CommittedTable, CommittedTables, TableLayout};
 
     use crate::test_utils::{E, F};
 
@@ -319,36 +319,39 @@ fn phases() {
                 width,
                 num_vars,
                 Uniforms::default(),
-                &config,
             )
             .expect("layout")
         })
         .collect();
     let layout = start.elapsed();
 
+    // `commit` is now the one commitment the whole proof shares, so this phase
+    // is where the stacking shows up.
     let start = Instant::now();
-    let committed: Vec<CommittedTable<'_, F, E>> = layouts
+    let tables: Vec<CommittedTable<'_, F, E>> = layouts
         .into_iter()
         .zip(&pairs)
         .map(|(layout, (_, trace, _))| {
             let columns = trace.columns_main();
-            CommittedTable::from_layout(layout, &config, |col| columns[col as usize].clone())
-                .expect("commit")
+            CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
+                .expect("materialize")
         })
         .collect();
+    let count = tables.len();
+    let committed = CommittedTables::commit(tables, &config).expect("commit");
     let commit = start.elapsed();
 
     let start = Instant::now();
-    let tables: Vec<&CommittedTable<'_, F, E>> = committed.iter().collect();
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    let proofs = multilinear_table::multi_prove(&tables, &config, &mut transcript).expect("prove");
+    let proof =
+        multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove");
     let argue = start.elapsed();
     let total = total.elapsed();
 
     println!(
-        "\n{label} — CPU, RAYON_NUM_THREADS={threads}, {} tables, {} queries",
-        tables.len(),
+        "\n{label} — CPU, RAYON_NUM_THREADS={threads}, {count} tables, {} queries, {} commitment(s)",
         config.num_queries,
+        proof.roots.len(),
     );
     println!("{:<14} {:>9} {:>7}", "phase", "seconds", "share");
     for (tag, took) in [
@@ -365,7 +368,7 @@ fn phases() {
         );
     }
     println!("{:<14} {:>9.2}", "total", total.as_secs_f64());
-    assert_eq!(proofs.len(), tables.len());
+    assert_eq!(proof.tables.len(), count);
 }
 
 /// What a proof is made of, part by part.
@@ -397,33 +400,38 @@ fn proof_composition() {
         .expect("whole")
         .len();
 
-    // Each part on its own, summed across tables.
+    // Each part on its own, summed across tables. The opening is not among
+    // them: there is one for the whole proof, not one per table.
     let mut gkr = 0usize;
     let mut sumcheck = 0usize;
     let mut reduce = 0usize;
-    let mut columns = 0usize;
     let mut factor_values = 0usize;
-    for t in &proof.tables {
+    for t in &proof.proof.tables {
         gkr += rkyv::to_bytes::<rkyv::rancor::Error>(&t.gkr)
             .expect("gkr")
             .len();
-        sumcheck += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.sumcheck)
+        sumcheck += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.sumcheck)
             .expect("sumcheck")
             .len();
-        reduce += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.reduce)
+        reduce += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.reduce)
             .expect("reduce")
             .len();
-        columns += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.columns)
-            .expect("columns")
-            .len();
-        factor_values += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.factor_values)
+        factor_values += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.factor_values)
             .expect("factor_values")
             .len();
     }
+    let columns = rkyv::to_bytes::<rkyv::rancor::Error>(&proof.proof.columns)
+        .expect("columns")
+        .len();
     let _ = ser;
 
     let label = if input.is_empty() { &name } else { &input };
-    println!("\n{label} — {} tables", proof.tables.len());
+    println!(
+        "\n{label} — {} tables, {} commitment(s)",
+        proof.proof.tables.len(),
+        proof.proof.roots.len(),
+    );
+
     println!(
         "{:<18} {:>10} {:>8} {:>12}",
         "part", "MiB", "share", "per table"
@@ -439,7 +447,7 @@ fn proof_composition() {
             "{tag:<18} {:>10.2} {:>7.1}% {:>11.3}",
             size(&vec![0u8; n]),
             100.0 * n as f64 / total as f64,
-            size(&vec![0u8; n]) / proof.tables.len() as f64,
+            size(&vec![0u8; n]) / proof.proof.tables.len() as f64,
         );
     }
     println!("{:<18} {:>10.2}", "whole proof", size(&vec![0u8; total]));

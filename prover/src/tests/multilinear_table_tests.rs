@@ -22,7 +22,9 @@ use math::field::{
 };
 use multilinear::whir_chain::{ChainConfig, GrindBits};
 use stark::multilinear_air::Uniforms;
-use stark::multilinear_table::{self, CommittedTable, TableLayout, TableStatement};
+use stark::multilinear_table::{
+    self, CommittedTable, CommittedTables, TableLayout, TableStatement,
+};
 use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
@@ -99,56 +101,49 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     columns: Vec<Vec<FieldElement<Fp>>>,
 ) -> Result<(ExtE, ExtE), multilinear::Error> {
     let num_vars = columns[0].len().trailing_zeros() as usize;
+    let layout = || {
+        TableLayout::<Fp, Ext>::new(
+            air.constraint_program(),
+            air.constraints_meta(),
+            air.bus_interactions(),
+            num_main_columns,
+            num_vars,
+            Uniforms::default(),
+        )
+    };
     // The trace goes in as it is: base-field. Only the challenges are not.
-    let table = CommittedTable::<Fp, Ext>::commit(
-        air.constraint_program(),
-        air.constraints_meta(),
-        air.bus_interactions(),
-        num_main_columns,
-        num_vars,
-        Uniforms::default(),
-        &config(),
-        |col| columns[col as usize].clone(),
-    )?;
+    let table = CommittedTable::from_layout(layout()?, |col| columns[col as usize].clone())?;
+    let committed = CommittedTables::commit(vec![table], &config())?;
+
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-table");
-    let proofs = multilinear_table::multi_prove(&[&table], &config(), &mut prover)?;
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)?;
 
     // One commitment for the whole trace, one opening, one pass over the rows.
-    assert_eq!(table.roots().len(), 1);
-    assert_eq!(proofs[0].constraint.columns.polys.len(), 1);
-    assert_eq!(proofs[0].constraint.core.sumcheck.rounds.len(), num_vars);
+    assert_eq!(proof.roots.len(), 1);
+    assert_eq!(proof.columns.polys.len(), 1);
+    assert_eq!(proof.tables[0].constraint.sumcheck.rounds.len(), num_vars);
 
-    // The verifier rebuilds the layout from the AIR alone - no trace - and the
+    // The verifier rebuilds the layout from the AIR alone — no trace — and the
     // roots it absorbs come out of the proof.
-    let layout = TableLayout::<Fp, Ext>::new(
-        air.constraint_program(),
-        air.constraints_meta(),
-        air.bus_interactions(),
-        num_main_columns,
-        num_vars,
-        Uniforms::default(),
-        &config(),
-    )?;
-    let statement = layout.statement();
+    let verifier_layout = layout()?;
+    let statement = verifier_layout.statement();
 
-    // `multi_verify` would demand the balance, which one table of a bus cannot
-    // have on its own; this checks the table and hands its share back.
+    // A single table's bus need not balance on its own, so the share it owes
+    // is whatever it produced: what is under test here is the table, not the
+    // balance.
+    let owed = multilinear_table::contribution(&proof.tables[0].bus_output)
+        .ok_or(multilinear::Error::BusImbalance)?;
     let mut verifier = DefaultTranscript::<Ext>::new(b"vm-table");
-    for root in &proofs[0].roots {
-        verifier.append_bytes(root);
-    }
-    let z: ExtE = verifier.sample_field_element();
-    let alpha: ExtE = verifier.sample_field_element();
-    let beta: ExtE = verifier.sample_field_element();
-    multilinear_table::verify(
-        &proofs[0],
-        statement,
-        &z,
-        &alpha,
-        &beta,
+    multilinear_table::multi_verify(
+        &proof,
+        &[statement],
+        committed.layout(),
+        committed.domain(),
+        &owed,
         &config(),
         &mut verifier,
-    )
+    )?;
+    Ok(proof.tables[0].bus_output)
 }
 
 fn argue_eq(columns: Vec<Vec<FieldElement<Fp>>>) -> Result<(ExtE, ExtE), multilinear::Error> {
@@ -250,7 +245,6 @@ fn layout_dyn<'a>(
         num_main_columns,
         num_vars,
         Uniforms::default(),
-        &config(),
     )
 }
 
@@ -300,24 +294,27 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         })
         .collect();
 
-    let mut committed = Vec::with_capacity(pairs.len());
+    let mut tables = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter().zip(&shapes) {
         let columns = trace.columns_main();
         let layout =
             layout_dyn(*air, width, num_vars).unwrap_or_else(|e| panic!("{}: {e:?}", air.name()));
-        committed.push(
-            CommittedTable::from_layout(layout, &config(), |col| columns[col as usize].clone())
+        tables.push(
+            CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
                 .unwrap_or_else(|e| panic!("{}: {e:?}", air.name())),
         );
     }
-    let tables: Vec<&CommittedTable<'_, Fp, Ext>> = committed.iter().collect();
+    let count = tables.len();
+    // Every table's columns in one commitment: 55 of them still open once.
+    let committed = CommittedTables::commit(tables, &config()).expect("commit every table");
 
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    let proofs =
-        multilinear_table::multi_prove(&tables, &config(), &mut prover).expect("prove every table");
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)
+        .expect("prove every table");
 
     // Verifier side: the layouts are rebuilt from the AIRs and the shapes, with
-    // no trace and no committed table in reach. The roots come from the proofs.
+    // no trace and no committed table in reach. The roots come from the proof,
+    // and so does the stack — which the verifier rebuilds from the shapes too.
     let verifier_layouts: Vec<TableLayout<'_, Fp, Ext>> = pairs
         .iter()
         .zip(&shapes)
@@ -329,15 +326,16 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         .iter()
         .map(TableLayout::statement)
         .collect();
+    let stacked = multilinear_table::global_layout(&shapes).expect("rebuild the stack");
+    let domain =
+        multilinear::whir::Domain::<Fp>::new(stacked.n_stack() + config().log_blowup).unwrap();
 
     // The verifier redraws the shared LogUp challenges, so the offset has to be
     // computed against the same ones — which means replaying the transcript up
     // to that point exactly as `multi_verify` will.
     let mut probe = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    for proof in &proofs {
-        for root in &proof.roots {
-            probe.append_bytes(root);
-        }
+    for root in &proof.roots {
+        probe.append_bytes(root);
     }
     let z: ExtE = probe.sample_field_element();
     let alpha: ExtE = probe.sample_field_element();
@@ -346,10 +344,18 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         .expect("the commit fingerprints are invertible");
 
     let mut verifier = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    multilinear_table::multi_verify(&proofs, &statements, &expected, &config(), &mut verifier)
-        .expect("the whole table set verifies");
+    multilinear_table::multi_verify(
+        &proof,
+        &statements,
+        &stacked,
+        &domain,
+        &expected,
+        &config(),
+        &mut verifier,
+    )
+    .expect("the whole table set verifies");
 
-    tables.len()
+    count
 }
 
 /// **The whole VM through the multilinear path**: every live table of a real
@@ -403,58 +409,46 @@ fn a_real_table_proof_survives_serialization() {
     let air = create_eq_air(&options);
     let columns = generate_eq_trace(&eq_operations()).columns_main();
     let num_vars = columns[0].len().trailing_zeros() as usize;
+    let layout = || {
+        TableLayout::<Fp, Ext>::new(
+            air.constraint_program(),
+            air.constraints_meta(),
+            air.bus_interactions(),
+            eq::cols::NUM_COLUMNS,
+            num_vars,
+            Uniforms::default(),
+        )
+        .unwrap()
+    };
 
-    let table = CommittedTable::<Fp, Ext>::commit(
-        air.constraint_program(),
-        air.constraints_meta(),
-        air.bus_interactions(),
-        eq::cols::NUM_COLUMNS,
-        num_vars,
-        Uniforms::default(),
-        &config(),
-        |col| columns[col as usize].clone(),
-    )
-    .unwrap();
+    let table = CommittedTable::from_layout(layout(), |col| columns[col as usize].clone()).unwrap();
+    let committed = CommittedTables::commit(vec![table], &config()).unwrap();
     let mut prover = DefaultTranscript::<Ext>::new(b"serialized");
-    let proofs = multilinear_table::multi_prove(&[&table], &config(), &mut prover).unwrap();
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover).unwrap();
 
-    let json = serde_json::to_vec(&proofs[0]).expect("serde round trip");
-    let from_json: multilinear_table::TableProof<Fp, Ext> =
+    let json = serde_json::to_vec(&proof).expect("serde round trip");
+    let from_json: multilinear_table::MultiProof<Fp, Ext> =
         serde_json::from_slice(&json).expect("serde round trip");
 
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proofs[0]).expect("rkyv round trip");
-    let from_rkyv: multilinear_table::TableProof<Fp, Ext> =
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("rkyv round trip");
+    let from_rkyv: multilinear_table::MultiProof<Fp, Ext> =
         rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).expect("rkyv round trip");
 
     // The layout the verifier rebuilds, with the trace out of scope.
-    let layout = TableLayout::<Fp, Ext>::new(
-        air.constraint_program(),
-        air.constraints_meta(),
-        air.bus_interactions(),
-        eq::cols::NUM_COLUMNS,
-        num_vars,
-        Uniforms::default(),
-        &config(),
-    )
-    .unwrap();
-    let statement = layout.statement();
+    let verifier_layout = layout();
+    let statement = verifier_layout.statement();
+    let owed = multilinear_table::contribution(&proof.tables[0].bus_output).unwrap();
 
-    for (label, proof) in [("serde", &from_json), ("rkyv", &from_rkyv)] {
+    for (label, round_tripped) in [("serde", &from_json), ("rkyv", &from_rkyv)] {
         // The roots travel in the proof, so a format that dropped them would
         // fail here rather than pass on the original's.
         let mut verifier = DefaultTranscript::<Ext>::new(b"serialized");
-        for root in &proof.roots {
-            verifier.append_bytes(root);
-        }
-        let z: ExtE = verifier.sample_field_element();
-        let alpha: ExtE = verifier.sample_field_element();
-        let beta: ExtE = verifier.sample_field_element();
-        multilinear_table::verify(
-            proof,
-            statement,
-            &z,
-            &alpha,
-            &beta,
+        multilinear_table::multi_verify(
+            round_tripped,
+            &[statement],
+            committed.layout(),
+            committed.domain(),
+            &owed,
             &config(),
             &mut verifier,
         )
@@ -513,18 +507,19 @@ fn a_real_table_is_one_commitment_for_its_main_columns() {
     let columns = trace.columns_main();
     let num_vars = columns[0].len().trailing_zeros() as usize;
     // The trace goes in as it is: base-field. Only the challenges are not.
-    let table = CommittedTable::<Fp, Ext>::commit(
+    let table = CommittedTable::<Fp, Ext>::new(
         air.constraint_program(),
         air.constraints_meta(),
         air.bus_interactions(),
         lt::cols::NUM_COLUMNS,
         num_vars,
         Uniforms::default(),
-        &config(),
         |col| columns[col as usize].clone(),
     )
     .unwrap();
 
     assert_eq!(table.num_committed_columns(), lt::cols::NUM_COLUMNS);
-    assert_eq!(table.roots().len(), 1);
+    // And they all ride in one stacked polynomial, alone or alongside others.
+    let committed = CommittedTables::commit(vec![table], &config()).unwrap();
+    assert_eq!(committed.roots().len(), 1);
 }

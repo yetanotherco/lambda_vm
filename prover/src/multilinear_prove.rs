@@ -45,7 +45,9 @@ use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ChainConfig, GrindBits};
 use stark::multilinear_air::Uniforms;
-use stark::multilinear_table::{self, CommittedTable, TableLayout, TableProof, TableStatement};
+use stark::multilinear_table::{
+    self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
+};
 use stark::traits::AIR;
 
 use crate::statement::{self, MULTILINEAR_TAG};
@@ -66,8 +68,9 @@ type Shape = (usize, usize);
 /// bound into the transcript so restating them changes every challenge.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MultilinearVmProof {
-    /// One per table, in [`VmAirs::air_refs`] order.
-    pub tables: Vec<TableProof<F, E>>,
+    /// Every table's argument and the one opening that settles all of them,
+    /// in [`VmAirs::air_refs`] order.
+    pub proof: MultiProof<F, E>,
     /// Each table's height in variables, same order.
     pub table_num_vars: Vec<u8>,
     pub runtime_page_ranges: Vec<RuntimePageRange>,
@@ -235,7 +238,7 @@ pub fn prove_with_options_and_inputs(
     // Commit every table against the layout the verifier will rebuild.
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
-        let layout = layout_of(*air, width, num_vars, &config)
+        let layout = layout_of(*air, width, num_vars)
             .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
         let columns = trace.columns_main();
         // The verifier will rebuild these and demand the proof open to them, so a
@@ -250,17 +253,20 @@ pub fn prove_with_options_and_inputs(
             }
         }
         committed.push(
-            CommittedTable::from_layout(layout, &config, |col| columns[col as usize].clone())
+            CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
     }
 
-    let tables: Vec<&CommittedTable<'_, F, E>> = committed.iter().collect();
-    let proofs = multilinear_table::multi_prove(&tables, &config, &mut transcript)
+    // One commitment for every table in the proof: the opening is nearly all of
+    // a proof's bytes, and one settles them all.
+    let committed =
+        CommittedTables::commit(committed, &config).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     Ok(MultilinearVmProof {
-        tables: proofs,
+        proof,
         table_num_vars,
         runtime_page_ranges,
         table_counts,
@@ -283,7 +289,6 @@ fn layout_of<'a>(
     air: &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     width: usize,
     num_vars: usize,
-    config: &ChainConfig,
 ) -> Result<TableLayout<'a, F, E>, multilinear::Error> {
     TableLayout::<F, E>::new(
         air.constraint_program(),
@@ -292,7 +297,6 @@ fn layout_of<'a>(
         width,
         num_vars,
         Uniforms::default(),
-        config,
     )
 }
 
@@ -329,22 +333,22 @@ pub fn verify_with_options(
         &program,
         &proof.runtime_page_ranges,
         proof.num_private_input_pages,
-        proof.tables.len(),
+        proof.proof.tables.len(),
     )?;
 
     let expected = proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected != proof.tables.len() {
+    if expected != proof.proof.tables.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {expected}, but the proof carries {} tables",
             proof.table_counts.total(),
             page_configs.len(),
-            proof.tables.len(),
+            proof.proof.tables.len(),
         )));
     }
-    if proof.table_num_vars.len() != proof.tables.len() {
+    if proof.table_num_vars.len() != proof.proof.tables.len() {
         return Err(Error::InvalidTableCounts(format!(
             "the proof carries {} tables but {} heights",
-            proof.tables.len(),
+            proof.proof.tables.len(),
             proof.table_num_vars.len(),
         )));
     }
@@ -362,11 +366,11 @@ pub fn verify_with_options(
         None,
     );
     let air_refs = airs.air_refs();
-    if air_refs.len() != proof.tables.len() {
+    if air_refs.len() != proof.proof.tables.len() {
         return Err(Error::InvalidTableCounts(format!(
             "the layout has {} tables, the proof carries {}",
             air_refs.len(),
-            proof.tables.len(),
+            proof.proof.tables.len(),
         )));
     }
 
@@ -394,7 +398,7 @@ pub fn verify_with_options(
         .iter()
         .zip(&shapes)
         .map(|(air, &(width, num_vars))| {
-            layout_of(*air, width, num_vars, &config)
+            layout_of(*air, width, num_vars)
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
         })
         .collect::<Result<_, _>>()?;
@@ -415,10 +419,8 @@ pub fn verify_with_options(
     // its offset depends on the very challenges `multi_verify` is about to draw
     // — so the transcript is replayed to that point on a fork.
     let mut probe = transcript.clone();
-    for table in &proof.tables {
-        for root in &table.roots {
-            probe.append_bytes(root);
-        }
+    for root in &proof.proof.roots {
+        probe.append_bytes(root);
     }
     let z: FieldElement<E> = probe.sample_field_element();
     let alpha: FieldElement<E> = probe.sample_field_element();
@@ -427,14 +429,20 @@ pub fn verify_with_options(
         return Ok(false);
     };
 
-    Ok(
-        multilinear_table::multi_verify(
-            &proof.tables,
-            &statements,
-            &owed,
-            &config,
-            &mut transcript,
-        )
-        .is_ok(),
+    // The stack every table's columns share, rebuilt from the shapes alone.
+    let stacked =
+        multilinear_table::global_layout(&shapes).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let domain = multilinear::whir::Domain::<F>::new(stacked.n_stack() + config.log_blowup)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    Ok(multilinear_table::multi_verify(
+        &proof.proof,
+        &statements,
+        &stacked,
+        &domain,
+        &owed,
+        &config,
+        &mut transcript,
     )
+    .is_ok())
 }
