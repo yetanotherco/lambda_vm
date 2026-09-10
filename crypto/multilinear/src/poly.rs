@@ -4,7 +4,7 @@
 
 use math::field::{element::FieldElement, traits::IsField};
 
-use crate::{Error, mle::Mle};
+use crate::{Error, mle::Mle, program::Program};
 
 /// A polynomial over the hypercube, presented as multilinear factors plus a
 /// rule for combining their values.
@@ -25,8 +25,40 @@ pub trait SumcheckPolynomial<F: IsField> {
     /// The polynomial's value, given each factor's value at the same point.
     fn combine(&self, values: &[FieldElement<F>]) -> FieldElement<F>;
 
+    /// The same, with a scratch buffer the caller owns. The sumcheck calls this
+    /// once per cube index per interpolation node, so an implementation backed
+    /// by a program has nowhere to put its steps that is not the caller's.
+    fn combine_in(
+        &self,
+        values: &[FieldElement<F>],
+        scratch: &mut Vec<FieldElement<F>>,
+    ) -> FieldElement<F> {
+        let _ = scratch;
+        self.combine(values)
+    }
+
     /// Binds variable 0 to `r` in every factor.
     fn fix_first_variable(&mut self, r: &FieldElement<F>) -> Result<(), Error>;
+
+    /// The program this polynomial is, when it can say: the description a
+    /// device runs in place of [`combine`](Self::combine).
+    ///
+    /// An implementation that offers one must also accept its factors back
+    /// through [`accept_folded`](Self::accept_folded) — the device binds them
+    /// there, and the sumcheck's contract is that the polynomial comes back
+    /// folded.
+    fn program(&self) -> Option<&Program<F>> {
+        None
+    }
+
+    /// Takes factors bound elsewhere, in the order [`polys`](Self::polys)
+    /// returns them.
+    fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        let _ = polys;
+        Err(Error::DeviceFailed {
+            stage: "write-back",
+        })
+    }
 
     /// Value at hypercube index `i`.
     fn eval_at_index(&self, i: usize) -> FieldElement<F> {
@@ -60,6 +92,8 @@ pub struct Composed<F: IsField, C> {
     combine: C,
     degree: usize,
     num_vars: usize,
+    /// The same rule as straight-line code, when the caller can say what it is.
+    program: Option<Program<F>>,
 }
 
 impl<F: IsField, C> Composed<F, C>
@@ -82,7 +116,15 @@ where
             combine,
             degree,
             num_vars,
+            program: None,
         })
+    }
+
+    /// The same, saying which program the closure is. The two must agree: the
+    /// device runs the program and the host may run either.
+    pub fn with_program(mut self, program: Program<F>) -> Self {
+        self.program = Some(program);
+        self
     }
 }
 
@@ -116,11 +158,38 @@ where
         (self.combine)(values)
     }
 
+    fn combine_in(
+        &self,
+        values: &[FieldElement<F>],
+        scratch: &mut Vec<FieldElement<F>>,
+    ) -> FieldElement<F> {
+        match &self.program {
+            Some(program) => program.eval(values, scratch),
+            None => (self.combine)(values),
+        }
+    }
+
     fn fix_first_variable(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
         for p in &mut self.polys {
             p.fix_first_variable_in_place(r)?;
         }
         self.num_vars -= 1;
+        Ok(())
+    }
+
+    fn program(&self) -> Option<&Program<F>> {
+        self.program.as_ref()
+    }
+
+    fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        if polys.len() != self.polys.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: self.polys.len(),
+                got: polys.len(),
+            });
+        }
+        self.num_vars = polys.first().map(Mle::num_vars).unwrap_or(0);
+        self.polys = polys;
         Ok(())
     }
 }

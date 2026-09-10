@@ -135,6 +135,7 @@ const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.c
 const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
+const SUMCHECK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sumcheck.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -240,6 +241,10 @@ pub struct Backend {
     pub logup_apply_offsets_add_ext3: CudaFunction,
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
+
+    // sumcheck.cubin
+    pub sumcheck_round_ext3: CudaFunction,
+    pub sumcheck_fold_ext3: CudaFunction,
 
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
@@ -354,6 +359,7 @@ impl Backend {
         let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
+        let sumcheck = ctx.load_module(Ptx::from_binary(SUMCHECK_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -474,6 +480,8 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
+            sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp

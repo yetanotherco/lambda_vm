@@ -19,6 +19,7 @@ use multilinear::{
     constraint_argument::FactorKind,
     mle::Mle,
     poly::SumcheckPolynomial,
+    program::{Builder, Program},
     selector::Selector,
 };
 use std::collections::BTreeMap;
@@ -817,6 +818,60 @@ where
     /// the challenge behind it is drawn after the trace is committed, which a
     /// layout built before there is a transcript cannot know. Size it with
     /// [`num_roots`](Self::num_roots).
+    /// The zerocheck rule as straight-line code over the factor values:
+    /// [`combine`](Self::combine) times the weight at factor slot `weight`.
+    ///
+    /// The steps go in first and unchanged, so a step's index is its operand
+    /// number; the batched roots, their selectors and the weight follow.
+    pub fn program(
+        &self,
+        beta_powers: &[FieldElement<E>],
+        weight: usize,
+    ) -> Result<Program<E>, MlError> {
+        if beta_powers.len() != self.roots.len() {
+            return Err(MlError::VariableCountMismatch {
+                expected: self.roots.len(),
+                got: beta_powers.len(),
+            });
+        }
+        let mut builder = Builder::<E>::new();
+        for step in &self.steps {
+            let emitted = match *step {
+                Step::Fixed(ref c) => builder.fixed(c.clone()),
+                Step::Var(i) => builder.var(i as usize),
+                Step::Add(a, b) => builder.add(a, b),
+                Step::Sub(a, b) => builder.sub(a, b),
+                Step::Mul(a, b) => builder.mul(a, b),
+                Step::Neg(a) => builder.neg(a),
+            };
+            debug_assert_eq!(
+                emitted as usize,
+                builder.len() - 1,
+                "a step's index is its operand number"
+            );
+        }
+        let terms: Vec<(u32, FieldElement<E>)> = self
+            .root_steps
+            .iter()
+            .zip(beta_powers)
+            .zip(&self.selector_of_root)
+            .map(|((&root, beta), selector)| {
+                let term = match selector {
+                    Some(slot) => {
+                        let s = builder.var(*slot);
+                        builder.mul(root, s)
+                    }
+                    None => root,
+                };
+                (term, beta.clone())
+            })
+            .collect();
+        let sum = builder.weighted_sum(&terms);
+        let w = builder.var(weight);
+        let root = builder.mul(w, sum);
+        builder.finish(root)
+    }
+
     pub fn combine(
         &self,
         beta_powers: &[FieldElement<E>],
@@ -1534,6 +1589,45 @@ mod tests {
         let poly =
             IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta).unwrap();
         assert_eq!(poly.polys().len(), num_leaves + 1);
+    }
+
+    /// The compiled rule must agree with the walk it replaces: same roots,
+    /// same beta powers, same selectors, times the weight.
+    #[test]
+    fn the_zerocheck_program_agrees_with_the_walk() {
+        let num_vars = 3;
+        let (prog, meta) = fib_program();
+        let columns = fib_columns(num_vars);
+        let leaves = fib_leaves(&columns, num_vars);
+        let poly =
+            IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta).unwrap();
+        let shape = poly.shape().clone();
+        let betas = beta_powers(&ExtE::from(5), shape.num_roots());
+
+        // One more factor than the shape reads: the last is the weight.
+        let width = poly.polys().len();
+        let values: Vec<ExtE> = (0..=width)
+            .map(|i| ExtE::from((i as u64).wrapping_mul(2654435761) + 11))
+            .collect();
+        let program = shape.program(&betas, width).unwrap();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            program.eval(&values, &mut scratch),
+            &values[width] * shape.combine(&betas, &values[..width])
+        );
+    }
+
+    /// A beta power per root, or the rule would batch the wrong number of them.
+    #[test]
+    fn a_program_with_the_wrong_beta_count_is_rejected() {
+        let num_vars = 3;
+        let (prog, meta) = fib_program();
+        let columns = fib_columns(num_vars);
+        let leaves = fib_leaves(&columns, num_vars);
+        let poly =
+            IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta).unwrap();
+        let shape = poly.shape().clone();
+        assert!(shape.program(&[ExtE::one()], poly.polys().len()).is_err());
     }
 
     // ---------------------------------------------------------------

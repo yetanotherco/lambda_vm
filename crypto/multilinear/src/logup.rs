@@ -20,7 +20,14 @@ use math::field::{element::FieldElement, traits::IsField};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::{Error, batch::Rule, eq::eq_evals, gkr::FractionLayer, mle::Mle};
+use crate::{
+    Error,
+    batch::Rule,
+    eq::eq_evals,
+    gkr::FractionLayer,
+    mle::Mle,
+    program::{Builder, Program},
+};
 
 /// An affine expression over the sumcheck factors: `Σ c_j·f_{s_j} + k`.
 #[derive(Clone, Debug)]
@@ -55,6 +62,25 @@ impl<E: IsField> Affine<E> {
             .fold(self.constant.clone(), |acc, (slot, coefficient)| {
                 acc + coefficient * &values[*slot]
             })
+    }
+
+    /// The expression as steps over the factor values, returning the step
+    /// holding it.
+    pub fn emit(&self, builder: &mut Builder<E>) -> u32 {
+        if self.terms.is_empty() {
+            return builder.fixed(self.constant.clone());
+        }
+        let terms: Vec<(u32, FieldElement<E>)> = self
+            .terms
+            .iter()
+            .map(|(slot, coefficient)| (builder.var(*slot), coefficient.clone()))
+            .collect();
+        let sum = builder.weighted_sum(&terms);
+        if self.constant == FieldElement::zero() {
+            return sum;
+        }
+        let constant = builder.fixed(self.constant.clone());
+        builder.add(sum, constant)
     }
 
     /// The expression's table over the cube. `factors` must not be empty: its
@@ -182,25 +208,33 @@ pub fn claim_statements<'a, E: IsField>(
         .fold(FieldElement::<E>::zero(), |acc, w| acc + w);
     let live = weights[..interactions.len()].to_vec();
 
-    let numerator_weights = live.clone();
-    let numerator = Rule::new(2, move |f: &[FieldElement<E>]| {
-        let sum = interactions
-            .iter()
-            .zip(&numerator_weights)
-            .fold(FieldElement::<E>::zero(), |acc, (i, w)| {
-                acc + w * i.numerator.evaluate(f)
-            });
-        &f[weight] * sum
-    });
-    let denominator = Rule::new(2, move |f: &[FieldElement<E>]| {
-        let sum = interactions
-            .iter()
+    // `Σ_i w_i · side_i(f)` (plus the padding, where it belongs), times the row
+    // weight — the shape both sides of the bus statement take.
+    let weighted = |sides: Vec<&Affine<E>>, constant: Option<FieldElement<E>>| {
+        let mut builder = Builder::<E>::new();
+        let mut terms: Vec<(u32, FieldElement<E>)> = sides
+            .into_iter()
             .zip(&live)
-            .fold(padding.clone(), |acc, (i, w)| {
-                acc + w * i.denominator.evaluate(f)
-            });
-        &f[weight] * sum
-    });
+            .map(|(side, w)| (side.emit(&mut builder), w.clone()))
+            .collect();
+        if let Some(constant) = constant {
+            let step = builder.fixed(constant);
+            terms.push((step, FieldElement::one()));
+        }
+        let sum = builder.weighted_sum(&terms);
+        let row = builder.var(weight);
+        let root = builder.mul(row, sum);
+        builder.finish(root)
+    };
+
+    let numerator: Program<E> =
+        weighted(interactions.iter().map(|i| &i.numerator).collect(), None)?;
+    let denominator: Program<E> = weighted(
+        interactions.iter().map(|i| &i.denominator).collect(),
+        Some(padding),
+    )?;
+    let numerator = Rule::compiled(2, numerator);
+    let denominator = Rule::compiled(2, denominator);
 
     Ok(BusStatements {
         numerator,

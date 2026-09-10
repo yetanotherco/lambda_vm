@@ -17,16 +17,25 @@ use crate::{
     Error, challenge_powers,
     mle::Mle,
     poly::SumcheckPolynomial,
+    program::{self, Program},
     sumcheck::{self, SumcheckProof},
 };
 
 /// One statement's rule: what it makes of the batch's factors.
 ///
-/// `eval` indexes the **whole** factor list, so a sub-argument that already
-/// combines a prefix of it can be used unchanged.
+/// Reads the **whole** factor list, so a sub-argument that already combines a
+/// prefix of it can be used unchanged.
 pub struct Rule<'a, F: IsField> {
-    eval: RuleFn<'a, F>,
+    body: Body<'a, F>,
     degree: usize,
+}
+
+/// A rule is either a closure or the program it is. A statement that can say
+/// which program it is gets the sumcheck's device path; the closure form is for
+/// the ones that cannot.
+enum Body<'a, F: IsField> {
+    Closure(RuleFn<'a, F>),
+    Compiled(Program<F>),
 }
 
 /// A statement's value from the batch's factor values.
@@ -40,7 +49,15 @@ impl<'a, F: IsField> Rule<'a, F> {
         eval: impl Fn(&[FieldElement<F>]) -> FieldElement<F> + Sync + 'a,
     ) -> Self {
         Self {
-            eval: Box::new(eval),
+            body: Body::Closure(Box::new(eval)),
+            degree,
+        }
+    }
+
+    /// The same rule as straight-line code over the factor values.
+    pub fn compiled(degree: usize, program: Program<F>) -> Self {
+        Self {
+            body: Body::Compiled(program),
             degree,
         }
     }
@@ -49,8 +66,28 @@ impl<'a, F: IsField> Rule<'a, F> {
         self.degree
     }
 
+    /// The program this rule is, when it has one.
+    pub fn program(&self) -> Option<&Program<F>> {
+        match &self.body {
+            Body::Compiled(program) => Some(program),
+            Body::Closure(_) => None,
+        }
+    }
+
     pub fn apply(&self, values: &[FieldElement<F>]) -> FieldElement<F> {
-        (self.eval)(values)
+        self.apply_in(values, &mut Vec::new())
+    }
+
+    /// The same, reusing the caller's scratch for a compiled rule's steps.
+    pub fn apply_in(
+        &self,
+        values: &[FieldElement<F>],
+        scratch: &mut Vec<FieldElement<F>>,
+    ) -> FieldElement<F> {
+        match &self.body {
+            Body::Closure(eval) => eval(values),
+            Body::Compiled(program) => program.eval(values, scratch),
+        }
     }
 }
 
@@ -61,6 +98,9 @@ pub struct Batched<'a, F: IsField> {
     lambdas: Vec<FieldElement<F>>,
     num_vars: usize,
     degree: usize,
+    /// The whole batch as one program, when every rule is compiled. The round
+    /// loop runs this instead of the rules, and it is what a device gets.
+    program: Option<Program<F>>,
 }
 
 impl<'a, F: IsField> Batched<'a, F> {
@@ -89,13 +129,24 @@ impl<'a, F: IsField> Batched<'a, F> {
             }
         }
         let degree = rules.iter().map(Rule::degree).max().unwrap_or(0);
+        let programs: Option<Vec<&Program<F>>> = rules.iter().map(Rule::program).collect();
+        let program = match programs {
+            Some(programs) => Some(program::combine(&programs, &lambdas)?),
+            None => None,
+        };
         Ok(Self {
             polys,
             rules,
             lambdas,
             num_vars,
             degree,
+            program,
         })
+    }
+
+    /// The batch as one program, when it has one.
+    pub fn program(&self) -> Option<&Program<F>> {
+        self.program.as_ref()
     }
 }
 
@@ -113,11 +164,22 @@ impl<F: IsField> SumcheckPolynomial<F> for Batched<'_, F> {
     }
 
     fn combine(&self, values: &[FieldElement<F>]) -> FieldElement<F> {
+        self.combine_in(values, &mut Vec::new())
+    }
+
+    fn combine_in(
+        &self,
+        values: &[FieldElement<F>],
+        scratch: &mut Vec<FieldElement<F>>,
+    ) -> FieldElement<F> {
+        if let Some(program) = &self.program {
+            return program.eval(values, scratch);
+        }
         self.rules
             .iter()
             .zip(&self.lambdas)
             .fold(FieldElement::zero(), |acc, (rule, lambda)| {
-                acc + lambda * rule.apply(values)
+                acc + lambda * rule.apply_in(values, scratch)
             })
     }
 
@@ -126,6 +188,22 @@ impl<F: IsField> SumcheckPolynomial<F> for Batched<'_, F> {
             p.fix_first_variable_in_place(r)?;
         }
         self.num_vars -= 1;
+        Ok(())
+    }
+
+    fn program(&self) -> Option<&Program<F>> {
+        self.program.as_ref()
+    }
+
+    fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        if polys.len() != self.polys.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: self.polys.len(),
+                got: polys.len(),
+            });
+        }
+        self.num_vars = polys.first().map(Mle::num_vars).unwrap_or(0);
+        self.polys = polys;
         Ok(())
     }
 }
@@ -147,7 +225,7 @@ pub fn prove<F, T>(
     transcript: &mut T,
 ) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
 {
     if claims.len() != rules.len() {

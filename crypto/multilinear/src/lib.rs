@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod logup;
 pub mod mle;
 pub mod poly;
+pub mod program;
 pub mod selector;
 pub mod stacked_eval;
 pub mod stacking;
@@ -103,4 +104,8 @@ pub enum Error {
     ShiftedReadMismatch,
     #[error("column {column}: its claimed value does not match the commitment")]
     ColumnOpeningRejected { column: usize },
+    /// A device path that had already drawn a challenge cannot be retried on
+    /// the host: the transcript has moved.
+    #[error("the device failed mid-{stage}, after the transcript had moved")]
+    DeviceFailed { stage: &'static str },
 }

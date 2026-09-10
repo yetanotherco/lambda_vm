@@ -13,7 +13,7 @@ use math::field::{element::FieldElement, traits::IsField};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::{Error, poly::SumcheckPolynomial};
+use crate::{Error, mle::Mle, poly::SumcheckPolynomial};
 
 /// One round: the round polynomial as evaluations at `1, .., degree`.
 ///
@@ -129,6 +129,8 @@ where
         let mut hi = vec![FieldElement::<F>::zero(); width];
         let mut delta = vec![FieldElement::<F>::zero(); width];
         let mut values = vec![FieldElement::<F>::zero(); width];
+        // A compiled rule's steps go here, once for the whole slice.
+        let mut scratch = Vec::new();
 
         for j in range {
             for (k, p) in poly.polys().iter().enumerate() {
@@ -148,7 +150,7 @@ where
                         *v = l + t * d;
                     }
                 }
-                *total += poly.combine(&values);
+                *total += poly.combine_in(&values, &mut scratch);
             }
         }
         totals
@@ -182,6 +184,29 @@ where
     }
 }
 
+/// The round polynomial's evaluations at `1..=degree` for one compiled rule
+/// over `factors`, through the host round loop.
+///
+/// This is the reference the device round is checked against
+/// (`math-cuda/tests/sumcheck.rs`): the comparison has to be against the loop
+/// the prover actually runs, not a second copy of the formula.
+pub fn round_evaluations_for_program<F>(
+    factors: &[Mle<F>],
+    program: &crate::program::Program<F>,
+    degree: usize,
+) -> Result<Vec<FieldElement<F>>, Error>
+where
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let batched = crate::batch::Batched::new(
+        factors.to_vec(),
+        vec![crate::batch::Rule::compiled(degree, program.clone())],
+        vec![FieldElement::one()],
+    )?;
+    Ok(round_evaluations(&batched, degree, false))
+}
+
 /// Runs the prover, absorbing each round polynomial and drawing each challenge
 /// from `transcript`.
 ///
@@ -192,7 +217,7 @@ pub fn prove<F, T, P>(
     transcript: &mut T,
 ) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
     P: SumcheckPolynomial<F> + Sync,
     FieldElement<F>: Send + Sync,
@@ -215,7 +240,7 @@ pub fn prove_rounds<F, T, P>(
     transcript: &mut T,
 ) -> Result<RoundGroup<F>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
     P: SumcheckPolynomial<F> + Sync,
     FieldElement<F>: Send + Sync,
@@ -227,6 +252,32 @@ where
         });
     }
     let degree = poly.degree().max(1);
+
+    // The rounds on device when the polynomial says which program it is and the
+    // device takes it. Only a whole sumcheck: a group of rounds leaves tables
+    // the caller needs back, and downloading them between groups costs more
+    // than the rounds do.
+    let attempt = if rounds == poly.num_vars() {
+        match poly.program() {
+            Some(program) => {
+                crate::gpu::prove_sumcheck(poly.polys(), program, degree, |evaluations| {
+                    for e in evaluations {
+                        transcript.append_field_element(e);
+                    }
+                    transcript.sample_field_element()
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(outcome) = attempt {
+        let (proofs, challenges, folded) = outcome?;
+        poly.accept_folded(folded)?;
+        return Ok((proofs, challenges));
+    }
+
     let mut proofs = Vec::with_capacity(rounds);
     let mut challenges = Vec::with_capacity(rounds);
     // The identity the verifier now takes on faith. Checking it costs the pass

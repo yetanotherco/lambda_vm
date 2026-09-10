@@ -267,7 +267,7 @@ impl<F: IsField, E: IsField> TraceData<F, E> {
 
 impl<
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
 > CommittedTrace<F, E>
 where
     FieldElement<F>: AsBytes + Sync + Send,
@@ -452,7 +452,7 @@ pub fn prove_statements<F, E, T>(
 ) -> Result<ConstraintProof<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -487,7 +487,7 @@ pub fn prove_core<F, E, T>(
 ) -> Result<(ConstraintCore<E>, Vec<FieldElement<E>>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -601,7 +601,7 @@ pub fn verify_core<E, T, P>(
     transcript: &mut T,
 ) -> Result<claim_reduce::ReducedClaim<E>, Error>
 where
-    E: IsField,
+    E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
@@ -641,7 +641,7 @@ pub fn prove<F, E, T, C>(
 ) -> Result<ConstraintProof<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,

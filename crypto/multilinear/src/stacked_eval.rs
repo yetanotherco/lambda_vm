@@ -257,7 +257,7 @@ pub fn prove<F, E, T>(
 ) -> Result<StackedProof<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,

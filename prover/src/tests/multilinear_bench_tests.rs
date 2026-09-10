@@ -249,6 +249,8 @@ fn whir_against_fri() {
 #[ignore]
 fn phases() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use math::field::element::FieldElement;
     use stark::multilinear_air::Uniforms;
     use stark::multilinear_table::{self, CommittedTable, CommittedTables, TableLayout};
 
@@ -341,11 +343,47 @@ fn phases() {
     let committed = CommittedTables::commit(tables, &config).expect("commit");
     let commit = start.elapsed();
 
+    // `multi_prove`'s own body, so the tables' arguments and the one opening
+    // that settles them can be clocked apart: the transcript makes the loop
+    // sequential, so this is the same work in the same order.
     let start = Instant::now();
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    let proof =
-        multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove");
-    let argue = start.elapsed();
+    for root in committed.roots() {
+        transcript.append_bytes(root);
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    let beta: FieldElement<E> = transcript.sample_field_element();
+    let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+    let mut values: Vec<FieldElement<E>> = Vec::new();
+    let mut table_proofs = Vec::with_capacity(committed.tables().len());
+    for table in committed.tables() {
+        let (proof, point) =
+            multilinear_table::prove(table, &z, &alpha, &beta, &mut transcript).expect("table");
+        for _ in 0..table.num_committed_columns() {
+            points.push(point.clone());
+        }
+        values.extend(proof.constraint.reduce.column_values.iter().cloned());
+        table_proofs.push(proof);
+    }
+    let tables_argued = start.elapsed();
+
+    let start = Instant::now();
+    let columns = multilinear::stacked_eval::prove::<F, E, _>(
+        committed.stacked(),
+        &multilinear::stacked_eval::Claimed::PerColumn(&points),
+        &values,
+        &config,
+        &mut transcript,
+    )
+    .expect("the opening");
+    let opened = start.elapsed();
+    let argue = tables_argued + opened;
+    let proof = multilinear_table::MultiProof {
+        roots: committed.roots().to_vec(),
+        tables: table_proofs,
+        columns,
+    };
     let total = total.elapsed();
 
     println!(
@@ -360,6 +398,8 @@ fn phases() {
         ("layout", layout),
         ("commit", commit),
         ("argue", argue),
+        ("  tables", tables_argued),
+        ("  opening", opened),
     ] {
         println!(
             "{tag:<14} {:>9.2} {:>6.1}%",
@@ -372,11 +412,14 @@ fn phases() {
     // feature on is the signal that a dispatch declined and the phase above is
     // a CPU number wearing a GPU label.
     #[cfg(feature = "cuda")]
-    println!(
-        "{:<14} {:>9}",
-        "gpu grinds",
-        stark::gpu_lde::gpu_grind_calls()
-    );
+    for (tag, count) in [
+        ("gpu grinds", stark::gpu_lde::gpu_grind_calls()),
+        ("gpu commits", multilinear::gpu::commit_calls()),
+        ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
+        ("gpu rounds", multilinear::gpu::sumcheck_rounds()),
+    ] {
+        println!("{tag:<14} {count:>9}");
+    }
     assert_eq!(proof.tables.len(), count);
 }
 

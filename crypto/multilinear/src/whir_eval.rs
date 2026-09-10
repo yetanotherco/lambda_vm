@@ -70,7 +70,7 @@ pub fn commit<F, E>(
 ) -> Result<(CodewordCommitment<E>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
@@ -103,7 +103,7 @@ pub fn prove<F, E, T>(
 ) -> Result<EvalProof<E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
@@ -121,7 +121,7 @@ pub fn prove_weighted<F, E, T>(
 ) -> Result<EvalProof<E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {

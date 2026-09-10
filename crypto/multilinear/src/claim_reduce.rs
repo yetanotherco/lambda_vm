@@ -30,6 +30,7 @@ use crate::{
     eq::{shift_eval, shift_mle},
     mle::Mle,
     poly::Composed,
+    program::{Builder, Program},
     sumcheck::{self, SumcheckProof},
 };
 
@@ -91,6 +92,20 @@ fn pair_products<E: IsField>(values: &[FieldElement<E>]) -> FieldElement<E> {
         .fold(FieldElement::zero(), |acc, pair| acc + &pair[0] * &pair[1])
 }
 
+/// The same sum as straight-line code, over `pairs` kernel/column pairs.
+fn pair_products_program<E: IsField>(pairs: usize) -> Result<Program<E>, Error> {
+    let mut b = Builder::<E>::new();
+    let terms: Vec<u32> = (0..pairs)
+        .map(|pair| {
+            let kernel = b.var(2 * pair);
+            let column = b.var(2 * pair + 1);
+            b.mul(kernel, column)
+        })
+        .collect();
+    let root = b.sum(&terms);
+    b.finish(root)
+}
+
 fn check_shape<E: IsField>(
     sources: &[FactorSource],
     factor_values: &[FieldElement<E>],
@@ -125,7 +140,7 @@ fn batched_column<F, E>(
 ) -> Result<Mle<E>, Error>
 where
     F: IsField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
 {
     let mut acc = vec![FieldElement::<E>::zero(); 1usize << num_vars];
     for (i, source) in sources.iter().enumerate() {
@@ -154,7 +169,7 @@ pub fn prove<F, E, T>(
 ) -> Result<(ReduceProof<E>, Vec<FieldElement<E>>), Error>
 where
     F: IsField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
     T: IsTranscript<E>,
 {
     check_shape(sources, factor_values, columns.len())?;
@@ -186,8 +201,12 @@ where
         )?);
     }
 
-    let (sumcheck, point) =
-        sumcheck::prove(Composed::new(polys, pair_products::<E>, 2)?, transcript)?;
+    let pairs = polys.len() / 2;
+    let (sumcheck, point) = sumcheck::prove(
+        Composed::new(polys, pair_products::<E>, 2)?
+            .with_program(pair_products_program::<E>(pairs)?),
+        transcript,
+    )?;
 
     let column_values = columns
         .iter()
@@ -217,7 +236,7 @@ pub fn verify<E, T>(
     transcript: &mut T,
 ) -> Result<ReducedClaim<E>, Error>
 where
-    E: IsField,
+    E: IsField + 'static,
     T: IsTranscript<E>,
 {
     check_shape(sources, factor_values, num_columns)?;

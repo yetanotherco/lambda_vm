@@ -187,4 +187,5 @@ fn main() {
     compile_kernel("inverse.cu", "inverse.cubin", have_nvcc);
     compile_kernel("logup.cu", "logup.cubin", have_nvcc);
     compile_kernel("constraint_interp.cu", "constraint_interp.cubin", have_nvcc);
+    compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc);
 }

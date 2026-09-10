@@ -87,7 +87,7 @@ pub fn ood_point<E: IsField>(z0: &FieldElement<E>, num_vars: usize) -> Vec<Field
 fn require_out_of_domain<F, E>(z0: &FieldElement<E>, domain: &Domain<F>) -> Result<(), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
 {
     let mut power = z0.clone();
     for _ in 0..domain.log_size() {
@@ -105,7 +105,7 @@ where
 /// a caller that has not chosen its parameters yet pays nothing.
 fn grind<E, T>(transcript: &mut T, bits: u8) -> Result<u64, Error>
 where
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
 {
     if bits == 0 {
@@ -121,7 +121,7 @@ where
 /// absorbed the same way.
 fn check_grind<E, T>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
 where
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
 {
     if bits == 0 {
@@ -390,7 +390,7 @@ pub fn prove<F, E, T>(
 ) -> Result<ChainProof<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -409,7 +409,7 @@ pub fn prove_weighted<F, E, T>(
 ) -> Result<ChainProof<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,

@@ -66,7 +66,7 @@ pub struct ZeroCheckOutput<F: IsField> {
 /// constraint after seeing it.
 pub fn prove<F, T, P>(constraint: P, transcript: &mut T) -> Result<ZeroCheckOutput<F>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
     P: SumcheckPolynomial<F> + Sync,
     FieldElement<F>: Send + Sync,
@@ -95,7 +95,7 @@ pub fn verify<F, T>(
     transcript: &mut T,
 ) -> Result<ZeroCheckClaim<F>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
 {
     let r: Vec<FieldElement<F>> = (0..num_vars)

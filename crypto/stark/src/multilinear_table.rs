@@ -184,7 +184,7 @@ where
 pub struct CommittedTable<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -195,7 +195,7 @@ where
 impl<'a, F, E> CommittedTable<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -299,7 +299,7 @@ where
 pub struct CommittedTables<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -362,7 +362,7 @@ pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError
 impl<'a, F, E> CommittedTables<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -405,6 +405,11 @@ where
 
     pub fn domain(&self) -> &Domain<F> {
         self.stacked.domain()
+    }
+
+    /// What the one opening settles against.
+    pub fn stacked(&self) -> &StackedCommitment<F> {
+        &self.stacked
     }
 }
 
@@ -515,7 +520,7 @@ pub fn prove<F, E, T>(
 ) -> Result<(TableProof<E>, Vec<FieldElement<E>>), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
@@ -549,9 +554,7 @@ where
 
     let shape = table.shape();
     let betas = multilinear_air::beta_powers(beta, shape.num_roots());
-    let zerocheck = Rule::new(shape.degree() + 1, move |f: &[FieldElement<E>]| {
-        &f[weight_r] * shape.combine(&betas, &f[..weight_r])
-    });
+    let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
 
     let (constraint, point) = constraint_argument::prove_core::<F, E, T>(
         &table.trace,
@@ -593,7 +596,7 @@ pub fn verify<E, T>(
     transcript: &mut T,
 ) -> Result<TableVerdict<E>, MlError>
 where
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
@@ -620,9 +623,7 @@ where
 
     let shape = statement.shape;
     let betas = multilinear_air::beta_powers(beta, shape.num_roots());
-    let zerocheck = Rule::new(shape.degree() + 1, move |f: &[FieldElement<E>]| {
-        &f[weight_r] * shape.combine(&betas, &f[..weight_r])
-    });
+    let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
 
     let reduced = constraint_argument::verify_core(
         &proof.constraint,
@@ -712,7 +713,7 @@ pub fn multi_prove<F, E, T>(
 ) -> Result<MultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,

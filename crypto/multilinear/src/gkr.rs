@@ -16,6 +16,7 @@ use crate::{
     eq::{eq_eval, eq_mle},
     mle::Mle,
     poly::SumcheckPolynomial,
+    program::{Builder, Program},
     sumcheck::{self, SumcheckProof},
 };
 
@@ -115,6 +116,8 @@ struct LayerRelation<F: IsField> {
     /// `[eq, p_lo, p_hi, q_lo, q_hi]`.
     polys: Vec<Mle<F>>,
     lambda: FieldElement<F>,
+    /// The same rule as straight-line code, for the device path.
+    program: Program<F>,
 }
 
 impl<F: IsField> LayerRelation<F> {
@@ -140,8 +143,29 @@ impl<F: IsField> LayerRelation<F> {
         let (q_lo, q_hi) = split(&next.q)?;
         Ok(Self {
             polys: vec![eq_mle(r)?, p_lo, p_hi, q_lo, q_hi],
+            program: Self::program_for(&lambda)?,
             lambda,
         })
+    }
+
+    /// `eq·(p_lo·q_hi + p_hi·q_lo + lambda·q_lo·q_hi)`, the same expression
+    /// [`combine`](SumcheckPolynomial::combine) evaluates.
+    fn program_for(lambda: &FieldElement<F>) -> Result<Program<F>, Error> {
+        let mut b = Builder::<F>::new();
+        let eq = b.var(Self::EQ);
+        let p_lo = b.var(Self::P_LO);
+        let p_hi = b.var(Self::P_HI);
+        let q_lo = b.var(Self::Q_LO);
+        let q_hi = b.var(Self::Q_HI);
+        let first = b.mul(p_lo, q_hi);
+        let second = b.mul(p_hi, q_lo);
+        let numerator = b.add(first, second);
+        let denominator = b.mul(q_lo, q_hi);
+        let weighted = b.fixed(lambda.clone());
+        let scaled = b.mul(weighted, denominator);
+        let sum = b.add(numerator, scaled);
+        let root = b.mul(eq, sum);
+        b.finish(root)
     }
 }
 
@@ -169,6 +193,21 @@ impl<F: IsField> SumcheckPolynomial<F> for LayerRelation<F> {
         for p in &mut self.polys {
             p.fix_first_variable_in_place(r)?;
         }
+        Ok(())
+    }
+
+    fn program(&self) -> Option<&Program<F>> {
+        Some(&self.program)
+    }
+
+    fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        if polys.len() != self.polys.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: self.polys.len(),
+                got: polys.len(),
+            });
+        }
+        self.polys = polys;
         Ok(())
     }
 }
@@ -242,7 +281,7 @@ fn combine_halves<F: IsField>(
 /// Proves the tree, from the output fraction down to the input layer.
 pub fn prove<F, T>(tree: &FractionTree<F>, transcript: &mut T) -> Result<GkrOutput<F>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
 {
     let mut layers = Vec::with_capacity(tree.num_layers().saturating_sub(1));
@@ -306,7 +345,7 @@ pub fn verify<F, T>(
     transcript: &mut T,
 ) -> Result<GkrClaim<F>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
 {
     let (mut p_claim, mut q_claim) = output;
