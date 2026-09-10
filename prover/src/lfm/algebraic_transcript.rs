@@ -701,8 +701,10 @@ mod tests {
             keccak_rnd: 1,
             blake3: 1,
         };
+        // Must mirror `counts` above field for field: 11..24 are the fourteen
+        // split-table families, then `keccak_rnd`, then `blake3`.
         let count_array: [u64; NUM_TABLE_COUNTS] =
-            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1];
+            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1, 1];
         const PAGES: usize = 6;
         const FPLD: u8 = 3;
 

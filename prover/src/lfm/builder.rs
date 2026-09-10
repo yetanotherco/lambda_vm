@@ -280,6 +280,14 @@ impl LfmBuilder {
 
     /// `assert_eq` lowers to `diff = a − b; _ = diff / ZERO`: provable (and
     /// executable) iff `diff = 0` under the `0/0 = 1` convention.
+    ///
+    /// ⚠ READ A `DivByZero` FROM A PROGRAM BUILT HERE AS "AN ASSERTION FAILED",
+    /// not as "arithmetic went wrong". Every assertion in this builder is a
+    /// division by a zero constant, so a failing one is indistinguishable from a
+    /// genuine divide-by-zero at the executor, and `LfmExecError::DivByZero`
+    /// reports the address of the DIFF cell — the numerator — rather than of
+    /// anything a reader would recognise as a check. It cost hours once, chasing
+    /// a divisor that was zero on purpose.
     pub fn assert_eq(&mut self, a: Felt, b: Felt) {
         let diff = self.sub(a, b);
         let zero = self.felt_const(FE::zero());

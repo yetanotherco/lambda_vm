@@ -210,6 +210,76 @@ impl TableCounts {
     /// It is bounded above instead: nothing is gained by claiming more than one
     /// BLAKE3 table, and an unbounded count would have the verifier allocate
     /// AIRs off a number the proof has not yet been checked against.
+    /// How many counts the statement absorbs — the WIDTH of [`Self::absorbed`].
+    ///
+    /// Not derivable from the struct in stable Rust, so it is written down; the
+    /// array literal in `absorbed` must have exactly this many elements or the
+    /// compiler rejects it, which is what keeps the two honest.
+    pub const ABSORBED: usize = 16;
+
+    /// Every count, in declaration order, exactly as the statement absorbs
+    /// them.
+    ///
+    /// ★ The ONE definition of that order and width. `statement::absorb_statement`
+    /// absorbs this array, and the recursion guest's `EpochStatementShape` is
+    /// built from it — so the host encoding and the guest's replay of it cannot
+    /// drift. They did once: `keccak_rnd` was added to this struct, the
+    /// exhaustive destructure in `statement.rs` refused to compile and was duly
+    /// extended, and the guest's copy — a bare `NUM_TABLE_COUNTS = 15` in
+    /// another module, with a comment stating that one count too few makes every
+    /// downstream challenge diverge — was untouched, because nothing connected
+    /// them. The wrap then failed a `DivByZero`, which is how a failed
+    /// `assert_eq` reports itself in the LFM builder's dialect.
+    ///
+    /// Adding a field is now three compile errors in this one function: the
+    /// destructure, then the array's length against [`Self::ABSORBED`], then
+    /// the constant. Bump `statement::DOMAIN_TAG` and
+    /// `statement::CONTINUATION_EPOCH_TAG` with them — the count loop is shared,
+    /// so a monolithic bump alone leaves continuation proofs from two encodings
+    /// sharing a transcript prefix.
+    pub fn absorbed(&self) -> [u64; Self::ABSORBED] {
+        let &Self {
+            cpu,
+            lt,
+            memw,
+            memw_aligned,
+            load,
+            mul,
+            dvrm,
+            shift,
+            branch,
+            memw_register,
+            eq,
+            bytewise,
+            store,
+            cpu32,
+            keccak_rnd,
+            blake3,
+        } = self;
+        [
+            cpu as u64,
+            lt as u64,
+            memw as u64,
+            memw_aligned as u64,
+            load as u64,
+            mul as u64,
+            dvrm as u64,
+            shift as u64,
+            branch as u64,
+            memw_register as u64,
+            eq as u64,
+            bytewise as u64,
+            store as u64,
+            cpu32 as u64,
+            // A chunk count like the ones above it.
+            keccak_rnd as u64,
+            // 0 or 1, and the one count the verifier cannot derive for itself —
+            // binding it is what stops prover and verifier building different
+            // AIR sets from the same bytes (see `TableCounts::blake3`).
+            blake3 as u64,
+        ]
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
         if self.blake3 > 1 {
             return Err(Error::InvalidTableCounts(format!(

@@ -101,51 +101,13 @@ pub(crate) fn absorb_statement_with_digest(
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
     t.append_bytes(public_output);
 
-    // table_counts: fixed-width u64s in declared order. The exhaustive
-    // destructure makes any field added to TableCounts a compile error here —
-    // that's the signal to extend the loop below and bump DOMAIN_TAG.
-    let &TableCounts {
-        cpu,
-        lt,
-        memw,
-        memw_aligned,
-        load,
-        mul,
-        dvrm,
-        shift,
-        branch,
-        memw_register,
-        eq,
-        bytewise,
-        store,
-        cpu32,
-        keccak_rnd,
-        blake3,
-    } = table_counts;
-    for count in [
-        cpu,
-        lt,
-        memw,
-        memw_aligned,
-        load,
-        mul,
-        dvrm,
-        shift,
-        branch,
-        memw_register,
-        eq,
-        bytewise,
-        store,
-        cpu32,
-        // A chunk count like the ones above it: the verifier reads it from the
-        // proof it is checking and rebuilds the same number of KECCAK_RND AIRs.
-        keccak_rnd,
-        // 0 or 1, and the one count the verifier cannot derive for itself —
-        // binding it is what stops prover and verifier building different AIR
-        // sets from the same bytes (see `TableCounts::blake3`).
-        blake3,
-    ] {
-        t.append_bytes(&(count as u64).to_le_bytes());
+    // table_counts: fixed-width u64s in declared order, from the ONE definition
+    // of that order and width — `TableCounts::absorbed`. The tripwire that
+    // forces a new field into this encoding lives there with it, so the guest's
+    // replay (`lfm::statement_replay`) can be built from the same array instead
+    // of a hand-kept copy.
+    for count in table_counts.absorbed() {
+        t.append_bytes(&count.to_le_bytes());
     }
 
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());

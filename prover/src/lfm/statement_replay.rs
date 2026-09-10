@@ -41,12 +41,17 @@ use super::builder::{Ext, Felt, LfmBuilder};
 use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
 
-/// Counts `TableCounts` absorbs: fourteen split-table families plus the
-/// 0-or-1 BLAKE3 presence count. The guest must absorb exactly what the host's
+/// Counts `TableCounts` absorbs. The guest must absorb exactly what the host's
 /// `statement::absorb_statement_with_digest` does — one count too few and every
-/// challenge downstream diverges, so this tracks that encoding, not a
-/// structural property of the machine.
-pub const NUM_TABLE_COUNTS: usize = 15;
+/// challenge downstream diverges.
+///
+/// ★ BOUND to the host's own width rather than restated. It was `15` written
+/// out here while the host absorbed sixteen, and nothing connected the two: the
+/// exhaustive-destructure tripwire in `statement.rs` guarded its own copy and
+/// could not know a second existed behind this constant. The divergence
+/// surfaced as a `DivByZero` in the epoch wrap — a failed `assert_eq`, three
+/// hours into a box run. An alias cannot drift.
+pub const NUM_TABLE_COUNTS: usize = crate::TableCounts::ABSORBED;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]
