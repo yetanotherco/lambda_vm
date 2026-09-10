@@ -86,6 +86,16 @@ where
     }
 }
 
+impl<F: IsField, C> Composed<F, C> {
+    /// The factors, dropping the rule.
+    ///
+    /// A chained WHIR needs them back after each group of rounds: it rebuilds
+    /// its weight from the folded one, so it cannot keep the polynomial.
+    pub fn into_polys(self) -> Vec<Mle<F>> {
+        self.polys
+    }
+}
+
 impl<F: IsField, C> SumcheckPolynomial<F> for Composed<F, C>
 where
     C: Fn(&[FieldElement<F>]) -> FieldElement<F>,

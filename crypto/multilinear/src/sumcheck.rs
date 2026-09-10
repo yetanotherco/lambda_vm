@@ -1,56 +1,97 @@
 //! The sumcheck protocol, reducing `Σ_x f(x) = S` to one evaluation of `f`.
 //!
-//! Round polynomials travel as evaluations at `0, 1, .., d`. [`verify`] returns
-//! the residual claim rather than deciding it — the caller must discharge it.
+//! Round polynomials travel as evaluations at `1, .., d`. `g(0)` is **not**
+//! sent: `g(0) + g(1)` is the claim carried into the round, which fixes it. So
+//! the prover skips a whole pass over the cube and the proof loses one field
+//! element per round — and the rejection that used to happen per round now
+//! happens **only** against the final claim, which [`verify`] returns and the
+//! caller must discharge.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
 use crate::{Error, poly::SumcheckPolynomial};
 
-/// One round: the round polynomial as evaluations at `0, 1, .., degree`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One round: the round polynomial as evaluations at `1, .., degree`.
+///
+/// `g(0)` is absent by construction — see the module docs.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct RoundProof<F: IsField> {
     pub evaluations: Vec<FieldElement<F>>,
 }
 
 /// A full sumcheck transcript.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct SumcheckProof<F: IsField> {
     pub rounds: Vec<RoundProof<F>>,
 }
 
 /// What the verifier is left holding: `f(point)` must equal `expected_evaluation`.
+///
+/// Discharging this is the **only** place a sumcheck rejects, so dropping it
+/// silently accepts anything.
+#[must_use]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SumcheckClaim<F: IsField> {
     pub point: Vec<FieldElement<F>>,
     pub expected_evaluation: FieldElement<F>,
 }
 
-/// Lagrange-interpolates values at `0, 1, .., d` and evaluates at `x`. Round
-/// polynomials are small, so the quadratic form is the cheap one.
+/// Lagrange-interpolates values at `0, 1, .., d` and evaluates at `x`.
+///
+/// Round polynomials are small, so the quadratic form is the cheap one. The
+/// denominators depend only on how many nodes there are, so they go through one
+/// batched inversion instead of one each — and the quadratic numerators are
+/// kept rather than switching to the barycentric form, which would divide by
+/// `x − x_i` and so need a special case for an `x` that lands on a node.
 fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> FieldElement<F> {
     let n = values.len();
-    let mut acc = FieldElement::<F>::zero();
-    for (i, y_i) in values.iter().enumerate() {
-        let x_i = FieldElement::<F>::from(i as u64);
-        let mut num = FieldElement::<F>::one();
-        let mut den = FieldElement::<F>::one();
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let x_j = FieldElement::<F>::from(j as u64);
-            num *= x - &x_j;
-            den *= &x_i - &x_j;
-        }
-        // The nodes are distinct, so `den` is never zero.
-        acc += y_i * num * den.inv().expect("distinct interpolation nodes");
-    }
-    acc
+    let node = |j: usize| FieldElement::<F>::from(j as u64);
+    let others = |i: usize, at: &FieldElement<F>| {
+        (0..n)
+            .filter(|&j| j != i)
+            .fold(FieldElement::<F>::one(), |acc, j| acc * (at - node(j)))
+    };
+
+    let mut denominators: Vec<FieldElement<F>> = (0..n).map(|i| others(i, &node(i))).collect();
+    // The nodes are distinct, so none of them is zero.
+    FieldElement::inplace_batch_inverse(&mut denominators).expect("distinct interpolation nodes");
+
+    values
+        .iter()
+        .zip(&denominators)
+        .enumerate()
+        .fold(FieldElement::zero(), |acc, (i, (y_i, inv))| {
+            acc + y_i * others(i, x) * inv
+        })
 }
 
-/// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube, for `t = 0..=degree`.
+/// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube.
+///
+/// `t` runs over `1..=degree`, or `0..=degree` when `with_zero` — which only
+/// the prover's debug self-check asks for.
 ///
 /// `poly` has already been folded on the earlier variables, so its first
 /// variable is the one this round binds. For `t` in `{0, 1}` the sum reads the
@@ -59,24 +100,32 @@ fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> F
 fn round_evaluations<F: IsField, P: SumcheckPolynomial<F>>(
     poly: &P,
     degree: usize,
+    with_zero: bool,
 ) -> Vec<FieldElement<F>> {
     let half = 1usize << (poly.num_vars() - 1);
-    let mut out = Vec::with_capacity(degree + 1);
+    let first = usize::from(!with_zero);
+    let mut out = Vec::with_capacity(degree + 1 - first);
+    // One buffer for the whole round. Collecting a fresh `Vec` per cube index
+    // would be one heap allocation per index per `t`, which on a real trace is
+    // millions of them per round and dwarfs the arithmetic.
+    let mut values: Vec<FieldElement<F>> = vec![FieldElement::zero(); poly.polys().len()];
 
-    for t in 0..=degree {
+    for t in first..=degree {
         let t_fe = FieldElement::<F>::from(t as u64);
         let mut total = FieldElement::<F>::zero();
         for j in 0..half {
-            // Extend every factor along the bound axis: lo + t·(hi − lo).
-            let values: Vec<FieldElement<F>> = poly
-                .polys()
-                .iter()
-                .map(|p| {
-                    let lo = &p.evals()[j];
-                    let hi = &p.evals()[j + half];
-                    lo + &t_fe * &(hi - lo)
-                })
-                .collect();
+            // Extend every factor along the bound axis: lo + t·(hi − lo). At
+            // `t = 0` and `t = 1` that is a half of the table read straight
+            // off, so the multiplication is skipped.
+            for (slot, p) in values.iter_mut().zip(poly.polys()) {
+                let lo = &p.evals()[j];
+                let hi = &p.evals()[j + half];
+                *slot = match t {
+                    0 => lo.clone(),
+                    1 => hi.clone(),
+                    _ => lo + &t_fe * &(hi - lo),
+                };
+            }
             total += poly.combine(&values);
         }
         out.push(total);
@@ -99,23 +148,68 @@ where
     P: SumcheckPolynomial<F>,
 {
     let num_vars = poly.num_vars();
-    let degree = poly.degree().max(1);
-    let mut rounds = Vec::with_capacity(num_vars);
-    let mut challenges = Vec::with_capacity(num_vars);
+    let (rounds, challenges) = prove_rounds(&mut poly, num_vars, transcript)?;
+    Ok((SumcheckProof { rounds }, challenges))
+}
 
-    for _ in 0..num_vars {
-        let evaluations = round_evaluations(&poly, degree);
-        for e in &evaluations {
+/// A group of round polynomials and the challenges they drew.
+pub type RoundGroup<F> = (Vec<RoundProof<F>>, Vec<FieldElement<F>>);
+
+/// Runs `rounds` rounds, leaving `poly` folded on them.
+///
+/// A chained WHIR interleaves: between groups of rounds it folds its codeword
+/// and commits the successor, so it cannot run the whole sumcheck in one call.
+pub fn prove_rounds<F, T, P>(
+    poly: &mut P,
+    rounds: usize,
+    transcript: &mut T,
+) -> Result<RoundGroup<F>, Error>
+where
+    F: IsField,
+    T: IsTranscript<F>,
+    P: SumcheckPolynomial<F>,
+{
+    if rounds > poly.num_vars() {
+        return Err(Error::RoundCountMismatch {
+            expected: poly.num_vars(),
+            got: rounds,
+        });
+    }
+    let degree = poly.degree().max(1);
+    let mut proofs = Vec::with_capacity(rounds);
+    let mut challenges = Vec::with_capacity(rounds);
+    // The identity the verifier now takes on faith. Checking it costs the pass
+    // over the cube the protocol exists to skip, so it runs in debug only —
+    // where it turns a silent prover bug into a local failure.
+    #[cfg(debug_assertions)]
+    let mut running: Option<FieldElement<F>> = None;
+
+    for _ in 0..rounds {
+        let all = round_evaluations(poly, degree, cfg!(debug_assertions));
+        let sent = all[all.len() - degree..].to_vec();
+        for e in &sent {
             transcript.append_field_element(e);
         }
         let r = transcript.sample_field_element();
 
+        #[cfg(debug_assertions)]
+        {
+            let sum = &all[0] + &all[1];
+            if let Some(expected) = &running {
+                debug_assert_eq!(
+                    &sum, expected,
+                    "sumcheck: g(0) + g(1) is not the claim carried into the round"
+                );
+            }
+            running = Some(interpolate(&all, &r));
+        }
+
         poly.fix_first_variable(&r)?;
-        rounds.push(RoundProof { evaluations });
+        proofs.push(RoundProof { evaluations: sent });
         challenges.push(r);
     }
 
-    Ok((SumcheckProof { rounds }, challenges))
+    Ok((proofs, challenges))
 }
 
 /// Checks every round against the running claim and returns the final claim.
@@ -140,35 +234,50 @@ where
             got: proof.rounds.len(),
         });
     }
+    verify_rounds(&proof.rounds, claimed_sum, degree, transcript)
+}
+
+/// Verifies a group of rounds against a running claim.
+///
+/// The returned claim carries this group's challenges and the claim it leaves,
+/// which is what the next group starts from. Round indices in errors are
+/// relative to the group.
+pub fn verify_rounds<F, T>(
+    rounds: &[RoundProof<F>],
+    claimed_sum: FieldElement<F>,
+    degree: usize,
+    transcript: &mut T,
+) -> Result<SumcheckClaim<F>, Error>
+where
+    F: IsField,
+    T: IsTranscript<F>,
+{
     let degree = degree.max(1);
 
     let mut current = claimed_sum;
-    let mut point = Vec::with_capacity(num_vars);
+    let mut point = Vec::with_capacity(rounds.len());
 
-    for (round, r_proof) in proof.rounds.iter().enumerate() {
-        if r_proof.evaluations.len() != degree + 1 {
+    for (round, r_proof) in rounds.iter().enumerate() {
+        if r_proof.evaluations.len() != degree {
             return Err(Error::RoundDegreeMismatch {
                 round,
                 expected: degree,
                 got: r_proof.evaluations.len(),
             });
         }
-        // g_j(0) + g_j(1) must reproduce the claim carried into this round.
-        let sum = &r_proof.evaluations[0] + &r_proof.evaluations[1];
-        if sum != current {
-            return Err(Error::RoundSumMismatch {
-                round,
-                claimed: format!("{current:?}"),
-                got: format!("{sum:?}"),
-            });
-        }
+        // `g(0)` is recovered rather than checked: `g(0) + g(1)` is the claim
+        // carried in. So nothing is rejected here, and everything rides on the
+        // claim this returns.
+        let mut all = Vec::with_capacity(degree + 1);
+        all.push(&current - &r_proof.evaluations[0]);
+        all.extend(r_proof.evaluations.iter().cloned());
 
         for e in &r_proof.evaluations {
             transcript.append_field_element(e);
         }
         let r = transcript.sample_field_element();
 
-        current = interpolate(&r_proof.evaluations, &r);
+        current = interpolate(&all, &r);
         point.push(r);
     }
 
@@ -285,31 +394,39 @@ mod tests {
         assert_eq!(f.evaluate(&claim.point).unwrap(), claim.expected_evaluation);
     }
 
+    /// `g(0)` is derived from the claim, so a wrong claim is not caught in the
+    /// round — it is caught by the residual, which stops being the
+    /// polynomial's value. Every caller discharges that; this is the property
+    /// they rely on.
     #[test]
-    fn a_wrong_claimed_sum_is_rejected_in_the_first_round() {
+    fn a_wrong_claimed_sum_corrupts_the_residual() {
         let f = VirtualPolynomial::new(vec![pseudo_mle(3, 1)], vec![Term::single(0)]).unwrap();
         let claimed = f.sum_over_hypercube();
-        let (proof, _) = prove(f, &mut transcript()).unwrap();
+        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
 
-        let err = verify(&proof, claimed + FE::one(), 3, 1, &mut transcript()).unwrap_err();
-        assert!(matches!(err, Error::RoundSumMismatch { round: 0, .. }));
+        let honest = verify(&proof, claimed, 3, 1, &mut transcript()).unwrap();
+        assert_eq!(
+            f.evaluate(&honest.point).unwrap(),
+            honest.expected_evaluation
+        );
+
+        let lied = verify(&proof, claimed + FE::one(), 3, 1, &mut transcript()).unwrap();
+        assert_ne!(f.evaluate(&lied.point).unwrap(), lied.expected_evaluation);
     }
 
     #[test]
-    fn a_tampered_round_polynomial_is_rejected() {
+    fn a_tampered_round_polynomial_corrupts_the_residual() {
         let f = VirtualPolynomial::new(
             vec![pseudo_mle(4, 1), pseudo_mle(4, 2)],
             vec![Term::new(FE::one(), vec![0, 1])],
         )
         .unwrap();
         let claimed = f.sum_over_hypercube();
-        let (mut proof, _) = prove(f, &mut transcript()).unwrap();
+        let (mut proof, _) = prove(f.clone(), &mut transcript()).unwrap();
 
-        // Shift one endpoint of a later round: round 0 still passes, so this
-        // exercises the running-claim check rather than the initial one.
         proof.rounds[2].evaluations[0] += FE::one();
-        let err = verify(&proof, claimed, 4, 2, &mut transcript()).unwrap_err();
-        assert!(matches!(err, Error::RoundSumMismatch { round: 2, .. }));
+        let claim = verify(&proof, claimed, 4, 2, &mut transcript()).unwrap();
+        assert_ne!(f.evaluate(&claim.point).unwrap(), claim.expected_evaluation);
     }
 
     #[test]
@@ -360,11 +477,21 @@ mod tests {
         // lifted onto a different statement stops matching.
         let f = VirtualPolynomial::new(vec![pseudo_mle(4, 1)], vec![Term::single(0)]).unwrap();
         let claimed = f.sum_over_hypercube();
-        let (proof, _) = prove(f, &mut transcript()).unwrap();
+        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
 
-        verify(&proof, claimed, 4, 1, &mut transcript()).unwrap();
+        let honest = verify(&proof, claimed, 4, 1, &mut transcript()).unwrap();
+        assert_eq!(
+            f.evaluate(&honest.point).unwrap(),
+            honest.expected_evaluation
+        );
 
+        // Replayed, the verifier redraws different challenges, so the residual
+        // stops describing the polynomial.
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
-        assert!(verify(&proof, claimed, 4, 1, &mut other).is_err());
+        let replayed = verify(&proof, claimed, 4, 1, &mut other).unwrap();
+        assert_ne!(
+            f.evaluate(&replayed.point).unwrap(),
+            replayed.expected_evaluation
+        );
     }
 }

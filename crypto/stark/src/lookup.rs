@@ -844,6 +844,12 @@ pub struct AirWithBuses<
     preprocessed_commitment: Option<crate::config::Commitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Builds the precomputed columns on demand. Only the multilinear path asks
+    /// for them, and only on the verifying side, so they are generated rather
+    /// than carried — BITWISE's are 2^20 rows.
+    #[allow(clippy::type_complexity)]
+    precomputed_columns:
+        Option<std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
     /// Maximum number of bus elements across all interactions.
@@ -878,6 +884,7 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: self.preprocessed_commitment,
             num_precomputed_cols: self.num_precomputed_cols,
+            precomputed_columns: self.precomputed_columns.clone(),
             name: self.name.clone(),
             max_bus_elements: self.max_bus_elements,
         }
@@ -964,6 +971,7 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            precomputed_columns: None,
             name: None,
             max_bus_elements,
         }
@@ -993,6 +1001,22 @@ impl<
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
         self
+    }
+
+    /// The same, plus a generator for the columns themselves.
+    ///
+    /// Needed by the multilinear path, which checks the claimed openings of the
+    /// precomputed columns instead of comparing a commitment. Without it that
+    /// path cannot tell a real preprocessed table from a forged one.
+    pub fn with_preprocessed_columns(
+        self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        let mut air = self.with_preprocessed(commitment, num_precomputed_cols);
+        air.precomputed_columns = Some(columns);
+        air
     }
 
     /// Set a debug name for this AIR (for per-table bus sum tracking).
@@ -1361,6 +1385,13 @@ where
     fn precomputed_commitment(&self) -> crate::config::Commitment {
         self.preprocessed_commitment.unwrap_or([0u8; 32])
     }
+
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<F>>> {
+        self.precomputed_columns
+            .as_ref()
+            .map(|build| build())
+            .unwrap_or_default()
+    }
 }
 
 /// Struct representing how each lookup air should build its auxiliary trace
@@ -1420,7 +1451,7 @@ impl Multiplicity {
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
     #[inline]
-    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    pub(crate) fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,

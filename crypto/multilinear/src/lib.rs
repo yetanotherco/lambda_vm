@@ -1,26 +1,48 @@
 //! Multilinear machinery for a sumcheck-based proof system: extensions over the
-//! Boolean hypercube, sumcheck, zerocheck, LogUp-GKR, stacking and WHIR.
+//! Boolean hypercube, batched sumcheck, zerocheck, LogUp-GKR, stacking and
+//! WHIR.
 //!
 //! Not wired into the prover. The codeword domain is a two-adic subgroup of the
 //! base field; codeword values live in the extension.
 
+pub mod batch;
+pub mod claim_reduce;
 pub mod constraint_argument;
 pub mod eq;
 pub mod gkr;
+pub mod logup;
 pub mod mle;
 pub mod poly;
 pub mod selector;
+pub mod stacked_eval;
 pub mod stacking;
 pub mod sumcheck;
 pub mod uni_skip;
 pub mod virtual_poly;
 pub mod whir;
+pub mod whir_chain;
 pub mod whir_commit;
 pub mod whir_eval;
 pub mod whir_round;
 pub mod zerocheck;
 
+use math::field::{element::FieldElement, traits::IsField};
 use thiserror::Error;
+
+/// `[1, gamma, gamma^2, ..]` — the weights a batching challenge expands into.
+pub(crate) fn challenge_powers<F: IsField>(
+    gamma: &FieldElement<F>,
+    count: usize,
+) -> Vec<FieldElement<F>> {
+    let mut acc = FieldElement::<F>::one();
+    (0..count)
+        .map(|_| {
+            let current = acc.clone();
+            acc = &acc * gamma;
+            current
+        })
+        .collect()
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
@@ -34,12 +56,6 @@ pub enum Error {
     UnknownPolynomial { index: usize, len: usize },
     #[error("virtual polynomial has no terms")]
     EmptyPolynomial,
-    #[error("round {round}: claimed sum {claimed} does not match g(0) + g(1) = {got}")]
-    RoundSumMismatch {
-        round: usize,
-        claimed: String,
-        got: String,
-    },
     #[error("round {round}: expected a degree-{expected} polynomial, got {got} evaluations")]
     RoundDegreeMismatch {
         round: usize,
@@ -72,8 +88,18 @@ pub enum Error {
     EvaluationMismatch,
     #[error("eq(z, alpha) vanished, leaving the evaluation unconstrained")]
     DegenerateEvaluationPoint,
+    #[error("the out-of-domain point landed inside the evaluation domain")]
+    OodPointInDomain,
+    #[error("no proof-of-work nonce found for {bits} bits")]
+    GrindingFailed { bits: u8 },
+    #[error("a proof-of-work nonce does not carry the required {bits} bits")]
+    GrindingRejected { bits: u8 },
+    #[error("the buses do not balance across the proof")]
+    BusImbalance,
+    #[error("the statements rebuilt from the factor values are not what the batch demands")]
+    BatchMismatch,
+    #[error("a shifted read is not the shift of the column it claims to shift")]
+    ShiftedReadMismatch,
     #[error("column {column}: its claimed value does not match the commitment")]
     ColumnOpeningRejected { column: usize },
-    #[error("the constraint rebuilt from the column values is not what the zerocheck demands")]
-    ConstraintMismatch,
 }

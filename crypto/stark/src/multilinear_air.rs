@@ -1,15 +1,26 @@
-//! Bridges an AIR's constraint IR to the hypercube: one factor per distinct
-//! `(main, offset, col)` trace read, `offset` as a cyclic rotation, and row
-//! domains as [`Selector`]s.
+//! Bridges an AIR's constraint IR to the hypercube: one committed column per
+//! distinct `(main, col)` trace read, `offset` as a cyclic shift *view* of that
+//! column, and row domains as [`Selector`]s.
 //!
-//! Not sound on its own: nothing yet forces a rotated factor to be the shift of
-//! the column it claims to shift.
+//! Nothing here has to be taken on trust. A shifted factor gets no commitment
+//! of its own â [`claim_reduce`] binds its value to the column it shifts â and
+//! a selector gets none either: it is a *public* factor, which the verifier
+//! evaluates through [`Selector::evaluate`] rather than reading out of a
+//! commitment. Only the trace columns are committed, and they stay in the base
+//! field they are; the sumcheck's factors are lifted for it.
 
 use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
 };
-use multilinear::{Error as MlError, mle::Mle, poly::SumcheckPolynomial, selector::Selector};
+use multilinear::{
+    Error as MlError,
+    claim_reduce::{self, FactorSource},
+    constraint_argument::FactorKind,
+    mle::Mle,
+    poly::SumcheckPolynomial,
+    selector::Selector,
+};
 use std::collections::BTreeMap;
 
 use crate::constraint_ir::ir::{ConstraintProgram, Op};
@@ -17,7 +28,7 @@ use crate::constraints::builder::ConstraintMeta;
 
 /// Identifies a trace read: main-vs-aux, frame-step offset, column.
 ///
-/// `row` is not part of the key — every table in this VM reads row 0 of each
+/// `row` is not part of the key â every table in this VM reads row 0 of each
 /// frame step, which the IR interpreter asserts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LeafKey {
@@ -26,70 +37,128 @@ pub struct LeafKey {
     pub col: u16,
 }
 
-/// The multilinear factors an IR program reads, one per distinct trace leaf.
+/// Identifies a committed column: the same read with its offset dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ColumnKey {
+    pub main: bool,
+    pub col: u16,
+}
+
+impl LeafKey {
+    pub fn column(&self) -> ColumnKey {
+        ColumnKey {
+            main: self.main,
+            col: self.col,
+        }
+    }
+}
+
+/// Which column each sumcheck factor reads and how many steps ahead â the
+/// structure of [`TraceLeaves`] with none of the trace in it.
 ///
-/// Construction is `O(leaves · 2^n)`: each leaf's table is a rotation of its
-/// column.
-#[derive(Clone, Debug)]
-pub struct TraceLeaves<E: IsField> {
-    /// Leaf -> index into `polys`, kept ordered so the layout is deterministic.
+/// One slot per distinct `(main, offset, col)` read, one column per distinct
+/// `(main, col)`. A read at offset `k` is a **view**: the shifted table the
+/// sumcheck folds is derived from the column, and the column is the only thing
+/// that gets committed.
+///
+/// The verifier holds one of these: every slot assignment comes from the
+/// program, so both sides derive the same one and only the columns' values are
+/// missing. Building it lives here once â if the two sides laid out slots
+/// separately they could disagree, and every claim would be about the wrong
+/// table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafLayout {
+    /// Leaf -> factor slot, kept ordered so the layout is deterministic.
     index: BTreeMap<LeafKey, usize>,
-    polys: Vec<Mle<E>>,
+    /// Column key -> index into the columns.
+    column_index: BTreeMap<ColumnKey, usize>,
+    /// Column index -> which column it is, so materialization order is
+    /// explicit rather than a side effect of discovery order.
+    column_keys: Vec<ColumnKey>,
+    /// One entry per factor, in factor order.
+    sources: Vec<FactorSource>,
     num_vars: usize,
 }
 
-impl<E: IsField> TraceLeaves<E> {
-    /// Materializes one MLE per leaf in `program`.
-    ///
-    /// `main_column` and `aux_column` return a column's values indexed by step;
-    /// both must return exactly `2^num_vars` entries.
-    pub fn build<F>(
-        program: &ConstraintProgram<F, E>,
-        num_vars: usize,
-        mut main_column: impl FnMut(u16) -> Vec<FieldElement<E>>,
-        mut aux_column: impl FnMut(u16) -> Vec<FieldElement<E>>,
-    ) -> Result<Self, MlError>
+impl LeafLayout {
+    /// Records every trace read in `program`.
+    pub fn build<F, E>(program: &ConstraintProgram<F, E>, num_vars: usize) -> Self
     where
         F: IsField,
+        E: IsField,
     {
-        let size = 1usize << num_vars;
-        let mut index = BTreeMap::new();
-        let mut polys = Vec::new();
+        Self::build_live(program, &vec![true; program.nodes.len()], num_vars)
+    }
 
-        for op in &program.nodes {
+    /// The same, restricted to the reads a [`live_nodes`] mask keeps â so a
+    /// table's dropped LogUp constraints do not drag their auxiliary columns
+    /// in.
+    pub fn build_live<F, E>(
+        program: &ConstraintProgram<F, E>,
+        live: &[bool],
+        num_vars: usize,
+    ) -> Self
+    where
+        F: IsField,
+        E: IsField,
+    {
+        let mut layout = Self {
+            index: BTreeMap::new(),
+            column_index: BTreeMap::new(),
+            column_keys: Vec::new(),
+            sources: Vec::new(),
+            num_vars,
+        };
+
+        for (id, op) in program.nodes.iter().enumerate() {
+            if !live.get(id).copied().unwrap_or(false) {
+                continue;
+            }
             let Op::Var {
                 main, offset, col, ..
             } = *op
             else {
                 continue;
             };
-            let key = LeafKey { main, offset, col };
-            if index.contains_key(&key) {
-                continue;
-            }
-
-            let column = if main {
-                main_column(col)
-            } else {
-                aux_column(col)
-            };
-            if column.len() != size {
-                return Err(MlError::NotPowerOfTwo(column.len()));
-            }
-            // offset = k reads k steps ahead; on the cube that is a cyclic shift.
-            let shift = offset as usize % size;
-            let rotated = (0..size)
-                .map(|s| column[(s + shift) % size].clone())
-                .collect();
-
-            index.insert(key, polys.len());
-            polys.push(Mle::new(rotated)?);
+            layout.record(LeafKey { main, offset, col });
         }
 
-        Ok(Self {
-            index,
-            polys,
-            num_vars,
+        layout
+    }
+
+    /// Assigns `key` a factor slot, and its column an index if this is the
+    /// first read of it. Returns the slot, which an already-recorded key keeps.
+    fn record(&mut self, key: LeafKey) -> usize {
+        if let Some(&slot) = self.index.get(&key) {
+            return slot;
+        }
+        let column = match self.column_index.get(&key.column()) {
+            Some(&i) => i,
+            None => {
+                let i = self.column_keys.len();
+                self.column_keys.push(key.column());
+                self.column_index.insert(key.column(), i);
+                i
+            }
+        };
+        let slot = self.sources.len();
+        self.index.insert(key, slot);
+        self.sources
+            .push(FactorSource::shifted(column, key.offset as usize));
+        slot
+    }
+
+    /// Registers main column `col`, read unshifted, as a factor â returning the
+    /// slot it already had if the constraints read it too.
+    ///
+    /// A bus interaction reads columns the constraints may not, and the two
+    /// must share one factor when they overlap: that is what makes a column
+    /// read by a constraint and by a fingerprint fold once.
+    pub fn register_main(&mut self, col: u16) -> usize {
+        self.record(LeafKey {
+            main: true,
+            offset: 0,
+            col,
         })
     }
 
@@ -97,20 +166,182 @@ impl<E: IsField> TraceLeaves<E> {
         self.num_vars
     }
 
-    pub fn polys(&self) -> &[Mle<E>] {
-        &self.polys
+    /// The columns to commit, in the order they must be materialized.
+    pub fn column_keys(&self) -> &[ColumnKey] {
+        &self.column_keys
     }
 
+    /// How many columns get committed.
+    pub fn num_columns(&self) -> usize {
+        self.column_keys.len()
+    }
+
+    /// What each factor reads.
+    pub fn sources(&self) -> &[FactorSource] {
+        &self.sources
+    }
+
+    /// Number of sumcheck factors.
     pub fn len(&self) -> usize {
-        self.polys.len()
+        self.sources.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.polys.is_empty()
+        self.sources.is_empty()
     }
 
+    /// Factor slot of a trace read.
     pub fn index_of(&self, key: &LeafKey) -> Option<usize> {
         self.index.get(key).copied()
+    }
+
+    /// Column slot of a trace read.
+    pub fn column_of(&self, key: &ColumnKey) -> Option<usize> {
+        self.column_index.get(key).copied()
+    }
+
+    /// Fills the layout in, one call per column in [`column_keys`] order.
+    ///
+    /// [`column_keys`]: Self::column_keys
+    pub fn materialize<V: IsField>(
+        self,
+        mut column: impl FnMut(ColumnKey) -> Vec<FieldElement<V>>,
+    ) -> Result<TraceLeaves<V>, MlError> {
+        let size = 1usize << self.num_vars;
+        let mut columns = Vec::with_capacity(self.column_keys.len());
+        for &key in &self.column_keys {
+            let values = column(key);
+            if values.len() != size {
+                return Err(MlError::NotPowerOfTwo(values.len()));
+            }
+            columns.push(Mle::new(values)?);
+        }
+        Ok(TraceLeaves {
+            layout: self,
+            columns,
+        })
+    }
+}
+
+/// A [`LeafLayout`] with its columns materialized.
+///
+/// `V` is the columns' value field: the trace's, which is the base one.
+#[derive(Clone, Debug)]
+pub struct TraceLeaves<V: IsField> {
+    pub(crate) layout: LeafLayout,
+    pub(crate) columns: Vec<Mle<V>>,
+}
+
+impl<V: IsField> TraceLeaves<V> {
+    /// Materializes one MLE per distinct column in `program` and records the
+    /// offset each factor reads it at.
+    ///
+    /// `main_column` and `aux_column` return a column's values indexed by step;
+    /// both must return exactly `2^num_vars` entries.
+    pub fn build<F, E>(
+        program: &ConstraintProgram<F, E>,
+        num_vars: usize,
+        main_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
+        aux_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
+    ) -> Result<Self, MlError>
+    where
+        F: IsField,
+        E: IsField,
+    {
+        Self::build_live(
+            program,
+            &vec![true; program.nodes.len()],
+            num_vars,
+            main_column,
+            aux_column,
+        )
+    }
+
+    /// The same, restricted to the reads a [`live_nodes`] mask keeps.
+    pub fn build_live<F, E>(
+        program: &ConstraintProgram<F, E>,
+        live: &[bool],
+        num_vars: usize,
+        mut main_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
+        mut aux_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
+    ) -> Result<Self, MlError>
+    where
+        F: IsField,
+        E: IsField,
+    {
+        LeafLayout::build_live(program, live, num_vars).materialize(|key| {
+            if key.main {
+                main_column(key.col)
+            } else {
+                aux_column(key.col)
+            }
+        })
+    }
+
+    /// The slot assignment alone.
+    pub fn layout(&self) -> &LeafLayout {
+        &self.layout
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.layout.num_vars
+    }
+
+    /// The columns to commit.
+    pub fn columns(&self) -> &[Mle<V>] {
+        &self.columns
+    }
+
+    /// What each factor reads.
+    pub fn sources(&self) -> &[FactorSource] {
+        &self.layout.sources
+    }
+
+    /// The factor tables, every shifted read materialized.
+    pub fn factors(&self) -> Result<Vec<Mle<V>>, MlError> {
+        self.layout
+            .sources
+            .iter()
+            .map(|s| claim_reduce::materialize(&self.columns, s))
+            .collect()
+    }
+
+    /// Number of sumcheck factors.
+    pub fn len(&self) -> usize {
+        self.layout.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layout.is_empty()
+    }
+
+    /// Factor slot of a trace read.
+    pub fn index_of(&self, key: &LeafKey) -> Option<usize> {
+        self.layout.index_of(key)
+    }
+
+    /// Column slot of a trace read.
+    pub fn column_of(&self, key: &ColumnKey) -> Option<usize> {
+        self.layout.column_of(key)
+    }
+
+    /// Registers main column `col`, read unshifted, as a factor â returning the
+    /// slot it already had if the constraints read it too. `values` is only
+    /// consulted the first time the column appears.
+    pub fn register_main(
+        &mut self,
+        col: u16,
+        values: impl FnOnce() -> Vec<FieldElement<V>>,
+    ) -> Result<usize, MlError> {
+        let slot = self.layout.register_main(col);
+        if self.layout.column_keys.len() > self.columns.len() {
+            let values = values();
+            if values.len() != 1usize << self.layout.num_vars {
+                return Err(MlError::NotPowerOfTwo(values.len()));
+            }
+            self.columns.push(Mle::new(values)?);
+        }
+        Ok(slot)
     }
 }
 
@@ -133,6 +364,53 @@ impl<E: IsField> Default for Uniforms<E> {
             logup_table_offset: FieldElement::zero(),
         }
     }
+}
+
+/// The nodes reachable from `roots`, marked in one reverse pass â the node list
+/// is topologically ordered, so an operand always has a lower id.
+///
+/// A real table's program carries its LogUp constraints after the base prefix.
+/// The multilinear path replaces those with a bus, so their roots are dropped â
+/// and their subtrees are a large part of the DAG and read auxiliary columns
+/// and challenges this path does not have. Filtering by reachability is what
+/// keeps them out.
+pub fn live_nodes<F: IsField, E: IsField>(
+    program: &ConstraintProgram<F, E>,
+    roots: &[u32],
+) -> Vec<bool> {
+    let mut live = vec![false; program.nodes.len()];
+    for &root in roots {
+        live[root as usize] = true;
+    }
+    for (id, op) in program.nodes.iter().enumerate().rev() {
+        if !live[id] {
+            continue;
+        }
+        match *op {
+            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
+                live[a as usize] = true;
+                live[b as usize] = true;
+            }
+            Op::Neg(a) | Op::Embed(a) => live[a as usize] = true,
+            _ => {}
+        }
+    }
+    live
+}
+
+/// `beta^i` for `i` in `0..n` — the coefficients that batch a program's roots
+/// into one constraint.
+///
+/// Kept out of [`IrShape`] on purpose: `beta` is drawn once the trace is
+/// committed, and a shape is built before that.
+pub fn beta_powers<E: IsField>(beta: &FieldElement<E>, n: usize) -> Vec<FieldElement<E>> {
+    let mut powers = Vec::with_capacity(n);
+    let mut acc = FieldElement::<E>::one();
+    for _ in 0..n {
+        powers.push(acc.clone());
+        acc *= beta;
+    }
+    powers
 }
 
 /// Per-node degree of an IR program, in the trace variables.
@@ -158,19 +436,34 @@ fn node_degrees<F: IsField, E: IsField>(program: &ConstraintProgram<F, E>) -> Ve
     deg
 }
 
-/// An AIR's constraints as one polynomial: `C = Σ_i beta^i · s_i(x) · C_i(x)`.
+/// An AIR's constraints as one polynomial: `C = Î£_i beta^i Â· s_i(x) Â· C_i(x)`.
 ///
 /// Factors are the trace leaves followed by one table per distinct non-trivial
 /// selector, in that order.
 pub struct IrPolynomial<'a, F: IsField, E: IsField> {
     shape: IrShape<'a, F, E>,
+    beta_powers: Vec<FieldElement<E>>,
     polys: Vec<Mle<E>>,
+    layout: CommitLayout<F, E>,
+}
+
+/// What the argument needs from an [`IrPolynomial`]: the columns to commit,
+/// where every factor's table comes from, and the public tables in factor
+/// order.
+///
+/// The columns are the trace, so base-field; the public tables are computed and
+/// live where the challenges do.
+#[derive(Clone, Debug)]
+pub struct CommitLayout<F: IsField, E: IsField> {
+    pub columns: Vec<Mle<F>>,
+    pub kinds: Vec<FactorKind>,
+    pub public_tables: Vec<Mle<E>>,
 }
 
 /// The constraint's *structure*, with no trace data in it.
 ///
 /// [`combine`](Self::combine) turns factor values into the batched constraint,
-/// and needs nothing but this — so the verifier can hold one and rebuild
+/// and needs nothing but this â so the verifier can hold one and rebuild
 /// `C(point)` from values it learned through the commitment scheme, without
 /// ever seeing a column.
 #[derive(Clone)]
@@ -183,8 +476,10 @@ pub struct IrShape<'a, F: IsField, E: IsField> {
     /// Index into the factor list of each root's selector, or `None` when it
     /// applies on every step and the multiplication can be skipped.
     selector_of_root: Vec<Option<usize>>,
-    /// `beta^i` for each selected root.
-    beta_powers: Vec<FieldElement<E>>,
+    /// The public factors, in factor order â what the verifier recomputes.
+    public_selectors: Vec<Selector>,
+    /// Nodes reachable from `roots`; the rest are never evaluated.
+    live: Vec<bool>,
     degree: usize,
     num_vars: usize,
 }
@@ -198,7 +493,7 @@ where
     /// `meta`.
     pub fn new(
         program: &'a ConstraintProgram<F, E>,
-        leaves: TraceLeaves<E>,
+        leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
         meta: &[ConstraintMeta],
@@ -217,7 +512,7 @@ where
     /// wrap included.
     pub fn new_unselected(
         program: &'a ConstraintProgram<F, E>,
-        leaves: TraceLeaves<E>,
+        leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
     ) -> Result<Self, MlError> {
@@ -229,12 +524,91 @@ where
     /// Batches the listed roots with the matching selectors.
     pub fn with_roots(
         program: &'a ConstraintProgram<F, E>,
-        leaves: TraceLeaves<E>,
+        leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
         roots: Vec<u32>,
         selectors: &[Selector],
     ) -> Result<Self, MlError> {
+        let TraceLeaves { layout, columns } = leaves;
+        let (shape, kinds) = IrShape::build(program, &layout, uniforms, roots, selectors)?;
+        let beta_powers = beta_powers(&beta, shape.num_roots());
+        let public_tables = shape.public_tables()?;
+
+        let mut public = public_tables.iter().cloned();
+        let polys = kinds
+            .iter()
+            .map(|kind| match kind {
+                // The sumcheck's factors share a field, so a base view is
+                // lifted for it.
+                FactorKind::Committed(s) => {
+                    let view = claim_reduce::materialize(&columns, s)?;
+                    Mle::new(
+                        view.evals()
+                            .iter()
+                            .map(|v| v.clone().to_extension::<E>())
+                            .collect(),
+                    )
+                }
+                FactorKind::Public => public.next().ok_or(MlError::EmptyPolynomial),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            shape,
+            beta_powers,
+            polys,
+            layout: CommitLayout {
+                columns,
+                kinds,
+                public_tables,
+            },
+        })
+    }
+
+    /// The structure alone, for the verifier.
+    pub fn shape(&self) -> &IrShape<'a, F, E> {
+        &self.shape
+    }
+
+    /// The columns to commit and, for each sumcheck factor, where its table
+    /// comes from. Selectors are public factors, so they are not columns.
+    pub fn committed(&self) -> (&[Mle<F>], &[FactorKind]) {
+        (&self.layout.columns, &self.layout.kinds)
+    }
+
+    /// The whole layout, dropping the factor tables â the argument rebuilds
+    /// those from the columns and the public tables.
+    pub fn into_layout(self) -> CommitLayout<F, E> {
+        self.layout
+    }
+
+    /// The structure and the layout together, dropping the factor tables.
+    pub fn into_shape_and_layout(self) -> (IrShape<'a, F, E>, CommitLayout<F, E>) {
+        (self.shape, self.layout)
+    }
+}
+
+impl<'a, F, E> IrShape<'a, F, E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    /// The batched constraint's structure, from the program and a slot
+    /// assignment alone.
+    ///
+    /// Returns the factor kinds alongside it: the trace leaves in slot order,
+    /// then one public factor per distinct non-trivial selector. **The verifier
+    /// builds this too** â the whole point of taking a [`LeafLayout`] rather
+    /// than a materialized [`TraceLeaves`] â so the two sides cannot disagree
+    /// on what a factor slot means.
+    pub fn build(
+        program: &'a ConstraintProgram<F, E>,
+        leaves: &LeafLayout,
+        uniforms: Uniforms<E>,
+        roots: Vec<u32>,
+        selectors: &[Selector],
+    ) -> Result<(Self, Vec<FactorKind>), MlError> {
         if selectors.len() != roots.len() {
             return Err(MlError::VariableCountMismatch {
                 expected: roots.len(),
@@ -243,16 +617,21 @@ where
         }
         let num_vars = leaves.num_vars;
         let degrees = node_degrees(program);
+        let live = live_nodes(program, &roots);
 
-        let TraceLeaves {
-            index: leaf_index,
-            mut polys,
-            ..
-        } = leaves;
+        let mut kinds: Vec<FactorKind> = leaves
+            .sources
+            .iter()
+            .copied()
+            .map(FactorKind::Committed)
+            .collect();
 
-        // One table per distinct non-trivial selector, shared across roots.
+        // One table per distinct non-trivial selector, shared across roots, and
+        // public: the verifier evaluates it in closed form instead of reading
+        // it out of a commitment.
         let mut selector_slot: BTreeMap<usize, usize> = BTreeMap::new();
         let mut selector_of_root = Vec::with_capacity(roots.len());
+        let mut public_selectors = Vec::new();
         for selector in selectors {
             if selector.is_trivial() {
                 selector_of_root.push(None);
@@ -261,10 +640,11 @@ where
             let slot = match selector_slot.get(&selector.end_exemptions) {
                 Some(&i) => i,
                 None => {
-                    let i = polys.len();
-                    polys.push(selector.table(num_vars)?);
-                    selector_slot.insert(selector.end_exemptions, i);
-                    i
+                    let factor = kinds.len();
+                    kinds.push(FactorKind::Public);
+                    public_selectors.push(*selector);
+                    selector_slot.insert(selector.end_exemptions, factor);
+                    factor
                 }
             };
             selector_of_root.push(Some(slot));
@@ -278,31 +658,32 @@ where
             .max()
             .unwrap_or(0);
 
-        let mut beta_powers = Vec::with_capacity(roots.len());
-        let mut acc = FieldElement::<E>::one();
-        for _ in 0..roots.len() {
-            beta_powers.push(acc.clone());
-            acc *= &beta;
-        }
-
-        Ok(Self {
-            shape: IrShape {
+        Ok((
+            Self {
                 program,
-                leaf_index,
+                leaf_index: leaves.index.clone(),
                 uniforms,
                 roots,
                 selector_of_root,
-                beta_powers,
+                public_selectors,
+                live,
                 degree,
                 num_vars,
             },
-            polys,
-        })
+            kinds,
+        ))
     }
 
-    /// The structure alone, for the verifier.
-    pub fn shape(&self) -> &IrShape<'a, F, E> {
-        &self.shape
+    /// The public factors' tables, in the order they appear in the kinds.
+    ///
+    /// Only the prover needs them: the verifier evaluates the same selectors in
+    /// closed form through [`public_values`](Self::public_values), which is why
+    /// building the structure does not build these.
+    pub fn public_tables(&self) -> Result<Vec<Mle<E>>, MlError> {
+        self.public_selectors
+            .iter()
+            .map(|s| s.table(self.num_vars))
+            .collect()
     }
 }
 
@@ -319,12 +700,26 @@ where
         self.num_vars
     }
 
+    /// How many roots are batched — the length `beta_powers` must have.
+    pub fn num_roots(&self) -> usize {
+        self.roots.len()
+    }
+
     /// The batched constraint, given each factor's value at a point.
-    pub fn combine(&self, values: &[FieldElement<E>]) -> FieldElement<E> {
+    ///
+    /// `beta_powers` batches the roots and is **not** part of the structure:
+    /// the challenge behind it is drawn after the trace is committed, which a
+    /// layout built before there is a transcript cannot know. Size it with
+    /// [`num_roots`](Self::num_roots).
+    pub fn combine(
+        &self,
+        beta_powers: &[FieldElement<E>],
+        values: &[FieldElement<E>],
+    ) -> FieldElement<E> {
         let nodes = self.run(values);
         self.roots
             .iter()
-            .zip(&self.beta_powers)
+            .zip(beta_powers)
             .zip(&self.selector_of_root)
             .fold(FieldElement::zero(), |acc, ((&root, beta_pow), sel)| {
                 let mut term = &nodes[root as usize] * beta_pow;
@@ -335,10 +730,29 @@ where
             })
     }
 
+    /// The public factors' values at `point`, in factor order.
+    ///
+    /// A selector is structure, not data, so the verifier computes it here
+    /// rather than believing a commitment for it.
+    pub fn public_values(
+        &self,
+        point: &[FieldElement<E>],
+    ) -> Result<Vec<FieldElement<E>>, MlError> {
+        self.public_selectors
+            .iter()
+            .map(|s| s.evaluate(point))
+            .collect()
+    }
+
     /// Runs the DAG with each trace leaf taking the supplied value.
     fn run(&self, values: &[FieldElement<E>]) -> Vec<FieldElement<E>> {
         let mut nodes: Vec<FieldElement<E>> = Vec::with_capacity(self.program.nodes.len());
-        for op in &self.program.nodes {
+        for (id, op) in self.program.nodes.iter().enumerate() {
+            if !self.live[id] {
+                // Not reachable from a selected root, so nothing reads it.
+                nodes.push(FieldElement::zero());
+                continue;
+            }
             let v = match *op {
                 Op::ConstBase(idx) => {
                     let base = self.program.base_consts[idx as usize].clone();
@@ -388,7 +802,7 @@ where
     }
 
     fn combine(&self, values: &[FieldElement<E>]) -> FieldElement<E> {
-        self.shape.combine(values)
+        self.shape.combine(&self.beta_powers, values)
     }
 
     fn fix_first_variable(&mut self, r: &FieldElement<E>) -> Result<(), MlError> {
@@ -413,6 +827,8 @@ mod tests {
     };
 
     type ExtE = FieldElement<Ext>;
+    /// The trace's own field: a column is base, only the challenges are not.
+    type BaseE = FieldElement<Fp>;
 
     const COL_A: usize = 0;
     const COL_B: usize = 1;
@@ -420,11 +836,11 @@ mod tests {
 
     /// Two constraints in the shape real tables use:
     ///
-    /// - idx 0, degree 1, reads the **next** step: `next(a) − a − b`
-    /// - idx 1, degree 2, current step only: `a·a − c`
+    /// - idx 0, degree 1, reads the **next** step: `next(a) â a â b`
+    /// - idx 1, degree 2, current step only: `aÂ·a â c`
     ///
     /// Unlike the Fibonacci examples these hold cyclically, so no wrap-around
-    /// exemption is needed — selectors are not modelled yet (see module docs).
+    /// exemption is needed â selectors are not modelled yet (see module docs).
     struct SampleSet;
 
     impl ConstraintSet<Fp, Ext> for SampleSet {
@@ -450,19 +866,19 @@ mod tests {
     }
 
     /// Columns satisfying both constraints on every step, wrap included.
-    fn satisfying_columns(num_vars: usize) -> [Vec<ExtE>; 3] {
+    fn satisfying_columns(num_vars: usize) -> [Vec<BaseE>; 3] {
         let size = 1usize << num_vars;
-        let a: Vec<ExtE> = (0..size as u64)
-            .map(|i| ExtE::from(i.wrapping_mul(7).wrapping_add(3)))
+        let a: Vec<BaseE> = (0..size as u64)
+            .map(|i| BaseE::from(i.wrapping_mul(7).wrapping_add(3)))
             .collect();
-        // b is the cyclic forward difference, so `next(a) − a − b` vanishes
+        // b is the cyclic forward difference, so `next(a) â a â b` vanishes
         // including across the wrap.
-        let b: Vec<ExtE> = (0..size).map(|i| a[(i + 1) % size] - a[i]).collect();
-        let c: Vec<ExtE> = a.iter().map(|x| x * x).collect();
+        let b: Vec<BaseE> = (0..size).map(|i| a[(i + 1) % size] - a[i]).collect();
+        let c: Vec<BaseE> = a.iter().map(|x| x * x).collect();
         [a, b, c]
     }
 
-    fn leaves_from(columns: &[Vec<ExtE>; 3], num_vars: usize) -> TraceLeaves<Ext> {
+    fn leaves_from(columns: &[Vec<BaseE>; 3], num_vars: usize) -> TraceLeaves<Fp> {
         let prog = program();
         TraceLeaves::build(
             &prog,
@@ -481,7 +897,7 @@ mod tests {
     fn one_leaf_per_distinct_trace_read() {
         let num_vars = 4;
         let leaves = leaves_from(&satisfying_columns(num_vars), num_vars);
-        // a@0, b@0, a@1, c@0 — the next-step read of `a` is its own factor.
+        // a@0, b@0, a@1, c@0 â the next-step read of `a` is its own factor.
         assert_eq!(leaves.len(), 4);
         assert!(
             leaves
@@ -495,10 +911,11 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_leaf_is_the_rotation_of_its_column() {
+    fn an_offset_leaf_is_a_shift_view_of_one_committed_column() {
         let num_vars = 3;
         let columns = satisfying_columns(num_vars);
         let leaves = leaves_from(&columns, num_vars);
+        let factors = leaves.factors().unwrap();
         let size = 1usize << num_vars;
 
         let cur = leaves
@@ -516,14 +933,129 @@ mod tests {
             })
             .unwrap();
 
+        // Both factors read the same committed column.
+        assert_eq!(leaves.sources()[cur].column, leaves.sources()[next].column);
+        assert_eq!(leaves.sources()[cur].offset, 0);
+        assert_eq!(leaves.sources()[next].offset, 1);
+
         for s in 0..size {
-            assert_eq!(leaves.polys()[cur].evals()[s], columns[COL_A][s]);
+            assert_eq!(factors[cur].evals()[s], columns[COL_A][s]);
             assert_eq!(
-                leaves.polys()[next].evals()[s],
+                factors[next].evals()[s],
                 columns[COL_A][(s + 1) % size],
                 "step {s}"
             );
         }
+    }
+
+    #[test]
+    fn a_next_step_read_adds_no_commitment() {
+        // Four factors â a@0, b@0, a@1, c@0 â over three columns: the next-step
+        // read of `a` rides on `a`'s commitment instead of taking its own.
+        let num_vars = 3;
+        let leaves = leaves_from(&satisfying_columns(num_vars), num_vars);
+        assert_eq!(leaves.len(), 4);
+        assert_eq!(leaves.columns().len(), 3);
+    }
+
+    #[test]
+    fn registering_a_column_the_constraints_read_reuses_its_factor() {
+        let num_vars = 3;
+        let columns = satisfying_columns(num_vars);
+        let mut leaves = leaves_from(&columns, num_vars);
+        let before = (leaves.len(), leaves.columns().len());
+
+        let slot = leaves
+            .register_main(COL_A as u16, || unreachable!("already a factor"))
+            .unwrap();
+
+        assert_eq!(
+            slot,
+            leaves
+                .index_of(&LeafKey {
+                    main: true,
+                    offset: 0,
+                    col: COL_A as u16
+                })
+                .unwrap()
+        );
+        assert_eq!((leaves.len(), leaves.columns().len()), before);
+    }
+
+    #[test]
+    fn registering_a_column_no_constraint_reads_adds_one_of_each() {
+        // A bus can read a column the constraints ignore, and then it does need
+        // a commitment.
+        let num_vars = 3;
+        let columns = satisfying_columns(num_vars);
+        let mut leaves = leaves_from(&columns, num_vars);
+        let (factors, committed) = (leaves.len(), leaves.columns().len());
+
+        let bus_column: Vec<BaseE> = (0..(1u64 << num_vars)).map(BaseE::from).collect();
+        let slot = leaves.register_main(9, || bus_column.clone()).unwrap();
+
+        assert_eq!(slot, factors);
+        assert_eq!(leaves.len(), factors + 1);
+        assert_eq!(leaves.columns().len(), committed + 1);
+        assert_eq!(leaves.factors().unwrap()[slot].evals(), &bus_column[..]);
+    }
+
+    /// Reads column 0 only at the next step, so its column is committed with no
+    /// unshifted factor of its own.
+    struct AheadOnlySet;
+
+    impl ConstraintSet<Fp, Ext> for AheadOnlySet {
+        fn max_degree(&self) -> usize {
+            1
+        }
+
+        fn eval<B: ConstraintBuilder<Fp, Ext>>(&self, b: &mut B) {
+            let next = b.main(1, COL_A);
+            let other = b.main(0, COL_B);
+            b.emit_base(0, next - other);
+        }
+    }
+
+    #[test]
+    fn registering_a_column_only_read_ahead_reuses_its_commitment() {
+        let num_vars = 3;
+        let columns = satisfying_columns(num_vars);
+        let mut cb = CaptureBuilder::<Fp, Ext>::new();
+        AheadOnlySet.eval(&mut cb);
+        let prog = cb.finish(1).0;
+
+        let mut leaves = TraceLeaves::build(
+            &prog,
+            num_vars,
+            |col| columns[col as usize].clone(),
+            |_| unreachable!("no aux reads"),
+        )
+        .unwrap();
+        // Two factors â A ahead, B here â over two columns.
+        assert_eq!((leaves.len(), leaves.columns().len()), (2, 2));
+
+        let slot = leaves
+            .register_main(COL_A as u16, || unreachable!("already committed"))
+            .unwrap();
+
+        // A new factor, but no new commitment: the shifted read already put
+        // column A in.
+        assert_eq!(slot, 2);
+        assert_eq!((leaves.len(), leaves.columns().len()), (3, 2));
+        assert_eq!(leaves.factors().unwrap()[slot].evals(), &columns[COL_A][..]);
+    }
+
+    #[test]
+    fn a_registered_column_of_the_wrong_height_is_rejected() {
+        let num_vars = 3;
+        let columns = satisfying_columns(num_vars);
+        let mut leaves = leaves_from(&columns, num_vars);
+        assert_eq!(
+            leaves
+                .register_main(9, || vec![BaseE::zero(); 3])
+                .unwrap_err(),
+            MlError::NotPowerOfTwo(3)
+        );
     }
 
     #[test]
@@ -533,7 +1065,7 @@ mod tests {
         let leaves = leaves_from(&satisfying_columns(num_vars), num_vars);
         let poly = IrPolynomial::new_unselected(&prog, leaves, Uniforms::default(), ExtE::from(5))
             .unwrap();
-        // `a·a − c` is the degree-2 constraint; batching does not raise it.
+        // `aÂ·a â c` is the degree-2 constraint; batching does not raise it.
         assert_eq!(poly.degree(), 2);
     }
 
@@ -567,32 +1099,46 @@ mod tests {
         let num_vars = 5;
         let prog = program();
         let mut columns = satisfying_columns(num_vars);
-        columns[COL_C][9] += ExtE::one();
+        columns[COL_C][9] += BaseE::one();
 
-        let leaves = leaves_from(&columns, num_vars);
-        let poly = IrPolynomial::new_unselected(&prog, leaves, Uniforms::default(), ExtE::from(5))
-            .unwrap();
+        let build = || {
+            IrPolynomial::new_unselected(
+                &prog,
+                leaves_from(&columns, num_vars),
+                Uniforms::default(),
+                ExtE::from(5),
+            )
+            .unwrap()
+        };
+        let poly = build();
         assert_ne!(poly.sum_over_hypercube(), ExtE::zero());
         let degree = poly.degree();
 
+        // `g(0)` is derived from the claim, so the lie surfaces in the residual
+        // rather than inside a round â and discharging that is the caller's.
         let proof = zerocheck::prove(poly, &mut transcript()).unwrap().proof;
-        assert!(zerocheck::verify(&proof, num_vars, degree, &mut transcript()).is_err());
+        let claim = zerocheck::verify(&proof, num_vars, degree, &mut transcript()).unwrap();
+        assert_ne!(
+            claim.constraint_evaluation(),
+            Some(build().evaluate(&claim.point).unwrap()),
+            "a violated constraint produced a consistent claim"
+        );
     }
 
     #[test]
     fn violations_that_cancel_in_the_sum_are_still_caught() {
-        // Perturbing a[3] breaks `next(a) − a − b` twice: at step 2 the
+        // Perturbing a[3] breaks `next(a) â a â b` twice: at step 2 the
         // next-step read is one too high, at step 3 the current-step read is.
         // The two violations are equal and opposite, so the plain sum over the
-        // cube stays zero — this is exactly the case eq(r, ·) exists to catch,
+        // cube stays zero â this is exactly the case eq(r, Â·) exists to catch,
         // and it is reachable from an ordinary AIR, not just a contrived one.
         let num_vars = 4;
         let prog = program();
         let mut columns = satisfying_columns(num_vars);
-        columns[COL_A][3] += ExtE::one();
+        columns[COL_A][3] += BaseE::one();
         columns[COL_C][3] = columns[COL_A][3] * columns[COL_A][3]; // keep idx 1 satisfied
 
-        let build = |cols: &[Vec<ExtE>; 3]| {
+        let build = |cols: &[Vec<BaseE>; 3]| {
             IrPolynomial::new_unselected(
                 &prog,
                 leaves_from(cols, num_vars),
@@ -634,12 +1180,12 @@ mod tests {
     #[test]
     fn batching_covers_every_constraint() {
         // With only the degree-2 root selected, a violation of the degree-1
-        // one must go unnoticed — which is what makes the batched version's
+        // one must go unnoticed â which is what makes the batched version's
         // rejection meaningful.
         let num_vars = 4;
         let prog = program();
         let mut columns = satisfying_columns(num_vars);
-        columns[COL_B][2] += ExtE::one(); // breaks idx 0 only
+        columns[COL_B][2] += BaseE::one(); // breaks idx 0 only
 
         let only_second = IrPolynomial::with_roots(
             &prog,
@@ -705,10 +1251,10 @@ mod tests {
 
     /// A genuine Fibonacci trace: the recurrence holds on every step except
     /// the wrap, exactly where the exemption applies.
-    fn fib_columns(num_vars: usize) -> [Vec<ExtE>; 2] {
+    fn fib_columns(num_vars: usize) -> [Vec<BaseE>; 2] {
         let size = 1usize << num_vars;
-        let mut c0 = vec![ExtE::one()];
-        let mut c1 = vec![ExtE::one()];
+        let mut c0 = vec![BaseE::one()];
+        let mut c1 = vec![BaseE::one()];
         for i in 1..size {
             // s0_{i} = s0_{i-1} + s1_{i-1}; s1_{i} = s1_{i-1} + s0_{i}
             let next0 = c0[i - 1] + c1[i - 1];
@@ -719,7 +1265,7 @@ mod tests {
         [c0, c1]
     }
 
-    fn fib_leaves(columns: &[Vec<ExtE>; 2], num_vars: usize) -> TraceLeaves<Ext> {
+    fn fib_leaves(columns: &[Vec<BaseE>; 2], num_vars: usize) -> TraceLeaves<Fp> {
         let (prog, _) = fib_program();
         TraceLeaves::build(
             &prog,
@@ -816,8 +1362,38 @@ mod tests {
         let num_vars = 5;
         let (prog, meta) = fib_program();
         let mut columns = fib_columns(num_vars);
-        columns[0][7] += ExtE::one();
+        columns[0][7] += BaseE::one();
 
+        let build = || {
+            IrPolynomial::new(
+                &prog,
+                fib_leaves(&columns, num_vars),
+                Uniforms::default(),
+                ExtE::from(5),
+                &meta,
+            )
+            .unwrap()
+        };
+        let poly = build();
+        let degree = poly.degree();
+
+        let proof = zerocheck::prove(poly, &mut transcript()).unwrap().proof;
+        let claim = zerocheck::verify(&proof, num_vars, degree, &mut transcript()).unwrap();
+        assert_ne!(
+            claim.constraint_evaluation(),
+            Some(build().evaluate(&claim.point).unwrap()),
+            "a violated constraint produced a consistent claim"
+        );
+    }
+
+    #[test]
+    fn the_fibonacci_air_commits_only_its_two_columns() {
+        // Five factors: both columns at the current and the next step, plus the
+        // shared selector. Two commitments: the next-step reads are views of
+        // the columns, and the selector is public.
+        let num_vars = 3;
+        let (prog, meta) = fib_program();
+        let columns = fib_columns(num_vars);
         let poly = IrPolynomial::new(
             &prog,
             fib_leaves(&columns, num_vars),
@@ -826,10 +1402,39 @@ mod tests {
             &meta,
         )
         .unwrap();
-        let degree = poly.degree();
 
-        let proof = zerocheck::prove(poly, &mut transcript()).unwrap().proof;
-        assert!(zerocheck::verify(&proof, num_vars, degree, &mut transcript()).is_err());
+        let (committed, kinds) = poly.committed();
+        assert_eq!(kinds.len(), 5);
+        assert_eq!(committed.len(), 2);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == FactorKind::Public).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_verifier_recomputes_the_selector_it_never_receives() {
+        // The public value the argument uses is the selector's closed form, and
+        // it is the same table the prover folded.
+        let num_vars = 3;
+        let (prog, meta) = fib_program();
+        let columns = fib_columns(num_vars);
+        let poly = IrPolynomial::new(
+            &prog,
+            fib_leaves(&columns, num_vars),
+            Uniforms::default(),
+            ExtE::from(5),
+            &meta,
+        )
+        .unwrap();
+
+        let shape = poly.shape().clone();
+        let point: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(31 + i as u64)).collect();
+        let public = shape.public_values(&point).unwrap();
+        assert_eq!(public.len(), 1);
+
+        let table = poly.into_layout().public_tables.pop().unwrap();
+        assert_eq!(public[0], table.evaluate(&point).unwrap());
     }
 
     #[test]
@@ -853,15 +1458,12 @@ mod tests {
 
     /// Runs the full argument over the captured AIR and returns the verdict.
     ///
-    /// **Caveat, and it is not small.** The `next`-step read is committed as its
-    /// own polynomial, so nothing here forces it to be the rotation of the
-    /// column it claims to shift — a prover free to choose both could satisfy
-    /// this with unrelated tables. Closing that needs the rotation kernel
-    /// (`multilinear::eq::rot_eval`) wired as its own argument.
-    fn argue_fib(columns: &[Vec<ExtE>; 2], num_vars: usize) -> Result<(), multilinear::Error> {
+    /// The `next`-step read is a view of the column it shifts: it gets no
+    /// commitment, and the shift kernel binds its value to that column.
+    fn argue_fib(columns: &[Vec<BaseE>; 2], num_vars: usize) -> Result<(), multilinear::Error> {
         use multilinear::{
             constraint_argument::{self, CommittedTrace, TraceClaim},
-            whir_eval::EvalConfig,
+            whir_chain::{ChainConfig, GrindBits},
         };
 
         let (prog, meta) = fib_program();
@@ -873,35 +1475,48 @@ mod tests {
         )?;
         let poly = IrPolynomial::new(&prog, leaves, Uniforms::default(), ExtE::from(5), &meta)?;
         let degree = poly.degree();
-        let factors = poly.polys().to_vec();
         let shape = poly.shape().clone();
+        let layout = poly.into_layout();
 
-        let config = EvalConfig {
+        let config = ChainConfig {
             log_blowup: 2,
+            log_folding: 2,
             num_queries: 3,
+            grind: GrindBits::default(),
         };
         // Domain in the base field, columns in the degree-3 extension.
-        let trace = CommittedTrace::<Fp, Ext>::commit(factors, &config)?;
+        let n_stack = constraint_argument::one_stack(num_vars, layout.columns.len());
+        let trace = CommittedTrace::<Fp, Ext>::commit_views(
+            layout.columns,
+            layout.kinds,
+            layout.public_tables,
+            n_stack,
+            &config,
+        )?;
         let roots = trace.roots();
+        let betas = beta_powers(&ExtE::from(5), shape.num_roots());
 
         let mut prover_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
         let proof = constraint_argument::prove::<Fp, Ext, _, _>(
             &trace,
-            |v: &[ExtE]| shape.combine(v),
+            |v: &[ExtE]| shape.combine(&betas, v),
             degree,
             &config,
             &mut prover_transcript,
         )?;
 
         let mut verifier_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
-        constraint_argument::verify::<Fp, Ext, _, _>(
+        constraint_argument::verify::<Fp, Ext, _, _, _>(
             &proof,
             TraceClaim {
                 roots: &roots,
+                kinds: trace.kinds(),
+                layout: trace.layout(),
                 domain: trace.domain(),
                 num_vars,
             },
-            |v: &[ExtE]| shape.combine(v),
+            |v: &[ExtE]| shape.combine(&betas, v),
+            |point: &[ExtE]| shape.public_values(point),
             degree,
             &config,
             &mut verifier_transcript,
@@ -922,7 +1537,7 @@ mod tests {
     fn a_real_air_with_a_broken_row_is_rejected_end_to_end() {
         let num_vars = 4;
         let mut columns = fib_columns(num_vars);
-        columns[1][6] += ExtE::one();
+        columns[1][6] += BaseE::one();
         assert!(argue_fib(&columns, num_vars).is_err());
     }
 }

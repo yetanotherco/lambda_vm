@@ -13,6 +13,12 @@ use math::field::{
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 
+#[cfg(not(feature = "parallel"))]
+use math::fft::bowers_fft::bowers_fft_opt_fused;
+#[cfg(feature = "parallel")]
+use math::fft::bowers_fft::bowers_fft_opt_fused_parallel;
+use math::fft::{bit_reversing::in_place_bit_reverse_permute, bowers_fft::LayerTwiddles};
+
 use crate::{Error, mle::Mle};
 
 /// The evaluation domain: a coset-free multiplicative subgroup of order `2^k`.
@@ -112,17 +118,26 @@ fn reverse_bits(index: usize, width: usize) -> usize {
     (0..width).fold(0, |acc, i| acc | (((index >> i) & 1) << (width - 1 - i)))
 }
 
-/// Evaluates the univariate lift on every point of `domain`.
+/// Evaluates the univariate lift on every point of `domain`, in domain order:
+/// `out[j] = F(g^j)`.
 ///
-/// Naive Horner per point: this is the reference, not the fast path. A real
-/// prover runs an NTT here.
+/// One NTT, threaded under the `parallel` feature. The Bowers transform leaves
+/// its output bit-reversed, and the ordering is load-bearing —
+/// [`fold_codeword`] pairs `j` with `j + N/2` because `g^(j + N/2) = −g^j` — so
+/// it is permuted back.
+///
+/// The `Send + Sync` bounds are unconditional so the signature does not change
+/// with the feature; the serial path does not need them, and every field this
+/// crate is used with satisfies them.
 pub fn encode<F, E>(
     coeffs: &[FieldElement<E>],
     domain: &Domain<F>,
 ) -> Result<Vec<FieldElement<E>>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
 {
     if coeffs.len() > domain.size() {
         return Err(Error::CodewordTooShort {
@@ -130,27 +145,42 @@ where
             domain: domain.size(),
         });
     }
-    Ok(domain
-        .elements()
-        .iter()
-        .map(|x| {
-            coeffs
-                .iter()
-                .rfold(FieldElement::<E>::zero(), |acc, c| x * acc + c)
-        })
-        .collect())
+    let mut values = coeffs.to_vec();
+    values.resize(domain.size(), FieldElement::<E>::zero());
+    if domain.log_size == 0 {
+        return Ok(values);
+    }
+
+    let twiddles =
+        LayerTwiddles::<F>::new(domain.log_size as u64).ok_or(Error::SkipDomainUnavailable {
+            l_skip: domain.log_size,
+            two_adicity: F::TWO_ADICITY as usize,
+        })?;
+    #[cfg(feature = "parallel")]
+    bowers_fft_opt_fused_parallel::<F, E>(&mut values, &twiddles)
+        .map_err(|_| Error::NotPowerOfTwo(domain.size()))?;
+    #[cfg(not(feature = "parallel"))]
+    bowers_fft_opt_fused::<F, E>(&mut values, &twiddles)
+        .map_err(|_| Error::NotPowerOfTwo(domain.size()))?;
+    in_place_bit_reverse_permute(&mut values);
+    Ok(values)
 }
 
 /// Folds a codeword once: `F_α = F₀ + α·F₁`, recovering the halves from `F(x)`
 /// and `F(−x)`. `−x` is half a period away, so `j` pairs with `j + N/2`.
-pub fn fold_codeword<F, E>(
-    codeword: &[FieldElement<E>],
+///
+/// The values go in over `C` and come out over `N`: a committed trace codeword
+/// is base-field, and the first fold is what lifts it, since `α` is an
+/// extension challenge. Later folds are `N → N`.
+pub fn fold_codeword<F, C, N>(
+    codeword: &[FieldElement<C>],
     domain: &Domain<F>,
-    alpha: &FieldElement<E>,
-) -> Result<Vec<FieldElement<E>>, Error>
+    alpha: &FieldElement<N>,
+) -> Result<Vec<FieldElement<N>>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N>,
+    N: IsField,
 {
     if codeword.len() != domain.size() {
         return Err(Error::CodewordTooShort {
@@ -165,34 +195,52 @@ where
     let two_inv = (FieldElement::<F>::one() + FieldElement::<F>::one())
         .inv()
         .expect("2 is invertible");
+    // The odd half needs `1/g^j`, and those are the powers of `1/g` — so one
+    // inversion, not one per position. Folded together with `1/2` while we are
+    // at it, since they only ever appear as a product.
+    let step = domain
+        .generator()
+        .inv()
+        .expect("a domain generator is nonzero");
+    let mut odd_scale = two_inv.clone();
 
-    let mut x = FieldElement::<F>::one();
     let mut out = Vec::with_capacity(half);
     for j in 0..half {
         let (a, b) = (&codeword[j], &codeword[j + half]);
         let even = &two_inv * (a + b);
-        let x_inv = x.inv().expect("domain elements are nonzero");
-        let odd = (&two_inv * x_inv) * (a - b);
-        out.push(even + alpha * odd);
-        x *= domain.generator();
+        let odd = &odd_scale * (a - b);
+        // The base element on the left: the only direction the tower gives.
+        out.push(even + odd * alpha);
+        odd_scale *= &step;
     }
     Ok(out)
 }
 
 /// Folds `k` times, squaring the domain at each step.
-pub fn fold_codeword_k<F, E>(
-    codeword: &[FieldElement<E>],
+///
+/// The first fold lifts `C` into `N`; the rest stay there.
+pub fn fold_codeword_k<F, C, N>(
+    codeword: &[FieldElement<C>],
     domain: &Domain<F>,
-    alphas: &[FieldElement<E>],
-) -> Result<(Vec<FieldElement<E>>, Domain<F>), Error>
+    alphas: &[FieldElement<N>],
+) -> Result<(Vec<FieldElement<N>>, Domain<F>), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N>,
+    N: IsField,
 {
-    let mut current = codeword.to_vec();
-    let mut current_domain = domain.clone();
-    for alpha in alphas {
-        current = fold_codeword(&current, &current_domain, alpha)?;
+    let Some((first, rest)) = alphas.split_first() else {
+        let lifted = codeword
+            .iter()
+            .map(|v| v.clone().to_extension::<N>())
+            .collect();
+        return Ok((lifted, domain.clone()));
+    };
+
+    let mut current = fold_codeword::<F, C, N>(codeword, domain, first)?;
+    let mut current_domain = domain.squared()?;
+    for alpha in rest {
+        current = fold_codeword::<F, N, N>(&current, &current_domain, alpha)?;
         current_domain = current_domain.squared()?;
     }
     Ok((current, current_domain))
@@ -219,6 +267,62 @@ mod tests {
     /// Evaluates the univariate lift directly, for comparison.
     fn eval_univariate(coeffs: &[FE], x: &FE) -> FE {
         coeffs.iter().rfold(FE::zero(), |acc, c| acc * x + c)
+    }
+
+    #[test]
+    #[ignore = "timing, not a property"]
+    fn measure_encode_against_horner() {
+        let num_vars = 12;
+        let f = pseudo_mle(num_vars, 5);
+        let coeffs = lift_coefficients(&f);
+        let domain = Domain::<F>::new(num_vars + 2).unwrap();
+
+        let t = std::time::Instant::now();
+        let ntt = encode::<F, F>(&coeffs, &domain).unwrap();
+        let ntt_time = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let horner: Vec<FE> = domain
+            .elements()
+            .iter()
+            .map(|x| coeffs.iter().rfold(FE::zero(), |acc, c| x * acc + c))
+            .collect();
+        let horner_time = t.elapsed();
+
+        assert_eq!(ntt, horner);
+        println!(
+            "MEASURE encode 2^{num_vars} on 2^{}: ntt {ntt_time:?} vs horner {horner_time:?}",
+            domain.log_size()
+        );
+    }
+
+    /// The property a base-field commitment rests on: folding a base codeword
+    /// with an extension challenge gives what folding the lifted one would.
+    /// Without it, committing the trace over `F` would not be the same
+    /// statement as committing it over `E`.
+    #[test]
+    fn folding_a_base_codeword_matches_folding_the_lifted_one() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+        type ExtE = FieldElement<Ext>;
+
+        for num_vars in 1..=4usize {
+            let f = pseudo_mle(num_vars, 3 * num_vars as u64);
+            let domain = Domain::<F>::new(num_vars + 2).unwrap();
+            let alphas: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(31 + i as u64)).collect();
+
+            // Left: a base codeword, folded with extension challenges.
+            let base = encode::<F, F>(&lift_coefficients(&f), &domain).unwrap();
+            let (from_base, _) = fold_codeword_k::<F, F, Ext>(&base, &domain, &alphas).unwrap();
+
+            // Right: lift first, then fold.
+            let lifted =
+                Mle::new(f.evals().iter().map(|v| v.to_extension::<Ext>()).collect()).unwrap();
+            let extension = encode::<F, Ext>(&lift_coefficients(&lifted), &domain).unwrap();
+            let (from_extension, _) =
+                fold_codeword_k::<F, Ext, Ext>(&extension, &domain, &alphas).unwrap();
+
+            assert_eq!(from_base, from_extension, "num_vars={num_vars}");
+        }
     }
 
     #[test]

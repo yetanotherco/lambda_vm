@@ -210,6 +210,17 @@ pub trait AIR: Send + Sync {
         [0u8; 32]
     }
 
+    /// The precomputed columns themselves, `0..num_precomputed_columns()`.
+    ///
+    /// Empty unless `is_preprocessed()`. The univariate path never needs these
+    /// — it compares [`precomputed_commitment`](Self::precomputed_commitment)
+    /// against the proof's root — but the multilinear one has no separate root
+    /// to compare, so it checks the claimed openings against these directly.
+    /// Generating them is the same work recomputing that commitment costs.
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
+        Vec::new()
+    }
+
     fn num_auxiliary_rap_columns(&self) -> usize {
         self.trace_layout().1
     }

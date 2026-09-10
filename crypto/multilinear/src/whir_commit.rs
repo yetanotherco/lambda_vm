@@ -33,7 +33,16 @@ where
 }
 
 /// One opened block, with its authentication path.
-#[derive(Clone, Debug)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct CosetOpening<F: IsField> {
     /// The `2^k` codeword values, in coset order.
     pub values: Vec<FieldElement<F>>,
@@ -126,6 +135,22 @@ where
         self.log_domain_size
     }
 
+    /// The committed codeword, back in domain order.
+    ///
+    /// The blocks are a strided permutation of it, so the prover folds from
+    /// here rather than encoding a second time — on a real trace that second
+    /// NTT is the most expensive thing in the proof after the sumcheck, and it
+    /// computes something already in memory.
+    pub fn codeword(&self) -> Vec<FieldElement<F>> {
+        let num_leaves = self.leaves.len();
+        (0..(1usize << self.log_domain_size))
+            .map(|p| {
+                let (leaf, slot) = leaf_and_slot(p, num_leaves);
+                self.leaves[leaf][slot].clone()
+            })
+            .collect()
+    }
+
     /// Opens the block that folds onto `index`.
     pub fn open(&self, index: usize) -> Result<CosetOpening<F>, Error> {
         let proof = self
@@ -153,20 +178,64 @@ where
         .verify::<Backend<F>>(root, index, &opening.values)
 }
 
+/// One level of a block's fold.
+///
+/// Within the block the pair for slot `t` is `(t, t + half)`, mirroring the
+/// global layout one level up. Each pair sits at its own domain point: slot `t`
+/// is at `j + t·(N/L)`, so the points are `g^j·η^t` with `η` a primitive
+/// `L`-th root of unity. Using one `x` for the whole level is only correct when
+/// the block holds a single pair.
+fn fold_block_level<F, A, B>(
+    values: &[FieldElement<A>],
+    domain: &Domain<F>,
+    position: usize,
+    alpha: &FieldElement<B>,
+) -> Vec<FieldElement<B>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<A> + IsSubFieldOf<B>,
+    A: IsField + IsSubFieldOf<B>,
+    B: IsField,
+{
+    let two_inv = (FieldElement::<F>::one() + FieldElement::<F>::one())
+        .inv()
+        .expect("2 is invertible");
+    let half = values.len() / 2;
+    let eta = domain
+        .generator()
+        .pow((domain.size() / values.len()) as u64);
+
+    let mut out = Vec::with_capacity(half);
+    let mut x = domain.generator().pow(position as u64);
+    for t in 0..half {
+        let (a, b) = (&values[t], &values[t + half]);
+        let even = &two_inv * (a + b);
+        let x_inv = x.inv().expect("domain elements are nonzero");
+        let odd = (&two_inv * x_inv) * (a - b);
+        // The base element on the left: the only direction the tower gives.
+        out.push(even + odd * alpha);
+        x *= &eta;
+    }
+    out
+}
+
 /// Folds an opened block down to the single value it contributes.
 ///
 /// The verifier's local mirror of [`fold_codeword_k`](crate::whir::fold_codeword_k):
 /// it never sees the whole codeword, only this block, and must reach the same
 /// value the prover would have.
-pub fn fold_coset<F, E>(
-    values: &[FieldElement<E>],
+///
+/// The values go in over `C` and come out over `N`, matching the codeword fold:
+/// the committed trace's blocks are base-field, and the first fold lifts them.
+pub fn fold_coset<F, C, N>(
+    values: &[FieldElement<C>],
     domain: &Domain<F>,
     index: usize,
-    alphas: &[FieldElement<E>],
-) -> Result<FieldElement<E>, Error>
+    alphas: &[FieldElement<N>],
+) -> Result<FieldElement<N>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N>,
+    N: IsField,
 {
     if values.len() != 1usize << alphas.len() {
         return Err(Error::CodewordTooShort {
@@ -174,38 +243,20 @@ where
             domain: 1usize << alphas.len(),
         });
     }
-    let two_inv = (FieldElement::<F>::one() + FieldElement::<F>::one())
-        .inv()
-        .expect("2 is invertible");
+    let Some((first, rest)) = alphas.split_first() else {
+        return Ok(values[0].clone().to_extension::<N>());
+    };
 
-    let mut current = values.to_vec();
     let mut current_domain = domain.clone();
     // The block's own position within each successively squared domain.
     let mut position = index;
 
-    for alpha in alphas {
-        let half = current.len() / 2;
-        // Within the block the pair for slot `t` is `(t, t + half)`, mirroring
-        // the global layout one level up. Each pair sits at its own domain
-        // point: slot `t` is at `j + t·(N/L)`, so the points are `g^j·η^t` with
-        // `η` a primitive L-th root of unity. Using one `x` for the whole level
-        // is only correct when the block holds a single pair.
-        let base = current_domain.generator().pow(position as u64);
-        let eta = current_domain
-            .generator()
-            .pow((current_domain.size() / current.len()) as u64);
+    let mut current = fold_block_level::<F, C, N>(values, &current_domain, position, first);
+    current_domain = current_domain.squared()?;
+    position %= current_domain.size();
 
-        let mut next = Vec::with_capacity(half);
-        let mut x = base;
-        for t in 0..half {
-            let (a, b) = (&current[t], &current[t + half]);
-            let even = &two_inv * (a + b);
-            let x_inv = x.inv().expect("domain elements are nonzero");
-            let odd = (&two_inv * x_inv) * (a - b);
-            next.push(even + alpha * odd);
-            x *= &eta;
-        }
-        current = next;
+    for alpha in rest {
+        current = fold_block_level::<F, N, N>(&current, &current_domain, position, alpha);
         current_domain = current_domain.squared()?;
         position %= current_domain.size();
     }

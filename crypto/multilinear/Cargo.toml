@@ -6,9 +6,23 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-math = { path = "../math", features = ["std"] }
-crypto = { path = "../crypto", features = ["std"] }
+# Same feature set as `stark`: the proofs this crate produces have to serialize
+# in the same format the univariate ones do.
+math = { path = "../math", features = [
+    "std",
+    "lambdaworks-serde-binary",
+    "rkyv",
+] }
+crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
 thiserror = "1.0.38"
+serde = { version = "1.0", features = ["derive"] }
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "bytecheck",
+    "aligned",
+    "pointer_width_64",
+] }
 rayon = { version = "1.8.0", optional = true }
 
 [features]

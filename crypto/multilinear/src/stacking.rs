@@ -137,10 +137,7 @@ impl StackedLayout {
     }
 
     /// Builds the stacked polynomials, zero-filling the padding.
-    pub fn stack<F: IsField>(
-        &self,
-        columns: &[Vec<FieldElement<F>>],
-    ) -> Result<Vec<Mle<F>>, Error> {
+    pub fn stack<F: IsField>(&self, columns: &[Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
         if columns.len() != self.placements.len() {
             return Err(Error::VariableCountMismatch {
                 expected: self.placements.len(),
@@ -155,7 +152,8 @@ impl StackedLayout {
             if column.len() != expected {
                 return Err(Error::NotPowerOfTwo(column.len()));
             }
-            polys[place.poly][place.offset..place.offset + expected].clone_from_slice(column);
+            polys[place.poly][place.offset..place.offset + expected]
+                .clone_from_slice(column.evals());
         }
 
         polys.into_iter().map(Mle::new).collect()
@@ -173,10 +171,13 @@ mod tests {
 
     type FE = FieldElement<F>;
 
-    fn column(len: usize, seed: u64) -> Vec<FE> {
-        (0..len as u64)
-            .map(|i| FE::from(i.wrapping_mul(2654435761).wrapping_add(seed)))
-            .collect()
+    fn column(len: usize, seed: u64) -> Mle<F> {
+        Mle::new(
+            (0..len as u64)
+                .map(|i| FE::from(i.wrapping_mul(2654435761).wrapping_add(seed)))
+                .collect(),
+        )
+        .unwrap()
     }
 
     /// Heights in the shape our tables actually have, scaled down.
@@ -248,7 +249,7 @@ mod tests {
     #[test]
     fn stacked_cells_land_where_the_layout_says() {
         let layout = StackedLayout::build(&REAL_SHAPE, 8).unwrap();
-        let columns: Vec<Vec<FE>> = REAL_SHAPE
+        let columns: Vec<Mle<F>> = REAL_SHAPE
             .iter()
             .enumerate()
             .map(|(i, &m)| column(1 << m, i as u64 + 1))
@@ -256,7 +257,7 @@ mod tests {
         let stacked = layout.stack(&columns).unwrap();
 
         for (col_idx, place) in layout.placements().iter().enumerate() {
-            for (j, cell) in columns[col_idx].iter().enumerate() {
+            for (j, cell) in columns[col_idx].evals().iter().enumerate() {
                 assert_eq!(
                     stacked[place.poly].evals()[place.offset + j],
                     *cell,
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn a_column_evaluation_is_the_stacked_evaluation_at_the_lifted_point() {
         let layout = StackedLayout::build(&REAL_SHAPE, 8).unwrap();
-        let columns: Vec<Vec<FE>> = REAL_SHAPE
+        let columns: Vec<Mle<F>> = REAL_SHAPE
             .iter()
             .enumerate()
             .map(|(i, &m)| column(1 << m, i as u64 + 1))
@@ -298,7 +299,7 @@ mod tests {
         let stacked = layout.stack(&columns).unwrap();
 
         for (col_idx, place) in layout.placements().iter().enumerate() {
-            let mle = Mle::new(columns[col_idx].clone()).unwrap();
+            let mle = &columns[col_idx];
             // A point off the cube, where a wrong lift would show up.
             let z: Vec<FE> = (0..place.num_vars)
                 .map(|k| FE::from(1000 + k as u64 + col_idx as u64))
@@ -336,7 +337,7 @@ mod tests {
     fn a_single_row_column_still_lifts() {
         // HALT is one row: no variables of its own, all prefix.
         let layout = StackedLayout::build(&[0], 4).unwrap();
-        let columns = vec![vec![FE::from(42)]];
+        let columns = vec![Mle::new(vec![FE::from(42)]).unwrap()];
         let stacked = layout.stack(&columns).unwrap();
         let place = layout.placement(0).unwrap();
 

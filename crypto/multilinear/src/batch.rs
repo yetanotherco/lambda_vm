@@ -1,0 +1,491 @@
+//! Several sumcheck statements over one cube, proved in a single pass.
+//!
+//! A zerocheck is `Σ_x eq(r,x)·C(x) = 0`. A LogUp-GKR input-layer claim is
+//! `Σ_x eq(z,x)·P(x) = p(z)`. Both have the shape `Σ_x weight(x)·poly(x) =
+//! claimed` over the same trace, so batching them with powers of a challenge
+//! costs one pass instead of one per argument.
+//!
+//! The factors are **one list, shared by every statement**: a column read by a
+//! constraint and by a bus fingerprint is folded once, not twice. Each
+//! statement is a rule that indexes that list, so a statement's weight table is
+//! just another factor it multiplies in.
+
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::field::{element::FieldElement, traits::IsField};
+
+use crate::{
+    Error, challenge_powers,
+    mle::Mle,
+    poly::SumcheckPolynomial,
+    sumcheck::{self, SumcheckProof},
+};
+
+/// One statement's rule: what it makes of the batch's factors.
+///
+/// `eval` indexes the **whole** factor list, so a sub-argument that already
+/// combines a prefix of it can be used unchanged.
+pub struct Rule<'a, F: IsField> {
+    eval: RuleFn<'a, F>,
+    degree: usize,
+}
+
+/// A statement's value from the batch's factor values.
+type RuleFn<'a, F> = Box<dyn Fn(&[FieldElement<F>]) -> FieldElement<F> + 'a>;
+
+impl<'a, F: IsField> Rule<'a, F> {
+    /// `degree` must upper-bound the rule's total degree in the factors, its
+    /// weight table included.
+    pub fn new(degree: usize, eval: impl Fn(&[FieldElement<F>]) -> FieldElement<F> + 'a) -> Self {
+        Self {
+            eval: Box::new(eval),
+            degree,
+        }
+    }
+
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+
+    pub fn apply(&self, values: &[FieldElement<F>]) -> FieldElement<F> {
+        (self.eval)(values)
+    }
+}
+
+/// The batch as one polynomial: `Σ_i lambda^i · rule_i`.
+pub struct Batched<'a, F: IsField> {
+    polys: Vec<Mle<F>>,
+    rules: Vec<Rule<'a, F>>,
+    lambdas: Vec<FieldElement<F>>,
+    num_vars: usize,
+    degree: usize,
+}
+
+impl<'a, F: IsField> Batched<'a, F> {
+    /// `lambdas` weights the statements; there must be one per rule.
+    pub fn new(
+        polys: Vec<Mle<F>>,
+        rules: Vec<Rule<'a, F>>,
+        lambdas: Vec<FieldElement<F>>,
+    ) -> Result<Self, Error> {
+        if rules.is_empty() {
+            return Err(Error::EmptyPolynomial);
+        }
+        if lambdas.len() != rules.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: rules.len(),
+                got: lambdas.len(),
+            });
+        }
+        let num_vars = polys.first().map(|p| p.num_vars()).unwrap_or(0);
+        for p in &polys {
+            if p.num_vars() != num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: num_vars,
+                    got: p.num_vars(),
+                });
+            }
+        }
+        let degree = rules.iter().map(Rule::degree).max().unwrap_or(0);
+        Ok(Self {
+            polys,
+            rules,
+            lambdas,
+            num_vars,
+            degree,
+        })
+    }
+}
+
+impl<F: IsField> SumcheckPolynomial<F> for Batched<'_, F> {
+    fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    fn degree(&self) -> usize {
+        self.degree
+    }
+
+    fn polys(&self) -> &[Mle<F>] {
+        &self.polys
+    }
+
+    fn combine(&self, values: &[FieldElement<F>]) -> FieldElement<F> {
+        self.rules
+            .iter()
+            .zip(&self.lambdas)
+            .fold(FieldElement::zero(), |acc, (rule, lambda)| {
+                acc + lambda * rule.apply(values)
+            })
+    }
+
+    fn fix_first_variable(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        for p in &mut self.polys {
+            p.fix_first_variable_in_place(r)?;
+        }
+        self.num_vars -= 1;
+        Ok(())
+    }
+}
+
+/// The degree the batched sumcheck runs at: the worst statement's.
+pub fn degree_of<F: IsField>(rules: &[Rule<'_, F>]) -> usize {
+    rules.iter().map(Rule::degree).max().unwrap_or(0)
+}
+
+/// Proves every statement in one sumcheck, returning the proof and its point.
+///
+/// `claims[i]` is what `Σ_x rule_i(x)` must come to. They are absorbed before
+/// the batching challenge, so the prover cannot pick a statement after seeing
+/// it.
+pub fn prove<F, T>(
+    polys: Vec<Mle<F>>,
+    rules: Vec<Rule<'_, F>>,
+    claims: &[FieldElement<F>],
+    transcript: &mut T,
+) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
+where
+    F: IsField,
+    T: IsTranscript<F>,
+{
+    if claims.len() != rules.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: rules.len(),
+            got: claims.len(),
+        });
+    }
+    for claim in claims {
+        transcript.append_field_element(claim);
+    }
+    let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
+    sumcheck::prove(Batched::new(polys, rules, lambdas)?, transcript)
+}
+
+/// Checks the batched sumcheck against the factor values it reduces to.
+///
+/// `values_at` is handed the sumcheck point and returns every factor's value
+/// there. A weight table is not committed, so the verifier computes it in
+/// closed form; the trace factors come from the proof, and binding *those* to
+/// the committed columns is the caller's next step.
+///
+/// Returns the point.
+pub fn verify<F, T, V>(
+    proof: &SumcheckProof<F>,
+    rules: &[Rule<'_, F>],
+    claims: &[FieldElement<F>],
+    values_at: V,
+    num_vars: usize,
+    transcript: &mut T,
+) -> Result<Vec<FieldElement<F>>, Error>
+where
+    F: IsField,
+    T: IsTranscript<F>,
+    V: FnOnce(&[FieldElement<F>]) -> Result<Vec<FieldElement<F>>, Error>,
+{
+    if rules.is_empty() {
+        return Err(Error::EmptyPolynomial);
+    }
+    if claims.len() != rules.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: rules.len(),
+            got: claims.len(),
+        });
+    }
+    for claim in claims {
+        transcript.append_field_element(claim);
+    }
+    let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
+
+    let claimed = lambdas
+        .iter()
+        .zip(claims)
+        .fold(FieldElement::<F>::zero(), |acc, (l, c)| acc + l * c);
+    let claim = sumcheck::verify(proof, claimed, num_vars, degree_of(rules), transcript)?;
+
+    let values = values_at(&claim.point)?;
+    let rebuilt = rules
+        .iter()
+        .zip(&lambdas)
+        .fold(FieldElement::<F>::zero(), |acc, (rule, lambda)| {
+            acc + lambda * rule.apply(&values)
+        });
+    if rebuilt != claim.expected_evaluation {
+        return Err(Error::BatchMismatch);
+    }
+
+    Ok(claim.point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::goldilocks::GoldilocksField as F;
+
+    use crate::{
+        eq::{eq_eval, eq_mle},
+        gkr::{self, FractionLayer, FractionTree},
+    };
+
+    type FE = FieldElement<F>;
+
+    fn transcript() -> DefaultTranscript<F> {
+        DefaultTranscript::<F>::new(b"batch-test")
+    }
+
+    /// Factor layout shared by every statement below.
+    const MULT: usize = 0;
+    const VALUE: usize = 1;
+    const SQUARE: usize = 2;
+    const EQ_R: usize = 3;
+    const EQ_Z: usize = 4;
+
+    /// A bus and a constraint over the same two columns: `mult` is the signed
+    /// multiplicity, `value` the fingerprint, `square` its square. Each
+    /// fingerprint is sent once and received once, so the bus balances.
+    fn columns(num_vars: usize) -> [Mle<F>; 3] {
+        let size = 1usize << num_vars;
+        let half = size / 2;
+        let value: Vec<FE> = (0..size).map(|i| FE::from((i % half) as u64 + 1)).collect();
+        let mult: Vec<FE> = (0..size)
+            .map(|i| if i < half { FE::one() } else { -FE::one() })
+            .collect();
+        let square: Vec<FE> = value.iter().map(|x| x * x).collect();
+        [
+            Mle::new(mult).unwrap(),
+            Mle::new(value).unwrap(),
+            Mle::new(square).unwrap(),
+        ]
+    }
+
+    /// The three statements, all indexing the one factor list:
+    ///
+    /// - the zerocheck, `Σ_x eq(r,x)·(value² − square) = 0`;
+    /// - the bus's numerator claim, `Σ_x eq(z,x)·mult = p(z)`;
+    /// - its denominator claim, `Σ_x eq(z,x)·(alpha − value) = q(z)`.
+    ///
+    /// The denominator is never a column: it is `alpha − value`, read off the
+    /// committed `value`.
+    fn statements(alpha: FE) -> Vec<Rule<'static, F>> {
+        vec![
+            Rule::new(3, |v: &[FE]| v[EQ_R] * (v[VALUE] * v[VALUE] - v[SQUARE])),
+            Rule::new(2, |v: &[FE]| v[EQ_Z] * v[MULT]),
+            Rule::new(2, move |v: &[FE]| v[EQ_Z] * (alpha - v[VALUE])),
+        ]
+    }
+
+    /// Runs GKR over the bus, then settles its input-layer claim in the same
+    /// sumcheck as the constraint's zerocheck.
+    ///
+    /// `batch_mult` overrides the multiplicity column the *batch* reads, while
+    /// the tree keeps the original — a prover arguing about a different table
+    /// than the one it ran GKR over.
+    fn fuse(
+        cols: [Mle<F>; 3],
+        num_vars: usize,
+        batch_mult: Option<Mle<F>>,
+    ) -> Result<usize, Error> {
+        let alpha = FE::from(97);
+        let [mult, value, square] = cols;
+        let batch_mult = batch_mult.unwrap_or_else(|| mult.clone());
+        let denominator = Mle::new(value.evals().iter().map(|x| alpha - x).collect())?;
+        let tree = FractionTree::build(FractionLayer::new(mult.clone(), denominator)?)?;
+        let output = tree.output();
+
+        let mut prover = transcript();
+        let gkr_out = gkr::prove(&tree, &mut prover)?;
+        // The zerocheck challenge, drawn from the same transcript.
+        let r: Vec<FE> = (0..num_vars)
+            .map(|_| prover.sample_field_element())
+            .collect();
+        let z = gkr_out.claim.point.clone();
+
+        let factors = || -> Result<Vec<Mle<F>>, Error> {
+            Ok(vec![
+                batch_mult.clone(),
+                value.clone(),
+                square.clone(),
+                eq_mle(&r)?,
+                eq_mle(&z)?,
+            ])
+        };
+        let claims = [FE::zero(), gkr_out.claim.p, gkr_out.claim.q];
+
+        let (proof, point) = prove(factors()?, statements(alpha), &claims, &mut prover)?;
+        let trace_values: Vec<FE> = factors()?[..=SQUARE]
+            .iter()
+            .map(|f| f.evaluate(&point))
+            .collect::<Result<_, _>>()?;
+
+        let mut verifier = transcript();
+        let gkr_claim = gkr::verify(&gkr_out.proof, output, &mut verifier)?;
+        let vr: Vec<FE> = (0..num_vars)
+            .map(|_| verifier.sample_field_element())
+            .collect();
+
+        let checked = verify(
+            &proof,
+            &statements(alpha),
+            &claims,
+            // The weights are not committed: the verifier computes them.
+            |at: &[FE]| {
+                let mut values = trace_values.clone();
+                values.push(eq_eval(&vr, at)?);
+                values.push(eq_eval(&gkr_claim.point, at)?);
+                Ok(values)
+            },
+            num_vars,
+            &mut verifier,
+        )?;
+        assert_eq!(checked, point);
+        Ok(proof.rounds.len())
+    }
+
+    /// The design decision this module exists for: the constraint's zerocheck
+    /// and the bus's input-layer claim share one sumcheck, so every column is
+    /// folded once.
+    #[test]
+    fn a_bus_claim_settles_in_the_constraint_s_sumcheck() {
+        for num_vars in 1..=4usize {
+            let rounds = fuse(columns(num_vars), num_vars, None)
+                .unwrap_or_else(|e| panic!("num_vars={num_vars}: {e:?}"));
+            // One pass over the cube for all three statements, not one each.
+            assert_eq!(rounds, num_vars);
+        }
+    }
+
+    #[test]
+    fn a_constraint_broken_in_one_row_is_rejected() {
+        let mut cols = columns(3);
+        let mut square = cols[2].evals().to_vec();
+        square[5] += FE::one();
+        cols[2] = Mle::new(square).unwrap();
+
+        assert!(fuse(cols, 3, None).is_err());
+    }
+
+    /// The GKR's input-layer claim is only worth anything if it lands on the
+    /// same table the rest of the argument reads.
+    #[test]
+    fn a_bus_table_the_tree_was_not_built_on_is_rejected() {
+        let cols = columns(3);
+        let mut mult = cols[0].evals().to_vec();
+        mult[2] += FE::one();
+
+        assert!(fuse(cols, 3, Some(Mle::new(mult).unwrap())).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // The batching itself.
+    // ---------------------------------------------------------------
+
+    fn mle(vals: &[u64]) -> Mle<F> {
+        Mle::new(vals.iter().map(|v| FE::from(*v)).collect()).unwrap()
+    }
+
+    /// Two statements over one factor list: `Σ eq(r,x)·a(x) = ã(r)` and
+    /// `Σ eq(r,x)·b(x) = b̃(r)`, sharing the weight table.
+    fn two_evaluation_claims(r: &[FE]) -> (Vec<Mle<F>>, Vec<Rule<'static, F>>, [FE; 2]) {
+        let a = mle(&[3, 5, 8, 13]);
+        let b = mle(&[21, 34, 55, 89]);
+        let claims = [a.evaluate(r).unwrap(), b.evaluate(r).unwrap()];
+        let polys = vec![a, b, eq_mle(r).unwrap()];
+        let rules = vec![
+            Rule::new(2, |v: &[FE]| v[2] * v[0]),
+            Rule::new(2, |v: &[FE]| v[2] * v[1]),
+        ];
+        (polys, rules, claims)
+    }
+
+    fn run_two(r: &[FE], claims: [FE; 2]) -> Result<(), Error> {
+        let (polys, rules, _) = two_evaluation_claims(r);
+        let values = polys.clone();
+        let (proof, _) = prove(polys, rules, &claims, &mut transcript())?;
+
+        let (_, rules, _) = two_evaluation_claims(r);
+        verify(
+            &proof,
+            &rules,
+            &claims,
+            |at: &[FE]| values.iter().map(|p| p.evaluate(at)).collect(),
+            r.len(),
+            &mut transcript(),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn statements_sharing_a_weight_table_hold_it_once() {
+        let r = [FE::from(11), FE::from(13)];
+        let (polys, _, claims) = two_evaluation_claims(&r);
+        // Three factors for two statements: the weight is shared.
+        assert_eq!(polys.len(), 3);
+        run_two(&r, claims).unwrap();
+    }
+
+    #[test]
+    fn a_false_claim_in_one_statement_is_rejected() {
+        let r = [FE::from(11), FE::from(13)];
+        let (_, _, claims) = two_evaluation_claims(&r);
+        let lying = [claims[0], claims[1] + FE::one()];
+        assert!(run_two(&r, lying).is_err());
+    }
+
+    #[test]
+    fn the_batch_degree_is_the_worst_statement_s() {
+        let rules: Vec<Rule<'static, F>> = vec![
+            Rule::new(2, |v: &[FE]| v[0]),
+            Rule::new(5, |v: &[FE]| v[0]),
+            Rule::new(3, |v: &[FE]| v[0]),
+        ];
+        assert_eq!(degree_of(&rules), 5);
+    }
+
+    #[test]
+    fn a_claim_per_statement_is_required() {
+        let r = [FE::from(11), FE::from(13)];
+        let (polys, rules, _) = two_evaluation_claims(&r);
+        assert_eq!(
+            prove(polys, rules, &[FE::zero()], &mut transcript()).unwrap_err(),
+            Error::VariableCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    #[test]
+    fn factors_of_differing_heights_are_rejected() {
+        let rules: Vec<Rule<'static, F>> = vec![Rule::new(1, |v: &[FE]| v[0])];
+        let result = Batched::new(
+            vec![mle(&[1, 2]), mle(&[1, 2, 3, 4])],
+            rules,
+            vec![FE::one()],
+        );
+        assert!(matches!(
+            result.err(),
+            Some(Error::VariableCountMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_proof_replayed_under_another_transcript_is_rejected() {
+        let r = [FE::from(11), FE::from(13)];
+        let (polys, rules, claims) = two_evaluation_claims(&r);
+        let values = polys.clone();
+        let (proof, _) = prove(polys, rules, &claims, &mut transcript()).unwrap();
+
+        let (_, rules, _) = two_evaluation_claims(&r);
+        let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
+        assert!(
+            verify(
+                &proof,
+                &rules,
+                &claims,
+                |at: &[FE]| values.iter().map(|p| p.evaluate(at)).collect(),
+                r.len(),
+                &mut other,
+            )
+            .is_err()
+        );
+    }
+}

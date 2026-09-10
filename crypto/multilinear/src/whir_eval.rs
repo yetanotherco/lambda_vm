@@ -1,10 +1,20 @@
-//! Proving `f(z) = y` about a committed polynomial, which is what settles the
-//! residual claims the other arguments hand back.
+//! Proving `Σ_x w(x)·f(x) = y` about a committed polynomial, which is what
+//! settles the residual claims the other arguments hand back.
 //!
-//! The sumcheck on `Σ_x eq(z, x)·f(x) = y` produces the folding randomness; the
-//! fully folded codeword is the constant `f(α)`. Both must name the same value.
+//! The sumcheck produces the folding randomness; the fully folded codeword is
+//! the constant `f(α)`, and the sumcheck's residual is `w(α)·f(α)`. Both must
+//! name the same `f(α)`.
 //!
-//! One round, folding all the way down, so a block is the whole message.
+//! An evaluation claim is the weight `w = eq(z, ·)`, which is what [`prove`]
+//! and [`verify`] specialize to. A **stacked** claim — many columns packed into
+//! one committed polynomial, each read from its own subcube — is a weight that
+//! sums several of those, and settling it costs the same one sumcheck. That is
+//! why the general form is the one implemented.
+//!
+//! One round, folding all the way down, so a block is the whole message — which
+//! is what [`whir_chain`](crate::whir_chain) exists to fix. This module is the
+//! degenerate one-round case of it, kept as the reference for the identity the
+//! whole thing rests on.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::{
@@ -36,7 +46,16 @@ pub struct EvalConfig {
 }
 
 /// A proof that a committed polynomial takes a claimed value at a point.
-#[derive(Clone, Debug)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct EvalProof<E: IsField> {
     pub sumcheck: SumcheckProof<E>,
     /// The constant the codeword folds to — the prover's claim for `f(α)`.
@@ -51,7 +70,7 @@ pub fn commit<F, E>(
 ) -> Result<(CodewordCommitment<E>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
@@ -61,13 +80,13 @@ where
     Ok((commitment, domain))
 }
 
-/// `Σ_x eq(z, x)·f(x)`, the sumcheck an evaluation claim becomes.
-fn eq_weighted<F: IsField>(
+/// `Σ_x w(x)·f(x)`, the sumcheck a weighted claim becomes.
+fn weighted<F: IsField>(
     f: &Mle<F>,
-    z: &[FieldElement<F>],
+    weight: Mle<F>,
 ) -> Result<EqScaled<F, VirtualPolynomial<F>>, Error> {
     let inner = VirtualPolynomial::new(vec![f.clone()], vec![Term::single(0)])?;
-    EqScaled::new(inner, eq_mle(z)?)
+    EqScaled::new(inner, weight)
 }
 
 /// Proves `f(z) = y`.
@@ -84,14 +103,33 @@ pub fn prove<F, E, T>(
 ) -> Result<EvalProof<E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
-    let (sumcheck, alphas) = sumcheck::prove(eq_weighted(f, z)?, transcript)?;
+    prove_weighted::<F, E, T>(f, eq_mle(z)?, commitment, domain, config, transcript)
+}
 
-    let codeword = encode::<F, E>(&lift_coefficients(f), domain)?;
-    let (folded, _) = fold_codeword_k::<F, E>(&codeword, domain, &alphas)?;
+/// Proves `Σ_x w(x)·f(x) = y` for a weight the verifier can evaluate itself.
+pub fn prove_weighted<F, E, T>(
+    f: &Mle<E>,
+    weight: Mle<E>,
+    commitment: &CodewordCommitment<E>,
+    domain: &Domain<F>,
+    config: &EvalConfig,
+    transcript: &mut T,
+) -> Result<EvalProof<E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+{
+    let (sumcheck, alphas) = sumcheck::prove(weighted(f, weight)?, transcript)?;
+
+    // From the commitment, not a second encoding: it is the same array, and a
+    // prover that folded a different one could not then answer the openings.
+    let (folded, _) = fold_codeword_k::<F, E, E>(&commitment.codeword(), domain, &alphas)?;
     let final_value = folded[0].clone();
     transcript.append_field_element(&final_value);
 
@@ -130,21 +168,54 @@ pub fn verify<F, E, T>(
 ) -> Result<(), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + 'static,
+    E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
-    let num_vars = z.len();
-    // `eq` raises the degree of the plain `f` term to two.
+    verify_weighted::<F, E, T, _>(
+        proof,
+        root,
+        |alphas: &[FieldElement<E>]| eq_eval(z, alphas),
+        y,
+        z.len(),
+        domain,
+        config,
+        transcript,
+    )
+}
+
+/// Verifies `Σ_x w(x)·f(x) = y`.
+///
+/// `weight_at` is the weight's closed form; the verifier evaluates it at the
+/// sumcheck point rather than holding its table.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_weighted<F, E, T, W>(
+    proof: &EvalProof<E>,
+    root: &Commitment,
+    weight_at: W,
+    y: FieldElement<E>,
+    num_vars: usize,
+    domain: &Domain<F>,
+    config: &EvalConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
+{
+    // The weight raises the degree of the plain `f` term to two.
     let claim = sumcheck::verify(&proof.sumcheck, y, num_vars, 2, transcript)?;
     let alphas = &claim.point;
 
-    // The sumcheck's residual is eq(z, α)·f(α); the verifier knows eq.
-    let eq_at = eq_eval(z, alphas)?;
+    // The sumcheck's residual is w(α)·f(α); the verifier knows w.
+    let weight = weight_at(alphas)?;
     let required = claim
         .expected_evaluation
         .clone()
-        .mul_by_inverse_of(&eq_at)
+        .mul_by_inverse_of(&weight)
         .ok_or(Error::DegenerateEvaluationPoint)?;
 
     transcript.append_field_element(&proof.final_value);
@@ -167,7 +238,7 @@ where
         if !verify_opening::<E>(root, q, opening) {
             return Err(Error::OpeningRejected { query: i });
         }
-        if fold_coset::<F, E>(&opening.values, domain, q, alphas)? != proof.final_value {
+        if fold_coset::<F, E, E>(&opening.values, domain, q, alphas)? != proof.final_value {
             return Err(Error::FoldInconsistent { query: i });
         }
     }
@@ -274,7 +345,9 @@ mod tests {
             &mut transcript(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::RoundSumMismatch { .. }));
+        // The lie propagates into the residual, so it is the wire between the
+        // sumcheck and the folded codeword that breaks.
+        assert_eq!(err, Error::EvaluationMismatch);
     }
 
     #[test]
@@ -347,7 +420,10 @@ mod tests {
             &mut transcript(),
         )
         .unwrap_err();
-        assert!(matches!(err, Error::FoldInconsistent { .. }));
+        // The codeword comes out of the commitment, so a prover cannot be
+        // inconsistent between the two: the lie surfaces on the wire between
+        // the sumcheck and the folded value.
+        assert_eq!(err, Error::EvaluationMismatch);
     }
 
     #[test]

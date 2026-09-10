@@ -202,11 +202,16 @@ mod tests {
         .unwrap();
         assert_ne!(broken.sum_over_hypercube(), FE::zero());
 
-        // The prover runs the protocol honestly on a false statement: the very
-        // first round polynomial cannot sum to the claimed zero.
+        // The prover runs the protocol honestly on a false statement. `g(0)` is
+        // derived from the claim, so nothing is rejected in the round — the lie
+        // surfaces in the residual, which stops describing the constraint.
         let proof = prove(broken.clone(), &mut transcript()).unwrap().proof;
-        let err = verify(&proof, 3, broken.degree(), &mut transcript()).unwrap_err();
-        assert!(matches!(err, Error::RoundSumMismatch { round: 0, .. }));
+        let claim = verify(&proof, 3, broken.degree(), &mut transcript()).unwrap();
+        assert_ne!(
+            claim.constraint_evaluation(),
+            Some(broken.evaluate(&claim.point).unwrap()),
+            "a violated constraint produced a consistent claim"
+        );
     }
 
     #[test]
@@ -223,19 +228,14 @@ mod tests {
         let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
         let result = verify(&proof, 1, c.degree(), &mut transcript());
 
-        match result {
-            Err(Error::RoundSumMismatch { .. }) => {}
-            Ok(claim) => {
-                // If the round check passed, the residual claim must still be
-                // inconsistent with the real polynomial.
-                assert_ne!(
-                    claim.constraint_evaluation(),
-                    Some(c.evaluate(&claim.point).unwrap()),
-                    "a non-vanishing constraint produced a consistent claim"
-                );
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
+        // The residual claim must be inconsistent with the real polynomial:
+        // that is where a non-vanishing constraint gets caught.
+        let claim = result.unwrap();
+        assert_ne!(
+            claim.constraint_evaluation(),
+            Some(c.evaluate(&claim.point).unwrap()),
+            "a non-vanishing constraint produced a consistent claim"
+        );
     }
 
     #[test]
@@ -243,9 +243,9 @@ mod tests {
         let c = satisfied_constraint(3);
         let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
         // C has degree 2; with eq the round polynomials are degree 3, so each
-        // carries 4 evaluations.
+        // carries three evaluations — `g(1), g(2), g(3)`, with `g(0)` derived.
         assert_eq!(c.degree(), 2);
-        assert_eq!(proof.sumcheck.rounds[0].evaluations.len(), 4);
+        assert_eq!(proof.sumcheck.rounds[0].evaluations.len(), 3);
     }
 
     #[test]

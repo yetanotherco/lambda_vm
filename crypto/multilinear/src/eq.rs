@@ -1,5 +1,6 @@
 //! The equality kernel `eq(r, x) = ∏_i (r_i·x_i + (1 - r_i)(1 - x_i))` and the
-//! cyclic rotation kernel, `rot(x, y) = 1` iff `index(y) = index(x) + 1 mod 2^n`.
+//! shift kernel, `shift_k(x, y) = 1` iff `index(y) = index(x) + k mod 2^n`, of
+//! which the cyclic rotation `rot` is the `k = 1` case.
 
 use math::field::{element::FieldElement, traits::IsField};
 
@@ -86,6 +87,107 @@ pub fn rot_eval<F: IsField>(
     y: &[FieldElement<F>],
 ) -> Result<FieldElement<F>, Error> {
     Ok(eq_and_rot_eval(x, y)?.1)
+}
+
+/// `shift_k(x, y) = 1` iff `index(y) = index(x) + k mod 2^n`, extended
+/// multilinearly. `k = 0` is [`eq_eval`], `k = 1` is [`rot_eval`].
+///
+/// Adds the constant `k` bit by bit from the least significant end, which is
+/// variable `n − 1`. `state[c]` is the weight of the bits handled so far having
+/// produced carry `c`; the shift wraps, so both carries are accepted at the end.
+pub fn shift_eval<F: IsField>(
+    x: &[FieldElement<F>],
+    y: &[FieldElement<F>],
+    k: usize,
+) -> Result<FieldElement<F>, Error> {
+    if x.len() != y.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: x.len(),
+            got: y.len(),
+        });
+    }
+    let one = FieldElement::<F>::one();
+    let zero = FieldElement::<F>::zero();
+    let mut state = [one.clone(), zero.clone()];
+
+    for (t, (x_j, y_j)) in x.iter().zip(y).rev().enumerate() {
+        let eq_j = x_j * y_j + (&one - x_j) * (&one - y_j);
+        // y_j = 1 − x_j: x_j = 1 carries out, x_j = 0 does not.
+        let carry = x_j * (&one - y_j);
+        let no_carry = (&one - x_j) * y_j;
+
+        let mut next = [zero.clone(), zero.clone()];
+        for (c, weight) in state.iter().enumerate() {
+            match ((k >> t) & 1) + c {
+                0 => next[0] += weight * &eq_j,
+                1 => {
+                    next[0] += weight * &no_carry;
+                    next[1] += weight * &carry;
+                }
+                _ => next[1] += weight * &eq_j,
+            }
+        }
+        state = next;
+    }
+
+    Ok(&state[0] + &state[1])
+}
+
+/// The table of `shift_k(x, ·)` over the cube, in `O(2^n)`.
+///
+/// Same carry recursion as [`shift_eval`], but each step doubles the table
+/// instead of multiplying `y_j`'s weight out — prepending `y_j` as the new most
+/// significant bit, which is the indexing [`Mle`] folds on.
+pub fn shift_evals<F: IsField>(x: &[FieldElement<F>], k: usize) -> Vec<FieldElement<F>> {
+    let one = FieldElement::<F>::one();
+    let zero = FieldElement::<F>::zero();
+    let mut state = [vec![one.clone()], vec![zero.clone()]];
+
+    for (t, x_j) in x.iter().rev().enumerate() {
+        let one_minus = &one - x_j;
+        let len = state[0].len();
+        let mut next = [vec![zero.clone(); 2 * len], vec![zero.clone(); 2 * len]];
+
+        for (c, table) in state.iter().enumerate() {
+            match ((k >> t) & 1) + c {
+                // y_j = x_j, carry unchanged.
+                0 => {
+                    for (i, v) in table.iter().enumerate() {
+                        next[0][i] += &one_minus * v;
+                        next[0][len + i] += x_j * v;
+                    }
+                }
+                // y_j = 1 − x_j: the `y_j = 1` half needs x_j = 0 and keeps the
+                // carry clear, the `y_j = 0` half needs x_j = 1 and raises it.
+                1 => {
+                    for (i, v) in table.iter().enumerate() {
+                        next[1][i] += x_j * v;
+                        next[0][len + i] += &one_minus * v;
+                    }
+                }
+                // y_j = x_j, carry out.
+                _ => {
+                    for (i, v) in table.iter().enumerate() {
+                        next[1][i] += &one_minus * v;
+                        next[1][len + i] += x_j * v;
+                    }
+                }
+            }
+        }
+        state = next;
+    }
+
+    let [no_carry, carried] = state;
+    no_carry
+        .into_iter()
+        .zip(carried)
+        .map(|(a, b)| a + b)
+        .collect()
+}
+
+/// The multilinear extension of `shift_k(x, ·)`.
+pub fn shift_mle<F: IsField>(x: &[FieldElement<F>], k: usize) -> Result<Mle<F>, Error> {
+    Mle::new(shift_evals(x, k))
 }
 
 #[cfg(test)]
@@ -261,5 +363,100 @@ mod tests {
     #[test]
     fn rot_rejects_mismatched_arity() {
         assert!(rot_eval(&point(&[1, 2]), &point(&[1])).is_err());
+    }
+
+    #[test]
+    fn shift_is_the_offset_indicator_on_the_hypercube() {
+        for num_vars in 1..=4usize {
+            let size = 1usize << num_vars;
+            // Past `size` too, so wrapping is exercised as its own case.
+            for k in 0..(size + 3) {
+                for xi in 0..size {
+                    for yi in 0..size {
+                        let expected = if yi == (xi + k) % size {
+                            FE::one()
+                        } else {
+                            FE::zero()
+                        };
+                        assert_eq!(
+                            shift_eval(&corner(xi, num_vars), &corner(yi, num_vars), k).unwrap(),
+                            expected,
+                            "n={num_vars}, k={k}, x={xi}, y={yi}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shift_zero_is_eq_and_shift_one_is_rot() {
+        // Off the cube, where agreeing on corners would not be enough.
+        let x = point(&[3, 11, 4]);
+        let y = point(&[7, 13, 2]);
+        assert_eq!(shift_eval(&x, &y, 0).unwrap(), eq_eval(&x, &y).unwrap());
+        assert_eq!(shift_eval(&x, &y, 1).unwrap(), rot_eval(&x, &y).unwrap());
+    }
+
+    #[test]
+    fn shift_table_matches_the_closed_form() {
+        let x = point(&[5, 9, 2]);
+        for k in 0..10usize {
+            for (yi, entry) in shift_evals(&x, k).into_iter().enumerate() {
+                assert_eq!(entry, shift_eval(&x, &corner(yi, 3), k).unwrap(), "k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn shift_table_is_the_multilinear_extension() {
+        // The verifier evaluates the kernel at a random point while the prover
+        // folds the table, so the two must be the same polynomial.
+        let x = point(&[3, 11, 4]);
+        let z = point(&[7, 13, 2]);
+        for k in 0..8usize {
+            assert_eq!(
+                shift_mle(&x, k).unwrap().evaluate(&z).unwrap(),
+                shift_eval(&x, &z, k).unwrap(),
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_reproduces_a_shifted_column() {
+        // The identity the reduction leans on:
+        // f_shift_k(z) = Σ_y shift_k(z, y)·f(y).
+        let n = 3;
+        let size = 1usize << n;
+        let f: Vec<FE> = (0..size as u64).map(|i| FE::from(i * 7 + 5)).collect();
+        let z = point(&[5, 9, 2]);
+
+        for k in 0..6usize {
+            let shifted = Mle::new((0..size).map(|i| f[(i + k) % size]).collect()).unwrap();
+            let summed = shift_evals(&z, k)
+                .into_iter()
+                .zip(&f)
+                .fold(FE::zero(), |acc, (w, v)| acc + w * v);
+            assert_eq!(summed, shifted.evaluate(&z).unwrap(), "k={k}");
+        }
+    }
+
+    #[test]
+    fn shift_sums_to_one_over_the_cube() {
+        // The kernel picks out one corner, so its extension sums to one at any
+        // point — a cheap check that the carry recursion loses no weight.
+        let x = point(&[4, 6, 8]);
+        for k in 0..10usize {
+            let total = shift_evals(&x, k)
+                .into_iter()
+                .fold(FE::zero(), |acc, v| acc + v);
+            assert_eq!(total, FE::one(), "k={k}");
+        }
+    }
+
+    #[test]
+    fn shift_rejects_mismatched_arity() {
+        assert!(shift_eval(&point(&[1, 2]), &point(&[1]), 1).is_err());
     }
 }

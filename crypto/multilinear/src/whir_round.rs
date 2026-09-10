@@ -39,12 +39,25 @@ pub struct RoundCommitments<'a> {
 }
 
 /// The openings one round sends.
-#[derive(Clone, Debug)]
-pub struct RoundProof<E: IsField> {
+///
+/// The two value fields differ in the first round of a chain: the committed
+/// codeword is base-field, because a trace is, while its successor has been
+/// folded with an extension challenge. Later rounds have `C = N`.
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct RoundProof<C: IsField, N: IsField> {
     /// Per query: the block of the current codeword that folds onto the query.
-    pub current: Vec<CosetOpening<E>>,
+    pub current: Vec<CosetOpening<C>>,
     /// Per query: the successor block holding the folded value.
-    pub next: Vec<CosetOpening<E>>,
+    pub next: Vec<CosetOpening<N>>,
 }
 
 /// Draws the query positions. Both sides run this on the same transcript.
@@ -65,16 +78,18 @@ where
 ///
 /// `current` and `next` must already be committed, and `next` must be the fold
 /// of `current` by `alphas` — [`verify`] is what checks that claim.
-pub fn prove<E, T>(
-    current: &CodewordCommitment<E>,
-    next: &CodewordCommitment<E>,
+pub fn prove<C, N, T>(
+    current: &CodewordCommitment<C>,
+    next: &CodewordCommitment<N>,
     config: &RoundConfig,
     transcript: &mut T,
-) -> Result<RoundProof<E>, Error>
+) -> Result<RoundProof<C, N>, Error>
 where
-    E: IsField,
-    FieldElement<E>: AsBytes + Sync + Send,
-    T: IsTranscript<E>,
+    C: IsField,
+    N: IsField,
+    FieldElement<C>: AsBytes + Sync + Send,
+    FieldElement<N>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
 {
     let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
 
@@ -96,19 +111,21 @@ where
 ///
 /// Re-derives the queries from the transcript, so the prover could not have
 /// chosen them.
-pub fn verify<F, E, T>(
-    proof: &RoundProof<E>,
+pub fn verify<F, C, N, T>(
+    proof: &RoundProof<C, N>,
     commitments: RoundCommitments<'_>,
     domain: &Domain<F>,
-    alphas: &[FieldElement<E>],
+    alphas: &[FieldElement<N>],
     config: &RoundConfig,
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField + 'static,
-    FieldElement<E>: AsBytes + Sync + Send,
-    T: IsTranscript<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    FieldElement<N>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
 {
     if alphas.len() != config.log_folding {
         return Err(Error::VariableCountMismatch {
@@ -131,15 +148,15 @@ where
         .zip(proof.current.iter().zip(&proof.next))
         .enumerate()
     {
-        if !crate::whir_commit::verify_opening::<E>(commitments.current_root, q, cur) {
+        if !crate::whir_commit::verify_opening::<C>(commitments.current_root, q, cur) {
             return Err(Error::OpeningRejected { query: i });
         }
         let (leaf, slot) = leaf_and_slot(q, commitments.next_num_leaves);
-        if !crate::whir_commit::verify_opening::<E>(commitments.next_root, leaf, nxt) {
+        if !crate::whir_commit::verify_opening::<N>(commitments.next_root, leaf, nxt) {
             return Err(Error::OpeningRejected { query: i });
         }
 
-        let folded = fold_coset::<F, E>(&cur.values, domain, q, alphas)?;
+        let folded = fold_coset::<F, C, N>(&cur.values, domain, q, alphas)?;
         let claimed = nxt.values.get(slot).ok_or(Error::QueryOutOfRange {
             index: slot,
             bound: nxt.values.len(),
@@ -201,8 +218,8 @@ mod tests {
         }
     }
 
-    fn run(fx: &Fixture, proof: &RoundProof<F>) -> Result<(), Error> {
-        verify::<F, F, _>(
+    fn run(fx: &Fixture, proof: &RoundProof<F, F>) -> Result<(), Error> {
+        verify::<F, F, F, _>(
             proof,
             RoundCommitments {
                 current_root: &fx.current.root(),
@@ -300,7 +317,7 @@ mod tests {
         run(&fx, &proof).unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
-        let result = verify::<F, F, _>(
+        let result = verify::<F, F, F, _>(
             &proof,
             RoundCommitments {
                 current_root: &fx.current.root(),

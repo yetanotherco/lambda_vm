@@ -3,7 +3,10 @@
 //! Index `i` is read with **variable 0 as the most significant bit**. Every
 //! fold in this crate assumes that.
 
-use math::field::{element::FieldElement, traits::IsField};
+use math::field::{
+    element::FieldElement,
+    traits::{IsField, IsSubFieldOf},
+};
 
 use crate::Error;
 
@@ -128,6 +131,49 @@ impl<F: IsField> Mle<F> {
             current.fix_first_variable_in_place(r)?;
         }
         Ok(current.evals[0].clone())
+    }
+
+    /// The extension at a point in a **larger** field.
+    ///
+    /// A trace column lives in the base field while the challenges do not, so
+    /// this is how a committed column answers a claim: the first fold lifts,
+    /// the rest stay up. Lifting the whole table first would instead cost its
+    /// size times the extension degree.
+    pub fn evaluate_in<E>(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        if point.len() != self.num_vars {
+            return Err(Error::VariableCountMismatch {
+                expected: self.num_vars,
+                got: point.len(),
+            });
+        }
+        let Some((first, rest)) = point.split_first() else {
+            return Ok(self.evals[0].clone().to_extension::<E>());
+        };
+
+        let half = self.evals.len() / 2;
+        let mut current: Vec<FieldElement<E>> = (0..half)
+            .map(|j| {
+                let lo = &self.evals[j];
+                let hi = &self.evals[j + half];
+                // The base element on the left: the only direction the tower
+                // gives.
+                lo.clone().to_extension::<E>() + (hi - lo) * first
+            })
+            .collect();
+
+        for r in rest {
+            let half = current.len() / 2;
+            for j in 0..half {
+                let delta = &current[j + half] - &current[j];
+                current[j] = &current[j] + r * &delta;
+            }
+            current.truncate(half);
+        }
+        Ok(current.into_iter().next().expect("one value remains"))
     }
 
     /// The single remaining evaluation, once every variable has been fixed.
@@ -265,6 +311,35 @@ mod tests {
                 assert_eq!(via_fold, direct, "a={a}, b={b}");
             }
         }
+    }
+
+    #[test]
+    fn evaluating_in_a_larger_field_matches_lifting_first() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+        type ExtE = FieldElement<Ext>;
+
+        for num_vars in 0..=4usize {
+            let f = mle(&(0..(1u64 << num_vars))
+                .map(|i| i.wrapping_mul(6364136223846793005) >> 13)
+                .collect::<Vec<_>>());
+            let point: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(101 + i as u64)).collect();
+
+            let lifted =
+                Mle::new(f.evals().iter().map(|v| v.to_extension::<Ext>()).collect()).unwrap();
+
+            assert_eq!(
+                f.evaluate_in(&point).unwrap(),
+                lifted.evaluate(&point).unwrap(),
+                "num_vars={num_vars}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluating_in_the_same_field_is_evaluating() {
+        let f = mle(&[3, 5, 8, 13]);
+        let point = [FE::from(6), FE::from(7)];
+        assert_eq!(f.evaluate_in(&point).unwrap(), f.evaluate(&point).unwrap());
     }
 
     #[test]

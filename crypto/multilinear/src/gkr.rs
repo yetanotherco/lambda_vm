@@ -161,7 +161,18 @@ impl<F: IsField> SumcheckPolynomial<F> for LayerRelation<F> {
 }
 
 /// One layer's transcript: the sumcheck plus the four values it reduces to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct LayerProof<F: IsField> {
     pub sumcheck: SumcheckProof<F>,
     pub p_lo: FieldElement<F>,
@@ -171,7 +182,18 @@ pub struct LayerProof<F: IsField> {
 }
 
 /// A proof for the whole tree, output layer first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct GkrProof<F: IsField> {
     pub layers: Vec<LayerProof<F>>,
 }
@@ -182,6 +204,16 @@ pub struct GkrClaim<F: IsField> {
     pub point: Vec<FieldElement<F>>,
     pub p: FieldElement<F>,
     pub q: FieldElement<F>,
+}
+
+/// What proving leaves the caller holding.
+///
+/// The claim is the same one [`verify`] arrives at: the prover needs it to
+/// discharge the input layer, which is where the trace is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GkrOutput<F: IsField> {
+    pub proof: GkrProof<F>,
+    pub claim: GkrClaim<F>,
 }
 
 /// `(1 − c)·lo + c·hi` — the multilinear interpolation that turns the two
@@ -195,7 +227,7 @@ fn combine_halves<F: IsField>(
 }
 
 /// Proves the tree, from the output fraction down to the input layer.
-pub fn prove<F, T>(tree: &FractionTree<F>, transcript: &mut T) -> Result<GkrProof<F>, Error>
+pub fn prove<F, T>(tree: &FractionTree<F>, transcript: &mut T) -> Result<GkrOutput<F>, Error>
 where
     F: IsField,
     T: IsTranscript<F>,
@@ -204,6 +236,7 @@ where
     // The output layer has no variables, so the first claim sits at the empty
     // point and needs no challenge.
     let mut point: Vec<FieldElement<F>> = Vec::new();
+    let (mut p_claim, mut q_claim) = tree.output();
 
     for i in 0..tree.num_layers() - 1 {
         let next = tree.layer(i + 1);
@@ -226,6 +259,11 @@ where
         }
         let c = transcript.sample_field_element();
 
+        // Next layer's claim lives at (c, z).
+        p_claim = combine_halves(&p_lo, &p_hi, &c);
+        q_claim = combine_halves(&q_lo, &q_hi, &c);
+        point = std::iter::once(c).chain(z).collect();
+
         layers.push(LayerProof {
             sumcheck,
             p_lo,
@@ -233,12 +271,16 @@ where
             q_lo,
             q_hi,
         });
-
-        // Next layer's claim lives at (c, z).
-        point = std::iter::once(c).chain(z).collect();
     }
 
-    Ok(GkrProof { layers })
+    Ok(GkrOutput {
+        proof: GkrProof { layers },
+        claim: GkrClaim {
+            point,
+            p: p_claim,
+            q: q_claim,
+        },
+    })
 }
 
 /// Verifies the tree against a claimed output fraction.
@@ -391,7 +433,7 @@ mod tests {
         let tree = FractionTree::build(balanced_logup_layer(5)).unwrap();
         let output = tree.output();
 
-        let proof = prove(&tree, &mut transcript()).unwrap();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
         assert_eq!(proof.layers.len(), tree.num_layers() - 1);
 
         let claim = verify(&proof, output, &mut transcript()).unwrap();
@@ -412,7 +454,7 @@ mod tests {
         let input = FractionLayer::new(Mle::new(p).unwrap(), balanced_logup_layer(4).q).unwrap();
         let tree = FractionTree::build(input).unwrap();
 
-        let proof = prove(&tree, &mut transcript()).unwrap();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
         let claim = verify(&proof, tree.output(), &mut transcript()).unwrap();
         assert_eq!(
             tree.input_layer().p.evaluate(&claim.point).unwrap(),
@@ -421,10 +463,25 @@ mod tests {
     }
 
     #[test]
+    fn the_prover_arrives_at_the_claim_the_verifier_does() {
+        // The prover has to discharge the input-layer claim against the trace,
+        // so it needs the same claim the verifier ends up holding.
+        let tree = FractionTree::build(balanced_logup_layer(3)).unwrap();
+        let out = prove(&tree, &mut transcript()).unwrap();
+        let claim = verify(&out.proof, tree.output(), &mut transcript()).unwrap();
+        assert_eq!(out.claim, claim);
+
+        // And it is the input layer's value at that point.
+        let input = tree.input_layer();
+        assert_eq!(claim.p, input.p.evaluate(&claim.point).unwrap());
+        assert_eq!(claim.q, input.q.evaluate(&claim.point).unwrap());
+    }
+
+    #[test]
     fn a_wrong_output_claim_is_rejected() {
         let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
         let (p, q) = tree.output();
-        let proof = prove(&tree, &mut transcript()).unwrap();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
 
         assert!(verify(&proof, (p + FE::one(), q), &mut transcript()).is_err());
     }
@@ -433,7 +490,7 @@ mod tests {
     fn a_tampered_half_value_is_rejected() {
         let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
         let output = tree.output();
-        let mut proof = prove(&tree, &mut transcript()).unwrap();
+        let mut proof = prove(&tree, &mut transcript()).unwrap().proof;
 
         proof.layers[1].q_lo += FE::one();
         let err = verify(&proof, output, &mut transcript()).unwrap_err();
@@ -444,7 +501,7 @@ mod tests {
     fn a_tampered_sumcheck_round_is_rejected() {
         let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
         let output = tree.output();
-        let mut proof = prove(&tree, &mut transcript()).unwrap();
+        let mut proof = prove(&tree, &mut transcript()).unwrap().proof;
 
         proof.layers[2].sumcheck.rounds[0].evaluations[0] += FE::one();
         assert!(verify(&proof, output, &mut transcript()).is_err());
@@ -454,7 +511,7 @@ mod tests {
     fn a_proof_replayed_under_another_transcript_is_rejected() {
         let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
         let output = tree.output();
-        let proof = prove(&tree, &mut transcript()).unwrap();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
 
         verify(&proof, output, &mut transcript()).unwrap();
         let mut other = DefaultTranscript::<F>::new(b"another-statement");
@@ -466,7 +523,7 @@ mod tests {
         let tree = FractionTree::build(layer(&[7], &[3])).unwrap();
         assert_eq!(tree.num_layers(), 1);
 
-        let proof = prove(&tree, &mut transcript()).unwrap();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
         assert!(proof.layers.is_empty());
 
         let claim = verify(&proof, tree.output(), &mut transcript()).unwrap();
