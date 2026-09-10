@@ -56,11 +56,12 @@ lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 # KZG is not linked, so the point-evaluation precompile (0x0a) is unsupported —
 # see src/main.rs.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program", default-features = false }
-# `lambda-vm-syscalls` can still reach the graph as a git dep pinned to a commit
-# of THIS repo, which upstream bumps on its own schedule. Override it
-# with the working-tree copy so the guest always links the same syscalls as the rest
-# of the repo — including uncommitted local edits — rather than whatever commit
-# ethrex last pinned. (At the current ethrex rev the two happen to coincide; this
-# override is what keeps that coincidence from being load-bearing.)
+# Defence in depth, inert today. `lambda-vm-syscalls` can reach this graph only as a git
+# dep of `ethrex-guest-program`'s `lambdavm` feature, which this manifest does not enable
+# — the lockfile carries no `git+https://github.com/yetanotherco/lambda_vm.git` source at
+# all, so this patch currently matches nothing and cargo does not warn about it. It stays
+# because the hazard it covers is real and silent: a future ethrex rev that pulls those
+# syscalls from git would link a different copy than the rest of the repo, and the guest
+# is the one binary where that divergence matters.
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
