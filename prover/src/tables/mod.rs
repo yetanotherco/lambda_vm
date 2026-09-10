@@ -63,40 +63,57 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
-/// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
-/// MEMW (effective width 127) at 2^19 is the baseline; other tables are scaled
-/// proportionally: max_rows = (127 × 2^19) / effective_width, rounded to 2^N.
-/// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
-///    benchmarks show better parallel throughput with smaller chunks.)
+/// ★ **How to re-derive this table** (it is documentation — nothing reads it, so
+/// it rots silently): `Main` is that table's `cols::NUM_COLUMNS`; `Bus` is
+/// `bus_interactions().len()`; `Aux` is `⌈Bus/2⌉`, the committed extension
+/// columns LogUp actually allocates — `num_term_columns + 1` per
+/// `stark::lookup`'s `AirBuilder`, which `split_interactions` makes equal to
+/// `⌈Bus/2⌉` for every `Bus ≥ 1`, and which `auto_storage::aux_cols` spells as
+/// that closed form (that module is behind the `disk-spill` feature, so
+/// `stark::lookup` is the always-compiled source of truth). An extension
+/// element is three base felts, so
+/// `Eff.width = Main + 3 × Aux`. ⚠ Do NOT use `Main + 3 × Bus`: that was the
+/// previous formula here and it double-counts the bus term.
 ///
-/// | Table   | Main | Bus | Eff.width | Max rows |
-/// |---------|------|-----|-----------|----------|
-/// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  74  |  40 |    194    |  2^19    |
-/// | DVRM    |  34  |  34 |    136    |  2^19    |
-/// | MUL     |  26  |  16 |     74    |  2^20    |
-/// | LT      |  15  |   9 |     42    |  2^20    |
-/// | SHIFT   |  27  |  15 |     72    |  2^20    |
-/// | LOAD    |  18  |   5 |     33    |  2^20    |
-/// | BRANCH  |  14  |   6 |     32    |  2^20    |
-/// | MEMW_R  |  10  |   7 |     31    |  2^20    |
+/// MEMW (Eff.width 88) at 2^19 is the baseline; the rest scale as
+/// `max_rows = nearest 2^N of (88 × 2^19) / Eff.width`, **capped at 2^20**.
+/// The cap is what holds LOAD, BRANCH, MEMW_R, EQ and STORE at 2^20 where the
+/// ratio alone would put them at 2^21.
+/// (* MEMW_A's ratio gives 2^20, but it is set to 2^19 to match MEMW chunk
+///    geometry; benchmarks show better parallel throughput with smaller chunks.)
+///
+/// | Table    | Main | Bus | Aux | Eff.width | Max rows |
+/// |----------|------|-----|-----|-----------|----------|
+/// | MEMW     |  49  |  26 |  13 |     88    |  2^19    |
+/// | MEMW_A   |  29  |  20 |  10 |     59    |  2^19 *  |
+/// | CPU      |  38  |  20 |  10 |     68    |  2^19    |
+/// | CPU32    |  38  |  23 |  12 |     74    |  2^19    |
+/// | DVRM     |  34  |  34 |  17 |     85    |  2^19    |
+/// | MUL      |  26  |  24 |  12 |     62    |  2^20    |
+/// | SHIFT    |  29  |  18 |   9 |     56    |  2^20    |
+/// | BYTEWISE |  26  |   9 |   5 |     41    |  2^20    |
+/// | LT       |  17  |   9 |   5 |     32    |  2^20    |
+/// | STORE    |  16  |  10 |   5 |     31    |  2^20    |
+/// | LOAD     |  18  |   5 |   3 |     27    |  2^20    |
+/// | BRANCH   |  14  |   6 |   3 |     23    |  2^20    |
+/// | MEMW_R   |  10  |   7 |   4 |     22    |  2^20    |
+/// | EQ       |  12  |   6 |   3 |     21    |  2^20    |
 pub mod max_rows {
-    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
-    pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
-    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
-    pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
-    pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
-    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42
-    pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
-    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
-    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
-    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
+    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 68
+    pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 88 (baseline)
+    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 59
+    pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 85
+    pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 62
+    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 32
+    pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 56
+    pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 27 (capped)
+    pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 23 (capped)
+    pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 22 (capped)
     // Auxiliary ALU / memory / CPU32 dispatch chips
-    pub const EQ: usize = 1 << 20;
-    pub const BYTEWISE: usize = 1 << 20;
-    pub const STORE: usize = 1 << 20;
-    pub const CPU32: usize = 1 << 19;
+    pub const EQ: usize = 1 << 20; // 1,048,576 — eff. width 21 (capped)
+    pub const BYTEWISE: usize = 1 << 20; // 1,048,576 — eff. width 41
+    pub const STORE: usize = 1 << 20; // 1,048,576 — eff. width 31 (capped)
+    pub const CPU32: usize = 1 << 19; // 524,288  — eff. width 74
 }
 
 /// Per-table maximum row limits, configurable for different environments.
