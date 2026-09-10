@@ -136,6 +136,7 @@ const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
 const SUMCHECK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sumcheck.cubin"));
+const WHIR_FOLD_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whir_fold.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -197,6 +198,7 @@ pub struct Backend {
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_coset: CudaFunction,
+    pub keccak256_leaves_ext3_coset: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub grind_search: CudaFunction,
@@ -245,6 +247,10 @@ pub struct Backend {
     // sumcheck.cubin
     pub sumcheck_round_ext3: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
+
+    // whir_fold.cubin
+    pub whir_fold_base_ext3: CudaFunction,
+    pub whir_fold_ext3: CudaFunction,
 
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
@@ -360,6 +366,7 @@ impl Backend {
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
         let sumcheck = ctx.load_module(Ptx::from_binary(SUMCHECK_CUBIN.to_vec()))?;
+        let whir_fold = ctx.load_module(Ptx::from_binary(WHIR_FOLD_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -439,6 +446,7 @@ impl Backend {
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
+            keccak256_leaves_ext3_coset: keccak.load_function("keccak256_leaves_ext3_coset")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
@@ -480,6 +488,8 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            whir_fold_base_ext3: whir_fold.load_function("whir_fold_base_ext3")?,
+            whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             constraint_interp_kernel: constraint_interp

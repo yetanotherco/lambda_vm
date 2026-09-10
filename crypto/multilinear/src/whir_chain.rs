@@ -389,7 +389,7 @@ pub fn prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<ChainProof<F, E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -408,7 +408,7 @@ pub fn prove_weighted<F, E, T>(
     transcript: &mut T,
 ) -> Result<ChainProof<F, E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -540,7 +540,7 @@ fn final_openings<C, N, T>(
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
 where
-    C: IsField,
+    C: IsField + 'static,
     N: IsField,
     FieldElement<C>: AsBytes + Sync + Send,
     T: IsTranscript<N>,

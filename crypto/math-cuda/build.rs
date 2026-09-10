@@ -188,4 +188,5 @@ fn main() {
     compile_kernel("logup.cu", "logup.cubin", have_nvcc);
     compile_kernel("constraint_interp.cu", "constraint_interp.cubin", have_nvcc);
     compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc);
+    compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc);
 }

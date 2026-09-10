@@ -268,6 +268,32 @@ extern "C" __global__ void keccak256_leaves_base_coset(
     hash_base_row(codeword, num_leaves, block, tid, hashed_leaves_out + tid * 32);
 }
 
+// Leaf hashing for an ext3 codeword's fold blocks: leaf `j` hashes
+// `codeword[j + t·num_leaves]` for `t` in `[0, block)`, each element as its
+// three components in canonical big-endian order — what
+// `FieldElement::<Ext3>::write_bytes_be` streams, and what the base-field
+// coset kernel does one component at a time.
+extern "C" __global__ void keccak256_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
+                                                       uint64_t num_leaves, uint64_t block,
+                                                       uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t st[25];
+#pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t t = 0; t < block; ++t) {
+        const uint64_t *at = codeword + (tid + t * num_leaves) * 3;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(at[k])));
+        }
+    }
+    finalize_keccak256(st, rate_pos, out + tid * 32);
+}
+
 // ---------------------------------------------------------------------------
 // Goldilocks BASE-FIELD row-pair leaf hashing.
 //

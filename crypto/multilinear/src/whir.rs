@@ -272,9 +272,34 @@ pub fn fold_codeword_k<F, C, N>(
     alphas: &[FieldElement<N>],
 ) -> Result<(Vec<FieldElement<N>>, Domain<F>), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
-    C: IsField + IsSubFieldOf<N>,
-    N: IsField,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N> + 'static,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
+{
+    // Every level of the group in one residency: the codeword is the biggest
+    // thing the proof moves, and the device halves it level by level without
+    // handing it back in between.
+    if let Some(folded) = crate::gpu::fold_codeword_k(codeword, domain.generator(), alphas) {
+        let mut folded_domain = domain.clone();
+        for _ in alphas {
+            folded_domain = folded_domain.squared()?;
+        }
+        return Ok((folded, folded_domain));
+    }
+    fold_codeword_k_on_host(codeword, domain, alphas)
+}
+
+/// The same on the host, whatever a device would have done — the reference the
+/// kernel is checked against.
+pub fn fold_codeword_k_on_host<F, C, N>(
+    codeword: &[FieldElement<C>],
+    domain: &Domain<F>,
+    alphas: &[FieldElement<N>],
+) -> Result<(Vec<FieldElement<N>>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N> + 'static,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
 {
     let Some((first, rest)) = alphas.split_first() else {
         let lifted = codeword

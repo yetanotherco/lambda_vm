@@ -585,3 +585,152 @@ mod tests {
         assert!(lower(&program).is_none());
     }
 }
+
+/// Codeword size below which the host fold wins: one launch per level plus the
+/// round trip, against a pass a few cores finish in microseconds.
+#[cfg(feature = "cuda")]
+const FOLD_THRESHOLD: usize = 1 << 16;
+
+/// Folds a codeword `alphas.len()` times on device.
+///
+/// `generator` is the fold domain's, and the domain squares with every level —
+/// the kernel takes each level's inverse generator, which is this one's inverse
+/// squared level by level.
+#[cfg(feature = "cuda")]
+pub(crate) fn fold_codeword_k<F, C, N>(
+    codeword: &[math::field::element::FieldElement<C>],
+    generator: &math::field::element::FieldElement<F>,
+    alphas: &[math::field::element::FieldElement<N>],
+) -> Option<Vec<math::field::element::FieldElement<N>>>
+where
+    F: math::field::traits::IsField + 'static,
+    C: math::field::traits::IsField + 'static,
+    N: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<N>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let base = TypeId::of::<C>() == TypeId::of::<Gl>();
+    if !base && TypeId::of::<C>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    if alphas.is_empty() || codeword.len() < FOLD_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_FOLD").is_some()) {
+        return None;
+    }
+
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let generator = unsafe { *(generator as *const _ as *const u64) };
+    let generator = FieldElement::<Gl>::from_raw(generator);
+    let two = FieldElement::<Gl>::from(2u64);
+    let two_inv = *two.inv().ok()?.value();
+    let mut g_inv = generator.inv().ok()?;
+    let mut g_invs = Vec::with_capacity(alphas.len());
+    for _ in 0..alphas.len() {
+        g_invs.push(*g_inv.value());
+        g_inv = g_inv.square();
+    }
+
+    let mut raw_alphas = Vec::with_capacity(alphas.len() * 3);
+    for alpha in alphas {
+        raw_alphas.extend_from_slice(&ext3_raw(alpha)?);
+    }
+
+    // SAFETY: `C` is one of the two fields checked above, and both wrap their
+    // limbs transparently — one `u64` per base element, three per ext3.
+    let limbs = if base { 1 } else { 3 };
+    let raw = unsafe {
+        core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * limbs)
+    };
+    let folded = if base {
+        math_cuda::whir::fold_codeword_base(raw, two_inv, &g_invs, &raw_alphas).ok()?
+    } else {
+        math_cuda::whir::fold_codeword_ext3(raw, two_inv, &g_invs, &raw_alphas).ok()?
+    };
+
+    // SAFETY: `N == Ext3`, three limbs per element and no drop glue, so the
+    // allocation changes type in place instead of being copied.
+    let mut folded = core::mem::ManuallyDrop::new(folded);
+    Some(unsafe {
+        Vec::from_raw_parts(
+            folded.as_mut_ptr() as *mut FieldElement<N>,
+            folded.len() / 3,
+            folded.capacity() / 3,
+        )
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn fold_codeword_k<F, C, N>(
+    _codeword: &[math::field::element::FieldElement<C>],
+    _generator: &math::field::element::FieldElement<F>,
+    _alphas: &[math::field::element::FieldElement<N>],
+) -> Option<Vec<math::field::element::FieldElement<N>>>
+where
+    F: math::field::traits::IsField + 'static,
+    C: math::field::traits::IsField + 'static,
+    N: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// Merkle-commits an ext3 codeword's fold blocks on device, returning the tree
+/// in the host node layout.
+#[cfg(feature = "cuda")]
+pub(crate) fn commit_tree_ext3<F>(
+    codeword: &[math::field::element::FieldElement<F>],
+    log_folding: usize,
+) -> Option<Vec<[u8; 32]>>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<Ext3>() {
+        return None;
+    }
+    if codeword.len() < COMMIT_THRESHOLD || codeword.len() >> log_folding < 2 {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+        return None;
+    }
+    // SAFETY: `F == Ext3`, three transparent `u64` limbs per element.
+    let raw =
+        unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
+    let nodes = math_cuda::whir::commit_codeword_ext3(raw, log_folding).ok()?;
+    if !nodes.len().is_multiple_of(32) {
+        return None;
+    }
+    COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(
+        nodes
+            .chunks_exact(32)
+            .map(|node| {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(node);
+                out
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn commit_tree_ext3<F>(
+    _codeword: &[math::field::element::FieldElement<F>],
+    _log_folding: usize,
+) -> Option<Vec<[u8; 32]>>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}

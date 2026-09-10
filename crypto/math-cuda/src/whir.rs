@@ -120,3 +120,174 @@ pub fn commit_codeword(
     stream.synchronize()?;
     Ok((codeword, nodes))
 }
+
+/// Folds a codeword `levels` times in one residency, lifting the base field on
+/// the first fold.
+///
+/// `g_invs` is each level's inverse domain generator (the domain squares as the
+/// codeword halves) and `alphas` the folding challenges, three u64 per level.
+/// Returns the folded codeword as interleaved ext3.
+pub fn fold_codeword_base(
+    codeword: &[u64],
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<Vec<u64>> {
+    let levels = g_invs.len();
+    assert!(levels > 0, "a fold needs a level");
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.len().is_power_of_two(),
+        "a codeword is a power of two"
+    );
+    assert!(
+        codeword.len() >> levels >= 1,
+        "{levels} folds do not fit a codeword of {}",
+        codeword.len()
+    );
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut half = codeword.len() / 2;
+    let input = stream.clone_htod(codeword)?;
+    let alpha = stream.clone_htod(alphas)?;
+
+    // SAFETY: the kernel writes every element of the half it produces.
+    let mut current = unsafe { stream.alloc::<u64>(half * 3) }?;
+    let half_arg = half as u64;
+    let g_inv = g_invs[0];
+    unsafe {
+        stream
+            .launch_builder(&be.whir_fold_base_ext3)
+            .arg(&input)
+            .arg(&half_arg)
+            .arg(&two_inv)
+            .arg(&g_inv)
+            .arg(&alpha.slice(0..3))
+            .arg(&mut current)
+            .launch(LaunchConfig::for_num_elems(half as u32))?;
+    }
+    drop(input);
+
+    for level in 1..levels {
+        half /= 2;
+        // SAFETY: as above.
+        let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
+        let half_arg = half as u64;
+        let g_inv = g_invs[level];
+        unsafe {
+            stream
+                .launch_builder(&be.whir_fold_ext3)
+                .arg(&current)
+                .arg(&half_arg)
+                .arg(&two_inv)
+                .arg(&g_inv)
+                .arg(&alpha.slice(level * 3..level * 3 + 3))
+                .arg(&mut next)
+                .launch(LaunchConfig::for_num_elems(half as u32))?;
+        }
+        current = next;
+    }
+
+    let out = stream.clone_dtoh(&current)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// The same for a codeword already in the extension.
+pub fn fold_codeword_ext3(
+    codeword: &[u64],
+    two_inv: u64,
+    g_invs: &[u64],
+    alphas: &[u64],
+) -> Result<Vec<u64>> {
+    let levels = g_invs.len();
+    assert!(levels > 0, "a fold needs a level");
+    assert_eq!(alphas.len(), levels * 3, "three u64 per challenge");
+    assert!(
+        codeword.len().is_multiple_of(3),
+        "three u64 per ext3 element"
+    );
+    let elements = codeword.len() / 3;
+    assert!(elements.is_power_of_two(), "a codeword is a power of two");
+    assert!(elements >> levels >= 1, "{levels} folds do not fit");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut half = elements / 2;
+    let alpha = stream.clone_htod(alphas)?;
+    let mut current = stream.clone_htod(codeword)?;
+
+    for level in 0..levels {
+        // SAFETY: the kernel writes every element of the half it produces.
+        let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
+        let half_arg = half as u64;
+        let g_inv = g_invs[level];
+        unsafe {
+            stream
+                .launch_builder(&be.whir_fold_ext3)
+                .arg(&current)
+                .arg(&half_arg)
+                .arg(&two_inv)
+                .arg(&g_inv)
+                .arg(&alpha.slice(level * 3..level * 3 + 3))
+                .arg(&mut next)
+                .launch(LaunchConfig::for_num_elems(half as u32))?;
+        }
+        current = next;
+        half /= 2;
+    }
+
+    let out = stream.clone_dtoh(&current)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Merkle-commits an ext3 codeword's fold blocks on device, returning the tree
+/// in the host node layout.
+///
+/// The codeword itself stays where the caller has it: a folded codeword is the
+/// next round's input on the host side, so only the tree comes back.
+pub fn commit_codeword_ext3(codeword: &[u64], log_folding: usize) -> Result<Vec<u8>> {
+    assert!(
+        codeword.len().is_multiple_of(3),
+        "three u64 per ext3 element"
+    );
+    let elements = codeword.len() / 3;
+    assert!(elements.is_power_of_two(), "a codeword is a power of two");
+    assert!(
+        log_folding <= elements.trailing_zeros() as usize,
+        "a leaf cannot exceed the codeword"
+    );
+    let num_leaves = elements >> log_folding;
+    assert!(num_leaves >= 2, "tree needs at least two leaves");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let values = stream.clone_htod(codeword)?;
+
+    let total_nodes = 2 * num_leaves - 1;
+    // SAFETY: every byte is written before it is read — the leaves by the
+    // kernel below, the inner nodes by the level loop after it.
+    let mut nodes = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
+    {
+        let leaves_offset = (num_leaves - 1) * 32;
+        let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+        let num_leaves_u64 = num_leaves as u64;
+        let block = 1u64 << log_folding;
+        unsafe {
+            stream
+                .launch_builder(&be.keccak256_leaves_ext3_coset)
+                .arg(&values)
+                .arg(&num_leaves_u64)
+                .arg(&block)
+                .arg(&mut leaves)
+                .launch(keccak_launch_cfg(num_leaves_u64))?;
+        }
+    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves)?;
+
+    let out = stream.clone_dtoh(&nodes)?;
+    stream.synchronize()?;
+    Ok(out)
+}

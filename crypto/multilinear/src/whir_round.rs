@@ -85,8 +85,8 @@ pub fn prove<C, N, T>(
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
 where
-    C: IsField,
-    N: IsField,
+    C: IsField + 'static,
+    N: IsField + 'static,
     FieldElement<C>: AsBytes + Sync + Send,
     FieldElement<N>: AsBytes + Sync + Send,
     T: IsTranscript<N>,

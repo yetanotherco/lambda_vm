@@ -73,7 +73,7 @@ pub fn leaf_and_slot(position: usize, num_leaves: usize) -> (usize, usize) {
     (position % num_leaves, position / num_leaves)
 }
 
-impl<F: IsField> std::fmt::Debug for CodewordCommitment<F>
+impl<F: IsField + 'static> std::fmt::Debug for CodewordCommitment<F>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
@@ -87,7 +87,7 @@ where
     }
 }
 
-impl<F: IsField> CodewordCommitment<F>
+impl<F: IsField + 'static> CodewordCommitment<F>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
@@ -115,6 +115,34 @@ where
             });
         }
 
+        if let Some(nodes) = crate::gpu::commit_tree_ext3(&codeword, log_folding) {
+            let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
+            return Ok(Self {
+                tree,
+                codeword,
+                log_folding,
+                log_domain_size,
+            });
+        }
+        Self::from_codeword_on_host(codeword, log_folding)
+    }
+
+    /// The same with the leaves hashed here, whatever a device would have done
+    /// — the reference the kernel is checked against.
+    pub fn from_codeword_on_host(
+        codeword: Vec<FieldElement<F>>,
+        log_folding: usize,
+    ) -> Result<Self, Error> {
+        if !codeword.len().is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(codeword.len()));
+        }
+        let log_domain_size = codeword.len().trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
         let num_leaves = 1usize << (log_domain_size - log_folding);
         let block = 1usize << log_folding;
         // One reused buffer per worker: a block is the leaf the backend hashes,

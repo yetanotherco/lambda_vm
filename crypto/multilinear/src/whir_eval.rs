@@ -69,7 +69,7 @@ pub fn commit<F, E>(
     config: &EvalConfig,
 ) -> Result<(CodewordCommitment<E>, Domain<F>), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -102,7 +102,7 @@ pub fn prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<EvalProof<E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -120,7 +120,7 @@ pub fn prove_weighted<F, E, T>(
     transcript: &mut T,
 ) -> Result<EvalProof<E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -167,7 +167,7 @@ pub fn verify<F, E, T>(
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
@@ -200,7 +200,7 @@ pub fn verify_weighted<F, E, T, W>(
     transcript: &mut T,
 ) -> Result<(), Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
