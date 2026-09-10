@@ -490,6 +490,13 @@ impl ContinuationProof {
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
     }
+
+    /// What each epoch declared it carries, for tests that have to show the
+    /// epochs disagree. `epochs` itself stays private.
+    #[cfg(test)]
+    pub(crate) fn epoch_table_counts(&self) -> Vec<&TableCounts> {
+        self.epochs.iter().map(|e| &e.table_counts).collect()
+    }
 }
 
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
@@ -2071,11 +2078,23 @@ mod tests {
         );
 
         // And the epochs disagree: some table is in one and out of another.
-        let disagreeing: Vec<&str> = per_epoch[0]
+        //
+        // Among the *non-final* epochs only. The final epoch is the one that
+        // carries HALT and the one where a program's output is committed, so a
+        // difference that involves it can be structural — a whole-run table set
+        // would still produce it, and this assertion would pass while measuring
+        // nothing about per-epoch granularity.
+        assert!(
+            per_epoch.len() >= 3,
+            "need at least two non-final epochs to compare, got {} epochs",
+            per_epoch.len()
+        );
+        let non_final = &per_epoch[..per_epoch.len() - 1];
+        let disagreeing: Vec<&str> = non_final[0]
             .iter()
             .enumerate()
             .filter(|(i, (_, first))| {
-                per_epoch
+                non_final
                     .iter()
                     .any(|row| (row[*i].1 == 0) != (*first == 0))
             })
@@ -2083,11 +2102,39 @@ mod tests {
             .collect();
         assert!(
             !disagreeing.is_empty(),
-            "every epoch carries the same tables, so per-epoch granularity is \
-             untested here — pick a program or epoch size that varies:\n  {}",
+            "the non-final epochs all carry the same tables, so per-epoch \
+             granularity is untested here — pick a program or epoch size that \
+             varies:\n  {}",
             layout()
         );
-        println!("tables present in some epochs but not others: {disagreeing:?}");
+
+        // Sharper: a table that is present, goes away, and comes back cannot be
+        // produced by any scheme that computes one set over the run or over a
+        // prefix of it. Counting the blocks of consecutive epochs a table
+        // appears in, more than one block is exactly that shape.
+        let blocks = |i: usize| {
+            let present: Vec<bool> = per_epoch.iter().map(|row| row[i].1 > 0).collect();
+            present
+                .iter()
+                .enumerate()
+                .filter(|(k, p)| **p && (*k == 0 || !present[k - 1]))
+                .count()
+        };
+        let reappearing: Vec<&str> = per_epoch[0]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| blocks(*i) > 1)
+            .map(|(_, (name, _))| *name)
+            .collect();
+        assert!(
+            !reappearing.is_empty(),
+            "no table leaves and comes back, so a union or prefix scheme would \
+             produce this same layout — the test cannot tell them apart:\n  {}",
+            layout()
+        );
+
+        println!("tables present in some non-final epochs but not others: {disagreeing:?}");
+        println!("tables that leave and come back: {reappearing:?}");
         println!("  {}", layout());
 
         // The mixed-shape bundle has to verify end to end.
@@ -2394,6 +2441,65 @@ mod tests {
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// The continuation counterpart of the monolithic
+    /// `test_verify_rejects_undercounted_table_count`: an epoch that declares
+    /// away a table it actually carries. Both branches of the cross-check are
+    /// exercised, because the fixed-table term differs between a non-final
+    /// epoch (`FIXED_TABLE_COUNT - 1`, no HALT) and the final one — and
+    /// `verify_epoch` swallows the mismatch as `Ok(false)` rather than an
+    /// error, so a regression in that arithmetic would be silent.
+    #[test]
+    fn test_split_verify_rejects_undercounted_epoch_table_count() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need a non-final and a final epoch, got {}",
+            bundle.epochs.len()
+        );
+        let last = bundle.epochs.len() - 1;
+        for epoch in [0, last] {
+            // Whatever this epoch does carry: the point is declaring one of its
+            // own tables away, not which one.
+            let counts = &mut bundle.epochs[epoch].table_counts;
+            let (name, restore) = if counts.load > 0 {
+                ("load", std::mem::replace(&mut counts.load, 0))
+            } else if counts.store > 0 {
+                ("store", std::mem::replace(&mut counts.store, 0))
+            } else {
+                ("lt", std::mem::replace(&mut counts.lt, 0))
+            };
+            assert!(
+                restore > 0,
+                "epoch {epoch} carries no optional table to declare away"
+            );
+            assert!(
+                verify_continuation(&elf_bytes, &bundle, &opts)
+                    .unwrap()
+                    .is_none(),
+                "epoch {epoch} declaring away its {name} table must be rejected"
+            );
+            let counts = &mut bundle.epochs[epoch].table_counts;
+            match name {
+                "load" => counts.load = restore,
+                "store" => counts.store = restore,
+                _ => counts.lt = restore,
+            }
+        }
+
+        // The control, and the reason the rejections above mean something: put
+        // the counts back and the same bundle verifies. One verify, at the end,
+        // rather than one before and one after — each costs a full pass.
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "restoring the counts must bring the bundle back"
         );
     }
 
