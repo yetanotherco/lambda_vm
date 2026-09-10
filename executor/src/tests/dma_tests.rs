@@ -277,8 +277,9 @@ fn dma_memset_rejects_every_gap_but_one() {
         );
     }
 
-    // Rejected for count 0 too: the AIR pins the gap on every `is_set` row, and a
-    // zero-length call still emits one.
+    // Rejected for count 0 too. A zero-length call with a *correct* gap is fine and
+    // provable (one row, first = end = 1, no read, no write); what this case exercises
+    // is `dst == src`, which the guard refuses regardless of count.
     let mut memory = Memory::default();
     assert!(matches!(
         run_memset(&mut memory, 0x2000, 0x2000, 0),
@@ -292,6 +293,27 @@ fn dma_memset_rejects_every_gap_but_one() {
         run_memset(&mut memory, 0x1_0000_0000, 0xFFFF_FFF8, 8),
         Err(ExecutionError::DmaMemsetBadGap { .. })
     ));
+
+    // And the bound must cover the whole range, not just the first row. This chain
+    // starts clear of the boundary but walks into it: at offset 248 the row is
+    // `src = 0xFFFF_FFF8, dst = 0x1_0000_0000`, whose low limbs differ by
+    // `-0xFFFF_FFF8` rather than by the gap, so the AIR rejects that row. Accepting
+    // the call here would hand an honest guest a trace no prover can prove.
+    let mut memory = Memory::default();
+    assert!(
+        matches!(
+            run_memset(&mut memory, 0xFFFF_FF08, 0xFFFF_FF00, 256),
+            Err(ExecutionError::DmaMemsetBadGap { .. })
+        ),
+        "a memset whose range crosses the 2^32 limb boundary must be refused"
+    );
+
+    // The row just inside the boundary is still fine, so the bound is not blanket.
+    let mut memory = Memory::default();
+    let src = 0xFFFF_FFFF - 256 - 8;
+    seed(&mut memory, src, 0x3C);
+    run_memset(&mut memory, src + 8, src, 256).unwrap();
+    assert_eq!(memory.load_byte(src + 263), 0x3C);
 
     // And the one legal shape still works.
     let mut memory = Memory::default();

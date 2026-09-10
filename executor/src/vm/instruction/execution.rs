@@ -125,6 +125,15 @@ pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u6
 /// ECALL number `-32`, i.e. `u64::MAX - 31`. It is not `-31` because
 /// [`HINT_SYSCALL_NUMBER`] already holds that, so the copy group is `-30` and `-32`
 /// with the hint wedged between. Must match `syscalls/src/syscalls.rs`.
+///
+/// The adjacency has a consequence in the AIR. MEMMOVE decodes the functionality by
+/// receiving the syscall number as a linear function of its `is_set` bit, so the
+/// received lo32 is `MEMCPY_LO32 - 2 * is_set`. HINT's number sits exactly halfway
+/// between the two, which means `is_set = 2^-1` in the field reproduces HINT's ecall
+/// tuple bit for bit. The only thing separating them is the `IS_BIT` constraint on
+/// `is_set`. That is sufficient, but it is a single degree-2 constraint standing
+/// between two live syscalls -- keep the two copy numbers an even distance apart, or
+/// keep nothing received in between, if these are ever renumbered again.
 pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
 
 /// The one operand shape a DMA memset ecall may have: the destination trails the
@@ -729,7 +738,17 @@ impl Instruction {
                         // of the low limb, and rejecting the straddle here is cheaper
                         // than spending a carry column on an address range no guest
                         // reaches (cf. the HINT limb bounds below).
-                        if src & 0xFFFF_FFFF > 0xFFFF_FFFF - DMA_MEMSET_GAP
+                        //
+                        // The bound has to cover the whole range, not just the first
+                        // row. `src` and `dst` both advance by the row width, and the
+                        // AIR pins the gap on EVERY `is_set` row, so a chain that starts
+                        // clear of the boundary can still walk into it: with
+                        // `src = 0xFFFF_FF00, n = 256` the row at offset 248 has
+                        // `SRC_0 = 0xFFFF_FFF8` against `DST_0 = 0`, which satisfies the
+                        // gap in full 64-bit arithmetic but not limb-wise. Bounding the
+                        // starting limb alone would accept an execution no prover can
+                        // then prove.
+                        if (src & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF
                             || dst != src + DMA_MEMSET_GAP
                         {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
@@ -961,7 +980,8 @@ pub enum ExecutionError {
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
     #[error(
-        "DMA memset needs dst == src + {DMA_MEMSET_GAP} with src's low limb clear of the          boundary; got src {src:#x}, dst {dst:#x}"
+        "DMA memset needs dst == src + {DMA_MEMSET_GAP}, with src and src + n clear of \
+         the 2^32 limb boundary; got src {src:#x}, dst {dst:#x}"
     )]
     DmaMemsetBadGap { src: u64, dst: u64 },
     #[error("Hint address range overflows the lower 32-bit limb")]

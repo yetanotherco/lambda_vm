@@ -783,9 +783,24 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // Pinning the exact gap rather than merely `src != dst` also settles the
         // direction: `dst < src` is sound but propagates the wrong way, so the AIR
         // would otherwise admit traces the executor's forward byte walk never produces.
-        // The limb-wise form cannot express a carry out of the low limb, which is why
-        // the executor rejects a `src` whose low limb sits within `DMA_MEMSET_GAP` of
-        // the boundary.
+        //
+        // On what these two actually pin: taken together they force
+        // `packed(dst) - packed(src) = 8` in the field, and that holds whichever way a
+        // prover splits an address across the two limbs -- re-splitting as
+        // `(lo + 2^32, hi - 1)` cancels between the pair. So `DST_0 = SRC_0 + 8` always
+        // differs from `SRC_0`, and the aliasing forgery is dead unconditionally. What
+        // these constraints do NOT give on their own is the gap over the integers:
+        // getting from "gap of 8 in F" to "gap of 8 in Z" needs both limbs canonical,
+        // and MEMMOVE range-checks none of `SRC_0/SRC_1/DST_0/DST_1` (only the three
+        // `_INCR`/`_DECR` dwords get `IS_HALF`). Canonicality comes from the far end of
+        // the `Memory` bus instead: PAGE builds `address_lo` as `page_base_lo + OFFSET`
+        // from a preprocessed offset, and in continuations L2G must chain back to a
+        // GLOBAL_MEMORY genesis token of the same shape, so a non-canonical limb pair
+        // has no receiver. Worth knowing before adding another `Memw` producer or a
+        // non-PAGE `Memory` endpoint -- either would weaken this to the field statement.
+        //
+        // The executor additionally refuses a call whose range crosses the 2^32 limb
+        // boundary, so the honest trace never has to rely on that argument.
         let gap = b.const_base(DMA_MEMSET_GAP);
         b.emit_base(
             32,
