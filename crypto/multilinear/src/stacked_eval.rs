@@ -35,7 +35,7 @@ use math::{
 
 use crate::{
     Error, challenge_powers,
-    eq::{eq_eval, eq_evals},
+    eq::{eq_eval, eq_evals_into},
     mle::Mle,
     stacking::{Placement, StackedLayout},
     whir::Domain,
@@ -180,14 +180,12 @@ where
                 got: point.len(),
             });
         }
-        let eq = eq_evals(point);
-        let weight = &weights[column];
-        for (slot, e) in table[place.offset..place.offset + eq.len()]
-            .iter_mut()
-            .zip(&eq)
-        {
-            *slot = weight * e;
-        }
+        let cells = 1usize << place.num_vars;
+        eq_evals_into(
+            point,
+            &weights[column],
+            &mut table[place.offset..place.offset + cells],
+        )?;
     }
     Mle::new(table)
 }
@@ -256,7 +254,7 @@ pub fn prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<StackedProof<F, E>, Error>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,

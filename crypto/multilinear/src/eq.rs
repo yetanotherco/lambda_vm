@@ -19,39 +19,52 @@ pub fn eq_evals<F: IsField>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>>
 where
     FieldElement<F>: Send + Sync,
 {
-    let mut table = vec![FieldElement::<F>::one()];
-    for r_i in r.iter().rev() {
+    let mut table = vec![FieldElement::<F>::zero(); 1usize << r.len()];
+    // The length is `2^r.len()` by construction.
+    eq_evals_into(r, &FieldElement::<F>::one(), &mut table).expect("the table is sized for r");
+    table
+}
+
+/// The same table, scaled by `by`, written into `dst`.
+///
+/// The scale rides the seed rather than a pass over the result: the table is a
+/// product over the variables, so one more factor at the start scales every
+/// entry. And the doubling happens in place — a caller that wants the table
+/// inside a bigger one (a stacked polynomial's weight, say) hands over that
+/// range and pays no copy.
+pub fn eq_evals_into<F: IsField>(
+    r: &[FieldElement<F>],
+    by: &FieldElement<F>,
+    dst: &mut [FieldElement<F>],
+) -> Result<(), Error>
+where
+    FieldElement<F>: Send + Sync,
+{
+    if dst.len() != 1usize << r.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: 1usize << r.len(),
+            got: dst.len(),
+        });
+    }
+    dst[0] = by.clone();
+    for (level, r_i) in r.iter().rev().enumerate() {
         let one_minus = FieldElement::<F>::one() - r_i;
         // Each half of the doubled table is an independent scaling of the
-        // current one. The last levels are the whole cube, so they carry the
-        // cost and the pool is worth it there.
-        let mut next = vec![FieldElement::<F>::zero(); table.len() * 2];
-        let (lo, hi) = next.split_at_mut(table.len());
+        // current one, and the halves are disjoint — so this is one pass over
+        // the level, and the last levels are the whole cube, which is where the
+        // pool is worth it.
+        let half = 1usize << level;
+        let (lo, hi) = dst[..half * 2].split_at_mut(half);
+        let scale = |(l, h): (&mut FieldElement<F>, &mut FieldElement<F>)| {
+            *h = &*l * r_i;
+            *l = &*l * &one_minus;
+        };
         #[cfg(feature = "parallel")]
-        rayon::join(
-            || {
-                lo.par_iter_mut()
-                    .zip(table.par_iter())
-                    .for_each(|(slot, v)| *slot = v * &one_minus)
-            },
-            || {
-                hi.par_iter_mut()
-                    .zip(table.par_iter())
-                    .for_each(|(slot, v)| *slot = v * r_i)
-            },
-        );
+        lo.par_iter_mut().zip(hi.par_iter_mut()).for_each(scale);
         #[cfg(not(feature = "parallel"))]
-        {
-            lo.iter_mut()
-                .zip(table.iter())
-                .for_each(|(slot, v)| *slot = v * &one_minus);
-            hi.iter_mut()
-                .zip(table.iter())
-                .for_each(|(slot, v)| *slot = v * r_i);
-        }
-        table = next;
+        lo.iter_mut().zip(hi.iter_mut()).for_each(scale);
     }
-    table
+    Ok(())
 }
 
 /// The multilinear extension of `eq(r, ·)`.
