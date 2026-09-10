@@ -13,6 +13,8 @@ ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb1
 ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-config", default-features = false }
 # Provides `NativeCrypto`, the host `Crypto` implementation used to recover
 # transaction keys, hash the BAL, and validate the generated stateless input.
+# Already in the graph via `ethrex-config` -> `ethrex-p2p`, so this adds no
+# compilation; the line exists because the bin build needs its own.
 ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-crypto", default-features = false, features = ["secp256k1"] }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-rlp" }
 # Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
@@ -21,10 +23,10 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0
 # `ethrex-config` dep above pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
 # propagates to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
 # switch it off, because ethrex's own workspace declares `ethrex-p2p` with its
-# defaults on. So this graph links a working c-kzg (and malachite modexp, and
-# `ark-ff/asm` BN254) that the guest does not have; verify with
-# `cargo tree -e features -i ethrex-crypto`. Closing that gap means dropping
-# `ethrex-config` and sourcing `ChainConfig` another way — see the README.
+# defaults on. So this graph links a working c-kzg that the guest does not have;
+# verify with `cargo tree -e features -i ethrex-crypto`. c-kzg is the whole gap now —
+# malachite modexp and `ark-ff/asm` are on both sides since ethrex-trie's `std` default.
+# Closing it means dropping `ethrex-config` and sourcing `ChainConfig` another way.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-guest-program", default-features = false }
 
 # Exact pin: keep the SSZ implementation in sync with the guest's ethrex rev.
@@ -53,9 +55,3 @@ lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
 # No feature delta against the rest of the graph (sha2/std is already on), so this
 # one can stay a dev-dependency without forcing the rebuild described above.
 sha2 = "0.10"
-
-# `ethrex-guest-program`'s `lambdavm` feature git-deps `lambda-vm-syscalls` at a
-# pinned commit of this repo; override it with the working-tree copy, as the guest
-# does, so both resolve the same syscalls.
-[patch."https://github.com/yetanotherco/lambda_vm.git"]
-lambda-vm-syscalls = { path = "../../syscalls" }

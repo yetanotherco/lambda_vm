@@ -14,7 +14,10 @@
 //!   back to the pure-Rust `ProjectivePoint::lincomb`.
 //!
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
-//! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
+//! crates: `ark-bn254`, `p256`, `sha2`, `ripemd`, …), except two families that
+//! error because no backend is linked: KZG `0x0a` (reverts) and BLS12-381
+//! `0x0b`-`0x11` (aborts). Pinned by `no_{kzg,bls}_backend_linked` in
+//! `tooling/ethrex-tests`.
 
 #[cfg(not(target_arch = "riscv64"))]
 use ethrex_crypto::keccak::keccak_hash;

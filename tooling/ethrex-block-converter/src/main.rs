@@ -24,6 +24,13 @@ use serde::Deserialize;
 /// Current replay caches carry the witness as raw RLP preimages. A future cache
 /// may carry the Amsterdam block access list beside the block; accepting it here
 /// keeps the converter independent of replay's Rust type layout.
+///
+/// Deliberately deserialized with *our* pinned ethrex types rather than by
+/// depending on `ethrex-replay`: it tracks ethrex `main` while we pin a commit of
+/// it, and the input type has diverged between the two before. This JSON carries
+/// only `blocks` + `witness` + `network` as plain serde, so it stays the
+/// version-tolerant interface between them. Extra fields in the file (L2 blob
+/// data, custom `chain_config`) are ignored.
 #[derive(Deserialize)]
 struct Cache {
     blocks: Vec<Block>,

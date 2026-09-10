@@ -95,6 +95,14 @@ root has both sets measured side by side.
 Measured on the guest ELF at ethrex `2cb18b0b`: 37,137,386 cycles, 6,003 keccak
 calls, 164 ECSM calls. Fixture: 549,144 bytes.
 
+**Pin the ELF whenever you quote a cycle count.** Those three counts are
+deterministic for a given ELF and input, and they move with anything that changes
+the guest: the ethrex rev, guest optimisation flags, and the **clang major
+version** by around 2 %. The guest embeds C (`secp256k1-sys`) and the Makefile
+pins target flags but not the compiler, so `cc` picks up whatever `clang` is on
+PATH — two boxes with different clang majors report different counts for the same
+commit. A count without its ELF is not comparable to anything.
+
 ### Choosing the epoch size, and what the workload costs
 
 Measured on the bench runner (`vm-benchmarks-1`, which is also the CI

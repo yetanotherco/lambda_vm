@@ -40,6 +40,13 @@ jobs:
       - name: Check ethrex fixture checksums
         run: make check-ethrex-fixture-checksums
 
+      # Five manifests carry the ethrex rev and they must agree: a skew is not a build
+      # failure, it is a fixture the guest decodes as the all-zero default. `--show`
+      # exits non-zero on MIXED. It reads manifests only; the matching locks are held by
+      # `--locked` on each workspace's own test/build step.
+      - name: Check the ethrex rev is consistent across manifests
+        run: scripts/set_ethrex_rev.sh --show
+
       # The benchmark comment harness: verifies every steps.X.outputs.Y consumed in
       # benchmark-pr.yml has a producer (the orphaned-wiring class that once broke
       # /bench-growth silently), then renders the full comment scenario suite.
@@ -153,7 +160,7 @@ jobs:
       - name: Run ethrex host-reference tests (detached workspace)
         run: |
           cd tooling/ethrex-tests && \
-            cargo test --release -- --include-ignored --skip test_ethrex_real_block
+            cargo test --locked --release -- --include-ignored --skip test_ethrex_real_block
 
   test-cli:
     name: CLI tests

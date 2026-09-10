@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Re-pin every ethrex git dependency in this repo to one rev, atomically.
 #
-# The guest and the host-side tooling exchange ethrex types (the SSZ stateless
+# The guest and the host-side tooling exchange ethrex types (the rkyv stateless
 # input the converter writes and the guest decodes), so a rev that differs
 # between them is not a version skew that fails to build -- it is a fixture the
 # guest silently decodes as the all-zero default. Keeping every pin on one rev
@@ -54,8 +54,9 @@ if [[ "${1:-}" == "--show" || $# -eq 0 ]]; then
   if [[ "$(printf '%s\n' "$revs" | wc -l | tr -d ' ')" == "1" ]]; then
     echo "$revs"
   else
-    # Expected mid-benchmark (a `--guest-only` re-pin is exactly this state), so
-    # report it rather than failing.
+    # Non-zero on purpose: this is the skew the script exists to prevent, and it is
+    # what makes `--show` usable as a CI gate. A `--guest-only` re-pin is legitimately
+    # this state, so a caller doing that should ignore the status.
     echo "MIXED:" >&2
     printf '  %s\n' $revs >&2
     exit 1
@@ -63,6 +64,7 @@ if [[ "${1:-}" == "--show" || $# -eq 0 ]]; then
   exit 0
 fi
 
+COUNTS=()
 TARGETS=("${MANIFESTS[@]}")
 SCOPE="all manifests"
 if [[ "${1:-}" == "--guest-only" ]]; then
@@ -77,11 +79,29 @@ if [[ ! "$NEW_REV" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
+# Only rewrite revs on ethrex deps: the same file may pin other git deps.
+PATTERN='(github\.com/lambdaclass/ethrex\.git", rev = ")[0-9a-f]{40}(")'
+
+# Two passes so a partial rewrite is impossible. Pass 1 only counts: the pattern needs
+# the git URL and `rev` on ONE physical line, so a manifest in `[dependencies.x]` table
+# form matches nothing, and rewriting the others anyway would leave exactly the skew this
+# script exists to prevent -- while reporting success.
 for manifest in "${TARGETS[@]}"; do
   [[ -f "$manifest" ]] || { echo "error: missing $manifest" >&2; exit 1; }
-  # Only rewrite revs on ethrex deps: the same file may pin other git deps.
-  perl -pi -e 's{(github\.com/lambdaclass/ethrex\.git", rev = ")[0-9a-f]{40}(")}{${1}'"$NEW_REV"'${2}}g' "$manifest"
+  n="$(perl -ne "\$c++ while m{$PATTERN}g; END { print \$c + 0 }" "$manifest")"
+  if [[ "$n" == "0" ]]; then
+    echo "error: $manifest carries no ethrex rev this script can rewrite." >&2
+    echo "  The pattern needs the git URL and \`rev\` on one line; a \`[dependencies.x]\`" >&2
+    echo "  table form does not match. Nothing was written." >&2
+    exit 1
+  fi
+  COUNTS+=("$manifest ($n)")
+done
+
+# Pass 2 rewrites, now that every target is known to match.
+for manifest in "${TARGETS[@]}"; do
+  perl -pi -e "s{$PATTERN}{\${1}$NEW_REV\${2}}g" "$manifest"
 done
 
 echo "re-pinned $SCOPE to $NEW_REV:"
-printf '  %s\n' "${TARGETS[@]}"
+printf '  %s\n' "${COUNTS[@]}"

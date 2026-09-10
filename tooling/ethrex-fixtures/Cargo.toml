@@ -8,7 +8,8 @@ edition = "2024"
 
 [dependencies]
 # Pinned to the SAME ethrex rev as the guest so generated SSZ inputs match what
-# the stateless guest deserializes.
+# the stateless guest deserializes. Re-pin every manifest together with
+# scripts/set_ethrex_rev.sh.
 ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-blockchain" }
 ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-storage" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-common" }

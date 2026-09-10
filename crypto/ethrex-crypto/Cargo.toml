@@ -18,6 +18,7 @@ license = "MIT OR Apache-2.0"
 # Defines the `Crypto` trait, `CryptoError`, and `keccak::keccak_hash`. Same rev
 # + `default-features = false` as the guest's ethrex-crypto, so feature
 # unification adds nothing to the guest build (no C secp256k1 / malachite / kzg).
+# `std` is on anyway, via ethrex-trie's default.
 ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-crypto", default-features = false }
 # Pinned to the exact 0.13.4 ethrex uses so the guest resolves a single k256
 # (a version split would make `FieldElement`/`Scalar` incompatible types).

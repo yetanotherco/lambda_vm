@@ -68,9 +68,22 @@ fn test_ethrex_real_block_native() {
     native_output(&inputs);
 }
 
-/// The dependency graph intentionally has no KZG backend. Keep this check so
-/// a future feature change cannot silently make the guest and host precompile
-/// surfaces diverge.
+/// Pins the property the test above leans on: this crate's dependency graph must
+/// link no KZG backend, so a block calling point evaluation (0x0a) diverges from
+/// consensus and fails rather than passing on a surface the guest doesn't have.
+/// If a future dependency pulls `c-kzg` or `kzg-rs` in, this goes red instead of
+/// the screen silently disappearing.
+/// Detection is by error *text*, deliberately: zero input fails under a linked
+/// backend too (invalid G1 encoding), and both paths surface as
+/// `CryptoError::Other`, so the variant can't tell them apart. The string comes
+/// from `ethrex-crypto`'s `KzgError::Unimplemented`; if upstream rewords it this
+/// test goes red, which is the safe direction — and it has: the 4f658c2b rev bump
+/// dropped `openvm-kzg` from the sentence, so the expected text moved with it.
+///
+/// Worth knowing why this can regress: `ethrex-crypto`'s own default feature set
+/// is `["std", "kzg-rs", "secp256k1", "aws-lc-rs", "blst"]`, so any future
+/// dependency pulling it in with defaults on restores a backend and silently
+/// removes the screen.
 #[test]
 fn no_kzg_backend_linked() {
     use ethrex_guest_program::crypto::Crypto;
@@ -82,11 +95,41 @@ fn no_kzg_backend_linked() {
     };
     assert!(
         message.contains("One of features c-kzg or kzg-rs should be active"),
-        "a KZG backend is linked into ethrex-tests: {message}"
+        "a KZG backend is linked into ethrex-tests, so test_ethrex_real_block_native no \
+         longer screens precompile 0x0a: {message}"
     );
 }
 
-#[ignore = "real block through the VM; unmeasured runtime"]
+/// Same screen for EIP-2537 (0x0b-0x11), which the 797df554 bump moved behind the
+/// native-only `blst` feature. Unlike the KZG gap these do NOT revert: levm maps
+/// `CryptoError::Unsupported` to `InternalError`, which aborts the run. Goes red if a
+/// dependency restores a backend, or if upstream rewords the message.
+#[test]
+fn no_bls_backend_linked() {
+    use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
+    let result = NativeCrypto.bls12_381_g1_add(([0u8; 48], [0u8; 48]), ([0u8; 48], [0u8; 48]));
+    let message = match result {
+        Ok(_) => "bls12_381_g1_add accepted zero input".to_string(),
+        Err(err) => format!("{err:?}"),
+    };
+    assert!(
+        message.contains("requires the `blst` feature"),
+        "a BLS12-381 backend is linked into ethrex-tests, so the native reference no \
+         longer matches the guest on 0x0b-0x11: {message}"
+    );
+}
+
+/// The same real block through the guest ELF, checking the VM's committed
+/// output matches the native reference. Split from the native gate above
+/// because this one needs the ethrex ELF and is far heavier than the synthetic
+/// fixtures (a ~1 MB witness, real contract execution).
+///
+/// Deliberately excluded from the PR CI step, which otherwise runs everything
+/// via `--include-ignored`: the cycle cost of a real block in the VM has not
+/// been measured yet, so it is opt-in until we know what it does to job time.
+/// Run it explicitly with:
+///   cd tooling/ethrex-tests && cargo test --release test_ethrex_real_block_vm -- --ignored
+#[ignore = "real block through the VM; unmeasured runtime, run explicitly on a build server"]
 #[test]
 fn test_ethrex_real_block_vm() {
     run_fixture(REAL_BLOCK_FIXTURE);

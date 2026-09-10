@@ -50,7 +50,8 @@ lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 # Declaring nothing is also what frees the pin: `lambdavm` exists ONLY on that
 # unmerged branch, so requiring it is precisely what tied this guest to it. See
 # scripts/bench_ethrex_pr.sh, which re-pins across arbitrary revs to measure
-# upstream guest PRs.
+# upstream guest PRs, and scripts/set_ethrex_rev.sh, which moves every manifest
+# together.
 #
 # KZG is not linked, so the point-evaluation precompile (0x0a) is unsupported —
 # see src/main.rs.

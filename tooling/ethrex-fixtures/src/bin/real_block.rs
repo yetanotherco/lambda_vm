@@ -25,6 +25,7 @@
 use bytes::Bytes;
 use ethrex_blockchain::payload::{BuildPayloadArgs, create_payload};
 use ethrex_blockchain::{Blockchain, BlockchainOptions};
+use ethrex_common::H256;
 use ethrex_common::types::block_access_list::BlockAccessList;
 use ethrex_common::types::block_execution_witness::{
     ExecutionWitness, RpcExecutionWitness, amsterdam_chain_config, decode_witness_headers,
@@ -34,7 +35,6 @@ use ethrex_common::types::stateless_ssz::{
     STATELESS_INPUT_SCHEMA_ID, SszExecutionWitness, SszPublicKeys, SszStatelessInput,
 };
 use ethrex_common::types::{AccountState, Block, ELASTICITY_MULTIPLIER, Genesis};
-use ethrex_common::H256;
 use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
 use ethrex_guest_program::l1::run_stateless_guest;
 use ethrex_rlp::decode::RLPDecode;
