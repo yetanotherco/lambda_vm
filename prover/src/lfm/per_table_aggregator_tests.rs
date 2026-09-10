@@ -1866,6 +1866,20 @@ fn the_production_leaf_node_measures() {
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
             build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        // ★ THE WRAP'S OWN CHIP PANEL, printed BEFORE the prove.
+        //
+        // Whether a wrap chip has stepped is not derivable from the outcome: a
+        // wrap that proves says only that no table exceeded the budget, and one
+        // that aborts names the table but not its headroom. Every statement
+        // about this program's `LFM_HASH` height so far has been an inference
+        // from a measurement taken at another posture. The panel is a reading —
+        // and it is taken at the artifacts' own tenant, so the cells belong to
+        // the permutation this wrap is about to prove.
+        super::wrap_tests::report_census_with_hasher(
+            &format!("EPOCH WRAP {k} — a leaf child"),
+            &program,
+            artifacts.hasher,
+        );
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove");
         let layout = SchemaLayout::wrap(out_halves);
@@ -1935,6 +1949,20 @@ fn the_production_leaf_node_measures() {
     let prove_secs = t.elapsed().as_secs_f64();
     println!("   lfm_prove: {prove_secs:.1}s");
     mark("after lfm_prove");
+    // The node's own chip panel, for the same reason as the wraps' above: the
+    // node pays `log(height)` over its fixed sub-proof set, so which of its
+    // chips sit near a step is what says whether the next fan-in doubles
+    // anything.
+    //
+    // ⚠ AFTER the prove, not before it, and the census is a static property of
+    // the program so nothing is lost by waiting. Between `build_artifacts` and
+    // `lfm_prove` sit the marks that ARE this test's memory instrument, and the
+    // panel must not be a term in them.
+    super::wrap_tests::report_census_with_hasher(
+        "THE PRODUCTION LEAF NODE",
+        &program,
+        artifacts.hasher,
+    );
     #[cfg(feature = "cuda")]
     {
         use stark::gpu_lde as g;

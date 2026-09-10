@@ -42,11 +42,14 @@ use std::time::Instant;
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
-use super::airs::{HeightRule, LfmChipCells, lfm_cell_counts, lfm_chip_census};
+use super::airs::{
+    HeightRule, LfmChipCells, lfm_cell_counts_with_hasher, lfm_chip_census_with_hasher,
+};
 use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
 use super::epoch_tests::EpochInputs;
 use super::executor::execute;
+use super::hash::HasherKind;
 use super::instr::Instr;
 use super::proof::{LfmProveError, lfm_prove, lfm_prove_with_residency, verify_against};
 use super::registry::{build_artifacts, build_artifacts_with_hasher};
@@ -194,8 +197,26 @@ fn report_row_cliffs(census: &[LfmChipCells]) {
 /// the totals the hash matrix wants.
 /// Returns `(main_cells, aux_cells)` so a caller can assert on them.
 pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
-    let census = lfm_chip_census(program);
-    let (main, aux) = lfm_cell_counts(program);
+    report_census_with_hasher(label, program, HasherKind::default())
+}
+
+/// [`report_census`] for a program that will be PROVED under `hasher`.
+///
+/// ⚠ **Anything measuring production must call THIS, and pass the hasher the
+/// artifacts name** (`artifacts.hasher`, or `crate::hash_pin::BLOCK_HASHER`).
+/// The socket chip's width is tenant-dependent — RPX 316 value columns, RPO 436,
+/// Poseidon 612, BLAKE3 3,056 — and `HasherKind::default()` is
+/// `HasherKind::Test`, so the defaulted panel does not print a smaller
+/// `LFM_HASH`, it prints a DIFFERENT chip's. Heights are tenant-independent, so
+/// the row counts and the headroom are right either way; every cell figure is
+/// not.
+pub(super) fn report_census_with_hasher(
+    label: &str,
+    program: &LfmProgram,
+    hasher: HasherKind,
+) -> (u64, u64) {
+    let census = lfm_chip_census_with_hasher(program, hasher);
+    let (main, aux) = lfm_cell_counts_with_hasher(program, hasher);
     // The census is `lfm_cell_counts`' own decomposition, so summing it is not an
     // independent check of the total — it is the same arithmetic. What IS
     // independent is that the sub-proof COUNT the census implies must equal the
@@ -217,7 +238,7 @@ pub(super) fn report_census(label: &str, program: &LfmProgram) -> (u64, u64) {
         ),
         "the census must have one entry per sub-proof the AIR set builds"
     );
-    println!("\n★ CHIP CENSUS — {label}");
+    println!("\n★ CHIP CENSUS — {label} (at {hasher:?})");
     println!(
         "   {:>12} {:>10} {:>12} {:>9} {:>6} {:>6} {:>16} {:>14}",
         "chip", "rows", "used", "headroom", "main", "aux", "main cells", "aux cells"
@@ -1280,6 +1301,11 @@ fn the_wrap_census() {
 
     report_program("ASSEMBLED (spine + legs)", &profile, &program);
     report_program("SPINE ALONE (no legs)", &profile, &spine);
+    // ⚠ THE DEFAULT TENANT. This instrument emits and never proves, so nothing
+    // here is inconsistent — but its cell figures are `HasherKind::Test`'s, not
+    // the pin's, and the socket chip's width is tenant-dependent. Do not quote
+    // them as production numbers; `report_census_with_hasher` is what a
+    // measurement of a program that will be PROVED must use.
     let (main, aux) = report_census(&format!("assembled, epoch {profile}"), &program);
     let (spine_main, spine_aux) = report_census(&format!("spine alone, epoch {profile}"), &spine);
     println!(
@@ -1295,7 +1321,9 @@ fn the_wrap_census() {
     // The fixed-machine floor: what a program of NO instructions still pays for
     // the 14 chips. The number every cells-per-verify figure sits on top of.
     let empty = super::compiler::compile(super::builder::LfmBuilder::new().finish());
-    let (floor_main, floor_aux) = lfm_cell_counts(&empty);
+    // The default tenant, to match the two censuses above it — the ratio below
+    // is only meaningful if both sides are the same tenant.
+    let (floor_main, floor_aux) = lfm_cell_counts_with_hasher(&empty, HasherKind::default());
     println!(
         "   fixed-machine floor (an empty program): {floor_main} main + {floor_aux} aux — \
          {:.1}% of the assembled verifier's main cells",
@@ -1594,7 +1622,9 @@ fn the_census_reports_real_and_committed_heights_separately() {
     use super::layout::MIN_GROUP_ROWS;
 
     let program = super::programs::keccak_chain_program();
-    let census = lfm_chip_census(&program);
+    // The default tenant is right here: this pins the RELATIONSHIP between a
+    // chip's two heights, and heights are tenant-independent.
+    let census = lfm_chip_census_with_hasher(&program, HasherKind::default());
     let chunk_perms = super::airs::keccak_rnd_chunk_permutations(&program);
     let mut chunk = chunk_perms.iter();
 
