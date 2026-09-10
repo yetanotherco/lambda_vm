@@ -129,7 +129,7 @@ where
 
     // From the commitment, not a second encoding: it is the same array, and a
     // prover that folded a different one could not then answer the openings.
-    let (folded, _) = fold_codeword_k::<F, E, E>(&commitment.codeword(), domain, &alphas)?;
+    let (folded, _) = fold_codeword_k::<F, E, E>(commitment.codeword(), domain, &alphas)?;
     let final_value = folded[0].clone();
     transcript.append_field_element(&final_value);
 

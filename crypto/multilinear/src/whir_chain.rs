@@ -356,8 +356,8 @@ where
     let schedule = config.schedule(f.num_vars());
     let first = schedule.first().copied().unwrap_or(0);
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
-    let codeword = encode::<F, F>(&lift_coefficients(f), &domain)?;
-    let commitment = CodewordCommitment::new(&codeword, first)?;
+    let commitment =
+        CodewordCommitment::from_codeword(encode::<F, F>(&lift_coefficients(f), &domain)?, first)?;
     Ok((commitment, domain))
 }
 
@@ -370,8 +370,8 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    Base(Vec<FieldElement<F>>, &'a CodewordCommitment<F>),
-    Extension(Vec<FieldElement<E>>, CodewordCommitment<E>),
+    Base(&'a CodewordCommitment<F>),
+    Extension(CodewordCommitment<E>),
 }
 
 /// Proves `f(z) = y`.
@@ -419,10 +419,9 @@ where
             .map(|v| v.clone().to_extension::<E>())
             .collect(),
     )?;
-    let mut current =
-        // The codeword comes out of the commitment rather than being encoded
-        // again: it is the same array, and the NTT is not cheap.
-        Current::<F, E>::Base(commitment.codeword(), commitment);
+    // The codeword comes out of the commitment rather than being encoded
+    // again: it is the same array, and the NTT is not cheap.
+    let mut current = Current::<F, E>::Base(commitment);
     let mut current_domain = domain.clone();
 
     let mut rounds = Vec::with_capacity(schedule.len());
@@ -445,11 +444,11 @@ where
         // The fold lands in the extension whichever field it started in, so
         // this is the only place the two cases differ.
         let (folded, folded_domain) = match &current {
-            Current::Base(codeword, _) => {
-                fold_codeword_k::<F, F, E>(codeword, &current_domain, &alphas)?
+            Current::Base(held) => {
+                fold_codeword_k::<F, F, E>(held.codeword(), &current_domain, &alphas)?
             }
-            Current::Extension(codeword, _) => {
-                fold_codeword_k::<F, E, E>(codeword, &current_domain, &alphas)?
+            Current::Extension(held) => {
+                fold_codeword_k::<F, E, E>(held.codeword(), &current_domain, &alphas)?
             }
         };
 
@@ -457,7 +456,7 @@ where
         // be chosen to match them.
         let next = match schedule.get(r + 1) {
             Some(&next_k) => {
-                let next = CodewordCommitment::new(&folded, next_k)?;
+                let next = CodewordCommitment::from_codeword(folded, next_k)?;
                 transcript.append_bytes(&next.root());
                 Some(next)
             }
@@ -492,22 +491,18 @@ where
             log_folding: k,
         };
         let openings = match (&current, &next) {
-            (Current::Base(_, held), Some(next)) => {
+            (Current::Base(held), Some(next)) => {
                 RoundOpenings::Base(whir_round::prove(*held, next, &round_config, transcript)?)
             }
-            (Current::Base(_, held), None) => {
+            (Current::Base(held), None) => {
                 RoundOpenings::Base(final_openings::<F, E, T>(held, &round_config, transcript)?)
             }
-            (Current::Extension(_, held), Some(next)) => {
+            (Current::Extension(held), Some(next)) => {
                 RoundOpenings::Extension(whir_round::prove(held, next, &round_config, transcript)?)
             }
-            (Current::Extension(_, held), None) => {
-                RoundOpenings::Extension(final_openings::<E, E, T>(
-                    held,
-                    &round_config,
-                    transcript,
-                )?)
-            }
+            (Current::Extension(held), None) => RoundOpenings::Extension(
+                final_openings::<E, E, T>(held, &round_config, transcript)?,
+            ),
         };
 
         rounds.push(ChainRound {
@@ -518,7 +513,7 @@ where
             openings,
         });
         if let Some(next) = next {
-            current = Current::Extension(folded, next);
+            current = Current::Extension(next);
         }
         current_domain = folded_domain;
     }

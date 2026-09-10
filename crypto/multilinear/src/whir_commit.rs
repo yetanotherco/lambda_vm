@@ -5,6 +5,7 @@
 
 use crypto::merkle_tree::{
     backends::types::BatchKeccak256Backend, merkle::MerkleTree, proof::Proof,
+    traits::IsMerkleTreeBackend,
 };
 use math::{
     field::{
@@ -13,6 +14,9 @@ use math::{
     },
     traits::AsBytes,
 };
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::{Error, whir::Domain};
 
@@ -27,7 +31,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     tree: Tree<F>,
-    leaves: Vec<Vec<FieldElement<F>>>,
+    codeword: Vec<FieldElement<F>>,
     log_folding: usize,
     log_domain_size: usize,
 }
@@ -76,7 +80,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodewordCommitment")
             .field("root", &self.root())
-            .field("leaves", &self.leaves.len())
+            .field("leaves", &self.num_leaves())
             .field("log_folding", &self.log_folding)
             .field("log_domain_size", &self.log_domain_size)
             .finish()
@@ -89,6 +93,17 @@ where
 {
     /// Groups `codeword` into fold blocks and Merkle-commits them.
     pub fn new(codeword: &[FieldElement<F>], log_folding: usize) -> Result<Self, Error> {
+        Self::from_codeword(codeword.to_vec(), log_folding)
+    }
+
+    /// The same, taking the codeword. The commitment keeps it — the prover
+    /// folds from here rather than encoding a second time — so a caller that
+    /// has no further use for its own copy hands it over instead of paying for
+    /// a second one.
+    pub fn from_codeword(
+        codeword: Vec<FieldElement<F>>,
+        log_folding: usize,
+    ) -> Result<Self, Error> {
         if !codeword.len().is_power_of_two() {
             return Err(Error::NotPowerOfTwo(codeword.len()));
         }
@@ -101,19 +116,29 @@ where
         }
 
         let num_leaves = 1usize << (log_domain_size - log_folding);
-        let leaves: Vec<Vec<FieldElement<F>>> = (0..num_leaves)
-            .map(|j| {
-                coset_of(j, log_domain_size, log_folding)
-                    .into_iter()
-                    .map(|p| codeword[p].clone())
-                    .collect()
-            })
+        let block = 1usize << log_folding;
+        // One reused buffer per worker: a block is the leaf the backend hashes,
+        // and the coset is strided, so it has to be gathered somewhere.
+        let hash_leaf = |buffer: &mut Vec<FieldElement<F>>, j: usize| {
+            buffer.clear();
+            buffer.extend((0..block).map(|t| codeword[j + t * num_leaves].clone()));
+            Backend::<F>::hash_data(buffer)
+        };
+        #[cfg(feature = "parallel")]
+        let hashed: Vec<_> = (0..num_leaves)
+            .into_par_iter()
+            .map_init(|| Vec::with_capacity(block), hash_leaf)
             .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed: Vec<_> = {
+            let mut buffer = Vec::with_capacity(block);
+            (0..num_leaves).map(|j| hash_leaf(&mut buffer, j)).collect()
+        };
 
-        let tree = Tree::<F>::build(&leaves).ok_or(Error::EmptyPolynomial)?;
+        let tree = Tree::<F>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
-            leaves,
+            codeword,
             log_folding,
             log_domain_size,
         })
@@ -124,7 +149,7 @@ where
     }
 
     pub fn num_leaves(&self) -> usize {
-        self.leaves.len()
+        1usize << (self.log_domain_size - self.log_folding)
     }
 
     pub fn log_folding(&self) -> usize {
@@ -135,33 +160,30 @@ where
         self.log_domain_size
     }
 
-    /// The committed codeword, back in domain order.
+    /// The committed codeword, in domain order.
     ///
-    /// The blocks are a strided permutation of it, so the prover folds from
-    /// here rather than encoding a second time — on a real trace that second
-    /// NTT is the most expensive thing in the proof after the sumcheck, and it
-    /// computes something already in memory.
-    pub fn codeword(&self) -> Vec<FieldElement<F>> {
-        let num_leaves = self.leaves.len();
-        (0..(1usize << self.log_domain_size))
-            .map(|p| {
-                let (leaf, slot) = leaf_and_slot(p, num_leaves);
-                self.leaves[leaf][slot].clone()
-            })
-            .collect()
+    /// The prover folds from here rather than encoding a second time — on a
+    /// real trace that second NTT is the most expensive thing in the proof
+    /// after the sumcheck, and it computes something already in memory.
+    pub fn codeword(&self) -> &[FieldElement<F>] {
+        &self.codeword
     }
 
     /// Opens the block that folds onto `index`.
     pub fn open(&self, index: usize) -> Result<CosetOpening<F>, Error> {
+        let num_leaves = self.num_leaves();
         let proof = self
             .tree
             .get_proof_by_pos(index)
             .ok_or(Error::QueryOutOfRange {
                 index,
-                bound: self.leaves.len(),
+                bound: num_leaves,
             })?;
         Ok(CosetOpening {
-            values: self.leaves[index].clone(),
+            values: coset_of(index, self.log_domain_size, self.log_folding)
+                .into_iter()
+                .map(|p| self.codeword[p].clone())
+                .collect(),
             proof,
         })
     }
