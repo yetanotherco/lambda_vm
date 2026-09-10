@@ -82,7 +82,7 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint, dma, dma_set.
+/// keccak_rc, register, ecsm, ecdas, hint, memmove.
 pub const FIXED_TABLE_COUNT: usize = 12;
 
 /// Number of chunks for each split table.

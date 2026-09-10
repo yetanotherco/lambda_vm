@@ -1255,9 +1255,10 @@ fn test_prove_dma_memset_min_rust_guest() {
 }
 
 /// End-to-end memset: the guest exercises every row-schedule boundary (empty,
-/// sub-tail, exact widths, the per-ecall cap, multi-chunk, a masked wide fill,
-/// and an unaligned page-crossing destination), so a passing proof covers the
-/// DMA_SET trace, its bus balance, and the fill-byte bound together.
+/// sub-tail, exact widths, the per-ecall cap, multi-chunk, a wide fill truncated
+/// to its low byte, and an unaligned page-crossing destination), so a passing
+/// proof covers the memset rows, their bus balance, and the operand-gap pin
+/// together.
 #[test]
 fn test_prove_dma_memset_cases_rust_guest() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1346,7 +1347,7 @@ fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
     let forged_row = dma_row_matching(&traces, |first, end, _tail| !first && !end);
 
     // Shift both the current source and its locally-consistent successor. The
-    // row's ADD remains valid, but the predecessor's DmaNext tuple and the
+    // row's ADD remains valid, but the predecessor's MemmoveNext tuple and the
     // source-memory read no longer match.
     let src_lo = *traces.memmove.main_table.get(forged_row, dma_cols::SRC_0);
     let src_incr_lo = *traces
@@ -1458,9 +1459,6 @@ fn test_prove_dma_memset_forged_wide_tail_rejected() {
     assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
 }
 
-/// Soundness: a one-byte row must not broadcast its fill into lanes 1..7. This
-/// is the direction that matters — it is an eight-byte write where a single byte
-/// was authorised. The wide-row test above covers the opposite, harmless case.
 /// Soundness: the timestamp order is what makes a memset a memset. Clearing `IS_SET`
 /// on a chain turns the row back into an ordinary snapshot copy, which reads at `T+1`
 /// instead of `T+2` — so the read no longer observes the previous row's write and the

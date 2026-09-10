@@ -39,8 +39,6 @@ pub mod decode_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod disk_spill_tests;
 #[cfg(test)]
-#[cfg(test)]
-#[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
 pub mod ecdas_tests;
@@ -68,7 +66,8 @@ pub mod memmove_tests;
 pub mod memw_aligned_tests;
 #[cfg(test)]
 pub mod memw_register_tests;
-mod memw_tests;
+#[cfg(test)]
+pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]

@@ -309,8 +309,8 @@ pub enum BusId {
     Decode = 18,
     /// System call handling (CPU → HALT/COMMIT for all ECALLs)
     Ecall = 19,
-    /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte = 20,
+    // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
+    // recursion moved to MEMMOVE, which chains over [`BusId::MemmoveNext`].
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
@@ -356,17 +356,10 @@ pub enum BusId {
     // =========================================================================
     // DMA memcpy accelerator
     // =========================================================================
-    /// DMA self-referential streaming bus (COMMIT-style): each DMA table row sends
-    /// `(timestamp, src_incr, dst_incr, count_decr)` to the next row and receives
-    /// `(timestamp, src, dst, count)` from the previous row, chaining a variable-length
-    /// copy. Only the first row receives the CPU's `Ecall`; the rest chain here.
-    DmaNext = 29,
-
-    /// DMA memset streaming bus: each DMA_SET row sends
-    /// `(timestamp, dst_incr, count_decr, fill)` to the next row and receives
-    /// `(timestamp, dst, count, fill)` from the previous one. Separate from
-    /// [`BusId::DmaNext`] so a memcpy row can never consume a memset token.
-    DmaSetNext = 32,
+    // IDs 29 and 32 are reserved for the removed DmaNext and DmaSetNext buses:
+    // the DMA and DMA_SET tables they chained are both replaced by MEMMOVE, which
+    // chains over [`BusId::MemmoveNext`] and carries the functionality selectors
+    // inside the tuple rather than separating the paths by bus id.
 
     // =========================================================================
     // Continuations
@@ -383,7 +376,7 @@ pub enum BusId {
     /// row and receives `(timestamp, src, dst, count, is_set, is_commit)` from the
     /// previous one. The functionality selectors travel inside the tuple, so a chain
     /// cannot change operation half way through it — the guarantee the three separate
-    /// DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
+    /// the removed DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
     MemmoveNext = 33,
     /// COMMIT → MEMMOVE hand-off: COMMIT keeps the `sys_write` ecall number and the
     /// register-254 update, and defers its byte loop here as
@@ -407,7 +400,6 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
             BusId::MemmoveNext => "MemmoveNext",
             BusId::CommitDefer => "CommitDefer",
@@ -419,8 +411,6 @@ impl BusId {
             BusId::Cpu32 => "Cpu32",
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
-            BusId::DmaNext => "DmaNext",
-            BusId::DmaSetNext => "DmaSetNext",
             BusId::GlobalMemory => "GlobalMemory",
         }
     }
@@ -443,7 +433,6 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
             33 => Ok(BusId::MemmoveNext),
             34 => Ok(BusId::CommitDefer),
@@ -454,8 +443,6 @@ impl TryFrom<u64> for BusId {
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
-            29 => Ok(BusId::DmaNext),
-            32 => Ok(BusId::DmaSetNext),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
             other => Err(other),

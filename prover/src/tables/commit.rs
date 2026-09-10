@@ -1,11 +1,20 @@
 //! COMMIT (ECALL) table for writing bytes to stdout.
 //!
 //! This table handles the `write` syscall (ECALL #64): writing bytes from a memory
-//! buffer to stdout. It uses a **recursive design** — each row commits one byte,
-//! and rows are linked via a self-referencing "CommitNextByte" bus.
+//! buffer to stdout. It is **one row per ECALL** — it accepts the syscall number,
+//! reads the operand registers and advances the committed-length register, then
+//! defers the byte copying itself to the MEMMOVE chip over `BusId::CommitDefer`.
 //!
-//! Only the first row of each commit sequence receives from the CPU's ECALL bus;
-//! subsequent rows receive from the previous commit row via the CommitNextByte bus.
+//! The per-byte recursion this table used to run, and its self-referencing
+//! `CommitNextByte` bus, are gone: MEMMOVE walks the buffer instead, and it — not
+//! this table — is what sends the committed bytes on `BusId::Commit`, as eight
+//! `(index, value)` pairs per row. That is the fact to keep in mind when reasoning
+//! about the verifier, which rebuilds that bus from `public_output`
+//! (`compute_commit_bus_offset`).
+//!
+//! Several columns are now vestigial — `address_incr`, `count_decr` and `value`
+//! model a multi-row sequence that no longer exists — and could be dropped, at the
+//! cost of another change to the committed column count.
 //!
 //! ## Columns (19 total)
 //! - `timestamp`: DWordWL (2 cols) — timestamp of the ECALL
@@ -236,10 +245,6 @@ pub fn generate_commit_trace(
 /// - **Sends** to Zero for end detection (mult = mu)
 /// - **Sends** to Memw for register/memory accesses (×5, mult varies)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    // Reusable multiplicity expressions
-    let _mu_minus_end = Multiplicity::Diff(cols::MU, cols::END);
-    let _mu_minus_first = Multiplicity::Diff(cols::MU, cols::FIRST);
-
     vec![
         // 1. Receive ECALL from CPU (mult = first)
         // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
