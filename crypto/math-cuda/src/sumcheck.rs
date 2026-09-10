@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
@@ -34,10 +34,17 @@ const MAX_THREADS: u64 = 1 << 20;
 
 /// One sumcheck's device state: the factors, the program, and the scratch the
 /// rounds reuse.
+///
+/// The factors reach the kernels as a table of device pointers, so they need
+/// not be one allocation: a batch uploads them together, while a GKR layer's
+/// are halves of buffers the fraction tree already holds.
 pub struct SumcheckSession {
     stream: Arc<CudaStream>,
-    /// Factor `k` at cube index `j`, component `c`: `[(k*stride + j)*3 + c]`.
-    factors: CudaSlice<u64>,
+    /// One device address per factor.
+    factor_ptrs: CudaSlice<u64>,
+    /// The upload, when this session made one. A session over borrowed device
+    /// factors leaves it empty and the caller owns them.
+    owned: Option<CudaSlice<u64>>,
     stride: usize,
     width: usize,
     /// Cube indices left. Halves with every fold.
@@ -88,6 +95,17 @@ impl SumcheckSession {
             let mut slab = buffer.slice_mut(at..at + factor.len());
             stream.memcpy_htod(*factor, &mut slab)?;
         }
+        // The base address plus the slab offsets, which stay inside the
+        // allocation by construction. The guard orders the read on `stream`
+        // and is dropped here — every later use of the pointers is on the same
+        // stream, which is what orders them.
+        let addresses: Vec<u64> = {
+            let (base, _record) = buffer.device_ptr(&stream);
+            (0..width)
+                .map(|k| base + (k * stride * 3 * 8) as u64)
+                .collect()
+        };
+        let factor_ptrs = stream.clone_htod(&addresses)?;
 
         // The slot file is per thread, so it is the grid that gives way.
         let per_thread = num_slots as u64 * 3 * 8;
@@ -109,7 +127,8 @@ impl SumcheckSession {
 
         Ok(Self {
             stream,
-            factors: buffer,
+            factor_ptrs,
+            owned: Some(buffer),
             stride,
             width,
             len: stride,
@@ -160,14 +179,12 @@ impl SumcheckSession {
             // One ext3 accumulator per thread, reduced one node at a time.
             shared_mem_bytes: BLOCK_DIM * 3 * 8,
         };
-        let stride = self.stride as u64;
         let num_nodes = self.num_nodes as u64;
         let num_t_u32 = num_t as u32;
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_round_ext3)
-                .arg(&self.factors)
-                .arg(&stride)
+                .arg(&self.factor_ptrs)
                 .arg(&half)
                 .arg(&self.nodes)
                 .arg(&num_nodes)
@@ -203,13 +220,11 @@ impl SumcheckSession {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stride = self.stride as u64;
         let width = self.width as u64;
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_fold_ext3)
-                .arg(&mut self.factors)
-                .arg(&stride)
+                .arg(&mut self.factor_ptrs)
                 .arg(&half)
                 .arg(&width)
                 .arg(&r_dev)
@@ -222,12 +237,16 @@ impl SumcheckSession {
     /// Every factor's remaining values, interleaved as three u64 per element —
     /// what the host needs to carry on where the device stopped.
     pub fn download(&self) -> Result<Vec<Vec<u64>>> {
+        let factors = self
+            .owned
+            .as_ref()
+            .expect("a session over borrowed factors does not own them");
         let mut out = Vec::with_capacity(self.width);
         for k in 0..self.width {
             let at = k * self.stride * 3;
             out.push(
                 self.stream
-                    .clone_dtoh(&self.factors.slice(at..at + self.len * 3))?,
+                    .clone_dtoh(&factors.slice(at..at + self.len * 3))?,
             );
         }
         self.stream.synchronize()?;
@@ -330,6 +349,14 @@ fn fold_to_one(
     len: u64,
     point: &[u64],
 ) -> Result<()> {
+    // The fold kernel takes a table of factors; here there is one, and it
+    // folds in place, so its address holds for every level.
+    let address = {
+        let (base, _record) = values.device_ptr(stream);
+        [base]
+    };
+    let mut table = stream.clone_htod(&address)?;
+
     let width = 1u64;
     let mut half = len / 2;
     for coordinate in point.chunks_exact(3) {
@@ -338,8 +365,7 @@ fn fold_to_one(
         unsafe {
             stream
                 .launch_builder(&be.sumcheck_fold_ext3)
-                .arg(&mut *values)
-                .arg(&len)
+                .arg(&mut table)
                 .arg(&half)
                 .arg(&width)
                 .arg(&r)

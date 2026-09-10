@@ -74,15 +74,14 @@ __device__ __forceinline__ void store_slot(uint64_t *slots, uint64_t stride, uin
 __device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes,
                                             uint64_t num_nodes,
                                             const uint64_t *__restrict__ d_consts,
-                                            const uint64_t *__restrict__ d_factors,
-                                            uint64_t factor_stride, uint64_t j, uint64_t half,
-                                            const Fe3 &t, uint64_t *slots, uint64_t stride,
-                                            uint32_t root_slot) {
+                                            const uint64_t *const *__restrict__ d_factors,
+                                            uint64_t j, uint64_t half, const Fe3 &t,
+                                            uint64_t *slots, uint64_t stride, uint32_t root_slot) {
     for (uint64_t i = 0; i < num_nodes; i++) {
         Node nd = load_node(d_nodes, i);
         switch (nd.op) {
         case OP_VAR: {
-            const uint64_t *column = d_factors + (uint64_t)nd.a * factor_stride * 3;
+            const uint64_t *column = d_factors[nd.a];
             Fe3 lo = load_ext(column + j * 3);
             Fe3 hi = load_ext(column + (j + half) * 3);
             Fe3 v = ext3::add(lo, ext3::mul(t, ext3::sub(hi, lo)));
@@ -115,9 +114,9 @@ __device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes
 }
 
 extern "C" __global__ void sumcheck_round_ext3(
-    // factors: factor `k` at cube index `j`, component `c`, is
-    // `d_factors[(k*factor_stride + j)*3 + c]`
-    const uint64_t *__restrict__ d_factors, uint64_t factor_stride,
+    // one device pointer per factor; factor `k` at cube index `j`, component
+    // `c`, is `d_factors[k][j*3 + c]`
+    const uint64_t *const *__restrict__ d_factors,
     // cube indices this round: `lo` at `j`, `hi` at `j + half`
     uint64_t half,
     // the program
@@ -141,8 +140,8 @@ extern "C" __global__ void sumcheck_round_ext3(
     for (uint64_t j = tid; j < half; j += num_threads) {
         for (uint32_t ti = 0; ti < num_t; ti++) {
             Fe3 t = load_ext(d_t + (uint64_t)ti * 3);
-            Fe3 v = eval_program(d_nodes, num_nodes, d_consts, d_factors, factor_stride, j, half, t,
-                                 slots, num_threads, root_slot);
+            Fe3 v = eval_program(d_nodes, num_nodes, d_consts, d_factors, j, half, t, slots,
+                                 num_threads, root_slot);
             acc[ti] = ext3::add(acc[ti], v);
         }
     }
@@ -176,6 +175,53 @@ extern "C" __global__ void sumcheck_round_ext3(
     }
 }
 
+// One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
+// `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
+// host seeds `dst[0]` and walks the variables back to front, which is what
+// puts variable 0 in the high bit.
+extern "C" __global__ void eq_expand_level_ext3(uint64_t *__restrict__ dst, uint64_t half,
+                                                const uint64_t *__restrict__ r) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= half) return;
+    Fe3 value = load_ext(dst + j * 3);
+    Fe3 challenge = load_ext(r);
+    Fe3 hi = ext3::mul(value, challenge);
+    Fe3 lo = ext3::sub(value, hi);
+    uint64_t *at = dst + j * 3;
+    at[0] = lo.a;
+    at[1] = lo.b;
+    at[2] = lo.c;
+    uint64_t *up = dst + (j + half) * 3;
+    up[0] = hi.a;
+    up[1] = hi.b;
+    up[2] = hi.c;
+}
+
+// One level of the fraction tree: `p' = p_lo·q_hi + p_hi·q_lo`, `q' = q_lo·q_hi`
+// over the halves of the layer below. Out of place — the halves are read by
+// threads that write the level above.
+extern "C" __global__ void fraction_fold_ext3(const uint64_t *__restrict__ p,
+                                              const uint64_t *__restrict__ q, uint64_t half,
+                                              uint64_t *__restrict__ p_out,
+                                              uint64_t *__restrict__ q_out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= half) return;
+    Fe3 p_lo = load_ext(p + j * 3);
+    Fe3 p_hi = load_ext(p + (j + half) * 3);
+    Fe3 q_lo = load_ext(q + j * 3);
+    Fe3 q_hi = load_ext(q + (j + half) * 3);
+    Fe3 numerator = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+    Fe3 denominator = ext3::mul(q_lo, q_hi);
+    uint64_t *at = p_out + j * 3;
+    at[0] = numerator.a;
+    at[1] = numerator.b;
+    at[2] = numerator.c;
+    uint64_t *down = q_out + j * 3;
+    down[0] = denominator.a;
+    down[1] = denominator.b;
+    down[2] = denominator.c;
+}
+
 // The first fold of a base-field table, which lifts it:
 //   out[j] = in[j] + r·(in[j + half] − in[j])
 // with `in` base and `out` ext3. Later folds stay in the extension and go
@@ -198,8 +244,8 @@ extern "C" __global__ void mle_fold_base_ext3(const uint64_t *__restrict__ in, u
 
 // Binds the round's variable: `f(j) <- f(j) + r·(f(j + half) − f(j))` for every
 // factor, halving the cube. One thread per (factor, index) pair.
-extern "C" __global__ void sumcheck_fold_ext3(uint64_t *__restrict__ d_factors,
-                                              uint64_t factor_stride, uint64_t half, uint64_t width,
+extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_factors,
+                                              uint64_t half, uint64_t width,
                                               const uint64_t *__restrict__ d_r) {
     uint64_t total = width * half;
     Fe3 r = load_ext(d_r);
@@ -207,7 +253,7 @@ extern "C" __global__ void sumcheck_fold_ext3(uint64_t *__restrict__ d_factors,
          task += (uint64_t)gridDim.x * blockDim.x) {
         uint64_t k = task / half;
         uint64_t j = task - k * half;
-        uint64_t *column = d_factors + k * factor_stride * 3;
+        uint64_t *column = d_factors[k];
         Fe3 lo = load_ext(column + j * 3);
         Fe3 hi = load_ext(column + (j + half) * 3);
         Fe3 v = ext3::add(lo, ext3::mul(r, ext3::sub(hi, lo)));

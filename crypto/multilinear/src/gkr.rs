@@ -294,19 +294,26 @@ where
         let next = tree.layer(i + 1);
         let lambda = transcript.sample_field_element();
 
-        let relation = LayerRelation::new(next, &point, lambda)?;
+        let mut relation = LayerRelation::new(next, &point, lambda)?;
         let half_vars = relation.num_vars();
-        let (sumcheck, z) = sumcheck::prove(relation, transcript)?;
+        let (rounds, z) = sumcheck::prove_rounds(&mut relation, half_vars, transcript)?;
+        let sumcheck = SumcheckProof { rounds };
 
-        // The four restricted values the verifier needs to close the round.
-        // Evaluated straight off the layer's halves: copying them out first
-        // would be four copies of the layer per round, and the layers are the
-        // biggest thing the fraction tree holds.
-        let half = next.p.len() / 2;
-        let p_lo = Mle::evaluate_at(&next.p.evals()[..half], &z)?;
-        let p_hi = Mle::evaluate_at(&next.p.evals()[half..], &z)?;
-        let q_lo = Mle::evaluate_at(&next.q.evals()[..half], &z)?;
-        let q_hi = Mle::evaluate_at(&next.q.evals()[half..], &z)?;
+        // The four restricted values the verifier needs to close the round are
+        // what the sumcheck's own factors have become: binding every variable
+        // to `z` is the evaluation at `z`. Evaluating the halves again would be
+        // a second pass over the layer, and the layers are the biggest thing
+        // the fraction tree holds.
+        let bound = |slot: usize| -> Result<FieldElement<F>, Error> {
+            relation.polys()[slot]
+                .as_constant()
+                .cloned()
+                .ok_or(Error::NoVariablesLeft)
+        };
+        let p_lo = bound(LayerRelation::<F>::P_LO)?;
+        let p_hi = bound(LayerRelation::<F>::P_HI)?;
+        let q_lo = bound(LayerRelation::<F>::Q_LO)?;
+        let q_hi = bound(LayerRelation::<F>::Q_HI)?;
         debug_assert_eq!(z.len(), half_vars);
 
         for v in [&p_lo, &p_hi, &q_lo, &q_hi] {
