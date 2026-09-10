@@ -236,3 +236,17 @@ input = ["Bit", "Word",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
 kind = "interaction"
 tag = "BIT"
 input = ["Word", "Byte"]
+
+
+# Field VM
+[[signatures]]
+kind = "interaction"
+tag = "FIELD_VM_MEM"
+input = ["BaseField"]
+output = "ExtField"
+
+[[signatures]]
+kind = "interaction"
+tag = "FIELD_VM_DECODE"
+# PARAM: ["BaseField", ["BaseField", 4], ["BaseField", 4], ["BaseField", 4], ["Bit", 4], ["Bit", N], "Bit"]
+input = ["BaseField", ["BaseField", 4], ["BaseField", 4], ["BaseField", 4], ["Bit", 4], ["Bit", 5], "Bit"]

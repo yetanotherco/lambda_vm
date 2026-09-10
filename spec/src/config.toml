@@ -8,6 +8,11 @@ range = [0, "18446744069414584320"]
 desc = "Variable that can assume any value in the base field."
 
 [[variables.types]]
+label = "ExtField"
+subtypes = ["ExtField"]
+desc = "Variables that can assume any value in the extension field."
+
+[[variables.types]]
 label = "Bit"
 subtypes = ["BaseField"]
 range = [0, 1]
