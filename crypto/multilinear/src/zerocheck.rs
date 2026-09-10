@@ -68,7 +68,8 @@ pub fn prove<F, T, P>(constraint: P, transcript: &mut T) -> Result<ZeroCheckOutp
 where
     F: IsField,
     T: IsTranscript<F>,
-    P: SumcheckPolynomial<F>,
+    P: SumcheckPolynomial<F> + Sync,
+    FieldElement<F>: Send + Sync,
 {
     let num_vars = constraint.num_vars();
     let r: Vec<FieldElement<F>> = (0..num_vars)

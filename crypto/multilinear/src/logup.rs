@@ -17,6 +17,9 @@
 
 use math::field::{element::FieldElement, traits::IsField};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{Error, batch::Rule, eq::eq_evals, gkr::FractionLayer, mle::Mle};
 
 /// An affine expression over the sumcheck factors: `Σ c_j·f_{s_j} + k`.
@@ -56,7 +59,10 @@ impl<E: IsField> Affine<E> {
 
     /// The expression's table over the cube. `factors` must not be empty: its
     /// first entry sets the height.
-    pub fn table(&self, factors: &[Mle<E>]) -> Result<Mle<E>, Error> {
+    pub fn table(&self, factors: &[Mle<E>]) -> Result<Mle<E>, Error>
+    where
+        FieldElement<E>: Send + Sync,
+    {
         let size = factors.first().ok_or(Error::EmptyPolynomial)?.len();
         let mut evals = vec![self.constant.clone(); size];
         for (slot, coefficient) in &self.terms {
@@ -70,6 +76,14 @@ impl<E: IsField> Affine<E> {
                     got: factor.num_vars(),
                 });
             }
+            // One pass per term over the whole column. The bus builds one of
+            // these per interaction, so it is a hot loop on a real table.
+            #[cfg(feature = "parallel")]
+            evals
+                .par_iter_mut()
+                .zip(factor.evals().par_iter())
+                .for_each(|(slot, value)| *slot += coefficient * value);
+            #[cfg(not(feature = "parallel"))]
             for (slot, value) in evals.iter_mut().zip(factor.evals()) {
                 *slot += coefficient * value;
             }

@@ -8,6 +8,9 @@
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{
     Error,
     eq::{eq_eval, eq_mle},
@@ -39,7 +42,10 @@ impl<F: IsField> FractionLayer<F> {
     }
 
     /// Adds the two halves pointwise, giving the layer one level up.
-    pub fn fold(&self) -> Result<Self, Error> {
+    pub fn fold(&self) -> Result<Self, Error>
+    where
+        FieldElement<F>: Send + Sync,
+    {
         if self.num_vars() == 0 {
             return Err(Error::NoVariablesLeft);
         }
@@ -47,12 +53,19 @@ impl<F: IsField> FractionLayer<F> {
         let (p_lo, p_hi) = self.p.evals().split_at(half);
         let (q_lo, q_hi) = self.q.evals().split_at(half);
 
-        let mut next_p = Vec::with_capacity(half);
-        let mut next_q = Vec::with_capacity(half);
-        for i in 0..half {
-            next_p.push(&p_lo[i] * &q_hi[i] + &p_hi[i] * &q_lo[i]);
-            next_q.push(&q_lo[i] * &q_hi[i]);
-        }
+        // Every index folds on its own, and building the tree is a pass over
+        // the input layer at every level, so this is worth the pool.
+        let both = |i: usize| {
+            (
+                &p_lo[i] * &q_hi[i] + &p_hi[i] * &q_lo[i],
+                &q_lo[i] * &q_hi[i],
+            )
+        };
+        #[cfg(feature = "parallel")]
+        let (next_p, next_q): (Vec<_>, Vec<_>) = (0..half).into_par_iter().map(both).unzip();
+        #[cfg(not(feature = "parallel"))]
+        let (next_p, next_q): (Vec<_>, Vec<_>) = (0..half).map(both).unzip();
+
         Self::new(Mle::new(next_p)?, Mle::new(next_q)?)
     }
 }
@@ -247,11 +260,14 @@ where
         let (sumcheck, z) = sumcheck::prove(relation, transcript)?;
 
         // The four restricted values the verifier needs to close the round.
+        // Evaluated straight off the layer's halves: copying them out first
+        // would be four copies of the layer per round, and the layers are the
+        // biggest thing the fraction tree holds.
         let half = next.p.len() / 2;
-        let p_lo = Mle::new(next.p.evals()[..half].to_vec())?.evaluate(&z)?;
-        let p_hi = Mle::new(next.p.evals()[half..].to_vec())?.evaluate(&z)?;
-        let q_lo = Mle::new(next.q.evals()[..half].to_vec())?.evaluate(&z)?;
-        let q_hi = Mle::new(next.q.evals()[half..].to_vec())?.evaluate(&z)?;
+        let p_lo = Mle::evaluate_at(&next.p.evals()[..half], &z)?;
+        let p_hi = Mle::evaluate_at(&next.p.evals()[half..], &z)?;
+        let q_lo = Mle::evaluate_at(&next.q.evals()[..half], &z)?;
+        let q_hi = Mle::evaluate_at(&next.q.evals()[half..], &z)?;
         debug_assert_eq!(z.len(), half_vars);
 
         for v in [&p_lo, &p_hi, &q_lo, &q_hi] {

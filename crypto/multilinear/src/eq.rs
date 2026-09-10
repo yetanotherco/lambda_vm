@@ -4,6 +4,9 @@
 
 use math::field::{element::FieldElement, traits::IsField};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{Error, mle::Mle};
 
 /// Builds the table of `eq(r, x)` for every `x` in `{0,1}^n`, in `O(2^n)`.
@@ -12,16 +15,39 @@ use crate::{Error, mle::Mle};
 /// the new most significant bit, so the variables are consumed **back to
 /// front**: that leaves variable 0 in the high bit, which is the indexing
 /// convention [`Mle`](crate::mle::Mle) folds on.
-pub fn eq_evals<F: IsField>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>> {
+pub fn eq_evals<F: IsField>(r: &[FieldElement<F>]) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
     let mut table = vec![FieldElement::<F>::one()];
     for r_i in r.iter().rev() {
-        let mut next = Vec::with_capacity(table.len() * 2);
         let one_minus = FieldElement::<F>::one() - r_i;
-        for v in &table {
-            next.push(v * &one_minus);
-        }
-        for v in &table {
-            next.push(v * r_i);
+        // Each half of the doubled table is an independent scaling of the
+        // current one. The last levels are the whole cube, so they carry the
+        // cost and the pool is worth it there.
+        let mut next = vec![FieldElement::<F>::zero(); table.len() * 2];
+        let (lo, hi) = next.split_at_mut(table.len());
+        #[cfg(feature = "parallel")]
+        rayon::join(
+            || {
+                lo.par_iter_mut()
+                    .zip(table.par_iter())
+                    .for_each(|(slot, v)| *slot = v * &one_minus)
+            },
+            || {
+                hi.par_iter_mut()
+                    .zip(table.par_iter())
+                    .for_each(|(slot, v)| *slot = v * r_i)
+            },
+        );
+        #[cfg(not(feature = "parallel"))]
+        {
+            lo.iter_mut()
+                .zip(table.iter())
+                .for_each(|(slot, v)| *slot = v * &one_minus);
+            hi.iter_mut()
+                .zip(table.iter())
+                .for_each(|(slot, v)| *slot = v * r_i);
         }
         table = next;
     }

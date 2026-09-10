@@ -8,6 +8,9 @@ use math::field::{
     traits::{IsField, IsSubFieldOf},
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::Error;
 
 /// A multilinear polynomial held by its hypercube evaluations.
@@ -88,10 +91,17 @@ impl<F: IsField> Mle<F> {
             return Err(Error::NoVariablesLeft);
         }
         let half = self.evals.len() / 2;
-        for j in 0..half {
-            let delta = &self.evals[j + half] - &self.evals[j];
-            self.evals[j] = &self.evals[j] + r * &delta;
-        }
+        let (lo, hi) = self.evals.split_at_mut(half);
+        // Every index is independent, and the halves are disjoint slices, so the
+        // split is what lets the rows go out to the pool at all.
+        #[cfg(feature = "parallel")]
+        lo.par_iter_mut()
+            .zip(hi.par_iter())
+            .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+        #[cfg(not(feature = "parallel"))]
+        lo.iter_mut()
+            .zip(hi.iter())
+            .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
         self.evals.truncate(half);
         self.num_vars -= 1;
         Ok(())
@@ -126,11 +136,52 @@ impl<F: IsField> Mle<F> {
                 got: point.len(),
             });
         }
-        let mut current = self.clone();
-        for r in point {
-            current.fix_first_variable_in_place(r)?;
+        Self::evaluate_at(&self.evals, point)
+    }
+
+    /// The extension of `evals` at `point`, without owning an [`Mle`].
+    ///
+    /// The first fold reads the slice and writes the half-size buffer the rest
+    /// fold in place, so the table is never copied at full width. A caller
+    /// holding a slice of a bigger table — a GKR layer's half, say — evaluates
+    /// it without materializing it at all.
+    pub fn evaluate_at(
+        evals: &[FieldElement<F>],
+        point: &[FieldElement<F>],
+    ) -> Result<FieldElement<F>, Error> {
+        if evals.len() != 1usize << point.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: point.len(),
+                got: evals.len().trailing_zeros() as usize,
+            });
         }
-        Ok(current.evals[0].clone())
+        let Some((first, rest)) = point.split_first() else {
+            return Ok(evals[0].clone());
+        };
+
+        let half = evals.len() / 2;
+        let (lo, hi) = evals.split_at(half);
+        let combine = |(l, h): (&FieldElement<F>, &FieldElement<F>)| l + first * &(h - l);
+        #[cfg(feature = "parallel")]
+        let mut current: Vec<FieldElement<F>> =
+            lo.par_iter().zip(hi.par_iter()).map(combine).collect();
+        #[cfg(not(feature = "parallel"))]
+        let mut current: Vec<FieldElement<F>> = lo.iter().zip(hi.iter()).map(combine).collect();
+
+        for r in rest {
+            let half = current.len() / 2;
+            let (lo, hi) = current.split_at_mut(half);
+            #[cfg(feature = "parallel")]
+            lo.par_iter_mut()
+                .zip(hi.par_iter())
+                .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+            #[cfg(not(feature = "parallel"))]
+            lo.iter_mut()
+                .zip(hi.iter())
+                .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+            current.truncate(half);
+        }
+        Ok(current.swap_remove(0))
     }
 
     /// The extension at a point in a **larger** field.

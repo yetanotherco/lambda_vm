@@ -30,12 +30,15 @@ pub struct Rule<'a, F: IsField> {
 }
 
 /// A statement's value from the batch's factor values.
-type RuleFn<'a, F> = Box<dyn Fn(&[FieldElement<F>]) -> FieldElement<F> + 'a>;
+type RuleFn<'a, F> = Box<dyn Fn(&[FieldElement<F>]) -> FieldElement<F> + Sync + 'a>;
 
 impl<'a, F: IsField> Rule<'a, F> {
     /// `degree` must upper-bound the rule's total degree in the factors, its
     /// weight table included.
-    pub fn new(degree: usize, eval: impl Fn(&[FieldElement<F>]) -> FieldElement<F> + 'a) -> Self {
+    pub fn new(
+        degree: usize,
+        eval: impl Fn(&[FieldElement<F>]) -> FieldElement<F> + Sync + 'a,
+    ) -> Self {
         Self {
             eval: Box::new(eval),
             degree,

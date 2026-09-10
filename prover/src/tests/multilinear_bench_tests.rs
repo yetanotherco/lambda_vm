@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use multilinear::whir_chain::GrindBits;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 use crate::multilinear_prove;
@@ -297,7 +298,14 @@ fn phases() {
             (columns.len(), columns[0].len().trailing_zeros() as usize)
         })
         .collect();
-    let config = multilinear_prove::chain_config(&shapes);
+    let mut config = multilinear_prove::chain_config(&shapes);
+    // `LAMBDA_VM_BENCH_NO_GRIND` zeroes the proof of work while leaving the query
+    // count alone. Not a valid proof — it drops the bits grinding buys — but it
+    // is the only way to read the grinding cost off the same run, since asking
+    // `with_security` for fewer bits would hand them back as extra queries.
+    if std::env::var_os("LAMBDA_VM_BENCH_NO_GRIND").is_some() {
+        config.grind = GrindBits::default();
+    }
 
     let start = Instant::now();
     let layouts: Vec<TableLayout<'_, F, E>> = pairs

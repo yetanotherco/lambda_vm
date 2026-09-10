@@ -10,6 +10,9 @@
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{Error, poly::SumcheckPolynomial};
 
 /// One round: the round polynomial as evaluations at `1, .., degree`.
@@ -89,48 +92,94 @@ fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> F
 }
 
 /// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube.
+/// Sums `f(r_0..r_{j-1}, t, rest)` over the remaining cube.
 ///
 /// `t` runs over `1..=degree`, or `0..=degree` when `with_zero` — which only
 /// the prover's debug self-check asks for.
 ///
 /// `poly` has already been folded on the earlier variables, so its first
-/// variable is the one this round binds. For `t` in `{0, 1}` the sum reads the
-/// corresponding half of each table directly; for `t >= 2` each factor is
-/// extended along the axis first.
-fn round_evaluations<F: IsField, P: SumcheckPolynomial<F>>(
-    poly: &P,
-    degree: usize,
-    with_zero: bool,
-) -> Vec<FieldElement<F>> {
+/// variable is the one this round binds.
+///
+/// One pass over the cube serves **every** `t`: each factor's `lo` and `hi` are
+/// read once per index and the extensions come off `hi - lo`, rather than
+/// re-reading the tables once per `t`. On a real trace the factors are hundreds
+/// of megabytes, so the reads are the cost, not the arithmetic.
+fn round_evaluations<F, P>(poly: &P, degree: usize, with_zero: bool) -> Vec<FieldElement<F>>
+where
+    F: IsField,
+    P: SumcheckPolynomial<F> + Sync,
+    FieldElement<F>: Send + Sync,
+{
     let half = 1usize << (poly.num_vars() - 1);
     let first = usize::from(!with_zero);
-    let mut out = Vec::with_capacity(degree + 1 - first);
-    // One buffer for the whole round. Collecting a fresh `Vec` per cube index
-    // would be one heap allocation per index per `t`, which on a real trace is
-    // millions of them per round and dwarfs the arithmetic.
-    let mut values: Vec<FieldElement<F>> = vec![FieldElement::zero(); poly.polys().len()];
+    let steps: Vec<FieldElement<F>> = (first..=degree)
+        .map(|t| FieldElement::<F>::from(t as u64))
+        .collect();
 
-    for t in first..=degree {
-        let t_fe = FieldElement::<F>::from(t as u64);
-        let mut total = FieldElement::<F>::zero();
-        for j in 0..half {
-            // Extend every factor along the bound axis: lo + t·(hi − lo). At
-            // `t = 0` and `t = 1` that is a half of the table read straight
-            // off, so the multiplication is skipped.
-            for (slot, p) in values.iter_mut().zip(poly.polys()) {
-                let lo = &p.evals()[j];
-                let hi = &p.evals()[j + half];
-                *slot = match t {
-                    0 => lo.clone(),
-                    1 => hi.clone(),
-                    _ => lo + &t_fe * &(hi - lo),
-                };
+    // A slice of the cube, summed independently. The rounds are the whole cost
+    // of the prover, and every index is independent, so this is where the cores
+    // go in.
+    let slice = |range: std::ops::Range<usize>| -> Vec<FieldElement<F>> {
+        let width = poly.polys().len();
+        // Buffers for the whole slice. Collecting a fresh `Vec` per cube index
+        // would be one heap allocation per index, which on a real trace is
+        // millions of them per round and dwarfs the arithmetic.
+        let mut totals = vec![FieldElement::<F>::zero(); steps.len()];
+        let mut lo = vec![FieldElement::<F>::zero(); width];
+        let mut hi = vec![FieldElement::<F>::zero(); width];
+        let mut delta = vec![FieldElement::<F>::zero(); width];
+        let mut values = vec![FieldElement::<F>::zero(); width];
+
+        for j in range {
+            for (k, p) in poly.polys().iter().enumerate() {
+                lo[k] = p.evals()[j].clone();
+                hi[k] = p.evals()[j + half].clone();
+                delta[k] = &hi[k] - &lo[k];
             }
-            total += poly.combine(&values);
+            for (total, t) in totals.iter_mut().zip(&steps) {
+                // `t = 0` and `t = 1` are the halves as they are, so they skip
+                // the multiplication entirely.
+                if t == &FieldElement::<F>::zero() {
+                    values.clone_from(&lo);
+                } else if t == &FieldElement::<F>::one() {
+                    values.clone_from(&hi);
+                } else {
+                    for (v, (l, d)) in values.iter_mut().zip(lo.iter().zip(&delta)) {
+                        *v = l + t * d;
+                    }
+                }
+                *total += poly.combine(&values);
+            }
         }
-        out.push(total);
+        totals
+    };
+
+    let add = |mut acc: Vec<FieldElement<F>>, part: Vec<FieldElement<F>>| {
+        for (a, p) in acc.iter_mut().zip(part) {
+            *a += p;
+        }
+        acc
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        // Below this the pool costs more than the round does.
+        const SERIAL_BELOW: usize = 1 << 10;
+        if half < SERIAL_BELOW {
+            return slice(0..half);
+        }
+        let chunk = half.div_ceil(rayon::current_num_threads().max(1));
+        (0..half)
+            .into_par_iter()
+            .step_by(chunk)
+            .map(|start| slice(start..(start + chunk).min(half)))
+            .reduce(|| vec![FieldElement::<F>::zero(); steps.len()], add)
     }
-    out
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = add;
+        slice(0..half)
+    }
 }
 
 /// Runs the prover, absorbing each round polynomial and drawing each challenge
@@ -145,7 +194,8 @@ pub fn prove<F, T, P>(
 where
     F: IsField,
     T: IsTranscript<F>,
-    P: SumcheckPolynomial<F>,
+    P: SumcheckPolynomial<F> + Sync,
+    FieldElement<F>: Send + Sync,
 {
     let num_vars = poly.num_vars();
     let (rounds, challenges) = prove_rounds(&mut poly, num_vars, transcript)?;
@@ -167,7 +217,8 @@ pub fn prove_rounds<F, T, P>(
 where
     F: IsField,
     T: IsTranscript<F>,
-    P: SumcheckPolynomial<F>,
+    P: SumcheckPolynomial<F> + Sync,
+    FieldElement<F>: Send + Sync,
 {
     if rounds > poly.num_vars() {
         return Err(Error::RoundCountMismatch {

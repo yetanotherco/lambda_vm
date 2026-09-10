@@ -34,6 +34,9 @@ use math::{
     traits::AsBytes,
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{
     Error,
     batch::{self, Rule},
@@ -260,10 +263,21 @@ where
     /// and fold them anyway, so a second copy kept for the whole proof would be
     /// one more resident copy of the trace and nothing else.
     pub fn factors(&self) -> Result<Vec<Mle<E>>, Error> {
-        let mut public = self.public.iter();
-        self.kinds
-            .iter()
-            .map(|kind| match kind {
+        // Which public table each public factor takes, resolved up front so the
+        // factors can be built out of order.
+        let mut public_at = Vec::with_capacity(self.kinds.len());
+        let mut seen = 0usize;
+        for kind in &self.kinds {
+            public_at.push(seen);
+            if kind.source().is_none() {
+                seen += 1;
+            }
+        }
+
+        // One lift of the whole trace into the extension, which is the biggest
+        // allocation the argument makes after the codeword.
+        let build = |(kind, at): (&FactorKind, &usize)| -> Result<Mle<E>, Error> {
+            match kind {
                 // The sumcheck's factors share a field, so a base view is
                 // lifted for it. The codeword is what stays base.
                 FactorKind::Committed(s) => {
@@ -275,9 +289,18 @@ where
                             .collect(),
                     )
                 }
-                FactorKind::Public => public.next().cloned().ok_or(Error::EmptyPolynomial),
-            })
-            .collect()
+                FactorKind::Public => self.public.get(*at).cloned().ok_or(Error::EmptyPolynomial),
+            }
+        };
+        #[cfg(feature = "parallel")]
+        return self
+            .kinds
+            .par_iter()
+            .zip(public_at.par_iter())
+            .map(build)
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        return self.kinds.iter().zip(public_at.iter()).map(build).collect();
     }
 
     pub fn columns(&self) -> &[Mle<F>] {
@@ -472,7 +495,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
-    C: Fn(&[FieldElement<E>]) -> FieldElement<E>,
+    C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
 {
     for root in trace.roots() {
         transcript.append_bytes(&root);
@@ -511,7 +534,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
-    C: Fn(&[FieldElement<E>]) -> FieldElement<E>,
+    C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
     P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
 {
     for root in claim_shape.roots {

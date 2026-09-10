@@ -19,6 +19,9 @@ use math::fft::bowers_fft::bowers_fft_opt_fused;
 use math::fft::bowers_fft::bowers_fft_opt_fused_parallel;
 use math::fft::{bit_reversing::in_place_bit_reverse_permute, bowers_fft::LayerTwiddles};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{Error, mle::Mle};
 
 /// The evaluation domain: a coset-free multiplicative subgroup of order `2^k`.
@@ -202,17 +205,43 @@ where
         .generator()
         .inv()
         .expect("a domain generator is nonzero");
-    let mut odd_scale = two_inv.clone();
+    // `odd_scale` walks the powers of `1/g`, which is a chain — so a chunk
+    // starts from `two_inv · step^start` and walks from there. That is what
+    // lets the fold go out to the pool at all: one `pow` per chunk instead of
+    // one inversion per position.
+    let fold_chunk = |start: usize, out: &mut Vec<FieldElement<N>>, len: usize| {
+        let mut odd_scale = &two_inv * step.pow(start as u64);
+        for j in start..start + len {
+            let (a, b) = (&codeword[j], &codeword[j + half]);
+            let even = &two_inv * (a + b);
+            let odd = &odd_scale * (a - b);
+            // The base element on the left: the only direction the tower gives.
+            out.push(even + odd * alpha);
+            odd_scale *= &step;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        const SERIAL_BELOW: usize = 1 << 12;
+        if half >= SERIAL_BELOW {
+            let chunk = half.div_ceil(rayon::current_num_threads().max(1));
+            let parts: Vec<Vec<FieldElement<N>>> = (0..half)
+                .into_par_iter()
+                .step_by(chunk)
+                .map(|start| {
+                    let len = chunk.min(half - start);
+                    let mut out = Vec::with_capacity(len);
+                    fold_chunk(start, &mut out, len);
+                    out
+                })
+                .collect();
+            return Ok(parts.concat());
+        }
+    }
 
     let mut out = Vec::with_capacity(half);
-    for j in 0..half {
-        let (a, b) = (&codeword[j], &codeword[j + half]);
-        let even = &two_inv * (a + b);
-        let odd = &odd_scale * (a - b);
-        // The base element on the left: the only direction the tower gives.
-        out.push(even + odd * alpha);
-        odd_scale *= &step;
-    }
+    fold_chunk(0, &mut out, half);
     Ok(out)
 }
 
