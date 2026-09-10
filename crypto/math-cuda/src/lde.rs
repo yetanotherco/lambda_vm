@@ -1075,12 +1075,14 @@ fn coset_lde_row_major_inner(
     what: &str,
     retain_trace_col_major: bool,
     retain_host_lde: bool,
+    download_tree: bool,
 ) -> Result<(
     GpuMerkleTree,
     CudaSlice<u64>,
     Vec<u64>,
     Option<CudaSlice<u64>>,
     Arc<crate::device::PooledEvent>,
+    Option<Vec<u8>>,
 )> {
     let input_len = match &input {
         InnerInput::Host(h) => h.len(),
@@ -1203,6 +1205,17 @@ fn coset_lde_row_major_inner(
         None => Vec::new(),
     };
 
+    // Full node buffer to host, when the caller will keep the tree there. Done
+    // after the LDE drain so it does not sit in front of the transpose; the
+    // caller frees the device copy by dropping the handle's tree.
+    let tree_nodes_host = if download_tree {
+        let v = stream.clone_dtoh(&nodes_dev)?;
+        stream.synchronize()?;
+        Some(v)
+    } else {
+        None
+    };
+
     let tree = GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
@@ -1214,6 +1227,7 @@ fn coset_lde_row_major_inner(
         lde_out,
         trace_col_major,
         Arc::new(ready),
+        tree_nodes_host,
     ))
 }
 
@@ -1239,22 +1253,25 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
     retain_trace_col_major: bool,
-) -> Result<(GpuLdeBase, Vec<u64>)> {
+    download_tree: bool,
+) -> Result<(GpuLdeBase, Vec<u64>, Option<Vec<u8>>)> {
     let input = match predev {
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
     };
-    let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
-        input,
-        hash,
-        n,
-        m,
-        blowup_factor,
-        weights,
-        "coset_lde_row_major lde_size",
-        retain_trace_col_major,
-        retain_host_lde,
-    )?;
+    let (tree, col_major_dev, lde_out, trace_col_major, ready, tree_nodes) =
+        coset_lde_row_major_inner(
+            input,
+            hash,
+            n,
+            m,
+            blowup_factor,
+            weights,
+            "coset_lde_row_major lde_size",
+            retain_trace_col_major,
+            retain_host_lde,
+            download_tree,
+        )?;
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
         m,
@@ -1264,7 +1281,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
-    Ok((handle, lde_out))
+    Ok((handle, lde_out, tree_nodes))
 }
 
 /// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
@@ -1459,7 +1476,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready, _) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         hash,
         n,
@@ -1469,6 +1486,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         "coset_lde_ext3_row_major lde_size",
         false,
         retain_host_lde,
+        false,
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),
@@ -1493,7 +1511,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready, _) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
         hash,
         n,
@@ -1503,6 +1521,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         "coset_lde_ext3_row_major_dev lde_size",
         false,
         retain_host_lde,
+        false,
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),

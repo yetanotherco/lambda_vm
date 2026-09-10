@@ -305,7 +305,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                 let fwd_tw =
                     TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
-                let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+                let (handle, _lde, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
                     &row_major,
                     None,
                     math_cuda::DeviceHash::Keccak256,
@@ -315,6 +315,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                     &weights_u64,
                     true,
                     true,
+                    false,
                 )
                 .expect("new row-major GPU pipeline");
                 let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;

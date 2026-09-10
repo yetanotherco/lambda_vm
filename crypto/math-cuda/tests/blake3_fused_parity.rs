@@ -86,7 +86,7 @@ fn gpu_fused_blake3_root(columns: &[Vec<u64>], blowup: usize, weights_u64: &[u64
         }
     }
 
-    let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    let (handle, _lde, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         &row_major,
         None,
         math_cuda::DeviceHash::Blake3,
@@ -96,6 +96,7 @@ fn gpu_fused_blake3_root(columns: &[Vec<u64>], blowup: usize, weights_u64: &[u64
         weights_u64,
         true,
         true,
+        false,
     )
     .expect("fused BLAKE3 GPU pipeline");
     handle.tree.as_ref().expect("resident merkle tree").root

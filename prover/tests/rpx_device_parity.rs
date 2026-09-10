@@ -156,7 +156,7 @@ fn gpu_fused_rpx_root(columns: &[Vec<u64>], blowup: usize, weights_u64: &[u64]) 
             row_major[r * num_cols + c] = v;
         }
     }
-    let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    let (handle, _lde, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         &row_major,
         None,
         math_cuda::DeviceHash::Rpx256,
@@ -166,6 +166,7 @@ fn gpu_fused_rpx_root(columns: &[Vec<u64>], blowup: usize, weights_u64: &[u64]) 
         weights_u64,
         true,
         true,
+        false,
     )
     .expect("fused RPX GPU pipeline");
     handle.tree.as_ref().expect("resident merkle tree").root

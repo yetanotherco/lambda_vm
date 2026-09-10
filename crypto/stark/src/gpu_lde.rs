@@ -482,6 +482,35 @@ pub(crate) fn keep_r1_trace_snapshot() -> bool {
     *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_R1_SNAPSHOT").is_ok_and(|v| v != "0"))
 }
 
+/// Keep the R1 main Merkle tree on the device (`LAMBDA_VM_DEVICE_MAIN_TREE=1`).
+///
+/// Lever (ii) against the R1 barrier. The commit builds the full node buffer on
+/// device and, until now, left it there for the life of the handle so R4 could
+/// gather authentication paths with [`gather_proofs_dev`]. That is
+/// `(lde - 1) * 32` bytes per table, `128 * sum_t n_t` at blowup 4 — around a
+/// fifth of the barrier overall, and 24% of a NARROW table's share, which is
+/// where an epoch's rows actually are.
+///
+/// Default is now OFF: the node buffer is downloaded once at commit time and
+/// the host tree is the real one. R4's dispatch already keys on tree presence —
+/// `main_dev_proofs` is `Some` exactly when `handle.tree` is `Some`, and its own
+/// comment says the openings walk the host tree otherwise — so the fallback is
+/// a pre-existing path, not a new one.
+///
+/// Soundness surface: none. `tree_from_node_bytes` feeds
+/// `MerkleTree::from_precomputed_nodes`, the layout the preprocessed split path
+/// already uses for its precomputed tree, and the root is asserted equal to the
+/// one the device computed before the device copy is released.
+///
+/// Costs a D2H of `(lde - 1) * 32` per table and holds the same bytes in host
+/// RSS for the prove. It also CLOSES an abort site: the device-only envelope
+/// documents the R4 gather as the one path it cannot degrade out of, precisely
+/// because the host tree was root-only.
+pub(crate) fn keep_main_tree_on_device() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_DEVICE_MAIN_TREE").is_ok_and(|v| v != "0"))
+}
+
 /// Test hook: decline the device R2 path unconditionally so device-only
 /// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
 /// Setting it also enables the test-only host fallback
@@ -1315,27 +1344,29 @@ where
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     // Admitted means the device path is the only path: a failure here aborts.
-    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
-        raw,
-        predev,
-        device_hash_of::<B>(),
-        n,
-        m,
-        blowup_factor,
-        &weights_u64,
-        retain_host_lde,
-        keep_r1_trace_snapshot(),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            abort_or_test_fallback(
-                &shape,
-                Some(&set),
-                DevicePathFailure::DeviceError(format!("{e:?}")),
-            );
-            return None;
-        }
-    };
+    let (mut handle, lde_u64, tree_nodes) =
+        match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+            raw,
+            predev,
+            device_hash_of::<B>(),
+            n,
+            m,
+            blowup_factor,
+            &weights_u64,
+            retain_host_lde,
+            keep_r1_trace_snapshot(),
+            !keep_main_tree_on_device(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                abort_or_test_fallback(
+                    &shape,
+                    Some(&set),
+                    DevicePathFailure::DeviceError(format!("{e:?}")),
+                );
+                return None;
+            }
+        };
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1347,10 +1378,27 @@ where
         )
     };
 
-    // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
-    // serves openings; only the commitment root lives on host.
+    // Either the device tree serves openings and the host tree is a root-only
+    // placeholder, or the node buffer came back and the HOST tree is the real
+    // one — in which case the device copy is released here and R4 takes its
+    // documented host arm (`main_dev_proofs` is `Some` exactly when
+    // `handle.tree` is).
     let root = handle.tree.as_ref()?.root;
-    let tree = MerkleTree::<B>::from_root(root);
+    let tree = match tree_nodes {
+        Some(nodes) => {
+            let host_tree = tree_from_node_bytes::<B>(nodes)?;
+            // The host tree must be the tree that was committed to. Checked
+            // before the device copy is dropped, so a mismatch can never become
+            // a proof.
+            assert_eq!(
+                host_tree.root, root,
+                "downloaded main tree root disagrees with the device root"
+            );
+            handle.tree = None;
+            host_tree
+        }
+        None => MerkleTree::<B>::from_root(root),
+    };
     Some((tree, handle, lde_out))
 }
 

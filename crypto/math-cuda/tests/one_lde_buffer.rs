@@ -109,7 +109,7 @@ fn base_handle_is_the_in_place_transpose_of_the_host_lde() {
         let mut rng = ChaCha8Rng::seed_from_u64(0x1DE_0000 + i as u64);
         let row_major = random_row_major(&mut rng, n, cols);
         let weights = coset_weights_u64(n, COSET_OFFSET);
-        let (handle, host_lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+        let (handle, host_lde, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
             &row_major,
             None,
             hash_for(i),
@@ -119,6 +119,7 @@ fn base_handle_is_the_in_place_transpose_of_the_host_lde() {
             &weights,
             true,
             true,
+            false,
         )
         .expect("fused base commit");
         assert_eq!(handle.m, cols);
@@ -321,7 +322,7 @@ fn vram_arm() {
     let mut first_root = None;
     for it in 0..iters {
         let t0 = std::time::Instant::now();
-        let (handle, host) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+        let (handle, host, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
             &row_major,
             predev_buf.as_ref(),
             hash,
@@ -331,6 +332,7 @@ fn vram_arm() {
             &weights,
             false,
             true,
+            false,
         )
         .expect("fused commit");
         // The handle's `ready` fires after the transpose; wait so the timing
