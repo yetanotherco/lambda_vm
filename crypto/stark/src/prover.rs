@@ -3254,6 +3254,25 @@ pub trait IsStarkProver<
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
         let Some(proofs) = dev_proofs else {
+            // Tree on host, LDE still on device: authenticate with the host
+            // tree and take the VALUES from the device row gather. This is the
+            // combination the main-tree download creates, and it is a real one
+            // — the proof's source (the tree) and the values' source (the LDE)
+            // are independent, and moving one to host does not move the other.
+            // The root-only guard below is what rules out the case where the
+            // tree is a placeholder rather than a real host tree.
+            if let Some(dev_vals) = dev_values
+                && !tree.is_root_only()
+            {
+                let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
+                let (even, odd) = (even[col_range.clone()].to_vec(), odd[col_range].to_vec());
+                return Self::open_polys_from_values(
+                    tree.get_proof_by_pos(challenge)
+                        .expect("FRI query index in bounds"),
+                    even,
+                    odd,
+                );
+            }
             assert!(
                 !lde_trace.host_trace_empty(),
                 "R4 {what} opening fell back to the host tree, but it is device-only (empty)"
@@ -3401,27 +3420,22 @@ pub trait IsStarkProver<
         // below; Stage 3 drops the host copy once this path is proven. `None`
         // when the LDE is not device resident or the tower is not Goldilocks (→
         // host gather). Row-major: `q`-th row's columns at `[q*ncols ..]`.
-        // Gate the value gathers on the corresponding device-tree proofs so the
-        // two device arms stay aligned (`*_dev_proofs.is_some() ⇔
-        // *_dev_values.is_some()` on the Goldilocks path) and we never gather
-        // rows for a tree that is not device resident.
+        // Gated on the LDE's OWN residency, not on the tree's. The gather reads
+        // the device LDE; the proofs read the tree; the main-tree download moves
+        // the tree to host while the LDE stays device-resident, so tying the two
+        // together would leave the values unreachable for exactly the tables the
+        // download affects (`open_trace_polys_device` handles that pairing).
         #[cfg(feature = "cuda")]
         let main_dev_values: Option<Vec<FieldElement<Field>>> =
-            main_dev_proofs.as_ref().and_then(|_| {
-                lde_trace.gpu_main().and_then(|h| {
-                    Self::gather_query_rows_device(
-                        lde_trace,
-                        "main",
-                        |stream| {
-                            math_cuda::barycentric::gather_rows_base_on_device(
-                                h,
-                                &query_rows,
-                                stream,
-                            )
-                        },
-                        |raw| crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(raw),
-                    )
-                })
+            lde_trace.gpu_main().and_then(|h| {
+                Self::gather_query_rows_device(
+                    lde_trace,
+                    "main",
+                    |stream| {
+                        math_cuda::barycentric::gather_rows_base_on_device(h, &query_rows, stream)
+                    },
+                    |raw| crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(raw),
+                )
             });
 
         #[cfg(feature = "cuda")]
