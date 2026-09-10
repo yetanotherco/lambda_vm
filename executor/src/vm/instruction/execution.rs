@@ -38,12 +38,12 @@ syscall_numbers! {
     /// inverse/sqrt, guest verifies).
     Hint = 95,
     /// Placeholder discriminant. The actual syscall value is
-    /// `DMA_MEMCPY_SYSCALL_NUMBER`. DMA memcpy chunks are proven by the
-    /// dedicated DMA table.
+    /// `DMA_MEMCPY_SYSCALL_NUMBER`. `memcpy` and `memmove` chunks are proven by
+    /// the MEMMOVE table.
     DmaMemcpy = 96,
     /// Placeholder discriminant. The actual syscall value is
-    /// `DMA_MEMSET_SYSCALL_NUMBER`. DMA memset chunks are proven by the
-    /// dedicated DMA_SET table.
+    /// `DMA_MEMSET_SYSCALL_NUMBER`. `memset` chunks are proven by the same
+    /// MEMMOVE table, which derives the inverted timestamp order from this number.
     DmaMemset = 97,
 }
 
@@ -60,8 +60,16 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
-/// DMA memcpy syscall number. Must match `syscalls/src/syscalls.rs`.
-pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Syscall number for the copy accelerator, serving `memcpy` and `memmove`.
+///
+/// The spec uses ECALL number `-30`, i.e. `u64::MAX - 29 = 0xFFFF_FFFF_FFFF_FFE2`,
+/// which the MEMMOVE table puts on the `Ecall` bus as
+/// `[lo32, hi32] = [2^32 - 30, 2^32 - 1]`.
+///
+/// It starts a new group deliberately. `-1` through `-10` are reserved for hash
+/// accelerators (`-1` SHA256, `-2` KECCAK today), and the earlier `-3`/`-4` pair sat
+/// inside that range. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 29;
 /// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks
 /// larger copies, and the prover enforces this bound on every first DMA row.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
@@ -111,8 +119,13 @@ pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u6
     }
     rows
 }
-/// DMA memset syscall number. Must match `syscalls/src/syscalls.rs`.
-pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+/// Syscall number for `memset`, the same accelerator run with the read/write
+/// timestamp order inverted.
+///
+/// ECALL number `-32`, i.e. `u64::MAX - 31`. It is not `-31` because
+/// [`HINT_SYSCALL_NUMBER`] already holds that, so the copy group is `-30` and `-32`
+/// with the hint wedged between. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
 
 /// The one operand shape a DMA memset ecall may have: the destination trails the
 /// source by exactly one wide row.
