@@ -1397,7 +1397,7 @@ fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
         .main_table
         .set(forged_row, dma_cols::TAIL, FieldElement::one());
 
-    assert_dma_forgery_rejected(&elf, &mut traces, "TAIL must equal count < 8");
+    assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
 }
 
 #[test]
@@ -3416,7 +3416,13 @@ fn test_prove_ef_io_demo_concatenates() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_demo.elf"))
             .expect("ef_io_demo.elf not found — run `make compile-programs-rust`");
-    let input: &[u8] = b"hello world!";
+    // 25 bytes, so `ef_io_demo`'s `buf_size / 2` split gives commits of 12 and 13.
+    // Both exceed eight, so each ecall emits a WIDE commit row, and the second is
+    // based at global index 12 -- not 8-aligned. That is the configuration where a
+    // prover-side row schedule and the verifier's `public_output` rebuild would drift
+    // apart if the COMMIT bus were grouped per row rather than per byte. The old
+    // input, `b"hello world!"`, split 6 + 6 and so produced only one-byte commit rows.
+    let input: &[u8] = b"hello world, and hello ef";
     let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify should not error"),

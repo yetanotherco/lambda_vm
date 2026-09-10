@@ -1,5 +1,5 @@
 use crate::tables::memmove::{MemmoveOperation, cols, generate_memmove_trace};
-use crate::tables::types::FE;
+use crate::tables::types::{FE, VmTable};
 use crate::test_utils::{busless_air, validate_busless};
 
 /// A memset row. The contract the AIR pins is `dst = src + 8`, so build it that
@@ -19,6 +19,35 @@ fn set_row(count: u64, first: bool, end: bool, src: u64, dst: u64) -> MemmoveOpe
         value: if end {
             [0; 8]
         } else if count < 8 {
+            [0xAB, 0, 0, 0, 0, 0, 0, 0]
+        } else {
+            [0xAB; 8]
+        },
+    }
+}
+
+/// A row whose width is chosen independently of `count`, so a test can express
+/// `tail != (count < 8)`. `row()` and `set_row()` both derive width from count, which
+/// makes `(1 - tail) * lt8` identically zero and constraint 14 impossible to state.
+fn row_of_width(
+    functionality: crate::tables::memmove::Functionality,
+    count: u64,
+    width: u8,
+    first: bool,
+    end: bool,
+    src: u64,
+    dst: u64,
+) -> MemmoveOperation {
+    MemmoveOperation {
+        width,
+        functionality,
+        timestamp: 100,
+        src,
+        dst,
+        count,
+        first,
+        end,
+        value: if width == 1 {
             [0xAB, 0, 0, 0, 0, 0, 0, 0]
         } else {
             [0xAB; 8]
@@ -365,13 +394,165 @@ fn memmove_constraints_pin_the_memset_gap() {
         "a gap of 8 in the low limb but not the high one must be rejected"
     );
 
-    // And the gate really is `is_set`: the copy path is untouched by it.
+    // And the gate really is `is_set`. This has to be a genuinely aliased copy —
+    // `row()` hardcodes src 0x1000 / dst 0x2000, so using it here would only show
+    // that the constraints tolerate a gap of 0x1000, not that they are off for Copy.
+    // A memcpy with dst == src is harmless: its read is at T+1 and pins `value` to
+    // live memory, which is exactly why the pin is gated on `is_set`.
+    let copy = crate::tables::memmove::Functionality::Copy;
     let copy_aliased = generate_memmove_trace(&[
-        row(8, true, false, *b"abcdefgh"),
-        row(0, false, true, [0; 8]),
+        row_of_width(copy, 8, 8, true, false, 0x1000, 0x1000),
+        row_of_width(copy, 0, 1, false, true, 0x1008, 0x1008),
     ]);
     assert!(
         validate_busless(&air, &copy_aliased),
-        "constraints 32-33 must not fire on Copy rows"
+        "constraints 32-33 must not fire on Copy rows, even with dst == src"
+    );
+}
+
+/// Constraint 14, `(1 - tail) * lt8 = 0`, in both directions.
+///
+/// This is the constraint that replaced the old DMA table's hard pin of
+/// `tail = (count < 8)`. Erik asked for exactly this relaxation so the prover may
+/// take one-byte rows at any count and reach the aligned `MEMW_A` path, so both
+/// directions matter: the narrow-at-high-count row must be ACCEPTED (it is the
+/// alignment prologue `memmove_row_width` emits), and the wide-at-low-count row must
+/// be REJECTED (it would move eight bytes where fewer were authorised).
+///
+/// Neither case is expressible through `row()` or `set_row()`, which derive width
+/// from count and so can only ever produce `tail == lt8`.
+#[test]
+fn memmove_constraint_14_frees_narrow_rows_but_not_wide_ones() {
+    use crate::tables::memmove::Functionality::Copy;
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
+
+    // ACCEPTED: a one-byte row with eight bytes still to go — the prologue that
+    // walks `dst` up to eight-byte alignment. `tail = 1`, `lt8 = 0`.
+    let prologue = generate_memmove_trace(&[
+        row_of_width(Copy, 16, 1, true, false, 0x1001, 0x2001),
+        row_of_width(Copy, 15, 1, false, false, 0x1002, 0x2002),
+        row_of_width(Copy, 14, 8, false, false, 0x1003, 0x2003),
+        row_of_width(Copy, 6, 1, false, false, 0x100B, 0x200B),
+        row_of_width(Copy, 0, 1, false, true, 0x100C, 0x200C),
+    ]);
+    assert!(
+        validate_busless(&air, &prologue),
+        "a one-byte row at count >= 8 is legal: it is the alignment prologue"
+    );
+
+    // REJECTED: an eight-byte row with fewer than eight bytes left. `tail = 0`,
+    // `lt8 = 1`, so `(1 - tail) * lt8 = 1`.
+    let overrun = generate_memmove_trace(&[
+        row_of_width(Copy, 7, 8, true, false, 0x1000, 0x2000),
+        row_of_width(Copy, 0, 1, false, true, 0x1008, 0x2008),
+    ]);
+    assert!(
+        !validate_busless(&air, &overrun),
+        "an eight-byte row must be illegal when only seven bytes remain"
+    );
+}
+
+/// The `Commit` functionality at constraint level, which had no negative coverage
+/// at all: memcpy rows have four forgery tests and memset five, commit none. The
+/// `prove_elfs` forgery helper excludes it by construction (`is_copy = !IS_SET &&
+/// !IS_COMMIT`), so the accepting direction is exercised end to end but nothing ever
+/// tried to break the COMMIT-domain gating.
+///
+/// Covers constraints 12 (one-hot), 13 (no selector on a padding row) and 18
+/// (`mu_com_wide = mu_com * (1 - tail)`), the last being the structural successor of
+/// the deleted DMA_SET `FILL_WIDE`, which had four negative tests and lost them all.
+#[test]
+fn memmove_constraints_gate_the_commit_functionality() {
+    use crate::tables::memmove::Functionality::{Commit, Copy};
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
+
+    // Baseline: an honest commit chain. `dst` is the global byte index, so it starts
+    // at 0 and the gap pin must not fire here — commit is not `is_set`.
+    let honest = generate_memmove_trace(&[
+        row_of_width(Commit, 12, 8, true, false, 0x3000, 0),
+        row_of_width(Commit, 4, 1, false, false, 0x3008, 8),
+        row_of_width(Commit, 3, 1, false, false, 0x3009, 9),
+        row_of_width(Commit, 2, 1, false, false, 0x300A, 10),
+        row_of_width(Commit, 1, 1, false, false, 0x300B, 11),
+        row_of_width(Commit, 0, 1, false, true, 0x300C, 12),
+    ]);
+    assert!(
+        validate_busless(&air, &honest),
+        "an honest commit chain must be accepted"
+    );
+
+    // Constraint 12: a row cannot claim two functionalities. Setting `is_set` on a
+    // commit row would buy the inverted timestamp order on a chain the COMMIT chip
+    // authorised.
+    //
+    // This case has to be built on a chain whose addresses already satisfy the memset
+    // gap pin (constraints 32-33), or those reject it first and the assertion passes
+    // for the wrong reason — verified by mutation: neutering 12 alone left an earlier
+    // version of this test green.
+    let gap_clean = generate_memmove_trace(&[
+        row_of_width(Commit, 8, 8, true, false, 0x3000, 0x3008),
+        row_of_width(Commit, 0, 1, false, true, 0x3008, 0x3010),
+    ]);
+    assert!(
+        validate_busless(&air, &gap_clean),
+        "the gap-clean commit baseline must itself be accepted"
+    );
+    let mut one_hot = gap_clean.clone();
+    one_hot.main_table.set_fe(0, cols::IS_SET, FE::one());
+    assert!(
+        !validate_busless(&air, &one_hot),
+        "is_set and is_commit must not both be set (constraint 12)"
+    );
+
+    // Constraint 18: widen a one-byte commit row. `mu_com_wide` is what stops it
+    // broadcasting seven spurious `(index, 0)` pairs onto the COMMIT bus, which the
+    // verifier rebuilds from `public_output` — so a forgery here corrupts the output
+    // fingerprint rather than merely wasting a row.
+    let mut trace = honest.clone();
+    trace.main_table.set_fe(1, cols::MU_COM_WIDE, FE::one());
+    assert!(
+        !validate_busless(&air, &trace),
+        "a one-byte commit row must not claim the wide lanes (constraint 18)"
+    );
+
+    // Constraint 13: no selector on a padding row. The chain above is six rows, so
+    // the trace pads to eight and row 7 is padding with mu = 0.
+    let mut trace = honest.clone();
+    assert_eq!(
+        trace.main_table.get_row(7)[cols::MU],
+        FE::zero(),
+        "row 7 is expected to be padding"
+    );
+    trace.main_table.set_fe(7, cols::IS_COMMIT, FE::one());
+    assert!(
+        !validate_busless(&air, &trace),
+        "a padding row must not carry a functionality selector (constraint 13)"
+    );
+
+    // And the mirror of the memset gate: `mu_ram` is off for commit, so the RAM write
+    // is suppressed. Flipping it on is a commit row that also writes to RAM.
+    let mut trace = honest.clone();
+    trace.main_table.set_fe(0, cols::MU_RAM, FE::one());
+    assert!(
+        !validate_busless(&air, &trace),
+        "a commit row must not also claim the RAM write (constraint 16)"
+    );
+
+    // Control: the same forgeries on a Copy chain are a different matter — this only
+    // establishes that the honest Copy baseline is clean, so the failures above are
+    // attributable to the commit gating rather than to the row shapes.
+    let copy_ok = generate_memmove_trace(&[
+        row_of_width(Copy, 8, 8, true, false, 0x1000, 0x2000),
+        row_of_width(Copy, 0, 1, false, true, 0x1008, 0x2008),
+    ]);
+    assert!(
+        validate_busless(&air, &copy_ok),
+        "Copy baseline must be clean"
     );
 }
