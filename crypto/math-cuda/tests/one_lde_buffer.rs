@@ -118,6 +118,7 @@ fn base_handle_is_the_in_place_transpose_of_the_host_lde() {
             blowup,
             &weights,
             true,
+            true,
         )
         .expect("fused base commit");
         assert_eq!(handle.m, cols);
@@ -200,6 +201,7 @@ fn split_tree_handle_is_the_in_place_transpose_of_the_host_lde() {
             blowup,
             &weights,
             split_col,
+            true,
             true,
             true,
         )
@@ -328,6 +330,7 @@ fn vram_arm() {
             blowup,
             &weights,
             false,
+            true,
         )
         .expect("fused commit");
         // The handle's `ready` fires after the transpose; wait so the timing

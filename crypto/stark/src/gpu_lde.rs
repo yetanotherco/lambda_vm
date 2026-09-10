@@ -458,6 +458,30 @@ fn refuse_host_recovery(what: &str, rows: usize, main_cols: usize, aux_cols: usi
     );
 }
 
+/// Restore the R1 trace-domain snapshot (`LAMBDA_VM_R1_SNAPSHOT=1`).
+///
+/// The R1 main commit used to always retain a column-major copy of the TRACE
+/// (`n * m * 8` bytes) in its handle, so the LogUp aux fingerprint kernel could
+/// read it in place instead of re-uploading. It is a cache, and it is a cache
+/// with an unfortunate lifetime: round 1 is a Fiat-Shamir barrier, so EVERY
+/// table's snapshot is resident at the R1/R2 transition and the sum
+/// `8 * sum_t n_t*m_t` stands on the card as part of a barrier no gate counts.
+///
+/// Default is now OFF. The aux build uploads what it needs INSIDE the table's
+/// own admitted task, where the bytes are charged to that table's incremental
+/// instead of to the whole-prove barrier. The trade is a per-table H2D of
+/// `n * m * 8` against `8 * sum_t n_t*m_t` of standing device memory.
+///
+/// Soundness surface: none. The snapshot is a copy of the host row-major trace,
+/// which is still resident (`retain_host_lde` governs the LDE's D2H, not the
+/// trace's), and the fingerprint kernel computes the same values from either
+/// source. `logup_gpu::try_build_aux_resident_gpu` already takes the resident
+/// pointer as an `Option` and uploads when it is `None`.
+pub(crate) fn keep_r1_trace_snapshot() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_R1_SNAPSHOT").is_ok_and(|v| v != "0"))
+}
+
 /// Test hook: decline the device R2 path unconditionally so device-only
 /// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
 /// Setting it also enables the test-only host fallback
@@ -1300,6 +1324,7 @@ where
         blowup_factor,
         &weights_u64,
         retain_host_lde,
+        keep_r1_trace_snapshot(),
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1428,6 +1453,7 @@ where
         split_col,
         build_precomputed,
         want_host,
+        keep_r1_trace_snapshot(),
     ) {
         Ok(v) => v,
         Err(e) => {

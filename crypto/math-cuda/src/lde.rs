@@ -1238,6 +1238,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     blowup_factor: usize,
     weights: &[u64],
     retain_host_lde: bool,
+    retain_trace_col_major: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
     let input = match predev {
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
@@ -1251,7 +1252,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         blowup_factor,
         weights,
         "coset_lde_row_major lde_size",
-        true,
+        retain_trace_col_major,
         retain_host_lde,
     )?;
     let handle = GpuLdeBase {
@@ -1294,6 +1295,7 @@ pub fn coset_lde_row_major_split_trees(
     split_col: usize,
     build_precomputed: bool,
     retain_host_lde: bool,
+    retain_trace_col_major: bool,
 ) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
@@ -1319,8 +1321,16 @@ pub fn coset_lde_row_major_split_trees(
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
     };
-    let (buf, trace_col_major) =
-        expand_row_major_on_stream(&stream, be, input, n, m, blowup_factor, weights, true)?;
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
+        be,
+        input,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_trace_col_major,
+    )?;
 
     // One subset tree per column range, built sequentially on the stream.
     let build_subset_tree_dev = |col_start: u64, col_end: u64| -> Result<CudaSlice<u8>> {

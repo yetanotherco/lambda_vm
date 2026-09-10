@@ -314,6 +314,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                     blowup,
                     &weights_u64,
                     true,
+                    true,
                 )
                 .expect("new row-major GPU pipeline");
                 let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;

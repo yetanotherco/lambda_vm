@@ -165,6 +165,7 @@ fn gpu_fused_rpx_root(columns: &[Vec<u64>], blowup: usize, weights_u64: &[u64]) 
         blowup,
         weights_u64,
         true,
+        true,
     )
     .expect("fused RPX GPU pipeline");
     handle.tree.as_ref().expect("resident merkle tree").root
