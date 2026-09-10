@@ -232,6 +232,7 @@ impl TableCounts {
             ("bytewise", self.bytewise),
             ("store", self.store),
             ("cpu32", self.cpu32),
+            ("keccak_rnd", self.keccak_rnd),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -909,7 +910,7 @@ impl VmAirs {
         let halt: VmAir = Box::new(create_halt_air(proof_options));
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: Vec<VmAir> = (0..table_counts.keccak_rnd.max(1))
+        let keccak_rnd: Vec<VmAir> = (0..table_counts.keccak_rnd)
             .map(|i| {
                 Box::new(
                     create_keccak_rnd_air(proof_options).with_name(&format!("KECCAK_RND[{}]", i)),
