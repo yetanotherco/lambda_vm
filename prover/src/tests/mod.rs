@@ -69,6 +69,8 @@ pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod multilinear_bench_tests;
+#[cfg(test)]
 pub mod multilinear_prove_tests;
 #[cfg(test)]
 pub mod multilinear_table_tests;
