@@ -101,11 +101,17 @@ pub mod max_rows {
     /// anything the rule above produces, and the reason a uniform ROW cap
     /// mis-allocates by 52× across this registry.
     ///
-    /// Rounded DOWN to a whole number of permutations (`ROWS_PER_PERMUTATION`):
-    /// 2,730 × 24 = 65,520, which pads to 2^16 with 16 rows to spare. The
-    /// chunker divides by 24 and splits OPERATIONS, so the alignment is
-    /// structural rather than a value that has to stay correct.
-    pub const KECCAK_RND: usize = 2730 * super::keccak_rnd::ROWS_PER_PERMUTATION; // 65,520
+    /// ⚠ The budget is QUANTISED, and the schedule must land on a power of two.
+    /// A chunk pads to `next_pow2(rows)`, so the incremental is set by the
+    /// PADDED height and not by the cap: 2,730 permutations and 2,048 both pad
+    /// to 2^16 and both cost 5.68 GiB. A cap between two powers of two buys no
+    /// device memory and costs sub-proofs. The schedule is therefore
+    /// `2^floor(log2(H / (120·aux + 1232)))`, group-aligned UNDER that — here
+    /// 1,365 × 24 = 32,760 rows, padding to 2^15 for 2.93 GiB.
+    ///
+    /// The chunker divides by `ROWS_PER_PERMUTATION` and splits OPERATIONS, so
+    /// the alignment is structural rather than a value that has to stay right.
+    pub const KECCAK_RND: usize = 1365 * super::keccak_rnd::ROWS_PER_PERMUTATION; // 32,760 -> 2^15
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub const EQ: usize = 1 << 20;
     pub const BYTEWISE: usize = 1 << 20;
@@ -128,10 +134,18 @@ pub mod max_rows {
 ///
 /// | table | aux | `120·aux+1232` | rows at `H` |
 /// |---|---|---|---|
-/// | KECCAK_RND | 740 | 90,032 | 67,700 → 65,520 (permutation-aligned) |
-/// | DVRM | 17 | 3,272 | 1,864,000 → 2^20 |
-/// | HINT | 14 | 2,912 | 2,094,000 → 2^21, does NOT bind |
-/// | MEMW | 13 | 2,792 | 2,184,000 → 2^21, does NOT bind |
+/// | KECCAK_RND | 740 | 90,032 | 2^15, group-aligned to 1,365 × 24 |
+/// | DVRM | 17 | 3,272 | 2^20 |
+/// | HINT | 14 | 2,912 | 2^21, does NOT bind |
+/// | MEMW | 13 | 2,792 | 2^21, does NOT bind |
+///
+/// ⚠ Only KECCAK_RND is far enough off the uniform knob's scale to need an
+/// entry here. Every other table's device budget is within one power of two of
+/// the knob, so the knob itself is the right instrument for them: at a 2^22
+/// epoch `LAMBDA_VM_MAX_ROWS_LOG2=20` holds the whole population at 2^20 and
+/// `H` = 2.93 GiB, where 21 leaves MEMW_A at 5.00 GiB and the epoch does not
+/// fit. Enumerating tables here instead would mean enumerating them correctly,
+/// and the population is what the knob already covers.
 ///
 /// [`MaxRowsConfig::uniform`] takes the MINIMUM of the knob and these, so the
 /// knob can still lower a cap but never raise one past the card. Without that,
