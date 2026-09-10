@@ -93,8 +93,14 @@ pub struct RuntimePageRange {
 }
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
-/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
+/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rc,
+/// register, ecsm, ecdas, hint.
+///
+/// ⚠ KECCAK_RND LEFT THIS SET when it became chunked — its count lives in
+/// [`TableCounts::keccak_rnd`] and is summed by [`TableCounts::total`]. The two
+/// must move together: counting it here AND omitting it there cancels at one
+/// chunk and only at one chunk, which is a bug that reconstructs some epochs
+/// and rejects others.
 ///
 /// ⚠ Every always-on table costs every proof a near-empty AIR even when the
 /// workload never touches it (the EC-campaign lesson, PR #871). BLAKE3 was
@@ -103,7 +109,7 @@ pub struct RuntimePageRange {
 /// out of a table carrying 0.035% of the epoch's own cells. It is counted in
 /// [`TableCounts::blake3`] now — see that field for why omitting it is sound
 /// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`).
-pub const FIXED_TABLE_COUNT: usize = 11;
+pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -180,22 +186,25 @@ pub struct TableCounts {
 
 impl TableCounts {
     /// Sum of all chunk counts across the split tables.
+    /// Total sub-proofs the split and conditional tables contribute.
+    ///
+    /// ★ A FOLD OF [`Self::absorbed`], not a second sum. It was a hand-written
+    /// list of fourteen fields plus `blake3`, and when `keccak_rnd` was added it
+    /// was the one shape-derivation in this struct with no exhaustive
+    /// destructure to refuse compilation — so it silently kept the old arity
+    /// while `absorbed` and `validate` learned the new field.
+    ///
+    /// The cost of that: `continuation::reconstruct_epoch_airs` computes
+    /// `total() + fixed + 1` and rejects the epoch when it disagrees with the
+    /// proof's sub-proof count. Undercounting here by the chunk count, while
+    /// `FIXED_TABLE_COUNT` still counted KECCAK_RND as always-one, cancelled at
+    /// exactly ONE chunk and at no other — so every test and the whole
+    /// twenty-one-node tree passed, and the honest verifier rejected the first
+    /// two-chunk epoch it ever saw as "structurally invalid".
+    ///
+    /// As a fold it cannot drift from the encoding again.
     pub fn total(&self) -> usize {
-        self.cpu
-            + self.lt
-            + self.memw
-            + self.memw_aligned
-            + self.load
-            + self.mul
-            + self.dvrm
-            + self.shift
-            + self.branch
-            + self.memw_register
-            + self.eq
-            + self.bytewise
-            + self.store
-            + self.cpu32
-            + self.blake3
+        self.absorbed().iter().sum::<u64>() as usize
     }
 
     /// Validate the chunk counts.

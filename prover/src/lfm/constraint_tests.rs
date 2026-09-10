@@ -1498,14 +1498,20 @@ fn continuation_epoch_constraint_leg_cost() {
         "CPU", "LT", "SHIFT", "EQ", "BYTEWISE", "STORE", "CPU32", "MEMW", "MEMW_A", "MEMW_R",
         "LOAD", "MUL", "DVRM", "BRANCH",
     ];
-    /// `FIXED_TABLE_COUNT`'s ten, which contribute exactly one sub-proof each
-    /// regardless of `TableCounts`. HALT is last: an intermediate epoch drops it.
+    /// The always-one tables, which contribute exactly one sub-proof each
+    /// regardless of `TableCounts`. HALT is last: an intermediate epoch drops
+    /// it. KECCAK_RND is NOT here — it is chunked, and its count is in
+    /// `TableCounts`.
+    ///
+    /// ⚠ This list is nine and `FIXED_TABLE_COUNT` is ten: HINT is in the
+    /// constant's set and has never been in this one. Pre-existing, not
+    /// introduced by the chunking change, and left alone because adding it
+    /// moves what this cost table partitions.
     const FIXED: &[&str] = &[
         "BITWISE",
         "DECODE",
         "COMMIT",
         "KECCAK",
-        "KECCAK_RND",
         "KECCAK_RC",
         "REGISTER",
         "ECSM",

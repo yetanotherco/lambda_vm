@@ -230,3 +230,62 @@ fn continuation_global_state_binds_program_epoch_count_pages_and_touched_set() {
         "must bind the touched page-base count"
     );
 }
+
+/// ★ `TableCounts::total` must move with `keccak_rnd`, at EVERY chunk count.
+///
+/// The regression this pins cancelled at exactly one chunk: `total` omitted
+/// `keccak_rnd` while `FIXED_TABLE_COUNT` still counted KECCAK_RND as
+/// always-one, so `reconstruct_epoch_airs`'s `total() + fixed + 1` was right
+/// for a one-chunk epoch and short by `n - 1` for an n-chunk one. Every test
+/// and a twenty-one-node tree passed on one-chunk epochs; the honest verifier
+/// then rejected the first two-chunk epoch it ever saw as "structurally
+/// invalid".
+///
+/// ⚠ So a single-count test cannot catch it. This one spans 1, 2 and 3 —
+/// `total` must rise by exactly one per added chunk, and `absorbed` must carry
+/// the same value at the same position.
+#[test]
+fn total_and_absorbed_track_the_keccak_rnd_chunk_count() {
+    let base = sample_counts();
+    let baseline = TableCounts {
+        keccak_rnd: 1,
+        ..base.clone()
+    };
+    for chunks in [1usize, 2, 3] {
+        let counts = TableCounts {
+            keccak_rnd: chunks,
+            ..base.clone()
+        };
+        assert_eq!(
+            counts.total(),
+            baseline.total() + (chunks - 1),
+            "total() must rise by one per KECCAK_RND chunk (chunks = {chunks})"
+        );
+        // `total` is a fold of `absorbed`, so the encoding must carry the same
+        // number at the same position — index 14, between cpu32 and blake3.
+        let absorbed = counts.absorbed();
+        assert_eq!(
+            absorbed[14], chunks as u64,
+            "absorbed()[14] must be the KECCAK_RND count (chunks = {chunks})"
+        );
+        assert_eq!(
+            absorbed.iter().sum::<u64>() as usize,
+            counts.total(),
+            "total() must equal the sum of absorbed()"
+        );
+        assert!(
+            counts.validate().is_ok(),
+            "a positive chunk count must validate (chunks = {chunks})"
+        );
+    }
+    // And zero is refused like every other chunk count.
+    assert!(
+        TableCounts {
+            keccak_rnd: 0,
+            ..base
+        }
+        .validate()
+        .is_err(),
+        "a zero KECCAK_RND count must be rejected"
+    );
+}

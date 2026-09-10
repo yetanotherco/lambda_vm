@@ -1098,7 +1098,6 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
                 &traces.keccak,
                 RowWitness::GatedOff(&[keccak::cols::MU]),
             ),
-            ("KECCAK_RND", &traces.keccak_rnd[0], RowWitness::Blank),
             (
                 "KECCAK_RC",
                 &traces.keccak_rc,
