@@ -458,6 +458,7 @@ fn proof_composition() {
 #[test]
 #[ignore]
 fn constraint_program_sizes() {
+    use crate::test_utils::{E, F};
     use stark::traits::AIR;
     let bytes = elf_bytes("ethrex");
     let inputs = input_bytes("ethrex_10_transfers");
@@ -482,20 +483,51 @@ fn constraint_program_sizes() {
         None,
     );
     let pairs = airs.air_trace_pairs(&mut traces);
-    let mut sizes: Vec<(String, usize, usize)> = pairs
+    // What each table would need resident on a device: its factor tables, which
+    // is what the sumcheck folds and the biggest thing a round touches.
+    let mut sizes: Vec<(String, usize, usize, usize, f64, f64)> = pairs
         .iter()
         .map(|(air, trace, _)| {
+            let columns = trace.columns_main();
+            let rows = columns[0].len();
+            let layout = stark::multilinear_table::TableLayout::<F, E>::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                columns.len(),
+                rows.trailing_zeros() as usize,
+                stark::multilinear_air::Uniforms::default(),
+            )
+            .expect("layout");
+            let factors = layout.kinds().len();
+            // ext3 is three Goldilocks limbs.
+            let bytes = factors as f64 * rows as f64 * 24.0;
+            // The fraction tree: an input layer indexed by (interaction, row),
+            // and every level above it — which is one more of the same again.
+            let interactions = air.bus_interactions().len().max(1);
+            let layer = (rows * interactions.next_power_of_two()) as f64;
+            let tree = layer * 2.0 * 2.0 * 24.0;
             (
                 air.name().to_string(),
                 air.constraint_program().nodes.len(),
-                trace.columns_main()[0].len(),
+                rows,
+                factors,
+                bytes / (1u64 << 30) as f64,
+                tree / (1u64 << 30) as f64,
             )
         })
         .collect();
-    sizes.sort_by_key(|(_, n, _)| std::cmp::Reverse(*n));
+    let factors_total: f64 = sizes.iter().map(|s| s.4).sum();
+    let tree_max = sizes.iter().map(|s| s.5).fold(0.0f64, f64::max);
+    sizes.sort_by(|a, b| (b.4 + b.5).partial_cmp(&(a.4 + a.5)).unwrap());
     sizes.dedup_by(|a, b| a.0 == b.0);
-    println!("\n{:<22} {:>10} {:>10}", "table", "DAG nodes", "rows");
-    for (name, nodes, rows) in sizes.iter().take(8) {
-        println!("{name:<22} {nodes:>10} {rows:>10}");
+    println!(
+        "\n{:<22} {:>10} {:>9} {:>8} {:>10} {:>10}",
+        "table", "DAG nodes", "rows", "factors", "ext3 GiB", "GKR GiB"
+    );
+    for (name, nodes, rows, factors, gib, tree) in sizes.iter().take(10) {
+        println!("{name:<22} {nodes:>10} {rows:>9} {factors:>8} {gib:>9.2} {tree:>9.2}");
     }
+    println!("\nfactores de todas las tablas juntos: {factors_total:.2} GiB");
+    println!("arbol de fracciones mas grande:      {tree_max:.2} GiB");
 }
