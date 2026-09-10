@@ -6,8 +6,9 @@
 //! lets a query count buy more soundness than its own bits.
 //!
 //! Lives here rather than in a proof-system crate because both the univariate
-//! prover and the multilinear one grind against the same primitive; the GPU
-//! dispatch stays with the backend that has a device.
+//! prover and the multilinear one grind against the same primitive, and so does
+//! the device dispatch below: `multilinear` cannot reach `stark`, which depends
+//! on it.
 
 use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
@@ -70,6 +71,67 @@ pub fn generate_nonce(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
     return (0..u64::MAX).into_par_iter().find_any(|&candidate_nonce| {
         is_valid_nonce_for_inner_hash(&inner_hash, candidate_nonce, limit)
     });
+}
+
+/// Successful GPU grind dispatches — one per nonce search that ran on device
+/// and produced a nonce the host check accepted (a device miss or an invalid
+/// kernel result falls back to the CPU search and is not counted).
+#[cfg(feature = "cuda")]
+static GPU_GRIND_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "cuda")]
+pub fn gpu_grind_calls() -> u64 {
+    GPU_GRIND_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda")]
+pub fn reset_gpu_grind_calls() {
+    GPU_GRIND_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
+/// otherwise (or on any device error). Which valid nonce comes back depends on
+/// the arm: the device search returns the smallest in the range it scanned,
+/// while the CPU's `find_any` returns an arbitrary one. Neither is a contract —
+/// the verifier accepts any nonce passing [`is_valid_nonce`], and nothing
+/// downstream depends on the choice.
+#[cfg(feature = "cuda")]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    debug_assert!(
+        (1..=64).contains(&grinding_factor),
+        "grinding_factor must be in 1..=64, got {grinding_factor}"
+    );
+    // Kill switch (presence-based, matching `LAMBDA_VM_NO_GPU_LOGUP`):
+    // `LAMBDA_VM_NO_GPU_GRIND` forces the CPU search — a production escape hatch
+    // and fallback-path coverage. Cached; read once.
+    static GPU_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
+        return generate_nonce(seed, grinding_factor);
+    }
+    let inner_lanes = inner_hash_lanes(seed, grinding_factor);
+    if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
+        // Validate unconditionally (one host hash against the ~2^grinding_factor
+        // device search): a kernel/driver defect must degrade to the CPU search,
+        // never append an unverifiable nonce to the transcript.
+        if is_valid_nonce(seed, nonce, grinding_factor) {
+            GPU_GRIND_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Some(nonce);
+        }
+        // eprintln, not log::warn: the CLI initialises env_logger with no
+        // default filter, so a warn-level line is invisible unless RUST_LOG is
+        // set — and this is the only signal that the kernel has started
+        // returning garbage and the feature has silently reverted to the CPU
+        // search.
+        eprintln!(
+            "[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search"
+        );
+    }
+    generate_nonce(seed, grinding_factor)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn generate_nonce_maybe_gpu(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
+    generate_nonce(seed, grinding_factor)
 }
 
 /// Checks if the leftmost 8 bytes of `Hash(inner_hash || candidate_nonce)` are less than `limit`

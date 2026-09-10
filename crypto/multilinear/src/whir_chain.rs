@@ -111,7 +111,7 @@ where
     if bits == 0 {
         return Ok(0);
     }
-    let nonce = crypto::grinding::generate_nonce(&transcript.state(), bits)
+    let nonce = crypto::grinding::generate_nonce_maybe_gpu(&transcript.state(), bits)
         .ok_or(Error::GrindingFailed { bits })?;
     transcript.append_bytes(&nonce.to_be_bytes());
     Ok(nonce)

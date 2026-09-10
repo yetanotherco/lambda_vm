@@ -27,3 +27,5 @@ rayon = { version = "1.8.0", optional = true }
 
 [features]
 parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
+# The grind on device. The kernels this path calls live behind `crypto/cuda`.
+cuda = ["crypto/cuda"]

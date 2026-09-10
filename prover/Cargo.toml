@@ -14,7 +14,7 @@ parallel = [
     "ecsm/parallel",
     "dep:rayon",
 ]
-cuda = ["stark/cuda"]
+cuda = ["stark/cuda", "multilinear/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]

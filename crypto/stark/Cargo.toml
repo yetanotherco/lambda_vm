@@ -56,7 +56,7 @@ instruments = []                                                     # This enab
 profile-markers = []                                                 # Emits inlining-immune asm markers for guest step profiling
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
-cuda = ["dep:math-cuda"]
+cuda = ["dep:math-cuda", "crypto/cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 # NVTX ranges for Nsight Systems: every instruments span (prover phases,
 # per-epoch marks) becomes a named timeline range. Pulls in `instruments`
