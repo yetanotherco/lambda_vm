@@ -192,10 +192,20 @@ fn assert_every_slice_published_the_same_pair(
 /// ★ Through [`super::logup::emit_bus_closure`] rather than a hand-written fold,
 /// because that function already IS "sum a fixed-size list of contributions and
 /// assert the total equals a target": the unsliced wrap passes zero over its
-/// tables' contributions, and this passes zero over the slices' partials. Its
-/// `num_contributing_tables` assert then pins the SLICE COUNT as program shape,
-/// which is the property that matters — a parent that summed a number of
-/// partials read off the proof would let the prover choose how many there were.
+/// tables' contributions, and this passes zero over the slices' partials.
+///
+/// ⛔ **ITS `num_contributing_tables` ASSERT DOES NOT FIRE HERE, AND MUST NOT BE
+/// QUOTED AS IF IT DID.** That assert compares `contributions.len()` against
+/// `shape.num_contributing_tables`; at THIS call site both are `legs.len()`, so
+/// it is a tautology — a check that cannot fail, and worse than none because it
+/// produces evidence. It earns its keep in the wrap, where the contributing set
+/// is a subset of the tables and the two counts are independently derived.
+///
+/// ⇒ What pins the slice count as program text is [`emit_global_parent`]'s
+/// `slices.len() == partition.k()`, checked against the partition before a
+/// single leg is emitted — and shown to fire in both directions by
+/// [`tests::a_parent_handed_too_many_slices_is_refused`] and
+/// [`tests::a_parent_handed_too_few_slices_is_refused`].
 fn assert_the_partials_sum_to_zero(b: &mut LfmBuilder, legs: &[LegCells], layout: &SliceLayout) {
     let at = layout.partial_sum_word();
     let partials: Vec<Ext> = legs
@@ -565,6 +575,57 @@ mod tests {
             "a partial with a nonzero fourth lane is not an extension element and \
              must not be read as one"
         );
+    }
+
+    /// Emit a parent for a `k`-way partition handed `n` slice proofs.
+    ///
+    /// The slices carry no tables: the count assert runs before a single leg is
+    /// emitted, so a shape with an empty table list is enough to reach it and
+    /// costs nothing.
+    fn parent_over(n: usize, k: usize) {
+        let id: stark::config::Commitment = [0u8; 32];
+        let layout = SliceLayout::over(GlobalLayout {
+            num_epochs: 19,
+            lanes_per_root: super::super::proof_arena::lanes_per_root(),
+        });
+        let slices: Vec<ChildShape<'_>> = (0..n)
+            .map(|_| ChildShape {
+                program_id: &id,
+                num_public_words: layout.total(),
+                fri_final_poly_log_degree: 1,
+                tables: Vec::new(),
+            })
+            .collect();
+        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::production());
+        emit_global_parent(
+            &mut b,
+            &ParentInputs {
+                slices: &slices,
+                partition: &SlicePartition::even(41, k),
+                layout: &layout,
+            },
+        );
+    }
+
+    /// ⛔ THE ASSERT THAT PINS THE SLICE COUNT — shown to fire, both ways.
+    ///
+    /// ⚠ Named here rather than left to `emit_bus_closure`'s shape assert, which
+    /// this module's call site cannot make fire (see
+    /// [`assert_the_partials_sum_to_zero`]). A parent emitted for a `k = 2`
+    /// partition and handed THREE slice proofs would pin a partition its
+    /// children were never compiled against.
+    #[test]
+    #[should_panic(expected = "slice proofs were given")]
+    fn a_parent_handed_too_many_slices_is_refused() {
+        parent_over(3, 2);
+    }
+
+    /// ⛔ And the other direction: a table set covered by fewer proofs than the
+    /// partition splits it into leaves tables verified by nobody.
+    #[test]
+    #[should_panic(expected = "slice proofs were given")]
+    fn a_parent_handed_too_few_slices_is_refused() {
+        parent_over(1, 2);
     }
 
     /// ⛔ A parent needs at least TWO slices, and exactly as many proofs as the
