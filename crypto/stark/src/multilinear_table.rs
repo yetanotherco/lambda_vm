@@ -60,7 +60,7 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField,
 {
-    shape: IrShape<'a, F, E>,
+    shape: IrShape<F, E>,
     interactions: &'a [BusInteraction],
     leaves: LeafLayout,
     /// Main column -> the factor that reads it unshifted.
@@ -148,7 +148,7 @@ where
         }
     }
 
-    pub fn shape(&self) -> &IrShape<'a, F, E> {
+    pub fn shape(&self) -> &IrShape<F, E> {
         &self.shape
     }
 
@@ -267,7 +267,7 @@ where
         self.trace.kinds()
     }
 
-    pub fn shape(&self) -> &IrShape<'a, F, E> {
+    pub fn shape(&self) -> &IrShape<F, E> {
         self.layout.shape()
     }
 
@@ -410,7 +410,7 @@ where
 
 /// What the verifier holds: the table's structure and what was committed.
 pub struct TableStatement<'a, F: IsFFTField + IsPrimeField, E: IsField> {
-    pub shape: &'a IrShape<'a, F, E>,
+    pub shape: &'a IrShape<F, E>,
     pub interactions: &'a [BusInteraction],
     /// Main column -> the factor that reads it unshifted.
     pub slot_of: &'a [usize],
@@ -586,7 +586,7 @@ pub type TableVerdict<E> = (
 /// stack.
 pub fn verify<E, T>(
     proof: &TableProof<E>,
-    statement: TableStatement<'_, impl IsFFTField + IsPrimeField + IsSubFieldOf<E>, E>,
+    statement: TableStatement<'_, impl IsFFTField + IsPrimeField + IsSubFieldOf<E> + Sync, E>,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,

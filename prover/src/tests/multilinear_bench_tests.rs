@@ -452,3 +452,50 @@ fn proof_composition() {
     }
     println!("{:<18} {:>10.2}", "whole proof", size(&vec![0u8; total]));
 }
+
+/// How big the constraint DAG is per table — the thing `IrShape::combine`
+/// walks once per hypercube index.
+#[test]
+#[ignore]
+fn constraint_program_sizes() {
+    use stark::traits::AIR;
+    let bytes = elf_bytes("ethrex");
+    let inputs = input_bytes("ethrex_10_transfers");
+    let elf = Elf::load(&bytes).unwrap();
+    let logs = Executor::new(&elf, inputs.clone())
+        .and_then(Executor::run)
+        .unwrap()
+        .logs;
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).unwrap();
+    let table_counts = traces.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &options(),
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let mut sizes: Vec<(String, usize, usize)> = pairs
+        .iter()
+        .map(|(air, trace, _)| {
+            (
+                air.name().to_string(),
+                air.constraint_program().nodes.len(),
+                trace.columns_main()[0].len(),
+            )
+        })
+        .collect();
+    sizes.sort_by_key(|(_, n, _)| std::cmp::Reverse(*n));
+    sizes.dedup_by(|a, b| a.0 == b.0);
+    println!("\n{:<22} {:>10} {:>10}", "table", "DAG nodes", "rows");
+    for (name, nodes, rows) in sizes.iter().take(8) {
+        println!("{name:<22} {nodes:>10} {rows:>10}");
+    }
+}

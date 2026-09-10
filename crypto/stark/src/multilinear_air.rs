@@ -22,6 +22,7 @@ use multilinear::{
     selector::Selector,
 };
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 use crate::constraint_ir::ir::{ConstraintProgram, Op};
 use crate::constraints::builder::ConstraintMeta;
@@ -398,6 +399,83 @@ pub fn live_nodes<F: IsField, E: IsField>(
     live
 }
 
+/// Compiles the subgraph the roots reach into straight-line steps.
+///
+/// Runs once, at build time, so the evaluator never touches the `BTreeMap`, a
+/// dead node, or a slot it does not need. Returns the steps and, per root, the
+/// step holding its value.
+fn compile<F, E>(
+    program: &ConstraintProgram<F, E>,
+    live: &[bool],
+    leaf_index: &BTreeMap<LeafKey, usize>,
+    uniforms: &Uniforms<E>,
+    roots: &[u32],
+) -> Result<(Vec<Step<E>>, Vec<u32>), MlError>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mut steps = Vec::new();
+    // Node id -> the step holding its value. `Embed` maps to its operand's,
+    // which is why this is a mapping and not just a running count.
+    let mut at = vec![u32::MAX; program.nodes.len()];
+    let step_of = |at: &[u32], id: u32| -> Result<u32, MlError> {
+        let slot = at[id as usize];
+        if slot == u32::MAX {
+            // An operand of a live node is live, so this cannot happen unless
+            // the node list stopped being topologically ordered.
+            return Err(MlError::UnknownPolynomial {
+                index: id as usize,
+                len: program.nodes.len(),
+            });
+        }
+        Ok(slot)
+    };
+
+    for (id, op) in program.nodes.iter().enumerate() {
+        if !live.get(id).copied().unwrap_or(false) {
+            continue;
+        }
+        let step = match *op {
+            Op::ConstBase(idx) => Step::Fixed(
+                program.base_consts[idx as usize]
+                    .clone()
+                    .to_extension::<E>(),
+            ),
+            Op::ConstExt(idx) => Step::Fixed(program.ext_consts[idx as usize].clone()),
+            Op::RapChallenge { idx } => Step::Fixed(uniforms.rap_challenges[idx as usize].clone()),
+            Op::AlphaPow { idx } => Step::Fixed(uniforms.logup_alpha_powers[idx as usize].clone()),
+            Op::TableOffset => Step::Fixed(uniforms.logup_table_offset.clone()),
+            Op::Var {
+                main, offset, col, ..
+            } => {
+                let key = LeafKey { main, offset, col };
+                let slot = *leaf_index
+                    .get(&key)
+                    .expect("every Var leaf was materialized at build time");
+                Step::Var(slot as u32)
+            }
+            Op::Add(a, b) => Step::Add(step_of(&at, a)?, step_of(&at, b)?),
+            Op::Sub(a, b) => Step::Sub(step_of(&at, a)?, step_of(&at, b)?),
+            Op::Mul(a, b) => Step::Mul(step_of(&at, a)?, step_of(&at, b)?),
+            Op::Neg(a) => Step::Neg(step_of(&at, a)?),
+            // A no-op on values: alias the operand rather than copy it.
+            Op::Embed(a) => {
+                at[id] = step_of(&at, a)?;
+                continue;
+            }
+        };
+        at[id] = steps.len() as u32;
+        steps.push(step);
+    }
+
+    let root_steps = roots
+        .iter()
+        .map(|&r| step_of(&at, r))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((steps, root_steps))
+}
+
 /// `beta^i` for `i` in `0..n` — the coefficients that batch a program's roots
 /// into one constraint.
 ///
@@ -440,8 +518,8 @@ fn node_degrees<F: IsField, E: IsField>(program: &ConstraintProgram<F, E>) -> Ve
 ///
 /// Factors are the trace leaves followed by one table per distinct non-trivial
 /// selector, in that order.
-pub struct IrPolynomial<'a, F: IsField, E: IsField> {
-    shape: IrShape<'a, F, E>,
+pub struct IrPolynomial<F: IsField, E: IsField> {
+    shape: IrShape<F, E>,
     beta_powers: Vec<FieldElement<E>>,
     polys: Vec<Mle<E>>,
     layout: CommitLayout<F, E>,
@@ -467,24 +545,51 @@ pub struct CommitLayout<F: IsField, E: IsField> {
 /// `C(point)` from values it learned through the commitment scheme, without
 /// ever seeing a column.
 #[derive(Clone)]
-pub struct IrShape<'a, F: IsField, E: IsField> {
-    program: &'a ConstraintProgram<F, E>,
-    leaf_index: BTreeMap<LeafKey, usize>,
-    uniforms: Uniforms<E>,
+/// Owned: once the program is compiled there is nothing left to borrow from
+/// it, and a shape that borrows nothing is one less lifetime to thread.
+pub struct IrShape<F: IsField, E: IsField> {
+    /// Compiling folds the base field away — constants are lifted once — so
+    /// nothing here holds an `F`, but the shape is still the shape of a program
+    /// over the tower and says so.
+    field: PhantomData<F>,
+    /// The program compiled to straight-line steps.
+    steps: Vec<Step<E>>,
+    /// Each batched root's step, in `roots` order.
+    root_steps: Vec<u32>,
     /// Roots to batch, in order.
     roots: Vec<u32>,
     /// Index into the factor list of each root's selector, or `None` when it
     /// applies on every step and the multiplication can be skipped.
     selector_of_root: Vec<Option<usize>>,
-    /// The public factors, in factor order â what the verifier recomputes.
+    /// The public factors, in factor order — what the verifier recomputes.
     public_selectors: Vec<Selector>,
-    /// Nodes reachable from `roots`; the rest are never evaluated.
-    live: Vec<bool>,
     degree: usize,
     num_vars: usize,
 }
 
-impl<'a, F, E> IrPolynomial<'a, F, E>
+/// One step of the compiled constraint program.
+///
+/// The IR is a DAG over every node the AIR emits, and evaluating it used to
+/// mean walking that whole list per hypercube index: a `BTreeMap` probe for
+/// each variable read, a pushed zero for each node the selected roots do not
+/// reach, and a buffer the width of the entire program — tens of thousands of
+/// extension elements on the precompile tables. This is the reachable subgraph
+/// renumbered so operands are dense indices, resolved once.
+///
+/// `Embed` leaves no step: it aliases its operand's.
+#[derive(Clone, Debug)]
+enum Step<E: IsField> {
+    /// Known before the trace: a constant or a uniform.
+    Fixed(FieldElement<E>),
+    /// A factor value, by slot.
+    Var(u32),
+    Add(u32, u32),
+    Sub(u32, u32),
+    Mul(u32, u32),
+    Neg(u32),
+}
+
+impl<F, E> IrPolynomial<F, E>
 where
     F: IsSubFieldOf<E>,
     E: IsField,
@@ -492,7 +597,7 @@ where
     /// Batches every constraint in `program`, taking each one's row domain from
     /// `meta`.
     pub fn new(
-        program: &'a ConstraintProgram<F, E>,
+        program: &ConstraintProgram<F, E>,
         leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
@@ -511,7 +616,7 @@ where
     /// Only correct for AIRs whose constraints really do hold on every step,
     /// wrap included.
     pub fn new_unselected(
-        program: &'a ConstraintProgram<F, E>,
+        program: &ConstraintProgram<F, E>,
         leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
@@ -523,7 +628,7 @@ where
 
     /// Batches the listed roots with the matching selectors.
     pub fn with_roots(
-        program: &'a ConstraintProgram<F, E>,
+        program: &ConstraintProgram<F, E>,
         leaves: TraceLeaves<F>,
         uniforms: Uniforms<E>,
         beta: FieldElement<E>,
@@ -567,7 +672,7 @@ where
     }
 
     /// The structure alone, for the verifier.
-    pub fn shape(&self) -> &IrShape<'a, F, E> {
+    pub fn shape(&self) -> &IrShape<F, E> {
         &self.shape
     }
 
@@ -584,12 +689,12 @@ where
     }
 
     /// The structure and the layout together, dropping the factor tables.
-    pub fn into_shape_and_layout(self) -> (IrShape<'a, F, E>, CommitLayout<F, E>) {
+    pub fn into_shape_and_layout(self) -> (IrShape<F, E>, CommitLayout<F, E>) {
         (self.shape, self.layout)
     }
 }
 
-impl<'a, F, E> IrShape<'a, F, E>
+impl<F, E> IrShape<F, E>
 where
     F: IsSubFieldOf<E>,
     E: IsField,
@@ -603,7 +708,7 @@ where
     /// than a materialized [`TraceLeaves`] â so the two sides cannot disagree
     /// on what a factor slot means.
     pub fn build(
-        program: &'a ConstraintProgram<F, E>,
+        program: &ConstraintProgram<F, E>,
         leaves: &LeafLayout,
         uniforms: Uniforms<E>,
         roots: Vec<u32>,
@@ -658,15 +763,16 @@ where
             .max()
             .unwrap_or(0);
 
+        let (steps, root_steps) = compile(program, &live, &leaves.index, &uniforms, &roots)?;
+
         Ok((
             Self {
-                program,
-                leaf_index: leaves.index.clone(),
-                uniforms,
+                field: PhantomData,
+                steps,
+                root_steps,
                 roots,
                 selector_of_root,
                 public_selectors,
-                live,
                 degree,
                 num_vars,
             },
@@ -687,7 +793,7 @@ where
     }
 }
 
-impl<F, E> IrShape<'_, F, E>
+impl<F, E> IrShape<F, E>
 where
     F: IsSubFieldOf<E>,
     E: IsField,
@@ -717,7 +823,7 @@ where
         values: &[FieldElement<E>],
     ) -> FieldElement<E> {
         let nodes = self.run(values);
-        self.roots
+        self.root_steps
             .iter()
             .zip(beta_powers)
             .zip(&self.selector_of_root)
@@ -746,45 +852,23 @@ where
 
     /// Runs the DAG with each trace leaf taking the supplied value.
     fn run(&self, values: &[FieldElement<E>]) -> Vec<FieldElement<E>> {
-        let mut nodes: Vec<FieldElement<E>> = Vec::with_capacity(self.program.nodes.len());
-        for (id, op) in self.program.nodes.iter().enumerate() {
-            if !self.live[id] {
-                // Not reachable from a selected root, so nothing reads it.
-                nodes.push(FieldElement::zero());
-                continue;
-            }
-            let v = match *op {
-                Op::ConstBase(idx) => {
-                    let base = self.program.base_consts[idx as usize].clone();
-                    base.to_extension::<E>()
-                }
-                Op::ConstExt(idx) => self.program.ext_consts[idx as usize].clone(),
-                Op::Var {
-                    main, offset, col, ..
-                } => {
-                    let key = LeafKey { main, offset, col };
-                    let i = *self
-                        .leaf_index
-                        .get(&key)
-                        .expect("every Var leaf was materialized at build time");
-                    values[i].clone()
-                }
-                Op::RapChallenge { idx } => self.uniforms.rap_challenges[idx as usize].clone(),
-                Op::AlphaPow { idx } => self.uniforms.logup_alpha_powers[idx as usize].clone(),
-                Op::TableOffset => self.uniforms.logup_table_offset.clone(),
-                Op::Add(a, b) => &nodes[a as usize] + &nodes[b as usize],
-                Op::Sub(a, b) => &nodes[a as usize] - &nodes[b as usize],
-                Op::Mul(a, b) => &nodes[a as usize] * &nodes[b as usize],
-                Op::Neg(a) => -&nodes[a as usize],
-                Op::Embed(a) => nodes[a as usize].clone(),
+        let mut out: Vec<FieldElement<E>> = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            let v = match *step {
+                Step::Fixed(ref c) => c.clone(),
+                Step::Var(i) => values[i as usize].clone(),
+                Step::Add(a, b) => &out[a as usize] + &out[b as usize],
+                Step::Sub(a, b) => &out[a as usize] - &out[b as usize],
+                Step::Mul(a, b) => &out[a as usize] * &out[b as usize],
+                Step::Neg(a) => -&out[a as usize],
             };
-            nodes.push(v);
+            out.push(v);
         }
-        nodes
+        out
     }
 }
 
-impl<F, E> SumcheckPolynomial<E> for IrPolynomial<'_, F, E>
+impl<F, E> SumcheckPolynomial<E> for IrPolynomial<F, E>
 where
     F: IsSubFieldOf<E>,
     E: IsField,
