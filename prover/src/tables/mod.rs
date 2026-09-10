@@ -113,6 +113,40 @@ pub mod max_rows {
     pub const CPU32: usize = 1 << 19;
 }
 
+/// DEVICE per-chunk ceilings — the cap schedule, in rows, at blowup 4.
+///
+/// Distinct from [`max_rows`], which sizes chunks for equal HOST memory. This
+/// module sizes them for the round-2-to-4 DEVICE incremental,
+/// `n · (120·aux + 1232)` bytes, against a single budget `H`. Two numbers, two
+/// resources, and they disagree by up to 52× across this registry because
+/// `120·aux + 1232` spans 1.75× over the tables `max_rows` covers and 66× over
+/// all of them.
+///
+/// A table appears here only when its device budget is BELOW the tallest
+/// posture the uniform knob offers (2^21). At `H = 5.68 GiB` — the budget
+/// KECCAK_RND's own cap sets — that is exactly two tables:
+///
+/// | table | aux | `120·aux+1232` | rows at `H` |
+/// |---|---|---|---|
+/// | KECCAK_RND | 740 | 90,032 | 67,700 → 65,520 (permutation-aligned) |
+/// | DVRM | 17 | 3,272 | 1,864,000 → 2^20 |
+/// | HINT | 14 | 2,912 | 2,094,000 → 2^21, does NOT bind |
+/// | MEMW | 13 | 2,792 | 2,184,000 → 2^21, does NOT bind |
+///
+/// [`MaxRowsConfig::uniform`] takes the MINIMUM of the knob and these, so the
+/// knob can still lower a cap but never raise one past the card. Without that,
+/// `LAMBDA_VM_MAX_ROWS_LOG2=21` — the line every run uses — silently hands
+/// KECCAK_RND 87,381 permutations per chunk and DVRM 2^21 rows, and the
+/// schedule is inert in the only configuration anyone runs.
+pub mod device_ceiling {
+    /// Permutation-aligned; see [`super::max_rows::KECCAK_RND`].
+    pub const KECCAK_RND: usize = super::max_rows::KECCAK_RND;
+    /// 17 aux columns is the widest LogUp footprint outside the hash chips,
+    /// so DVRM's incremental at 2^21 is 6.54 GiB — it, not KECCAK_RND, would
+    /// set `H` if the knob were allowed to raise it there.
+    pub const DVRM: usize = 1 << 20;
+}
+
 /// Per-table maximum row limits, configurable for different environments.
 ///
 /// `Default` uses the production values from [`max_rows`].
@@ -187,7 +221,7 @@ impl MaxRowsConfig {
             cpu: rows,
             memw: rows,
             memw_aligned: rows,
-            dvrm: rows,
+            dvrm: rows.min(device_ceiling::DVRM),
             mul: rows,
             lt: rows,
             shift: rows,
@@ -198,7 +232,8 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
-            // NOT flattened to `rows`. The uniform knob is a SHAPE choice —
+            // NOT flattened to `rows`: see `device_ceiling`. The uniform knob is
+            // a SHAPE choice —
             // it exists to make tables taller and cut the sub-proof count —
             // but KECCAK_RND's cap is a DEVICE budget, and raising it past
             // that budget is the one thing it cannot survive: at a 2^22 epoch
@@ -209,7 +244,7 @@ impl MaxRowsConfig {
             // run that sets the knob — which is every campaign run.
             //
             // The knob still LOWERS it: `min` keeps a small-cap posture small.
-            keccak_rnd: rows.min(max_rows::KECCAK_RND),
+            keccak_rnd: rows.min(device_ceiling::KECCAK_RND),
         }
     }
 
