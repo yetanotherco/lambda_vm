@@ -3084,6 +3084,79 @@ fn the_production_tree_composes_to_a_root() {
              2^20 confirms the mechanism and clears the budget (26.22 -> 13.11 GiB \
              against 15.625). Still 2^21 REFUTES it."
         );
+
+        // ★★ PROVE ONE SLICE, STANDALONE — the measurement the emit cannot make.
+        //
+        // The emit says the R1 barrier should be 12.98 GiB against 15.625. Whether
+        // that PLUS the slice's own incremental PLUS the ~5 GiB floor clears a
+        // 32 GiB card is a different question, and this campaign has been wrong
+        // about exactly that arithmetic in both directions today.
+        //
+        // ✓ Nothing about it needs the parent: a slice is a program, `lfm_prove`
+        // takes a program, and the arenas are unchanged — `per_table` declares for
+        // ALL tables and only the LEGS are restricted, so `global_arena_words`
+        // still matches declaration order exactly. The unread declarations cost
+        // hint words, not chip rows, which is why the census halved.
+        if let Ok(which) = std::env::var("LFM_TREE_PROVE_SLICE") {
+            let slice: usize = which
+                .parse()
+                .expect("LFM_TREE_PROVE_SLICE must be an integer");
+            let partition = super::global_split::SlicePartition::even(g.tables.len(), 2);
+            assert!(
+                slice < partition.k(),
+                "slice {slice} does not exist at k={}",
+                partition.k()
+            );
+            let (lo, hi) = partition.slice(slice);
+            let program = global_slice_program(&g, &partition, slice);
+            let arenas = global_arena_words(&g);
+            let t = Instant::now();
+            let artifacts =
+                build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            println!(
+                "\n★ PROVING global slice {slice} (tables {lo}..{hi}): \
+                 build_artifacts {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+            let sampler = HostSampler::start();
+            #[cfg(feature = "cuda")]
+            stark::gpu_lde::reset_all_gpu_call_counters();
+            let t = Instant::now();
+            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                .expect("★ THE GLOBAL SLICE MUST PROVE");
+            let prove_secs = t.elapsed().as_secs_f64();
+            let (peak, at) = sampler.stop();
+            #[cfg(feature = "cuda")]
+            {
+                let total: u64 = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    total > 0,
+                    "the slice prove reached the device ZERO times — it ran on the \
+                     host even though cuda is compiled in, so the peak is not the \
+                     production figure"
+                );
+                println!("   GPU dispatches during the SLICE prove: {total}");
+            }
+            let t = Instant::now();
+            assert!(
+                super::proof::verify_against_artifacts(
+                    &artifacts,
+                    &proved.proof,
+                    &proved.public_words,
+                    &wrap_opts
+                ),
+                "the global slice's proof must verify"
+            );
+            println!(
+                "\n★★★ GLOBAL SLICE {slice} PROVED AND VERIFIED\n   prove \
+                 {prove_secs:.1}s · verify {:.2}s · {} published words\n   host \
+                 peak {peak:.3} GiB at t={at:.1}",
+                t.elapsed().as_secs_f64(),
+                proved.public_words.len(),
+            );
+        }
         return;
     }
 
