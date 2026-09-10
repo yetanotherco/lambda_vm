@@ -1563,7 +1563,7 @@ fn prove_node_as_child(
     mode: CacheMode,
     cache: Option<std::path::PathBuf>,
 ) -> (RealChild, super::per_table_aggregator::SchemaLayout) {
-    use super::per_table_aggregator::{NodePublishSet, SchemaLayout};
+    use super::per_table_aggregator::NodePublishSet;
 
     let program = node_program(
         children,
@@ -1572,13 +1572,48 @@ fn prove_node_as_child(
         label_range,
         NodePublishSet::Aggregation,
     );
+    prove_node_program_as_child(label, &program, children, out_halves, opts, mode, cache)
+}
+
+/// [`prove_node_as_child`] for a caller that has ALREADY emitted the program.
+///
+/// ⛔ EMITTING IT TWICE IS NOT FREE. The tree driver builds a node's program to
+/// take its census and its chip panel, and then called `prove_node_as_child`,
+/// which emitted the identical program a second time — 7.4M instructions per
+/// node, twice, at every one of 21 nodes. It was invisible because both halves
+/// were correct and the only symptom was wall clock, which is exactly the
+/// quantity we had agreed to treat as context.
+///
+/// ⇒ The census and the prove now share one program, and the split timings below
+/// are what would have made the duplication visible in the first place: an
+/// unattributed "60 s per node" cannot say whether it is emission, artifacts or
+/// the prove.
+#[allow(clippy::too_many_arguments)]
+fn prove_node_program_as_child(
+    label: &str,
+    program: &LfmProgram,
+    children: &[RealChild],
+    out_halves: usize,
+    opts: &crate::ProofOptions,
+    mode: CacheMode,
+    cache: Option<std::path::PathBuf>,
+) -> (RealChild, super::per_table_aggregator::SchemaLayout) {
+    use super::per_table_aggregator::SchemaLayout;
+    use std::time::Instant;
+
+    let t = Instant::now();
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
+    let t_arenas = t.elapsed().as_secs_f64();
+    let t = Instant::now();
     let artifacts =
-        super::registry::build_artifacts_with_hasher(&program, opts, crate::hash_pin::BLOCK_HASHER);
+        super::registry::build_artifacts_with_hasher(program, opts, crate::hash_pin::BLOCK_HASHER);
+    let t_artifacts = t.elapsed().as_secs_f64();
+    let t = Instant::now();
     let proved = cached_stage(mode, cache, label, || {
-        super::proof::lfm_prove(&program, &artifacts, &arenas, opts)
+        super::proof::lfm_prove(program, &artifacts, &arenas, opts)
             .expect("an aggregation node must prove")
     });
+    let t_prove = t.elapsed().as_secs_f64();
     // ⛔ A LIVE MARK, NOT A HIGH-WATER — and within-run is not enough on its own.
     //
     // This line used to print `peak_rss_gib()`, a `VmHWM`. Read across leaf 0,
@@ -1595,7 +1630,18 @@ fn prove_node_as_child(
     mark(&format!("AFTER {label}"));
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
-    (real_child(artifacts, opts.clone(), &proved), layout)
+    let t = Instant::now();
+    let child = real_child(artifacts, opts.clone(), &proved);
+    // ★ THE SPLIT, because "60 s per node" attributes nothing. Which half a
+    // second cache layer would have to hold — the artifacts or the harvest —
+    // is a different build depending on this line, and guessing it is how a
+    // campaign builds the wrong cache.
+    println!(
+        "   {label} TIMING: arenas {t_arenas:.1}s · build_artifacts {t_artifacts:.1}s \
+         · prove {t_prove:.1}s · harvest {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    (child, layout)
 }
 
 /// ★ THE INNER NODE — a node whose children are NODE proofs.
@@ -2945,6 +2991,7 @@ fn the_production_tree_composes_to_a_root() {
             );
             let out_halves = kid_layouts[arity - 1].out_halves;
 
+            let t_emit = Instant::now();
             let program = node_program(
                 kids,
                 kid_layouts,
@@ -2952,16 +2999,20 @@ fn the_production_tree_composes_to_a_root() {
                 range,
                 super::per_table_aggregator::NodePublishSet::Aggregation,
             );
+            println!(
+                "   {label}: emitted in {:.1}s",
+                t_emit.elapsed().as_secs_f64()
+            );
             let (cells, instrs) = census_and_panel(&program, &label, fan_in);
 
             let sampler = HostSampler::start();
             let t_node = Instant::now();
-            let (child, layout) = prove_node_as_child(
+            // ⛔ The program the census was taken on, NOT a second emission of
+            // the same thing. See `prove_node_program_as_child`.
+            let (child, layout) = prove_node_program_as_child(
                 &label,
+                &program,
                 kids,
-                kid_layouts,
-                &label_refs,
-                range,
                 out_halves,
                 &wrap_opts,
                 stage_mode(level_no),
