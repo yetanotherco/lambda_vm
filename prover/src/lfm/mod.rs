@@ -21,7 +21,7 @@ pub mod algebraic_transcript;
 pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
-mod block_root;
+pub mod block_root;
 pub mod builder;
 pub mod chips;
 pub mod chunking;

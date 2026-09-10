@@ -29,15 +29,6 @@
 //! block N" therefore terminates in a host-side recompute against a trusted ELF.
 //! That is deliberate, predates this campaign, and the root does not change it.
 
-// ⓘ STAGED, 2026-09-10. These items are built and tested but not yet CALLED —
-// the root's assembly (its child set, binding pass and publish set) is the next
-// commit, and the publish set is still one open ruling (see
-// `A-block-root-design.md` §7 and the note on the fold's tree shape).
-// ⛔ This allow comes OFF with that commit. It is scoped to this module and
-// dated so it cannot quietly become permanent: once the assembly calls them,
-// anything still dead is dead for a real reason and must show up.
-#![allow(dead_code)]
-
 use super::builder::LfmBuilder;
 use super::edsl::WrapDigest;
 use super::per_table_aggregator::{
@@ -311,6 +302,42 @@ mod tests {
         }
     }
 
+    /// ★★ THE ARTIFACT'S WIDTH DOES NOT DEPEND ON HOW WE PROVED IT.
+    ///
+    /// The campaign's rule: the artifact's schema may depend on the BLOCK
+    /// (pages, public output), never on the PROVING STRATEGY (epoch count,
+    /// fan-in, tree depth). `root_schema_words` takes neither an epoch count nor
+    /// an arity, so today the rule is enforced by the SIGNATURE — and this test
+    /// is what makes adding one a failure rather than a quiet regression.
+    ///
+    /// It also pins the two arms against each other: `WithFold` is exactly the
+    /// NODE schema, and `AssertOnly` is that minus the one strategy-dependent
+    /// item — which is the whole content of the open ruling, as arithmetic.
+    #[test]
+    fn the_artifact_width_is_independent_of_the_proving_strategy() {
+        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let lanes = super::super::proof_arena::lanes_per_root();
+        for out_halves in [0usize, 1, 7, 64] {
+            let assert_only = root_schema_words(num_reg, out_halves, RootPublishSet::AssertOnly);
+            let with_fold = root_schema_words(num_reg, out_halves, RootPublishSet::WithFold);
+            assert_eq!(
+                with_fold - assert_only,
+                lanes,
+                "the two arms differ by exactly the folded L2G digest and \
+                 nothing else — that difference IS the open ruling"
+            );
+            assert_eq!(
+                with_fold,
+                SchemaLayout::node(out_halves).total(),
+                "the WithFold root publishes exactly the NODE schema; if these \
+                 drift, a parent could no longer read a root as it reads a node"
+            );
+            // Block-dependent, as the rule allows: the width moves with the
+            // block's public output and with nothing else in this call.
+            assert_eq!(assert_only, 2 + 2 * num_reg + 4 + out_halves);
+        }
+    }
+
     /// ⛔ A grouping divergence must be LOUD. `refold` is handed the flat epoch
     /// list, and if the interior grouped differently the counts stop matching —
     /// that has to abort at emit time, not produce a digest that quietly differs.
@@ -333,5 +360,197 @@ mod tests {
             .collect();
         // A shape built for TEN epochs, handed three.
         FoldShape::interior(10, 2).refold(&mut b, &digests);
+    }
+}
+
+// ======================== the root's assembly ========================
+
+/// What the root publishes — the campaign's finish line, as an enum so the
+/// decision is a measurement rather than an argument.
+///
+/// ⛔ **THE OPEN RULING.** The interior's L2G digest is TREE-SHAPED (see
+/// [`FoldShape`]), so its VALUE depends on fan-in and depth — the proving
+/// strategy. Publishing it satisfies the letter of *schema may not depend on the
+/// proving strategy* (it is fixed-size) while breaking its purpose: two provers
+/// at fan-in 2 and 3 would emit **different artifact bytes for the same block**,
+/// and the levers moving 19 epochs to 10 would change the thing being claimed.
+///
+/// Both arms are built so the choice can be made on a census and a published
+/// word count rather than on a preference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootPublishSet {
+    /// The block-level claim only. The L2G agreement is ASSERTED in-machine and
+    /// nothing L2G-shaped is published, so no strategy-dependent value enters the
+    /// artifact. ★ Lane A's recommendation.
+    AssertOnly,
+    /// The block-level claim plus the folded L2G digest, as a node publishes it.
+    /// ⚠ Carries a strategy-dependent value into the artifact; see above.
+    WithFold,
+}
+
+/// Everything the root verifies and binds.
+///
+/// The interior children are the top interior level's nodes — `<= fan_in` of
+/// them — and `global` is the extra child that makes `fan_in + 1`.
+pub struct RootInputs<'a> {
+    pub interior: &'a [ChildShape<'a>],
+    pub interior_layouts: &'a [SchemaLayout],
+    /// Per interior child, the epoch labels it must carry (the two ends of its
+    /// subtree).
+    pub labels: &'a [&'a [u64]],
+    /// The first and last epoch label of the whole BLOCK.
+    pub label_range: (u64, u64),
+    pub global: &'a ChildShape<'a>,
+    pub global_layout: &'a GlobalLayout,
+    pub fold_shape: &'a FoldShape,
+    pub publishes: RootPublishSet,
+}
+
+/// Emit the block-artifact root: verify every child, bind them, compare the L2G,
+/// publish the claim.
+///
+/// # The one thing that is not like a node
+///
+/// A node's children are homogeneous and go through one binding pass. The root's
+/// are not: `fan_in` interior children carry an attestation id, a register run
+/// and a label pair, and the global wrap carries **none of them** — it publishes
+/// `z`, `alpha` and the per-epoch L2G roots and nothing else. Handing it to
+/// [`super::per_table_aggregator::emit_chain_bindings`] would index past its
+/// published words. So the interior children are bound by that pass unchanged and
+/// the global child is bound by the L2G compare, which is the entirety of what it
+/// is for.
+pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
+    let RootInputs {
+        interior,
+        interior_layouts,
+        labels,
+        label_range,
+        global,
+        global_layout,
+        fold_shape,
+        publishes,
+    } = *inputs;
+    assert!(
+        !interior.is_empty(),
+        "the root aggregates at least one interior child"
+    );
+    assert_eq!(
+        interior.len(),
+        interior_layouts.len(),
+        "one layout per interior child"
+    );
+    assert_eq!(
+        interior.len(),
+        labels.len(),
+        "one label run per interior child"
+    );
+    for (child, layout) in interior.iter().zip(interior_layouts) {
+        layout.assert_covers(child.num_public_words);
+    }
+    assert_global_child_is_bound_only_by_l2g(global_layout, global.num_public_words);
+
+    // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
+    // Every child's arenas are declared before any leg is emitted, exactly as a
+    // node does it; putting the global wrap last keeps the interior children's
+    // arena indices identical to what they would be under `emit_node`, so a
+    // reader comparing the two programs is comparing like with like.
+    let interior_legs: Vec<LegCells> = interior
+        .iter()
+        .map(|child| emit_child_leg(b, child))
+        .collect();
+    let global_leg = emit_child_leg(b, global);
+
+    super::per_table_aggregator::emit_chain_bindings(b, &interior_legs, interior_layouts, labels);
+    emit_l2g_compare(
+        b,
+        &interior_legs,
+        interior_layouts,
+        &global_leg,
+        global_layout,
+        fold_shape,
+    );
+    emit_root_publishes(b, &interior_legs, interior_layouts, label_range, publishes);
+}
+
+/// The block artifact's claim.
+///
+/// The block-level fields are exactly what a node republishes, minus the L2G
+/// item under [`RootPublishSet::AssertOnly`]: the attestation id every wrap
+/// agreed on, the block's opening register vector, its closing register vector,
+/// the first and last epoch labels as constants of THIS program, and the block's
+/// public output.
+///
+/// ⓘ OPEN, and deliberately not invented here: the archive's `aggregator_program`
+/// also published each folded page's base, the private-input page count and the
+/// touched-page list. Those are BLOCK-dependent (allowed to vary) but they need
+/// page material at the root that nothing currently hands it. Adding them is a
+/// separate, named piece rather than a guess made inside this function.
+fn emit_root_publishes(
+    b: &mut LfmBuilder,
+    legs: &[LegCells],
+    layouts: &[SchemaLayout],
+    label_range: (u64, u64),
+    publishes: RootPublishSet,
+) {
+    use crate::tables::types::FE;
+
+    let first = &legs[0];
+    let last = legs.last().expect("nonempty");
+    let l_first = &layouts[0];
+    let l_last = layouts.last().expect("nonempty");
+
+    for half in 0..2 {
+        let lanes = &first.publics[l_first.id(half)].lanes;
+        let word = b.pack_word([lanes[0], lanes[1], lanes[2], lanes[3]]);
+        b.public(word);
+    }
+    for r in 0..l_first.num_reg {
+        b.public(first.publics[l_first.reg_init(r)].lanes[0].as_cell());
+    }
+    for r in 0..l_last.num_reg {
+        b.public(last.publics[l_last.reg_fini(r)].lanes[0].as_cell());
+    }
+    for label in [label_range.0, label_range.1] {
+        let lo = b.felt_const(FE::from(label & 0xFFFF_FFFF));
+        b.public(lo.as_cell());
+        let hi = b.felt_const(FE::from(label >> 32));
+        b.public(hi.as_cell());
+    }
+    for i in 0..l_last.out_halves {
+        b.public(last.publics[l_last.out_half(i)].lanes[0].as_cell());
+    }
+    if publishes == RootPublishSet::WithFold {
+        let digests: Vec<WrapDigest> = legs
+            .iter()
+            .zip(layouts)
+            .map(|(leg, layout)| {
+                let lanes: Vec<_> = (0..layout.l2g_words)
+                    .map(|w| leg.publics[layout.l2g_word(w)].lanes[0])
+                    .collect();
+                digest_from_lanes(b, &lanes)
+            })
+            .collect();
+        let folded = fold_l2g(b, &digests);
+        for cell in folded.cells() {
+            for lane in b.unpack(*cell) {
+                b.public(lane.as_cell());
+            }
+        }
+    }
+}
+
+/// Words the root publishes under `publishes` — the artifact's width, which a
+/// consumer must know before it reads a single one.
+///
+/// ★ Under [`RootPublishSet::AssertOnly`] this depends on `num_reg` (a machine
+/// constant) and `out_halves` (the BLOCK's public output) and on nothing else.
+/// It does NOT depend on the epoch count, the fan-in or the tree's depth. That is
+/// the rule the artifact has to satisfy, stated as arithmetic so a test can hold
+/// it rather than a comment asking to be believed.
+pub fn root_schema_words(num_reg: usize, out_halves: usize, publishes: RootPublishSet) -> usize {
+    let base = 2 + 2 * num_reg + 4 + out_halves;
+    match publishes {
+        RootPublishSet::AssertOnly => base,
+        RootPublishSet::WithFold => base + super::proof_arena::lanes_per_root(),
     }
 }
