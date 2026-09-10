@@ -23,6 +23,7 @@ fn sample_counts() -> TableCounts {
         bytewise: 1,
         store: 1,
         cpu32: 1,
+        keccak_rnd: 2,
         blake3: 1,
     }
 }

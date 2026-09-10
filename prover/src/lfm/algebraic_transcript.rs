@@ -698,6 +698,7 @@ mod tests {
             bytewise: 22,
             store: 23,
             cpu32: 24,
+            keccak_rnd: 1,
             blake3: 1,
         };
         let count_array: [u64; NUM_TABLE_COUNTS] =

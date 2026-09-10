@@ -124,6 +124,9 @@ pub struct TableCounts {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// KECCAK_RND chunk count. Chunked by whole permutations, so a count here
+    /// is a number of `ROWS_PER_PERMUTATION`-row groups, never a row split.
+    pub keccak_rnd: usize,
     /// ★ BLAKE3 tables: **0 or 1**, not a chunk count — 1 iff the workload
     /// executed at least one BLAKE3 syscall.
     ///
@@ -607,7 +610,7 @@ pub(crate) struct VmAirs {
     pub halt: VmAir,
     pub commit: VmAir,
     pub keccak: VmAir,
-    pub keccak_rnd: VmAir,
+    pub keccak_rnd: Vec<VmAir>,
     pub keccak_rc: VmAir,
     pub blake3: VmAir,
     pub ecsm: VmAir,
@@ -644,9 +647,14 @@ impl VmAirs {
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.commit.as_ref(), &mut traces.commit, &()),
             (self.keccak.as_ref(), &mut traces.keccak, &()),
-            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
-            (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
         ];
+        // KECCAK_RND's chunks occupy the slot the single table held, before
+        // KECCAK_RC — `air_trace_pairs` and `air_refs` ARE the proof's layout
+        // and must move together.
+        for (air, trace) in self.keccak_rnd.iter().zip(traces.keccak_rnd.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        pairs.push((self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()));
         // BLAKE3 keeps its original slot between KECCAK_RC and ECSM, so a proof
         // that carries the table is laid out exactly as it always was; a proof
         // that does not simply omits this one entry.
@@ -725,9 +733,11 @@ impl VmAirs {
             self.decode.as_ref(),
             self.commit.as_ref(),
             self.keccak.as_ref(),
-            self.keccak_rnd.as_ref(),
-            self.keccak_rc.as_ref(),
         ];
+        for air in &self.keccak_rnd {
+            refs.push(air.as_ref());
+        }
+        refs.push(self.keccak_rc.as_ref());
         // The same slot as `air_trace_pairs`: these two orders ARE the proof's
         // layout, and must move together.
         if self.include_blake3 {
@@ -899,7 +909,13 @@ impl VmAirs {
         let halt: VmAir = Box::new(create_halt_air(proof_options));
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let keccak_rnd: Vec<VmAir> = (0..table_counts.keccak_rnd.max(1))
+            .map(|i| {
+                Box::new(
+                    create_keccak_rnd_air(proof_options).with_name(&format!("KECCAK_RND[{}]", i)),
+                ) as VmAir
+            })
+            .collect();
         let blake3: VmAir = Box::new(create_blake3_air(proof_options));
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),

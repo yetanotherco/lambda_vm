@@ -3410,7 +3410,10 @@ pub struct Traces {
     pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// KECCAK_RND round table (24 rows per keccak call)
-    pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// KECCAK_RND, split into chunks of whole permutations (`max_rows.keccak_rnd
+    /// / ROWS_PER_PERMUTATION` operations each). Chunking the OPERATIONS rather
+    /// than the rows is what keeps a permutation from straddling a boundary.
+    pub keccak_rnd: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -4089,7 +4092,19 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
-        keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
+        // Chunk by OPERATIONS, not rows: each op is `ROWS_PER_PERMUTATION`
+        // contiguous rows, so an operation-aligned split is permutation-aligned
+        // by construction and no row cap has to be a multiple of 24.
+        let ops_per_chunk = (max_rows.keccak_rnd / keccak_rnd::ROWS_PER_PERMUTATION).max(1);
+        let chunks: Vec<&[KeccakRoundOperation]> = if keccak_rnd_ops.is_empty() {
+            vec![&[][..]]
+        } else {
+            keccak_rnd_ops.chunks(ops_per_chunk).collect()
+        };
+        chunks
+            .into_iter()
+            .map(keccak_rnd::generate_keccak_rnd_trace)
+            .collect::<Vec<_>>()
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
     let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);
@@ -4620,7 +4635,7 @@ impl Traces {
         // a stale device copy to be committed.
         tables.push(&mut self.decode);
         tables.push(&mut self.keccak);
-        tables.push(&mut self.keccak_rnd);
+        tables.extend(self.keccak_rnd.iter_mut());
         tables.push(&mut self.ecsm);
         tables.push(&mut self.ecdas);
 
@@ -4758,7 +4773,9 @@ impl Traces {
             total += (t.num_rows() * MEMW_R_COLS) as u64;
         }
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
-        total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
+        for t in keccak_rnd {
+            total += (t.num_rows() * KECCAK_RND_COLS) as u64;
+        }
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         // Counted only when the proof carries the table (`table_counts().blake3`);
         // an unused BLAKE3 trace is padding the prover never commits.
@@ -4899,7 +4916,9 @@ impl Traces {
             total += (t.num_rows() * n_memw_r) as u64;
         }
         total += (keccak.num_rows() * n_keccak) as u64;
-        total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
+        for t in keccak_rnd {
+            total += (t.num_rows() * n_keccak_rnd) as u64;
+        }
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         if *num_blake3_ops > 0 {
             total += (blake3.num_rows() * n_blake3) as u64;
@@ -4939,6 +4958,7 @@ impl Traces {
             bytewise: self.bytewises.len(),
             store: self.stores.len(),
             cpu32: self.cpu32s.len(),
+            keccak_rnd: self.keccak_rnd.len(),
             // 0 or 1: the table is carried only when the workload used it.
             blake3: usize::from(self.num_blake3_ops > 0),
         }

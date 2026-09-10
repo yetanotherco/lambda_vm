@@ -238,6 +238,17 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
     }
 }
 
+/// Rows one keccak permutation occupies, contiguously — the generator below
+/// writes `row_idx = op_idx * ROWS_PER_PERMUTATION + round`.
+///
+/// It is the CHUNK UNIT for this table. A boundary that is not a multiple of it
+/// would cut a permutation in half, and whether that is survivable is a
+/// question about the constraint set that nobody should have to answer.
+/// Chunking the OPERATIONS instead of the rows makes it unreachable, which is
+/// cheaper than proving it safe and cannot rot — note that no power of two is a
+/// multiple of 24, so a row cap could never have been aligned.
+pub const ROWS_PER_PERMUTATION: usize = 24;
+
 #[allow(clippy::needless_range_loop)]
 /// Generate the KECCAK_RND trace table.
 ///

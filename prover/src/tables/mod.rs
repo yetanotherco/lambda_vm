@@ -92,6 +92,20 @@ pub mod max_rows {
     pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
     pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
     pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31
+    /// KECCAK_RND, the widest table in the machine: 1,480 main + 740 ext aux.
+    ///
+    /// Sized by the DEVICE per-chunk budget rather than the host equal-memory
+    /// rule above, because this is the table that sets the round-2-to-4 peak:
+    /// its incremental is `n · (120·aux + 1232)` = 90,032 B/row at blowup 4, so
+    /// one chunk of `H = 5.6 GiB` is 66,800 rows — 30× narrower in rows than
+    /// anything the rule above produces, and the reason a uniform ROW cap
+    /// mis-allocates by 52× across this registry.
+    ///
+    /// Rounded DOWN to a whole number of permutations (`ROWS_PER_PERMUTATION`):
+    /// 2,730 × 24 = 65,520, which pads to 2^16 with 16 rows to spare. The
+    /// chunker divides by 24 and splits OPERATIONS, so the alignment is
+    /// structural rather than a value that has to stay correct.
+    pub const KECCAK_RND: usize = 2730 * super::keccak_rnd::ROWS_PER_PERMUTATION; // 65,520
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub const EQ: usize = 1 << 20;
     pub const BYTEWISE: usize = 1 << 20;
@@ -119,6 +133,7 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    pub keccak_rnd: usize,
 }
 
 impl Default for MaxRowsConfig {
@@ -160,6 +175,7 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            keccak_rnd: max_rows::KECCAK_RND,
         }
     }
 }
@@ -182,6 +198,7 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
+            keccak_rnd: rows,
         }
     }
 
@@ -203,6 +220,7 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            keccak_rnd: 1 << 5,
         }
     }
 }

@@ -2207,6 +2207,7 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         bytewise: c[11],
         store: c[12],
         cpu32: c[13],
+        keccak_rnd: 1,
         blake3: c[14],
     };
     let ranges: Vec<RuntimePageRange> = shape

@@ -2967,6 +2967,7 @@ fn test_verify_rejects_zero_table_counts() {
             bytewise: 0,
             store: 0,
             cpu32: 0,
+            keccak_rnd: 0,
             blake3: 0,
         },
         ..vm_proof
@@ -3043,6 +3044,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        keccak_rnd: 0,
         // 0 is legal here (the table is conditional), so this fixture stays a
         // test of the REQUIRED tables' zero-rejection.
         blake3: 0,
@@ -4363,6 +4365,7 @@ fn the_blake3_count_is_bound_into_the_statement() {
         bytewise: 1,
         store: 1,
         cpu32: 1,
+        keccak_rnd: 1,
         blake3: 1,
     };
 
@@ -4421,6 +4424,7 @@ fn a_blake3_count_above_one_is_rejected() {
         bytewise: 1,
         store: 1,
         cpu32: 1,
+        keccak_rnd: 1,
         blake3: 1,
     };
     assert!(counts.validate().is_ok(), "1 is the honest maximum");
