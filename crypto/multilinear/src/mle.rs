@@ -20,7 +20,7 @@ pub struct Mle<F: IsField> {
     num_vars: usize,
 }
 
-impl<F: IsField> Mle<F> {
+impl<F: IsField + 'static> Mle<F> {
     /// Builds an MLE from `2^n` evaluations in hypercube order.
     pub fn new(evals: Vec<FieldElement<F>>) -> Result<Self, Error> {
         let len = evals.len();
@@ -155,6 +155,9 @@ impl<F: IsField> Mle<F> {
                 got: evals.len().trailing_zeros() as usize,
             });
         }
+        if let Some(value) = crate::gpu::evaluate_mle(evals, point) {
+            return Ok(value);
+        }
         let Some((first, rest)) = point.split_first() else {
             return Ok(evals[0].clone());
         };
@@ -193,13 +196,16 @@ impl<F: IsField> Mle<F> {
     pub fn evaluate_in<E>(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error>
     where
         F: IsSubFieldOf<E>,
-        E: IsField,
+        E: IsField + 'static,
     {
         if point.len() != self.num_vars {
             return Err(Error::VariableCountMismatch {
                 expected: self.num_vars,
                 got: point.len(),
             });
+        }
+        if let Some(value) = crate::gpu::evaluate_mle(&self.evals, point) {
+            return Ok(value);
         }
         let Some((first, rest)) = point.split_first() else {
             return Ok(self.evals[0].clone().to_extension::<E>());

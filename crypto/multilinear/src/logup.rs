@@ -36,7 +36,7 @@ pub struct Affine<E: IsField> {
     constant: FieldElement<E>,
 }
 
-impl<E: IsField> Affine<E> {
+impl<E: IsField + 'static> Affine<E> {
     /// `terms` pairs a factor slot with its coefficient.
     pub fn new(terms: Vec<(usize, FieldElement<E>)>, constant: FieldElement<E>) -> Self {
         Self { terms, constant }
@@ -148,7 +148,7 @@ pub fn input_layer_vars(interactions: usize, num_row_vars: usize) -> usize {
 ///
 /// Interactions are padded up to a power of two with `0/1`, which the tree adds
 /// without moving the sum.
-pub fn input_layer<E: IsField>(
+pub fn input_layer<E: IsField + 'static>(
     interactions: &[Interaction<E>],
     factors: &[Mle<E>],
 ) -> Result<FractionLayer<E>, Error> {
@@ -185,7 +185,7 @@ pub struct BusStatements<'a, E: IsField> {
 /// `weight` is the factor slot holding `eq(row_point, ·)`, which the caller
 /// adds as a public factor. Both sides must build these from the same
 /// interactions: they are the bus's structure, not proof data.
-pub fn claim_statements<'a, E: IsField>(
+pub fn claim_statements<'a, E: IsField + 'static>(
     interactions: &'a [Interaction<E>],
     claim_point: &[FieldElement<E>],
     num_row_vars: usize,

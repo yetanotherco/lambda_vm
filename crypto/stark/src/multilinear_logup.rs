@@ -48,7 +48,7 @@ fn probe<E, S>(
     eval: impl Fn(&dyn Fn(usize) -> FieldElement<E>) -> FieldElement<E>,
 ) -> Result<Affine<E>, MlError>
 where
-    E: IsField,
+    E: IsField + 'static,
     S: FnMut(usize) -> Result<usize, MlError>,
 {
     let constant = eval(&|_| FieldElement::<E>::zero());
@@ -83,7 +83,7 @@ pub fn interactions<E, S>(
     mut slot_of: S,
 ) -> Result<Vec<Interaction<E>>, MlError>
 where
-    E: IsField,
+    E: IsField + 'static,
     S: FnMut(usize) -> Result<usize, MlError>,
 {
     let width = buses

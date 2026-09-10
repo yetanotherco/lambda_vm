@@ -8,7 +8,7 @@ use crate::{Error, mle::Mle, program::Program};
 
 /// A polynomial over the hypercube, presented as multilinear factors plus a
 /// rule for combining their values.
-pub trait SumcheckPolynomial<F: IsField> {
+pub trait SumcheckPolynomial<F: IsField + 'static> {
     /// Variables left to bind.
     fn num_vars(&self) -> usize;
 
@@ -96,9 +96,9 @@ pub struct Composed<F: IsField, C> {
     program: Option<Program<F>>,
 }
 
-impl<F: IsField, C> Composed<F, C>
+impl<F: IsField + 'static, C> Composed<F, C>
 where
-    C: Fn(&[FieldElement<F>]) -> FieldElement<F>,
+    C: Fn(&[FieldElement<F>]) -> FieldElement<F> + 'static,
 {
     /// `degree` must upper-bound the closure's total degree in the factors.
     pub fn new(polys: Vec<Mle<F>>, combine: C, degree: usize) -> Result<Self, Error> {
@@ -138,7 +138,7 @@ impl<F: IsField, C> Composed<F, C> {
     }
 }
 
-impl<F: IsField, C> SumcheckPolynomial<F> for Composed<F, C>
+impl<F: IsField + 'static, C> SumcheckPolynomial<F> for Composed<F, C>
 where
     C: Fn(&[FieldElement<F>]) -> FieldElement<F>,
 {
@@ -199,7 +199,7 @@ where
 /// This is what turns a sumcheck into a zerocheck, and it works for any
 /// underlying polynomial rather than only the sum-of-products one.
 #[derive(Debug)]
-pub struct EqScaled<F: IsField, P: SumcheckPolynomial<F>> {
+pub struct EqScaled<F: IsField + 'static, P: SumcheckPolynomial<F>> {
     inner: P,
     /// `inner`'s factors followed by the `eq` table — the layout `combine` and
     /// the sumcheck prover both index.

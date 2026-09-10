@@ -103,7 +103,7 @@ pub struct Batched<'a, F: IsField> {
     program: Option<Program<F>>,
 }
 
-impl<'a, F: IsField> Batched<'a, F> {
+impl<'a, F: IsField + 'static> Batched<'a, F> {
     /// `lambdas` weights the statements; there must be one per rule.
     pub fn new(
         polys: Vec<Mle<F>>,
@@ -150,7 +150,7 @@ impl<'a, F: IsField> Batched<'a, F> {
     }
 }
 
-impl<F: IsField> SumcheckPolynomial<F> for Batched<'_, F> {
+impl<F: IsField + 'static> SumcheckPolynomial<F> for Batched<'_, F> {
     fn num_vars(&self) -> usize {
         self.num_vars
     }
@@ -209,7 +209,7 @@ impl<F: IsField> SumcheckPolynomial<F> for Batched<'_, F> {
 }
 
 /// The degree the batched sumcheck runs at: the worst statement's.
-pub fn degree_of<F: IsField>(rules: &[Rule<'_, F>]) -> usize {
+pub fn degree_of<F: IsField + 'static>(rules: &[Rule<'_, F>]) -> usize {
     rules.iter().map(Rule::degree).max().unwrap_or(0)
 }
 
@@ -258,7 +258,7 @@ pub fn verify<F, T, V>(
     transcript: &mut T,
 ) -> Result<Vec<FieldElement<F>>, Error>
 where
-    F: IsField,
+    F: IsField + 'static,
     T: IsTranscript<F>,
     V: FnOnce(&[FieldElement<F>]) -> Result<Vec<FieldElement<F>>, Error>,
 {

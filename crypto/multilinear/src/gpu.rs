@@ -14,6 +14,8 @@ static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
 static SUMCHECK_ROUNDS: AtomicU64 = AtomicU64::new(0);
+/// Multilinear evaluations bound on device.
+static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -27,10 +29,15 @@ pub fn sumcheck_rounds() -> u64 {
     SUMCHECK_ROUNDS.load(Ordering::Relaxed)
 }
 
+pub fn evaluate_calls() -> u64 {
+    EVALUATE_CALLS.load(Ordering::Relaxed)
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
+    EVALUATE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and the factors the
@@ -596,6 +603,73 @@ pub(crate) fn commit_tree_ext3<F>(
 ) -> Option<Vec<[u8; 32]>>
 where
     F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// Table size below which the host evaluation wins: one launch per variable
+/// against a couple of passes a few cores finish in microseconds.
+#[cfg(feature = "cuda")]
+const EVALUATE_THRESHOLD: usize = 1 << 16;
+
+/// A multilinear's value at `point`, bound variable by variable on device.
+///
+/// `evals` may be base-field or ext3; the point is always ext3, which is what
+/// a challenge is.
+#[cfg(feature = "cuda")]
+pub(crate) fn evaluate_mle<C, E>(
+    evals: &[math::field::element::FieldElement<C>],
+    point: &[math::field::element::FieldElement<E>],
+) -> Option<math::field::element::FieldElement<E>>
+where
+    C: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let base = TypeId::of::<C>() == TypeId::of::<Gl>();
+    if !base && TypeId::of::<C>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    if point.is_empty() || evals.len() < EVALUATE_THRESHOLD || evals.len() != 1 << point.len() {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some()) {
+        return None;
+    }
+
+    let mut raw_point = Vec::with_capacity(point.len() * 3);
+    for coordinate in point {
+        raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+    }
+    // SAFETY: `C` is one of the two fields checked above, and both wrap their
+    // limbs transparently — one `u64` per base element, three per ext3.
+    let limbs = if base { 1 } else { 3 };
+    let raw =
+        unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len() * limbs) };
+    let value = if base {
+        math_cuda::sumcheck::evaluate_mle_base(raw, &raw_point).ok()?
+    } else {
+        math_cuda::sumcheck::evaluate_mle_ext3(raw, &raw_point).ok()?
+    };
+    EVALUATE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(ext3_from_raw::<E>(&value))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn evaluate_mle<C, E>(
+    _evals: &[math::field::element::FieldElement<C>],
+    _point: &[math::field::element::FieldElement<E>],
+) -> Option<math::field::element::FieldElement<E>>
+where
+    C: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
 {
     None
 }

@@ -176,6 +176,26 @@ extern "C" __global__ void sumcheck_round_ext3(
     }
 }
 
+// The first fold of a base-field table, which lifts it:
+//   out[j] = in[j] + r·(in[j + half] − in[j])
+// with `in` base and `out` ext3. Later folds stay in the extension and go
+// through `sumcheck_fold_ext3` with a single factor.
+extern "C" __global__ void mle_fold_base_ext3(const uint64_t *__restrict__ in, uint64_t half,
+                                              const uint64_t *__restrict__ r,
+                                              uint64_t *__restrict__ out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= half) return;
+    uint64_t lo = in[j];
+    uint64_t delta = goldilocks::sub(in[j + half], lo);
+    // `delta·r` with `delta` in the base field, then `lo +` it: the mixed-field
+    // shortcuts, bit-identical to the full ext3 ops on the embedding.
+    Fe3 scaled = ext3::mul_base(ext3::make(r[0], r[1], r[2]), delta);
+    uint64_t *at = out + j * 3;
+    at[0] = goldilocks::add(lo, scaled.a);
+    at[1] = scaled.b;
+    at[2] = scaled.c;
+}
+
 // Binds the round's variable: `f(j) <- f(j) + r·(f(j + half) − f(j))` for every
 // factor, halving the cube. One thread per (factor, index) pair.
 extern "C" __global__ void sumcheck_fold_ext3(uint64_t *__restrict__ d_factors,

@@ -205,7 +205,7 @@ impl LeafLayout {
     /// Fills the layout in, one call per column in [`column_keys`] order.
     ///
     /// [`column_keys`]: Self::column_keys
-    pub fn materialize<V: IsField>(
+    pub fn materialize<V: IsField + 'static>(
         self,
         mut column: impl FnMut(ColumnKey) -> Vec<FieldElement<V>>,
     ) -> Result<TraceLeaves<V>, MlError> {
@@ -234,7 +234,7 @@ pub struct TraceLeaves<V: IsField> {
     pub(crate) columns: Vec<Mle<V>>,
 }
 
-impl<V: IsField> TraceLeaves<V> {
+impl<V: IsField + 'static> TraceLeaves<V> {
     /// Materializes one MLE per distinct column in `program` and records the
     /// offset each factor reads it at.
     ///
@@ -247,8 +247,8 @@ impl<V: IsField> TraceLeaves<V> {
         aux_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
     ) -> Result<Self, MlError>
     where
-        F: IsField,
-        E: IsField,
+        F: IsField + 'static,
+        E: IsField + 'static,
     {
         Self::build_live(
             program,
@@ -268,8 +268,8 @@ impl<V: IsField> TraceLeaves<V> {
         mut aux_column: impl FnMut(u16) -> Vec<FieldElement<V>>,
     ) -> Result<Self, MlError>
     where
-        F: IsField,
-        E: IsField,
+        F: IsField + 'static,
+        E: IsField + 'static,
     {
         LeafLayout::build_live(program, live, num_vars).materialize(|key| {
             if key.main {
@@ -592,8 +592,8 @@ enum Step<E: IsField> {
 
 impl<F, E> IrPolynomial<F, E>
 where
-    F: IsSubFieldOf<E>,
-    E: IsField,
+    F: IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
     /// Batches every constraint in `program`, taking each one's row domain from
     /// `meta`.
@@ -698,7 +698,7 @@ where
 impl<F, E> IrShape<F, E>
 where
     F: IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
 {
     /// The batched constraint's structure, from the program and a slot
     /// assignment alone.
@@ -797,7 +797,7 @@ where
 impl<F, E> IrShape<F, E>
 where
     F: IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
 {
     pub fn degree(&self) -> usize {
         self.degree
@@ -926,7 +926,7 @@ where
 impl<F, E> SumcheckPolynomial<E> for IrPolynomial<F, E>
 where
     F: IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
 {
     fn num_vars(&self) -> usize {
         self.shape.num_vars
@@ -1613,7 +1613,7 @@ mod tests {
         let mut scratch = Vec::new();
         assert_eq!(
             program.eval(&values, &mut scratch),
-            &values[width] * shape.combine(&betas, &values[..width])
+            values[width] * shape.combine(&betas, &values[..width])
         );
     }
 

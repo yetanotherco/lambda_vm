@@ -27,7 +27,7 @@ pub struct FractionLayer<F: IsField> {
     pub q: Mle<F>,
 }
 
-impl<F: IsField> FractionLayer<F> {
+impl<F: IsField + 'static> FractionLayer<F> {
     pub fn new(p: Mle<F>, q: Mle<F>) -> Result<Self, Error> {
         if p.num_vars() != q.num_vars() {
             return Err(Error::VariableCountMismatch {
@@ -79,7 +79,7 @@ pub struct FractionTree<F: IsField> {
     layers: Vec<FractionLayer<F>>,
 }
 
-impl<F: IsField> FractionTree<F> {
+impl<F: IsField + 'static> FractionTree<F> {
     /// Builds every layer by repeated folding.
     pub fn build(input: FractionLayer<F>) -> Result<Self, Error> {
         let mut layers = vec![input];
@@ -120,7 +120,7 @@ struct LayerRelation<F: IsField> {
     program: Program<F>,
 }
 
-impl<F: IsField> LayerRelation<F> {
+impl<F: IsField + 'static> LayerRelation<F> {
     const EQ: usize = 0;
     const P_LO: usize = 1;
     const P_HI: usize = 2;
@@ -169,7 +169,7 @@ impl<F: IsField> LayerRelation<F> {
     }
 }
 
-impl<F: IsField> SumcheckPolynomial<F> for LayerRelation<F> {
+impl<F: IsField + 'static> SumcheckPolynomial<F> for LayerRelation<F> {
     fn num_vars(&self) -> usize {
         self.polys[Self::EQ].num_vars()
     }

@@ -32,7 +32,7 @@ impl Selector {
     }
 
     /// The selector's hypercube table.
-    pub fn table<F: IsField>(&self, num_vars: usize) -> Result<Mle<F>, Error> {
+    pub fn table<F: IsField + 'static>(&self, num_vars: usize) -> Result<Mle<F>, Error> {
         let size = 1usize << num_vars;
         if self.end_exemptions > size {
             return Err(Error::TooManyExemptions {

@@ -247,6 +247,7 @@ pub struct Backend {
     // sumcheck.cubin
     pub sumcheck_round_ext3: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
+    pub mle_fold_base_ext3: CudaFunction,
 
     // whir_fold.cubin
     pub whir_fold_base_ext3: CudaFunction,
@@ -492,6 +493,7 @@ impl Backend {
             whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
+            mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp

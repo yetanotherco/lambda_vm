@@ -86,7 +86,7 @@ impl<F: IsFFTField + IsPrimeField> Domain<F> {
 /// The inverse of the evaluation map: reading a multilinear's `2^m` hypercube
 /// values as `Σ_S ĉ_S ∏_{i∈S} x_i`. Computed by the Möbius transform, in
 /// `O(m·2^m)`.
-pub fn monomial_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>>
+pub fn monomial_coefficients<F: IsField + 'static>(mle: &Mle<F>) -> Vec<FieldElement<F>>
 where
     FieldElement<F>: Send + Sync,
 {
@@ -115,7 +115,7 @@ where
 ///
 /// Reverses the coefficient index so variable 0 is the low bit, making one fold
 /// bind the variable one sumcheck round binds.
-pub fn lift_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>>
+pub fn lift_coefficients<F: IsField + 'static>(mle: &Mle<F>) -> Vec<FieldElement<F>>
 where
     FieldElement<F>: Send + Sync,
 {

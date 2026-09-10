@@ -162,7 +162,7 @@ fn columns_in(layout: &StackedLayout, poly: usize) -> impl Iterator<Item = (usiz
 /// Each column owns a contiguous subcube of the stack, so its share of the
 /// weight is written straight into that range and the gaps stay zero. Columns
 /// of different heights cost nothing extra here — the range is just shorter.
-fn weight_table<E: IsField>(
+fn weight_table<E: IsField + 'static>(
     layout: &StackedLayout,
     poly: usize,
     points: &Claimed<'_, E>,

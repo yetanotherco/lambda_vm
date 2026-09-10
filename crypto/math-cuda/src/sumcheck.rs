@@ -263,3 +263,89 @@ fn goldilocks_add(a: u64, b: u64) -> u64 {
     let (sum, over) = sum.overflowing_add(if over { EPSILON } else { 0 });
     if over { sum + EPSILON } else { sum }
 }
+
+/// A multilinear's value at `point`, bound one variable at a time on device.
+///
+/// `table` is `2^point_len` ext3 values interleaved, `point` three u64 per
+/// coordinate. Mirrors `Mle::evaluate_at`: the same folds in the same order,
+/// with the table halving under them.
+pub fn evaluate_mle_ext3(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
+    assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+    let vars = point.len() / 3;
+    assert_eq!(
+        table.len(),
+        (1usize << vars) * 3,
+        "the table spans the point"
+    );
+    assert!(vars > 0, "a point with no coordinates is the table itself");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut values = stream.clone_htod(table)?;
+    let stride = 1u64 << vars;
+    fold_to_one(&stream, be, &mut values, stride, point)?;
+    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    stream.synchronize()?;
+    Ok([out[0], out[1], out[2]])
+}
+
+/// The same for a base-field table at a point in the extension: the first fold
+/// lifts, the rest stay up.
+pub fn evaluate_mle_base(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
+    assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+    let vars = point.len() / 3;
+    assert_eq!(table.len(), 1usize << vars, "the table spans the point");
+    assert!(vars > 0, "a point with no coordinates is the table itself");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let base = stream.clone_htod(table)?;
+    let half = table.len() / 2;
+    let r = stream.clone_htod(&point[..3])?;
+    // SAFETY: the kernel writes every element of the half it produces.
+    let mut values = unsafe { stream.alloc::<u64>(half * 3) }?;
+    let half_arg = half as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.mle_fold_base_ext3)
+            .arg(&base)
+            .arg(&half_arg)
+            .arg(&r)
+            .arg(&mut values)
+            .launch(LaunchConfig::for_num_elems(half as u32))?;
+    }
+    drop(base);
+    fold_to_one(&stream, be, &mut values, half as u64, &point[3..])?;
+    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    stream.synchronize()?;
+    Ok([out[0], out[1], out[2]])
+}
+
+/// Binds every coordinate of `point` in a resident ext3 table of `len`
+/// elements, leaving the value in its first slot.
+fn fold_to_one(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    values: &mut CudaSlice<u64>,
+    len: u64,
+    point: &[u64],
+) -> Result<()> {
+    let width = 1u64;
+    let mut half = len / 2;
+    for coordinate in point.chunks_exact(3) {
+        let r = stream.clone_htod(coordinate)?;
+        let cfg = LaunchConfig::for_num_elems((half * width) as u32);
+        unsafe {
+            stream
+                .launch_builder(&be.sumcheck_fold_ext3)
+                .arg(&mut *values)
+                .arg(&len)
+                .arg(&half)
+                .arg(&width)
+                .arg(&r)
+                .launch(cfg)?;
+        }
+        half /= 2;
+    }
+    Ok(())
+}

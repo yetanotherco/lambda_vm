@@ -137,7 +137,7 @@ impl StackedLayout {
     }
 
     /// Builds the stacked polynomials, zero-filling the padding.
-    pub fn stack<F: IsField>(&self, columns: &[Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
+    pub fn stack<F: IsField + 'static>(&self, columns: &[Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
         if columns.len() != self.placements.len() {
             return Err(Error::VariableCountMismatch {
                 expected: self.placements.len(),

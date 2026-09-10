@@ -139,7 +139,7 @@ fn batched_column<F, E>(
     num_vars: usize,
 ) -> Result<Mle<E>, Error>
 where
-    F: IsField + IsSubFieldOf<E>,
+    F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
     let mut acc = vec![FieldElement::<E>::zero(); 1usize << num_vars];
@@ -168,7 +168,7 @@ pub fn prove<F, E, T>(
     transcript: &mut T,
 ) -> Result<(ReduceProof<E>, Vec<FieldElement<E>>), Error>
 where
-    F: IsField + IsSubFieldOf<E>,
+    F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
     T: IsTranscript<E>,
 {
@@ -291,7 +291,10 @@ where
 
 /// The factor `source` describes, materialized: the column shifted cyclically
 /// by its offset.
-pub fn materialize<E: IsField>(columns: &[Mle<E>], source: &FactorSource) -> Result<Mle<E>, Error> {
+pub fn materialize<E: IsField + 'static>(
+    columns: &[Mle<E>],
+    source: &FactorSource,
+) -> Result<Mle<E>, Error> {
     let column = columns.get(source.column).ok_or(Error::UnknownPolynomial {
         index: source.column,
         len: columns.len(),

@@ -68,7 +68,7 @@ where
 }
 
 /// The multilinear extension of `eq(r, ·)`.
-pub fn eq_mle<F: IsField>(r: &[FieldElement<F>]) -> Result<Mle<F>, Error> {
+pub fn eq_mle<F: IsField + 'static>(r: &[FieldElement<F>]) -> Result<Mle<F>, Error> {
     Mle::new(eq_evals(r))
 }
 
@@ -225,7 +225,7 @@ pub fn shift_evals<F: IsField>(x: &[FieldElement<F>], k: usize) -> Vec<FieldElem
 }
 
 /// The multilinear extension of `shift_k(x, ·)`.
-pub fn shift_mle<F: IsField>(x: &[FieldElement<F>], k: usize) -> Result<Mle<F>, Error> {
+pub fn shift_mle<F: IsField + 'static>(x: &[FieldElement<F>], k: usize) -> Result<Mle<F>, Error> {
     Mle::new(shift_evals(x, k))
 }
 

@@ -417,6 +417,7 @@ fn phases() {
         ("gpu commits", multilinear::gpu::commit_calls()),
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu rounds", multilinear::gpu::sumcheck_rounds()),
+        ("gpu evals", multilinear::gpu::evaluate_calls()),
     ] {
         println!("{tag:<14} {count:>9}");
     }

@@ -72,7 +72,7 @@ where
 impl<'a, F, E> TableLayout<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + 'static,
 {
     /// Lays out a table's factors and its stack.
     ///
@@ -589,7 +589,11 @@ pub type TableVerdict<E> = (
 /// stack.
 pub fn verify<E, T>(
     proof: &TableProof<E>,
-    statement: TableStatement<'_, impl IsFFTField + IsPrimeField + IsSubFieldOf<E> + Sync, E>,
+    statement: TableStatement<
+        '_,
+        impl IsFFTField + IsPrimeField + IsSubFieldOf<E> + Sync + 'static,
+        E,
+    >,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
@@ -665,8 +669,8 @@ fn check_preprocessed<F, E>(
     reduced: &claim_reduce::ReducedClaim<E>,
 ) -> Result<(), MlError>
 where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
     for (col, column) in statement.preprocessed.iter().enumerate() {
         let factor = slot(statement.slot_of, col)?;

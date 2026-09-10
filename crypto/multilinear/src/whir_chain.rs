@@ -135,7 +135,7 @@ where
 }
 
 /// `w + gamma·eq`, the weight the next group carries.
-fn batch_weight<E: IsField>(
+fn batch_weight<E: IsField + 'static>(
     w: &Mle<E>,
     eq: &Mle<E>,
     gamma: &FieldElement<E>,

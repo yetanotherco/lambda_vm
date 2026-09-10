@@ -106,7 +106,7 @@ fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> F
 /// of megabytes, so the reads are the cost, not the arithmetic.
 fn round_evaluations<F, P>(poly: &P, degree: usize, with_zero: bool) -> Vec<FieldElement<F>>
 where
-    F: IsField,
+    F: IsField + 'static,
     P: SumcheckPolynomial<F> + Sync,
     FieldElement<F>: Send + Sync,
 {

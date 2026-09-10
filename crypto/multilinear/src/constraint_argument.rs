@@ -163,7 +163,7 @@ pub struct TraceData<F: IsField, E: IsField> {
     kinds: Vec<FactorKind>,
 }
 
-impl<F: IsField, E: IsField> TraceData<F, E> {
+impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     /// Checks the shapes agree and that `kinds` asks for exactly the public
     /// tables given.
     pub fn new(

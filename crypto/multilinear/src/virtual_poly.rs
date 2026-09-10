@@ -37,7 +37,7 @@ pub struct VirtualPolynomial<F: IsField> {
     num_vars: usize,
 }
 
-impl<F: IsField> VirtualPolynomial<F> {
+impl<F: IsField + 'static> VirtualPolynomial<F> {
     /// Builds the polynomial, checking that every factor resolves and that all
     /// operands agree on the number of variables.
     pub fn new(polys: Vec<Mle<F>>, terms: Vec<Term<F>>) -> Result<Self, Error> {
@@ -83,7 +83,7 @@ impl<F: IsField> VirtualPolynomial<F> {
     }
 }
 
-impl<F: IsField> SumcheckPolynomial<F> for VirtualPolynomial<F> {
+impl<F: IsField + 'static> SumcheckPolynomial<F> for VirtualPolynomial<F> {
     fn num_vars(&self) -> usize {
         self.num_vars
     }
