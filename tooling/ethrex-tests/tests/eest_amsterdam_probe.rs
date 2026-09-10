@@ -33,22 +33,32 @@ fn eest_amsterdam_fixtures_validate_natively() {
 
     for path in entries {
         let inputs = std::fs::read(&path).expect("read fixture");
+        let name = path.file_name().unwrap().to_string_lossy();
+        // Every field below is read by index, so the shapes are checked first: a short
+        // file or a short output should fail with the message that says which, not with
+        // a slice-index panic. `chars()` because a byte slice of a `str` would panic on
+        // a multi-byte boundary in a non-ASCII filename.
+        // 2 = the big-endian schema-id prefix. Spelled out rather than imported: the
+        // constant lives in `ethrex-common`, which this crate does not depend on.
+        assert!(
+            inputs.len() >= 2,
+            "{name}: file is shorter than the schema-id prefix"
+        );
         let schema_id = u16::from_be_bytes([inputs[0], inputs[1]]);
         let started = std::time::Instant::now();
         let output = run_stateless_guest(&inputs, Arc::new(NativeCrypto));
         let elapsed = started.elapsed();
-        let name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(output.len(), 43, "{name}: unexpected output length");
         println!(
             "{:<60} in={:>9} B schema={:#06x} out={} B ok={} chain_id={} native={:?}",
-            &name[..name.len().min(60)],
+            name.chars().take(60).collect::<String>(),
             inputs.len(),
             schema_id,
             output.len(),
-            output.get(32).copied().unwrap_or(255),
+            output[32],
             u64::from_le_bytes(output[33..41].try_into().unwrap()),
             elapsed,
         );
-        assert_eq!(output.len(), 43, "{name}: unexpected output length");
         assert_eq!(output[32], 1, "{name}: native stateless validation failed");
     }
 }
