@@ -381,13 +381,52 @@ mod tests {
 pub enum RootPublishSet {
     /// The block-level claim only. The L2G agreement is ASSERTED in-machine and
     /// nothing L2G-shaped is published, so no strategy-dependent value enters the
-    /// artifact. ★ Lane A's recommendation.
+    /// artifact. ★ **RULED 2026-09-10, and the default.**
     AssertOnly,
     /// The block-level claim plus the folded L2G digest, as a node publishes it.
     /// ⚠ Carries a strategy-dependent value into the artifact; see above.
     WithFold,
 }
 
+impl Default for RootPublishSet {
+    /// ★ RULED 2026-09-10. The whole decision is one field — [`WithFold`] is
+    /// exactly the node schema and [`AssertOnly`] is that minus
+    /// `lanes_per_root()` — and that field carries a value depending on fan-in
+    /// and tree depth. Publishing it would mean two honest provers at different
+    /// postures emit different artifact bytes for the same block, which is the
+    /// property the campaign's rule protects. Nothing external can consume the
+    /// digest anyway: the global roots live inside the same proof, so the compare
+    /// binds in-machine and the published digest would have no reader.
+    ///
+    /// [`WithFold`]: RootPublishSet::WithFold
+    /// [`AssertOnly`]: RootPublishSet::AssertOnly
+    fn default() -> Self {
+        Self::AssertOnly
+    }
+}
+
+/// ★ WHY NOTHING PAGE-SHAPED IS PUBLISHED EITHER — ✓ VERIFIED, not assumed.
+///
+/// The archive's aggregator published each folded page's base, the private-input
+/// page count and the touched-page list. None of it belongs here, and the reason
+/// is that a consumer can already derive or already holds every piece:
+///
+/// - **The identity pages are ELF-DERIVED.** `recursion::check_attestation` calls
+///   `expected_program_id(trusted_elf, opts)` → `precomputed_commitments(elf,
+///   opts)`, which builds the DECODE commitment and the page commitments from
+///   `Traces::page_configs_from_elf` — **the ELF bytes and the proof options
+///   alone**. No block data, no private input, no bundle. So a consumer holding a
+///   trusted ELF recomputes the whole id unaided, and republishing the pages
+///   would restate what the id already commits to.
+/// - **The runtime touched-page list is a different set, and is already bound.**
+///   It is verifier input for rebuilding the GLOBAL_MEMORY AIR set, and
+///   `continuation.rs:585-590` records that it is bus-enforced: a wrong set
+///   imbalances the GlobalMemory bus or mismatches the AIR count, and it is bound
+///   into the global Fiat-Shamir statement. A published copy would add nothing a
+///   forger could not already not-do.
+///
+/// ⇒ Publishing page material would be redundant twice over, by two different
+/// mechanisms. That is why this is an absence with a reason rather than a gap.
 /// Everything the root verifies and binds.
 ///
 /// The interior children are the top interior level's nodes — `<= fan_in` of
