@@ -229,7 +229,7 @@ jobs:
           # because vast can't numerically compare the driver_version string server-side.
           MIN_DRIVER: "580"
         run: |
-          # cpu_ram filter is in GB. Floor 64 GB, raised from 48 with the ethrex 25
+          # cpu_ram filter is in GB. Floor 64 GB, raised from 48 with the rebuilt
           # workload: that block peaks at 44.81 GiB (47.0 GB) at epoch 2^22 on the CPU
           # path, which on a 48 GB box is 98% of RAM -- not headroom to lose to a
           # rental with a slightly hungrier allocator, it is already over. 64 GB restores the ~28% headroom the

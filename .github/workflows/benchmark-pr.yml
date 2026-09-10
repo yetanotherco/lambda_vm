@@ -113,7 +113,7 @@ env:
   #
   # The pre-bump numbers this replaces (block 25368371, 50.78M cycles, 158.8 s at
   # 2^22 on this runner, ~52 GB) measured a DIFFERENT workload: that fixture was an
-  # rkyv ProgramInput, which ethrex 25's guest rejects. Do not compare across the
+  # rkyv ProgramInput, which the pinned guest rejects. Do not compare across the
   # bump. This block was picked to land as close to it as an Amsterdam rebuild can —
   # see the screen in the Makefile's ETHREX_REAL_BLOCK comment.
   #
@@ -315,7 +315,7 @@ jobs:
         if: steps.config.outputs.run_real == 'true'
         run: |
           # Gitignored and never in the checkout, like the synthetic fixtures above.
-          # Built, not downloaded: ethrex 25's guest decodes only the Amsterdam schema,
+          # Built, not downloaded: the pinned guest decodes only the Amsterdam schema,
           # so a hosted artifact for this pre-Amsterdam block cannot be valid — it would
           # run ~500 cycles and commit `successful_validation = 0` without failing. The
           # generator rebuilds the block's real transactions on its real pre-state and

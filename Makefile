@@ -316,7 +316,7 @@ ETHREX_REAL_BLOCK := 25453112
 # not a selection criterion — every pre-Amsterdam block loses 26-50% of its
 # transactions to the fork, which is a property of the fork and not of the block.
 #
-# The fixture is GENERATED from the cache below, not fetched. ethrex 25's guest
+# The fixture is GENERATED from the cache below, not fetched. The pinned guest
 # decodes only the Amsterdam schema (`0x1501`) and mainnet has no Amsterdam fork,
 # so no hosted artifact for this block can be valid: the release's rkyv one now
 # runs 496 cycles and commits `successful_validation = 0` instead of failing.

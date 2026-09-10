@@ -1,7 +1,7 @@
 //! Rebuild a real mainnet block as an Amsterdam block the stateless guest accepts.
 //!
 //! The retired benchmark fixture (`ethrex_mainnet_25368371.bin`) is an rkyv
-//! `ProgramInput` from before execution-specs #3278. ethrex 25's guest only
+//! `ProgramInput` from before execution-specs #3278. The pinned guest only
 //! decodes schema `0x1501` (Amsterdam) and mainnet has no Amsterdam fork yet, so
 //! that block cannot be re-serialized: it has no block access list hash and no
 //! slot number, and its state carries none of the EIP-8282 predeploys Amsterdam

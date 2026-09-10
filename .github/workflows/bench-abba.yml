@@ -27,7 +27,7 @@ name: Bench ABBA tiebreaker
 # exclusivity line reporting the CPU share of every prove and flagging any that came in
 # under 90% of the batch's best. A flagged batch belongs in the right-hand column.
 #
-# The rebuild for ethrex 25 did tighten this, but not as far as first recorded: a
+# The workload rebuild did tighten this, but not as far as first recorded: a
 # 5-prove baseline put the CV at 0.57%, and its 95% interval was [0.34%, 1.64%] — wide
 # enough that the point estimate was not worth pinning a table to, which is what the
 # 14-prove follow-up then showed. Numbers from before the bump measured a different

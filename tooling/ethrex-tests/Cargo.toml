@@ -12,7 +12,7 @@ executor = { path = "../../executor" }
 # Pinned to the SAME ethrex rev as the guest so the native reference reads the
 # same SSZ stateless input and output. Re-pin every manifest together with
 # scripts/set_ethrex_rev.sh.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-guest-program" }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program" }
 libssz = "=0.3.0"
 
 # Match the root workspace's optimized dev profile: these tests execute the VM.

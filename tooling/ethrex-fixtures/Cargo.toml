@@ -2,6 +2,12 @@
 name = "ethrex-fixtures"
 version = "0.1.0"
 edition = "2024"
+# This crate grew a second binary (`real_block`), which made a bare `cargo run`
+# ambiguous and broke `make regen-ethrex-fixtures` plus the commands the fixture
+# READMEs tell you to run on a rev bump. The synthetic generator is the one that
+# should answer to a bare `cargo run`; the real-block rebuild is always explicit
+# (`--bin real_block`, as the Makefile invokes it).
+default-run = "ethrex-fixtures"
 
 # Detached workspace: keeps the heavy ethrex host deps out of the main build.
 [workspace]
@@ -10,15 +16,15 @@ edition = "2024"
 # Pinned to the SAME ethrex rev as the guest so generated SSZ inputs match what
 # the stateless guest deserializes. Re-pin every manifest together with
 # scripts/set_ethrex_rev.sh.
-ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-blockchain" }
-ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-storage" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-common" }
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-guest-program" }
-ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-l2-rpc" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-rlp" }
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-blockchain" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-storage" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-common" }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program" }
+ethrex-l2-rpc = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-l2-rpc" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-rlp" }
 # Walking the witness tries: the storage keys are `keccak(slot)`, so recovering a
 # genesis-shaped alloc from a witness needs the node types, not just the accessors.
-ethrex-trie = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-trie" }
+ethrex-trie = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-trie" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Exact pin: keep the SSZ implementation in sync with the guest's ethrex rev.

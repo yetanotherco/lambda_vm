@@ -93,7 +93,10 @@ EEST benchmark fixtures; `ETHREX_BENCH_WORKLOAD_AFTER_BUMP.md` in the repository
 root has both sets measured side by side.
 
 Measured on the guest ELF at ethrex `2cb18b0b`: 37,137,386 cycles, 6,003 keccak
-calls, 164 ECSM calls. Fixture: 549,144 bytes.
+calls, 164 ECSM calls. Fixture: 549,144 bytes. The pin has since moved to
+`8effcb06`, which declares 26.0.0 and whose tree is byte-identical in every crate
+this repo compiles, so the counts carry — and the fixture regenerates to the same
+digest at both.
 
 **Pin the ELF whenever you quote a cycle count.** Those three counts are
 deterministic for a given ELF and input, and they move with anything that changes

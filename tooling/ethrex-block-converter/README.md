@@ -14,7 +14,7 @@ cargo run --release -- <cache.json> <output_path>
 ```
 
 The output starts with the two-byte big-endian schema ID `0x1501`. The current
-ethrex 25 stateless schema validates one Amsterdam block at a time. A replay
+pinned stateless schema validates one Amsterdam block at a time. A replay
 cache must therefore contain one block, its `slot_number`, its
 `block_access_list_hash`, and the raw BAL when the BAL is non-empty. Caches
 created before Amsterdam are rejected rather than silently rewriting their
@@ -30,7 +30,7 @@ The converter, fixture generator, guest, and host tests all pin:
 
 ```text
 https://github.com/lambdaclass/ethrex.git
-2cb18b0b95b27a2555d3debffdebc43c9685d6e3
+8effcb0671c5d0b12fe0161ea37c174ec4466b6a
 ```
 
 Keep these pins together. The SSZ wire format and the guest implementation are
@@ -54,7 +54,7 @@ sha256sum "$(make -s print-real-block-fixture)"
 Publish the resulting SSZ artifact and matching Amsterdam cache, then update
 their URLs and checksums in the Makefile before enabling the real-block
 benchmark. The old release assets are rkyv `ProgramInput` artifacts and are
-incompatible with ethrex 25.
+incompatible with the pinned ethrex.
 
 The converter's tests use the Hoodi cache under `caches/` and verify that an
 unmapped network is rejected. The checked release cache predates Amsterdam, so

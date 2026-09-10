@@ -9,14 +9,14 @@ edition = "2024"
 [dependencies]
 # Pinned to the SAME ethrex rev as the guest so the generated SSZ input matches
 # what the stateless guest deserializes.
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-common", default-features = false, features = ["secp256k1"] }
-ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-config", default-features = false }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-common", default-features = false, features = ["secp256k1"] }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-config", default-features = false }
 # Provides `NativeCrypto`, the host `Crypto` implementation used to recover
 # transaction keys, hash the BAL, and validate the generated stateless input.
 # Already in the graph via `ethrex-config` -> `ethrex-p2p`, so this adds no
 # compilation; the line exists because the bin build needs its own.
-ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-crypto", default-features = false, features = ["secp256k1"] }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-rlp" }
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-crypto", default-features = false, features = ["secp256k1"] }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-rlp" }
 # Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
 #
 # CAVEAT: this line alone does NOT reproduce the guest's precompile surface. The
@@ -27,7 +27,7 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0
 # verify with `cargo tree -e features -i ethrex-crypto`. c-kzg is the whole gap now —
 # malachite modexp and `ark-ff/asm` are on both sides since ethrex-trie's `std` default.
 # Closing it means dropping `ethrex-config` and sourcing `ChainConfig` another way.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "2cb18b0b95b27a2555d3debffdebc43c9685d6e3", package = "ethrex-guest-program", default-features = false }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program", default-features = false }
 
 # Exact pin: keep the SSZ implementation in sync with the guest's ethrex rev.
 libssz = "=0.3.0"

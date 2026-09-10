@@ -86,7 +86,7 @@ jobs:
             tooling/ethrex-fixtures -> target
             tooling/ethrex-tests -> target
 
-      # Built from the block's replay cache, not downloaded: ethrex 25's guest decodes
+      # Built from the block's replay cache, not downloaded: the pinned guest decodes
       # only the Amsterdam schema, so no hosted artifact for a pre-Amsterdam block can
       # be valid. The generator validates the block through the guest before writing,
       # which is what the screen below then re-checks against the ELF. The guard covers

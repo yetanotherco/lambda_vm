@@ -108,7 +108,7 @@ fn stateless_input_from_cache(
     };
     if cache.blocks.len() != 1 {
         return Err(format!(
-            "cache contains {} blocks; the ethrex 25 stateless guest accepts one block",
+            "cache contains {} blocks; the pinned stateless guest accepts one block",
             cache.blocks.len()
         )
         .into());

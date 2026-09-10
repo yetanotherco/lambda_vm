@@ -10,14 +10,14 @@ commit:
 
 ```text
 https://github.com/lambdaclass/ethrex.git
-2cb18b0b95b27a2555d3debffdebc43c9685d6e3
+8effcb0671c5d0b12fe0161ea37c174ec4466b6a
 ```
 
 Five manifests carry that pin, not one. `scripts/set_ethrex_rev.sh --show` prints
 it and fails if they ever disagree.
 
 The generator enables Amsterdam in its synthetic genesis and includes the two
-EIP-8282 request predeploys required by ethrex 25.
+EIP-8282 request predeploys the pinned ethrex requires.
 
 ### Generation
 
@@ -75,7 +75,7 @@ ethrex_bench_4.bin
 The blocks above are synthetic. For a representative workload — real contract
 execution, real trie depth, real bytecode — `make ethrex-real-block-fixture`
 BUILDS `ethrex_mainnet_25453112.bin` from the block's replay cache, which is the
-only fetched artifact; nothing about the fixture is published, because ethrex 25's
+only fetched artifact; nothing about the fixture is published, because the pinned
 guest decodes only the Amsterdam schema and no hosted artifact for a pre-Amsterdam
 block can be valid. It is gitignored rather than committed, so its digest lives
 next to the block pin in the Makefile rather than in the table above, and it is
