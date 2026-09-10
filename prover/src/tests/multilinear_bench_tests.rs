@@ -368,7 +368,138 @@ fn phases() {
         );
     }
     println!("{:<14} {:>9.2}", "total", total.as_secs_f64());
+    // Which pieces of the argument ran on device. A zero here with the `cuda`
+    // feature on is the signal that a dispatch declined and the phase above is
+    // a CPU number wearing a GPU label.
+    #[cfg(feature = "cuda")]
+    println!(
+        "{:<14} {:>9}",
+        "gpu grinds",
+        stark::gpu_lde::gpu_grind_calls()
+    );
     assert_eq!(proof.tables.len(), count);
+}
+
+/// Where `commit` goes, pass by pass.
+///
+/// The phase is one Möbius transform, one NTT and one Merkle commit per stacked
+/// polynomial, and only the last two have a kernel already. This says which of
+/// the three is worth a kernel first, on the real workload rather than on an
+/// operation count.
+#[test]
+#[ignore]
+fn commit_phases() {
+    use multilinear::whir::{self, Domain};
+    use multilinear::whir_commit::CodewordCommitment;
+    use stark::multilinear_air::Uniforms;
+    use stark::multilinear_table::{self, TableLayout};
+
+    use crate::test_utils::{E, F};
+
+    let name =
+        std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "all_instructions_64".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let elf = Elf::load(&bytes).expect("load");
+    let logs = Executor::new(&elf, inputs.clone())
+        .and_then(Executor::run)
+        .expect("run")
+        .logs;
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).expect("trace");
+    let table_counts = traces.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &options(),
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let pairs = airs.air_trace_pairs(&mut traces);
+
+    // The columns that actually get committed are the live ones the layout
+    // keeps, not every column of the trace.
+    let mut columns: Vec<multilinear::mle::Mle<F>> = Vec::new();
+    let mut shapes: Vec<(usize, usize)> = Vec::new();
+    for (air, trace, _) in &pairs {
+        let main = trace.columns_main();
+        let num_vars = main[0].len().trailing_zeros() as usize;
+        let layout = TableLayout::<F, E>::new(
+            air.constraint_program(),
+            air.constraints_meta(),
+            air.bus_interactions(),
+            main.len(),
+            num_vars,
+            Uniforms::default(),
+        )
+        .expect("layout");
+        let keys = layout.column_keys().to_vec();
+        shapes.push((keys.len(), num_vars));
+        for key in keys {
+            columns
+                .push(multilinear::mle::Mle::new(main[key.col as usize].clone()).expect("column"));
+        }
+    }
+    let config = multilinear_prove::chain_config(&shapes);
+    let layout = multilinear_table::global_layout(&shapes).expect("global layout");
+    let start = Instant::now();
+    let polys = layout.stack(&columns).expect("stack");
+    let stack = start.elapsed();
+    drop(columns);
+
+    let mut lift = std::time::Duration::ZERO;
+    let mut encode = std::time::Duration::ZERO;
+    let mut merkle = std::time::Duration::ZERO;
+    for poly in &polys {
+        let domain = Domain::<F>::new(poly.num_vars() + config.log_blowup).expect("domain");
+        let start = Instant::now();
+        let coeffs = whir::lift_coefficients(poly);
+        lift += start.elapsed();
+        let start = Instant::now();
+        let codeword = whir::encode::<F, F>(&coeffs, &domain).expect("encode");
+        encode += start.elapsed();
+        let start = Instant::now();
+        let commitment = CodewordCommitment::new(
+            &codeword,
+            config
+                .schedule(poly.num_vars())
+                .first()
+                .copied()
+                .unwrap_or(0),
+        )
+        .expect("commit");
+        merkle += start.elapsed();
+        drop(commitment);
+    }
+
+    let label = if input.is_empty() { &name } else { &input };
+    let total = stack + lift + encode + merkle;
+    println!(
+        "\n{label} — {} stacked polynomials of 2^{} cells, blowup {}",
+        polys.len(),
+        layout.n_stack(),
+        1 << config.log_blowup,
+    );
+    println!("{:<14} {:>9} {:>7}", "pass", "seconds", "share");
+    for (tag, took) in [
+        ("stack", stack),
+        ("lift", lift),
+        ("encode", encode),
+        ("merkle", merkle),
+    ] {
+        println!(
+            "{tag:<14} {:>9.2} {:>6.1}%",
+            took.as_secs_f64(),
+            100.0 * took.as_secs_f64() / total.as_secs_f64()
+        );
+    }
+    println!("{:<14} {:>9.2}", "total", total.as_secs_f64());
 }
 
 /// What a proof is made of, part by part.
@@ -459,7 +590,6 @@ fn proof_composition() {
 #[ignore]
 fn constraint_program_sizes() {
     use crate::test_utils::{E, F};
-    use stark::traits::AIR;
     let bytes = elf_bytes("ethrex");
     let inputs = input_bytes("ethrex_10_transfers");
     let elf = Elf::load(&bytes).unwrap();
