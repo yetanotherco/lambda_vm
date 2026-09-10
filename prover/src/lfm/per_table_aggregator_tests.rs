@@ -3048,6 +3048,45 @@ fn the_production_tree_composes_to_a_root() {
     // rejects_tampers` only EXECUTES this program, it has never proved it.
     let t = Instant::now();
     let g = real_global(&inputs.elf_bytes, &bundle, &inner);
+
+    // ★★ THE GO/NO-GO ON SLICING, and it proves NOTHING so it cannot abort.
+    //
+    // The unsliced global wrap aborts at `LFM_HASH` 2^21 x 329 = 26.22 GiB — over
+    // the 16000 budget AND over the 80% default of 25.12, which is why no budget
+    // change alone could clear it. Halving the WALKS should halve that to
+    // 13.11 GiB, under 15.625. ⇒ Whether it does is one emission away, and the
+    // whole partial-bus-sum story rests on it.
+    //
+    // ⛔ FALSIFIER, as registered: `LFM_HASH` still at 2^21 at k = 2 means the
+    // walks are NOT what dominates and the mechanism is wrong. Report the miss;
+    // do not repair the estimate.
+    if std::env::var("LFM_TREE_SIZE_GLOBAL").is_ok() {
+        println!(
+            "\n★★★ SIZING THE GLOBAL WRAP — emitted, never proved. {} tables \
+             ({} L2G), {} epochs.",
+            g.tables.len(),
+            g.num_l2g,
+            bundle.num_epochs(),
+        );
+        for k in [1usize, 2] {
+            let partition = super::global_split::SlicePartition::even(g.tables.len(), k);
+            for slice in 0..k {
+                let (lo, hi) = partition.slice(slice);
+                let t = Instant::now();
+                let program = global_slice_program(&g, &partition, slice);
+                let label = format!("global k={k} slice {slice} (tables {lo}..{hi})");
+                println!("\n── {label}: emitted in {:.1}s", t.elapsed().as_secs_f64());
+                census_and_panel(&program, &label, fan_in);
+            }
+        }
+        println!(
+            "\n⇒ COMPARE `LFM_HASH`'s COMMITTED HEIGHT at k=1 against k=2. 2^21 -> \
+             2^20 confirms the mechanism and clears the budget (26.22 -> 13.11 GiB \
+             against 15.625). Still 2^21 REFUTES it."
+        );
+        return;
+    }
+
     let program = global_verifier_program(&g);
     let arenas = global_arena_words(&g);
     let artifacts =
