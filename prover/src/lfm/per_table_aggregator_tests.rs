@@ -2861,6 +2861,65 @@ fn the_production_tree_composes_to_a_root() {
         t_level.elapsed().as_secs_f64()
     );
 
+    // ---- level 0, the OTHER child: the GLOBAL WRAP.
+    //
+    // ★ The root takes `fan_in + 1` children and this is the extra one. It is
+    // not an epoch wrap and never appears at an interior level, so a cache that
+    // holds `bundle` + N epoch wraps + every node is complete for the INTERIOR
+    // and missing exactly the child that makes a root a root.
+    //
+    // ✓ Everything it needs is already in the bundle: `ContinuationProof` carries
+    // `global`, `num_private_input_pages` and `touched_page_bases`
+    // (`continuation.rs:581-591`), and `real_global` harvests straight from it —
+    // so no re-prove of the base is ever required to produce this.
+    // ⚠ But the global wrap PROOF is new work: `the_global_verifier_leg_runs_and_
+    // rejects_tampers` only EXECUTES this program, it has never proved it.
+    let t = Instant::now();
+    let g = real_global(&inputs.elf_bytes, &bundle, &inner);
+    let program = global_verifier_program(&g);
+    let arenas = global_arena_words(&g);
+    let artifacts =
+        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let proved = cached_stage(
+        stage_mode(0),
+        stage_path(cache_dir.as_deref(), "global-wrap"),
+        "the GLOBAL wrap (the root's extra child)",
+        || {
+            lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                .expect("the global wrap must prove")
+        },
+    );
+    // ⛔ Its own message. A root that cannot find its GLOBAL child is a different
+    // failure from one that cannot find a node child, and a generic cache miss
+    // would report the reader's hypothesis rather than what happened.
+    let g_layout = super::block_root::GlobalLayout {
+        num_epochs: g.num_l2g,
+        lanes_per_root: super::proof_arena::lanes_per_root(),
+    };
+    assert_eq!(
+        proved.public_words.len(),
+        g_layout.total(),
+        "THE GLOBAL WRAP'S LAYOUT DOES NOT DESCRIBE IT: it published {} words, \
+         the layout says {} (z, alpha, then {} L2G roots x {} lanes). Every index \
+         the root's L2G compare reads is shifted by this, so it must abort here \
+         rather than compare the wrong words",
+        proved.public_words.len(),
+        g_layout.total(),
+        g_layout.num_epochs,
+        g_layout.lanes_per_root,
+    );
+    println!(
+        "   ★ GLOBAL WRAP: {:.1}s, {} published words ({} L2G roots), {} \
+         sub-proofs, {} touched pages in the bundle",
+        t.elapsed().as_secs_f64(),
+        proved.public_words.len(),
+        g.num_l2g,
+        g.tables.len(),
+        bundle.touched_pages().len(),
+    );
+    let _global_child = real_child(artifacts, wrap_opts.clone(), &proved);
+    mark("AFTER the global wrap");
+
     // ---- levels 1..=hi.
     let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
     for (li, level) in shape.iter().enumerate().take(hi) {

@@ -689,8 +689,25 @@ pub fn digest_from_lanes(b: &mut LfmBuilder, lanes: &[Felt]) -> super::edsl::Wra
 /// and the root recomputes the same fold over the global wrap's published roots
 /// and compares one digest.
 ///
-/// The rule is stated here because the root must replicate it exactly: left
-/// fold, in tree order, `hash_pair(acc, next)`; a single root folds to itself.
+/// ⛔ **THE FOLD COMPOUNDS: IT IS TREE-SHAPED, NOT FLAT.** An earlier version of
+/// this paragraph said only *"left fold, in tree order"*, which is true of ONE
+/// node and actively misleading at the ROOT — which is exactly where it is read.
+///
+/// A node folds its children's PUBLISHED digests, and a node child's published
+/// digest is already a fold. So a level-1 node publishes `H(r0, r1)` and a
+/// level-2 node publishes `H(H(r0,r1), H(r2,r3))` — **not** the flat left fold
+/// `H(H(H(r0,r1),r2),r3)`. `hash_pair` is a two-to-one compression and is not
+/// associative, so those are different digests.
+///
+/// ⇒ The global wrap publishes the FLAT list of per-epoch roots. A root that
+/// folds them left to right computes a digest an honest prover never produced,
+/// and the failure lands on **completeness, not soundness**: correct code,
+/// correct inputs, honest prover, wrong answer — the worst kind to diagnose from
+/// a failing prove. The root must group them exactly as the interior did, level
+/// by level, which is what `block_root::FoldShape` exists to make unavoidable.
+///
+/// Within ONE node the rule is: left fold, `hash_pair(acc, next)`, in child
+/// order; a single child folds to itself.
 pub fn fold_l2g(
     b: &mut LfmBuilder,
     digests: &[super::edsl::WrapDigest],
