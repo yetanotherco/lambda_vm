@@ -86,19 +86,26 @@ impl<F: IsFFTField + IsPrimeField> Domain<F> {
 /// The inverse of the evaluation map: reading a multilinear's `2^m` hypercube
 /// values as `Σ_S ĉ_S ∏_{i∈S} x_i`. Computed by the Möbius transform, in
 /// `O(m·2^m)`.
-pub fn monomial_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>> {
+pub fn monomial_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
     let mut coeffs = mle.evals().to_vec();
     let n = coeffs.len();
     let mut stride = 1;
     while stride < n {
-        let mut start = 0;
-        while start < n {
-            for i in start..start + stride {
-                let lo = coeffs[i].clone();
-                coeffs[i + stride] = &coeffs[i + stride] - &lo;
+        // Each block of `2·stride` is independent: its high half takes the low
+        // half away and nothing crosses the boundary.
+        let level = |chunk: &mut [FieldElement<F>]| {
+            let (lo, hi) = chunk.split_at_mut(stride);
+            for (h, l) in hi.iter_mut().zip(lo.iter()) {
+                *h = &*h - l;
             }
-            start += stride * 2;
-        }
+        };
+        #[cfg(feature = "parallel")]
+        coeffs.par_chunks_mut(stride * 2).for_each(level);
+        #[cfg(not(feature = "parallel"))]
+        coeffs.chunks_mut(stride * 2).for_each(level);
         stride *= 2;
     }
     coeffs
@@ -108,17 +115,28 @@ pub fn monomial_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>> {
 ///
 /// Reverses the coefficient index so variable 0 is the low bit, making one fold
 /// bind the variable one sumcheck round binds.
-pub fn lift_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>> {
+pub fn lift_coefficients<F: IsField>(mle: &Mle<F>) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
     let coeffs = monomial_coefficients(mle);
     let num_vars = mle.num_vars();
-    (0..coeffs.len())
-        .map(|i| coeffs[reverse_bits(i, num_vars)].clone())
-        .collect()
+    let gather = |i: usize| coeffs[reverse_bits(i, num_vars)].clone();
+    #[cfg(feature = "parallel")]
+    return (0..coeffs.len()).into_par_iter().map(gather).collect();
+    #[cfg(not(feature = "parallel"))]
+    return (0..coeffs.len()).map(gather).collect();
 }
 
 /// Reverses the low `width` bits of `index`.
+///
+/// One instruction and a shift, not a loop over the bits: this runs once per
+/// element of a codeword, so the difference is a pass over the whole thing.
 fn reverse_bits(index: usize, width: usize) -> usize {
-    (0..width).fold(0, |acc, i| acc | (((index >> i) & 1) << (width - 1 - i)))
+    if width == 0 {
+        return 0;
+    }
+    index.reverse_bits() >> (usize::BITS as usize - width)
 }
 
 /// Evaluates the univariate lift on every point of `domain`, in domain order:

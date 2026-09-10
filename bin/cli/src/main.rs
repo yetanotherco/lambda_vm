@@ -830,7 +830,8 @@ fn cmd_prove_whir(
     }
 
     eprintln!("Proof written to {:?}", output_path);
-    println!("Tables: {}", proof.tables.len());
+    println!("Tables: {}", proof.proof.tables.len());
+    println!("Commitments: {}", proof.proof.roots.len());
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
     }
