@@ -116,7 +116,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     // One commitment for the whole trace, one opening, one pass over the rows.
     assert_eq!(table.roots().len(), 1);
     assert_eq!(proofs[0].constraint.columns.polys.len(), 1);
-    assert_eq!(proofs[0].constraint.sumcheck.rounds.len(), num_vars);
+    assert_eq!(proofs[0].constraint.core.sumcheck.rounds.len(), num_vars);
 
     // The verifier rebuilds the layout from the AIR alone - no trace - and the
     // roots it absorbs come out of the proof.

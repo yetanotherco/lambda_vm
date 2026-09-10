@@ -860,7 +860,10 @@ mod tests {
             // Three statements — the constraint and the bus's two claims — in
             // one pass over the table's rows, one commitment for the whole
             // trace and one opening to settle it.
-            assert_eq!(proof.constraint.sumcheck.rounds.len(), table.num_vars());
+            assert_eq!(
+                proof.constraint.core.sumcheck.rounds.len(),
+                table.num_vars()
+            );
             assert_eq!(proof.constraint.columns.polys.len(), 1);
             assert_eq!(table.roots().len(), 1);
         }

@@ -367,3 +367,80 @@ fn phases() {
     println!("{:<14} {:>9.2}", "total", total.as_secs_f64());
     assert_eq!(proofs.len(), tables.len());
 }
+
+/// What a proof is made of, part by part.
+///
+/// The multilinear proof grows with the **number of tables**, and the suspicion
+/// is that the per-table WHIR opening is why: every table commits on its own,
+/// so every table pays its own queries. This says how much of the bytes that
+/// actually is, which is what decides whether stacking the tables together is
+/// worth the work.
+#[test]
+#[ignore]
+fn proof_composition() {
+    let name =
+        std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "all_instructions_64".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let proof = multilinear_prove::prove_with_options_and_inputs(
+        &bytes,
+        &inputs,
+        &options(),
+        &MaxRowsConfig::default(),
+    )
+    .expect("prove");
+
+    let size = |v: &[u8]| v.len() as f64 / (1024.0 * 1024.0);
+    let ser = |x: &dyn Fn() -> Vec<u8>| x();
+    let total = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+        .expect("whole")
+        .len();
+
+    // Each part on its own, summed across tables.
+    let mut gkr = 0usize;
+    let mut sumcheck = 0usize;
+    let mut reduce = 0usize;
+    let mut columns = 0usize;
+    let mut factor_values = 0usize;
+    for t in &proof.tables {
+        gkr += rkyv::to_bytes::<rkyv::rancor::Error>(&t.gkr)
+            .expect("gkr")
+            .len();
+        sumcheck += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.sumcheck)
+            .expect("sumcheck")
+            .len();
+        reduce += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.reduce)
+            .expect("reduce")
+            .len();
+        columns += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.columns)
+            .expect("columns")
+            .len();
+        factor_values += rkyv::to_bytes::<rkyv::rancor::Error>(&t.constraint.core.factor_values)
+            .expect("factor_values")
+            .len();
+    }
+    let _ = ser;
+
+    let label = if input.is_empty() { &name } else { &input };
+    println!("\n{label} — {} tables", proof.tables.len());
+    println!(
+        "{:<18} {:>10} {:>8} {:>12}",
+        "part", "MiB", "share", "per table"
+    );
+    for (tag, n) in [
+        ("WHIR opening", columns),
+        ("GKR", gkr),
+        ("sumcheck", sumcheck),
+        ("claim reduce", reduce),
+        ("factor values", factor_values),
+    ] {
+        println!(
+            "{tag:<18} {:>10.2} {:>7.1}% {:>11.3}",
+            size(&vec![0u8; n]),
+            100.0 * n as f64 / total as f64,
+            size(&vec![0u8; n]) / proof.tables.len() as f64,
+        );
+    }
+    println!("{:<18} {:>10.2}", "whole proof", size(&vec![0u8; total]));
+}

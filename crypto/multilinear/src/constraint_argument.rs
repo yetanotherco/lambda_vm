@@ -333,6 +333,27 @@ pub struct TraceClaim<'a, F: IsFFTField + IsPrimeField> {
 )]
 #[serde(bound = "")]
 pub struct ConstraintProof<F: IsField, E: IsField> {
+    pub core: ConstraintCore<E>,
+    /// The columns' values at the reduced point, against the stack.
+    pub columns: StackedProof<F, E>,
+}
+
+/// A statement bundle's argument **up to** the columns' claims.
+///
+/// Split out because the opening need not belong to one bundle: when several
+/// tables share a commitment, each produces a core of its own and the stack is
+/// opened once for all of them.
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct ConstraintCore<E: IsField> {
     /// The one sumcheck every statement shares.
     pub sumcheck: SumcheckProof<E>,
     /// Each **committed** factor's value at the sumcheck point. The public
@@ -340,8 +361,6 @@ pub struct ConstraintProof<F: IsField, E: IsField> {
     pub factor_values: Vec<FieldElement<E>>,
     /// Binds every committed factor value to the column it reads.
     pub reduce: ReduceProof<E>,
-    /// The columns' values at the reduced point, against the stack.
-    pub columns: StackedProof<F, E>,
 }
 
 /// Proves every statement in one sumcheck and settles it against the
@@ -360,6 +379,40 @@ pub fn prove_statements<F, E, T>(
     config: &ChainConfig,
     transcript: &mut T,
 ) -> Result<ConstraintProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+{
+    let (core, reduced_point) = prove_core::<F, E, T>(trace, weights, rules, claims, transcript)?;
+
+    // Every column's value at one shared point, so the whole trace is settled
+    // against the stack in one go.
+    let columns = stacked_eval::prove::<F, E, T>(
+        &trace.stacked,
+        &stacked_eval::Claimed::Shared(&reduced_point),
+        &core.reduce.column_values,
+        config,
+        transcript,
+    )?;
+
+    Ok(ConstraintProof { core, columns })
+}
+
+/// The argument up to the columns' claims, leaving the opening to the caller.
+///
+/// Returns the point the columns are claimed at, which is what a caller
+/// settling several tables against one commitment collects before opening it
+/// once.
+pub fn prove_core<F, E, T>(
+    trace: &CommittedTrace<F, E>,
+    weights: Vec<Mle<E>>,
+    rules: Vec<Rule<'_, E>>,
+    claims: &[FieldElement<E>],
+    transcript: &mut T,
+) -> Result<(ConstraintCore<E>, Vec<FieldElement<E>>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -393,22 +446,14 @@ where
         transcript,
     )?;
 
-    // Every column's value at one shared point, so the whole trace is settled
-    // against the stack in one go.
-    let columns = stacked_eval::prove::<F, E, T>(
-        &trace.stacked,
-        &stacked_eval::Claimed::Shared(&reduced_point),
-        &reduce.column_values,
-        config,
-        transcript,
-    )?;
-
-    Ok(ConstraintProof {
-        sumcheck,
-        factor_values,
-        reduce,
-        columns,
-    })
+    Ok((
+        ConstraintCore {
+            sumcheck,
+            factor_values,
+            reduce,
+        },
+        reduced_point,
+    ))
 }
 
 /// Verifies the statements against the commitments.
@@ -440,33 +485,21 @@ where
     T: IsTranscript<E>,
     P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
 {
-    let roots = claim_shape.roots;
-    let kinds = claim_shape.kinds;
-
-    // The rules rebuild the statements from the factor values: the committed
-    // ones out of the proof, the public ones recomputed here.
-    let point = batch::verify(
-        &proof.sumcheck,
+    let reduced = verify_core(
+        &proof.core,
+        claim_shape.kinds,
+        claim_shape.layout.placements().len(),
+        claim_shape.num_vars,
         rules,
         claims,
-        |at: &[FieldElement<E>]| weave(kinds, &proof.factor_values, &public_values(at)?),
-        claim_shape.num_vars,
-        transcript,
-    )?;
-
-    let reduced = claim_reduce::verify(
-        &proof.reduce,
-        &sources_of(kinds),
-        &proof.factor_values,
-        &point,
-        claim_shape.layout.placements().len(),
+        public_values,
         transcript,
     )?;
 
     stacked_eval::verify::<F, E, T>(
         &proof.columns,
         claim_shape.layout,
-        roots,
+        claim_shape.roots,
         &stacked_eval::Claimed::Shared(&reduced.point),
         &reduced.column_values,
         claim_shape.domain,
@@ -475,6 +508,51 @@ where
     )?;
 
     Ok(reduced)
+}
+
+/// The verifying half of [`prove_core`]: everything up to the columns' claims,
+/// leaving the opening to the caller.
+///
+/// `num_columns` is the table's own column count, which is what
+/// [`claim_reduce`] reduces to — not the width of whatever stack those columns
+/// end up sharing.
+#[allow(clippy::too_many_arguments)]
+#[must_use = "the column values are the only place a known column can be checked"]
+pub fn verify_core<E, T, P>(
+    core: &ConstraintCore<E>,
+    kinds: &[FactorKind],
+    num_columns: usize,
+    num_vars: usize,
+    rules: &[Rule<'_, E>],
+    claims: &[FieldElement<E>],
+    public_values: P,
+    transcript: &mut T,
+) -> Result<claim_reduce::ReducedClaim<E>, Error>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
+{
+    // The rules rebuild the statements from the factor values: the committed
+    // ones out of the proof, the public ones recomputed here.
+    let point = batch::verify(
+        &core.sumcheck,
+        rules,
+        claims,
+        |at: &[FieldElement<E>]| weave(kinds, &core.factor_values, &public_values(at)?),
+        num_vars,
+        transcript,
+    )?;
+
+    claim_reduce::verify(
+        &core.reduce,
+        &sources_of(kinds),
+        &core.factor_values,
+        &point,
+        num_columns,
+        transcript,
+    )
 }
 
 /// The single-constraint case: `Σ_x eq(r,x)·C(x) = 0`.
@@ -666,7 +744,7 @@ mod tests {
         let mut proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
 
         // Claim a different value for one factor, leaving everything else.
-        proof.factor_values[0] += FE::one();
+        proof.core.factor_values[0] += FE::one();
 
         let err = verify(
             &proof,
@@ -745,7 +823,7 @@ mod tests {
         let columns = satisfying(3);
         let trace = CommittedTrace::<F, F>::commit(columns, &config()).unwrap();
         let mut proof = prove(&trace, constraint, 2, &config(), &mut transcript()).unwrap();
-        proof.factor_values.pop();
+        proof.core.factor_values.pop();
 
         let err = verify(
             &proof,
@@ -974,7 +1052,7 @@ mod tests {
         )
         .unwrap();
         let mut proof = prove(&trace, transition, 1, &config(), &mut transcript()).unwrap();
-        proof.reduce.column_values[0] += FE::one();
+        proof.core.reduce.column_values[0] += FE::one();
 
         let err = verify(
             &proof,
@@ -1083,7 +1161,7 @@ mod tests {
         assert_eq!(trace.kinds().len(), 4);
         assert_eq!(trace.roots().len(), 1);
         assert_eq!(proof.columns.polys.len(), 1);
-        assert_eq!(proof.factor_values.len(), 3);
+        assert_eq!(proof.core.factor_values.len(), 3);
 
         verify(
             &proof,
@@ -1369,8 +1447,8 @@ mod tests {
         assert_eq!(trace.kinds().len(), 5);
         assert_eq!(roots.len(), 1);
         assert_eq!(proof.columns.polys.len(), 1);
-        assert_eq!(proof.factor_values.len(), 4);
-        Ok(proof.sumcheck.rounds.len())
+        assert_eq!(proof.core.factor_values.len(), 4);
+        Ok(proof.core.sumcheck.rounds.len())
     }
 
     /// The composition this crate is being built for: a constraint that reads
