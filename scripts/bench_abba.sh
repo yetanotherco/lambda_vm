@@ -180,21 +180,13 @@ INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
 # `successful_validation == 1` assert in tooling/ethrex-tests), while a small TX_COUNT
 # legitimately lands near this floor -- a 1-transfer block ran 1.80M cycles before the
 # bump, an empty one 0.99M. Applying the floor there would reject valid runs.
+#
+# Runs after step 2 and reuses `cli_B`: the baseline prover executes the workload just as
+# well as a freshly built one, and building a third binary here would be a full extra
+# release build -- at the repo root with default features, so sharing neither the
+# worktree's target dir nor its feature set. Free on a warm runner, a cold build on paid
+# time on a rented GPU box.
 MIN_PLAUSIBLE_CYCLES=1000000
-if [ ! -x ./target/release/cli ]; then
-  cargo build --release -p cli >/dev/null
-fi
-workload_cycles="$(./target/release/cli execute "$ELF" --private-input "$INPUT" --cycles \
-  | awk '/^Cycles:/ {print $2}')"
-if [ "$WORKLOAD" = "real" ] && [ "${workload_cycles:-0}" -lt "$MIN_PLAUSIBLE_CYCLES" ]; then
-  echo "ERROR: the workload executed only ${workload_cycles:-0} cycles, below the" >&2
-  echo "       ${MIN_PLAUSIBLE_CYCLES} floor. The guest almost certainly rejected the input:" >&2
-  echo "         ELF   $ELF" >&2
-  echo "         input $INPUT" >&2
-  echo "       Rebuild the fixture at this ethrex rev (make regen-real-block-fixture)." >&2
-  exit 1
-fi
-echo "==> Workload executes: $workload_cycles cycles"
 
 # --- 2. Build (or reuse) both prover binaries ---
 need_build=0
@@ -243,6 +235,23 @@ if [ "$need_build" = "1" ]; then
 else
   echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
+fi
+
+if [ "$WORKLOAD" = "real" ]; then
+  # `|| workload_cycles=""` keeps the failure inside a compound: a bare assignment from a
+  # failing command substitution aborts under `set -e` before the diagnostic below can
+  # print, which is fail-closed but silent.
+  workload_cycles="$("$WORK/cli_B" execute "$ELF" --private-input "$INPUT" --cycles 2>&1 \
+    | awk '/^Cycles:/ {print $2}')" || workload_cycles=""
+  if [ "${workload_cycles:-0}" -lt "$MIN_PLAUSIBLE_CYCLES" ]; then
+    echo "ERROR: the workload executed only ${workload_cycles:-0} cycles, below the" >&2
+    echo "       ${MIN_PLAUSIBLE_CYCLES} floor. The guest almost certainly rejected the input:" >&2
+    echo "         ELF   $ELF" >&2
+    echo "         input $INPUT" >&2
+    echo "       Rebuild the fixture at this ethrex rev (make regen-real-block-fixture)." >&2
+    exit 1
+  fi
+  echo "==> Workload executes: $workload_cycles cycles"
 fi
 
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
