@@ -213,9 +213,9 @@ fn assert_the_partials_sum_to_zero(b: &mut LfmBuilder, legs: &[LegCells], layout
 /// CHECK 3 — every slice published the same L2G roots.
 ///
 /// See the module doc: this is what licenses republishing a prefix in which every
-/// slice claims roots for tables it did not all walk. Compared against slice 0, which is also
-/// the copy [`emit_parent_publishes`] republishes, so the words compared and the
-/// words republished are literally the same cells.
+/// slice claims roots for tables it did not all walk. Compared against slice 0,
+/// which is also the copy [`emit_parent_publishes`] republishes — so the words
+/// compared and the words republished are literally the same cells.
 fn assert_every_slice_published_the_same_roots(
     b: &mut LfmBuilder,
     legs: &[LegCells],
@@ -315,9 +315,7 @@ mod tests {
         let mut partials: Vec<FEE> = (0..k - 1)
             .map(|i| FEE::from(977 * (i as u64 + 1)))
             .collect();
-        let sum = partials
-            .iter()
-            .fold(FEE::zero(), |acc, p| acc + p.clone());
+        let sum = partials.iter().fold(FEE::zero(), |acc, p| acc + *p);
         partials.push(FEE::zero() - sum);
 
         (0..k)
@@ -440,14 +438,13 @@ mod tests {
                 );
                 for epoch in 0..num_epochs {
                     for lane in 0..g.lanes_per_root {
-                        let got =
-                            word_as_base(&exec.public_words[g.l2g_word(epoch, lane)].1)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "epoch {epoch} lane {lane} was republished as something \
+                        let got = word_as_base(&exec.public_words[g.l2g_word(epoch, lane)].1)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "epoch {epoch} lane {lane} was republished as something \
                                          that is not a BASE word; the root reads lanes[0] of it"
-                                    )
-                                });
+                                )
+                            });
                         assert_eq!(
                             got,
                             root_lane(&layout, epoch, lane),

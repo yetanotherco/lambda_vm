@@ -281,6 +281,21 @@ impl GlobalPublishes {
         }
     }
 
+    /// The SLICE shape, and `None` for the unsliced wrap.
+    ///
+    /// ★ What a [`super::global_parent`] needs, and the `None` is the point:
+    /// there is no parent over a wrap. At `k = 1` the wrap closes its own bus
+    /// against zero, publishes no partial and IS the root's global child — so a
+    /// caller reaching for a slice layout there is asking for the shape of a
+    /// program that was never emitted, and gets an absence rather than a layout
+    /// describing one word that does not exist.
+    pub fn as_slice(&self) -> Option<&SliceLayout> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Slice(s) => Some(s),
+        }
+    }
+
     /// The shape spelled out for an abort message: a reader who hits a mismatch
     /// needs to know WHICH set was expected, not only a number that differs.
     pub fn describe(&self) -> String {
@@ -595,6 +610,12 @@ mod tests {
              word it never published"
         );
         assert_eq!(whole.partial_sum_word(), None, "k = 1 publishes no partial");
+        assert!(
+            whole.as_slice().is_none(),
+            "k = 1 has no SLICE layout: there is no parent over a wrap, and a \
+             layout handed out here would describe a partial the wrap never \
+             published"
+        );
         for k in 2..=6 {
             let sliced = GlobalPublishes::of(&SlicePartition::even(41, k), shared());
             assert!(
@@ -608,6 +629,12 @@ mod tests {
                 whole.total() + 1,
                 "k={k}: a slice publishes exactly one word more than the \
                  unsliced wrap, and it is the partial"
+            );
+            assert_eq!(
+                sliced.as_slice().map(SliceLayout::total),
+                Some(sliced.total()),
+                "k={k}: the SLICE layout a parent reads its children through must \
+                 be the same shape this describes"
             );
             assert_eq!(
                 sliced.partial_sum_word(),
