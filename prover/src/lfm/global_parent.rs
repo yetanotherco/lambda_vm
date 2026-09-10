@@ -308,6 +308,14 @@ mod tests {
 
     /// The `k` slices' published words: agreeing on `(z, α)` and on every root,
     /// with partials that sum to zero.
+    ///
+    /// ⛔ **WRITTEN POSITIONALLY, IN `global_slice_program`'s PUBLISH ORDER, AND
+    /// NOT THROUGH THE LAYOUT — do not "tidy" this into indexed writes.** The
+    /// parent READS through [`SliceLayout`]; a fixture that WROTE through it too
+    /// would cancel any drift between the layout and the order a slice actually
+    /// publishes in, and every arm below would pass while the parent read the
+    /// wrong words off a real slice. Appending in the emitter's own order is the
+    /// independent statement that makes the layout-indexed reads a check.
     fn honest_slice_publics(k: usize, layout: &SliceLayout) -> Vec<Vec<LfmWord>> {
         let g = &layout.shared;
         let z = FEE::new([FE::from(7), FE::from(8), FE::from(9)]);
