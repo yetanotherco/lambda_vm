@@ -31,6 +31,7 @@
 
 use super::builder::LfmBuilder;
 use super::edsl::WrapDigest;
+use super::global_split::SlicePartition;
 use super::per_table_aggregator::{
     ChildShape, LegCells, SchemaLayout, declare_leg_arenas, digest_from_lanes, emit_leg, fold_l2g,
 };
@@ -167,6 +168,116 @@ impl GlobalLayout {
                 digest_from_lanes(b, &lanes)
             })
             .collect()
+    }
+}
+
+/// What a SLICE of the global wrap publishes: everything the unsliced wrap
+/// publishes, and then its PARTIAL bus sum.
+///
+/// ⛔ **WHY THIS IS A SECOND TYPE AND NOT A WIDER [`GlobalLayout`].** A slice
+/// closes nothing. It sums the bus over its own tables, publishes that partial
+/// and leaves the zero-assert to a parent — so it publishes exactly one word the
+/// unsliced set does not contain. Loosening one layout until both shapes pass
+/// would be a check that cannot fail under the failure mode it exists for, and
+/// [`GlobalLayout::l2g_word`]'s own warning says why that is not survivable:
+/// **every index the root's L2G compare reads shifts if the layout is wrong**, so
+/// a wrong layout is silent and downstream. One layout per shape, each exact.
+///
+/// ⛔ **AND WHY IT IS COMPOSED RATHER THAN RE-DERIVED.** The prefix is not *like*
+/// the wrap's, it **is** the wrap's: the same emit code, above the one branch that
+/// differs. So it is held as a [`GlobalLayout`] and read through it, and there is
+/// no second copy of `2 + epochs × lanes` to drift when a word is added to either
+/// shape.
+pub struct SliceLayout {
+    /// The prefix a slice shares with the unsliced wrap, word for word.
+    pub shared: GlobalLayout,
+}
+
+impl SliceLayout {
+    /// The partial bus sum is ONE published word.
+    ///
+    /// ✓ Read off the emitter, not assumed: `global_slice_program`'s slice arm
+    /// ends in a single `b.public(total.as_cell())`, and one `Ext` cell is one
+    /// published word — which is also why [`GlobalLayout::total`]'s leading `2`
+    /// counts `z` and `alpha` as one word each.
+    const PARTIAL_SUM_WORDS: usize = 1;
+
+    pub fn over(shared: GlobalLayout) -> Self {
+        Self { shared }
+    }
+
+    /// Words a slice publishes: the wrap's set, then the partial.
+    pub fn total(&self) -> usize {
+        self.shared.total() + Self::PARTIAL_SUM_WORDS
+    }
+
+    /// Index of the partial bus sum — APPENDED, after every word the wrap
+    /// publishes, so no index the L2G compare reads can land on it.
+    pub fn partial_sum_word(&self) -> usize {
+        self.shared.total()
+    }
+}
+
+/// The layout describing what the global program ACTUALLY published, chosen by
+/// the partition the emitter was handed.
+///
+/// ⛔ **THE SELECTION IS THE LOAD-BEARING PART.** `global_slice_program` has one
+/// branch — `partition.k() == 1` closes the bus against zero, anything else
+/// publishes a partial — and those are two SHAPES with two `program_id`s, not one
+/// shape with a tolerance. So the shape is read off the SAME [`SlicePartition`]
+/// the emitter compiled against. A harness cannot pick a layout independently of
+/// the program it describes, and a separately-typed `k` here would reintroduce
+/// exactly the second copy of a constant this campaign has already paid for.
+pub enum GlobalPublishes {
+    /// `k == 1`: every table, the bus closed against zero, no partial.
+    Whole(GlobalLayout),
+    /// `k > 1`: one slice's tables, and its partial bus sum.
+    Slice(SliceLayout),
+}
+
+impl GlobalPublishes {
+    pub fn of(partition: &SlicePartition, shared: GlobalLayout) -> Self {
+        if partition.k() == 1 {
+            Self::Whole(shared)
+        } else {
+            Self::Slice(SliceLayout::over(shared))
+        }
+    }
+
+    /// Exactly how many words this shape publishes.
+    pub fn total(&self) -> usize {
+        match self {
+            Self::Whole(g) => g.total(),
+            Self::Slice(s) => s.total(),
+        }
+    }
+
+    /// The partial's index, and `None` for the unsliced wrap — which has no
+    /// partial to index, rather than a partial at some sentinel.
+    pub fn partial_sum_word(&self) -> Option<usize> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Slice(s) => Some(s.partial_sum_word()),
+        }
+    }
+
+    /// The shape spelled out for an abort message: a reader who hits a mismatch
+    /// needs to know WHICH set was expected, not only a number that differs.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Whole(g) => format!(
+                "the WRAP's set — z, alpha, then {} L2G roots x {} lanes, and NO \
+                 partial, because at k = 1 the bus closes against zero here",
+                g.num_epochs, g.lanes_per_root,
+            ),
+            Self::Slice(s) => format!(
+                "the SLICE's set — z, alpha, {} L2G roots x {} lanes, then the \
+                 PARTIAL bus sum at index {}",
+                s.shared.num_epochs,
+                s.shared.lanes_per_root,
+                s.partial_sum_word(),
+            ),
+        }
     }
 }
 
@@ -381,6 +492,99 @@ mod tests {
             .collect();
         // A shape built for TEN epochs, handed three.
         FoldShape::interior(10, 2).refold(&mut b, &digests);
+    }
+
+    /// ★ A slice's layout is the wrap's set PLUS a partial that lands past every
+    /// index the root's L2G compare reads.
+    ///
+    /// Pure arithmetic, so it runs on every suite — and it CAN fail. A layout
+    /// collapsed to serve both shapes puts the partial at or past `total()`, and
+    /// a partial index written as anything but *after the shared prefix* collides
+    /// with an L2G lane, which is the silent-and-downstream failure `SliceLayout`
+    /// exists to prevent.
+    #[test]
+    fn a_slice_layout_appends_its_partial_past_every_l2g_index() {
+        for num_epochs in [1usize, 2, 5, 19, 36] {
+            for lanes_per_root in [4usize, 8] {
+                let s = SliceLayout::over(GlobalLayout {
+                    num_epochs,
+                    lanes_per_root,
+                });
+                assert!(
+                    s.total() > s.shared.total(),
+                    "{num_epochs}x{lanes_per_root}: a slice publishes a partial \
+                     the wrap does not, so the two sets cannot be the same size"
+                );
+                assert!(
+                    s.partial_sum_word() >= s.shared.total(),
+                    "the partial at {} lands INSIDE the wrap's {} words",
+                    s.partial_sum_word(),
+                    s.shared.total(),
+                );
+                assert!(
+                    s.partial_sum_word() < s.total(),
+                    "the partial at {} is outside the slice's own {} words",
+                    s.partial_sum_word(),
+                    s.total(),
+                );
+                for k in 0..num_epochs {
+                    for w in 0..lanes_per_root {
+                        assert_ne!(
+                            s.shared.l2g_word(k, w),
+                            s.partial_sum_word(),
+                            "epoch {k} lane {w} and the partial are the SAME \
+                             index: the compare would read a bus sum as root \
+                             material"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ★ And the SHAPE follows the partition, not a hand-passed `k`.
+    ///
+    /// ⚠ What this pins and what it does not. The `matches!` arms are the real
+    /// check: `k == 1` is the emitter's own branch, and inverting it or writing
+    /// `k >= 1` here would describe the wrong shape at every `k`. The width
+    /// relation is the number a PARENT will index the partial at, recorded
+    /// executably — it is not an independent derivation of it, and only an edit
+    /// to `PARTIAL_SUM_WORDS` moves it.
+    #[test]
+    fn the_publish_shape_follows_the_partition() {
+        let shared = || GlobalLayout {
+            num_epochs: 19,
+            lanes_per_root: super::super::proof_arena::lanes_per_root(),
+        };
+        let whole = GlobalPublishes::of(&SlicePartition::even(41, 1), shared());
+        assert!(
+            matches!(whole, GlobalPublishes::Whole(_)),
+            "k = 1 is the unsliced wrap: it closes its bus against zero and \
+             publishes no partial, so describing it as a SLICE would expect one \
+             word it never published"
+        );
+        assert_eq!(whole.partial_sum_word(), None, "k = 1 publishes no partial");
+        for k in 2..=6 {
+            let sliced = GlobalPublishes::of(&SlicePartition::even(41, k), shared());
+            assert!(
+                matches!(sliced, GlobalPublishes::Slice(_)),
+                "k={k} was described as the WRAP: at k > 1 the emitter publishes \
+                 a partial instead of closing the bus, so the wrap's layout \
+                 under-counts a slice by one word and shifts nothing visibly"
+            );
+            assert_eq!(
+                sliced.total(),
+                whole.total() + 1,
+                "k={k}: a slice publishes exactly one word more than the \
+                 unsliced wrap, and it is the partial"
+            );
+            assert_eq!(
+                sliced.partial_sum_word(),
+                Some(whole.total()),
+                "k={k}: the partial must sit at the first index PAST the wrap's \
+                 set, or it collides with L2G material the root's compare reads"
+            );
+        }
     }
 }
 
