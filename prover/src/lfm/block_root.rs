@@ -63,11 +63,32 @@ impl FoldShape {
     /// two nodes into one; the root takes those two directly, so its own level is
     /// dropped here.
     pub fn interior(epochs: usize, fan_in: usize) -> Self {
+        Self::for_root(epochs, fan_in, true)
+    }
+
+    /// The fold shape for a root that either REPLACES the top interior level or
+    /// sits ABOVE it — and the choice is a measurement, not a preference.
+    ///
+    /// ⛔ It changes the root's CHILD COUNT and therefore its sub-proof count,
+    /// which is what decides whether `LFM_HASH` crosses a power of two:
+    ///
+    /// - `replaces_top = true` — the root takes the top level's `fan_in` nodes
+    ///   plus the global wrap. More sub-proofs, larger root.
+    /// - `replaces_top = false` — the interior closes to ONE node and the root
+    ///   takes that plus the global wrap. One extra interior node (already
+    ///   proved), fewer sub-proofs at the root.
+    ///
+    /// ⚠ A step is a property of where a chip sits relative to its power of two,
+    /// not of a workload ratio, so this cannot be settled by scaling a rate — it
+    /// is settled by emitting both and reading the panels.
+    pub fn for_root(epochs: usize, fan_in: usize, replaces_top: bool) -> Self {
         let mut levels: Vec<Vec<usize>> = super::per_table_aggregator::tree_shape(epochs, fan_in)
             .into_iter()
             .map(|l| l.arities)
             .collect();
-        levels.pop();
+        if replaces_top {
+            levels.pop();
+        }
         Self { levels }
     }
 

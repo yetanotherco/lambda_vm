@@ -958,6 +958,45 @@ pub(super) fn node_program(
     compile(b.finish())
 }
 
+/// One level's proofs, their layouts and their label runs — kept as three
+/// parallel vectors because `node_program` and `prove_node_program_as_child` take
+/// `&[RealChild]` and `&[SchemaLayout]`, so a node's child group is a subslice of
+/// each rather than a clone of every child's harvest.
+pub(super) type TreeLevel = (
+    Vec<RealChild>,
+    Vec<super::per_table_aggregator::SchemaLayout>,
+    Vec<Vec<u64>>,
+);
+
+/// Emit a block-artifact ROOT program, for sizing or for proving.
+pub(super) fn root_program(
+    interior: &[RealChild],
+    interior_layouts: &[super::per_table_aggregator::SchemaLayout],
+    labels: &[&[u64]],
+    label_range: (u64, u64),
+    global: &RealChild,
+    global_layout: &super::block_root::GlobalLayout,
+    fold_shape: &super::block_root::FoldShape,
+) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let shapes: Vec<_> = interior.iter().map(child_shape).collect();
+    let g = child_shape(global);
+    super::block_root::emit_block_root(
+        &mut b,
+        &super::block_root::RootInputs {
+            interior: &shapes,
+            interior_layouts,
+            labels,
+            label_range,
+            global: &g,
+            global_layout,
+            fold_shape,
+            publishes: super::block_root::RootPublishSet::default(),
+        },
+    );
+    compile(b.finish())
+}
+
 /// Name any sub-proof whose query sampler would be handed a zero bit width,
 /// BEFORE emission reaches it.
 ///
@@ -2724,22 +2763,47 @@ fn the_production_tree_composes_to_a_root() {
     );
 
     let spec = std::env::var("LFM_TREE_LEVELS").unwrap_or_else(|_| "all".to_string());
-    let (lo, hi_req): (usize, Option<usize>) = match spec.as_str() {
-        "all" => (0, None),
-        s => match s.split_once('-') {
-            Some((a, b)) => (
-                a.parse().expect("LFM_TREE_LEVELS lo must be an integer"),
-                Some(b.parse().expect("LFM_TREE_LEVELS hi must be an integer")),
-            ),
-            None => {
-                let n = s
-                    .parse()
-                    .expect("LFM_TREE_LEVELS must be `all`, `N` or `lo-hi`");
-                (n, Some(n))
-            }
-        },
+    // ★★ SIZING MODE: load every level, prove NOTHING, emit both root options
+    // and print their censuses and chip panels.
+    //
+    // ⛔ WHY IT EXISTS. Whether the root's `LFM_HASH` crosses 2^20 -> 2^21 decides
+    // whether the root is a ~500M-cell node that fits or a ~900M-cell one within
+    // 0.5% of the fan-in-3 node that OOM'd at 97.4% of the card. And it CANNOT be
+    // settled by scaling a rate: every level of the measured tree carries the
+    // SAME sub-proof count (22), so those four points contain no information
+    // about the per-sub-proof coefficient the root's 41 needs. The only place
+    // sub-proof count varies at all is the wrap -> node transition, and that is
+    // confounded with a change of child kind.
+    // ⇒ Emit both and read the panels. `census_and_panel` is a pure function of a
+    // compiled program, so this costs a cache load and seconds of emission.
+    let size_root = std::env::var("LFM_TREE_SIZE_ROOT").is_ok();
+    let (lo, hi_req): (usize, Option<usize>) = if size_root {
+        // `lo` above every level means no stage proves.
+        (usize::MAX, None)
+    } else {
+        match spec.as_str() {
+            "all" => (0, None),
+            s => match s.split_once('-') {
+                Some((a, b)) => (
+                    a.parse().expect("LFM_TREE_LEVELS lo must be an integer"),
+                    Some(b.parse().expect("LFM_TREE_LEVELS hi must be an integer")),
+                ),
+                None => {
+                    let n = s
+                        .parse()
+                        .expect("LFM_TREE_LEVELS must be `all`, `N` or `lo-hi`");
+                    (n, Some(n))
+                }
+            },
+        }
     };
     let cache_dir = std::env::var("A_CACHE_DIR").ok();
+    assert!(
+        !size_root || cache_dir.is_some(),
+        "LFM_TREE_SIZE_ROOT needs A_CACHE_DIR: it sizes the root from a tree that \
+         has already been proved, and proving one here would be a different and \
+         much longer experiment than the one asked for"
+    );
     assert!(
         lo == 0 || cache_dir.is_some(),
         "LFM_TREE_LEVELS starts at {lo}, so levels below it must be LOADED — but \
@@ -2821,7 +2885,7 @@ fn the_production_tree_composes_to_a_root() {
     let top = shape.len();
     let hi = hi_req.unwrap_or(top).min(top);
     assert!(
-        lo <= hi,
+        lo <= hi || size_root,
         "LFM_TREE_LEVELS {lo}-{hi} is empty; the tree has {top} node levels"
     );
     println!(
@@ -2963,11 +3027,12 @@ fn the_production_tree_composes_to_a_root() {
         g.tables.len(),
         bundle.touched_pages().len(),
     );
-    let _global_child = real_child(artifacts, wrap_opts.clone(), &proved);
+    let global_child = real_child(artifacts, wrap_opts.clone(), &proved);
     mark("AFTER the global wrap");
 
     // ---- levels 1..=hi.
     let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
+    let mut penultimate: Option<TreeLevel> = None;
     for (li, level) in shape.iter().enumerate().take(hi) {
         let level_no = li + 1;
         let t_level = Instant::now();
@@ -3040,6 +3105,16 @@ fn the_production_tree_composes_to_a_root() {
         // ★ The level below goes, and the trough is the point: a tree-builder at
         // level k holds level k-1 and nothing under it. Only a live sample can
         // show a release; a high-water cannot.
+        // ★ Keep the level BELOW the top: those are root option A's interior
+        // children (a root REPLACING the top level), while `children` after the
+        // loop holds option B's single child (a root sitting ABOVE it).
+        if size_root && level_no + 1 == top {
+            penultimate = Some((
+                std::mem::take(&mut children),
+                std::mem::take(&mut layouts),
+                std::mem::take(&mut labels),
+            ));
+        }
         children = next;
         layouts = next_layouts;
         labels = next_labels;
@@ -3048,6 +3123,74 @@ fn the_production_tree_composes_to_a_root() {
             "   level {level_no}: {} nodes in {:.1}s",
             children.len(),
             t_level.elapsed().as_secs_f64()
+        );
+    }
+
+    // ---- SIZING: emit both root options, prove neither.
+    if size_root {
+        let g_layout = super::block_root::GlobalLayout {
+            num_epochs: g.num_l2g,
+            lanes_per_root: super::proof_arena::lanes_per_root(),
+        };
+        println!(
+            "\n★★★ SIZING THE ROOT — emitted, never proved. Global child: {} \
+             published words, {} sub-proofs ({} L2G).",
+            global_child.public_words.len(),
+            global_child.tables.len(),
+            g.num_l2g,
+        );
+        let (pen, pen_layouts, pen_labels) = penultimate
+            .take()
+            .expect("size mode captures the level below the top");
+        let block_range = (
+            crate::tables::local_to_global::epoch_label(0),
+            crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+        );
+        for (name, replaces_top, kids, kid_layouts, kid_labels) in [
+            (
+                "A: root REPLACES the top level",
+                true,
+                &pen,
+                &pen_layouts,
+                &pen_labels,
+            ),
+            (
+                "B: root sits ABOVE it (the level-top scaffold is kept)",
+                false,
+                &children,
+                &layouts,
+                &labels,
+            ),
+        ] {
+            let refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
+            let shape =
+                super::block_root::FoldShape::for_root(bundle.num_epochs(), fan_in, replaces_top);
+            let t = Instant::now();
+            let program = root_program(
+                kids,
+                kid_layouts,
+                &refs,
+                block_range,
+                &global_child,
+                &g_layout,
+                &shape,
+            );
+            let sub_proofs: usize =
+                kids.iter().map(|c| c.tables.len()).sum::<usize>() + global_child.tables.len();
+            println!(
+                "\n── {name}: {} interior children + the global wrap = {} sub-proofs \
+                 (emitted in {:.1}s)",
+                kids.len(),
+                sub_proofs,
+                t.elapsed().as_secs_f64(),
+            );
+            census_and_panel(&program, name, fan_in);
+        }
+        println!(
+            "\n⇒ READ `LFM_HASH`'s COMMITTED HEIGHT IN EACH PANEL. That single step \
+             is 170,393,600 cells — 32% of a level-1 node — and it is what decides \
+             whether the root resembles a proven-to-fit node or the fan-in-3 node \
+             that aborted at 97.4% of the card."
         );
     }
 
