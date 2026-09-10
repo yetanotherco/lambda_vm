@@ -183,7 +183,7 @@ fn dma_memset_fills_unaligned_body_and_tail() {
 fn dma_memset_zero_count_writes_nothing() {
     let mut memory = Memory::default();
     memory.store_byte(0x3000, 0x11);
-    run_memset(&mut memory, 0x3000, 0x4000, 0).unwrap();
+    run_memset(&mut memory, 0x3008, 0x3000, 0).unwrap();
     assert_eq!(memory.load_byte(0x3000), 0x11);
 }
 
@@ -248,5 +248,56 @@ proptest! {
 
         let actual = memory.load_bytes(BASE, REGION as u64).unwrap();
         prop_assert_eq!(actual, expected);
+    }
+}
+
+/// The operand contract is what pins `value` on an `is_set` row, so the executor
+/// must accept exactly the shapes the AIR can prove -- no wider, or an honest
+/// execution becomes unprovable, and no narrower, or the AIR admits executions
+/// that never happened.
+#[test]
+fn dma_memset_rejects_every_gap_but_one() {
+    for (dst, src, why) in [
+        (
+            0x2000u64,
+            0x2000u64,
+            "dst == src leaves the value lanes unconstrained",
+        ),
+        (0x2004, 0x2000, "a gap under one row width"),
+        (0x2020, 0x2000, "a gap over one row width"),
+        (0x2000, 0x2008, "dst below src propagates the wrong way"),
+    ] {
+        let mut memory = Memory::default();
+        assert!(
+            matches!(
+                run_memset(&mut memory, dst, src, 16),
+                Err(ExecutionError::DmaMemsetBadGap { .. })
+            ),
+            "{why} (src {src:#x}, dst {dst:#x})"
+        );
+    }
+
+    // Rejected for count 0 too: the AIR pins the gap on every `is_set` row, and a
+    // zero-length call still emits one.
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_memset(&mut memory, 0x2000, 0x2000, 0),
+        Err(ExecutionError::DmaMemsetBadGap { .. })
+    ));
+
+    // The AIR pins the gap limb-wise, so a `src` whose low limb sits within the gap
+    // of the boundary has no representable successor and must be refused here.
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_memset(&mut memory, 0x1_0000_0000, 0xFFFF_FFF8, 8),
+        Err(ExecutionError::DmaMemsetBadGap { .. })
+    ));
+
+    // And the one legal shape still works.
+    let mut memory = Memory::default();
+    seed(&mut memory, 0x2000, 0x5A);
+    run_memset(&mut memory, 0x2008, 0x2000, 8).unwrap();
+    for addr in 0x2000..0x2010 {
+        assert_eq!(memory.load_byte(addr), 0x5A, "byte at {addr:#x}");
     }
 }

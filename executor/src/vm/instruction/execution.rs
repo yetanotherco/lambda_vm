@@ -114,6 +114,21 @@ pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u6
 /// DMA memset syscall number. Must match `syscalls/src/syscalls.rs`.
 pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 3;
 
+/// The one operand shape a DMA memset ecall may have: the destination trails the
+/// source by exactly one wide row.
+///
+/// This is not a convention, it is what makes the call sound. The accelerator runs
+/// an `is_set` call with the write at `T+1` and the read at `T+2`, so a row's read
+/// observes writes the same call already made — which is what propagates the seed.
+/// That pins the copied value only while the read resolves to a *different*,
+/// already-written address. With `dst == src` the read and the write address the
+/// same cell at adjacent timestamps, the memory argument is satisfied by
+/// `value == value`, and the eight value lanes become free field elements: a prover
+/// could put anything it liked into RAM. The AIR therefore pins `dst = src + 8` on
+/// every `is_set` row, and this constant is what both sides import so the two
+/// bounds cannot drift.
+pub const DMA_MEMSET_GAP: u64 = 8;
+
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
 /// The host computes a modular inverse or square root and writes it back to the
@@ -694,6 +709,19 @@ impl Instruction {
                         dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
                         src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
 
+                        // The operand contract, enforced unconditionally so that the
+                        // executions this accepts are exactly the ones the AIR can
+                        // prove. The low-limb condition is the second half of that: the
+                        // AIR pins the gap limb-wise and so cannot express a carry out
+                        // of the low limb, and rejecting the straddle here is cheaper
+                        // than spending a carry column on an address range no guest
+                        // reaches (cf. the HINT limb bounds below).
+                        if src & 0xFFFF_FFFF > 0xFFFF_FFFF - DMA_MEMSET_GAP
+                            || dst != src + DMA_MEMSET_GAP
+                        {
+                            return Err(ExecutionError::DmaMemsetBadGap { src, dst });
+                        }
+
                         for i in 0..n {
                             let byte = memory.load_byte(src + i);
                             memory.store_byte(dst + i, byte);
@@ -919,6 +947,10 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
+    #[error(
+        "DMA memset needs dst == src + {DMA_MEMSET_GAP} with src's low limb clear of the          boundary; got src {src:#x}, dst {dst:#x}"
+    )]
+    DmaMemsetBadGap { src: u64, dst: u64 },
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
     #[error("Unknown hint selector: {0}")]

@@ -65,7 +65,7 @@ use crate::constraints::templates::{
 };
 
 use executor::vm::instruction::execution::{
-    DMA_MEMCPY_MAX_BYTES as EXECUTOR_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER,
+    DMA_MEMCPY_MAX_BYTES as EXECUTOR_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP,
     DMA_MEMSET_SYSCALL_NUMBER,
 };
 
@@ -536,8 +536,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ),
         // 22. The first row of an ecall-driven call proves `count <= MEMMOVE_MAX_BYTES`.
-        //     Commit is excluded: it arrives over CommitDefer and the guest does not
-        //     chunk it, so its length is bounded by the COMMIT chip instead.
+        //     Commit is excluded: it arrives over CommitDefer, which the guest does not
+        //     chunk. Note that nothing bounds a commit chain's length in-circuit -- the
+        //     COMMIT chip range-checks no `count` either -- so a single `sys_write` can
+        //     append rows here in proportion to its byte count. That is pre-existing
+        //     (the deleted per-byte COMMIT loop had the same property) and it is not
+        //     verifier-exploitable, since the COMMIT bus still has to balance against
+        //     `public_output`; it is a prover-cost bound only, tracked separately.
         BusInteraction::sender(
             BusId::Alu,
             Multiplicity::Column(cols::F_NCOMMIT),
@@ -754,6 +759,42 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         for (i, &column) in cols::VALUE.iter().enumerate().skip(1) {
             b.emit_base(25 + i - 1, tail.clone() * b.main(0, column));
         }
+
+        // memset's operand contract: `dst = src + 8`, limb-wise.
+        //
+        // This is what pins `value` on an `is_set` row. The inverted order puts the
+        // write at `T+1` and the read at `T+2`, so a row's read observes writes this
+        // call already made -- that is the propagation. It pins the copied value only
+        // while the read resolves to a *different* address, already written, with the
+        // recursion bottoming out in memory the call never wrote. `dst == src` is the
+        // one degenerate case: read and write address the same cell at adjacent
+        // timestamps, the memory argument closes on `value == value`, and all eight
+        // lanes become free field elements -- unconstrained RAM, chosen by the prover.
+        // Nothing else touches them (the lane constraints above only *zero* lanes 1..7
+        // on narrow rows, and no `AreBytes` reaches them), so this is the only thing
+        // standing between the chip and an arbitrary memory write.
+        //
+        // `is_set` alone is the correct gate. `step` advances `src` and `dst` together
+        // (constraints 19 and 21), so `dst - src` is invariant along a chain and the
+        // relation holds on the terminal row as well; padding rows leave `is_set = 0`.
+        // Gating on `is_set * mu_ram` would exempt terminal rows at the cost of a
+        // degree, and the table is asserted to stay at degree 2.
+        //
+        // Pinning the exact gap rather than merely `src != dst` also settles the
+        // direction: `dst < src` is sound but propagates the wrong way, so the AIR
+        // would otherwise admit traces the executor's forward byte walk never produces.
+        // The limb-wise form cannot express a carry out of the low limb, which is why
+        // the executor rejects a `src` whose low limb sits within `DMA_MEMSET_GAP` of
+        // the boundary.
+        let gap = b.const_base(DMA_MEMSET_GAP);
+        b.emit_base(
+            32,
+            is_set.clone() * (b.main(0, cols::DST_0) - b.main(0, cols::SRC_0) - gap),
+        );
+        b.emit_base(
+            33,
+            is_set.clone() * (b.main(0, cols::DST_1) - b.main(0, cols::SRC_1)),
+        );
     }
 }
 

@@ -2,6 +2,30 @@ use crate::tables::memmove::{MemmoveOperation, cols, generate_memmove_trace};
 use crate::tables::types::FE;
 use crate::test_utils::{busless_air, validate_busless};
 
+/// A memset row. The contract the AIR pins is `dst = src + 8`, so build it that
+/// way by default and let the tests below break it deliberately.
+fn set_row(count: u64, first: bool, end: bool, src: u64, dst: u64) -> MemmoveOperation {
+    MemmoveOperation {
+        width: if count < 8 { 1 } else { 8 },
+        functionality: crate::tables::memmove::Functionality::Set,
+        timestamp: 100,
+        src,
+        dst,
+        count,
+        first,
+        end,
+        // A narrow row must leave lanes 1..7 clear (constraints 25-31), and the
+        // terminal row copies nothing at all.
+        value: if end {
+            [0; 8]
+        } else if count < 8 {
+            [0xAB, 0, 0, 0, 0, 0, 0, 0]
+        } else {
+            [0xAB; 8]
+        },
+    }
+}
+
 fn row(count: u64, first: bool, end: bool, value: [u8; 8]) -> MemmoveOperation {
     MemmoveOperation {
         width: if count < 8 { 1 } else { 8 },
@@ -159,7 +183,7 @@ fn memmove_constraints_count_and_indices() {
     use crate::tables::memmove::MemmoveConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = MemmoveConstraints.meta();
-    assert_eq!(meta.len(), 32);
+    assert_eq!(meta.len(), 34);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -272,4 +296,82 @@ fn memmove_commit_sends_one_pair_per_byte() {
             "lane {lane} must carry value[{lane}]"
         );
     }
+}
+
+/// The memset operand contract, in the direction that matters.
+///
+/// `dst == src` is the degenerate case: read and write address the same cell at
+/// adjacent timestamps, so the memory argument closes on `value == value` and every
+/// value lane becomes a free field element. Constraints 32 and 33 are the only thing
+/// that rejects it, so both are tested here in both directions, and a `Copy` row is
+/// tested to confirm the gate is `is_set` and does not leak onto the copy path (a
+/// memcpy with `dst == src` is harmless -- its read is at `T+1` and pins `value` to
+/// live memory).
+#[test]
+fn memmove_constraints_pin_the_memset_gap() {
+    let air = busless_air(
+        cols::NUM_COLUMNS,
+        crate::tables::memmove::MemmoveConstraints,
+    );
+
+    // Honest: dst = src + 8, on a wide row, a narrow row and the terminal row.
+    let honest = generate_memmove_trace(&[
+        set_row(16, true, false, 0x1000, 0x1008),
+        set_row(8, false, false, 0x1008, 0x1010),
+        set_row(0, false, true, 0x1010, 0x1018),
+    ]);
+    assert!(
+        validate_busless(&air, &honest),
+        "a memset chain with dst = src + 8 must be accepted"
+    );
+
+    // The forgery: dst == src leaves `value` unconstrained.
+    let degenerate = generate_memmove_trace(&[
+        set_row(16, true, false, 0x1000, 0x1000),
+        set_row(0, false, true, 0x1000, 0x1000),
+    ]);
+    assert!(
+        !validate_busless(&air, &degenerate),
+        "dst == src must be rejected: it makes every value lane a free field element"
+    );
+
+    // Wrong gap, and the wrong direction, are both out of contract too.
+    for (src, dst, why) in [
+        (0x1000u64, 0x1004u64, "a gap under one row width"),
+        (0x1000, 0x1020, "a gap over one row width"),
+        (
+            0x1008,
+            0x1000,
+            "dst below src, which propagates the wrong way",
+        ),
+    ] {
+        let trace = generate_memmove_trace(&[
+            set_row(16, true, false, src, dst),
+            set_row(0, false, true, src, dst),
+        ]);
+        assert!(
+            !validate_busless(&air, &trace),
+            "{why} must be rejected (src {src:#x}, dst {dst:#x})"
+        );
+    }
+
+    // The high limb is pinned as well, so the gap cannot be forged across limbs.
+    let straddle = generate_memmove_trace(&[
+        set_row(16, true, false, 0x1000, 0x1_0000_1008),
+        set_row(0, false, true, 0x1000, 0x1_0000_1008),
+    ]);
+    assert!(
+        !validate_busless(&air, &straddle),
+        "a gap of 8 in the low limb but not the high one must be rejected"
+    );
+
+    // And the gate really is `is_set`: the copy path is untouched by it.
+    let copy_aliased = generate_memmove_trace(&[
+        row(8, true, false, *b"abcdefgh"),
+        row(0, false, true, [0; 8]),
+    ]);
+    assert!(
+        validate_busless(&air, &copy_aliased),
+        "constraints 32-33 must not fire on Copy rows"
+    );
 }
