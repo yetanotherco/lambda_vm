@@ -1346,6 +1346,204 @@ fn a_zero_bit_query_draw_consumes_what_the_host_does() {
     );
 }
 
+// ============================== the stage cache ==============================
+
+/// The named experiment, applied to every cached stage of a run.
+///
+/// ⛔ ONE mode decision, read once, applied everywhere. Two independent
+/// cache-if-present decisions is how a harness comes to load one stage and prove
+/// another, and the run then answers a question nobody asked: an unconditional
+/// `A_BUNDLE` export once made a relaunch load a base an earlier run had saved,
+/// so `prove_continuation` never ran and the run answered the CONTROL having been
+/// launched as the TEST. `A_BUNDLE_MODE` names the mode; nothing infers it from
+/// the filesystem.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CacheMode {
+    /// No caching: every stage proves. The default, and what CI runs.
+    Off,
+    /// Prove each stage and SAVE it. Refuses to overwrite an existing stage.
+    Prove,
+    /// LOAD each stage. Refuses to prove one whose cache is missing.
+    Load,
+}
+
+impl CacheMode {
+    /// `A_BUNDLE_MODE`, checked against whether a cache location was given.
+    pub(super) fn from_env(located: bool) -> Self {
+        match (located, std::env::var("A_BUNDLE_MODE").ok().as_deref()) {
+            (false, _) => Self::Off,
+            (true, None) => panic!(
+                "a cache location is set but A_BUNDLE_MODE is not. Name the \
+                 experiment — `prove` (prove each stage and save it) or `load` \
+                 (load each saved stage) — so the harness cannot pick one from \
+                 filesystem state"
+            ),
+            (true, Some("prove")) => Self::Prove,
+            (true, Some("load")) => Self::Load,
+            (true, Some(other)) => {
+                panic!("A_BUNDLE_MODE must be `prove` or `load`, got `{other}`")
+            }
+        }
+    }
+}
+
+/// Run `prove`, or substitute a cached proof, as `mode` says — and say which.
+///
+/// ★ WHY ONLY THE PROOF IS CACHED. A level's `LfmProof` is the one thing it
+/// produces that cannot be re-derived cheaply: the program is a pure function of
+/// its children's shapes and re-emits in seconds, and `build_artifacts` is a pure
+/// function of the program. So the cache holds proofs and re-derives everything
+/// else — which is also what makes a loaded arm's `L` the right number, because a
+/// tree-builder carries the harvested children, not the emitters that made them.
+///
+/// ⇒ This is the precondition for pricing a LEVEL. Proving levels 0 and 1 in the
+/// measuring process leaves their residue live and their peak already set, and a
+/// `VmHWM` that never moves afterwards then reports a whole-process bound rather
+/// than the level's cost. One arm per process is the fix, and skipping the
+/// children's proves is what makes one arm per process affordable.
+fn cached_stage(
+    mode: CacheMode,
+    path: Option<std::path::PathBuf>,
+    label: &str,
+    prove: impl FnOnce() -> super::proof::LfmProof,
+) -> super::proof::LfmProof {
+    type CachedProof = (
+        stark::proof::stark::MultiProof<GoldilocksField, GoldilocksExtension, ()>,
+        Vec<(u32, LfmWord)>,
+    );
+    let Some(p) = path.filter(|_| mode != CacheMode::Off) else {
+        println!("   {label}: PROVED in-process, NOT cached");
+        return prove();
+    };
+    match mode {
+        CacheMode::Load => {
+            assert!(
+                p.exists(),
+                "A_BUNDLE_MODE=load but {label}'s cache {} is absent: this would \
+                 silently become a full prove, i.e. a different experiment",
+                p.display()
+            );
+            let bytes = std::fs::read(&p).expect("the cached stage must read");
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+            aligned.extend_from_slice(&bytes);
+            let (proof, public_words) =
+                rkyv::from_bytes::<CachedProof, rkyv::rancor::Error>(&aligned)
+                    .expect("the cached stage must deserialize");
+            println!(
+                "   {label}: LOADED from {} ({} bytes) — NOT proved in this process",
+                p.display(),
+                bytes.len()
+            );
+            super::proof::LfmProof {
+                proof,
+                public_words,
+            }
+        }
+        CacheMode::Prove => {
+            assert!(
+                !p.exists(),
+                "A_BUNDLE_MODE=prove but {label}'s cache {} already exists: \
+                 refusing to overwrite it, and refusing to silently load it \
+                 instead",
+                p.display()
+            );
+            let proved = prove();
+            let cached: CachedProof = (proved.proof.clone(), proved.public_words.clone());
+            let bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&cached).expect("the stage must serialize");
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).expect("the cache directory must exist");
+            }
+            std::fs::write(&p, &bytes).expect("the stage must persist");
+            println!(
+                "   {label}: PROVED and saved to {} ({} bytes)",
+                p.display(),
+                bytes.len()
+            );
+            proved
+        }
+        CacheMode::Off => unreachable!("filtered above"),
+    }
+}
+
+/// [`cached_stage`] for the base continuation, which is not an `LfmProof`.
+///
+/// ★ The pair of numbers a bundle cache buys is the measurement, not a
+/// convenience: proving the base in-process leaves its residue live when a node
+/// runs, so the node's measured carry-in is `L_children + L_base_residue`, while
+/// a run that LOADS the bundle carries in `L_children` alone — which is what any
+/// separately-written tree-builder would carry. The difference between the two IS
+/// the base residue, and therefore how much of any high peak belongs to this
+/// harness rather than to the tree. The deserialise path is production's own
+/// (`bin/cli/src/main.rs:877-886`).
+fn cached_bundle(
+    mode: CacheMode,
+    path: Option<std::path::PathBuf>,
+    prove: impl FnOnce() -> crate::continuation::ContinuationProof,
+) -> crate::continuation::ContinuationProof {
+    let Some(p) = path.filter(|_| mode != CacheMode::Off) else {
+        println!(
+            "   base: PROVED in-process, NOT cached — carries in L_children + the base residue"
+        );
+        return prove();
+    };
+    match mode {
+        CacheMode::Load => {
+            assert!(
+                p.exists(),
+                "A_BUNDLE_MODE=load but {} does not exist: this would silently \
+                 become a full base prove, i.e. a different experiment",
+                p.display()
+            );
+            let bytes = std::fs::read(&p).expect("the cached bundle must read");
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+            aligned.extend_from_slice(&bytes);
+            let bundle = rkyv::from_bytes::<
+                crate::continuation::ContinuationProof,
+                rkyv::rancor::Error,
+            >(&aligned)
+            .expect("the cached bundle must deserialize");
+            println!(
+                "   base: LOADED from {} — carries in L_children ALONE, no base residue",
+                p.display()
+            );
+            bundle
+        }
+        CacheMode::Prove => {
+            assert!(
+                !p.exists(),
+                "A_BUNDLE_MODE=prove but {} already exists: refusing to overwrite \
+                 a saved base, and refusing to silently load it instead",
+                p.display()
+            );
+            let bundle = prove();
+            let bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("the bundle must serialize");
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).expect("the cache directory must exist");
+            }
+            std::fs::write(&p, &bytes).expect("the bundle must persist");
+            println!(
+                "   base: PROVED in-process and saved to {} — carries in \
+                 L_children + the base residue",
+                p.display()
+            );
+            bundle
+        }
+        CacheMode::Off => unreachable!("filtered above"),
+    }
+}
+
+/// Where a stage of THIS run's tree caches, or `None` when `A_CACHE_DIR` is unset.
+///
+/// One directory, one file per stage, named for the stage rather than for the
+/// run: a level-2 arm must load exactly the level-1 proofs an earlier arm saved,
+/// and a name that encoded anything else would let two different trees share a
+/// cache entry.
+fn stage_path(dir: Option<&str>, stage: &str) -> Option<std::path::PathBuf> {
+    dir.map(|d| std::path::Path::new(d).join(format!("{stage}.rkyv")))
+}
+
 /// Prove one aggregation node and hand it back as a CHILD of the next level.
 ///
 /// The whole composition argument in one function: a node's proof is a plain
@@ -1362,6 +1560,8 @@ fn prove_node_as_child(
     label_range: (u64, u64),
     out_halves: usize,
     opts: &crate::ProofOptions,
+    mode: CacheMode,
+    cache: Option<std::path::PathBuf>,
 ) -> (RealChild, super::per_table_aggregator::SchemaLayout) {
     use super::per_table_aggregator::{NodePublishSet, SchemaLayout};
 
@@ -1375,18 +1575,24 @@ fn prove_node_as_child(
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
     let artifacts =
         super::registry::build_artifacts_with_hasher(&program, opts, crate::hash_pin::BLOCK_HASHER);
-    let proved = super::proof::lfm_prove(&program, &artifacts, &arenas, opts)
-        .expect("an aggregation node must prove");
-    // ★ PER-LEVEL marks, so flatness is a WITHIN-RUN comparison. One gate's peak
-    // against another's cannot settle it: the leaf gate runs at
-    // FIXTURE_EPOCH_LOG2 and this one at FIXTURE_EPOCH_LOG2 - 1, so their nodes
-    // sit over different-sized epochs. Only levels measured inside ONE run are
-    // comparable, and this is what makes that comparison possible.
-    println!(
-        "   RSS high-water AFTER proving {label}: {:?} GiB ({} instructions)",
-        super::wrap_tests::peak_rss_gib(),
-        program.instrs.len(),
-    );
+    let proved = cached_stage(mode, cache, label, || {
+        super::proof::lfm_prove(&program, &artifacts, &arenas, opts)
+            .expect("an aggregation node must prove")
+    });
+    // ⛔ A LIVE MARK, NOT A HIGH-WATER — and within-run is not enough on its own.
+    //
+    // This line used to print `peak_rss_gib()`, a `VmHWM`. Read across leaf 0,
+    // leaf 1 and an inner node it never moved, and the flatness was published as
+    // "the tree does not grow per level". A high-water only rises: with the base
+    // and four wraps already proved in the same process and no mark before leaf
+    // 0, the reading bounds the WHOLE process and prices no level inside it —
+    // level 1 included. Being a within-run comparison does not rescue it.
+    // ⇒ The live figure plus `t=` is what prices a phase: `L` before, `L` after,
+    // and an external sampler sliced to the window between the two stamps. One
+    // arm per process (`A_CACHE_DIR` + `A_BUNDLE_MODE=load`) is what makes the
+    // live figure mean the level rather than the run.
+    println!("   {label}: {} instructions", program.instrs.len());
+    mark(&format!("AFTER {label}"));
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
     (real_child(artifacts, opts.clone(), &proved), layout)
@@ -1451,8 +1657,36 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     // milliseconds. If a third appears, it is a shape the emitter has to handle
     // and this is the cheapest place to find it.
     let epoch_log2 = super::proof_fixture::FIXTURE_EPOCH_LOG2 - 1;
-    let bundle = crate::continuation::prove_continuation(&elf_bytes, &[], epoch_log2, &inner)
-        .expect("the fixture continuation must prove");
+
+    // ★★ ONE ARM PER PROCESS, which is what lets a LEVEL be priced.
+    //
+    // With `A_CACHE_DIR` set and `A_BUNDLE_MODE=load`, every stage below level 2
+    // is read from disk instead of proved: the base, the four wraps and the two
+    // leaf nodes. The inner node is then the only prove in the process, so `L`
+    // before it is exactly what a tree-builder would carry — the bundle plus two
+    // level-1 children — and the live marks around it price the level rather than
+    // the run. An `A_BUNDLE_MODE=prove` arm writes that cache; the arms are
+    // otherwise identical, and neither picks itself from filesystem state.
+    //
+    // ⚠ Loading a level-1 proof does NOT skip re-emitting its program: a node's
+    // program is a pure function of its children's shapes and its `program_id`
+    // must match the loaded proof, so the wrap harvests are still built (cheaply,
+    // artifacts only) to re-emit the leaf programs. They are dropped before the
+    // inner node proves, because they are not its children.
+    let cache_dir = std::env::var("A_CACHE_DIR").ok();
+    let mode = CacheMode::from_env(cache_dir.is_some());
+    println!(
+        "★ INNER NODE ARM: cache {mode:?}{}",
+        match &cache_dir {
+            Some(d) => format!(" in {d}"),
+            None => String::new(),
+        }
+    );
+
+    let bundle = cached_bundle(mode, stage_path(cache_dir.as_deref(), "bundle"), || {
+        crate::continuation::prove_continuation(&elf_bytes, &[], epoch_log2, &inner)
+            .expect("the fixture continuation must prove")
+    });
     let needed = FAN_IN * FAN_IN;
     assert!(
         bundle.num_epochs() >= needed,
@@ -1488,8 +1722,15 @@ fn the_inner_node_verifies_two_leaf_nodes() {
             let arenas = super::epoch_tests::epoch_arena_words(&e, true);
             let artifacts =
                 build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-                .expect("the epoch wrap must prove");
+            let proved = cached_stage(
+                mode,
+                stage_path(cache_dir.as_deref(), &format!("wrap-{leaf}-{i}")),
+                &format!("wrap {k} (leaf {leaf}, child {i})"),
+                || {
+                    lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                        .expect("the epoch wrap must prove")
+                },
+            );
             let layout = SchemaLayout::wrap(out_halves);
             layout.assert_covers(proved.public_words.len());
             wrap_layouts.push(layout);
@@ -1509,12 +1750,25 @@ fn the_inner_node_verifies_two_leaf_nodes() {
             range,
             out_halves,
             &wrap_opts,
+            mode,
+            stage_path(cache_dir.as_deref(), &format!("leaf-{leaf}")),
         );
         println!(
             "   leaf {leaf}: {} published words, {} sub-proofs",
             child.public_words.len(),
             child.tables.len()
         );
+        // ★ THE LEVEL-0 HARVESTS GO, and the trough is the point.
+        //
+        // A tree-builder proving level 2 holds its level-1 children and nothing
+        // below them. Keeping the wraps alive here would inflate `L` by a whole
+        // level that the real thing would have released, and a high-water could
+        // not have shown the difference — only a live mark on either side of the
+        // drop can. Emission borrowed their shapes; the leaf `RealChild` owns its
+        // own artifacts, so nothing here is still borrowed.
+        drop(wraps);
+        drop(wrap_layouts);
+        mark(&format!("AFTER dropping leaf {leaf}'s wrap harvests"));
         leaves.push(child);
         leaf_layouts.push(layout);
         leaf_labels.push([range.0, range.1]);
@@ -1529,6 +1783,10 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     let range = (leaf_labels[0][0], leaf_labels[FAN_IN - 1][1]);
     let out_halves = leaf_layouts[FAN_IN - 1].out_halves;
     let t = Instant::now();
+    // ⛔ The inner node is NEVER cached — it is the measurement. `CacheMode::Off`
+    // here regardless of the arm, so a `load` arm cannot accidentally read back a
+    // level-2 proof and report the load as the level's cost.
+    mark("BEFORE the inner node (this live figure is L for level 2)");
     let (inner_node, inner_layout) = prove_node_as_child(
         "the INNER node (level 2)",
         &leaves,
@@ -1537,6 +1795,8 @@ fn the_inner_node_verifies_two_leaf_nodes() {
         range,
         out_halves,
         &wrap_opts,
+        CacheMode::Off,
+        None,
     );
     println!(
         "\n★ INNER NODE PROVED AND VERIFIED (a node over {FAN_IN} NODE proofs)\n   \
@@ -1837,65 +2097,17 @@ fn the_production_leaf_node_measures() {
     // ⇒ `prove` with the file present is a refusal, not a silent load; `load`
     // without it is a refusal, not a silent 20-minute prove.
     let bundle_path = std::env::var("A_BUNDLE").ok();
-    let cached = match (&bundle_path, std::env::var("A_BUNDLE_MODE").ok().as_deref()) {
-        (None, _) => false,
-        (Some(_), None) => panic!(
-            "A_BUNDLE is set but A_BUNDLE_MODE is not. Name the experiment — \
-             `prove` (prove the base and save it) or `load` (load a saved base) — \
-             so the harness cannot pick one from filesystem state"
-        ),
-        (Some(p), Some("load")) => {
-            assert!(
-                std::path::Path::new(p).exists(),
-                "A_BUNDLE_MODE=load but {p} does not exist: this would silently \
-                 become a full base prove, i.e. a different experiment"
-            );
-            true
-        }
-        (Some(p), Some("prove")) => {
-            assert!(
-                !std::path::Path::new(p).exists(),
-                "A_BUNDLE_MODE=prove but {p} already exists: refusing to overwrite \
-                 a saved base, and refusing to silently load it instead"
-            );
-            false
-        }
-        (Some(_), Some(other)) => {
-            panic!("A_BUNDLE_MODE must be `prove` or `load`, got `{other}`")
-        }
-    };
+    let mode = CacheMode::from_env(bundle_path.is_some());
     let t = Instant::now();
-    let bundle = if cached {
-        let p = bundle_path.as_deref().expect("cached implies a path");
-        let bytes = std::fs::read(p).expect("the cached bundle must read");
-        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
-        aligned.extend_from_slice(&bytes);
-        rkyv::from_bytes::<crate::continuation::ContinuationProof, rkyv::rancor::Error>(&aligned)
-            .expect("the cached bundle must deserialize")
-    } else {
-        let b = crate::continuation::prove_continuation(
+    let bundle = cached_bundle(mode, bundle_path.map(std::path::PathBuf::from), || {
+        crate::continuation::prove_continuation(
             &inputs.elf_bytes,
             &inputs.private_input,
             inputs.epoch_log2,
             &inner,
         )
-        .expect("the block must prove");
-        if let Some(p) = bundle_path.as_deref() {
-            let bytes =
-                rkyv::to_bytes::<rkyv::rancor::Error>(&b).expect("the bundle must serialize");
-            std::fs::write(p, &bytes).expect("the bundle must persist");
-        }
-        b
-    };
-    println!(
-        "   base: {} — a LOADED bundle carries in L_children alone; a PROVED one \
-         also carries the base's residue",
-        if cached {
-            "LOADED from cache"
-        } else {
-            "PROVED in-process"
-        }
-    );
+        .expect("the block must prove")
+    });
     assert!(
         bundle.num_epochs() >= fan_in,
         "a fan-in-{fan_in} leaf needs {fan_in} epochs, the block has {}",
