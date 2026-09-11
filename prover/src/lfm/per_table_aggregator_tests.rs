@@ -4543,6 +4543,19 @@ fn the_production_tree_composes_to_a_root() {
              recomputes the id from an ELF the consumer trusts, host-side. \
              \"One proof for this block\" terminates there"
         );
+        // ⛔ AND THE SECOND RUNG OF THE LADDER, WHICH THIS RUN DOES NOT REACH.
+        // The claim ladder was fixed before the result: a root proved and
+        // verified is "the block is compressed"; "PINNED" needs the tamper arms
+        // green, and this is a PROVE, not a `--lib` run. Printed here because the
+        // log is where the claim gets read, and a reader who sees only the line
+        // above will report the stronger one.
+        println!(
+            "   ⛔ NOT YET \"PINNED\": that rung needs the tamper arms green in a \
+             `--lib` run — lfm::block_root (the root's five), lfm::global_parent \
+             and lfm::global_split (the parent's). This run PROVES; it runs none \
+             of them, so a root proved without them is a demonstration with a \
+             stated gap, not a soundness claim"
+        );
         // ★ THE TWO-POSTURE BYTE-IDENTITY CHECK, REFUSED BY NAME.
         //
         // `root_schema_words`' signature pins the artifact's WIDTH against the
