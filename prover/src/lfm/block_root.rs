@@ -599,7 +599,7 @@ mod tests {
     /// item — which is the whole content of the open ruling, as arithmetic.
     #[test]
     fn the_artifact_width_is_independent_of_the_proving_strategy() {
-        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let num_reg = fixture_num_reg();
         let lanes = super::super::proof_arena::lanes_per_root();
         for out_halves in [0usize, 1, 7, 64] {
             let assert_only = root_schema_words(num_reg, out_halves, RootPublishSet::AssertOnly);
@@ -882,6 +882,19 @@ mod tests {
     // DOES with words its children published, and that is exactly what a fixture
     // can hold.
 
+    /// The register-address count, read from the LAYOUT rather than from the
+    /// machine constant.
+    ///
+    /// ⛔ ONE DERIVATION, and the reason is not tidiness. `emit_root_publishes`
+    /// reads `l_first.num_reg`, so the layout is where the emitter gets this; a
+    /// gate that spelled `NUM_REGISTER_ADDRESSES` instead would be a SECOND
+    /// source for one quantity, and two derivations of one quantity in adjacent
+    /// gates is the shape that has bitten this campaign repeatedly. Same value
+    /// today, and `SchemaLayout::node` is the place it comes from.
+    fn fixture_num_reg() -> usize {
+        SchemaLayout::node(0).num_reg
+    }
+
     /// A lane of epoch `k`'s L2G root, DISTINGUISHABLE at every `(epoch, lane)`.
     ///
     /// ⛔ Injective in the flat index, which is the whole point of the moved-root
@@ -1025,7 +1038,7 @@ mod tests {
         out_halves: usize,
     ) -> (RootPlan, RootFixture) {
         let lanes = super::super::proof_arena::lanes_per_root();
-        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let num_reg = fixture_num_reg();
         let shape = FoldShape::for_root(epochs, fan_in, replaces_top);
         let ranges = top_level_epoch_ranges(&shape, epochs);
         let children = ranges.len();
@@ -1216,11 +1229,7 @@ mod tests {
                 });
                 assert_eq!(
                     exec.public_words.len(),
-                    root_schema_words(
-                        plan.interior_layouts[0].num_reg,
-                        out_halves,
-                        RootPublishSet::AssertOnly
-                    ),
+                    root_schema_words(fixture_num_reg(), out_halves, RootPublishSet::AssertOnly),
                     "{epochs}@{fan_in}: the artifact's width"
                 );
             }
@@ -1348,7 +1357,7 @@ mod tests {
     /// labels must be constants of the root rather than anything a child chose.
     #[test]
     fn the_root_publishes_a_fixed_size_schema() {
-        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let num_reg = fixture_num_reg();
         let mut widths: Vec<(usize, usize)> = Vec::new();
         for (epochs, fan_in, replaces_top) in ROOT_SHAPES {
             for out_halves in [0usize, 1, 3] {
@@ -1665,11 +1674,25 @@ pub fn emit_block_root(b: &mut LfmBuilder, inputs: &RootInputs<'_>) {
         publishes,
     } = *inputs;
 
-    // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
-    // Every child's arenas are declared before any leg is emitted, exactly as a
-    // node does it; putting the global wrap last keeps the interior children's
-    // arena indices identical to what they would be under `emit_node`, so a
-    // reader comparing the two programs is comparing like with like.
+    // ⚠ DECLARATION ORDER IS ARENA ORDER, and the global child goes LAST.
+    //
+    // ⛔ CORRECTED: this comment used to claim every child's arenas are declared
+    // BEFORE any leg is emitted. They are not. `emit_child_leg` declares one
+    // child's arenas and immediately emits its leg, so declaration and emission
+    // INTERLEAVE per child — which is also what `emit_node` does.
+    //
+    // ✓ It is equivalent, and the reason is narrow enough to state: nothing on
+    // the leg path calls `declare_arena` after `declare_leg_arenas` returns, so
+    // no arena of child `k + 1` can be handed an id that child `k`'s leg would
+    // have taken. The ids are therefore identical to a batched declaration, and
+    // the host fills them as a plain per-child concatenation in this order — the
+    // order `child_arena_words` builds. ⚠ That equivalence rests on the leg path
+    // declaring nothing; a future leg that did would break the concatenation
+    // silently, and this is where a reader would look.
+    //
+    // Putting the global child last keeps the interior children's arena indices
+    // identical to what they would be under `emit_node`, so a reader comparing
+    // the two programs is comparing like with like.
     let interior_legs: Vec<LegCells> = interior
         .iter()
         .map(|child| emit_child_leg(b, child))
