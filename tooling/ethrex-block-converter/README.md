@@ -38,25 +38,25 @@ coupled to the ethrex revision.
 
 ## Real-block fixture
 
-The benchmark fixture is a fetched release artifact, not a build dependency:
-
-```bash
-make ethrex-real-block-fixture
-```
-
-After an ethrex revision bump, regenerate it from the matching cache:
+The benchmark fixture is generated rather than fetched, and not by this crate:
+`tooling/ethrex-fixtures --bin real_block` rebuilds a real mainnet block as an
+Amsterdam block. What is hosted is that block's replay cache, which is
+fork-independent. `make ethrex-real-block-fixture` produces the fixture when it is
+missing; after an ethrex revision bump, rebuild it and re-baseline its digest:
 
 ```bash
 make regen-real-block-fixture
-sha256sum "$(make -s print-real-block-fixture)"
+sha256sum "$(make -s print-real-block-fixture)"   # -> ETHREX_REAL_BLOCK_FIXTURE_SHA256
 ```
 
-Publish the resulting SSZ artifact and matching Amsterdam cache, then update
-their URLs and checksums in the Makefile before enabling the real-block
-benchmark. The old release assets are rkyv `ProgramInput` artifacts and are
-incompatible with the pinned ethrex.
+There is no artifact left to publish: the generator is deterministic, so re-running
+it is how the fixture is replaced. The old release assets are rkyv `ProgramInput`
+artifacts and are incompatible with the pinned ethrex.
 
-The converter's tests use the Hoodi cache under `caches/` and verify that an
-unmapped network is rejected. The checked release cache predates Amsterdam, so
-it is intentionally rejected until a cache containing the new payload fields
-is published.
+## What the tests cover
+
+Both tests assert a rejection. The pinned Hoodi cache predates Amsterdam and is
+refused rather than rewritten, and an unmappable network is refused too. The
+success path — cache in, valid SSZ out — has no automated coverage: it needs a
+cache from a network that runs Amsterdam, and none is published yet. Until one is,
+the encoder is exercised by hand through the `cargo run` above.

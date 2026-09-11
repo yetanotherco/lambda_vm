@@ -471,23 +471,27 @@ print-real-block-cache-url:
 # path builds this crate.
 #
 # Its TEST input is pinned to Hoodi 1265656, independently of whichever block the
-# benchmarks currently prove, and stays there across a repoint. What these tests
-# exercise is the CONVERSION — cache JSON in, correctly serialized SSZ out — which
-# any real block demonstrates equally well. Hoodi's is the one cache ethrex-replay
-# publishes, so pinning there costs us no hosting, cannot drift, and leaves the
-# benchmark block free to change without touching this crate.
+# benchmarks currently prove, and stays there across a repoint. Hoodi's is the one
+# cache ethrex-replay publishes, so pinning there costs us no hosting, cannot drift,
+# and leaves the benchmark block free to change without touching this crate.
+#
+# What those tests reach is only the REJECTION paths: a pre-Amsterdam cache, and an
+# unmappable network. The conversion's success path cannot be covered yet — it needs a
+# cache carrying `slot_number` and `block_access_list_hash`, and no published cache has
+# them until a network runs Amsterdam. Until one does, this crate's SSZ encoder is
+# exercised by hand (`cargo run`) and by nothing automatic.
 #
 # Pinned by immutable `rev`, as the guest pins ethrex itself: a branch ref would let
-# the converter's reproducibility digest drift under a fixed input.
+# the test input move under a fixed set of assertions.
 ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
 ETHREX_CONVERTER_TEST_BLOCK := hoodi_1265656
 ETHREX_CONVERTER_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_CONVERTER_TEST_BLOCK).json
 # The cache filename is keyed on the block only, and its download rule has no other
 # prerequisite, so make would treat an already-present cache as up to date across an
 # `ETHREX_REPLAY_REV` bump and silently keep reading the old input. Depending on a
-# rev-stamped marker makes a re-pin discard the stale cache; without it the mismatch
-# only surfaces downstream as a `conversion_is_reproducible` digest failure, which
-# reads as "regenerate the fixture" and points at the wrong thing.
+# rev-stamped marker makes a re-pin discard the stale cache. Nothing downstream would
+# catch it otherwise: the two tests that remain assert that a cache is REJECTED, and a
+# stale cache satisfies that just as well as the right one.
 ETHREX_REPLAY_REV_STAMP := tooling/ethrex-block-converter/caches/.replay-rev-$(ETHREX_REPLAY_REV)
 
 $(ETHREX_REPLAY_REV_STAMP):
@@ -503,9 +507,10 @@ $(ETHREX_CONVERTER_CACHE): $(ETHREX_REPLAY_REV_STAMP)
 
 ethrex-real-block-converter-cache: $(ETHREX_CONVERTER_CACHE)
 
-# Converter correctness: host-side parity through the guest's own Crypto impl, the
-# network-rejection guard, and the reproducibility digest. Runs on changes to the
-# converter (see .github/workflows/ethrex-block-converter.yml), not on every PR.
+# Converter correctness, as far as it is testable today: a pre-Amsterdam cache and an
+# unmappable network are both rejected. The success path needs an Amsterdam cache —
+# see the comment above. Runs on changes to the converter
+# (see .github/workflows/ethrex-block-converter.yml), not on every PR.
 test-ethrex-real-block-converter: $(ETHREX_CONVERTER_CACHE)
 	cd tooling/ethrex-block-converter && cargo test --locked --release
 
