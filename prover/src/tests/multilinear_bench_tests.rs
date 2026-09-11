@@ -418,6 +418,8 @@ fn phases() {
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu rounds", multilinear::gpu::sumcheck_rounds()),
         ("gpu evals", multilinear::gpu::evaluate_calls()),
+        ("gpu trees", multilinear::gpu::tree_calls()),
+        ("gpu factors", multilinear::gpu::factor_calls()),
     ] {
         println!("{tag:<14} {count:>9}");
     }

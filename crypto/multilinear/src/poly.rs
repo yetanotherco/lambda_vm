@@ -51,6 +51,13 @@ pub trait SumcheckPolynomial<F: IsField + 'static> {
         None
     }
 
+    /// Factors this polynomial's first ones already have on a device, when
+    /// something upstream put them there. The device path folds those in place
+    /// and uploads only the rest.
+    fn device_factors(&self) -> Option<&std::sync::Arc<crate::gpu::DeviceFactors>> {
+        None
+    }
+
     /// Takes factors bound elsewhere, in the order [`polys`](Self::polys)
     /// returns them.
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {

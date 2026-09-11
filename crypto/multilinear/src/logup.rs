@@ -172,6 +172,38 @@ pub fn input_layer<E: IsField + 'static>(
     FractionLayer::new(Mle::new(p)?, Mle::new(q)?)
 }
 
+/// The input layer and the tree above it, built where the factors already are.
+///
+/// The layer is `interactions × rows` fractions — the biggest thing a table's
+/// argument builds — and every one of its cells is an affine expression over
+/// the factors, which is a program the device can run.
+///
+/// `None` when the device declines; the caller then builds the layer here.
+pub fn resident_tree<E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    factors: &crate::gpu::DeviceFactors,
+) -> Option<crate::gkr::FractionTree<E>> {
+    if interactions.is_empty() {
+        return None;
+    }
+    let emit = |side: &Affine<E>| {
+        let mut builder = Builder::<E>::new();
+        let root = side.emit(&mut builder);
+        builder.finish(root).ok()
+    };
+    let numerators: Vec<Program<E>> = interactions
+        .iter()
+        .map(|i| emit(&i.numerator))
+        .collect::<Option<_>>()?;
+    let denominators: Vec<Program<E>> = interactions
+        .iter()
+        .map(|i| emit(&i.denominator))
+        .collect::<Option<_>>()?;
+
+    let tree = crate::gpu::input_layer_tree(factors, &numerators, &denominators)?;
+    crate::gkr::FractionTree::from_device(tree).ok()
+}
+
 /// What the batch needs to settle a bus's input-layer claim.
 pub struct BusStatements<'a, E: IsField> {
     pub numerator: Rule<'a, E>,

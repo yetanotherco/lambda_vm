@@ -473,3 +473,196 @@ fn fold_to_one(
     }
     Ok(())
 }
+
+/// A table's factors, uploaded once and read by everything that walks them:
+/// the LogUp input layer, and then the batched sumcheck.
+pub struct DeviceFactors {
+    stream: Arc<CudaStream>,
+    buffer: Arc<CudaSlice<u64>>,
+    addresses: Vec<u64>,
+    len: usize,
+}
+
+impl DeviceFactors {
+    /// Uploads `factors`, each `len` ext3 values interleaved.
+    pub fn upload(factors: &[&[u64]]) -> Result<Self> {
+        assert!(!factors.is_empty(), "a table has factors");
+        let span = factors[0].len();
+        assert!(span.is_multiple_of(3), "three u64 per ext3 element");
+        assert!(
+            factors.iter().all(|f| f.len() == span),
+            "every factor spans the same cube"
+        );
+        let len = span / 3;
+
+        let be = backend()?;
+        let stream = be.next_stream();
+        let mut buffer = unsafe { stream.alloc::<u64>(factors.len() * span) }?;
+        for (k, factor) in factors.iter().enumerate() {
+            let at = k * span;
+            let mut slab = buffer.slice_mut(at..at + span);
+            stream.memcpy_htod(*factor, &mut slab)?;
+        }
+        let addresses = {
+            let (base, _record) = buffer.device_ptr(&stream);
+            (0..factors.len())
+                .map(|k| base + (k * span * 8) as u64)
+                .collect()
+        };
+        Ok(Self {
+            stream,
+            buffer: Arc::new(buffer),
+            addresses,
+            len,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> usize {
+        self.addresses.len()
+    }
+
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Writes `program`'s value at every row into a fresh buffer.
+    ///
+    /// This is how a bus interaction's two sides become an input-layer slab:
+    /// the affine expression is the program, and the rows are the cube.
+    pub fn map_program(
+        &self,
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+        out: &mut CudaSlice<u64>,
+        offset: usize,
+    ) -> Result<()> {
+        assert!(nodes.len().is_multiple_of(2), "two u64 per step");
+        assert!(
+            consts.len().is_multiple_of(3),
+            "three u64 per ext3 constant"
+        );
+        assert!(
+            out.len() >= (offset + self.len) * 3,
+            "the output holds the rows"
+        );
+
+        let be = backend()?;
+        let (grid, num_threads) = grid_for(num_slots);
+        let factor_ptrs = self.stream.clone_htod(&self.addresses)?;
+        let nodes_dev = self.stream.clone_htod(nodes)?;
+        let consts_dev = self.stream.clone_htod(if consts.is_empty() {
+            &[0u64][..]
+        } else {
+            consts
+        })?;
+        let mut slots = unsafe {
+            self.stream
+                .alloc::<u64>(num_slots * 3 * num_threads as usize)
+        }?;
+        let mut target = out.slice_mut(offset * 3..(offset + self.len) * 3);
+        let rows = self.len as u64;
+        let num_nodes = (nodes.len() / 2) as u64;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&be.program_map_ext3)
+                .arg(&factor_ptrs)
+                .arg(&rows)
+                .arg(&nodes_dev)
+                .arg(&num_nodes)
+                .arg(&consts_dev)
+                .arg(&root_slot)
+                .arg(&mut slots)
+                .arg(&mut target)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// A sumcheck over these factors followed by `extra`, which is uploaded
+    /// here — the weight tables a batch adds on top of the trace's.
+    ///
+    /// The rounds fold the factors in place, so the handle is spent for
+    /// everything else once this runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn session(
+        &self,
+        extra: &[&[u64]],
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+    ) -> Result<SumcheckSession> {
+        let span = self.len * 3;
+        let mut addresses = self.addresses.clone();
+        let mut held = vec![self.buffer.clone()];
+        if !extra.is_empty() {
+            assert!(
+                extra.iter().all(|f| f.len() == span),
+                "every factor spans the same cube"
+            );
+            let mut buffer = unsafe { self.stream.alloc::<u64>(extra.len() * span) }?;
+            for (k, factor) in extra.iter().enumerate() {
+                let at = k * span;
+                let mut slab = buffer.slice_mut(at..at + span);
+                self.stream.memcpy_htod(*factor, &mut slab)?;
+            }
+            {
+                let (base, _record) = buffer.device_ptr(&self.stream);
+                addresses.extend((0..extra.len()).map(|k| base + (k * span * 8) as u64));
+            }
+            held.push(Arc::new(buffer));
+        }
+        SumcheckSession::from_device(
+            self.stream.clone(),
+            &addresses,
+            self.len,
+            held,
+            nodes,
+            consts,
+            num_slots,
+            root_slot,
+        )
+    }
+}
+
+/// Fills `count` ext3 cells of `dst` from `offset` with one value.
+pub fn fill_ext3(
+    stream: &Arc<CudaStream>,
+    dst: &mut CudaSlice<u64>,
+    offset: usize,
+    count: usize,
+    value: &[u64],
+) -> Result<()> {
+    assert_eq!(value.len(), 3, "an ext3 value");
+    if count == 0 {
+        return Ok(());
+    }
+    let be = backend()?;
+    let value_dev = stream.clone_htod(value)?;
+    let mut target = dst.slice_mut(offset * 3..(offset + count) * 3);
+    let count_arg = count as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.fill_ext3)
+            .arg(&mut target)
+            .arg(&count_arg)
+            .arg(&value_dev)
+            .launch(LaunchConfig::for_num_elems(count as u32))?;
+    }
+    Ok(())
+}

@@ -93,14 +93,7 @@ impl<F: IsField + 'static> FractionTree<F> {
         FieldElement<F>: Send + Sync,
     {
         if let Some(device) = crate::gpu::build_tree(&input.p, &input.q) {
-            let num_layers = device.num_layers();
-            let output = device.output()?;
-            return Ok(Self {
-                layers: Vec::new(),
-                device: Some(device),
-                num_layers,
-                output,
-            });
+            return Self::from_device(device);
         }
 
         let mut layers = vec![input];
@@ -115,6 +108,18 @@ impl<F: IsField + 'static> FractionTree<F> {
         Ok(Self {
             layers,
             device: None,
+            num_layers,
+            output,
+        })
+    }
+
+    /// A tree a device already holds, layers and all.
+    pub fn from_device(device: crate::gpu::DeviceTree) -> Result<Self, Error> {
+        let num_layers = device.num_layers();
+        let output = device.output()?;
+        Ok(Self {
+            layers: Vec::new(),
+            device: Some(device),
             num_layers,
             output,
         })

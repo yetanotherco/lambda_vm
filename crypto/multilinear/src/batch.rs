@@ -101,6 +101,8 @@ pub struct Batched<'a, F: IsField> {
     /// The whole batch as one program, when every rule is compiled. The round
     /// loop runs this instead of the rules, and it is what a device gets.
     program: Option<Program<F>>,
+    /// The trace's factors, when a device already holds them.
+    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
 }
 
 impl<'a, F: IsField + 'static> Batched<'a, F> {
@@ -141,7 +143,16 @@ impl<'a, F: IsField + 'static> Batched<'a, F> {
             num_vars,
             degree,
             program,
+            device: None,
         })
+    }
+
+    /// The same, over factors a device already holds — the batch's first
+    /// `width` polynomials, in order. What follows them goes up with the
+    /// session.
+    pub fn with_device(mut self, device: std::sync::Arc<crate::gpu::DeviceFactors>) -> Self {
+        self.device = Some(device);
+        self
     }
 
     /// The batch as one program, when it has one.
@@ -195,6 +206,10 @@ impl<F: IsField + 'static> SumcheckPolynomial<F> for Batched<'_, F> {
         self.program.as_ref()
     }
 
+    fn device_factors(&self) -> Option<&std::sync::Arc<crate::gpu::DeviceFactors>> {
+        self.device.as_ref()
+    }
+
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
         if polys.len() != self.polys.len() {
             return Err(Error::VariableCountMismatch {
@@ -228,6 +243,22 @@ where
     F: IsField + 'static,
     T: IsTranscript<F>,
 {
+    prove_resident(polys, None, rules, claims, transcript)
+}
+
+/// The same, over factors a device already holds — the first of them, in the
+/// order `polys` lists them.
+pub fn prove_resident<F, T>(
+    polys: Vec<Mle<F>>,
+    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
+    rules: Vec<Rule<'_, F>>,
+    claims: &[FieldElement<F>],
+    transcript: &mut T,
+) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
+where
+    F: IsField + 'static,
+    T: IsTranscript<F>,
+{
     if claims.len() != rules.len() {
         return Err(Error::VariableCountMismatch {
             expected: rules.len(),
@@ -238,7 +269,12 @@ where
         transcript.append_field_element(claim);
     }
     let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
-    sumcheck::prove(Batched::new(polys, rules, lambdas)?, transcript)
+    let batched = Batched::new(polys, rules, lambdas)?;
+    let batched = match device {
+        Some(device) => batched.with_device(device),
+        None => batched,
+    };
+    sumcheck::prove(batched, transcript)
 }
 
 /// Checks the batched sumcheck against the factor values it reduces to.

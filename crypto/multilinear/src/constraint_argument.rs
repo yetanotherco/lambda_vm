@@ -153,7 +153,7 @@ where
 ///
 /// Says nothing about where the columns are committed, which is the point:
 /// several tables can share one commitment, and then no single table owns it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TraceData<F: IsField, E: IsField> {
     columns: Vec<Mle<F>>,
     /// The public factors' tables, in the order they appear in `kinds`. Held
@@ -161,6 +161,11 @@ pub struct TraceData<F: IsField, E: IsField> {
     /// are rebuilt on demand rather than kept for the whole proof.
     public: Vec<Mle<E>>,
     kinds: Vec<FactorKind>,
+    /// The factors on a device, put there by whoever needed them first. The
+    /// input layer reads them and the sumcheck folds them, and they are the
+    /// biggest thing a table's argument holds — uploading them twice would
+    /// cost more than either use.
+    device: std::sync::Mutex<Option<std::sync::Arc<crate::gpu::DeviceFactors>>>,
 }
 
 impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
@@ -197,6 +202,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         Ok(Self {
             columns,
             public,
+            device: std::sync::Mutex::new(None),
             kinds,
         })
     }
@@ -219,6 +225,25 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     /// Materialized on each call rather than stored. The sumcheck has to own
     /// and fold them anyway, so a second copy kept for the whole proof would be
     /// one more resident copy of the trace and nothing else.
+    /// The factors on a device, if they are there.
+    ///
+    /// Whoever needs them first calls [`reside`](Self::reside); the handle is
+    /// shared from then on. Folding them — which the sumcheck does — spends
+    /// them, and nothing reads them after that.
+    pub fn device_factors(&self) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
+        self.device.lock().ok()?.clone()
+    }
+
+    /// Puts `factors` on a device and keeps the handle, or leaves it empty
+    /// when the device declines.
+    pub fn reside(&self, factors: &[Mle<E>]) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
+        let mut slot = self.device.lock().ok()?;
+        if slot.is_none() {
+            *slot = crate::gpu::upload_factors(factors).map(std::sync::Arc::new);
+        }
+        slot.clone()
+    }
+
     pub fn factors(&self) -> Result<Vec<Mle<E>>, Error>
     where
         F: IsSubFieldOf<E>,
@@ -493,8 +518,9 @@ where
     T: IsTranscript<E>,
 {
     let mut factors = trace.factors()?;
+    let resident = trace.device_factors();
     factors.extend(weights);
-    let (sumcheck, point) = batch::prove(factors, rules, claims, transcript)?;
+    let (sumcheck, point) = batch::prove_resident(factors, resident, rules, claims, transcript)?;
 
     // The sumcheck leaves a claim about the factors at its point. Settle it in
     // two steps: reduce every committed factor's value there to a claim about

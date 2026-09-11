@@ -44,9 +44,27 @@ impl DeviceFractionTree {
 
         let be = backend()?;
         let stream = be.next_stream();
+        let input_p = stream.clone_htod(p)?;
+        let input_q = stream.clone_htod(q)?;
+        Self::from_device(stream, input_p, input_q)
+    }
+
+    /// The same for an input layer the device already holds — what the LogUp
+    /// fingerprints write straight into.
+    pub fn from_device(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+    ) -> Result<Self> {
+        assert_eq!(p.len(), q.len(), "a layer's halves span one cube");
+        assert!(p.len().is_multiple_of(3), "three u64 per ext3 element");
+        let elements = p.len() / 3;
+        assert!(elements.is_power_of_two(), "the cube is a power of two");
+
+        let be = backend()?;
         let mut layers = vec![DeviceLayer {
-            p: Arc::new(stream.clone_htod(p)?),
-            q: Arc::new(stream.clone_htod(q)?),
+            p: Arc::new(p),
+            q: Arc::new(q),
             num_vars: elements.trailing_zeros() as usize,
         }];
 

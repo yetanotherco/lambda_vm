@@ -175,6 +175,45 @@ extern "C" __global__ void sumcheck_round_ext3(
     }
 }
 
+// The program's value at every row, written out rather than summed: the LogUp
+// input layer is one of these per interaction per side.
+//
+// Reuses the round's walk with `half = 0` and `t = 0`, which makes `OP_VAR`
+// read `lo` and extend it by nothing — the plain value at the row.
+extern "C" __global__ void program_map_ext3(const uint64_t *const *__restrict__ d_factors,
+                                            uint64_t num_rows,
+                                            const uint64_t *__restrict__ d_nodes,
+                                            uint64_t num_nodes,
+                                            const uint64_t *__restrict__ d_consts,
+                                            uint32_t root_slot, uint64_t *__restrict__ d_slots,
+                                            uint64_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
+    uint64_t *slots = d_slots + tid;
+    Fe3 zero = ext3::make(0, 0, 0);
+
+    for (uint64_t row = tid; row < num_rows; row += num_threads) {
+        Fe3 v = eval_program(d_nodes, num_nodes, d_consts, d_factors, row, 0, zero, slots,
+                             num_threads, root_slot);
+        uint64_t *at = out + row * 3;
+        at[0] = v.a;
+        at[1] = v.b;
+        at[2] = v.c;
+    }
+}
+
+// Fills a range with one ext3 value — the padding interactions of an input
+// layer, whose numerators vanish and whose denominators are one.
+extern "C" __global__ void fill_ext3(uint64_t *__restrict__ dst, uint64_t count,
+                                     const uint64_t *__restrict__ value) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= count) return;
+    uint64_t *at = dst + j * 3;
+    at[0] = value[0];
+    at[1] = value[1];
+    at[2] = value[2];
+}
+
 // One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
 // `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
 // host seeds `dst[0]` and walks the variables back to front, which is what

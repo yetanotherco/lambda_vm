@@ -18,6 +18,8 @@ static SUMCHECK_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees built and kept on device.
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Tables whose factors were uploaded once and reused.
+static FACTOR_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -39,12 +41,17 @@ pub fn tree_calls() -> u64 {
     TREE_CALLS.load(Ordering::Relaxed)
 }
 
+pub fn factor_calls() -> u64 {
+    FACTOR_CALLS.load(Ordering::Relaxed)
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
+    FACTOR_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and the factors the
@@ -318,6 +325,7 @@ where
 #[cfg(feature = "cuda")]
 pub(crate) fn prove_sumcheck<E>(
     polys: &[crate::mle::Mle<E>],
+    resident: Option<&DeviceFactors>,
     program: &crate::program::Program<E>,
     degree: usize,
     challenge: impl FnMut(
@@ -366,14 +374,31 @@ where
         })
         .collect();
 
-    let mut session = math_cuda::sumcheck::SumcheckSession::new(
-        &raw,
-        &lowered.nodes,
-        &lowered.consts,
-        lowered.num_slots,
-        lowered.root_slot,
-    )
-    .ok()?;
+    // Factors already on device are folded where they are; the rest — a
+    // batch's weight tables — go up with them.
+    let session = match resident {
+        Some(factors) => {
+            let held = factors.0.width();
+            if held > raw.len() || factors.0.len() != first.len() {
+                return None;
+            }
+            factors.0.session(
+                &raw[held..],
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        }
+        None => math_cuda::sumcheck::SumcheckSession::new(
+            &raw,
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+        ),
+    };
+    let mut session = session.ok()?;
 
     // Diagnostic hook: recompute each round on the host from the factors the
     // device holds and stop at the first disagreement, naming the round. A
@@ -404,12 +429,14 @@ where
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    let Ok(tables) = session.download() else {
+    // Every variable is bound, so each factor is one value — read where it
+    // lies, which is the only thing a session over resident factors can say.
+    let Ok(bound) = session.bound_values() else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
-    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = tables
+    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = bound
         .iter()
-        .map(|table| crate::mle::Mle::new(table.chunks_exact(3).map(ext3_from_raw::<E>).collect()))
+        .map(|value| crate::mle::Mle::new(vec![ext3_from_raw::<E>(value)]))
         .collect();
     let Ok(folded) = folded else {
         return Some(Err(crate::Error::DeviceFailed {
@@ -486,6 +513,7 @@ where
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn prove_sumcheck<E>(
     _polys: &[crate::mle::Mle<E>],
+    _resident: Option<&DeviceFactors>,
     _program: &crate::program::Program<E>,
     _degree: usize,
     _challenge: impl FnMut(
@@ -1036,4 +1064,123 @@ impl DeviceTree {
             [value(1), value(2), value(3), value(4)],
         )))
     }
+}
+
+/// A table's factors, uploaded once for everything that walks them.
+#[cfg(feature = "cuda")]
+pub struct DeviceFactors(math_cuda::sumcheck::DeviceFactors);
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for DeviceFactors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceFactors")
+            .field("factors", &self.0.width())
+            .field("cells", &self.0.len())
+            .finish()
+    }
+}
+
+/// Factors a build declined to upload. Never constructed.
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+pub struct DeviceFactors(std::convert::Infallible);
+
+/// Uploads a table's factors, or declines.
+#[cfg(feature = "cuda")]
+pub fn upload_factors<E>(factors: &[crate::mle::Mle<E>]) -> Option<DeviceFactors>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() {
+        return None;
+    }
+    let first = factors.first()?;
+    if first.len() < SUMCHECK_THRESHOLD || factors.iter().any(|f| f.len() != first.len()) {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_FACTORS").is_some()) {
+        return None;
+    }
+    // SAFETY: `E == Ext3`, three transparent `u64` limbs per element.
+    let raw: Vec<&[u64]> = factors
+        .iter()
+        .map(|f| unsafe {
+            core::slice::from_raw_parts(f.evals().as_ptr() as *const u64, f.len() * 3)
+        })
+        .collect();
+    let uploaded = math_cuda::sumcheck::DeviceFactors::upload(&raw).ok()?;
+    FACTOR_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(DeviceFactors(uploaded))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_factors<E>(_factors: &[crate::mle::Mle<E>]) -> Option<DeviceFactors>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// The fraction tree's input layer, written by the device from the factors it
+/// already holds, and folded into a tree without ever coming back.
+///
+/// Each interaction contributes a `p` and a `q` slab of `rows`, in the order
+/// [`logup::input_layer`](crate::logup::input_layer) lays them out, with the
+/// padding slots carrying `0/1`.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree<E>(
+    factors: &DeviceFactors,
+    numerators: &[crate::program::Program<E>],
+    denominators: &[crate::program::Program<E>],
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+
+    let rows = factors.0.len();
+    let slots = numerators.len().next_power_of_two();
+    let stream = factors.0.stream().clone();
+    let mut p = stream.alloc_zeros::<u64>(slots * rows * 3).ok()?;
+    let mut q = stream.alloc_zeros::<u64>(slots * rows * 3).ok()?;
+
+    for (i, (numerator, denominator)) in numerators.iter().zip(denominators).enumerate() {
+        for (program, out) in [(numerator, &mut p), (denominator, &mut q)] {
+            let lowered = lower(program)?;
+            factors
+                .0
+                .map_program(
+                    &lowered.nodes,
+                    &lowered.consts,
+                    lowered.num_slots,
+                    lowered.root_slot,
+                    out,
+                    i * rows,
+                )
+                .ok()?;
+        }
+    }
+    // The padding interactions: numerator zero (already), denominator one.
+    let one = ext3_raw(&FieldElement::<E>::one())?;
+    let padding = (slots - numerators.len()) * rows;
+    math_cuda::sumcheck::fill_ext3(&stream, &mut q, numerators.len() * rows, padding, &one).ok()?;
+
+    let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
+    TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(DeviceTree(tree))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn input_layer_tree<E>(
+    _factors: &DeviceFactors,
+    _numerators: &[crate::program::Program<E>],
+    _denominators: &[crate::program::Program<E>],
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
 }

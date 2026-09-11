@@ -533,11 +533,20 @@ where
         |col| slot(table.slot_of(), col),
     )?;
 
-    // The input layer reads the trace's factors; they are materialized here,
-    // used and dropped rather than held for the proof.
+    // The input layer reads the trace's factors. On a device they stay there
+    // for the sumcheck too — they are the biggest thing the argument holds —
+    // and the layer is written where they are; on the host they are
+    // materialized here, used and dropped.
     let tree = {
         let factors = table.trace.factors()?;
-        FractionTree::build(logup::input_layer(&interactions, &factors)?)?
+        match table
+            .trace
+            .reside(&factors)
+            .and_then(|resident| logup::resident_tree(&interactions, &resident))
+        {
+            Some(tree) => tree,
+            None => FractionTree::build(logup::input_layer(&interactions, &factors)?)?,
+        }
     };
     let bus_output = tree.output();
     transcript.append_field_element(&bus_output.0);
