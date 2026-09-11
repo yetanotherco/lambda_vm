@@ -33,7 +33,7 @@ impl OpeningSession {
         let len = weight.len() / 3;
         let be = backend()?;
         let stream = be.next_stream();
-        let weight_dev = stream.clone_htod(weight)?;
+        let weight_dev = crate::device::htod_or_trim(&stream, weight)?;
         Self::with_weight(stream, weight_dev, len, message)
     }
 
@@ -50,10 +50,10 @@ impl OpeningSession {
     ) -> Result<Self> {
         let be = backend()?;
         let stream = be.next_stream();
-        let mut weight = stream.alloc_zeros::<u64>(len * 3)?;
-        for (offset, point, scale) in shares {
-            crate::sumcheck::eq_expand_into(&stream, &mut weight, *offset, point, scale)?;
-        }
+        // Zeroed because the gaps between the shares' subcubes are part of the
+        // weight and nothing writes them.
+        let mut weight = crate::device::alloc_zeros_or_trim::<u64>(&stream, len * 3)?;
+        crate::sumcheck::eq_expand_shares_ext3(&stream, &mut weight, shares)?;
         Self::with_weight(stream, weight, len, message)
     }
 
@@ -67,7 +67,7 @@ impl OpeningSession {
         assert!(len.is_power_of_two(), "the cube is a power of two");
 
         let be = backend()?;
-        let base = stream.clone_htod(message)?;
+        let base = crate::device::htod_or_trim(&stream, message)?;
         // SAFETY: the kernel writes every element it is sized for.
         let mut lifted = unsafe { stream.alloc::<u64>(len * 3) }?;
         let count = len as u64;
@@ -155,7 +155,7 @@ impl OpeningSession {
         assert_eq!(scale.len(), 3, "an ext3 scale");
         let be = backend()?;
         let eq = crate::sumcheck::eq_table_ext3(&self.stream, point, self.len)?;
-        let scale_dev = self.stream.clone_htod(scale)?;
+        let scale_dev = crate::device::htod_or_trim(&self.stream, scale)?;
         let count = self.len as u64;
         // The kernel writes through a shared reference, the way the tree's
         // layers are folded: what orders these is the stream, and the weight

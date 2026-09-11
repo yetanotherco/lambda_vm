@@ -30,6 +30,9 @@ struct DeviceLayer {
 pub struct DeviceFractionTree {
     stream: Arc<CudaStream>,
     layers: Vec<DeviceLayer>,
+    /// The room the whole tree promised itself: the input layer and every
+    /// level above it, which together are twice the input layer.
+    _room: crate::device::DeviceReservation,
 }
 
 impl DeviceFractionTree {
@@ -44,8 +47,8 @@ impl DeviceFractionTree {
 
         let be = backend()?;
         let stream = be.next_stream();
-        let input_p = stream.clone_htod(p)?;
-        let input_q = stream.clone_htod(q)?;
+        let input_p = crate::device::htod_or_trim(&stream, p)?;
+        let input_q = crate::device::htod_or_trim(&stream, q)?;
         Self::from_device(stream, input_p, input_q)
     }
 
@@ -62,6 +65,13 @@ impl DeviceFractionTree {
         assert!(elements.is_power_of_two(), "the cube is a power of two");
 
         let be = backend()?;
+        // The levels above the input layer halve, so the whole tree is twice
+        // it — and the input layer is `p` and `q` together.
+        let Some(room) = be.reserve(p.len() as u64 * 8 * 4) else {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ));
+        };
         let mut layers = vec![DeviceLayer {
             p: Arc::new(p),
             q: Arc::new(q),
@@ -94,7 +104,11 @@ impl DeviceFractionTree {
         }
 
         layers.reverse();
-        Ok(Self { stream, layers })
+        Ok(Self {
+            stream,
+            layers,
+            _room: room,
+        })
     }
 
     pub fn num_layers(&self) -> usize {

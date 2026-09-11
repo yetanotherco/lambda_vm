@@ -592,6 +592,10 @@ where
         ],
         transcript,
     )?;
+    // The sumcheck folded the factors where they lay, so they are spent — and
+    // the table outlives its own argument. Letting go of them here is what
+    // keeps a proof from holding every table's at once.
+    table.trace.release_device();
 
     Ok((
         TableProof {

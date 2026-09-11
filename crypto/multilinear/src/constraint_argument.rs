@@ -242,6 +242,18 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     /// cheaper on the side that is going to fold them. This path never goes
     /// through [`factors`](Self::factors), so on a device the host copy is
     /// never made.
+    /// Lets go of the factors on the device.
+    ///
+    /// The sumcheck folds them where they lie, which spends them, and nothing
+    /// reads them afterwards — but the table outlives its own argument, so
+    /// without this every table's factors stay on the device until the whole
+    /// proof is done. On a real trace that is gigabytes held for nothing.
+    pub fn release_device(&self) {
+        if let Ok(mut slot) = self.device.lock() {
+            *slot = None;
+        }
+    }
+
     pub fn reside_from_columns(&self) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
         let mut slot = self.device.lock().ok()?;
         if slot.is_none() {

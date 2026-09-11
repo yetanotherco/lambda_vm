@@ -4,7 +4,7 @@
 //! on a single CUDA context; a pool of streams lets rayon-parallel callers
 //! overlap H2D / compute / D2H.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream};
@@ -160,9 +160,12 @@ pub struct Backend {
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     next: AtomicUsize,
-    /// VRAM budget (bytes) for table-session admission control. See
+    /// VRAM budget (bytes) for admission control. See
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
+    /// Device bytes promised to structures that are still alive. See
+    /// [`Backend::reserve`].
+    reserved: AtomicU64,
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
@@ -251,6 +254,8 @@ pub struct Backend {
     pub sumcheck_fold_ext3: CudaFunction,
     pub mle_fold_base_ext3: CudaFunction,
     pub eq_expand_level_ext3: CudaFunction,
+    pub eq_seed_shares_ext3: CudaFunction,
+    pub eq_expand_level_shares_ext3: CudaFunction,
     pub program_map_ext3: CudaFunction,
     pub factors_from_columns_ext3: CudaFunction,
     pub mle_lift_base_ext3: CudaFunction,
@@ -310,6 +315,20 @@ fn retain_default_mempool(ctx: &CudaContext) {
     }
 }
 
+/// Device bytes held for as long as this lives. See [`Backend::reserve`].
+#[derive(Debug)]
+pub struct DeviceReservation {
+    bytes: u64,
+}
+
+impl Drop for DeviceReservation {
+    fn drop(&mut self) {
+        if let Ok(be) = backend() {
+            be.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Hands the device default memory pool's retained blocks back to the OS.
 ///
 /// The pool keeps freed stream-ordered allocations forever by design (see
@@ -348,36 +367,6 @@ fn drain_and_trim() -> Result<()> {
     Ok(())
 }
 
-/// Whether the device has `bytes` free for something about to be built there.
-///
-/// The stream-ordered pool counts its retained blocks as used, so the first
-/// answer understates what is available; a "no" is therefore re-asked after
-/// draining and trimming, which is the expensive part and only happens when it
-/// matters. A driver that will not answer is taken as a yes — this is a
-/// courtesy check, not a guarantee.
-pub fn room_for(bytes: u64) -> bool {
-    let enough = || {
-        let Ok(be) = backend() else { return true };
-        if be.ctx.bind_to_thread().is_err() {
-            return true;
-        }
-        use cudarc::driver::sys;
-        // SAFETY: a driver query into two stack slots, context bound above.
-        unsafe {
-            let mut free: usize = 0;
-            let mut total: usize = 0;
-            if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
-                .result()
-                .is_err()
-            {
-                return true;
-            }
-            free as u64 >= bytes
-        }
-    };
-    enough() || (drain_and_trim().is_ok() && enough())
-}
-
 /// Allocates on `stream`, and if the device says no, gives the pool's retained
 /// blocks back and asks once more.
 ///
@@ -401,6 +390,22 @@ pub unsafe fn alloc_or_trim<T: cudarc::driver::DeviceRepr>(
             drain_and_trim()?;
             // SAFETY: the caller's, forwarded.
             unsafe { stream.alloc::<T>(len) }
+        }
+    }
+}
+
+/// Uploads on `stream`, with the same one retry as [`alloc_or_trim`]: a copy
+/// to the device allocates too, and the small ones are no less fatal for being
+/// small.
+pub fn htod_or_trim<T: cudarc::driver::DeviceRepr + Unpin>(
+    stream: &Arc<CudaStream>,
+    src: &[T],
+) -> Result<CudaSlice<T>> {
+    match stream.clone_htod(src) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.clone_htod(src)
         }
     }
 }
@@ -617,6 +622,8 @@ impl Backend {
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,
+            eq_seed_shares_ext3: sumcheck.load_function("eq_seed_shares_ext3")?,
+            eq_expand_level_shares_ext3: sumcheck.load_function("eq_expand_level_shares_ext3")?,
             program_map_ext3: sumcheck.load_function("program_map_ext3")?,
             factors_from_columns_ext3: sumcheck.load_function("factors_from_columns_ext3")?,
             mle_lift_base_ext3: sumcheck.load_function("mle_lift_base_ext3")?,
@@ -639,13 +646,44 @@ impl Backend {
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
+            reserved: AtomicU64::new(0),
         })
     }
 
-    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// VRAM budget in bytes for admission control. `u64::MAX`
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
+    }
+
+    /// Promises `bytes` of the device to something about to be built there, or
+    /// refuses.
+    ///
+    /// Asking the driver how much is free does not answer this: two callers
+    /// can both be told yes and both be right at the moment they ask. What a
+    /// structure needs is that the room stays its own until it is done — a
+    /// codeword that is admitted and then cannot fold has nowhere to go, since
+    /// there is no copy on the host by then.
+    ///
+    /// Refusing is cheap wherever it is asked, because everything that asks
+    /// has a host path. The budget binds only when several proofs share a
+    /// card: one of them is enough to fill it.
+    pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        let mut held = self.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(bytes) > self.vram_budget_bytes {
+                return None;
+            }
+            match self.reserved.compare_exchange_weak(
+                held,
+                held + bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(DeviceReservation { bytes }),
+                Err(seen) => held = seen,
+            }
+        }
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different

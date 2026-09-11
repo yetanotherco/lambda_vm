@@ -142,25 +142,28 @@ impl SumcheckSession {
                 .map(|k| base + (k * stride * 3 * 8) as u64)
                 .collect()
         };
-        let factor_ptrs = stream.clone_htod(&addresses)?;
+        let factor_ptrs = crate::device::htod_or_trim(&stream, &addresses)?;
 
         let ceiling = thread_ceiling(num_slots);
         let (grid, block) = launch_shape(ceiling, (stride / 2) as u64);
         let num_threads = grid as u64 * block as u64;
         let widest = widest_grid(ceiling, (stride / 2) as u64);
 
-        let nodes_dev = stream.clone_htod(nodes)?;
+        let nodes_dev = crate::device::htod_or_trim(&stream, nodes)?;
         // A program with no constants still needs an allocation to point at.
-        let consts_dev = stream.clone_htod(if consts.is_empty() {
-            &[0u64][..]
-        } else {
-            consts
-        })?;
+        let consts_dev = crate::device::htod_or_trim(
+            &stream,
+            if consts.is_empty() {
+                &[0u64][..]
+            } else {
+                consts
+            },
+        )?;
         let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
         // Every partial the round reads is one the round wrote.
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
-        let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
-        let r_dev = stream.alloc_zeros::<u64>(3)?;
+        let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
+        let r_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, 3)?;
 
         Ok(Self {
             stream,
@@ -216,17 +219,20 @@ impl SumcheckSession {
         let (grid, block) = launch_shape(ceiling, (len / 2) as u64);
         let num_threads = grid as u64 * block as u64;
         let widest = widest_grid(ceiling, (len / 2) as u64);
-        let factor_ptrs = stream.clone_htod(addresses)?;
-        let nodes_dev = stream.clone_htod(nodes)?;
-        let consts_dev = stream.clone_htod(if consts.is_empty() {
-            &[0u64][..]
-        } else {
-            consts
-        })?;
+        let factor_ptrs = crate::device::htod_or_trim(&stream, addresses)?;
+        let nodes_dev = crate::device::htod_or_trim(&stream, nodes)?;
+        let consts_dev = crate::device::htod_or_trim(
+            &stream,
+            if consts.is_empty() {
+                &[0u64][..]
+            } else {
+                consts
+            },
+        )?;
         let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
-        let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
-        let r_dev = stream.alloc_zeros::<u64>(3)?;
+        let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
+        let r_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, 3)?;
         let _ = be;
 
         Ok(Self {
@@ -498,7 +504,7 @@ pub fn evaluate_mle_ext3(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
 
     let be = backend()?;
     let stream = be.next_stream();
-    let mut values = stream.clone_htod(table)?;
+    let mut values = crate::device::htod_or_trim(&stream, table)?;
     let stride = 1u64 << vars;
     fold_to_one(&stream, be, &mut values, stride, point)?;
     let out = stream.clone_dtoh(&values.slice(0..3))?;
@@ -516,9 +522,9 @@ pub fn evaluate_mle_base(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
 
     let be = backend()?;
     let stream = be.next_stream();
-    let base = stream.clone_htod(table)?;
+    let base = crate::device::htod_or_trim(&stream, table)?;
     let half = table.len() / 2;
-    let r = stream.clone_htod(&point[..3])?;
+    let r = crate::device::htod_or_trim(&stream, &point[..3])?;
     // SAFETY: the kernel writes every element of the half it produces.
     let mut values = unsafe { stream.alloc::<u64>(half * 3) }?;
     let half_arg = half as u64;
@@ -553,9 +559,9 @@ fn fold_to_one(
         let (base, _record) = values.device_ptr(stream);
         [base]
     };
-    let mut table = stream.clone_htod(&address)?;
+    let mut table = crate::device::htod_or_trim(stream, &address)?;
 
-    let point_dev = stream.clone_htod(point)?;
+    let point_dev = crate::device::htod_or_trim(stream, point)?;
     let width = 1u64;
     let mut half = len / 2;
     for at in (0..point.len()).step_by(3) {
@@ -581,6 +587,9 @@ pub struct DeviceFactors {
     stream: Arc<CudaStream>,
     buffer: Arc<CudaSlice<u64>>,
     addresses: Vec<u64>,
+    /// The room this table's argument promised itself: the factors, the
+    /// columns they are built from, and the rounds' scratch.
+    _room: crate::device::DeviceReservation,
     /// The same list on device, where every program that walks these factors
     /// reads it — one send, not one per interaction.
     factor_ptrs: CudaSlice<u64>,
@@ -603,6 +612,11 @@ impl DeviceFactors {
         let len = span / 3;
 
         let be = backend()?;
+        let Some(room) = be.reserve(factors.len() as u64 * span as u64 * 8) else {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ));
+        };
         let stream = be.next_stream();
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, factors.len() * span) }?;
         for (k, factor) in factors.iter().enumerate() {
@@ -610,17 +624,18 @@ impl DeviceFactors {
             let mut slab = buffer.slice_mut(at..at + span);
             stream.memcpy_htod(*factor, &mut slab)?;
         }
-        let addresses = {
+        let addresses: Vec<u64> = {
             let (base, _record) = buffer.device_ptr(&stream);
             (0..factors.len())
                 .map(|k| base + (k * span * 8) as u64)
                 .collect()
         };
-        let factor_ptrs = stream.clone_htod(&addresses)?;
+        let factor_ptrs = crate::device::htod_or_trim(&stream, &addresses)?;
         Ok(Self {
             stream,
             buffer: Arc::new(buffer),
             addresses,
+            _room: room,
             factor_ptrs,
             len,
         })
@@ -662,6 +677,13 @@ impl DeviceFactors {
         );
 
         let be = backend()?;
+        // What stays: the factors. The base columns they are gathered from are
+        // a third of that and are freed as soon as the gather has read them.
+        let Some(room) = be.reserve(width as u64 * rows as u64 * 24) else {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ));
+        };
         let stream = be.next_stream();
 
         let span = rows * 3;
@@ -683,7 +705,7 @@ impl DeviceFactors {
                 let mut slab = base.slice_mut(at..at + rows);
                 stream.memcpy_htod(*column, &mut slab)?;
             }
-            let plan_dev = stream.clone_htod(plan)?;
+            let plan_dev = crate::device::htod_or_trim(&stream, plan)?;
             let num_plan = (plan.len() / 3) as u64;
             let rows_arg = rows as u64;
             let total = num_plan * rows_arg;
@@ -708,15 +730,16 @@ impl DeviceFactors {
             drop(base);
         }
 
-        let addresses = {
+        let addresses: Vec<u64> = {
             let (base, _record) = buffer.device_ptr(&stream);
             (0..width).map(|k| base + (k * span * 8) as u64).collect()
         };
-        let factor_ptrs = stream.clone_htod(&addresses)?;
+        let factor_ptrs = crate::device::htod_or_trim(&stream, &addresses)?;
         Ok(Self {
             stream,
             buffer: Arc::new(buffer),
             addresses,
+            _room: room,
             factor_ptrs,
             len: rows,
         })
@@ -764,12 +787,15 @@ impl DeviceFactors {
         let be = backend()?;
         let (grid, block) = launch_shape(thread_ceiling(num_slots), self.len as u64);
         let num_threads = grid as u64 * block as u64;
-        let nodes_dev = self.stream.clone_htod(nodes)?;
-        let consts_dev = self.stream.clone_htod(if consts.is_empty() {
-            &[0u64][..]
-        } else {
-            consts
-        })?;
+        let nodes_dev = crate::device::htod_or_trim(&self.stream, nodes)?;
+        let consts_dev = crate::device::htod_or_trim(
+            &self.stream,
+            if consts.is_empty() {
+                &[0u64][..]
+            } else {
+                consts
+            },
+        )?;
         let mut slots = unsafe {
             self.stream
                 .alloc::<u64>(num_slots * 3 * num_threads as usize)
@@ -858,7 +884,7 @@ pub fn fill_ext3(
         return Ok(());
     }
     let be = backend()?;
-    let value_dev = stream.clone_htod(value)?;
+    let value_dev = crate::device::htod_or_trim(stream, value)?;
     let mut target = dst.slice_mut(offset * 3..(offset + count) * 3);
     let count_arg = count as u64;
     unsafe {
@@ -915,7 +941,7 @@ pub fn eq_expand_into(
     // The whole point goes up once and each level reads its coordinate where
     // it lies: a stacked polynomial's weight is one of these per column, so a
     // send per level is tens of thousands of them for three u64 each.
-    let point_dev = stream.clone_htod(point)?;
+    let point_dev = crate::device::htod_or_trim(stream, point)?;
     let vars = point.len() / 3;
     for level in 0..vars {
         let at = (vars - 1 - level) * 3;
@@ -929,6 +955,98 @@ pub fn eq_expand_into(
                 .arg(&filled)
                 .arg(&r)
                 .launch(LaunchConfig::for_num_elems(filled as u32))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every share of a stacked polynomial's weight, built in one pass per level
+/// instead of one pass per level per share.
+///
+/// A share is `(offset, point, scale)`: its subcube's start, the point its
+/// `eq` table is over, and what that table is scaled by. They are disjoint, so
+/// the only reason to do them one at a time was that the kernel took one — and
+/// on a real trace that is tens of thousands of launches for a tenth of a
+/// second of work.
+///
+/// `dst` must be zero where no share writes: the gaps between subcubes are
+/// part of the weight.
+pub fn eq_expand_shares_ext3(
+    stream: &Arc<CudaStream>,
+    dst: &mut CudaSlice<u64>,
+    shares: &[(usize, Vec<u64>, [u64; 3])],
+) -> Result<()> {
+    if shares.is_empty() {
+        return Ok(());
+    }
+    let be = backend()?;
+
+    // Sorted by variable count, descending: then the shares still doubling at
+    // level `l` are a prefix, and a thread finds its share by shifting.
+    let mut order: Vec<usize> = (0..shares.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(shares[*i].1.len()));
+
+    let mut table = Vec::with_capacity(order.len() * 3);
+    let mut points = Vec::new();
+    let mut scales = Vec::with_capacity(order.len() * 3);
+    for &i in &order {
+        let (offset, point, scale) = &shares[i];
+        assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+        table.push(*offset as u64);
+        table.push((point.len() / 3) as u64);
+        table.push((points.len() / 3) as u64);
+        points.extend_from_slice(point);
+        scales.extend_from_slice(scale);
+    }
+    let max_vars = shares[order[0]].1.len() / 3;
+
+    let table_dev = crate::device::htod_or_trim(stream, &table)?;
+    let scales_dev = crate::device::htod_or_trim(stream, &scales)?;
+    let points_dev = crate::device::htod_or_trim(
+        stream,
+        if points.is_empty() {
+            &[0u64][..]
+        } else {
+            &points
+        },
+    )?;
+
+    let count = order.len() as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.eq_seed_shares_ext3)
+            .arg(&mut *dst)
+            .arg(&table_dev)
+            .arg(&scales_dev)
+            .arg(&count)
+            .launch(LaunchConfig::for_num_elems(order.len() as u32))?;
+    }
+
+    for level in 0..max_vars {
+        // The prefix still doubling: `vars > level`, and the list is sorted.
+        let active = order
+            .iter()
+            .take_while(|i| shares[**i].1.len() / 3 > level)
+            .count() as u64;
+        if active == 0 {
+            break;
+        }
+        let total = active << level;
+        let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+        let level_arg = level as u64;
+        unsafe {
+            stream
+                .launch_builder(&be.eq_expand_level_shares_ext3)
+                .arg(&mut *dst)
+                .arg(&table_dev)
+                .arg(&points_dev)
+                .arg(&active)
+                .arg(&level_arg)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
     }
     Ok(())

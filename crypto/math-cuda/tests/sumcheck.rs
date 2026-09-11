@@ -222,3 +222,58 @@ fn factors_built_on_device_match_the_host() {
     factor_parity(12, 3, &[0, 1, 7], 0);
     factor_parity(9, 2, &[0], 3);
 }
+
+/// The weight built share by share and the weight built all at once must be
+/// the same buffer.
+///
+/// They are the same `eq` doubling either way; what differs is that one walks
+/// a level of every share per launch and the other a level of one share. A
+/// share reading the wrong coordinate — the index runs backwards — would be a
+/// perfectly well-formed proof of a different claim.
+fn weight_parity(len: usize, shares: &[(usize, usize)]) {
+    use math_cuda::device::backend;
+
+    let built: Vec<(usize, Vec<u64>, [u64; 3])> = shares
+        .iter()
+        .enumerate()
+        .map(|(k, (offset, vars))| {
+            let point: Vec<u64> = (0..*vars)
+                .flat_map(|i| {
+                    ext3_raw(&FE::new([
+                        FieldElement::<Gl>::from((7 * k + i + 1) as u64),
+                        FieldElement::<Gl>::from((3 * i + 2) as u64),
+                        FieldElement::<Gl>::from((k + 5) as u64),
+                    ]))
+                    .expect("ext3")
+                })
+                .collect();
+            let scale = ext3_raw(&FE::from((k + 1) as u64)).expect("ext3");
+            (*offset, point, [scale[0], scale[1], scale[2]])
+        })
+        .collect();
+
+    let be = backend().expect("a device");
+    let stream = be.next_stream();
+
+    let mut one_at_a_time = stream.alloc_zeros::<u64>(len * 3).expect("alloc");
+    for (offset, point, scale) in &built {
+        math_cuda::sumcheck::eq_expand_into(&stream, &mut one_at_a_time, *offset, point, scale)
+            .expect("a share");
+    }
+    let mut all_at_once = stream.alloc_zeros::<u64>(len * 3).expect("alloc");
+    math_cuda::sumcheck::eq_expand_shares_ext3(&stream, &mut all_at_once, &built)
+        .expect("the shares");
+
+    let expected = stream.clone_dtoh(&one_at_a_time).expect("read back");
+    let got = stream.clone_dtoh(&all_at_once).expect("read back");
+    stream.synchronize().expect("sync");
+    assert_eq!(expected, got, "the batched weight differs at len {len}");
+}
+
+#[test]
+fn a_weight_built_all_at_once_matches_one_share_at_a_time() {
+    // Shares of different heights, in and out of descending order, with gaps.
+    weight_parity(1 << 10, &[(0, 9), (512, 8), (768, 6), (832, 4)]);
+    weight_parity(1 << 12, &[(0, 6), (64, 11), (2112, 5), (2144, 10)]);
+    weight_parity(1 << 8, &[(0, 8)]);
+}

@@ -24,6 +24,10 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
+    /// The room the chain promised itself: this codeword, the folds that halve
+    /// it, and the tree each of them is committed and opened through. Shared
+    /// with the folds, which live inside it.
+    _room: Arc<crate::device::DeviceReservation>,
 }
 
 impl DeviceCodeword {
@@ -189,6 +193,15 @@ pub fn commit_codeword(
     );
 
     let be = backend()?;
+    // What the chain holds from here to its last opening: this codeword, the
+    // folds — the first is `n/2^k` extension elements, a sixth of it, and they
+    // halve from there — and one tree at a time, which is `2n/2^k` hashes.
+    // Twice the codeword covers all three.
+    let Some(room) = be.reserve(n as u64 * 8 * 2) else {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+        ));
+    };
     let stream = be.next_stream();
 
     // The coefficients get a buffer of their own: the Möbius transform runs
@@ -237,6 +250,7 @@ pub fn commit_codeword(
         stream,
         elements: n,
         base: true,
+        _room: Arc::new(room),
     };
     let root = codeword.commit(log_folding)?;
     Ok((codeword, root))
@@ -395,6 +409,9 @@ pub fn fold_resident(
         stream,
         elements: half,
         base: false,
+        // The fold lives inside the room the codeword it came from promised:
+        // it is half of it, and that one is still alive.
+        _room: codeword._room.clone(),
     })
 }
 

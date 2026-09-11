@@ -303,6 +303,64 @@ extern "C" __global__ void eq_expand_level_ext3(uint64_t *__restrict__ dst, uint
     up[2] = hi.c;
 }
 
+// A stacked polynomial's weight is one `eq` table per column, each in its own
+// subcube. Building them one at a time is a launch per level per column —
+// tens of thousands of launches for a hundred milliseconds of work — so these
+// two do every column at once.
+//
+// The shares arrive sorted by variable count, descending, so the ones still
+// doubling at level `l` are exactly the first `active` of them. Three u64 per
+// share: where its subcube starts, how many variables it has, and where its
+// point starts in `d_points`.
+
+// Seeds every share's first cell with its scale. The table is a product over
+// the variables, so one more factor at the start scales every cell.
+extern "C" __global__ void eq_seed_shares_ext3(uint64_t *__restrict__ dst,
+                                               const uint64_t *__restrict__ d_shares,
+                                               const uint64_t *__restrict__ d_scales,
+                                               uint64_t count) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    uint64_t *at = dst + d_shares[i * 3] * 3;
+    at[0] = d_scales[i * 3 + 0];
+    at[1] = d_scales[i * 3 + 1];
+    at[2] = d_scales[i * 3 + 2];
+}
+
+// One level of the doubling, for every share still doubling at it. The body is
+// `eq_expand_level_ext3`'s, with the share's own coordinate and subcube.
+extern "C" __global__ void eq_expand_level_shares_ext3(uint64_t *__restrict__ dst,
+                                                       const uint64_t *__restrict__ d_shares,
+                                                       const uint64_t *__restrict__ d_points,
+                                                       uint64_t active, uint64_t level) {
+    uint64_t filled = (uint64_t)1 << level;
+    uint64_t total = active * filled;
+    for (uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t s = t >> level;
+        uint64_t j = t & (filled - 1);
+        uint64_t offset = d_shares[s * 3 + 0];
+        uint64_t vars = d_shares[s * 3 + 1];
+        uint64_t point_at = d_shares[s * 3 + 2];
+
+        uint64_t *cube = dst + offset * 3;
+        // Variables go back to front, which is what leaves variable 0 in the
+        // high bit.
+        Fe3 challenge = load_ext(d_points + (point_at + vars - 1 - level) * 3);
+        Fe3 value = load_ext(cube + j * 3);
+        Fe3 hi = ext3::mul(value, challenge);
+        Fe3 lo = ext3::sub(value, hi);
+        uint64_t *at = cube + j * 3;
+        at[0] = lo.a;
+        at[1] = lo.b;
+        at[2] = lo.c;
+        uint64_t *up = cube + (j + filled) * 3;
+        up[0] = hi.a;
+        up[1] = hi.b;
+        up[2] = hi.c;
+    }
+}
+
 // One level of the fraction tree: `p' = p_lo·q_hi + p_hi·q_lo`, `q' = q_lo·q_hi`
 // over the halves of the layer below. Out of place — the halves are read by
 // threads that write the level above.
