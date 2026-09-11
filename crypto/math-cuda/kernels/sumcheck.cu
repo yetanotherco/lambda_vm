@@ -3,10 +3,12 @@
 // by `crypto/multilinear/src/gpu.rs`).
 //
 // Design:
-//   * One thread per cube index, grid-stride, so the launch is fixed at any
-//     size. The interpolation nodes `t` are the inner loop: a factor's `lo` and
-//     `hi` are read once per node but stay in cache across them, which is why
-//     the loops are this way round and not the other.
+//   * One thread per (cube index, interpolation node), grid-stride in both:
+//     `blockIdx.x` walks the cube and `blockIdx.y` the nodes. A late round has
+//     a cube smaller than the device is wide and nothing left to hide the slot
+//     file's latency behind, and the nodes are the only parallelism left to
+//     give it. The nodes stay the inner loop, so a factor's `lo` and `hi` are
+//     read once and stay in cache across the nodes a block owns.
 //   * Every value is ext3 — the sumcheck runs in one field, and the factors
 //     were lifted when they were built.
 //   * The lowering assigns each step a slot with liveness reuse, so the
@@ -128,17 +130,24 @@ extern "C" __global__ void sumcheck_round_ext3(
     uint64_t *__restrict__ d_slots,
     // out: one partial per (node, block), ext3
     uint64_t *__restrict__ d_partials) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
+    // The slot file is per thread and a thread is a (cube index, node) pair,
+    // so both grid dimensions go into the address.
+    uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
     uint64_t *slots = d_slots + tid;
 
+    uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t index_stride = (uint64_t)gridDim.x * blockDim.x;
+
+    // Each node belongs to exactly one `blockIdx.y`, so the partial it writes
+    // below has one writer whatever the grid's second dimension is.
     Fe3 acc[MAX_NODES];
-    for (uint32_t ti = 0; ti < num_t; ti++) {
+    for (uint32_t ti = blockIdx.y; ti < num_t; ti += gridDim.y) {
         acc[ti] = ext3::make(0, 0, 0);
     }
 
-    for (uint64_t j = tid; j < half; j += num_threads) {
-        for (uint32_t ti = 0; ti < num_t; ti++) {
+    for (uint64_t j = index; j < half; j += index_stride) {
+        for (uint32_t ti = blockIdx.y; ti < num_t; ti += gridDim.y) {
             Fe3 t = load_ext(d_t + (uint64_t)ti * 3);
             Fe3 v = eval_program(d_nodes, num_nodes, d_consts, d_factors, j, half, t, slots,
                                  num_threads, root_slot);
@@ -149,7 +158,7 @@ extern "C" __global__ void sumcheck_round_ext3(
     // One node at a time through the same shared buffer: the round's degree is
     // a handful, and a buffer per node would bound the block size instead.
     extern __shared__ uint64_t shared[];
-    for (uint32_t ti = 0; ti < num_t; ti++) {
+    for (uint32_t ti = blockIdx.y; ti < num_t; ti += gridDim.y) {
         shared[threadIdx.x * 3 + 0] = acc[ti].a;
         shared[threadIdx.x * 3 + 1] = acc[ti].b;
         shared[threadIdx.x * 3 + 2] = acc[ti].c;

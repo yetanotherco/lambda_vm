@@ -78,6 +78,10 @@ pub struct SumcheckSession {
     consts: CudaSlice<u64>,
     root_slot: u32,
     slots: CudaSlice<u64>,
+    /// Threads `slots` was sized for. A round that splits over more
+    /// interpolation nodes than the last one asks for more.
+    slot_threads: u64,
+    num_slots: usize,
     partials: CudaSlice<u64>,
     /// The threads this session's program can afford at once. Every round's
     /// launch is shaped out of it and the indices it has left.
@@ -173,6 +177,8 @@ impl SumcheckSession {
             consts: consts_dev,
             root_slot,
             slots,
+            slot_threads: num_threads,
+            num_slots,
             partials,
             thread_ceiling: ceiling,
             t_dev,
@@ -239,6 +245,8 @@ impl SumcheckSession {
             consts: consts_dev,
             root_slot,
             slots,
+            slot_threads: num_threads,
+            num_slots,
             partials,
             thread_ceiling: ceiling,
             t_dev,
@@ -281,6 +289,22 @@ impl SumcheckSession {
         // needs, and a block past the indices left writes a partial with
         // nothing in it.
         let (grid, block) = launch_shape(self.thread_ceiling, half);
+        // Once the cube stops filling the ceiling, the nodes do: a late round
+        // is the same walk of the program at each of them, and they are
+        // independent. The partials keep the same shape either way — a node
+        // has one owning block in the second dimension.
+        let per_node = grid as u64 * block as u64;
+        let nodes_wide = (self.thread_ceiling / per_node.max(1)).clamp(1, num_t as u64) as u32;
+        let threads = per_node * nodes_wide as u64;
+        if threads > self.slot_threads {
+            // SAFETY: the kernel writes a slot before it reads it, for every
+            // thread it launches.
+            self.slots = unsafe {
+                self.stream
+                    .alloc::<u64>(self.num_slots * 3 * threads as usize)
+            }?;
+            self.slot_threads = threads;
+        }
         if self.t_host != t {
             let mut head = self.t_dev.slice_mut(0..t.len());
             self.stream.memcpy_htod(t, &mut head)?;
@@ -288,7 +312,7 @@ impl SumcheckSession {
             self.t_host.extend_from_slice(t);
         }
         let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
+            grid_dim: (grid, nodes_wide, 1),
             block_dim: (block, 1, 1),
             // One ext3 accumulator per thread, reduced one node at a time.
             shared_mem_bytes: block * 3 * 8,
