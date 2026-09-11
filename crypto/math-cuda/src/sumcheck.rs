@@ -24,6 +24,20 @@ pub const MAX_NODES: usize = 16;
 
 const BLOCK_DIM: u32 = 256;
 
+/// Smallest block a launch will take: one warp. Below this a block is not a
+/// unit of scheduling any more.
+const MIN_BLOCK: u32 = 32;
+
+/// Blocks a launch aims for before it starts making them wider.
+///
+/// A round's threads are one per cube index, so a small cube — which is every
+/// late round, and the late rounds are most of them — used to arrive as a
+/// single block of 256 on a device with a hundred and seventy
+/// multiprocessors. Spreading the same threads over narrow blocks puts them on
+/// different multiprocessors, which is where the latency of the slot file gets
+/// hidden.
+const SPREAD_BLOCKS: u32 = 512;
+
 /// Scratch ceiling for the per-thread slot file, which is what caps the grid:
 /// a wider program buys fewer threads. 512 MiB leaves the factors and the
 /// resident codewords room on a 32 GiB device.
@@ -65,8 +79,9 @@ pub struct SumcheckSession {
     root_slot: u32,
     slots: CudaSlice<u64>,
     partials: CudaSlice<u64>,
-    /// The session's widest launch, set by its first round.
-    max_grid: u32,
+    /// The threads this session's program can afford at once. Every round's
+    /// launch is shaped out of it and the indices it has left.
+    thread_ceiling: u64,
     /// The interpolation nodes as the device last saw them, and the buffer
     /// they live in. They are the same every round of a sumcheck, so the send
     /// happens once and the comparison is what decides that.
@@ -126,8 +141,10 @@ impl SumcheckSession {
         };
         let factor_ptrs = stream.clone_htod(&addresses)?;
 
-        let grid = grid_for_work(grid_ceiling(num_slots), (stride / 2) as u64);
-        let num_threads = grid as u64 * BLOCK_DIM as u64;
+        let ceiling = thread_ceiling(num_slots);
+        let (grid, block) = launch_shape(ceiling, (stride / 2) as u64);
+        let num_threads = grid as u64 * block as u64;
+        let widest = widest_grid(ceiling, (stride / 2) as u64);
 
         let nodes_dev = stream.clone_htod(nodes)?;
         // A program with no constants still needs an allocation to point at.
@@ -138,7 +155,7 @@ impl SumcheckSession {
         })?;
         let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
         // Every partial the round reads is one the round wrote.
-        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * grid as usize * 3) }?;
+        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * widest as usize * 3) }?;
         let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
         let r_dev = stream.alloc_zeros::<u64>(3)?;
 
@@ -157,7 +174,7 @@ impl SumcheckSession {
             root_slot,
             slots,
             partials,
-            max_grid: grid,
+            thread_ceiling: ceiling,
             t_dev,
             t_host: Vec::new(),
             r_dev,
@@ -191,8 +208,10 @@ impl SumcheckSession {
 
         let be = backend()?;
         let width = addresses.len();
-        let grid = grid_for_work(grid_ceiling(num_slots), (len / 2) as u64);
-        let num_threads = grid as u64 * BLOCK_DIM as u64;
+        let ceiling = thread_ceiling(num_slots);
+        let (grid, block) = launch_shape(ceiling, (len / 2) as u64);
+        let num_threads = grid as u64 * block as u64;
+        let widest = widest_grid(ceiling, (len / 2) as u64);
         let factor_ptrs = stream.clone_htod(addresses)?;
         let nodes_dev = stream.clone_htod(nodes)?;
         let consts_dev = stream.clone_htod(if consts.is_empty() {
@@ -201,7 +220,7 @@ impl SumcheckSession {
             consts
         })?;
         let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
-        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * grid as usize * 3) }?;
+        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * widest as usize * 3) }?;
         let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
         let r_dev = stream.alloc_zeros::<u64>(3)?;
         let _ = be;
@@ -221,7 +240,7 @@ impl SumcheckSession {
             root_slot,
             slots,
             partials,
-            max_grid: grid,
+            thread_ceiling: ceiling,
             t_dev,
             t_host: Vec::new(),
             r_dev,
@@ -231,8 +250,8 @@ impl SumcheckSession {
     /// Bytes this session holds on device, for admission control.
     pub fn device_bytes(factors: usize, cube: usize, num_slots: usize) -> u64 {
         let per_thread = num_slots as u64 * 3 * 8;
-        let grid = grid_for_work(grid_ceiling(num_slots), (cube / 2) as u64);
-        let threads = grid as u64 * BLOCK_DIM as u64;
+        let (grid, block) = launch_shape(thread_ceiling(num_slots), (cube / 2) as u64);
+        let threads = grid as u64 * block as u64;
         factors as u64 * cube as u64 * 24 + threads * per_thread
     }
 
@@ -257,9 +276,11 @@ impl SumcheckSession {
 
         let be = backend()?;
         let half = (self.len / 2) as u64;
-        // The grid follows the cube down: a block past the indices left writes
-        // a partial with nothing in it, and that partial is what comes back.
-        let grid = grid_for_work(self.max_grid, half);
+        // The launch follows the cube down, and narrows its blocks as it goes:
+        // the same threads across more multiprocessors is what a late round
+        // needs, and a block past the indices left writes a partial with
+        // nothing in it.
+        let (grid, block) = launch_shape(self.thread_ceiling, half);
         if self.t_host != t {
             let mut head = self.t_dev.slice_mut(0..t.len());
             self.stream.memcpy_htod(t, &mut head)?;
@@ -268,9 +289,9 @@ impl SumcheckSession {
         }
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
-            block_dim: (BLOCK_DIM, 1, 1),
+            block_dim: (block, 1, 1),
             // One ext3 accumulator per thread, reduced one node at a time.
-            shared_mem_bytes: BLOCK_DIM * 3 * 8,
+            shared_mem_bytes: block * 3 * 8,
         };
         let num_nodes = self.num_nodes as u64;
         let num_t_u32 = num_t as u32;
@@ -380,23 +401,41 @@ impl SumcheckSession {
     }
 }
 
-/// The most blocks a program of `num_slots` live values may launch: the slot
-/// file is per thread, so it is the grid that gives way to a wider program.
-///
-/// This is a ceiling, not a shape — what a launch actually takes is
-/// [`grid_for_work`], because a grid past the indices it walks costs a partial
-/// per idle block and a reduction with nothing in it.
-fn grid_ceiling(num_slots: usize) -> u32 {
+/// The most threads a program of `num_slots` live values may run at once: the
+/// slot file is per thread, so it is the thread count that gives way to a wider
+/// program.
+fn thread_ceiling(num_slots: usize) -> u64 {
     let per_thread = num_slots as u64 * 3 * 8;
-    let threads = (SLOT_BUDGET_BYTES / per_thread.max(1))
+    (SLOT_BUDGET_BYTES / per_thread.max(1))
         .min(MAX_THREADS)
-        .max(BLOCK_DIM as u64);
-    ((threads / BLOCK_DIM as u64) as u32).max(1)
+        .max(MIN_BLOCK as u64)
 }
 
-/// The blocks `work` indices need, never past `ceiling`.
-fn grid_for_work(ceiling: u32, work: u64) -> u32 {
-    work.div_ceil(BLOCK_DIM as u64).clamp(1, ceiling as u64) as u32
+/// The `(grid, block)` a launch of `work` indices takes, given the thread
+/// ceiling: one thread per index, spread over [`SPREAD_BLOCKS`] blocks before
+/// any block is made wider than a warp.
+fn launch_shape(ceiling: u64, work: u64) -> (u32, u32) {
+    let threads = work.clamp(1, ceiling);
+    let wide = (threads / SPREAD_BLOCKS as u64).max(1);
+    let block = (1u64 << (63 - wide.leading_zeros() as u64))
+        .clamp(MIN_BLOCK as u64, BLOCK_DIM as u64) as u32;
+    let grid = threads.div_ceil(block as u64).max(1) as u32;
+    (grid, block)
+}
+
+/// The widest grid any round of a session will take, which is what the
+/// per-block partials have to have room for. The cube halves every round and
+/// the blocks narrow as it does, so the widest is not always the first.
+fn widest_grid(ceiling: u64, first_half: u64) -> u32 {
+    let mut widest = 1;
+    let mut work = first_half.max(1);
+    loop {
+        widest = widest.max(launch_shape(ceiling, work).0);
+        if work <= 1 {
+            return widest;
+        }
+        work /= 2;
+    }
 }
 
 /// Sums the per-block partials of each interpolation node.
@@ -634,7 +673,7 @@ impl DeviceFactors {
             let num_plan = (plan.len() / 3) as u64;
             let rows_arg = rows as u64;
             let total = num_plan * rows_arg;
-            let grid = grid_for_work(MAX_GRID, total);
+            let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
             let cfg = LaunchConfig {
                 grid_dim: (grid, 1, 1),
                 block_dim: (BLOCK_DIM, 1, 1),
@@ -709,8 +748,8 @@ impl DeviceFactors {
         );
 
         let be = backend()?;
-        let grid = grid_for_work(grid_ceiling(num_slots), self.len as u64);
-        let num_threads = grid as u64 * BLOCK_DIM as u64;
+        let (grid, block) = launch_shape(thread_ceiling(num_slots), self.len as u64);
+        let num_threads = grid as u64 * block as u64;
         let nodes_dev = self.stream.clone_htod(nodes)?;
         let consts_dev = self.stream.clone_htod(if consts.is_empty() {
             &[0u64][..]
@@ -726,7 +765,7 @@ impl DeviceFactors {
         let num_nodes = (nodes.len() / 2) as u64;
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
-            block_dim: (BLOCK_DIM, 1, 1),
+            block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
@@ -901,4 +940,61 @@ pub fn evaluate_resident_ext3(
     let out = stream.clone_dtoh(&values.slice(0..3))?;
     stream.synchronize()?;
     Ok([out[0], out[1], out[2]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A launch never runs more threads than the cube has indices, nor more
+    /// than the slot file can hold, and always fills at least one warp.
+    #[test]
+    fn a_launch_takes_a_thread_per_index_and_no_more() {
+        for slots in [1usize, 6, 64, 522, 1036, 8192] {
+            let ceiling = thread_ceiling(slots);
+            for log_work in 0..24u32 {
+                let work = 1u64 << log_work;
+                let (grid, block) = launch_shape(ceiling, work);
+                assert!((MIN_BLOCK..=BLOCK_DIM).contains(&block), "block {block}");
+                let threads = grid as u64 * block as u64;
+                assert!(threads >= work.min(ceiling), "{threads} threads for {work}");
+                assert!(
+                    threads < work.min(ceiling) + block as u64,
+                    "{threads} threads for {work}: a whole block of nothing",
+                );
+            }
+        }
+    }
+
+    /// A small cube spreads over blocks instead of arriving as one of them:
+    /// that is the whole point, and it is what a late round looks like.
+    #[test]
+    fn a_small_cube_spreads_over_the_device() {
+        let ceiling = thread_ceiling(1036);
+        for work in [128u64, 1024, 8192] {
+            let (grid, _) = launch_shape(ceiling, work);
+            assert!(grid >= 4, "{work} indices arrived as {grid} block(s)");
+        }
+    }
+
+    /// The partials buffer is sized for the widest round, which is not always
+    /// the first — the blocks narrow as the cube shrinks.
+    #[test]
+    fn the_partials_hold_every_round() {
+        for slots in [6usize, 1036] {
+            let ceiling = thread_ceiling(slots);
+            for log_half in 0..22u32 {
+                let first = 1u64 << log_half;
+                let widest = widest_grid(ceiling, first);
+                let mut work = first;
+                loop {
+                    assert!(launch_shape(ceiling, work).0 <= widest);
+                    if work <= 1 {
+                        break;
+                    }
+                    work /= 2;
+                }
+            }
+        }
+    }
 }
