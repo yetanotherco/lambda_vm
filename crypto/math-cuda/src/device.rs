@@ -176,9 +176,11 @@ pub struct Backend {
 
     // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
+    pub lift_spread: CudaFunction,
     pub mobius_level: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
+    pub ntt_dit_tile: CudaFunction,
     pub pointwise_mul: CudaFunction,
     pub scalar_mul: CudaFunction,
     pub bit_reverse_permute_batched: CudaFunction,
@@ -543,9 +545,11 @@ impl Backend {
             ext3_add: arith.load_function("ext3_add_kernel")?,
             ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
+            lift_spread: ntt.load_function("lift_spread")?,
             mobius_level: ntt.load_function("mobius_level")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
+            ntt_dit_tile: ntt.load_function("ntt_dit_tile")?,
             pointwise_mul: ntt.load_function("pointwise_mul")?,
             scalar_mul: ntt.load_function("scalar_mul")?,
             bit_reverse_permute_batched: ntt.load_function("bit_reverse_permute_batched")?,

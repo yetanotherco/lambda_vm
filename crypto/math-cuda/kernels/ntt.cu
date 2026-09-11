@@ -13,6 +13,24 @@ using goldilocks::add;
 using goldilocks::sub;
 using goldilocks::mul;
 
+/// The lift's permutation and the NTT's, composed — which turns out to be
+/// neither of them.
+///
+/// The lift reverses a coefficient's index over `log_evals` bits and the NTT
+/// wants its input reversed over `log_n = log_evals + log_blowup`. Reversing
+/// twice around the zero padding leaves coefficient `m` at `m << log_blowup`
+/// and a zero at every other index: the two passes over the whole codeword,
+/// each of them a scattered read, are one pass that also writes the padding.
+extern "C" __global__ void lift_spread(const uint64_t *__restrict__ coeffs,
+                                       uint64_t n,
+                                       uint32_t log_blowup,
+                                       uint64_t *__restrict__ out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    uint64_t mask = ((uint64_t)1 << log_blowup) - 1;
+    out[j] = (j & mask) == 0 ? coeffs[j >> log_blowup] : 0;
+}
+
 /// Reverse the low `log_n` bits of each index and swap x[i] ↔ x[rev(i)].
 /// One thread per index; guarded by `tid < rev` to avoid double-swap.
 extern "C" __global__ void bit_reverse_permute(uint64_t *x,
@@ -245,6 +263,71 @@ extern "C" __global__ void ntt_dit_level(uint64_t *x,
 /// before the first kernel launch).
 ///
 /// Assumes `n` is a multiple of 256, i.e. `log_n >= 8`.
+/// Columns a tile spans: one warp, so the load and the store are coalesced.
+#define NTT_TILE_COLS 32
+
+/// `k_levels` DIT levels from `base`, fused through shared memory.
+///
+/// The elements that interact across levels `base .. base + k_levels - 1` are
+/// exactly those differing only in the middle `k_levels` bits of their index:
+/// write `i = q·2^(base+k) + r·2^base + c` and the levels move `r` while `q`
+/// and `c` stay put. So a block takes one `q`, a warp's worth of *consecutive*
+/// `c`, and every `r`.
+///
+/// That last part is the whole point. The older fused path at `base > 0`
+/// gathered its tile along the stride — consecutive threads a group apart —
+/// and lost more to uncoalesced traffic than it saved in passes. Here
+/// `threadIdx.x` walks `c`, which is contiguous in memory, and the stride is
+/// `threadIdx.y`, which is the dimension the butterflies work on.
+///
+/// Requires `2^base >= NTT_TILE_COLS`; the low levels are the fused
+/// `ntt_dit_8_levels`, which is already coalesced at `base = 0`.
+extern "C" __global__ void ntt_dit_tile(uint64_t *x,
+                                        const uint64_t *tw,
+                                        uint64_t n,
+                                        uint64_t log_n,
+                                        uint64_t base,
+                                        uint32_t k_levels) {
+    // rows × (NTT_TILE_COLS + 1): the odd stride keeps a column off one bank.
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = NTT_TILE_COLS;
+    const uint32_t rows = 1u << k_levels;
+    const uint32_t pitch = cols + 1;
+
+    uint64_t low = (uint64_t)1 << base;
+    uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    uint64_t i = (uint64_t)blockIdx.y * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+
+    tile[threadIdx.y * pitch + threadIdx.x] = x[i];
+    __syncthreads();
+
+    // Half the rows hold a butterfly's lower element at each level, the same
+    // way the 256-element kernel uses half its threads.
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        if (threadIdx.y < (rows >> 1)) {
+            uint32_t half = 1u << l;
+            uint32_t grp = threadIdx.y >> l;
+            uint32_t pos = threadIdx.y & (half - 1);
+            uint32_t r0 = (grp << (l + 1)) + pos;
+            uint32_t r1 = r0 + half;
+
+            // The twiddle index is the element's low `base + l` bits, which is
+            // `pos` in the middle bits and `c` in the low ones — the same
+            // `k << (log_n - level - 1)` the per-level kernel uses.
+            uint64_t k_index = (uint64_t)pos * low + c;
+            uint64_t w = tw[k_index << (log_n - base - l - 1)];
+
+            uint64_t u = tile[r0 * pitch + threadIdx.x];
+            uint64_t v = mul(w, tile[r1 * pitch + threadIdx.x]);
+            tile[r0 * pitch + threadIdx.x] = add(u, v);
+            tile[r1 * pitch + threadIdx.x] = sub(u, v);
+        }
+        __syncthreads();
+    }
+
+    x[i] = tile[threadIdx.y * pitch + threadIdx.x];
+}
+
 extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
                                             const uint64_t *tw,
                                             uint64_t n,

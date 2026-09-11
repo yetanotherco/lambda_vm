@@ -10,7 +10,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::Result;
-use crate::device::backend;
+use crate::device::{alloc_or_trim, backend};
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -118,13 +118,11 @@ pub fn commit_codeword(
     let be = backend()?;
     let stream = be.next_stream();
 
-    // The tail past the coefficients is the zero padding `encode` adds, so the
-    // buffer is allocated zeroed and only the coefficient half is written.
-    let mut x = stream.alloc_zeros::<u64>(n)?;
-    {
-        let mut head = x.slice_mut(0..evals.len());
-        stream.memcpy_htod(evals, &mut head)?;
-    }
+    // The coefficients get a buffer of their own: the Möbius transform runs
+    // over them, and the spread below reads them while it writes the codeword.
+    // SAFETY: every element is written by the copy below.
+    let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, evals.len()) }?;
+    stream.memcpy_htod(evals, &mut coeffs)?;
 
     let half = (evals.len() / 2) as u64;
     let half_cfg = LaunchConfig::for_num_elems(half as u32);
@@ -133,33 +131,31 @@ pub fn commit_codeword(
         unsafe {
             stream
                 .launch_builder(&be.mobius_level)
-                .arg(&mut x)
+                .arg(&mut coeffs)
                 .arg(&half)
                 .arg(&stride)
                 .launch(half_cfg)?;
         }
     }
 
-    // Two permutations, not one: the lift reverses the coefficient index over
-    // `log_evals` bits and the NTT wants its input reversed over `log_n`.
-    let coeffs = evals.len() as u64;
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut x)
-            .arg(&coeffs)
-            .arg(&log_evals)
-            .launch(LaunchConfig::for_num_elems(coeffs as u32))?;
-    }
+    // The lift's bit-reverse and the NTT's cancel around the zero padding —
+    // see `lift_spread`. What was two scattered passes over the codeword plus
+    // the memset that zeroed it is one pass that writes all of it.
+    // SAFETY: the spread writes every element, padding included.
+    let mut x = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
     let n_u64 = n as u64;
+    let log_blowup_u32 = log_blowup as u32;
     unsafe {
         stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut x)
+            .launch_builder(&be.lift_spread)
+            .arg(&coeffs)
             .arg(&n_u64)
-            .arg(&log_n)
+            .arg(&log_blowup_u32)
+            .arg(&mut x)
             .launch(LaunchConfig::for_num_elems(n as u32))?;
     }
+    // Spent: the spread has read them, and the free is stream-ordered.
+    drop(coeffs);
     let twiddles = be.fwd_twiddles_for(log_n)?;
     crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
 
