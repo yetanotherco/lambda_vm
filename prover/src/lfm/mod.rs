@@ -29,6 +29,7 @@ pub mod commit;
 pub mod compiler;
 pub mod constraints;
 pub mod deep;
+pub mod device_permit;
 pub mod edsl;
 pub mod epoch;
 pub mod epoch_verify;

@@ -236,6 +236,14 @@ pub(crate) fn prove_traces_with_hasher(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
+    // a driver has armed it, and then exclusive: `multi_prove` builds its own
+    // full-budget `VramGate`, so two of them in flight would budget the card
+    // twice over. Held here rather than around the whole of `lfm_prove`
+    // deliberately — the executor and the trace fill run BEFORE this call and
+    // must be free to overlap another proof's device phase, which is the entire
+    // point of the lever.
+    let _card = super::device_permit::hold();
     let airs = LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,

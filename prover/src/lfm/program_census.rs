@@ -201,8 +201,20 @@ pub fn build_artifacts_counted(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
+    // ⛔ THE CARD, FOR THE FIRST OF A PROOF'S TWO DEVICE PHASES.
+    // `commit_group_device_or_host` dispatches to `gpu_lde` from inside this
+    // build, outside `multi_prove` and so outside every `VramGate`, and its
+    // admission is a per-dispatch bound with no running total. Inert unless a
+    // driver has armed it.
+    //
+    // ⚠ Inside the timer on purpose: what a build COST a concurrent level
+    // includes what it waited for the card, and a figure that excluded the wait
+    // would make a device-bound level look host-bound.
     let t = Instant::now();
-    let artifacts = build_artifacts_with_hasher(program, options, hasher);
+    let artifacts = {
+        let _card = super::device_permit::hold();
+        build_artifacts_with_hasher(program, options, hasher)
+    };
     let build_nanos = t.elapsed().as_nanos();
     lock().record(artifacts.program_id, build_nanos);
     artifacts
