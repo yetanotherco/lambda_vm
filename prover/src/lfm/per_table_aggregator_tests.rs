@@ -3108,6 +3108,23 @@ fn the_block_root_proves_over_real_children() {
         wrap_stats.proofs, epochs,
         "every wrap must build its artifacts exactly once"
     );
+    // ⛔ AND UNDER CUDA, THAT THE DEVICE BRANCH WAS ACTUALLY TAKEN. `gpu_lde`
+    // admits on `padded_rows · blowup >= 2^14`, so a gate whose groups all sit
+    // under the floor commits on the host and compares a host root with a host
+    // root — green, and evidence of nothing. The registry drift pins are exactly
+    // that case but for ONE group (`LFM_RANGE`, 65,536 × 1, program-independent);
+    // this fixture's groups are program-dependent and tall enough to clear it, so
+    // here the claim can be asserted rather than hoped for.
+    #[cfg(feature = "cuda")]
+    assert!(
+        wrap_stats.device_groups > 0,
+        "every committed group fell back to the HOST: {} device / {} host. This \
+         gate then proves nothing about the device commit path — check whether \
+         the fixture shrank below gpu_lde's 2^14 lde floor, or whether \
+         LFM_DEVICE_ARTIFACTS=0 is set",
+        wrap_stats.device_groups,
+        wrap_stats.host_groups,
+    );
     assert_eq!(
         wrap_stats.distinct, epochs,
         "sibling wraps differ by construction: {epochs} proofs must be {epochs} programs, \
