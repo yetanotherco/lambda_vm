@@ -12,13 +12,13 @@ pad = 0
 [[variables.auxiliary]]
 name = "index"
 type = "BaseField"
-desc = "Index of the first value being committed by this sequence."
+desc = "Index of the first value being committed by this sequence"
 pad = 0
 
 [[variables.auxiliary]]
 name = "address"
 type = "DWordWL"
-desc = "Address of first byte to commit."
+desc = "Address of first byte to commit"
 pad = 0
 
 [[variables.auxiliary]]
