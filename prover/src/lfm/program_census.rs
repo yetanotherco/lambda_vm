@@ -34,6 +34,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use stark::config::Commitment;
@@ -51,8 +52,20 @@ pub struct LevelStats {
     /// Distinct `program_id`s among them. Expected to equal `proofs`; see the
     /// module note for why, and for what it would mean if it did not.
     pub distinct: usize,
-    /// Time spent inside `build_artifacts_with_hasher`.
+    /// Time spent inside `build_artifacts_with_hasher`, SUMMED over the
+    /// proofs above.
+    ///
+    /// ⚠ A SUM, not a wall, and the distinction only appears when a level
+    /// proves its siblings concurrently: two overlapping 9 s builds sum to 18 s
+    /// inside a 9 s window. Serial, the two are the same number, which is
+    /// exactly why this needs saying before anything runs concurrently — a
+    /// figure that has been a wall for the whole campaign would silently start
+    /// being something else and read as a regression. [`Self::wall_nanos`] is
+    /// the window's own elapsed time, and [`Self::describe`] says so on the
+    /// line whenever the two disagree.
     pub build_nanos: u128,
+    /// How long the window was open: `begin_level` to `end_level`.
+    pub wall_nanos: u128,
     /// The largest device working set any artifact commit has ASKED FOR in this
     /// process, in bytes — `stark::device_set`'s own term-by-term accounting,
     /// which is the number admission decides on. Zero when nothing went to the
@@ -96,13 +109,55 @@ impl LevelStats {
             } else {
                 " ⚠ FEWER PROGRAMS THAN PROOFS — the label pinning changed, a memo is back on the table"
             },
-        )
+        ) + &self.concurrency_note()
+    }
+
+    /// Empty while the level is serial, so the line is byte-identical to every
+    /// one already in the campaign's logs — and present the moment the sum
+    /// stops being a wall, so nobody reads a concurrent level's `artifacts`
+    /// figure as the wall it used to be.
+    ///
+    /// The 5% margin is a clock margin, not a tolerance for overlap: the two
+    /// spans are taken by different timers and a serial level lands a hair
+    /// under, never over.
+    fn concurrency_note(&self) -> String {
+        let sum = Duration::from_nanos(self.build_nanos as u64).as_secs_f64();
+        let wall = Duration::from_nanos(self.wall_nanos as u64).as_secs_f64();
+        if wall > 0.0 && sum > wall * 1.05 {
+            format!(
+                " · ⓘ artifacts is a SUM over {} proofs ({sum:.1}s) inside a {wall:.1}s \
+                 window — this level proved concurrently",
+                self.proofs
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
 struct Window {
     seen: HashSet<Commitment>,
     stats: LevelStats,
+    /// When the window opened, for [`LevelStats::wall_nanos`].
+    opened_at: Instant,
+    /// ★★★ THE THREADS THIS LEVEL IS MADE OF. A build on any other thread is
+    /// not this level's work and is not counted.
+    ///
+    /// ⛔ THIS IS WHY THE WINDOW CAN SURVIVE CONCURRENCY. It is process-global
+    /// and it already miscounted once: at `--test-threads=2` a sibling test
+    /// building on another thread landed inside an open window and the counting
+    /// test read 5 proofs where it had made 3 — and a first run that happened
+    /// to serialize them passed, which is the worst way for a counter to be
+    /// wrong. Serializing the builders was the fix available then. It is not
+    /// available to a level that proves its siblings concurrently, because
+    /// concurrent builders are the point.
+    ///
+    /// ⇒ So membership is EXPLICIT rather than ambient. A thread that did not
+    /// enrol cannot inflate the window no matter what it builds or when, which
+    /// makes the bad state unreachable instead of merely unlikely — and the
+    /// same guarantee covers the serial path, where it is the case that
+    /// actually bit.
+    enrolled: HashSet<ThreadId>,
     /// The device/host group counters as they stood when the window OPENED.
     ///
     /// ⛔ The counters in `commit` are process-cumulative, because the device
@@ -155,13 +210,60 @@ pub fn build_artifacts_counted(
 
 impl Census {
     fn record(&mut self, program_id: Commitment, build_nanos: u128) {
-        if let Some(w) = self.window.as_mut() {
-            w.seen.insert(program_id);
-            w.stats.proofs += 1;
-            w.stats.distinct = w.seen.len();
-            w.stats.build_nanos += build_nanos;
+        let Some(w) = self.window.as_mut() else {
+            return;
+        };
+        if !w.enrolled.contains(&std::thread::current().id()) {
+            return;
+        }
+        w.seen.insert(program_id);
+        w.stats.proofs += 1;
+        w.stats.distinct = w.seen.len();
+        w.stats.build_nanos += build_nanos;
+    }
+}
+
+/// A worker thread's membership of the open level window, for as long as it is
+/// held.
+///
+/// Taken by each thread that proves a sibling of the level being counted, and
+/// dropped when that thread is done. The driver's own thread is enrolled by
+/// [`begin_level`], so a serial level needs none of this.
+#[must_use = "an enrolment that is dropped immediately counts nothing"]
+pub struct Enrolment {
+    thread: ThreadId,
+}
+
+impl Drop for Enrolment {
+    fn drop(&mut self) {
+        // ⚠ NOT `lock()`. This runs during unwinding when a worker panics, and
+        // `lock()` panics on a poisoned mutex — a panic inside a `Drop` that is
+        // already unwinding aborts the process. A counter is not worth that, so
+        // a poisoned census here simply leaves the enrolment in place: the
+        // window is about to be discarded by a failing run anyway.
+        if let Ok(mut census) = census().lock()
+            && let Some(w) = census.window.as_mut()
+        {
+            w.enrolled.remove(&self.thread);
         }
     }
+}
+
+/// Enrol the CALLING thread in the open level window.
+///
+/// ⚠ Call it on the worker itself, not on the thread that spawned it: the
+/// enrolment names `std::thread::current()`, and enrolling from the spawner
+/// would enrol the spawner twice and the worker never — a mistake that counts
+/// zero rather than counting wrong, which is the direction this should fail in.
+///
+/// A no-op when no window is open, so a worker need not know whether its level
+/// is being counted.
+pub fn enrol() -> Enrolment {
+    let thread = std::thread::current().id();
+    if let Some(w) = lock().window.as_mut() {
+        w.enrolled.insert(thread);
+    }
+    Enrolment { thread }
 }
 
 /// Start counting a level. Replaces any window already open — the driver's
@@ -171,6 +273,10 @@ pub fn begin_level() {
     lock().window = Some(Window {
         seen: HashSet::new(),
         stats: LevelStats::default(),
+        opened_at: Instant::now(),
+        // The caller's own thread, so a level that never spawns anything counts
+        // exactly what it did before this existed.
+        enrolled: HashSet::from([std::thread::current().id()]),
         groups_at_open,
     });
 }
@@ -179,6 +285,7 @@ pub fn begin_level() {
 pub fn end_level() -> Option<LevelStats> {
     let w = lock().window.take()?;
     let mut stats = w.stats;
+    stats.wall_nanos = w.opened_at.elapsed().as_nanos();
     stats.device_peak_bytes = super::commit::device_artifact_peak_bytes();
     let (dev, host) = super::commit::device_host_group_counts();
     stats.device_groups = dev.saturating_sub(w.groups_at_open.0);
@@ -195,13 +302,17 @@ mod tests {
 
     /// ⛔ EVERY TEST HERE THAT BUILDS TAKES THIS, not just the one that counts.
     ///
-    /// The window is process-global, so a sibling test calling
-    /// `build_artifacts_counted` on another harness thread lands INSIDE an open
-    /// window and inflates it. That is not hypothetical: at `--test-threads=2`
-    /// the counting test read 5 proofs where it had made 3, and a first run that
-    /// happened to serialize them passed. Serializing the builders is the fix;
-    /// counting only under the guard would leave the same race for the next test
-    /// somebody adds.
+    /// It no longer guards the COUNT. A sibling test building on another
+    /// harness thread used to land inside an open window and inflate it — at
+    /// `--test-threads=2` the counting test read 5 proofs where it had made 3,
+    /// and a first run that happened to serialize them passed. Enrolment closed
+    /// that by construction: an un-enrolled thread's build is not counted, and
+    /// `a_build_on_an_unenrolled_thread_is_not_counted` is the assertion that it
+    /// stays closed.
+    ///
+    /// What is left for the guard is the WINDOW ITSELF: `begin_level` replaces
+    /// whatever is open, so two tests opening one concurrently would each see
+    /// the other's. One window at a time is the invariant, and this is it.
     ///
     /// Outside this module nothing touches the census in a default `cargo test`
     /// run — the driver tests that do are all `#[ignore]`.
@@ -296,6 +407,97 @@ mod tests {
         assert!(
             end_level().is_none(),
             "the window closes once, not once per read"
+        );
+    }
+
+    /// ★★★ THE CONTAMINATION, MADE UNREACHABLE. A thread that did not enrol
+    /// builds inside an open window and the window does not move.
+    ///
+    /// This is the defect that already shipped once and passed on scheduling
+    /// luck. It is asserted rather than avoided because avoiding it — keeping
+    /// the builders serial — is precisely what a level proving its siblings
+    /// concurrently cannot do.
+    #[test]
+    fn a_build_on_an_unenrolled_thread_is_not_counted() {
+        let _guard = WINDOW.lock().expect("the window guard is never poisoned");
+        let options = opts();
+
+        begin_level();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // No `enrol()`. This thread is not part of the level.
+                let _ = build_artifacts_counted(&fri_toy_program(), &options, HasherKind::Test);
+            });
+        });
+        let stats = end_level().expect("a window was open");
+        assert_eq!(
+            stats.proofs, 0,
+            "an un-enrolled thread's build inflated the window: {stats:?}"
+        );
+        assert_eq!(
+            stats.build_nanos, 0,
+            "and it must contribute no time either"
+        );
+    }
+
+    /// ★★ AND THE OTHER DIRECTION, which is what makes the test above a gate
+    /// rather than a way of counting nothing: an ENROLLED worker IS counted.
+    ///
+    /// Without this, `record` could return early on every call and the
+    /// unreachability test would still pass.
+    #[test]
+    fn an_enrolled_worker_thread_is_counted() {
+        let _guard = WINDOW.lock().expect("the window guard is never poisoned");
+        let options = opts();
+
+        begin_level();
+        std::thread::scope(|s| {
+            for p in [fri_toy_program(), trivial_program()] {
+                let options = &options;
+                s.spawn(move || {
+                    let _enrolled = enrol();
+                    let _ = build_artifacts_counted(&p, options, HasherKind::Test);
+                });
+            }
+        });
+        let stats = end_level().expect("a window was open");
+        assert_eq!(
+            stats.proofs, 2,
+            "two enrolled workers, two proofs: {stats:?}"
+        );
+        assert_eq!(stats.distinct, 2, "two different programs");
+        assert!(
+            stats.build_nanos > 0,
+            "and their build time reached the window"
+        );
+    }
+
+    /// ★ THE LINE SAYS WHEN ITS `artifacts` FIGURE STOPPED BEING A WALL — and
+    /// says nothing when it has not, so every line already in the campaign's
+    /// logs still reads the same.
+    #[test]
+    fn the_level_line_announces_a_concurrent_sum_and_only_then() {
+        let serial = LevelStats {
+            proofs: 2,
+            distinct: 2,
+            build_nanos: 9_000_000_000,
+            wall_nanos: 9_100_000_000,
+            ..LevelStats::default()
+        };
+        assert!(
+            !serial.describe("level x").contains("SUM"),
+            "a serial level must not have acquired a new clause: {}",
+            serial.describe("level x")
+        );
+
+        let concurrent = LevelStats {
+            build_nanos: 18_000_000_000,
+            ..serial
+        };
+        assert!(
+            concurrent.describe("level x").contains("SUM"),
+            "a sum twice its window must say so: {}",
+            concurrent.describe("level x")
         );
     }
 }
