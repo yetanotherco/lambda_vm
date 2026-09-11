@@ -145,6 +145,18 @@ fn test_bus_interactions_count() {
     }
 }
 
+/// Pins the committed width of the table.
+///
+/// **The spec says 7 and this says 8, and both are right** — the spec types
+/// `timestamp` as a `Word` (one column) where this code uses a `DWordWL` (two). The
+/// high limb is provably zero, so the extra column carries no information. The same
+/// `+1` applies to MEMMOVE, where the spec says 37 and the code has 38. See
+/// `memmove::shape_tests::the_committed_shape_is_pinned`.
+#[test]
+fn the_committed_shape_is_pinned() {
+    assert_eq!(cols::NUM_COLUMNS, 8, "COMMIT columns (spec: 7 + 1)");
+}
+
 #[test]
 fn test_constraints_count_and_indices() {
     use crate::tables::commit::CommitConstraints;

@@ -788,10 +788,10 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // standing between the chip and an arbitrary memory write.
         //
         // `is_set` alone is the correct gate. `step` advances `src` and `dst` together
-        // (constraints 19 and 21), so `dst - src` is invariant along a chain and the
+        // (constraints 17 and 19), so `dst - src` is invariant along a chain and the
         // relation holds on the terminal row as well; padding rows leave `is_set = 0`.
-        // Gating on `is_set * mu_ram` would exempt terminal rows at the cost of a
-        // degree, and the table is asserted to stay at degree 2.
+        // Gating on the RAM-write multiplicity instead would exempt terminal rows at
+        // the cost of a degree, and the table is asserted to stay at degree 2.
         //
         // Pinning the exact gap rather than merely `src != dst` also settles the
         // direction: `dst < src` is sound but propagates the wrong way, so the AIR
@@ -828,8 +828,30 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
 #[cfg(test)]
 mod shape_tests {
+    /// Pins the committed width of the table.
+    ///
+    /// The bus-interaction and constraint counts are asserted in `memmove_tests`, but
+    /// the column count was only ever printed, and it is the number readers check
+    /// against the spec.
+    ///
+    /// **The spec says 37 and this says 38, and both are right.** The spec types
+    /// `timestamp` as a `Word` — one column — where this code uses a `DWordWL`, which
+    /// is two. The high limb is provably zero (the CPU sends `constant(0)` in the
+    /// `Ecall` tuple and `MemmoveNext` propagates it), so the extra column carries no
+    /// information; it is a convention divergence, not a disagreement. The same `+1`
+    /// applies to COMMIT, where the spec says 7 and the code has 8, and to `memw.toml`.
+    /// Three readers have now reported this as a bug, so it is written down here.
+    ///
+    /// Unrelated trap for anyone grepping: `cpu_tests.rs` also asserts 38, for the CPU
+    /// table. Coincidence.
     #[test]
-    fn reports_the_merged_shape() {
+    fn the_committed_shape_is_pinned() {
+        assert_eq!(
+            super::cols::NUM_COLUMNS,
+            38,
+            "MEMMOVE columns (spec: 37 + 1)"
+        );
+
         let n = super::bus_interactions().len();
         println!(
             "MEMMOVE: {} columns, {} bus interactions, aux {} -> weight {}",
