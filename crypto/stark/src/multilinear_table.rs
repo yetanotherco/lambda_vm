@@ -536,15 +536,17 @@ where
     // for the sumcheck too — they are the biggest thing the argument holds —
     // and the layer is written where they are; on the host they are
     // materialized here, used and dropped.
-    let tree = {
-        let factors = table.trace.factors()?;
-        match table
-            .trace
-            .reside(&factors)
-            .and_then(|resident| logup::resident_tree(&interactions, &resident))
-        {
-            Some(tree) => tree,
-            None => FractionTree::build(logup::input_layer(&interactions, &factors)?)?,
+    let tree = match table
+        .trace
+        .reside_from_columns()
+        .and_then(|resident| logup::resident_tree(&interactions, &resident))
+    {
+        Some(tree) => tree,
+        // No device took them, so the host builds what it needs: the factors,
+        // used here and by the sumcheck that follows.
+        None => {
+            let factors = table.trace.factors()?;
+            FractionTree::build(logup::input_layer(&interactions, &factors)?)?
         }
     };
     let bus_output = tree.output();

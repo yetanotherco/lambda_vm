@@ -1027,40 +1027,107 @@ impl std::fmt::Debug for DeviceFactors {
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
 
-/// Uploads a table's factors, or declines.
+/// A table's factors, built on the device out of its base columns.
+///
+/// A committed factor is a column read at a frame-step offset and lifted, so
+/// the columns are a third of what the factors are and the lift is a gather.
+/// Building them there rather than here sends the trace instead of its lift —
+/// on a real proof that is most of what crosses the bus — and the host never
+/// holds the extension copy at all.
 #[cfg(feature = "cuda")]
-pub fn upload_factors<E>(factors: &[crate::mle::Mle<E>]) -> Option<DeviceFactors>
+pub fn upload_factors_from_columns<F, E>(
+    columns: &[crate::mle::Mle<F>],
+    kinds: &[crate::constraint_argument::FactorKind],
+    public: &[crate::mle::Mle<E>],
+) -> Option<DeviceFactors>
 where
+    F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
 {
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
 
-    if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() {
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
         return None;
     }
-    let first = factors.first()?;
-    if first.len() < SUMCHECK_THRESHOLD || factors.iter().any(|f| f.len() != first.len()) {
+    let rows = columns.first()?.len();
+    if rows < SUMCHECK_THRESHOLD || kinds.is_empty() {
+        return None;
+    }
+    if columns.iter().any(|column| column.len() != rows)
+        || public.iter().any(|table| table.len() != rows)
+    {
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_FACTORS").is_some()) {
         return None;
     }
-    // SAFETY: `E == Ext3`, three transparent `u64` limbs per element.
-    let raw: Vec<&[u64]> = factors
+
+    // Three u64 per committed factor — where its column starts in the
+    // concatenated columns, its shift, and the slot it fills — and the public
+    // tables paired with theirs.
+    let mut plan = Vec::with_capacity(kinds.len() * 3);
+    let mut public_slots = Vec::new();
+    let mut next_public = 0usize;
+    for (slot, kind) in kinds.iter().enumerate() {
+        match kind.source() {
+            Some(source) => {
+                if source.column >= columns.len() {
+                    return None;
+                }
+                plan.push((source.column * rows) as u64);
+                plan.push((source.offset % rows) as u64);
+                plan.push(slot as u64);
+            }
+            None => {
+                public_slots.push((slot, public.get(next_public)?));
+                next_public += 1;
+            }
+        }
+    }
+    if next_public != public.len() {
+        return None;
+    }
+
+    // SAFETY: `F == Gl` and `E == Ext3`, each wrapping its limbs transparently
+    // — one `u64` per base element, three per ext3.
+    let raw_columns: Vec<&[u64]> = columns
         .iter()
-        .map(|f| unsafe {
-            core::slice::from_raw_parts(f.evals().as_ptr() as *const u64, f.len() * 3)
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
         })
         .collect();
-    let uploaded = math_cuda::sumcheck::DeviceFactors::upload(&raw).ok()?;
+    let raw_public: Vec<(usize, &[u64])> = public_slots
+        .iter()
+        .map(|(slot, table)| {
+            (*slot, unsafe {
+                core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
+            })
+        })
+        .collect();
+
+    let uploaded = math_cuda::sumcheck::DeviceFactors::from_columns(
+        &raw_columns,
+        &plan,
+        &raw_public,
+        rows,
+        kinds.len(),
+    )
+    .ok()?;
     FACTOR_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(DeviceFactors(uploaded))
 }
 
 #[cfg(not(feature = "cuda"))]
-pub fn upload_factors<E>(_factors: &[crate::mle::Mle<E>]) -> Option<DeviceFactors>
+pub fn upload_factors_from_columns<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _kinds: &[crate::constraint_argument::FactorKind],
+    _public: &[crate::mle::Mle<E>],
+) -> Option<DeviceFactors>
 where
+    F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
 {
     None

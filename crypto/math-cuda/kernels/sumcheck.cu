@@ -202,6 +202,38 @@ extern "C" __global__ void program_map_ext3(const uint64_t *const *__restrict__ 
     }
 }
 
+// Builds a table's factors out of its base columns: factor `slot` at row `j` is
+// the column it reads, taken at its frame-step offset and lifted into the
+// extension.
+//
+// `d_plan` is three u64 per committed factor — where its column starts inside
+// `d_columns`, how far it is shifted (already reduced mod `rows`), and the slot
+// it fills. The public factors are not here: they are in the extension already
+// and are copied in as they are.
+//
+// The point of this kernel is that the columns are a third of what the factors
+// are, so what crosses the bus is the trace and not its lift.
+extern "C" __global__ void factors_from_columns_ext3(const uint64_t *__restrict__ d_columns,
+                                                     const uint64_t *__restrict__ d_plan,
+                                                     uint64_t num_plan, uint64_t rows,
+                                                     uint64_t *__restrict__ out) {
+    uint64_t total = num_plan * rows;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t p = task / rows;
+        uint64_t j = task - p * rows;
+        uint64_t base = d_plan[p * 3 + 0];
+        uint64_t shift = d_plan[p * 3 + 1];
+        uint64_t slot = d_plan[p * 3 + 2];
+        uint64_t k = j + shift;
+        if (k >= rows) k -= rows;
+        uint64_t *at = out + (slot * rows + j) * 3;
+        at[0] = d_columns[base + k];
+        at[1] = 0;
+        at[2] = 0;
+    }
+}
+
 // Fills a range with one ext3 value — the padding interactions of an input
 // layer, whose numerators vanish and whose denominators are one.
 extern "C" __global__ void fill_ext3(uint64_t *__restrict__ dst, uint64_t count,

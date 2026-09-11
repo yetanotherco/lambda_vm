@@ -234,12 +234,20 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.device.lock().ok()?.clone()
     }
 
-    /// Puts `factors` on a device and keeps the handle, or leaves it empty
+    /// Puts the factors on a device and keeps the handle, or leaves it empty
     /// when the device declines.
-    pub fn reside(&self, factors: &[Mle<E>]) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
+    ///
+    /// They are built there, out of the columns: a factor is a column read at
+    /// a frame-step offset and lifted into the extension, and both of those are
+    /// cheaper on the side that is going to fold them. This path never goes
+    /// through [`factors`](Self::factors), so on a device the host copy is
+    /// never made.
+    pub fn reside_from_columns(&self) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
         let mut slot = self.device.lock().ok()?;
         if slot.is_none() {
-            *slot = crate::gpu::upload_factors(factors).map(std::sync::Arc::new);
+            *slot =
+                crate::gpu::upload_factors_from_columns(&self.columns, &self.kinds, &self.public)
+                    .map(std::sync::Arc::new);
         }
         slot.clone()
     }

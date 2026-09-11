@@ -32,6 +32,10 @@ const SLOT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// Most threads a round launches, whatever the slot file allows.
 const MAX_THREADS: u64 = 1 << 20;
 
+/// Blocks an elementwise kernel here may take. Enough to fill the device; past
+/// it the grid-stride loop takes over.
+const MAX_GRID: u32 = 4096;
+
 /// One sumcheck's device state: the factors, the program, and the scratch the
 /// rounds reuse.
 ///
@@ -532,6 +536,9 @@ pub struct DeviceFactors {
 
 impl DeviceFactors {
     /// Uploads `factors`, each `len` ext3 values interleaved.
+    ///
+    /// The prover builds them with [`from_columns`](Self::from_columns)
+    /// instead; this is what that is checked against.
     pub fn upload(factors: &[&[u64]]) -> Result<Self> {
         assert!(!factors.is_empty(), "a table has factors");
         let span = factors[0].len();
@@ -563,6 +570,102 @@ impl DeviceFactors {
             addresses,
             factor_ptrs,
             len,
+        })
+    }
+
+    /// Builds the factors from the table's base columns rather than taking
+    /// them built.
+    ///
+    /// A factor is a column read at a frame-step offset and lifted into the
+    /// extension, so the columns are a third of what the factors are: building
+    /// them here sends the trace instead of its lift, and spares the host the
+    /// copy.
+    ///
+    /// `columns` is one base-field slice of `rows` values each; `plan` is three
+    /// u64 per committed factor — the column it reads, its shift (already
+    /// reduced mod `rows`), and the slot it fills; `public` is the extension
+    /// tables that are not views of a column, each with the slot it goes to.
+    pub fn from_columns(
+        columns: &[&[u64]],
+        plan: &[u64],
+        public: &[(usize, &[u64])],
+        rows: usize,
+        width: usize,
+    ) -> Result<Self> {
+        assert!(rows.is_power_of_two(), "the cube is a power of two");
+        assert!(width > 0, "a table has factors");
+        assert!(
+            plan.len().is_multiple_of(3),
+            "three u64 per committed factor"
+        );
+        assert_eq!(
+            plan.len() / 3 + public.len(),
+            width,
+            "every slot is filled once"
+        );
+        assert!(
+            columns.iter().all(|column| column.len() == rows),
+            "every column spans the cube"
+        );
+
+        let be = backend()?;
+        let stream = be.next_stream();
+
+        let span = rows * 3;
+        // SAFETY: every cell is written below — the public slots by their
+        // copies, the rest by the kernel, which covers every (factor, row).
+        let mut buffer = unsafe { stream.alloc::<u64>(width * span) }?;
+        for (slot, table) in public {
+            assert_eq!(table.len(), span, "a public factor spans the cube");
+            let at = slot * span;
+            let mut slab = buffer.slice_mut(at..at + span);
+            stream.memcpy_htod(*table, &mut slab)?;
+        }
+
+        if !plan.is_empty() {
+            // SAFETY: every cell is written by the copies below.
+            let mut base = unsafe { stream.alloc::<u64>(columns.len() * rows) }?;
+            for (k, column) in columns.iter().enumerate() {
+                let at = k * rows;
+                let mut slab = base.slice_mut(at..at + rows);
+                stream.memcpy_htod(*column, &mut slab)?;
+            }
+            let plan_dev = stream.clone_htod(plan)?;
+            let num_plan = (plan.len() / 3) as u64;
+            let rows_arg = rows as u64;
+            let total = num_plan * rows_arg;
+            let grid = grid_for_work(MAX_GRID, total);
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&be.factors_from_columns_ext3)
+                    .arg(&base)
+                    .arg(&plan_dev)
+                    .arg(&num_plan)
+                    .arg(&rows_arg)
+                    .arg(&mut buffer)
+                    .launch(cfg)?;
+            }
+            // The columns are spent. Freeing them is stream-ordered, so it
+            // happens behind the kernel that just read them.
+            drop(base);
+        }
+
+        let addresses = {
+            let (base, _record) = buffer.device_ptr(&stream);
+            (0..width).map(|k| base + (k * span * 8) as u64).collect()
+        };
+        let factor_ptrs = stream.clone_htod(&addresses)?;
+        Ok(Self {
+            stream,
+            buffer: Arc::new(buffer),
+            addresses,
+            factor_ptrs,
+            len: rows,
         })
     }
 

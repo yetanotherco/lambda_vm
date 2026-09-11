@@ -115,3 +115,110 @@ fn device_rounds_match_the_host_sumcheck() {
     parity(14, 4, 5);
     parity(9, 12, 2);
 }
+
+/// The factors a device builds from the columns must be the ones the host
+/// builds from the same columns and uploads.
+///
+/// The two disagree silently otherwise: a factor read at the wrong offset is a
+/// perfectly well-formed proof of a different statement.
+fn factor_parity(num_vars: usize, columns: usize, offsets: &[usize], publics: usize) {
+    use math_cuda::sumcheck::DeviceFactors;
+
+    let rows = 1usize << num_vars;
+    let base: Vec<Mle<Gl>> = (0..columns)
+        .map(|k| {
+            let evals: Vec<FieldElement<Gl>> = (0..rows as u64)
+                .map(|i| FieldElement::<Gl>::from(i.wrapping_mul(2654435761 + k as u64) >> 3))
+                .collect();
+            Mle::new(evals).expect("power of two")
+        })
+        .collect();
+    let public: Vec<Mle<Ext3>> = (0..publics)
+        .map(|k| factor(num_vars, 900 + k as u64))
+        .collect();
+
+    // One factor per (column, offset), then the public tables — the order
+    // `kinds` gives them in.
+    let mut host: Vec<Mle<Ext3>> = Vec::new();
+    let mut plan: Vec<u64> = Vec::new();
+    for (k, column) in base.iter().enumerate() {
+        for offset in offsets {
+            let shift = offset % rows;
+            let (wrapped, rest) = column.evals().split_at(shift);
+            host.push(
+                Mle::new(
+                    rest.iter()
+                        .chain(wrapped)
+                        .map(|v| (*v).to_extension::<Ext3>())
+                        .collect(),
+                )
+                .expect("power of two"),
+            );
+            plan.push((k * rows) as u64);
+            plan.push(shift as u64);
+            plan.push((host.len() - 1) as u64);
+        }
+    }
+    let mut public_slots = Vec::new();
+    for table in &public {
+        public_slots.push(host.len());
+        host.push(table.clone());
+    }
+
+    let raw_columns: Vec<Vec<u64>> = base
+        .iter()
+        .map(|column| column.evals().iter().map(|v| *v.value()).collect())
+        .collect();
+    let raw_public: Vec<Vec<u64>> = public
+        .iter()
+        .map(|table| {
+            table
+                .evals()
+                .iter()
+                .flat_map(|v| ext3_raw(v).expect("ext3"))
+                .collect()
+        })
+        .collect();
+
+    let columns_ref: Vec<&[u64]> = raw_columns.iter().map(Vec::as_slice).collect();
+    let public_ref: Vec<(usize, &[u64])> = public_slots
+        .iter()
+        .zip(&raw_public)
+        .map(|(slot, table)| (*slot, table.as_slice()))
+        .collect();
+
+    let built = DeviceFactors::from_columns(&columns_ref, &plan, &public_ref, rows, host.len())
+        .expect("factors on device (needs a GPU)");
+
+    // Read them back the only way a `DeviceFactors` can be read: a sumcheck
+    // that binds nothing yet, whose session owns the same buffer.
+    let program = program(host.len());
+    let lowered = lower(&program).expect("lowers");
+    let mut session = built
+        .session(
+            &[],
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+        )
+        .expect("a session");
+    let mut t = Vec::new();
+    for node in 1..=2u64 {
+        t.extend_from_slice(&ext3_raw(&FE::from(node)).expect("ext3"));
+    }
+    let device = session.round(&t).expect("a round");
+    let expected = round_evaluations_for_program(&host, &program, 2).expect("the host round");
+    let device: Vec<FE> = device.chunks_exact(3).map(ext3_from_raw::<Ext3>).collect();
+    assert_eq!(
+        device, expected,
+        "factors built on device differ at 2^{num_vars}, {columns} columns"
+    );
+}
+
+#[test]
+fn factors_built_on_device_match_the_host() {
+    factor_parity(10, 4, &[0, 1], 2);
+    factor_parity(12, 3, &[0, 1, 7], 0);
+    factor_parity(9, 2, &[0], 3);
+}
