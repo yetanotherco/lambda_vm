@@ -24,7 +24,7 @@ use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
 
 use super::airs::{BLAKE3_SLOT, ChipSet, LfmAirs, NUM_LFM_CHIPS};
 use super::compiler::LfmProgram;
-use super::executor::{LfmExecError, execute};
+use super::executor::{LfmExecError, LfmExecution, execute};
 use super::hash::HasherKind;
 use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError, resolve};
 use super::statement::absorb_lfm_statement;
@@ -169,20 +169,41 @@ pub(crate) fn lfm_prove_with_residency(
     // that panics, so a partial split would describe a run that produced no
     // proof — and the cell would then hand it to the NEXT stage on this thread
     // as if it were that stage's own.
+    //
+    // ⚠ The two `drop`s below are the other half of that reasoning: this
+    // function's PEAK, not its clock, is what fences a third concurrent sibling
+    // on a 57.5 GiB host. Both are placed AFTER the elapsed-time read, so
+    // `execute` and `fill` keep measuring exactly what they measured before and
+    // stay comparable across the change; only the wall absorbs the free, which
+    // is a handful of `munmap`s.
     let t = Instant::now();
-    let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    let LfmExecution {
+        records,
+        public_words,
+        memory,
+    } = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
     let execute_secs = t.elapsed().as_secs_f64();
+    // The final write-once array: 32 bytes per address, a few hundred MB for a
+    // wrap. It is a diagnostic surface for tests — nothing on the proving path
+    // reads it — so held to the end of this scope it would stay live through the
+    // fill AND the whole device phase, on every worker at once, for nothing.
+    drop(memory);
 
     let t = Instant::now();
-    let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
+    let mut traces = build_traces_with_hasher(program, &records, hasher);
     let fill_secs = t.elapsed().as_secs_f64();
+    // Same reason, larger: the records are what the fill consumes, and they are
+    // dead the moment it returns. The traces it produced are the live set from
+    // here on; holding the records as well doubles the values through the card
+    // phase.
+    drop(records);
 
     let t = Instant::now();
     let waited_before = super::device_permit::waited_secs();
     let proof = prove_traces_with_hasher(
         artifacts,
         &mut traces,
-        &exec.public_words,
+        &public_words,
         options,
         hasher,
         residency,
@@ -204,7 +225,7 @@ pub(crate) fn lfm_prove_with_residency(
 
     Ok(LfmProof {
         proof,
-        public_words: exec.public_words,
+        public_words,
     })
 }
 
