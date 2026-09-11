@@ -10,8 +10,8 @@
 //! ## What is checked
 //!
 //! 1. **Byte identity**, cell for cell, over every table in `LfmTraces` — the
-//!    thirteen chip traces plus the three keccak-family ones the walk does not
-//!    touch, since a regression there would be just as fatal.
+//!    chip traces the walk fills, and also the keccak-family ones it does not,
+//!    since a regression there would be just as fatal and costs nothing to see.
 //! 2. **Coverage**: the cases must, between them, give every chip with a
 //!    non-empty fill at least one real row. Without this the identity assertion
 //!    passes vacuously on a chip nothing exercised.
@@ -120,7 +120,7 @@ fn cases() -> Vec<Case> {
 
 /// Every table in an `LfmTraces`, paired with the chip's name, in one flat list
 /// so the comparison walks both sides in lockstep and can say which chip moved.
-fn tables<'a>(t: &'a LfmTraces) -> Vec<(String, &'a TraceTable<F, E>)> {
+fn tables(t: &LfmTraces) -> Vec<(String, &TraceTable<F, E>)> {
     let mut out: Vec<(String, &TraceTable<F, E>)> = vec![
         ("LFM_CONST".into(), &t.const_),
         ("LFM_BALU".into(), &t.balu),
@@ -329,7 +329,7 @@ fn threads() -> usize {
 // The scale probe
 // =========================================================================
 
-/// log2 of the row count the probe fills. 2^18 rows of RPX witness is ~690 MiB
+/// log2 of the row count the probe fills. 2^18 rows of RPX witness is 0.64 GiB
 /// of trace, which a laptop can hold twice; the box arm can raise it to the
 /// production 2^20 through the environment without a rebuild.
 fn probe_log_rows() -> u32 {
