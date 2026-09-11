@@ -65,7 +65,7 @@ where
     /// into `Vec`s first would be one more resident copy of the whole trace.
     pub fn commit(
         layout: StackedLayout,
-        columns: &[Mle<F>],
+        columns: &[&Mle<F>],
         config: &ChainConfig,
     ) -> Result<Self, Error> {
         let polys = layout.stack(columns)?;
@@ -398,7 +398,8 @@ mod tests {
         at: &[FE],
         claimed: &[FE],
     ) -> Result<usize, Error> {
-        let stacked = StackedCommitment::<F>::commit(layout, columns, &config())?;
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(columns), &config())?;
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
@@ -518,7 +519,7 @@ mod tests {
         let at = point(num_vars);
         let weights: Vec<FE> = (0..3).map(|i| FE::from(3 + i as u64)).collect();
 
-        let stacked = layout.stack(&columns).unwrap();
+        let stacked = layout.stack(&crate::stacking::borrow(&columns)).unwrap();
         let table = weight_table(&layout, 0, &Claimed::Shared(&at), &weights).unwrap();
         // Σ_x w(x)·stacked(x) must be the batched column values.
         let summed = table
@@ -550,7 +551,9 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
+                .unwrap();
         assert!(matches!(
             prove(
                 &stacked,
@@ -574,7 +577,9 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
+                .unwrap();
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
@@ -628,7 +633,9 @@ mod tests {
             .map(|c| c.evaluate_in(&at).unwrap())
             .collect();
 
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
+                .unwrap();
         let roots = stacked.roots();
         assert_eq!(roots.len(), 1);
 
@@ -681,7 +688,9 @@ mod tests {
             .map(|(c, p)| c.evaluate(p).unwrap())
             .collect();
 
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, &config()).unwrap();
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
+                .unwrap();
         let roots = stacked.roots();
         let at = Claimed::PerColumn(&points);
 

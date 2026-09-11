@@ -377,10 +377,9 @@ where
             .collect();
         let layout = global_layout(&shapes)?;
 
-        let columns: Vec<Mle<F>> = tables
-            .iter()
-            .flat_map(|t| t.trace.columns().iter().cloned())
-            .collect();
+        // By reference: the stack copies every column into its own buffer, and
+        // the trace holds the originals for the rest of the proof.
+        let columns: Vec<&Mle<F>> = tables.iter().flat_map(|t| t.trace.columns()).collect();
         let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
         let roots = stacked.roots();
         Ok(Self {

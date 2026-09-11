@@ -495,7 +495,9 @@ fn commit_phases() {
     let config = multilinear_prove::chain_config(&shapes);
     let layout = multilinear_table::global_layout(&shapes).expect("global layout");
     let start = Instant::now();
-    let polys = layout.stack(&columns).expect("stack");
+    let polys = layout
+        .stack(&multilinear::stacking::borrow(&columns))
+        .expect("stack");
     let stack = start.elapsed();
     drop(columns);
 

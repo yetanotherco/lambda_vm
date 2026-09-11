@@ -356,7 +356,8 @@ where
         layout: StackedLayout,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
+        let stacked =
+            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), config)?;
         Ok(Self {
             data: TraceData::new(columns, kinds, public)?,
             stacked,

@@ -137,7 +137,7 @@ impl StackedLayout {
     }
 
     /// Builds the stacked polynomials, zero-filling the padding.
-    pub fn stack<F: IsField + 'static>(&self, columns: &[Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
+    pub fn stack<F: IsField + 'static>(&self, columns: &[&Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
         if columns.len() != self.placements.len() {
             return Err(Error::VariableCountMismatch {
                 expected: self.placements.len(),
@@ -158,6 +158,11 @@ impl StackedLayout {
 
         polys.into_iter().map(Mle::new).collect()
     }
+}
+
+/// Every column, by reference — what [`stack`](StackedLayout::stack) reads.
+pub fn borrow<F: IsField>(columns: &[Mle<F>]) -> Vec<&Mle<F>> {
+    columns.iter().collect()
 }
 
 fn placements_poly_count(placements: &[Placement]) -> usize {
@@ -254,7 +259,7 @@ mod tests {
             .enumerate()
             .map(|(i, &m)| column(1 << m, i as u64 + 1))
             .collect();
-        let stacked = layout.stack(&columns).unwrap();
+        let stacked = layout.stack(&borrow(&columns)).unwrap();
 
         for (col_idx, place) in layout.placements().iter().enumerate() {
             for (j, cell) in columns[col_idx].evals().iter().enumerate() {
@@ -271,7 +276,7 @@ mod tests {
     fn padding_is_zero() {
         let layout = StackedLayout::build(&[3, 1], 5).unwrap();
         let columns = vec![column(8, 1), column(2, 2)];
-        let stacked = layout.stack(&columns).unwrap();
+        let stacked = layout.stack(&borrow(&columns)).unwrap();
 
         let (used, committed) = layout.occupancy();
         assert_eq!(used, 10);
@@ -296,7 +301,7 @@ mod tests {
             .enumerate()
             .map(|(i, &m)| column(1 << m, i as u64 + 1))
             .collect();
-        let stacked = layout.stack(&columns).unwrap();
+        let stacked = layout.stack(&borrow(&columns)).unwrap();
 
         for (col_idx, place) in layout.placements().iter().enumerate() {
             let mle = &columns[col_idx];
@@ -338,7 +343,7 @@ mod tests {
         // HALT is one row: no variables of its own, all prefix.
         let layout = StackedLayout::build(&[0], 4).unwrap();
         let columns = vec![Mle::new(vec![FE::from(42)]).unwrap()];
-        let stacked = layout.stack(&columns).unwrap();
+        let stacked = layout.stack(&borrow(&columns)).unwrap();
         let place = layout.placement(0).unwrap();
 
         let lifted = place.point_in_stacked::<F>(&[]).unwrap();

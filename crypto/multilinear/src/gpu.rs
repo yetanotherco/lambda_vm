@@ -105,9 +105,7 @@ where
     // representation — the same one the kernels read and write.
     let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
     let (codeword, nodes) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
-    if nodes.len() % 32 != 0 {
-        return None;
-    }
+    let nodes = nodes_in_place(nodes)?;
 
     // SAFETY: as above, plus `FieldElement` has no drop glue over a `u64`, so
     // the allocation changes type in place. Relabelling a gigabyte codeword
@@ -120,16 +118,29 @@ where
             codeword.capacity(),
         )
     };
-    let nodes = nodes
-        .chunks_exact(32)
-        .map(|node| {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(node);
-            out
-        })
-        .collect();
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((codeword, nodes))
+}
+
+/// A byte buffer of Merkle nodes, relabelled as nodes without copying.
+///
+/// A tree over a stacked polynomial is hundreds of megabytes; chunking it into
+/// arrays would copy all of it to change nothing but the type.
+#[cfg(feature = "cuda")]
+fn nodes_in_place(bytes: Vec<u8>) -> Option<Vec<[u8; 32]>> {
+    if !bytes.len().is_multiple_of(32) || !bytes.capacity().is_multiple_of(32) {
+        return None;
+    }
+    // SAFETY: `[u8; 32]` has the alignment of `u8` and 32 times its size, so
+    // the allocation describes the same bytes either way.
+    let mut bytes = core::mem::ManuallyDrop::new(bytes);
+    Some(unsafe {
+        Vec::from_raw_parts(
+            bytes.as_mut_ptr() as *mut [u8; 32],
+            bytes.len() / 32,
+            bytes.capacity() / 32,
+        )
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -648,20 +659,9 @@ where
     let raw =
         unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
     let nodes = math_cuda::whir::commit_codeword_ext3(raw, log_folding).ok()?;
-    if !nodes.len().is_multiple_of(32) {
-        return None;
-    }
+    let nodes = nodes_in_place(nodes)?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(
-        nodes
-            .chunks_exact(32)
-            .map(|node| {
-                let mut out = [0u8; 32];
-                out.copy_from_slice(node);
-                out
-            })
-            .collect(),
-    )
+    Some(nodes)
 }
 
 #[cfg(not(feature = "cuda"))]
