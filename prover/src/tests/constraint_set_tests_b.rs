@@ -242,6 +242,20 @@ mod commit {
 }
 
 // =============================================================================
+// dma.rs
+// =============================================================================
+
+mod memmove {
+    use super::*;
+    use crate::tables::memmove::{MemmoveConstraints, cols};
+
+    #[test]
+    fn memmove_constraint_set_folder_capture_agree() {
+        check_table("memmove", &MemmoveConstraints, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
 // keccak.rs
 // =============================================================================
 

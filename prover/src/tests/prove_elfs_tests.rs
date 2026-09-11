@@ -1212,6 +1212,370 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
+#[test]
+fn test_prove_dma_memcpy_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"))
+            .expect("dma_memcpy_min.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memcpy guest should verify"
+    );
+    assert_eq!(
+        proof.public_output,
+        b"DMA copies eight-byte rows and a short tail"
+    );
+}
+
+/// Positive control for the fixture the memset forgery tests tamper with. Those
+/// tests assert that verification FAILS, so without this they would also pass if
+/// the untampered trace never verified in the first place.
+#[test]
+fn test_prove_dma_memset_min_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_min.elf"))
+            .expect("dma_memset_min.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memset guest should verify"
+    );
+    assert_eq!(proof.public_output, [0x3Cu8; 43]);
+}
+
+/// End-to-end memset: the guest exercises every row-schedule boundary (empty,
+/// sub-tail, exact widths, the per-ecall cap, multi-chunk, a wide fill truncated
+/// to its low byte, and an unaligned page-crossing destination), so a passing
+/// proof covers the memset rows, their bus balance, and the operand-gap pin
+/// together.
+#[test]
+fn test_prove_dma_memset_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_cases.elf"))
+            .expect("dma_memset_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memset guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memset-ok");
+}
+
+/// memmove rides the memcpy ecall unchanged. The interesting case is a forward
+/// overlap longer than one 256-byte chunk: the stub must walk chunks backwards,
+/// or an earlier chunk clobbers source bytes a later one still needs.
+#[test]
+fn test_prove_dma_memmove_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memmove_cases.elf"))
+            .expect("dma_memmove_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memmove guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memmove-ok");
+}
+
+#[test]
+fn test_prove_dma_memcpy_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_cases.elf"))
+            .expect("dma_memcpy_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA differential cases guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-cases-ok");
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_value_rejected() {
+    use crate::tables::memmove::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_, end, _tail| !end);
+    let original = *traces
+        .memmove
+        .main_table
+        .get(forged_row, dma_cols::VALUE[0]);
+    traces.memmove.main_table.set(
+        forged_row,
+        dma_cols::VALUE[0],
+        original + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "changing the structurally shared copied byte must unbalance MEMW",
+    );
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
+    use crate::tables::memmove::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |first, end, _tail| !first && !end);
+
+    // Shift both the current source and its locally-consistent successor. The
+    // row's ADD remains valid, but the predecessor's MemmoveNext tuple and the
+    // source-memory read no longer match.
+    let src_lo = *traces.memmove.main_table.get(forged_row, dma_cols::SRC_0);
+    let src_incr_lo = *traces
+        .memmove
+        .main_table
+        .get(forged_row, dma_cols::SRC_INCR_0);
+    traces.memmove.main_table.set(
+        forged_row,
+        dma_cols::SRC_0,
+        src_lo + FieldElement::from(8u64),
+    );
+    traces.memmove.main_table.set(
+        forged_row,
+        dma_cols::SRC_INCR_0,
+        src_incr_lo + FieldElement::from(8u64),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate source row must remain chained to its predecessor",
+    );
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_early_end_rejected() {
+    use crate::tables::memmove::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_first, end, _tail| !end);
+    traces
+        .memmove
+        .main_table
+        .set(forged_row, dma_cols::END, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
+    use crate::tables::memmove::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_first, end, tail| !end && !tail);
+    traces
+        .memmove
+        .main_table
+        .set(forged_row, dma_cols::TAIL, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
+}
+
+#[test]
+fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
+    use crate::tables::memmove::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    // `!tail` matters: on a one-byte row `fill_wide` must stay zero, so shifting
+    // both lanes there would trip constraint 9 locally and the test would prove
+    // something else.
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
+    // Shift both lanes so the row stays internally consistent (constraint 10
+    // still holds); only the chain token and the MEMW write disagree.
+    for column in [dma_set_cols::VALUE[0], dma_set_cols::VALUE[1]] {
+        let original = *traces.memmove.main_table.get(forged_row, column);
+        traces.memmove.main_table.set(
+            forged_row,
+            column,
+            original + FieldElement::<GoldilocksField>::one(),
+        );
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate row must keep the fill byte its predecessor sent",
+    );
+}
+
+#[test]
+fn test_prove_dma_memset_forged_early_end_rejected() {
+    use crate::tables::memmove::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
+    traces
+        .memmove
+        .main_table
+        .set(forged_row, dma_set_cols::END, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+}
+
+/// Flipping `tail` rewrites `step` from 8 to 1, so the row's own address and
+/// count arithmetic stop holding. Note this is rejected locally by the ADD
+/// carries, NOT by the ALU LT that pins `tail = (count < 8)` — that bus has no
+/// negative coverage here, the same gap the memcpy sibling has.
+#[test]
+fn test_prove_dma_memset_forged_wide_tail_rejected() {
+    use crate::tables::memmove::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
+    traces
+        .memmove
+        .main_table
+        .set(forged_row, dma_set_cols::TAIL, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
+}
+
+/// Soundness: the timestamp order is what makes a memset a memset. Clearing `IS_SET`
+/// on a chain turns the row back into an ordinary snapshot copy, which reads at `T+1`
+/// instead of `T+2` — so the read no longer observes the previous row's write and the
+/// MEMW tuples stop matching the memory the executor produced. This is the one piece of
+/// the unified chip with no ancestor in either of the tables it replaces.
+#[test]
+fn test_prove_dma_memset_forged_order_bit_rejected() {
+    use crate::tables::memmove::cols as mm_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
+    traces
+        .memmove
+        .main_table
+        .set(forged_row, mm_cols::IS_SET, FieldElement::zero());
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "clearing the order bit must break the propagation the fill depends on",
+    );
+}
+
+#[test]
+fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
+    use crate::tables::memmove::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
+
+    // Shift both the current destination and its locally-consistent successor.
+    // The row's ADD stays valid; the predecessor's MemmoveNext tuple and the
+    // memory write no longer match.
+    for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
+        let original = *traces.memmove.main_table.get(forged_row, column);
+        traces
+            .memmove
+            .main_table
+            .set(forged_row, column, original + FieldElement::from(8u64));
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate row must stay chained to its predecessor's address",
+    );
+}
+
+fn dma_memset_fixture() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_min.elf"))
+            .expect("dma_memset_min.elf not found — build its make target");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+fn dma_set_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
+    use crate::tables::memmove::cols as mm_cols;
+
+    let one = FieldElement::<GoldilocksField>::one();
+    (0..traces.memmove.num_rows())
+        .find(|&row| {
+            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            get(mm_cols::MU)
+                && get(mm_cols::IS_SET)
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
+        })
+        .expect("guest must contain the requested real memset row")
+}
+
+fn dma_memcpy_fixture() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"))
+            .expect("dma_memcpy_min.elf not found — build its make target");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
+    use crate::tables::memmove::cols as mm_cols;
+
+    let one = FieldElement::<GoldilocksField>::one();
+    (0..traces.memmove.num_rows())
+        .find(|&row| {
+            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            // memcpy rows only: memset and commit have their own forgery surface.
+            let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_COMMIT);
+            get(mm_cols::MU)
+                && is_copy
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
+        })
+        .expect("guest must contain the requested real MEMMOVE copy row")
+}
+
+fn assert_dma_forgery_rejected(elf: &Elf, traces: &mut Traces, reason: &str) {
+    assert!(!prove_and_verify_vm_minimal(elf, traces), "{reason}");
+}
 /// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
 /// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
 /// This exercises the whole HINT table bus surface (Ecall receive, the x10/x11/x12
@@ -3052,7 +3416,13 @@ fn test_prove_ef_io_demo_concatenates() {
     let elf_bytes =
         std::fs::read(workspace_root.join("executor/program_artifacts/rust/ef_io_demo.elf"))
             .expect("ef_io_demo.elf not found — run `make compile-programs-rust`");
-    let input: &[u8] = b"hello world!";
+    // 25 bytes, so `ef_io_demo`'s `buf_size / 2` split gives commits of 12 and 13.
+    // Both exceed eight, so each ecall emits a WIDE commit row, and the second is
+    // based at global index 12 -- not 8-aligned. That is the configuration where a
+    // prover-side row schedule and the verifier's `public_output` rebuild would drift
+    // apart if the COMMIT bus were grouped per row rather than per byte. The old
+    // input, `b"hello world!"`, split 6 + 6 and so produced only one-byte commit rows.
+    let input: &[u8] = b"hello world, and hello ef";
     let proof = crate::prove_with_inputs(&elf_bytes, input).expect("prove should succeed");
     assert!(
         crate::verify(&proof, &elf_bytes).expect("verify should not error"),

@@ -14,6 +14,9 @@ use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as D
 use crate::tables::halt::{bus_interactions as halt_buses, cols::NUM_COLUMNS as HALT_COLS};
 use crate::tables::load::{bus_interactions as load_buses, cols::NUM_COLUMNS as LOAD_COLS};
 use crate::tables::lt::{bus_interactions as lt_buses, cols::NUM_COLUMNS as LT_COLS};
+use crate::tables::memmove::{
+    bus_interactions as memmove_buses, cols::NUM_COLUMNS as MEMMOVE_COLS,
+};
 use crate::tables::memw::{bus_interactions as memw_buses, cols::NUM_COLUMNS as MEMW_COLS};
 use crate::tables::memw_aligned::{
     bus_interactions as memw_a_buses, cols::NUM_COLUMNS as MEMW_A_COLS,
@@ -176,6 +179,12 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             lengths.commit_padded_rows,
             COMMIT_COLS as u64,
             aux_cols(commit_buses().len()),
+            1,
+        ),
+        (
+            lengths.memmove_padded_rows,
+            MEMMOVE_COLS as u64,
+            aux_cols(memmove_buses().len()),
             1,
         ),
         // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit

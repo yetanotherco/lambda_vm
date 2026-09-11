@@ -7,18 +7,44 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
-pub enum SyscallNumbers {
-    // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
+/// Declares `SyscallNumbers` and derives `ALL` from the same variant list, so a
+/// syscall added to the enum is enumerated by everything driven off `ALL` (the
+/// CLI's accelerator-parity test) without a second list to keep in sync.
+macro_rules! syscall_numbers {
+    ($($(#[$meta:meta])* $variant:ident = $discriminant:literal,)+) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SyscallNumbers {
+            $($(#[$meta])* $variant = $discriminant,)+
+        }
+
+        impl SyscallNumbers {
+            /// Every variant, generated alongside the enum.
+            pub const ALL: &'static [SyscallNumbers] = &[$(SyscallNumbers::$variant,)+];
+        }
+    };
+}
+
+syscall_numbers! {
+    /// Placeholder discriminant. The actual syscall value is `KECCAK_SYSCALL_NUMBER`.
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
     Commit = 64,
     Halt = 93,
-    // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
+    /// Placeholder discriminant. The actual syscall value is `ECSM_SYSCALL_NUMBER`.
     Ecsm = 94,
-    // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
-    // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
+    /// Placeholder discriminant. The actual syscall value is
+    /// `HINT_SYSCALL_NUMBER`. Non-constraining hint (host computes modular
+    /// inverse/sqrt, guest verifies).
     Hint = 95,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `DMA_MEMCPY_SYSCALL_NUMBER`. `memcpy` and `memmove` chunks are proven by
+    /// the MEMMOVE table.
+    DmaMemcpy = 96,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `DMA_MEMSET_SYSCALL_NUMBER`. `memset` chunks are proven by the same
+    /// MEMMOVE table, which derives the inverted timestamp order from this number.
+    DmaMemset = 97,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -33,6 +59,110 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
+
+/// Syscall number for the copy accelerator, serving `memcpy` and `memmove`.
+///
+/// The spec uses ECALL number `-30`, i.e. `u64::MAX - 29 = 0xFFFF_FFFF_FFFF_FFE2`,
+/// which the MEMMOVE table puts on the `Ecall` bus as
+/// `[lo32, hi32] = [2^32 - 30, 2^32 - 1]`.
+///
+/// It starts a new group deliberately. `-1` through `-10` are reserved for hash
+/// accelerators (`-1` SHA256, `-2` KECCAK today), and the earlier `-3`/`-4` pair sat
+/// inside that range. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 29;
+/// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks
+/// larger copies, and the prover enforces this bound on every first DMA row.
+pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
+
+/// Width of one MEMMOVE row: eight bytes while at least eight remain, then one per
+/// remaining byte.
+///
+/// The AIR does not require this schedule. `tail` is a free bit, constrained only by
+/// `(1 - tail) * lt8 = 0`, so a one-byte row is legal at any count and a prover may
+/// walk one-byte rows to reach eight-byte alignment and keep the body on the cheaper
+/// `MEMW_A` table. This function simply declines to.
+///
+/// It used to do exactly that, splitting whenever `src` and `dst` shared a residue
+/// mod 8. Measured on a real mainnet block, that cost more than it saved: prove time
+/// 109.169s without the split against 111.780s with it, with row counts lower and
+/// committed elements unchanged on three of four fixtures and lower on the fourth.
+/// The reason is that the chip has only two widths. Aligning an end costs up to seven
+/// one-byte rows at the head and shifts the tail into up to seven more, so buying two
+/// or three `MEMW_A` rows costs a dozen rows on the wider `MEMW` table. A schedule
+/// gated on a minimum body length could still win; the AIR already permits it, so it
+/// can be added later without touching the constraint system or the proof format.
+///
+/// `src`, `dst`, `offset` and `to_commit` stay in the signature for that reason: every
+/// consumer — the executor's row count, the trace builder, the sizing pass and the CLI
+/// report — already routes through here, so a future schedule needs no new plumbing.
+pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64, to_commit: bool) -> u8 {
+    if remaining < 8 {
+        return 1;
+    }
+    let _ = (src, dst, offset, to_commit);
+    8
+}
+
+/// Total MEMMOVE rows one ecall produces: its data rows plus the terminal row.
+///
+/// A pure function of `(dst, count)` — the width now depends on the destination's
+/// alignment, not on `count` alone. Every consumer that needs a row count (the
+/// trace builder, the sizing pass, the CLI's accelerator report) goes through this
+/// function, so none of them can drift from the trace the prover actually builds.
+pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u64 {
+    let mut rows = 1;
+    let mut offset = 0u64;
+    let mut remaining = count;
+    while remaining != 0 {
+        let width = u64::from(memmove_row_width(src, dst, offset, remaining, to_commit));
+        offset += width;
+        remaining -= width;
+        rows += 1;
+    }
+    rows
+}
+/// Syscall number for `memset`, the same accelerator run with the read/write
+/// timestamp order inverted.
+///
+/// ECALL number `-32`, i.e. `u64::MAX - 31`. It is not `-31` because
+/// [`HINT_SYSCALL_NUMBER`] already holds that, so the copy group is `-30` and `-32`
+/// with the hint wedged between. Must match `syscalls/src/syscalls.rs`.
+///
+/// MEMMOVE decodes the functionality by receiving the syscall number as a line in
+/// `is_set`, so any number on that line is reachable by some field element and no
+/// particular neighbour is special. `IS_BIT(is_set)` is what carries the decoding
+/// argument, and it does so whatever the numbering.
+pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
+
+/// The one operand shape a DMA memset ecall may have: the destination trails the
+/// source by exactly one wide row.
+///
+/// This is not a convention, it is what makes the call sound. The accelerator runs
+/// an `is_set` call with the write at `T+1` and the read at `T+2`, so a row's read
+/// observes writes the same call already made — which is what propagates the seed.
+/// That pins the copied value only while the read resolves to a *different*,
+/// already-written address. With `dst == src` the read and the write address the
+/// same cell at adjacent timestamps, the memory argument is satisfied by
+/// `value == value`, and the eight value lanes become free field elements: a prover
+/// could put anything it liked into RAM. The AIR therefore pins `dst = src + 8` on
+/// every `is_set` row, and this constant is what both sides import so the two
+/// bounds cannot drift.
+pub const DMA_MEMSET_GAP: u64 = 8;
+
+/// Whether a memset over `[dst, dst + n)` would straddle the 2^32 limb boundary.
+///
+/// The AIR pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
+/// limb carries has no representable successor. The executor refuses such a call and
+/// the guest stub steers around it with a plain store loop; this is the single
+/// predicate both sides are written against, so they cannot drift.
+///
+/// It is not a theoretical case. The stack starts at `STACK_TOP = 0xFFFF_FFFF_FFFF_FFF0`,
+/// whose low limb is `0xFFFF_FFF0`, so a buffer within `n + 8` bytes of the stack top
+/// crosses — which is `main`'s own frame.
+pub const fn dma_memset_crosses_limb_boundary(dst: u64, n: u64) -> bool {
+    // `n` is bounded by DMA_MEMCPY_MAX_BYTES on the ecall path, so this cannot wrap.
+    (dst & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF
+}
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -88,6 +218,8 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
+            v if v == DMA_MEMSET_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemset),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
@@ -99,9 +231,26 @@ impl TryFrom<u64> for SyscallNumbers {
 pub enum Accelerator {
     Keccak,
     Ecsm,
+    Dma,
 }
 
 impl SyscallNumbers {
+    /// The raw `a7` value this syscall is invoked with. The accelerator numbers
+    /// exceed `isize::MAX`, so they can't be enum discriminants.
+    pub fn raw(self) -> u64 {
+        match self {
+            SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
+            SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemset => DMA_MEMSET_SYSCALL_NUMBER,
+            SyscallNumbers::Hint => HINT_SYSCALL_NUMBER,
+            SyscallNumbers::Print => SyscallNumbers::Print as u64,
+            SyscallNumbers::Panic => SyscallNumbers::Panic as u64,
+            SyscallNumbers::Commit => SyscallNumbers::Commit as u64,
+            SyscallNumbers::Halt => SyscallNumbers::Halt as u64,
+        }
+    }
+
     /// The accelerator this syscall drives, if any. Exhaustive `match self`:
     /// adding a `SyscallNumbers` variant is a compile error here, so a new
     /// accelerator can't be silently missed by counters that consume this.
@@ -109,6 +258,7 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -550,6 +700,78 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::DmaMemcpy => {
+                        // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
+                        // before writing, which also gives this ecall well-defined
+                        // memmove semantics when the regions overlap. The DMA trace
+                        // authenticates the same read-at-T+1/write-at-T+2 relation.
+                        let dst = registers.read(10)?;
+                        let src = registers.read(11)?;
+                        let n = registers.read(12)?;
+                        if n > DMA_MEMCPY_MAX_BYTES {
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
+                        }
+                        dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+                        src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+
+                        // The fixed-size scratch avoids a heap allocation on every
+                        // hot-path ecall while preserving snapshot semantics.
+                        let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
+                        for (i, byte) in bytes[..n as usize].iter_mut().enumerate() {
+                            *byte = memory.load_byte(src + i as u64);
+                        }
+                        for (i, &byte) in bytes[..n as usize].iter().enumerate() {
+                            memory.store_byte(dst + i as u64, byte);
+                        }
+                        src2_val = memmove_trace_rows(src, dst, n, false);
+                        dst_val = n;
+                    }
+                    SyscallNumbers::DmaMemset => {
+                        // memset(dst = x10, src = x11, n = x12) — a *propagating* copy,
+                        // not a fill. The stub seeds the first eight bytes with an
+                        // ordinary store and calls with `dst = seed_end`,
+                        // `src = seed_start`, so this is a plain overlapping memmove
+                        // and only the timestamp order distinguishes it: the accelerator
+                        // writes at T+1 and reads at T+2, so each step observes the
+                        // previous step's write and the seed propagates across the range.
+                        // A forward byte walk is exactly that semantics.
+                        let dst = registers.read(10)?;
+                        let src = registers.read(11)?;
+                        let n = registers.read(12)?;
+                        if n > DMA_MEMCPY_MAX_BYTES {
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
+                        }
+                        dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+                        src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+
+                        // The operand contract, enforced unconditionally so that the
+                        // executions this accepts are exactly the ones the AIR can
+                        // prove. The low-limb condition is the second half of that: the
+                        // AIR pins the gap limb-wise and so cannot express a carry out
+                        // of the low limb, and rejecting the straddle here is cheaper
+                        // than spending a carry column on an address range no guest
+                        // reaches (cf. the HINT limb bounds below).
+                        //
+                        // The bound has to cover the whole range, not just the first
+                        // row. `src` and `dst` both advance by the row width, and the
+                        // AIR pins the gap on EVERY `is_set` row, so a chain that starts
+                        // clear of the boundary can still walk into it: with
+                        // `src = 0xFFFF_FF00, n = 256` the row at offset 248 has
+                        // `SRC_0 = 0xFFFF_FFF8` against `DST_0 = 0`, which satisfies the
+                        // gap in full 64-bit arithmetic but not limb-wise. Bounding the
+                        // starting limb alone would accept an execution no prover can
+                        // then prove.
+                        if dma_memset_crosses_limb_boundary(src, n) || dst != src + DMA_MEMSET_GAP {
+                            return Err(ExecutionError::DmaMemsetBadGap { src, dst });
+                        }
+
+                        for i in 0..n {
+                            let byte = memory.load_byte(src + i);
+                            memory.store_byte(dst + i, byte);
+                        }
+                        src2_val = memmove_trace_rows(src, dst, n, false);
+                        dst_val = n;
+                    }
                     SyscallNumbers::Hint => {
                         // Non-constraining hint: host computes a modular inverse/sqrt
                         // and writes it to the guest, which verifies it (and falls back
@@ -766,6 +988,13 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
+    DmaChunkTooLarge(u64),
+    #[error(
+        "DMA memset needs dst == src + {DMA_MEMSET_GAP}, with src and src + n clear of \
+         the 2^32 limb boundary; got src {src:#x}, dst {dst:#x}"
+    )]
+    DmaMemsetBadGap { src: u64, dst: u64 },
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
     #[error("Unknown hint selector: {0}")]

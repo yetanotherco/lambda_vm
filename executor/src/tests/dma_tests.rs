@@ -1,0 +1,359 @@
+use crate::vm::instruction::decoding::Instruction;
+use crate::vm::instruction::execution::{
+    DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
+    ExecutionError, dma_memset_crosses_limb_boundary, memmove_row_width, memmove_trace_rows,
+};
+use crate::vm::memory::Memory;
+use crate::vm::registers::Registers;
+use proptest::prelude::*;
+
+fn run_dma(memory: &mut Memory, dst: u64, src: u64, count: u64) -> Result<(), ExecutionError> {
+    let mut registers = Registers::default();
+    let mut pc = 0;
+    registers.write(17, DMA_MEMCPY_SYSCALL_NUMBER)?;
+    registers.write(10, dst)?;
+    registers.write(11, src)?;
+    registers.write(12, count)?;
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, memory)?;
+    Ok(())
+}
+
+#[test]
+fn dma_memcpy_copies_unaligned_body_and_tail() {
+    let mut memory = Memory::default();
+    let input: Vec<u8> = (0..27).map(|i| (i * 7 + 3) as u8).collect();
+    for (i, &byte) in input.iter().enumerate() {
+        memory.store_byte(0x1003 + i as u64, byte);
+    }
+
+    run_dma(&mut memory, 0x2005, 0x1003, input.len() as u64).unwrap();
+    assert_eq!(
+        memory.load_bytes(0x2005, input.len() as u64).unwrap(),
+        input
+    );
+}
+
+#[test]
+fn dma_memcpy_has_snapshot_semantics_for_overlap() {
+    let mut memory = Memory::default();
+    let input: Vec<u8> = (0..32).map(|i| i as u8).collect();
+    for (i, &byte) in input.iter().enumerate() {
+        memory.store_byte(0x3000 + i as u64, byte);
+    }
+
+    run_dma(&mut memory, 0x3004, 0x3000, 24).unwrap();
+    assert_eq!(
+        memory.load_bytes(0x3004, 24).unwrap(),
+        input[..24],
+        "overlap must read the complete source snapshot before writing"
+    );
+}
+
+#[test]
+fn dma_memcpy_rejects_wrapping_ranges() {
+    let mut memory = Memory::default();
+    assert!(run_dma(&mut memory, 0x1000, u64::MAX - 3, 8).is_err());
+    assert!(run_dma(&mut memory, u64::MAX - 3, 0x1000, 8).is_err());
+}
+
+#[test]
+fn dma_memcpy_rejects_oversized_direct_ecall() {
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_dma(
+            &mut memory,
+            0x2000,
+            0x1000,
+            DMA_MEMCPY_MAX_BYTES + 1
+        ),
+        Err(ExecutionError::DmaChunkTooLarge(n))
+            if n == DMA_MEMCPY_MAX_BYTES + 1
+    ));
+}
+
+/// The row helpers are what the trace builder sizes the DMA trace with and what
+/// the CLI reports as the accelerator's cost, so pin them to the chunking rule
+/// the trace builder actually walks rather than to the closed form itself.
+#[test]
+fn dma_row_helpers_match_the_chunk_loop() {
+    for count in 0..=DMA_MEMCPY_MAX_BYTES {
+        // The width no longer depends on either end's alignment, but the pairs are
+        // kept so the row count stays pinned if a future schedule reintroduces it.
+        for (src, dst) in [(0u64, 0u64), (5, 5), (7, 7), (0, 5), (2, 5), (8, 16)] {
+            let mut chunks = 0u64;
+            let mut remaining = count;
+            let mut offset = 0u64;
+            while remaining != 0 {
+                let width = u64::from(memmove_row_width(src, dst, offset, remaining, false));
+                remaining -= width;
+                offset += width;
+                chunks += 1;
+            }
+            assert_eq!(
+                memmove_trace_rows(src, dst, count, false),
+                chunks + 1,
+                "src {src}, dst {dst}, count {count}: the terminal row is always emitted"
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Differentially compare the DMA snapshot semantics against a byte-vector
+    /// oracle. The generated ranges cover unaligned copies, both overlap
+    /// directions, zero/small/tail lengths, full chunks, and page crossings.
+    #[test]
+    fn dma_memcpy_matches_snapshot_oracle(
+        src_offset in 0usize..768,
+        dst_offset in 0usize..768,
+        count in 0usize..=DMA_MEMCPY_MAX_BYTES as usize,
+        seed in any::<u64>(),
+    ) {
+        const BASE: u64 = 0x0F00;
+        const REGION: usize = 1024;
+
+        let mut initial = vec![0u8; REGION];
+        let mut state = seed;
+        for byte in &mut initial {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+
+        let mut expected = initial.clone();
+        let snapshot = expected[src_offset..src_offset + count].to_vec();
+        expected[dst_offset..dst_offset + count].copy_from_slice(&snapshot);
+
+        let mut memory = Memory::default();
+        for (i, &byte) in initial.iter().enumerate() {
+            memory.store_byte(BASE + i as u64, byte);
+        }
+        run_dma(
+            &mut memory,
+            BASE + dst_offset as u64,
+            BASE + src_offset as u64,
+            count as u64,
+        )
+        .unwrap();
+
+        let actual = memory.load_bytes(BASE, REGION as u64).unwrap();
+        prop_assert_eq!(actual, expected);
+    }
+}
+
+/// Drives the memset ecall directly. `a1` is a *source address* now, not a fill
+/// byte: the accelerator performs a propagating copy, and the guest stub is what
+/// seeds the first bytes.
+fn run_memset(memory: &mut Memory, dst: u64, src: u64, count: u64) -> Result<(), ExecutionError> {
+    let mut registers = Registers::default();
+    let mut pc = 0;
+    registers.write(17, DMA_MEMSET_SYSCALL_NUMBER)?;
+    registers.write(10, dst)?;
+    registers.write(11, src)?;
+    registers.write(12, count)?;
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, memory)?;
+    Ok(())
+}
+
+/// What the guest stub does before the ecall: seed eight bytes with the fill.
+fn seed(memory: &mut Memory, dst: u64, fill: u8) {
+    for i in 0..8 {
+        memory.store_byte(dst + i, fill);
+    }
+}
+
+#[test]
+fn dma_memset_fills_unaligned_body_and_tail() {
+    let mut memory = Memory::default();
+    // 27 bytes at an unaligned base: the stub seeds eight and the ecall propagates
+    // the remaining nineteen from them.
+    seed(&mut memory, 0x2005, 0x3C);
+    run_memset(&mut memory, 0x2005 + 8, 0x2005, 27 - 8).unwrap();
+
+    assert_eq!(memory.load_bytes(0x2005, 27).unwrap(), vec![0x3Cu8; 27]);
+    // Neighbours must be untouched.
+    assert_eq!(memory.load_byte(0x2004), 0);
+    assert_eq!(memory.load_byte(0x2005 + 27), 0);
+}
+
+#[test]
+fn dma_memset_zero_count_writes_nothing() {
+    let mut memory = Memory::default();
+    memory.store_byte(0x3000, 0x11);
+    run_memset(&mut memory, 0x3008, 0x3000, 0).unwrap();
+    assert_eq!(memory.load_byte(0x3000), 0x11);
+}
+
+#[test]
+fn dma_memset_rejects_wrapping_range() {
+    let mut memory = Memory::default();
+    assert!(run_memset(&mut memory, u64::MAX - 3, 0x2000, 8).is_err());
+}
+
+#[test]
+fn dma_memset_rejects_oversized_chunk() {
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_memset(&mut memory, 0x2000, 0x4000, DMA_MEMCPY_MAX_BYTES + 1),
+        Err(ExecutionError::DmaChunkTooLarge(n)) if n == DMA_MEMCPY_MAX_BYTES + 1
+    ));
+}
+
+#[test]
+fn dma_memset_propagates_rather_than_filling() {
+    // The distinguishing property: the ecall is an overlapping *copy* walked
+    // forward, so whatever the stub seeded spreads across the range. Seeding a
+    // non-uniform pattern makes that visible — a real fill could not produce it.
+    let mut memory = Memory::default();
+    for i in 0..8u64 {
+        memory.store_byte(0x2000 + i, i as u8);
+    }
+    run_memset(&mut memory, 0x2008, 0x2000, 16).unwrap();
+
+    assert_eq!(
+        memory.load_bytes(0x2000, 24).unwrap(),
+        (0..24u8).map(|i| i % 8).collect::<Vec<_>>(),
+        "each step must observe the previous step's write"
+    );
+}
+
+proptest! {
+    /// The stub-plus-ecall pair must reproduce a reference fill for any length and
+    /// any destination alignment: the stub seeds `min(8, count)` bytes and the ecall
+    /// propagates the rest from them.
+    #[test]
+    fn dma_memset_matches_reference_fill(
+        dst_offset in 0usize..64,
+        count in 0usize..=(DMA_MEMCPY_MAX_BYTES as usize + 8),
+        fill in 0u8..=255,
+    ) {
+        const BASE: u64 = 0x9000;
+        const REGION: usize = 400;
+
+        let mut expected = vec![0u8; REGION];
+        expected[dst_offset..dst_offset + count].fill(fill);
+
+        let mut memory = Memory::default();
+        let dst = BASE + dst_offset as u64;
+        let seeded = count.min(8);
+        for i in 0..seeded as u64 {
+            memory.store_byte(dst + i, fill);
+        }
+        if count > seeded {
+            run_memset(&mut memory, dst + seeded as u64, dst, (count - seeded) as u64).unwrap();
+        }
+
+        let actual = memory.load_bytes(BASE, REGION as u64).unwrap();
+        prop_assert_eq!(actual, expected);
+    }
+}
+
+/// The operand contract is what pins `value` on an `is_set` row, so the executor
+/// must accept exactly the shapes the AIR can prove -- no wider, or an honest
+/// execution becomes unprovable, and no narrower, or the AIR admits executions
+/// that never happened.
+#[test]
+fn dma_memset_rejects_every_gap_but_one() {
+    for (dst, src, why) in [
+        (
+            0x2000u64,
+            0x2000u64,
+            "dst == src leaves the value lanes unconstrained",
+        ),
+        (0x2004, 0x2000, "a gap under one row width"),
+        (0x2020, 0x2000, "a gap over one row width"),
+        (0x2000, 0x2008, "dst below src propagates the wrong way"),
+    ] {
+        let mut memory = Memory::default();
+        assert!(
+            matches!(
+                run_memset(&mut memory, dst, src, 16),
+                Err(ExecutionError::DmaMemsetBadGap { .. })
+            ),
+            "{why} (src {src:#x}, dst {dst:#x})"
+        );
+    }
+
+    // Rejected for count 0 too. A zero-length call with a *correct* gap is fine and
+    // provable (one row, first = end = 1, no read, no write); what this case exercises
+    // is `dst == src`, which the guard refuses regardless of count.
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_memset(&mut memory, 0x2000, 0x2000, 0),
+        Err(ExecutionError::DmaMemsetBadGap { .. })
+    ));
+
+    // The AIR pins the gap limb-wise, so a `src` whose low limb sits within the gap
+    // of the boundary has no representable successor and must be refused here.
+    let mut memory = Memory::default();
+    assert!(matches!(
+        run_memset(&mut memory, 0x1_0000_0000, 0xFFFF_FFF8, 8),
+        Err(ExecutionError::DmaMemsetBadGap { .. })
+    ));
+
+    // And the bound must cover the whole range, not just the first row. This chain
+    // starts clear of the boundary but walks into it: at offset 248 the row is
+    // `src = 0xFFFF_FFF8, dst = 0x1_0000_0000`, whose low limbs differ by
+    // `-0xFFFF_FFF8` rather than by the gap, so the AIR rejects that row. Accepting
+    // the call here would hand an honest guest a trace no prover can prove.
+    let mut memory = Memory::default();
+    assert!(
+        matches!(
+            run_memset(&mut memory, 0xFFFF_FF08, 0xFFFF_FF00, 256),
+            Err(ExecutionError::DmaMemsetBadGap { .. })
+        ),
+        "a memset whose range crosses the 2^32 limb boundary must be refused"
+    );
+
+    // The row just inside the boundary is still fine, so the bound is not blanket.
+    let mut memory = Memory::default();
+    let src = 0xFFFF_FFFF - 256 - 8;
+    seed(&mut memory, src, 0x3C);
+    run_memset(&mut memory, src + 8, src, 256).unwrap();
+    assert_eq!(memory.load_byte(src + 263), 0x3C);
+
+    // And the one legal shape still works.
+    let mut memory = Memory::default();
+    seed(&mut memory, 0x2000, 0x5A);
+    run_memset(&mut memory, 0x2008, 0x2000, 8).unwrap();
+    for addr in 0x2000..0x2010 {
+        assert_eq!(memory.load_byte(addr), 0x5A, "byte at {addr:#x}");
+    }
+}
+
+/// The predicate the guest stub's fallback branch is written against.
+///
+/// That branch is assembly and never runs on the host, so this is what pins its
+/// logic: the stub takes the plain store loop exactly when this says the range
+/// crosses, and the executor refuses the ecall on the same condition. If the two ever
+/// disagree, an honest `memset` either aborts or produces an unprovable trace.
+#[test]
+fn the_memset_limb_boundary_predicate_matches_the_rows_the_air_can_pin() {
+    // Brute force: for every low limb near the boundary and every legal length, the
+    // predicate must agree with "some row of this chain has a carrying low limb".
+    for n in [0u64, 1, 8, 9, 255, 256] {
+        for delta in 0..600u64 {
+            let dst = 0x1_0000_0000u64.wrapping_sub(delta);
+            let any_row_carries = (0..=n).any(|offset| {
+                let row_dst = dst.wrapping_add(offset);
+                (row_dst & 0xFFFF_FFFF) + DMA_MEMSET_GAP > 0xFFFF_FFFF
+            });
+            assert_eq!(
+                dma_memset_crosses_limb_boundary(dst, n),
+                any_row_carries,
+                "dst {dst:#x} (low {:#x}), n {n}",
+                dst & 0xFFFF_FFFF
+            );
+        }
+    }
+
+    // The stack top is the reachable case, and it is `main`'s own frame.
+    const STACK_TOP: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+    assert!(dma_memset_crosses_limb_boundary(STACK_TOP - 8, 256));
+    assert!(!dma_memset_crosses_limb_boundary(STACK_TOP - 264, 256));
+    // Ordinary heap buffers are nowhere near it.
+    assert!(!dma_memset_crosses_limb_boundary(0x1_0000, 256));
+}

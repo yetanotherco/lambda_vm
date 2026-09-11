@@ -58,6 +58,7 @@ use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
 use super::local_to_global;
 use super::lt::{self, LtOperation};
+use super::memmove;
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
 use super::memw_register::{self, RegRow};
@@ -550,6 +551,7 @@ fn collect_ops_from_cpu(
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
+    Vec<memmove::MemmoveOperation>,
     Vec<hint::HintOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
@@ -562,6 +564,7 @@ fn collect_ops_from_cpu(
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
+    let mut memmove_ops: Vec<memmove::MemmoveOperation> = Vec::new();
     let mut hint_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
@@ -604,6 +607,16 @@ fn collect_ops_from_cpu(
             ));
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw.extend_ops(reg_commit_ops);
+            let (commit_memw, commit_rows) = collect_memmove_ops(
+                memmove::Functionality::Commit,
+                op.timestamp,
+                op.commit_buf_addr,
+                current_commit_index as u64,
+                op.commit_count,
+                memory_state,
+            );
+            memw.extend_ops(commit_memw);
+            memmove_ops.extend(commit_rows);
             let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
@@ -657,6 +670,66 @@ fn collect_ops_from_cpu(
             ecdas_ops.extend(ecdas_rows);
         }
 
+        // DMA memcpy: authenticate x10/x11/x12, snapshot all source bytes at
+        // T+1, then write all destination bytes at T+2.
+        if op.ecall_dma_memcpy {
+            let dst = register_state.read(10).0;
+            let src = register_state.read(11).0;
+            let count = register_state.read(12).0;
+            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
+                let packed = pack_register_value(value);
+                let (_old_value, old_ts) = register_state.read(reg);
+                memw.extend_ops(vec![
+                    MemwOperation::new(true, 2 * reg as u64, packed, op.timestamp, 2, true)
+                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+                ]);
+                register_state.write(reg, value, op.timestamp);
+            }
+            let (mm_memw, rows) = collect_memmove_ops(
+                memmove::Functionality::Copy,
+                op.timestamp,
+                src,
+                dst,
+                count,
+                memory_state,
+            );
+            memw.extend_ops(mm_memw);
+            memmove_ops.extend(rows);
+        }
+
+        // DMA memset: authenticate x10/x11/x12, then run the copy primitive with the
+        // read/write order inverted — write at T+1, read at T+2. There IS a source
+        // phase, and the self-overlap is the point: the stub seeds eight bytes and
+        // calls with `dst = src + 8`, so each row's read observes the write eight
+        // bytes back and the seed propagates. That is what constraints 30/31 pin.
+        if op.ecall_dma_memset {
+            // memset is a memmove call whose only distinguishing feature is the
+            // inverted timestamp order; the stub already seeded the first eight
+            // bytes and passed dst = seed_end, src = seed_start, count = n - 8.
+            let dst = register_state.read(10).0;
+            let src = register_state.read(11).0;
+            let count = register_state.read(12).0;
+            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
+                let packed = pack_register_value(value);
+                let (_old_value, old_ts) = register_state.read(reg);
+                memw.extend_ops(vec![
+                    MemwOperation::new(true, 2 * reg as u64, packed, op.timestamp, 2, true)
+                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+                ]);
+                register_state.write(reg, value, op.timestamp);
+            }
+            let (memset_memw, rows) = collect_memmove_ops(
+                memmove::Functionality::Set,
+                op.timestamp,
+                src,
+                dst,
+                count,
+                memory_state,
+            );
+            memw.extend_ops(memset_memw);
+            memmove_ops.extend(rows);
+        }
+
         // Collect Hint ecall operations (the 32-byte output write).
         if op.ecall_hint {
             let (hint_memw, hint_op) = collect_hint_ops(op, memory_state, register_state);
@@ -700,12 +773,22 @@ fn collect_ops_from_cpu(
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    // Each ecall generates count+1 operations (count real rows + 1 end row).
-    // Count only this epoch's rows, so subtract the carried start index.
+    // COMMIT is one row per ecall now: the sys_write number, the fd check and the
+    // x254 update. The byte loop lives on the MEMMOVE chip, so the committed length
+    // is checked against the rows that actually move the bytes.
     debug_assert_eq!(
         commit_ops.len(),
-        (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
-        "commit_ops count should match accumulated commit index plus end rows"
+        commit_ecall_count as usize,
+        "COMMIT should hold exactly one row per commit ecall"
+    );
+    debug_assert_eq!(
+        memmove_ops
+            .iter()
+            .filter(|op| op.functionality == memmove::Functionality::Commit && !op.end)
+            .map(|op| op.width as u64)
+            .sum::<u64>(),
+        (current_commit_index - start_commit_index) as u64,
+        "MEMMOVE should move exactly the committed byte count"
     );
 
     (
@@ -719,6 +802,7 @@ fn collect_ops_from_cpu(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        memmove_ops,
         hint_ops,
     )
 }
@@ -957,6 +1041,161 @@ fn collect_ecsm_ops(
     };
 
     (memw_ops, ecsm_op, ecdas_ops)
+}
+
+/// Replays one ecall through the unified memmove primitive.
+///
+/// Register operands are read at `T`. For a copy, every source chunk is read at `T+1`
+/// before any destination chunk is written at `T+2`, which is the executor's snapshot
+/// semantics even when the regions overlap; a memset inverts that order so each row's
+/// read observes the previous row's write. Chunks are eight bytes while at least eight
+/// remain, then one byte per tail row — width is a per-row choice the AIR permits at
+/// any count, and this is simply the schedule the builder takes.
+///
+/// Timestamp order follows the functionality: `Copy` and `Commit` read every chunk
+/// at `T+1` and write at `T+2`, which snapshots the whole source range and gives
+/// overlapping regions memmove semantics; `Set` inverts it, writing at `T+1` and
+/// reading at `T+2`, so each row observes the previous row's write and the seeded
+/// bytes propagate across the range. `Commit` writes into the COMMIT domain, so it
+/// emits no MEMW write at all.
+fn collect_memmove_ops(
+    functionality: memmove::Functionality,
+    timestamp: u64,
+    src: u64,
+    dst: u64,
+    count: u64,
+    memory_state: &mut MemoryState,
+) -> (Vec<MemwOperation>, Vec<memmove::MemmoveOperation>) {
+    let mut memw_ops = Vec::new();
+    let mut rows = Vec::new();
+    let inverted = functionality == memmove::Functionality::Set;
+    let to_commit_domain = functionality == memmove::Functionality::Commit;
+    let read_ts = timestamp + 1 + u64::from(inverted);
+    let write_ts = timestamp + 2 - u64::from(inverted);
+
+    let mut offset = 0u64;
+    let mut remaining = count;
+    let mut first = true;
+    // Snapshot order needs every read to land before any write, so the writes of a
+    // non-inverted call are held back to a second pass.
+    let mut deferred_writes = Vec::new();
+
+    while remaining != 0 {
+        let width = executor::vm::instruction::execution::memmove_row_width(
+            src,
+            dst,
+            offset,
+            remaining,
+            to_commit_domain,
+        );
+        let source_addr = src.wrapping_add(offset);
+        let destination_addr = dst.wrapping_add(offset);
+        let (value, old_timestamps) = memory_state.read_bytes(source_addr, width as usize);
+        let bytes = value.map(|byte| byte as u8);
+        let dword = u64::from_le_bytes(bytes);
+
+        if inverted {
+            // Write first, at the earlier timestamp, so this row's read sees the
+            // previous row's write.
+            let (old_values, old_dst_timestamps) =
+                memory_state.read_bytes(destination_addr, width as usize);
+            memw_ops.push(
+                MemwOperation::new(false, destination_addr, value, write_ts, width, false)
+                    .with_old(old_values, old_dst_timestamps),
+            );
+            memory_state.write_bytes(destination_addr, dword, width as usize, write_ts);
+            memw_ops.push(
+                MemwOperation::new(false, source_addr, value, read_ts, width, true)
+                    .with_old(value, old_timestamps),
+            );
+            memory_state.write_bytes(source_addr, dword, width as usize, read_ts);
+        } else {
+            memw_ops.push(
+                MemwOperation::new(false, source_addr, value, read_ts, width, true)
+                    .with_old(value, old_timestamps),
+            );
+            memory_state.write_bytes(source_addr, dword, width as usize, read_ts);
+            if !to_commit_domain {
+                deferred_writes.push((destination_addr, width, value, dword));
+            }
+        }
+
+        rows.push(memmove::MemmoveOperation {
+            timestamp,
+            src: source_addr,
+            dst: destination_addr,
+            count: remaining,
+            width,
+            first,
+            end: false,
+            functionality,
+            value: bytes,
+        });
+
+        first = false;
+        offset += u64::from(width);
+        remaining -= u64::from(width);
+    }
+
+    for (destination_addr, width, value, dword) in deferred_writes {
+        let (old_values, old_timestamps) =
+            memory_state.read_bytes(destination_addr, width as usize);
+        memw_ops.push(
+            MemwOperation::new(false, destination_addr, value, write_ts, width, false)
+                .with_old(old_values, old_timestamps),
+        );
+        memory_state.write_bytes(destination_addr, dword, width as usize, write_ts);
+    }
+
+    rows.push(memmove::MemmoveOperation {
+        timestamp,
+        src: src.wrapping_add(count),
+        dst: dst.wrapping_add(count),
+        count: 0,
+        width: 1,
+        first,
+        end: true,
+        functionality,
+        value: [0; 8],
+    });
+
+    (memw_ops, rows)
+}
+
+/// Sizing-pass replay of one MEMMOVE-driven ecall.
+///
+/// Deliberately delegates to [`collect_memmove_ops`] rather than re-deriving the
+/// schedule: the two used to be separate implementations pinned together by an
+/// assertion, and the schedule is now a function of `dst` as well as `count`, which
+/// is exactly the kind of thing that drifts. The cost is one allocation per ecall.
+#[cfg(feature = "disk-spill")]
+fn replay_memmove_for_sizing(
+    functionality: memmove::Functionality,
+    timestamp: u64,
+    src: u64,
+    dst: u64,
+    count: u64,
+    memory_state: &mut MemoryState,
+    mut visit_memw: impl FnMut(&MemwOperation),
+) -> u64 {
+    let (memw_ops, rows) =
+        collect_memmove_ops(functionality, timestamp, src, dst, count, memory_state);
+    for op in &memw_ops {
+        visit_memw(op);
+    }
+    rows.len() as u64
+}
+
+/// Test hook for the schedule, so the MEMMOVE unit tests can pin it.
+#[cfg(test)]
+pub fn memmove_row_width_for_test(
+    src: u64,
+    dst: u64,
+    offset: u64,
+    remaining: u64,
+    to_commit: bool,
+) -> u8 {
+    executor::vm::instruction::execution::memmove_row_width(src, dst, offset, remaining, to_commit)
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -1285,7 +1524,7 @@ fn cpu32_chip_op(
 fn collect_commit_memw_ops(
     op: &CpuOperation,
     register_state: &mut RegisterState,
-    memory_state: &mut MemoryState,
+    _memory_state: &mut MemoryState,
 ) -> Vec<MemwOperation> {
     let ts = op.timestamp;
     let buf_addr = op.commit_buf_addr;
@@ -1359,18 +1598,7 @@ fn collect_commit_memw_ops(
         register_state.write_index(new_index, ts);
     }
 
-    // Memory byte reads at ts
-    for i in 0..count {
-        let addr = buf_addr.wrapping_add(i);
-        let (byte_val, old_ts) = memory_state.read_byte(addr);
-        let value = [byte_val as u32, 0, 0, 0, 0, 0, 0, 0];
-        let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
-        let memw_op =
-            MemwOperation::new(false, addr, value, ts, 1, true).with_old(value, old_timestamps);
-        memw_ops.push(memw_op);
-        memory_state.write_byte(addr, byte_val, ts);
-    }
-
+    // The byte reads moved to the MEMMOVE chip, eight at a time.
     memw_ops
 }
 
@@ -2249,88 +2477,50 @@ fn collect_bitwise_from_page<I: ImageSource>(
 /// at the moment the ECALL executes.
 fn expand_commit_operations_for_ecall(
     ecall: &CpuOperation,
-    memory_state: &MemoryState,
+    _memory_state: &MemoryState,
     start_index: u64,
 ) -> Vec<CommitOperation> {
-    let mut ops = Vec::new();
-
-    let timestamp = ecall.timestamp;
-    let buf_addr = ecall.commit_buf_addr;
+    // One row per ecall now: the sys_write number, the fd check and the x254 update.
+    // The byte loop is deferred to the MEMMOVE chip over `BusId::CommitDefer`.
     let count = ecall.commit_count;
-
-    for i in 0..=count {
-        let remaining = count - i;
-        let is_end = remaining == 0;
-        let value = if !is_end {
-            let (byte_val, _ts) = memory_state.read_byte(buf_addr.wrapping_add(i));
-            byte_val
-        } else {
-            0
-        };
-        ops.push(CommitOperation {
-            timestamp,
-            index: start_index.wrapping_add(i),
-            address: buf_addr.wrapping_add(i),
-            count: remaining,
-            first: i == 0,
-            end: is_end,
-            value,
-        });
-    }
-
-    ops
+    vec![CommitOperation {
+        timestamp: ecall.timestamp,
+        index: start_index,
+        address: ecall.commit_buf_addr,
+        count,
+    }]
 }
 
-/// Collect bitwise lookups from COMMIT operations.
-///
-/// The COMMIT table sends:
-/// - IsHalfword for count_decr components (4 per real row, mult = mu)
-/// - IsHalfword for address_incr halfwords (4 per real row, mult = mu)
-/// - Zero for end detection (1 per real row, mult = mu)
-///
-/// Note: AreBytes for value is intentionally omitted per spec.
-fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
-    let mut lookups = Vec::new();
+/// BITWISE lookups sent by the MEMMOVE table: twelve `IS_HALF` for the three
+/// incremented dwords plus the `ZERO` end detection, one set per row.
+fn collect_bitwise_from_memmove(ops: &[memmove::MemmoveOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::with_capacity(ops.len() * 13);
+    for op in ops {
+        let width = u64::from(op.width);
+        let count_decr = op.count.wrapping_sub(width);
+        let src_incr = op.src.wrapping_add(width);
+        let dst_incr = op.dst.wrapping_add(width);
 
-    for op in commit_ops {
-        // IsHalfword for count_decr components (4 halfwords, mult = mu)
-        let count_decr = if op.count == 0 {
-            u64::MAX
-        } else {
-            op.count - 1
-        };
-        for shift in [0, 16, 32, 48] {
-            let half = ((count_decr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
+        for value in [count_decr, src_incr, dst_incr] {
+            for shift in [0, 16, 32, 48] {
+                let half = ((value >> shift) & 0xFFFF) as u16;
+                lookups.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
         }
 
-        // IsHalfword for address_incr halfwords (4 halfwords, mult = mu)
-        // All real rows send these, matching the spec's unconditional mult = mu.
-        let address_incr = op.address.wrapping_add(1);
-        for shift in [0, 16, 32, 48] {
-            let half = ((address_incr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
-        }
-
-        // Zero bus for end detection (mult = mu)
-        // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)
-        // When count_decr = 0xFFFF_FFFF_FFFF_FFFF (count=0), sum = 0 → end=1
-        let cd_0 = (count_decr & 0xFFFF) as u32;
-        let cd_1 = ((count_decr >> 16) & 0xFFFF) as u32;
-        let cd_2 = ((count_decr >> 32) & 0xFFFF) as u32;
-        let cd_3 = ((count_decr >> 48) & 0xFFFF) as u32;
-        let zero_input = (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3);
+        let halves = [
+            (count_decr & 0xFFFF) as u32,
+            ((count_decr >> 16) & 0xFFFF) as u32,
+            ((count_decr >> 32) & 0xFFFF) as u32,
+            ((count_decr >> 48) & 0xFFFF) as u32,
+        ];
+        let zero_input = halves.into_iter().map(|half| 65535 - half).sum();
         lookups.push(BitwiseOperation::zero(zero_input));
     }
-
     lookups
 }
 
@@ -2870,6 +3060,10 @@ pub struct Traces {
     /// ECDAS double/add table (variable rows per ecall)
     pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// Unified MEMMOVE table: one streaming copy primitive for memcpy/memmove,
+    /// memset and the commit byte loop, selected by decoded functionality columns.
+    pub memmove: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// HINT table (one row per non-constraining hint ecall).
     pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -2915,6 +3109,8 @@ struct CollectedOps {
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    // Unified memmove rows: memcpy/memmove, memset and the commit byte loop.
+    memmove_ops: Vec<memmove::MemmoveOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
 }
@@ -2971,6 +3167,7 @@ fn collect_all_ops(
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    memmove_ops: Vec<memmove::MemmoveOperation>,
     hint_ops: Vec<hint::HintOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
@@ -3115,6 +3312,7 @@ fn collect_all_ops(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        memmove_ops,
     }
 }
 
@@ -3158,6 +3356,7 @@ fn build_traces<I: ImageSource + Sync>(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        memmove_ops,
         hint_ops,
     } = ops;
 
@@ -3166,6 +3365,18 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    // MEMMOVE: `lt8` on every row, and the per-ecall byte bound on the first row.
+    lt_ops.extend(
+        memmove_ops
+            .iter()
+            .map(|op| LtOperation::new(op.count, 8, false)),
+    );
+    lt_ops.extend(
+        memmove_ops
+            .iter()
+            .filter(|op| op.first && op.functionality != memmove::Functionality::Commit)
+            .map(|op| LtOperation::new(op.count, memmove::MEMMOVE_MAX_BYTES + 1, false)),
+    );
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
@@ -3183,11 +3394,19 @@ fn build_traces<I: ImageSource + Sync>(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p4_bitwise_collect");
 
-    let public_output_bytes: Vec<u8> = commit_ops
-        .iter()
-        .filter(|op| !op.end)
-        .map(|op| op.value)
-        .collect();
+    // The committed bytes now flow through the MEMMOVE chip, so the public output is
+    // read off its COMMIT-domain rows rather than off COMMIT's (one row per ecall).
+    let public_output_bytes: Vec<u8> = {
+        let mut rows: Vec<&memmove::MemmoveOperation> = memmove_ops
+            .iter()
+            .filter(|op| op.functionality == memmove::Functionality::Commit && !op.end)
+            .collect();
+        // `dst` is the COMMIT-domain address, i.e. the running global byte index.
+        rows.sort_by_key(|op| op.dst);
+        rows.iter()
+            .flat_map(|op| op.value[..op.width as usize].iter().copied())
+            .collect()
+    };
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
@@ -3241,7 +3460,7 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_memmove(&memmove_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
@@ -3532,6 +3751,7 @@ fn build_traces<I: ImageSource + Sync>(
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
+    let gen_memmove = || memmove::generate_memmove_trace(&memmove_ops);
     // HINT table (all-padding for programs that make no hint ecalls).
     let gen_hint = || hint::generate_hint_trace(&hint_ops);
 
@@ -3546,6 +3766,7 @@ fn build_traces<I: ImageSource + Sync>(
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
     let (mut ecsm_slot, mut ecdas_slot) = (None, None);
+    let mut memmove_slot = None;
     let mut hint_slot = None;
 
     #[cfg(feature = "disk-spill")]
@@ -3588,6 +3809,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(cpu32s_slot, gen_cpu32s);
             spawn_into!(ecsm_slot, gen_ecsm);
             spawn_into!(ecdas_slot, gen_ecdas);
+            spawn_into!(memmove_slot, gen_memmove);
             spawn_into!(hint_slot, gen_hint);
         });
     } else {
@@ -3616,6 +3838,7 @@ fn build_traces<I: ImageSource + Sync>(
         cpu32s_slot = Some(gen_cpu32s());
         ecsm_slot = Some(gen_ecsm());
         ecdas_slot = Some(gen_ecdas());
+        memmove_slot = Some(gen_memmove());
         hint_slot = Some(gen_hint());
     }
 
@@ -3651,6 +3874,7 @@ fn build_traces<I: ImageSource + Sync>(
     let mut halt_trace = halt_slot.expect(PHASE5_RAN);
     let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
+    let memmove_trace = memmove_slot.expect(PHASE5_RAN);
     let hint_trace = hint_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3719,6 +3943,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
+        memmove: memmove_trace,
         hint: hint_trace,
         memw_registers,
         local_to_global,
@@ -3763,6 +3988,7 @@ pub struct TableLengths {
     pub dvrm_padded_rows: u64,
     pub branch_padded_rows: u64,
     pub commit_padded_rows: u64,
+    pub memmove_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
     pub cycle_count: u64,
@@ -3802,6 +4028,7 @@ pub fn count_table_lengths(
     let mut dvrm_count = 0usize;
     let mut branch_count = 0usize;
     let mut commit_count = 0usize;
+    let mut memmove_count = 0usize;
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,
@@ -3871,11 +4098,8 @@ pub fn count_table_lengths(
 
         // ECALL Commit
         if cpu_op.ecall_commit {
-            // Match `expand_commit_operations_for_ecall`'s `0..=count` loop
-            // without building the op vector.
-            commit_count += (cpu_op.commit_count as usize)
-                .checked_add(1)
-                .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
+            // COMMIT is one row per ecall now; the byte loop is MEMMOVE's.
+            commit_count += 1;
             let reg_commit_ops =
                 collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
             for memw_op in &reg_commit_ops {
@@ -3886,11 +4110,73 @@ pub fn count_table_lengths(
                     &mut memw_register_count,
                 );
             }
+            let rows = replay_memmove_for_sizing(
+                memmove::Functionality::Commit,
+                cpu_op.timestamp,
+                cpu_op.commit_buf_addr,
+                current_commit_index as u64,
+                cpu_op.commit_count,
+                &mut memory_state,
+                |memw_op| {
+                    partition_memw(
+                        memw_op,
+                        &mut memw_by_width,
+                        &mut memw_aligned_count,
+                        &mut memw_register_count,
+                    );
+                },
+            );
+            memmove_count += rows as usize;
+            lt_count += rows as usize;
             let count = u32::try_from(cpu_op.commit_count)
                 .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
+        }
+
+        if cpu_op.ecall_dma_memcpy || cpu_op.ecall_dma_memset {
+            let functionality = if cpu_op.ecall_dma_memset {
+                memmove::Functionality::Set
+            } else {
+                memmove::Functionality::Copy
+            };
+            let dst = register_state.read(10).0;
+            let src = register_state.read(11).0;
+            let count = register_state.read(12).0;
+            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
+                let packed = pack_register_value(value);
+                let (_old_value, old_ts) = register_state.read(reg);
+                let reg_op =
+                    MemwOperation::new(true, 2 * reg as u64, packed, cpu_op.timestamp, 2, true)
+                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]);
+                partition_memw(
+                    &reg_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+                register_state.write(reg, value, cpu_op.timestamp);
+            }
+            let rows = replay_memmove_for_sizing(
+                functionality,
+                cpu_op.timestamp,
+                src,
+                dst,
+                count,
+                &mut memory_state,
+                |memw_op| {
+                    partition_memw(
+                        memw_op,
+                        &mut memw_by_width,
+                        &mut memw_aligned_count,
+                        &mut memw_register_count,
+                    );
+                },
+            );
+            memmove_count += rows as usize;
+            // One LT per row pins `lt8`, plus one per ecall for the chunk cap.
+            lt_count += rows as usize + 1;
         }
 
         if cpu_op.ecall_hint {
@@ -3971,6 +4257,7 @@ pub fn count_table_lengths(
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)
             .max(4) as u64,
+        memmove_padded_rows: memmove_count.next_power_of_two().max(4) as u64,
         decode_rows,
         unique_page_count,
         cycle_count,
@@ -4037,6 +4324,11 @@ impl Traces {
         tables.push(&mut self.keccak_rnd);
         tables.push(&mut self.ecsm);
         tables.push(&mut self.ecdas);
+        // MEMMOVE qualifies on the same criterion as ECSM/ECDAS: of the tables left
+        // out, it is the only one whose height scales with the workload rather than
+        // being one row per event. Nothing mutates it after the build, so unlike
+        // BITWISE it cannot go stale on the device.
+        tables.push(&mut self.memmove);
 
         let bytes_of = |t: &TraceTable<GoldilocksField, GoldilocksExtension>| {
             t.num_rows() * t.num_main_columns * 8
@@ -4118,6 +4410,7 @@ impl Traces {
             ecsm,
             ecdas,
             hint,
+            memmove,
             memw_registers,
             eqs,
             bytewises,
@@ -4185,6 +4478,7 @@ impl Traces {
         }
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
+        total += (memmove.num_rows() * super::memmove::cols::NUM_COLUMNS) as u64;
         total += (hint.num_rows() * HINT_COLS) as u64;
         total
     }
@@ -4227,6 +4521,7 @@ impl Traces {
         let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
+        let n_memmove = aux_cols(super::memmove::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
 
         let Traces {
@@ -4251,6 +4546,7 @@ impl Traces {
             ecsm,
             ecdas,
             hint,
+            memmove,
             memw_registers,
             eqs,
             bytewises,
@@ -4318,6 +4614,7 @@ impl Traces {
         }
         total += (ecsm.num_rows() * n_ecsm) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
+        total += (memmove.num_rows() * n_memmove) as u64;
         total += (hint.num_rows() * n_hint) as u64;
         total
     }
@@ -4673,6 +4970,7 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            memmove_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4692,6 +4990,7 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            memmove_ops,
             &mut register_state,
             is_final,
         );
@@ -4786,6 +5085,7 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            memmove_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
@@ -4801,6 +5101,7 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            memmove_ops,
             &mut register_state,
             true,
         );

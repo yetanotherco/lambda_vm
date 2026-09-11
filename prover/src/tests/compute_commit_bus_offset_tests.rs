@@ -6,6 +6,8 @@
 
 use math::field::element::FieldElement;
 
+use executor::vm::instruction::execution::memmove_row_width;
+
 use crate::compute_commit_bus_offset;
 use crate::tables::types::{BusId, GoldilocksExtension};
 
@@ -121,4 +123,86 @@ fn test_zero_fingerprint_in_middle_returns_none() {
         compute_commit_bus_offset(&public_output, 0, &z, &alpha),
         None,
     );
+}
+
+/// The COMMIT tuples the MEMMOVE chip actually sends, walking the production row
+/// schedule one commit ECALL at a time.
+///
+/// This is the prover side, not a second copy of the verifier: the widths come from
+/// `memmove_row_width`, the same function the trace builder and the sizing pass use,
+/// and the tuple shape is the chip's — one `(global index, byte)` pair per byte.
+/// `commits` is the per-ECALL split of the public output, which is exactly the thing
+/// the verifier never learns.
+fn prover_offset(
+    commits: &[&[u8]],
+    start_index: u64,
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> Option<FieldElement<E>> {
+    let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
+    let alpha_sq = alpha * alpha;
+    let mut total = FieldElement::<E>::zero();
+    let mut index = start_index;
+
+    for bytes in commits {
+        let base = index;
+        let mut offset = 0u64;
+        let mut remaining = bytes.len() as u64;
+        while remaining != 0 {
+            let width = u64::from(memmove_row_width(0, base, offset, remaining, true));
+            for lane in 0..width {
+                let byte = bytes[(offset + lane) as usize];
+                let lc = bus_id
+                    + (FieldElement::<E>::from(base + offset + lane) * alpha)
+                    + (FieldElement::<E>::from(byte as u64) * alpha_sq);
+                total += (z - lc).inv().ok()?;
+            }
+            offset += width;
+            remaining -= width;
+        }
+        index += bytes.len() as u64;
+    }
+
+    Some(total)
+}
+
+/// The verifier rebuilds the COMMIT bus from the concatenated `public_output` and
+/// never learns where one commit ECALL ended and the next began. So the prover's
+/// tuples must not depend on that split.
+///
+/// This is the regression test for the eight-lane tuple: with one tuple per row,
+/// `[&[..4], &[..4]]` sent eight one-byte tuples while the verifier, chunking the
+/// eight bytes it sees, expected a single eight-byte one — an honest proof rejected.
+#[test]
+fn test_prover_tuples_are_independent_of_the_ecall_split() {
+    let z = FieldElement::<E>::from(9_876_543_211u64);
+    let alpha = FieldElement::<E>::from(1_357u64);
+
+    let splits: &[&[&[u8]]] = &[
+        // One ECALL, sub-eight, exact eight, and a wide body with a tail.
+        &[&[1, 2, 3, 4]],
+        &[&[1, 2, 3, 4, 5, 6, 7, 8]],
+        &[&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]],
+        // Several ECALLs. Only the last may be a multiple of eight without the
+        // schedule and the verifier's chunking drifting apart.
+        &[&[1, 2, 3, 4], &[5, 6, 7, 8]],
+        &[&[1, 2, 3], &[4, 5, 6, 7, 8, 9, 10, 11, 12]],
+        &[&[1, 2, 3, 4, 5, 6, 7, 8], &[9], &[10, 11, 12, 13, 14]],
+        &[&[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]],
+    ];
+
+    for (case, commits) in splits.iter().enumerate() {
+        for &start_index in &[0u64, 1, 7, 8, 4_294_967_290] {
+            let concatenated: Vec<u8> = commits.concat();
+            let prover = prover_offset(commits, start_index, &z, &alpha)
+                .expect("no fingerprint collision on the prover side");
+            let verifier = compute_commit_bus_offset(&concatenated, start_index, &z, &alpha)
+                .expect("no fingerprint collision on the verifier side");
+            assert_eq!(
+                prover, verifier,
+                "case {case} at start_index {start_index}: the COMMIT bus does not \
+                 balance, so an honest proof would be rejected"
+            );
+        }
+    }
 }
