@@ -192,6 +192,46 @@ pub fn sponge_leaf(kind: HasherKind, felts: &[FE]) -> LfmWord {
     [state[0], state[1], state[2], state[3]]
 }
 
+/// `sponge_leaf(kind, &felts_from_bytes(bytes))`, without materialising the
+/// felts.
+///
+/// The leaf construction over a byte string is what every [`AlgebraicDigest`]
+/// finalize performs, and the intermediate `Vec<FE>` it built was pure
+/// allocation: the sponge consumes the felts one rate block at a time and never
+/// looks back, and the felt count the capacity needs — `ceil(len / 8)` — is
+/// known from the length alone. Under the algebraic pin that `Vec` was one of
+/// the two heap allocations every proof-of-work grinding trial paid.
+///
+/// ⚠ Equivalent to the two-step form BY TEST (`sponge_leaf_bytes_matches_the_felt_form`),
+/// not by construction: the trailing partial group is zero-extended on the LOW
+/// side here, which is what `felts_from_bytes` does and is easy to get backwards.
+pub fn sponge_leaf_bytes(kind: HasherKind, bytes: &[u8]) -> LfmWord {
+    let num_felts = bytes.len().div_ceil(BYTES_PER_FELT);
+    let mut state = [FE::zero(); HASH_STATE_FELTS];
+    let cap = leaf_capacity(num_felts);
+    state[RATE_FELTS..].copy_from_slice(&cap);
+
+    if bytes.is_empty() {
+        return [state[0], state[1], state[2], state[3]];
+    }
+    // One rate block is eight felts, i.e. 64 bytes.
+    for block in bytes.chunks(RATE_FELTS * BYTES_PER_FELT) {
+        for (lane, slot) in state.iter_mut().take(RATE_FELTS).enumerate() {
+            let start = lane * BYTES_PER_FELT;
+            *slot = if start >= block.len() {
+                FE::zero()
+            } else {
+                let end = (start + BYTES_PER_FELT).min(block.len());
+                let mut b = [0u8; BYTES_PER_FELT];
+                b[..end - start].copy_from_slice(&block[start..end]);
+                FE::from(u64::from_be_bytes(b))
+            };
+        }
+        state = kind.permute(state);
+    }
+    [state[0], state[1], state[2], state[3]]
+}
+
 /// Every 8-byte big-endian group of `bytes` as a felt.
 ///
 /// The inverse of the serialisation `ByteConversion::write_bytes_be` performs,
@@ -464,7 +504,7 @@ impl<H: AlgebraicHasher> AlgebraicDigest<H> {
     /// The digest of everything absorbed so far — the leaf construction over
     /// the buffered bytes.
     pub fn finalize_digest(&self) -> Commitment {
-        digest_to_commitment(&sponge_leaf(H::KIND, &felts_from_bytes(&self.buf)))
+        digest_to_commitment(&sponge_leaf_bytes(H::KIND, &self.buf))
     }
 }
 
@@ -815,6 +855,71 @@ mod tests {
 
     /// A digest round-trips through its 32 canonical big-endian bytes, or
     /// `Commitment` does not name the digest.
+    #[test]
+    /// The HOST proof-of-work search still finds a nonce the predicate accepts,
+    /// under the RPX configuration and through the streaming leaf.
+    ///
+    /// This is the fallback arm: whenever there is no GPU, no CUDA build, a
+    /// device error, or `LAMBDA_VM_NO_GPU_GRIND`, every table's nonce comes from
+    /// here. `sponge_leaf_bytes` changed the code path both the search and the
+    /// verifier's check run on, and a change that broke them *together* would
+    /// leave a self-consistent prover producing proofs nothing else accepts —
+    /// so the cross-hash control below, where BLAKE3 work must not satisfy the
+    /// RPX predicate, is the part that makes this more than a tautology.
+    ///
+    /// Factor 16: ~65k trials, a fraction of a second, and a nonce passes by
+    /// chance with probability 2⁻¹⁶.
+    #[test]
+    fn the_host_search_finds_a_valid_nonce_under_rpx() {
+        type RpxGrind = stark::config::GrindingDigest<RpxStarkHash>;
+
+        let seed = [0x3cu8; 32];
+        let factor = 16u8;
+        let nonce = stark::grinding::generate_nonce::<RpxGrind>(&seed, factor)
+            .expect("a nonce exists at this factor");
+        assert!(
+            stark::grinding::is_valid_nonce::<RpxGrind>(&seed, nonce, factor),
+            "the host search must return a nonce its own predicate accepts"
+        );
+
+        // CONTROL: work done against another hash is not work against this one.
+        // Without it, `generate_nonce::<RpxGrind>` could be hashing anything at
+        // all and every assertion above would still hold.
+        type Blake3Grind = stark::config::GrindingDigest<stark::config::Blake3StarkHash>;
+        let other = stark::grinding::generate_nonce::<Blake3Grind>(&seed, factor)
+            .expect("a nonce exists at this factor");
+        assert!(
+            !stark::grinding::is_valid_nonce::<RpxGrind>(&seed, other, factor),
+            "a BLAKE3-ground nonce must not satisfy the RPX predicate"
+        );
+    }
+
+    /// [`sponge_leaf_bytes`] IS `sponge_leaf(kind, &felts_from_bytes(bytes))`.
+    ///
+    /// The streaming form exists to drop the intermediate `Vec<FE>` every
+    /// `AlgebraicDigest` finalize allocated, so the only thing that matters is
+    /// that it hashes the same message. It is checked at every length across two
+    /// rate blocks — the empty leaf (no permutation at all), every partial
+    /// group, both exact-block boundaries where the padding flag returns to zero
+    /// — and at a length whose last group is partial, which is where a low-side
+    /// versus high-side zero-extension would diverge.
+    #[test]
+    fn sponge_leaf_bytes_matches_the_felt_form() {
+        fn check<H: AlgebraicHasher>(name: &str) {
+            for len in 0..=132usize {
+                let bytes: Vec<u8> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                    .collect();
+                assert_eq!(
+                    sponge_leaf_bytes(H::KIND, &bytes),
+                    sponge_leaf(H::KIND, &felts_from_bytes(&bytes)),
+                    "{name}: the streaming leaf must equal the felt form at {len} bytes"
+                );
+            }
+        }
+        for_each_tenant!(check);
+    }
+
     #[test]
     fn a_digest_round_trips_through_its_commitment_bytes() {
         let d: LfmWord = [
