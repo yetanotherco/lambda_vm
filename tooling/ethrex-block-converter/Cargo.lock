@@ -511,12 +511,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "critical-section"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
-
-[[package]]
 name = "crossbeam"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,12 +772,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embedded-hal"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
-
-[[package]]
 name = "enum-ordinalize"
 version = "4.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,18 +842,17 @@ dependencies = [
  "ethrex-config",
  "ethrex-crypto",
  "ethrex-guest-program",
- "k256",
- "lambda-vm-ethrex-crypto",
- "rkyv",
+ "ethrex-rlp",
+ "libssz",
+ "libssz-types",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
 name = "ethrex-blockchain"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -889,8 +876,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -912,6 +899,7 @@ dependencies = [
  "once_cell",
  "rkyv",
  "rustc-hash",
+ "secp256k1",
  "serde",
  "serde_json",
  "sha2",
@@ -921,8 +909,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-config"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "ethrex-common",
  "ethrex-p2p",
@@ -933,8 +921,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -947,6 +935,7 @@ dependencies = [
  "num-bigint",
  "p256",
  "ripemd",
+ "secp256k1",
  "sha2",
  "thiserror 2.0.19",
  "tiny-keccak",
@@ -954,8 +943,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -965,6 +954,10 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-vm",
  "hex",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
  "rkyv",
  "serde",
  "serde_with",
@@ -973,8 +966,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -991,8 +984,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1009,8 +1002,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-metrics"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -1021,8 +1014,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-p2p"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1063,8 +1056,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -1073,8 +1066,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-storage"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1095,8 +1088,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1115,8 +1108,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-vm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?rev=797df5540c7d35cafd69b6971a74b2a49c67d1dd#797df5540c7d35cafd69b6971a74b2a49c67d1dd"
+version = "26.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?rev=8effcb0671c5d0b12fe0161ea37c174ec4466b6a#8effcb0671c5d0b12fe0161ea37c174ec4466b6a"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1623,27 +1616,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
-name = "lambda-vm-ethrex-crypto"
-version = "0.1.0"
-dependencies = [
- "ethrex-crypto",
- "k256",
- "lambda-vm-syscalls",
-]
-
-[[package]]
-name = "lambda-vm-syscalls"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.2.17",
- "getrandom 0.3.4",
- "lazy_static",
- "rand 0.9.5",
- "riscv",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "lambdaworks-crypto"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1691,18 +1663,18 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libssz"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
+checksum = "b4bdd6d63ed811ae164966de20810be780e07de784a4834ccfe6be90480c369e"
 dependencies = [
  "smallvec",
 ]
 
 [[package]]
 name = "libssz-derive"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ddfb5c969c28a4a54043e630f80c723352637bd1020f256ee3ac7a8814922b"
+checksum = "aeee1b9ac9200429f7e9830492765445989ea61c3fb9028ad5a96e1dd5f5e913"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1711,9 +1683,9 @@ dependencies = [
 
 [[package]]
 name = "libssz-merkle"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
+checksum = "863eca32d1a43e5ec41106a515552efa8307768d37c68d26b7f21ff13cfee1a7"
 dependencies = [
  "libssz",
  "sha2",
@@ -1721,9 +1693,9 @@ dependencies = [
 
 [[package]]
 name = "libssz-types"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747273ab2d923e82ed147091fe0fb3e602dd2012c872cdad5efe69e27c3b4099"
+checksum = "d4231ac301726840a3fe111f11bd4619d3c97ed155cb94c88dbf92b70e04e017"
 dependencies = [
  "libssz",
  "libssz-merkle",
@@ -2333,36 +2305,6 @@ checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
 dependencies = [
  "digest",
 ]
-
-[[package]]
-name = "riscv"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b05cfa3f7b30c84536a9025150d44d26b8e1cc20ddf436448d74cd9591eefb25"
-dependencies = [
- "critical-section",
- "embedded-hal",
- "paste",
- "riscv-macros",
- "riscv-pac",
-]
-
-[[package]]
-name = "riscv-macros"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d323d13972c1b104aa036bc692cd08b822c8bbf23d79a27c526095856499799"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "riscv-pac"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
 
 [[package]]
 name = "rkyv"

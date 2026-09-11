@@ -8,7 +8,7 @@ test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
-print-real-block-fixture-url \
+print-real-block-cache-url \
 test-ethrex-real-block-converter regen-real-block-fixture
 
 UNAME := $(shell uname)
@@ -280,7 +280,7 @@ test-rust: compile-programs-rust
 # from tooling/ethrex-fixtures. Two artifacts, both gitignored and both FETCHED
 # rather than built:
 #
-#   the fixture   the rkyv ProgramInput the benchmarks prove (~1 MB)
+#   the fixture   the schema-prefixed SSZ input the benchmarks prove
 #   the cache     the ethrex-replay JSON it was converted from (~2 MB), read only
 #                 by `regen-real-block-fixture`. The converter's TESTS read a
 #                 different, upstream-pinned cache — see below.
@@ -303,20 +303,48 @@ test-rust: compile-programs-rust
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
 # tooling/ethrex-tests, which points the usability screen at the block actually
 # being proven. The converter's own pins do NOT move — see below.
-# tooling/ethrex-block-converter/README.md carries the procedure and each candidate's
-# measured cost.
+# tooling/ethrex-fixtures/README.md carries what the workload costs and how to pick
+# the epoch size; the converter's README covers converting a cache by hand.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
-ETHREX_REAL_BLOCK := 25368371
-# The asset name carries the ethrex rev because the bytes are a function of it: the
-# archived ProgramInput layout moves with the pin, so one block has one fixture per rev.
-# Uploading under a new name rather than replacing the old one keeps `main` — which still
-# expects the pre-bump sha256 — fetching its own artifact while this branch is open.
-ETHREX_REAL_BLOCK_FIXTURE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/ethrex_mainnet_25368371_797df554.bin
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f
-# The block's source cache, hosted in the same release. Only `regen-real-block-fixture`
-# reads it — the converter's TESTS use a different, upstream-pinned cache (below).
-ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
-ETHREX_REAL_BLOCK_CACHE_SHA256 := 7aa88a5f7c5755b7575870f95e6c5c26186947f5e9e0d52199148c74e2a2736b
+ETHREX_REAL_BLOCK := 25453112
+# WHY THIS BLOCK: 25368371 was the pre-bump default, and under Amsterdam its
+# transactions lose so much gas to the new state-gas model that the workload drops
+# to 20.36M cycles against the 30.50M the retired fixture cost on today's guest. A
+# screen of twelve real mainnet blocks (our two release caches plus ethrex's curated
+# zkevm_bench corpus) put this one closest: 37.14M cycles, +22% against that target,
+# where 25368371 is -33% and the next candidate up (25087308) is +197%. Reverts are
+# not a selection criterion — every pre-Amsterdam block loses 26-50% of its
+# transactions to the fork, which is a property of the fork and not of the block.
+#
+# The fixture is GENERATED from the cache below, not fetched. The pinned guest
+# decodes only the Amsterdam schema (`0x1501`) and mainnet has no Amsterdam fork,
+# so no hosted artifact for this block can be valid: the release's rkyv one now
+# runs 496 cycles and commits `successful_validation = 0` instead of failing.
+# `tooling/ethrex-fixtures --bin real_block` rebuilds the block's real
+# transactions and real pre-state as an Amsterdam block and validates the result
+# through the guest before writing it. Nothing to publish, and it works offline
+# once the cache is there. Read the caveat in tooling/ethrex-fixtures/README.md
+# before quoting numbers: Amsterdam's gas model (EIP-8037 state gas, cold access
+# 2600 -> 3000) makes 10 of this block's Osaka-era transactions run out of gas.
+#
+# The digest below is what keeps a stale fixture out of a benchmark. Generating
+# validates the block, but generation only happens when the file is MISSING (see
+# the rule), and the bench runner is persistent -- so without this, a fixture
+# built before a rev bump survives it and every benchmark keeps proving the old
+# workload. The minimum-cycle floor in bench_abba.sh cannot see that either: a
+# stale fixture still runs tens of millions of cycles, and both sides of an A/B
+# read the same file, so the delta looks healthy while the absolute numbers
+# belong to the wrong block. Verified byte-identical on macOS arm64 and on the
+# Linux x86-64 runner, which is what makes pinning it safe. Repointing the block
+# or moving the ethrex rev changes it: run `make regen-real-block-fixture`, take
+# the new digest, and paste it here. Leaving it empty disables the check and says
+# so out loud.
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 08a52e10c2f89870dade14f7b0dfe01625e57416afbff664ad31fcd067233eea
+# The block's source cache: an ethrex-replay dump, fork-independent, still the one
+# hosted in bench-fixtures-v1. Only the fixture rebuild reads it; converter TESTS
+# use a different, upstream-pinned cache (below).
+ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25453112.json
+ETHREX_REAL_BLOCK_CACHE_SHA256 := 20ffbbc1b051df9dfa6285f0ea7bd3f6d054db883aba92230ea20350f1b1d4ad
 
 ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin
@@ -354,8 +382,9 @@ define ensure_verified
 	if [ -z "$(1)" ]; then \
 		echo "$(4): $(5) is unset." >&2; \
 		echo "  The $(ETHREX_REAL_BLOCK_ID) $(4) is fetched, not built. Set $(5) in the" >&2; \
-		echo "  Makefile to wherever the artifact is hosted; see" >&2; \
-		echo "  tooling/ethrex-block-converter/README.md for how to produce and host one." >&2; \
+		echo "  Makefile to wherever it is hosted. The FIXTURE is not fetched at all -" >&2; \
+		echo "  it is built by 'make regen-real-block-fixture'; see" >&2; \
+		echo "  tooling/ethrex-fixtures/README.md." >&2; \
 		exit 1; \
 	fi; \
 	mkdir -p $(dir $(3)); \
@@ -375,8 +404,44 @@ define ensure_verified
 	trap - EXIT
 endef
 
-ethrex-real-block-fixture:
-	$(call ensure_verified,$(ETHREX_REAL_BLOCK_FIXTURE_URL),$(ETHREX_REAL_BLOCK_FIXTURE_SHA256),$(ETHREX_REAL_BLOCK_FIXTURE),fixture,ETHREX_REAL_BLOCK_FIXTURE_URL)
+# A file rule, unlike the fetched artifacts above: those are phony so their digest
+# is re-checked on every invocation, which is how a stale download is caught. This
+# one is BUILT from the cache (whose digest IS re-checked) by a deterministic
+# generator, so its digest is re-checked here the same way -- hashing 549 KB costs
+# nothing, and only a MISMATCH pays for a rebuild, which is what keeps a cargo
+# build off every benchmark's critical path.
+ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
+	@set -e; \
+	want="$(ETHREX_REAL_BLOCK_FIXTURE_SHA256)"; \
+	if [ -z "$$want" ]; then \
+		echo "::warning::ETHREX_REAL_BLOCK_FIXTURE_SHA256 is unset - the fixture is not being verified."; \
+		exit 0; \
+	fi; \
+	if command -v sha256sum >/dev/null 2>&1; then shacmd="sha256sum"; \
+	elif command -v shasum >/dev/null 2>&1; then shacmd="shasum -a 256"; \
+	else echo "fixture: missing sha256sum or shasum for checksum verification" >&2; exit 1; fi; \
+	sha_of() { $$shacmd "$$1" | awk '{print $$1}'; }; \
+	if [ "$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")" = "$$want" ]; then exit 0; fi; \
+	echo "fixture $(ETHREX_REAL_BLOCK_FIXTURE) does not match $$want - regenerating."; \
+	$(MAKE) regen-real-block-fixture; \
+	got="$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")"; \
+	if [ "$$got" != "$$want" ]; then \
+		echo "ERROR: the freshly generated fixture is $$got, not the pinned $$want." >&2; \
+		echo "  The generator is deterministic, so this means its inputs or its output" >&2; \
+		echo "  format moved: the ethrex rev, the cache, or the generator itself. If that" >&2; \
+		echo "  was intended, re-baseline ETHREX_REAL_BLOCK_FIXTURE_SHA256 in the Makefile" >&2; \
+		echo "  and re-measure -- the workload is no longer the one every recorded number" >&2; \
+		echo "  was taken against." >&2; \
+		exit 1; \
+	fi
+
+# No prerequisites on purpose. `ethrex-real-block-cache` is phony (so its digest is
+# re-checked on every call), and a phony prerequisite always reads as newer than its
+# target, which would rebuild the fixture on every single benchmark invocation. The
+# cache is fetched from inside `regen-real-block-fixture` instead, so this recipe runs
+# only when the file is genuinely missing.
+$(ETHREX_REAL_BLOCK_FIXTURE):
+	$(MAKE) regen-real-block-fixture
 
 ethrex-real-block-cache:
 	$(call ensure_verified,$(ETHREX_REAL_BLOCK_CACHE_URL),$(ETHREX_REAL_BLOCK_CACHE_SHA256),$(ETHREX_REAL_BLOCK_CACHE),cache,ETHREX_REAL_BLOCK_CACHE_URL)
@@ -385,14 +450,19 @@ ethrex-real-block-cache:
 # scripts/bench_abba.sh, scripts/perf_diff.sh and
 # .github/workflows/benchmark-pr.yml read the fixture path from here instead of
 # hardcoding it, so repointing the block above moves every benchmark at once.
+# One consumer is NOT wired through here: `REAL_BLOCK_FIXTURE` in
+# tooling/ethrex-tests/tests/ethrex.rs is a const, because a glob would happily
+# pick up a stale fixture from an earlier block and pass. Repointing the block
+# means editing it too; it fails on the missing file, loudly.
 # `-s` on the caller's side keeps the output clean.
 print-real-block-fixture:
 	@echo $(ETHREX_REAL_BLOCK_FIXTURE)
 
-# Lets CI ask "is the fixture hosted yet?" without parsing the Makefile. Prints
-# nothing while the URL is unset, which is the condition callers branch on.
-print-real-block-fixture-url:
-	@echo $(ETHREX_REAL_BLOCK_FIXTURE_URL)
+# Lets CI ask "can the fixture be produced?" without parsing the Makefile. The
+# fixture itself is generated, so what has to be hosted is its source cache;
+# prints nothing while that URL is unset, which is the condition callers branch on.
+print-real-block-cache-url:
+	@echo $(ETHREX_REAL_BLOCK_CACHE_URL)
 
 # ===== Real-block converter (regeneration tool, off the build path) =====
 #
@@ -401,23 +471,27 @@ print-real-block-fixture-url:
 # path builds this crate.
 #
 # Its TEST input is pinned to Hoodi 1265656, independently of whichever block the
-# benchmarks currently prove, and stays there across a repoint. What these tests
-# exercise is the CONVERSION — cache JSON in, correctly-laid-out rkyv out — which
-# any real block demonstrates equally well. Hoodi's is the one cache ethrex-replay
-# publishes, so pinning there costs us no hosting, cannot drift, and leaves the
-# benchmark block free to change without touching this crate.
+# benchmarks currently prove, and stays there across a repoint. Hoodi's is the one
+# cache ethrex-replay publishes, so pinning there costs us no hosting, cannot drift,
+# and leaves the benchmark block free to change without touching this crate.
+#
+# What those tests reach is only the REJECTION paths: a pre-Amsterdam cache, and an
+# unmappable network. The conversion's success path cannot be covered yet — it needs a
+# cache carrying `slot_number` and `block_access_list_hash`, and no published cache has
+# them until a network runs Amsterdam. Until one does, this crate's SSZ encoder is
+# exercised by hand (`cargo run`) and by nothing automatic.
 #
 # Pinned by immutable `rev`, as the guest pins ethrex itself: a branch ref would let
-# the converter's reproducibility digest drift under a fixed input.
+# the test input move under a fixed set of assertions.
 ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
 ETHREX_CONVERTER_TEST_BLOCK := hoodi_1265656
 ETHREX_CONVERTER_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_CONVERTER_TEST_BLOCK).json
 # The cache filename is keyed on the block only, and its download rule has no other
 # prerequisite, so make would treat an already-present cache as up to date across an
 # `ETHREX_REPLAY_REV` bump and silently keep reading the old input. Depending on a
-# rev-stamped marker makes a re-pin discard the stale cache; without it the mismatch
-# only surfaces downstream as a `conversion_is_reproducible` digest failure, which
-# reads as "regenerate the fixture" and points at the wrong thing.
+# rev-stamped marker makes a re-pin discard the stale cache. Nothing downstream would
+# catch it otherwise: the two tests that remain assert that a cache is REJECTED, and a
+# stale cache satisfies that just as well as the right one.
 ETHREX_REPLAY_REV_STAMP := tooling/ethrex-block-converter/caches/.replay-rev-$(ETHREX_REPLAY_REV)
 
 $(ETHREX_REPLAY_REV_STAMP):
@@ -433,22 +507,23 @@ $(ETHREX_CONVERTER_CACHE): $(ETHREX_REPLAY_REV_STAMP)
 
 ethrex-real-block-converter-cache: $(ETHREX_CONVERTER_CACHE)
 
-# Converter correctness: host-side parity through the guest's own Crypto impl, the
-# network-rejection guard, and the reproducibility digest. Runs on changes to the
-# converter (see .github/workflows/ethrex-block-converter.yml), not on every PR.
+# Converter correctness, as far as it is testable today: a pre-Amsterdam cache and an
+# unmappable network are both rejected. The success path needs an Amsterdam cache —
+# see the comment above. Runs on changes to the converter
+# (see .github/workflows/ethrex-block-converter.yml), not on every PR.
 test-ethrex-real-block-converter: $(ETHREX_CONVERTER_CACHE)
 	cd tooling/ethrex-block-converter && cargo test --locked --release
 
-# Manual regeneration of the BENCHMARK fixture (not the converter's test block):
-# fetches that block's own cache and re-converts it, overwriting the fixture in
-# place so you can hash the result and upload it. That upload, plus SHA256/URL at
-# the top, is how the fixture is actually replaced.
+# The BENCHMARK fixture (not the converter's test block): rebuilt from that block's
+# own replay cache. Deterministic, so re-running it is how the fixture is replaced —
+# there is no artifact to upload.
 regen-real-block-fixture: ethrex-real-block-cache
-	cd tooling/ethrex-block-converter && \
-		cargo run --release -- ../../$(ETHREX_REAL_BLOCK_CACHE) ../../$(ETHREX_REAL_BLOCK_FIXTURE)
+	cd tooling/ethrex-fixtures && \
+		cargo run --release --bin real_block -- \
+			../../$(ETHREX_REAL_BLOCK_CACHE) ../../$(ETHREX_REAL_BLOCK_FIXTURE)
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
-# workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
+# workspace (the ethrex host dependency tree is isolated in its own Cargo.lock).
 # Needs the real-block fixture, so it needs the fixture URL to be set. This is a
 # local convenience target: no workflow invokes it. The PR gate spells out the
 # `-offline` variant below inline (pr_main.yaml), and ethrex-block-converter.yml's

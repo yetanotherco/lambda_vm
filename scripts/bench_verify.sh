@@ -37,7 +37,7 @@
 #        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 is the
 #        laptop-safe setting, not the fast one: prefer the calibrated tier for the box
 #        you are on — 2^22 on the bench runner or a 64 GiB machine, 2^23 on a 128 GiB
-#        one (see tooling/ethrex-block-converter/README.md, "Choosing the epoch size"),
+#        one (see tooling/ethrex-fixtures/README.md, "Choosing the epoch size"),
 #        which is what /bench and /bench-abba pin. (`cli prove --epoch-size-log2 --help`
 #        measured ethrex 10tx at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does
 #        NOT match bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW

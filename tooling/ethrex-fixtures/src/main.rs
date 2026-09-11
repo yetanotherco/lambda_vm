@@ -1,4 +1,4 @@
-//! Generate synthetic ethrex block fixtures (serialized `ProgramInput`) for the
+//! Generate synthetic ethrex block fixtures (SSZ stateless inputs) for the
 //! lambda-vm prover/benchmarks — in-memory, offline, deterministic.
 //!
 //! Usage:
@@ -18,17 +18,20 @@
 //! the LambdaVM-backend ethrex PR lands on ethrex `main` and fixtures are
 //! generated via `ethrex-replay custom block` instead.
 //!
-//! Pinned to the same ethrex rev as the guest, so the rkyv `ProgramInput`
-//! layout matches what the guest deserializes.
+//! Pinned to the same ethrex rev as the guest, so the SSZ layout matches what
+//! the guest deserializes.
 
 use bytes::Bytes;
 use ethrex_blockchain::payload::{BuildPayloadArgs, create_payload};
 use ethrex_blockchain::{Blockchain, BlockchainOptions};
+use ethrex_common::types::block_execution_witness::RpcExecutionWitness;
 use ethrex_common::types::{
     EIP1559Transaction, ELASTICITY_MULTIPLIER, Genesis, GenesisAccount, Transaction, TxKind,
 };
 use ethrex_common::{Address, H256, U256};
-use ethrex_guest_program::l1::ProgramInput;
+use ethrex_fixtures::build_stateless_input;
+use ethrex_guest_program::crypto::NativeCrypto;
+use ethrex_guest_program::l1::run_stateless_guest;
 use ethrex_l2_rpc::signer::{LocalSigner, Signable, Signer};
 use ethrex_storage::{EngineType, Store};
 use secp256k1::SecretKey;
@@ -107,6 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 1. genesis -> in-memory store -------------------------------------
     let mut genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;
+    // The stateless guest consumes the Amsterdam SSZ schema. Keep the local
+    // chain's fork schedule aligned with that schema while preserving the
+    // fixture's deterministic execution rules.
+    genesis.config.amsterdam_time = Some(0);
+    genesis.config.blob_schedule.amsterdam = Some(genesis.config.blob_schedule.bpo2);
 
     // For `distinct`, fund each synthetic sender in genesis so its tx is valid.
     if mode == Mode::Distinct {
@@ -127,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::new(".ethrex-fixtures-tmp", EngineType::InMemory)?;
     store.add_initial_state(genesis).await?;
 
-    let head_number = store.get_latest_block_number().await?;
+    let head_number = store.get_latest_block_number()?;
     let head = store
         .get_block_header(head_number)?
         .ok_or("missing genesis header")?;
@@ -187,14 +195,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         random: H256::zero(),
         withdrawals: Some(vec![]),
         beacon_root: Some(H256::zero()),
-        slot_number: None,
-        version: 3,
+        slot_number: Some(1),
+        version: 4,
         elasticity_multiplier: ELASTICITY_MULTIPLIER,
         gas_ceil: 60_000_000,
     };
     let skeleton = create_payload(&payload_args, &store, Bytes::new())?;
     let result = blockchain.build_payload(skeleton)?;
     let block = result.payload;
+    let block_access_list = result.block_access_list;
     let included = block.body.transactions.len();
     assert_eq!(
         included as u64, n_transfers,
@@ -202,12 +211,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          (check gas limit / account balance / nonces)"
     );
 
-    // --- 4. stateless witness -> ProgramInput -> rkyv ----------------------
+    // --- 4. stateless witness -> SSZ ---------------------------------------
     let witness = blockchain
         .generate_witness_for_blocks(std::slice::from_ref(&block))
         .await?;
-    let program_input = ProgramInput::new(vec![block], witness);
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input)?;
+    let witness: RpcExecutionWitness = witness.try_into()?;
+    let bytes = build_stateless_input(&block, &witness, block_access_list.as_ref(), chain_id)?;
+    let output = run_stateless_guest(&bytes, std::sync::Arc::new(NativeCrypto));
+    if output.len() != 43 || output[32] == 0 {
+        return Err("generated stateless fixture failed native validation".into());
+    }
     std::fs::write(&out_path, &bytes)?;
 
     let mode_label = match mode {

@@ -70,45 +70,52 @@ env:
   ELF: executor/program_artifacts/rust/ethrex.elf
   # The workload: a real Ethereum block. WHICH block lives in
   # the Makefile and nowhere else — nothing in this file names one, so a repoint
-  # moves this job without editing it. At the current default and pinned ethrex rev that
-  # is 30,498,818 cycles, 10,659 keccak calls and 116 ecsm calls — several times the work
-  # of the synthetic block, at a very different keccak:ecrecover mix. That is the whole
-  # point: a prover change can move the synthetic number and the real one in opposite
-  # directions. All three figures move with the ethrex rev, so re-measure on a bump
-  # rather than carrying them across one.
+  # moves this job without editing it. At the current default that is 37,137,748
+  # cycles, 6,003 keccak calls and 164 ecsm calls: 13.6x the work of the synthetic
+  # block (ethrex_bench_4, 2,727,681 cycles) with a keccak:ecrecover mix of 37:1
+  # against its 13:1. That is the whole point — a prover change can move the
+  # synthetic number and the real one in opposite directions.
+  #
+  # Those three counts are deterministic for a given ELF and input, so they are the
+  # check that the workload is what this job thinks it is; every figure below that
+  # carries seconds or bytes is machine-dependent and was measured on THIS runner.
+  # All three move with the ethrex rev, so re-measure on a bump rather than carrying
+  # them across one.
   #
   # The path is resolved from the Makefile (`make -s print-real-block-fixture`) into
-  # REAL_INPUT at run time. The ~1 MB .bin is gitignored and FETCHED by URL + sha256
-  # (see "Fetch ethrex real-block fixture"); while that URL is unset the whole
-  # section degrades to a warning rather than failing the job.
+  # REAL_INPUT at run time. The .bin is gitignored and BUILT from the block's replay
+  # cache (see "Build ethrex real-block fixture"); while that cache's URL is unset the
+  # whole section degrades to a warning rather than failing the job.
   #
   # Continuations are mandatory here, not a preference: a monolithic prove costs
   # ~4.9 GB of peak heap per million cycles on this workload family (from the
   # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so the
-  # current default would need ~240 GB and a heavier candidate far more.
+  # current default would need ~182 GB and a heavier candidate far more.
   # `--continuations` makes peak heap a function of the epoch size instead of the
-  # trace length. Costs move with the block; the per-candidate table is in
-  # tooling/ethrex-block-converter/README.md.
+  # trace length. Costs move with the block; what this one costs is in
+  # tooling/ethrex-fixtures/README.md.
   #
-  # Budget ~1.2 GB of disk for the bundle each run — hence the `rm -f` after every
-  # prove. A heavier block pushes it past 2 GiB, which needs rkyv `pointer_width_64`;
-  # a PR branch predating that fix fails at write time rather than mismeasuring.
+  # Budget ~790 MB of disk for the bundle each run (measured: 828,430,552 bytes) —
+  # hence the `rm -f` after every prove. A heavier block pushes it past 2 GiB, which
+  # needs rkyv `pointer_width_64` in the PROVER's bundle serialisation; a PR branch
+  # predating that fix fails at write time rather than mismeasuring.
   #
-  # Epoch 2^22, from the CPU sweep on 2026-07-31 (124 GiB / 32-core box, real block,
-  # branch vintage; full table in tooling/ethrex-block-converter/README.md):
+  # Epoch 2^22, measured on THIS runner on 2026-09-08 (box idle): mean 125.17 s over
+  # 14 proves, sd 1.58 s, CV 1.26%, 44.81 GiB peak RSS, 790 MB bundle; verifying one
+  # bundle is 12.0 s.
   #
-  #   2^21   464.26 s   18.43 GiB RSS   26 epochs   1.72 GB proof
-  #   2^22   397.88 s   32.21 GiB RSS   13 epochs   1.15 GB proof
-  #   2^23   356.47 s   60.01 GiB RSS    7 epochs   0.90 GB proof
+  # Memory, not speed, is what picks 2^22. The epoch trade-off was swept on the
+  # previous block (2^21 +13.7% wall / -12 GiB, 2^23 -7.5% wall / +16 GiB): peak RSS
+  # is set by the epoch size rather than the block, so the shape carries over even
+  # though the absolute seconds do not. 2^23 would take this workload past 50 GiB
+  # against the runner's >=64 GiB floor. Both tables in
+  # tooling/ethrex-fixtures/README.md.
   #
-  # Those RSS figures are the CALIBRATION BOX's, and memory does not transfer between
-  # machines any better than seconds do: this runner measured ~52 GB of peak heap for
-  # the same block at 2^22 — over 1.5x the calibration box's 32.21 GiB, and close
-  # enough to its >=64 GiB floor that 2^23 (60 GiB on the roomier box, so more here)
-  # is out of the question. Memory, not speed, is what picks 2^22. Moving off 2^21 is
-  # worth ~14% wall on the calibration box; treat that ratio as transferable and
-  # neither the absolute seconds nor the RSS column as such. This runner's own
-  # measured time at 2^22 is 158.8 s (median of 3, 2.8% spread, 13 epochs).
+  # The pre-bump numbers this replaces (block 25368371, 50.78M cycles, 158.8 s at
+  # 2^22 on this runner, ~52 GB) measured a DIFFERENT workload: that fixture was an
+  # rkyv ProgramInput, which the pinned guest rejects. Do not compare across the
+  # bump. This block was picked to land as close to it as an Amsterdam rebuild can —
+  # see the screen in the Makefile's ETHREX_REAL_BLOCK comment.
   #
   # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide
@@ -118,11 +125,15 @@ env:
   # each run is minutes rather than seconds; enough that one slow run shows up as
   # spread instead of moving the median.
   #
-  # THIS IS THE DIAL. A run measures 158.8 s on this runner (median of 3, 2.8% spread,
-  # at the epoch above), so 3 runs is ~8 min of proving and the right count. Should a
+  # THIS IS THE DIAL. A run measures 125.17 s on this runner (mean of 5, CV 0.57%, at
+  # the epoch above), so 3 runs is ~6.3 min of proving and the right count. Should a
   # future block or prover change take a run past ~6 min, /bench becomes a ~25 min
   # occupancy of a runner every other bench queues behind, and this count is what to
   # turn down (2, or 1) before reaching for anything else.
+  #
+  # What 3 runs can actually resolve, from that sd: a two-sided 95% delta of ~2.00%.
+  # Five per side gets to ~1.00% and ten to ~0.58%, so a sub-2% claim needs `/bench N`
+  # (clamped to 5) or the ABBA tiebreaker, not a re-read of a 3-run table.
   # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
   # beat the ~1% session-drift wall anyway — that is what /bench-abba is for, and it
   # proves this same block at this same epoch, so escalating keeps the question fixed.
@@ -229,10 +240,10 @@ jobs:
           # not need a second command to ask for, and it is the only workload /bench
           # proves.
           #
-          # The cost is real and lands on a shared runner: 158.8 s per run x
-          # BENCH_RUNS_REAL is ~8 min of proving, so every /bench and every push to main
-          # occupies the bench server for roughly 15 min once checkout, the two-sided
-          # build, the fixture fetch and the guest ELF are counted, and /bench-abba and
+          # The cost is real and lands on a shared runner: 125.17 s per run x
+          # BENCH_RUNS_REAL is ~6.3 min of proving, so every /bench and every push to main
+          # occupies the bench server for roughly 13 min once checkout, the two-sided
+          # build, the fixture build and the guest ELF are counted, and /bench-abba and
           # /bench-verify queue behind it. That trade was made deliberately — see
           # BENCH_RUNS_REAL above for the dial if it proves too expensive.
           RUN_REAL=true
@@ -244,8 +255,8 @@ jobs:
           # the growth sweep still runs and feeds the baseline artifact (no comment is
           # posted on those events — the Comment step is gated to comment triggers);
           # on a plain /bench nothing is left to measure, and the footer says so.
-          if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-fixture-url)" ]; then
-            echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_FIXTURE_URL is unset in the Makefile."
+          if [ "$RUN_REAL" = "true" ] && [ -z "$(make -s print-real-block-cache-url)" ]; then
+            echo "::warning::Real-block benchmark skipped: ETHREX_REAL_BLOCK_CACHE_URL is unset in the Makefile."
             RUN_REAL=false
           fi
           echo "run_real=$RUN_REAL" >> "$GITHUB_OUTPUT"
@@ -273,9 +284,9 @@ jobs:
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
           # (it can't beat the ~1% drift wall); use /bench-abba for finer deltas — it
-          # resolves ~1% over the same block in ~72 min at its default 12 pairs.
-          # At 158.8 s a run this is also the difference between a ~10 min and a ~20 min
-          # occupancy of the one bench runner.
+          # resolves ~0.5% over the same block in ~58 min at its default 12 pairs.
+          # At 125.17 s a run this is also the difference between a ~10 min and a ~20 min
+          # occupancy of the one bench runner. Three runs resolve ~2.00%, five ~1.00%.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
             echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_REAL"
             RUNS=$BENCH_RUNS_REAL
@@ -300,14 +311,16 @@ jobs:
             echo "Using $RUNS iterations, TABLE_PARALLELISM=default"
           fi
 
-      - name: Fetch ethrex real-block fixture
+      - name: Build ethrex real-block fixture
         if: steps.config.outputs.run_real == 'true'
         run: |
-          # ~1 MB, gitignored, and never in the checkout: fetch it rather than failing
-          # on a missing file, the same way the synthetic fixtures are generated above.
-          # This is a URL + sha256 download, not a build — no converter, no ethrex host
-          # dependency tree, no ethrex-replay cache. The step is already gated on the
-          # URL being set (see "Determine run count").
+          # Gitignored and never in the checkout, like the synthetic fixtures above.
+          # Built, not downloaded: the pinned guest decodes only the Amsterdam schema,
+          # so a hosted artifact for this pre-Amsterdam block cannot be valid — it would
+          # run ~500 cycles and commit `successful_validation = 0` without failing. The
+          # generator rebuilds the block's real transactions on its real pre-state and
+          # validates the result through the guest before writing. The step is gated on
+          # the cache URL being set (see "Determine run count").
           #
           # Untracked, so like the ELF it survives `git checkout origin/main` and both
           # sides prove the identical block.
@@ -998,7 +1011,7 @@ jobs:
             if (!realTime) {
               body += `\n> 🧱 **No prover measurement — the real-block fixture was not available.** `;
               body += `\`/bench\` proves only the real block, so nothing was measured this run. `;
-              body += `Check that \`ETHREX_REAL_BLOCK_FIXTURE_URL\` is set in the Makefile and that the artifact is reachable; the run log carries the warning.\n`;
+              body += `Check that \`ETHREX_REAL_BLOCK_CACHE_URL\` is set in the Makefile and that the replay cache is reachable; the fixture is generated from it, and the run log carries the warning.\n`;
             }
             const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;

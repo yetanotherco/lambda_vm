@@ -9,7 +9,7 @@ name: Benchmark GPU (PR)
 # Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 14) or via
 # workflow_dispatch.
 #
-# Workload: the real block (see tooling/ethrex-block-converter/README.md), proven with
+# Workload: the real block (see tooling/ethrex-fixtures/README.md), proven with
 # --continuations at the calibrated epoch size below.
 # Orchestration runs on a GitHub-hosted runner; all GPU work happens on the rented
 # Vast box (provisioned by the template onstart).
@@ -229,11 +229,19 @@ jobs:
           # because vast can't numerically compare the driver_version string server-side.
           MIN_DRIVER: "580"
         run: |
-          # cpu_ram filter is in GB. Floor 48 GB: the real block at epoch 2^22 peaks at
-          # ~36 GB host RSS on the CUDA path (measured, main vintage) — ~25% headroom.
+          # cpu_ram filter is in GB. Floor 64 GB, raised from 48 with the rebuilt
+          # workload: that block peaks at 44.81 GiB (47.0 GB) at epoch 2^22 on the CPU
+          # path, which on a 48 GB box is 98% of RAM -- not headroom to lose to a
+          # rental with a slightly hungrier allocator, it is already over. 64 GB restores the ~28% headroom the
+          # 48 GB floor had for the old block (~36 GB host RSS on the CUDA path,
+          # measured at main vintage) and matches the CPU runner's own floor. It costs
+          # offer availability: fewer boxes qualify, so PRICE_CAP may need a look if
+          # the query starts coming back empty. Peak is set by the epoch size, not the
+          # block, so dropping GPU_REAL_EPOCH_LOG2 to 21 is the other lever (~24 GiB,
+          # +14% wall).
           # Continuation peak is set by the epoch size, not the block, so bigger blocks
-          # don't move it; raising the epoch would (see the calibration tables in
-          # tooling/ethrex-block-converter/README.md).
+          # don't move it; raising the epoch would (see the epoch table in
+          # tooling/ethrex-fixtures/README.md).
           # gpu_frac=1 requires a WHOLE-MACHINE offer (you rent every GPU on the host), so
           # Vast places no other tenant on the box: CPU cores, RAM/memory bandwidth, PCIe,
           # and NVMe are fully dedicated. Without it the "most expensive" sort below lands on
@@ -246,7 +254,7 @@ jobs:
           # at the toolchain sanity gate. `reliability` is the queryable field (the
           # `reliability2` in the response schema is display-only, not filterable).
           # Over-strict just yields no offers, surfaced by the retry loop's "No offer".
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true reliability>=0.95 cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=64 disk_space>=64 verified=true rentable=true reliability>=0.95 cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
           # (within the price cap). Within the now whole-machine pool, price just tracks
@@ -495,7 +503,7 @@ jobs:
           # That surfaces as the OOM killer reaping a rustc ("signal: 9") or as an
           # allocation failure mid-compile. (Distinct from the toolchain gate's concern
           # above, which is a host that is broken before any load is applied.)
-          # 8 leaves ~6 GB/job on the >=48 GB floor; the build is a one-time per-bench
+          # 8 leaves ~8 GB/job on the >=64 GB floor; the build is a one-time per-bench
           # cost, and the job timeout above has ample room for it.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
