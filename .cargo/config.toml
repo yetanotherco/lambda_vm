@@ -1,13 +1,12 @@
-# Guest-only build flags. The key is scoped to the guest target, so host builds
-# (the prover, the CLI, the tooling) read this file and take nothing from it.
+# Guest-only build flags: the key is scoped to the guest target, so host builds
+# read this file and take nothing from it. Cargo joins `rustflags` across
+# ancestor configs, so each guest crate keeps its own flags and gains this one.
 [target.riscv64im-lambda-vm-elf]
-# `compiler_builtins` turns its `mem-unaligned` feature on for x86, aarch64 and
-# bpf only, so on RISC-V every misaligned word inside `memcpy`/`memmove` is
-# reassembled with a load, two shifts, an or and a store. This VM does unaligned
-# scalar accesses natively (#864 already builds guests with
-# `unaligned-scalar-mem`), so that detour buys nothing: the rest of the guest was
-# already emitting unaligned loads and only these two functions avoided them.
-#
-# Cargo joins `rustflags` arrays across ancestor config files, so each guest
-# crate's own `.cargo/config.toml` keeps its flags and gains this one.
+# `compiler_builtins` turns `mem-unaligned` on for x86, aarch64 and bpf only, so
+# on RISC-V `memcpy`/`memmove` reassemble every misaligned word by hand; this VM
+# does unaligned scalar accesses natively (#864). The cfg reaches every crate in
+# the guest graph, but only `compiler-builtins` reads that name, and it declares
+# the value in its own check-cfg. It lives in that crate's `build.rs` with no
+# stability guarantee: bumping the `nightly-2026-02-01` pin in the Makefile can
+# turn this into a silent no-op.
 rustflags = ["--cfg", "feature=\"mem-unaligned\""]
