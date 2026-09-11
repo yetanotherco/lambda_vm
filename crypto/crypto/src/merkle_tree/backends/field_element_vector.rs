@@ -43,6 +43,9 @@ use lambda_vm_syscalls::keccak::Keccak256 as SyscallKeccak256;
 fn hash_streamed<D: Digest + 'static, const NUM_BYTES: usize>(
     feed: impl Fn(&mut dyn FnMut(&[u8])),
 ) -> [u8; NUM_BYTES] {
+    // Metric: a Merkle finalize (leaf or node) — the total keccak count is taken
+    // at the primitive; this is the Merkle sub-count. No-op on guest / disabled.
+    crate::hash_metrics::count_merkle();
     #[cfg(target_arch = "riscv64")]
     if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
         let mut hasher = SyscallKeccak256::new();
@@ -75,6 +78,10 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
     left: &[u8; NUM_BYTES],
     right: &[u8; NUM_BYTES],
 ) -> [u8; NUM_BYTES] {
+    // Metric: a Merkle parent (auth-path) compression. On the host this also
+    // flows through `hash_streamed` (one `count_merkle`), so merkle − nodes =
+    // leaves. No-op on the guest / when disabled.
+    crate::hash_metrics::count_merkle_node();
     #[cfg(target_arch = "riscv64")]
     if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
         let l: &[u8; 32] = left[..].try_into().unwrap();

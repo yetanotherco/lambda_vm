@@ -1664,9 +1664,17 @@ pub trait IsStarkVerifier<
         // verify grinding
         let grinding_factor = air.context().proof_options.grinding_factor;
         if grinding_factor > 0 {
+            // Exclude the proof-of-work check from the host hash metric
+            // (`crypto::hash_metrics`): the metric asks for "all hashes except
+            // grinding". No-op on the guest and whenever counting is off.
+            let hm_was = crypto::hash_metrics::is_enabled();
+            crypto::hash_metrics::disable();
             let nonce_is_valid = proof.nonce().is_some_and(|nonce_value| {
                 grinding::is_valid_nonce(&challenges.grinding_seed, nonce_value, grinding_factor)
             });
+            if hm_was {
+                crypto::hash_metrics::enable();
+            }
 
             if !nonce_is_valid {
                 #[cfg(not(feature = "test_fiat_shamir"))]

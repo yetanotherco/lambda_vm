@@ -1052,6 +1052,61 @@ fn test_dump_recursion_input() {
     }
 }
 
+/// Count the keccak hashes done to VERIFY the dumped recursion blob — a
+/// prover-change metric: fewer hashes ⇒ a cheaper recursion guest. Runs the exact
+/// guest verify (`verify_continuation_and_attest`) on `/tmp/recursion_input.bin`
+/// (override with `RECURSION_INPUT_PATH`) with `crypto::hash_metrics` counting
+/// EVERY keccak-256 finalize EXCEPT the grinding proof-of-work check. The preset
+/// MUST match the dump's `RECURSION_DUMP_PRESET`, or the verify fails.
+///
+/// Loop: change the prover → re-run `test_dump_recursion_input` (re-proves +
+/// dumps the new blob) → run this (fast, verify-only) → compare the counts.
+///
+///   RECURSION_DUMP_PRESET=blowup4 cargo test --release \
+///     -p lambda-vm-prover --lib test_count_recursion_hashes -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic: counts keccak hashes verifying the dumped recursion blob"]
+fn test_count_recursion_hashes() {
+    let preset_name =
+        std::env::var("RECURSION_DUMP_PRESET").unwrap_or_else(|_| "blowup4".to_string());
+    let preset = Preset::ALL
+        .into_iter()
+        .find(|p| p.name() == preset_name)
+        .unwrap_or_else(|| panic!("unknown RECURSION_DUMP_PRESET '{preset_name}'"));
+    let path = std::env::var("RECURSION_INPUT_PATH")
+        .unwrap_or_else(|_| "/tmp/recursion_input.bin".to_string());
+    let blob = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("read {path} (run test_dump_recursion_input first): {e}"));
+
+    crypto::hash_metrics::reset();
+    crypto::hash_metrics::enable();
+    let attestation = recursion::verify_continuation_and_attest(&blob, &preset.options())
+        .expect("verify_continuation_and_attest errored");
+    crypto::hash_metrics::disable();
+    let (total, merkle, nodes) = crypto::hash_metrics::snapshot();
+
+    assert!(
+        attestation.is_some(),
+        "the blob must verify under preset '{}' — does it match the dump's RECURSION_DUMP_PRESET?",
+        preset.name()
+    );
+    // `total` = every keccak-256 finalize EXCEPT the grinding PoW check (excluded
+    // at its call site). `merkle` is its Merkle subset; `total - merkle` is the
+    // transcript + program-id/ELF fold + anything else.
+    println!(
+        "[hash-count] preset={} blob={}B fri_queries={} | total(excl. grinding)={} | \
+         merkle={} (nodes={} leaves={}) | transcript+other={}",
+        preset.name(),
+        blob.len(),
+        preset.options().fri_number_of_queries,
+        total,
+        merkle,
+        nodes,
+        merkle.saturating_sub(nodes),
+        total.saturating_sub(merkle),
+    );
+}
+
 /// Cycle count only of the recursion guest verifying a 1-query inner proof.
 #[test]
 #[ignore = "diagnostic: fast; recursion guest cycle count (1 query)"]
