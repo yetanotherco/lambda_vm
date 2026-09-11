@@ -434,8 +434,6 @@ impl TryFrom<u64> for BusId {
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
             21 => Ok(BusId::Commit),
-            33 => Ok(BusId::MemmoveNext),
-            34 => Ok(BusId::CommitDefer),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
             24 => Ok(BusId::ByteAlu),
@@ -445,6 +443,8 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            33 => Ok(BusId::MemmoveNext),
+            34 => Ok(BusId::CommitDefer),
             other => Err(other),
         }
     }

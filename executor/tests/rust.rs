@@ -184,6 +184,30 @@ fn test_dma_memcpy_compiler_emitted_copies() {
     );
 }
 
+/// `memmove` shares the copy ecall with `memcpy`, so the only thing distinguishing it
+/// is the stub's backward chunking when the ranges overlap with `dst` above `src`.
+/// The guest walks both directions across the 256-byte chunk boundary; without this
+/// the symbol was exercised only in `prove_elfs_tests`, where a failure reads as a
+/// proving bug rather than an execution one.
+#[test]
+fn test_dma_memmove_cases() {
+    let elf_data = std::fs::read("./program_artifacts/rust/dma_memmove_cases.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    assert_eq!(result.return_values.memory_values, b"dma-memmove-ok");
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "the strong memmove symbol must execute at least one copy ecall"
+    );
+}
+
 #[test]
 fn test_dma_memset_cases() {
     let elf_data = std::fs::read("./program_artifacts/rust/dma_memset_cases.elf").unwrap();

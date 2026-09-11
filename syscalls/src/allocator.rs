@@ -1,6 +1,17 @@
 use riscv as _;
 
 const MAX_MEMORY_SIZE: usize = 0xC000_0000;
+
+/// The accelerated `memset` depends on this.
+///
+/// MEMMOVE pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
+/// 32-bit limb carries has no representable successor and the executor refuses the
+/// call. Keeping every non-stack address below 2^32 is half of why no well-formed
+/// object can produce such a row; the other half is that a stack object satisfies
+/// `buf + n <= STACK_TOP`, whose low limb is `0xFFFF_FFF0`, leaving 15 bytes of
+/// headroom for the 8-byte gap. Raise this ceiling past 2^32 and accelerated `memset`
+/// starts failing on heap buffers.
+const _: () = assert!(MAX_MEMORY_SIZE < 1 << 32);
 const WORD_SIZE: usize = 4;
 
 // Guest global allocator, selectable at build time. The default was chosen on measured A/Bs

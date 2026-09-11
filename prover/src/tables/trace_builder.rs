@@ -701,7 +701,7 @@ fn collect_ops_from_cpu(
         // read/write order inverted — write at T+1, read at T+2. There IS a source
         // phase, and the self-overlap is the point: the stub seeds eight bytes and
         // calls with `dst = src + 8`, so each row's read observes the write eight
-        // bytes back and the seed propagates. That is what constraints 32/33 pin.
+        // bytes back and the seed propagates. That is what constraints 30/31 pin.
         if op.ecall_dma_memset {
             // memset is a memmove call whose only distinguishing feature is the
             // inverted timestamp order; the stub already seeded the first eight
@@ -1043,17 +1043,14 @@ fn collect_ecsm_ops(
     (memw_ops, ecsm_op, ecdas_ops)
 }
 
-/// Replays one DMA memcpy ecall.
-///
-/// Register operands are read at `T`. Source chunks are all read at `T+1`
-/// before any destination chunk is written at `T+2`, matching the executor's
-/// snapshot semantics even when the regions overlap. Chunks are eight bytes
-/// while `remaining >= 8`, then one byte per tail row.
 /// Replays one ecall through the unified memmove primitive.
 ///
-/// The schedule walks one-byte rows until `dst` is eight-aligned, eight-byte rows
-/// through the body, and one-byte rows for the remainder, so the body stays in the
-/// aligned MEMW_A case. Width is a per-row choice the AIR permits at any count.
+/// Register operands are read at `T`. For a copy, every source chunk is read at `T+1`
+/// before any destination chunk is written at `T+2`, which is the executor's snapshot
+/// semantics even when the regions overlap; a memset inverts that order so each row's
+/// read observes the previous row's write. Chunks are eight bytes while at least eight
+/// remain, then one byte per tail row — width is a per-row choice the AIR permits at
+/// any count, and this is simply the schedule the builder takes.
 ///
 /// Timestamp order follows the functionality: `Copy` and `Commit` read every chunk
 /// at `T+1` and write at `T+2`, which snapshots the whole source range and gives
@@ -4327,6 +4324,11 @@ impl Traces {
         tables.push(&mut self.keccak_rnd);
         tables.push(&mut self.ecsm);
         tables.push(&mut self.ecdas);
+        // MEMMOVE qualifies on the same criterion as ECSM/ECDAS: of the tables left
+        // out, it is the only one whose height scales with the workload rather than
+        // being one row per event. Nothing mutates it after the build, so unlike
+        // BITWISE it cannot go stale on the device.
+        tables.push(&mut self.memmove);
 
         let bytes_of = |t: &TraceTable<GoldilocksField, GoldilocksExtension>| {
             t.num_rows() * t.num_main_columns * 8
