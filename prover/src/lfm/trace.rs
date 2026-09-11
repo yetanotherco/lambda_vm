@@ -91,7 +91,7 @@ pub(super) enum Walk {
 ///   writes only the slice it is handed, so the chunks' writes are disjoint.
 ///   `fill` is `Fn + Sync`, not `FnMut`, so a closure that wants to carry state
 ///   from row to row fails to compile here instead of racing on the box.
-fn chip_trace(
+pub(super) fn chip_trace(
     walk: Walk,
     group: &ColumnGroup,
     num_columns: usize,
@@ -315,6 +315,46 @@ pub(super) fn fill_rpx_witness(out: &mut [FE]) {
     );
 }
 
+/// Writes one `LFM_HASH` row: the record's state in and out, the capacity cells
+/// its MODE calls for, and then the hasher's round witness.
+///
+/// A free function rather than a closure inside [`build_traces_walked`] so the
+/// scale probe in `trace_identity_tests` times the filler production runs
+/// instead of a copy of it. Row-local, like every other chip's fill: it reads
+/// one record and writes only `out`.
+pub(super) fn fill_hash_row(
+    hasher: HasherKind,
+    r: &super::executor::HashRow,
+    mode: HashMode,
+    out: &mut [FE],
+) {
+    out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
+    for k in 0..4 {
+        // S_i = MODE_P·IN_i + (MODE_C + MODE_T + MODE_L)·IV_i, materialized.
+        // Every mode but the permutation takes the IV. The capacity a row takes
+        // is its MODE's, not one value for the whole trace: RPO separates its
+        // socket domains through the capacity, so a transcript row and a parent
+        // row carry different constants. `mode_iv` is the one rule the executor
+        // reads too.
+        out[hash::cols::S8 + k] = if mode == HashMode::Permute {
+            r.ins[8 + k]
+        } else {
+            hasher.mode_iv(mode)[k]
+        };
+    }
+    out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
+    match hasher {
+        HasherKind::Test => {}
+        HasherKind::Poseidon => fill_poseidon_witness(out),
+        // The domain is read off the row's own mode columns, which `chip_trace`
+        // populated before calling this — the same discipline
+        // `fill_poseidon_witness` follows for its input.
+        HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
+        HasherKind::Rpo => fill_rpo_witness(out),
+        HasherKind::Rpx => fill_rpx_witness(out),
+    }
+}
+
 pub fn build_traces(program: &LfmProgram, records: &LfmRecords) -> LfmTraces {
     build_traces_with_hasher(program, records, HasherKind::default())
 }
@@ -355,12 +395,6 @@ pub(super) fn build_traces_walked(
             _ => None,
         })
         .collect();
-    // The capacity a row takes is its MODE's, not one value for the whole
-    // trace: RPO separates its socket domains through the capacity, so a
-    // transcript row and a parent row carry different constants. `mode_iv` is
-    // the one rule the executor reads too.
-    let mode_iv = |mode: HashMode| hasher.mode_iv(mode);
-
     // The keccak family's traces are driven by the executor's records; the tag
     // is the row ordinal, exactly as the compiler emitted it into the
     // preprocessed group (one rule, `layout::keccak::tag_for_row`, two callers).
@@ -488,28 +522,7 @@ pub(super) fn build_traces_walked(
             out[bitdec::cols::GINV] = r.ginv;
         }),
         hash: chip_trace(walk, &g.hash, hash::num_columns(hasher), |row, out| {
-            let r = &records.hash[row];
-            out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
-            for k in 0..4 {
-                // S_i = MODE_P·IN_i + (MODE_C + MODE_T + MODE_L)·IV_i,
-                // materialized. Every mode but the permutation takes the IV.
-                out[hash::cols::S8 + k] = if hash_modes[row] == HashMode::Permute {
-                    r.ins[8 + k]
-                } else {
-                    mode_iv(hash_modes[row])[k]
-                };
-            }
-            out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
-            match hasher {
-                HasherKind::Test => {}
-                HasherKind::Poseidon => fill_poseidon_witness(out),
-                // The domain is read off the row's own mode columns, which
-                // `chip_trace` populated before calling this — the same
-                // discipline `fill_poseidon_witness` follows for its input.
-                HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
-                HasherKind::Rpo => fill_rpo_witness(out),
-                HasherKind::Rpx => fill_rpx_witness(out),
-            }
+            fill_hash_row(hasher, &records.hash[row], hash_modes[row], out)
         }),
         keccak: chip_trace(walk, &g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
             let r = &records.keccak[row];

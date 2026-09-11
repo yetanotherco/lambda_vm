@@ -129,6 +129,8 @@ mod tests;
 #[cfg(all(test, not(feature = "cuda")))]
 mod transcript_diff_tests;
 #[cfg(test)]
+mod trace_identity_tests;
+#[cfg(test)]
 mod transcript_kats;
 #[cfg(test)]
 mod transcript_tests;
