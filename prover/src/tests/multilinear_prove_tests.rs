@@ -143,8 +143,8 @@ fn a_forged_preprocessed_column_is_rejected() {
         let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript).unwrap();
         (
             proof,
-            committed.layout().clone(),
-            committed.domain().clone(),
+            committed.groups()[0].layout().clone(),
+            committed.groups()[0].domain().clone(),
         )
     };
 
@@ -165,8 +165,9 @@ fn a_forged_preprocessed_column_is_rejected() {
         multilinear_table::multi_verify(
             &proof,
             &[statement],
-            &stacked,
-            &domain,
+            std::slice::from_ref(&stacked),
+            std::slice::from_ref(&domain),
+            &[1],
             &FieldElement::<E>::zero(),
             &config,
             &mut transcript,

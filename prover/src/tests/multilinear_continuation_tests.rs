@@ -126,3 +126,64 @@ fn a_broken_register_carry_is_rejected() {
         "a restated register carry was accepted"
     );
 }
+
+/// **The binding.** An epoch commits its local-to-global bookend on its own, and
+/// the cross-epoch proof will commit the same table: the two roots have to
+/// match, or nothing says they are the same table.
+///
+/// This rebuilds that root from the boundary alone — which is all the
+/// cross-epoch proof will have — and demands the epoch's proof carries it.
+#[test]
+fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let opts = ProofOptions::default_test_options();
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+
+    let mut roots: Vec<(stark::config::Commitment, stark::config::Commitment)> = Vec::new();
+    continuation::for_each_epoch(&elf, &[], 4, &artifacts, |prepared, _| {
+        let boundary = std::sync::Arc::clone(&prepared.boundary);
+        let register_init = prepared.register_init.clone();
+        let label = prepared.label;
+        let is_final = prepared.is_final;
+        let proof = multilinear_continuation::prove_epoch(
+            &elf,
+            &elf_bytes,
+            &register_init,
+            label,
+            prepared.traces,
+            is_final,
+            &boundary,
+            &opts,
+            None,
+        )?;
+        // The config the standalone commitment runs at is the epoch's: the root
+        // depends on the blowup and the fold width, and those are fixed —
+        // which is exactly what lets two proofs over different table sets agree
+        // on it.
+        let shapes: Vec<(usize, usize)> = proof
+            .table_num_vars
+            .iter()
+            .map(|&n| (1usize, n as usize))
+            .collect();
+        let standalone = multilinear_continuation::l2g_commitment(
+            &boundary,
+            &crate::multilinear_prove::chain_config(&shapes),
+        )
+        .expect("the bookend commits");
+        roots.push((
+            proof.l2g_root().expect("the epoch carries a root"),
+            standalone,
+        ));
+        Ok(())
+    })
+    .expect("the epochs prepare");
+
+    assert!(!roots.is_empty());
+    for (index, (carried, rebuilt)) in roots.iter().enumerate() {
+        assert_eq!(
+            carried, rebuilt,
+            "epoch {index}'s bookend root is not the one its table commits to"
+        );
+    }
+}

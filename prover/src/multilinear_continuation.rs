@@ -61,6 +61,55 @@ pub struct EpochProof {
     pub reg_fini: Vec<u32>,
 }
 
+impl EpochProof {
+    /// The root of the commitment the local-to-global bookend has to itself.
+    ///
+    /// This is what ties the epoch to the cross-epoch proof: the two commit the
+    /// same table, and with the bookend committed alone its root says so. Every
+    /// other table shares a stack and has no root of its own.
+    ///
+    /// [`verify_epoch`] checks the bookend really is one polynomial of its own
+    /// before this means anything.
+    pub fn l2g_root(&self) -> Option<stark::config::Commitment> {
+        self.proof.roots.last().copied()
+    }
+}
+
+/// The root the local-to-global table commits to on its own — what an epoch
+/// proof carries and the cross-epoch proof has to reproduce.
+///
+/// A function of the table, the blowup and the fold width, and of nothing else:
+/// in particular not of the query count, which is what lets two proofs over
+/// different table sets agree on it.
+pub fn l2g_commitment(
+    boundary: &[CellBoundary],
+    config: &ChainConfig,
+) -> Result<stark::config::Commitment, Error> {
+    let trace = local_to_global::generate_local_to_global_trace(boundary);
+    let columns: Vec<Mle<F>> = trace
+        .columns_main()
+        .into_iter()
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("{e:?}"))))
+        .collect::<Result<_, _>>()?;
+    let shape = [(
+        columns.len(),
+        trace.main_table.height.trailing_zeros() as usize,
+    )];
+    let layout =
+        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let stacked = multilinear::stacked_eval::StackedCommitment::<F>::commit(
+        layout,
+        &multilinear::stacking::borrow(&columns),
+        config,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    stacked
+        .roots()
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Prover("the bookend commits to nothing".to_string()))
+}
+
 /// Binds an epoch's statement into the transcript before any challenge.
 ///
 /// The monolithic multilinear statement plus the epoch's position. A
@@ -97,6 +146,17 @@ fn absorb_epoch(
         t.append_bytes(&value.to_le_bytes());
     }
     t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+}
+
+/// How an epoch's tables are split across commitments: everything together,
+/// and the local-to-global bookend on its own.
+///
+/// The bookend needs a root of its own because the cross-epoch proof commits
+/// the same table and the two have to be compared. A table that shares a stack
+/// has no root — the stack gives one per stacked *polynomial* — so committing
+/// it alone is the only way to say "this is that table".
+pub(crate) fn epoch_groups(num_tables: usize) -> Vec<usize> {
+    vec![num_tables - 1, 1]
 }
 
 /// A table's layout, from the AIR and the shape the verifier states.
@@ -222,8 +282,9 @@ pub fn prove_epoch(
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
     }
-    let committed =
-        CommittedTables::commit(committed, &config).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let sizes = epoch_groups(committed.len());
+    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -397,16 +458,22 @@ pub fn verify_epoch(
         return Ok(false);
     };
 
-    let stacked =
-        multilinear_table::global_layout(&shapes).map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let domain = multilinear::whir::Domain::<F>::new(stacked.n_stack() + config.log_blowup)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let sizes = epoch_groups(shapes.len());
+    let (layouts, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
+    // What makes [`EpochProof::l2g_root`] mean anything: the bookend is
+    // committed alone, and in one polynomial, so the last root is its own.
+    if layouts.last().map(|l| l.num_polys()) != Some(1) {
+        return Err(Error::ContinuationInvariant(
+            "the local-to-global bookend must commit to one polynomial of its own".to_string(),
+        ));
+    }
 
     Ok(multilinear_table::multi_verify(
         &epoch.proof,
         &statements,
-        &stacked,
-        &domain,
+        &layouts,
+        &domains,
+        &sizes,
         &owed,
         &config,
         &mut transcript,

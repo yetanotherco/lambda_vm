@@ -120,7 +120,8 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
 
     // One commitment for the whole trace, one opening, one pass over the rows.
     assert_eq!(proof.roots.len(), 1);
-    assert_eq!(proof.columns.polys.len(), 1);
+    assert_eq!(proof.columns.len(), 1);
+    assert_eq!(proof.columns[0].polys.len(), 1);
     assert_eq!(proof.tables[0].constraint.sumcheck.rounds.len(), num_vars);
 
     // The verifier rebuilds the layout from the AIR alone — no trace — and the
@@ -137,8 +138,9 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     multilinear_table::multi_verify(
         &proof,
         &[statement],
-        committed.layout(),
-        committed.domain(),
+        std::slice::from_ref(committed.groups()[0].layout()),
+        std::slice::from_ref(committed.groups()[0].domain()),
+        committed.sizes(),
         &owed,
         &config(),
         &mut verifier,
@@ -347,8 +349,9 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     multilinear_table::multi_verify(
         &proof,
         &statements,
-        &stacked,
-        &domain,
+        std::slice::from_ref(&stacked),
+        std::slice::from_ref(&domain),
+        &[statements.len()],
         &expected,
         &config(),
         &mut verifier,
@@ -446,8 +449,9 @@ fn a_real_table_proof_survives_serialization() {
         multilinear_table::multi_verify(
             round_tripped,
             &[statement],
-            committed.layout(),
-            committed.domain(),
+            std::slice::from_ref(committed.groups()[0].layout()),
+            std::slice::from_ref(committed.groups()[0].domain()),
+            committed.sizes(),
             &owed,
             &config(),
             &mut verifier,

@@ -302,6 +302,32 @@ fn layout_of<'a>(
     )
 }
 
+/// Each commitment group's stack and the domain it is committed over, rebuilt
+/// from the shapes and the split alone — the verifier never takes either from
+/// the proof.
+pub(crate) fn stacks(
+    shapes: &[Shape],
+    sizes: &[usize],
+    config: &ChainConfig,
+) -> Result<
+    (
+        Vec<multilinear::stacking::StackedLayout>,
+        Vec<multilinear::whir::Domain<F>>,
+    ),
+    Error,
+> {
+    let layouts = multilinear_table::global_layouts(shapes, sizes)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let domains = layouts
+        .iter()
+        .map(|layout| {
+            multilinear::whir::Domain::<F>::new(layout.n_stack() + config.log_blowup)
+                .map_err(|e| Error::Prover(format!("{e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((layouts, domains))
+}
+
 /// A table's preprocessed columns as MLEs, empty for a table that has none.
 fn preprocessed_mles(
     air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -431,17 +457,17 @@ pub fn verify_with_options(
         return Ok(false);
     };
 
-    // The stack every table's columns share, rebuilt from the shapes alone.
-    let stacked =
-        multilinear_table::global_layout(&shapes).map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let domain = multilinear::whir::Domain::<F>::new(stacked.n_stack() + config.log_blowup)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    // The stack every table's columns share, rebuilt from the shapes alone. A
+    // monolithic proof commits them all together, so there is one group.
+    let sizes = [shapes.len()];
+    let (layouts, domains) = stacks(&shapes, &sizes, &config)?;
 
     Ok(multilinear_table::multi_verify(
         &proof.proof,
         &statements,
-        &stacked,
-        &domain,
+        &layouts,
+        &domains,
+        &sizes,
         &owed,
         &config,
         &mut transcript,

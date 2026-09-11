@@ -375,7 +375,7 @@ fn phases() {
 
     let start = Instant::now();
     let columns = multilinear::stacked_eval::prove::<F, E, _>(
-        committed.stacked(),
+        &committed.groups()[0],
         &multilinear::stacked_eval::Claimed::PerColumn(&points),
         &values,
         &config,
@@ -387,7 +387,7 @@ fn phases() {
     let proof = multilinear_table::MultiProof {
         roots: committed.roots().to_vec(),
         tables: table_proofs,
-        columns,
+        columns: vec![columns],
     };
     let total = total.elapsed();
 

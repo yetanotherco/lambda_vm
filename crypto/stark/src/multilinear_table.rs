@@ -319,7 +319,13 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     tables: Vec<CommittedTable<'a, F, E>>,
-    stacked: StackedCommitment<F>,
+    /// The stacks the tables are committed in, in table order. One is the usual
+    /// case; more than one exists so a table can have a commitment of its own —
+    /// which is what binds the same table across two proofs, since a table has
+    /// no root of its own when it shares a stack.
+    groups: Vec<StackedCommitment<F>>,
+    /// How many tables each group holds, in order.
+    sizes: Vec<usize>,
     roots: Vec<Commitment>,
 }
 
@@ -374,6 +380,26 @@ pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError
     StackedLayout::build(&heights, n_stack)
 }
 
+/// One layout per group, from the shapes and how the tables are split.
+pub fn global_layouts(
+    shapes: &[(usize, usize)],
+    sizes: &[usize],
+) -> Result<Vec<StackedLayout>, MlError> {
+    if sizes.iter().sum::<usize>() != shapes.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: shapes.len(),
+            got: sizes.iter().sum(),
+        });
+    }
+    let mut layouts = Vec::with_capacity(sizes.len());
+    let mut at = 0usize;
+    for &size in sizes {
+        layouts.push(global_layout(&shapes[at..at + size])?);
+        at += size;
+    }
+    Ok(layouts)
+}
+
 impl<'a, F, E> CommittedTables<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -386,20 +412,52 @@ where
         tables: Vec<CommittedTable<'a, F, E>>,
         config: &ChainConfig,
     ) -> Result<Self, MlError> {
-        let shapes: Vec<(usize, usize)> = tables
-            .iter()
-            .map(|t| (t.num_committed_columns(), t.num_vars()))
-            .collect();
-        let layout = global_layout(&shapes)?;
+        let sizes = [tables.len()];
+        Self::commit_grouped(tables, &sizes, config)
+    }
 
-        // By reference: the stack copies every column into its own buffer, and
-        // the trace holds the originals for the rest of the proof.
-        let columns: Vec<&Mle<F>> = tables.iter().flat_map(|t| t.trace.columns()).collect();
-        let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
-        let roots = stacked.roots();
+    /// The same, with the tables split across several stacks.
+    ///
+    /// `sizes` is how many tables each group takes, in order, and must cover
+    /// them all. A group of one is a table with a commitment of its own: the
+    /// only way to say "this is the same table" to another proof, since a table
+    /// that shares a stack has no root to compare.
+    ///
+    /// Everything else is unchanged — the tables are argued in one transcript
+    /// against one set of roots, and each group is opened once.
+    pub fn commit_grouped(
+        tables: Vec<CommittedTable<'a, F, E>>,
+        sizes: &[usize],
+        config: &ChainConfig,
+    ) -> Result<Self, MlError> {
+        if sizes.iter().sum::<usize>() != tables.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: tables.len(),
+                got: sizes.iter().sum(),
+            });
+        }
+        let mut groups = Vec::with_capacity(sizes.len());
+        let mut roots = Vec::new();
+        let mut at = 0usize;
+        for &size in sizes {
+            let group = &tables[at..at + size];
+            let shapes: Vec<(usize, usize)> = group
+                .iter()
+                .map(|t| (t.num_committed_columns(), t.num_vars()))
+                .collect();
+            let layout = global_layout(&shapes)?;
+            // By reference: the stack copies every column into its own buffer,
+            // and the trace holds the originals for the rest of the proof.
+            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.trace.columns()).collect();
+            let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
+            roots.extend(stacked.roots());
+            groups.push(stacked);
+            at += size;
+        }
         Ok(Self {
             tables,
-            stacked,
+            groups,
+            sizes: sizes.to_vec(),
             roots,
         })
     }
@@ -408,22 +466,19 @@ where
         &self.tables
     }
 
-    /// One root per stacked polynomial, for the whole proof.
+    /// Every group's roots, in order — what the transcript absorbs.
     pub fn roots(&self) -> &[Commitment] {
         &self.roots
     }
 
-    pub fn layout(&self) -> &StackedLayout {
-        self.stacked.layout()
+    /// How many tables each group holds.
+    pub fn sizes(&self) -> &[usize] {
+        &self.sizes
     }
 
-    pub fn domain(&self) -> &Domain<F> {
-        self.stacked.domain()
-    }
-
-    /// What the one opening settles against.
-    pub fn stacked(&self) -> &StackedCommitment<F> {
-        &self.stacked
+    /// The stacks, one per group.
+    pub fn groups(&self) -> &[StackedCommitment<F>] {
+        &self.groups
     }
 }
 
@@ -495,8 +550,9 @@ pub struct MultiProof<F: IsField, E: IsField> {
     /// one — and carrying them here is what makes the proof self-contained.
     pub roots: Vec<Commitment>,
     pub tables: Vec<TableProof<E>>,
-    /// Every table's columns, at each one's own point, against one stack.
-    pub columns: StackedProof<F, E>,
+    /// Every table's columns, at each one's own point — one opening per
+    /// commitment group, in group order.
+    pub columns: Vec<StackedProof<F, E>>,
 }
 
 /// The table's share of the bus, `p/q`.
@@ -772,13 +828,27 @@ where
         tables.push(proof);
     }
 
-    let columns = stacked_eval::prove::<F, E, T>(
-        &committed.stacked,
-        &Claimed::PerColumn(&points),
-        &values,
-        config,
-        transcript,
-    )?;
+    // One opening per group, over that group's columns. The points and values
+    // are in the global column order, so a group takes the slice its tables
+    // span.
+    let mut columns = Vec::with_capacity(committed.groups().len());
+    let mut table_at = 0usize;
+    let mut column_at = 0usize;
+    for (group, &size) in committed.groups().iter().zip(committed.sizes()) {
+        let width: usize = committed.tables()[table_at..table_at + size]
+            .iter()
+            .map(|t| t.num_committed_columns())
+            .sum();
+        columns.push(stacked_eval::prove::<F, E, T>(
+            group,
+            &Claimed::PerColumn(&points[column_at..column_at + width]),
+            &values[column_at..column_at + width],
+            config,
+            transcript,
+        )?);
+        table_at += size;
+        column_at += width;
+    }
 
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
@@ -799,8 +869,9 @@ where
 pub fn multi_verify<F, E, T>(
     proof: &MultiProof<F, E>,
     statements: &[TableStatement<'_, F, E>],
-    layout: &StackedLayout,
-    domain: &Domain<F>,
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    sizes: &[usize],
     expected: &FieldElement<E>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -816,6 +887,16 @@ where
         return Err(MlError::QueryCountMismatch {
             expected: statements.len(),
             got: proof.tables.len(),
+        });
+    }
+    if layouts.len() != sizes.len()
+        || domains.len() != sizes.len()
+        || proof.columns.len() != sizes.len()
+        || sizes.iter().sum::<usize>() != statements.len()
+    {
+        return Err(MlError::QueryCountMismatch {
+            expected: sizes.len(),
+            got: proof.columns.len(),
         });
     }
     for root in &proof.roots {
@@ -840,16 +921,40 @@ where
         return Err(MlError::BusImbalance);
     }
 
-    stacked_eval::verify::<F, E, T>(
-        &proof.columns,
-        layout,
-        &proof.roots,
-        &Claimed::PerColumn(&points),
-        &values,
-        domain,
-        config,
-        transcript,
-    )
+    // Each group settles its own columns against its own roots, in the order
+    // the prover opened them.
+    let mut statement_at = 0usize;
+    let mut column_at = 0usize;
+    let mut root_at = 0usize;
+    for (((opening, layout), domain), &size) in
+        proof.columns.iter().zip(layouts).zip(domains).zip(sizes)
+    {
+        let width: usize = statements[statement_at..statement_at + size]
+            .iter()
+            .map(|s| s.slot_of.len())
+            .sum();
+        let roots = proof
+            .roots
+            .get(root_at..root_at + layout.num_polys())
+            .ok_or(MlError::QueryCountMismatch {
+                expected: root_at + layout.num_polys(),
+                got: proof.roots.len(),
+            })?;
+        stacked_eval::verify::<F, E, T>(
+            opening,
+            layout,
+            roots,
+            &Claimed::PerColumn(&points[column_at..column_at + width]),
+            &values[column_at..column_at + width],
+            domain,
+            config,
+            transcript,
+        )?;
+        statement_at += size;
+        column_at += width;
+        root_at += layout.num_polys();
+    }
+    Ok(())
 }
 
 fn slot(slots: &[usize], column: usize) -> Result<usize, MlError> {
@@ -1033,7 +1138,8 @@ mod tests {
         // Three tables of different heights, and **one** commitment with one
         // opening for all of them.
         assert_eq!(proof.roots.len(), 1);
-        assert_eq!(proof.columns.polys.len(), 1);
+        assert_eq!(proof.columns.len(), 1);
+        assert_eq!(proof.columns[0].polys.len(), 1);
         for (table, table_proof) in committed.tables().iter().zip(&proof.tables) {
             // Three statements — the constraint and the bus's two claims — in
             // one pass over the table's rows.
@@ -1050,8 +1156,9 @@ mod tests {
         multi_verify(
             &proof,
             &statements,
-            committed.layout(),
-            committed.domain(),
+            std::slice::from_ref(committed.groups()[0].layout()),
+            std::slice::from_ref(committed.groups()[0].domain()),
+            committed.sizes(),
             &ExtE::zero(),
             &config(),
             &mut verifier,
