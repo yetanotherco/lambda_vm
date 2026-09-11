@@ -56,7 +56,9 @@ use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, LazyCommitment, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
@@ -163,7 +165,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// committed trace (equal Merkle roots). So under collision resistance the trace the
 /// global bus runs over already satisfies all those constraints — do not add them
 /// here (it would be redundant, not a missing check).
-fn l2g_global_air(
+pub(crate) fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
@@ -223,7 +225,7 @@ pub(crate) fn l2g_memory_air(
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
 /// `None` recomputes from `config` as before.
-fn global_memory_air(
+pub(crate) fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
     preprocessed: Option<Commitment>,
@@ -243,19 +245,37 @@ fn global_memory_air(
         // `address_lo = page_base_lo + OFFSET` is prover-chosen and the genesis
         // token can name an arbitrary address. GLOBAL_MEMORY's OFFSET column is
         // identical to PAGE's, so the same commitment serves both.
-        return air.with_preprocessed(
+        return air.with_preprocessed_columns(
             page::private_page_preprocessed_commitment(opts),
             page::NUM_PREPROCESSED_COLS_PRIVATE,
+            Arc::new(|| vec![page::offset_column()]),
         );
     }
-    let commitment = preprocessed.unwrap_or_else(|| {
-        if config.init_values.is_some() {
-            page::compute_precomputed_commitment(config, opts)
-        } else {
-            page::zero_init_preprocessed_commitment(opts)
+    // The columns as well as the root: the univariate path compares the root
+    // the verifier recomputes, the multilinear one has no second root and
+    // compares these instead. They are PAGE's — GLOBAL_MEMORY's preprocessed
+    // prefix is the same OFFSET and INIT, which is why the same commitment
+    // serves both.
+    let commitment = match preprocessed {
+        Some(commitment) => LazyCommitment::ready(commitment),
+        None => {
+            let config = config.clone();
+            let options = opts.clone();
+            LazyCommitment::deferred(move || {
+                if config.init_values.is_some() {
+                    page::compute_precomputed_commitment(&config, &options)
+                } else {
+                    page::zero_init_preprocessed_commitment(&options)
+                }
+            })
         }
-    });
-    air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
+    };
+    let config = config.clone();
+    air.with_lazy_preprocessed_columns(
+        commitment,
+        global_memory::NUM_PREPROCESSED_COLS,
+        Arc::new(move || page::preprocessed_columns(&config)),
+    )
 }
 
 /// The sorted, deduped set of page bases the touched cells fall on — the SINGLE source
@@ -265,7 +285,7 @@ fn global_memory_air(
 /// and verifier iterate the identical sequence — `multi_verify` matches AIRs to sub-proofs
 /// positionally. Carries page bases ONLY: no cell values, so private-input bytes never
 /// enter the bundle (unlike the full `CellBoundary`, whose `init.value` is a private byte).
-fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
+pub(crate) fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
     boundaries
         .iter()
         .flat_map(|epoch| epoch.iter())
@@ -296,7 +316,7 @@ fn canonical_page_bases(page_bases: &[u64]) -> Vec<u64> {
 /// genesis from the ELF and never needs the raw private bytes. They are identified EXACTLY
 /// as the monolithic verifier does — the first `num_private_input_pages` pages from
 /// `PRIVATE_INPUT_START_INDEX` (see [`page::is_private_input_page`]).
-fn global_memory_configs(
+pub(crate) fn global_memory_configs(
     page_bases: &[u64],
     elf: &Elf,
     num_private_input_pages: usize,
@@ -362,7 +382,7 @@ fn elf_page_has_data(elf: &Elf, page_base: u64) -> bool {
 /// non-preprocessed and never consults `init_values` (and its `init_page_data` is built
 /// from the ELF alone, so there is nothing to load) — the config carries an explicitly
 /// empty vec so no code path can silently start depending on verifier-side private data.
-fn global_memory_configs_from_init_page_data(
+pub(crate) fn global_memory_configs_from_init_page_data(
     page_bases: &[u64],
     init_page_data: &HashMap<u64, Vec<u8>>,
     num_private_input_pages: usize,

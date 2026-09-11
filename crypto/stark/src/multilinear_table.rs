@@ -76,8 +76,9 @@ where
 {
     /// Lays out a table's factors and its stack.
     ///
-    /// Every main column is committed, read or not — the trace is the trace,
-    /// and a bus reads columns the constraints may not.
+    /// Every main column is committed, read or not, **in index order** — the
+    /// trace is the trace, a bus reads columns the constraints may not, and two
+    /// AIRs over the same table have to commit the same polynomial.
     ///
     /// `uniforms` is normally [`Uniforms::default`]: a table's own constraint
     /// set is base-rooted, so it reads no challenge.
@@ -103,7 +104,10 @@ where
 
         let roots = program.roots[..program.num_base].to_vec();
         let live = live_nodes(program, &roots);
-        let mut leaves = LeafLayout::build_live(program, &live, num_vars);
+        // The main columns are registered first, in index order, so what a
+        // table commits and in what order is a function of the table alone —
+        // not of which of them this AIR's constraints happen to read first.
+        let mut leaves = LeafLayout::build_live_over(program, &live, num_vars, num_main_columns);
 
         let slot_of: Vec<usize> = (0..num_main_columns)
             .map(|col| leaves.register_main(col as u16))

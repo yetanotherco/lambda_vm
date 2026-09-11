@@ -6,14 +6,19 @@
 //! epoch's tables are argued: one WHIR commitment over the whole epoch and one
 //! opening, the way [`crate::multilinear_prove`] does it for a whole program.
 //!
-//! # What is not here yet
+//! # The binding
 //!
-//! The cross-epoch global-memory proof, and with it the binding that says an
-//! epoch's local-to-global table is the one the global proof chains. The
-//! univariate path compares that table's own Merkle root across the two proofs;
-//! here a table has no root of its own — the stack gives one root per *stacked
-//! polynomial*, shared by whatever columns land in it — so the binding needs
-//! its own mechanism. See the module's notes in `thoughts/`.
+//! A continuation is two halves: every epoch, and one cross-epoch proof over
+//! the bookends and the global-memory tables. What makes them one proof is that
+//! an epoch's bookend is the table the cross-epoch proof chained — and a table
+//! here has no root of its own, since the stack gives one root per *stacked
+//! polynomial*, shared by whatever columns land in it.
+//!
+//! So each bookend is committed in a group by itself, whose layout follows from
+//! the table's shape alone and is therefore the same on both sides, and the
+//! binding is comparing those roots. That only holds because a table commits
+//! the same columns in the same order wherever it is argued, which is
+//! `LeafLayout::build_live_over`'s job, not this module's.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -193,6 +198,289 @@ fn owed(
     crate::compute_commit_bus_offset(public_output, start_index, &z, &alpha)
 }
 
+/// Domain tag for the multilinear cross-epoch proof.
+const MULTILINEAR_GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
+
+/// The one cross-epoch proof: every epoch's bookend and the global-memory
+/// tables, in one transcript.
+///
+/// The bookends come first, one commitment group each, so root `k` is the one
+/// epoch `k` carries — that comparison is what says the two proofs are about
+/// the same table.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GlobalProof {
+    pub proof: MultiProof<F, E>,
+    pub table_num_vars: Vec<u8>,
+}
+
+impl GlobalProof {
+    /// The root each epoch's bookend was committed under here, in epoch order.
+    ///
+    /// [`verify_global`] checks each bookend really is one polynomial of its
+    /// own before this means anything.
+    pub fn l2g_roots(&self, num_epochs: usize) -> Option<&[stark::config::Commitment]> {
+        self.proof.roots.get(..num_epochs)
+    }
+}
+
+/// Binds the cross-epoch statement: what the run was, not what any epoch was.
+fn absorb_global(
+    t: &mut DefaultTranscript<E>,
+    elf_digest: &[u8; 32],
+    num_epochs: usize,
+    num_private_input_pages: usize,
+    page_bases: &[u64],
+    table_num_vars: &[u8],
+    config: &ChainConfig,
+) {
+    t.append_bytes(MULTILINEAR_GLOBAL_TAG);
+    t.append_bytes(elf_digest);
+    t.append_bytes(&(num_epochs as u64).to_le_bytes());
+    t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+    t.append_bytes(&(page_bases.len() as u64).to_le_bytes());
+    for base in page_bases {
+        t.append_bytes(&base.to_le_bytes());
+    }
+    t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    t.append_bytes(table_num_vars);
+    let &ChainConfig {
+        log_blowup,
+        log_folding,
+        num_queries,
+        grind,
+    } = config;
+    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+        t.append_bytes(&value.to_le_bytes());
+    }
+    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+}
+
+/// How the cross-epoch proof's tables are split: every bookend alone — so its
+/// root can be compared against the epoch that committed it — and the
+/// global-memory tables together.
+pub(crate) fn global_groups(num_epochs: usize, num_pages: usize) -> Vec<usize> {
+    let mut sizes = vec![1usize; num_epochs];
+    // A run that touched no memory has no global-memory tables, and a group of
+    // none is a commitment to nothing.
+    if num_pages > 0 {
+        sizes.push(num_pages);
+    }
+    sizes
+}
+
+/// Proves the cross-epoch memory chain: each epoch's bookend, and one
+/// global-memory table per page the run touched.
+pub fn prove_global(
+    boundaries: &[std::sync::Arc<Vec<CellBoundary>>],
+    elf_bytes: &[u8],
+    init_page_data: &std::collections::HashMap<u64, Vec<u8>>,
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+) -> Result<GlobalProof, Error> {
+    // Each cell's final state; the boundaries are in epoch order, so the last
+    // fini wins.
+    let mut final_state: crate::tables::global_memory::FiniStateMap =
+        std::collections::HashMap::new();
+    for epoch in boundaries {
+        for b in epoch.iter() {
+            final_state.insert(
+                b.address,
+                crate::tables::global_memory::FiniState {
+                    value: (b.fini.value & 0xFF) as u8,
+                    epoch: b.fini.epoch,
+                },
+            );
+        }
+    }
+
+    let gm_configs = crate::continuation::global_memory_configs_from_init_page_data(
+        page_bases,
+        init_page_data,
+        num_private_input_pages,
+        true,
+    );
+
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| crate::continuation::l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
+    let gm_airs: Vec<_> = gm_configs
+        .iter()
+        .map(|config| crate::continuation::global_memory_air(opts, config, None))
+        .collect();
+    let mut l2g_traces: Vec<_> = boundaries
+        .iter()
+        .map(|epoch| local_to_global::generate_local_to_global_trace(epoch.as_slice()))
+        .collect();
+    let mut gm_traces: Vec<_> = gm_configs
+        .iter()
+        .map(|config| crate::tables::global_memory::generate_global_trace(config, &final_state))
+        .collect();
+
+    let mut pairs: Vec<crate::AirTracePair<'_>> = Vec::new();
+    for (air, trace) in l2g_airs.iter().zip(l2g_traces.iter_mut()) {
+        pairs.push((air, trace, &()));
+    }
+    for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
+        pairs.push((air, trace, &()));
+    }
+
+    let shapes: Vec<(usize, usize)> = pairs
+        .iter()
+        .map(|(_, trace, _)| {
+            (
+                trace.main_table.width,
+                trace.main_table.height.trailing_zeros() as usize,
+            )
+        })
+        .collect();
+    let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
+    let config = chain_config(&shapes);
+
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_global(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        boundaries.len(),
+        num_private_input_pages,
+        page_bases,
+        &table_num_vars,
+        &config,
+    );
+
+    let mut committed = Vec::with_capacity(pairs.len());
+    for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
+        let layout = layout_of(*air, width, num_vars)
+            .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+        let mut columns = trace.columns_main();
+        for (col, expected) in air.precomputed_columns().iter().enumerate() {
+            if columns.get(col) != Some(expected) {
+                return Err(Error::Prover(format!(
+                    "{}: preprocessed column {col} is not what the run implies",
+                    air.name(),
+                )));
+            }
+        }
+        committed.push(
+            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
+                .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
+        );
+    }
+    let sizes = global_groups(boundaries.len(), gm_configs.len());
+    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    Ok(GlobalProof {
+        proof,
+        table_num_vars,
+    })
+}
+
+/// Verifies the cross-epoch proof from the ELF and the run's public shape.
+///
+/// `page_bases` and `num_epochs` are the bundle's, and both are bound into the
+/// transcript and pinned by the bus: a wrong set leaves the GlobalMemory bus
+/// unbalanced or the AIR count mismatched.
+pub fn verify_global(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    global: &GlobalProof,
+    num_epochs: usize,
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+) -> Result<bool, Error> {
+    let l2g_airs: Vec<_> = (0..num_epochs)
+        .map(|i| crate::continuation::l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
+    // Rebuilt from the ELF, never from the bundle: this is the genesis binding.
+    let gm_configs =
+        crate::continuation::global_memory_configs(page_bases, elf, num_private_input_pages);
+    let gm_airs: Vec<_> = gm_configs
+        .iter()
+        .map(|config| crate::continuation::global_memory_air(opts, config, None))
+        .collect();
+
+    let mut air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        l2g_airs.iter().map(|a| a as _).collect();
+    for air in &gm_airs {
+        air_refs.push(air);
+    }
+    if air_refs.len() != global.proof.tables.len() || global.table_num_vars.len() != air_refs.len()
+    {
+        return Err(Error::InvalidTableCounts(format!(
+            "the cross-epoch layout has {} tables, the proof carries {} and {} heights",
+            air_refs.len(),
+            global.proof.tables.len(),
+            global.table_num_vars.len(),
+        )));
+    }
+
+    let shapes: Vec<(usize, usize)> = air_refs
+        .iter()
+        .zip(&global.table_num_vars)
+        .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
+        .collect();
+    let config = chain_config(&shapes);
+
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_global(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        num_epochs,
+        num_private_input_pages,
+        page_bases,
+        &global.table_num_vars,
+        &config,
+    );
+
+    let layouts: Vec<TableLayout<'_, F, E>> = air_refs
+        .iter()
+        .zip(&shapes)
+        .map(|(air, &(width, num_vars))| {
+            layout_of(*air, width, num_vars).map_err(|e| Error::Prover(format!("{e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let preprocessed: Vec<Vec<Mle<F>>> = air_refs
+        .iter()
+        .map(|air| {
+            air.precomputed_columns()
+                .into_iter()
+                .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("{e:?}"))))
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let statements: Vec<TableStatement<'_, F, E>> = layouts
+        .iter()
+        .zip(&preprocessed)
+        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .collect();
+
+    let sizes = global_groups(num_epochs, gm_configs.len());
+    let (stacks, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
+    // What makes [`GlobalProof::l2g_roots`] mean anything.
+    if stacks[..num_epochs].iter().any(|l| l.num_polys() != 1) {
+        return Err(Error::ContinuationInvariant(
+            "every bookend must commit to one polynomial of its own".to_string(),
+        ));
+    }
+
+    // The cross-epoch bus has no counterparty in the statement: it must vanish.
+    Ok(multilinear_table::multi_verify(
+        &global.proof,
+        &statements,
+        &stacks,
+        &domains,
+        &sizes,
+        &FieldElement::<E>::zero(),
+        &config,
+        &mut transcript,
+    )
+    .is_ok())
+}
+
 /// Proves one epoch: its tables plus the local-to-global bookend, against one
 /// commitment.
 #[allow(clippy::too_many_arguments)]
@@ -295,6 +583,145 @@ pub fn prove_epoch(
         public_output,
         reg_fini,
     })
+}
+
+/// A self-contained multilinear continuation proof.
+///
+/// Mirrors [`crate::continuation::ContinuationProof`]: the per-epoch proofs in
+/// execution order, the one cross-epoch proof, and the two public values the
+/// verifier rebuilds the cross-epoch tables from. **No cell values travel** —
+/// the boundaries stay with the prover, because a boundary's init value is a
+/// byte of the private input for a private read.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct ContinuationProof {
+    pub epochs: Vec<EpochProof>,
+    pub global: GlobalProof,
+    pub num_private_input_pages: usize,
+    /// Sorted, deduped page bases the run touched: page bases ONLY, so no
+    /// private byte is in here. Prover-supplied but bus-enforced — a wrong set
+    /// leaves the cross-epoch bus unbalanced or the table count mismatched, and
+    /// it is bound into the cross-epoch statement.
+    pub touched_page_bases: Vec<u64>,
+}
+
+impl ContinuationProof {
+    pub fn num_epochs(&self) -> usize {
+        self.epochs.len()
+    }
+
+    /// The run's committed output: every epoch's slice, in order.
+    pub fn public_output(&self) -> Vec<u8> {
+        self.epochs
+            .iter()
+            .flat_map(|e| e.public_output.iter().copied())
+            .collect()
+    }
+}
+
+/// Proves a whole run: every epoch, then the one cross-epoch proof that chains
+/// their memory.
+pub fn prove_continuation(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<ContinuationProof, Error> {
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
+
+    let mut epochs = Vec::new();
+    let boundaries = crate::continuation::for_each_epoch(
+        &elf,
+        private_inputs,
+        epoch_size_log2,
+        &artifacts,
+        |prepared, _| {
+            epochs.push(prove_epoch(
+                &elf,
+                elf_bytes,
+                &prepared.register_init,
+                prepared.label,
+                prepared.traces,
+                prepared.is_final,
+                &prepared.boundary,
+                opts,
+                Some(decode_commitment),
+            )?);
+            Ok(())
+        },
+    )?;
+
+    // The genesis image, which is the one the run started from — rebuilt here
+    // rather than carried, because `for_each_epoch` advances its copy.
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(&elf, private_inputs),
+    );
+    let num_private_input_pages = crate::tables::page::private_input_page_count(private_inputs);
+    // One source of truth: the same list drives the committed tables and
+    // travels in the bundle, so the two cannot diverge.
+    let touched_page_bases = crate::continuation::touched_page_bases(&boundaries);
+    let global = prove_global(
+        &boundaries,
+        elf_bytes,
+        &init_page_data,
+        &touched_page_bases,
+        num_private_input_pages,
+        opts,
+    )?;
+
+    Ok(ContinuationProof {
+        epochs,
+        global,
+        num_private_input_pages,
+        touched_page_bases,
+    })
+}
+
+/// Verifies a whole run from the bundle and the ELF alone.
+///
+/// The verifier enumerates the epochs itself — `epoch_label` and `is_final` are
+/// positions, not claims — derives each one's starting registers from the ELF
+/// or the previous proof, closes the cross-epoch bus with genesis rebuilt from
+/// the ELF, and **ties each epoch's bookend to the cross-epoch proof by its
+/// root**. Without that last step the two halves are about unrelated tables.
+pub fn verify_continuation(
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+    opts: &ProofOptions,
+) -> Result<bool, Error> {
+    if bundle.epochs.is_empty() {
+        return Ok(false);
+    }
+    if !verify_epochs(elf_bytes, &bundle.epochs, opts)? {
+        return Ok(false);
+    }
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    if !verify_global(
+        &elf,
+        elf_bytes,
+        &bundle.global,
+        bundle.epochs.len(),
+        &bundle.touched_page_bases,
+        bundle.num_private_input_pages,
+        opts,
+    )? {
+        return Ok(false);
+    }
+
+    // The binding: epoch `k`'s bookend and the one the cross-epoch proof
+    // chained are the same table, or neither half says anything about the
+    // other.
+    let Some(chained) = bundle.global.l2g_roots(bundle.epochs.len()) else {
+        return Ok(false);
+    };
+    for (epoch, root) in bundle.epochs.iter().zip(chained) {
+        if epoch.l2g_root() != Some(*root) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Proves every epoch of a run, in order, chaining the register file.

@@ -1,14 +1,13 @@
-//! One continuation epoch, proved and verified through the multilinear path.
+//! Continuations through the multilinear path: the epochs, the cross-epoch
+//! proof, and what ties them.
 //!
 //! The epoch split, the local-to-global bookend and the cross-epoch register
 //! carry are [`crate::continuation`]'s and do not depend on the commitment
 //! scheme; what these check is that an epoch's AIRs — which differ from the
 //! monolithic ones, PAGE replaced by the bookend and REGISTER preprocessing
-//! both ends — argue correctly under WHIR.
-//!
-//! The cross-epoch global-memory proof is not here yet, so these do not prove a
-//! *continuation*: they prove every epoch of one, and check that the register
-//! carry the epochs are chained by is the one each proof binds.
+//! both ends — argue correctly under WHIR, and that everything the chain rests
+//! on is rejected when it is restated: the register carry, the bookend root,
+//! and the touched page set.
 
 use executor::elf::Elf;
 use stark::proof::options::ProofOptions;
@@ -127,12 +126,12 @@ fn a_broken_register_carry_is_rejected() {
     );
 }
 
-/// **The binding.** An epoch commits its local-to-global bookend on its own, and
-/// the cross-epoch proof will commit the same table: the two roots have to
-/// match, or nothing says they are the same table.
+/// **The binding.** An epoch commits its local-to-global bookend on its own and
+/// the cross-epoch proof commits the same table: the two roots have to match,
+/// or nothing says they are the same table.
 ///
 /// This rebuilds that root from the boundary alone — which is all the
-/// cross-epoch proof will have — and demands the epoch's proof carries it.
+/// cross-epoch proof holds — and demands the epoch's proof carries it.
 #[test]
 fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
     let elf_bytes = asm_elf_bytes("sub");
@@ -186,4 +185,70 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
             "epoch {index}'s bookend root is not the one its table commits to"
         );
     }
+}
+
+/// A run that reads its private input from another page, so it touches memory
+/// across epochs — which is what the cross-epoch proof is about.
+fn a_run_that_touches_memory() -> (Vec<u8>, Vec<u8>) {
+    let mut input: Vec<u8> = Vec::with_capacity(16);
+    input.extend_from_slice(&16u32.to_le_bytes());
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    input.extend_from_slice(&[0u8; 4]);
+    (asm_elf_bytes("test_private_input_xpage"), input)
+}
+
+/// A whole run: every epoch plus the one cross-epoch proof that chains their
+/// memory, checked from the bundle and the ELF alone.
+#[test]
+fn a_continuation_proves_and_verifies() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    // The committed output is the run's, not any one epoch's.
+    assert_eq!(bundle.public_output(), input[4..12]);
+    assert!(bundle.num_epochs() >= 1);
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "the continuation does not verify"
+    );
+}
+
+/// The binding is what makes the two halves one proof: swapping an epoch's
+/// bookend root has to be caught even though both halves still verify on their
+/// own.
+#[test]
+fn a_bookend_that_is_not_the_one_chained_is_rejected() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let mut bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    let last = bundle.epochs[0].proof.roots.len() - 1;
+    bundle.epochs[0].proof.roots[last][0] ^= 1;
+    assert!(
+        !multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "a bookend root the cross-epoch proof never chained was accepted"
+    );
+}
+
+/// The touched page set drives which cross-epoch tables exist, so restating it
+/// has to be rejected.
+#[test]
+fn a_restated_touched_page_set_is_rejected() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let mut bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    assert!(
+        !bundle.touched_page_bases.is_empty(),
+        "the run touched memory"
+    );
+    bundle.touched_page_bases.pop();
+    assert!(
+        matches!(
+            multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts),
+            Ok(false) | Err(_)
+        ),
+        "a restated touched page set was accepted"
+    );
 }

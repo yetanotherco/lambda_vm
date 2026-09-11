@@ -104,6 +104,26 @@ impl LeafLayout {
         F: IsField,
         E: IsField,
     {
+        Self::build_live_over(program, live, num_vars, 0)
+    }
+
+    /// The same, with the table's first `num_main_columns` registered up front.
+    ///
+    /// Which columns a table commits, and in **what order**, is then a function
+    /// of the table and not of the AIR that reads it: two AIRs over the same
+    /// trace — an epoch's local-to-global bookend and the cross-epoch one, say
+    /// — commit the same polynomial, which is the only way one proof can say to
+    /// another that it committed that table.
+    pub fn build_live_over<F, E>(
+        program: &ConstraintProgram<F, E>,
+        live: &[bool],
+        num_vars: usize,
+        num_main_columns: usize,
+    ) -> Self
+    where
+        F: IsField,
+        E: IsField,
+    {
         let mut layout = Self {
             index: BTreeMap::new(),
             column_index: BTreeMap::new(),
@@ -111,6 +131,10 @@ impl LeafLayout {
             sources: Vec::new(),
             num_vars,
         };
+
+        for col in 0..num_main_columns {
+            layout.register_main(col as u16);
+        }
 
         for (id, op) in program.nodes.iter().enumerate() {
             if !live.get(id).copied().unwrap_or(false) {
