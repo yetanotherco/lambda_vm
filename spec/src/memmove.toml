@@ -1,4 +1,5 @@
 name = "MEMMOVE"
+code = "MMV"
 
 # Input
 
@@ -67,7 +68,7 @@ pad = 1
 [[variables.auxiliary]]
 name = "short"
 type = "Bit"
-desc = "Whether $#`count` < 8$, i.e. whether eight bytes are still available to move."
+desc = "Whether $#`count` < 8$, i.e. whether this row may not move eight bytes."
 pad = 1
 
 [[variables.auxiliary]]
@@ -111,7 +112,7 @@ pad = 0
 [[variables.virtual]]
 name = "step"
 type = "Byte"
-desc = "The stride this row advances by: eight, or one when `tail` is set. No bytes are moved on the terminal row."
+desc = "The stride this row advances by: eight, or one when `tail` is set."
 def = ["-", 8, ["*", 7, "tail"]]
 
 [[variables.virtual]]

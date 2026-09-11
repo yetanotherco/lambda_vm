@@ -52,9 +52,9 @@
       ("commit", [`COMMIT` chip], <commit>),
       ("sha256", [`SHA256` accelerator], <sha256>),
       ("keccak", [`KECCAK` accelerator], <keccak>),
-      ("memmove", [`MEMMOVE` accelerator], <memmove>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
+      ("memmove", [`MEMMOVE` accelerator], <memmove>),
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),

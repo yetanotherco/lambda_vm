@@ -59,11 +59,6 @@ This template introduces the following constraints
 #add asserts an equality modulo $2^64$; #addnw is the variant that rules out the wraparound.
 It constrains that $#`sum` = #`lhs` + #`rhs`$ _over the integers_ when the expression `cond` is non-zero, and is intended for chips whose operands are addresses, where a wraparound would silently move an access to an unrelated region of memory.
 
-The two limbs are treated asymmetrically, and deliberately so.
-The carry out of the _least_ significant limb is constrained on every row, so the low limb of `sum` always means what it says.
-The carry out of the _most_ significant limb is pinned only where `cond` is non-zero, which leaves `sum`'s high limb free on the rows where a chip does not consume the result --- typically padding rows, and the terminal row of a recursive sequence.
-Constraining it there would buy nothing and would force those rows to carry a well-formed successor they never use.
-
 == Variables
 This template introduces #nw_interactions interaction(s).
 #render_chip_variable_table(nwchip, config)
@@ -77,3 +72,8 @@ This template introduces the following constraints
 
 Note that `carry` is defined exactly as it is in #add, so @addnw:c:no_wraparound is precisely the statement that the addition of the most significant limbs does not carry out;
 combined with @addnw:a:sum, that is equivalent to $#`lhs` + #`rhs` < 2^64$.
+
+The two limbs are treated asymmetrically, and deliberately so.
+The carry out of the _least_ significant limb is constrained on every row, so the low limb of `sum` always means what it says.
+The carry out of the _most_ significant limb is pinned only where `cond` is non-zero, which leaves `sum`'s high limb free on the rows where a chip does not consume the result --- typically padding rows, and the terminal row of a recursive sequence.
+Constraining it there would buy nothing and would force those rows to carry a well-formed successor they never use.
