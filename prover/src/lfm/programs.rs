@@ -300,6 +300,18 @@ pub const TRANSCRIPT_QUERY_BITS: usize = 20;
 /// 24 bytes still in it, a raw `sample()` that invalidates with 16 bytes still
 /// in it, a two-block segment (squeeze #3), and both draw kinds. Get any of the
 /// invalidation rules wrong and the values diverge from the real transcript.
+/// ★ The hash the R1d replay is ABOUT, named once so a count over it cannot
+/// drift from the program it counts.
+///
+/// `WrapHash::production` is deliberately NOT read here — its own doc carves out
+/// the instruments that name their hash directly, and this is one of them. The
+/// script is a BYTE sponge: the table above is denominated in 32- and 136-byte
+/// segments and in which rate block each squeeze lands in, none of which is a
+/// statement an algebraic sponge can be right or wrong about. Exporting it is
+/// what lets `machine_tests::transcript_replay_cell_counts` count against the
+/// same hash the builder used instead of against the pin, which read zero.
+pub const TRANSCRIPT_REPLAY_WRAP_HASH: WrapHash = WrapHash::Blake3;
+
 pub fn transcript_replay_program_source() -> LfmProgramSource {
     use super::builder::Felt;
     use super::edsl::bits_to_felt;
@@ -307,7 +319,7 @@ pub fn transcript_replay_program_source() -> LfmProgramSource {
 
     let halves_a = TRANSCRIPT_ABSORB_A / super::keccak_host::BYTES_PER_HALF;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let mut b = LfmBuilder::new().with_wrap_hash(TRANSCRIPT_REPLAY_WRAP_HASH);
     let arena = b.declare_arena(TRANSCRIPT_ARENA_HALVES);
     let halves: Vec<Felt> = (0..TRANSCRIPT_ARENA_HALVES)
         .map(|i| b.hint_felt(arena, i))

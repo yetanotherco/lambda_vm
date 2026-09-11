@@ -1485,10 +1485,10 @@ fn registry_drift_transcript_replay_v0_blowup2() {
 /// missing squeeze — the classic invalidation-rule bug — moves this number.
 #[test]
 fn transcript_replay_cell_counts() {
-    /// Compressions the replay emits under the CONFIGURED wrap hash. It was 6
-    /// under keccak — "five squeezes over six rate blocks" — and a 136-byte
-    /// sponge rate does not divide this script the way a 64-byte BLAKE3 block
-    /// does, so the number is re-derived rather than carried over.
+    /// Compressions the replay emits under the hash it NAMES. It was 6 under
+    /// keccak — "five squeezes over six rate blocks" — and a 136-byte sponge
+    /// rate does not divide this script the way a 64-byte BLAKE3 block does, so
+    /// the number was re-derived rather than carried over.
     const TRANSCRIPT_REPLAY_COMPRESSIONS: usize = 8;
 
     let program = transcript_replay_program();
@@ -1501,7 +1501,7 @@ fn transcript_replay_cell_counts() {
         aux
     );
     assert_eq!(
-        wrap_hash_rows(&program),
+        wrap_hash_rows_at(&program, super::programs::TRANSCRIPT_REPLAY_WRAP_HASH),
         TRANSCRIPT_REPLAY_COMPRESSIONS,
         "the replay's compression count"
     );
@@ -3431,7 +3431,24 @@ pub(super) fn byteswap_cells() -> u64 {
 /// `groups.keccak` directly made them silently read ZERO the moment production
 /// moved to BLAKE3, which reports a true structural claim as a failed one.
 pub(super) fn wrap_hash_rows(program: &super::compiler::LfmProgram) -> usize {
-    match super::edsl::WrapHash::production() {
+    wrap_hash_rows_at(program, super::edsl::WrapHash::production())
+}
+
+/// [`wrap_hash_rows`] against a NAMED hash rather than the production pin.
+///
+/// ★ For the programs that are ABOUT a hash. `WrapHash::production`'s own doc
+/// carves them out — the R1b/R1c/R1d instruments name their hash directly and
+/// must keep doing so — and a count taken over such a program has to name the
+/// same one, or it reads zero the moment the pin moves away from it and reports
+/// a true structural claim as a failed one. That is not hypothetical: it is
+/// exactly what the RPX pin did to `transcript_replay_cell_counts`, whose script
+/// is a BYTE sponge (a 136-byte segment spanning two rate blocks) and has no
+/// meaning on the algebraic arm at all.
+pub(super) fn wrap_hash_rows_at(
+    program: &super::compiler::LfmProgram,
+    hash: super::edsl::WrapHash,
+) -> usize {
+    match hash {
         super::edsl::WrapHash::Keccak => program.groups.keccak.real_rows,
         super::edsl::WrapHash::Blake3 => program.groups.blake3.real_rows,
         // The algebraic wrap hash IS the socket, so its rows are the hash
