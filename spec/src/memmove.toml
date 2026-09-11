@@ -14,7 +14,7 @@ pad = 0
 [[variables.auxiliary]]
 name = "src"
 type = "DWordWL"
-desc = "Address of the first byte read by this row."
+desc = "Address of the first byte read by this row"
 pad = 0
 
 [[variables.auxiliary]]
@@ -26,7 +26,7 @@ pad = 1
 [[variables.auxiliary]]
 name = "dst"
 type = "DWordWL"
-desc = "Address of the first byte written by this row. For `commit`, the index of that byte in the committed output."
+desc = "Address of the first byte written by this row. For `commit`, the index of that byte in the committed output"
 pad = 0
 
 [[variables.auxiliary]]
@@ -38,7 +38,7 @@ pad = 1
 [[variables.auxiliary]]
 name = "count"
 type = "DWordWL"
-desc = "Number of bytes that still have to be moved, including those moved by this row."
+desc = "Number of bytes that still have to be moved, including those moved by this row"
 pad = 1
 
 [[variables.auxiliary]]
@@ -50,61 +50,61 @@ pad = ["arr", 0, 0, 0, 0]
 [[variables.auxiliary]]
 name = "first"
 type = "Bit"
-desc = "Whether this is the first row of this sequence."
+desc = "Whether this is the first row of this sequence"
 pad = 0
 
 [[variables.auxiliary]]
 name = "end"
 type = "Bit"
-desc = "Whether this is the end of the sequence."
+desc = "Whether this is the end of the sequence"
 pad = 0
 
 [[variables.auxiliary]]
 name = "tail"
 type = "Bit"
-desc = "Whether this row moves a single byte rather than eight."
+desc = "Whether this row moves a single byte rather than eight"
 pad = 1
 
 [[variables.auxiliary]]
-name = "short"
+name = "count_lt8"
 type = "Bit"
-desc = "Whether $#`count` < 8$, i.e. whether this row may not move eight bytes."
+desc = "Whether $#`count` < 8$, i.e. whether this row may not move eight bytes"
 pad = 1
 
 [[variables.auxiliary]]
 name = "is_set"
 type = "Bit"
-desc = "Whether this row runs the `memset` functionality, which inverts the order of the read and the write."
+desc = "Whether this row runs the `memset` functionality, which inverts the order of the read and the write"
 pad = 0
 
 [[variables.auxiliary]]
 name = "is_commit"
 type = "Bit"
-desc = "Whether this row runs the `commit` functionality, which writes to the commitment domain rather than to RAM."
+desc = "Whether this row runs the `commit` functionality, which writes to the commitment domain rather than to RAM"
 pad = 0
 
 [[variables.auxiliary]]
 name = "first_ecall"
 type = "Bit"
-desc = "$#`first` dot (1 - #`is_commit`)$; whether this row is the first of a sequence entered through an `ECALL`."
+desc = "$#`first` dot (1 - #`is_commit`)$; whether this row is the first of a sequence entered through an `ECALL`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "commit_write"
 type = "Bit"
-desc = "$(#`μ` - #`end`) dot #`is_commit`$; whether this row writes to the commitment domain."
+desc = "$(#`μ` - #`end`) dot #`is_commit`$; whether this row writes to the commitment domain"
 pad = 0
 
 [[variables.auxiliary]]
 name = "commit_write_wide"
 type = "Bit"
-desc = "$#`commit_write` dot (1 - #`tail`)$; whether this row writes eight bytes to the commitment domain."
+desc = "$#`commit_write` dot (1 - #`tail`)$; whether this row writes eight bytes to the commitment domain"
 pad = 0
 
 [[variables.auxiliary]]
 name = "value"
 type = "DWordBL"
-desc = "The bytes moved by this row; only $#`value`_0$ is moved when $#`tail` = 1$. Unconstrained on rows that move nothing."
+desc = "The bytes moved by this row; only $#`value`_0$ is moved when $#`tail` = 1$. Unconstrained on rows that move nothing"
 pad = 0
 
 # Virtual
@@ -112,25 +112,25 @@ pad = 0
 [[variables.virtual]]
 name = "step"
 type = "Byte"
-desc = "The stride this row advances by: eight, or one when `tail` is set."
+desc = "The stride this row advances by: eight, or one when `tail` is set"
 def = ["-", 8, ["*", 7, "tail"]]
 
 [[variables.virtual]]
-name = "first_defer"
+name = "first_commit"
 type = "Bit"
-desc = "$#`first` dot #`is_commit`$; whether this row is the first of a sequence deferred by `COMMIT`."
+desc = "$#`first` dot #`is_commit`$; whether this row is the first of a sequence deferred by `COMMIT`"
 def = ["-", "first", "first_ecall"]
 
 [[variables.virtual]]
 name = "ram_write"
 type = "Bit"
-desc = "$(#`μ` - #`end`) dot (1 - #`is_commit`)$; whether this row writes to RAM."
+desc = "$(#`μ` - #`end`) dot (1 - #`is_commit`)$; whether this row writes to RAM"
 def = ["-", "μ", "end", "commit_write"]
 
 [[variables.virtual]]
 name = "commit_lane"
 type = ["Bit", 8]
-desc = "Whether lane $i$ reaches the commitment domain: lane $0$ on every committing row, lanes $1$ through $7$ only on a wide one."
+desc = "Whether lane $i$ reaches the commitment domain: lane $0$ on every committing row, lanes $1$ through $7$ only on a wide one"
 def = {idx = "i", polys = [
     {iter = 0, poly = "commit_write"},
     {iter = [1, 7], poly = "commit_write_wide"},
@@ -181,7 +181,7 @@ ref = "memmove:c:receive_ecall"
 kind = "interaction"
 tag = "COMMIT_DEFER"
 input = ["timestamp", "src", "dst", "count"]
-multiplicity = ["-", "first_defer"]
+multiplicity = ["-", "first_commit"]
 ref = "memmove:c:receive_commit_defer"
 
 [[constraint_groups]]
@@ -251,14 +251,14 @@ name = "width"
 kind = "interaction"
 tag = "ALU"
 input = ["count", ["cast", 8, "DWordWL"], ["opsel", "LT"]]
-output = ["arr", "short", 0]
+output = ["arr", "count_lt8", 0]
 multiplicity = "μ"
 ref = "memmove:c:short"
 
 [[constraints.width]]
 kind = "arith"
-constraint = "$#`short` => #`tail` = 1$"
-poly = ["*", ["not", "tail"], "short"]
+constraint = "$#`count_lt8` => #`tail` = 1$"
+poly = ["*", ["not", "tail"], "count_lt8"]
 ref = "memmove:c:wide_needs_eight"
 
 [[constraints.width]]
@@ -410,8 +410,8 @@ ref = "memmove:c:range_tail"
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
-input = ["short"]
-ref = "memmove:c:range_short"
+input = ["count_lt8"]
+ref = "memmove:c:range_count_lt8"
 
 [[constraints.bits]]
 kind = "template"
