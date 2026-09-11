@@ -437,3 +437,124 @@ fn rpx_fused_tamper_diverges() {
         "a corrupted input element must move the root"
     );
 }
+
+// ===========================================================================
+// The proof-of-work grind.
+//
+// Unlike everything above, the claim here is not "the device reproduces the
+// host's bytes" but "the device finds the nonces the host's PREDICATE accepts"
+// — a search, whose answer is not unique. So what is asserted is validity
+// under `is_valid_nonce`, never a proof byte and never a comparison with the
+// CPU search's `find_any`, which does not agree with itself between runs.
+//
+// The kernel's arithmetic is pinned without a GPU by layer 8 of
+// `crypto/math-cuda/tests/host_kat/rpx_host_kat.cpp`. What needs a GPU, and is
+// here, is that a real parallel launch reduces to the same answer and that the
+// production dispatch actually reaches it.
+// ===========================================================================
+
+/// The digest the RPX configuration grinds over — its transcript's hash.
+type RpxGrind = stark::config::GrindingDigest<RpxStarkHash>;
+
+/// A real launch returns a nonce the host predicate accepts, and it is the
+/// smallest in the range.
+///
+/// Minimality is not a contract — the verifier takes any valid nonce — but it
+/// is a cheap probe of search completeness that plain validity cannot make: a
+/// stride or bounds defect would still return a *valid* nonce, just not the
+/// first one. It is deterministic despite the parallel grid because `atomicMin`
+/// is an order-independent reduction, which is the property this test exists to
+/// exercise and the host harness cannot.
+///
+/// Factor 14 so the exhaustive host scan below the answer stays cheap.
+#[test]
+fn rpx_gpu_grind_returns_the_smallest_valid_nonce() {
+    let seed = [14u8; 32];
+    let factor = 14u8;
+    let nonce = math_cuda::grinding::generate_nonce_rpx_gpu(
+        &stark::grinding::inner_hash_felts::<RpxGrind>(&seed, factor),
+        factor,
+    )
+    .expect("GPU RPX grind (needs a GPU)");
+    assert!(
+        stark::grinding::is_valid_nonce::<RpxGrind>(&seed, nonce, factor),
+        "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
+    );
+    assert!(
+        (0..nonce).all(|n| !stark::grinding::is_valid_nonce::<RpxGrind>(&seed, n, factor)),
+        "GPU nonce {nonce} is not the smallest valid nonce (factor {factor})"
+    );
+}
+
+/// At the shipped factor the launch returns a valid nonce. Validity only —
+/// scanning below it would be ~2^20 host sponges.
+#[test]
+fn rpx_gpu_grind_valid_at_the_production_factor() {
+    let seed = [20u8; 32];
+    let factor = 20u8;
+    let nonce = math_cuda::grinding::generate_nonce_rpx_gpu(
+        &stark::grinding::inner_hash_felts::<RpxGrind>(&seed, factor),
+        factor,
+    )
+    .expect("GPU RPX grind (needs a GPU)");
+    assert!(
+        stark::grinding::is_valid_nonce::<RpxGrind>(&seed, nonce, factor),
+        "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
+    );
+}
+
+/// ★ THE DISPATCH GATE: `generate_nonce_maybe_gpu` reaches the device under
+/// `Rpx256`, and does not under a hash with no grind kernel.
+///
+/// Both arms return a valid nonce whatever happens — the CPU fallback is
+/// correct — so validity alone would pass with the device never touched, which
+/// is exactly the failure this feature can have. `gpu_grind_calls` counts only
+/// device searches whose nonce passed the host check, so the deltas are the
+/// claim; the BLAKE3 arm is the control that makes the RPX one mean something.
+///
+/// One test rather than two because the counter is process-global. Nothing else
+/// in this binary grinds.
+#[test]
+fn the_rpx_dispatch_reaches_the_device_and_blake3_does_not() {
+    use stark::config::CommitmentHash;
+
+    let seed = [7u8; 32];
+    let factor = 20u8;
+
+    let before = stark::gpu_lde::gpu_grind_calls();
+    let nonce = stark::grinding::generate_nonce_maybe_gpu::<RpxGrind>(
+        &seed,
+        factor,
+        CommitmentHash::Rpx256,
+    )
+    .expect("a nonce exists");
+    assert!(
+        stark::grinding::is_valid_nonce::<RpxGrind>(&seed, nonce, factor),
+        "the dispatched nonce {nonce} fails is_valid_nonce"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_grind_calls(),
+        before + 1,
+        "the Rpx256 arm must have run on the device (set LAMBDA_VM_NO_GPU_GRIND and this fails, \
+         which is the point)"
+    );
+
+    // CONTROL: a configuration whose transcript has no grind kernel must not
+    // pay a device search at all.
+    let before = stark::gpu_lde::gpu_grind_calls();
+    let nonce = stark::grinding::generate_nonce_maybe_gpu::<RpxGrind>(
+        &seed,
+        factor,
+        CommitmentHash::Blake3,
+    )
+    .expect("a nonce exists");
+    assert!(
+        stark::grinding::is_valid_nonce::<RpxGrind>(&seed, nonce, factor),
+        "the host-search nonce {nonce} fails is_valid_nonce"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_grind_calls(),
+        before,
+        "a hash with no grind kernel must not reach the device"
+    );
+}
