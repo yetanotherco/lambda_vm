@@ -149,6 +149,21 @@ pub fn device_artifact_peak_bytes() -> u64 {
 }
 
 static DEVICE_PEAK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEVICE_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOST_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many committed groups took the device path and how many the host, over
+/// the life of the process.
+///
+/// ⛔ THE NUMBER THAT ATTRIBUTES O1's SAVING. `gpu_lde` admits on
+/// `padded_rows · blowup >= 2^14`, so a program's SHORT groups stay on the host
+/// whatever the card is doing. Without this split, "the artifact build got
+/// faster" cannot distinguish "the big groups moved to the device" from "the
+/// device took everything" — and the two imply different residual host time.
+pub fn device_host_group_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (DEVICE_GROUPS.load(Relaxed), HOST_GROUPS.load(Relaxed))
+}
 
 /// Commit one instruction column group — on the device where there is one, on
 /// the host otherwise.
@@ -202,10 +217,12 @@ pub fn commit_group_device_or_host(
             options.blowup_factor as usize,
             &FE::from(options.coset_offset),
         ) {
+            DEVICE_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return root;
         }
     }
     let _ = label;
+    HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     commit_lde_columns(&lde_columns(&group_columns(group), options))
 }
 

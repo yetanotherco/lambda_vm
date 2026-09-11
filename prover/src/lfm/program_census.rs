@@ -63,6 +63,11 @@ pub struct LevelStats {
     /// set is what the build ever needed. It is what the artifact build ASKED
     /// for; an external sampler is what says what the process held.
     pub device_peak_bytes: u64,
+    /// Committed groups that took the device path, and those that stayed on the
+    /// host because `padded_rows · blowup` was under `gpu_lde`'s 2^14 floor.
+    /// Process totals, like the peak.
+    pub device_groups: u64,
+    pub host_groups: u64,
 }
 
 impl LevelStats {
@@ -76,8 +81,10 @@ impl LevelStats {
             match self.device_peak_bytes {
                 0 => String::new(),
                 b => format!(
-                    " · device set {:.2} GiB",
-                    b as f64 / (1024.0 * 1024.0 * 1024.0)
+                    " · device set {:.2} GiB · groups {}/{} on device",
+                    b as f64 / (1024.0 * 1024.0 * 1024.0),
+                    self.device_groups,
+                    self.device_groups + self.host_groups,
                 ),
             },
             if self.distinct == self.proofs {
@@ -157,6 +164,9 @@ pub fn begin_level() {
 pub fn end_level() -> Option<LevelStats> {
     let mut stats = lock().window.take().map(|w| w.stats)?;
     stats.device_peak_bytes = super::commit::device_artifact_peak_bytes();
+    let (dev, host) = super::commit::device_host_group_counts();
+    stats.device_groups = dev;
+    stats.host_groups = host;
     Some(stats)
 }
 
