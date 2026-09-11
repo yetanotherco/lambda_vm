@@ -65,7 +65,7 @@ pub struct LevelStats {
     pub device_peak_bytes: u64,
     /// Committed groups that took the device path, and those that stayed on the
     /// host because `padded_rows · blowup` was under `gpu_lde`'s 2^14 floor.
-    /// Process totals, like the peak.
+    /// ★ THIS LEVEL's own, not the process total — see [`Window::groups_at_open`].
     pub device_groups: u64,
     pub host_groups: u64,
 }
@@ -80,11 +80,15 @@ impl LevelStats {
             Duration::from_nanos(self.build_nanos as u64).as_secs_f64(),
             match self.device_peak_bytes {
                 0 => String::new(),
+                // ⚠ The two figures have DIFFERENT scopes and the line says so.
+                // The groups are this level's; the set is the largest any commit
+                // has asked for since the process started, because it is an
+                // atomic maximum and a window cannot un-see one.
                 b => format!(
-                    " · device set {:.2} GiB · groups {}/{} on device",
-                    b as f64 / (1024.0 * 1024.0 * 1024.0),
+                    " · groups {}/{} on device · device set <= {:.2} GiB (process max)",
                     self.device_groups,
                     self.device_groups + self.host_groups,
+                    b as f64 / (1024.0 * 1024.0 * 1024.0),
                 ),
             },
             if self.distinct == self.proofs {
@@ -99,6 +103,15 @@ impl LevelStats {
 struct Window {
     seen: HashSet<Commitment>,
     stats: LevelStats,
+    /// The device/host group counters as they stood when the window OPENED.
+    ///
+    /// ⛔ The counters in `commit` are process-cumulative, because the device
+    /// floor is a process constant and a running total is the useful thing to
+    /// keep. A per-LEVEL line reporting them raw reads as "all groups so far",
+    /// which is exactly how a reader ends up subtracting two levels by hand to
+    /// recover the one they wanted. The window keeps its own baseline and
+    /// reports the DELTA.
+    groups_at_open: (u64, u64),
 }
 
 #[derive(Default)]
@@ -154,19 +167,22 @@ impl Census {
 /// Start counting a level. Replaces any window already open — the driver's
 /// levels do not nest.
 pub fn begin_level() {
+    let groups_at_open = super::commit::device_host_group_counts();
     lock().window = Some(Window {
         seen: HashSet::new(),
         stats: LevelStats::default(),
+        groups_at_open,
     });
 }
 
 /// Close the window and take what it counted. `None` when no window was open.
 pub fn end_level() -> Option<LevelStats> {
-    let mut stats = lock().window.take().map(|w| w.stats)?;
+    let w = lock().window.take()?;
+    let mut stats = w.stats;
     stats.device_peak_bytes = super::commit::device_artifact_peak_bytes();
     let (dev, host) = super::commit::device_host_group_counts();
-    stats.device_groups = dev;
-    stats.host_groups = host;
+    stats.device_groups = dev.saturating_sub(w.groups_at_open.0);
+    stats.host_groups = host.saturating_sub(w.groups_at_open.1);
     Some(stats)
 }
 
@@ -334,10 +350,21 @@ mod measure {
             for (name, p) in &progs {
                 let mut admitted = 0;
                 let mut total = 0;
+                // ⛔ TWELVE GROUPS, NOT ELEVEN. `build_artifacts_with_hasher`
+                // commits `program_groups` (10) plus `LFM_RANGE`, and THEN one
+                // group per `LFM_BLAKE3` chunk in a second loop. Slot 11 is
+                // committed whether or not the family is used — the digest binds
+                // it either way — so a walk that stops at `range` undercounts by
+                // the chunk count, which is how this lane predicted 8 of 11 for
+                // a production wrap when the answer is 8 of 12.
+                let chunks: Vec<_> = (0..p.blake3_chunk_count())
+                    .map(|c| p.blake3_chunk_group(c))
+                    .collect();
                 for (i, g) in program_groups(p)
                     .iter()
                     .copied()
                     .chain(std::iter::once(&range))
+                    .chain(chunks.iter())
                     .enumerate()
                 {
                     let lde = g.padded_rows * blowup;
