@@ -3581,15 +3581,18 @@ fn the_production_tree_composes_to_a_root() {
         lo <= hi || size_root || prove_root,
         "LFM_TREE_LEVELS {lo}-{hi} is empty; the tree has {top} node levels"
     );
-    // ★ OPTION A STOPS ONE LEVEL SHORT, because the level it would walk is the
-    // level the root REPLACES. So a run under A never loads, harvests or
-    // verifies `node-{top}-0.rkyv` — it is not a child of anything — and after
-    // the loop `children` IS the root's interior children, with no second
-    // capture and no clobbering. Under B the loop closes the tree as always and
-    // `children` is the single node the root sits above.
+    // ★ THE LOOP STOPS AT THE LEVEL THE ROOT'S CHILDREN COME FROM, and that
+    // level is `RootOption::child_level` — the one named rule both this and the
+    // sizing capture below read, rather than index arithmetic written out twice.
+    //
+    // Under A that is `top - 1`, so a run under A never loads, harvests or
+    // verifies `node-{top}-0.rkyv`: it is not a child of anything. Under B it is
+    // `top`, so the loop closes the tree as always. Either way `children` after
+    // the loop IS the root's interior children, with no capture and no
+    // clobbering.
     let hi = match root_option {
-        Some(o) if o.replaces_top() => top.saturating_sub(1),
-        _ => hi,
+        Some(o) => o.child_level(top),
+        None => hi,
     };
     println!(
         "   ★ SHAPE from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
@@ -4204,7 +4207,10 @@ fn the_production_tree_composes_to_a_root() {
 
     // ---- levels 1..=hi.
     let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
-    let mut penultimate: Option<TreeLevel> = None;
+    // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
+    // the loop. `None` on every other arm, where one level's output is all the
+    // run needs.
+    let mut top_level: Option<TreeLevel> = None;
     for (li, level) in shape.iter().enumerate().take(hi) {
         let level_no = li + 1;
         let t_level = Instant::now();
@@ -4277,24 +4283,70 @@ fn the_production_tree_composes_to_a_root() {
         // ★ The level below goes, and the trough is the point: a tree-builder at
         // level k holds level k-1 and nothing under it. Only a live sample can
         // show a release; a high-water cannot.
-        // ★ Keep the level BELOW the top: those are root option A's interior
-        // children (a root REPLACING the top level), while `children` after the
-        // loop holds option B's single child (a root sitting ABOVE it).
-        if size_root && level_no + 1 == top {
-            penultimate = Some((
-                std::mem::take(&mut children),
-                std::mem::take(&mut layouts),
-                std::mem::take(&mut labels),
-            ));
+        //
+        // ⛔ EXCEPT AT THE TOP LEVEL UNDER SIZING, WHERE BOTH ARE HELD — and this
+        // is the fix for a real abort, so it is worth being exact about.
+        //
+        // The sizing arm emits BOTH root options, and they take DIFFERENT levels'
+        // OUTPUTS: A takes `RootOption::A.child_level(top)`'s, B takes `top`'s.
+        // A single pass cannot hand both out by capturing one mid-loop, because
+        // `RealChild` is not cloneable and a capture therefore MOVES the very
+        // children the next level is built from.
+        //
+        // ⇒ The previous code captured at `level_no + 1 == top`, evaluated BEFORE
+        // this swap, so it held level `top - 1`'s INPUT rather than its OUTPUT —
+        // one level lower again. At 19 epochs and fan-in 2 it handed the root 3
+        // children where option A's fold shape refolds to 2, and
+        // `emit_l2g_compare`'s count guard aborted a box run thirteen minutes in.
+        // ⚠ The guard catching it was luck of the shape: where the two counts
+        // agree, the root compares a fold of the wrong depth and an HONEST prover
+        // fails instead.
+        //
+        // ⇒ So at the TOP level the new output is kept as B's and the swap is
+        // SKIPPED, leaving `children` = A's children. Nothing is moved, nothing
+        // is cloned, and there is no mid-loop capture to be off by one.
+        let produced = next.len();
+        let both_held = size_root && level_no == top;
+        if both_held {
+            top_level = Some((next, next_layouts, next_labels));
+        } else {
+            children = next;
+            layouts = next_layouts;
+            labels = next_labels;
         }
-        children = next;
-        layouts = next_layouts;
-        labels = next_labels;
-        mark(&format!("AFTER level {level_no}, its children released"));
+        mark(&format!(
+            "AFTER level {level_no}, {}",
+            if both_held {
+                "its children HELD — the sizing arm needs both levels live"
+            } else {
+                "its children released"
+            }
+        ));
         println!(
-            "   level {level_no}: {} nodes in {:.1}s",
-            children.len(),
+            "   level {level_no}: {produced} nodes in {:.1}s",
             t_level.elapsed().as_secs_f64()
+        );
+    }
+    // ⛔ AND THE CAPTURE IS CHECKED HERE, in the driver, rather than being left
+    // to abort inside the emitter. `children` must be the OUTPUT of the level
+    // option A names; getting that wrong is what sent a box run downstream, and
+    // a count is cheap to state where the levels are still in view.
+    if size_root {
+        let a_level = super::block_root::RootOption::A.child_level(top);
+        let want = if a_level == 0 {
+            bundle.num_epochs()
+        } else {
+            shape[a_level - 1].arities.len()
+        };
+        assert_eq!(
+            children.len(),
+            want,
+            "option A's children must be the OUTPUT of level {a_level} ({want} \
+             proofs) and this run holds {}. A count taken one level low, or on a \
+             level's input side, lands HERE — where the levels are still in \
+             view — rather than inside emit_l2g_compare's guard, a whole global \
+             child later",
+            children.len(),
         );
     }
 
@@ -4311,9 +4363,13 @@ fn the_production_tree_composes_to_a_root() {
             global_child.tables.len(),
             g.num_l2g,
         );
-        let (pen, pen_layouts, pen_labels) = penultimate
-            .take()
-            .expect("size mode captures the level below the top");
+        // ⚠ BORROWED, NOT TAKEN. The closure assert below reads this same level
+        // to say what the interior closed to; consuming it here would leave that
+        // read looking at option A's level and firing on a tree that closed
+        // perfectly well.
+        let (b_kids, b_layouts, b_labels) = top_level
+            .as_ref()
+            .expect("the sizing arm holds the TOP level as option B's child");
         let block_range = (
             crate::tables::local_to_global::epoch_label(0),
             crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
@@ -4322,16 +4378,16 @@ fn the_production_tree_composes_to_a_root() {
             (
                 "A: root REPLACES the top level",
                 true,
-                &pen,
-                &pen_layouts,
-                &pen_labels,
+                &children,
+                &layouts,
+                &labels,
             ),
             (
                 "B: root sits ABOVE it (the level-top scaffold is kept)",
                 false,
-                &children,
-                &layouts,
-                &labels,
+                b_kids,
+                b_layouts,
+                b_labels,
             ),
         ] {
             let refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
@@ -4367,16 +4423,17 @@ fn the_production_tree_composes_to_a_root() {
         );
     }
 
-    println!(
-        "\n★★★ TREE COMPOSED — {} proof(s) at level {hi}",
-        children.len()
-    );
+    // ⚠ THE TOP LEVEL'S COUNT, WHICH UNDER SIZING IS NOT `children`. The sizing
+    // arm holds level `top` as option B's child and leaves `children` at option
+    // A's level, so reading `children` here would report the wrong level AND
+    // fire the closure assert on a tree that closed perfectly well.
+    let closed = top_level
+        .as_ref()
+        .map(|(c, _, _)| c.len())
+        .unwrap_or(children.len());
+    println!("\n★★★ TREE COMPOSED — {closed} proof(s) at level {hi}");
     if hi == top {
-        assert_eq!(
-            children.len(),
-            1,
-            "the interior must close to exactly one proof"
-        );
+        assert_eq!(closed, 1, "the interior must close to exactly one proof");
     }
     println!("\nlevel arity        cells  instructions  host GiB   argmax t    wall s");
     for (l, a, cells, instrs, peak, at, wall) in &report {

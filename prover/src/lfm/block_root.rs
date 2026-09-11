@@ -184,6 +184,38 @@ impl RootOption {
         FoldShape::for_root(epochs, fan_in, self.replaces_top())
     }
 
+    /// Which interior LEVEL's **OUTPUT** this option's root takes as its
+    /// children, in the driver's own numbering: level 0's output is the epoch
+    /// wraps and level `k`'s output is what level `k` produced, so a tree with
+    /// `top` node levels has outputs `0..=top`.
+    ///
+    /// ⛔ **THE OFF-BY-ONE THIS EXISTS TO PREVENT, AND IT HAS ALREADY HAPPENED.**
+    /// `A` REPLACES the top level, so its children are level `top - 1`'s OUTPUT.
+    /// That is **not** the same thing as "what `children` holds while level
+    /// `top - 1` is running", which is level `top - 1`'s INPUT — one level lower
+    /// again. A driver capture taken before a level's swap holds the input, and
+    /// at 19 epochs / fan-in 2 the two are **3 nodes and 2**.
+    ///
+    /// ⇒ That mis-capture sent a box run into [`emit_l2g_compare`]'s count guard
+    /// thirteen minutes downstream: the root refolded to 2 digests and was handed
+    /// 3 children. The guard did its job, and the good case is exactly that it
+    /// aborts. ⚠ The BAD case is a tree shape where the two counts happen to
+    /// agree, where the root would compare a fold of the wrong depth against
+    /// children from the wrong level and fail an HONEST prover instead.
+    ///
+    /// ⇒ So the rule is a named function both the emitter's side and the
+    /// driver's side read, rather than an index arithmetic written out twice.
+    pub fn child_level(self, top: usize) -> usize {
+        match self {
+            // ⚠ `saturating_sub`: at `top == 0` there are no node levels and A's
+            // children ARE the epoch wraps, which is output 0 — the zero-level
+            // fold `for_root(epochs, fan_in, true)` produces for `epochs <=
+            // fan_in`. Not a clamp papering over an underflow.
+            Self::A => top.saturating_sub(1),
+            Self::B => top,
+        }
+    }
+
     /// The option spelled out for a log line.
     pub fn describe(self) -> &'static str {
         match self {
@@ -716,6 +748,91 @@ mod tests {
                 "k={k}: the partial must sit at the first index PAST the wrap's \
                  set, or it collides with L2G material the root's compare reads"
             );
+        }
+    }
+
+    /// ★★ THE ROOT TAKES ITS CHILDREN FROM THE LEVEL ITS OPTION NAMES — and the
+    /// level ONE BELOW is a different count, which is the bug this pins.
+    ///
+    /// ⛔ WHAT HAPPENED. The sizing driver captured option A's children with
+    /// `if level_no + 1 == top { take(children) }`, evaluated BEFORE that level's
+    /// swap — so it held level `top - 1`'s INPUT, not its output. At 19 epochs
+    /// and fan-in 2 the interior outputs are `[19, 10, 5, 3, 2, 1]`: the capture
+    /// took **3** where option A takes **2**, and `emit_l2g_compare`'s count
+    /// guard aborted a box run thirteen minutes in with exactly those two
+    /// numbers.
+    ///
+    /// ⚠ `FoldShape::for_root` was never wrong, in either arm. This test says so
+    /// executably rather than leaving a reader to re-derive it: the agreement it
+    /// asserts is precisely the one the emitter's guard checks, at the real
+    /// numbers and then across a sweep — so a `child_level` off by one in either
+    /// direction fails here, in milliseconds, instead of on a box.
+    #[test]
+    fn the_root_takes_its_children_from_the_level_its_option_names() {
+        use super::super::builder::LfmBuilder;
+        use super::super::edsl::WrapHash;
+
+        // The count each option's fold shape produces, which is what the root
+        // compares against its children — `emit_l2g_compare`'s own `recomputed`.
+        let refolded = |epochs: usize, fan_in: usize, option: RootOption| -> usize {
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let lanes = super::super::proof_arena::lanes_per_root();
+            let digests: Vec<_> = (0..epochs)
+                .map(|k| {
+                    let cells: Vec<_> = (0..lanes)
+                        .map(|w| b.felt_const(FE::from((17 * k + w) as u64)))
+                        .collect();
+                    digest_from_lanes(&mut b, &cells)
+                })
+                .collect();
+            option
+                .fold_shape(epochs, fan_in)
+                .refold(&mut b, &digests)
+                .len()
+        };
+        // The interior's OUTPUTS, level by level, with output 0 = the wraps.
+        let outputs = |epochs: usize, fan_in: usize| -> Vec<usize> {
+            std::iter::once(epochs)
+                .chain(tree_shape(epochs, fan_in).iter().map(|l| l.arities.len()))
+                .collect::<Vec<_>>()
+        };
+
+        // ---- the real tree, with the real numbers from the box log.
+        let real = outputs(19, 2);
+        assert_eq!(
+            real,
+            vec![19, 10, 5, 3, 2, 1],
+            "19 epochs at fan-in 2 is the tree that is proved and cached; if this              moved, every number below is about a different tree"
+        );
+        let top = real.len() - 1;
+        assert_eq!(top, 5, "five node levels");
+        assert_eq!(RootOption::A.child_level(top), 4, "A replaces level 5");
+        assert_eq!(RootOption::B.child_level(top), 5, "B sits above it");
+        assert_eq!(real[RootOption::A.child_level(top)], 2, "A takes 2 nodes");
+        assert_eq!(real[RootOption::B.child_level(top)], 1, "B takes 1 node");
+        // ⛔ The mis-capture, named: one level below A's is a DIFFERENT count.
+        assert_eq!(
+            real[RootOption::A.child_level(top) - 1],
+            3,
+            "level 4's INPUT is 3 nodes — what the old capture held, and what the              emitter's guard reported as `right: 3` against its `left: 2`"
+        );
+
+        // ---- and the rule generally: the level an option names carries exactly
+        // as many children as that option's fold shape refolds to.
+        for fan_in in [2usize, 3] {
+            for epochs in [2usize, 3, 4, 5, 7, 10, 19, 36] {
+                let out = outputs(epochs, fan_in);
+                let top = out.len() - 1;
+                for option in [RootOption::A, RootOption::B] {
+                    assert_eq!(
+                        out[option.child_level(top)],
+                        refolded(epochs, fan_in, option),
+                        "{epochs} epochs at fan-in {fan_in}, option {option:?}: the                          driver would hand the root {} children and its fold shape                          refolds to {} digests. That mismatch IS the abort the box                          hit, and it is an emit-time guard only because the counts                          differed — at a shape where they agree it becomes an                          honest prover failing the compare",
+                        out[option.child_level(top)],
+                        refolded(epochs, fan_in, option),
+                    );
+                }
+            }
         }
     }
 
