@@ -3769,6 +3769,19 @@ fn the_production_tree_composes_to_a_root() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let t_emit = t.elapsed().as_secs_f64();
+        // ★ THE WRAP'S SIZE, in the shape every node already prints. Without it
+        // the only way to price a wrap is a clock, and a clock cannot say
+        // whether a wrap is dear because of its instruction count or its cells
+        // — which is the difference between the executor being the lever and
+        // the prover being it. ⓘ `fan_in` is 1: a wrap consumes ONE epoch, so
+        // the panel's step line reads as "at twice this epoch size", which is
+        // the posture question actually asked of a wrap.
+        //
+        // ⓘ Deliberately OUTSIDE the five timed fields, exactly as the node's
+        // census is outside its TIMING line, so the fields stay comparable to
+        // the arm that measured them. Its cost lands in `wall` instead, and it
+        // is now the one named term in that residual.
+        census_and_panel(&program, &format!("wrap {k}"), 1);
         let t = Instant::now();
         let artifacts =
             build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
@@ -3793,9 +3806,9 @@ fn the_production_tree_composes_to_a_root() {
         layouts.push(layout);
         labels.push(vec![crate::tables::local_to_global::epoch_label(k as u64)]);
         // ⓘ `wall` is printed so the five fields read as a CLOSED account:
-        // what they do not sum to is the residual — the out-halves read,
-        // `assert_samplable`, the label push — and a residual that stops being
-        // noise is a phase nobody is timing.
+        // what they do not sum to is the residual — the census and panel above,
+        // the out-halves read, `assert_samplable`, the label push — and a
+        // residual that grows beyond those is a phase nobody is timing.
         println!(
             "   wrap {k} TIMING: reconstruct {t_recon:.2}s · emit+arenas {t_emit:.2}s \
              · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s \
