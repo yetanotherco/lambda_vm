@@ -536,10 +536,19 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
-    let mut factors = trace.factors()?;
+    // The trace's factors are not built here when a device holds them: that
+    // build is the whole trace in the extension, and nothing on that path
+    // reads it. The closure is what makes them if the device turns the rounds
+    // down.
     let resident = trace.device_factors();
-    factors.extend(weights);
-    let (sumcheck, point) = batch::prove_resident(factors, resident, rules, claims, transcript)?;
+    let (sumcheck, point) = batch::prove_resident(
+        weights,
+        resident,
+        || trace.factors(),
+        rules,
+        claims,
+        transcript,
+    )?;
 
     // The sumcheck leaves a claim about the factors at its point. Settle it in
     // two steps: reduce every committed factor's value there to a claim about

@@ -260,8 +260,7 @@ where
     let attempt = if rounds == poly.num_vars() {
         match poly.program() {
             Some(program) => {
-                let resident = poly.device_factors().map(std::sync::Arc::as_ref);
-                crate::gpu::prove_sumcheck(poly.polys(), resident, program, degree, |evaluations| {
+                crate::gpu::prove_sumcheck(poly.polys(), program, degree, |evaluations| {
                     for e in evaluations {
                         transcript.append_field_element(e);
                     }

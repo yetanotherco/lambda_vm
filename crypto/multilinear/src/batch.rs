@@ -101,8 +101,6 @@ pub struct Batched<'a, F: IsField> {
     /// The whole batch as one program, when every rule is compiled. The round
     /// loop runs this instead of the rules, and it is what a device gets.
     program: Option<Program<F>>,
-    /// The trace's factors, when a device already holds them.
-    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
 }
 
 impl<'a, F: IsField + 'static> Batched<'a, F> {
@@ -143,16 +141,31 @@ impl<'a, F: IsField + 'static> Batched<'a, F> {
             num_vars,
             degree,
             program,
-            device: None,
         })
     }
 
-    /// The same, over factors a device already holds — the batch's first
-    /// `width` polynomials, in order. What follows them goes up with the
-    /// session.
-    pub fn with_device(mut self, device: std::sync::Arc<crate::gpu::DeviceFactors>) -> Self {
-        self.device = Some(device);
-        self
+    /// Puts `polys` in front of the ones already here.
+    ///
+    /// A batch whose first factors a device holds is built over the rest
+    /// alone; this is what brings them back when the device turns the rounds
+    /// down and the host has to run them.
+    pub fn prepend(&mut self, mut polys: Vec<Mle<F>>) -> Result<(), Error> {
+        if polys.is_empty() {
+            return Ok(());
+        }
+        let num_vars = polys[0].num_vars();
+        for p in polys.iter().chain(&self.polys) {
+            if p.num_vars() != num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: num_vars,
+                    got: p.num_vars(),
+                });
+            }
+        }
+        polys.append(&mut self.polys);
+        self.polys = polys;
+        self.num_vars = num_vars;
+        Ok(())
     }
 
     /// The batch as one program, when it has one.
@@ -206,10 +219,6 @@ impl<F: IsField + 'static> SumcheckPolynomial<F> for Batched<'_, F> {
         self.program.as_ref()
     }
 
-    fn device_factors(&self) -> Option<&std::sync::Arc<crate::gpu::DeviceFactors>> {
-        self.device.as_ref()
-    }
-
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
         if polys.len() != self.polys.len() {
             return Err(Error::VariableCountMismatch {
@@ -243,22 +252,6 @@ where
     F: IsField + 'static,
     T: IsTranscript<F>,
 {
-    prove_resident(polys, None, rules, claims, transcript)
-}
-
-/// The same, over factors a device already holds — the first of them, in the
-/// order `polys` lists them.
-pub fn prove_resident<F, T>(
-    polys: Vec<Mle<F>>,
-    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
-    rules: Vec<Rule<'_, F>>,
-    claims: &[FieldElement<F>],
-    transcript: &mut T,
-) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
-where
-    F: IsField + 'static,
-    T: IsTranscript<F>,
-{
     if claims.len() != rules.len() {
         return Err(Error::VariableCountMismatch {
             expected: rules.len(),
@@ -269,11 +262,74 @@ where
         transcript.append_field_element(claim);
     }
     let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
-    let batched = Batched::new(polys, rules, lambdas)?;
-    let batched = match device {
-        Some(device) => batched.with_device(device),
-        None => batched,
+    sumcheck::prove(Batched::new(polys, rules, lambdas)?, transcript)
+}
+
+/// The same, over factors a device already holds — the batch's first ones, in
+/// the order the rules read them.
+///
+/// `extra` is what the device does not have (the weight tables), and `absent`
+/// makes what it does. That second one is a builder and not a value because on
+/// the device path it is never called: building a table's factors here is most
+/// of what the argument used to spend on the host, and the whole point of them
+/// being up there is not to.
+///
+/// It *is* called when the device turns the rounds down. Nothing has been said
+/// about the factors to the transcript by then — only the claims and the
+/// batching challenge, which are the same either way — so the host path
+/// continues from where the device left off and produces the same proof.
+pub fn prove_resident<F, T, B>(
+    extra: Vec<Mle<F>>,
+    device: Option<std::sync::Arc<crate::gpu::DeviceFactors>>,
+    absent: B,
+    rules: Vec<Rule<'_, F>>,
+    claims: &[FieldElement<F>],
+    transcript: &mut T,
+) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
+where
+    F: IsField + 'static,
+    T: IsTranscript<F>,
+    B: Fn() -> Result<Vec<Mle<F>>, Error>,
+{
+    if claims.len() != rules.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: rules.len(),
+            got: claims.len(),
+        });
+    }
+    let Some(device) = device else {
+        let mut polys = absent()?;
+        polys.extend(extra);
+        return prove(polys, rules, claims, transcript);
     };
+
+    for claim in claims {
+        transcript.append_field_element(claim);
+    }
+    let lambdas = challenge_powers(&transcript.sample_field_element(), rules.len());
+    let mut batched = Batched::new(extra, rules, lambdas)?;
+    let degree = batched.degree().max(1);
+    if let Some(program) = batched.program() {
+        let attempt = crate::gpu::prove_sumcheck_resident(
+            &device,
+            batched.polys(),
+            program,
+            degree,
+            |evaluations| {
+                for e in evaluations {
+                    transcript.append_field_element(e);
+                }
+                transcript.sample_field_element()
+            },
+        );
+        if let Some(outcome) = attempt {
+            let (rounds, challenges) = outcome?;
+            return Ok((SumcheckProof { rounds }, challenges));
+        }
+    }
+    // Declined before the first round: the host runs them, and for that the
+    // factors have to be here after all.
+    batched.prepend(absent()?)?;
     sumcheck::prove(batched, transcript)
 }
 

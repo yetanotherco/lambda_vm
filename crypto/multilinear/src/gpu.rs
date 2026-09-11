@@ -63,6 +63,13 @@ pub fn reset_call_counters() {
 
 /// A sumcheck's round proofs, the challenges they drew, and the factors the
 /// rounds left bound.
+/// A sumcheck's round proofs and the challenges they drew, with the factors
+/// left where they were folded.
+type ResidentRounds<E> = (
+    Vec<crate::sumcheck::RoundProof<E>>,
+    Vec<math::field::element::FieldElement<E>>,
+);
+
 type SumcheckRounds<E> = (
     Vec<crate::sumcheck::RoundProof<E>>,
     Vec<math::field::element::FieldElement<E>>,
@@ -276,7 +283,6 @@ where
 #[cfg(feature = "cuda")]
 pub(crate) fn prove_sumcheck<E>(
     polys: &[crate::mle::Mle<E>],
-    resident: Option<&DeviceFactors>,
     program: &crate::program::Program<E>,
     degree: usize,
     challenge: impl FnMut(
@@ -325,31 +331,14 @@ where
         })
         .collect();
 
-    // Factors already on device are folded where they are; the rest — a
-    // batch's weight tables — go up with them.
-    let session = match resident {
-        Some(factors) => {
-            let held = factors.0.width();
-            if held > raw.len() || factors.0.len() != first.len() {
-                return None;
-            }
-            factors.0.session(
-                &raw[held..],
-                &lowered.nodes,
-                &lowered.consts,
-                lowered.num_slots,
-                lowered.root_slot,
-            )
-        }
-        None => math_cuda::sumcheck::SumcheckSession::new(
-            &raw,
-            &lowered.nodes,
-            &lowered.consts,
-            lowered.num_slots,
-            lowered.root_slot,
-        ),
-    };
-    let mut session = session.ok()?;
+    let mut session = math_cuda::sumcheck::SumcheckSession::new(
+        &raw,
+        &lowered.nodes,
+        &lowered.consts,
+        lowered.num_slots,
+        lowered.root_slot,
+    )
+    .ok()?;
 
     // Diagnostic hook: recompute each round on the host from the factors the
     // device holds and stop at the first disagreement, naming the round. A
@@ -466,13 +455,109 @@ where
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn prove_sumcheck<E>(
     _polys: &[crate::mle::Mle<E>],
-    _resident: Option<&DeviceFactors>,
     _program: &crate::program::Program<E>,
     _degree: usize,
     _challenge: impl FnMut(
         &[math::field::element::FieldElement<E>],
     ) -> math::field::element::FieldElement<E>,
 ) -> Option<Result<SumcheckRounds<E>, crate::Error>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// The same sumcheck, with the trace's factors already on the device and only
+/// the weight tables here.
+///
+/// The rounds fold the resident factors where they lie, which spends them: a
+/// table's argument runs one of these.
+///
+/// `None` is a decline, and it is always before the first round — so the
+/// caller can still build those factors here and run the host path from the
+/// same transcript. Once the rounds start, a failure is a failure.
+#[cfg(feature = "cuda")]
+pub(crate) fn prove_sumcheck_resident<E>(
+    resident: &DeviceFactors,
+    extra: &[crate::mle::Mle<E>],
+    program: &crate::program::Program<E>,
+    degree: usize,
+    challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+) -> Option<Result<ResidentRounds<E>, crate::Error>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    if std::any::TypeId::of::<E>() != std::any::TypeId::of::<Ext3>() {
+        return None;
+    }
+    let len = resident.0.len();
+    let num_vars = len.trailing_zeros() as usize;
+    if len < SUMCHECK_THRESHOLD || num_vars == 0 {
+        return None;
+    }
+    if degree == 0 || degree > math_cuda::sumcheck::MAX_NODES {
+        return None;
+    }
+    if extra.iter().any(|table| table.len() != len) {
+        return None;
+    }
+    // A slot past the factor list would be an out-of-bounds device read, which
+    // no kernel can check for itself.
+    let width = resident.0.width() + extra.len();
+    if program
+        .max_slot()
+        .is_some_and(|slot| slot as usize >= width)
+    {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_SUMCHECK").is_some()) {
+        return None;
+    }
+    let lowered = lower(program)?;
+
+    // SAFETY: `E == Ext3` is established above, and its `FieldElement` is a
+    // transparent wrapper over three `u64` limbs — the layout the kernel reads.
+    let raw: Vec<&[u64]> = extra
+        .iter()
+        .map(|table| unsafe {
+            core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
+        })
+        .collect();
+    let mut session = resident
+        .0
+        .session(
+            &raw,
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+        )
+        .ok()?;
+
+    let outcome = run_rounds(&mut session, degree, num_vars, challenge, |_| None);
+    let rounds = match outcome {
+        Ok(rounds) => rounds,
+        Err(error) => return Some(Err(error)),
+    };
+    SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(Ok(rounds))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn prove_sumcheck_resident<E>(
+    _resident: &DeviceFactors,
+    _extra: &[crate::mle::Mle<E>],
+    _program: &crate::program::Program<E>,
+    _degree: usize,
+    _challenge: impl FnMut(
+        &[math::field::element::FieldElement<E>],
+    ) -> math::field::element::FieldElement<E>,
+) -> Option<Result<ResidentRounds<E>, crate::Error>>
 where
     E: math::field::traits::IsField + 'static,
 {
