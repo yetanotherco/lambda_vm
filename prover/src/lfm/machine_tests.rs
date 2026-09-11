@@ -3944,7 +3944,7 @@ fn program_id_matches_production_on_the_real_fixture() {
     let (elf_digest, pc_start, decode, pages) = r1g_program_id_inputs();
     assert!(
         pages.is_empty(),
-        "the fibonacci fixture is expected to touch no data pages; if this \
+        "the continuation fixture is expected to touch no data pages; if this \
          changes, the shape below must change with it"
     );
     let shape = ProgramIdShape {

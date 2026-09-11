@@ -33,30 +33,50 @@ use stark::proof::options::ProofOptions;
 
 use crate::recursion::MIN_PROOF_OPTIONS;
 
-/// Inner guest whose execution the fixture proves. `fibonacci` rather than
-/// `empty`: the fixture needs enough cycles to actually split into two epochs,
-/// and `empty` collapses to a single (monolithic-style) one.
-pub const FIXTURE_INNER_ELF: &str = "fibonacci";
+/// Inner guest whose execution the fixture proves.
+///
+/// ★ **Not `fibonacci`, and the difference is a property the fixture has to
+/// have.** Every guest in this suite before this one committed its public output
+/// immediately before `halt()`, which puts the output in the FINAL epoch. But
+/// `epoch_tests::EpochFront::build` asserts `!is_final` — it harvests an
+/// INTERMEDIATE epoch on purpose — so under such a guest `RealEpoch::public_output`
+/// is empty for every epoch that harness can reach, and the output half of
+/// `the_closure_rejects_a_moved_index_or_output` has nothing to tamper. That test
+/// spent four weeks red on its own anti-vacuity guard saying exactly that.
+///
+/// `continuation-fixture` commits and then does bounded work, so the committing
+/// epoch is intermediate by CONSTRUCTION. `fibonacci` could not simply grow a
+/// tail: `bench_vs/run.sh` builds it as the Lambda VM arm of a cross-prover
+/// benchmark against `bench_vs/sp1/fibonacci`, and the two arms have to run the
+/// same program.
+pub const FIXTURE_INNER_ELF: &str = "continuation-fixture";
 
 /// Epoch size, as `log2(cycles)`.
 ///
-/// Measured, not guessed: this guest runs **15 cycles** — the fixture passes no
-/// private input, so `n` reads as 0 and the loop body never executes — which an
-/// 8-cycle epoch splits into two and a 16-cycle one does not. A single-epoch
+/// Measured, not guessed: the guest runs **48 cycles**, committing at cycle 13.
+/// A 32-cycle epoch therefore splits it into two, with the commit 19 cycles
+/// inside the first and the halt 16 cycles past the boundary. A single-epoch
 /// fixture would defeat the point, since the whole target is a CONTINUATION,
 /// and `continuation_fixture_generates_two_epochs` is the canary for it.
 ///
-/// ⚠ **The cycle count is a property of the compiled ELF, not of the guest
-/// source.** `bench_vs/lambda/fibonacci` has no dependencies, so nothing in this
-/// workspace moves it — but the pinned nightly and the sysroot do, and a
-/// codegen change of two instructions is enough to cross an epoch boundary at
-/// this size. If the canary reports one epoch, re-measure rather than guess:
-/// run the ELF to completion under `Executor::resume_with_limit` and count the
-/// logs, one per cycle, then set this to a `log2` strictly below the count.
+/// ★ The three margins are the design, not a happy result — see the guest's own
+/// `TAIL_STEPS`, which is the dial that sets them at two cycles per step — and
+/// [`tests::the_fixture_guest_commits_in_an_intermediate_epoch`] asserts them.
+/// This constant used to be a four-cycle question, and the answer moved under it
+/// when the toolchain rebuilt the ELF two instructions shorter; the epoch COUNT
+/// did not move when that happened, which is why the count alone is not the
+/// canary it was taken for.
 ///
-/// Blob sizes for the record: 947,340 bytes at the two epochs this selects,
-/// against 309,084 for the single epoch a 16-cycle one collapses to.
-pub const FIXTURE_EPOCH_LOG2: u32 = 3;
+/// ⚠ **The cycle count is a property of the compiled ELF, not of the guest
+/// source.** `bench_vs/lambda/continuation-fixture` has no dependencies, so
+/// nothing in this workspace moves it — but the pinned nightly and the sysroot
+/// do. If the canary reports anything but two epochs, re-measure rather than
+/// guess: run the ELF to completion under `Executor::resume_with_limit`, count
+/// the logs (one per cycle), and note which one carries syscall 64 — this must
+/// stay strictly between that cycle and the count.
+///
+/// Blob size for the record: **596,828 bytes** at the two epochs this selects.
+pub const FIXTURE_EPOCH_LOG2: u32 = 5;
 
 /// Proof options the fixture is proved under: the `min` preset, which is the
 /// cheapest to generate. It is explicitly NOT a secure parameter set — this
@@ -229,5 +249,78 @@ impl FixtureArchive {
             &self.aligned,
         )
         .expect("fixture blob must validate")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIXTURE_EPOCH_LOG2, read_inner_elf};
+
+    /// `SYSCALL_COMMIT` as the guest spells it — the syscall number an `ECALL`
+    /// log carries in `src1_val`.
+    const SYSCALL_COMMIT: u64 = 64;
+
+    /// ★ The fixture's THREE MARGINS, asserted rather than recorded in a doc.
+    ///
+    /// `machine_tests::continuation_fixture_generates_two_epochs` checks the
+    /// epoch COUNT, which is necessary and was never sufficient. A run can split
+    /// in two with its commit on either side of the boundary, and only one of
+    /// those is a fixture the output-tamper tests can use: `EpochFront::build`
+    /// harvests epoch 0 and asserts it is INTERMEDIATE, so the public output has
+    /// to be committed before the first boundary and the guest has to still be
+    /// running after it.
+    ///
+    /// That is the property [`the_closure_rejects_a_moved_index_or_output`]'s
+    /// second half needs, it is the one that silently went away when the
+    /// toolchain rebuilt the old guest two instructions shorter, and the epoch
+    /// count did not move when it did. So it is asserted here, in the same
+    /// currency the guest's `TAIL_STEPS` is denominated in.
+    #[test]
+    fn the_fixture_guest_commits_in_an_intermediate_epoch() {
+        use executor::elf::Elf;
+        use executor::vm::execution::Executor;
+
+        let bytes = read_inner_elf();
+        let elf = Elf::load(&bytes).expect("the fixture ELF must load");
+        let mut executor = Executor::new(&elf, Vec::new()).expect("executor");
+        let mut logs = Vec::new();
+        while let Some(batch) = executor.resume_with_limit(1 << 20).expect("resume") {
+            logs.extend_from_slice(batch);
+        }
+
+        let commit = logs
+            .iter()
+            .position(|l| l.src1_val == SYSCALL_COMMIT)
+            .expect("the fixture guest must COMMIT — that is the whole point of it");
+        let total = logs.len();
+        let boundary = 1usize << FIXTURE_EPOCH_LOG2;
+
+        println!(
+            "fixture guest: {total} cycles, commit at {commit}, boundary {boundary} — \
+             margins {}/{}/{}",
+            boundary - commit,
+            total - boundary,
+            2 * boundary - total,
+        );
+
+        assert!(
+            commit < boundary,
+            "the commit is at cycle {commit} and the epoch boundary at {boundary}: \
+             epoch 0 would carry no public output, and every test that tampers it \
+             is vacuous. Lower FIXTURE_EPOCH_LOG2 or commit earlier"
+        );
+        assert!(
+            total > boundary,
+            "the guest halts at cycle {total}, inside the first {boundary}-cycle \
+             epoch: epoch 0 is FINAL and `EpochFront::build`'s `!is_final` fires. \
+             Give the guest more tail"
+        );
+        assert!(
+            total <= 2 * boundary,
+            "the guest runs {total} cycles over {boundary}-cycle epochs, which is \
+             more than two: harmless for the closure test but it makes every \
+             fixture prove dearer, and `continuation_fixture_generates_two_epochs` \
+             is written for two"
+        );
     }
 }

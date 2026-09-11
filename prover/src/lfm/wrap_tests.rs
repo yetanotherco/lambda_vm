@@ -452,7 +452,7 @@ fn the_wrap_proves_and_verifies() {
 ///
 /// The smallest shape that still exercises every leg: the min preset
 /// ([`super::proof_fixture::fixture_options`] — blowup 2, ONE query) over the
-/// fibonacci fixture epoch ([`EpochInputs::fixture`], `FIXTURE_EPOCH_LOG2`).
+/// continuation fixture epoch ([`EpochInputs::fixture`], `FIXTURE_EPOCH_LOG2`).
 /// `EpochInputs::fixture` rather than `from_env`, deliberately: a measurement
 /// run's `LFM_CENSUS_*` variables must not be able to turn a suite gate into a
 /// real-block run.
@@ -820,7 +820,7 @@ fn inner_blowup_8_with_queries(queries: usize) -> ProofOptions {
 }
 
 /// The wrap, end to end, under supplied INNER proof options, over whatever epoch
-/// [`EpochInputs::from_env`] names — the fibonacci fixture unless a measurement
+/// [`EpochInputs::from_env`] names — the continuation fixture unless a measurement
 /// run overrode it.
 fn wrap_run(inner: ProofOptions) {
     wrap_run_from(inner, EpochInputs::from_env());
@@ -1197,7 +1197,7 @@ fn the_wrap_commitments_match_across_residency_modes() {
 
 /// ★ GATE B — a REAL Ethereum-block epoch, wrapped.
 ///
-/// Everything else in this module wraps the 16-cycle fibonacci fixture, which
+/// Everything else in this module wraps the 47-cycle continuation fixture, which
 /// exercises every structure but at a size no production workload has. This
 /// wraps one epoch of a real mainnet block at a SECURE inner preset
 /// (blowup 4 / 110 queries, grinding as the preset sets it): one real block
@@ -1237,7 +1237,7 @@ fn the_real_block_epoch_wraps() {
         assert!(
             std::env::var(var).is_ok(),
             "{var} must name a file: this test wraps a REAL block epoch, and \
-             without it the harness would build the fibonacci fixture and report \
+             without it the harness would build the continuation fixture and report \
              it under this test's name"
         );
     }
@@ -1829,7 +1829,7 @@ fn the_real_block_proves_and_wraps_end_to_end() {
         assert!(
             std::env::var(var).is_ok(),
             "{var} must name a file: this test proves a REAL block, and without \
-             it the harness would build the fibonacci fixture and report it \
+             it the harness would build the continuation fixture and report it \
              under this test's name"
         );
     }

@@ -663,8 +663,8 @@ pub(super) fn real_epoch() -> RealEpoch {
 /// independent — options change what verifying the epoch costs, these change
 /// what the epoch IS.
 ///
-/// [`EpochInputs::fixture`] is the 16-cycle fibonacci fixture every existing
-/// test builds; [`EpochInputs::from_env`] is that with the three overrides a
+/// [`EpochInputs::fixture`] is the continuation fixture every existing test
+/// builds; [`EpochInputs::from_env`] is that with the three overrides a
 /// measurement run needs, and it is what [`real_epoch_with`] uses, so with
 /// nothing set every caller keeps the exact path it had.
 pub(super) struct EpochInputs {
@@ -677,14 +677,20 @@ pub(super) struct EpochInputs {
 }
 
 impl EpochInputs {
-    /// The fibonacci fixture: the ELF the recursion suite builds, no private
+    /// The continuation fixture: the ELF the recursion suite builds, no private
     /// input, [`FIXTURE_EPOCH_LOG2`](super::proof_fixture::FIXTURE_EPOCH_LOG2).
+    ///
+    /// ★ The guest is [`FIXTURE_INNER_ELF`](super::proof_fixture::FIXTURE_INNER_ELF),
+    /// which commits and then keeps running, so the epoch this builds — the
+    /// INTERMEDIATE one [`EpochFront::build`] insists on — actually carries
+    /// public output. Under a guest that commits immediately before halting it
+    /// does not, and every test that tampers `public_output` is vacuous.
     pub(super) fn fixture() -> Self {
         Self {
             elf_bytes: super::proof_fixture::read_inner_elf(),
             private_input: Vec::new(),
             epoch_log2: super::proof_fixture::FIXTURE_EPOCH_LOG2,
-            label: "fibonacci fixture".to_string(),
+            label: format!("{} fixture", super::proof_fixture::FIXTURE_INNER_ELF),
         }
     }
 
@@ -695,7 +701,7 @@ impl EpochInputs {
     /// - `LFM_CENSUS_EPOCH_LOG2` — epoch size, log2.
     ///
     /// The input override exists because a guest's epoch count is a property of
-    /// its INPUT, not just its ELF: the fibonacci guest reads its iteration
+    /// its INPUT, not just its ELF: the fixture guest reads its iteration
     /// count from private input, so a run that needs a multi-epoch execution has
     /// to be able to ask for one without a recompile. The ELF and epoch-size
     /// overrides are what let the same harness build a real Ethereum-block
@@ -727,7 +733,7 @@ impl EpochInputs {
 /// The options are the INNER proof's, so they change what the verifier has to do:
 /// the query count, the LDE depth every Merkle walk climbs, and how many FRI
 /// layers commit. What the epoch IS comes from [`EpochInputs::from_env`], which
-/// is the fibonacci fixture unless a measurement run overrode it — so two runs
+/// is the continuation fixture unless a measurement run overrode it — so two runs
 /// at different options stay comparable, and assembly ledger entry 10 still
 /// holds: the trace-length profile travels with every number.
 pub(super) fn real_epoch_with(opts: crate::ProofOptions) -> RealEpoch {

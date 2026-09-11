@@ -416,7 +416,7 @@ pub fn decode_commitment(archive: &FixtureArchive) -> Commitment {
 
 /// The supplied per-page genesis roots, `(base, commitment)`.
 ///
-/// ⚠ EMPTY for the `fibonacci` fixture — that guest touches no data pages — so
+/// ⚠ EMPTY for the `continuation-fixture` guest — it touches no data pages — so
 /// any test that only uses the fixture leaves the page path unexercised. Drive
 /// it with a synthetic shape rather than treating it as covered.
 pub fn page_commitments(archive: &FixtureArchive) -> Vec<(u64, Commitment)> {

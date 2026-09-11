@@ -54,9 +54,16 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 
 # Recursion smoke-test guests, in bench_vs/lambda/ (shared with bench_vs/run.sh)
 # rather than executor/programs/. The recursion guest is the in-VM STARK verifier.
+#
+# `continuation-fixture` is the exception and the reason this comment grew: it has
+# no benchmark arm and run.sh does not build it. It lives here anyway because
+# `proof_fixture::read_inner_elf` reads the recursion artifact directory, and
+# because it is a sibling of `fibonacci` in everything but its tail — which is
+# precisely what must not be added to the benchmarked one, whose whole job is to
+# run the same program as bench_vs/sp1/fibonacci. See its own main.rs.
 RECURSION_GUESTS_DIR=./bench_vs/lambda
 RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
-RECURSION_GUESTS := empty fibonacci
+RECURSION_GUESTS := empty fibonacci continuation-fixture
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # The recursion verifier itself (bench_vs/lambda/recursion) requires picking

@@ -1314,7 +1314,7 @@ fn the_assembled_verifier_contains_every_composition_and_terminal_check() {
 /// The rate model's corrected pieces, WITHOUT a real epoch.
 ///
 /// The hash-matrix permutation-axis block that consumes these lives inside
-/// `the_assembled_epoch_verifier_runs`, which needs `fibonacci.elf`. That is
+/// `the_assembled_epoch_verifier_runs`, which needs the fixture guest ELF. That is
 /// exactly how `LFM_HASH_RATE_FELTS = 8` outlived the three-cell duplex it was
 /// derived from: nothing that ran in a bare checkout touched it. This test does,
 /// on shapes built by hand.
