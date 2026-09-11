@@ -2700,13 +2700,19 @@ pub trait IsStarkProver<
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let security_bits = air.context().proof_options.grinding_factor;
+        // `grinding_factor`, not `security_bits`: proof-of-work is a prover cost
+        // multiplier, and the two are not interchangeable names for one number.
+        let grinding_factor = air.context().proof_options.grinding_factor;
         let mut nonce = None;
-        if security_bits > 0 {
+        if grinding_factor > 0 {
             let nonce_value =
                 grinding::generate_nonce_maybe_gpu::<crate::config::GrindingDigest<H>>(
                     &transcript.state(),
-                    security_bits,
+                    grinding_factor,
+                    // ★ `H`'s own hash, not the global `config::COMMITMENT_HASH`:
+                    // the block path proves under a separately pinned
+                    // configuration, and the global would not follow it.
+                    <H as crate::config::StarkHash>::COMMITMENT_HASH,
                 )
                 .expect("nonce not found");
             transcript.append_bytes(&nonce_value.to_be_bytes());

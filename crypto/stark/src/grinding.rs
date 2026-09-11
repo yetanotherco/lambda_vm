@@ -113,7 +113,7 @@ where
 }
 
 /// The inner hash as the four little-endian u64 lanes Keccak absorbs it into —
-/// the form the device nonce search takes as input.
+/// the form the keccak device nonce search takes as input.
 ///
 /// The GPU dispatch and its test both go through here rather than each doing
 /// their own byte-to-lane conversion: a second copy would let this one drift
@@ -128,35 +128,91 @@ where
     core::array::from_fn(|i| u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
 }
 
-/// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
-/// otherwise (or on any device error). Which valid nonce comes back depends on
-/// the arm: the device search returns the smallest in the range it scanned,
-/// while the CPU's `find_any` returns an arbitrary one. Neither is a contract —
-/// the verifier accepts any nonce passing `is_valid_nonce`, and nothing
-/// downstream depends on the choice. The heavy per-table-per-epoch
-/// ~2^grinding_factor hashing is the prover's dominant CPU cost, so this moves
-/// it off the 16 cores onto the idle GPU.
+/// The inner hash as the four **big-endian** felts an algebraic digest absorbs
+/// it into — the form the RPX device nonce search takes as input.
+///
+/// ⚠ The endianness is the whole difference from [`inner_hash_lanes`], and it
+/// is not cosmetic. An algebraic digest's `felts_from_bytes` reads consecutive
+/// eight-byte groups big-endian, so these four `u64`s ARE the felts the host
+/// sponge absorbs; keccak reads its lanes little-endian. Crossing the two
+/// compiles and runs, and produces a device search for a nonce under a message
+/// the host never hashes — every returned nonce rejected, the fallback taken
+/// every table, and nothing louder than one warning line to say so. That is why
+/// there are two named functions and not one with a flag.
+///
+/// The four values are already canonical: the inner hash is an algebraic
+/// digest's own output, which `digest_to_commitment` writes as four canonical
+/// big-endian `u64`s. Nothing here reduces them, and the device does not either.
+pub fn inner_hash_felts<D>(seed: &[u8; 32], grinding_factor: u8) -> [u64; 4]
+where
+    D: Digest + OutputSizeUser<OutputSize = U32>,
+{
+    let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
+    core::array::from_fn(|i| u64::from_be_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
+/// Grind on the GPU when a CUDA backend is up and the configuration's hash has
+/// a grind kernel, falling back to the CPU search otherwise (or on any device
+/// error).
+///
+/// ★ **`commitment_hash` is `H::COMMITMENT_HASH` at the call site, never the
+/// global `config::COMMITMENT_HASH`.** The global names the *aliases'* hash and
+/// nothing else: the block path proves under `prover::hash_pin::BlockStarkHash`,
+/// which is pinned separately precisely so the two can differ, so a dispatch
+/// keyed on the global would read BLAKE3 under the RPX pin and this whole path
+/// would be dead code that still compiled.
+///
+/// ⚠ The keccak arm additionally checks the concrete digest by `TypeId`, the
+/// way the merkle backends' keccak fast paths do. The RPX arm cannot: its
+/// digest is `prover::lfm::algebraic_commit::AlgebraicDigest<RpxCommit>`, and
+/// `prover` depends on this crate rather than the reverse, so there is no type
+/// here to name. What closes that gap is the unconditional host validation
+/// below — a configuration that said `Rpx256` and transcripted with something
+/// else would lose one device search per table and fall back loudly, never
+/// append an unverifiable nonce.
+///
+/// Which valid nonce comes back depends on the arm: the device search returns
+/// the smallest in the range it scanned, while the CPU's `find_any` returns an
+/// arbitrary one. Neither is a contract — the verifier accepts any nonce
+/// passing `is_valid_nonce`, and nothing downstream depends on the choice. The
+/// heavy per-table-per-epoch ~2^grinding_factor hashing is the prover's
+/// dominant CPU cost, so this moves it off the cores onto the idle GPU.
 #[cfg(feature = "cuda")]
-pub fn generate_nonce_maybe_gpu<D>(seed: &[u8; 32], grinding_factor: u8) -> Option<u64>
+pub fn generate_nonce_maybe_gpu<D>(
+    seed: &[u8; 32],
+    grinding_factor: u8,
+    commitment_hash: crate::config::CommitmentHash,
+) -> Option<u64>
 where
     D: Digest + OutputSizeUser<OutputSize = U32> + 'static,
 {
+    use crate::config::CommitmentHash;
+
     debug_assert!(
         (1..=64).contains(&grinding_factor),
         "grinding_factor must be in 1..=64, got {grinding_factor}"
     );
-    // The device search's outer hash is the keccak kernel, so only the keccak
-    // grinding digest can take it; any other digest (the BLAKE3 configurations)
-    // goes straight to the host search. Keyed on the concrete digest, exactly
-    // like the merkle backends' keccak fast paths — the unconditional
-    // validation below would reject a cross-hash nonce anyway, but only after
-    // wasting the full ~2^grinding_factor device search and logging a spurious
-    // invalid-nonce warning every table.
-    if core::any::TypeId::of::<D>()
-        != core::any::TypeId::of::<crypto::hash::platform_keccak::PlatformKeccak256>()
-    {
-        return generate_nonce::<D>(seed, grinding_factor);
+
+    // Pick the arm before doing any work. A configuration with no grind kernel
+    // (BLAKE3, RPO256, Poseidon) goes straight to the host search — the
+    // unconditional validation below would reject a cross-hash nonce anyway,
+    // but only after wasting the full ~2^grinding_factor device search and
+    // logging a spurious invalid-nonce warning every table.
+    enum Arm {
+        Keccak256,
+        Rpx256,
     }
+    let arm = match commitment_hash {
+        CommitmentHash::Keccak256
+            if core::any::TypeId::of::<D>()
+                == core::any::TypeId::of::<crypto::hash::platform_keccak::PlatformKeccak256>() =>
+        {
+            Arm::Keccak256
+        }
+        CommitmentHash::Rpx256 => Arm::Rpx256,
+        _ => return generate_nonce::<D>(seed, grinding_factor),
+    };
+
     // Kill switch (presence-based, matching `LAMBDA_VM_NO_GPU_LOGUP`):
     // `LAMBDA_VM_NO_GPU_GRIND` forces the CPU search — a production escape hatch
     // and fallback-path coverage. Cached; read once.
@@ -164,8 +220,19 @@ where
     if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
         return generate_nonce::<D>(seed, grinding_factor);
     }
-    let inner_lanes = inner_hash_lanes::<D>(seed, grinding_factor);
-    if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
+
+    let found = match arm {
+        Arm::Keccak256 => math_cuda::grinding::generate_nonce_gpu(
+            &inner_hash_lanes::<D>(seed, grinding_factor),
+            grinding_factor,
+        ),
+        Arm::Rpx256 => math_cuda::grinding::generate_nonce_rpx_gpu(
+            &inner_hash_felts::<D>(seed, grinding_factor),
+            grinding_factor,
+        ),
+    };
+
+    if let Some(nonce) = found {
         // Validate unconditionally (one host hash against the ~2^grinding_factor
         // device search): a kernel/driver defect must degrade to the CPU search,
         // never append an unverifiable nonce to the transcript. This runs in
@@ -179,15 +246,17 @@ where
         // set — and this is the only signal that the kernel has started
         // returning garbage and the feature has silently reverted to the CPU
         // search. Matches the `[gpu]` prefix the other device-decline paths use.
-        eprintln!(
-            "[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search"
-        );
+        eprintln!("[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search");
     }
     generate_nonce::<D>(seed, grinding_factor)
 }
 
 #[cfg(not(feature = "cuda"))]
-pub fn generate_nonce_maybe_gpu<D>(seed: &[u8; 32], grinding_factor: u8) -> Option<u64>
+pub fn generate_nonce_maybe_gpu<D>(
+    seed: &[u8; 32],
+    grinding_factor: u8,
+    _commitment_hash: crate::config::CommitmentHash,
+) -> Option<u64>
 where
     D: Digest + OutputSizeUser<OutputSize = U32> + 'static,
 {
