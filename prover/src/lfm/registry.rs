@@ -119,6 +119,13 @@ impl LfmRegistryEntry {
 
 /// A program's committed artifacts (what a registry entry pins).
 ///
+/// `PartialEq` + `Debug` because the gates compare two builds FIELD BY FIELD.
+/// Comparing `program_id` alone would pass on a value whose roots had drifted,
+/// since a digest is only as binding as the fields a test actually reads.
+/// `Clone` because the value is a few hundred bytes — fifteen roots, fifteen
+/// heights and two short chunk lists — and callers that hold one while handing
+/// another onward should not have to thread a borrow to do it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LfmArtifacts {
     pub roots: [Commitment; NUM_LFM_CHIPS],
     pub log_heights: [u8; NUM_LFM_CHIPS],

@@ -573,8 +573,8 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
 #[test]
 #[ignore = "box tier: proves a fixture continuation, k global slices and their parent"]
 fn the_global_slices_verify_and_sum_to_zero() {
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     const K: usize = 2;
@@ -615,7 +615,7 @@ fn the_global_slices_verify_and_sum_to_zero() {
         let (lo, hi) = partition.slice(i);
         let program = global_slice_program(&g, &partition, i);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let t = Instant::now();
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .unwrap_or_else(|e| panic!("global slice {i} (tables {lo}..{hi}) must prove: {e:?}"));
@@ -694,8 +694,7 @@ fn the_global_slices_verify_and_sum_to_zero() {
     // ---- the parent.
     let program = global_parent_program(&slices, &partition, slice_layout);
     let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
-    let artifacts =
-        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
         .unwrap_or_else(|e| panic!("★ THE GLOBAL PARENT MUST PROVE: {e:?}"));
@@ -1368,8 +1367,8 @@ fn assert_samplable(label: &str, shapes: &[&super::epoch::TableChallengeShape]) 
 fn the_leaf_node_verifies_and_binds_two_wraps() {
     use super::epoch_tests::Publishes;
     use super::per_table_aggregator::{FAN_IN, NodePublishSet, SchemaLayout};
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     let elf_bytes = super::proof_fixture::read_inner_elf();
@@ -1409,7 +1408,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove at the aggregation preset");
         let layout = SchemaLayout::wrap(out_halves);
@@ -1532,8 +1531,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     // ⓘ This measurement runs ONE proof, so it is always a cache MISS and the
     // figure below is a real build — which is what it is here to price.
     let t = Instant::now();
-    let artifacts =
-        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     println!(
         "   RSS high-water AFTER build_artifacts ({:.1}s): {:?} GiB",
         t.elapsed().as_secs_f64(),
@@ -1944,8 +1942,11 @@ fn prove_node_program_as_child(
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
     let t_arenas = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let artifacts =
-        super::registry::build_artifacts_with_hasher(program, opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = super::program_census::build_artifacts_counted(
+        program,
+        opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let t_artifacts = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let proved = cached_stage(mode, cache, label, || {
@@ -2021,8 +2022,8 @@ fn prove_node_program_as_child(
 fn the_inner_node_verifies_two_leaf_nodes() {
     use super::epoch_tests::Publishes;
     use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     let elf_bytes = super::proof_fixture::read_inner_elf();
@@ -2107,7 +2108,7 @@ fn the_inner_node_verifies_two_leaf_nodes() {
                 super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
             let arenas = super::epoch_tests::epoch_arena_words(&e, true);
             let artifacts =
-                build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
             let proved = cached_stage(
                 mode,
                 stage_path(cache_dir.as_deref(), &format!("wrap-{leaf}-{i}")),
@@ -2393,8 +2394,8 @@ fn mark(label: &str) {
 fn the_production_leaf_node_measures() {
     use super::epoch_tests::{EpochInputs, Publishes};
     use super::per_table_aggregator::{FAN_IN, SchemaLayout};
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     // ⛔ THE DEVICE, ASSERTED IN-PROCESS. `cfg!` rather than `#[cfg]` so the body
@@ -2532,7 +2533,7 @@ fn the_production_leaf_node_measures() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove");
         let layout = SchemaLayout::wrap(out_halves);
@@ -2649,8 +2650,7 @@ fn the_production_leaf_node_measures() {
     mark("BEFORE build_artifacts (this live figure IS L)");
 
     let t = Instant::now();
-    let artifacts =
-        build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     println!("   build_artifacts: {:.1}s", t.elapsed().as_secs_f64());
     mark("after build_artifacts");
     // Counters reset HERE, not at the top: the base prove and the wraps have
@@ -3025,8 +3025,8 @@ fn the_block_root_proves_over_real_children() {
     use super::block_root::{GlobalLayout, GlobalPublishes, RootOption, RootPublishSet};
     use super::epoch_tests::Publishes;
     use super::per_table_aggregator::{NodePublishSet, SchemaLayout, tree_shape};
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     const K: usize = 2;
@@ -3057,6 +3057,12 @@ fn the_block_root_proves_over_real_children() {
     let mut wraps: Vec<RealChild> = Vec::with_capacity(epochs);
     let mut wrap_layouts: Vec<SchemaLayout> = Vec::with_capacity(epochs);
     let mut wrap_labels: Vec<Vec<u64>> = Vec::with_capacity(epochs);
+    // ★ THE ARTIFACT-CACHE COUNT, ON A FIXTURE THE LAPTOP CAN RUN. The tree
+    // driver prints this per level on the box; this gate is the only place the
+    // number is reachable without one, which is what makes the pre-registration's
+    // "one or two distinct programs per level" checkable before a box run rather
+    // than after it.
+    super::program_census::begin_level();
     // One ELF parse and one DECODE commitment for the walk — see the tree
     // driver's level 0, which hoists the same pair for the same reason.
     let epoch_konsts = super::epoch_tests::EpochConstants::load(&elf_bytes, &inner, None)
@@ -3072,7 +3078,7 @@ fn the_block_root_proves_over_real_children() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove at the aggregation preset");
         let layout = SchemaLayout::wrap(out_halves);
@@ -3089,6 +3095,27 @@ fn the_block_root_proves_over_real_children() {
         "   {epochs} epoch wraps proved in {:.1}s",
         t.elapsed().as_secs_f64()
     );
+    let wrap_stats = super::program_census::end_level().expect("a window was open");
+    println!("   {}", wrap_stats.describe("level 0"));
+    // ⛔ AN ASSERT, NOT A PRINT ONLY. `N proofs, N distinct programs` is the
+    // measurement behind the ruling that there is nothing here to memoize, and
+    // a ruling that rests on an unasserted print is a ruling that rots. Every
+    // wrap pins its own epoch label as a program CONSTANT, so N/N is what the
+    // emitter guarantees; a run that ever reported fewer programs than proofs
+    // would mean the label pinning had changed and the memo was worth
+    // revisiting, and it must surface here rather than in a box log.
+    assert_eq!(
+        wrap_stats.proofs, epochs,
+        "every wrap must build its artifacts exactly once"
+    );
+    assert_eq!(
+        wrap_stats.distinct, epochs,
+        "sibling wraps differ by construction: {epochs} proofs must be {epochs} programs, \
+         not {}. If this ever fails, the epoch label stopped being a program constant \
+         and an artifact memo is back on the table",
+        wrap_stats.distinct,
+    );
+
     // ---- level 1: ONE node over every wrap. It is option B's interior child,
     // and the only thing that makes B's fold a real `hash_pair` rather than the
     // identity.
@@ -3104,7 +3131,7 @@ fn the_block_root_proves_over_real_children() {
     );
     let node_arenas: Vec<Vec<LfmWord>> = wraps.iter().flat_map(child_arena_words).collect();
     let node_artifacts =
-        build_artifacts_with_hasher(&node_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        build_artifacts_counted(&node_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     let node_proved = lfm_prove(&node_prog, &node_artifacts, &node_arenas, &wrap_opts)
         .expect("the leaf node must prove");
     let node_layout = SchemaLayout::node(node_out_halves);
@@ -3136,7 +3163,7 @@ fn the_block_root_proves_over_real_children() {
     for i in 0..K {
         let program = global_slice_program(&g, &partition, i);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let proved = lfm_prove(&program, &artifacts, &slice_arenas, &wrap_opts)
             .unwrap_or_else(|e| panic!("global slice {i} must prove: {e:?}"));
         assert_eq!(proved.public_words.len(), slice_layout.total());
@@ -3145,7 +3172,7 @@ fn the_block_root_proves_over_real_children() {
     let parent_prog = global_parent_program(&slices, &partition, slice_layout);
     let parent_arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
     let parent_artifacts =
-        build_artifacts_with_hasher(&parent_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        build_artifacts_counted(&parent_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
     let parent_proved = lfm_prove(&parent_prog, &parent_artifacts, &parent_arenas, &wrap_opts)
         .expect("the global parent must prove");
     let g_layout = g_shared();
@@ -3195,7 +3222,7 @@ fn the_block_root_proves_over_real_children() {
             .flat_map(child_arena_words)
             .collect();
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         // ⛔ `lfm_prove` and not `execute`: a root that EXECUTES has satisfied
         // every assert, and a root that PROVES and does not VERIFY is the failure
         // that reads as success. Only the pair says anything.
@@ -3316,8 +3343,8 @@ fn the_block_root_proves_over_real_children() {
 fn the_production_tree_composes_to_a_root() {
     use super::epoch_tests::{EpochInputs, Publishes};
     use super::per_table_aggregator::{FAN_IN, SchemaLayout, tree_node_count, tree_shape};
+    use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
-    use super::registry::build_artifacts_with_hasher;
     use std::time::Instant;
 
     // ⛔ THE DEVICE, ASSERTED IN-PROCESS — see the leaf measurement's own note.
@@ -3612,6 +3639,10 @@ fn the_production_tree_composes_to_a_root() {
 
     // ---- level 0: one wrap per epoch.
     let t_level = Instant::now();
+    // ★ See the interior loop: this is where the wrap programs are counted, and
+    // level 0 is the level the pre-registration expects TWO on — the 2-chunk
+    // epoch's sub-proof shape differs from the other eighteen's.
+    super::program_census::begin_level();
     // ★ THREE PARALLEL VECTORS, not a vector of structs, because `node_program`
     // and `prove_node_as_child` take `&[RealChild]` and `&[SchemaLayout]` — a
     // contiguous slice of each is exactly what a node's child group is, and
@@ -3659,7 +3690,7 @@ fn the_production_tree_composes_to_a_root() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         let proved = cached_stage(
             stage_mode(0),
             stage_path(cache_dir.as_deref(), &format!("wrap-{k}")),
@@ -3680,6 +3711,9 @@ fn the_production_tree_composes_to_a_root() {
         children.len(),
         t_level.elapsed().as_secs_f64()
     );
+    if let Some(stats) = super::program_census::end_level() {
+        println!("   {}", stats.describe("level 0"));
+    }
 
     // ---- level 0, the OTHER child: the GLOBAL WRAP.
     //
@@ -3760,7 +3794,7 @@ fn the_production_tree_composes_to_a_root() {
             let arenas = global_arena_words(&g);
             let t = Instant::now();
             let artifacts =
-                build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
             println!(
                 "\n★ PROVING global slice {slice} (tables {lo}..{hi}): \
                  build_artifacts {:.1}s",
@@ -3898,7 +3932,7 @@ fn the_production_tree_composes_to_a_root() {
         // emitted rather than a second spelling of it.
         let program = global_slice_program(&g, &partition, i);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         // ⛔ ONE CACHE NAME PER SHAPE, for the same reason there is one layout per
         // shape. The k = 1 wrap closes its bus against zero and a slice does not,
         // so they are DIFFERENT PROGRAMS with different `program_id`s: a slice
@@ -4069,7 +4103,7 @@ fn the_production_tree_composes_to_a_root() {
         census_and_panel(&program, "the GLOBAL PARENT", fan_in);
         let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         #[cfg(feature = "cuda")]
         stark::gpu_lde::reset_all_gpu_call_counters();
         let sampler = HostSampler::start();
@@ -4218,6 +4252,11 @@ fn the_production_tree_composes_to_a_root() {
     for (li, level) in shape.iter().enumerate().take(hi) {
         let level_no = li + 1;
         let t_level = Instant::now();
+        // ★ HOW MANY DISTINCT PROGRAMS THIS LEVEL ACTUALLY HAS. The artifact
+        // cache's premise is that a level's nodes share one — the pre-registration
+        // predicts one or two, and a level that reports as many programs as nodes
+        // is the falsifier, printed either way rather than assumed.
+        super::program_census::begin_level();
         let (mut next, mut next_layouts, mut next_labels) = (
             Vec::with_capacity(level.arities.len()),
             Vec::with_capacity(level.arities.len()),
@@ -4330,6 +4369,9 @@ fn the_production_tree_composes_to_a_root() {
             "   level {level_no}: {produced} nodes in {:.1}s",
             t_level.elapsed().as_secs_f64()
         );
+        if let Some(stats) = super::program_census::end_level() {
+            println!("   {}", stats.describe(&format!("level {level_no}")));
+        }
     }
     // ⛔ AND THE CAPTURE IS CHECKED HERE, in the driver, rather than being left
     // to abort inside the emitter. `children` must be the OUTPUT of the level
@@ -4512,7 +4554,7 @@ fn the_production_tree_composes_to_a_root() {
             .flat_map(child_arena_words)
             .collect();
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
         #[cfg(feature = "cuda")]
         stark::gpu_lde::reset_all_gpu_call_counters();
         let sampler = HostSampler::start();

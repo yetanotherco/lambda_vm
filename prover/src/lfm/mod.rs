@@ -46,6 +46,7 @@ pub mod lde;
 pub mod logup;
 pub mod per_table_aggregator;
 pub mod poseidon;
+pub mod program_census;
 pub mod programs;
 pub mod proof;
 pub mod proof_arena;
@@ -69,6 +70,7 @@ pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
 pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};
 pub use hash::{HasherKind, LfmHasher, TestPermutation};
 pub use instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr};
+pub use program_census::build_artifacts_counted;
 pub use proof::{LfmProof, LfmProveError, lfm_prove, lfm_verify, verify_against_artifacts};
 pub use registry::{
     LFM_REGISTRY, LfmArtifacts, LfmProgramKind, LfmRegistryEntry, LfmRegistryError,
