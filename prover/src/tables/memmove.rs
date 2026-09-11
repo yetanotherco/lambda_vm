@@ -910,17 +910,18 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_aligns_both_ends_or_neither() {
+    fn the_schedule_is_wide_until_the_tail_whatever_the_alignment() {
         use super::super::trace_builder::memmove_row_width_for_test as w;
-        // Matched residues (both 5 mod 8): one-byte rows until alignment, then wide.
-        assert_eq!(w(0x1005, 0x2005, 0, 24, false), 1);
-        assert_eq!(w(0x1005, 0x2005, 3, 21, false), 8);
-        // Mismatched: aligning `dst` would misalign `src`, so do not split at all.
-        assert_eq!(w(0x1002, 0x2005, 0, 24, false), 8);
-        // A short remainder always falls back to one byte a row.
+        // Alignment no longer enters into it: matched residues, mismatched residues
+        // and both-aligned all take eight bytes while eight remain.
+        for (src, dst) in [(0x1005u64, 0x2005u64), (0x1002, 0x2005), (0x1000, 0x2000)] {
+            assert_eq!(w(src, dst, 0, 24, false), 8, "src {src:#x} dst {dst:#x}");
+            assert_eq!(w(src, dst, 8, 16, false), 8, "src {src:#x} dst {dst:#x}");
+        }
+        // A short remainder is one byte a row, which is the only case that narrows.
         assert_eq!(w(0x1000, 0x2000, 16, 5, false), 1);
-        // A commit row ignores both residues: its width has to follow from the index.
+        assert_eq!(w(0x1005, 0x2005, 0, 7, false), 1);
+        // Commit is unchanged.
         assert_eq!(w(0x1002, 0x2005, 0, 24, true), 8);
-        assert_eq!(w(0x1005, 0x2005, 0, 24, true), 8);
     }
 }

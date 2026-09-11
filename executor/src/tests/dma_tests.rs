@@ -1,7 +1,7 @@
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER, ExecutionError,
-    memmove_row_width, memmove_trace_rows,
+    DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
+    ExecutionError, dma_memset_crosses_limb_boundary, memmove_row_width, memmove_trace_rows,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -77,8 +77,8 @@ fn dma_memcpy_rejects_oversized_direct_ecall() {
 #[test]
 fn dma_row_helpers_match_the_chunk_loop() {
     for count in 0..=DMA_MEMCPY_MAX_BYTES {
-        // The width depends on both ends' residues now, so the row count is pinned
-        // for matched and mismatched pairs alike.
+        // The width no longer depends on either end's alignment, but the pairs are
+        // kept so the row count stays pinned if a future schedule reintroduces it.
         for (src, dst) in [(0u64, 0u64), (5, 5), (7, 7), (0, 5), (2, 5), (8, 16)] {
             let mut chunks = 0u64;
             let mut remaining = count;
@@ -322,4 +322,38 @@ fn dma_memset_rejects_every_gap_but_one() {
     for addr in 0x2000..0x2010 {
         assert_eq!(memory.load_byte(addr), 0x5A, "byte at {addr:#x}");
     }
+}
+
+/// The predicate the guest stub's fallback branch is written against.
+///
+/// That branch is assembly and never runs on the host, so this is what pins its
+/// logic: the stub takes the plain store loop exactly when this says the range
+/// crosses, and the executor refuses the ecall on the same condition. If the two ever
+/// disagree, an honest `memset` either aborts or produces an unprovable trace.
+#[test]
+fn the_memset_limb_boundary_predicate_matches_the_rows_the_air_can_pin() {
+    // Brute force: for every low limb near the boundary and every legal length, the
+    // predicate must agree with "some row of this chain has a carrying low limb".
+    for n in [0u64, 1, 8, 9, 255, 256] {
+        for delta in 0..600u64 {
+            let dst = 0x1_0000_0000u64.wrapping_sub(delta);
+            let any_row_carries = (0..=n).any(|offset| {
+                let row_dst = dst.wrapping_add(offset);
+                (row_dst & 0xFFFF_FFFF) + DMA_MEMSET_GAP > 0xFFFF_FFFF
+            });
+            assert_eq!(
+                dma_memset_crosses_limb_boundary(dst, n),
+                any_row_carries,
+                "dst {dst:#x} (low {:#x}), n {n}",
+                dst & 0xFFFF_FFFF
+            );
+        }
+    }
+
+    // The stack top is the reachable case, and it is `main`'s own frame.
+    const STACK_TOP: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+    assert!(dma_memset_crosses_limb_boundary(STACK_TOP - 8, 256));
+    assert!(!dma_memset_crosses_limb_boundary(STACK_TOP - 264, 256));
+    // Ordinary heap buffers are nowhere near it.
+    assert!(!dma_memset_crosses_limb_boundary(0x1_0000, 256));
 }

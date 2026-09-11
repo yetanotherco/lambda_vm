@@ -74,31 +74,33 @@ pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 29;
 /// larger copies, and the prover enforces this bound on every first DMA row.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 
-/// Width of one MEMMOVE row: one byte until `dst` reaches eight-alignment, then
-/// eight while at least eight bytes remain, then one per remaining byte. Keeping
-/// the body aligned is what lets those rows take the `MEMW_A` fast path.
+/// Width of one MEMMOVE row: eight bytes while at least eight remain, then one per
+/// remaining byte.
+///
+/// The AIR does not require this schedule. `tail` is a free bit, constrained only by
+/// `(1 - tail) * lt8 = 0`, so a one-byte row is legal at any count and a prover may
+/// walk one-byte rows to reach eight-byte alignment and keep the body on the cheaper
+/// `MEMW_A` table. This function simply declines to.
+///
+/// It used to do exactly that, splitting whenever `src` and `dst` shared a residue
+/// mod 8. Measured on a real mainnet block, that cost more than it saved: prove time
+/// 109.169s without the split against 111.780s with it, with row counts lower and
+/// committed elements unchanged on three of four fixtures and lower on the fourth.
+/// The reason is that the chip has only two widths. Aligning an end costs up to seven
+/// one-byte rows at the head and shifts the tail into up to seven more, so buying two
+/// or three `MEMW_A` rows costs a dozen rows on the wider `MEMW` table. A schedule
+/// gated on a minimum body length could still win; the AIR already permits it, so it
+/// can be added later without touching the constraint system or the proof format.
+///
+/// `src`, `dst`, `offset` and `to_commit` stay in the signature for that reason: every
+/// consumer — the executor's row count, the trace builder, the sizing pass and the CLI
+/// report — already routes through here, so a future schedule needs no new plumbing.
 pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64, to_commit: bool) -> u8 {
     if remaining < 8 {
         return 1;
     }
-    // A commit row's width has to follow from the global byte index alone: the verifier
-    // rebuilds the COMMIT tuples out of `public_output`, and it knows the index, not the
-    // guest buffer the bytes were read from. Eight until fewer than eight remain.
-    if to_commit {
-        return 8;
-    }
-    // Only split when the two ends share a residue mod 8. Aligning `dst` alone
-    // pushes `src` out of alignment on every call whose residues differ — 59% of
-    // them on a real block — and measures as a net loss; splitting only on matched
-    // residues aligns both ends or neither.
-    if src % 8 != dst % 8 {
-        return 8;
-    }
-    if dst.wrapping_add(offset).is_multiple_of(8) {
-        8
-    } else {
-        1
-    }
+    let _ = (src, dst, offset, to_commit);
+    8
 }
 
 /// Total MEMMOVE rows one ecall produces: its data rows plus the terminal row.
@@ -146,6 +148,21 @@ pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
 /// every `is_set` row, and this constant is what both sides import so the two
 /// bounds cannot drift.
 pub const DMA_MEMSET_GAP: u64 = 8;
+
+/// Whether a memset over `[dst, dst + n)` would straddle the 2^32 limb boundary.
+///
+/// The AIR pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
+/// limb carries has no representable successor. The executor refuses such a call and
+/// the guest stub steers around it with a plain store loop; this is the single
+/// predicate both sides are written against, so they cannot drift.
+///
+/// It is not a theoretical case. The stack starts at `STACK_TOP = 0xFFFF_FFFF_FFFF_FFF0`,
+/// whose low limb is `0xFFFF_FFF0`, so a buffer within `n + 8` bytes of the stack top
+/// crosses — which is `main`'s own frame.
+pub const fn dma_memset_crosses_limb_boundary(dst: u64, n: u64) -> bool {
+    // `n` is bounded by DMA_MEMCPY_MAX_BYTES on the ecall path, so this cannot wrap.
+    (dst & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF
+}
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -744,9 +761,7 @@ impl Instruction {
                         // gap in full 64-bit arithmetic but not limb-wise. Bounding the
                         // starting limb alone would accept an execution no prover can
                         // then prove.
-                        if (src & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF
-                            || dst != src + DMA_MEMSET_GAP
-                        {
+                        if dma_memset_crosses_limb_boundary(src, n) || dst != src + DMA_MEMSET_GAP {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
                         }
 
