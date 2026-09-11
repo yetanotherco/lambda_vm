@@ -293,11 +293,16 @@ fn phases() {
         None,
     );
     let pairs = airs.air_trace_pairs(&mut traces);
+    // The table's own shape, the way `multilinear_prove::shapes_of` reads it:
+    // transposing the trace to count it is the whole trace copied for two
+    // numbers, and it would land outside every phase below.
     let shapes: Vec<(usize, usize)> = pairs
         .iter()
         .map(|(_, trace, _)| {
-            let columns = trace.columns_main();
-            (columns.len(), columns[0].len().trailing_zeros() as usize)
+            (
+                trace.main_table.width,
+                trace.main_table.height.trailing_zeros() as usize,
+            )
         })
         .collect();
     let mut config = multilinear_prove::chain_config(&shapes);
