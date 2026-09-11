@@ -12,7 +12,13 @@
 //!             canonicalisation witness (see `permutation_inputs`);
 //!   Table 3 — the rate-8 OVERWRITE-duplex leaf (`algebraic_commit::sponge_leaf`)
 //!             at lengths 0, 1, 7, 8, 9, 16, 17 felts;
-//!   Table 4 — the parent `compress(l, r)` = one permutation of `[l ‖ r ‖ 0⁴]`.
+//!   Table 4 — the parent `compress(l, r)` = one permutation of `[l ‖ r ‖ 0⁴]`;
+//!   Table 5 — the proof-of-work grind: the inner hash's four BIG-endian felts
+//!             and the SMALLEST valid nonce, at three grinding factors, taken
+//!             through the production predicate `stark::grinding::is_valid_nonce`
+//!             over `GrindingDigest<RpxStarkHash>` — plus, as the endianness
+//!             control, what the same kernel returns on the little-endian
+//!             reading of the same inner hash.
 //!
 //! Every printed value is CANONICAL (`< p`), and the harness compares the
 //! kernel's output against it RAW — the kernel's final canonicalisation loop
@@ -28,10 +34,15 @@
 //! fixed seeds and printed alongside the outputs, so the header stays
 //! self-contained data — the harness never regenerates anything.
 
-use lambda_vm_prover::lfm::algebraic_commit::sponge_leaf;
+use lambda_vm_prover::lfm::algebraic_commit::{RpxStarkHash, digest_to_commitment, sponge_leaf};
 use lambda_vm_prover::lfm::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use lambda_vm_prover::lfm::rpx::Rpx256;
 use lambda_vm_prover::tables::types::FE;
+use stark::config::GrindingDigest;
+use stark::grinding::{inner_hash_felts, is_valid_nonce};
+
+/// The digest the RPX configuration grinds over — its transcript's hash.
+type RpxGrind = GrindingDigest<RpxStarkHash>;
 
 /// The Goldilocks prime, for canonicalising raw values and for the `p − 1`
 /// input.
@@ -134,6 +145,30 @@ fn permutation_inputs() -> Vec<(&'static str, [u64; HASH_STATE_FELTS])> {
     v
 }
 
+/// The grind rows: `(seed byte, grinding factor)`. The seed is the byte
+/// repeated 32 times, as `transcript.state()` never is — which is the point,
+/// since a vector wants to be reproducible from the header alone rather than
+/// from a prover run.
+///
+/// The factors are small so the harness can scan `[0, nonce]` one permutation
+/// at a time in a fraction of a second, and large enough that a broken kernel
+/// cannot pass by luck: at factor 12 a wrong hash lands under the limit with
+/// probability 2⁻¹².
+const GRIND_ROWS: [(u8, u8); 3] = [(0x5a, 12), (0x11, 13), (0x20, 14)];
+
+/// The device predicate, spelled out over an explicit felt block.
+///
+/// Used ONLY for the endianness control below. The pinned rows go through
+/// `is_valid_nonce`, the production predicate, which takes a seed and so cannot
+/// be pointed at a deliberately wrong reading of the inner hash.
+fn grind_head(inner: &[u64; 4], nonce: u64) -> u64 {
+    let felts: [FE; 5] = core::array::from_fn(|i| {
+        FE::from(if i < 4 { inner[i] } else { nonce })
+    });
+    let commitment = digest_to_commitment(&sponge_leaf(HasherKind::Rpx, &felts));
+    u64::from_be_bytes(commitment[..8].try_into().unwrap())
+}
+
 #[test]
 #[ignore = "prints the Rust-oracle tables for rpx_kat_vectors.h; run with --ignored --nocapture"]
 fn print_rpx_host_kat_vectors() {
@@ -216,6 +251,54 @@ fn print_rpx_host_kat_vectors() {
             cpp_list(l),
             cpp_list(r),
             cpp_list(&got)
+        ));
+    }
+    out.push_str("};\n");
+    // ---- Table 5: the proof-of-work grind ---------------------------------
+    out.push_str(&format!(
+        "\ninline constexpr int NUM_RPX_GRIND_VECTORS = {};\n",
+        GRIND_ROWS.len()
+    ));
+    out.push_str("inline constexpr RpxGrindVector RPX_GRIND_VECTORS[NUM_RPX_GRIND_VECTORS] = {\n");
+    for &(seed_byte, factor) in &GRIND_ROWS {
+        let seed = [seed_byte; 32];
+        let be = inner_hash_felts::<RpxGrind>(&seed, factor);
+        // The SMALLEST valid nonce, by the production predicate. `generate_nonce`
+        // would do, but its `find_any` returns an arbitrary one and the harness
+        // pins minimality as its completeness probe.
+        let nonce = (0u64..)
+            .find(|&n| is_valid_nonce::<RpxGrind>(&seed, n, factor))
+            .expect("a valid nonce exists at these factors");
+        // The endianness control: the same inner hash read the way keccak's
+        // lanes are. Its answer over the same range must differ, which is what
+        // makes the harness's BE row a claim about the reading and not just
+        // about the permutation.
+        let limit = 1u64 << (64 - factor);
+        // ★ CROSS-CHECK, not decoration: `is_valid_nonce` reaches the sponge
+        // through `AlgebraicDigest`'s byte buffer and `felts_from_bytes`, while
+        // `grind_head` builds the five felts directly — the way the kernel
+        // does. Agreeing on the whole scanned range is what says the device's
+        // felt block IS the host's message, and it is the one claim a device
+        // test on a box cannot make cheaply.
+        assert!(
+            (0..=nonce).all(|n| (grind_head(&be, n) < limit)
+                == is_valid_nonce::<RpxGrind>(&seed, n, factor)),
+            "the explicit felt block and the production predicate disagree \
+             at seed {seed_byte:#x} factor {factor}"
+        );
+        let le: [u64; 4] = core::array::from_fn(|i| be[i].swap_bytes());
+        let le_nonce = (0..=nonce)
+            .find(|&n| grind_head(&le, n) < limit)
+            .map_or(u64::MAX, |n| n);
+        assert_ne!(
+            le_nonce, nonce,
+            "the endianness control is vacuous at seed {seed_byte:#x} factor {factor}"
+        );
+        out.push_str(&format!(
+            "    {{{seed_byte}u, {factor}u,\n     {{{}}},\n     {}ull, {}ull}},\n",
+            cpp_list(&be),
+            nonce,
+            le_nonce
         ));
     }
     out.push_str("};\n");

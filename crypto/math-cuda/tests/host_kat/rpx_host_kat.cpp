@@ -39,6 +39,11 @@
 //      replayed thread by thread through the shim against the CPU leaf spec
 //      and the host parent — the read patterns and the node encoding, with the
 //      hash over them anchored by the layers above.
+//   8. The proof-of-work grind kernel against the HOST predicate
+//      `stark::grinding::is_valid_nonce` over `AlgebraicDigest<RpxCommit>` —
+//      the nonce, its minimality, that `base` participates, and an endianness
+//      control (the little-endian reading of the same inner hash finds nothing
+//      where the big-endian one finds the nonce).
 //
 // Build and run with `make test-rpx-host-kat`.
 
@@ -995,6 +1000,82 @@ void permute_probe_matches_the_oracle_table() {
            NUM_RPX_PERMUTATION_VECTORS);
 }
 
+// ---------------------------------------------------------------------------
+// Layer 8 — the proof-of-work grind kernel.
+//
+// `rpx_grind_search` is the one kernel whose correctness is a statement about
+// a HOST predicate rather than about the permutation: it has to search for the
+// nonces `stark::grinding::is_valid_nonce` accepts over
+// `AlgebraicDigest<RpxCommit>`, and the two reach the sponge by different
+// routes — the host through a byte buffer and `felts_from_bytes`, the kernel by
+// building the five felts directly. Table 5's rows are that agreement, pinned
+// on the Rust side (the generator asserts the two routes match over the whole
+// scanned range) and reproduced here through the kernel entry point.
+//
+// Driven single-threaded, so what this covers is the per-candidate arithmetic
+// and the loop bounds. That the parallel `atomicMin` reduction returns the same
+// answer is a property of a real launch, and belongs to the GPU test.
+// ---------------------------------------------------------------------------
+uint64_t run_grind(const uint64_t inner[4], uint8_t factor, uint64_t base, uint64_t count) {
+    const uint64_t limit = (uint64_t)1 << (64 - factor);
+    uint64_t result = UINT64_MAX;
+    CUDA_HOST_SINGLE_THREAD();
+    rpx_grind_search(inner, limit, base, count, (volatile unsigned long long *)&result);
+    return result;
+}
+
+void grind_kernel_finds_the_nonce_the_host_predicate_accepts() {
+    for (int n = 0; n < NUM_RPX_GRIND_VECTORS; ++n) {
+        const RpxGrindVector &v = RPX_GRIND_VECTORS[n];
+        char what[160];
+
+        // The nonce is in range: the kernel returns exactly it, and it is the
+        // SMALLEST — a stride or bounds defect would still return a *valid*
+        // nonce, just not the first one, which plain validity cannot see.
+        snprintf(what, sizeof what,
+                 "rpx_grind_search must return the host's nonce %llu (seed 0x%02x, factor %u)",
+                 (unsigned long long)v.nonce, v.seed_byte, v.factor);
+        check(run_grind(v.inner_felts, v.factor, 0, v.nonce + 1) == v.nonce, what);
+
+        // One short of it: nothing in `[0, nonce)` passes, so the kernel must
+        // leave the sentinel alone. This is what says the nonce above is the
+        // first — and it exercises the not-found path the launcher's range walk
+        // depends on.
+        snprintf(what, sizeof what,
+                 "rpx_grind_search must find nothing below %llu (seed 0x%02x, factor %u)",
+                 (unsigned long long)v.nonce, v.seed_byte, v.factor);
+        check(run_grind(v.inner_felts, v.factor, 0, v.nonce) == UINT64_MAX, what);
+
+        // Offset base: the same nonce is found when the block starts inside the
+        // range, which pins that `base` participates rather than being ignored.
+        if (v.nonce > 0) {
+            snprintf(what, sizeof what,
+                     "rpx_grind_search must honour base (seed 0x%02x, factor %u)", v.seed_byte,
+                     v.factor);
+            check(run_grind(v.inner_felts, v.factor, v.nonce, 1) == v.nonce, what);
+        }
+
+        // ★ THE ENDIANNESS CONTROL. `felts_from_bytes` reads big-endian and
+        // keccak's `inner_hash_lanes` reads little-endian; feeding the kernel
+        // the wrong one compiles, runs, and searches a message the host never
+        // hashes. The same kernel on the byte-swapped inner hash must give the
+        // oracle's `le_nonce` — which is the sentinel for every row here, i.e.
+        // it finds NOTHING where the correct reading finds the nonce.
+        uint64_t swapped[4];
+        for (int i = 0; i < 4; ++i) {
+            uint64_t x = v.inner_felts[i], y = 0;
+            for (int b = 0; b < 8; ++b) y |= ((x >> (8 * b)) & 0xffull) << (8 * (7 - b));
+            swapped[i] = y;
+        }
+        snprintf(what, sizeof what,
+                 "the LE reading must not answer the BE one (seed 0x%02x, factor %u)", v.seed_byte,
+                 v.factor);
+        check(run_grind(swapped, v.factor, 0, v.nonce + 1) == v.le_nonce, what);
+    }
+    printf("grind kernel: %d oracle rows — nonce, minimality, base, and the endianness control\n",
+           NUM_RPX_GRIND_VECTORS);
+}
+
 }  // namespace
 
 int main() {
@@ -1024,6 +1105,8 @@ int main() {
     row_major_leaf_kernels_read_the_specified_felts();
     merkle_compressors_match_the_host_parent();
     permute_probe_matches_the_oracle_table();
+    printf("\n-- layer 8: the proof-of-work grind kernel against the host predicate --\n");
+    grind_kernel_finds_the_nonce_the_host_predicate_accepts();
     if (failures != 0) {
         printf("\n*** %d FAILURE(S) ***\n", failures);
         return 1;
