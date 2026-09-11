@@ -1,16 +1,16 @@
 //! Host tests for the untrusted-hint verify-then-fallback paths (`scalar_inv`,
 //! `field_inv`, `decompress_r`).
 //!
-//! The guest asks the (untrusted, prover-chosen) `hint` ecall for a modular
-//! inverse / square root, then verifies it in-circuit. These tests inject the
-//! oracle directly — an *honest* oracle (matching the executor's `compute_hint`)
-//! and a *lying* one — and assert the software fallback makes the result identical
-//! either way. That is the property the whole hint design rests on: because the
-//! prover chooses the hinted bytes and the ecall adds no correctness constraint, a
-//! bad hint must only be able to make the guest do more work, never change its
-//! accept/reject outcome. On the guest this code is `cfg(target_arch = "riscv64")`;
-//! the `test` gate on `*_with_oracle` is what lets CI compile and exercise it on
-//! the host.
+//! The guest reads each modular inverse / square root from the untrusted,
+//! prover-chosen private-input **hint arena**, then verifies it in-circuit.
+//! These tests inject the oracle directly — an *honest* oracle (matching the
+//! executor's `compute_hint`) and a *lying* one — and assert the software
+//! fallback makes the result identical either way. That is the property the
+//! whole hint design rests on: because the prover chooses the arena bytes and
+//! they are unconstrained, a bad hint must only be able to make the guest do
+//! more work, never change its accept/reject outcome. On the guest this code
+//! is `cfg(target_arch = "riscv64")`; the `test` gate on `*_with_oracle` is
+//! what lets CI compile and exercise it on the host.
 
 use crate::*;
 

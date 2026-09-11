@@ -53,8 +53,8 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
     create_register_air, create_shift_air, create_store_air,
 };
@@ -82,8 +82,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, register, ecsm, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -522,7 +522,6 @@ pub(crate) struct VmAirs {
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
-    pub hint: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -548,7 +547,6 @@ impl VmAirs {
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
-            (self.hint.as_ref(), &mut traces.hint, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -623,7 +621,6 @@ impl VmAirs {
             self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
-            self.hint.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -795,7 +792,6 @@ impl VmAirs {
         ));
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
-        let hint: VmAir = Box::new(create_hint_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -916,7 +912,6 @@ impl VmAirs {
             keccak_rc,
             ecsm,
             ecdas,
-            hint,
             register,
             pages,
             memw_registers,
@@ -1048,6 +1043,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
 }
 
 /// Prove an ELF binary execution with private inputs. Returns a serializable proof bundle.
+///
+/// A hint-consuming guest needs nothing extra from the caller: the executor
+/// answers each hint request as the guest makes it, inside the single execution
+/// this call already performs, and the arena that run produced is what the
+/// trace commits.
 pub fn prove_with_inputs(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<VmProof, Error> {
     prove_with_options_and_inputs(
         elf_bytes,
@@ -1072,11 +1072,15 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The arena the run produced. Counting against anything else would count a
+    // different region than the one the guest read.
+    let hints = &result.hints;
     let traces = Traces::from_elf_and_logs(
         &program,
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
+        hints,
         #[cfg(feature = "disk-spill")]
         StorageMode::Ram,
     )?;
@@ -1121,9 +1125,12 @@ pub fn prove_with_options_and_inputs(
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
-    let result = executor
+    let mut result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The arena the run produced. Taken out of `result` because the trace build
+    // drops `result` while still needing the arena.
+    let hints = std::mem::take(&mut result.hints);
 
     #[cfg(feature = "instruments")]
     drop(__sp);
@@ -1140,7 +1147,8 @@ pub fn prove_with_options_and_inputs(
 
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
-        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
+        let lengths =
+            count_table_lengths(&program, &result.logs, max_rows, private_inputs, &hints)?;
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
@@ -1149,6 +1157,7 @@ pub fn prove_with_options_and_inputs(
         &result.logs,
         max_rows,
         private_inputs,
+        &hints,
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;

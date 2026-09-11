@@ -47,8 +47,6 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
-pub mod hint_tests;
-#[cfg(test)]
 pub mod ir_stats_dump;
 #[cfg(test)]
 pub mod keccak_rnd_tests;

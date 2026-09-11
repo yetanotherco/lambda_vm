@@ -156,6 +156,7 @@ fn craft_proof(
         &result.logs,
         &max_rows,
         private_inputs,
+        &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -541,7 +542,7 @@ fn poc_real_ethrex_inputs_produce_private_input_pages() {
         let Ok(bytes) = std::fs::read(&path) else {
             continue; // fixture not present in this checkout
         };
-        let pages = private_input_page_count(&bytes);
+        let pages = private_input_page_count(&bytes, 0);
         println!(
             "{name}: {} bytes -> {pages} private-input page(s) = {} free-OFFSET rows",
             bytes.len(),
@@ -641,6 +642,7 @@ fn craft_proof_with_duplicate_page(
         &program,
         &result.logs,
         &max_rows,
+        &[],
         &[],
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
