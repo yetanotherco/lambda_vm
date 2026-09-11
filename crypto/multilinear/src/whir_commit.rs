@@ -31,9 +31,49 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     tree: Tree<F>,
-    codeword: Vec<FieldElement<F>>,
+    codeword: Codeword<F>,
     log_folding: usize,
     log_domain_size: usize,
+}
+
+/// Where a commitment's codeword lives.
+///
+/// A device commit leaves it there and the chain folds it there: it is the
+/// biggest array the proof holds, and all the host needs of it is the handful
+/// of values a query opens.
+#[derive(Debug)]
+pub enum Codeword<F: IsField> {
+    Host(Vec<FieldElement<F>>),
+    Device(crate::gpu::DeviceCodeword),
+}
+
+impl<F: IsField> Codeword<F> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(values) => values.len(),
+            Self::Device(device) => device.elements(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The values on the host, when they are there.
+    pub fn host(&self) -> Option<&[FieldElement<F>]> {
+        match self {
+            Self::Host(values) => Some(values),
+            Self::Device(_) => None,
+        }
+    }
+
+    /// The device holding them, when one does.
+    pub fn device(&self) -> Option<&crate::gpu::DeviceCodeword> {
+        match self {
+            Self::Host(_) => None,
+            Self::Device(device) => Some(device),
+        }
+    }
 }
 
 /// One opened block, with its authentication path.
@@ -119,7 +159,7 @@ where
             let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
             return Ok(Self {
                 tree,
-                codeword,
+                codeword: Codeword::Host(codeword),
                 log_folding,
                 log_domain_size,
             });
@@ -166,16 +206,16 @@ where
         let tree = Tree::<F>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
-            codeword,
+            codeword: Codeword::Host(codeword),
             log_folding,
             log_domain_size,
         })
     }
 
     /// The same, with the codeword and the tree both already computed — a
-    /// device commit. The nodes carry no proof of their own correctness, so the
-    /// caller answers for the layout: `2*num_leaves - 1` nodes, root first,
-    /// leaves last.
+    /// device commit that handed the codeword back. The nodes carry no proof
+    /// of their own correctness, so the caller answers for the layout:
+    /// `2*num_leaves - 1` nodes, root first, leaves last.
     pub fn from_precomputed(
         codeword: Vec<FieldElement<F>>,
         nodes: Vec<Commitment>,
@@ -194,7 +234,34 @@ where
         let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
-            codeword,
+            codeword: Codeword::Host(codeword),
+            log_folding,
+            log_domain_size,
+        })
+    }
+
+    /// A commitment whose codeword stays on the device that built it, with the
+    /// tree that device built beside it.
+    pub fn from_device(
+        codeword: crate::gpu::DeviceCodeword,
+        nodes: Vec<Commitment>,
+        log_folding: usize,
+    ) -> Result<Self, Error> {
+        let elements = codeword.elements();
+        if !elements.is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(elements));
+        }
+        let log_domain_size = elements.trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
+        let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
+        Ok(Self {
+            tree,
+            codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
         })
@@ -221,8 +288,55 @@ where
     /// The prover folds from here rather than encoding a second time — on a
     /// real trace that second NTT is the most expensive thing in the proof
     /// after the sumcheck, and it computes something already in memory.
-    pub fn codeword(&self) -> &[FieldElement<F>] {
+    pub fn codeword(&self) -> &Codeword<F> {
         &self.codeword
+    }
+
+    /// Opens every block a round asks for.
+    ///
+    /// One call rather than one per query: on a device the blocks are gathered
+    /// in a single pass over the codeword, and a round asks for a hundred of
+    /// them.
+    pub fn open_many(&self, indices: &[usize]) -> Result<Vec<CosetOpening<F>>, Error> {
+        let num_leaves = self.num_leaves();
+        let proofs = indices
+            .iter()
+            .map(|index| {
+                self.tree
+                    .get_proof_by_pos(*index)
+                    .ok_or(Error::QueryOutOfRange {
+                        index: *index,
+                        bound: num_leaves,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let block = 1usize << self.log_folding;
+        let blocks: Vec<Vec<FieldElement<F>>> = match &self.codeword {
+            Codeword::Host(values) => indices
+                .iter()
+                .map(|index| {
+                    coset_of(*index, self.log_domain_size, self.log_folding)
+                        .into_iter()
+                        .map(|p| values[p].clone())
+                        .collect()
+                })
+                .collect(),
+            Codeword::Device(device) => {
+                device
+                    .cosets(indices, num_leaves, block)
+                    .ok_or(Error::QueryOutOfRange {
+                        index: 0,
+                        bound: num_leaves,
+                    })?
+            }
+        };
+
+        Ok(blocks
+            .into_iter()
+            .zip(proofs)
+            .map(|(values, proof)| CosetOpening { values, proof })
+            .collect())
     }
 
     /// Opens the block that folds onto `index`.
@@ -235,13 +349,22 @@ where
                 index,
                 bound: num_leaves,
             })?;
-        Ok(CosetOpening {
-            values: coset_of(index, self.log_domain_size, self.log_folding)
+        let values = match &self.codeword {
+            Codeword::Host(values) => coset_of(index, self.log_domain_size, self.log_folding)
                 .into_iter()
-                .map(|p| self.codeword[p].clone())
+                .map(|p| values[p].clone())
                 .collect(),
-            proof,
-        })
+            // A query opens `2^log_folding` values of an array that is not
+            // here: that is a gather, not a codeword coming back.
+            Codeword::Device(device) => device
+                .cosets(&[index], num_leaves, 1usize << self.log_folding)
+                .and_then(|blocks| blocks.into_iter().next())
+                .ok_or(Error::QueryOutOfRange {
+                    index,
+                    bound: num_leaves,
+                })?,
+        };
+        Ok(CosetOpening { values, proof })
     }
 }
 

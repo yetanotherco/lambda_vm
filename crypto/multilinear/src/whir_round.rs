@@ -93,17 +93,14 @@ where
 {
     let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
 
-    let mut current_openings = Vec::with_capacity(queries.len());
-    let mut next_openings = Vec::with_capacity(queries.len());
-    for &q in &queries {
-        current_openings.push(current.open(q)?);
-        let (leaf, _) = leaf_and_slot(q, next.num_leaves());
-        next_openings.push(next.open(leaf)?);
-    }
+    let leaves: Vec<usize> = queries
+        .iter()
+        .map(|q| leaf_and_slot(*q, next.num_leaves()).0)
+        .collect();
 
     Ok(RoundProof {
-        current: current_openings,
-        next: next_openings,
+        current: current.open_many(&queries)?,
+        next: next.open_many(&leaves)?,
     })
 }
 

@@ -55,7 +55,7 @@ use crate::{
     poly::Composed,
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
-    whir_commit::{CodewordCommitment, Commitment, fold_coset, verify_opening},
+    whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening},
     whir_round::{self, RoundCommitments, RoundConfig, RoundProof},
 };
 
@@ -356,8 +356,10 @@ where
     let schedule = config.schedule(f.num_vars());
     let first = schedule.first().copied().unwrap_or(0);
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
-    let commitment = match crate::gpu::commit_codeword(f.evals(), config.log_blowup, first) {
-        Some((codeword, nodes)) => CodewordCommitment::from_precomputed(codeword, nodes, first)?,
+    // On a device the codeword stays there: the chain folds it and opens a
+    // handful of its values, and it is the biggest array the proof holds.
+    let commitment = match crate::gpu::commit_resident(f.evals(), config.log_blowup, first) {
+        Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
         None => CodewordCommitment::from_codeword(
             encode::<F, F>(&lift_coefficients(f), &domain)?,
             first,
@@ -603,13 +605,12 @@ where
         let (sumcheck_rounds, alphas) = factors.rounds(k, transcript)?;
 
         // The fold lands in the extension whichever field it started in, so
-        // this is the only place the two cases differ.
+        // the field is the only thing the two cases differ in — and a codeword
+        // the device holds is folded where it is.
         let (folded, folded_domain) = match &current {
-            Current::Base(held) => {
-                fold_codeword_k::<F, F, E>(held.codeword(), &current_domain, &alphas)?
-            }
+            Current::Base(held) => fold_held::<F, F, E>(held.codeword(), &current_domain, &alphas)?,
             Current::Extension(held) => {
-                fold_codeword_k::<F, E, E>(held.codeword(), &current_domain, &alphas)?
+                fold_held::<F, E, E>(held.codeword(), &current_domain, &alphas)?
             }
         };
 
@@ -617,12 +618,12 @@ where
         // be chosen to match them.
         let next = match schedule.get(r + 1) {
             Some(&next_k) => {
-                let next = CodewordCommitment::from_codeword(folded, next_k)?;
+                let next = commit_folded::<E>(folded, next_k)?;
                 transcript.append_bytes(&next.root());
                 Some(next)
             }
             None => {
-                final_value = folded[0].clone();
+                final_value = first_value::<E>(&folded)?;
                 transcript.append_field_element(&final_value);
                 None
             }
@@ -685,6 +686,66 @@ where
     })
 }
 
+/// Folds a codeword wherever it is, leaving the result where it was.
+fn fold_held<F, C, N>(
+    codeword: &Codeword<C>,
+    domain: &Domain<F>,
+    alphas: &[FieldElement<N>],
+) -> Result<(Codeword<N>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N> + 'static,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+{
+    if let Some(folded) = codeword
+        .device()
+        .and_then(|device| device.fold(domain.generator(), alphas))
+    {
+        let mut folded_domain = domain.clone();
+        for _ in alphas {
+            folded_domain = folded_domain.squared()?;
+        }
+        return Ok((Codeword::Device(folded), folded_domain));
+    }
+    let values = codeword.host().ok_or(Error::EmptyPolynomial)?;
+    let (folded, folded_domain) = fold_codeword_k::<F, C, N>(values, domain, alphas)?;
+    Ok((Codeword::Host(folded), folded_domain))
+}
+
+/// Commits a folded codeword where it is.
+fn commit_folded<N>(
+    codeword: Codeword<N>,
+    log_folding: usize,
+) -> Result<CodewordCommitment<N>, Error>
+where
+    N: IsField + 'static,
+    FieldElement<N>: AsBytes + Sync + Send,
+{
+    match codeword {
+        Codeword::Host(values) => CodewordCommitment::from_codeword(values, log_folding),
+        Codeword::Device(device) => {
+            let nodes = device
+                .commit(log_folding)
+                .ok_or(Error::DeviceFailed { stage: "fold tree" })?;
+            CodewordCommitment::from_device(device, nodes, log_folding)
+        }
+    }
+}
+
+/// The value the last fold leaves behind.
+fn first_value<N>(codeword: &Codeword<N>) -> Result<FieldElement<N>, Error>
+where
+    N: IsField + 'static,
+{
+    match codeword {
+        Codeword::Host(values) => values.first().cloned().ok_or(Error::EmptyPolynomial),
+        Codeword::Device(device) => device.first().ok_or(Error::DeviceFailed {
+            stage: "final value",
+        }),
+    }
+}
+
 /// The last round's openings: only the current codeword's blocks, since what
 /// they fold to is the constant the prover sends.
 ///
@@ -701,14 +762,11 @@ where
     FieldElement<C>: AsBytes + Sync + Send,
     T: IsTranscript<N>,
 {
-    let openings = (0..config.num_queries)
-        .map(|_| {
-            let q = transcript.sample_u64(current.num_leaves() as u64) as usize;
-            current.open(q)
-        })
-        .collect::<Result<_, _>>()?;
+    let queries: Vec<usize> = (0..config.num_queries)
+        .map(|_| transcript.sample_u64(current.num_leaves() as u64) as usize)
+        .collect();
     Ok(RoundProof {
-        current: openings,
+        current: current.open_many(&queries)?,
         next: Vec::new(),
     })
 }

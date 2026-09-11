@@ -129,7 +129,12 @@ where
 
     // From the commitment, not a second encoding: it is the same array, and a
     // prover that folded a different one could not then answer the openings.
-    let (folded, _) = fold_codeword_k::<F, E, E>(commitment.codeword(), domain, &alphas)?;
+    // This path builds its own commitment on the host, so the codeword is here.
+    let values = commitment
+        .codeword()
+        .host()
+        .ok_or(crate::Error::EmptyPolynomial)?;
+    let (folded, _) = fold_codeword_k::<F, E, E>(values, domain, &alphas)?;
     let final_value = folded[0].clone();
     transcript.append_field_element(&final_value);
 

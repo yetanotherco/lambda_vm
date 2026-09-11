@@ -69,65 +69,10 @@ type SumcheckRounds<E> = (
     Vec<crate::mle::Mle<E>>,
 );
 
-/// A committed codeword and the Merkle tree over its fold blocks.
-type CommittedCodeword<F> = (Vec<math::field::element::FieldElement<F>>, Vec<[u8; 32]>);
-
 /// Codeword size below which the host wins: the kernels are a dozen launches
 /// and a round trip, and a small NTT finishes in host cache before that.
 #[cfg(feature = "cuda")]
 const COMMIT_THRESHOLD: usize = 1 << 16;
-
-/// Commits one stacked polynomial on device, returning its codeword in domain
-/// order and its Merkle tree in the host node layout.
-#[cfg(feature = "cuda")]
-pub(crate) fn commit_codeword<F>(
-    evals: &[math::field::element::FieldElement<F>],
-    log_blowup: usize,
-    log_folding: usize,
-) -> Option<CommittedCodeword<F>>
-where
-    F: math::field::traits::IsField + 'static,
-{
-    use math::field::element::FieldElement;
-    use math::field::goldilocks::GoldilocksField;
-
-    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    if !evals.len().is_power_of_two() || evals.len() < 2 {
-        return None;
-    }
-    if evals.len() << log_blowup < COMMIT_THRESHOLD {
-        return None;
-    }
-    // Presence-based kill switch, matching `LAMBDA_VM_NO_GPU_GRIND`: a
-    // production escape hatch, and what makes the host path stay covered.
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
-        return None;
-    }
-
-    // SAFETY: `F == GoldilocksField` is established above, and
-    // `FieldElement<GoldilocksField>` is a transparent wrapper over its `u64`
-    // representation — the same one the kernels read and write.
-    let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
-    let (codeword, nodes) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
-    let nodes = nodes_in_place(nodes)?;
-
-    // SAFETY: as above, plus `FieldElement` has no drop glue over a `u64`, so
-    // the allocation changes type in place. Relabelling a gigabyte codeword
-    // element by element would cost more than the kernels it came from.
-    let mut codeword = core::mem::ManuallyDrop::new(codeword);
-    let codeword = unsafe {
-        Vec::from_raw_parts(
-            codeword.as_mut_ptr() as *mut FieldElement<F>,
-            codeword.len(),
-            codeword.capacity(),
-        )
-    };
-    COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some((codeword, nodes))
-}
 
 /// A byte buffer of Merkle nodes, relabelled as nodes without copying.
 ///
@@ -148,18 +93,6 @@ fn nodes_in_place(bytes: Vec<u8>) -> Option<Vec<[u8; 32]>> {
             bytes.capacity() / 32,
         )
     })
-}
-
-#[cfg(not(feature = "cuda"))]
-pub(crate) fn commit_codeword<F>(
-    _evals: &[math::field::element::FieldElement<F>],
-    _log_blowup: usize,
-    _log_folding: usize,
-) -> Option<CommittedCodeword<F>>
-where
-    F: math::field::traits::IsField + 'static,
-{
-    None
 }
 
 /// Op tags the sumcheck kernel reads. MUST stay in sync with
@@ -1453,4 +1386,242 @@ where
     E: math::field::traits::IsField + 'static,
 {
     None
+}
+
+/// A codeword the device holds: the commit leaves one there and the chain
+/// folds it there, so the array itself never crosses the bus.
+#[cfg(feature = "cuda")]
+pub struct DeviceCodeword(math_cuda::whir::DeviceCodeword);
+
+/// A codeword a commit declined to keep. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct DeviceCodeword(std::convert::Infallible);
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for DeviceCodeword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeword")
+            .field("elements", &self.0.elements())
+            .field("base", &self.0.is_base())
+            .finish()
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl std::fmt::Debug for DeviceCodeword {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {}
+    }
+}
+
+/// Commits a stacked polynomial with the codeword left on device.
+#[cfg(feature = "cuda")]
+pub(crate) fn commit_resident<F>(
+    evals: &[math::field::element::FieldElement<F>],
+    log_blowup: usize,
+    log_folding: usize,
+) -> Option<(DeviceCodeword, Vec<[u8; 32]>)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if !evals.len().is_power_of_two() || evals.len() << log_blowup < COMMIT_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
+    let (codeword, nodes) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
+    let nodes = nodes_in_place(nodes)?;
+    COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((DeviceCodeword(codeword), nodes))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn commit_resident<F>(
+    _evals: &[math::field::element::FieldElement<F>],
+    _log_blowup: usize,
+    _log_folding: usize,
+) -> Option<(DeviceCodeword, Vec<[u8; 32]>)>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceCodeword {
+    pub(crate) fn elements(&self) -> usize {
+        self.0.elements()
+    }
+
+    /// Folds it `alphas.len()` times, leaving the result on device too.
+    pub(crate) fn fold<F, N>(
+        &self,
+        generator: &math::field::element::FieldElement<F>,
+        alphas: &[math::field::element::FieldElement<N>],
+    ) -> Option<Self>
+    where
+        F: math::field::traits::IsField + 'static,
+        N: math::field::traits::IsField + 'static,
+    {
+        let (two_inv, g_invs, raw_alphas) = fold_scalars(generator, alphas)?;
+        let folded = math_cuda::whir::fold_resident(&self.0, two_inv, &g_invs, &raw_alphas).ok()?;
+        Some(Self(folded))
+    }
+
+    /// The tree over its fold blocks, in the host node layout.
+    pub(crate) fn commit(&self, log_folding: usize) -> Option<Vec<[u8; 32]>> {
+        let nodes = math_cuda::whir::commit_resident_ext3(&self.0, log_folding).ok()?;
+        let nodes = nodes_in_place(nodes)?;
+        COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        Some(nodes)
+    }
+
+    /// The blocks `indices` open, gathered where they lie — one launch and one
+    /// copy back for the whole round.
+    pub(crate) fn cosets<F>(
+        &self,
+        indices: &[usize],
+        num_leaves: usize,
+        block: usize,
+    ) -> Option<Vec<Vec<math::field::element::FieldElement<F>>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        let indices: Vec<u64> = indices.iter().map(|index| *index as u64).collect();
+        let raw = self.0.cosets(&indices, num_leaves, block).ok()?;
+        let values = values_from_raw::<F>(&raw, self.0.is_base())?;
+        Some(values.chunks_exact(block).map(<[_]>::to_vec).collect())
+    }
+
+    /// Its first value, which is what the last fold leaves behind.
+    pub(crate) fn first<F>(&self) -> Option<math::field::element::FieldElement<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        let raw = self.0.first().ok()?;
+        values_from_raw(&raw, false)?.into_iter().next()
+    }
+}
+
+/// `two_inv`, each level's inverse generator, and the challenges as limbs.
+#[cfg(feature = "cuda")]
+fn fold_scalars<F, N>(
+    generator: &math::field::element::FieldElement<F>,
+    alphas: &[math::field::element::FieldElement<N>],
+) -> Option<(u64, Vec<u64>, Vec<u64>)>
+where
+    F: math::field::traits::IsField + 'static,
+    N: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<N>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    if alphas.is_empty() {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let generator = unsafe { *(generator as *const _ as *const u64) };
+    let generator = FieldElement::<Gl>::from_raw(generator);
+    let two_inv = *FieldElement::<Gl>::from(2u64).inv().ok()?.value();
+    let mut g_inv = generator.inv().ok()?;
+    let mut g_invs = Vec::with_capacity(alphas.len());
+    for _ in 0..alphas.len() {
+        g_invs.push(*g_inv.value());
+        g_inv = g_inv.square();
+    }
+    let mut raw = Vec::with_capacity(alphas.len() * 3);
+    for alpha in alphas {
+        raw.extend_from_slice(&ext3_raw(alpha)?);
+    }
+    Some((two_inv, g_invs, raw))
+}
+
+/// Limbs as field elements, one `u64` each for a base codeword and three for
+/// an extension one.
+#[cfg(feature = "cuda")]
+fn values_from_raw<F>(raw: &[u64], base: bool) -> Option<Vec<math::field::element::FieldElement<F>>>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if base {
+        if TypeId::of::<F>() != TypeId::of::<Gl>() {
+            return None;
+        }
+        return Some(
+            raw.iter()
+                .map(|limb| {
+                    let value = FieldElement::<Gl>::from_raw(*limb);
+                    // SAFETY: `F == Gl`, checked above; same representation.
+                    unsafe {
+                        core::mem::transmute_copy::<FieldElement<Gl>, FieldElement<F>>(&value)
+                    }
+                })
+                .collect(),
+        );
+    }
+    if TypeId::of::<F>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    Some(raw.chunks_exact(3).map(ext3_from_raw::<F>).collect())
+}
+
+#[cfg(not(feature = "cuda"))]
+impl DeviceCodeword {
+    pub(crate) fn elements(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn fold<F, N>(
+        &self,
+        _generator: &math::field::element::FieldElement<F>,
+        _alphas: &[math::field::element::FieldElement<N>],
+    ) -> Option<Self>
+    where
+        F: math::field::traits::IsField + 'static,
+        N: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn commit(&self, _log_folding: usize) -> Option<Vec<[u8; 32]>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn cosets<F>(
+        &self,
+        _indices: &[usize],
+        _num_leaves: usize,
+        _block: usize,
+    ) -> Option<Vec<Vec<math::field::element::FieldElement<F>>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn first<F>(&self) -> Option<math::field::element::FieldElement<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
 }

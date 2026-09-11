@@ -28,8 +28,9 @@ fn poly(num_vars: usize, seed: u64) -> Mle<F> {
 fn parity(num_vars: usize, log_blowup: usize, log_folding: usize) {
     let f = poly(num_vars, 1 + num_vars as u64);
     let raw: Vec<u64> = f.evals().iter().map(|v| *v.value()).collect();
-    let (device_codeword, nodes) = math_cuda::whir::commit_codeword(&raw, log_blowup, log_folding)
-        .expect("device commit (needs a GPU)");
+    let (device_codeword, nodes) =
+        math_cuda::whir::commit_codeword_to_host(&raw, log_blowup, log_folding)
+            .expect("device commit (needs a GPU)");
 
     let domain = Domain::<F>::new(num_vars + log_blowup).expect("domain");
     let host_codeword =

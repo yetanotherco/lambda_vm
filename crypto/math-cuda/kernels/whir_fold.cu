@@ -79,3 +79,21 @@ extern "C" __global__ void whir_fold_ext3(const uint64_t *__restrict__ in, uint6
     at[1] = res.b;
     at[2] = res.c;
 }
+
+// The fold blocks a round's queries open, gathered into one buffer:
+// `out[(q*block + t)*limbs ..]` is `codeword[(index[q] + t*num_leaves)*limbs]`.
+// One launch and one copy back, against one of each per value.
+extern "C" __global__ void gather_cosets(const uint64_t *__restrict__ codeword,
+                                         const uint64_t *__restrict__ indices, uint64_t queries,
+                                         uint64_t num_leaves, uint64_t block, uint64_t limbs,
+                                         uint64_t *__restrict__ out) {
+    uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= queries * block) return;
+    uint64_t q = task / block;
+    uint64_t t = task - q * block;
+    const uint64_t *from = codeword + (indices[q] + t * num_leaves) * limbs;
+    uint64_t *at = out + task * limbs;
+    for (uint64_t k = 0; k < limbs; ++k) {
+        at[k] = from[k];
+    }
+}
