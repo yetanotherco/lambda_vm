@@ -238,6 +238,110 @@ fn whir_against_fri() {
     }
 }
 
+/// A whole run proved by epochs: the multilinear continuation against the
+/// univariate one, at the same epoch size.
+///
+/// This is the measurement the multilinear continuation exists for. Wall-clock
+/// is the visible number, but the reason is the peak: a monolithic proof holds
+/// every table of the run at once and an epoch holds one epoch's. That number
+/// comes from the OS, one backend per process:
+///
+/// ```text
+/// LAMBDA_VM_BENCH_BACKEND=whir LAMBDA_VM_BENCH_ELF=ethrex \
+///   LAMBDA_VM_BENCH_INPUT=ethrex_10_transfers \
+///   /usr/bin/time -v cargo test --release ...
+/// ```
+///
+/// `LAMBDA_VM_BENCH_EPOCH_LOG2` is the epoch length in cycles, the CLI's
+/// default (2^20) unless it is set. It is a resource knob, not a property of
+/// either prover: both sides get the same one.
+#[test]
+#[ignore]
+fn continuations() {
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let backend = std::env::var("LAMBDA_VM_BENCH_BACKEND").unwrap_or_else(|_| "both".into());
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let opts = options();
+    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "all".into());
+    let label = if input.is_empty() { &name } else { &input };
+    println!(
+        "\n{label} — continuation, epoch_size_log2={epoch_size_log2}, \
+RAYON_NUM_THREADS={threads}, backend={backend}"
+    );
+
+    let mib = |n: usize| n as f64 / (1024.0 * 1024.0);
+    let mut fri = None;
+    let mut whir = None;
+
+    if backend != "whir" {
+        let start = Instant::now();
+        let bundle =
+            crate::continuation::prove_continuation(&bytes, &inputs, epoch_size_log2, &opts)
+                .expect("univariate continuation");
+        let prove = start.elapsed();
+        let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+            .expect("serialize")
+            .len();
+        let epochs = bundle.num_epochs();
+        let start = Instant::now();
+        let output = crate::continuation::verify_continuation(&bytes, &bundle, &opts)
+            .expect("univariate verify");
+        assert!(output.is_some(), "the univariate continuation must verify");
+        fri = Some((prove, start.elapsed(), size, epochs));
+    }
+
+    if backend != "fri" {
+        let start = Instant::now();
+        let bundle = crate::multilinear_continuation::prove_continuation(
+            &bytes,
+            &inputs,
+            epoch_size_log2,
+            &opts,
+        )
+        .expect("multilinear continuation");
+        let prove = start.elapsed();
+        let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+            .expect("serialize")
+            .len();
+        let epochs = bundle.num_epochs();
+        let start = Instant::now();
+        let ok = crate::multilinear_continuation::verify_continuation(&bytes, &bundle, &opts)
+            .expect("multilinear verify");
+        assert!(ok, "the multilinear continuation must verify");
+        whir = Some((prove, start.elapsed(), size, epochs));
+    }
+
+    println!(
+        "{:<12} {:>10} {:>10} {:>12} {:>8}",
+        "backend", "prove", "verify", "proof", "epochs"
+    );
+    for (tag, run) in [("FRI", &fri), ("WHIR", &whir)] {
+        if let Some((prove, verify, size, epochs)) = run {
+            println!(
+                "{tag:<12} {:>9.2}s {:>9.2}s {:>10.2} MiB {epochs:>8}",
+                prove.as_secs_f64(),
+                verify.as_secs_f64(),
+                mib(*size)
+            );
+        }
+    }
+    if let (Some(f), Some(w)) = (fri, whir) {
+        println!(
+            "{:<12} {:>9.2}x {:>9.2}x {:>10.2}x",
+            "WHIR/FRI",
+            w.0.as_secs_f64() / f.0.as_secs_f64(),
+            w.1.as_secs_f64() / f.1.as_secs_f64(),
+            w.2 as f64 / f.2 as f64,
+        );
+    }
+}
+
 /// Where the multilinear prover's time goes, phase by phase.
 ///
 /// Replays the same pipeline [`multilinear_prove::prove_with_options_and_inputs`]
