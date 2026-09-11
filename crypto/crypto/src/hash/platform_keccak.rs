@@ -60,7 +60,49 @@ mod imp {
 
 #[cfg(not(target_arch = "riscv64"))]
 mod imp {
-    pub type PlatformKeccak256 = sha3::Keccak256;
+    use digest::{
+        FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update,
+    };
+
+    /// Host keccak-256: `sha3::Keccak256` plus a finalize counter for
+    /// [`crate::hash_metrics`] (the total "all hashes" verify metric). The
+    /// counter is a PURE SIDE EFFECT — every method forwards to the inner
+    /// `sha3::Keccak256`, so the digest is byte-identical to the bare hasher.
+    /// Only compiled on the host; the guest keeps the syscall passthrough above.
+    #[derive(Clone, Default)]
+    pub struct PlatformKeccak256(sha3::Keccak256);
+
+    impl HashMarker for PlatformKeccak256 {}
+
+    impl OutputSizeUser for PlatformKeccak256 {
+        type OutputSize = digest::typenum::U32;
+    }
+
+    impl Update for PlatformKeccak256 {
+        fn update(&mut self, data: &[u8]) {
+            Update::update(&mut self.0, data);
+        }
+    }
+
+    impl FixedOutput for PlatformKeccak256 {
+        fn finalize_into(self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_total();
+            FixedOutput::finalize_into(self.0, out);
+        }
+    }
+
+    impl Reset for PlatformKeccak256 {
+        fn reset(&mut self) {
+            Reset::reset(&mut self.0);
+        }
+    }
+
+    impl FixedOutputReset for PlatformKeccak256 {
+        fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_total();
+            FixedOutputReset::finalize_into_reset(&mut self.0, out);
+        }
+    }
 }
 
 pub use imp::PlatformKeccak256;
