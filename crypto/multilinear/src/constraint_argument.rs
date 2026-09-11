@@ -266,11 +266,21 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
             match kind {
                 // The sumcheck's factors share a field, so a base view is
                 // lifted for it. The codeword is what stays base.
+                //
+                // The shift rides the lift rather than preceding it: a view
+                // materialized first is a second copy of the column, and the
+                // rotation is two runs of consecutive cells, not a modulus per
+                // cell.
                 FactorKind::Committed(s) => {
-                    let view = claim_reduce::materialize(&self.columns, s)?;
+                    let column = self.columns.get(s.column).ok_or(Error::UnknownPolynomial {
+                        index: s.column,
+                        len: self.columns.len(),
+                    })?;
+                    let shift = s.offset % column.len();
+                    let (wrapped, rest) = column.evals().split_at(shift);
                     Mle::new(
-                        view.evals()
-                            .iter()
+                        rest.iter()
+                            .chain(wrapped)
                             .map(|v| v.clone().to_extension::<E>())
                             .collect(),
                     )
@@ -528,13 +538,14 @@ where
     // the column it reads, then open each column once. The public factors need
     // neither step.
     //
-    // Each shifted view is rebuilt, read and dropped, so this costs one table
-    // rather than a second copy of the whole factor list.
+    // A shifted view is rebuilt, read and dropped; an unshifted one is read
+    // where it lies. Either way this costs one column rather than a second
+    // copy of the whole factor list.
     let factor_values = trace
         .kinds
         .iter()
         .filter_map(FactorKind::source)
-        .map(|source| claim_reduce::materialize(&trace.columns, &source)?.evaluate_in(&point))
+        .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
         .collect::<Result<Vec<_>, _>>()?;
 
     let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(

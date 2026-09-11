@@ -317,6 +317,31 @@ where
 
 /// The factor `source` describes, materialized: the column shifted cyclically
 /// by its offset.
+/// A factor's value at `point`, without building the view when there is none
+/// to build.
+///
+/// An unshifted source *is* its column, and a column is the biggest thing the
+/// argument holds: copying one to read a single value out of it is the whole
+/// trace copied again, once per factor.
+pub fn evaluate_source<F, E>(
+    columns: &[Mle<F>],
+    source: &FactorSource,
+    point: &[FieldElement<E>],
+) -> Result<FieldElement<E>, Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    let column = columns.get(source.column).ok_or(Error::UnknownPolynomial {
+        index: source.column,
+        len: columns.len(),
+    })?;
+    if source.offset.is_multiple_of(column.len()) {
+        return column.evaluate_in(point);
+    }
+    materialize(columns, source)?.evaluate_in(point)
+}
+
 pub fn materialize<E: IsField + 'static>(
     columns: &[Mle<E>],
     source: &FactorSource,
