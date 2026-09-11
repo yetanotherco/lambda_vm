@@ -3,6 +3,12 @@
 .vscode
 .DS_Store
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
 # Compiled ELF artifacts (built by CI/make)
 executor/program_artifacts/
 
