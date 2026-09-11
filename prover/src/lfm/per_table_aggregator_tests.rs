@@ -2015,6 +2015,30 @@ fn prove_node_program_as_child(
     mark(&format!("AFTER {label}"));
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
+    // ★★★ THE BYTE-IDENTITY LINE. Two arms that schedule differently must
+    // produce the same tree, and this is the line that says so: `diff` the
+    // IDENTITY lines of a serial run against a concurrent one and an empty diff
+    // IS the proof, rather than a reader comparing walls and hoping.
+    //
+    // `program_id` is the right fingerprint because it is what a PARENT
+    // absorbs: a digest over every group root, the chunk-root tail, the
+    // heights, the chip set and the hasher. Move any committed felt and it
+    // moves. The heights are printed beside it anyway — `LFM_HASH`'s among them
+    // — because when the digest does move, the heights say WHICH shape did, and
+    // a bare digest mismatch prices no debugging at all.
+    println!(
+        "   {label} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
+         · published {} words",
+        artifacts
+            .program_id
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        artifacts.log_heights,
+        artifacts.blake3_chunk_log_heights,
+        proved.public_words.len(),
+    );
     let t = Instant::now();
     let (child, t_verify) = real_child_timed(artifacts, opts.clone(), &proved);
     let t_harvest = t.elapsed().as_secs_f64();
@@ -3084,7 +3108,8 @@ fn in_index_order_re_raises_a_worker_panic_with_its_message() {
     );
 }
 
-/// `LFM_TREE_SIBLINGS` — how many proofs of one INTERIOR level run at once.
+/// How many proofs of one INTERIOR level run at once — `LFM_TREE_SIBLINGS`, or
+/// `LFM_TREE_K` for the same thing.
 ///
 /// Unset or `1` is the control and runs the original serial path: no threads,
 /// no permit, no sampler change. ⛔ The control must be the ORIGINAL code, not
@@ -3092,25 +3117,88 @@ fn in_index_order_re_raises_a_worker_panic_with_its_message() {
 /// running alone measures the scheduler against itself and hides any constant
 /// cost in both arms.
 ///
+/// ★ TWO SPELLINGS ON PURPOSE, and it is not indecision. A launch line naming
+/// a knob this driver does not read fails SILENTLY: the run goes serial,
+/// reports no speed-up, and the lever is filed as refuted by an arm that never
+/// armed it. Accepting both names costs four lines and removes that whole class
+/// of result. Set to DIFFERENT values it refuses, because then the launch line
+/// does not name one experiment. And [`the_production_tree_composes_to_a_root`]
+/// PRINTS the resolved count, so the log says what the run actually did rather
+/// than what the launcher meant.
+///
 /// ⚠ NOT `TABLE_PARALLELISM`, which is the number of TABLES one prove puts on
-/// the card at once and is governed by that prove's own `VramGate`. This is the
-/// number of PROOFS in flight, and the card permit is what governs it. The two
-/// multiply: at `TABLE_PARALLELISM=4` and `LFM_TREE_SIBLINGS=2` the card still
-/// sees one proof's four tables, because the permit admits one proof at a time.
+/// the card at once and is governed by that prove's own `VramGate` — and which
+/// the box launchers already export from a shell variable spelled `K`. This is
+/// the number of PROOFS in flight, and the card permit is what governs it. The
+/// two multiply: at `TABLE_PARALLELISM=4` and two siblings the card still sees
+/// one proof's four tables, because the permit admits one proof at a time.
+fn tree_siblings() -> usize {
+    let k = std::env::var("LFM_TREE_K").ok();
+    let s = std::env::var("LFM_TREE_SIBLINGS").ok();
+    resolve_siblings(k.as_deref(), s.as_deref())
+}
+
+/// [`tree_siblings`] with the environment supplied, so the resolution is
+/// testable without mutating process state.
 ///
 /// An empty value reads as unset — `FOO= cmd` is the shell clearing a variable,
 /// and failing a run for that spelling of "default" helps nobody.
-fn tree_siblings() -> usize {
-    match std::env::var("LFM_TREE_SIBLINGS").ok().as_deref() {
-        None | Some("") => 1,
-        Some(v) => {
-            let n: usize = v.parse().unwrap_or_else(|_| {
-                panic!("LFM_TREE_SIBLINGS must be a positive integer, got `{v}`")
-            });
-            assert!(n >= 1, "LFM_TREE_SIBLINGS must be at least 1, got {n}");
-            n
-        }
+fn resolve_siblings(k: Option<&str>, siblings: Option<&str>) -> usize {
+    fn clean(v: Option<&str>) -> Option<&str> {
+        v.filter(|v| !v.is_empty())
     }
+    let (k, siblings) = (clean(k), clean(siblings));
+    let named = match (k, siblings) {
+        (None, None) => return 1,
+        (Some(a), Some(b)) => {
+            assert_eq!(
+                a, b,
+                "LFM_TREE_K=`{a}` and LFM_TREE_SIBLINGS=`{b}` are the same knob \
+                 set to two values, so the launch line does not name one \
+                 experiment. Set one of them"
+            );
+            a
+        }
+        (Some(v), None) | (None, Some(v)) => v,
+    };
+    let n: usize = named
+        .parse()
+        .unwrap_or_else(|_| panic!("the sibling count must be a positive integer, got `{named}`"));
+    assert!(n >= 1, "the sibling count must be at least 1, got {n}");
+    n
+}
+
+/// Either spelling is read, and neither is required.
+#[test]
+fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
+    assert_eq!(resolve_siblings(None, None), 1, "unset is the control");
+    assert_eq!(resolve_siblings(Some(""), Some("")), 1, "empty is unset");
+    assert_eq!(resolve_siblings(Some("2"), None), 2, "LFM_TREE_K alone");
+    assert_eq!(
+        resolve_siblings(None, Some("3")),
+        3,
+        "LFM_TREE_SIBLINGS alone"
+    );
+    assert_eq!(
+        resolve_siblings(Some("2"), Some("2")),
+        2,
+        "agreeing is fine"
+    );
+    // ★ The one that matters: a launch line setting both to different values
+    // names two experiments, and a run that silently picked one would be
+    // reported under the other's name.
+    assert!(
+        std::panic::catch_unwind(|| resolve_siblings(Some("2"), Some("4"))).is_err(),
+        "two values for one knob must refuse"
+    );
+    assert!(
+        std::panic::catch_unwind(|| resolve_siblings(Some("lots"), None)).is_err(),
+        "a non-integer must refuse"
+    );
+    assert!(
+        std::panic::catch_unwind(|| resolve_siblings(Some("0"), None)).is_err(),
+        "zero workers is not an experiment"
+    );
 }
 
 fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
@@ -4543,7 +4631,16 @@ fn the_production_tree_composes_to_a_root() {
     // two siblings the card would sit idle most of the level and the host would
     // bind. ⇒ whoever extends this to level 0 must re-derive the count, not
     // inherit it.
-    super::device_permit::arm(tree_siblings());
+    let siblings_wanted = tree_siblings();
+    // ★ THE LOG SAYS WHAT THE RUN DID, not what the launcher meant. A knob
+    // that never reached the process is otherwise indistinguishable from a
+    // lever that did not work, and the second reading is the one that gets
+    // written down.
+    println!(
+        "   ★ SIBLING CONCURRENCY: {siblings_wanted} proof(s) at once per interior level \
+         (LFM_TREE_SIBLINGS or LFM_TREE_K; 1 = the serial control)"
+    );
+    super::device_permit::arm(siblings_wanted);
     let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
     // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
     // the loop. `None` on every other arm, where one level's output is all the
