@@ -38,6 +38,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
+use stark::lookup::LazyCommitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -766,20 +767,32 @@ impl VmAirs {
                 Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
             })
             .collect();
-        let decode_root = decode_commitment.unwrap_or_else(|| {
-            decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment")
-        });
         let decode: VmAir = {
             // The instruction map, decoded once here rather than on every call:
             // only the multilinear verifier asks, but it asks per proof.
-            let instructions = decode::instructions_from_elf(elf)
-                .expect("the decode commitment above already decoded this ELF");
-            Box::new(create_decode_air(proof_options).with_preprocessed_columns(
-                decode_root,
-                decode::NUM_PRECOMPUTED_COLS,
-                Arc::new(move || decode::preprocessed_columns(&instructions)),
-            ))
+            let instructions = Arc::new(
+                decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
+            );
+            // Deferred: the commitment is an LDE and a Merkle tree over the
+            // program's whole instruction table, and only the univariate path
+            // compares it — the multilinear one checks the columns instead.
+            let decode_root = match decode_commitment {
+                Some(commitment) => LazyCommitment::ready(commitment),
+                None => {
+                    let instructions = instructions.clone();
+                    let options = proof_options.clone();
+                    LazyCommitment::deferred(move || {
+                        decode::compute_precomputed_commitment(&instructions, &options)
+                    })
+                }
+            };
+            Box::new(
+                create_decode_air(proof_options).with_lazy_preprocessed_columns(
+                    decode_root,
+                    decode::NUM_PRECOMPUTED_COLS,
+                    Arc::new(move || decode::preprocessed_columns(&instructions)),
+                ),
+            )
         };
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| {
@@ -874,16 +887,22 @@ impl VmAirs {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
                     // (recursion guest); otherwise recompute from the ELF.
+                    // Deferred when it has to be computed: two dozen pages of
+                    // LDE and Merkle that only the univariate path compares.
                     let commitment = page_commitments
                         .unwrap_or(&[])
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
-                        .map(|(_, c)| *c)
+                        .map(|(_, c)| LazyCommitment::ready(*c))
                         .unwrap_or_else(|| {
-                            page::compute_precomputed_commitment(config, proof_options)
+                            let config = config.clone();
+                            let options = proof_options.clone();
+                            LazyCommitment::deferred(move || {
+                                page::compute_precomputed_commitment(&config, &options)
+                            })
                         });
                     let config = config.clone();
-                    Box::new(air.with_preprocessed_columns(
+                    Box::new(air.with_lazy_preprocessed_columns(
                         commitment,
                         page::NUM_PREPROCESSED_COLS,
                         Arc::new(move || page::preprocessed_columns(&config)),

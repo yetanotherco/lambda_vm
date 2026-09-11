@@ -810,6 +810,56 @@ impl BusValue {
 /// table's base-field transition constraints, and the framework appends the
 /// LogUp constraints (generated from [`Self::logup`]) after them. One body
 /// serves the compiled prover folder, the verifier folder, and IR capture.
+/// A preprocessed table's commitment, computed when someone asks for it.
+///
+/// The univariate path compares it against the proof's root and so always
+/// does; the multilinear one has no separate root and checks the claimed
+/// openings against [`precomputed_columns`] instead, so on that path nobody
+/// ever asks. On a real program the ones that are not compiled-in constants —
+/// the ELF's data pages and its instruction table — are an LDE and a Merkle
+/// tree each, and there are two dozen of them.
+///
+/// [`precomputed_columns`]: crate::traits::AIR::precomputed_columns
+#[derive(Clone)]
+pub struct LazyCommitment {
+    value: std::sync::Arc<std::sync::OnceLock<crate::config::Commitment>>,
+    #[allow(clippy::type_complexity)]
+    build: std::sync::Arc<dyn Fn() -> crate::config::Commitment + Send + Sync>,
+}
+
+impl std::fmt::Debug for LazyCommitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyCommitment")
+            .field("computed", &self.value.get().is_some())
+            .finish()
+    }
+}
+
+impl LazyCommitment {
+    /// One that is already known — a compiled-in constant, or a caller's.
+    pub fn ready(value: crate::config::Commitment) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            value: std::sync::Arc::new(cell),
+            build: std::sync::Arc::new(|| [0u8; 32]),
+        }
+    }
+
+    /// One that costs something, computed on the first [`get`](Self::get) and
+    /// shared by every clone of the AIR from then on.
+    pub fn deferred(build: impl Fn() -> crate::config::Commitment + Send + Sync + 'static) -> Self {
+        Self {
+            value: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build: std::sync::Arc::new(build),
+        }
+    }
+
+    pub fn get(&self) -> crate::config::Commitment {
+        *self.value.get_or_init(|| (self.build)())
+    }
+}
+
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
@@ -840,8 +890,9 @@ pub struct AirWithBuses<
         std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
-    /// Commitment to precomputed columns (if this is a preprocessed table)
-    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Commitment to precomputed columns (if this is a preprocessed table),
+    /// computed on demand — see [`LazyCommitment`].
+    preprocessed_commitment: Option<LazyCommitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
     /// Builds the precomputed columns on demand. Only the multilinear path asks
@@ -882,7 +933,7 @@ impl<
             constraint_program: self.constraint_program.clone(),
             auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
             boundary_constraint_builder: PhantomData,
-            preprocessed_commitment: self.preprocessed_commitment,
+            preprocessed_commitment: self.preprocessed_commitment.clone(),
             num_precomputed_cols: self.num_precomputed_cols,
             precomputed_columns: self.precomputed_columns.clone(),
             name: self.name.clone(),
@@ -994,8 +1045,17 @@ impl<
     ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
     /// ```
     pub fn with_preprocessed(
-        mut self,
+        self,
         commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.with_lazy_preprocessed(LazyCommitment::ready(commitment), num_precomputed_cols)
+    }
+
+    /// The same for a commitment nobody may end up needing.
+    pub fn with_lazy_preprocessed(
+        mut self,
+        commitment: LazyCommitment,
         num_precomputed_cols: usize,
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
@@ -1014,7 +1074,22 @@ impl<
         num_precomputed_cols: usize,
         columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
     ) -> Self {
-        let mut air = self.with_preprocessed(commitment, num_precomputed_cols);
+        self.with_lazy_preprocessed_columns(
+            LazyCommitment::ready(commitment),
+            num_precomputed_cols,
+            columns,
+        )
+    }
+
+    /// The same with the commitment deferred: the multilinear path checks the
+    /// columns and never forces it.
+    pub fn with_lazy_preprocessed_columns(
+        self,
+        commitment: LazyCommitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        let mut air = self.with_lazy_preprocessed(commitment, num_precomputed_cols);
         air.precomputed_columns = Some(columns);
         air
     }
@@ -1383,7 +1458,10 @@ where
     }
 
     fn precomputed_commitment(&self) -> crate::config::Commitment {
-        self.preprocessed_commitment.unwrap_or([0u8; 32])
+        self.preprocessed_commitment
+            .as_ref()
+            .map(LazyCommitment::get)
+            .unwrap_or([0u8; 32])
     }
 
     fn precomputed_columns(&self) -> Vec<Vec<FieldElement<F>>> {
