@@ -32,7 +32,21 @@ struct CudaHostDim3 {
 static CudaHostDim3 blockIdx;
 static CudaHostDim3 threadIdx;
 static CudaHostDim3 cuda_host_block_dim;
+static CudaHostDim3 cuda_host_grid_dim;
 #define blockDim cuda_host_block_dim
+#define gridDim cuda_host_grid_dim
+
+// The one atomic the grid-stride search kernels use. Single-threaded on host,
+// so the read-modify-write needs no protection; it returns the OLD value, as
+// CUDA's does, and takes a non-volatile pointer because the kernels cast the
+// volatility away at the call (the `volatile` there is for the *reads* that
+// drive the early exit, which the shim's single thread makes moot).
+static inline unsigned long long atomicMin(unsigned long long *address,
+                                           unsigned long long val) {
+    unsigned long long old = *address;
+    if (val < old) *address = val;
+    return old;
+}
 
 // `goldilocks.cuh`'s field multiply needs this intrinsic. `blake3.cu` only uses
 // `goldilocks::canonical`, but the header compiles as a whole, so supply it.
@@ -68,3 +82,17 @@ static inline uint64_t __brevll(uint64_t x) {
          i < (unsigned)(n) &&                                                    \
          (blockIdx.x = 0, blockDim.x = 0, threadIdx.x = i, true);                \
          ++i)
+
+// Replay a GRID-STRIDE kernel as ONE thread that covers the whole range:
+// `tid = 0`, `stride = gridDim.x * blockDim.x = 1`, so a kernel written as
+// `for (i = tid; i < count; i += stride)` scans `[0, count)` in order.
+//
+// `CUDA_HOST_FOR_EACH_THREAD` cannot do this — it leaves `blockDim.x = 0`,
+// which is a zero stride and an unterminated loop.
+//
+// ⚠ Says nothing about the parallel reduction a real launch performs. What it
+// checks is the per-candidate arithmetic and the loop's bounds; that
+// `atomicMin` over many threads yields the same answer is a property of the
+// reduction, pinned on a GPU.
+#define CUDA_HOST_SINGLE_THREAD()                                               \
+    (gridDim.x = 1, blockDim.x = 1, blockIdx.x = 0, threadIdx.x = 0, (void)0)

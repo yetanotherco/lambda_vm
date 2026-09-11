@@ -793,58 +793,99 @@ extern "C" __global__ void rpx_permute_probe(const uint64_t *states, uint64_t n,
     for (int i = 0; i < rpx::STATE_FELTS; ++i) out[tid * rpx::STATE_FELTS + i] = s[i];
 }
 
-// ===========================================================================
-// PHASE 3 (lane K, not yet coded) — the proof-of-work GRIND on device.
+// ---------------------------------------------------------------------------
+// Proof-of-work grinding search, RPX arm.
 //
-// THE MAPPING the kernel must reproduce, derived from the host and pinned here
-// so it is not re-derived (✓ VERIFIED against the sources named):
+// Twin of `keccak.cu`'s `grind_search`, same signature shape and the same
+// first-hit reduction; only the outer hash differs. The host path it replaces
+// is `stark::grinding::generate_nonce`, a per-table ~2^grinding_factor search
+// that is the prover's dominant CPU cost once the transcript is algebraic.
 //
-//   host predicate   stark/src/grinding.rs::is_valid_nonce_for_inner_hash (:85-97):
+// THE MAPPING this reproduces, derived from the host (✓ VERIFIED against the
+// sources named) and stated here so it is not re-derived at each reading:
+//
+//   host predicate   stark/src/grinding.rs::is_valid_nonce_for_inner_hash:
 //                    valid ⇔ u64::from_be_bytes(D::digest(inner ‖ nonce.to_be_bytes())[..8]) < limit,
 //                    limit = 1 << (64 − grinding_factor); inner = D::digest(PREFIX ‖ seed ‖ factor),
-//                    41 bytes, computed ONCE per table on the host (:102-113) and never on device.
-//   D for RPX        prover/src/lfm/algebraic_commit.rs AlgebraicDigest<RpxCommit> (:440-500):
+//                    41 bytes, computed ONCE per table on the host and never on device.
+//   D for RPX        prover/src/lfm/algebraic_commit.rs AlgebraicDigest<RpxCommit>:
 //                    D::digest(bytes) = digest_to_commitment(sponge_leaf(Rpx, felts_from_bytes(bytes)))
-//                    — the LEAF construction, on purpose (:421-436).
-//   bytes → felts    felts_from_bytes (:196-206): consecutive 8-byte groups, each
+//                    — the LEAF construction, on purpose.
+//   bytes → felts    felts_from_bytes: consecutive 8-byte groups, each
 //                    FE::from(u64::from_be_bytes(group)) — BIG-endian, and `FE::from` is
-//                    `from_u64`, which maps a raw value ≥ p to raw − p (one subtraction).
+//                    `from_u64`, which maps a raw value ≥ p to raw − p (ONE subtraction,
+//                    goldilocks.rs:172-178 — exactly `goldilocks::canonical`).
 //                    The 40-byte outer block is therefore EXACTLY five felts:
 //                        f0..f3 = the inner hash's four big-endian u64s (canonical already —
 //                                 they are digest_to_commitment output, so each < p),
-//                        f4     = the nonce itself (any u64; ≥ p means the element nonce − p,
-//                                 which absorbing the raw nonce yields identically because
-//                                 the permutation is representation-independent).
-//                    ⚠ Big-endian, unlike keccak's `inner_hash_lanes` (LITTLE-endian lanes,
-//                    grinding.rs:123-129). A separate host helper, `inner_hash_felts` (BE),
-//                    must feed this kernel; feeding it the keccak lanes is a silent wrong hash.
-//   sponge mode      sponge_leaf over five felts (:169-184): ONE permutation of
+//                        f4     = the nonce.
+//                    ⚠ Big-endian, unlike keccak's `inner_hash_lanes` (LITTLE-endian lanes).
+//                    A separate host helper, `stark::grinding::inner_hash_felts` (BE), feeds
+//                    this kernel; feeding it the keccak lanes is a silent wrong hash.
+//   sponge mode      sponge_leaf over five felts: ONE permutation of
 //                        [f0, f1, f2, f3, nonce, 0, 0, 0 | 5, 0x4C4D464C, 0, 0]
 //                    — rate lanes 5..8 zero-padded, capacity lane 8 = padding flag
 //                    `5 mod 8 = 5`, lane 9 = DOMAIN_LEAF ("LFML"), lanes 10, 11 = 0.
-//                    Identical to `Sponge::init(5)`, five `absorb`s, `finalize`.
-//   the head         digest_to_commitment writes lane 0 CANONICAL as 8 big-endian bytes and the
-//                    host reads those 8 bytes back big-endian, so `seed_head` IS the canonical
-//                    value of state lane 0 after the permutation — no byte reinterpretation.
-//                    `permute` canonicalises, hence on device: valid ⇔ s[0] < limit.
+//                    ★ Built here through `rpx::Sponge` — `init(5)`, five `absorb`s,
+//                    `finalize` — rather than by writing those twelve lanes out, so the
+//                    capacity rule has ONE statement on device and a change to it cannot
+//                    leave the grind behind.
+//   the head         digest_to_commitment writes lane 0 CANONICAL as 8 big-endian bytes and
+//                    the host reads those 8 bytes back big-endian, so `seed_head` IS the
+//                    canonical value of state lane 0 after the permutation — no byte
+//                    reinterpretation. `permute` canonicalises its output, so on device the
+//                    predicate is just `digest[0] < limit`.
 //
-// THE KERNEL (twin of keccak.cu:158 `grind_search`, same signature shape):
-//   rpx_grind_search(const uint64_t *inner_felts /*4, BE*/, uint64_t limit, uint64_t base,
-//                    uint64_t count, volatile unsigned long long *result)
-//   grid-stride over [base, base+count); per candidate: build the 12-lane state above, ONE
-//   `permute` call (it stays __noinline__), `if (s[0] < limit) atomicMin(result, nonce)`;
-//   early exit `if (nonce >= *result) break;` and the u64-wrap guard exactly as keccak's.
-//   Host launcher `rpx::generate_nonce_gpu(&[u64; 4] /*BE felts*/, factor)` mirrors
-//   `grinding::generate_nonce_gpu` (min factor 12 → CPU, count = clamp(8·2^f, 2^18, 2^28),
-//   grid 1024×256, sentinel loop, None on any error). Dispatch arm in stark grinding.rs keyed
-//   through crate::config (GrindingDigest<DefaultStarkHash> + COMMITMENT_HASH == Rpx256), so
-//   the pin decides and no prover type is named from the stark crate.
+// THE NONCE LANE is `goldilocks::canonical(nonce)`, matching `FE::from(nonce)`
+// exactly. It is a no-op for every nonce this search can reach (the first
+// nonce ≥ p is 2^64 − 2^32 + 1, and the launcher's range walk bails long
+// before), and the device representation is lazy anyway — but absorbing the
+// canonical value is what makes "the device absorbs what `FE::from` produces"
+// true by inspection rather than by an argument about reachability.
 //
-// PREDICTION (before the box build): entry ≈ 120–200 PTX lines (state setup, one call, one
-// compare, one atomic, the loop); the permute `.func` is shared, so rpx.ptx grows from 6,241 to
-// ≈ 6,450 lines; ≈ 40 registers like rpx_permute_probe, ≈ 200 B stack (the state crossing the
-// call), 0 spills. Per table at factor 20 the expected work is ≈ 2^20 + 2^18 permutations
-// (the smallest valid nonce plus the in-flight tail) ≈ 4·10^9 field multiplications, i.e.
-// of order 10 ms on a 5090; the host's rayon `find_any` on 48 cores is of order 50–150 ms.
-// Both are measurements to be taken ×10 on one box, never quoted from here.
-// ===========================================================================
+// Each thread strides over `[base, base+count)` and `atomicMin`s the smallest
+// valid nonce it finds into `*result` (initialised to U64_MAX by the caller),
+// so the launch returns the globally smallest valid nonce in the searched
+// block — deterministic despite the parallel grid, and any valid nonce
+// satisfies the verifier.
+// ---------------------------------------------------------------------------
+
+// The outer block is `inner_hash ‖ nonce`: 40 bytes, five felts. Named because
+// the capacity's padding flag is `5 mod 8` and the count is what `init` needs.
+__device__ constexpr uint64_t GRIND_FELTS = 5;
+
+extern "C" __global__ void rpx_grind_search(const uint64_t *inner_felts,
+                                            uint64_t limit,
+                                            uint64_t base,
+                                            uint64_t count,
+                                            volatile unsigned long long *result) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t f0 = inner_felts[0], f1 = inner_felts[1], f2 = inner_felts[2],
+                   f3 = inner_felts[3];
+    for (uint64_t i = tid; i < count; i += stride) {
+        uint64_t nonce = base + i;
+        // Guard the u64 wrap on the final block (the launcher bails before it,
+        // so this is unreachable in practice): a wrapped nonce is < base, so
+        // stop rather than re-scan from 0.
+        if (nonce < base) break;
+        // A thread's nonces only increase, so once a smaller valid one is known
+        // this thread can never beat it — stop scanning. `result` is volatile
+        // so this load re-reads L2 (where the atomicMin writes land) instead of
+        // being hoisted into a register or served stale from L1; the early exit
+        // depends on that, though correctness does not.
+        if (nonce >= (uint64_t)*result) break;
+        rpx::Sponge sp;
+        sp.init(GRIND_FELTS);
+        sp.absorb(f0);
+        sp.absorb(f1);
+        sp.absorb(f2);
+        sp.absorb(f3);
+        sp.absorb(goldilocks::canonical(nonce));
+        uint64_t digest[rpx::DIGEST_FELTS];
+        sp.finalize(digest);
+        if (digest[0] < limit) {
+            atomicMin((unsigned long long *)result, (unsigned long long)nonce);
+        }
+    }
+}

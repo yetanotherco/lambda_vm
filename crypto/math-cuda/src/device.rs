@@ -245,6 +245,7 @@ pub struct Backend {
     pub rpx_merkle_level: CudaFunction,
     pub rpx_merkle_tail: CudaFunction,
     pub rpx_permute_probe: CudaFunction,
+    pub rpx_grind_search: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -576,6 +577,7 @@ impl Backend {
             rpx_merkle_level: rpx.load_function("rpx_merkle_level")?,
             rpx_merkle_tail: rpx.load_function("rpx_merkle_tail")?,
             rpx_permute_probe: rpx.load_function("rpx_permute_probe")?,
+            rpx_grind_search: rpx.load_function("rpx_grind_search")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
