@@ -47,8 +47,29 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "shift"
     );
     assert_eq!(
-        predicted.commit_padded_rows, traces.commit.main_table.height as u64,
+        predicted.commit_padded_rows,
+        sum_heights(&traces.commits),
         "commit"
+    );
+    assert_eq!(
+        predicted.keccak_padded_rows,
+        sum_heights(&traces.keccaks),
+        "keccak"
+    );
+    assert_eq!(
+        predicted.keccak_rnd_padded_rows,
+        sum_heights(&traces.keccak_rnds),
+        "keccak_rnd"
+    );
+    assert_eq!(
+        predicted.ecsm_padded_rows,
+        sum_heights(&traces.ecsms),
+        "ecsm"
+    );
+    assert_eq!(
+        predicted.hint_padded_rows,
+        sum_heights(&traces.hints),
+        "hint"
     );
     assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,
@@ -80,6 +101,13 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         predicted.branch_padded_rows,
         sum_heights(&traces.branches)
     );
+    // ECDAS rows depend on the scalar, so the prediction uses the per-call ceiling.
+    assert!(
+        predicted.ecdas_padded_rows >= sum_heights(&traces.ecdases),
+        "ecdas: predicted={} actual={}",
+        predicted.ecdas_padded_rows,
+        sum_heights(&traces.ecdases)
+    );
 
     // Auxiliary scalars.
     assert_eq!(predicted.cycle_count, logs.len() as u64, "cycle_count");
@@ -96,6 +124,15 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
 #[test]
 fn count_table_lengths_matches_traces() {
     let (elf, logs, _) = run_asm_elf("fib_iterative_372k");
+    assert_count_table_lengths_matches(&elf, &logs);
+}
+
+/// The accelerator predictions above are trivially satisfied at zero calls, and the
+/// only guests reaching the other cases make none. This one makes three keccak
+/// permutations, so KECCAK (one row per call) and KECCAK_RND (24) are non-empty.
+#[test]
+fn count_table_lengths_matches_keccak_trace() {
+    let (elf, logs, _) = run_asm_elf("test_keccak_multi");
     assert_count_table_lengths_matches(&elf, &logs);
 }
 
