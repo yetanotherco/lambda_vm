@@ -1053,9 +1053,27 @@ pub(super) fn real_child(
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> RealChild {
+    real_child_timed(artifacts, opts, proved).0
+}
+
+/// [`real_child`], and the seconds its opening assert cost.
+///
+/// ⛔ THE ASSERT IS TIMED, NOT SKIPPED, AND THERE IS NO KNOB THAT SKIPS IT.
+/// It is a complete host STARK verify of the proof produced moments earlier,
+/// and it is what the harness's trustworthiness rests on — a child read from a
+/// proof production would reject describes nothing. What it is NOT is work a
+/// production driver does at this point, so it belongs on a line of its own
+/// rather than inside a `harvest` figure that then gets quoted as the cost of
+/// harvesting.
+pub(super) fn real_child_timed(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> (RealChild, f64) {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use stark::proof::view::MultiProofView;
 
+    let t_verify = std::time::Instant::now();
     assert!(
         super::proof::verify_against_artifacts(
             &artifacts,
@@ -1065,6 +1083,7 @@ pub(super) fn real_child(
         ),
         "the harness only reads children production accepts"
     );
+    let verify_secs = t_verify.elapsed().as_secs_f64();
 
     let airs = super::airs::LfmAirs::new_chunked(
         &artifacts.roots,
@@ -1128,14 +1147,17 @@ pub(super) fn real_child(
         .map(|(idx, air)| super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup))
         .collect();
 
-    RealChild {
-        artifacts,
-        opts,
-        public_words: proved.public_words.clone(),
-        tables,
-        legs,
-        z_alpha: (lookup[0], lookup[1]),
-    }
+    (
+        RealChild {
+            artifacts,
+            opts,
+            public_words: proved.public_words.clone(),
+            tables,
+            legs,
+            z_alpha: (lookup[0], lookup[1]),
+        },
+        verify_secs,
+    )
 }
 
 /// The child's shape, as the node's emitter reads it.
@@ -1724,6 +1746,26 @@ impl CacheMode {
     }
 }
 
+/// ★ THE `prove` FIELD, SPLIT — `execute · fill · multi_prove`.
+///
+/// The per-node TIMING line prints the whole of `lfm_prove` as one number, and
+/// the three phases inside it are three different machines: a single-threaded
+/// interpreter, a parallel trace fill, and the only one that reaches the card.
+/// A lever aimed at the wrong one reads zero.
+///
+/// ⓘ Printed HERE rather than beside the timers, for the stage's label — a
+/// bare line is unattributable the moment two proofs are in flight. Silent on a
+/// LOADED stage, because nothing proved: `take_prove_split` returns `None` and
+/// there is nothing to attribute.
+fn print_prove_split(label: &str) {
+    if let Some(split) = super::proof::take_prove_split() {
+        println!(
+            "   {label} LFM PROVE: execute {:.2}s · fill {:.2}s · multi_prove {:.2}s",
+            split.execute, split.fill, split.multi_prove
+        );
+    }
+}
+
 /// Run `prove`, or substitute a cached proof, as `mode` says — and say which.
 ///
 /// ★ WHY ONLY THE PROOF IS CACHED. A level's `LfmProof` is the one thing it
@@ -1750,7 +1792,9 @@ fn cached_stage(
     );
     let Some(p) = path.filter(|_| mode != CacheMode::Off) else {
         println!("   {label}: PROVED in-process, NOT cached");
-        return prove();
+        let proved = prove();
+        print_prove_split(label);
+        return proved;
     };
     match mode {
         CacheMode::Load => {
@@ -1797,6 +1841,7 @@ fn cached_stage(
                 p.display(),
                 bytes.len()
             );
+            print_prove_split(label);
             proved
         }
         CacheMode::Off => unreachable!("filtered above"),
@@ -1971,15 +2016,21 @@ fn prove_node_program_as_child(
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
     let t = Instant::now();
-    let child = real_child(artifacts, opts.clone(), &proved);
+    let (child, t_verify) = real_child_timed(artifacts, opts.clone(), &proved);
+    let t_harvest = t.elapsed().as_secs_f64();
     // ★ THE SPLIT, because "60 s per node" attributes nothing. Which half a
     // second cache layer would have to hold — the artifacts or the harvest —
     // is a different build depending on this line, and guessing it is how a
     // campaign builds the wrong cache.
+    //
+    // ★ And the harvest carries its OWN split, because the two halves belong to
+    // different owners: `verify` is the harness's assert, `replay` is the
+    // transcript walk a driver genuinely needs. Summed, the field prices a
+    // phase no real pipeline has.
     println!(
         "   {label} TIMING: arenas {t_arenas:.1}s · build_artifacts {t_artifacts:.1}s \
-         · prove {t_prove:.1}s · harvest {:.1}s",
-        t.elapsed().as_secs_f64()
+         · prove {t_prove:.1}s · harvest {t_harvest:.1}s (verify {t_verify:.2} + replay {:.2})",
+        t_harvest - t_verify
     );
     (child, layout)
 }
@@ -3681,8 +3732,18 @@ fn the_production_tree_composes_to_a_root() {
     let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
         .expect("the inner ELF and its DECODE commitment must build once");
     for k in 0..bundle.num_epochs() {
+        // ★ THE WRAP'S OWN TIMING LINE. Level 0 is 49% of the block and until
+        // now it printed ONE number for nineteen wraps — every per-phase figure
+        // ever published for a wrap was derived by subtracting an assumed term
+        // from a level wall, which is how two derivations agreeing came to be
+        // read as confirmation. These are the same five fields the interior
+        // node has printed all along, so the two proof classes can be read
+        // against each other instead of against a model.
+        let t_wrap = Instant::now();
+        let t = Instant::now();
         let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
             .expect("every epoch must reconstruct from proofs alone");
+        let t_recon = t.elapsed().as_secs_f64();
         let out_halves = e.statement.public_output_len.div_ceil(4);
         if k == 0 {
             // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation fold
@@ -3703,11 +3764,16 @@ fn the_production_tree_composes_to_a_root() {
         let shapes: Vec<&super::epoch::TableChallengeShape> =
             e.tables.iter().map(|h| &h.shape).collect();
         assert_samplable(&format!("inner epoch {k}"), &shapes);
+        let t = Instant::now();
         let program =
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let t_emit = t.elapsed().as_secs_f64();
+        let t = Instant::now();
         let artifacts =
             build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let t_artifacts = t.elapsed().as_secs_f64();
+        let t = Instant::now();
         let proved = cached_stage(
             stage_mode(0),
             stage_path(cache_dir.as_deref(), &format!("wrap-{k}")),
@@ -3717,11 +3783,26 @@ fn the_production_tree_composes_to_a_root() {
                     .expect("the epoch wrap must prove")
             },
         );
+        let t_prove = t.elapsed().as_secs_f64();
         let layout = SchemaLayout::wrap(out_halves);
         layout.assert_covers(proved.public_words.len());
-        children.push(real_child(artifacts, wrap_opts.clone(), &proved));
+        let t = Instant::now();
+        let (child, t_verify) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+        let t_harvest = t.elapsed().as_secs_f64();
+        children.push(child);
         layouts.push(layout);
         labels.push(vec![crate::tables::local_to_global::epoch_label(k as u64)]);
+        // ⓘ `wall` is printed so the five fields read as a CLOSED account:
+        // what they do not sum to is the residual — the out-halves read,
+        // `assert_samplable`, the label push — and a residual that stops being
+        // noise is a phase nobody is timing.
+        println!(
+            "   wrap {k} TIMING: reconstruct {t_recon:.2}s · emit+arenas {t_emit:.2}s \
+             · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s \
+             · harvest {t_harvest:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s",
+            t_harvest - t_verify,
+            t_wrap.elapsed().as_secs_f64()
+        );
     }
     println!(
         "   level 0: {} wraps in {:.1}s",

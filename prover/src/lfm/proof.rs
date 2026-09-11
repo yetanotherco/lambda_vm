@@ -7,6 +7,9 @@
 //! compute the expected `LfmPublic` balance from the *claimed* public words
 //! (the COMMIT-bus pattern), and run `multi_verify_views`.
 
+use std::cell::Cell;
+use std::time::Instant;
+
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
 use stark::config::Commitment;
@@ -35,6 +38,47 @@ pub struct LfmProof {
     pub proof: MultiProof<F, E, ()>,
     /// The public output the execution produced, in emission order.
     pub public_words: Vec<(u32, LfmWord)>,
+}
+
+/// The three phases of a prove, in seconds: the LFM interpreter, the chip
+/// trace fill, and `multi_prove`.
+///
+/// ★ RECORDED, NOT PRINTED. This file is a production path — every shipped
+/// prove goes through [`lfm_prove`] — so a `println!` beside the three
+/// statements would put a timing line on the stdout of everything that proves,
+/// which the rest of the module deliberately does not do (its one diagnostic is
+/// a `log::info!`). The driver that wants the split takes it and prints it
+/// beside the stage label it already holds.
+///
+/// ⇒ Two things fall out of recording instead of printing, and both are why it
+/// is worth the extra type. A stage LOADED from cache did not prove, so
+/// [`take_prove_split`] returns `None` and the driver prints nothing rather
+/// than reprinting the previous stage's numbers. And the cell is PER-THREAD,
+/// so when sibling proofs run concurrently each worker fills and reads its own
+/// — a shared print would emit unattributable lines the moment a second proof
+/// is in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProveSplit {
+    /// `execute` — the LFM interpreter's walk over the program.
+    pub execute: f64,
+    /// `build_traces_with_hasher` — the chip trace fill.
+    pub fill: f64,
+    /// `prove_traces_with_hasher` — AIR construction, the transcript and
+    /// `multi_prove` itself.
+    pub multi_prove: f64,
+}
+
+thread_local! {
+    static LAST_PROVE_SPLIT: Cell<Option<ProveSplit>> = const { Cell::new(None) };
+}
+
+/// Take the split of the most recent prove ON THIS THREAD, clearing it.
+///
+/// `None` when nothing has proved on this thread since the last take. A caller
+/// that prints on `Some` therefore stays silent for a cached stage, which is
+/// the reading it wants: a line that appears is a prove that happened.
+pub fn take_prove_split() -> Option<ProveSplit> {
+    LAST_PROVE_SPLIT.with(|c| c.take())
 }
 
 #[derive(Debug)]
@@ -107,8 +151,25 @@ pub(crate) fn lfm_prove_with_residency(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<LfmProof, LfmProveError> {
+    // ★ THE SPLIT OF THE `prove` FIELD. The driver's per-node TIMING line prints
+    // this whole function as one number, and the three statements below are
+    // three different machines: `execute` is a single-threaded interpreter,
+    // `build_traces_with_hasher` is a parallel fill, and only the third reaches
+    // the card. Timing them separately is what lets a lever be aimed at one.
+    //
+    // ⚠ Recorded on the SUCCESS path only. The `?`s below return to a caller
+    // that panics, so a partial split would describe a run that produced no
+    // proof — and the cell would then hand it to the NEXT stage on this thread
+    // as if it were that stage's own.
+    let t = Instant::now();
     let exec = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    let execute_secs = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
     let mut traces = build_traces_with_hasher(program, &exec.records, hasher);
+    let fill_secs = t.elapsed().as_secs_f64();
+
+    let t = Instant::now();
     let proof = prove_traces_with_hasher(
         artifacts,
         &mut traces,
@@ -118,6 +179,15 @@ pub(crate) fn lfm_prove_with_residency(
         residency,
     )
     .map_err(LfmProveError::Prover)?;
+    let multi_prove_secs = t.elapsed().as_secs_f64();
+
+    LAST_PROVE_SPLIT.with(|c| {
+        c.set(Some(ProveSplit {
+            execute: execute_secs,
+            fill: fill_secs,
+            multi_prove: multi_prove_secs,
+        }))
+    });
 
     Ok(LfmProof {
         proof,

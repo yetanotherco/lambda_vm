@@ -1042,6 +1042,18 @@ fn harvest_real_epoch(
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
 
     // ---- production must ACCEPT it, or nothing below describes a real epoch.
+    //
+    // ★ TIMED, AND ON ITS OWN LINE, because this half and the replay below it
+    // have different owners. This is a complete host STARK verify of the base
+    // epoch's sub-proofs whose only use is to refuse — the harness will not
+    // read an epoch production rejects. The replay that follows is the Phase A
+    // walk and the per-table forks a driver genuinely needs. Reported as one
+    // `reconstruct` figure the two are indistinguishable, and the block's
+    // production-equivalent time was a BAND for exactly that reason.
+    //
+    // ⛔ Timed, never skipped and never gated: an epoch nothing verified is not
+    // a faster epoch, it is a different experiment.
+    let t_verify = std::time::Instant::now();
     let start_index = register_init[register::X254_INDEX] as u64;
     let expected = crate::compute_expected_commit_bus_balance_view(
         &refs,
@@ -1059,6 +1071,8 @@ fn harvest_real_epoch(
     ) {
         return Err("production's verifier rejects the epoch".to_string());
     }
+    let verify_secs = t_verify.elapsed().as_secs_f64();
+    let t_replay = std::time::Instant::now();
 
     // ---- Phase A, transcribed from `multi_verify_views:1160-1227`.
     let mut transcript = seed();
@@ -1117,6 +1131,12 @@ fn harvest_real_epoch(
             super::epoch_verify_tests::build_table_legs(*air, view.get(idx), &lookup_challenges)
         })
         .collect();
+
+    println!(
+        "   epoch {label}: production verify {verify_secs:.2}s (harness-only) \
+         · replay {:.2}s",
+        t_replay.elapsed().as_secs_f64()
+    );
 
     Ok(RealEpoch {
         statement: super::statement_replay::EpochStatementShape {

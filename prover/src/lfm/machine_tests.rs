@@ -10,7 +10,7 @@ use super::airs::BLAKE3_SLOT;
 use super::executor::LfmExecError;
 use super::fixture::{self, bump_lane0, fixture_prove};
 use super::programs::{fri_toy_program, trivial_program, trivial_program_source};
-use super::proof::{LfmProveError, lfm_prove, lfm_verify};
+use super::proof::{LfmProveError, lfm_prove, lfm_verify, take_prove_split};
 use super::registry::{LfmProgramKind, LfmRegistryError, build_artifacts, resolve};
 use super::validator::validate;
 use super::word::LfmWord;
@@ -47,6 +47,50 @@ fn trivial_program_proves_and_verifies() {
     )
     .expect("registry entry exists");
     assert!(ok, "honest machine proof must verify");
+}
+
+/// ★ THE GATE ON THE PROVE SPLIT — that it is recorded, that it covers the
+/// function rather than a corner of it, and that it is consumed.
+///
+/// Every one of the three assertions below can fail, and each fails on a
+/// different mistake. Drop the recording, or move it above one of the `?`s,
+/// and the `Some` goes. Time two statements instead of three and the coverage
+/// floor goes. Leave the cell set and the second take stops being `None` —
+/// which is the one that matters in a run with a cache, because a stage that
+/// LOADED would then be reported with the previous stage's numbers, and a
+/// figure attributed to the wrong stage is worse than no figure.
+#[test]
+fn the_prove_split_is_recorded_covers_the_prove_and_is_consumed() {
+    let opts = options();
+    let program = trivial_program();
+    let artifacts = build_artifacts(&program, &opts);
+
+    // Anything an earlier prove on this thread may have left behind.
+    let _ = take_prove_split();
+
+    let wall = std::time::Instant::now();
+    let _ = lfm_prove(&program, &artifacts, &arenas(), &opts).expect("prove");
+    let wall = wall.elapsed().as_secs_f64();
+
+    let split = take_prove_split().expect("a prove that returned Ok must leave its split");
+    assert!(
+        split.execute > 0.0 && split.fill > 0.0 && split.multi_prove > 0.0,
+        "every phase must have a positive span: {split:?}"
+    );
+    let sum = split.execute + split.fill + split.multi_prove;
+    assert!(
+        sum <= wall,
+        "three disjoint spans inside the call cannot exceed the call: {sum} > {wall}"
+    );
+    assert!(
+        sum >= 0.7 * wall,
+        "the three spans must cover the prove, not a corner of it: {sum} of {wall}"
+    );
+    assert!(
+        take_prove_split().is_none(),
+        "the split is taken once, not once per read — a second reader would \
+         attribute this prove's numbers to whatever ran next"
+    );
 }
 
 #[test]
