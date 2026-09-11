@@ -1321,6 +1321,7 @@ where
     Some(tree.root)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     table: &str,
     what: &'static str,
@@ -4003,6 +4004,7 @@ mod admission_box_tests {
         let weights: Vec<Fp> = (0..n).map(|i| Fp::from(i as u64 + 1)).collect();
         let committed = try_expand_leaf_and_tree_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
             "admission_box_test",
+            "admission box",
             &data,
             None,
             n,
