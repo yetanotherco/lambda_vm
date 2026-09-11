@@ -5,7 +5,7 @@
 
 use stark::trace::TraceTable;
 
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField, zeroed_fe_vec};
 
 use crate::tables::{bitwise, keccak_rc, keccak_rnd};
 
@@ -61,15 +61,114 @@ pub fn range_group() -> ColumnGroup {
     }
 }
 
+/// Which row walk [`chip_trace`] runs.
+///
+/// Production is always [`Walk::Parallel`], and it is the only variant a
+/// production build has: `SerialReference` is the two-loop walk this module had
+/// before the rows were split across threads, kept verbatim under `cfg(test)` so
+/// the identity gate in `trace_identity_tests` compares against the code the
+/// parallel walk replaced rather than a second spelling of the walk under test.
+/// Gating it means no shipped build can reach the old walk by accident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Walk {
+    Parallel,
+    #[cfg(test)]
+    SerialReference,
+}
+
 /// Builds one chip's trace: copy the (already padded) group into the leading
 /// columns, then let `fill` write the value columns of each real row.
+///
+/// The walk is over rows, and rows are independent, so it runs across the
+/// prover's rayon pool. Two facts make the split byte-identical to the serial
+/// one, and both are load-bearing:
+///
+/// * A row's body is its prefix copy *then* its `fill` — the order the two
+///   serial loops gave any single row. The hash arm reads back what the copy
+///   wrote: `blake3_socket`'s filler takes its domain off the row's own mode
+///   columns, and every `fill_*_witness` reads the `IN`/`S` cells.
+/// * No chip's body touches another row. Each closure reads `records[row]` and
+///   writes only the slice it is handed, so the chunks' writes are disjoint.
+///   `fill` is `Fn + Sync`, not `FnMut`, so a closure that wants to carry state
+///   from row to row fails to compile here instead of racing on the box.
 fn chip_trace(
+    walk: Walk,
+    group: &ColumnGroup,
+    num_columns: usize,
+    fill: impl Fn(usize, &mut [FE]) + Sync,
+) -> TraceTable<F, E> {
+    let rows = group.padded_rows;
+    // calloc rather than `vec![FE::zero(); n]`'s element-wise sweep: a chip
+    // trace runs to gigabytes and the fill is memory-bandwidth-bound, so the
+    // eager zeroing pass is pure cost. `zeroed_fe_vec` carries the soundness
+    // argument and its own guard test.
+    let mut data = zeroed_fe_vec(rows * num_columns);
+    match walk {
+        Walk::Parallel => fill_rows(&mut data, group, num_columns, &fill),
+        #[cfg(test)]
+        Walk::SerialReference => fill_rows_serial_reference(&mut data, group, num_columns, fill),
+    }
+    TraceTable::new_main(data, num_columns, 1)
+}
+
+/// One row of [`chip_trace`]'s walk: the preprocessed prefix, then the value
+/// columns if this is a real row. `row` indexes the whole table; `out` is that
+/// row's `num_columns` cells and nothing else.
+#[inline]
+fn chip_row(group: &ColumnGroup, fill: &impl Fn(usize, &mut [FE]), row: usize, out: &mut [FE]) {
+    out[..group.width].copy_from_slice(&group.data[row * group.width..(row + 1) * group.width]);
+    if row < group.real_rows {
+        fill(row, out);
+    }
+}
+
+/// [`Walk::Parallel`]: the rows, chunked across the pool the rest of the prover
+/// already uses. No second pool — `rayon`'s global one, entered through the
+/// crate's `parallel` feature, exactly as `tables::bitwise` and
+/// `tables::trace_builder` enter it.
+#[cfg(feature = "parallel")]
+fn fill_rows(
+    data: &mut [FE],
+    group: &ColumnGroup,
+    num_columns: usize,
+    fill: &(impl Fn(usize, &mut [FE]) + Sync),
+) {
+    use rayon::prelude::*;
+
+    data.par_chunks_mut(num_columns)
+        .enumerate()
+        .for_each(|(row, out)| chip_row(group, fill, row, out));
+}
+
+/// [`Walk::Parallel`] without the feature: the same row bodies in order. This is
+/// the walk, not the reference — `--no-default-features` builds still have to
+/// produce the trace, and they produce the same one.
+#[cfg(not(feature = "parallel"))]
+fn fill_rows(
+    data: &mut [FE],
+    group: &ColumnGroup,
+    num_columns: usize,
+    fill: &(impl Fn(usize, &mut [FE]) + Sync),
+) {
+    for (row, out) in data.chunks_mut(num_columns).enumerate() {
+        chip_row(group, fill, row, out);
+    }
+}
+
+/// [`Walk::SerialReference`]: the pre-parallel body, verbatim — the whole
+/// table's prefixes in one loop, then the real rows' values in a second.
+///
+/// It deliberately does not go through [`chip_row`]. The gate's whole value is
+/// that the two sides were written independently, so a bug introduced into the
+/// shared row body would have to be introduced twice to go unnoticed.
+#[cfg(test)]
+fn fill_rows_serial_reference(
+    data: &mut [FE],
     group: &ColumnGroup,
     num_columns: usize,
     mut fill: impl FnMut(usize, &mut [FE]),
-) -> TraceTable<F, E> {
+) {
     let rows = group.padded_rows;
-    let mut data = vec![FE::zero(); rows * num_columns];
     for row in 0..rows {
         data[row * num_columns..row * num_columns + group.width]
             .copy_from_slice(&group.data[row * group.width..(row + 1) * group.width]);
@@ -77,7 +176,6 @@ fn chip_trace(
     for row in 0..group.real_rows {
         fill(row, &mut data[row * num_columns..(row + 1) * num_columns]);
     }
-    TraceTable::new_main(data, num_columns, 1)
 }
 
 /// Writes the Poseidon round witness into a hash row whose `IN`/`S`/`OUT`
@@ -232,6 +330,21 @@ pub fn build_traces_with_hasher(
     records: &LfmRecords,
     hasher: HasherKind,
 ) -> LfmTraces {
+    build_traces_walked(program, records, hasher, Walk::Parallel)
+}
+
+/// [`build_traces_with_hasher`] with the row walk named.
+///
+/// The walk is a parameter for exactly one reason: so `trace_identity_tests` can
+/// build the whole `LfmTraces` both ways, through these closures and no others,
+/// and compare the results cell for cell. Nothing outside this module chooses;
+/// every production entry point above takes [`Walk::Parallel`].
+pub(super) fn build_traces_walked(
+    program: &LfmProgram,
+    records: &LfmRecords,
+    hasher: HasherKind,
+    walk: Walk,
+) -> LfmTraces {
     let g = &program.groups;
 
     let hash_modes: Vec<HashMode> = program
@@ -287,7 +400,7 @@ pub fn build_traces_with_hasher(
                 .blake3_chunking
                 .chunk_range(g.blake3.real_rows, c)
                 .start;
-            chip_trace(&group, blake3_chip::cols::NUM_COLUMNS, |row, out| {
+            chip_trace(walk, &group, blake3_chip::cols::NUM_COLUMNS, |row, out| {
                 blake3_chip::fill_blake3_witness(out, &records.blake3[base + row]);
             })
         })
@@ -345,22 +458,22 @@ pub fn build_traces_with_hasher(
     histogram.fill_multiplicities(&mut bitwise_trace);
 
     LfmTraces {
-        const_: chip_trace(&g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
-        balu: chip_trace(&g.balu, balu::cols::NUM_COLUMNS, |row, out| {
+        const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
+        balu: chip_trace(walk, &g.balu, balu::cols::NUM_COLUMNS, |row, out| {
             let r = &records.balu[row];
             out[balu::cols::A] = r.a;
             out[balu::cols::B] = r.b;
             out[balu::cols::C] = r.c;
             out[balu::cols::OUT] = r.out;
         }),
-        xalu: chip_trace(&g.xalu, xalu::cols::NUM_COLUMNS, |row, out| {
+        xalu: chip_trace(walk, &g.xalu, xalu::cols::NUM_COLUMNS, |row, out| {
             let r = &records.xalu[row];
             out[xalu::cols::A0..xalu::cols::A0 + 3].copy_from_slice(&r.a);
             out[xalu::cols::B0..xalu::cols::B0 + 3].copy_from_slice(&r.b);
             out[xalu::cols::C0..xalu::cols::C0 + 3].copy_from_slice(&r.c);
             out[xalu::cols::OUT0..xalu::cols::OUT0 + 3].copy_from_slice(&r.out);
         }),
-        select: chip_trace(&g.select, select::cols::NUM_COLUMNS, |row, out| {
+        select: chip_trace(walk, &g.select, select::cols::NUM_COLUMNS, |row, out| {
             let r = &records.select[row];
             out[select::cols::BIT] = r.bit;
             out[select::cols::INL0..select::cols::INL0 + 4].copy_from_slice(&r.in_l);
@@ -368,13 +481,13 @@ pub fn build_traces_with_hasher(
             out[select::cols::OUTL0..select::cols::OUTL0 + 4].copy_from_slice(&r.out_l);
             out[select::cols::OUTR0..select::cols::OUTR0 + 4].copy_from_slice(&r.out_r);
         }),
-        bitdec: chip_trace(&g.bitdec, bitdec::cols::NUM_COLUMNS, |row, out| {
+        bitdec: chip_trace(walk, &g.bitdec, bitdec::cols::NUM_COLUMNS, |row, out| {
             let r = &records.bitdec[row];
             out[bitdec::cols::BITS0..bitdec::cols::BITS0 + 64].copy_from_slice(&r.bits);
             out[bitdec::cols::Z] = r.z;
             out[bitdec::cols::GINV] = r.ginv;
         }),
-        hash: chip_trace(&g.hash, hash::num_columns(hasher), |row, out| {
+        hash: chip_trace(walk, &g.hash, hash::num_columns(hasher), |row, out| {
             let r = &records.hash[row];
             out[hash::cols::IN0..hash::cols::IN0 + 12].copy_from_slice(&r.ins);
             for k in 0..4 {
@@ -398,7 +511,7 @@ pub fn build_traces_with_hasher(
                 HasherKind::Rpx => fill_rpx_witness(out),
             }
         }),
-        keccak: chip_trace(&g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
+        keccak: chip_trace(walk, &g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
             let r = &records.keccak[row];
             for lane in 0..25 {
                 for b in 0..8 {
@@ -413,16 +526,17 @@ pub fn build_traces_with_hasher(
             }
         }),
         blake3: blake3_traces,
-        lanes: chip_trace(&g.lanes, lanes::cols::NUM_COLUMNS, |row, out| {
+        lanes: chip_trace(walk, &g.lanes, lanes::cols::NUM_COLUMNS, |row, out| {
             out[lanes::cols::V0..lanes::cols::V0 + 4].copy_from_slice(&records.lanes[row]);
         }),
-        hint: chip_trace(&g.hint, hint::cols::NUM_COLUMNS, |row, out| {
+        hint: chip_trace(walk, &g.hint, hint::cols::NUM_COLUMNS, |row, out| {
             out[hint::cols::V0..hint::cols::V0 + 4].copy_from_slice(&records.hint[row]);
         }),
-        public: chip_trace(&g.public, public::cols::NUM_COLUMNS, |row, out| {
+        public: chip_trace(walk, &g.public, public::cols::NUM_COLUMNS, |row, out| {
             out[public::cols::V0..public::cols::V0 + 4].copy_from_slice(&records.public[row]);
         }),
         range: chip_trace(
+            walk,
             &range_group(),
             super::chips::range::cols::NUM_COLUMNS,
             |_, _| {},
