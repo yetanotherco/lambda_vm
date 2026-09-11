@@ -24,7 +24,7 @@ pub const MAX_NODES: usize = 16;
 
 const BLOCK_DIM: u32 = 256;
 
-/// Scratch ceiling for the per-thread slot file, which is what sets the grid:
+/// Scratch ceiling for the per-thread slot file, which is what caps the grid:
 /// a wider program buys fewer threads. 512 MiB leaves the factors and the
 /// resident codewords room on a 32 GiB device.
 const SLOT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
@@ -61,7 +61,16 @@ pub struct SumcheckSession {
     root_slot: u32,
     slots: CudaSlice<u64>,
     partials: CudaSlice<u64>,
-    grid: u32,
+    /// The session's widest launch, set by its first round.
+    max_grid: u32,
+    /// The interpolation nodes as the device last saw them, and the buffer
+    /// they live in. They are the same every round of a sumcheck, so the send
+    /// happens once and the comparison is what decides that.
+    t_dev: CudaSlice<u64>,
+    t_host: Vec<u64>,
+    /// Three u64 of scratch for the round's challenge, written in place rather
+    /// than allocated per fold.
+    r_dev: CudaSlice<u64>,
 }
 
 impl SumcheckSession {
@@ -113,7 +122,8 @@ impl SumcheckSession {
         };
         let factor_ptrs = stream.clone_htod(&addresses)?;
 
-        let (grid, num_threads) = grid_for(num_slots);
+        let grid = grid_for_work(grid_ceiling(num_slots), (stride / 2) as u64);
+        let num_threads = grid as u64 * BLOCK_DIM as u64;
 
         let nodes_dev = stream.clone_htod(nodes)?;
         // A program with no constants still needs an allocation to point at.
@@ -123,7 +133,10 @@ impl SumcheckSession {
             consts
         })?;
         let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
-        let partials = stream.alloc_zeros::<u64>(MAX_NODES * grid as usize * 3)?;
+        // Every partial the round reads is one the round wrote.
+        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * grid as usize * 3) }?;
+        let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
+        let r_dev = stream.alloc_zeros::<u64>(3)?;
 
         Ok(Self {
             stream,
@@ -140,7 +153,10 @@ impl SumcheckSession {
             root_slot,
             slots,
             partials,
-            grid,
+            max_grid: grid,
+            t_dev,
+            t_host: Vec::new(),
+            r_dev,
         })
     }
 
@@ -171,7 +187,8 @@ impl SumcheckSession {
 
         let be = backend()?;
         let width = addresses.len();
-        let (grid, num_threads) = grid_for(num_slots);
+        let grid = grid_for_work(grid_ceiling(num_slots), (len / 2) as u64);
+        let num_threads = grid as u64 * BLOCK_DIM as u64;
         let factor_ptrs = stream.clone_htod(addresses)?;
         let nodes_dev = stream.clone_htod(nodes)?;
         let consts_dev = stream.clone_htod(if consts.is_empty() {
@@ -180,7 +197,9 @@ impl SumcheckSession {
             consts
         })?;
         let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
-        let partials = stream.alloc_zeros::<u64>(MAX_NODES * grid as usize * 3)?;
+        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * grid as usize * 3) }?;
+        let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
+        let r_dev = stream.alloc_zeros::<u64>(3)?;
         let _ = be;
 
         Ok(Self {
@@ -198,16 +217,18 @@ impl SumcheckSession {
             root_slot,
             slots,
             partials,
-            grid,
+            max_grid: grid,
+            t_dev,
+            t_host: Vec::new(),
+            r_dev,
         })
     }
 
     /// Bytes this session holds on device, for admission control.
     pub fn device_bytes(factors: usize, cube: usize, num_slots: usize) -> u64 {
         let per_thread = num_slots as u64 * 3 * 8;
-        let threads = (SLOT_BUDGET_BYTES / per_thread.max(1))
-            .min(MAX_THREADS)
-            .max(BLOCK_DIM as u64);
+        let grid = grid_for_work(grid_ceiling(num_slots), (cube / 2) as u64);
+        let threads = grid as u64 * BLOCK_DIM as u64;
         factors as u64 * cube as u64 * 24 + threads * per_thread
     }
 
@@ -232,9 +253,17 @@ impl SumcheckSession {
 
         let be = backend()?;
         let half = (self.len / 2) as u64;
-        let t_dev = self.stream.clone_htod(t)?;
+        // The grid follows the cube down: a block past the indices left writes
+        // a partial with nothing in it, and that partial is what comes back.
+        let grid = grid_for_work(self.max_grid, half);
+        if self.t_host != t {
+            let mut head = self.t_dev.slice_mut(0..t.len());
+            self.stream.memcpy_htod(t, &mut head)?;
+            self.t_host.clear();
+            self.t_host.extend_from_slice(t);
+        }
         let cfg = LaunchConfig {
-            grid_dim: (self.grid, 1, 1),
+            grid_dim: (grid, 1, 1),
             block_dim: (BLOCK_DIM, 1, 1),
             // One ext3 accumulator per thread, reduced one node at a time.
             shared_mem_bytes: BLOCK_DIM * 3 * 8,
@@ -250,7 +279,7 @@ impl SumcheckSession {
                 .arg(&num_nodes)
                 .arg(&self.consts)
                 .arg(&self.root_slot)
-                .arg(&t_dev)
+                .arg(&self.t_dev)
                 .arg(&num_t_u32)
                 .arg(&mut self.slots)
                 .arg(&mut self.partials)
@@ -260,10 +289,10 @@ impl SumcheckSession {
         // The per-block partials come back and are summed here: it is a few
         // kilobytes against the cube the kernel just walked, and the round
         // cannot proceed without the host anyway.
-        let used = num_t * self.grid as usize * 3;
+        let used = num_t * grid as usize * 3;
         let partials = self.stream.clone_dtoh(&self.partials.slice(0..used))?;
         self.stream.synchronize()?;
-        Ok(sum_partials(&partials, num_t, self.grid as usize))
+        Ok(sum_partials(&partials, num_t, grid as usize))
     }
 
     /// Binds the round's variable to `r` (ext3, three u64) in every factor.
@@ -272,7 +301,7 @@ impl SumcheckSession {
         assert!(self.len >= 2, "a fold needs a variable to bind");
         let be = backend()?;
         let half = (self.len / 2) as u64;
-        let r_dev = self.stream.clone_htod(r)?;
+        self.stream.memcpy_htod(r, &mut self.r_dev)?;
         let total = self.width as u64 * half;
         let grid = total.div_ceil(BLOCK_DIM as u64).min(4096) as u32;
         let cfg = LaunchConfig {
@@ -287,7 +316,7 @@ impl SumcheckSession {
                 .arg(&mut self.factor_ptrs)
                 .arg(&half)
                 .arg(&width)
-                .arg(&r_dev)
+                .arg(&self.r_dev)
                 .launch(cfg)?;
         }
         self.len /= 2;
@@ -347,15 +376,23 @@ impl SumcheckSession {
     }
 }
 
-/// The launch shape for a program of `num_slots` live values: the slot file is
-/// per thread, so it is the grid that gives way to a wider program.
-fn grid_for(num_slots: usize) -> (u32, u64) {
+/// The most blocks a program of `num_slots` live values may launch: the slot
+/// file is per thread, so it is the grid that gives way to a wider program.
+///
+/// This is a ceiling, not a shape — what a launch actually takes is
+/// [`grid_for_work`], because a grid past the indices it walks costs a partial
+/// per idle block and a reduction with nothing in it.
+fn grid_ceiling(num_slots: usize) -> u32 {
     let per_thread = num_slots as u64 * 3 * 8;
     let threads = (SLOT_BUDGET_BYTES / per_thread.max(1))
         .min(MAX_THREADS)
         .max(BLOCK_DIM as u64);
-    let grid = ((threads / BLOCK_DIM as u64) as u32).max(1);
-    (grid, grid as u64 * BLOCK_DIM as u64)
+    ((threads / BLOCK_DIM as u64) as u32).max(1)
+}
+
+/// The blocks `work` indices need, never past `ceiling`.
+fn grid_for_work(ceiling: u32, work: u64) -> u32 {
+    work.div_ceil(BLOCK_DIM as u64).clamp(1, ceiling as u64) as u32
 }
 
 /// Sums the per-block partials of each interpolation node.
@@ -461,10 +498,11 @@ fn fold_to_one(
     };
     let mut table = stream.clone_htod(&address)?;
 
+    let point_dev = stream.clone_htod(point)?;
     let width = 1u64;
     let mut half = len / 2;
-    for coordinate in point.chunks_exact(3) {
-        let r = stream.clone_htod(coordinate)?;
+    for at in (0..point.len()).step_by(3) {
+        let r = point_dev.slice(at..at + 3);
         let cfg = LaunchConfig::for_num_elems((half * width) as u32);
         unsafe {
             stream
@@ -486,6 +524,9 @@ pub struct DeviceFactors {
     stream: Arc<CudaStream>,
     buffer: Arc<CudaSlice<u64>>,
     addresses: Vec<u64>,
+    /// The same list on device, where every program that walks these factors
+    /// reads it — one send, not one per interaction.
+    factor_ptrs: CudaSlice<u64>,
     len: usize,
 }
 
@@ -515,10 +556,12 @@ impl DeviceFactors {
                 .map(|k| base + (k * span * 8) as u64)
                 .collect()
         };
+        let factor_ptrs = stream.clone_htod(&addresses)?;
         Ok(Self {
             stream,
             buffer: Arc::new(buffer),
             addresses,
+            factor_ptrs,
             len,
         })
     }
@@ -563,8 +606,8 @@ impl DeviceFactors {
         );
 
         let be = backend()?;
-        let (grid, num_threads) = grid_for(num_slots);
-        let factor_ptrs = self.stream.clone_htod(&self.addresses)?;
+        let grid = grid_for_work(grid_ceiling(num_slots), self.len as u64);
+        let num_threads = grid as u64 * BLOCK_DIM as u64;
         let nodes_dev = self.stream.clone_htod(nodes)?;
         let consts_dev = self.stream.clone_htod(if consts.is_empty() {
             &[0u64][..]
@@ -586,7 +629,7 @@ impl DeviceFactors {
         unsafe {
             self.stream
                 .launch_builder(&be.program_map_ext3)
-                .arg(&factor_ptrs)
+                .arg(&self.factor_ptrs)
                 .arg(&rows)
                 .arg(&nodes_dev)
                 .arg(&num_nodes)
@@ -713,8 +756,14 @@ pub fn eq_expand_into(
         let mut head = dst.slice_mut(offset * 3..offset * 3 + 3);
         stream.memcpy_htod(seed, &mut head)?;
     }
-    for (level, coordinate) in point.chunks_exact(3).rev().enumerate() {
-        let r = stream.clone_htod(coordinate)?;
+    // The whole point goes up once and each level reads its coordinate where
+    // it lies: a stacked polynomial's weight is one of these per column, so a
+    // send per level is tens of thousands of them for three u64 each.
+    let point_dev = stream.clone_htod(point)?;
+    let vars = point.len() / 3;
+    for level in 0..vars {
+        let at = (vars - 1 - level) * 3;
+        let r = point_dev.slice(at..at + 3);
         let filled = 1u64 << level;
         let mut range = dst.slice_mut(offset * 3..(offset + len) * 3);
         unsafe {
