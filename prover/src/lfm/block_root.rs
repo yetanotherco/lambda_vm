@@ -930,7 +930,11 @@ mod tests {
 
         // ---- what each interior child must have published for its subtree.
         let folded = refolded_by_the_machine(epochs, fan_in, replaces_top, &roots);
-        assert_eq!(folded.len(), children, "one folded digest per interior child");
+        assert_eq!(
+            folded.len(),
+            children,
+            "one folded digest per interior child"
+        );
 
         // ---- the interior children, in `emit_node_publishes`' own order.
         let id = [FE::from(31), FE::from(37), FE::from(41), FE::from(43)];
@@ -966,8 +970,9 @@ mod tests {
             labels.push(run.to_vec());
         }
 
-        let interior_layouts: Vec<SchemaLayout> =
-            (0..children).map(|_| SchemaLayout::node(out_halves)).collect();
+        let interior_layouts: Vec<SchemaLayout> = (0..children)
+            .map(|_| SchemaLayout::node(out_halves))
+            .collect();
         for (w, l) in interior.iter().zip(&interior_layouts) {
             assert_eq!(w.len(), l.total(), "the fixture IS the node layout");
         }
@@ -1084,7 +1089,8 @@ mod tests {
     fn the_block_root_binds_the_global_wrap() {
         for (epochs, fan_in, replaces_top) in ROOT_SHAPES {
             for out_halves in [0usize, 3] {
-                let (plan, exec) = run_root_fixture(epochs, fan_in, replaces_top, out_halves, |_| {});
+                let (plan, exec) =
+                    run_root_fixture(epochs, fan_in, replaces_top, out_halves, |_| {});
                 let exec = exec.unwrap_or_else(|e| {
                     panic!(
                         "{epochs} epochs at fan-in {fan_in} (replaces_top={replaces_top}, \
@@ -1122,11 +1128,10 @@ mod tests {
             );
             for epoch in 0..epochs {
                 for lane in 0..lanes {
-                    let (plan, tampered) =
-                        run_root_fixture(epochs, fan_in, replaces_top, 0, |f| {
-                            let at = 2 + epoch * lanes + lane;
-                            f.global[at][0] += FE::one();
-                        });
+                    let (plan, tampered) = run_root_fixture(epochs, fan_in, replaces_top, 0, |f| {
+                        let at = 2 + epoch * lanes + lane;
+                        f.global[at][0] += FE::one();
+                    });
                     assert_eq!(
                         plan.global_layout.l2g_word(epoch, lane),
                         2 + epoch * lanes + lane,
@@ -1246,8 +1251,14 @@ mod tests {
 
                 // ---- the id, as the four-lane word every child agreed on.
                 let words = &exec.public_words;
-                assert_eq!(words[0].1, [FE::from(31), FE::from(37), FE::from(41), FE::from(43)]);
-                assert_eq!(words[1].1, [FE::from(47), FE::from(53), FE::from(59), FE::from(61)]);
+                assert_eq!(
+                    words[0].1,
+                    [FE::from(31), FE::from(37), FE::from(41), FE::from(43)]
+                );
+                assert_eq!(
+                    words[1].1,
+                    [FE::from(47), FE::from(53), FE::from(59), FE::from(61)]
+                );
                 // ---- the block's OPENING registers, from the FIRST child.
                 let last = plan.interior_layouts.len() - 1;
                 for r in 0..num_reg {

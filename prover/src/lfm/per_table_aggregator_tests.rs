@@ -3108,7 +3108,10 @@ fn the_block_root_proves_over_real_children() {
     let node_layout = SchemaLayout::node(node_out_halves);
     node_layout.assert_covers(node_proved.public_words.len());
     let node = real_child(node_artifacts, wrap_opts.clone(), &node_proved);
-    println!("   the leaf NODE proved in {:.1}s", t.elapsed().as_secs_f64());
+    println!(
+        "   the leaf NODE proved in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     // ---- the GLOBAL CHILD: `k` slices and the PARENT that folds them, which is
     // what production hands the root. ⛔ Not the unsliced wrap: the parent's
@@ -3426,9 +3429,10 @@ fn the_production_tree_composes_to_a_root() {
              which; this driver must not guess, and must not carry a default that \
              silently becomes the answer"
         ),
-        (true, Some(v)) => Some(super::block_root::RootOption::parse(v).unwrap_or_else(|e| {
-            panic!("LFM_TREE_ROOT_OPTION: {e}")
-        })),
+        (true, Some(v)) => Some(
+            super::block_root::RootOption::parse(v)
+                .unwrap_or_else(|e| panic!("LFM_TREE_ROOT_OPTION: {e}")),
+        ),
     };
     let (lo, hi_req): (usize, Option<usize>) = if size_root || prove_root {
         // `lo` above every level means no stage proves.
@@ -3508,8 +3512,8 @@ fn the_production_tree_composes_to_a_root() {
          levels: {} · cache {}\n   cgroup ceiling: {}",
         match root_option {
             Some(o) => format!("PRODUCTION TREE + THE BLOCK-ARTIFACT ROOT, option {o:?}"),
-            None if size_root => "PRODUCTION TREE, SIZING BOTH ROOT OPTIONS (proving neither)"
-                .to_string(),
+            None if size_root =>
+                "PRODUCTION TREE, SIZING BOTH ROOT OPTIONS (proving neither)".to_string(),
             None => "PRODUCTION TREE (INTERIOR ONLY — not the block-artifact root)".to_string(),
         },
         inputs.label,
