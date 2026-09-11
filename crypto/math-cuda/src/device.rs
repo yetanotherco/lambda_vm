@@ -308,6 +308,115 @@ fn retain_default_mempool(ctx: &CudaContext) {
     }
 }
 
+/// Hands the device default memory pool's retained blocks back to the OS.
+///
+/// The pool keeps freed stream-ordered allocations forever by design (see
+/// [`retain_default_mempool`]), which is what makes repeated allocations cheap
+/// — and also what makes a *new* shape of allocation fail while the pool sits
+/// on memory it is not using. Best-effort: a failure leaves things as they are.
+fn trim_default_mempool() {
+    use cudarc::driver::sys;
+    let Ok(be) = backend() else { return };
+    // SAFETY: raw driver calls. The device is the backend's, the out-pointer a
+    // stack slot, and the target size is read as a u64. Errors are swallowed.
+    unsafe {
+        let dev = be.ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        let _ = sys::cuMemPoolTrimTo(pool, 0).result();
+    }
+}
+
+/// Lands every stream's pending frees and hands the pool's retained blocks
+/// back.
+///
+/// The frees are stream-ordered, so a buffer dropped on another stream is not
+/// free until that stream reaches the drop — and the pool cannot return what
+/// it has not been given yet. Draining the whole context first is what makes
+/// the trim worth doing.
+fn drain_and_trim() -> Result<()> {
+    let be = backend()?;
+    be.ctx.synchronize()?;
+    trim_default_mempool();
+    Ok(())
+}
+
+/// Whether the device has `bytes` free for something about to be built there.
+///
+/// The stream-ordered pool counts its retained blocks as used, so the first
+/// answer understates what is available; a "no" is therefore re-asked after
+/// draining and trimming, which is the expensive part and only happens when it
+/// matters. A driver that will not answer is taken as a yes — this is a
+/// courtesy check, not a guarantee.
+pub fn room_for(bytes: u64) -> bool {
+    let enough = || {
+        let Ok(be) = backend() else { return true };
+        if be.ctx.bind_to_thread().is_err() {
+            return true;
+        }
+        use cudarc::driver::sys;
+        // SAFETY: a driver query into two stack slots, context bound above.
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+                .result()
+                .is_err()
+            {
+                return true;
+            }
+            free as u64 >= bytes
+        }
+    };
+    enough() || (drain_and_trim().is_ok() && enough())
+}
+
+/// Allocates on `stream`, and if the device says no, gives the pool's retained
+/// blocks back and asks once more.
+///
+/// "Out of memory" from the stream-ordered allocator usually means the pool is
+/// holding blocks of the wrong shape, not that the device is full — a second
+/// prover on the same card is enough. It is worth one retry: a prove whose
+/// tables are already on the device has nowhere to fall back to, so a failure
+/// here is a failed proof.
+///
+/// # Safety
+/// The caller must write every element before reading it, as with
+/// `CudaStream::alloc`.
+pub unsafe fn alloc_or_trim<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    // SAFETY: the caller's, forwarded.
+    match unsafe { stream.alloc::<T>(len) } {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            // SAFETY: the caller's, forwarded.
+            unsafe { stream.alloc::<T>(len) }
+        }
+    }
+}
+
+/// The same, zeroed.
+pub fn alloc_zeros_or_trim<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    match stream.alloc_zeros::<T>(len) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.alloc_zeros::<T>(len)
+        }
+    }
+}
+
 /// Device VRAM budget in bytes for table session admission control.
 ///
 /// LAMBDA_VM_VRAM_BUDGET_MB overrides it (used to force the throttle in tests).

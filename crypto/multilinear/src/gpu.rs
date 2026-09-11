@@ -1119,6 +1119,13 @@ impl std::fmt::Debug for DeviceFactors {
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
 
+/// How much of a table's argument a device holds, counted in what its factors
+/// weigh: the factors themselves, the fraction tree over them, and the
+/// scratch the rounds walk. Measured on the widest tables, where the tree
+/// alone is four times the factors.
+#[cfg(feature = "cuda")]
+const ARGUMENT_OVER_FACTORS: u64 = 6;
+
 /// A table's factors, built on the device out of its base columns.
 ///
 /// A committed factor is a column read at a frame-step offset and lifted, so
@@ -1154,6 +1161,16 @@ where
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_FACTORS").is_some()) {
+        return None;
+    }
+    // A table's argument holds several of these at once: the factors, the
+    // LogUp tree over them — which on the widest tables is four times their
+    // size — and the rounds' scratch. Declining here is the one place it is
+    // free: nothing is resident yet, so the whole argument runs on the host
+    // exactly as it does without a device. On a card another prover is already
+    // using, that is the right answer.
+    let held = (kinds.len() * rows * 24) as u64;
+    if !math_cuda::device::room_for(held.saturating_mul(ARGUMENT_OVER_FACTORS)) {
         return None;
     }
 
@@ -1245,8 +1262,8 @@ where
     let rows = factors.0.len();
     let slots = numerators.len().next_power_of_two();
     let stream = factors.0.stream().clone();
-    let mut p = stream.alloc_zeros::<u64>(slots * rows * 3).ok()?;
-    let mut q = stream.alloc_zeros::<u64>(slots * rows * 3).ok()?;
+    let mut p = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, slots * rows * 3).ok()?;
+    let mut q = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, slots * rows * 3).ok()?;
 
     for (i, (numerator, denominator)) in numerators.iter().zip(denominators).enumerate() {
         for (program, out) in [(numerator, &mut p), (denominator, &mut q)] {

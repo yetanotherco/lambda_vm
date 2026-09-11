@@ -72,8 +72,8 @@ impl DeviceFractionTree {
             let below = layers.last().expect("non-empty");
             let half = (1usize << below.num_vars) / 2;
             // SAFETY: the kernel writes every element of the level it produces.
-            let mut p_out = unsafe { stream.alloc::<u64>(half * 3) }?;
-            let mut q_out = unsafe { stream.alloc::<u64>(half * 3) }?;
+            let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(&stream, half * 3) }?;
+            let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(&stream, half * 3) }?;
             let half_arg = half as u64;
             unsafe {
                 stream

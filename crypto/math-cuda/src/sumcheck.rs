@@ -16,7 +16,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 
 use crate::Result;
-use crate::device::backend;
+use crate::device::{alloc_or_trim, alloc_zeros_or_trim, backend};
 
 /// Interpolation nodes per round the kernel has accumulator room for. Mirrors
 /// `MAX_NODES` in `kernels/sumcheck.cu`.
@@ -78,10 +78,9 @@ pub struct SumcheckSession {
     consts: CudaSlice<u64>,
     root_slot: u32,
     slots: CudaSlice<u64>,
-    /// Threads `slots` was sized for. A round that splits over more
-    /// interpolation nodes than the last one asks for more.
+    /// Threads `slots` was sized for, which is the first round's. Later
+    /// rounds need fewer for the cube, and spend the difference on nodes.
     slot_threads: u64,
-    num_slots: usize,
     partials: CudaSlice<u64>,
     /// The threads this session's program can afford at once. Every round's
     /// launch is shaped out of it and the indices it has left.
@@ -127,7 +126,7 @@ impl SumcheckSession {
         let stream = be.next_stream();
 
         let width = factors.len();
-        let mut buffer = unsafe { stream.alloc::<u64>(width * stride * 3) }?;
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, width * stride * 3) }?;
         for (k, factor) in factors.iter().enumerate() {
             let at = k * stride * 3;
             let mut slab = buffer.slice_mut(at..at + factor.len());
@@ -157,9 +156,9 @@ impl SumcheckSession {
         } else {
             consts
         })?;
-        let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
+        let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
         // Every partial the round reads is one the round wrote.
-        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * widest as usize * 3) }?;
+        let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
         let r_dev = stream.alloc_zeros::<u64>(3)?;
 
@@ -178,7 +177,6 @@ impl SumcheckSession {
             root_slot,
             slots,
             slot_threads: num_threads,
-            num_slots,
             partials,
             thread_ceiling: ceiling,
             t_dev,
@@ -225,8 +223,8 @@ impl SumcheckSession {
         } else {
             consts
         })?;
-        let slots = unsafe { stream.alloc::<u64>(num_slots * 3 * num_threads as usize) }?;
-        let partials = unsafe { stream.alloc::<u64>(MAX_NODES * widest as usize * 3) }?;
+        let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
+        let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = stream.alloc_zeros::<u64>(MAX_NODES * 3)?;
         let r_dev = stream.alloc_zeros::<u64>(3)?;
         let _ = be;
@@ -246,7 +244,6 @@ impl SumcheckSession {
             root_slot,
             slots,
             slot_threads: num_threads,
-            num_slots,
             partials,
             thread_ceiling: ceiling,
             t_dev,
@@ -289,22 +286,15 @@ impl SumcheckSession {
         // needs, and a block past the indices left writes a partial with
         // nothing in it.
         let (grid, block) = launch_shape(self.thread_ceiling, half);
-        // Once the cube stops filling the ceiling, the nodes do: a late round
+        // Once the cube stops filling the slot file, the nodes do: a late round
         // is the same walk of the program at each of them, and they are
-        // independent. The partials keep the same shape either way — a node
-        // has one owning block in the second dimension.
+        // independent. The width comes out of the scratch the session already
+        // has — the first round fills it with indices and every round after
+        // frees half of it — so this costs no memory at all. The partials keep
+        // their shape either way: a node has one owning block in the second
+        // dimension.
         let per_node = grid as u64 * block as u64;
-        let nodes_wide = (self.thread_ceiling / per_node.max(1)).clamp(1, num_t as u64) as u32;
-        let threads = per_node * nodes_wide as u64;
-        if threads > self.slot_threads {
-            // SAFETY: the kernel writes a slot before it reads it, for every
-            // thread it launches.
-            self.slots = unsafe {
-                self.stream
-                    .alloc::<u64>(self.num_slots * 3 * threads as usize)
-            }?;
-            self.slot_threads = threads;
-        }
+        let nodes_wide = (self.slot_threads / per_node.max(1)).clamp(1, num_t as u64) as u32;
         if self.t_host != t {
             let mut head = self.t_dev.slice_mut(0..t.len());
             self.stream.memcpy_htod(t, &mut head)?;
@@ -614,7 +604,7 @@ impl DeviceFactors {
 
         let be = backend()?;
         let stream = be.next_stream();
-        let mut buffer = unsafe { stream.alloc::<u64>(factors.len() * span) }?;
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, factors.len() * span) }?;
         for (k, factor) in factors.iter().enumerate() {
             let at = k * span;
             let mut slab = buffer.slice_mut(at..at + span);
@@ -677,7 +667,7 @@ impl DeviceFactors {
         let span = rows * 3;
         // SAFETY: every cell is written below — the public slots by their
         // copies, the rest by the kernel, which covers every (factor, row).
-        let mut buffer = unsafe { stream.alloc::<u64>(width * span) }?;
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, width * span) }?;
         for (slot, table) in public {
             assert_eq!(table.len(), span, "a public factor spans the cube");
             let at = slot * span;
@@ -687,7 +677,7 @@ impl DeviceFactors {
 
         if !plan.is_empty() {
             // SAFETY: every cell is written by the copies below.
-            let mut base = unsafe { stream.alloc::<u64>(columns.len() * rows) }?;
+            let mut base = unsafe { alloc_or_trim::<u64>(&stream, columns.len() * rows) }?;
             for (k, column) in columns.iter().enumerate() {
                 let at = k * rows;
                 let mut slab = base.slice_mut(at..at + rows);
@@ -896,7 +886,7 @@ pub fn eq_table_ext3(
         len,
         "the point spans the table"
     );
-    let mut table = stream.alloc_zeros::<u64>(len * 3)?;
+    let mut table = alloc_zeros_or_trim::<u64>(stream, len * 3)?;
     eq_expand_into(stream, &mut table, 0, point, &[1, 0, 0])?;
     Ok(table)
 }
