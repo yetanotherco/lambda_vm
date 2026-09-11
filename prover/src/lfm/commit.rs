@@ -213,3 +213,86 @@ pub fn commit_group_device_or_host(
 pub fn commit_group(group: &ColumnGroup, options: &ProofOptions) -> Commitment {
     commit_columns(&group_columns(group), options)
 }
+
+/// ★★★ THE GATE THAT ACTUALLY REACHES THE DEVICE.
+///
+/// `#[cfg(feature = "cuda")]` because without it both sides of the comparison
+/// are the host pass and the test is a tautology — a check that cannot fail is
+/// worse than no check, because it reads like coverage.
+///
+/// # Why the registry drift tests are not this gate
+///
+/// `gpu_lde` admits on `lde_size = padded_rows · blowup >= 2^14`, a ROW count.
+/// ✓ MEASURED over the registered fixtures: EXACTLY ONE group clears it, and it
+/// is slot 10 — `LFM_RANGE`, 65,536 rows × 1 column — which is
+/// program-INDEPENDENT and identical in all six. Every program-dependent group
+/// is far below: the largest is `statement_replay`'s slot 1 at 4,096 rows
+/// (lde 8,192 at blowup 2). So the six drift pins are ONE device observation
+/// repeated six times, at the narrowest shape the machine has.
+///
+/// ⇒ This test commits a group ABOVE the floor at production-like widths, both
+/// ways, and compares the roots. It is the smallest thing that can catch a
+/// device leaf convention that differs from
+/// `commit_bit_reversed_with(.., ROWS_PER_LEAF)` at a shape the recursion
+/// actually emits.
+#[cfg(all(test, feature = "cuda"))]
+mod device_parity {
+    use super::*;
+    use crate::lfm::compiler::ColumnGroup;
+    use stark::proof::options::GoldilocksCubicProofOptions;
+
+    /// A deterministic group of the given shape. Values are position-dependent
+    /// so a transposed or mis-strided read cannot land on the same root.
+    fn group(rows: usize, width: usize) -> ColumnGroup {
+        let data = (0..rows * width)
+            .map(|i| FE::from((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5))
+            .collect();
+        ColumnGroup {
+            width,
+            real_rows: rows,
+            padded_rows: rows,
+            data,
+        }
+    }
+
+    #[test]
+    fn the_device_commit_matches_the_host_commit_above_the_floor() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        // 4,096 · 4 = 16,384 is exactly the floor; 8,192 clears it with margin.
+        // The widths are the production extremes: 1 (LFM_RANGE), 20
+        // (LFM_BLAKE3), 134 (LFM_BITDEC, the widest prep group there is).
+        for (rows, width) in [(4_096usize, 1usize), (8_192, 20), (4_096, 134)] {
+            let g = group(rows, width);
+            let lde = rows * options.blowup_factor as usize;
+            assert!(
+                lde >= 1 << 14,
+                "{rows}x{width} gives lde {lde}, BELOW the 2^14 device floor — \
+                 this case would compare a host root with a host root"
+            );
+            let host = commit_lde_columns(&lde_columns(&group_columns(&g), &options));
+            let device = commit_group_device_or_host("device_parity", &g, &options);
+            assert_eq!(
+                device, host,
+                "{rows}x{width}: the device root differs from the host root. The \
+                 leaf convention diverged — see commitment.rs's leaf definition \
+                 and gpu_lde's single-tree path"
+            );
+        }
+    }
+
+    /// And the control: `LFM_DEVICE_ARTIFACTS=0` must reach the host pass. Read
+    /// once per process, so this asserts the knob's VALUE agrees with the branch
+    /// rather than flipping it mid-run.
+    #[test]
+    fn the_opt_out_and_the_branch_agree() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        let g = group(4_096, 20);
+        let host = commit_lde_columns(&lde_columns(&group_columns(&g), &options));
+        assert_eq!(
+            commit_group_device_or_host("device_parity_optout", &g, &options),
+            host,
+            "with LFM_DEVICE_ARTIFACTS={}, the commit must still equal the host root",
+            if device_artifacts() { "1" } else { "0" }
+        );
+    }
+}

@@ -291,6 +291,63 @@ mod measure {
     use super::*;
     use stark::proof::options::GoldilocksCubicProofOptions;
 
+    /// ★ WHICH SIDE OF THE DEVICE FLOOR EACH FIXTURE GROUP FALLS ON.
+    ///
+    /// `gpu_lde` admits on `lde_size = padded_rows · blowup >= 2^14` — a ROW
+    /// count, not bytes and not columns (`DEFAULT_GPU_LDE_THRESHOLD`, and the
+    /// note beside it says why a cells floor would degenerate). Below it the
+    /// commit falls back to the host, so a gate whose groups are all below the
+    /// floor compares a host root against a host root and says nothing about the
+    /// device path.
+    #[test]
+    #[ignore = "diagnostic: prints each registry fixture group against the 2^14 device floor"]
+    fn the_fixture_groups_against_the_device_floor() {
+        use crate::lfm::registry::program_groups;
+        const FLOOR: usize = 1 << 14;
+        let progs: [(&str, LfmProgram); 4] = [
+            ("trivial", crate::lfm::programs::trivial_program()),
+            ("fri_toy", crate::lfm::programs::fri_toy_program()),
+            (
+                "statement_replay",
+                crate::lfm::programs::statement_replay_program(),
+            ),
+            (
+                "keccak_sponge",
+                crate::lfm::programs::keccak_sponge_program(
+                    crate::lfm::programs::KECCAK_SPONGE_LEN,
+                ),
+            ),
+        ];
+        let range = crate::lfm::trace::range_group();
+        for blowup in [2usize, 4] {
+            println!("\n=== device floor {FLOOR} rows (lde = padded_rows x blowup {blowup}) ===");
+            for (name, p) in &progs {
+                let mut admitted = 0;
+                let mut total = 0;
+                for (i, g) in program_groups(p)
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(&range))
+                    .enumerate()
+                {
+                    let lde = g.padded_rows * blowup;
+                    total += 1;
+                    if lde >= FLOOR {
+                        admitted += 1;
+                    }
+                    println!(
+                        "  {name:<17} slot {i:>2}  {:>9} rows x {:>4} cols -> lde {:>9}  {}",
+                        g.padded_rows,
+                        g.width,
+                        lde,
+                        if lde >= FLOOR { "DEVICE" } else { "host" }
+                    );
+                }
+                println!("  {name:<17} => {admitted} of {total} groups reach the device");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "measurement: prints the artifact build's wall at this host's rayon width"]
     fn the_artifact_build_measures() {
