@@ -1227,9 +1227,14 @@ mod tests {
                          {out_halves} out halves): the HONEST root must execute: {e:?}"
                     )
                 });
+                // ⛔ `plan.publishes`, not `AssertOnly` spelled again. The plan
+                // carries the value that was handed to the emitter, so the width
+                // this asserts and the program that produced it cannot drift —
+                // the same single-source rule `fixture_num_reg` exists for, on
+                // the other constant in this line.
                 assert_eq!(
                     exec.public_words.len(),
-                    root_schema_words(fixture_num_reg(), out_halves, RootPublishSet::AssertOnly),
+                    root_schema_words(fixture_num_reg(), out_halves, plan.publishes),
                     "{epochs}@{fan_in}: the artifact's width"
                 );
             }
@@ -1364,7 +1369,7 @@ mod tests {
                 let (plan, exec) =
                     run_root_fixture(epochs, fan_in, replaces_top, out_halves, |_| {});
                 let exec = exec.expect("the honest root must execute");
-                let want = root_schema_words(num_reg, out_halves, RootPublishSet::AssertOnly);
+                let want = root_schema_words(num_reg, out_halves, plan.publishes);
                 assert_eq!(
                     exec.public_words.len(),
                     want,
