@@ -154,6 +154,28 @@ pub fn hint_public_words(
         .collect()
 }
 
+/// The INVERSE of [`hint_public_words`]: a child's published words as the
+/// eight-halves-per-word arena that function reads.
+///
+/// ★ ONE COPY, reached by every fixture. `child_arena_words` builds exactly this
+/// arena from a real harvest; a gate that drives an emitter over fabricated
+/// published words needs the same layout, and a per-gate copy of "lo 32 bits
+/// then hi 32 bits, four lanes, in order" is a rule free to drift from the
+/// serializer it is supposed to mirror.
+#[cfg(test)]
+pub(super) fn publics_arena(words: &[super::word::LfmWord]) -> Vec<super::word::LfmWord> {
+    use math::field::traits::IsPrimeField;
+    let mut out = Vec::with_capacity(LANES_PER_WORD * HALVES_PER_LANE * words.len());
+    for w in words {
+        for lane in w {
+            let v: u64 = crate::tables::types::GoldilocksField::canonical(lane.value());
+            out.push(super::word::base_word(FE::from(v & 0xFFFF_FFFF)));
+            out.push(super::word::base_word(FE::from(v >> 32)));
+        }
+    }
+    out
+}
+
 /// Emits [`super::statement::absorb_lfm_statement`] byte for byte: the tag, the
 /// child's program id (a PROGRAM CONSTANT), the machine version, the word count,
 /// each word's emit-time-constant index and hinted lane halves, and the FRI

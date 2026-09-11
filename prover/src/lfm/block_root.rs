@@ -412,8 +412,11 @@ pub fn assert_global_child_is_bound_only_by_l2g(
 // for a REAL reason still shows up.
 #[cfg(test)]
 mod tests {
-    use super::super::per_table_aggregator::tree_shape;
+    use super::super::executor::{LfmExecError, LfmExecution, execute};
+    use super::super::per_table_aggregator::{LegCells, tree_shape};
+    use super::super::word::{LfmWord, base_word, ext_word, word_as_base};
     use super::*;
+    use crate::tables::types::{FE, FEE};
 
     /// ★ The root's fold shape is the interior MINUS the level it replaces.
     ///
@@ -643,6 +646,661 @@ mod tests {
                  set, or it collides with L2G material the root's compare reads"
             );
         }
+    }
+
+    // ==================== THE ROOT'S GATES, over a FIXTURE ====================
+    //
+    // ⛔ Pre-registered as a SET in `A-block-root-design.md` §6, before any of
+    // this existed: `the_block_root_binds_the_global_wrap` ·
+    // `the_root_rejects_a_moved_l2g_root` ·
+    // `the_root_rejects_a_reordered_l2g_fold` ·
+    // `the_root_rejects_a_forged_attestation` ·
+    // `the_root_publishes_a_fixed_size_schema`. They drive
+    // [`emit_root_checks_and_publishes`] — the root's OWN contribution — over
+    // fabricated published words, and deliberately not `emit_leg`, which is
+    // already gated everywhere it is used. What is under test is what the root
+    // DOES with words its children published, and that is exactly what a fixture
+    // can hold.
+
+    /// A lane of epoch `k`'s L2G root, DISTINGUISHABLE at every `(epoch, lane)`.
+    ///
+    /// ⛔ Injective in the flat index, which is the whole point of the moved-root
+    /// and reordered-fold arms: a transposition, an off-by-one or a re-grouping
+    /// lands on a value that belongs somewhere else. A fixture of equal roots
+    /// would pass under every one of them.
+    fn global_root_lane(lanes_per_root: usize, epoch: usize, lane: usize) -> FE {
+        FE::from(1 + (epoch * lanes_per_root + lane) as u64 * 1_000_003)
+    }
+
+    /// What the root's children published — one vector per interior child in
+    /// `SchemaLayout::node`'s publish order, and the global child's set.
+    ///
+    /// ⛔ **WRITTEN POSITIONALLY, IN EACH EMITTER'S OWN PUBLISH ORDER, AND NOT
+    /// THROUGH THE LAYOUTS — do not "tidy" this into indexed writes.** The root
+    /// READS through `SchemaLayout` and [`GlobalLayout`]; a fixture that WROTE
+    /// through them too would cancel any drift between a layout and the order a
+    /// child actually publishes in, and every arm below would stay green while
+    /// the root read the wrong words off a real child.
+    struct RootFixture {
+        interior: Vec<Vec<LfmWord>>,
+        global: Vec<LfmWord>,
+    }
+
+    /// The shape a fixture was built for, so an arm can index into it.
+    struct RootPlan {
+        shape: FoldShape,
+        interior_layouts: Vec<SchemaLayout>,
+        global_layout: GlobalLayout,
+        labels: Vec<Vec<u64>>,
+        label_range: (u64, u64),
+        publishes: RootPublishSet,
+    }
+
+    /// The epoch range each TOP interior child covers, derived by applying the
+    /// fold shape's arities to the per-epoch ranges.
+    ///
+    /// ⚠ A SECOND derivation of the grouping, on purpose: `refold` merges
+    /// DIGESTS and this merges RANGES, so the labels the fixture publishes are
+    /// an independent statement about the same grouping rather than a restatement
+    /// of the code under test.
+    fn top_level_epoch_ranges(shape: &FoldShape, epochs: usize) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = (0..epochs).map(|k| (k, k)).collect();
+        for arities in &shape.levels {
+            let mut out = Vec::with_capacity(arities.len());
+            let mut cursor = 0usize;
+            for a in arities {
+                out.push((ranges[cursor].0, ranges[cursor + a - 1].1));
+                cursor += a;
+            }
+            ranges = out;
+        }
+        ranges
+    }
+
+    /// The digests the interior children must have published, computed the way
+    /// the INTERIOR computes them and executed in a throwaway program.
+    ///
+    /// ⛔ **NOT THROUGH `FoldShape::refold`, WHICH IS THE CODE UNDER TEST.** A
+    /// fixture that built its expectation with `refold` would cancel any drift
+    /// between the root's grouping and the interior's: a `refold` that reversed
+    /// each group, or regrouped a level, would produce the same wrong digest on
+    /// both sides and every arm below would stay green while an HONEST prover
+    /// failed on the box.
+    ///
+    /// ⇒ The expectation is built here from the interior's OWN sources —
+    /// `tree_shape`'s arities and `fold_l2g`, both already gated at every node
+    /// level — with the top level dropped when the root replaces it. That is the
+    /// independent statement that makes the honest control a check on the
+    /// grouping and not only on the indexing.
+    fn refolded_by_the_machine(
+        epochs: usize,
+        fan_in: usize,
+        replaces_top: bool,
+        roots: &[Vec<FE>],
+    ) -> Vec<Vec<FE>> {
+        use super::super::edsl::WrapHash;
+        use super::super::per_table_aggregator::fold_l2g;
+        let lanes_per_root = super::super::proof_arena::lanes_per_root();
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+        let digests: Vec<WrapDigest> = roots
+            .iter()
+            .map(|lanes| {
+                let cells: Vec<_> = lanes.iter().map(|v| b.felt_const(*v)).collect();
+                digest_from_lanes(&mut b, &cells)
+            })
+            .collect();
+        // The interior, level by level: a node folds its children's digests in
+        // CHILD ORDER, and the next level folds what those nodes published.
+        let mut levels: Vec<Vec<usize>> = tree_shape(epochs, fan_in)
+            .into_iter()
+            .map(|l| l.arities)
+            .collect();
+        if replaces_top {
+            levels.pop();
+        }
+        let mut out = digests;
+        for arities in &levels {
+            let mut next = Vec::with_capacity(arities.len());
+            let mut cursor = 0usize;
+            for a in arities {
+                next.push(fold_l2g(&mut b, &out[cursor..cursor + a]));
+                cursor += a;
+            }
+            assert_eq!(cursor, out.len(), "a level consumes every digest below it");
+            out = next;
+        }
+        // The SAME shape a node publishes its fold in: one BASE word per lane.
+        for d in &out {
+            for cell in d.cells().to_vec() {
+                for lane in b.unpack(cell) {
+                    b.public(lane.as_cell());
+                }
+            }
+        }
+        let program = super::super::compiler::compile(b.finish());
+        let arenas: Vec<Vec<LfmWord>> = Vec::new();
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the refold oracle must execute");
+        assert_eq!(
+            exec.public_words.len(),
+            out.len() * lanes_per_root,
+            "the oracle publishes one BASE word per lane of each folded digest"
+        );
+        exec.public_words
+            .chunks(lanes_per_root)
+            .map(|c| {
+                c.iter()
+                    .map(|(_, w)| word_as_base(w).expect("a folded lane is a BASE word"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Build the fixture and the plan for `epochs` at `fan_in`, for a root that
+    /// either replaces the top interior level or sits above it.
+    fn plan_and_fixture(
+        epochs: usize,
+        fan_in: usize,
+        replaces_top: bool,
+        out_halves: usize,
+    ) -> (RootPlan, RootFixture) {
+        let lanes = super::super::proof_arena::lanes_per_root();
+        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let shape = FoldShape::for_root(epochs, fan_in, replaces_top);
+        let ranges = top_level_epoch_ranges(&shape, epochs);
+        let children = ranges.len();
+
+        // ---- the GLOBAL child: z, alpha, then every epoch's root, lane by lane.
+        let z = FEE::new([FE::from(7), FE::from(8), FE::from(9)]);
+        let alpha = FEE::new([FE::from(11), FE::from(12), FE::from(13)]);
+        let mut global = vec![ext_word(&z), ext_word(&alpha)];
+        let mut roots: Vec<Vec<FE>> = Vec::with_capacity(epochs);
+        for epoch in 0..epochs {
+            let lane_vals: Vec<FE> = (0..lanes)
+                .map(|lane| global_root_lane(lanes, epoch, lane))
+                .collect();
+            for v in &lane_vals {
+                global.push(base_word(*v));
+            }
+            roots.push(lane_vals);
+        }
+
+        // ---- what each interior child must have published for its subtree.
+        let folded = refolded_by_the_machine(epochs, fan_in, replaces_top, &roots);
+        assert_eq!(folded.len(), children, "one folded digest per interior child");
+
+        // ---- the interior children, in `emit_node_publishes`' own order.
+        let id = [FE::from(31), FE::from(37), FE::from(41), FE::from(43)];
+        let id_hi = [FE::from(47), FE::from(53), FE::from(59), FE::from(61)];
+        let reg = |k: usize, r: usize| FE::from(900_000 + (k * num_reg + r) as u64);
+        let mut interior = Vec::with_capacity(children);
+        let mut labels: Vec<Vec<u64>> = Vec::with_capacity(children);
+        for (k, (lo, hi)) in ranges.iter().enumerate() {
+            let mut w: Vec<LfmWord> = Vec::new();
+            w.push(id);
+            w.push(id_hi);
+            for r in 0..num_reg {
+                w.push(base_word(reg(k, r)));
+            }
+            for r in 0..num_reg {
+                w.push(base_word(reg(k + 1, r)));
+            }
+            let run = [
+                crate::tables::local_to_global::epoch_label(*lo as u64),
+                crate::tables::local_to_global::epoch_label(*hi as u64),
+            ];
+            for label in run {
+                w.push(base_word(FE::from(label & 0xFFFF_FFFF)));
+                w.push(base_word(FE::from(label >> 32)));
+            }
+            for i in 0..out_halves {
+                w.push(base_word(FE::from(700_000 + (k * 64 + i) as u64)));
+            }
+            for lane in 0..lanes {
+                w.push(base_word(folded[k][lane]));
+            }
+            interior.push(w);
+            labels.push(run.to_vec());
+        }
+
+        let interior_layouts: Vec<SchemaLayout> =
+            (0..children).map(|_| SchemaLayout::node(out_halves)).collect();
+        for (w, l) in interior.iter().zip(&interior_layouts) {
+            assert_eq!(w.len(), l.total(), "the fixture IS the node layout");
+        }
+        let global_layout = GlobalLayout {
+            num_epochs: epochs,
+            lanes_per_root: lanes,
+        };
+        assert_eq!(
+            global.len(),
+            global_layout.total(),
+            "the fixture IS the global child's layout"
+        );
+        let label_range = (
+            crate::tables::local_to_global::epoch_label(0),
+            crate::tables::local_to_global::epoch_label(epochs as u64 - 1),
+        );
+        (
+            RootPlan {
+                shape,
+                interior_layouts,
+                global_layout,
+                labels,
+                label_range,
+                publishes: RootPublishSet::AssertOnly,
+            },
+            RootFixture { interior, global },
+        )
+    }
+
+    /// Emit the root's checks and publishes over a fixture, then execute it.
+    fn run_root_fixture(
+        epochs: usize,
+        fan_in: usize,
+        replaces_top: bool,
+        out_halves: usize,
+        mutate: impl FnOnce(&mut RootFixture),
+    ) -> (RootPlan, Result<LfmExecution, LfmExecError>) {
+        use super::super::edsl::WrapHash;
+        use super::super::per_table_aggregator::{hint_public_words, publics_arena};
+
+        let (plan, mut fixture) = plan_and_fixture(epochs, fan_in, replaces_top, out_halves);
+        mutate(&mut fixture);
+
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+        // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST —
+        // the order `emit_block_root` declares in, so the arenas below are a
+        // plain per-child concatenation in the same order.
+        let interior_ids: Vec<_> = fixture
+            .interior
+            .iter()
+            .map(|w| b.declare_arena((8 * w.len()) as u32))
+            .collect();
+        let global_id = b.declare_arena((8 * fixture.global.len()) as u32);
+        let mut dummy = 0u64;
+        let mut leg = |b: &mut LfmBuilder, arena, count| {
+            let publics = hint_public_words(b, arena, count);
+            // ⛔ DISTINCT PER CHILD, ON PURPOSE. `LegCells::z_alpha` is the ROOT's
+            // own per-child LFM pair and no root check reads it; unequal dummies
+            // make an accidental read fail the HONEST arm rather than hide behind
+            // a fixture of equal values.
+            dummy += 1;
+            let d = b.ext_const(&FEE::from(1_000 + dummy));
+            LegCells {
+                publics,
+                z_alpha: (d, d),
+            }
+        };
+        let interior_legs: Vec<LegCells> = interior_ids
+            .iter()
+            .zip(&fixture.interior)
+            .map(|(id, w)| leg(&mut b, *id, w.len()))
+            .collect();
+        let global_leg = leg(&mut b, global_id, fixture.global.len());
+
+        let label_refs: Vec<&[u64]> = plan.labels.iter().map(|l| &l[..]).collect();
+        emit_root_checks_and_publishes(
+            &mut b,
+            &RootLegs {
+                interior: &interior_legs,
+                interior_layouts: &plan.interior_layouts,
+                labels: &label_refs,
+                label_range: plan.label_range,
+                global: &global_leg,
+                global_child_layout: &plan.global_layout,
+                fold_shape: &plan.shape,
+                publishes: plan.publishes,
+            },
+        );
+        let program = super::super::compiler::compile(b.finish());
+        let mut arenas: Vec<Vec<LfmWord>> =
+            fixture.interior.iter().map(|w| publics_arena(w)).collect();
+        arenas.push(publics_arena(&fixture.global));
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER);
+        (plan, exec)
+    }
+
+    /// Every shape a root gate drives: `(epochs, fan_in, replaces_top)`.
+    ///
+    /// ⚠ `(2, 2, true)` has a ZERO-level fold, where `refold` is the identity and
+    /// the compare reads each epoch's root straight through. It is kept because
+    /// it is the one shape in which an indexing error cannot hide behind a hash,
+    /// and dropped shapes above it would leave the tree-shaped fold untested —
+    /// which is why the four-epoch shapes are here too.
+    const ROOT_SHAPES: [(usize, usize, bool); 4] =
+        [(2, 2, true), (4, 2, true), (5, 2, true), (4, 2, false)];
+
+    /// ★ THE HONEST CONTROL: the root verifies its children, binds them, and the
+    /// L2G compare passes when the global child's roots refold to what the
+    /// interior published.
+    ///
+    /// Every tamper arm below is worthless without it — an emitter that failed
+    /// on everything would pass all four of them.
+    #[test]
+    fn the_block_root_binds_the_global_wrap() {
+        for (epochs, fan_in, replaces_top) in ROOT_SHAPES {
+            for out_halves in [0usize, 3] {
+                let (plan, exec) = run_root_fixture(epochs, fan_in, replaces_top, out_halves, |_| {});
+                let exec = exec.unwrap_or_else(|e| {
+                    panic!(
+                        "{epochs} epochs at fan-in {fan_in} (replaces_top={replaces_top}, \
+                         {out_halves} out halves): the HONEST root must execute: {e:?}"
+                    )
+                });
+                assert_eq!(
+                    exec.public_words.len(),
+                    root_schema_words(
+                        plan.interior_layouts[0].num_reg,
+                        out_halves,
+                        RootPublishSet::AssertOnly
+                    ),
+                    "{epochs}@{fan_in}: the artifact's width"
+                );
+            }
+        }
+    }
+
+    /// ⛔ A MOVED L2G ROOT is rejected — at every epoch and every lane.
+    ///
+    /// One lane of one epoch's root in the GLOBAL child, moved by one. The
+    /// interior children still publish the fold of the ORIGINAL roots, so the
+    /// compare must fail. This is the check that ties the block's epoch set to
+    /// the global memory argument, and if it can be defeated the root's whole
+    /// claim about which epochs it covers is unbacked.
+    #[test]
+    fn the_root_rejects_a_moved_l2g_root() {
+        let lanes = super::super::proof_arena::lanes_per_root();
+        for (epochs, fan_in, replaces_top) in [(2usize, 2usize, true), (4, 2, true)] {
+            let (_, honest) = run_root_fixture(epochs, fan_in, replaces_top, 0, |_| {});
+            assert!(
+                honest.is_ok(),
+                "the honest control must execute, or the arm below proves nothing"
+            );
+            for epoch in 0..epochs {
+                for lane in 0..lanes {
+                    let (plan, tampered) =
+                        run_root_fixture(epochs, fan_in, replaces_top, 0, |f| {
+                            let at = 2 + epoch * lanes + lane;
+                            f.global[at][0] += FE::one();
+                        });
+                    assert_eq!(
+                        plan.global_layout.l2g_word(epoch, lane),
+                        2 + epoch * lanes + lane,
+                        "the fixture moved the word the layout names"
+                    );
+                    assert!(
+                        tampered.is_err(),
+                        "{epochs}@{fan_in}: epoch {epoch} lane {lane} was moved in the \
+                         GLOBAL child and the root's compare accepted it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ⛔ A REORDERED L2G fold is rejected.
+    ///
+    /// `hash_pair` is a two-to-one compression and is not commutative, so
+    /// swapping two epochs' roots changes the fold even though the MULTISET of
+    /// roots is untouched. A length assert cannot see this and neither can any
+    /// count: the global proof's roots are in sub-proof order and the interior
+    /// folded in epoch order, and the whole compare rests on those two
+    /// coinciding. ⇒ Both an INTRA-group swap and a CROSS-group one, because a
+    /// cross-group swap changes two digests and an intra-group swap changes one —
+    /// an emitter that folded a group as an unordered set would survive only the
+    /// first.
+    #[test]
+    fn the_root_rejects_a_reordered_l2g_fold() {
+        let lanes = super::super::proof_arena::lanes_per_root();
+        for (epochs, replaces_top, a, c) in [
+            (4usize, true, 0usize, 1usize),
+            (4, true, 1, 2),
+            (4, true, 0, 3),
+            (4, false, 0, 1),
+            (5, true, 2, 4),
+        ] {
+            let (_, honest) = run_root_fixture(epochs, 2, replaces_top, 0, |_| {});
+            assert!(honest.is_ok(), "the honest control must execute");
+            let (_, tampered) = run_root_fixture(epochs, 2, replaces_top, 0, |f| {
+                for lane in 0..lanes {
+                    f.global.swap(2 + a * lanes + lane, 2 + c * lanes + lane);
+                }
+            });
+            assert!(
+                tampered.is_err(),
+                "{epochs} epochs (replaces_top={replaces_top}): epochs {a} and {c} were \
+                 swapped in the GLOBAL child and the root refolded them to the same \
+                 digest — the fold is behaving as if it were order-free"
+            );
+        }
+    }
+
+    /// ⛔ A FORGED ATTESTATION is rejected: the interior children must all answer
+    /// for one attestation id.
+    ///
+    /// Two children verifying says nothing about their relationship. Without this
+    /// the root would be a statement about several executions that each happen to
+    /// prove, rather than about one block.
+    #[test]
+    fn the_root_rejects_a_forged_attestation() {
+        for (epochs, replaces_top) in [(4usize, true), (5, true)] {
+            let (_, honest) = run_root_fixture(epochs, 2, replaces_top, 0, |_| {});
+            assert!(honest.is_ok(), "the honest control must execute");
+            for half in 0..2usize {
+                for lane in 0..4usize {
+                    let (plan, tampered) = run_root_fixture(epochs, 2, replaces_top, 0, |f| {
+                        f.interior[1][half][lane] += FE::one();
+                    });
+                    assert!(
+                        plan.interior_layouts[1].id(half) == half,
+                        "a node publishes its attestation id first"
+                    );
+                    assert!(
+                        tampered.is_err(),
+                        "{epochs} epochs: interior child 1 published a different \
+                         attestation id half {half} lane {lane} and the root bound them \
+                         together anyway"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ★★ THE ARTIFACT'S WIDTH, AS EXECUTED — and nothing wider.
+    ///
+    /// `the_artifact_width_is_independent_of_the_proving_strategy` pins the
+    /// SIGNATURE: `root_schema_words` takes no epoch count and no arity. This
+    /// pins the PROGRAM against it — what the root actually publishes, at four
+    /// different tree shapes and three output widths, is exactly that count. A
+    /// root that grew a per-epoch item would satisfy the signature test and fail
+    /// this one.
+    ///
+    /// ⇒ And every published word is read back at its own index, because a
+    /// COUNT that matches while the values are drawn from the wrong child is the
+    /// silent-and-downstream failure this campaign keeps finding: the register
+    /// vectors must come from the FIRST and LAST child respectively, and the
+    /// labels must be constants of the root rather than anything a child chose.
+    #[test]
+    fn the_root_publishes_a_fixed_size_schema() {
+        let num_reg = crate::tables::register::NUM_REGISTER_ADDRESSES;
+        let mut widths: Vec<(usize, usize)> = Vec::new();
+        for (epochs, fan_in, replaces_top) in ROOT_SHAPES {
+            for out_halves in [0usize, 1, 3] {
+                let (plan, exec) =
+                    run_root_fixture(epochs, fan_in, replaces_top, out_halves, |_| {});
+                let exec = exec.expect("the honest root must execute");
+                let want = root_schema_words(num_reg, out_halves, RootPublishSet::AssertOnly);
+                assert_eq!(
+                    exec.public_words.len(),
+                    want,
+                    "{epochs} epochs at fan-in {fan_in} (replaces_top={replaces_top}) \
+                     published {} words, not {want}: the artifact's width moved with the \
+                     PROVING STRATEGY, which is the one thing it may never depend on",
+                    exec.public_words.len(),
+                );
+                widths.push((out_halves, exec.public_words.len()));
+
+                // ---- the id, as the four-lane word every child agreed on.
+                let words = &exec.public_words;
+                assert_eq!(words[0].1, [FE::from(31), FE::from(37), FE::from(41), FE::from(43)]);
+                assert_eq!(words[1].1, [FE::from(47), FE::from(53), FE::from(59), FE::from(61)]);
+                // ---- the block's OPENING registers, from the FIRST child.
+                let last = plan.interior_layouts.len() - 1;
+                for r in 0..num_reg {
+                    assert_eq!(
+                        word_as_base(&words[2 + r].1).expect("a register word is BASE"),
+                        FE::from(900_000 + r as u64),
+                        "register {r} INIT must come from the first interior child"
+                    );
+                }
+                // ---- the block's CLOSING registers, from the LAST child.
+                for r in 0..num_reg {
+                    assert_eq!(
+                        word_as_base(&words[2 + num_reg + r].1).expect("BASE"),
+                        FE::from(900_000 + ((last + 1) * num_reg + r) as u64),
+                        "register {r} FINI must come from the LAST interior child"
+                    );
+                }
+                // ---- the block's label range, as CONSTANTS of the root.
+                let at = 2 + 2 * num_reg;
+                for (i, label) in [plan.label_range.0, plan.label_range.1].iter().enumerate() {
+                    assert_eq!(
+                        word_as_base(&words[at + 2 * i].1).expect("BASE"),
+                        FE::from(label & 0xFFFF_FFFF)
+                    );
+                    assert_eq!(
+                        word_as_base(&words[at + 2 * i + 1].1).expect("BASE"),
+                        FE::from(label >> 32)
+                    );
+                }
+                // ---- the block's public output, from the LAST child.
+                for i in 0..out_halves {
+                    assert_eq!(
+                        word_as_base(&words[at + 4 + i].1).expect("BASE"),
+                        FE::from(700_000 + (last * 64 + i) as u64),
+                        "output half {i} must come from the LAST interior child"
+                    );
+                }
+            }
+        }
+        // ⇒ Read across the shapes: one width per output size, and the tree that
+        // produced it never appears.
+        for (out_halves, w) in &widths {
+            assert_eq!(
+                *w,
+                root_schema_words(num_reg, *out_halves, RootPublishSet::AssertOnly),
+                "the artifact's width is a function of the BLOCK alone"
+            );
+        }
+    }
+
+    /// ⛔ THE FOLD IS TREE-SHAPED, AND A FLAT ONE WOULD BE A DIFFERENT DIGEST.
+    ///
+    /// Not registered in §6, and added because it is the failure the root's own
+    /// doc warns about most loudly and nothing else could fail on: `emit_l2g_
+    /// compare` refolds the global child's FLAT root list, and a left fold there
+    /// computes `H(H(H(r0,r1),r2),r3)` where the interior published
+    /// `H(H(r0,r1),H(r2,r3))`. `hash_pair` is not associative, so those differ —
+    /// and the failure lands on COMPLETENESS: honest prover, correct inputs,
+    /// wrong answer. ⇒ Stated executably, so "the fold is tree-shaped" is a
+    /// result rather than a comment.
+    #[test]
+    fn a_tree_shaped_refold_differs_from_a_flat_one() {
+        use super::super::edsl::WrapHash;
+        use super::super::per_table_aggregator::fold_l2g;
+        let lanes = super::super::proof_arena::lanes_per_root();
+        for epochs in [4usize, 8] {
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let digests: Vec<WrapDigest> = (0..epochs)
+                .map(|k| {
+                    let cells: Vec<_> = (0..lanes)
+                        .map(|w| b.felt_const(global_root_lane(lanes, k, w)))
+                        .collect();
+                    digest_from_lanes(&mut b, &cells)
+                })
+                .collect();
+            let shape = FoldShape::for_root(epochs, 2, false);
+            let tree = shape.refold(&mut b, &digests);
+            assert_eq!(tree.len(), 1, "{epochs} epochs close to one digest");
+            let flat = fold_l2g(&mut b, &digests);
+            for d in [tree[0], flat] {
+                for cell in d.cells().to_vec() {
+                    for lane in b.unpack(cell) {
+                        b.public(lane.as_cell());
+                    }
+                }
+            }
+            let program = super::super::compiler::compile(b.finish());
+            let arenas: Vec<Vec<LfmWord>> = Vec::new();
+            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                .expect("both folds must execute");
+            let (tree_lanes, flat_lanes) = exec.public_words.split_at(lanes);
+            assert_ne!(
+                tree_lanes.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+                flat_lanes.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+                "{epochs} epochs: the tree-shaped refold and the flat left fold agreed. \
+                 Either `hash_pair` became associative or `refold` stopped grouping — \
+                 and if the root ever folds flat, an HONEST prover fails the compare"
+            );
+        }
+    }
+
+    /// ★ THE TWO-POSTURE BYTE-IDENTITY CHECK REFUSES, BY NAME, on fewer than two
+    /// DISTINCT postures — including two runs that share one.
+    ///
+    /// §3 of the pre-registration: it cannot run at this encoding and must SAY
+    /// so. A skip would be silent and a one-posture "identical" would be a check
+    /// that cannot fail, so the refusal is the result — and it is itself gated,
+    /// here and in `two_postures_with_different_artifact_bytes_are_rejected`,
+    /// so that "the check refuses" is not confused with "the check is absent".
+    #[test]
+    fn the_two_posture_byte_identity_check_refuses_a_single_posture() {
+        let words = |seed: u64| vec![(0u32, base_word(FE::from(seed)))];
+        let run = |p: &str, seed: u64| ArtifactUnderPosture {
+            posture: p.to_string(),
+            words: words(seed),
+        };
+        for runs in [
+            vec![],
+            vec![run("19 epochs at 2^21, fan-in 2, option B", 5)],
+            vec![
+                run("19 epochs at 2^21, fan-in 2, option B", 5),
+                run("19 epochs at 2^21, fan-in 2, option B", 5),
+            ],
+        ] {
+            let why = why_posture_identity_cannot_run(&runs)
+                .expect("fewer than two DISTINCT postures cannot be compared");
+            assert!(
+                why.contains("CANNOT RUN"),
+                "the refusal must name itself: {why}"
+            );
+        }
+        // ⇒ And it does NOT refuse two distinct postures, or the refusal would be
+        // unconditional and the check would never run even once it could.
+        let ok = vec![
+            run("19 epochs at 2^21, fan-in 2", 5),
+            run("10 epochs at 2^22, fan-in 3", 5),
+        ];
+        assert!(why_posture_identity_cannot_run(&ok).is_none());
+        assert_artifact_is_posture_independent(&ok);
+    }
+
+    /// ⛔ And when it CAN run, it can FAIL: two postures whose artifacts differ
+    /// are rejected word by word.
+    #[test]
+    #[should_panic(expected = "artifact word 1 differs")]
+    fn two_postures_with_different_artifact_bytes_are_rejected() {
+        assert_artifact_is_posture_independent(&[
+            ArtifactUnderPosture {
+                posture: "19 epochs at 2^21, fan-in 2".to_string(),
+                words: vec![(0, base_word(FE::from(5))), (1, base_word(FE::from(6)))],
+            },
+            ArtifactUnderPosture {
+                posture: "10 epochs at 2^22, fan-in 3".to_string(),
+                words: vec![(0, base_word(FE::from(5))), (1, base_word(FE::from(7)))],
+            },
+        ]);
     }
 }
 

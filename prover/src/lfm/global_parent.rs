@@ -298,12 +298,10 @@ fn published_ext(b: &mut LfmBuilder, w: &HintedPublicWord) -> Ext {
 mod tests {
     use super::*;
     use crate::tables::types::FE;
-    use crate::tables::types::GoldilocksField;
-    use math::field::traits::IsPrimeField;
 
     use super::super::block_root::GlobalLayout;
     use super::super::executor::{LfmExecError, LfmExecution, execute};
-    use super::super::per_table_aggregator::hint_public_words;
+    use super::super::per_table_aggregator::{hint_public_words, publics_arena};
     use super::super::word::{LfmWord, base_word, ext_word, word_as_base, word_as_ext};
 
     /// A root lane's fixture value, DISTINGUISHABLE at every `(epoch, lane)`.
@@ -351,20 +349,6 @@ mod tests {
                 words
             })
             .collect()
-    }
-
-    /// One slice's published words as the eight-halves-per-word arena
-    /// `hint_public_words` reads — the serializer's own layout.
-    fn publics_arena(words: &[LfmWord]) -> Vec<LfmWord> {
-        let mut out = Vec::with_capacity(8 * words.len());
-        for w in words {
-            for lane in w {
-                let v: u64 = GoldilocksField::canonical(lane.value());
-                out.push(base_word(FE::from(v & 0xFFFF_FFFF)));
-                out.push(base_word(FE::from(v >> 32)));
-            }
-        }
-        out
     }
 
     /// Emit the parent's checks and republish over a FIXTURE of `k` slices'
