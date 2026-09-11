@@ -53,16 +53,33 @@ pub struct LevelStats {
     pub distinct: usize,
     /// Time spent inside `build_artifacts_with_hasher`.
     pub build_nanos: u128,
+    /// The largest device working set any artifact commit has ASKED FOR in this
+    /// process, in bytes — `stark::device_set`'s own term-by-term accounting,
+    /// which is the number admission decides on. Zero when nothing went to the
+    /// card, which is every host build, so the line stays quiet there.
+    ///
+    /// ⓘ A running process maximum, not this level's own: the commits are
+    /// sequential and the card is released between them, so the largest single
+    /// set is what the build ever needed. It is what the artifact build ASKED
+    /// for; an external sampler is what says what the process held.
+    pub device_peak_bytes: u64,
 }
 
 impl LevelStats {
     /// The line the driver prints per level.
     pub fn describe(&self, label: &str) -> String {
         format!(
-            "{label}: {} proofs, {} distinct programs, artifacts {:.1}s{}",
+            "{label}: {} proofs, {} distinct programs, artifacts {:.1}s{}{}",
             self.proofs,
             self.distinct,
             Duration::from_nanos(self.build_nanos as u64).as_secs_f64(),
+            match self.device_peak_bytes {
+                0 => String::new(),
+                b => format!(
+                    " · device set {:.2} GiB",
+                    b as f64 / (1024.0 * 1024.0 * 1024.0)
+                ),
+            },
             if self.distinct == self.proofs {
                 " (N/N — sibling programs differ by construction; nothing to cache)"
             } else {
@@ -138,7 +155,9 @@ pub fn begin_level() {
 
 /// Close the window and take what it counted. `None` when no window was open.
 pub fn end_level() -> Option<LevelStats> {
-    lock().window.take().map(|w| w.stats)
+    let mut stats = lock().window.take().map(|w| w.stats)?;
+    stats.device_peak_bytes = super::commit::device_artifact_peak_bytes();
+    Some(stats)
 }
 
 #[cfg(test)]
