@@ -20,7 +20,7 @@ use crate::tables::{bitwise, keccak_rc};
 use super::airs::{BLAKE3_SLOT, ChipSet, NUM_LFM_CHIPS, blake3_chunk_rows};
 
 use super::commit::{commit_lde_columns, group_columns, lde_columns};
-use super::compiler::LfmProgram;
+use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
 use super::statement::lfm_program_id;
 use super::trace::range_group;
@@ -118,6 +118,7 @@ impl LfmRegistryEntry {
 }
 
 /// A program's committed artifacts (what a registry entry pins).
+///
 pub struct LfmArtifacts {
     pub roots: [Commitment; NUM_LFM_CHIPS],
     pub log_heights: [u8; NUM_LFM_CHIPS],
@@ -249,6 +250,93 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
     build_artifacts_with_hasher(program, options, REGISTRY_HASHER)
 }
 
+/// How many committed groups the artifact build expands at once.
+///
+/// Four by default, and the number is a RESIDENCY bound rather than a
+/// parallelism target.
+///
+/// ⚠ The pass was never STRICTLY one-core — `dispatch_fft` routes any buffer of
+/// 2^14 elements or more to the parallel Bowers FFT — but it is nowhere near
+/// full either, and the difference is the point. `bowers_fft.rs`'s per-layer
+/// `adaptive_parallel_threshold` is `max(num_threads * 4, 16)` BLOCKS, and the
+/// early layers of a single column have far fewer blocks than that, so they run
+/// serially over the whole array. ✓ MEASURED by lane P on a production node:
+/// `emit_merkle` 2,652% CPU (26.5 of 30.7 cores), `emit_lde` **445% (4.5
+/// cores)**. The column-level `par_iter` in [`lde_columns`] is what overlaps one
+/// column's serial early layers with another's, and that is where the headroom
+/// is. This window is the second-order half — it covers the SHORT groups, under
+/// 2^14 rows, where each column's FFT stays sequential and a width of 1, 2 or 3
+/// cannot fill anything alone — while multiplying the build's peak host
+/// residency by at most four rather than by the group count.
+///
+/// `LFM_ARTIFACT_GROUPS_IN_FLIGHT=1` walks the groups one at a time and leaves
+/// the column loops parallel; [`parallel_build`](super::commit::parallel_build)
+/// is the knob that restores the pre-change pass entirely.
+pub fn groups_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        // An empty value reads as unset — see `commit::parallel_build`.
+        match std::env::var("LFM_ARTIFACT_GROUPS_IN_FLIGHT") {
+            Ok(v) if v.is_empty() => 4,
+            Ok(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| {
+                    panic!("LFM_ARTIFACT_GROUPS_IN_FLIGHT must be a positive integer, got `{v}`")
+                }),
+            Err(_) => 4,
+        }
+    })
+}
+
+/// `items.iter().map(f).collect()`, on the global rayon pool where there is one.
+///
+/// ⛔ Indexed and ordered on both arms. `par_iter().map().collect()` over a slice
+/// preserves position, so slot `k` of a window is slot `k` of the result and the
+/// roots land where the serial walk put them. A `for_each` writing through a
+/// shared handle would not have that property for free.
+fn map_maybe_parallel<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    #[cfg(feature = "parallel")]
+    if super::commit::parallel_build() {
+        use rayon::prelude::*;
+        return items.par_iter().map(f).collect();
+    }
+    items.iter().map(f).collect()
+}
+
+/// Slots 0..=9 — the instruction column groups that belong to the PROGRAM.
+///
+/// Slot 10 (`LFM_RANGE`) is committed with them and is not one of them: its
+/// group comes from [`range_group`], which takes no arguments and so cannot
+/// vary with the program.
+pub const PROGRAM_GROUP_SLOTS: usize = 10;
+
+/// The program's own committed instruction column groups, in slot order.
+///
+/// Named rather than written inline in [`build_artifacts_with_hasher`] so the
+/// build's group list is one readable thing, and so the windowed walk below can
+/// index it. `LFM_RANGE` is appended by the build at slot 10; `LFM_BLAKE3` is
+/// slot 11 and is committed per chunk, which is why neither is here.
+pub fn program_groups(program: &LfmProgram) -> [&ColumnGroup; PROGRAM_GROUP_SLOTS] {
+    [
+        &program.groups.const_,
+        &program.groups.balu,
+        &program.groups.xalu,
+        &program.groups.select,
+        &program.groups.bitdec,
+        &program.groups.hash,
+        &program.groups.keccak,
+        &program.groups.lanes,
+        &program.groups.hint,
+        &program.groups.public,
+    ]
+}
+
 /// [`build_artifacts`] for a program proved under an explicitly chosen
 /// `LFM_HASH` permutation.
 ///
@@ -293,22 +381,18 @@ pub fn build_artifacts_with_hasher(
     hasher: HasherKind,
 ) -> LfmArtifacts {
     let range = range_group();
-    // Slots 0..=10 in slot order. Slot 11 (`LFM_BLAKE3`) is not here because it
-    // is the CHUNKED one: it contributes one committed matrix per chunk, built
-    // and absorbed after this list, which is where slot order puts it anyway.
-    let groups = [
-        &program.groups.const_,
-        &program.groups.balu,
-        &program.groups.xalu,
-        &program.groups.select,
-        &program.groups.bitdec,
-        &program.groups.hash,
-        &program.groups.keccak,
-        &program.groups.lanes,
-        &program.groups.hint,
-        &program.groups.public,
-        &range,
-    ];
+    // Slots 0..=10 in slot order: the program's own nine groups, then
+    // `LFM_RANGE`. Slot 11 (`LFM_BLAKE3`) is not here because it is the CHUNKED
+    // one: it contributes one committed matrix per chunk, built and absorbed
+    // after this list, which is where slot order puts it anyway.
+    let program_slots = program_groups(program);
+    let groups: [&ColumnGroup; 11] = std::array::from_fn(|i| {
+        if i < PROGRAM_GROUP_SLOTS {
+            program_slots[i]
+        } else {
+            &range
+        }
+    });
     let mut roots = [[0u8; 32]; NUM_LFM_CHIPS];
     let mut log_heights = [0u8; NUM_LFM_CHIPS];
 
@@ -326,25 +410,62 @@ pub fn build_artifacts_with_hasher(
         .collect();
     log_heights[BLAKE3_SLOT] = blake3_chunk_log_heights[0];
 
-    for (i, g) in groups.iter().enumerate() {
-        let lde = lde_columns(&group_columns(g), options);
-        roots[i] = commit_lde_columns(&lde);
-        // Dropped here — peak residency is one group's LDE.
-        drop(lde);
+    // ★ N GROUPS IN FLIGHT, NOT ONE AND NOT ELEVEN. Each pass is an independent
+    // expand-and-commit of its own matrix, so the loop parallelizes on its face;
+    // what stopped it was the residency trade the old comment named — "peak
+    // residency is one group's LDE" — taken when host memory was the binding
+    // constraint on this path. It is not any more: lane P measured a production
+    // L1 node's host peak at 14.4 GiB of 57.53.
+    //
+    // ⚠ So the trade is RE-PRICED, not discarded. Running all eleven at once
+    // would multiply the peak by the group count for a program whose group sizes
+    // we do not control; a fixed window multiplies it by at most
+    // `groups_in_flight()` and says so.
+    //
+    // ⛔ AND THE WINDOW IS THE SECOND-ORDER HALF. `lde_columns` → `dispatch_fft`
+    // already sends any buffer of 2^14 elements or more to the parallel Bowers
+    // FFT, so the work inside this loop was never strictly serial — but its
+    // per-layer block threshold leaves the early layers sequential, and lane P
+    // measures the result at 445% CPU (4.5 of 30.7 cores) on a production node
+    // against `emit_merkle`'s 2,652%. The COLUMN-level `par_iter` is what closes
+    // that gap; this window covers only the short groups, where each column's
+    // FFT stays sequential.
+    //
+    // ⚠ My own laptop A/B read both as a wash (serial 1.547 s, windowed 1.447 s
+    // on a 27 MiB program). That fixture concentrates its felts in ONE NARROW
+    // group, which is close to the worst case for a per-column spread — it is a
+    // statement about the fixture, not about the change. Lane P's production
+    // split is the number to plan against.
+    let in_flight = groups_in_flight();
+    for (base, window) in groups.chunks(in_flight).enumerate() {
+        let commits = map_maybe_parallel(window, |g| {
+            let lde = lde_columns(&group_columns(g), options);
+            let root = commit_lde_columns(&lde);
+            // Dropped here — a window's residency is its own groups' LDEs and
+            // nothing carried between windows.
+            drop(lde);
+            root
+        });
+        for (k, root) in commits.into_iter().enumerate() {
+            roots[base * in_flight + k] = root;
+        }
     }
-    // Then `LFM_BLAKE3`, one chunk at a time: materialize the chunk's group,
-    // expand it, commit it, drop both. Peak residency stays one chunk's LDE —
-    // which is the whole point of chunking this chip.
-    let blake3_chunk_roots: Vec<Commitment> = (0..blake3_chunk_log_heights.len())
-        .map(|c| {
-            let group = program.blake3_chunk_group(c);
+    // Then `LFM_BLAKE3`, one window of chunks at a time: materialize each
+    // chunk's group, expand it, commit it, drop both. Peak residency is the
+    // window's chunks — which is still the point of chunking this chip, at a
+    // bound that names itself.
+    let chunks: Vec<usize> = (0..blake3_chunk_log_heights.len()).collect();
+    let mut blake3_chunk_roots: Vec<Commitment> = Vec::with_capacity(chunks.len());
+    for window in chunks.chunks(in_flight) {
+        blake3_chunk_roots.extend(map_maybe_parallel(window, |c| {
+            let group = program.blake3_chunk_group(*c);
             let lde = lde_columns(&group_columns(&group), options);
             drop(group);
             let root = commit_lde_columns(&lde);
             drop(lde);
             root
-        })
-        .collect();
+        }));
+    }
     roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
     roots[13] = keccak_rc::preprocessed_commitment(options);
