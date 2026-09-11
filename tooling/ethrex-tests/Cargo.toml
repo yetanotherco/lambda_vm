@@ -10,8 +10,9 @@ edition = "2024"
 
 [dev-dependencies]
 executor = { path = "../../executor" }
-# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
-# so the native reference reads the same ProgramInput rkyv layout.
+# Pinned to the SAME ethrex rev as the guest so the native reference reads the same
+# ProgramInput rkyv layout. Re-pin all five manifests together with
+# scripts/set_ethrex_rev.sh.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-guest-program" }
 # Exact pin: the fixture writer and the guest/executor readers must agree on the
 # rkyv layout. Keep this in sync with tooling/ethrex-fixtures and

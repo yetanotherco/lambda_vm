@@ -149,6 +149,25 @@ fn no_kzg_backend_linked() {
     );
 }
 
+/// Same screen for EIP-2537 (0x0b-0x11), which the 797df554 bump moved behind the
+/// native-only `blst` feature. Unlike the KZG gap these do NOT revert: levm maps
+/// `CryptoError::Unsupported` to `InternalError`, which aborts the run. Goes red if a
+/// dependency restores a backend, or if upstream rewords the message.
+#[test]
+fn no_bls_backend_linked() {
+    use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
+    let result = NativeCrypto.bls12_381_g1_add(([0u8; 48], [0u8; 48]), ([0u8; 48], [0u8; 48]));
+    let message = match result {
+        Ok(_) => "bls12_381_g1_add accepted zero input".to_string(),
+        Err(err) => format!("{err:?}"),
+    };
+    assert!(
+        message.contains("requires the `blst` feature"),
+        "a BLS12-381 backend is linked into ethrex-tests, so the native reference no \
+         longer matches the guest on 0x0b-0x11: {message}"
+    );
+}
+
 /// The same real block through the guest ELF, checking the VM's committed
 /// output matches the native reference. Split from the native gate above
 /// because this one needs the ethrex ELF and is far heavier than the synthetic

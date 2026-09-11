@@ -75,11 +75,11 @@ fn program_input_from_cache(
 
     // `into_execution_witness` rebuilds the trie structures from the flat node
     // list and needs the parent header, which the cache carries inside `witness`.
-    // Those headers are now decoded by the caller rather than inside the call, and
-    // the `Crypto` argument is what recomputes the block hashes the parent lookup
-    // matches on. `NativeCrypto` is keccak-only here, so it produces the same bytes
-    // as the `LambdaVmEcsmCrypto` the guest injects (whose host path is also
-    // software keccak) — the fixture does not depend on which one converts it.
+    // Those headers are now decoded by the caller rather than inside the call, and the
+    // parent lookup matches on `h.number` without touching `crypto` at all. The `Crypto`
+    // argument is used only for keccak over the trie-node preimages, so `NativeCrypto`
+    // produces the same bytes as the `LambdaVmEcsmCrypto` the guest injects (whose host
+    // path is also software keccak) — the fixture does not depend on which one converts it.
     let chain_config = cache.network.get_genesis()?.config;
     let decoded_headers = decode_witness_headers(&cache.witness.headers)?;
     let witness = cache.witness.into_execution_witness(

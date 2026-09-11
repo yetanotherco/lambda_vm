@@ -7,14 +7,15 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
-# so the generated ProgramInput rkyv layout matches what the guest deserializes.
+# Pinned to the SAME ethrex rev as the guest so the generated ProgramInput rkyv
+# layout matches what the guest deserializes. Re-pin all five manifests together
+# with scripts/set_ethrex_rev.sh.
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-common", default-features = false }
 ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-config", default-features = false }
 # Only for `NativeCrypto`, the host `Crypto` impl that `into_execution_witness`
-# now takes. Nothing re-exports it, and this crate's own guest-crypto impl is a
-# dev-dependency, so the bin build needs its own line. Already in the graph via
-# `ethrex-config` → `ethrex-p2p`, so this adds no compilation.
+# now takes. `ethrex_guest_program::crypto` re-exports it, but this crate's own
+# guest-crypto impl is a dev-dependency, so the bin build needs its own line.
+# Already in the graph via `ethrex-config` → `ethrex-p2p`, so this adds no compilation.
 ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-crypto", default-features = false }
 # Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
 #
@@ -22,10 +23,10 @@ ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797d
 # `ethrex-config` dep above pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
 # propagates to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
 # switch it off, because ethrex's own workspace declares `ethrex-p2p` with its
-# defaults on. So this graph links a working c-kzg (and malachite modexp, and
-# `ark-ff/asm` BN254) that the guest does not have; verify with
-# `cargo tree -e features -i ethrex-crypto`. Closing that gap means dropping
-# `ethrex-config` and sourcing `ChainConfig` another way — see the README.
+# defaults on. So this graph links a working c-kzg that the guest does not have;
+# verify with `cargo tree -e features -i ethrex-crypto`. c-kzg is the whole gap now —
+# malachite modexp and `ark-ff/asm` are on both sides since ethrex-trie's `std` default.
+# Closing it means dropping `ethrex-config` and sourcing `ChainConfig` another way.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-guest-program", default-features = false }
 
 # Exact pin: the fixture writer and the guest/executor readers must agree on the
@@ -59,9 +60,3 @@ lambda-vm-ethrex-crypto = { path = "../../crypto/ethrex-crypto" }
 # No feature delta against the rest of the graph (sha2/std is already on), so this
 # one can stay a dev-dependency without forcing the rebuild described above.
 sha2 = "0.10"
-
-# `ethrex-guest-program`'s `lambdavm` feature git-deps `lambda-vm-syscalls` at a
-# pinned commit of this repo; override it with the working-tree copy, as the guest
-# does, so both resolve the same syscalls.
-[patch."https://github.com/yetanotherco/lambda_vm.git"]
-lambda-vm-syscalls = { path = "../../syscalls" }
