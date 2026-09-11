@@ -334,8 +334,8 @@ fn phases() {
         .into_iter()
         .zip(&pairs)
         .map(|(layout, (_, trace, _))| {
-            let columns = trace.columns_main();
-            CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
+            let mut columns = trace.columns_main();
+            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
                 .expect("materialize")
         })
         .collect();

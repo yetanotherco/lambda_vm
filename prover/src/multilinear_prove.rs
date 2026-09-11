@@ -151,24 +151,24 @@ fn shapes_of(pairs: &[crate::AirTracePair<'_>]) -> Result<Vec<Shape>, Error> {
     pairs
         .iter()
         .map(|(air, trace, _)| {
-            let columns = trace.columns_main();
-            let rows = columns.first().map_or(0, Vec::len);
-            if columns.is_empty() || !rows.is_power_of_two() {
+            // The table's own shape, not its columns: transposing the trace to
+            // count it is the whole trace copied for two numbers.
+            let width = trace.main_table.width;
+            let rows = trace.main_table.height;
+            if width == 0 || !rows.is_power_of_two() {
                 return Err(Error::Prover(format!(
-                    "{}: {} columns of {rows} rows, which the hypercube cannot hold",
+                    "{}: {width} columns of {rows} rows, which the hypercube cannot hold",
                     air.name(),
-                    columns.len(),
                 )));
             }
-            if columns.len() != air.trace_layout().0 {
+            if width != air.trace_layout().0 {
                 return Err(Error::Prover(format!(
-                    "{}: trace has {} main columns, the AIR declares {}",
+                    "{}: trace has {width} main columns, the AIR declares {}",
                     air.name(),
-                    columns.len(),
                     air.trace_layout().0,
                 )));
             }
-            Ok((columns.len(), rows.trailing_zeros() as usize))
+            Ok((width, rows.trailing_zeros() as usize))
         })
         .collect()
 }
@@ -240,7 +240,7 @@ pub fn prove_with_options_and_inputs(
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
         let layout = layout_of(*air, width, num_vars)
             .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
-        let columns = trace.columns_main();
+        let mut columns = trace.columns_main();
         // The verifier will rebuild these and demand the proof open to them, so a
         // trace that disagrees produces a proof nobody can verify. Better to say
         // so here than to hand out that proof.
@@ -253,7 +253,9 @@ pub fn prove_with_options_and_inputs(
             }
         }
         committed.push(
-            CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
+            // Moved, not cloned: `columns` is this iteration's own transpose
+            // of the trace and nothing reads it afterwards.
+            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
     }

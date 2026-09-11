@@ -227,10 +227,25 @@ where
     /// The same against a layout already built — the same one the verifier will
     /// rebuild, so the statement and the trace cannot describe different
     /// tables.
+    /// Each column is asked for exactly once, in [`column_keys`] order, so a
+    /// caller holding its own copy may hand it over rather than clone it —
+    /// which on a real trace is the difference between one copy of it and two.
+    ///
+    /// [`column_keys`]: TableLayout::column_keys
     pub fn from_layout(
         layout: TableLayout<'a, F, E>,
         mut main_column: impl FnMut(u16) -> Vec<FieldElement<F>>,
     ) -> Result<Self, MlError> {
+        debug_assert!(
+            {
+                let mut seen: Vec<u16> = layout.column_keys().iter().map(|k| k.col).collect();
+                seen.sort_unstable();
+                let asked = seen.len();
+                seen.dedup();
+                seen.len() == asked
+            },
+            "a caller may move its columns in, so each one must be asked for once",
+        );
         let size = 1usize << layout.num_vars();
         let mut columns = Vec::with_capacity(layout.num_columns());
         for key in layout.column_keys() {
