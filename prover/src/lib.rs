@@ -81,9 +81,10 @@ pub struct RuntimePageRange {
 }
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
-/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// of `TableCounts`: bitwise, decode, halt, keccak_rc, register. The
+/// accelerator chips are counted instead — a run that never calls one carries
+/// no table for it.
+pub const FIXED_TABLE_COUNT: usize = 5;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -104,52 +105,75 @@ pub struct TableCounts {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    // Accelerator chips. One table each when the run reaches them, none when it
+    // does not; they are counted rather than fixed so the count can later become
+    // a real chunk count without moving the statement encoding again.
+    pub keccak: usize,
+    pub keccak_rnd: usize,
+    pub ecsm: usize,
+    pub ecdas: usize,
+    pub hint: usize,
+    pub commit: usize,
 }
 
 impl TableCounts {
-    /// Sum of all chunk counts across the split tables.
-    pub fn total(&self) -> usize {
-        self.cpu
-            + self.lt
-            + self.memw
-            + self.memw_aligned
-            + self.load
-            + self.mul
-            + self.dvrm
-            + self.shift
-            + self.branch
-            + self.memw_register
-            + self.eq
-            + self.bytewise
-            + self.store
-            + self.cpu32
+    /// Sum of all chunk counts across the split tables, or `None` if they
+    /// overflow.
+    ///
+    /// The counts are prover-supplied and release builds wrap on overflow, so a
+    /// plain sum is not enough: the sub-proof cross-check compares only this
+    /// total, and a wrapped one lets a single astronomically large field pass it
+    /// and reach `VmAirs::new`, which sizes a `Vec` from that field directly.
+    pub fn total(&self) -> Option<usize> {
+        [
+            self.cpu,
+            self.lt,
+            self.memw,
+            self.memw_aligned,
+            self.load,
+            self.mul,
+            self.dvrm,
+            self.shift,
+            self.branch,
+            self.memw_register,
+            self.eq,
+            self.bytewise,
+            self.store,
+            self.cpu32,
+            self.keccak,
+            self.keccak_rnd,
+            self.ecsm,
+            self.ecdas,
+            self.hint,
+            self.commit,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
 
-    /// Validate that all required tables have at least one chunk.
+    /// Validate that the structurally-required tables have at least one chunk.
     ///
-    /// A zero count for any table would remove its constraints from verification,
-    /// allowing a malicious prover to bypass soundness checks.
+    /// CPU drives the run and MEMW_R carries the register file, so a proof
+    /// without them describes no execution at all and is rejected here.
+    ///
+    /// Every other chip is allowed a zero count: an epoch that runs no
+    /// multiplication has no MUL table, and paying a padded sub-proof for it
+    /// costs a full commitment, FRI chain and OOD opening set.
+    ///
+    /// What keeps a zero count honest is the LogUp bus, not this check. A chip
+    /// influences the run only through its bus interactions, and no chip carries
+    /// boundary constraints of its own, so a chip with no rows contributes zero
+    /// to the bus and removing it changes nothing. A prover that omits a table
+    /// whose operations *did* execute leaves the CPU's sends unmatched, and the
+    /// bus-balance check — summed over the tables that are present — rejects the
+    /// proof. That argument needs each omitted table to be a bus participant;
+    /// `every_table_participates_in_the_bus` pins it down for the whole AIR set.
     pub fn validate(&self) -> Result<(), Error> {
-        let checks = [
-            ("cpu", self.cpu),
-            ("lt", self.lt),
-            ("memw", self.memw),
-            ("memw_aligned", self.memw_aligned),
-            ("load", self.load),
-            ("mul", self.mul),
-            ("dvrm", self.dvrm),
-            ("shift", self.shift),
-            ("branch", self.branch),
-            ("memw_register", self.memw_register),
-            ("eq", self.eq),
-            ("bytewise", self.bytewise),
-            ("store", self.store),
-            ("cpu32", self.cpu32),
-        ];
-        for (name, count) in checks {
+        let required = [("cpu", self.cpu), ("memw_register", self.memw_register)];
+        for (name, count) in required {
             if count == 0 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is 0 — every table must have at least 1 chunk"
+                    "{name} count is 0 — required table must have at least 1 chunk"
                 )));
             }
         }
@@ -516,13 +540,13 @@ pub(crate) struct VmAirs {
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
-    pub commit: VmAir,
-    pub keccak: VmAir,
-    pub keccak_rnd: VmAir,
+    pub commits: Vec<VmAir>,
+    pub keccaks: Vec<VmAir>,
+    pub keccak_rnds: Vec<VmAir>,
     pub keccak_rc: VmAir,
-    pub ecsm: VmAir,
-    pub ecdas: VmAir,
-    pub hint: VmAir,
+    pub ecsms: Vec<VmAir>,
+    pub ecdases: Vec<VmAir>,
+    pub hints: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -542,17 +566,29 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
-            (self.commit.as_ref(), &mut traces.commit, &()),
-            (self.keccak.as_ref(), &mut traces.keccak, &()),
-            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
-            (self.ecsm.as_ref(), &mut traces.ecsm, &()),
-            (self.ecdas.as_ref(), &mut traces.ecdas, &()),
-            (self.hint.as_ref(), &mut traces.hint, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
             pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
+        }
+        for (air, trace) in self.commits.iter().zip(traces.commits.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.keccaks.iter().zip(traces.keccaks.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.keccak_rnds.iter().zip(traces.keccak_rnds.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.ecsms.iter().zip(traces.ecsms.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.ecdases.iter().zip(traces.ecdases.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
         }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
@@ -617,17 +653,29 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             self.bitwise.as_ref(),
             self.decode.as_ref(),
-            self.commit.as_ref(),
-            self.keccak.as_ref(),
-            self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
-            self.ecsm.as_ref(),
-            self.ecdas.as_ref(),
-            self.hint.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
             refs.push(self.halt.as_ref());
+        }
+        for air in &self.commits {
+            refs.push(air.as_ref());
+        }
+        for air in &self.keccaks {
+            refs.push(air.as_ref());
+        }
+        for air in &self.keccak_rnds {
+            refs.push(air.as_ref());
+        }
+        for air in &self.ecsms {
+            refs.push(air.as_ref());
+        }
+        for air in &self.ecdases {
+            refs.push(air.as_ref());
+        }
+        for air in &self.hints {
+            refs.push(air.as_ref());
         }
 
         for air in &self.cpus {
@@ -786,16 +834,44 @@ impl VmAirs {
             })
             .collect();
         let halt: VmAir = Box::new(create_halt_air(proof_options));
-        let commit: VmAir = Box::new(create_commit_air(proof_options));
-        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let commits: Vec<_> = (0..table_counts.commit)
+            .map(|i| {
+                Box::new(create_commit_air(proof_options).with_name(&format!("COMMIT[{i}]")))
+                    as VmAir
+            })
+            .collect();
+        let keccaks: Vec<_> = (0..table_counts.keccak)
+            .map(|i| {
+                Box::new(create_keccak_air(proof_options).with_name(&format!("KECCAK[{i}]")))
+                    as VmAir
+            })
+            .collect();
+        let keccak_rnds: Vec<_> = (0..table_counts.keccak_rnd)
+            .map(|i| {
+                Box::new(
+                    create_keccak_rnd_air(proof_options).with_name(&format!("KECCAK_RND[{i}]")),
+                ) as VmAir
+            })
+            .collect();
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         ));
-        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
-        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
-        let hint: VmAir = Box::new(create_hint_air(proof_options));
+        let ecsms: Vec<_> = (0..table_counts.ecsm)
+            .map(|i| {
+                Box::new(create_ecsm_air(proof_options).with_name(&format!("ECSM[{i}]"))) as VmAir
+            })
+            .collect();
+        let ecdases: Vec<_> = (0..table_counts.ecdas)
+            .map(|i| {
+                Box::new(create_ecdas_air(proof_options).with_name(&format!("ECDAS[{i}]"))) as VmAir
+            })
+            .collect();
+        let hints: Vec<_> = (0..table_counts.hint)
+            .map(|i| {
+                Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
+            })
+            .collect();
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -910,13 +986,13 @@ impl VmAirs {
             dvrms,
             branches,
             halt,
-            commit,
-            keccak,
-            keccak_rnd,
+            commits,
+            keccaks,
+            keccak_rnds,
             keccak_rc,
-            ecsm,
-            ecdas,
-            hint,
+            ecsms,
+            ecdases,
+            hints,
             register,
             pages,
             memw_registers,
@@ -1390,11 +1466,19 @@ fn verify_proof_parts(
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
-    let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    let Some(expected_proof_count) = table_counts
+        .total()
+        .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
+        .and_then(|t| t.checked_add(page_configs.len()))
+    else {
+        return Err(Error::InvalidTableCounts(
+            "declared table counts overflow usize".to_string(),
+        ));
+    };
     if expected_proof_count != proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
-            table_counts.total(),
+            expected_proof_count - FIXED_TABLE_COUNT - page_configs.len(),
             page_configs.len(),
             expected_proof_count,
             proofs.len(),

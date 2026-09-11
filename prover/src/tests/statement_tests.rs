@@ -23,6 +23,12 @@ fn sample_counts() -> TableCounts {
         bytewise: 1,
         store: 1,
         cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
     }
 }
 
@@ -61,6 +67,92 @@ fn state_after_absorb(
     t.state()
 }
 
+/// A `&mut` handle to every count, for tests that have to move each one.
+///
+/// The exhaustive destructure makes a new `TableCounts` field a compile error
+/// here, and `deny(unused_variables)` makes *destructuring it and then not
+/// returning it* an error too — which is the hole a plain destructure leaves:
+/// `absorb_statement` has the same exhaustive pattern, but the array it feeds
+/// the transcript is written out separately, so a field can be destructured
+/// there and quietly dropped before it reaches the sponge.
+#[deny(unused_variables)]
+fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
+    let TableCounts {
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
+        keccak,
+        keccak_rnd,
+        ecsm,
+        ecdas,
+        hint,
+        commit,
+    } = counts;
+    vec![
+        ("cpu", cpu),
+        ("lt", lt),
+        ("memw", memw),
+        ("memw_aligned", memw_aligned),
+        ("load", load),
+        ("mul", mul),
+        ("dvrm", dvrm),
+        ("shift", shift),
+        ("branch", branch),
+        ("memw_register", memw_register),
+        ("eq", eq),
+        ("bytewise", bytewise),
+        ("store", store),
+        ("cpu32", cpu32),
+        ("keccak", keccak),
+        ("keccak_rnd", keccak_rnd),
+        ("ecsm", ecsm),
+        ("ecdas", ecdas),
+        ("hint", hint),
+        ("commit", commit),
+    ]
+}
+
+/// Every count has to reach the transcript, not just the one a test happened
+/// to pick. The V4 encoding added six accelerator counts; a field that is
+/// destructured in `absorb_statement` and then left out of the array it
+/// absorbs compiles clean and changes nothing about the state, which is a
+/// prover-chosen number the verifier would no longer be bound to.
+#[test]
+fn state_depends_on_every_table_count() {
+    let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 7);
+
+    let names: Vec<&str> = each_count_mut(&mut sample_counts())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names.len(), 20, "every count must be probed");
+
+    for name in names {
+        let mut counts = sample_counts();
+        for (candidate, slot) in each_count_mut(&mut counts) {
+            if candidate == name {
+                *slot += 1;
+            }
+        }
+        assert_ne!(
+            baseline,
+            state_after_absorb(b"elf", b"out", &counts, 1, &sample_ranges(), 7),
+            "state must depend on table_counts.{name}",
+        );
+    }
+}
+
 #[test]
 fn state_is_deterministic() {
     let a = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges(), 7);
@@ -97,13 +189,8 @@ fn state_depends_on_every_field() {
         "state must depend on public_output",
     );
 
-    let mut counts2 = sample_counts();
-    counts2.branch += 1;
-    assert_ne!(
-        baseline,
-        state_after_absorb(b"elf", b"out", &counts2, 1, &sample_ranges(), 7),
-        "state must depend on table_counts",
-    );
+    // table_counts gets its own test: one field moving the state says nothing
+    // about the other nineteen. See `state_depends_on_every_table_count`.
 
     assert_ne!(
         baseline,
