@@ -853,9 +853,6 @@ mod tests {
         for_each_tenant!(check);
     }
 
-    /// A digest round-trips through its 32 canonical big-endian bytes, or
-    /// `Commitment` does not name the digest.
-    #[test]
     /// The HOST proof-of-work search still finds a nonce the predicate accepts,
     /// under the RPX configuration and through the streaming leaf.
     ///
@@ -920,6 +917,8 @@ mod tests {
         for_each_tenant!(check);
     }
 
+    /// A digest round-trips through its 32 canonical big-endian bytes, or
+    /// `Commitment` does not name the digest.
     #[test]
     fn a_digest_round_trips_through_its_commitment_bytes() {
         let d: LfmWord = [
