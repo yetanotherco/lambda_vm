@@ -3147,6 +3147,34 @@ fn tree_siblings() -> usize {
     resolve_siblings(k.as_deref(), s.as_deref())
 }
 
+/// How many EPOCH WRAPS prove at once — `LFM_TREE_SIBLINGS_L0`, or
+/// `LFM_TREE_K_L0`.
+///
+/// ★★ A SECOND KNOB, AND IT DEFAULTS TO 1 RATHER THAN TO THE INTERIOR'S VALUE.
+/// Three reasons, in the order they matter:
+///
+/// 1. ⛔ **The falsifiers are different.** The interior's binding constraint is
+///    the card; level 0's is the HOST PEAK. One knob would let a safe interior
+///    setting arm the risky level, and the run that discovers it does so by
+///    exhausting 57.53 GiB two hundred seconds in.
+/// 2. **They are different machines.** Measured: a level-1 node is device 3.80 s
+///    against host 3.86, one to one; a wrap is 2.85 against 7.90, one to 2.8. The
+///    count that saturates one starves the other, so a single value is wrong for
+///    at least one of them by construction.
+/// 3. **Every existing e2e number stays comparable.** Unset, level 0 runs exactly
+///    as it did, so an arm that changes only the interior is still the same
+///    experiment it was.
+///
+/// ⛔ Deliberately NOT a range or a list on the existing knob
+/// (`LFM_TREE_SIBLINGS=2,4`). That spelling makes the common case need
+/// punctuation and lets a typo arm level 0 silently — the one thing this must
+/// never do.
+fn tree_siblings_l0() -> usize {
+    let k = std::env::var("LFM_TREE_K_L0").ok();
+    let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
+    resolve_siblings(k.as_deref(), s.as_deref())
+}
+
 /// [`tree_siblings`] with the environment supplied, so the resolution is
 /// testable without mutating process state.
 ///
@@ -4003,7 +4031,24 @@ fn the_production_tree_composes_to_a_root() {
     // says so; the driver did not inherit it.
     let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
         .expect("the inner ELF and its DECODE commitment must build once");
-    for k in 0..bundle.num_epochs() {
+    // ★★★ LEVEL-0 CONCURRENCY. Armed with its OWN count and disarmed straight
+    // after, so the interior's knob and this one never reach across.
+    //
+    // ⛔ THE HOST PEAK IS THE FALSIFIER HERE, not the card. A wrap is device
+    // 2.85 s against host 7.90 — one to 2.8 — so the card idles long before the
+    // host does, and the binding constraint is how many wrap transients are
+    // live at once on a 57.53 GiB box. That is the opposite of the interior,
+    // where the card binds at two siblings and more workers only add peak.
+    let l0_siblings = tree_siblings_l0().min(bundle.num_epochs().max(1));
+    println!(
+        "   ★ LEVEL-0 CONCURRENCY: {l0_siblings} wrap(s) at once \
+         (LFM_TREE_SIBLINGS_L0 or LFM_TREE_K_L0; 1 = the serial control)"
+    );
+    super::device_permit::arm(l0_siblings);
+    let level0_sampler = HostSampler::start();
+
+    type WrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
+    let prove_one_wrap = |k: usize| -> WrapSlot {
         // ★ THE WRAP'S OWN TIMING LINE. Level 0 is 49% of the block and until
         // now it printed ONE number for nineteen wraps — every per-phase figure
         // ever published for a wrap was derived by subtracting an assumed term
@@ -4053,7 +4098,8 @@ fn the_production_tree_composes_to_a_root() {
         // census is outside its TIMING line, so the fields stay comparable to
         // the arm that measured them. Its cost lands in `wall` instead, and it
         // is now the one named term in that residual.
-        census_and_panel(&program, &format!("wrap {k}"), 1);
+        let (cells, instrs) = census_and_panel(&program, &format!("wrap {k}"), 1);
+        let wrap_sampler = HostSampler::start();
         let t = Instant::now();
         let artifacts =
             build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
@@ -4074,9 +4120,7 @@ fn the_production_tree_composes_to_a_root() {
         let t = Instant::now();
         let (child, t_verify) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
         let t_harvest = t.elapsed().as_secs_f64();
-        children.push(child);
-        layouts.push(layout);
-        labels.push(vec![crate::tables::local_to_global::epoch_label(k as u64)]);
+        let (peak, at) = wrap_sampler.stop();
         // ⓘ `wall` is printed so the five fields read as a CLOSED account:
         // what they do not sum to is the residual — the census and panel above,
         // the out-halves read, `assert_samplable`, the label push — and a
@@ -4088,12 +4132,79 @@ fn the_production_tree_composes_to_a_root() {
             t_harvest - t_verify,
             t_wrap.elapsed().as_secs_f64()
         );
+        // ★★ THE NUMBER THE LEVEL-0 COUNT IS CHOSEN ON, and nothing measured it
+        // before. The interior prints a per-node peak and that is how its
+        // retention-per-node was read; level 0 printed none, so what a SECOND
+        // live wrap transient costs on a 57.53 GiB box could only be scaled from
+        // a node — a different machine. ⚠ With siblings in flight this is the
+        // PROCESS during this wrap's window, not this wrap alone, and the line
+        // says so.
+        println!(
+            "   wrap {k}: host peak {peak:.3} GiB at t={at:.1}{}{}",
+            match &ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                Err(_) => String::new(),
+            },
+            if l0_siblings > 1 {
+                format!(" ⓘ PROCESS-WIDE, {l0_siblings} wraps in flight")
+            } else {
+                String::new()
+            },
+        );
+        (
+            child,
+            layout,
+            vec![crate::tables::local_to_global::epoch_label(k as u64)],
+            cells,
+            instrs,
+        )
+    };
+
+    // ★★★ THE WRAPS' BYTE-IDENTITY LINES, at the join and so in index order —
+    // the same gate the interior levels carry, in the same shape, so one grep
+    // covers the whole tree.
+    for (k, (child, layout, lbl, cells, instrs)) in
+        in_index_order(bundle.num_epochs(), l0_siblings, prove_one_wrap)
+            .into_iter()
+            .enumerate()
+    {
+        println!(
+            "   wrap {k} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
+             · published {} words · {cells} cells ({instrs} instructions)",
+            child
+                .artifacts
+                .program_id
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            child.artifacts.log_heights,
+            child.artifacts.blake3_chunk_log_heights,
+            child.public_words.len(),
+        );
+        children.push(child);
+        layouts.push(layout);
+        labels.push(lbl);
     }
+    // Everything after level 0 runs at its own count, or serial.
+    super::device_permit::arm(1);
+    let level0_wall = t_level.elapsed().as_secs_f64();
+    let (l0_peak, l0_at) = level0_sampler.stop();
+    println!("   level 0: {} wraps in {level0_wall:.1}s", children.len());
+    // ⛔ FALSIFIER 1's OWN LINE. The per-wrap peaks above are process-wide
+    // readings inside overlapping windows once wraps run together; this is the
+    // level's own window and it is the figure the 52 GiB stop is about.
     println!(
-        "   level 0: {} wraps in {:.1}s",
-        children.len(),
-        t_level.elapsed().as_secs_f64()
+        "   level 0: host peak {l0_peak:.3} GiB at t={l0_at:.1}{}, {l0_siblings} wrap(s) in flight",
+        match &ceiling {
+            Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * l0_peak / g),
+            Err(_) => String::new(),
+        },
     );
+    let l0_permit = super::device_permit::take_stats();
+    if l0_permit.acquisitions > 0 {
+        println!("   level 0: {}", l0_permit.describe(level0_wall));
+    }
     if let Some(stats) = super::program_census::end_level() {
         println!("   {}", stats.describe("level 0"));
     }
