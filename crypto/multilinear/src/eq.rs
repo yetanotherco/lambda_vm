@@ -174,58 +174,94 @@ pub fn shift_eval<F: IsField>(
 
 /// The table of `shift_k(x, ·)` over the cube, in `O(2^n)`.
 ///
-/// Same carry recursion as [`shift_eval`], but each step doubles the table
+/// Same carry recursion as [`shift_eval`], but each step doubles the tables
 /// instead of multiplying `y_j`'s weight out — prepending `y_j` as the new most
 /// significant bit, which is the indexing [`Mle`] folds on.
-pub fn shift_evals<F: IsField>(x: &[FieldElement<F>], k: usize) -> Vec<FieldElement<F>> {
-    let one = FieldElement::<F>::one();
-    let zero = FieldElement::<F>::zero();
-    let mut state = [vec![one.clone()], vec![zero.clone()]];
-
-    for (t, x_j) in x.iter().rev().enumerate() {
-        let one_minus = &one - x_j;
-        let len = state[0].len();
-        let mut next = [vec![zero.clone(); 2 * len], vec![zero.clone(); 2 * len]];
-
-        for (c, table) in state.iter().enumerate() {
-            match ((k >> t) & 1) + c {
-                // y_j = x_j, carry unchanged.
-                0 => {
-                    for (i, v) in table.iter().enumerate() {
-                        next[0][i] += &one_minus * v;
-                        next[0][len + i] += x_j * v;
-                    }
-                }
-                // y_j = 1 − x_j: the `y_j = 1` half needs x_j = 0 and keeps the
-                // carry clear, the `y_j = 0` half needs x_j = 1 and raises it.
-                1 => {
-                    for (i, v) in table.iter().enumerate() {
-                        next[1][i] += x_j * v;
-                        next[0][len + i] += &one_minus * v;
-                    }
-                }
-                // y_j = x_j, carry out.
-                _ => {
-                    for (i, v) in table.iter().enumerate() {
-                        next[1][i] += &one_minus * v;
-                        next[1][len + i] += x_j * v;
-                    }
-                }
-            }
-        }
-        state = next;
+///
+/// The two tables ride buffers the levels swap between rather than being
+/// allocated per level: the last level alone is the whole cube, so allocating
+/// per level is allocating the answer twice over.
+pub fn shift_evals<F: IsField>(x: &[FieldElement<F>], k: usize) -> Vec<FieldElement<F>>
+where
+    FieldElement<F>: Send + Sync,
+{
+    let size = 1usize << x.len();
+    // Only the low `n` bits of `k` are ever read, so a shift by a multiple of
+    // the cube is no shift — and no shift is `eq`, which carries one table
+    // instead of two and is one pass per level instead of three.
+    if k.is_multiple_of(size) {
+        return eq_evals(x);
     }
 
-    let [no_carry, carried] = state;
-    no_carry
-        .into_iter()
-        .zip(carried)
-        .map(|(a, b)| a + b)
-        .collect()
+    let one = FieldElement::<F>::one();
+    let zero = FieldElement::<F>::zero();
+    // "No carry out" and "carry out". Only the seed has to be set: every cell
+    // a level reads is one that level or an earlier one wrote.
+    let mut cur = [vec![zero.clone(); size], vec![zero.clone(); size]];
+    let mut next = [vec![zero.clone(); size], vec![zero; size]];
+    cur[0][0] = one.clone();
+
+    let mut len = 1usize;
+    for (t, x_j) in x.iter().rev().enumerate() {
+        let one_minus = &one - x_j;
+        {
+            let [s0, s1] = &cur;
+            let (s0, s1) = (&s0[..len], &s1[..len]);
+            let [n0, n1] = &mut next;
+            let (n0_lo, n0_rest) = n0.split_at_mut(len);
+            let (n1_lo, n1_rest) = n1.split_at_mut(len);
+            let n0_hi = &mut n0_rest[..len];
+            let n1_hi = &mut n1_rest[..len];
+            // Every level is made of the same three blocks and one of zeros:
+            //   b = (1 − x)·s0,   m = x·s0 + (1 − x)·s1,   h = x·s1
+            // and all the shift's bit decides is where each one goes.
+            let (b, m, h, blank) = if (k >> t) & 1 == 0 {
+                (n0_lo, n0_hi, n1_lo, n1_hi)
+            } else {
+                (n0_hi, n1_lo, n1_hi, n0_lo)
+            };
+            let scale_lo = |(o, v): (&mut FieldElement<F>, &FieldElement<F>)| *o = &one_minus * v;
+            let scale_hi = |(o, v): (&mut FieldElement<F>, &FieldElement<F>)| *o = x_j * v;
+            let mix =
+                |((o, a), c): ((&mut FieldElement<F>, &FieldElement<F>), &FieldElement<F>)| {
+                    *o = x_j * a + &one_minus * c
+                };
+            let clear = |o: &mut FieldElement<F>| *o = FieldElement::<F>::zero();
+            #[cfg(feature = "parallel")]
+            {
+                b.par_iter_mut().zip(s0.par_iter()).for_each(scale_lo);
+                h.par_iter_mut().zip(s1.par_iter()).for_each(scale_hi);
+                m.par_iter_mut()
+                    .zip(s0.par_iter())
+                    .zip(s1.par_iter())
+                    .for_each(mix);
+                blank.par_iter_mut().for_each(clear);
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                b.iter_mut().zip(s0.iter()).for_each(scale_lo);
+                h.iter_mut().zip(s1.iter()).for_each(scale_hi);
+                m.iter_mut().zip(s0.iter()).zip(s1.iter()).for_each(mix);
+                blank.iter_mut().for_each(clear);
+            }
+        }
+        len *= 2;
+        core::mem::swap(&mut cur, &mut next);
+    }
+
+    let [no_carry, carried] = cur;
+    let add = |(a, b): (FieldElement<F>, FieldElement<F>)| a + b;
+    #[cfg(feature = "parallel")]
+    return no_carry.into_par_iter().zip(carried).map(add).collect();
+    #[cfg(not(feature = "parallel"))]
+    return no_carry.into_iter().zip(carried).map(add).collect();
 }
 
 /// The multilinear extension of `shift_k(x, ·)`.
-pub fn shift_mle<F: IsField + 'static>(x: &[FieldElement<F>], k: usize) -> Result<Mle<F>, Error> {
+pub fn shift_mle<F: IsField + 'static>(x: &[FieldElement<F>], k: usize) -> Result<Mle<F>, Error>
+where
+    FieldElement<F>: Send + Sync,
+{
     Mle::new(shift_evals(x, k))
 }
 
