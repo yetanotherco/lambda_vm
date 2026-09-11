@@ -1409,6 +1409,7 @@ pub trait IsStarkProver<
                     H::Batched<Field>,
                 >(
                     table,
+                    "R1 main commit",
                     trace_slice,
                     trace.main_rowmajor_dev(),
                     n,

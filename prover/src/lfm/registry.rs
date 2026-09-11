@@ -19,7 +19,7 @@ use crate::tables::{bitwise, keccak_rc};
 
 use super::airs::{BLAKE3_SLOT, ChipSet, NUM_LFM_CHIPS, blake3_chunk_rows};
 
-use super::commit::{commit_lde_columns, group_columns, lde_columns};
+use super::commit::commit_group_device_or_host;
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
 use super::statement::lfm_program_id;
@@ -316,6 +316,16 @@ where
     items.iter().map(f).collect()
 }
 
+/// The dispatch label an artifact-prep commit carries into `gpu_lde`'s
+/// diagnostics. It names the PHASE rather than a chip, because the abort a
+/// reader would be holding says "which commit was this" and every group in this
+/// walk answers that the same way; the group's own shape is in the same message.
+const PREP_GROUP_LABEL: &str = "LFM_PREP_GROUP";
+
+/// The same, for the chunked `LFM_BLAKE3` groups — held apart so an abort says
+/// which of the two walks it came from.
+const BLAKE3_CHUNK_LABEL: &str = "LFM_PREP_BLAKE3_CHUNK";
+
 /// Slots 0..=9 — the instruction column groups that belong to the PROGRAM.
 ///
 /// Slot 10 (`LFM_RANGE`) is committed with them and is not one of them: its
@@ -443,15 +453,16 @@ pub fn build_artifacts_with_hasher(
     // group, which is close to the worst case for a per-column spread — it is a
     // statement about the fixture, not about the change. Lane P's production
     // split is the number to plan against.
+    //
+    // ⓘ ON A CUDA BUILD THE WINDOW IS A HOST-FALLBACK BOUND, not the live one.
+    // `commit_group_device_or_host` sends each group to the card, where the
+    // residency that matters is `stark::device_set`'s and admission enforces it
+    // per call. The window still bounds the host path exactly as before, which
+    // is the path a machine with no card takes.
     let in_flight = groups_in_flight();
     for (base, window) in groups.chunks(in_flight).enumerate() {
         let commits = map_maybe_parallel(window, |g| {
-            let lde = lde_columns(&group_columns(g), options);
-            let root = commit_lde_columns(&lde);
-            // Dropped here — a window's residency is its own groups' LDEs and
-            // nothing carried between windows.
-            drop(lde);
-            root
+            commit_group_device_or_host(PREP_GROUP_LABEL, g, options)
         });
         for (k, root) in commits.into_iter().enumerate() {
             roots[base * in_flight + k] = root;
@@ -466,11 +477,7 @@ pub fn build_artifacts_with_hasher(
     for window in chunks.chunks(in_flight) {
         blake3_chunk_roots.extend(map_maybe_parallel(window, |c| {
             let group = program.blake3_chunk_group(*c);
-            let lde = lde_columns(&group_columns(&group), options);
-            drop(group);
-            let root = commit_lde_columns(&lde);
-            drop(lde);
-            root
+            commit_group_device_or_host(BLAKE3_CHUNK_LABEL, &group, options)
         }));
     }
     roots[BLAKE3_SLOT] = blake3_chunk_roots[0];

@@ -122,6 +122,93 @@ pub fn group_columns(group: &ColumnGroup) -> Vec<Vec<FE>> {
     (0..group.width).map(column).collect()
 }
 
+/// Whether an instruction column group is committed on the DEVICE when one is
+/// present. `LFM_DEVICE_ARTIFACTS=0` forces the host pass and is the A/B control
+/// for O1.
+pub fn device_artifacts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("LFM_DEVICE_ARTIFACTS").ok().as_deref() {
+            Some("0") => false,
+            None | Some("") | Some("1") => true,
+            Some(other) => panic!("LFM_DEVICE_ARTIFACTS must be `0` or `1`, got `{other}`"),
+        },
+    )
+}
+
+/// The largest device working set any artifact commit has asked for in this
+/// process, in bytes. Zero when nothing has gone to the card.
+///
+/// ⓘ This is the ADMISSION's own accounting (`stark::device_set`), term by term:
+/// one LDE buffer, the trace-domain snapshot, one full Merkle node buffer and
+/// the small scratch — not a sampler reading. It is what the artifact build
+/// asked the card for, which is the number that decides whether it is admitted;
+/// an external sampler is what says what the process actually held.
+pub fn device_artifact_peak_bytes() -> u64 {
+    DEVICE_PEAK_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static DEVICE_PEAK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Commit one instruction column group — on the device where there is one, on
+/// the host otherwise.
+///
+/// # Why the device can do this at all
+///
+/// The group is ALREADY row-major (`ColumnGroup.data` is `padded_rows × width`),
+/// which is exactly the layout `gpu_lde`'s fused commit takes. So the device path
+/// skips `group_columns` entirely — the strided transpose exists only to feed the
+/// host's column-major pipeline — and does interpolate, coset-evaluate, leaf-hash
+/// and Merkle in one call, returning the root.
+///
+/// # The two paths must produce the same root, and that is gated
+///
+/// The host commits with `commit_bit_reversed_with(.., ROWS_PER_LEAF)`; the
+/// device builds its leaves from the row-major LDE. They are already required to
+/// agree elsewhere: `multi_prove` rebuilds the precomputed tree on the device and
+/// REFUSES the proof when its root differs from the one the AIR declares, and for
+/// an LFM proof that declared root is what this function produced. The six
+/// `registry_drift_*` tests are this caller's gate — they rebuild every
+/// registered program's artifacts and compare roots against blessed constants,
+/// so a device path that hashed differently fails them at once.
+///
+/// ⚠ A `None` from the device is a legitimate fallback (no card, a field the
+/// kernels do not take, or admission declining the shape), NOT an error swallowed
+/// quietly: once admission has ADMITTED a shape, `gpu_lde`'s own contract is that
+/// the device is the only path and a failure aborts with a diagnostic rather than
+/// returning here.
+pub fn commit_group_device_or_host(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+) -> Commitment {
+    #[cfg(feature = "cuda")]
+    if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
+        let set = stark::device_set::commit_device_set(
+            group.padded_rows,
+            group.width,
+            options.blowup_factor as usize,
+            true,
+        );
+        DEVICE_PEAK_BYTES.fetch_max(set.total(), std::sync::atomic::Ordering::Relaxed);
+        if let Some(root) = stark::gpu_lde::try_commit_row_major::<
+            GoldilocksField,
+            <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
+        >(
+            label,
+            &group.data,
+            group.padded_rows,
+            group.width,
+            options.blowup_factor as usize,
+            &FE::from(options.coset_offset),
+        ) {
+            return root;
+        }
+    }
+    let _ = label;
+    commit_lde_columns(&lde_columns(&group_columns(group), options))
+}
+
 /// Commits one instruction column group.
 pub fn commit_group(group: &ColumnGroup, options: &ProofOptions) -> Commitment {
     commit_columns(&group_columns(group), options)

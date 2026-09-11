@@ -1307,6 +1307,7 @@ where
     let weights = crate::prover::coset_weights::<F>(rows, coset_offset);
     let (tree, _handle, _lde) = try_expand_leaf_and_tree_row_major_keep::<F, F, B>(
         table,
+        "LFM artifact prep commit",
         row_major,
         None,
         rows,
@@ -1322,6 +1323,7 @@ where
 
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     table: &str,
+    what: &'static str,
     row_major: &[FieldElement<E>],
     predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
@@ -1349,9 +1351,13 @@ where
         return None;
     }
     let lde_size = n.saturating_mul(blowup_factor);
+    // ⛔ `what` is a PARAMETER because this call now has two callers with two
+    // different stories. An abort diagnostic naming "R1 main commit" for an
+    // artifact-prep commit would send the reader to the prove, which is not
+    // where the failure is.
     let shape = DispatchShape {
         table,
-        what: "R1 main commit",
+        what,
         n,
         base_cols: m,
         blowup: blowup_factor,
