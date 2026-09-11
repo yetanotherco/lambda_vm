@@ -104,6 +104,8 @@ mod framework_probe;
 #[cfg(test)]
 mod fri_tests;
 #[cfg(test)]
+mod goldilocks_simd_probe;
+#[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
