@@ -366,6 +366,133 @@ where
     Ok((commitment, domain))
 }
 
+/// The two tables a chain's rounds fold: the weight it carries and the message
+/// it is opening.
+///
+/// A group of rounds folds them, the group after that reads what is left, and
+/// they are each the width of a stacked polynomial — so on a device they stay
+/// there and only the round's few field elements cross the bus. The flow
+/// around them is the same either way: this is the only thing that differs.
+enum Factors<F: IsField + IsSubFieldOf<E>, E: IsField> {
+    Host {
+        weight: Mle<E>,
+        message: Mle<E>,
+        field: core::marker::PhantomData<F>,
+    },
+    Device(crate::gpu::OpeningFactors),
+}
+
+impl<F, E> Factors<F, E>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    /// The product of the two, which is what a round evaluates.
+    fn program() -> Result<crate::program::Program<E>, Error> {
+        let mut builder = crate::program::Builder::<E>::new();
+        let weight = builder.var(0);
+        let message = builder.var(1);
+        let root = builder.mul(weight, message);
+        builder.finish(root)
+    }
+
+    fn new(f: &Mle<F>, weight: Mle<E>) -> Result<Self, Error> {
+        if let Some(device) = crate::gpu::open_on_device(f, &weight, &Self::program()?) {
+            return Ok(Self::Device(device));
+        }
+        // The sumcheck's factors have to share a field, so the message is
+        // lifted here. The codeword is not, which is where the size is.
+        let message = Mle::new(
+            f.evals()
+                .iter()
+                .map(|v| v.clone().to_extension::<E>())
+                .collect(),
+        )?;
+        Ok(Self::Host {
+            weight,
+            message,
+            field: core::marker::PhantomData,
+        })
+    }
+
+    /// The same from a weight given as shares: on a device they are written
+    /// straight into its buffer, and the host builds the table only if none
+    /// takes them.
+    fn from_shares(
+        f: &Mle<F>,
+        shares: &[crate::stacked_eval::WeightShare<'_, E>],
+        n_stack: usize,
+    ) -> Result<Self, Error> {
+        if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
+            return Ok(Self::Device(device));
+        }
+        Self::new(f, crate::stacked_eval::weight_table(shares, n_stack)?)
+    }
+
+    fn num_vars(&self) -> usize {
+        match self {
+            Self::Host { message, .. } => message.num_vars(),
+            Self::Device(device) => device.num_vars(),
+        }
+    }
+
+    /// One group of `rounds` rounds, leaving the factors folded on them.
+    fn rounds<T: IsTranscript<E>>(
+        &mut self,
+        rounds: usize,
+        transcript: &mut T,
+    ) -> Result<sumcheck::RoundGroup<E>, Error> {
+        match self {
+            Self::Host {
+                weight, message, ..
+            } => {
+                let polys = vec![
+                    core::mem::replace(weight, Mle::new(vec![FieldElement::<E>::zero()])?),
+                    core::mem::replace(message, Mle::new(vec![FieldElement::<E>::zero()])?),
+                ];
+                let mut poly = Composed::new(polys, product::<E>, 2)?;
+                let out = sumcheck::prove_rounds(&mut poly, rounds, transcript)?;
+                let mut parts = poly.into_polys();
+                *message = parts.pop().expect("two factors");
+                *weight = parts.pop().expect("two factors");
+                Ok(out)
+            }
+            Self::Device(device) => {
+                let (proofs, challenges, _) = device.rounds(rounds, 2, |evaluations| {
+                    for value in evaluations {
+                        transcript.append_field_element(value);
+                    }
+                    transcript.sample_field_element()
+                })?;
+                Ok((proofs, challenges))
+            }
+        }
+    }
+
+    fn evaluate_message(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
+        match self {
+            Self::Host { message, .. } => message.evaluate(point),
+            Self::Device(device) => device.evaluate_message(point),
+        }
+    }
+
+    /// `weight += gamma·eq(point, ·)`, the weight the next group carries.
+    fn add_scaled_eq(
+        &mut self,
+        point: &[FieldElement<E>],
+        gamma: &FieldElement<E>,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Host { weight, .. } => {
+                *weight = batch_weight(weight, &eq_mle(point)?, gamma)?;
+                Ok(())
+            }
+            Self::Device(device) => device.add_scaled_eq(point, gamma),
+        }
+    }
+}
+
 /// What a round folds: the codeword and the commitment that answers for it.
 ///
 /// Only the first round's is base-field. Folding it with an extension challenge
@@ -398,6 +525,30 @@ where
     prove_weighted::<F, E, T>(f, eq_mle(z)?, commitment, domain, config, transcript)
 }
 
+/// The same for a weight given as the shares of a stacked polynomial's
+/// columns, which a device writes into its own buffer and the host
+/// materializes only if none does.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_shared<F, E, T>(
+    f: &Mle<F>,
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    n_stack: usize,
+    commitment: &CodewordCommitment<F>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+{
+    let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
+    prove_with_factors::<F, E, T>(f, factors, commitment, domain, config, transcript)
+}
+
 /// Proves `Σ_x w(x)·f(x) = y` for a weight the verifier can evaluate itself.
 pub fn prove_weighted<F, E, T>(
     f: &Mle<F>,
@@ -414,16 +565,27 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
+    let factors = Factors::<F, E>::new(f, weight)?;
+    prove_with_factors::<F, E, T>(f, factors, commitment, domain, config, transcript)
+}
+
+/// The chain itself, over factors that are wherever they are.
+fn prove_with_factors<F, E, T>(
+    f: &Mle<F>,
+    mut factors: Factors<F, E>,
+    commitment: &CodewordCommitment<F>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+{
     let schedule = config.schedule(f.num_vars());
-    let mut w = weight;
-    // The sumcheck's factors have to share a field, so the message is lifted
-    // here. The codeword is not, which is where the size is.
-    let mut message = Mle::new(
-        f.evals()
-            .iter()
-            .map(|v| v.clone().to_extension::<E>())
-            .collect(),
-    )?;
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E>::Base(commitment);
@@ -438,13 +600,7 @@ where
             ..RoundNonces::default()
         };
 
-        let mut poly = Composed::new(vec![w, message], product::<E>, 2)?;
-        let (sumcheck_rounds, alphas) = sumcheck::prove_rounds(&mut poly, k, transcript)?;
-        // The folded factors: the weight this group leaves, and the message the
-        // folded codeword encodes.
-        let mut parts = poly.into_polys();
-        message = parts.pop().expect("two factors");
-        w = parts.pop().expect("two factors");
+        let (sumcheck_rounds, alphas) = factors.rounds(k, transcript)?;
 
         // The fold lands in the extension whichever field it started in, so
         // this is the only place the two cases differ.
@@ -478,13 +634,13 @@ where
         let ood_value = if next.is_some() {
             let z0: FieldElement<E> = transcript.sample_field_element();
             require_out_of_domain::<F, E>(&z0, &folded_domain)?;
-            let point = ood_point(&z0, message.num_vars());
-            let y0 = message.evaluate(&point)?;
+            let point = ood_point(&z0, factors.num_vars());
+            let y0 = factors.evaluate_message(&point)?;
             transcript.append_field_element(&y0);
 
             nonces.ood = grind(transcript, config.grind.ood)?;
             let gamma: FieldElement<E> = transcript.sample_field_element();
-            w = batch_weight(&w, &eq_mle(&point)?, &gamma)?;
+            factors.add_scaled_eq(&point, &gamma)?;
             Some(y0)
         } else {
             None

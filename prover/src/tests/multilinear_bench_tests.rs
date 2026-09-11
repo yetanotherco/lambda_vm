@@ -420,6 +420,7 @@ fn phases() {
         ("gpu evals", multilinear::gpu::evaluate_calls()),
         ("gpu trees", multilinear::gpu::tree_calls()),
         ("gpu factors", multilinear::gpu::factor_calls()),
+        ("gpu openings", multilinear::gpu::open_calls()),
     ] {
         println!("{tag:<14} {count:>9}");
     }

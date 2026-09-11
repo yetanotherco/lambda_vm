@@ -20,6 +20,8 @@ static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 static TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Tables whose factors were uploaded once and reused.
 static FACTOR_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Openings whose two factors stayed on device across their groups.
+static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -45,6 +47,10 @@ pub fn factor_calls() -> u64 {
     FACTOR_CALLS.load(Ordering::Relaxed)
 }
 
+pub fn open_calls() -> u64 {
+    OPEN_CALLS.load(Ordering::Relaxed)
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
@@ -52,6 +58,7 @@ pub fn reset_call_counters() {
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
     TREE_CALLS.store(0, Ordering::Relaxed);
     FACTOR_CALLS.store(0, Ordering::Relaxed);
+    OPEN_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and the factors the
@@ -418,7 +425,9 @@ where
     static XCHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let xcheck = *XCHECK.get_or_init(|| std::env::var_os("LAMBDA_VM_GPU_XCHECK").is_some());
     let reference = |session: &math_cuda::sumcheck::SumcheckSession| {
-        if !xcheck {
+        // A session over factors that were already there has no layout to read
+        // back, so there is nothing to rebuild the host round from.
+        if !xcheck || !session.can_download() {
             return None;
         }
         let tables = session.download().expect("the device holds its factors");
@@ -1180,6 +1189,267 @@ pub fn input_layer_tree<E>(
     _denominators: &[crate::program::Program<E>],
 ) -> Option<DeviceTree>
 where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// The opening's two factors on a device: the weight the chain carries and the
+/// message it is opening, resident across groups of rounds.
+#[cfg(feature = "cuda")]
+pub struct OpeningFactors {
+    session: math_cuda::whir_open::OpeningSession,
+    lowered: Lowered,
+}
+
+/// Factors a build declined to upload. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct OpeningFactors(std::convert::Infallible);
+
+/// Puts the chain's two factors on a device, lifting the message on the way.
+///
+/// `program` is the rule the rounds evaluate — the product of the two — which
+/// the host path runs as a closure.
+#[cfg(feature = "cuda")]
+pub(crate) fn open_on_device<F, E>(
+    message: &crate::mle::Mle<F>,
+    weight: &crate::mle::Mle<E>,
+    program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    if message.len() != weight.len() || message.len() < SUMCHECK_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some()) {
+        return None;
+    }
+    let lowered = lower(program)?;
+
+    // SAFETY: the fields are the two checked above, each wrapping its limbs
+    // transparently — one `u64` per base element, three per ext3.
+    let raw_weight = unsafe {
+        core::slice::from_raw_parts(weight.evals().as_ptr() as *const u64, weight.len() * 3)
+    };
+    let raw_message = unsafe {
+        core::slice::from_raw_parts(message.evals().as_ptr() as *const u64, message.len())
+    };
+    let session = math_cuda::whir_open::OpeningSession::new(raw_weight, raw_message).ok()?;
+    OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(OpeningFactors { session, lowered })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn open_on_device<F, E>(
+    _message: &crate::mle::Mle<F>,
+    _weight: &crate::mle::Mle<E>,
+    _program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+#[cfg(feature = "cuda")]
+impl OpeningFactors {
+    pub(crate) fn num_vars(&self) -> usize {
+        self.session.num_vars()
+    }
+
+    /// One group of rounds, with the host drawing each challenge.
+    ///
+    /// The factors are folded in place and stay for the next group, which is
+    /// the whole point: they are the width of a stacked polynomial.
+    pub(crate) fn rounds<E>(
+        &mut self,
+        group: usize,
+        degree: usize,
+        challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Result<SumcheckRounds<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let mut session = self
+            .session
+            .sumcheck(
+                &self.lowered.nodes,
+                &self.lowered.consts,
+                self.lowered.num_slots,
+                self.lowered.root_slot,
+            )
+            .map_err(|_| failed("opening session"))?;
+        let (rounds, challenges) = run_rounds(&mut session, degree, group, challenge, |_| None)?;
+        self.session.bound(group);
+        SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+        // The factors stay on device; the caller reads them through this
+        // handle, not through the tables it no longer has.
+        Ok((rounds, challenges, Vec::new()))
+    }
+
+    /// The message's value at `point`, which the out-of-domain answer needs.
+    pub(crate) fn evaluate_message<E>(
+        &self,
+        point: &[math::field::element::FieldElement<E>],
+    ) -> Result<math::field::element::FieldElement<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let raw = raw_point(point).ok_or(crate::Error::DeviceFailed { stage: "ood point" })?;
+        let value = self
+            .session
+            .evaluate_message(&raw)
+            .map_err(|_| crate::Error::DeviceFailed { stage: "ood value" })?;
+        Ok(ext3_from_raw::<E>(&value))
+    }
+
+    /// `weight += gamma · eq(point, ·)`: the weight the next group carries.
+    pub(crate) fn add_scaled_eq<E>(
+        &mut self,
+        point: &[math::field::element::FieldElement<E>],
+        gamma: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let raw = raw_point(point).ok_or_else(|| failed("weight point"))?;
+        let scale = ext3_raw(gamma).ok_or_else(|| failed("weight scale"))?;
+        self.session
+            .add_scaled_eq(&raw, &scale)
+            .map_err(|_| failed("weight"))
+    }
+}
+
+/// A point as the limbs the kernels read.
+#[cfg(feature = "cuda")]
+fn raw_point<E>(point: &[math::field::element::FieldElement<E>]) -> Option<Vec<u64>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let mut raw = Vec::with_capacity(point.len() * 3);
+    for coordinate in point {
+        raw.extend_from_slice(&ext3_raw(coordinate)?);
+    }
+    Some(raw)
+}
+
+#[cfg(not(feature = "cuda"))]
+impl OpeningFactors {
+    pub(crate) fn num_vars(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn rounds<E>(
+        &mut self,
+        _group: usize,
+        _degree: usize,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Result<SumcheckRounds<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn evaluate_message<E>(
+        &self,
+        _point: &[math::field::element::FieldElement<E>],
+    ) -> Result<math::field::element::FieldElement<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn add_scaled_eq<E>(
+        &mut self,
+        _point: &[math::field::element::FieldElement<E>],
+        _gamma: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+/// The same with the weight written on device from its shares: a stacked
+/// polynomial's weight is as wide as the polynomial, and sending it would cost
+/// more than the rounds that read it.
+#[cfg(feature = "cuda")]
+pub(crate) fn open_shared<F, E>(
+    message: &crate::mle::Mle<F>,
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    n_stack: usize,
+    program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    if message.num_vars() != n_stack || message.len() < SUMCHECK_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some()) {
+        return None;
+    }
+    let lowered = lower(program)?;
+    let shares: Vec<(usize, Vec<u64>, [u64; 3])> = shares
+        .iter()
+        .map(|share| {
+            Some((
+                share.offset,
+                raw_point(share.point)?,
+                ext3_raw(&share.scale)?,
+            ))
+        })
+        .collect::<Option<_>>()?;
+
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw_message = unsafe {
+        core::slice::from_raw_parts(message.evals().as_ptr() as *const u64, message.len())
+    };
+    let session =
+        math_cuda::whir_open::OpeningSession::from_shares(&shares, message.len(), raw_message)
+            .ok()?;
+    OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(OpeningFactors { session, lowered })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn open_shared<F, E>(
+    _message: &crate::mle::Mle<F>,
+    _shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    _n_stack: usize,
+    _program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
 {
     None

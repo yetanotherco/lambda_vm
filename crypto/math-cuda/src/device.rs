@@ -250,6 +250,8 @@ pub struct Backend {
     pub mle_fold_base_ext3: CudaFunction,
     pub eq_expand_level_ext3: CudaFunction,
     pub program_map_ext3: CudaFunction,
+    pub mle_lift_base_ext3: CudaFunction,
+    pub add_scaled_ext3: CudaFunction,
     pub fill_ext3: CudaFunction,
     pub fraction_fold_ext3: CudaFunction,
 
@@ -500,6 +502,8 @@ impl Backend {
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,
             program_map_ext3: sumcheck.load_function("program_map_ext3")?,
+            mle_lift_base_ext3: sumcheck.load_function("mle_lift_base_ext3")?,
+            add_scaled_ext3: sumcheck.load_function("add_scaled_ext3")?,
             fill_ext3: sumcheck.load_function("fill_ext3")?,
             fraction_fold_ext3: sumcheck.load_function("fraction_fold_ext3")?,
             constraint_interp_kernel: constraint_interp

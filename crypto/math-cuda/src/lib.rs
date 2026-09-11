@@ -22,6 +22,7 @@ pub mod ntt;
 pub mod nvtx;
 pub mod sumcheck;
 pub mod whir;
+pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

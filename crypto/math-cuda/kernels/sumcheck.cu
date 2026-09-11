@@ -214,6 +214,32 @@ extern "C" __global__ void fill_ext3(uint64_t *__restrict__ dst, uint64_t count,
     at[2] = value[2];
 }
 
+// Lifts a base-field table into the extension: `out[j] = {in[j], 0, 0}`.
+extern "C" __global__ void mle_lift_base_ext3(const uint64_t *__restrict__ in, uint64_t count,
+                                              uint64_t *__restrict__ out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= count) return;
+    uint64_t *at = out + j * 3;
+    at[0] = in[j];
+    at[1] = 0;
+    at[2] = 0;
+}
+
+// `dst[j] += scale · src[j]`, the shape a weight takes when a round adds the
+// next claim to it.
+extern "C" __global__ void add_scaled_ext3(uint64_t *__restrict__ dst,
+                                           const uint64_t *__restrict__ src, uint64_t count,
+                                           const uint64_t *__restrict__ scale) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= count) return;
+    Fe3 term = ext3::mul(load_ext(src + j * 3), load_ext(scale));
+    Fe3 sum = ext3::add(load_ext(dst + j * 3), term);
+    uint64_t *at = dst + j * 3;
+    at[0] = sum.a;
+    at[1] = sum.b;
+    at[2] = sum.c;
+}
+
 // One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
 // `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
 // host seeds `dst[0]` and walks the variables back to front, which is what

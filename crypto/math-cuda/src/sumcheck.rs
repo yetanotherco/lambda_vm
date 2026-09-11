@@ -294,6 +294,12 @@ impl SumcheckSession {
         Ok(())
     }
 
+    /// Whether [`download`](Self::download) can read the factors back: only a
+    /// session that uploaded them knows their layout.
+    pub fn can_download(&self) -> bool {
+        self.uploaded
+    }
+
     /// What each factor has been bound to, once every variable is gone.
     ///
     /// Reads the factors where they lie rather than through their buffers: a
@@ -665,4 +671,82 @@ pub fn fill_ext3(
             .launch(LaunchConfig::for_num_elems(count as u32))?;
     }
     Ok(())
+}
+
+/// `eq(point, ·)` as a table of `len` ext3 cells, doubled a variable at a time.
+///
+/// Variables go in back to front, which is what leaves variable 0 in the high
+/// bit — the indexing every table here folds on.
+pub fn eq_table_ext3(
+    stream: &Arc<CudaStream>,
+    point: &[u64],
+    len: usize,
+) -> Result<CudaSlice<u64>> {
+    assert_eq!(
+        1usize << (point.len() / 3),
+        len,
+        "the point spans the table"
+    );
+    let mut table = stream.alloc_zeros::<u64>(len * 3)?;
+    eq_expand_into(stream, &mut table, 0, point, &[1, 0, 0])?;
+    Ok(table)
+}
+
+/// The same, scaled by `seed` and written into `dst` from `offset`.
+///
+/// The scale rides the seed: the table is a product over the variables, so one
+/// more factor at the start scales every cell. That is what lets a stacked
+/// polynomial's weight be written column by column into one buffer.
+pub fn eq_expand_into(
+    stream: &Arc<CudaStream>,
+    dst: &mut CudaSlice<u64>,
+    offset: usize,
+    point: &[u64],
+    seed: &[u64],
+) -> Result<()> {
+    assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+    assert_eq!(seed.len(), 3, "an ext3 seed");
+    let len = 1usize << (point.len() / 3);
+    assert!(dst.len() >= (offset + len) * 3, "the range holds the table");
+    let be = backend()?;
+    {
+        let mut head = dst.slice_mut(offset * 3..offset * 3 + 3);
+        stream.memcpy_htod(seed, &mut head)?;
+    }
+    for (level, coordinate) in point.chunks_exact(3).rev().enumerate() {
+        let r = stream.clone_htod(coordinate)?;
+        let filled = 1u64 << level;
+        let mut range = dst.slice_mut(offset * 3..(offset + len) * 3);
+        unsafe {
+            stream
+                .launch_builder(&be.eq_expand_level_ext3)
+                .arg(&mut range)
+                .arg(&filled)
+                .arg(&r)
+                .launch(LaunchConfig::for_num_elems(filled as u32))?;
+        }
+    }
+    Ok(())
+}
+
+/// A resident table's value at `point`, binding it in place.
+///
+/// The table is spent: what is left in its first cell is the value.
+pub fn evaluate_resident_ext3(
+    stream: &Arc<CudaStream>,
+    values: &mut CudaSlice<u64>,
+    len: usize,
+    point: &[u64],
+) -> Result<[u64; 3]> {
+    assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+    assert_eq!(
+        1usize << (point.len() / 3),
+        len,
+        "the point spans the table"
+    );
+    let be = backend()?;
+    fold_to_one(stream, be, values, len as u64, point)?;
+    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    stream.synchronize()?;
+    Ok([out[0], out[1], out[2]])
 }

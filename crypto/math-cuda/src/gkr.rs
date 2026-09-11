@@ -136,7 +136,7 @@ impl DeviceFractionTree {
         assert_eq!(point.len(), half_vars * 3, "the point spans the halves");
 
         let half = 1usize << half_vars;
-        let eq = Arc::new(self.eq_table(point, half)?);
+        let eq = Arc::new(crate::sumcheck::eq_table_ext3(&self.stream, point, half)?);
         let addresses = {
             let (eq_at, _eq_guard) = eq.device_ptr(&self.stream);
             let (p_at, _p_guard) = p.device_ptr(&self.stream);
@@ -155,33 +155,5 @@ impl DeviceFractionTree {
             num_slots,
             root_slot,
         )
-    }
-
-    /// `eq(point, ·)` over `half` cells, doubled a variable at a time.
-    ///
-    /// Variables go in back to front, which is what leaves variable 0 in the
-    /// high bit — the indexing every table here folds on.
-    fn eq_table(&self, point: &[u64], half: usize) -> Result<CudaSlice<u64>> {
-        let be = backend()?;
-        let mut table = self.stream.alloc_zeros::<u64>(half * 3)?;
-        // The seed is one, and the levels scale it into the whole table.
-        let one = [1u64, 0, 0];
-        {
-            let mut head = table.slice_mut(0..3);
-            self.stream.memcpy_htod(&one, &mut head)?;
-        }
-        for (level, coordinate) in point.chunks_exact(3).rev().enumerate() {
-            let r = self.stream.clone_htod(coordinate)?;
-            let filled = 1u64 << level;
-            unsafe {
-                self.stream
-                    .launch_builder(&be.eq_expand_level_ext3)
-                    .arg(&mut table)
-                    .arg(&filled)
-                    .arg(&r)
-                    .launch(LaunchConfig::for_num_elems(filled as u32))?;
-            }
-        }
-        Ok(table)
     }
 }

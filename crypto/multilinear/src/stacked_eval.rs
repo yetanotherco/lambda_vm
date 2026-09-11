@@ -157,34 +157,62 @@ fn columns_in(layout: &StackedLayout, poly: usize) -> impl Iterator<Item = (usiz
         .filter(move |(_, place)| place.poly == poly)
 }
 
+/// One column's share of a stacked polynomial's weight: the subcube it owns,
+/// the point it is claimed at, and the scale it carries.
+///
+/// The weight is the sum of these, and each lands in its own range — which is
+/// what lets whoever builds it write the cells where they go, here or on a
+/// device.
+pub struct WeightShare<'a, E: IsField> {
+    pub offset: usize,
+    pub point: &'a [FieldElement<E>],
+    pub scale: FieldElement<E>,
+}
+
+/// The shares of `poly`'s weight, one per column it holds.
+fn weight_shares<'a, E: IsField>(
+    layout: &StackedLayout,
+    poly: usize,
+    points: &'a Claimed<'a, E>,
+    weights: &'a [FieldElement<E>],
+) -> Result<Vec<WeightShare<'a, E>>, Error> {
+    columns_in(layout, poly)
+        .map(|(column, place)| {
+            let point = points.point(column)?;
+            if point.len() != place.num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: place.num_vars,
+                    got: point.len(),
+                });
+            }
+            Ok(WeightShare {
+                offset: place.offset,
+                point,
+                scale: weights[column].clone(),
+            })
+        })
+        .collect()
+}
+
 /// `Σ_i gamma^i·eq(prefix_i ‖ point_i, ·)` as a table.
 ///
 /// Each column owns a contiguous subcube of the stack, so its share of the
 /// weight is written straight into that range and the gaps stay zero. Columns
 /// of different heights cost nothing extra here — the range is just shorter.
-fn weight_table<E: IsField + 'static>(
-    layout: &StackedLayout,
-    poly: usize,
-    points: &Claimed<'_, E>,
-    weights: &[FieldElement<E>],
+pub fn weight_table<E: IsField + 'static>(
+    shares: &[WeightShare<'_, E>],
+    n_stack: usize,
 ) -> Result<Mle<E>, Error>
 where
     FieldElement<E>: Send + Sync,
 {
-    let mut table = vec![FieldElement::<E>::zero(); 1usize << layout.n_stack()];
-    for (column, place) in columns_in(layout, poly) {
-        let point = points.point(column)?;
-        if point.len() != place.num_vars {
-            return Err(Error::VariableCountMismatch {
-                expected: place.num_vars,
-                got: point.len(),
-            });
-        }
-        let cells = 1usize << place.num_vars;
+    let mut table = vec![FieldElement::<E>::zero(); 1usize << n_stack];
+    for share in shares {
+        let cells = 1usize << share.point.len();
         eq_evals_into(
-            point,
-            &weights[column],
-            &mut table[place.offset..place.offset + cells],
+            share.point,
+            &share.scale,
+            &mut table[share.offset..share.offset + cells],
         )?;
     }
     Mle::new(table)
@@ -274,9 +302,12 @@ where
 
     let mut polys = Vec::with_capacity(stacked.polys.len());
     for (i, (poly, commitment)) in stacked.polys.iter().zip(&stacked.commitments).enumerate() {
-        polys.push(whir_chain::prove_weighted::<F, E, T>(
+        // The weight goes down as its shares: a device writes them into its own
+        // buffer, and the host materializes the table only if none does.
+        polys.push(whir_chain::prove_shared::<F, E, T>(
             poly,
-            weight_table(layout, i, point, &weights)?,
+            &weight_shares(layout, i, point, &weights)?,
+            layout.n_stack(),
             commitment,
             &stacked.domain,
             config,
@@ -503,7 +534,9 @@ mod tests {
         let at = point(num_vars);
         let weights: Vec<FE> = (0..3).map(|i| FE::from(3 + i as u64)).collect();
 
-        let table = weight_table(&layout, 0, &Claimed::Shared(&at), &weights).unwrap();
+        let claimed = Claimed::Shared(&at);
+        let shares = weight_shares(&layout, 0, &claimed, &weights).unwrap();
+        let table = weight_table(&shares, layout.n_stack()).unwrap();
         let off_cube: Vec<FE> = (0..n_stack).map(|i| FE::from(31 + i as u64)).collect();
         assert_eq!(
             table.evaluate(&off_cube).unwrap(),
@@ -520,7 +553,9 @@ mod tests {
         let weights: Vec<FE> = (0..3).map(|i| FE::from(3 + i as u64)).collect();
 
         let stacked = layout.stack(&crate::stacking::borrow(&columns)).unwrap();
-        let table = weight_table(&layout, 0, &Claimed::Shared(&at), &weights).unwrap();
+        let claimed = Claimed::Shared(&at);
+        let shares = weight_shares(&layout, 0, &claimed, &weights).unwrap();
+        let table = weight_table(&shares, layout.n_stack()).unwrap();
         // Σ_x w(x)·stacked(x) must be the batched column values.
         let summed = table
             .evals()
@@ -539,7 +574,7 @@ mod tests {
         let layout = StackedLayout::build(&[3, 2], 5).unwrap();
         let weights = [FE::one(), FE::one()];
         assert!(matches!(
-            weight_table(&layout, 0, &Claimed::Shared(&point(3)), &weights).err(),
+            weight_shares(&layout, 0, &Claimed::Shared(&point(3)), &weights).err(),
             Some(Error::VariableCountMismatch { .. })
         ));
     }
