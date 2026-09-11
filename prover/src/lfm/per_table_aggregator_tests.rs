@@ -2031,30 +2031,6 @@ fn prove_node_program_as_child(
     mark(&format!("AFTER {label}"));
     let layout = SchemaLayout::node(out_halves);
     layout.assert_covers(proved.public_words.len());
-    // ★★★ THE BYTE-IDENTITY LINE. Two arms that schedule differently must
-    // produce the same tree, and this is the line that says so: `diff` the
-    // IDENTITY lines of a serial run against a concurrent one and an empty diff
-    // IS the proof, rather than a reader comparing walls and hoping.
-    //
-    // `program_id` is the right fingerprint because it is what a PARENT
-    // absorbs: a digest over every group root, the chunk-root tail, the
-    // heights, the chip set and the hasher. Move any committed felt and it
-    // moves. The heights are printed beside it anyway — `LFM_HASH`'s among them
-    // — because when the digest does move, the heights say WHICH shape did, and
-    // a bare digest mismatch prices no debugging at all.
-    println!(
-        "   {label} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
-         · published {} words",
-        artifacts
-            .program_id
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-        artifacts.log_heights,
-        artifacts.blake3_chunk_log_heights,
-        proved.public_words.len(),
-    );
     let t = Instant::now();
     let (child, t_verify) = real_child_timed(artifacts, opts.clone(), &proved);
     let t_harvest = t.elapsed().as_secs_f64();
@@ -4788,7 +4764,46 @@ fn the_production_tree_composes_to_a_root() {
             )
         };
 
-        for (child, layout, lbl, row) in in_index_order(groups.len(), siblings, prove_one) {
+        // ★★★ THE BYTE-IDENTITY LINES, PRINTED AT THE JOIN AND THEREFORE IN
+        // INDEX ORDER. Two arms that schedule differently must produce the same
+        // tree, and this is the line that says so: `diff` a serial run's
+        // IDENTITY lines against a concurrent one's and an EMPTY DIFF IS THE
+        // PROOF.
+        //
+        // ⛔ PRINTED HERE, NOT ON THE WORKER. A worker prints when it finishes,
+        // so at two siblings L2N1 lands before L2N0 and a raw `diff` files a
+        // SCHEDULING ORDER as a byte difference. Sorting both sides also works —
+        // each line begins with its own node label, so a permuted tree still
+        // sorts differently — but it is a step a reader has to remember, and the
+        // one who forgets reports a false red. The join already has every child
+        // in index order; printing there costs nothing and needs no procedure.
+        //
+        // `program_id` is the fingerprint that settles it because it is what a
+        // PARENT absorbs: a digest over every group root, the chunk-root tail,
+        // the heights, the chip set and the hasher. Move any committed felt and
+        // it moves. The heights ride along so that when the digest DOES move,
+        // the line says which shape moved; cells and instructions ride along so
+        // the line subsumes the census and one grep is the whole gate.
+        for (j, (child, layout, lbl, row)) in in_index_order(groups.len(), siblings, prove_one)
+            .into_iter()
+            .enumerate()
+        {
+            let (_, arity, cells, instrs, ..) = row;
+            println!(
+                "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights {:?} \
+                 · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                 ({instrs} instructions)",
+                child
+                    .artifacts
+                    .program_id
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                child.artifacts.log_heights,
+                child.artifacts.blake3_chunk_log_heights,
+                child.public_words.len(),
+            );
             report.push(row);
             next.push(child);
             next_layouts.push(layout);
