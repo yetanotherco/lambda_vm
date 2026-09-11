@@ -122,6 +122,64 @@ impl FoldShape {
     }
 }
 
+/// WHICH root — a NAMED INPUT, decided by the sizing arm and never by a default.
+///
+/// ⛔ **NO `Default`, AND THAT IS THE POINT.** The option changes the root's
+/// CHILD COUNT and therefore its sub-proof count, which is what decides whether
+/// `LFM_HASH` crosses a power of two. A default here would silently become the
+/// answer to a question that was supposed to be settled by a measurement, and
+/// the run that used it would look exactly like a run that had decided.
+///
+/// ⇒ It lives beside [`FoldShape::for_root`] rather than in a driver, so the
+/// mapping from the option to `replaces_top` has ONE spelling — a harness
+/// holding its own `bool` would be free to send the root a fold shape that does
+/// not match the children it harvested, and that failure is a `DivByZero` from
+/// the guest with an honest prover behind it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootOption {
+    /// The root REPLACES the top interior level: `fan_in` level-`n-1` nodes plus
+    /// the global child. More sub-proofs, larger root.
+    A,
+    /// The root sits ABOVE it: the single level-`n` node plus the global child.
+    /// One extra interior node (already proved), fewer sub-proofs at the root.
+    B,
+}
+
+impl RootOption {
+    /// `A` or `B`, refusing everything else — including the empty string, which
+    /// is what an exported-but-unset environment variable looks like.
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "A" => Ok(Self::A),
+            "B" => Ok(Self::B),
+            other => Err(format!(
+                "the root option must be `A` (the root REPLACES the top interior \
+                 level) or `B` (it sits ABOVE it), got `{other}`. It is a NAMED \
+                 INPUT decided by the sizing arm: it changes the root's child \
+                 count, and a guess here is a measurement nobody made"
+            )),
+        }
+    }
+
+    /// Whether the root replaces the top interior level.
+    pub fn replaces_top(self) -> bool {
+        matches!(self, Self::A)
+    }
+
+    /// The fold shape this option's root must refold with.
+    pub fn fold_shape(self, epochs: usize, fan_in: usize) -> FoldShape {
+        FoldShape::for_root(epochs, fan_in, self.replaces_top())
+    }
+
+    /// The option spelled out for a log line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::A => "A: the root REPLACES the top interior level",
+            Self::B => "B: the root sits ABOVE it (the top interior node is kept)",
+        }
+    }
+}
+
 /// The GLOBAL wrap's published layout, which no `SchemaLayout` constructor
 /// describes because it is unlike a wrap's and unlike a node's.
 ///
@@ -644,6 +702,38 @@ mod tests {
                 Some(whole.total()),
                 "k={k}: the partial must sit at the first index PAST the wrap's \
                  set, or it collides with L2G material the root's compare reads"
+            );
+        }
+    }
+
+    /// ★ THE ROOT OPTION IS A NAMED INPUT: `A` or `B`, and nothing else parses.
+    ///
+    /// ⛔ Including the empty string, which is what `export LFM_TREE_ROOT_OPTION=`
+    /// looks like from inside the process — a caller who believes they named the
+    /// experiment and did not. And the two options must produce DIFFERENT fold
+    /// shapes, or the input would be decorative and the driver could not be
+    /// choosing anything by reading it.
+    #[test]
+    fn the_root_option_is_a_named_input_with_no_default() {
+        assert_eq!(RootOption::parse("A"), Ok(RootOption::A));
+        assert_eq!(RootOption::parse("B"), Ok(RootOption::B));
+        for bad in ["", " ", "a", "b", "C", "AB", "A ", "0", "1", "true"] {
+            assert!(
+                RootOption::parse(bad).is_err(),
+                "`{bad}` parsed as a root option; the option decides the root's \
+                 child count and must not be guessable"
+            );
+        }
+        assert!(RootOption::A.replaces_top());
+        assert!(!RootOption::B.replaces_top());
+        for epochs in [4usize, 5, 19] {
+            let a = RootOption::A.fold_shape(epochs, 2);
+            let b = RootOption::B.fold_shape(epochs, 2);
+            assert_eq!(
+                a.levels.len() + 1,
+                b.levels.len(),
+                "{epochs} epochs: B folds exactly one level more than A, because \
+                 the level A replaces is the level B keeps"
             );
         }
     }
