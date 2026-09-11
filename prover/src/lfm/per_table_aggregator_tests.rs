@@ -2938,6 +2938,181 @@ fn cgroup_limit_gib() -> Result<f64, String> {
 /// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
 /// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
 /// usable. Print it at EVERY level.
+/// Run `task` over `0..n` on `workers` threads, and return the results **in
+/// index order** whatever order they finished in.
+///
+/// ★★★ THE ORDER IS THE SOUNDNESS PROPERTY, not a convenience. A level's
+/// children, layouts and label runs are three parallel vectors, and a node at
+/// the level above takes a contiguous SUBSLICE of each — which is exactly what
+/// makes contiguity across sibling subtrees a consequence of the label pins
+/// rather than a check of its own. Drain them in completion order and the pins
+/// still verify, one subtree at a time, while the tree they describe is not the
+/// tree that was built. ⇒ results land in per-index slots and are drained by
+/// index, so nothing downstream can observe that a scheduler ran at all.
+///
+/// `workers <= 1` runs `task` inline, on this thread, in order: the control arm
+/// is the original path and not this function with one worker.
+///
+/// # Panics
+///
+/// Re-raises the FIRST worker panic on the caller's thread, payload intact.
+/// ⚠ `std::thread::scope` otherwise propagates with the fixed string "a scoped
+/// thread panicked", which names neither the cause nor its location, and
+/// libtest's global hook files a spawned thread's own message against no test
+/// and drops it on the floor. The prover's `run_admitted` learned that the
+/// expensive way — eleven anonymous failures in one suite run.
+fn in_index_order<T: Send>(n: usize, workers: usize, task: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let slots: Vec<std::sync::Mutex<Option<T>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    if workers <= 1 {
+        for (j, slot) in slots.iter().enumerate() {
+            *slot.lock().expect("a slot is never poisoned") = Some(task(j));
+        }
+    } else {
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let first_panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
+            std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let (cursor, slots, first_panic, task) = (&cursor, &slots, &first_panic, &task);
+                scope.spawn(move || {
+                    // ⛔ THIS THREAD IS PART OF THIS LEVEL. Without the enrolment
+                    // its artifact builds are not counted and the level reports
+                    // fewer proofs than it made.
+                    let _enrolled = super::program_census::enrol();
+                    loop {
+                        let j = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if j >= slots.len() {
+                            break;
+                        }
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(j))) {
+                            Ok(out) => {
+                                *slots[j].lock().expect("a slot is never poisoned") = Some(out);
+                            }
+                            Err(payload) => {
+                                let mut first =
+                                    first_panic.lock().unwrap_or_else(|e| e.into_inner());
+                                if first.is_none() {
+                                    *first = Some(payload);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(payload) = first_panic.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            std::panic::resume_unwind(payload);
+        }
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(j, slot)| {
+            slot.into_inner()
+                .expect("a slot is never poisoned")
+                .unwrap_or_else(|| panic!("index {j} produced no result"))
+        })
+        .collect()
+}
+
+/// ★★★ THE ORDERING GATE, with the completion order FORCED to the reverse of
+/// the index order.
+///
+/// Index `j` sleeps for `(n - j)` ticks, so index 0 finishes LAST and index
+/// `n-1` first. A drain in completion order returns the reverse; a drain by
+/// index returns what the serial loop would have. Without the forcing this test
+/// would pass on a scheduler that happens to finish in order, which is the
+/// failure mode the permit's own first test had.
+///
+/// This is the assertion behind "scheduling is invisible to the bytes": a
+/// level's children, layouts and labels are three parallel vectors and the
+/// level above takes contiguous subslices of each, so a permuted drain builds a
+/// different tree whose label pins still verify one subtree at a time.
+#[test]
+fn in_index_order_returns_index_order_when_completion_is_reversed() {
+    const N: usize = 8;
+    let finished: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    let out = in_index_order(N, 4, |j| {
+        std::thread::sleep(std::time::Duration::from_millis(20 * (N - j) as u64));
+        finished.lock().expect("the order log").push(j);
+        j * 10
+    });
+    assert_eq!(
+        out,
+        (0..N).map(|j| j * 10).collect::<Vec<_>>(),
+        "results must arrive in INDEX order"
+    );
+    let finished = finished.into_inner().expect("the order log");
+    assert_ne!(
+        finished,
+        (0..N).collect::<Vec<_>>(),
+        "the test did not force a reordering, so it proved nothing: {finished:?}"
+    );
+}
+
+/// One worker, and the same answer — the control arm runs `task` inline and
+/// must not be a different computation from the parallel one.
+#[test]
+fn in_index_order_with_one_worker_matches_the_parallel_result() {
+    let serial = in_index_order(6, 1, |j| j * j);
+    let parallel = in_index_order(6, 3, |j| j * j);
+    assert_eq!(serial, parallel);
+}
+
+/// ⚠ A worker panic must arrive with its MESSAGE, not as "a scoped thread
+/// panicked". Eleven anonymous failures in one box suite run is what the
+/// payload capture costs to omit.
+#[test]
+fn in_index_order_re_raises_a_worker_panic_with_its_message() {
+    let caught = std::panic::catch_unwind(|| {
+        in_index_order(4, 2, |j| {
+            assert_ne!(j, 2, "NODE 2 SAYS SO");
+            j
+        })
+    });
+    let payload = caught.expect_err("a panicking task must panic the caller");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<not a string>");
+    assert!(
+        msg.contains("NODE 2 SAYS SO"),
+        "the worker's own message must survive, got: {msg}"
+    );
+}
+
+/// `LFM_TREE_SIBLINGS` — how many proofs of one INTERIOR level run at once.
+///
+/// Unset or `1` is the control and runs the original serial path: no threads,
+/// no permit, no sampler change. ⛔ The control must be the ORIGINAL code, not
+/// the parallel code with one worker — an A/B whose control is the scheduler
+/// running alone measures the scheduler against itself and hides any constant
+/// cost in both arms.
+///
+/// ⚠ NOT `TABLE_PARALLELISM`, which is the number of TABLES one prove puts on
+/// the card at once and is governed by that prove's own `VramGate`. This is the
+/// number of PROOFS in flight, and the card permit is what governs it. The two
+/// multiply: at `TABLE_PARALLELISM=4` and `LFM_TREE_SIBLINGS=2` the card still
+/// sees one proof's four tables, because the permit admits one proof at a time.
+///
+/// An empty value reads as unset — `FOO= cmd` is the shell clearing a variable,
+/// and failing a run for that spelling of "default" helps nobody.
+fn tree_siblings() -> usize {
+    match std::env::var("LFM_TREE_SIBLINGS").ok().as_deref() {
+        None | Some("") => 1,
+        Some(v) => {
+            let n: usize = v.parse().unwrap_or_else(|_| {
+                panic!("LFM_TREE_SIBLINGS must be a positive integer, got `{v}`")
+            });
+            assert!(n >= 1, "LFM_TREE_SIBLINGS must be at least 1, got {n}");
+            n
+        }
+    }
+}
+
 fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
     const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
     let (main, aux) =
@@ -4355,6 +4530,20 @@ fn the_production_tree_composes_to_a_root() {
     }
 
     // ---- levels 1..=hi.
+    //
+    // ★★★ ARMED HERE AND DISARMED AFTER, so the change is scoped to the
+    // INTERIOR. The base and the epoch wraps below run exactly as they did: the
+    // permit reads one relaxed `usize` and returns, taking no lock, so a level-0
+    // number from this binary is comparable to one from any earlier tip.
+    //
+    // ⚠ Wraps are a DIFFERENT MACHINE from nodes and want a different value.
+    // Measured at `94540566`: a node is device 3.80 s against host 3.86 s, one
+    // to one, so it is device-bound at two siblings and more buy nothing but
+    // host peak; a wrap is device 2.85 s against host 7.90 s, one to 2.8, so at
+    // two siblings the card would sit idle most of the level and the host would
+    // bind. ⇒ whoever extends this to level 0 must re-derive the count, not
+    // inherit it.
+    super::device_permit::arm(tree_siblings());
     let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
     // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
     // the loop. `None` on every other arm, where one level's output is all the
@@ -4374,7 +4563,34 @@ fn the_production_tree_composes_to_a_root() {
             Vec::with_capacity(level.arities.len()),
         );
         let groups = level_groups(&level.arities);
-        for (j, g) in groups.iter().enumerate() {
+        // ★★★ SIBLING CONCURRENCY. `siblings` proofs of this level run at once,
+        // each holding ONE shared card permit across each of its two device
+        // phases and releasing it between them, so one proof's executor and
+        // trace fill overlap another's time on the card.
+        //
+        // ⛔ `siblings == 1` IS THE CONTROL, and it runs the ORIGINAL path: no
+        // threads, no permit, no sampler change. An A/B whose control arm is
+        // "the parallel code with one worker" measures the scheduler against
+        // itself and would hide a constant cost in both arms.
+        //
+        // The proofs at a level are independent — the driver takes disjoint
+        // child subslices — so the only shared things a worker touches are the
+        // census window (which it enrols in) and the card (which the permit
+        // serialises). Results land in per-index slots and are drained in
+        // order, so `children`, `layouts` and `labels` are built in exactly the
+        // order the serial loop built them: scheduling is invisible to the
+        // bytes because nothing downstream can observe it.
+        let siblings = super::device_permit::workers().min(groups.len().max(1));
+        let level_sampler = HostSampler::start();
+
+        type NodeSlot = (
+            RealChild,
+            super::per_table_aggregator::SchemaLayout,
+            Vec<u64>,
+            (usize, usize, u64, usize, f64, f64, f64),
+        );
+        let prove_one = |j: usize| -> NodeSlot {
+            let g = &groups[j];
             let arity = &g.len();
             let kids = &children[g.clone()];
             let kid_layouts = &layouts[g.clone()];
@@ -4418,16 +4634,35 @@ fn the_production_tree_composes_to_a_root() {
             let wall = t_node.elapsed().as_secs_f64();
             let (peak, at) = sampler.stop();
             println!(
-                "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s",
+                "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s{}",
                 match &ceiling {
                     Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
                     Err(_) => String::new(),
                 },
+                // ⚠ `rss_marks` reads the PROCESS, so with a sibling in flight
+                // this figure is the process peak during this node's window and
+                // not this node's own. Said on the line rather than in a note,
+                // because the per-node peak is what the retention law was fitted
+                // on and a concurrent one must never be fed to it.
+                if siblings > 1 {
+                    format!(" ⓘ PROCESS-WIDE, {siblings} proofs in flight")
+                } else {
+                    String::new()
+                },
             );
-            report.push((level_no, *arity, cells, instrs, peak, at, wall));
+            (
+                child,
+                layout,
+                vec![range.0, range.1],
+                (level_no, *arity, cells, instrs, peak, at, wall),
+            )
+        };
+
+        for (child, layout, lbl, row) in in_index_order(groups.len(), siblings, prove_one) {
+            report.push(row);
             next.push(child);
             next_layouts.push(layout);
-            next_labels.push(vec![range.0, range.1]);
+            next_labels.push(lbl);
         }
         assert_eq!(
             groups.last().map(|g| g.end).unwrap_or(0),
@@ -4476,14 +4711,38 @@ fn the_production_tree_composes_to_a_root() {
                 "its children released"
             }
         ));
+        let level_wall = t_level.elapsed().as_secs_f64();
+        let (level_peak, level_at) = level_sampler.stop();
+        println!("   level {level_no}: {produced} nodes in {level_wall:.1}s");
+        // ★ THE LEVEL'S OWN PEAK, which is the figure the >52 GiB stop is about.
+        // The per-node peaks are process-wide readings taken inside overlapping
+        // windows once siblings run together, so the level needs a window of its
+        // own or the campaign has no concurrent host-peak number at all.
         println!(
-            "   level {level_no}: {produced} nodes in {:.1}s",
-            t_level.elapsed().as_secs_f64()
+            "   level {level_no}: host peak {level_peak:.3} GiB at t={level_at:.1}{}, {siblings} \
+             proof(s) in flight",
+            match &ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * level_peak / g),
+                Err(_) => String::new(),
+            },
         );
+        // ★★ WHICH RESOURCE BOUND THE LEVEL — and the falsifier's own evidence.
+        // `max holders` must read 1: more than one proof inside a device phase
+        // is the two-VramGates condition, and the permit asserts it at the
+        // instant it would happen rather than leaving it to a VRAM abort.
+        // `held` against the wall says whether the card or the host was the
+        // wall, which is what decides whether a HIGHER sibling count would buy
+        // anything at this level.
+        let permit = super::device_permit::take_stats();
+        if permit.acquisitions > 0 {
+            println!("   level {level_no}: {}", permit.describe(level_wall));
+        }
         if let Some(stats) = super::program_census::end_level() {
             println!("   {}", stats.describe(&format!("level {level_no}")));
         }
     }
+    // The interior is done; level 0 and everything after it run serial.
+    super::device_permit::arm(1);
     // ⛔ AND THE CAPTURE IS CHECKED HERE, in the driver, rather than being left
     // to abort inside the emitter. `children` must be the OUTPUT of the level
     // option A names; getting that wrong is what sent a box run downstream, and
