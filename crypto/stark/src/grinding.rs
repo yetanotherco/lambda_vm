@@ -246,7 +246,9 @@ where
         // set — and this is the only signal that the kernel has started
         // returning garbage and the feature has silently reverted to the CPU
         // search. Matches the `[gpu]` prefix the other device-decline paths use.
-        eprintln!("[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search");
+        eprintln!(
+            "[gpu] grind returned an invalid nonce ({nonce}); falling back to the CPU search"
+        );
     }
     generate_nonce::<D>(seed, grinding_factor)
 }

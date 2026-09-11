@@ -162,9 +162,7 @@ const GRIND_ROWS: [(u8, u8); 3] = [(0x5a, 12), (0x11, 13), (0x20, 14)];
 /// `is_valid_nonce`, the production predicate, which takes a seed and so cannot
 /// be pointed at a deliberately wrong reading of the inner hash.
 fn grind_head(inner: &[u64; 4], nonce: u64) -> u64 {
-    let felts: [FE; 5] = core::array::from_fn(|i| {
-        FE::from(if i < 4 { inner[i] } else { nonce })
-    });
+    let felts: [FE; 5] = core::array::from_fn(|i| FE::from(if i < 4 { inner[i] } else { nonce }));
     let commitment = digest_to_commitment(&sponge_leaf(HasherKind::Rpx, &felts));
     u64::from_be_bytes(commitment[..8].try_into().unwrap())
 }
@@ -281,8 +279,9 @@ fn print_rpx_host_kat_vectors() {
         // felt block IS the host's message, and it is the one claim a device
         // test on a box cannot make cheaply.
         assert!(
-            (0..=nonce).all(|n| (grind_head(&be, n) < limit)
-                == is_valid_nonce::<RpxGrind>(&seed, n, factor)),
+            (0..=nonce)
+                .all(|n| (grind_head(&be, n) < limit)
+                    == is_valid_nonce::<RpxGrind>(&seed, n, factor)),
             "the explicit felt block and the production predicate disagree \
              at seed {seed_byte:#x} factor {factor}"
         );
