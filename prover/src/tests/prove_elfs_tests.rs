@@ -1212,6 +1212,162 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
+#[test]
+fn test_prove_dma_memcpy_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"))
+            .expect("dma_memcpy_min.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memcpy guest should verify"
+    );
+    assert_eq!(
+        proof.public_output,
+        b"DMA copies eight-byte rows and a short tail"
+    );
+}
+
+#[test]
+fn test_prove_dma_memcpy_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_cases.elf"))
+            .expect("dma_memcpy_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA differential cases guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-cases-ok");
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_value_rejected() {
+    use crate::tables::dma::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_, end, _tail| !end);
+    let original = *traces.dma.main_table.get(forged_row, dma_cols::VALUE[0]);
+    traces.dma.main_table.set(
+        forged_row,
+        dma_cols::VALUE[0],
+        original + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "changing the structurally shared copied byte must unbalance MEMW",
+    );
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
+    use crate::tables::dma::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |first, end, _tail| !first && !end);
+
+    // Shift both the current source and its locally-consistent successor. The
+    // row's ADD remains valid, but the predecessor's DmaNext tuple and the
+    // source-memory read no longer match.
+    let src_lo = *traces.dma.main_table.get(forged_row, dma_cols::SRC_0);
+    let src_incr_lo = *traces.dma.main_table.get(forged_row, dma_cols::SRC_INCR_0);
+    traces.dma.main_table.set(
+        forged_row,
+        dma_cols::SRC_0,
+        src_lo + FieldElement::from(8u64),
+    );
+    traces.dma.main_table.set(
+        forged_row,
+        dma_cols::SRC_INCR_0,
+        src_incr_lo + FieldElement::from(8u64),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate source row must remain chained to its predecessor",
+    );
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_early_end_rejected() {
+    use crate::tables::dma::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_first, end, _tail| !end);
+    traces
+        .dma
+        .main_table
+        .set(forged_row, dma_cols::END, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+}
+
+#[test]
+fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
+    use crate::tables::dma::cols as dma_cols;
+
+    let (elf, mut traces) = dma_memcpy_fixture();
+    let forged_row = dma_row_matching(&traces, |_first, end, tail| !end && !tail);
+    traces
+        .dma
+        .main_table
+        .set(forged_row, dma_cols::TAIL, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "TAIL must equal count < 8");
+}
+
+fn dma_memcpy_fixture() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"))
+            .expect("dma_memcpy_min.elf not found — build its make target");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
+    use crate::tables::dma::cols as dma_cols;
+
+    (0..traces.dma.num_rows())
+        .find(|&row| {
+            let active = *traces.dma.main_table.get(row, dma_cols::MU)
+                == FieldElement::<GoldilocksField>::one();
+            let first = *traces.dma.main_table.get(row, dma_cols::FIRST)
+                == FieldElement::<GoldilocksField>::one();
+            let end = *traces.dma.main_table.get(row, dma_cols::END)
+                == FieldElement::<GoldilocksField>::one();
+            let tail = *traces.dma.main_table.get(row, dma_cols::TAIL)
+                == FieldElement::<GoldilocksField>::one();
+            active && predicate(first, end, tail)
+        })
+        .expect("guest must contain the requested real DMA row")
+}
+
+fn assert_dma_forgery_rejected(elf: &Elf, traces: &mut Traces, reason: &str) {
+    assert!(!prove_and_verify_vm_minimal(elf, traces), "{reason}");
+}
 /// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
 /// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
 /// This exercises the whole HINT table bus surface (Ecall receive, the x10/x11/x12

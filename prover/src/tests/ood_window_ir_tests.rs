@@ -90,6 +90,7 @@ fn all_table_windows_match_captured_ir() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
     assert_ood_window_matches_ir(&create_cpu_air(&opts), true, "CPU");
+    assert_ood_window_matches_ir(&create_dma_air(&opts), true, "DMA");
     assert_ood_window_matches_ir(&create_bitwise_air(&opts), true, "BITWISE");
     assert_ood_window_matches_ir(&create_lt_air(&opts), true, "LT");
     assert_ood_window_matches_ir(&create_shift_air(&opts), true, "SHIFT");

@@ -5,6 +5,7 @@ use crate::tables::trace_builder::{Traces, count_table_lengths};
 use crate::test_utils::run_asm_elf;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 
 fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
@@ -49,6 +50,10 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
     assert_eq!(
         predicted.commit_padded_rows, traces.commit.main_table.height as u64,
         "commit"
+    );
+    assert_eq!(
+        predicted.dma_padded_rows, traces.dma.main_table.height as u64,
+        "dma"
     );
     assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,
@@ -97,6 +102,44 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
 fn count_table_lengths_matches_traces() {
     let (elf, logs, _) = run_asm_elf("fib_iterative_372k");
     assert_count_table_lengths_matches(&elf, &logs);
+}
+
+/// Runs one Rust DMA guest and asserts the sizing pass matches the built traces.
+/// The two replays of a DMA ecall (`collect_dma_memcpy_ops` for generation and
+/// `replay_dma_memcpy_for_sizing` for counting) must agree, so the fixtures cover
+/// both a single chunk and the multi-chunk / overlapping / near-`MAX_DATA_ROWS`
+/// cases of `dma_memcpy_cases`.
+fn assert_dma_fixture_counts(elf_name: &str) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join(format!("executor/program_artifacts/rust/{elf_name}")))
+            .unwrap_or_else(|_| panic!("{elf_name} not found — build its make target"));
+    let elf = Elf::load(&elf_bytes).expect("valid DMA guest ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("DMA guest execution");
+
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == executor::vm::instruction::execution::DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "fixture must contain a DMA ecall"
+    );
+    assert_count_table_lengths_matches(&elf, &result.logs);
+}
+
+#[test]
+fn count_table_lengths_matches_nonempty_dma_trace() {
+    assert_dma_fixture_counts("dma_memcpy_min.elf");
+    assert_dma_fixture_counts("dma_memcpy_cases.elf");
 }
 
 /// The `hint` ecall routes three register reads (`a0`/`a1`/`a2`) and four output
