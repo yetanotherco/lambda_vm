@@ -254,3 +254,92 @@ mod tests {
         );
     }
 }
+
+/// The artifact build's own cost, on this host, at this concurrency.
+///
+/// ⛔ NOT a benchmark of the production node — the biggest registry program is
+/// orders of magnitude smaller than an L1 node's, and the campaign's numbers
+/// come from the box A/B. It exists so the branch is not pushed with an
+/// unmeasured claim about the parallel build: run it twice, once with
+/// `LFM_ARTIFACT_PARALLEL=0`, and the two walls bracket what the change does.
+///
+/// ```text
+/// cargo test -p lambda-vm-prover --lib -- the_artifact_build_measures \
+///     --ignored --nocapture --exact lfm::program_census::measure::the_artifact_build_measures
+/// ```
+#[cfg(test)]
+mod measure {
+    use super::*;
+    use stark::proof::options::GoldilocksCubicProofOptions;
+
+    #[test]
+    #[ignore = "measurement: prints the artifact build's wall at this host's rayon width"]
+    fn the_artifact_build_measures() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        // ⚠ The registry fixtures are half a megabyte of committed felts and a
+        // production node's groups are hundreds, so the SCALED sponge is the
+        // only row here whose program dominates its own build. The others are
+        // mostly the two FIXED tables (`bitwise` and `keccak_rc` at 2^20 rows),
+        // which this change does not touch — read them as a floor.
+        //
+        // ⚠⚠ AND THE COLUMN COUNT IS WHAT THIS PASS SPREADS, which is why the
+        // widest-group width is printed beside each wall. These fixtures
+        // concentrate their felts in ONE narrow group, so they are close to the
+        // WORST case for a `par_iter` over columns and must not be read as the
+        // production figure. Lane P measures `emit_lde` at 445% CPU on the real
+        // node — 4.5 of 30.7 cores — which is where the headroom is.
+        let sponge_len = crate::lfm::programs::KECCAK_SPONGE_LEN;
+        let programs: [(&str, LfmProgram); 4] = [
+            (
+                "statement_replay",
+                crate::lfm::programs::statement_replay_program(),
+            ),
+            (
+                "transcript_replay",
+                crate::lfm::programs::transcript_replay_program(),
+            ),
+            (
+                "keccak_sponge",
+                crate::lfm::programs::keccak_sponge_program(sponge_len),
+            ),
+            (
+                "keccak_sponge x8192",
+                crate::lfm::programs::keccak_sponge_program(sponge_len * 8192),
+            ),
+        ];
+        #[cfg(feature = "parallel")]
+        let width = rayon::current_num_threads();
+        #[cfg(not(feature = "parallel"))]
+        let width = 1usize;
+        println!(
+            "\n=== ARTIFACT BUILD — rayon width {width}, parallel {}, groups in flight {} ===",
+            crate::lfm::commit::parallel_build(),
+            crate::lfm::registry::groups_in_flight()
+        );
+        for (name, program) in &programs {
+            let groups = crate::lfm::registry::program_groups(program);
+            let felts: usize = groups.iter().map(|g| g.data.len()).sum::<usize>()
+                + program.groups.blake3.data.len();
+            let widest = groups.iter().map(|g| g.width).max().unwrap_or(0);
+            // Three reps, reported as the MIN: this laptop shares eleven cores
+            // with the other lanes, so the mean prices their load and the min
+            // prices the build.
+            let mut build = f64::MAX;
+            let mut id = None;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let built = build_artifacts_with_hasher(program, &options, HasherKind::Test);
+                build = build.min(t.elapsed().as_secs_f64());
+                id = Some(built.program_id);
+            }
+            let id = id.expect("three reps");
+            println!(
+                "  {name:<20} {felts:>12} committed felts ({:>8.1} MiB) · widest group \
+                 {widest:>4} cols · build {build:.3}s · id {:02x}{:02x}",
+                (felts * 8) as f64 / (1024.0 * 1024.0),
+                id[0],
+                id[1],
+            );
+        }
+    }
+}
