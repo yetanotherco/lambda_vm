@@ -143,7 +143,7 @@ fn global_transcript(
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
 #[derive(Clone, Copy)]
-struct L2gMemoryConstraints;
+pub(crate) struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
@@ -184,7 +184,7 @@ fn l2g_global_air(
 /// check too: this proof has the BITWISE provider, and the global proof commits
 /// the identical trace (the commitment binding compares roots), so checking here
 /// covers both. `epoch_label` is the `fini_epoch` constant used by both.
-fn l2g_memory_air(
+pub(crate) fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
@@ -402,13 +402,134 @@ struct EpochStart<'a> {
 /// `boundary` is shared (`Arc`): the same per-epoch boundary feeds both this
 /// epoch's prove and the cross-epoch global prove, which starts as soon as the
 /// producer has prepared the last epoch (see `prove_continuation`).
-struct PreparedEpoch {
-    index: u64,
-    register_init: Vec<u32>,
-    label: u64,
-    traces: Traces,
-    boundary: Arc<Vec<CellBoundary>>,
-    is_final: bool,
+pub(crate) struct PreparedEpoch {
+    pub index: u64,
+    pub register_init: Vec<u32>,
+    pub label: u64,
+    pub traces: Traces,
+    pub boundary: Arc<Vec<CellBoundary>>,
+    pub is_final: bool,
+}
+
+/// Every epoch's proving inputs, prepared in order and handed over one at a
+/// time.
+///
+/// This is the sequential half of [`prove_continuation`]'s pipeline — execution,
+/// op collection over the advancing memory image, the boundary, and the register
+/// carry — run to completion for one epoch before the next. **None of it depends
+/// on a proof, or on how one is made**, so it is the same work whichever
+/// commitment scheme argues the epochs; what differs is only what `each` does
+/// with a [`PreparedEpoch`].
+///
+/// One epoch is alive at a time, which is the whole point of continuations.
+/// `prove_continuation` runs the same steps across three threads instead, to
+/// overlap them; this one is for callers that want them in order.
+///
+/// Returns every epoch's boundary, which is what the cross-epoch global proof
+/// is made of. They stay prover-local: a boundary carries cell values, and for
+/// a private read that value is a byte of the private input.
+pub(crate) fn for_each_epoch(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    mut each: impl FnMut(PreparedEpoch, &[Arc<Vec<CellBoundary>>]) -> Result<(), Error>,
+) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
+    if epoch_size_log2 < 2 {
+        return Err(Error::InvalidContinuationEpochSize(
+            "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
+        ));
+    }
+    let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+        Error::InvalidContinuationEpochSize(format!(
+            "epoch_size_log2 {epoch_size_log2} is too large for this platform"
+        ))
+    })?;
+
+    let mut executor = Executor::new(elf, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let mut image = build_initial_image_paged(elf, private_inputs);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+
+    let mut boundaries: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
+    let mut prev_fini: Option<Vec<u32>> = None;
+    let mut index: u64 = 0;
+    while executor.pc() != 0 {
+        if index >= local_to_global::MAX_EPOCHS {
+            return Err(Error::InvalidContinuationEpochSize(format!(
+                "execution needs more than {} continuation epochs (the IsB20 \
+                 cross-epoch ordering range); use a larger epoch size",
+                local_to_global::MAX_EPOCHS
+            )));
+        }
+        let register_init: Vec<u32> = match (index, prev_fini.take()) {
+            (0, _) => register::register_init_from_entry_point(elf.entry_point),
+            (_, Some(fini)) => fini,
+            (_, None) => {
+                return Err(Error::ContinuationInvariant(
+                    "previous epoch final registers are missing after the first epoch".to_string(),
+                ));
+            }
+        };
+
+        let logs = match executor
+            .resume_with_limit(epoch_size)
+            .map_err(|e| Error::Execution(format!("{e}")))?
+        {
+            Some(logs) => logs.to_vec(),
+            None => break,
+        };
+        let is_final = executor.pc() == 0;
+        if !is_final && logs.len() != epoch_size {
+            return Err(Error::ContinuationInvariant(format!(
+                "intermediate epoch ran {} cycles, expected {epoch_size}",
+                logs.len()
+            )));
+        }
+
+        let label = local_to_global::epoch_label(index);
+        let collected = Traces::collect_epoch(artifacts, &image, &register_init, &logs, is_final)?;
+        let boundary = Arc::new(local_to_global::epoch_boundary(
+            &mut provenance,
+            label,
+            &collected.touched_memory_cells(),
+        ));
+        boundaries.push(Arc::clone(&boundary));
+        prev_fini = Some(collected.register_fini(&register_init));
+        for cell in boundary.iter() {
+            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+        }
+
+        let traces = Traces::build_from_collected(
+            artifacts,
+            collected,
+            // Continuation epochs use the L2G bookend: PAGE tables (the only
+            // image consumers in the build) are skipped.
+            None::<&HashMap<u64, u8>>,
+            &register_init,
+            &MaxRowsConfig::default(),
+            private_inputs,
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )?;
+        each(
+            PreparedEpoch {
+                index,
+                register_init,
+                label,
+                traces,
+                boundary,
+                is_final,
+            },
+            &boundaries,
+        )?;
+        index += 1;
+    }
+
+    Ok(boundaries)
 }
 
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
@@ -635,7 +756,7 @@ impl<'a> ContinuationProofView<'a> {
 /// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
 #[allow(clippy::too_many_arguments)]
-fn build_epoch_airs(
+pub(crate) fn build_epoch_airs(
     elf: &Elf,
     opts: &ProofOptions,
     page_configs: &[PageConfig],

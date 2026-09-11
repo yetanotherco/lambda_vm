@@ -18,6 +18,7 @@ pub mod continuation;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod multilinear_continuation;
 pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
