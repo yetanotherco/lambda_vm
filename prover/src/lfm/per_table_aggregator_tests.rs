@@ -3267,7 +3267,37 @@ fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, u
         .map(|c| c.name)
         .collect();
     println!("     ⇒ at {step:.3}× the workload these would STEP: {stepping:?}");
+    // ★ Lane E's dependency measurement, on the SAME production programs the
+    // panel above describes — folded in here rather than given its own fixture
+    // because this is the one call site every shape already passes through
+    // (every wrap, every interior node, the slices, the parent, the root), so
+    // the thing profiled is provably the program that gets proved.
+    //
+    // ⛔ OFF by default and behind its own variable. It costs a forward pass
+    // plus `4 · num_addrs + 8 · instrs` bytes of scratch — nothing a record run
+    // should pay, and nothing that may perturb a timed arm.
+    if std::env::var("LFM_REACH_PROFILE").is_ok_and(|v| !v.is_empty()) {
+        let t = std::time::Instant::now();
+        let p = super::reach_profile::profile(program);
+        print!("{}", p.describe(label, reach_ns_per_perm()));
+        println!("     (profile took {:.1}s)", t.elapsed().as_secs_f64());
+    }
     (cells, program.instrs.len())
+}
+
+/// The measured host cost of one RPX permutation, so the reach ladder reads in
+/// seconds rather than in permutation steps.
+///
+/// A knob rather than a constant because it is a property of the BOX, not of
+/// the code: lane E measured 2,356 ns on the 9950X (Zen 5) and 3,000 on the
+/// 7950X (Zen 4), and the ladder is wrong by the ratio if a run on one box
+/// quotes the other's number. The default is the faster box, which is where
+/// the record runs; `LFM_RPX_NS` overrides it.
+fn reach_ns_per_perm() -> f64 {
+    std::env::var("LFM_RPX_NS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2356.0)
 }
 
 /// The child index range each node of a level consumes, in order.
