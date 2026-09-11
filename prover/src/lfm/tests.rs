@@ -31,7 +31,7 @@ fn run(program: &LfmProgram, arenas: &[Vec<LfmWord>]) -> LfmExecution {
 }
 
 fn cell(exec: &LfmExecution, addr: Addr) -> LfmWord {
-    exec.memory[addr.0 as usize].expect("cell written")
+    exec.memory.get(addr).expect("cell written")
 }
 
 fn base_at(exec: &LfmExecution, addr: Addr) -> FE {
@@ -360,6 +360,216 @@ fn validator_rejects_double_write() {
     // The executor independently catches it.
     let err = execute(&program, &[], &TestPermutation).unwrap_err();
     assert_eq!(err, LfmExecError::DoubleWrite(add_out.0));
+}
+
+/// ★ The check the split memory layout made load-bearing.
+///
+/// The value array is zero-filled and the occupancy bit is now the ONLY thing
+/// separating "never written" from "written zero" — `Option<LfmWord>` used to
+/// carry that distinction inside the cell. So both halves are asserted here: a
+/// genuine zero reads back as a zero, and an address no instruction has written
+/// is an error rather than that same zero.
+///
+/// ⚠ Nothing else in the suite asserted `ReadBeforeWrite` from the executor
+/// (the cycle test stops at the validator), so deleting the bit test would have
+/// been silent.
+#[test]
+fn executor_rejects_read_before_write() {
+    // A written zero is a value.
+    let mut b = LfmBuilder::new();
+    let z = b.felt_const(fe(0));
+    let one = b.felt_const(fe(1));
+    let s = b.add(z, one);
+    b.public(s.as_cell());
+    let program = compile(b.finish());
+    let exec = run(&program, &[]);
+    assert_eq!(base_at(&exec, z.addr()), fe(0), "a written zero is a value");
+    assert_eq!(base_at(&exec, s.addr()), fe(1));
+
+    // An address only a LATER instruction writes is not that zero.
+    let mut program = small_valid_program();
+    let mul_out = program
+        .instrs
+        .iter()
+        .find_map(|i| match i {
+            Instr::BaseAlu {
+                op: super::instr::BaseOp::Mul,
+                out,
+                ..
+            } => Some(*out),
+            _ => None,
+        })
+        .unwrap();
+    for i in &mut program.instrs {
+        if let Instr::BaseAlu {
+            op: super::instr::BaseOp::Add,
+            a,
+            ..
+        } = i
+        {
+            *a = mul_out;
+        }
+    }
+    let err = execute(&program, &[], &TestPermutation).unwrap_err();
+    assert_eq!(err, LfmExecError::ReadBeforeWrite(mul_out.0));
+}
+
+/// An address past `num_addrs` is out of range in both directions, and the two
+/// directions report differently: a read is indistinguishable from an unwritten
+/// cell, a write is a caller bug the executor names.
+#[test]
+fn executor_rejects_addresses_outside_the_program() {
+    let mut program = small_valid_program();
+    let past = Addr(program.num_addrs);
+    for i in &mut program.instrs {
+        if let Instr::BaseAlu {
+            op: super::instr::BaseOp::Add,
+            a,
+            ..
+        } = i
+        {
+            *a = past;
+        }
+    }
+    assert_eq!(
+        execute(&program, &[], &TestPermutation).unwrap_err(),
+        LfmExecError::ReadBeforeWrite(past.0)
+    );
+
+    let mut program = small_valid_program();
+    let past = Addr(program.num_addrs);
+    for i in &mut program.instrs {
+        if let Instr::BaseAlu {
+            op: super::instr::BaseOp::Add,
+            out,
+            ..
+        } = i
+        {
+            *out = past;
+        }
+    }
+    assert_eq!(
+        execute(&program, &[], &TestPermutation).unwrap_err(),
+        LfmExecError::Internal("address out of range")
+    );
+}
+
+/// The memory cell divides the cache line. That is the whole mechanism behind
+/// splitting the occupancy flag out of the cell: `Option<LfmWord>` is 40 bytes
+/// (a Goldilocks felt has no niche), so a cell straddled two lines at half of
+/// all addresses. If the word ever grows past 32 bytes the argument is gone, and
+/// this says so rather than letting the layout quietly regress.
+#[test]
+fn the_memory_cell_divides_the_cache_line() {
+    assert_eq!(core::mem::size_of::<LfmWord>(), 32);
+    assert_eq!(64 % core::mem::size_of::<LfmWord>(), 0);
+    assert_eq!(core::mem::size_of::<Option<LfmWord>>(), 40);
+}
+
+/// A program touching most of the chips, with an arena, for the record-sizing
+/// test below. Row counts are deliberately not powers of two, so a vector grown
+/// by `push` doubling lands on a different capacity than a sized one.
+fn multi_chip_program() -> (LfmProgram, Vec<Vec<LfmWord>>) {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(1);
+    let h0 = b.hint_felt(arena, 0);
+    let x = b.felt_const(fe(7));
+    let y = b.felt_const(fe(5));
+    let s = b.add(x, y);
+    let d = b.sub(s, h0);
+    let m = b.mul(d, y);
+    let e0 = b.ext_const(&ext(1, 2, 3));
+    let e1 = b.ext_const(&ext(4, 5, 6));
+    let ep = b.emul(e0, e1);
+    let bit = b.bit_const(true);
+    let (l, r) = b.select(bit, x.as_cell(), y.as_cell());
+    let da = b.digest_const([fe(1), fe(2), fe(3), fe(4)]);
+    let db = b.digest_const([fe(5), fe(6), fe(7), fe(8)]);
+    let dc = b.compress(da, db);
+    let lanes = b.unpack(dc.as_cell());
+    let packed = b.pack_word(lanes);
+    b.public(packed);
+    b.public(l);
+    b.public(r);
+    b.public(ep.as_cell());
+    b.public(m.as_cell());
+    (compile(b.finish()), vec![vec![base_word(fe(3))]])
+}
+
+/// ★ The records are SIZED from the compiler's census, not grown.
+///
+/// Pass 2 opens one column-group row per instruction and the executor pushes one
+/// record per instruction of the same chip, so `real_rows` is each vector's
+/// final length exactly — which is what lets the executor allocate once instead
+/// of copying every record vector ~log2(rows) times per proof.
+///
+/// Both halves are asserted: the length identity (the contract), and
+/// `capacity == real_rows` (that the allocation was actually made up front —
+/// push doubling would overshoot on these deliberately non-power-of-two counts).
+#[test]
+fn the_records_are_sized_from_the_census() {
+    let (program, arenas) = multi_chip_program();
+    let exec = run(&program, &arenas);
+    let g = &program.groups;
+    let r = &exec.records;
+
+    // Non-degenerate: several chips have to actually be exercised, or the test
+    // would pass on a program that allocates nothing.
+    assert_eq!(r.balu.len(), 3, "add, sub, mul");
+    assert_eq!(r.lanes.len(), 2, "unpack, pack");
+    assert_eq!(r.public.len(), 5);
+    assert_eq!(r.hash.len(), 1);
+
+    let counts: [(&str, usize, usize, usize); 10] = [
+        ("balu", r.balu.len(), r.balu.capacity(), g.balu.real_rows),
+        ("xalu", r.xalu.len(), r.xalu.capacity(), g.xalu.real_rows),
+        (
+            "select",
+            r.select.len(),
+            r.select.capacity(),
+            g.select.real_rows,
+        ),
+        (
+            "bitdec",
+            r.bitdec.len(),
+            r.bitdec.capacity(),
+            g.bitdec.real_rows,
+        ),
+        ("hash", r.hash.len(), r.hash.capacity(), g.hash.real_rows),
+        (
+            "keccak",
+            r.keccak.len(),
+            r.keccak.capacity(),
+            g.keccak.real_rows,
+        ),
+        (
+            "blake3",
+            r.blake3.len(),
+            r.blake3.capacity(),
+            g.blake3.real_rows,
+        ),
+        (
+            "lanes",
+            r.lanes.len(),
+            r.lanes.capacity(),
+            g.lanes.real_rows,
+        ),
+        ("hint", r.hint.len(), r.hint.capacity(), g.hint.real_rows),
+        (
+            "public",
+            r.public.len(),
+            r.public.capacity(),
+            g.public.real_rows,
+        ),
+    ];
+    for (chip, len, cap, real_rows) in counts {
+        assert_eq!(len, real_rows, "{chip}: record count vs emitted rows");
+        assert_eq!(cap, real_rows, "{chip}: sized up front, not grown");
+    }
+    assert_eq!(
+        r.num_consts, g.const_.real_rows,
+        "const: record count vs emitted rows"
+    );
 }
 
 #[test]

@@ -15,7 +15,7 @@ use math::field::traits::IsPrimeField;
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
 use super::blake3_chip::Blake3Values;
-use super::compiler::LfmProgram;
+use super::compiler::{LfmColumnGroups, LfmProgram};
 use super::hash::{HASH_STATE_FELTS, LfmHasher};
 use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::word::{LfmWord, base_word, ext_word};
@@ -154,39 +154,136 @@ pub struct LfmRecords {
     pub public: Vec<LfmWord>,
 }
 
+impl LfmRecords {
+    /// Records sized from the census the compiler already holds.
+    ///
+    /// Pass 2 opens exactly one column-group row per instruction, and this
+    /// executor pushes exactly one record per instruction of the same chip — so
+    /// `ColumnGroup::real_rows` *is* each vector's final length, not an upper
+    /// bound. The trace fill already depends on that identity: it fills rows
+    /// `0..group.real_rows` by indexing the record vector
+    /// ([`super::trace`]), so a vector short of its group's row count is
+    /// already a panic there.
+    ///
+    /// Growing these by `push` instead re-allocated and copied every one of them
+    /// ~log2(rows) times per proof — a few hundred MB of memcpy and ~20 large
+    /// `mremap`s under the process allocator, on every concurrent worker at once.
+    fn with_capacity(groups: &LfmColumnGroups) -> Self {
+        LfmRecords {
+            num_consts: 0,
+            balu: Vec::with_capacity(groups.balu.real_rows),
+            xalu: Vec::with_capacity(groups.xalu.real_rows),
+            select: Vec::with_capacity(groups.select.real_rows),
+            bitdec: Vec::with_capacity(groups.bitdec.real_rows),
+            hash: Vec::with_capacity(groups.hash.real_rows),
+            keccak: Vec::with_capacity(groups.keccak.real_rows),
+            blake3: Vec::with_capacity(groups.blake3.real_rows),
+            lanes: Vec::with_capacity(groups.lanes.real_rows),
+            hint: Vec::with_capacity(groups.hint.real_rows),
+            public: Vec::with_capacity(groups.public.real_rows),
+        }
+    }
+}
+
+/// The executor's write-once memory: one value array plus one occupancy bit per
+/// address.
+///
+/// This used to be a single `Vec<Option<LfmWord>>`. `LfmWord` is `[F; 4]` = 32
+/// bytes and `F` has no niche, so `Option<LfmWord>` is **40** bytes: the
+/// occupancy flag cost 8 bytes per address *and* pushed the stride off the
+/// cache line, so half of all cells spanned two lines. Splitting the flag out
+/// restores the 32-byte stride (a cell never spans two lines) and puts the whole
+/// occupancy map in `num_addrs / 8` bytes, which stays cache-resident where the
+/// value array cannot.
+///
+/// The write-once rules are unchanged and still checked here, independently of
+/// the compiler's tripwire panics and of the admission validator: a second write
+/// to an address is [`LfmExecError::DoubleWrite`], and a read of an address no
+/// instruction has written yet is [`LfmExecError::ReadBeforeWrite`]. ⚠ The bit
+/// is the *only* thing that separates "unwritten" from "written zero" now — the
+/// value array is zero-filled, so dropping the check would silently hand out
+/// zeros instead of failing. The `executor_rejects_read_before_write` test is
+/// what makes that unreachable.
+#[derive(Debug)]
+pub struct WriteOnceMemory {
+    words: Vec<LfmWord>,
+    /// Bit `i % 64` of word `i / 64` is "address `i` has been written".
+    written: Vec<u64>,
+}
+
+impl WriteOnceMemory {
+    fn new(num_addrs: usize) -> Self {
+        WriteOnceMemory {
+            words: vec![[FE::zero(); 4]; num_addrs],
+            written: vec![0u64; num_addrs.div_ceil(64)],
+        }
+    }
+
+    /// The final value at `addr`, or `None` if no instruction wrote it (which
+    /// includes an address outside the program's range).
+    pub fn get(&self, addr: Addr) -> Option<LfmWord> {
+        self.read(addr).ok()
+    }
+
+    #[inline]
+    fn read(&self, addr: Addr) -> Result<LfmWord, LfmExecError> {
+        let i = addr.0 as usize;
+        let Some(&w) = self.words.get(i) else {
+            return Err(LfmExecError::ReadBeforeWrite(addr.0));
+        };
+        // `written` is sized `words.len().div_ceil(64)`, so the index is in
+        // range here; `get` rather than `[]` keeps a would-be panic an error.
+        let bits = self.written.get(i >> 6).copied().unwrap_or(0);
+        if (bits >> (i & 63)) & 1 == 0 {
+            return Err(LfmExecError::ReadBeforeWrite(addr.0));
+        }
+        Ok(w)
+    }
+
+    #[inline]
+    fn write(&mut self, addr: Addr, w: LfmWord) -> Result<(), LfmExecError> {
+        let i = addr.0 as usize;
+        let slot = self
+            .words
+            .get_mut(i)
+            .ok_or(LfmExecError::Internal("address out of range"))?;
+        let bits = self
+            .written
+            .get_mut(i >> 6)
+            .ok_or(LfmExecError::Internal("address out of range"))?;
+        let mask = 1u64 << (i & 63);
+        if *bits & mask != 0 {
+            return Err(LfmExecError::DoubleWrite(addr.0));
+        }
+        *bits |= mask;
+        *slot = w;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct LfmExecution {
     pub records: LfmRecords,
     /// The public output, in emission order: `(index, word)`.
     pub public_words: Vec<(u32, LfmWord)>,
     /// Final memory, exposed for tests and debugging.
-    pub memory: Vec<Option<LfmWord>>,
+    pub memory: WriteOnceMemory,
 }
 
 struct Machine<'a> {
-    memory: Vec<Option<LfmWord>>,
+    memory: WriteOnceMemory,
     arenas: &'a [Vec<LfmWord>],
 }
 
 impl Machine<'_> {
+    #[inline]
     fn write(&mut self, addr: Addr, w: LfmWord) -> Result<(), LfmExecError> {
-        let slot = self
-            .memory
-            .get_mut(addr.0 as usize)
-            .ok_or(LfmExecError::Internal("address out of range"))?;
-        if slot.is_some() {
-            return Err(LfmExecError::DoubleWrite(addr.0));
-        }
-        *slot = Some(w);
-        Ok(())
+        self.memory.write(addr, w)
     }
 
+    #[inline]
     fn read_word(&self, addr: Addr) -> Result<LfmWord, LfmExecError> {
-        self.memory
-            .get(addr.0 as usize)
-            .cloned()
-            .flatten()
-            .ok_or(LfmExecError::ReadBeforeWrite(addr.0))
+        self.memory.read(addr)
     }
 
     fn read_base(&self, addr: Addr) -> Result<FE, LfmExecError> {
@@ -223,11 +320,11 @@ pub fn execute(
     }
 
     let mut m = Machine {
-        memory: vec![None; program.num_addrs as usize],
+        memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas,
     };
-    let mut records = LfmRecords::default();
-    let mut public_words = Vec::new();
+    let mut records = LfmRecords::with_capacity(&program.groups);
+    let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
 
     for instr in &program.instrs {
         match instr {
@@ -638,6 +735,42 @@ pub fn execute(
             }
         }
     }
+
+    // The sizing above is exact, not an estimate: assert it on the success path
+    // so a chip whose emitter and executor arm drift apart says so here, where
+    // the two are written, instead of as an index panic inside the parallel
+    // fill. Chip order: const, balu, xalu, select, bitdec, hash, keccak,
+    // blake3, lanes, hint, public. (A `?` above returns early with short
+    // vectors by design — that program did not finish.)
+    debug_assert_eq!(
+        [
+            records.num_consts,
+            records.balu.len(),
+            records.xalu.len(),
+            records.select.len(),
+            records.bitdec.len(),
+            records.hash.len(),
+            records.keccak.len(),
+            records.blake3.len(),
+            records.lanes.len(),
+            records.hint.len(),
+            records.public.len(),
+        ],
+        [
+            program.groups.const_.real_rows,
+            program.groups.balu.real_rows,
+            program.groups.xalu.real_rows,
+            program.groups.select.real_rows,
+            program.groups.bitdec.real_rows,
+            program.groups.hash.real_rows,
+            program.groups.keccak.real_rows,
+            program.groups.blake3.real_rows,
+            program.groups.lanes.real_rows,
+            program.groups.hint.real_rows,
+            program.groups.public.real_rows,
+        ],
+        "record counts must equal the emitted column-group row counts"
+    );
 
     Ok(LfmExecution {
         records,

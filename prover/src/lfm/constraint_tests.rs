@@ -261,7 +261,9 @@ fn lowered_constraints_match_the_verifier_interpreter() {
             eval_program_verifier(&prog, &ctx, &mut expected);
 
             for (c, want) in expected.iter().enumerate() {
-                let cell = exec.memory[evals[c].addr().0 as usize]
+                let cell = exec
+                    .memory
+                    .get(evals[c].addr())
                     .unwrap_or_else(|| panic!("[{label}] constraint {c} cell unwritten"));
                 let got = word_as_ext(&cell).expect("an ext value has lane 3 zero");
                 assert_eq!(
@@ -314,7 +316,7 @@ fn the_differential_rejects_a_perturbed_constraint_value() {
     let mut expected = vec![FEE::zero(); prog.roots.len()];
     eval_program_verifier(&prog, &ctx, &mut expected);
 
-    let got = word_as_ext(&exec.memory[evals[0].addr().0 as usize].expect("written")).expect("ext");
+    let got = word_as_ext(&exec.memory.get(evals[0].addr()).expect("written")).expect("ext");
     assert_eq!(got, expected[0], "[{label}] baseline must agree");
     assert_ne!(
         got,
@@ -578,8 +580,7 @@ fn a_rooted_mul_is_never_fused_away() {
     let mut expected = vec![FEE::zero(); prog.roots.len()];
     eval_program_verifier(&prog, &ctx, &mut expected);
     for (c, want) in expected.iter().enumerate() {
-        let got =
-            word_as_ext(&exec.memory[evals[c].addr().0 as usize].expect("written")).expect("ext");
+        let got = word_as_ext(&exec.memory.get(evals[c].addr()).expect("written")).expect("ext");
         assert_eq!(got, *want, "constraint {c}");
     }
 }
