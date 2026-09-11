@@ -863,20 +863,30 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
             "the emitted program and the shape arithmetic must agree"
         );
         // One byteswap per extension component per leaf value: two values, three
-        // components, per committed layer.
+        // components, per committed layer — ON A BYTE HASH. Under the algebraic
+        // arm the term is zero and the only decomposition left per query is the
+        // index's, which is why the count is written as a WIDTH times a shape.
+        let per_value = super::machine_tests::byteswaps_per_value();
         assert_eq!(
             per.swaps,
-            1 + 6 * shape.num_committed(),
+            1 + 6 * shape.num_committed() * per_value,
             "the index decomposition plus six component byteswaps per layer"
         );
         // The inversion, asserted rather than left to the reader: byteswapping
         // is the majority of the instructions and a rounding error in cells.
+        //
+        // ⚠ Both halves are statements about a BYTE hash. The algebraic arm
+        // absorbs felts, so there is no rendering to dominate anything and the
+        // first half is simply false there — guarded rather than deleted,
+        // because it still holds and still has to hold under keccak and BLAKE3.
         let swap_instrs = per.swaps * 65;
-        assert!(
-            swap_instrs * 2 > per.instrs,
-            "byteswapping should be the majority of the leg's instructions              ({swap_instrs} of {})",
-            per.instrs
-        );
+        if per_value == 1 {
+            assert!(
+                swap_instrs * 2 > per.instrs,
+                "byteswapping should be the majority of the leg's instructions              ({swap_instrs} of {})",
+                per.instrs
+            );
+        }
         assert!(
             per.perms as u64 * perm_cells > 100 * per.swaps as u64 * swap_cells,
             "and a rounding error in main-trace cells"
@@ -974,12 +984,16 @@ fn the_fri_join_adds_no_second_point_derivation() {
     );
 
     // One decomposition of the index, plus one byteswap per field element that
-    // enters a leaf: a base element is one, an extension element three.
+    // enters a leaf: a base element is one, an extension element three — and
+    // that whole term is a BYTE-hash term, so it carries the same width factor
+    // `dw` carries above. On the algebraic arm it vanishes and the expected
+    // count is 1, which is the property this test is named for, undiluted.
     let leaf_swaps: usize = groups
         .iter()
         .map(|g| g.num_values() * if g.is_ext { 3 } else { 1 })
         .sum();
-    let expected_decs = 1 + leaf_swaps + 6 * h.shape.num_committed();
+    let expected_decs = 1
+        + (leaf_swaps + 6 * h.shape.num_committed()) * super::machine_tests::byteswaps_per_value();
     assert_eq!(
         per_query_decs,
         expected_decs,
