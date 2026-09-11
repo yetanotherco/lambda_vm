@@ -3,21 +3,34 @@
 //! # Why this is its own file
 //!
 //! Every other program in the tree is an aggregation node, and one emitter
-//! serves them all. The root is not one of them: it takes `fan_in + 1` children
-//! (the global wrap is the extra), performs the L2G compare that a split tree
+//! serves them all. The root is not one of them: it takes its interior children
+//! plus ONE more (the global child), performs the L2G compare that a split tree
 //! defers to the children's common ancestor, and answers the campaign's finish
 //! line — *what does this artifact claim about block N?* That question should be
 //! one file to read. Folded into [`super::per_table_aggregator::emit_node`] it
 //! would be answered by tracing branches, and the thing most likely to be
 //! quietly wrong at the end of a campaign is the claim, not the code.
 //!
-//! # Where it sits
+//! # Where it sits — an OPTION, and a measurement rather than a fact
 //!
-//! The root REPLACES the top interior level rather than sitting above it. Run
-//! the interior until `<= fan_in` nodes remain; the root takes those plus the
-//! global wrap. At 19 epochs and fan-in 2 the interior is levels 1..4 (10 + 5 +
-//! 3 + 2 = 20 nodes) and the root is level 5, with 2 + 1 = 3 children. The total
-//! is unchanged at 21 nodes — what changes is what the top node IS.
+//! ⚠ This paragraph used to state that the root REPLACES the top interior level.
+//! That is [`RootOption::A`], and it is one of two. The choice changes the root's
+//! CHILD COUNT and therefore its sub-proof count, which is what decides whether
+//! `LFM_HASH` crosses a power of two — so it is settled by emitting both and
+//! reading the panels, not by a preference stated in a doc.
+//!
+//! - **A** — run the interior until `<= fan_in` nodes remain; the root takes
+//!   those plus the global child. At 19 epochs and fan-in 2 the interior is
+//!   levels 1..4 (10 + 5 + 3 + 2 = 20 nodes) and the root is level 5 with
+//!   2 + 1 = 3 children. The total is unchanged at 21 nodes — what changes is
+//!   what the top node IS.
+//! - **B** — the interior closes to ONE node and the root sits above it, taking
+//!   that node plus the global child: 21 interior nodes and a 2-child root.
+//!
+//! ⛔ And "the global wrap" is now "the global CHILD". At `k = 1` it is the
+//! unsliced wrap; at `k > 1` it is the [`super::global_parent`] over `k` slices,
+//! which publishes the same set for a reason that is a coincidence of arithmetic
+//! rather than a design — see `global_child_layout` on [`RootInputs`].
 //!
 //! # ⛔ What this does NOT close
 //!

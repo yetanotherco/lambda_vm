@@ -2991,6 +2991,265 @@ fn the_level_groups_tile_every_child() {
 ///
 /// # One arm per process
 ///
+/// ★★★ THE BLOCK-ARTIFACT ROOT, OVER REAL CHILDREN — at fixture scale.
+///
+/// # What this adds over everything under it
+///
+/// The pieces are gated: `the_leaf_node_verifies_and_binds_two_wraps` proves a
+/// node over wraps, `the_global_slices_verify_and_sum_to_zero` proves `k` global
+/// slices and their parent, and `block_root`'s own arms drive the root's checks
+/// over fabricated published words. What NOTHING has ever done is prove a ROOT,
+/// and three of its obligations exist only there:
+///
+/// 1. **The L2G compare against a REPUBLISHED prefix.** The root reads its global
+///    child's per-epoch roots at `GlobalLayout::l2g_word`, and at `k > 1` those
+///    words were republished by a parent from slice 0.
+///    `global_parent::tests::the_parent_republishes_every_root_at_the_index_the_
+///    root_reads` states that packing over a fixture; this is the compare
+///    actually reading it, off a proof.
+/// 2. **The interior's published fold equalling that refold.** ⛔ The completeness
+///    trap in its exact form: tree-shaped, honest prover, and a wrong grouping
+///    produces a digest nobody ever computed. A fixture cannot reach it, because
+///    a fixture writes whatever the compare expects.
+/// 3. **The artifact's width, measured on a PROOF** rather than on an execution.
+///
+/// ⚠ BOTH OPTIONS, because they are different programs and one of them is not
+/// reachable at larger fixtures without building a second level: at two epochs
+/// `A` takes the epoch WRAPS directly — a ZERO-level fold, where the compare
+/// reads each root straight through — and `B` takes the single node above them,
+/// one level, where it reads a real `hash_pair`. The smallest fixture that has
+/// both is the one the suite already proves.
+#[test]
+#[ignore = "box tier: proves a fixture continuation, its wraps, a node, k global slices, their parent and the ROOT"]
+fn the_block_root_proves_over_real_children() {
+    use super::block_root::{GlobalLayout, GlobalPublishes, RootOption, RootPublishSet};
+    use super::epoch_tests::Publishes;
+    use super::per_table_aggregator::{NodePublishSet, SchemaLayout, tree_shape};
+    use super::proof::lfm_prove;
+    use super::registry::build_artifacts_with_hasher;
+    use std::time::Instant;
+
+    const K: usize = 2;
+    let fan_in = 2usize;
+
+    let elf_bytes = super::proof_fixture::read_inner_elf();
+    let inner = super::proof_fixture::fixture_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let bundle = crate::continuation::prove_continuation(
+        &elf_bytes,
+        &[],
+        super::proof_fixture::FIXTURE_EPOCH_LOG2,
+        &inner,
+    )
+    .expect("the fixture continuation must prove");
+    let epochs = bundle.num_epochs();
+    assert_eq!(
+        tree_shape(epochs, fan_in).len(),
+        1,
+        "this gate needs a ONE-level interior over its {epochs} epochs: option A \
+         then takes the epoch wraps and option B the single node above them, \
+         which is BOTH options at the smallest fixture that has them. A deeper \
+         fixture needs the whole tree built here, which is the driver's job"
+    );
+
+    // ---- level 0: one wrap per epoch, at the AGGREGATION publish set.
+    let t = Instant::now();
+    let mut wraps: Vec<RealChild> = Vec::with_capacity(epochs);
+    let mut wrap_layouts: Vec<SchemaLayout> = Vec::with_capacity(epochs);
+    let mut wrap_labels: Vec<Vec<u64>> = Vec::with_capacity(epochs);
+    for k in 0..epochs {
+        let e =
+            super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, k, None)
+                .expect("every epoch must reconstruct from proofs alone");
+        let out_halves = e.statement.public_output_len.div_ceil(4);
+        let shapes: Vec<&super::epoch::TableChallengeShape> =
+            e.tables.iter().map(|h| &h.shape).collect();
+        assert_samplable(&format!("inner epoch {k}"), &shapes);
+        let program =
+            super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+            .expect("the epoch wrap must prove at the aggregation preset");
+        let layout = SchemaLayout::wrap(out_halves);
+        layout.assert_covers(proved.public_words.len());
+        wrap_layouts.push(layout);
+        wrap_labels.push(vec![crate::tables::local_to_global::epoch_label(k as u64)]);
+        wraps.push(real_child(artifacts, wrap_opts.clone(), &proved));
+    }
+    let block_range = (
+        wrap_labels[0][0],
+        *wrap_labels[epochs - 1].last().expect("a label run"),
+    );
+    println!(
+        "   {epochs} epoch wraps proved in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+
+    // ---- level 1: ONE node over every wrap. It is option B's interior child,
+    // and the only thing that makes B's fold a real `hash_pair` rather than the
+    // identity.
+    let t = Instant::now();
+    let wrap_refs: Vec<&[u64]> = wrap_labels.iter().map(|l| &l[..]).collect();
+    let node_out_halves = wrap_layouts[epochs - 1].out_halves;
+    let node_prog = node_program(
+        &wraps,
+        &wrap_layouts,
+        &wrap_refs,
+        block_range,
+        NodePublishSet::Aggregation,
+    );
+    let node_arenas: Vec<Vec<LfmWord>> = wraps.iter().flat_map(child_arena_words).collect();
+    let node_artifacts =
+        build_artifacts_with_hasher(&node_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let node_proved = lfm_prove(&node_prog, &node_artifacts, &node_arenas, &wrap_opts)
+        .expect("the leaf node must prove");
+    let node_layout = SchemaLayout::node(node_out_halves);
+    node_layout.assert_covers(node_proved.public_words.len());
+    let node = real_child(node_artifacts, wrap_opts.clone(), &node_proved);
+    println!("   the leaf NODE proved in {:.1}s", t.elapsed().as_secs_f64());
+
+    // ---- the GLOBAL CHILD: `k` slices and the PARENT that folds them, which is
+    // what production hands the root. ⛔ Not the unsliced wrap: the parent's
+    // REPUBLISHED prefix is the thing the root's compare has never read off a
+    // real proof, and it is the one place a right COUNT of wrong words would be
+    // silent and downstream.
+    let t = Instant::now();
+    let g = real_global(&elf_bytes, &bundle, &inner);
+    let partition = super::global_split::SlicePartition::even(g.tables.len(), K);
+    let g_shared = || GlobalLayout {
+        num_epochs: g.num_l2g,
+        lanes_per_root: super::proof_arena::lanes_per_root(),
+    };
+    let publishes = GlobalPublishes::of(&partition, g_shared());
+    let slice_layout = publishes
+        .as_slice()
+        .expect("k > 1 is the SLICE shape, chosen by this same partition");
+    let slice_arenas = global_arena_words(&g);
+    let mut slices: Vec<RealChild> = Vec::with_capacity(K);
+    for i in 0..K {
+        let program = global_slice_program(&g, &partition, i);
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let proved = lfm_prove(&program, &artifacts, &slice_arenas, &wrap_opts)
+            .unwrap_or_else(|e| panic!("global slice {i} must prove: {e:?}"));
+        assert_eq!(proved.public_words.len(), slice_layout.total());
+        slices.push(real_child(artifacts, wrap_opts.clone(), &proved));
+    }
+    let parent_prog = global_parent_program(&slices, &partition, slice_layout);
+    let parent_arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
+    let parent_artifacts =
+        build_artifacts_with_hasher(&parent_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let parent_proved = lfm_prove(&parent_prog, &parent_artifacts, &parent_arenas, &wrap_opts)
+        .expect("the global parent must prove");
+    let g_layout = g_shared();
+    assert_eq!(
+        parent_proved.public_words.len(),
+        g_layout.total(),
+        "the parent republishes the SHARED prefix and nothing for the sum"
+    );
+    let global_child = real_child(parent_artifacts, wrap_opts.clone(), &parent_proved);
+    println!(
+        "   {K} global slices and their PARENT proved in {:.1}s ({} published \
+         words, {} sub-proofs)",
+        t.elapsed().as_secs_f64(),
+        global_child.public_words.len(),
+        global_child.tables.len(),
+    );
+
+    // ---- ★★★ THE ROOT, at BOTH options.
+    let node_labels = vec![vec![block_range.0, block_range.1]];
+    for option in [RootOption::A, RootOption::B] {
+        let (kids, kid_layouts, kid_labels): (&[RealChild], &[SchemaLayout], &[Vec<u64>]) =
+            if option.replaces_top() {
+                (&wraps, &wrap_layouts, &wrap_labels)
+            } else {
+                (
+                    std::slice::from_ref(&node),
+                    std::slice::from_ref(&node_layout),
+                    &node_labels,
+                )
+            };
+        let refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
+        let shape = option.fold_shape(epochs, fan_in);
+        let t = Instant::now();
+        let program = root_program(
+            kids,
+            kid_layouts,
+            &refs,
+            block_range,
+            &global_child,
+            &g_layout,
+            &shape,
+            RootPublishSet::AssertOnly,
+        );
+        let arenas: Vec<Vec<LfmWord>> = kids
+            .iter()
+            .chain(std::iter::once(&global_child))
+            .flat_map(child_arena_words)
+            .collect();
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        // ⛔ `lfm_prove` and not `execute`: a root that EXECUTES has satisfied
+        // every assert, and a root that PROVES and does not VERIFY is the failure
+        // that reads as success. Only the pair says anything.
+        let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts).unwrap_or_else(|e| {
+            panic!(
+                "★ THE BLOCK-ARTIFACT ROOT ({}) MUST PROVE: {e:?}. A DivByZero here \
+                 is an assert_eq failing in the emitted root, `addr` being the diff \
+                 cell — most likely the L2G compare, most likely the fold shape",
+                option.describe()
+            )
+        });
+        assert!(
+            super::proof::verify_against_artifacts(
+                &artifacts,
+                &proved.proof,
+                &proved.public_words,
+                &wrap_opts
+            ),
+            "★ THE BLOCK-ARTIFACT ROOT ({}) DOES NOT VERIFY",
+            option.describe(),
+        );
+        // ⛔ THE WIDTH, AND NOTHING WIDER — measured on the proof.
+        let want = super::block_root::root_schema_words(
+            kid_layouts[0].num_reg,
+            kid_layouts[kid_layouts.len() - 1].out_halves,
+            RootPublishSet::AssertOnly,
+        );
+        assert_eq!(
+            proved.public_words.len(),
+            want,
+            "option {}: the root published {} words, not {want}",
+            option.describe(),
+            proved.public_words.len(),
+        );
+        println!(
+            "   ★★★ THE ROOT PROVED AND VERIFIED — option {}\n      {} interior \
+             children + the global child = {} sub-proofs · {} published words · \
+             {:.1}s",
+            option.describe(),
+            kids.len(),
+            kids.iter().map(|c| c.tables.len()).sum::<usize>() + global_child.tables.len(),
+            proved.public_words.len(),
+            t.elapsed().as_secs_f64(),
+        );
+    }
+
+    // ⇒ ★ AND THE TWO OPTIONS AGREE ON THE ARTIFACT'S WIDTH, which is the one
+    // posture comparison this encoding CAN make. ⚠ It is NOT the two-posture
+    // byte-identity check: A and B are two shapes of the same tree over the same
+    // epochs, not two postures, and their published VALUES are equal only because
+    // `AssertOnly` publishes nothing strategy-dependent — which is what the width
+    // agreement is evidence for, not a proof of.
+    println!(
+        "   ⚠ the two-posture byte-identity check is NOT performed here: A and B \
+         are two shapes of ONE posture, and comparing them would be a check that \
+         cannot fail in the way the campaign's rule needs"
+    );
+}
+
 /// `LFM_TREE_LEVELS` names which levels THIS process proves — `all`, `N`, or
 /// `lo-hi`, where level 0 is the epoch wraps. Levels below `lo` are LOADED from
 /// `A_CACHE_DIR`; levels in `[lo, hi]` are PROVED; nothing above `hi` runs. The
@@ -3132,6 +3391,18 @@ fn the_production_tree_composes_to_a_root() {
          failure A_BUNDLE_MODE's own refusal exists for — the caller believes \
          they named an experiment and did not"
     );
+    // ⛔ AND THE TWO STOP-EARLY KNOBS RETURN BEFORE THE ROOT STAGE EVER RUNS.
+    // Left to combine, the run would end on a green `test result: ok` having
+    // proved no root at all — a pass that answers a question nobody asked, which
+    // is exactly how a campaign reports a stage it never ran.
+    for stop in ["LFM_TREE_STOP_AFTER_GLOBAL", "LFM_TREE_SIZE_GLOBAL"] {
+        assert!(
+            !prove_root || std::env::var(stop).is_err(),
+            "{stop} returns before any interior level runs, so with \
+             LFM_TREE_PROVE_ROOT set this run would finish GREEN having proved no \
+             root. Name one experiment"
+        );
+    }
     // ⛔ THE OPTION IS AN INPUT AND CARRIES NO DEFAULT. The sizing arm decides
     // it; it changes the root's child count and therefore its sub-proof count,
     // and a default would silently become the answer to a question a measurement
@@ -3231,10 +3502,16 @@ fn the_production_tree_composes_to_a_root() {
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(
-        "★★★ PRODUCTION TREE (INTERIOR ONLY — not the block-artifact root)\n   \
+        "★★★ {}\n   \
          guest {}, {} input bytes, 2^{} cycles/epoch, fan-in {fan_in}\n   \
          inner blowup {} / {} q · wrap blowup {} / {} q\n   \
-         levels: prove {lo}..={} · cache {}\n   cgroup ceiling: {}",
+         levels: {} · cache {}\n   cgroup ceiling: {}",
+        match root_option {
+            Some(o) => format!("PRODUCTION TREE + THE BLOCK-ARTIFACT ROOT, option {o:?}"),
+            None if size_root => "PRODUCTION TREE, SIZING BOTH ROOT OPTIONS (proving neither)"
+                .to_string(),
+            None => "PRODUCTION TREE (INTERIOR ONLY — not the block-artifact root)".to_string(),
+        },
         inputs.label,
         inputs.private_input.len(),
         inputs.epoch_log2,
@@ -3242,9 +3519,18 @@ fn the_production_tree_composes_to_a_root() {
         inner.fri_number_of_queries,
         wrap_opts.blowup_factor,
         wrap_opts.fri_number_of_queries,
-        match hi_req {
-            Some(h) => h.to_string(),
-            None => "top".to_string(),
+        // ⚠ `lo = usize::MAX` is the load-everything sentinel both root arms set;
+        // printing it raw reads as a parse bug rather than as the experiment.
+        if lo == usize::MAX {
+            "LOAD every level, prove nothing below the root".to_string()
+        } else {
+            format!(
+                "prove {lo}..={}",
+                match hi_req {
+                    Some(h) => h.to_string(),
+                    None => "top".to_string(),
+                }
+            )
         },
         cache_dir.as_deref().unwrap_or("<none>"),
         match &ceiling {
