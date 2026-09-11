@@ -3440,6 +3440,19 @@ pub(super) fn wrap_hash_rows(program: &super::compiler::LfmProgram) -> usize {
     }
 }
 
+/// ★ Byteswaps one leaf VALUE costs under the CONFIGURED wrap hash.
+///
+/// A byte hash renders every felt big-endian before absorbing it — one
+/// `LFM_BITDEC` row plus 64 `LFM_BALU` rows apiece. An algebraic leaf packs
+/// felts straight into the rate (`edsl::algebraic_leaf_hash` emits no `BitDec`
+/// at all), so the rendering does not exist and the count is ZERO rather than
+/// smaller. Closed forms over leaf values multiply by this for the same reason
+/// they multiply by `proof_arena::words_per_root`: the shape of the claim is
+/// hash-independent, the width of a term is not.
+pub(super) fn byteswaps_per_value() -> usize {
+    usize::from(super::edsl::WrapHash::production().byte_hash().is_some())
+}
+
 /// [`wrap_hash_rows`]'s instruction-stream twin: emitted compressions of the
 /// configured wrap hash.
 pub(super) fn wrap_hash_instrs(program: &super::compiler::LfmProgram) -> usize {
@@ -4261,7 +4274,7 @@ fn the_register_derivation_matches_production() {
 
         for (what, init, fini) in register_file_cases() {
             let arenas = register_arenas(&init, &fini);
-            let exec = super::executor::execute(&program, &arenas, &super::hash::TestPermutation)
+            let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
                 .unwrap_or_else(|e| panic!("blowup {blowup} / {what}: execution failed: {e:?}"));
             let expected = crate::tables::register::compute_precomputed_commitment_with_fini(
                 &opts, &init, &fini,
@@ -4453,9 +4466,11 @@ fn register_derivation_cost() {
         );
         assert_eq!(
             program.groups.bitdec.real_rows,
-            shape.leaves() * 6,
+            shape.leaves() * 6 * byteswaps_per_value(),
             "blowup {blowup}: one bit decomposition per leaf value — the leaf \
-             gadget is `keccak_leaf_hash` reused, not a second one"
+             gadget is `keccak_leaf_hash` reused, not a second one. The term is \
+             a BYTE-hash term: an algebraic leaf absorbs the six felts directly \
+             and decomposes nothing"
         );
         // Chunking is not a constraint at this scale and the leg should say so
         // rather than leave the next reader to work it out: the whole tree at
@@ -4516,7 +4531,17 @@ fn the_register_derivation_proves_and_verifies() {
         "the fixture is proved at blowup 2 / offset 3; if that moves, this test          is no longer about the fixture's own commitment"
     );
     let program = register_derivation_program(shape);
-    let artifacts = build_artifacts(&program, &opts);
+    // ★ The BLOCK pin's permutation, named at the call site — `build_artifacts`
+    // defaults to `REGISTRY_HASHER = Test` and must, but its own doc licenses
+    // that default only for programs that "pin a byte hash on their own builders,
+    // emit no `Instr::Hash`, and never consult the socket". Since the derivation
+    // follows `WrapHash::production()`, this one IS a socket program, and proving
+    // it under a toy permutation would derive a root production never computes.
+    let artifacts = super::registry::build_artifacts_with_hasher(
+        &program,
+        &opts,
+        crate::hash_pin::BLOCK_HASHER,
+    );
     let (init, fini) = fixture_register_boundary();
     let arenas = register_arenas(&init, &fini);
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("prove");

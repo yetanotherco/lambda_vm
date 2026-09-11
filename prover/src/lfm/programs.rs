@@ -1269,15 +1269,16 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
     use crate::tables::register::NUM_REGISTER_ADDRESSES;
 
     let supplied = NUM_REGISTER_ADDRESSES as u32;
-    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
     let init_arena = b.declare_arena(supplied);
     let fini_arena = b.declare_arena(supplied);
     let init: Vec<_> = (0..supplied).map(|r| b.hint_felt(init_arena, r)).collect();
     let fini: Vec<_> = (0..supplied).map(|r| b.hint_felt(fini_arena, r)).collect();
 
     let root = emit_register_commitment(&mut b, shape, &init, &fini);
-    b.public(root[0]);
-    b.public(root[1]);
+    for cell in root.cells() {
+        b.public(*cell);
+    }
     b.finish()
 }
 
