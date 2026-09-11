@@ -33,6 +33,9 @@ use math::{
     traits::AsBytes,
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{
     Error, challenge_powers,
     eq::{eq_eval, eq_evals_into},
@@ -69,12 +72,27 @@ where
         config: &ChainConfig,
     ) -> Result<Self, Error> {
         let polys = layout.stack(columns)?;
-        let mut commitments = Vec::with_capacity(polys.len());
+        // A commit spends most of its wall time waiting on a device — the tree
+        // coming back — with the next polynomial's transform not yet launched.
+        // Committing in pairs covers that wait and no more: a third in flight
+        // has nothing left to hide behind, and each one holds a codeword and a
+        // tree on the device while it runs. Every polynomial has the same
+        // variable count, so they share a domain.
+        let commit = |poly: &Mle<F>| whir_chain::commit::<F>(poly, config);
         let mut domain = None;
-        for poly in &polys {
-            let (commitment, d) = whir_chain::commit::<F>(poly, config)?;
-            commitments.push(commitment);
-            domain = Some(d);
+        let mut commitments = Vec::with_capacity(polys.len());
+        for pair in polys.chunks(2) {
+            #[cfg(feature = "parallel")]
+            let built = pair
+                .par_iter()
+                .map(commit)
+                .collect::<Result<Vec<_>, Error>>()?;
+            #[cfg(not(feature = "parallel"))]
+            let built = pair.iter().map(commit).collect::<Result<Vec<_>, Error>>()?;
+            for (commitment, d) in built {
+                commitments.push(commitment);
+                domain = Some(d);
+            }
         }
         Ok(Self {
             layout,
