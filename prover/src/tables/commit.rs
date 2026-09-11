@@ -59,7 +59,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
+use crate::constraints::templates::emit_is_bit;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -79,7 +79,7 @@ pub mod cols {
     pub const TIMESTAMP_1: usize = 1;
 
     // Commit index (BaseField: 1 col)
-    /// index: global byte index of the committed value
+    /// index: global byte index the committed range starts at
     pub const INDEX: usize = 2;
 
     // Buffer address (DWordWL: 2 cols)
@@ -88,49 +88,21 @@ pub mod cols {
     /// address[1]: high 32 bits
     pub const ADDRESS_1: usize = 4;
 
-    // address + 1 (DWordHL: 4 halfword cols)
-    /// address_incr[0]: halfword 0 (bits 0-15)
-    pub const ADDRESS_INCR_0: usize = 5;
-    /// address_incr[1]: halfword 1 (bits 16-31)
-    pub const ADDRESS_INCR_1: usize = 6;
-    /// address_incr[2]: halfword 2 (bits 32-47)
-    pub const ADDRESS_INCR_2: usize = 7;
-    /// address_incr[3]: halfword 3 (bits 48-63)
-    pub const ADDRESS_INCR_3: usize = 8;
-
-    // Remaining byte count (DWordWL: 2 cols)
+    // Byte count (DWordWL: 2 cols)
     /// count[0]: low 32 bits
-    pub const COUNT_0: usize = 9;
+    pub const COUNT_0: usize = 5;
     /// count[1]: high 32 bits
-    pub const COUNT_1: usize = 10;
-
-    // count - 1 (DWordHL: 4 halfword cols)
-    // When count > 0: count_decr = count - 1
-    // When count = 0: count_decr = 0xFFFF_FFFF_FFFF_FFFF (all halfwords = 0xFFFF)
-    /// count_decr[0]: halfword 0 (bits 0-15)
-    pub const COUNT_DECR_0: usize = 11;
-    /// count_decr[1]: halfword 1 (bits 16-31)
-    pub const COUNT_DECR_1: usize = 12;
-    /// count_decr[2]: halfword 2 (bits 32-47)
-    pub const COUNT_DECR_2: usize = 13;
-    /// count_decr[3]: halfword 3 (bits 48-63)
-    pub const COUNT_DECR_3: usize = 14;
-
-    // Control bits
-    /// first: 1 if this is the first row of a commit sequence
-    pub const FIRST: usize = 15;
-    /// end: 1 if this is the last row (count was 0)
-    pub const END: usize = 16;
-
-    // Byte value being committed
-    /// value: the byte [0, 256) being committed at this row
-    pub const VALUE: usize = 17;
+    pub const COUNT_1: usize = 6;
 
     /// mu: multiplicity bit (1 for real rows, 0 for padding)
-    pub const MU: usize = 18;
+    ///
+    /// There is no `first` column any more. This table is one row per ECALL, so a
+    /// real row is always the first row of its commit, and `first` was identically
+    /// `mu`; every multiplicity that used to read `first` reads `mu` instead.
+    pub const MU: usize = 7;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 19;
+    pub const NUM_COLUMNS: usize = 8;
 }
 
 // =========================================================================
@@ -145,18 +117,12 @@ pub mod cols {
 pub struct CommitOperation {
     /// Timestamp of the originating ECALL
     pub timestamp: u64,
-    /// Global commit index for this byte
+    /// Global commit index the committed range starts at
     pub index: u64,
-    /// Current buffer address for this byte
+    /// Buffer address the committed range starts at
     pub address: u64,
-    /// Remaining byte count (including this byte, 0 on end row)
+    /// Number of bytes this ECALL commits
     pub count: u64,
-    /// Whether this is the first row of a commit sequence
-    pub first: bool,
-    /// Whether this is the end row (count was 0, no byte committed)
-    pub end: bool,
-    /// The byte value being committed (0 on end row)
-    pub value: u8,
 }
 
 // =========================================================================
@@ -181,53 +147,16 @@ pub fn generate_commit_trace(
     let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        // Timestamp (DWordWL)
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-
-        // Index (BaseField)
         table.set_u64(row_idx, cols::INDEX, op.index);
-
-        // Address (DWordWL)
         table.set_dword_wl(row_idx, cols::ADDRESS_0, op.address);
-
-        // address_incr = address + 1 (DWordHL: 4 halfwords)
-        let address_incr = op.address.wrapping_add(1);
-        table.set_dword_hl(row_idx, cols::ADDRESS_INCR_0, address_incr);
-
-        // Count (DWordWL)
         table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
-
-        // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
-        let count_decr = if op.count == 0 {
-            u64::MAX
-        } else {
-            op.count - 1
-        };
-        table.set_dword_hl(row_idx, cols::COUNT_DECR_0, count_decr);
-
-        // Control bits
-        table.set_bool(row_idx, cols::FIRST, op.first);
-        table.set_bool(row_idx, cols::END, op.end);
-
-        // Value
-        table.set_byte(row_idx, cols::VALUE, op.value);
-
-        // mu = 1 for all real rows (first, middle, and end rows)
         table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    // Padding rows: spec requires count=1 and address_incr=[1,0,0,0] so
-    // the unconditional ADD/SUB templates have valid carry values.
-    // count=1 → count_decr=0 (all halfwords zero), address=0 → address_incr=1.
-    for row_idx in n..num_rows {
-        // count = 1 (low word)
-        table.set_fe(row_idx, cols::COUNT_0, FE::one());
-        // address_incr halfword 0 = 1 (address=0, so address+1 = 1)
-        table.set_fe(row_idx, cols::ADDRESS_INCR_0, FE::one());
-        // All other fields remain zero: timestamp=0, address=0, count_1=0,
-        // count_decr=[0,0,0,0], first=0, end=0, value=0, mu=0,
-        // address_incr_1..3=0
-    }
+    // Padding rows are all-zero. The ADD/SUB templates that used to force a
+    // non-zero padding row went with `address_incr` and `count_decr`; the one
+    // surviving constraint is `IS_BIT(mu)`, which zero satisfies.
 
     trace
 }
@@ -251,7 +180,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
         BusInteraction::receiver(
             BusId::Ecall,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
@@ -269,7 +198,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         //    ecall number and the register-254 update; the copying is handed over.
         BusInteraction::sender(
             BusId::CommitDefer,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
@@ -296,110 +225,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // 4-7. IsHalfword for count_decr (×4, mult = mu)
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::COUNT_DECR_0,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::COUNT_DECR_1,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::COUNT_DECR_2,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::COUNT_DECR_3,
-                packing: Packing::Direct,
-            }],
-        ),
-        // 8-11. IsHalfword for address_incr (×4, mult = mu)
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::ADDRESS_INCR_0,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::ADDRESS_INCR_1,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::ADDRESS_INCR_2,
-                packing: Packing::Direct,
-            }],
-        ),
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::ADDRESS_INCR_3,
-                packing: Packing::Direct,
-            }],
-        ),
-        // 12. ZERO bus for end detection (mult = mu)
-        // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)
-        // Output: end (1 when all count_decr halfwords are 0xFFFF, i.e., count was 0)
-        BusInteraction::sender(
-            BusId::Zero,
-            Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::linear(vec![
-                    LinearTerm::Constant(4 * 65535),
-                    LinearTerm::Column {
-                        coefficient: -1,
-                        column: cols::COUNT_DECR_0,
-                    },
-                    LinearTerm::Column {
-                        coefficient: -1,
-                        column: cols::COUNT_DECR_1,
-                    },
-                    LinearTerm::Column {
-                        coefficient: -1,
-                        column: cols::COUNT_DECR_2,
-                    },
-                    LinearTerm::Column {
-                        coefficient: -1,
-                        column: cols::COUNT_DECR_3,
-                    },
-                ]),
-                BusValue::Packed {
-                    start_column: cols::END,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
         // 13. MEMW read+write x10 (fd=1 → count) at ts (mult = first)
         // CO24 format: [old[8], is_register, base_addr[2], value[8], ts[2], w2, w4, w8]
         // old = [1,0,...,0] (asserts x10=1=fd), value = [count_0, count_1, 0,...,0] (writes count)
         BusInteraction::sender(
             BusId::Memw,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 // old[0..7] = [1, 0, 0, 0, 0, 0, 0, 0]
                 BusValue::constant(1),
@@ -448,7 +279,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // 14. MEMW read x11 (buf_addr) at ts (mult = first)
         BusInteraction::sender(
             BusId::Memw,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 // old[0..7] = [ADDRESS_0, ADDRESS_1, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
@@ -503,7 +334,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // 15. MEMW read x12 (count) at ts (mult = first)
         BusInteraction::sender(
             BusId::Memw,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 // old[0..7] = [COUNT_0, COUNT_1, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
@@ -559,7 +390,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // Single-word synthetic register per spec: width=1, base address 508.
         BusInteraction::sender(
             BusId::Memw,
-            Multiplicity::Column(cols::FIRST),
+            Multiplicity::Column(cols::MU),
             vec![
                 // old[0..7] = [INDEX, 0, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
@@ -633,36 +464,11 @@ pub struct CommitConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        // idx 0-2: IS_BIT for first, end, mu
-        emit_is_bit(b, 0, cols::FIRST, None);
-        emit_is_bit(b, 1, cols::END, None);
-        emit_is_bit(b, 2, cols::MU, None);
-
-        // idx 3: (first + end) * (1 - mu)
-        let one = b.one();
-        let first = b.main(0, cols::FIRST);
-        let end = b.main(0, cols::END);
-        let mu = b.main(0, cols::MU);
-        b.emit_base(3, (first + end) * (one - mu));
-
-        // idx 4,5: ADD template for address + 1 = address_incr (unconditional)
-        emit_add_pair(
-            b,
-            4,
-            &[],
-            &AddOperand::dword(cols::ADDRESS_0),
-            &AddOperand::constant(1),
-            &AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
-        );
-
-        // idx 6,7: SUB via ADD: count_decr + 1 = count (unconditional)
-        emit_add_pair(
-            b,
-            6,
-            &[],
-            &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
-            &AddOperand::constant(1),
-            &AddOperand::dword(cols::COUNT_0),
-        );
+        // One constraint is all that is left. This table is one row per ECALL: it
+        // accepts the syscall number, reads the operands, advances x254 and hands the
+        // byte loop to MEMMOVE. Everything that modelled a per-byte sequence went with
+        // the loop — `first` (identically `mu` now), `end` and its `Zero` detection,
+        // and the `address_incr`/`count_decr` ADD pairs with their range checks.
+        emit_is_bit(b, 0, cols::MU, None);
     }
 }

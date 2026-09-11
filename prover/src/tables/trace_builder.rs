@@ -2491,63 +2491,7 @@ fn expand_commit_operations_for_ecall(
         index: start_index,
         address: ecall.commit_buf_addr,
         count,
-        first: true,
-        end: count == 0,
-        value: 0,
     }]
-}
-
-/// Collect bitwise lookups from COMMIT operations.
-///
-/// The COMMIT table sends:
-/// - IsHalfword for count_decr components (4 per real row, mult = mu)
-/// - IsHalfword for address_incr halfwords (4 per real row, mult = mu)
-/// - Zero for end detection (1 per real row, mult = mu)
-///
-/// Note: AreBytes for value is intentionally omitted per spec.
-fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
-    let mut lookups = Vec::new();
-
-    for op in commit_ops {
-        // IsHalfword for count_decr components (4 halfwords, mult = mu)
-        let count_decr = if op.count == 0 {
-            u64::MAX
-        } else {
-            op.count - 1
-        };
-        for shift in [0, 16, 32, 48] {
-            let half = ((count_decr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
-        }
-
-        // IsHalfword for address_incr halfwords (4 halfwords, mult = mu)
-        // All real rows send these, matching the spec's unconditional mult = mu.
-        let address_incr = op.address.wrapping_add(1);
-        for shift in [0, 16, 32, 48] {
-            let half = ((address_incr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
-        }
-
-        // Zero bus for end detection (mult = mu)
-        // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)
-        // When count_decr = 0xFFFF_FFFF_FFFF_FFFF (count=0), sum = 0 → end=1
-        let cd_0 = (count_decr & 0xFFFF) as u32;
-        let cd_1 = ((count_decr >> 16) & 0xFFFF) as u32;
-        let cd_2 = ((count_decr >> 32) & 0xFFFF) as u32;
-        let cd_3 = ((count_decr >> 48) & 0xFFFF) as u32;
-        let zero_input = (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3);
-        lookups.push(BitwiseOperation::zero(zero_input));
-    }
-
-    lookups
 }
 
 /// BITWISE lookups sent by the MEMMOVE table: twelve `IS_HALF` for the three
@@ -3519,7 +3463,6 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memmove(&memmove_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),

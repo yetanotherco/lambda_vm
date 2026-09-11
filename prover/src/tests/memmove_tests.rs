@@ -28,7 +28,7 @@ fn set_row(count: u64, first: bool, end: bool, src: u64, dst: u64) -> MemmoveOpe
 
 /// A row whose width is chosen independently of `count`, so a test can express
 /// `tail != (count < 8)`. `row()` and `set_row()` both derive width from count, which
-/// makes `(1 - tail) * lt8` identically zero and constraint 14 impossible to state.
+/// makes `(1 - tail) * lt8` identically zero and constraint 13 impossible to state.
 fn row_of_width(
     functionality: crate::tables::memmove::Functionality,
     count: u64,
@@ -212,7 +212,7 @@ fn memmove_constraints_count_and_indices() {
     use crate::tables::memmove::MemmoveConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = MemmoveConstraints.meta();
-    assert_eq!(meta.len(), 34);
+    assert_eq!(meta.len(), 32);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -406,11 +406,11 @@ fn memmove_constraints_pin_the_memset_gap() {
     ]);
     assert!(
         validate_busless(&air, &copy_aliased),
-        "constraints 32-33 must not fire on Copy rows, even with dst == src"
+        "constraints 30-31 must not fire on Copy rows, even with dst == src"
     );
 }
 
-/// Constraint 14, `(1 - tail) * lt8 = 0`, in both directions.
+/// Constraint 13, `(1 - tail) * lt8 = 0`, in both directions.
 ///
 /// This is the constraint that replaced the old DMA table's hard pin of
 /// `tail = (count < 8)`. Erik asked for exactly this relaxation so the prover may
@@ -487,12 +487,12 @@ fn memmove_constraints_gate_the_commit_functionality() {
         "an honest commit chain must be accepted"
     );
 
-    // Constraint 12: a row cannot claim two functionalities. Setting `is_set` on a
+    // Constraint 11: a row cannot claim two functionalities. Setting `is_set` on a
     // commit row would buy the inverted timestamp order on a chain the COMMIT chip
     // authorised.
     //
     // This case has to be built on a chain whose addresses already satisfy the memset
-    // gap pin (constraints 32-33), or those reject it first and the assertion passes
+    // gap pin (constraints 30-31), or those reject it first and the assertion passes
     // for the wrong reason — verified by mutation: neutering 12 alone left an earlier
     // version of this test green.
     let gap_clean = generate_memmove_trace(&[
@@ -507,10 +507,10 @@ fn memmove_constraints_gate_the_commit_functionality() {
     one_hot.main_table.set_fe(0, cols::IS_SET, FE::one());
     assert!(
         !validate_busless(&air, &one_hot),
-        "is_set and is_commit must not both be set (constraint 12)"
+        "is_set and is_commit must not both be set (constraint 11)"
     );
 
-    // Constraint 18: widen a one-byte commit row. `mu_com_wide` is what stops it
+    // Constraint 16: widen a one-byte commit row. `mu_com_wide` is what stops it
     // broadcasting seven spurious `(index, 0)` pairs onto the COMMIT bus, which the
     // verifier rebuilds from `public_output` — so a forgery here corrupts the output
     // fingerprint rather than merely wasting a row.
@@ -518,10 +518,10 @@ fn memmove_constraints_gate_the_commit_functionality() {
     trace.main_table.set_fe(1, cols::MU_COM_WIDE, FE::one());
     assert!(
         !validate_busless(&air, &trace),
-        "a one-byte commit row must not claim the wide lanes (constraint 18)"
+        "a one-byte commit row must not claim the wide lanes (constraint 16)"
     );
 
-    // Constraint 13: no selector on a padding row. The chain above is six rows, so
+    // Constraint 12: no selector on a padding row. The chain above is six rows, so
     // the trace pads to eight and row 7 is padding with mu = 0.
     let mut trace = honest.clone();
     assert_eq!(
@@ -532,17 +532,14 @@ fn memmove_constraints_gate_the_commit_functionality() {
     trace.main_table.set_fe(7, cols::IS_COMMIT, FE::one());
     assert!(
         !validate_busless(&air, &trace),
-        "a padding row must not carry a functionality selector (constraint 13)"
+        "a padding row must not carry a functionality selector (constraint 12)"
     );
 
-    // And the mirror of the memset gate: `mu_ram` is off for commit, so the RAM write
-    // is suppressed. Flipping it on is a commit row that also writes to RAM.
-    let mut trace = honest.clone();
-    trace.main_table.set_fe(0, cols::MU_RAM, FE::one());
-    assert!(
-        !validate_busless(&air, &trace),
-        "a commit row must not also claim the RAM write (constraint 16)"
-    );
+    // There is deliberately no "commit row also claims the RAM write" case here any
+    // more. That forgery needed `mu_ram` to be a witness column; the RAM write now
+    // rides the linear multiplicity `mu - end - mu_com` directly, so a commit row
+    // (`mu_com = mu - end`) drives it to zero by construction and there is nothing
+    // left to forge.
 
     // Control: the same forgeries on a Copy chain are a different matter — this only
     // establishes that the honest Copy baseline is clean, so the failures above are

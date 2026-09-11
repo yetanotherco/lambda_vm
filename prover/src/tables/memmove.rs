@@ -122,16 +122,18 @@ pub mod cols {
     pub const LT8: usize = 34;
     /// `first * (1 - is_commit)` — the ecall receive and the register reads.
     pub const F_NCOMMIT: usize = 35;
-    /// `(mu - end) * (1 - is_commit)` — the RAM write.
-    pub const MU_RAM: usize = 36;
     /// `(mu - end) * is_commit` — the COMMIT-domain write.
-    pub const MU_COM: usize = 37;
+    pub const MU_COM: usize = 36;
     /// `mu_com * (1 - tail)` — lanes 1..7 of the COMMIT-domain write. Without it a
     /// one-byte commit row would send seven spurious `(index, 0)` pairs and corrupt
     /// the public-output fingerprint.
-    pub const MU_COM_WIDE: usize = 38;
+    pub const MU_COM_WIDE: usize = 37;
 
-    pub const NUM_COLUMNS: usize = 39;
+    /// The RAM write rides `mu - end - mu_com`, which is `(mu - end) * (1 - is_commit)`
+    /// expanded. It needs no column of its own: `Multiplicity::Linear` takes the
+    /// expression directly, and the product form was only ever a column because the
+    /// framework requires multiplicities to be linear.
+    pub const NUM_COLUMNS: usize = 38;
 }
 
 /// Which functionality a row is running.
@@ -215,7 +217,6 @@ pub fn generate_memmove_trace(
         table.set_bool(row_idx, cols::IS_COMMIT, is_commit);
         table.set_bool(row_idx, cols::LT8, op.count < 8);
         table.set_bool(row_idx, cols::F_NCOMMIT, op.first && !is_commit);
-        table.set_bool(row_idx, cols::MU_RAM, !op.end && !is_commit);
         table.set_bool(row_idx, cols::MU_COM, !op.end && is_commit);
         table.set_bool(
             row_idx,
@@ -584,28 +585,45 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             tuple
         }),
         // 24. Write the destination at `T + 2 - is_set`, RAM domain only.
-        BusInteraction::sender(BusId::Memw, Multiplicity::Column(cols::MU_RAM), {
-            let mut tuple = Vec::with_capacity(16);
-            tuple.push(BusValue::constant(0)); // is_register
-            tuple.push(BusValue::Packed {
-                start_column: cols::DST_0,
-                packing: Packing::Direct,
-            });
-            tuple.push(BusValue::Packed {
-                start_column: cols::DST_1,
-                packing: Packing::Direct,
-            });
-            tuple.extend(value_columns());
-            tuple.push(timestamp_with_order(2, -1));
-            tuple.push(BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            });
-            tuple.push(BusValue::constant(0)); // w2
-            tuple.push(BusValue::constant(0)); // w4
-            tuple.push(w8());
-            tuple
-        }),
+        BusInteraction::sender(
+            BusId::Memw,
+            Multiplicity::Linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MU,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::END,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::MU_COM,
+                },
+            ]),
+            {
+                let mut tuple = Vec::with_capacity(16);
+                tuple.push(BusValue::constant(0)); // is_register
+                tuple.push(BusValue::Packed {
+                    start_column: cols::DST_0,
+                    packing: Packing::Direct,
+                });
+                tuple.push(BusValue::Packed {
+                    start_column: cols::DST_1,
+                    packing: Packing::Direct,
+                });
+                tuple.extend(value_columns());
+                tuple.push(timestamp_with_order(2, -1));
+                tuple.push(BusValue::Packed {
+                    start_column: cols::TIMESTAMP_1,
+                    packing: Packing::Direct,
+                });
+                tuple.push(BusValue::constant(0)); // w2
+                tuple.push(BusValue::constant(0)); // w4
+                tuple.push(w8());
+                tuple
+            },
+        ),
     ];
 
     // 25-32. Write the destination in the COMMIT domain, one `(index, value)` pair per
@@ -670,9 +688,8 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         emit_is_bit(b, 5, cols::IS_COMMIT, None);
         emit_is_bit(b, 6, cols::LT8, None);
         emit_is_bit(b, 7, cols::F_NCOMMIT, None);
-        emit_is_bit(b, 8, cols::MU_RAM, None);
-        emit_is_bit(b, 9, cols::MU_COM, None);
-        emit_is_bit(b, 10, cols::MU_COM_WIDE, None);
+        emit_is_bit(b, 8, cols::MU_COM, None);
+        emit_is_bit(b, 9, cols::MU_COM_WIDE, None);
 
         let one = b.one();
         let first = b.main(0, cols::FIRST);
@@ -685,35 +702,30 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         // An active row is implied by first or end.
         b.emit_base(
-            11,
+            10,
             (first.clone() + end.clone()) * (one.clone() - mu.clone()),
         );
         // The functionality is one-hot and only set on active rows.
-        b.emit_base(12, is_set.clone() * is_commit.clone());
+        b.emit_base(11, is_set.clone() * is_commit.clone());
         b.emit_base(
-            13,
+            12,
             (is_set.clone() + is_commit.clone()) * (one.clone() - mu.clone()),
         );
         // An eight-byte row is illegal when fewer than eight bytes remain.
-        b.emit_base(14, (one.clone() - tail.clone()) * lt8);
+        b.emit_base(13, (one.clone() - tail.clone()) * lt8);
 
-        // The three gate columns.
+        // The two remaining gate columns.
         b.emit_base(
-            15,
+            14,
             b.main(0, cols::F_NCOMMIT) - first.clone() * (one.clone() - is_commit.clone()),
         );
         b.emit_base(
-            16,
-            b.main(0, cols::MU_RAM)
-                - (mu.clone() - end.clone()) * (one.clone() - is_commit.clone()),
-        );
-        b.emit_base(
-            17,
+            15,
             b.main(0, cols::MU_COM) - (mu.clone() - end.clone()) * is_commit,
         );
         let mu_com = b.main(0, cols::MU_COM);
         b.emit_base(
-            18,
+            16,
             b.main(0, cols::MU_COM_WIDE) - mu_com * (one.clone() - tail.clone()),
         );
 
@@ -730,7 +742,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         emit_add_pair_no_overflow(
             b,
-            19,
+            17,
             cols::MU,
             cols::END,
             &AddOperand::dword(cols::SRC_0),
@@ -739,7 +751,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         );
         emit_add_pair_no_overflow(
             b,
-            21,
+            19,
             cols::MU,
             cols::END,
             &AddOperand::dword(cols::DST_0),
@@ -748,7 +760,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         );
         emit_add_pair(
             b,
-            23,
+            21,
             &[],
             &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
             &step,
@@ -757,7 +769,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         // Unused lanes are zero on one-byte rows.
         for (i, &column) in cols::VALUE.iter().enumerate().skip(1) {
-            b.emit_base(25 + i - 1, tail.clone() * b.main(0, column));
+            b.emit_base(23 + i - 1, tail.clone() * b.main(0, column));
         }
 
         // memset's operand contract: `dst = src + 8`, limb-wise.
@@ -803,11 +815,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // boundary, so the honest trace never has to rely on that argument.
         let gap = b.const_base(DMA_MEMSET_GAP);
         b.emit_base(
-            32,
+            30,
             is_set.clone() * (b.main(0, cols::DST_0) - b.main(0, cols::SRC_0) - gap),
         );
         b.emit_base(
-            33,
+            31,
             is_set.clone() * (b.main(0, cols::DST_1) - b.main(0, cols::SRC_1)),
         );
     }
@@ -874,15 +886,15 @@ mod tests {
         let table = &trace.main_table;
         let get = |row: usize, column: usize| *table.get(row, column);
 
-        // Copy: RAM write on, COMMIT write off.
-        assert_eq!(get(0, cols::MU_RAM), FE::one());
+        // The RAM write rides `mu - end - mu_com` and has no column, so `mu_com` is
+        // what says which domain a row writes to.
+        // Copy: COMMIT write off, so the RAM write is on.
         assert_eq!(get(0, cols::MU_COM), FE::zero());
         // Commit: the mirror image, and the wide lanes are open on an eight-byte row.
-        assert_eq!(get(1, cols::MU_RAM), FE::zero());
         assert_eq!(get(1, cols::MU_COM), FE::one());
         assert_eq!(get(1, cols::MU_COM_WIDE), FE::one());
         // Set is a RAM-to-RAM copy like memcpy; only the order differs.
-        assert_eq!(get(2, cols::MU_RAM), FE::one());
+        assert_eq!(get(2, cols::MU_COM), FE::zero());
         assert_eq!(get(2, cols::IS_SET), FE::one());
     }
 

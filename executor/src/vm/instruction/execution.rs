@@ -126,14 +126,10 @@ pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u6
 /// [`HINT_SYSCALL_NUMBER`] already holds that, so the copy group is `-30` and `-32`
 /// with the hint wedged between. Must match `syscalls/src/syscalls.rs`.
 ///
-/// The adjacency has a consequence in the AIR. MEMMOVE decodes the functionality by
-/// receiving the syscall number as a linear function of its `is_set` bit, so the
-/// received lo32 is `MEMCPY_LO32 - 2 * is_set`. HINT's number sits exactly halfway
-/// between the two, which means `is_set = 2^-1` in the field reproduces HINT's ecall
-/// tuple bit for bit. The only thing separating them is the `IS_BIT` constraint on
-/// `is_set`. That is sufficient, but it is a single degree-2 constraint standing
-/// between two live syscalls -- keep the two copy numbers an even distance apart, or
-/// keep nothing received in between, if these are ever renumbered again.
+/// MEMMOVE decodes the functionality by receiving the syscall number as a line in
+/// `is_set`, so any number on that line is reachable by some field element and no
+/// particular neighbour is special. `IS_BIT(is_set)` is what carries the decoding
+/// argument, and it does so whatever the numbering.
 pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
 
 /// The one operand shape a DMA memset ecall may have: the destination trails the
