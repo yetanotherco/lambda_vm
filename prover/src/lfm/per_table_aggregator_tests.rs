@@ -1259,6 +1259,12 @@ pub(super) fn global_parent_program(
 }
 
 /// Emit a block-artifact ROOT program, for sizing or for proving.
+///
+/// ⛔ `publishes` IS A PARAMETER, not `RootPublishSet::default()` read here. The
+/// caller that emits the artifact is the caller that must assert its width, and
+/// a default read in one place against an expectation spelled in the other is
+/// two copies of the artifact's shape — free to drift the day the default moves.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn root_program(
     interior: &[RealChild],
     interior_layouts: &[super::per_table_aggregator::SchemaLayout],
@@ -1267,6 +1273,7 @@ pub(super) fn root_program(
     global: &RealChild,
     global_child_layout: &super::block_root::GlobalLayout,
     fold_shape: &super::block_root::FoldShape,
+    publishes: super::block_root::RootPublishSet,
 ) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let shapes: Vec<_> = interior.iter().map(child_shape).collect();
@@ -1281,7 +1288,7 @@ pub(super) fn root_program(
             global: &g,
             global_child_layout,
             fold_shape,
-            publishes: super::block_root::RootPublishSet::default(),
+            publishes,
         },
     );
     compile(b.finish())
@@ -3008,6 +3015,38 @@ fn the_level_groups_tile_every_child() {
 ///   lfm::per_table_aggregator_tests::the_production_tree_composes_to_a_root -- \
 ///   --ignored --exact --nocapture
 /// ```
+///
+/// # ★★★ The block-artifact ROOT
+///
+/// `LFM_TREE_PROVE_ROOT=1` proves the root over a tree that already exists: it
+/// LOADS every interior level, exactly as `LFM_TREE_SIZE_ROOT=1` does, and the
+/// only thing it proves is the root. It needs `A_CACHE_DIR`, refuses
+/// `LFM_TREE_LEVELS` (which would be set and silently ignored), and refuses
+/// `LFM_TREE_SIZE_ROOT` (a different experiment: that one emits BOTH options and
+/// proves neither).
+///
+/// `LFM_TREE_ROOT_OPTION=A|B` is a NAMED INPUT with no default — `A` takes the
+/// top interior level's nodes, `B` takes the single node above them, and both
+/// take the global child. The sizing arm decides it. Under `A` the run stops one
+/// level short, because that level is the one the root replaces, so
+/// `node-<top>-0.rkyv` is neither proved nor loaded.
+///
+/// `LFM_TREE_ROOT_MODE=prove|load`, in the parent's style: unset it proves and
+/// saves wherever a cache directory exists, and `CacheMode::Prove` still refuses
+/// to overwrite `block-root.rkyv`.
+///
+/// ⚠ The global child must be NAMED too, or its stages pick their own modes: a
+/// root run over a `k = 2` cache wants `LFM_TREE_GLOBAL_K=2` with the slices
+/// loading (the level-0 default) and `LFM_TREE_PARENT_MODE=load`, or the parent
+/// stage refuses to overwrite the `global-parent.rkyv` it is meant to consume.
+///
+/// ```text
+/// … A_CACHE_DIR=/root/a_tree LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=B \
+/// LFM_TREE_GLOBAL_K=2 LFM_TREE_PARENT_MODE=load \
+/// cargo test --release -p lambda-vm-prover --features cuda --lib \
+///   lfm::per_table_aggregator_tests::the_production_tree_composes_to_a_root -- \
+///   --ignored --exact --nocapture
+/// ```
 #[test]
 #[ignore = "box tier, production scale: composes the whole interior tree"]
 fn the_production_tree_composes_to_a_root() {
@@ -3067,7 +3106,60 @@ fn the_production_tree_composes_to_a_root() {
     // ⇒ Emit both and read the panels. `census_and_panel` is a pure function of a
     // compiled program, so this costs a cache load and seconds of emission.
     let size_root = std::env::var("LFM_TREE_SIZE_ROOT").is_ok();
-    let (lo, hi_req): (usize, Option<usize>) = if size_root {
+    // ★★★ THE BLOCK-ARTIFACT ROOT — the last proof of the campaign, and the one
+    // stage that answers *what does this artifact claim about block N?*
+    //
+    // ⛔ IT IS NAMED, NOT INFERRED FROM `hi == top`. Every launch line that has
+    // ever built this tree ends with the interior closed, and making those runs
+    // start emitting a root would change what an unset knob does — and would do
+    // it at the END of an hour of proving, where a wrong option is discovered
+    // after the work it invalidates.
+    // ⇒ `LFM_TREE_PROVE_ROOT=1` names the experiment, and like `LFM_TREE_SIZE_
+    // ROOT` it LOADS every interior level: the root is proved from a tree that
+    // already exists, and proving one here would be a different and much longer
+    // experiment than the one asked for.
+    let prove_root = std::env::var("LFM_TREE_PROVE_ROOT").is_ok();
+    assert!(
+        !(size_root && prove_root),
+        "LFM_TREE_SIZE_ROOT and LFM_TREE_PROVE_ROOT are two different \
+         experiments — one emits BOTH root options and proves neither, the other \
+         proves the ONE option it was given. Name one"
+    );
+    assert!(
+        !prove_root || std::env::var("LFM_TREE_LEVELS").is_err(),
+        "LFM_TREE_PROVE_ROOT loads every interior level, so LFM_TREE_LEVELS has \
+         no effect here. Unset it: a knob that is set and silently ignored is the \
+         failure A_BUNDLE_MODE's own refusal exists for — the caller believes \
+         they named an experiment and did not"
+    );
+    // ⛔ THE OPTION IS AN INPUT AND CARRIES NO DEFAULT. The sizing arm decides
+    // it; it changes the root's child count and therefore its sub-proof count,
+    // and a default would silently become the answer to a question a measurement
+    // was supposed to settle. `RootOption::parse` refuses everything but `A` and
+    // `B`, the empty string included.
+    let root_option: Option<super::block_root::RootOption> = match (
+        prove_root,
+        std::env::var("LFM_TREE_ROOT_OPTION").ok().as_deref(),
+    ) {
+        (false, None) => None,
+        (false, Some(v)) => panic!(
+            "LFM_TREE_ROOT_OPTION=`{v}` is set but LFM_TREE_PROVE_ROOT is not, so \
+             this run emits no root and the option has no effect. Set \
+             LFM_TREE_PROVE_ROOT=1 to prove one, or unset the option"
+        ),
+        (true, None) => panic!(
+            "LFM_TREE_PROVE_ROOT is set and LFM_TREE_ROOT_OPTION is NOT. The root \
+             takes either the top interior level's nodes (`A`) or the single node \
+             above them (`B`) plus the global child, and the two are different \
+             programs with different sub-proof counts. The sizing arm decides \
+             which; this driver must not guess, and must not carry a default that \
+             silently becomes the answer"
+        ),
+        (true, Some(v)) => Some(super::block_root::RootOption::parse(v).unwrap_or_else(|e| {
+            panic!("LFM_TREE_ROOT_OPTION: {e}")
+        })),
+    };
+    let (lo, hi_req): (usize, Option<usize>) = if size_root || prove_root {
         // `lo` above every level means no stage proves.
         (usize::MAX, None)
     } else {
@@ -3089,6 +3181,12 @@ fn the_production_tree_composes_to_a_root() {
     };
     let cache_dir = std::env::var("A_CACHE_DIR").ok();
     assert!(
+        !prove_root || cache_dir.is_some(),
+        "LFM_TREE_PROVE_ROOT needs A_CACHE_DIR: it proves the root over a tree, a \
+         global child and a base that have already been proved, and there is \
+         nowhere to load them from"
+    );
+    assert!(
         !size_root || cache_dir.is_some(),
         "LFM_TREE_SIZE_ROOT needs A_CACHE_DIR: it sizes the root from a tree that \
          has already been proved, and proving one here would be a different and \
@@ -3100,6 +3198,21 @@ fn the_production_tree_composes_to_a_root() {
          A_CACHE_DIR is unset. Proving them instead would silently make this a \
          different (and much longer) experiment"
     );
+    // ⛔ THE ROOT NEEDS ITS OWN MODE, for the parent's reason: the launch line
+    // that produces a root LOADS everything under it and must PROVE the root, so
+    // a shared mode would send it to load a `block-root.rkyv` that has never
+    // existed and the refusal would name the wrong stage. Unset, it proves and
+    // saves wherever a cache directory exists — the only experiment a run with no
+    // root on disk can be running — and `CacheMode::Prove` still REFUSES to
+    // overwrite, so a second run over a populated cache is a refusal rather than
+    // a silent re-prove or a silent load.
+    let root_mode = match std::env::var("LFM_TREE_ROOT_MODE").ok().as_deref() {
+        None if cache_dir.is_some() => CacheMode::Prove,
+        None => CacheMode::Off,
+        Some("prove") => CacheMode::Prove,
+        Some("load") => CacheMode::Load,
+        Some(other) => panic!("LFM_TREE_ROOT_MODE must be `prove` or `load`, got `{other}`"),
+    };
     // Levels below `lo` load; levels in the range prove, and save when a cache
     // directory exists. `CacheMode::Prove` refuses an existing file, so a re-run
     // over a populated directory is a refusal rather than an overwrite.
@@ -3175,9 +3288,19 @@ fn the_production_tree_composes_to_a_root() {
     let top = shape.len();
     let hi = hi_req.unwrap_or(top).min(top);
     assert!(
-        lo <= hi || size_root,
+        lo <= hi || size_root || prove_root,
         "LFM_TREE_LEVELS {lo}-{hi} is empty; the tree has {top} node levels"
     );
+    // ★ OPTION A STOPS ONE LEVEL SHORT, because the level it would walk is the
+    // level the root REPLACES. So a run under A never loads, harvests or
+    // verifies `node-{top}-0.rkyv` — it is not a child of anything — and after
+    // the loop `children` IS the root's interior children, with no second
+    // capture and no clobbering. Under B the loop closes the tree as always and
+    // `children` is the single node the root sits above.
+    let hi = match root_option {
+        Some(o) if o.replaces_top() => top.saturating_sub(1),
+        _ => hi,
+    };
     println!(
         "   ★ SHAPE from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
         bundle.num_epochs(),
@@ -3933,6 +4056,7 @@ fn the_production_tree_composes_to_a_root() {
                 &global_child,
                 &g_layout,
                 &shape,
+                super::block_root::RootPublishSet::AssertOnly,
             );
             let sub_proofs: usize =
                 kids.iter().map(|c| c.tables.len()).sum::<usize>() + global_child.tables.len();
@@ -3953,7 +4077,6 @@ fn the_production_tree_composes_to_a_root() {
         );
     }
 
-    let (run_peak, run_at) = whole_run.stop();
     println!(
         "\n★★★ TREE COMPOSED — {} proof(s) at level {hi}",
         children.len()
@@ -3969,6 +4092,191 @@ fn the_production_tree_composes_to_a_root() {
     for (l, a, cells, instrs, peak, at, wall) in &report {
         println!("{l:>5} {a:>5} {cells:>12} {instrs:>13} {peak:>9.3} {at:>10.1} {wall:>9.1}");
     }
+
+    // ---- ★★★ THE BLOCK-ARTIFACT ROOT.
+    //
+    // The one program whose output IS the block artifact: it verifies the top
+    // interior children and the global child, binds them into one execution,
+    // performs the L2G compare a split tree defers to their common ancestor, and
+    // publishes the block-level claim and nothing else.
+    if let Some(option) = root_option {
+        let g_layout = super::block_root::GlobalLayout {
+            num_epochs: g.num_l2g,
+            lanes_per_root: super::proof_arena::lanes_per_root(),
+        };
+        // ⛔ ONE OPTION DECIDES BOTH the children this run harvested and the fold
+        // shape the compare refolds with. They must agree: `emit_l2g_compare`
+        // refolds the global child's FLAT root list TREE-SHAPED, grouping exactly
+        // as the interior did, and a shape built for the other option compares a
+        // fold of the wrong depth. That failure is a `DivByZero` from the guest —
+        // an `assert_eq` failing, `addr` being the diff cell, NOT a divisor — and
+        // it lands on COMPLETENESS: honest prover, correct code, wrong answer.
+        let shape = option.fold_shape(bundle.num_epochs(), fan_in);
+        let block_range = (
+            crate::tables::local_to_global::epoch_label(0),
+            crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+        );
+        let refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+        // ⛔ `AssertOnly`, NAMED HERE AND HANDED TO BOTH the emitter and the width
+        // assert. The interior's L2G digest is tree-shaped, so its VALUE depends
+        // on fan-in and depth; publishing it would satisfy the letter of *the
+        // schema may not depend on the proving strategy* while breaking its
+        // purpose — two honest provers at different postures would emit DIFFERENT
+        // ARTIFACT BYTES for the same block. Nothing external could consume it
+        // either: the global roots live inside this same proof, so the compare
+        // binds in-machine and a published digest would have no reader.
+        let publishes = super::block_root::RootPublishSet::AssertOnly;
+        let t_emit = Instant::now();
+        let program = root_program(
+            &children,
+            &layouts,
+            &refs,
+            block_range,
+            &global_child,
+            &g_layout,
+            &shape,
+            publishes,
+        );
+        let sub_proofs: usize =
+            children.iter().map(|c| c.tables.len()).sum::<usize>() + global_child.tables.len();
+        println!(
+            "\n★★★ THE BLOCK-ARTIFACT ROOT — option {}\n   {} interior \
+             children + the global child = {sub_proofs} sub-proofs ({} from the \
+             global child alone) · emitted in {:.1}s",
+            option.describe(),
+            children.len(),
+            global_child.tables.len(),
+            t_emit.elapsed().as_secs_f64(),
+        );
+        // ★ THE PANEL BEFORE THE PROVE, as every other stage takes it. The
+        // pre-registration hangs on `LFM_HASH`'s COMMITTED HEIGHT, which is read
+        // off this panel and not inferred from a ratio.
+        census_and_panel(&program, "the BLOCK-ARTIFACT ROOT", fan_in);
+        // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST —
+        // `emit_block_root` declares every interior child's arenas before the
+        // global child's, so the arenas are a plain concatenation in that order.
+        let arenas: Vec<Vec<LfmWord>> = children
+            .iter()
+            .chain(std::iter::once(&global_child))
+            .flat_map(child_arena_words)
+            .collect();
+        let artifacts =
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        #[cfg(feature = "cuda")]
+        stark::gpu_lde::reset_all_gpu_call_counters();
+        let sampler = HostSampler::start();
+        let t_stage = Instant::now();
+        let proved = cached_stage(
+            root_mode,
+            stage_path(cache_dir.as_deref(), "block-root"),
+            "the BLOCK-ARTIFACT ROOT",
+            || {
+                lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                    .unwrap_or_else(|e| panic!("★ THE BLOCK-ARTIFACT ROOT MUST PROVE: {e:?}"))
+            },
+        );
+        let stage_secs = t_stage.elapsed().as_secs_f64();
+        let (peak, at) = sampler.stop();
+
+        // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER. `root_schema_words` takes
+        // no epoch count and no arity, so a mismatch means the artifact acquired
+        // a dependence on HOW WE PROVED IT. ⛔ Do not widen this assert: an
+        // artifact whose shape moves with the tree is not the thing this campaign
+        // set out to produce, and a tolerance here would hide exactly that.
+        let out_halves = layouts.last().expect("nonempty").out_halves;
+        let num_reg = layouts[0].num_reg;
+        let want = super::block_root::root_schema_words(num_reg, out_halves, publishes);
+        assert_eq!(
+            proved.public_words.len(),
+            want,
+            "★ THE ARTIFACT IS THE WRONG WIDTH: the root published {} words and \
+             root_schema_words({num_reg} registers, {out_halves} output halves, \
+             AssertOnly) is {want}. That signature takes NO epoch count and NO \
+             arity, so this is the artifact acquiring a dependence on the proving \
+             strategy",
+            proved.public_words.len(),
+        );
+        // ⛔ VERIFIED HERE, and by this stage rather than by a call it happens to
+        // make. A root that PROVES and does not VERIFY is the failure that reads
+        // as success, and under `LFM_TREE_ROOT_MODE=load` the proof came off the
+        // disk through `rkyv` and has never been checked in this process at all.
+        let t_verify = Instant::now();
+        assert!(
+            super::proof::verify_against_artifacts(
+                &artifacts,
+                &proved.proof,
+                &proved.public_words,
+                &wrap_opts
+            ),
+            "★ THE BLOCK-ARTIFACT ROOT DOES NOT VERIFY. Nothing may be reported \
+             or claimed from a proof production would reject"
+        );
+        let verify_secs = t_verify.elapsed().as_secs_f64();
+        // ⚠ ONLY WHERE THIS PROCESS ACTUALLY PROVED — under `load` no kernel runs
+        // and zero is the correct observation.
+        #[cfg(feature = "cuda")]
+        {
+            if root_mode != CacheMode::Load {
+                let calls = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    calls > 0,
+                    "the BLOCK-ARTIFACT ROOT reached the device ZERO times — it \
+                     proved on the HOST with cuda compiled in, so its peak is not \
+                     a production figure and the run does not show the GPU \
+                     accelerating anything"
+                );
+                println!("     GPU dispatches during the BLOCK-ARTIFACT ROOT: {calls}");
+            }
+        }
+        println!(
+            "\n★★★ THE BLOCK IS COMPRESSED — the block-artifact ROOT PROVED AND \
+             VERIFIED\n   option {}\n   stage {stage_secs:.1}s · verify \
+             {verify_secs:.1}s · {} published words (= root_schema_words({num_reg}, \
+             {out_halves}, AssertOnly), and NOTHING L2G-shaped)\n   host peak \
+             {peak:.3} GiB at t={at:.1}{}\n   cache entry block-root.rkyv\n   ⚠ the \
+             DEVICE peak is the prover's own VRAM accounting above, not a harness \
+             sample — this harness counts dispatches, it does not size the card",
+            option.describe(),
+            proved.public_words.len(),
+            match &ceiling {
+                Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
+                Err(_) => String::new(),
+            },
+        );
+        // ⛔ THE STANDING CAVEAT, PRINTED WITH THE CLAIM AND NOT LEFT TO A DOC.
+        println!(
+            "   ⛔ CAVEAT, unchanged by this proof and by design: the attestation \
+             is NOT self-enforcing. The guest uses supplied roots verbatim, and \
+             the binding happens OUTSIDE — `recursion::check_attestation` \
+             recomputes the id from an ELF the consumer trusts, host-side. \
+             \"One proof for this block\" terminates there"
+        );
+        // ★ THE TWO-POSTURE BYTE-IDENTITY CHECK, REFUSED BY NAME.
+        //
+        // `root_schema_words`' signature pins the artifact's WIDTH against the
+        // proving strategy. Nothing pins its VALUE except proving one block at
+        // TWO postures and comparing bytes, and this run has exactly one. ⇒ The
+        // refusal is the result. It is not a skip, and it is emphatically not a
+        // pass: a one-posture "identical" is a check that cannot fail, which is
+        // worse than no check because it produces evidence.
+        let runs = vec![super::block_root::ArtifactUnderPosture {
+            posture: format!(
+                "{} epochs at 2^{}, fan-in {fan_in}, root option {}",
+                bundle.num_epochs(),
+                inputs.epoch_log2,
+                if option.replaces_top() { "A" } else { "B" },
+            ),
+            words: proved.public_words.clone(),
+        }];
+        match super::block_root::why_posture_identity_cannot_run(&runs) {
+            Some(why) => println!("\n   ⚠ {why}"),
+            None => super::block_root::assert_artifact_is_posture_independent(&runs),
+        }
+    }
+
+    let (run_peak, run_at) = whole_run.stop();
     println!(
         "\nWHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
         t_all.elapsed().as_secs_f64()

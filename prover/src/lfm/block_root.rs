@@ -946,8 +946,8 @@ mod tests {
             for i in 0..out_halves {
                 w.push(base_word(FE::from(700_000 + (k * 64 + i) as u64)));
             }
-            for lane in 0..lanes {
-                w.push(base_word(folded[k][lane]));
+            for v in &folded[k] {
+                w.push(base_word(*v));
             }
             interior.push(w);
             labels.push(run.to_vec());
