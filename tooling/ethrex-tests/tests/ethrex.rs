@@ -127,11 +127,13 @@ fn test_ethrex_real_block_native() {
 /// backend too (invalid G1 encoding), and both paths surface as
 /// `CryptoError::Other`, so the variant can't tell them apart. The string comes
 /// from `ethrex-crypto`'s `KzgError::Unimplemented`; if upstream rewords it this
-/// test goes red, which is the safe direction.
+/// test goes red, which is the safe direction — and it has: the 4f658c2b rev bump
+/// dropped `openvm-kzg` from the sentence, so the expected text moved with it.
 ///
 /// Worth knowing why this can regress: `ethrex-crypto`'s own default feature set
-/// is `["std", "kzg-rs", "secp256k1"]`, so any future dependency pulling it in
-/// with defaults on restores a backend and silently removes the screen.
+/// is `["std", "kzg-rs", "secp256k1", "aws-lc-rs", "blst"]`, so any future
+/// dependency pulling it in with defaults on restores a backend and silently
+/// removes the screen.
 #[test]
 fn no_kzg_backend_linked() {
     use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
@@ -141,9 +143,28 @@ fn no_kzg_backend_linked() {
         Err(err) => format!("{err:?}"),
     };
     assert!(
-        message.contains("One of features c-kzg, openvm-kzg or kzg-rs should be active"),
+        message.contains("One of features c-kzg or kzg-rs should be active"),
         "a KZG backend is linked into ethrex-tests, so test_ethrex_real_block_native no \
          longer screens precompile 0x0a: {message}"
+    );
+}
+
+/// Same screen for EIP-2537 (0x0b-0x11), which the 797df554 bump moved behind the
+/// native-only `blst` feature. Unlike the KZG gap these do NOT revert: levm maps
+/// `CryptoError::Unsupported` to `InternalError`, which aborts the run. Goes red if a
+/// dependency restores a backend, or if upstream rewords the message.
+#[test]
+fn no_bls_backend_linked() {
+    use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
+    let result = NativeCrypto.bls12_381_g1_add(([0u8; 48], [0u8; 48]), ([0u8; 48], [0u8; 48]));
+    let message = match result {
+        Ok(_) => "bls12_381_g1_add accepted zero input".to_string(),
+        Err(err) => format!("{err:?}"),
+    };
+    assert!(
+        message.contains("requires the `blst` feature"),
+        "a BLS12-381 backend is linked into ethrex-tests, so the native reference no \
+         longer matches the guest on 0x0b-0x11: {message}"
     );
 }
 
