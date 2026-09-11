@@ -52,8 +52,9 @@ REF_A="$1"
 REF_B="${2:-origin/main}"
 WORKLOAD="${WORKLOAD:-real}"
 # 2^22: the calibrated tier for the bench server this script targets, same as
-# /bench's real-block arm. Memory picks it, not speed — that server peaks at ~52 GB on
-# a >=64 GiB floor, and 2^23 measured 60 GiB on a roomier box, so it would not fit here.
+# /bench's real-block arm. Memory picks it, not speed — this workload peaks at 44.81 GiB
+# there against a >=64 GiB floor, and 2^23 would take it past 50 GiB for ~7% of wall
+# (the epoch sweep is in tooling/ethrex-fixtures/README.md).
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-22}"
 case "$WORKLOAD" in
   synthetic|real) ;;
