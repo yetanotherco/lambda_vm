@@ -170,7 +170,9 @@ memmove:
 // range. The ecall number is what selects the order; the guest never chooses it.
 //
 // `a1` therefore carries a source address here, not the fill byte, and it is only ever
-// read by the `sb`s that lay down the seed. `sb` writes the low byte of its source, so
+// read by the `sb`s that lay down the seed. Fills whose range straddles the 2^32 limb
+// boundary also take the store loop, since the accelerator cannot represent the
+// destination there. `sb` writes the low byte of its source, so
 // C's `(unsigned char)c` truncation comes for free and needs no masking of its own --
 // a wide or negative `int` fill lands as the right byte either way.
 //
@@ -189,6 +191,17 @@ memset:
     beqz a2, .Ldma_memset_done
     li t2, 16
     bltu a2, t2, .Ldma_memset_bytewise
+    // A fill whose range straddles the 2^32 limb boundary takes the store loop.
+    // The accelerator pins `dst = src + 8` limb-wise, so a row whose low limb carries
+    // has no representable successor and the executor refuses the call — which would
+    // abort the guest on a `memset` that C says must simply work. Compute
+    // `low32(dst) + n + 8` and take the fallback if it reaches 2^32.
+    slli t2, a0, 32
+    srli t2, t2, 32
+    add  t2, t2, a2
+    addi t2, t2, 8
+    srli t2, t2, 32
+    bnez t2, .Ldma_memset_bytewise
     // Seed the first eight bytes one at a time. A doubleword store would be shorter
     // but would assume an alignment `dst` does not have: a byte array on the stack is
     // 1-aligned, and seeding it with `sd` is silently wrong there.

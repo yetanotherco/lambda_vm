@@ -12,47 +12,34 @@
 //! about the verifier, which rebuilds that bus from `public_output`
 //! (`compute_commit_bus_offset`).
 //!
-//! Several columns are now vestigial — `address_incr`, `count_decr` and `value`
-//! model a multi-row sequence that no longer exists — and could be dropped, at the
-//! cost of another change to the committed column count.
-//!
-//! ## Columns (19 total)
+//! ## Columns (8 total)
 //! - `timestamp`: DWordWL (2 cols) — timestamp of the ECALL
-//! - `index`: BaseField (1 col) — global byte index for this committed value
-//! - `address`: DWordWL (2 cols) — current buffer address
-//! - `address_incr`: DWordHL (4 cols) — address + 1, as 4 halfwords
-//! - `count`: DWordWL (2 cols) — remaining byte count
-//! - `count_decr`: DWordHL (4 cols) — count - 1 as 4 halfwords (or all 0xFFFF when count=0)
-//! - `first`: Bit — first row in a commit sequence
-//! - `end`: Bit — last row (count was 0)
-//! - `value`: Byte — the byte being committed
+//! - `index`: BaseField (1 col) — global byte index the committed range starts at
+//! - `address`: DWordWL (2 cols) — buffer address the committed range starts at
+//! - `count`: DWordWL (2 cols) — number of bytes this ECALL commits
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
-//! ## Bus Interactions (15 total)
-//! - **Receiver**: Ecall bus — receives `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` from CPU (mult = first)
-//! - **Sender**: CommitDefer bus — hands the byte loop to MEMMOVE (mult = first)
-//! - **Sender**: IsHalfword bus — range checks for count_decr halfwords (×4, mult = mu)
-//! - **Sender**: IsHalfword bus — range checks for address_incr halfwords (×4, mult = mu)
-//! - **Sender**: Zero bus — end detection via count_decr (mult = mu)
-//! - **Sender**: Memw bus — read+write x10 register (fd=1→count) at ts (mult = first)
-//! - **Sender**: Memw bus — read x11 register (buf_addr) at ts (mult = first)
-//! - **Sender**: Memw bus — read x12 register (count) at ts (mult = first)
-//! - **Sender**: Memw bus — read+write x254 commit index at ts (mult = first)
+//! There is no `first` column: one row per ECALL means a real row is always the first
+//! row of its commit, so `first` was identically `mu` and every multiplicity reads
+//! `mu` instead. `address_incr`, `count_decr`, `end` and `value` modelled the per-byte
+//! sequence and went with it.
 //!
-//! The per-byte `Memw` read and the `Commit` `(index, value)` sender are gone: both
-//! moved to MEMMOVE, which sends the committed bytes itself. `CommitNextByte` is
-//! retired (bus id 20 is now a reserved hole). The count is pinned by
+//! ## Bus Interactions (6 total)
+//! - **Receiver**: Ecall bus — receives `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` from CPU (mult = mu)
+//! - **Sender**: CommitDefer bus — hands the byte loop to MEMMOVE (mult = mu)
+//! - **Sender**: Memw bus — read+write x10 register (fd=1→count) at ts (mult = mu)
+//! - **Sender**: Memw bus — read x11 register (buf_addr) at ts (mult = mu)
+//! - **Sender**: Memw bus — read x12 register (count) at ts (mult = mu)
+//! - **Sender**: Memw bus — read+write x254 commit index at ts (mult = mu)
+//!
+//! The per-byte `Memw` read and the `Commit` `(index, value)` sender moved to MEMMOVE,
+//! which sends the committed bytes itself. The eight `IsHalfword` range checks and the
+//! `Zero` end-detection went with the columns they checked. `CommitNextByte` is retired
+//! (bus id 20 is now a reserved hole). The count is pinned by
 //! `commit_tests::test_bus_interactions_count`.
 //!
-//! ## Constraints (8 total)
-//! - `range_first`: first * (1 - first) = 0 (degree 2)
-//! - `range_end`: end * (1 - end) = 0 (degree 2)
+//! ## Constraints (1 total)
 //! - `range_mu`: mu * (1 - mu) = 0 (degree 2)
-//! - `first_or_end_implies_mu`: (first + end) * (1 - mu) = 0 (degree 2)
-//! - `address_incr_carry_0`: ADD template carry_0 for address + 1 = address_incr (degree 2)
-//! - `address_incr_carry_1`: ADD template carry_1 for address + 1 = address_incr (degree 2)
-//! - `count_decr_carry_0`: SUB template carry_0 for count_decr + 1 = count (degree 2)
-//! - `count_decr_carry_1`: SUB template carry_1 for count_decr + 1 = count (degree 2)
 //!
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -165,15 +152,12 @@ pub fn generate_commit_trace(
 // Bus interactions
 // =========================================================================
 
-/// Creates all bus interactions for the COMMIT table (15 total).
+/// Creates all bus interactions for the COMMIT table (6 total).
 ///
 /// The COMMIT table:
-/// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` (mult = first)
-/// - **Sends** to CommitDefer, handing the byte loop to MEMMOVE (mult = first)
-/// - **Sends** to IsHalfword for count_decr range checks (×4, mult = mu)
-/// - **Sends** to IsHalfword for address_incr range checks (×4, mult = mu)
-/// - **Sends** to Zero for end detection (mult = mu)
-/// - **Sends** to Memw for register accesses (×4, mult = first)
+/// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` (mult = mu)
+/// - **Sends** to CommitDefer, handing the byte loop to MEMMOVE (mult = mu)
+/// - **Sends** to Memw for register accesses (×4, mult = mu)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
         // 1. Receive ECALL from CPU (mult = first)
