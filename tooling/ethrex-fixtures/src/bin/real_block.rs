@@ -17,10 +17,6 @@
 //!
 //! Usage:
 //!   cargo run --release --bin real_block -- <cache.json> <out.bin>
-//!
-//! NOTE: `build_stateless_input` and its helpers are copied from `main.rs`
-//! rather than shared. A real PR should lift them into a module; keeping this
-//! binary self-contained leaves the committed generator untouched.
 
 use bytes::Bytes;
 use ethrex_blockchain::payload::{BuildPayloadArgs, create_payload};
