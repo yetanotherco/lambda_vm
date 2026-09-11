@@ -77,7 +77,10 @@ fn the_prove_split_is_recorded_covers_the_prove_and_is_consumed() {
         split.execute > 0.0 && split.fill > 0.0 && split.multi_prove > 0.0,
         "every phase must have a positive span: {split:?}"
     );
-    let sum = split.execute + split.fill + split.multi_prove;
+    // ⓘ The wait belongs in the sum: `multi_prove` is reported NET of it, so
+    // without this term the coverage floor would start failing the moment a
+    // sibling held the card — the one regime it most needs to hold in.
+    let sum = split.execute + split.fill + split.multi_prove + split.permit_wait;
     assert!(
         sum <= wall,
         "three disjoint spans inside the call cannot exceed the call: {sum} > {wall}"

@@ -73,6 +73,20 @@ static ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
 static HELD_NANOS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
+    /// ★ HOW LONG THIS THREAD HAS BLOCKED ON THE CARD, cumulative and never
+    /// cleared.
+    ///
+    /// A waiting worker's time lands inside whatever phase was running when it
+    /// asked — so at two siblings a node's `prove` field silently absorbs the
+    /// wait for `multi_prove` and stops being comparable to the serial arm's.
+    /// Measured at level 2: `prove` read 5.0 and 7.1 concurrently against 4.8
+    /// and 4.1 serial, entirely from this.
+    ///
+    /// ⇒ MONOTONE AND READ-ONLY, not a take-and-clear. A counter that clears
+    /// couples every reader to every other one: whoever samples first silently
+    /// steals the wait from whoever samples next. Callers bracket the span they
+    /// care about and subtract, which composes.
+    static WAITED_NANOS: Cell<u64> = const { Cell::new(0) };
     /// ⛔ Re-entry detection. `Mutex` is not reentrant, so a second `hold()` on
     /// a thread that already holds one parks it forever — and a silent park is
     /// exactly how the census memo cost twelve minutes of a test binary sitting
@@ -89,6 +103,12 @@ pub fn arm(workers: usize) {
 /// How many sibling proofs the driver is running at once.
 pub fn workers() -> usize {
     WORKERS.load(Ordering::Relaxed)
+}
+
+/// Seconds THIS THREAD has spent blocked on the card, cumulative since the
+/// process started. Bracket a span and subtract to price its wait.
+pub fn waited_secs() -> f64 {
+    WAITED_NANOS.with(|w| w.get()) as f64 / 1e9
 }
 
 /// What the permit did, for the line a level prints.
@@ -167,7 +187,9 @@ pub fn hold() -> CardPermit {
     );
     // A poisoned card is a panic already being reported: take it through the
     // poison rather than turning one failure into two.
+    let blocked_from = Instant::now();
     let guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+    WAITED_NANOS.with(|w| w.set(w.get() + blocked_from.elapsed().as_nanos() as u64));
     HELD_HERE.with(|h| h.set(true));
     let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     PEAK_IN_FLIGHT.fetch_max(now, Ordering::Relaxed);
@@ -243,6 +265,11 @@ mod tests {
 
         let first_is_in = std::sync::Barrier::new(2);
         let waited = Mutex::new(std::time::Duration::ZERO);
+        // ★ The counter the TIMING lines subtract with, read on the waiting
+        // thread itself. Without it a queued worker's wait stays inside
+        // whatever phase was running and the per-node numbers stop being
+        // comparable between arms.
+        let self_reported = Mutex::new(0.0f64);
         std::thread::scope(|s| {
             s.spawn(|| {
                 let _card = hold();
@@ -251,13 +278,24 @@ mod tests {
             });
             s.spawn(|| {
                 first_is_in.wait();
+                let before = waited_secs();
                 let t = Instant::now();
                 let _card = hold();
                 *waited.lock().expect("the timing lock") = t.elapsed();
+                *self_reported.lock().expect("the timing lock") = waited_secs() - before;
             });
         });
 
+        let self_reported = *self_reported.lock().expect("the timing lock");
         let waited = *waited.lock().expect("the timing lock");
+        assert!(
+            self_reported >= HOLD.as_secs_f64() / 2.0,
+            "the thread must report its OWN wait, got {self_reported}s"
+        );
+        assert!(
+            (self_reported - waited.as_secs_f64()).abs() < 0.05,
+            "the reported wait must be the observed one: {self_reported} vs {waited:?}"
+        );
         assert!(
             waited >= HOLD / 2,
             "the second worker took the card after {waited:?}, so it did not \

@@ -64,8 +64,16 @@ pub struct ProveSplit {
     /// `build_traces_with_hasher` — the chip trace fill.
     pub fill: f64,
     /// `prove_traces_with_hasher` — AIR construction, the transcript and
-    /// `multi_prove` itself.
+    /// `multi_prove` itself, NET of any wait for the card.
+    ///
+    /// ⛔ Net on purpose. Gross, this field absorbs however long a sibling held
+    /// the card, so the same work reads differently at one worker and at two
+    /// and the arms stop being comparable — which is exactly what a scheduling
+    /// A/B needs them to be.
     pub multi_prove: f64,
+    /// Seconds spent BLOCKED waiting for the card before `multi_prove` began.
+    /// Zero whenever the permit is inert, so a serial line is unchanged.
+    pub permit_wait: f64,
 }
 
 thread_local! {
@@ -170,6 +178,7 @@ pub(crate) fn lfm_prove_with_residency(
     let fill_secs = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
+    let waited_before = super::device_permit::waited_secs();
     let proof = prove_traces_with_hasher(
         artifacts,
         &mut traces,
@@ -179,13 +188,17 @@ pub(crate) fn lfm_prove_with_residency(
         residency,
     )
     .map_err(LfmProveError::Prover)?;
-    let multi_prove_secs = t.elapsed().as_secs_f64();
+    // The wait is SUBTRACTED rather than left inside, so `multi_prove` means
+    // the same thing at one worker and at two.
+    let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
+    let multi_prove_secs = (t.elapsed().as_secs_f64() - permit_wait).max(0.0);
 
     LAST_PROVE_SPLIT.with(|c| {
         c.set(Some(ProveSplit {
             execute: execute_secs,
             fill: fill_secs,
             multi_prove: multi_prove_secs,
+            permit_wait,
         }))
     });
 

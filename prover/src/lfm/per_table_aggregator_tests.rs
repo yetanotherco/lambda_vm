@@ -1760,8 +1760,18 @@ impl CacheMode {
 fn print_prove_split(label: &str) {
     if let Some(split) = super::proof::take_prove_split() {
         println!(
-            "   {label} LFM PROVE: execute {:.2}s · fill {:.2}s · multi_prove {:.2}s",
-            split.execute, split.fill, split.multi_prove
+            "   {label} LFM PROVE: execute {:.2}s · fill {:.2}s · multi_prove {:.2}s{}",
+            split.execute,
+            split.fill,
+            split.multi_prove,
+            // ⓘ Absent when there was no wait, so a serial line is byte-identical
+            // to every one already in the campaign's logs and the two arms diff
+            // on their numbers rather than on their shape.
+            if split.permit_wait > 0.0 {
+                format!(" · permit wait {:.2}s", split.permit_wait)
+            } else {
+                String::new()
+            },
         );
     }
 }
@@ -1983,6 +1993,7 @@ fn prove_node_program_as_child(
     use super::per_table_aggregator::SchemaLayout;
     use std::time::Instant;
 
+    let wait_before = super::device_permit::waited_secs();
     let t = Instant::now();
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
     let t_arenas = t.elapsed().as_secs_f64();
@@ -1993,6 +2004,11 @@ fn prove_node_program_as_child(
         crate::hash_pin::BLOCK_HASHER,
     );
     let t_artifacts = t.elapsed().as_secs_f64();
+    // ★ WHAT THE ARTIFACT BUILD SPENT QUEUEING rather than committing. Bracketed
+    // and subtracted rather than taken-and-cleared: a counter that clears
+    // couples every reader to every other one.
+    let wait_artifacts = (super::device_permit::waited_secs() - wait_before).max(0.0);
+    let wait_before = super::device_permit::waited_secs();
     let t = Instant::now();
     let proved = cached_stage(mode, cache, label, || {
         super::proof::lfm_prove(program, &artifacts, &arenas, opts)
@@ -2051,10 +2067,27 @@ fn prove_node_program_as_child(
     // different owners: `verify` is the harness's assert, `replay` is the
     // transcript walk a driver genuinely needs. Summed, the field prices a
     // phase no real pipeline has.
+    // ★★ THE WAIT IS CONTAINED IN THE TWO FIELDS ABOVE, NOT ADDITIONAL TO THEM.
+    // `build_artifacts` and `prove` are wall times and a queued worker's wait
+    // sits inside whichever was running, which is why the same node reads 4.1 s
+    // serial and 7.1 s at two siblings. Naming it here keeps the per-node
+    // numbers comparable across arms AND closes the level's accounting: at K
+    // workers the level's worker-seconds are K × wall, of which the permit's
+    // `held` is the card, the waits are the queue, and the rest is host work.
+    let wait_prove = (super::device_permit::waited_secs() - wait_before).max(0.0);
+    let wait_total = wait_artifacts + wait_prove;
     println!(
         "   {label} TIMING: arenas {t_arenas:.1}s · build_artifacts {t_artifacts:.1}s \
-         · prove {t_prove:.1}s · harvest {t_harvest:.1}s (verify {t_verify:.2} + replay {:.2})",
-        t_harvest - t_verify
+         · prove {t_prove:.1}s · harvest {t_harvest:.1}s (verify {t_verify:.2} + replay {:.2}){}",
+        t_harvest - t_verify,
+        if wait_total > 0.0 {
+            format!(
+                " · permit wait {wait_total:.2}s (inside build_artifacts {wait_artifacts:.2} \
+                 + prove {wait_prove:.2})"
+            )
+        } else {
+            String::new()
+        },
     );
     (child, layout)
 }
