@@ -25,6 +25,9 @@ use math::field::{
     traits::{IsField, IsSubFieldOf},
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{
     Error, challenge_powers,
     eq::{shift_eval, shift_mle},
@@ -129,6 +132,11 @@ fn check_shape<E: IsField>(
     Ok(())
 }
 
+/// Accumulator cells a worker takes at a time. Small enough that a short table
+/// still spreads, large enough that the columns streaming through one slab pay
+/// for the handoff.
+const ACCUMULATOR_CHUNK: usize = 1 << 12;
+
 /// `Σ_{i reads at `offset`} gamma^i · column_i`, the one polynomial that offset's
 /// kernel multiplies.
 fn batched_column<F, E>(
@@ -142,16 +150,34 @@ where
     F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
+    // Which columns read at this offset, so the walk below carries its whole
+    // list and the accumulator is written once rather than once per column.
+    let members: Vec<(usize, usize)> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| source.offset == offset)
+        .map(|(i, source)| (i, source.column))
+        .collect();
     let mut acc = vec![FieldElement::<E>::zero(); 1usize << num_vars];
-    for (i, source) in sources.iter().enumerate() {
-        if source.offset != offset {
-            continue;
+    // A slab of the accumulator, with every column streamed through it: a
+    // table brings dozens of columns, and this way its cells are touched once.
+    let fill = |(index, slab): (usize, &mut [FieldElement<E>])| {
+        let at = index * ACCUMULATOR_CHUNK;
+        for (weight, column) in &members {
+            let values = &columns[*column].evals()[at..at + slab.len()];
+            for (slot, value) in slab.iter_mut().zip(values) {
+                // The base element on the left: the only direction the tower
+                // gives.
+                *slot += value * &weights[*weight];
+            }
         }
-        for (slot, value) in acc.iter_mut().zip(columns[source.column].evals()) {
-            // The base element on the left: the only direction the tower gives.
-            *slot += value * &weights[i];
-        }
-    }
+    };
+    #[cfg(feature = "parallel")]
+    acc.par_chunks_mut(ACCUMULATOR_CHUNK)
+        .enumerate()
+        .for_each(fill);
+    #[cfg(not(feature = "parallel"))]
+    acc.chunks_mut(ACCUMULATOR_CHUNK).enumerate().for_each(fill);
     Mle::new(acc)
 }
 

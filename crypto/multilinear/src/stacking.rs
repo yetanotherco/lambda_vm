@@ -6,6 +6,9 @@
 
 use math::field::{element::FieldElement, traits::IsField};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{Error, mle::Mle};
 
 /// Where one column ended up.
@@ -137,6 +140,10 @@ impl StackedLayout {
     }
 
     /// Builds the stacked polynomials, zero-filling the padding.
+    ///
+    /// One polynomial per worker: they share no cells, and between the zeroing
+    /// and the copies this is gigabytes of memory traffic on a trace of any
+    /// size.
     pub fn stack<F: IsField + 'static>(&self, columns: &[&Mle<F>]) -> Result<Vec<Mle<F>>, Error> {
         if columns.len() != self.placements.len() {
             return Err(Error::VariableCountMismatch {
@@ -144,17 +151,31 @@ impl StackedLayout {
                 got: columns.len(),
             });
         }
-        let size = 1usize << self.n_stack;
-        let mut polys = vec![vec![FieldElement::<F>::zero(); size]; self.num_polys];
-
         for (column, place) in columns.iter().zip(&self.placements) {
-            let expected = 1usize << place.num_vars;
-            if column.len() != expected {
+            if column.len() != 1usize << place.num_vars {
                 return Err(Error::NotPowerOfTwo(column.len()));
             }
-            polys[place.poly][place.offset..place.offset + expected]
-                .clone_from_slice(column.evals());
         }
+        let size = 1usize << self.n_stack;
+        // Which columns land in which polynomial, so a worker owning one
+        // polynomial has its whole list without scanning the placements.
+        let mut by_poly: Vec<Vec<usize>> = vec![Vec::new(); self.num_polys];
+        for (index, place) in self.placements.iter().enumerate() {
+            by_poly[place.poly].push(index);
+        }
+        let fill = |members: &Vec<usize>| {
+            let mut buffer = vec![FieldElement::<F>::zero(); size];
+            for index in members {
+                let place = &self.placements[*index];
+                let span = 1usize << place.num_vars;
+                buffer[place.offset..place.offset + span].clone_from_slice(columns[*index].evals());
+            }
+            buffer
+        };
+        #[cfg(feature = "parallel")]
+        let polys: Vec<Vec<FieldElement<F>>> = by_poly.par_iter().map(fill).collect();
+        #[cfg(not(feature = "parallel"))]
+        let polys: Vec<Vec<FieldElement<F>>> = by_poly.iter().map(fill).collect();
 
         polys.into_iter().map(Mle::new).collect()
     }
