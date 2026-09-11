@@ -1242,6 +1242,84 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// handle's `.tree`); the returned host `MerkleTree` is root only, so query
 /// openings gather paths from the device tree via [`gather_proofs_dev`].
 #[allow(clippy::too_many_arguments)]
+/// Commit ONE preprocessed column group on the device: coset LDE, leaf hash and
+/// Merkle tree in a single fused call, returning only the root.
+///
+/// # Why this exists
+///
+/// `prover::lfm::registry::build_artifacts_with_hasher` commits every program's
+/// instruction column groups on the HOST — interpolate, coset-expand, Merkle —
+/// and lane P measured that at 12.6 s per epoch wrap and 22.0 s per interior
+/// node, the largest phase of the recursion pipeline, while the card sat at
+/// 1 MiB and 0%. The identical operation on the main trace already runs on the
+/// device inside `r1_main_commit`. This is the entry point that lets the
+/// artifact build reach it, and it is a `pub` wrapper rather than a visibility
+/// change because the caller lives in another crate and should see one named
+/// function, not the dispatch layer's internals.
+///
+/// # What it returns, and what it does NOT
+///
+/// The ROOT, and nothing else. The Merkle tree stays resident on the device
+/// inside the handle, which is dropped here — the artifact build wants the root
+/// (it goes into `lfm_program_id` and the AIR's declared commitment) and has no
+/// use for the nodes.
+///
+/// ⚠ That means this does NOT feed the process-wide precomputed-tree cache, and
+/// deliberately so: `precomputed_tree_cache_put` takes a FULL host tree because
+/// `multi_prove` opens against it, and a root-only tree in that cache would be a
+/// tree that cannot answer a query. `multi_prove` builds and caches its own
+/// precomputed tree on the device already (`try_expand_split_trees_row_major_keep`
+/// with `build_precomputed`), so nothing here is lost by staying out of it.
+///
+/// # The roots must match the host's, and a production invariant already says
+/// they do
+///
+/// The host commits with `commit_bit_reversed_with::<_, H::Batched<F>>(evals,
+/// ROWS_PER_LEAF)`. The device builds its leaves from the row-major LDE. These
+/// are already required to agree: `multi_prove` rebuilds the precomputed tree on
+/// the device from the row-major main trace and REFUSES the proof when its root
+/// differs from the one the AIR declares (`ProvingError::PrecomputedCommitmentMismatch`),
+/// and for an LFM proof the declared root is exactly what the host artifact build
+/// produced. Every GPU recursion proof passes that check today. The six
+/// `registry_drift_*` tests are the gate that keeps it true for this caller.
+///
+/// `None` means the device declined — admission said no, the field is not
+/// Goldilocks, or the shape is degenerate — and the caller must commit on the
+/// host. That is the same contract every other entry point in this module has.
+pub fn try_commit_row_major<F, B>(
+    table: &str,
+    row_major: &[FieldElement<F>],
+    rows: usize,
+    cols: usize,
+    blowup_factor: usize,
+    coset_offset: &FieldElement<F>,
+) -> Option<Commitment>
+where
+    F: IsFFTField + 'static,
+    B: DeviceTreeBackend,
+{
+    if rows == 0 || cols == 0 || row_major.len() != rows * cols {
+        return None;
+    }
+    // ⛔ The weights come from the prover's own derivation, not a second copy —
+    // they carry the iFFT normalization, so a divergence here is a divergence in
+    // the roots.
+    let weights = crate::prover::coset_weights::<F>(rows, coset_offset);
+    let (tree, _handle, _lde) = try_expand_leaf_and_tree_row_major_keep::<F, F, B>(
+        table,
+        row_major,
+        None,
+        rows,
+        cols,
+        blowup_factor,
+        &weights,
+        // The artifact build never reads the evaluations — only the root — so
+        // the row-major D2H is skipped entirely.
+        false,
+    )?;
+    Some(tree.root)
+}
+
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     table: &str,
     row_major: &[FieldElement<E>],

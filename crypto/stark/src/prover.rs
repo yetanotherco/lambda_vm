@@ -483,25 +483,40 @@ impl<F: IsFFTField> CompositionLdeTwiddles<F> {
     }
 }
 
+/// `[n_inv, n_inv·g, n_inv·g², …, n_inv·g^(n−1)]` — the iFFT normalization folded
+/// together with the coset generator's powers, which is what the row-major LDE
+/// (host and device alike) multiplies a column by before the forward transform.
+///
+/// ⛔ ONE DERIVATION, because it now has two readers. [`LdeTwiddles::new`] builds
+/// a table's weights for the prove, and
+/// [`gpu_lde::try_commit_row_major`](crate::gpu_lde::try_commit_row_major) builds
+/// them for a preprocessed group committed outside any prove. Written inline in
+/// both, a change to the normalization would move one path's roots and not the
+/// other's — and the two are required to agree bit for bit, since a proof
+/// declares the root the artifact build produced.
+pub(crate) fn coset_weights<F: IsFFTField>(
+    domain_size: usize,
+    offset: &FieldElement<F>,
+) -> Vec<FieldElement<F>> {
+    let domain_size_inv = FieldElement::<F>::from(domain_size as u64)
+        .inv()
+        .expect("domain_size is a power of two");
+    let mut w = Vec::with_capacity(domain_size);
+    let mut offset_power = domain_size_inv;
+    for _ in 0..domain_size {
+        w.push(offset_power.clone());
+        offset_power = offset * &offset_power;
+    }
+    w
+}
+
 impl<F: IsFFTField> LdeTwiddles<F> {
     /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
     pub(crate) fn new(domain: &Domain<F>) -> Self {
         let domain_size = domain.interpolation_domain_size;
         let lde_size = domain_size * domain.blowup_factor;
 
-        let domain_size_inv = FieldElement::<F>::from(domain_size as u64)
-            .inv()
-            .expect("domain_size is power of two");
-        let offset = &domain.coset_offset;
-        let coset_weights = {
-            let mut w = Vec::with_capacity(domain_size);
-            let mut offset_power = domain_size_inv;
-            for _ in 0..domain_size {
-                w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
-            }
-            w
-        };
+        let coset_weights = coset_weights(domain_size, &domain.coset_offset);
 
         Self {
             #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
