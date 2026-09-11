@@ -125,9 +125,16 @@ pub struct Lowered {
 }
 
 /// Slots the round kernel will hold per thread before the dispatch declines.
-/// The slot file is `slots * 24 * threads` bytes, so a program wider than this
-/// buys too few threads to be worth the launch.
-pub const MAX_SLOTS: usize = 512;
+///
+/// The slot file is `slots * 24 * threads` bytes and the scratch budget is
+/// fixed, so a wider program buys fewer threads. This is where that stops
+/// being a trade: at 8192 live values a single block of 256 already wants
+/// 48 MiB, and a launch of one block is not a launch.
+///
+/// It is a cliff, not a dial. The real AIRs peak near a thousand — the widest
+/// precompile lowers to 1036 — and a cap below that sends the tables with the
+/// *most* work per row to the host, which is where they cost the most.
+pub const MAX_SLOTS: usize = 8192;
 
 /// Cube size below which the host wins: the rounds are a launch and a round
 /// trip each, and a small cube fits in cache.
