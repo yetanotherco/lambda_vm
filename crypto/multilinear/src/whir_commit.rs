@@ -240,11 +240,14 @@ where
         })
     }
 
-    /// A commitment whose codeword stays on the device that built it, with the
-    /// tree that device built beside it.
+    /// A commitment whose codeword stays on the device that built it.
+    ///
+    /// Only the root comes back. The tree is rebuilt there when the queries
+    /// are known — see [`paths`](Self::paths) — so this holds a root-only
+    /// tree and nothing else.
     pub fn from_device(
         codeword: crate::gpu::DeviceCodeword,
-        nodes: Vec<Commitment>,
+        root: Commitment,
         log_folding: usize,
     ) -> Result<Self, Error> {
         let elements = codeword.elements();
@@ -258,9 +261,8 @@ where
                 n_stack: log_domain_size,
             });
         }
-        let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
-            tree,
+            tree: Tree::<F>::from_root(root),
             codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
@@ -299,17 +301,7 @@ where
     /// them.
     pub fn open_many(&self, indices: &[usize]) -> Result<Vec<CosetOpening<F>>, Error> {
         let num_leaves = self.num_leaves();
-        let proofs = indices
-            .iter()
-            .map(|index| {
-                self.tree
-                    .get_proof_by_pos(*index)
-                    .ok_or(Error::QueryOutOfRange {
-                        index: *index,
-                        bound: num_leaves,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let proofs = self.paths(indices)?;
 
         let block = 1usize << self.log_folding;
         let blocks: Vec<Vec<FieldElement<F>>> = match &self.codeword {
@@ -339,16 +331,55 @@ where
             .collect())
     }
 
+    /// One authentication path per index, from wherever the tree is.
+    ///
+    /// A codeword the device kept has no tree here — only its root. Rebuilding
+    /// it there costs a keccak pass; keeping it would cost half a gigabyte of
+    /// device memory per commitment for the whole proof, and bringing it home
+    /// costs ten times the rehash, because a pageable copy of half a gigabyte
+    /// is the slowest thing in the commit. What a proof wants of a tree is a
+    /// kilobyte per query.
+    fn paths(&self, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
+        let num_leaves = self.num_leaves();
+        let out_of_range = |index: usize| Error::QueryOutOfRange {
+            index,
+            bound: num_leaves,
+        };
+        match &self.codeword {
+            Codeword::Device(device) => {
+                if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
+                    return Err(out_of_range(bad));
+                }
+                // Past the range check there is one way to fail, and it is the
+                // device: the tree has to be rebuilt there because that is
+                // where the codeword is.
+                Ok(device
+                    .paths(self.log_folding, indices)
+                    .ok_or(Error::DeviceFailed {
+                        stage: "opening paths",
+                    })?
+                    .into_iter()
+                    .map(|merkle_path| Proof { merkle_path })
+                    .collect())
+            }
+            Codeword::Host(_) => indices
+                .iter()
+                .map(|index| {
+                    self.tree
+                        .get_proof_by_pos(*index)
+                        .ok_or_else(|| out_of_range(*index))
+                })
+                .collect(),
+        }
+    }
+
     /// Opens the block that folds onto `index`.
     pub fn open(&self, index: usize) -> Result<CosetOpening<F>, Error> {
         let num_leaves = self.num_leaves();
-        let proof = self
-            .tree
-            .get_proof_by_pos(index)
-            .ok_or(Error::QueryOutOfRange {
-                index,
-                bound: num_leaves,
-            })?;
+        let proof = self.paths(&[index])?.pop().ok_or(Error::QueryOutOfRange {
+            index,
+            bound: num_leaves,
+        })?;
         let values = match &self.codeword {
             Codeword::Host(values) => coset_of(index, self.log_domain_size, self.log_folding)
                 .into_iter()

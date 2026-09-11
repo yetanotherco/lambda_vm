@@ -1596,7 +1596,7 @@ pub(crate) fn commit_resident<F>(
     evals: &[math::field::element::FieldElement<F>],
     log_blowup: usize,
     log_folding: usize,
-) -> Option<(DeviceCodeword, Vec<[u8; 32]>)>
+) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
 {
@@ -1614,10 +1614,9 @@ where
     }
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
     let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
-    let (codeword, nodes) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
-    let nodes = nodes_in_place(nodes)?;
+    let (codeword, root) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some((DeviceCodeword(codeword), nodes))
+    Some((DeviceCodeword(codeword), root))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1625,7 +1624,7 @@ pub(crate) fn commit_resident<F>(
     _evals: &[math::field::element::FieldElement<F>],
     _log_blowup: usize,
     _log_folding: usize,
-) -> Option<(DeviceCodeword, Vec<[u8; 32]>)>
+) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
 {
@@ -1653,12 +1652,32 @@ impl DeviceCodeword {
         Some(Self(folded))
     }
 
-    /// The tree over its fold blocks, in the host node layout.
-    pub(crate) fn commit(&self, log_folding: usize) -> Option<Vec<[u8; 32]>> {
-        let nodes = math_cuda::whir::commit_resident_ext3(&self.0, log_folding).ok()?;
-        let nodes = nodes_in_place(nodes)?;
+    /// The root of the tree over its fold blocks.
+    ///
+    /// The tree is not kept: the only other thing a proof wants from it is a
+    /// path per query, and [`paths`](Self::paths) rebuilds it then, when the
+    /// queries are known — see the note there.
+    pub(crate) fn commit(&self, log_folding: usize) -> Option<[u8; 32]> {
+        let root = self.0.commit(log_folding).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-        Some(nodes)
+        Some(root)
+    }
+
+    /// One authentication path per index, against the same tree.
+    pub(crate) fn paths(
+        &self,
+        log_folding: usize,
+        indices: &[usize],
+    ) -> Option<Vec<Vec<[u8; 32]>>> {
+        let leaves = self.0.elements() >> log_folding;
+        if indices.iter().any(|index| *index >= leaves) {
+            return None;
+        }
+        let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
+        let bytes = self.0.paths(log_folding, &positions).ok()?;
+        let depth = leaves.trailing_zeros() as usize;
+        let nodes = nodes_in_place(bytes)?;
+        Some(nodes.chunks_exact(depth).map(<[_]>::to_vec).collect())
     }
 
     /// The blocks `indices` open, gathered where they lie — one launch and one
@@ -1778,7 +1797,15 @@ impl DeviceCodeword {
         match self.0 {}
     }
 
-    pub(crate) fn commit(&self, _log_folding: usize) -> Option<Vec<[u8; 32]>> {
+    pub(crate) fn commit(&self, _log_folding: usize) -> Option<[u8; 32]> {
+        match self.0 {}
+    }
+
+    pub(crate) fn paths(
+        &self,
+        _log_folding: usize,
+        _indices: &[usize],
+    ) -> Option<Vec<Vec<[u8; 32]>>> {
         match self.0 {}
     }
 

@@ -47,6 +47,79 @@ impl DeviceCodeword {
         })
     }
 
+    /// The Merkle tree over this codeword's fold blocks, built here.
+    ///
+    /// A leaf is the `2^log_folding` coset that folds onto one position, and
+    /// the layout is the host's: `2*num_leaves - 1` nodes of 32 bytes, root
+    /// first.
+    fn build_tree(&self, log_folding: usize) -> Result<(CudaSlice<u8>, usize)> {
+        let num_leaves = self.elements >> log_folding;
+        assert!(num_leaves >= 2, "tree needs at least two leaves");
+        let be = backend()?;
+        let total_nodes = 2 * num_leaves - 1;
+        // SAFETY: every byte is written before it is read — the leaves by the
+        // kernel below, the inner nodes by the level loop after it.
+        let mut nodes =
+            unsafe { crate::device::alloc_or_trim::<u8>(&self.stream, total_nodes * 32) }?;
+        {
+            let leaves_offset = (num_leaves - 1) * 32;
+            let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+            let num_leaves_u64 = num_leaves as u64;
+            let block = 1u64 << log_folding;
+            let kernel = if self.base {
+                &be.keccak256_leaves_base_coset
+            } else {
+                &be.keccak256_leaves_ext3_coset
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(self.buffer.as_ref())
+                    .arg(&num_leaves_u64)
+                    .arg(&block)
+                    .arg(&mut leaves)
+                    .launch(keccak_launch_cfg(num_leaves_u64))?;
+            }
+        }
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves)?;
+        Ok((nodes, num_leaves))
+    }
+
+    /// The root of that tree, which is the commitment.
+    ///
+    /// The tree itself is dropped: the only other thing anyone wants from it
+    /// is a path per query, and by then the queries are known — see
+    /// [`paths`](Self::paths).
+    pub fn commit(&self, log_folding: usize) -> Result<[u8; 32]> {
+        let (nodes, _) = self.build_tree(log_folding)?;
+        let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
+        self.stream.synchronize()?;
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&head);
+        Ok(root)
+    }
+
+    /// The whole tree in the host node layout — what a caller that walks it
+    /// here needs, and what the parity test compares against.
+    pub fn nodes_to_host(&self, log_folding: usize) -> Result<Vec<u8>> {
+        let (nodes, _) = self.build_tree(log_folding)?;
+        let out = self.stream.clone_dtoh(&nodes)?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
+
+    /// The authentication paths of `positions`, against the same tree.
+    ///
+    /// Rebuilt rather than kept or carried home. Keeping it costs half a
+    /// gigabyte of device memory per commitment for the whole proof; bringing
+    /// it back costs ten times the rehash, because a pageable copy of half a
+    /// gigabyte is the slowest thing in the commit. What the host needs of a
+    /// tree is a kilobyte per query.
+    pub fn paths(&self, log_folding: usize, positions: &[u32]) -> Result<Vec<u8>> {
+        let (nodes, num_leaves) = self.build_tree(log_folding)?;
+        crate::merkle::gather_merkle_paths_dev(&nodes, num_leaves, positions, &self.stream)
+    }
+
     /// The fold blocks `indices` open — `block` values at stride `num_leaves`
     /// from each — gathered where they lie, one launch and one copy back.
     ///
@@ -96,7 +169,7 @@ pub fn commit_codeword(
     evals: &[u64],
     log_blowup: usize,
     log_folding: usize,
-) -> Result<(DeviceCodeword, Vec<u8>)> {
+) -> Result<(DeviceCodeword, [u8; 32])> {
     assert!(
         evals.len().is_power_of_two(),
         "evals must be a power of two"
@@ -159,40 +232,14 @@ pub fn commit_codeword(
     let twiddles = be.fwd_twiddles_for(log_n)?;
     crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
 
-    // The leaf hashes are written straight into the node buffer's leaf half,
-    // so the tree never needs a buffer of its own.
-    let total_nodes = 2 * num_leaves - 1;
-    // SAFETY: every byte is written before it is read — the leaves by the
-    // kernel below, the inner nodes by the level loop after it.
-    let mut nodes = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
-    {
-        let leaves_offset = (num_leaves - 1) * 32;
-        let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-        let num_leaves_u64 = num_leaves as u64;
-        let block = 1u64 << log_folding;
-        unsafe {
-            stream
-                .launch_builder(&be.keccak256_leaves_base_coset)
-                .arg(&x)
-                .arg(&num_leaves_u64)
-                .arg(&block)
-                .arg(&mut leaves)
-                .launch(keccak_launch_cfg(num_leaves_u64))?;
-        }
-    }
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves)?;
-
-    let nodes = stream.clone_dtoh(&nodes)?;
-    stream.synchronize()?;
-    Ok((
-        DeviceCodeword {
-            buffer: Arc::new(x),
-            stream,
-            elements: n,
-            base: true,
-        },
-        nodes,
-    ))
+    let codeword = DeviceCodeword {
+        buffer: Arc::new(x),
+        stream,
+        elements: n,
+        base: true,
+    };
+    let root = codeword.commit(log_folding)?;
+    Ok((codeword, root))
 }
 
 /// The same, with the codeword brought back — what a caller that folds on the
@@ -202,9 +249,10 @@ pub fn commit_codeword_to_host(
     log_blowup: usize,
     log_folding: usize,
 ) -> Result<(Vec<u64>, Vec<u8>)> {
-    let (codeword, nodes) = commit_codeword(evals, log_blowup, log_folding)?;
+    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding)?;
     let values = codeword.stream.clone_dtoh(codeword.buffer.as_ref())?;
     codeword.stream.synchronize()?;
+    let nodes = codeword.nodes_to_host(log_folding)?;
     Ok((values, nodes))
 }
 
@@ -348,41 +396,6 @@ pub fn fold_resident(
         elements: half,
         base: false,
     })
-}
-
-/// Merkle-commits a resident ext3 codeword's fold blocks, returning the tree
-/// in the host node layout.
-pub fn commit_resident_ext3(codeword: &DeviceCodeword, log_folding: usize) -> Result<Vec<u8>> {
-    assert!(!codeword.base, "a folded codeword is in the extension");
-    let num_leaves = codeword.elements >> log_folding;
-    assert!(num_leaves >= 2, "tree needs at least two leaves");
-
-    let be = backend()?;
-    let stream = &codeword.stream;
-    let total_nodes = 2 * num_leaves - 1;
-    // SAFETY: every byte is written before it is read — the leaves by the
-    // kernel below, the inner nodes by the level loop after it.
-    let mut nodes = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
-    {
-        let leaves_offset = (num_leaves - 1) * 32;
-        let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-        let num_leaves_u64 = num_leaves as u64;
-        let block = 1u64 << log_folding;
-        unsafe {
-            stream
-                .launch_builder(&be.keccak256_leaves_ext3_coset)
-                .arg(codeword.buffer.as_ref())
-                .arg(&num_leaves_u64)
-                .arg(&block)
-                .arg(&mut leaves)
-                .launch(keccak_launch_cfg(num_leaves_u64))?;
-        }
-    }
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves)?;
-
-    let out = stream.clone_dtoh(&nodes)?;
-    stream.synchronize()?;
-    Ok(out)
 }
 
 /// The same for a codeword already in the extension.
