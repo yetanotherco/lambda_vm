@@ -708,7 +708,11 @@ where
         }
         return Ok((Codeword::Device(folded), folded_domain));
     }
-    let values = codeword.host().ok_or(Error::EmptyPolynomial)?;
+    // A codeword the device holds has no copy here: if the device turned the
+    // fold down, this round cannot happen anywhere.
+    let values = codeword.host().ok_or(Error::DeviceFailed {
+        stage: "codeword fold",
+    })?;
     let (folded, folded_domain) = fold_codeword_k::<F, C, N>(values, domain, alphas)?;
     Ok((Codeword::Host(folded), folded_domain))
 }

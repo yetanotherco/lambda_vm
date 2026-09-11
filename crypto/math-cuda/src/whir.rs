@@ -132,7 +132,7 @@ impl DeviceCodeword {
         let index_dev = self.stream.clone_htod(indices)?;
         let total = indices.len() * block;
         // SAFETY: the kernel writes every value it is sized for.
-        let mut out = unsafe { self.stream.alloc::<u64>(total * limbs) }?;
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, total * limbs) }?;
         let queries = indices.len() as u64;
         let num_leaves_u64 = num_leaves as u64;
         let block_u64 = block as u64;
@@ -288,7 +288,7 @@ pub fn fold_codeword_base(
     let alpha = stream.clone_htod(alphas)?;
 
     // SAFETY: the kernel writes every element of the half it produces.
-    let mut current = unsafe { stream.alloc::<u64>(half * 3) }?;
+    let mut current = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
     let half_arg = half as u64;
     let g_inv = g_invs[0];
     unsafe {
@@ -307,7 +307,7 @@ pub fn fold_codeword_base(
     for (level, g_inv) in g_invs.iter().enumerate().skip(1) {
         half /= 2;
         // SAFETY: as above.
-        let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
         let half_arg = half as u64;
         unsafe {
             stream
@@ -352,7 +352,7 @@ pub fn fold_resident(
     let mut half = codeword.elements / 2;
 
     // SAFETY: the kernel writes every element of the half it produces.
-    let mut current = unsafe { stream.alloc::<u64>(half * 3) }?;
+    let mut current = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
     let half_arg = half as u64;
     let kernel = if codeword.base {
         &be.whir_fold_base_ext3
@@ -374,7 +374,7 @@ pub fn fold_resident(
     for (level, g_inv) in g_invs.iter().enumerate().skip(1) {
         half /= 2;
         // SAFETY: as above.
-        let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
         let half_arg = half as u64;
         unsafe {
             stream
@@ -424,7 +424,7 @@ pub fn fold_codeword_ext3(
 
     for (level, g_inv) in g_invs.iter().enumerate() {
         // SAFETY: the kernel writes every element of the half it produces.
-        let mut next = unsafe { stream.alloc::<u64>(half * 3) }?;
+        let mut next = unsafe { alloc_or_trim::<u64>(&stream, half * 3) }?;
         let half_arg = half as u64;
         unsafe {
             stream
@@ -472,7 +472,7 @@ pub fn commit_codeword_ext3(codeword: &[u64], log_folding: usize) -> Result<Vec<
     let total_nodes = 2 * num_leaves - 1;
     // SAFETY: every byte is written before it is read — the leaves by the
     // kernel below, the inner nodes by the level loop after it.
-    let mut nodes = unsafe { stream.alloc::<u8>(total_nodes * 32) }?;
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
     {
         let leaves_offset = (num_leaves - 1) * 32;
         let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
