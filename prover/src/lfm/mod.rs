@@ -121,6 +121,10 @@ mod per_table_aggregator_tests;
 mod per_table_census_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
+// ★ Test-only: the dependency-structure measurement that prices a parallel
+// executor before one is written (lane E). No production path reaches it.
+#[cfg(test)]
+mod reach_profile;
 #[cfg(test)]
 mod rpo_chip_tests;
 #[cfg(test)]
