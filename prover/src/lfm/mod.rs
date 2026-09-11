@@ -126,10 +126,10 @@ mod rpx_chip_tests;
 mod step_size_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(all(test, not(feature = "cuda")))]
-mod transcript_diff_tests;
 #[cfg(test)]
 mod trace_identity_tests;
+#[cfg(all(test, not(feature = "cuda")))]
+mod transcript_diff_tests;
 #[cfg(test)]
 mod transcript_kats;
 #[cfg(test)]

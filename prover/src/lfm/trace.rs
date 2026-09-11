@@ -98,10 +98,22 @@ pub(super) fn chip_trace(
     fill: impl Fn(usize, &mut [FE]) + Sync,
 ) -> TraceTable<F, E> {
     let rows = group.padded_rows;
-    // calloc rather than `vec![FE::zero(); n]`'s element-wise sweep: a chip
-    // trace runs to gigabytes and the fill is memory-bandwidth-bound, so the
-    // eager zeroing pass is pure cost. `zeroed_fe_vec` carries the soundness
-    // argument and its own guard test.
+    // The serial walk got this for free: its second loop ran to `real_rows` and
+    // would have panicked slicing past the buffer. The parallel one walks the
+    // PADDED rows and asks each whether it is real, so an over-long real count
+    // would quietly fill nothing instead. Said once, per chip, rather than lost.
+    assert!(
+        group.real_rows <= rows,
+        "a column group's real rows ({}) cannot outrun its padded rows ({rows})",
+        group.real_rows
+    );
+    // calloc rather than `vec![FE::zero(); n]`'s element-wise sweep. A chip
+    // trace runs to gigabytes — `LFM_HASH` at 2^20 rows is 2.6 GiB — and the
+    // sweep writes every one of those bytes before the fill overwrites most of
+    // them. The calloc path hands back demand-zeroed pages instead, so the only
+    // cost is the faults the fill would take anyway. `zeroed_fe_vec` carries the
+    // soundness argument (`FE` is `repr(transparent)` over `u64` and Goldilocks
+    // has no Montgomery form) and its own guard test.
     let mut data = zeroed_fe_vec(rows * num_columns);
     match walk {
         Walk::Parallel => fill_rows(&mut data, group, num_columns, &fill),
@@ -395,6 +407,7 @@ pub(super) fn build_traces_walked(
             _ => None,
         })
         .collect();
+
     // The keccak family's traces are driven by the executor's records; the tag
     // is the row ordinal, exactly as the compiler emitted it into the
     // preprocessed group (one rule, `layout::keccak::tag_for_row`, two callers).

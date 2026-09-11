@@ -25,6 +25,11 @@
 //! thing; the trace is the object the walk produces and the trace is what this
 //! compares.
 //!
+//! Under `--no-default-features` both walks are serial (`fill_rows` has a
+//! non-rayon twin, since the crate still has to build there), so the gate is
+//! true by construction on that arm and says nothing. It is the default build it
+//! is written for.
+//!
 //! The scale probe at the bottom is a measurement, not a gate: it drives the
 //! `LFM_HASH` filler at a production-shaped height so the walk's speedup has a
 //! number attached. It asserts identity too, because that is free.
@@ -93,7 +98,9 @@ fn cases() -> Vec<Case> {
         Case {
             name: "FriToyV0 @ BLAKE3",
             program: super::programs::fri_toy_program(),
-            arenas: fri_arenas(&super::fixture::fixture_prove_with_hasher(HasherKind::Blake3)),
+            arenas: fri_arenas(&super::fixture::fixture_prove_with_hasher(
+                HasherKind::Blake3,
+            )),
             hasher: HasherKind::Blake3,
         },
         Case {
