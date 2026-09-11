@@ -1393,10 +1393,11 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     let mut layouts = Vec::with_capacity(FAN_IN);
     let mut labels = Vec::with_capacity(FAN_IN);
     let wrap_opts = super::proof::aggregation_wrap_options();
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     for k in 0..FAN_IN {
-        let e =
-            super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, k, None)
-                .expect("every epoch must reconstruct from proofs alone");
+        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+            .expect("every epoch must reconstruct from proofs alone");
         let out_halves = e.statement.public_output_len.div_ceil(4);
         // Pre-flight: the wrap program emits one query sampler per INNER
         // sub-proof, so a shape it cannot sample must be named here rather than
@@ -1522,12 +1523,14 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
 
     // ---- the node's own proof, so the level above has something to verify.
     //
-    // ⚠ THREE marks, not one. The mark above is taken BEFORE
-    // `build_artifacts_with_hasher`, which is not a bookkeeping call: it runs
-    // `lde_columns` + `commit_lde_columns` over every chip group and builds the
-    // prep round — a full commitment pass over the whole program. So a single
-    // "before the prove" mark brackets the artifact build and the prove TOGETHER
-    // and cannot say which of them costs what. These split it.
+    // ⚠ THREE marks, not one. The mark above is taken BEFORE the artifact
+    // build, which is not a bookkeeping call: it runs `lde_columns` +
+    // `commit_lde_columns` over every chip group and builds the prep round — a
+    // full commitment pass over the whole program. So a single "before the
+    // prove" mark brackets the artifact build and the prove TOGETHER and cannot
+    // say which of them costs what. These split it.
+    // ⓘ This measurement runs ONE proof, so it is always a cache MISS and the
+    // figure below is a real build — which is what it is here to price.
     let t = Instant::now();
     let artifacts =
         build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
@@ -2087,6 +2090,8 @@ fn the_inner_node_verifies_two_leaf_nodes() {
     let mut leaves = Vec::with_capacity(FAN_IN);
     let mut leaf_layouts = Vec::with_capacity(FAN_IN);
     let mut leaf_labels: Vec<[u64; 2]> = Vec::with_capacity(FAN_IN);
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     for leaf in 0..FAN_IN {
         let mut wraps = Vec::with_capacity(FAN_IN);
         let mut wrap_layouts = Vec::with_capacity(FAN_IN);
@@ -2094,10 +2099,9 @@ fn the_inner_node_verifies_two_leaf_nodes() {
         let mut out_halves = 0usize;
         for i in 0..FAN_IN {
             let k = leaf * FAN_IN + i;
-            let e = super::epoch_tests::real_epoch_from_continuation(
-                &inner, &elf_bytes, &bundle, k, None,
-            )
-            .expect("every epoch must reconstruct from proofs alone");
+            let e =
+                super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+                    .expect("every epoch must reconstruct from proofs alone");
             out_halves = e.statement.public_output_len.div_ceil(4);
             let program =
                 super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
@@ -2514,16 +2518,12 @@ fn the_production_leaf_node_measures() {
     let mut layouts = Vec::with_capacity(fan_in);
     let mut labels: Vec<[u64; 1]> = Vec::with_capacity(fan_in);
     let mut out_halves = 0usize;
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     for k in 0..fan_in {
         let t = Instant::now();
-        let e = super::epoch_tests::real_epoch_from_continuation(
-            &inner,
-            &inputs.elf_bytes,
-            &bundle,
-            k,
-            None,
-        )
-        .expect("every epoch must reconstruct from proofs alone");
+        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+            .expect("every epoch must reconstruct from proofs alone");
         out_halves = e.statement.public_output_len.div_ceil(4);
         let shapes: Vec<&super::epoch::TableChallengeShape> =
             e.tables.iter().map(|h| &h.shape).collect();
@@ -3057,10 +3057,13 @@ fn the_block_root_proves_over_real_children() {
     let mut wraps: Vec<RealChild> = Vec::with_capacity(epochs);
     let mut wrap_layouts: Vec<SchemaLayout> = Vec::with_capacity(epochs);
     let mut wrap_labels: Vec<Vec<u64>> = Vec::with_capacity(epochs);
+    // One ELF parse and one DECODE commitment for the walk — see the tree
+    // driver's level 0, which hoists the same pair for the same reason.
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     for k in 0..epochs {
-        let e =
-            super::epoch_tests::real_epoch_from_continuation(&inner, &elf_bytes, &bundle, k, None)
-                .expect("every epoch must reconstruct from proofs alone");
+        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+            .expect("every epoch must reconstruct from proofs alone");
         let out_halves = e.statement.public_output_len.div_ceil(4);
         let shapes: Vec<&super::epoch::TableChallengeShape> =
             e.tables.iter().map(|h| &h.shape).collect();
@@ -3086,7 +3089,6 @@ fn the_block_root_proves_over_real_children() {
         "   {epochs} epoch wraps proved in {:.1}s",
         t.elapsed().as_secs_f64()
     );
-
     // ---- level 1: ONE node over every wrap. It is option B's interior child,
     // and the only thing that makes B's fold a real `hash_pair` rather than the
     // identity.
@@ -3622,15 +3624,17 @@ fn the_production_tree_composes_to_a_root() {
     let mut children: Vec<RealChild> = Vec::with_capacity(bundle.num_epochs());
     let mut layouts: Vec<SchemaLayout> = Vec::with_capacity(bundle.num_epochs());
     let mut labels: Vec<Vec<u64>> = Vec::with_capacity(bundle.num_epochs());
+    // ⛔ ONE ELF PARSE AND ONE DECODE COMMITMENT FOR THE WHOLE WALK. Both are
+    // pure functions of the guest binary, so the nineteen epochs below share
+    // one of each; built per epoch — which is what `decode_commitment: None`
+    // does — this loop parsed 3.4 MB of ELF nineteen times and built the same
+    // commitment thirty-eight. `prove_continuation` hoists exactly this pair and
+    // says so; the driver did not inherit it.
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     for k in 0..bundle.num_epochs() {
-        let e = super::epoch_tests::real_epoch_from_continuation(
-            &inner,
-            &inputs.elf_bytes,
-            &bundle,
-            k,
-            None,
-        )
-        .expect("every epoch must reconstruct from proofs alone");
+        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
+            .expect("every epoch must reconstruct from proofs alone");
         let out_halves = e.statement.public_output_len.div_ceil(4);
         if k == 0 {
             // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation fold

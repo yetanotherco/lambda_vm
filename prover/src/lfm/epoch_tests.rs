@@ -1194,33 +1194,91 @@ pub(super) fn real_epoch_from_continuation(
     epoch_index: usize,
     decode_commitment: Option<Commitment>,
 ) -> Result<RealEpoch, String> {
-    use executor::elf::Elf;
+    let konsts = EpochConstants::load(elf_bytes, opts, decode_commitment)?;
+    real_epoch_from_constants(opts, &konsts, bundle, epoch_index)
+}
 
-    let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
-    let position = crate::continuation::epoch_chain_position(bundle, &elf, epoch_index)
+/// The two things an epoch harvest needs that are the SAME for every epoch of a
+/// run: the parsed guest ELF and its DECODE preprocessed commitment.
+///
+/// # Why this is a type and not two arguments
+///
+/// Both are pure functions of the guest binary, and `commitment_from_elf` also
+/// takes `opts` — so the commitment belongs to one (ELF, options) pair and to no
+/// other. Passed as two arguments they could be handed in from different
+/// sources; constructed together they cannot. `prove_continuation` hoists the
+/// same pair and says so in a comment (`continuation.rs`, *"compute it once here
+/// instead of once per epoch inside `build_epoch_airs`"*); the recursion driver
+/// did not inherit the fix, and lane P measured the cost: with
+/// `decode_commitment: None` a 19-epoch walk builds the DECODE commitment
+/// **38 times** — once inside `reconstruct_epoch_airs` and once again in the
+/// fallback below it — and re-parses the 3,448,712-byte ELF 19 times, for one
+/// distinct value each.
+pub(super) struct EpochConstants<'a> {
+    elf_bytes: &'a [u8],
+    elf: executor::elf::Elf,
+    decode_commitment: Commitment,
+}
+
+impl<'a> EpochConstants<'a> {
+    /// Parse the ELF once and take its DECODE commitment once.
+    ///
+    /// `supplied` lets a caller that already has the commitment skip the build;
+    /// `None` builds it here, which is the one place a run should.
+    pub(super) fn load(
+        elf_bytes: &'a [u8],
+        opts: &crate::ProofOptions,
+        supplied: Option<Commitment>,
+    ) -> Result<Self, String> {
+        use executor::elf::Elf;
+
+        let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
+        let decode_commitment = match supplied {
+            Some(c) => c,
+            None => crate::tables::decode::commitment_from_elf(&elf, opts)
+                .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
+        };
+        Ok(EpochConstants {
+            elf_bytes,
+            elf,
+            decode_commitment,
+        })
+    }
+}
+
+/// [`real_epoch_from_continuation`] for a caller walking EVERY epoch of one
+/// bundle, which is every production caller.
+///
+/// ⛔ The commitment reaches `reconstruct_epoch_airs` as `Some`, which is what
+/// makes this a hoist rather than a rename: handed `None` that function builds
+/// the commitment itself and the `match` below builds a second one, so the
+/// saving is two builds per epoch, not one.
+pub(super) fn real_epoch_from_constants(
+    opts: &crate::ProofOptions,
+    konsts: &EpochConstants<'_>,
+    bundle: &crate::continuation::ContinuationProof,
+    epoch_index: usize,
+) -> Result<RealEpoch, String> {
+    let elf = &konsts.elf;
+    let position = crate::continuation::epoch_chain_position(bundle, elf, epoch_index)
         .map_err(|e| format!("chain position for epoch {epoch_index}: {e:?}"))?
         .ok_or_else(|| format!("epoch {epoch_index} is out of range or the bundle is malformed"))?;
     let view = bundle.epoch_view(epoch_index);
     let recon = crate::continuation::reconstruct_epoch_airs(
-        &elf,
+        elf,
         view,
         &position.register_init,
         position.is_final,
         position.label,
         opts,
-        decode_commitment,
+        Some(konsts.decode_commitment),
     )
     .map_err(|e| format!("reconstructing epoch {epoch_index}: {e:?}"))?
     .ok_or_else(|| format!("epoch {epoch_index} is structurally invalid"))?;
-    let decode_root = match decode_commitment {
-        Some(c) => c,
-        None => crate::tables::decode::commitment_from_elf(&elf, opts)
-            .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
-    };
     harvest_real_epoch(
         opts,
-        elf_bytes.to_vec(),
-        &elf,
+        konsts.elf_bytes.to_vec(),
+        elf,
         &recon.airs,
         &*recon.l2g_air,
         position.register_init,
@@ -1229,7 +1287,7 @@ pub(super) fn real_epoch_from_continuation(
         view.public_output().to_vec(),
         recon.runtime_page_ranges,
         position.label,
-        decode_root,
+        konsts.decode_commitment,
         view.per_table_proof(),
     )
 }

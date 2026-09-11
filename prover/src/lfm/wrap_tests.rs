@@ -1887,22 +1887,19 @@ fn the_real_block_proves_and_wraps_end_to_end() {
     println!("   host verify (epochs + global + binding): {host_verify_secs:.1}s");
 
     // ---- every epoch, wrapped from the proofs alone.
-    let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
-    let decode = crate::tables::decode::commitment_from_elf(&elf, &inner)
-        .expect("the DECODE commitment must compute");
+    // ⓘ The DECODE commitment was already hoisted here; the ELF PARSE was not —
+    // `real_epoch_from_continuation` reloaded 3.4 MB of it per epoch. Both now
+    // ride one `EpochConstants`, which is what makes the pair impossible to
+    // hoist by halves.
+    let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
+        .expect("the inner ELF and its DECODE commitment must build once");
     let wrap_opts = wrap_options();
     let (mut construct_secs, mut wrap_prove_secs, mut wrap_verify_secs) = (0f64, 0f64, 0f64);
     let mut wrap_sizes = Vec::new();
     for i in 0..n {
         let t = Instant::now();
-        let e = super::epoch_tests::real_epoch_from_continuation(
-            &inner,
-            &inputs.elf_bytes,
-            &bundle,
-            i,
-            Some(decode),
-        )
-        .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
+        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, i)
+            .unwrap_or_else(|err| panic!("epoch {i} must reconstruct from the bundle: {err}"));
         let program = super::epoch_tests::epoch_program(&e, true);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
