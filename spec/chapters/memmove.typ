@@ -41,7 +41,7 @@ Both are derived from `is_set` and `is_commit`, and those two bits are in turn d
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)
 
-The #memmove chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interactions:
+The #memmove chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
 = Assumptions
@@ -52,10 +52,7 @@ There, `src`, `dst` and `count` come either from the register file or from `COMM
 Every later row receives all four over the `MEMMOVE_NEXT` bus, where @memmove:c:range_src_incr, @memmove:c:range_dst_incr and @memmove:c:range_count_decr range-check three of them on the sending side.
 The fourth, `timestamp`, is range-checked by neither side; it holds because the value travels unchanged from the `ECALL` at the root of the sequence, which is where @memmove:a:timestamp is discharged.
 
-@memmove:a:dst is the one that is not discharged on a commitment sequence: `dst` is then an index rather than an address, and `COMMIT` carries it as a `BaseField`.
-Nothing here leans on it.
-The gap of @memmove:c:set_gap_lo is read over the integers only for `memset`, which is not a commitment, and the strict increase that rules out a ring below is a statement about `src`, which `COMMIT` does read from `x11`.
-A denormalized index reaches no chip other than this one, and the memory argument stays consistent for it as it does for any other address.
+@memmove:a:dst is not discharged on a commitment sequence; that case is taken up at the end of this chapter.
 
 = Constraints
 This VM assigns system call number $-30$ to the copy functionality and $-32$ to `memset`.
@@ -69,16 +66,16 @@ There are two ways in: from the `CPU`, by accepting an `ECALL`, or from `COMMIT`
 `is_commit` is decoded from _which_ bus the first row accepted from: `COMMIT_DEFER` has exactly one sender, and that is `COMMIT`.
 
 #aside("The syscall number alone does not pin the selector")[
-  As a line in `is_set`, the expression in @memmove:c:receive_ecall runs over the whole field, so for _every_ system call number there is a field element that reproduces its tuple.
-  @memmove:c:range_is_set is what rules those out, and it therefore carries the whole decoding argument.
-  This matters when `ECALL` numbers are allocated (@ecall): a number is safe from this chip because `is_set` is a bit, never because it is far away from $-30$ and $-32$.
+  The low limb of @memmove:c:receive_ecall is a line in `is_set` and so runs over the whole field, while the high limb is the constant $2^32 - 1$.
+  Every system call number in the negative range is therefore reproduced by some field element, and @memmove:c:range_is_set is what rules those out --- it carries the whole decoding argument.
+  This matters when `ECALL` numbers are allocated (@ecall): a negative number is safe from this chip because `is_set` is a bit, never because it is far away from $-30$ and $-32$.
 ]
 
 @memmove:c:one_hot makes the two selectors mutually exclusive and @memmove:c:functionality_implies_mu keeps both clear on a padding row.
 Both selectors also ride _inside_ the `MEMMOVE_NEXT` tuple in either direction (@memmove:c:send_next_chunk, @memmove:c:receive_next_chunk), so a sequence cannot change functionality half way through it.
 #render_constraint_table(chip, config, groups: "functionality")
 
-The last three of these define nothing new; they are the two selectors combined with `first` and with $#`μ` - #`end`$.
+The last three of these define nothing new; they combine a selector with `first`, with $#`μ` - #`end`$, and with `tail` respectively.
 They exist as columns because a multiplicity has to be linear in the columns of the chip (@logup), and a product of two of them is not.
 The remaining combinations, `first_defer` and `ram_write`, are differences of columns and so need no column of their own.
 
@@ -86,7 +83,7 @@ The remaining combinations, `first_defer` and `ram_write`, are differences of co
 The guest-side `memcpy` this chip accelerates has the following signature:
 
 ```c
-void *memcpy(void dest[restrict count], const void src[restrict count], size_t count);
+void *memcpy(size_t count; void dest[restrict count], const void src[restrict count], size_t count);
 ```
 
 That is to say,
@@ -105,7 +102,7 @@ These reads are conditioned on `first_ecall`: a deferred commitment sequence tak
 A row moves eight bytes, or a single byte when `tail` is set.
 @memmove:c:short pins $#`short` = (#`count` < 8)$ to `LT` (@lt) and @memmove:c:wide_needs_eight forbids a wide row when fewer than eight bytes remain.
 The other direction is deliberately left free: the prover may cut any row down to a single byte.
-That freedom is what lets a schedule walk one-byte rows until both ends are eight-aligned and then take wide rows through the body, which is the condition under which those rows are admitted by `MEMW_A` rather than by the wider `MEMW` (@memw).
+That freedom is what lets a schedule choose where its wide rows fall, which is what decides whether they are admitted by `MEMW_A` rather than by the wider `MEMW` (@memw).
 Which schedule is used is a prover-side choice; the AIR grants the freedom and charges for the rows.
 
 Because a row is the unit in which this chip charges, an unbounded `count` would let a single guest instruction append an unbounded number of rows to the trace.
@@ -114,11 +111,12 @@ The guest-side stubs chunk larger operations into multiple `ECALL`s; the executo
 #render_constraint_table(chip, config, groups: "width")
 
 Note that @memmove:c:bound carries `first_ecall`, so a commitment sequence proves no byte bound at all --- and `COMMIT` range-checks no `count` either.
-This is a bound on prover cost and nothing else: the commitment bus still has to balance against the committed output, which the verifier knows in full, so a commitment sequence can only be as long as the output it produces.
+No prover gain follows: the commitment bus still has to balance against the committed output, which the verifier knows in full, so a sequence can only be as long as the output it produces.
+What it does cost is work, and not only the prover's --- the verifier contributes a token pair per committed byte --- so a `write` with an absurd `count` is unprovable and unverifiable rather than merely expensive.
 
 #aside("Why a one-byte tail")[
   Selecting between exactly two widths lets `tail` be a single bit, so $#`step` = 8 - 7 dot #`tail`$ stays linear and every constraint in this chip stays of degree 2.
-  Splitting the remainder into four-, two- and one-byte chunks instead would shave off at most four rows per sequence, at the cost of a two-bit width selector and a decoding of that selector into `MEMW`'s `write2`/`write4`/`write8` flags.
+  Splitting the remainder into four-, two- and one-byte chunks instead would shave off at most eight rows per sequence, at the cost of a two-bit width selector and a decoding of that selector into `MEMW`'s `write2`/`write4`/`write8` flags.
 ]
 
 == Performing the move
@@ -134,16 +132,15 @@ With the normal order that makes every read observe memory as it was before the 
 With the order inverted every read instead observes memory after all of the sequence's writes, and the sequence propagates rather than copies; that is `memset`, and @memmove:c:set_gap_lo and @memmove:c:set_gap_hi are what make it well-defined.
 Both orders keep the read and the write at distinct timestamps and both strictly after `timestamp`, so the memory argument is undisturbed either way.
 
-@memmove:c:tail_lanes canonicalises a one-byte row.
-Such a row addresses `MEMW` with $#`write2` = #`write4` = #`write8` = 0$, i.e. it presents a single-byte access.
-`MEMW` gates every memory interaction for lane $i >= 1$ on those same width flags (@memw), so the seven unused lanes never reach the memory argument at all;
-what they do reach is the `MEMW` tuple itself, and pinning them to zero is what keeps that tuple the canonical encoding of a single-byte access rather than one carrying seven free field elements.
+@memmove:c:tail_lanes canonicalises a one-byte row, which addresses `MEMW` with $#`write2` = #`write4` = #`write8` = 0$.
+`MEMW` gates lane $i >= 1$ on those same flags (@memw), so the seven unused lanes never reach the memory argument --- but they do reach the `MEMW` tuple, and pinning them to zero is what keeps it the canonical encoding of a single-byte access rather than one carrying seven free field elements.
 
 Which memory chip the two accesses reach is decided by their addresses, and this chip constrains neither.
-An eight-byte access lands on `MEMW_A`, the read-size aligned fast path (@memw), when its address is eight-byte aligned and all eight bytes were last touched at one timestamp: that chip stores a single old timestamp, so it needs one `LT` row (@lt) to order the access.
-Anything else falls to the general `MEMW`, which stores one old timestamp per byte and needs eight, on a row that is the wider of the two to begin with.
-The read and the write are routed independently, so a sequence can take the fast path at one end and not at the other, and --- since the width of a row is not tied to `count` --- a schedule is free to spend one-byte rows up front to bring an end into alignment.
-A misaligned sequence therefore commits more cells than an aligned one of the same length, which is why the row counts this chapter reasons about are not on their own the cost of an operation.
+`MEMW_A` is the fast path (@memw): it stores a single old timestamp, so it needs one `LT` row (@lt) to order the access, where the general `MEMW` stores one per byte and needs eight, on a row that is the wider of the two to begin with.
+Two conditions admit an access there, and neither is the eight-byte alignment of its address: the access must not cross a $2^16$ limb boundary, and all the bytes it touches must carry the same old timestamp.
+Alignment matters only through the second: a buffer last written in eight-byte aligned groups has one timestamp per group, so an eight-byte access that sits on a group reads one timestamp and an access that straddles two reads two.
+That is what a schedule is buying when it spends one-byte rows to move a wide row onto a group boundary, and it is a property of how the buffer was written rather than of this chip.
+The read and the write are routed independently, so a sequence can take the fast path at one end and not at the other, and the row counts this chapter reasons about are therefore not on their own the cost of an operation.
 
 == Writing to the commitment domain
 When `is_commit` is set the destination is not RAM.
@@ -159,12 +156,10 @@ When `is_commit` is set the destination is not RAM.
 These need no `MEMW`: a commitment cell is written once and read by nobody, so there is no old value to produce and no timestamp to order.
 #render_constraint_table(chip, config, groups: "commit")
 
-A committing row emits one interaction _per byte_, at index $#`dst` + i$, rather than one for the row.
-The grouping is what forces that.
-The verifier reconstructs this side of the bus from the committed output alone, and what it sees there is the concatenation of every commitment the program made --- not where one `write` ended and the next began.
-It therefore cannot reproduce the prover's row schedule, which restarts at every system call: a guest committing four bytes and then four more sends eight one-byte rows where a verifier chunking the eight bytes it sees would expect a single wide row, and an honest proof would be rejected.
-Addressing every byte by its own index leaves the two sides nothing to disagree about.
-`commit_lane` is what keeps a one-byte row from committing the seven bytes it never read.
+A committing row emits one interaction _per byte_, at index $#`dst` + i$, rather than one for the row, and the grouping is what forces that.
+The verifier reconstructs this side of the bus from the committed output alone, where it sees the concatenation of every commitment the program made --- not where one `write` ended and the next began --- so it cannot reproduce the prover's row schedule, which restarts at every system call.
+A guest committing four bytes and then four more sends eight one-byte rows where a verifier chunking the eight bytes it sees expects a single wide row, and an honest proof would be rejected.
+Addressing every byte by its own index removes the grouping; `commit_lane` keeps a one-byte row from committing the seven bytes it never read.
 
 == Advancing to the next chunk
 In parallel, we compute $#`src_incr` = #`src` + #`step`$ and $#`dst_incr` = #`dst` + #`step`$ as the positions at which the next chunk starts, and $#`count_decr` = #`count` - #`step`$ as the number of bytes that still have to be moved afterwards.
@@ -186,7 +181,7 @@ We use the `end` bit to indicate these circumstances.
 #render_constraint_table(chip, config, groups: "end")
 
 *Note*:
-+ As `COMMIT` used to (@commit), we set $#`end` = 1$ when $#`count_decr` = -1$ rather than when $#`count` = 0$, which allows `count` to be stored in a `DWordWL` rather than a `DWordHL`.
++ We set $#`end` = 1$ when $#`count_decr` = -1$ rather than when $#`count` = 0$, which allows `count` to be stored in a `DWordWL` rather than a `DWordHL`.
 + $forall i in [0, 3]: 65535 - #`count_decr`_i >= 0$ as a result of @memmove:c:range_count_decr.
  Hence,
   $
@@ -207,17 +202,14 @@ Both tuples carry the `timestamp`, and that is what separates one sequence from 
 without it, rows belonging to two different sequences could be spliced into each other's while the bus still balances.
 Since the CPU's timestamps strictly increase per instruction, no two #memmove sequences share one.
 
-Observe also that this chip has no constraint demanding that a sequence terminates.
-It does not need one, but the reason is worth stating carefully, because the obvious counting argument is not sufficient on its own.
-
+This chip has no constraint demanding that a sequence terminates, and the reason it needs none is worth stating carefully, because the obvious counting argument is not sufficient on its own.
 Fix a timestamp.
-Balancing `MEMMOVE_NEXT` forces the number of rows claiming `end` to equal the number claiming `first`, and $#`first` = #`first_ecall` + #`first_defer`$ caps the latter at one.
+Balancing `MEMMOVE_NEXT` forces the number of rows claiming `end` to equal the number claiming `first`, and $#`first` = #`first_ecall` + #`first_defer`$ caps the number of rows claiming `first` at one.
 The `CPU` sends a single `ECALL` per timestamp, which is what caps @memmove:c:receive_ecall; and `COMMIT` puts at most one row on `COMMIT_DEFER` per timestamp, for the same reason, which is what caps @memmove:c:receive_commit_defer.
 The two are moreover exclusive, since that single `ECALL` cannot be both a copy and a `write`.
 So a sequence that simply runs on without ever setting `end` sends one tuple more than it receives, and the bus does not balance.
 
-That argument rules out an _open_ sequence, and nothing more.
-It does not by itself rule out a _closed_ one: a ring of rows carrying $#`μ` = 1$ with neither `first` nor `end` set sends and receives one tuple each, so it balances, consumes no entry at all, and would still emit a read and a write per row.
+That rules out an _open_ sequence and nothing more: a ring of rows carrying $#`μ` = 1$ with neither `first` nor `end` set sends and receives one tuple each, so it balances, consumes no entry, and would still emit a read and a write per row.
 What forbids the ring is @memmove:c:src_incr: `ADDNW` forces $#`src_incr` = #`src` + #`step`$ _over the integers_ with $#`step` >= 1$, so `src` strictly increases along the sequence and can never return to a value it already held.
 This is the second reason the positions use `ADDNW` rather than `ADD`, and the more important of the two.
 
@@ -245,18 +237,32 @@ Because every row of the sequence writes at $#`timestamp` + 1$ and reads at $#`t
 The recursion bottoms out in the seed, which the sequence never wrote.
 None of this depends on how the prover schedules the widths.
 
+The call carries one precondition beyond the gap itself: neither `src` nor `src` $+$ `count` may cross the $2^32$ limb boundary, for the reason given in the third bullet below.
+This is a real restriction on the caller rather than a property the chip enforces --- the AIR simply has no satisfying assignment for such a call --- so the executor rejects it up front and the guest stub keeps its chunks clear of the boundary.
+
 @memmove:c:set_gap_lo and @memmove:c:set_gap_hi pin the gap, and the pinning is load-bearing rather than a convention.
 The degenerate case is $#`dst` = #`src`$: the read and the write then address the same cell at two adjacent timestamps, the memory argument is satisfied by $#`value` = #`value`$, and all eight lanes become free field elements.
 Nothing else in this chip touches them --- they are typed as bytes but range-checked nowhere, because on a moving row @memmove:c:read_value pins them --- so a prover could put anything it liked into RAM, and hence into the committed output.
 
 Three details of the pinning are worth spelling out:
-- The distance must be at least the width of the widest row, so $8$ is the smallest one that works.
-  At distance $1$ an eight-byte row's read range overlaps its own write range and the argument above returns.
+- Only $#`dst` = #`src`$ frees the lanes; at a distance $d$ with $1 <= d <= 8$ a row still pins $#`value`_i = #`value`_(i-d)$ for $i >= d$, and pins the first $d$ lanes against memory it did not write.
+  The gap is $8$ because that is the width of the widest row, so a wide row's read range and its write range stay disjoint, and because it is the length of the seed the guest lays down.
 - The gate is `is_set` alone, and not `is_set` together with a multiplicity.
-  `step` advances `src` and `dst` together, so $#`dst` - #`src`$ is invariant along a sequence and the relation holds on the terminal row as well; a padding row leaves $#`is_set` = 0$.
-  Gating on a product would cost a degree, and this chip stays at degree 2.
-- Taken together the two constraints force $#`dst` - #`src` = 8$ _in the field_, whichever way the prover splits the two addresses over their limbs, and that is already enough to rule out the aliasing.
-  Reading them as a gap of $8$ over the integers additionally needs @memmove:a:src and @memmove:a:dst, which the register file discharges on the first row and @memmove:c:range_src_incr and @memmove:c:range_dst_incr on every later one.
+  Gating on a product would cost a degree, and this chip stays at degree 2; a padding row leaves $#`is_set` = 0$, and the terminal row satisfies the relation for the same reason every other row does.
+- The two constraints are _limb-wise_, and that is stronger than a gap of $8$ on the 64-bit value.
+  They admit no carry out of the low limb: $#`src` = (2^32 - 16, 0)$ with $#`dst` = (2^32 - 8, 0)$ satisfies them, but one eight-byte step sends `dst` to $(0, 1)$ while `src` stays in limb $0$, and the successor row satisfies neither.
+  An honest `memset` whose range crosses the $2^32$ limb boundary therefore has no satisfying assignment at all.
+
+= The commitment index
+On a commitment sequence `dst` is a byte index rather than an address, and `COMMIT` carries it as a `BaseField` (@commit), so @memmove:a:dst is not discharged there.
+Two things in this chapter do lean on it, and both degrade rather than break.
+
+@memmove:c:dst_incr invokes `ADDNW`, whose @addnw:a:lhs _is_ that assumption: without it the template no longer forces $#`dst_incr` = #`dst` + #`step`$ over the integers, only the field statement, so a denormalized index admits a spurious carry into the high limb.
+And the per-lane addresses of @memmove:c:commit_value_out are built as $#`dst`_0 + i$ without the carry normalisation `MEMW` applies to its own lanes (@memw), so a row with $#`dst`_0 > 2^32 - 8$ addresses its upper lanes outside the low limb.
+
+Neither is a gain for a prover, because a token of that shape has no receiver: the commitment domain is reached by no chip other than this one, and the verifier supplies exactly one $(2, a, 0, dot)$ token per index.
+The argument that rules out a ring is unaffected, since it is a statement about `src`, which `COMMIT` does read from `x11`.
+Both would be settled at the source by range-checking `index` where it enters `COMMIT`; note that with `count` unbounded on this path, @commit:c:read_index can also write a value past the `Word` range into `x254`.
 
 = The Accelerated Memory Operations standard
 The Ethereum Foundation's Accelerated Memory Operations standard fixes what an accelerated `memcpy`, `memmove` and `memset` must provide.
@@ -267,6 +273,7 @@ The first is behavioural: the accelerated symbol must behave identically to the 
 The second concerns linking: the symbol must be a strong definition in an unconditionally linked object, or be linked with `--whole-archive`, so that a weak definition elsewhere cannot silently displace it.
 
 What the standard asks of the chip itself is that it accept operands of arbitrary alignment, which it does: no constraint here refers to the alignment of `src`, `dst` or `count`, and a row's width is not tied to any of them.
+The one operand restriction this chip does impose is not an alignment: a `memset` may not straddle the $2^32$ limb boundary, as described above.
 The standard's fourth operation, `memcmp`, is not covered: it does not copy, so it does not fit this chip, and accelerating it would need a table of its own.
 
 = Notes/optimizations
@@ -279,12 +286,11 @@ The standard's fourth operation, `memcmp`, is not covered: it does not copy, so 
   Only the seven lanes that a one-byte row leaves unused need @memmove:c:tail_lanes, since those never reach the read.
   On a row that moves nothing --- the terminal row, and padding rows --- there is no read, so $#`value`_0$ is an arbitrary field element there.
   That is harmless, because every write carries a multiplicity that vanishes with `end` and so does not fire either.
-- @memmove:c:range_src_incr and @memmove:c:range_dst_incr carry multiplicity $#`μ`$, but `src_incr` and `dst_incr` are constrained and consumed only at $#`μ` - #`end`$.
-  Lowering both to $#`μ` - #`end`$ would drop eight `IS_HALF` lookups on every terminal row at no cost.
-  It would not make the proof smaller, though: `IS_HALF` is answered by a preprocessed table whose height is fixed at compile time, so dropping lookups moves multiplicities and leaves the number of committed cells where it was.
+- @memmove:c:range_src_incr and @memmove:c:range_dst_incr carry multiplicity $#`μ`$, but `src_incr` and `dst_incr` are _consumed_ only at $#`μ` - #`end`$ --- on a terminal row they are pinned by nothing beyond @addnw:c:carry, which holds unconditionally.
+  Lowering both to $#`μ` - #`end`$ would drop eight `IS_HALF` lookups on every terminal row at no cost, though not a smaller proof: that table is preprocessed at a fixed height, so the committed cell count is unchanged.
   @memmove:c:range_count_decr genuinely needs $#`μ`$, since @memmove:c:end consumes `count_decr` at that multiplicity.
 - A row could move sixteen or thirty-two bytes rather than eight, at the cost of a wider `MEMW` signature.
-  It would also narrow the aligned fast path: `MEMW_A` admits an access only when it is aligned to its own width, so sixteen-byte rows would need sixteen-byte-aligned ends to stay on the cheap chip, and the widths `MEMW`'s signature can express today are one, two, four and eight.
+  It would also narrow the fast path: `MEMW_A` needs every byte of an access to share one old timestamp, which a sixteen-byte row can only manage where the buffer was last written in groups at least that wide, and the widths `MEMW`'s signature can express today are one, two, four and eight.
   Rows saved and cells saved therefore move in opposite directions here, and only the second is what the proof pays for.
-- The `memmove` property belongs to one `ECALL`, not to an arbitrarily large guest-level copy: a copy larger than 256 bytes is split by the guest stub into several `ECALL`s at distinct timestamps, and chunk $k+1$ reads what chunk $k$ has already written.
-  That is in-contract for `memcpy`, whose buffers may not overlap; a guest-side `memmove` has to keep each copy within a single `ECALL`, or chunk in the direction that preserves the semantics.
+- The `memmove` property belongs to one `ECALL`, not to an arbitrarily large guest-level copy: past 256 bytes the stub splits into several `ECALL`s at distinct timestamps, and chunk $k+1$ reads what chunk $k$ wrote.
+  That is in-contract for `memcpy`, whose buffers may not overlap; a guest-side `memmove` must keep each copy within one `ECALL` or chunk in the direction that preserves the semantics.

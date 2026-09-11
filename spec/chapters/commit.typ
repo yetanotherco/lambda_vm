@@ -20,7 +20,7 @@ It is one row per system call; the loop over the buffer lives in the other chip.
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_interactions = compute_nr_interactions(chip)
 
-The #commit chip leverages #nr_variables variables, spanning #nr_columns columns and leverages #nr_interactions interactions:
+The #commit chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
 = Constraints
@@ -71,7 +71,7 @@ Lastly, we must make sure `μ` is a bit.
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
 
-Since every constraint in this chip is conditioned on `μ`, a padding row is all-zero.
+Every interaction in this chip is conditioned on `μ`, and the one constraint is satisfied by $#`μ` = 0$, so a padding row is all-zero.
 
 = Notes/optimizations
 - The current version only supports writing to `stdout`.
