@@ -442,6 +442,21 @@ fn continuation_phases() {
         "prepare is {:.0}% of the run — what a pipeline could hide behind the previous proof",
         100.0 * prepared / secs(&total)
     );
+    // Which pieces ran on device, summed over every epoch. A count far below
+    // the number of tables is a phase above that is a CPU number wearing a GPU
+    // label — and over a whole continuation that is easy to miss, because the
+    // wall clock grows with the epochs either way.
+    #[cfg(feature = "cuda")]
+    for (tag, count) in [
+        ("gpu commits", multilinear::gpu::commit_calls()),
+        ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
+        ("gpu evals", multilinear::gpu::evaluate_calls()),
+        ("gpu trees", multilinear::gpu::tree_calls()),
+        ("gpu factors", multilinear::gpu::factor_calls()),
+        ("gpu openings", multilinear::gpu::open_calls()),
+    ] {
+        println!("{tag:<14} {count:>9}");
+    }
 }
 
 /// Where the multilinear prover's time goes, phase by phase.
