@@ -951,15 +951,34 @@ mod tests {
 #[cfg(feature = "cuda")]
 const TREE_THRESHOLD: usize = 1 << 14;
 
-/// A LogUp fraction tree the device holds, layers and all.
+/// A LogUp fraction tree the device holds.
+///
+/// The levels are here; the input layer is here only if it was cheap to carry.
+/// A tree built from resident factors gives it back after the first fold and
+/// writes it again for its own sumcheck — see
+/// [`input_layer_tree`](crate::gpu::input_layer_tree).
 #[cfg(feature = "cuda")]
-pub struct DeviceTree(math_cuda::gkr::DeviceFractionTree);
+pub struct DeviceTree {
+    /// Taken when the input layer's sumcheck comes: every level above it is
+    /// spent by then, and letting them go is what makes room for it.
+    tree: std::sync::Mutex<Option<math_cuda::gkr::DeviceFractionTree>>,
+    /// Writes the input layer again, for a tree that did not keep it.
+    #[allow(clippy::type_complexity)]
+    rebuild: Option<Box<dyn Fn() -> Option<math_cuda::gkr::InputLayer> + Send + Sync>>,
+    num_layers: usize,
+    input_num_vars: usize,
+    /// Read at build: whoever asks may be asking after the levels are gone.
+    output: ([u64; 3], [u64; 3]),
+    /// The room the whole thing promised itself, the handed-back layer
+    /// included.
+    _room: Option<math_cuda::device::DeviceReservation>,
+}
 
 #[cfg(feature = "cuda")]
 impl std::fmt::Debug for DeviceTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceTree")
-            .field("layers", &self.0.num_layers())
+            .field("layers", &self.num_layers)
             .finish()
     }
 }
@@ -1038,8 +1057,20 @@ where
         core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len() * 3)
     };
     let tree = math_cuda::gkr::DeviceFractionTree::build(raw(p), raw(q)).ok()?;
+    let output = tree.output().ok()?;
+    let num_layers = tree.num_layers();
+    let input_num_vars = tree.layer_num_vars(num_layers - 1);
     TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(DeviceTree(tree))
+    // This one keeps its input layer: it was uploaded whole, so there is
+    // nothing cheaper to hand back.
+    Some(DeviceTree {
+        tree: std::sync::Mutex::new(Some(tree)),
+        rebuild: None,
+        num_layers,
+        input_num_vars,
+        output,
+        _room: None,
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1053,7 +1084,7 @@ where
 #[cfg(feature = "cuda")]
 impl DeviceTree {
     pub(crate) fn num_layers(&self) -> usize {
-        self.0.num_layers()
+        self.num_layers
     }
 
     /// The output fraction, which is what says whether the bus balances.
@@ -1069,9 +1100,7 @@ impl DeviceTree {
     where
         E: math::field::traits::IsField + 'static,
     {
-        let (p, q) = self.0.output().map_err(|_| crate::Error::DeviceFailed {
-            stage: "tree output",
-        })?;
+        let (p, q) = self.output;
         Ok((ext3_from_raw::<E>(&p), ext3_from_raw::<E>(&q)))
     }
 
@@ -1098,15 +1127,48 @@ impl DeviceTree {
         for coordinate in point {
             raw_point.extend_from_slice(&ext3_raw(coordinate)?);
         }
-        let num_vars = self.0.layer_num_vars(layer).checked_sub(1)?;
-        let session = self.0.layer_sumcheck(
-            layer,
-            &raw_point,
-            &lowered.nodes,
-            &lowered.consts,
-            lowered.num_slots,
-            lowered.root_slot,
-        );
+        let input_layer = layer + 1 == self.num_layers;
+        let session = if input_layer && self.rebuild.is_some() {
+            // The one the tree gave back. Everything above it has been proved,
+            // so the levels go first and the layer is written where they were.
+            let num_vars = self.input_num_vars.checked_sub(1)?;
+            if num_vars * 3 != raw_point.len() {
+                return None;
+            }
+            drop(self.tree.lock().ok()?.take());
+            let rebuilt = (self.rebuild.as_ref()?)()?;
+            rebuilt.sumcheck(
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        } else {
+            let held = self.tree.lock().ok()?;
+            let tree = held.as_ref()?;
+            if tree.layer_num_vars(layer).checked_sub(1)? * 3 != raw_point.len() {
+                return None;
+            }
+            tree.layer_sumcheck(
+                layer,
+                &raw_point,
+                &lowered.nodes,
+                &lowered.consts,
+                lowered.num_slots,
+                lowered.root_slot,
+            )
+        };
+        let num_vars = if input_layer {
+            self.input_num_vars.checked_sub(1)?
+        } else {
+            self.tree
+                .lock()
+                .ok()?
+                .as_ref()?
+                .layer_num_vars(layer)
+                .checked_sub(1)?
+        };
         let Ok(mut session) = session else {
             return None;
         };
@@ -1260,17 +1322,23 @@ where
 }
 
 /// The fraction tree's input layer, written by the device from the factors it
-/// already holds, and folded into a tree without ever coming back.
+/// already holds.
 ///
 /// Each interaction contributes a `p` and a `q` slab of `rows`, in the order
-/// [`logup::input_layer`](crate::logup::input_layer) lays them out, with the
-/// padding slots carrying `0/1`.
+/// [`logup::input_layer`](crate::logup::input_layer) lays them out.
+///
+/// `padding` says whether the slots the interaction count is rounded up to are
+/// written as the `0/1` they are. They are, for the layer that answers its own
+/// sumcheck; they are not for the one that is only folded once, where they are
+/// half the memory of the widest precompiles and the fold reads them as
+/// constants instead.
 #[cfg(feature = "cuda")]
-pub fn input_layer_tree<E>(
+fn write_input_layer<E>(
     factors: &DeviceFactors,
     numerators: &[crate::program::Program<E>],
     denominators: &[crate::program::Program<E>],
-) -> Option<DeviceTree>
+    padding: bool,
+) -> Option<math_cuda::gkr::Halves>
 where
     E: math::field::traits::IsField + 'static,
 {
@@ -1278,9 +1346,14 @@ where
 
     let rows = factors.0.len();
     let slots = numerators.len().next_power_of_two();
+    let cells = if padding {
+        slots * rows
+    } else {
+        numerators.len() * rows
+    };
     let stream = factors.0.stream().clone();
-    let mut p = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, slots * rows * 3).ok()?;
-    let mut q = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, slots * rows * 3).ok()?;
+    let mut p = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, cells * 3).ok()?;
+    let mut q = math_cuda::device::alloc_zeros_or_trim::<u64>(&stream, cells * 3).ok()?;
 
     for (i, (numerator, denominator)) in numerators.iter().zip(denominators).enumerate() {
         for (program, out) in [(numerator, &mut p), (denominator, &mut q)] {
@@ -1298,21 +1371,76 @@ where
                 .ok()?;
         }
     }
-    // The padding interactions: numerator zero (already), denominator one.
-    let one = ext3_raw(&FieldElement::<E>::one())?;
-    let padding = (slots - numerators.len()) * rows;
-    math_cuda::sumcheck::fill_ext3(&stream, &mut q, numerators.len() * rows, padding, &one).ok()?;
+    if padding {
+        // The padding interactions: numerator zero (already), denominator one.
+        let one = ext3_raw(&FieldElement::<E>::one())?;
+        let tail = (slots - numerators.len()) * rows;
+        math_cuda::sumcheck::fill_ext3(&stream, &mut q, numerators.len() * rows, tail, &one)
+            .ok()?;
+    }
+    Some((p, q))
+}
 
-    let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
+/// The tree over that input layer, built without carrying the padding.
+///
+/// The layer is folded once and let go; when its own sumcheck comes — last,
+/// with every level above it spent — it is written again, padding and all.
+/// Writing it twice costs one pass of the interactions' programs; carrying it
+/// costs the memory that decides whether the widest precompiles get a device
+/// at all.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree<E>(
+    factors: std::sync::Arc<DeviceFactors>,
+    numerators: Vec<crate::program::Program<E>>,
+    denominators: Vec<crate::program::Program<E>>,
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let rows = factors.0.len();
+    let slots = numerators.len().next_power_of_two();
+    let full = slots * rows;
+    let real = numerators.len() * rows;
+    let stream = factors.0.stream().clone();
+
+    // One promise for the whole tree, held past it: the layer handed back for
+    // the last sumcheck is part of the same structure.
+    let room = math_cuda::device::reserve(math_cuda::gkr::padded_peak_bytes(real, full))?;
+
+    let (p, q) = write_input_layer(&factors, &numerators, &denominators, false)?;
+    let num_vars = full.trailing_zeros() as usize;
+    let tree =
+        math_cuda::gkr::DeviceFractionTree::from_padded_input(stream.clone(), p, q, real, num_vars)
+            .ok()?;
+    let output = tree.output().ok()?;
+    let num_layers = tree.num_layers();
+
+    let rebuild = move || {
+        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
+        Some(math_cuda::gkr::InputLayer::new(
+            stream.clone(),
+            p,
+            q,
+            num_vars,
+        ))
+    };
+
     TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(DeviceTree(tree))
+    Some(DeviceTree {
+        tree: std::sync::Mutex::new(Some(tree)),
+        rebuild: Some(Box::new(rebuild)),
+        num_layers,
+        input_num_vars: num_vars,
+        output,
+        _room: Some(room),
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
 pub fn input_layer_tree<E>(
-    _factors: &DeviceFactors,
-    _numerators: &[crate::program::Program<E>],
-    _denominators: &[crate::program::Program<E>],
+    _factors: std::sync::Arc<DeviceFactors>,
+    _numerators: Vec<crate::program::Program<E>>,
+    _denominators: Vec<crate::program::Program<E>>,
 ) -> Option<DeviceTree>
 where
     E: math::field::traits::IsField + 'static,

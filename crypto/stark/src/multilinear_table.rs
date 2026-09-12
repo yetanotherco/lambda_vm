@@ -614,7 +614,7 @@ where
     let tree = match table
         .trace
         .reside_from_columns()
-        .and_then(|resident| logup::resident_tree(&interactions, &resident))
+        .and_then(|resident| logup::resident_tree(&interactions, resident))
     {
         Some(tree) => tree,
         // No device took them, so the host builds what it needs: the factors,

@@ -262,6 +262,7 @@ pub struct Backend {
     pub add_scaled_ext3: CudaFunction,
     pub fill_ext3: CudaFunction,
     pub fraction_fold_ext3: CudaFunction,
+    pub fraction_fold_padded_ext3: CudaFunction,
 
     // whir_fold.cubin
     pub whir_fold_base_ext3: CudaFunction,
@@ -365,6 +366,12 @@ fn drain_and_trim() -> Result<()> {
     be.ctx.synchronize()?;
     trim_default_mempool();
     Ok(())
+}
+
+/// Promises `bytes` against the budget for a caller whose structure outlives
+/// the type that spends them.
+pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
+    backend().ok()?.reserve(bytes)
 }
 
 /// Allocates on `stream`, and if the device says no, gives the pool's retained
@@ -630,6 +637,7 @@ impl Backend {
             add_scaled_ext3: sumcheck.load_function("add_scaled_ext3")?,
             fill_ext3: sumcheck.load_function("fill_ext3")?,
             fraction_fold_ext3: sumcheck.load_function("fraction_fold_ext3")?,
+            fraction_fold_padded_ext3: sumcheck.load_function("fraction_fold_padded_ext3")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp

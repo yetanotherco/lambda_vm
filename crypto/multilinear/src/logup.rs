@@ -181,7 +181,7 @@ pub fn input_layer<E: IsField + 'static>(
 /// `None` when the device declines; the caller then builds the layer here.
 pub fn resident_tree<E: IsField + 'static>(
     interactions: &[Interaction<E>],
-    factors: &crate::gpu::DeviceFactors,
+    factors: std::sync::Arc<crate::gpu::DeviceFactors>,
 ) -> Option<crate::gkr::FractionTree<E>> {
     if interactions.is_empty() {
         return None;
@@ -200,7 +200,7 @@ pub fn resident_tree<E: IsField + 'static>(
         .map(|i| emit(&i.denominator))
         .collect::<Option<_>>()?;
 
-    let tree = crate::gpu::input_layer_tree(factors, &numerators, &denominators)?;
+    let tree = crate::gpu::input_layer_tree(factors, numerators, denominators)?;
     crate::gkr::FractionTree::from_device(tree).ok()
 }
 

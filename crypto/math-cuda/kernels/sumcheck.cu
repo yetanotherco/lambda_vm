@@ -386,6 +386,39 @@ extern "C" __global__ void fraction_fold_ext3(const uint64_t *__restrict__ p,
     down[2] = denominator.c;
 }
 
+// The same, for a layer whose upper half runs out: the interactions are padded
+// up to a power of two with the fraction 0/1, and a fraction nobody wrote is
+// one nobody has to store. The lower half is always there — the padding is
+// less than half the cube, because the count is rounded *up* to the power of
+// two above it.
+extern "C" __global__ void fraction_fold_padded_ext3(const uint64_t *__restrict__ p,
+                                                     const uint64_t *__restrict__ q, uint64_t half,
+                                                     uint64_t real,
+                                                     uint64_t *__restrict__ p_out,
+                                                     uint64_t *__restrict__ q_out) {
+    uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= half) return;
+    Fe3 p_lo = load_ext(p + j * 3);
+    Fe3 q_lo = load_ext(q + j * 3);
+    uint64_t hi = j + half;
+    Fe3 p_hi = {0, 0, 0};
+    Fe3 q_hi = {1, 0, 0};
+    if (hi < real) {
+        p_hi = load_ext(p + hi * 3);
+        q_hi = load_ext(q + hi * 3);
+    }
+    Fe3 numerator = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+    Fe3 denominator = ext3::mul(q_lo, q_hi);
+    uint64_t *at = p_out + j * 3;
+    at[0] = numerator.a;
+    at[1] = numerator.b;
+    at[2] = numerator.c;
+    uint64_t *down = q_out + j * 3;
+    down[0] = denominator.a;
+    down[1] = denominator.b;
+    down[2] = denominator.c;
+}
+
 // The first fold of a base-field table, which lifts it:
 //   out[j] = in[j] + r·(in[j + half] − in[j])
 // with `in` base and `out` ext3. Later folds stay in the extension and go
