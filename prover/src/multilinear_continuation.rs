@@ -67,29 +67,35 @@ pub struct EpochProof {
 }
 
 impl EpochProof {
-    /// The root of the commitment the local-to-global bookend has to itself.
+    /// The roots of the commitment the local-to-global bookend has to itself.
     ///
     /// This is what ties the epoch to the cross-epoch proof: the two commit the
-    /// same table, and with the bookend committed alone its root says so. Every
-    /// other table shares a stack and has no root of its own.
+    /// same table, and with the bookend in a commitment group of its own its
+    /// roots say so. Every other table shares a group.
     ///
-    /// [`verify_epoch`] checks the bookend really is one polynomial of its own
-    /// before this means anything.
-    pub fn l2g_root(&self) -> Option<stark::config::Commitment> {
-        self.proof.roots.last().copied()
+    /// `num_polys` is how many polynomials the stack split that group into —
+    /// one for a bookend that fits in a stack, more for an epoch long enough
+    /// that it does not. The group is the last, so its roots are the tail.
+    pub fn l2g_roots(&self, num_polys: usize) -> Option<&[stark::config::Commitment]> {
+        if num_polys == 0 {
+            return None;
+        }
+        let start = self.proof.roots.len().checked_sub(num_polys)?;
+        Some(&self.proof.roots[start..])
     }
 }
 
-/// The root the local-to-global table commits to on its own — what an epoch
+/// The roots the local-to-global table commits to on its own — what an epoch
 /// proof carries and the cross-epoch proof has to reproduce.
 ///
 /// A function of the table, the blowup and the fold width, and of nothing else:
 /// in particular not of the query count, which is what lets two proofs over
-/// different table sets agree on it.
+/// different table sets agree on them. One root per polynomial the stack split
+/// the table into.
 pub fn l2g_commitment(
     boundary: &[CellBoundary],
     config: &ChainConfig,
-) -> Result<stark::config::Commitment, Error> {
+) -> Result<Vec<stark::config::Commitment>, Error> {
     let trace = local_to_global::generate_local_to_global_trace(boundary);
     let columns: Vec<Mle<F>> = trace
         .columns_main()
@@ -108,11 +114,11 @@ pub fn l2g_commitment(
         config,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    stacked
-        .roots()
-        .first()
-        .copied()
-        .ok_or_else(|| Error::Prover("the bookend commits to nothing".to_string()))
+    let roots = stacked.roots().to_vec();
+    if roots.is_empty() {
+        return Err(Error::Prover("the bookend commits to nothing".to_string()));
+    }
+    Ok(roots)
 }
 
 /// Binds an epoch's statement into the transcript before any challenge.
@@ -214,12 +220,23 @@ pub struct GlobalProof {
 }
 
 impl GlobalProof {
-    /// The root each epoch's bookend was committed under here, in epoch order.
+    /// The roots each epoch's bookend was committed under here, in epoch order.
     ///
-    /// [`verify_global`] checks each bookend really is one polynomial of its
-    /// own before this means anything.
-    pub fn l2g_roots(&self, num_epochs: usize) -> Option<&[stark::config::Commitment]> {
-        self.proof.roots.get(..num_epochs)
+    /// The bookends are the first commitment groups, one each, and the roots
+    /// are flat — one per stacked polynomial — so a group's are a window.
+    /// `polys` is how many polynomials each one stacked into.
+    pub fn l2g_roots(&self, polys: &[usize]) -> Option<Vec<&[stark::config::Commitment]>> {
+        let mut start = 0usize;
+        let mut groups = Vec::with_capacity(polys.len());
+        for &num_polys in polys {
+            if num_polys == 0 {
+                return None;
+            }
+            let end = start.checked_add(num_polys)?;
+            groups.push(self.proof.roots.get(start..end)?);
+            start = end;
+        }
+        Some(groups)
     }
 }
 
@@ -392,6 +409,31 @@ pub fn verify_global(
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
+    Ok(verify_global_bookends(
+        elf,
+        elf_bytes,
+        global,
+        num_epochs,
+        page_bases,
+        num_private_input_pages,
+        opts,
+    )?
+    .is_some())
+}
+
+/// [`verify_global`], handing back the roots each epoch's bookend was
+/// committed under — which is what the binding compares. `None` is a proof
+/// that does not verify.
+#[allow(clippy::too_many_arguments)]
+fn verify_global_bookends(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    global: &GlobalProof,
+    num_epochs: usize,
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+) -> Result<Option<Vec<Vec<Commitment>>>, Error> {
     let l2g_airs: Vec<_> = (0..num_epochs)
         .map(|i| crate::continuation::l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
@@ -460,15 +502,12 @@ pub fn verify_global(
 
     let sizes = global_groups(num_epochs, gm_configs.len());
     let (stacks, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
-    // What makes [`GlobalProof::l2g_roots`] mean anything.
-    if stacks[..num_epochs].iter().any(|l| l.num_polys() != 1) {
-        return Err(Error::ContinuationInvariant(
-            "every bookend must commit to one polynomial of its own".to_string(),
-        ));
-    }
+    // Each bookend is a group of its own, so its roots are the group's — as
+    // many as the stack split it into.
+    let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
 
     // The cross-epoch bus has no counterparty in the statement: it must vanish.
-    Ok(multilinear_table::multi_verify(
+    if multilinear_table::multi_verify(
         &global.proof,
         &statements,
         &stacks,
@@ -478,7 +517,13 @@ pub fn verify_global(
         &config,
         &mut transcript,
     )
-    .is_ok())
+    .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(global
+        .l2g_roots(&polys)
+        .map(|groups| groups.into_iter().map(<[_]>::to_vec).collect()))
 }
 
 /// Proves one epoch: its tables plus the local-to-global bookend, against one
@@ -691,14 +736,11 @@ pub fn verify_continuation(
     bundle: &ContinuationProof,
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
-    if bundle.epochs.is_empty() {
+    let Some(proved) = verify_epochs_bookends(elf_bytes, &bundle.epochs, opts)? else {
         return Ok(false);
-    }
-    if !verify_epochs(elf_bytes, &bundle.epochs, opts)? {
-        return Ok(false);
-    }
+    };
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    if !verify_global(
+    let Some(chained) = verify_global_bookends(
         &elf,
         elf_bytes,
         &bundle.global,
@@ -706,22 +748,16 @@ pub fn verify_continuation(
         &bundle.touched_page_bases,
         bundle.num_private_input_pages,
         opts,
-    )? {
+    )?
+    else {
         return Ok(false);
-    }
+    };
 
     // The binding: epoch `k`'s bookend and the one the cross-epoch proof
     // chained are the same table, or neither half says anything about the
-    // other.
-    let Some(chained) = bundle.global.l2g_roots(bundle.epochs.len()) else {
-        return Ok(false);
-    };
-    for (epoch, root) in bundle.epochs.iter().zip(chained) {
-        if epoch.l2g_root() != Some(*root) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // other. Comparing the groups whole is also what catches a bookend the two
+    // sides stacked differently.
+    Ok(proved == chained)
 }
 
 /// Proves every epoch of a run, in order, chaining the register file.
@@ -781,20 +817,34 @@ pub fn verify_epochs(
     epochs: &[EpochProof],
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
+    Ok(verify_epochs_bookends(elf_bytes, epochs, opts)?.is_some())
+}
+
+/// [`verify_epochs`], handing back each epoch's bookend roots in order — which
+/// is what the binding compares. `None` is a run that does not verify.
+fn verify_epochs_bookends(
+    elf_bytes: &[u8],
+    epochs: &[EpochProof],
+    opts: &ProofOptions,
+) -> Result<Option<Vec<Vec<Commitment>>>, Error> {
     if epochs.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut carried = register::register_init_from_entry_point(elf.entry_point);
+    let mut bookends = Vec::with_capacity(epochs.len());
     for (index, epoch) in epochs.iter().enumerate() {
         let label = local_to_global::epoch_label(index as u64);
         let is_final = index + 1 == epochs.len();
-        if !verify_epoch(&elf, elf_bytes, epoch, &carried, is_final, label, opts)? {
-            return Ok(false);
-        }
+        let Some(roots) =
+            verify_epoch_bookend(&elf, elf_bytes, epoch, &carried, is_final, label, opts)?
+        else {
+            return Ok(None);
+        };
+        bookends.push(roots);
         carried.clone_from(&epoch.reg_fini);
     }
-    Ok(true)
+    Ok(Some(bookends))
 }
 
 /// Verifies one epoch from the bundle and the ELF alone.
@@ -812,6 +862,25 @@ pub fn verify_epoch(
     label: u64,
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
+    Ok(
+        verify_epoch_bookend(elf, elf_bytes, epoch, register_init, is_final, label, opts)?
+            .is_some(),
+    )
+}
+
+/// [`verify_epoch`], handing back the roots the epoch's bookend was committed
+/// under — which is what the binding compares. `None` is a proof that does not
+/// verify.
+#[allow(clippy::too_many_arguments)]
+fn verify_epoch_bookend(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    epoch: &EpochProof,
+    register_init: &[u32],
+    is_final: bool,
+    label: u64,
+    opts: &ProofOptions,
+) -> Result<Option<Vec<Commitment>>, Error> {
     let airs = crate::continuation::build_epoch_airs(
         elf,
         opts,
@@ -882,20 +951,16 @@ pub fn verify_epoch(
         &epoch.proof.roots,
         &transcript,
     ) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let sizes = epoch_groups(shapes.len());
     let (layouts, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
-    // What makes [`EpochProof::l2g_root`] mean anything: the bookend is
-    // committed alone, and in one polynomial, so the last root is its own.
-    if layouts.last().map(|l| l.num_polys()) != Some(1) {
-        return Err(Error::ContinuationInvariant(
-            "the local-to-global bookend must commit to one polynomial of its own".to_string(),
-        ));
-    }
+    // The bookend is committed in the last group, alone, so its roots are that
+    // group's — as many as the stack split it into.
+    let num_polys = layouts.last().map(|l| l.num_polys()).unwrap_or(0);
 
-    Ok(multilinear_table::multi_verify(
+    if multilinear_table::multi_verify(
         &epoch.proof,
         &statements,
         &layouts,
@@ -905,5 +970,9 @@ pub fn verify_epoch(
         &config,
         &mut transcript,
     )
-    .is_ok())
+    .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(epoch.l2g_roots(num_polys).map(<[_]>::to_vec))
 }

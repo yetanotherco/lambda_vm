@@ -139,7 +139,10 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
     let opts = ProofOptions::default_test_options();
     let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
 
-    let mut roots: Vec<(stark::config::Commitment, stark::config::Commitment)> = Vec::new();
+    let mut roots: Vec<(
+        Vec<stark::config::Commitment>,
+        Vec<stark::config::Commitment>,
+    )> = Vec::new();
     continuation::for_each_epoch(&elf, &[], 4, &artifacts, |prepared, _| {
         let boundary = std::sync::Arc::clone(&prepared.boundary);
         let register_init = prepared.register_init.clone();
@@ -165,13 +168,25 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
             .iter()
             .map(|&n| (1usize, n as usize))
             .collect();
-        let standalone = multilinear_continuation::l2g_commitment(
-            &boundary,
-            &crate::multilinear_prove::chain_config(&shapes),
-        )
-        .expect("the bookend commits");
+        let config = crate::multilinear_prove::chain_config(&shapes);
+        let standalone = multilinear_continuation::l2g_commitment(&boundary, &config)
+            .expect("the bookend commits");
+        // How many polynomials the bookend's group stacks into, derived the way
+        // the verifier derives it rather than read off the standalone roots.
+        let widths: Vec<(usize, usize)> = proof
+            .table_num_vars
+            .iter()
+            .map(|&n| (1usize, n as usize))
+            .collect();
+        let sizes = multilinear_continuation::epoch_groups(widths.len());
+        let (layouts, _) =
+            crate::multilinear_prove::stacks(&widths, &sizes, &config).expect("the epoch's stacks");
+        let num_polys = layouts.last().expect("a bookend group").num_polys();
         roots.push((
-            proof.l2g_root().expect("the epoch carries a root"),
+            proof
+                .l2g_roots(num_polys)
+                .expect("the epoch carries its bookend's roots")
+                .to_vec(),
             standalone,
         ));
         Ok(())
@@ -182,7 +197,7 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
     for (index, (carried, rebuilt)) in roots.iter().enumerate() {
         assert_eq!(
             carried, rebuilt,
-            "epoch {index}'s bookend root is not the one its table commits to"
+            "epoch {index}'s bookend roots are not the ones its table commits to"
         );
     }
 }
@@ -211,6 +226,41 @@ fn a_continuation_proves_and_verifies() {
     assert!(
         multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
         "the continuation does not verify"
+    );
+}
+
+/// The bookends are windows into one flat list of roots — one root per stacked
+/// polynomial, not per table — so the binding rests on that arithmetic. An
+/// epoch long enough that its bookend needs two polynomials widens the window;
+/// it does not move the next one along.
+#[test]
+fn the_bookend_roots_are_consecutive_windows() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    let epochs = bundle.num_epochs();
+    let roots = &bundle.global.proof.roots;
+
+    let windows = bundle
+        .global
+        .l2g_roots(&vec![1usize; epochs])
+        .expect("the bookends are committed first");
+    assert_eq!(windows.len(), epochs);
+    for (index, window) in windows.iter().enumerate() {
+        assert_eq!(*window, &roots[index..index + 1]);
+    }
+
+    // A window nobody can fill comes back empty-handed rather than reading
+    // whatever root sits next to it.
+    assert!(bundle.global.l2g_roots(&[roots.len() + 1]).is_none());
+    assert!(bundle.global.l2g_roots(&[0]).is_none());
+    assert!(bundle.global.l2g_roots(&[usize::MAX]).is_none());
+    assert!(bundle.epochs[0].l2g_roots(0).is_none());
+    assert!(
+        bundle.epochs[0]
+            .l2g_roots(bundle.epochs[0].proof.roots.len() + 1)
+            .is_none()
     );
 }
 
