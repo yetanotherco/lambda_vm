@@ -136,10 +136,30 @@ pub struct Lowered {
 /// *most* work per row to the host, which is where they cost the most.
 pub const MAX_SLOTS: usize = 8192;
 
-/// Cube size below which the host wins: the rounds are a launch and a round
-/// trip each, and a small cube fits in cache.
+/// Cube size below which the host wins for a table of one or two factors: the
+/// rounds are a launch and a round trip each, and a small cube fits in cache.
 #[cfg(feature = "cuda")]
 const SUMCHECK_THRESHOLD: usize = 1 << 12;
+
+/// Cells — factors times rows — below which the host wins.
+///
+/// The precompiles are short and very wide: a thousand factors over four
+/// thousand rows is four million cells, and a gate that reads the row count
+/// alone calls that small. It is not, and it is the shape where the host costs
+/// the most, so what the gate has to read is the work.
+#[cfg(feature = "cuda")]
+const DEVICE_CELLS: usize = 1 << 12;
+
+/// A cube too short to fill a few warps is a round trip for nothing, however
+/// wide the table is.
+#[cfg(feature = "cuda")]
+const MIN_CUBE: usize = 1 << 6;
+
+/// Whether a table of `width` factors over a cube of `len` is worth a device.
+#[cfg(feature = "cuda")]
+fn worth_the_device(width: usize, len: usize) -> bool {
+    len >= MIN_CUBE && width.saturating_mul(len) >= DEVICE_CELLS
+}
 
 /// Assigns every step a slot, reusing the slot of a value whose last read has
 /// passed.
@@ -306,7 +326,7 @@ where
     }
     let first = polys.first()?;
     let num_vars = first.num_vars();
-    if first.len() < SUMCHECK_THRESHOLD || num_vars == 0 {
+    if !worth_the_device(polys.len(), first.len()) || num_vars == 0 {
         return None;
     }
     if degree == 0 || degree > math_cuda::sumcheck::MAX_NODES {
@@ -503,7 +523,7 @@ where
     }
     let len = resident.0.len();
     let num_vars = len.trailing_zeros() as usize;
-    if len < SUMCHECK_THRESHOLD || num_vars == 0 {
+    if !worth_the_device(resident.0.width() + extra.len(), len) || num_vars == 0 {
         return None;
     }
     if degree == 0 || degree > math_cuda::sumcheck::MAX_NODES {
@@ -1159,7 +1179,7 @@ where
         return None;
     }
     let rows = columns.first()?.len();
-    if rows < SUMCHECK_THRESHOLD || kinds.is_empty() {
+    if kinds.is_empty() || !worth_the_device(kinds.len(), rows) {
         return None;
     }
     if columns.iter().any(|column| column.len() != rows)
