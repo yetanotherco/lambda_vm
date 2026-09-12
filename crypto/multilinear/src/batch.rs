@@ -265,6 +265,11 @@ where
     sumcheck::prove(Batched::new(polys, rules, lambdas)?, transcript)
 }
 
+/// A batched sumcheck's proof, the point its rounds drew, and what every
+/// factor slot was bound to there — empty when the factors were the host's and
+/// folded away as they went.
+type ResidentProof<F> = (SumcheckProof<F>, Vec<FieldElement<F>>, Vec<FieldElement<F>>);
+
 /// The same, over factors a device already holds — the batch's first ones, in
 /// the order the rules read them.
 ///
@@ -291,7 +296,7 @@ pub fn prove_resident<F, T, B>(
     rules: Vec<Rule<'_, F>>,
     claims: &[FieldElement<F>],
     transcript: &mut T,
-) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>, Vec<FieldElement<F>>), Error>
+) -> Result<ResidentProof<F>, Error>
 where
     F: IsField + 'static,
     T: IsTranscript<F>,
