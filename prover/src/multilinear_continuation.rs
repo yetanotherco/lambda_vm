@@ -677,12 +677,12 @@ pub fn prove_continuation(
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
 
     let mut epochs = Vec::new();
-    let boundaries = crate::continuation::for_each_epoch(
+    let boundaries = crate::continuation::for_each_epoch_overlapped(
         &elf,
         private_inputs,
         epoch_size_log2,
         &artifacts,
-        |prepared, _| {
+        |prepared| {
             epochs.push(prove_epoch(
                 &elf,
                 elf_bytes,
@@ -781,12 +781,12 @@ pub fn prove_epochs(
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
 
     let mut proofs = Vec::new();
-    crate::continuation::for_each_epoch(
+    crate::continuation::for_each_epoch_overlapped(
         &elf,
         private_inputs,
         epoch_size_log2,
         &artifacts,
-        |prepared, _| {
+        |prepared| {
             proofs.push(prove_epoch(
                 &elf,
                 elf_bytes,

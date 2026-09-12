@@ -552,6 +552,53 @@ pub(crate) fn for_each_epoch(
     Ok(boundaries)
 }
 
+/// [`for_each_epoch`], with the next epoch prepared while `each` still has the
+/// current one.
+///
+/// Preparing an epoch is the executor and the trace builders — host work — and
+/// for a prover `each` is a proof, which is mostly the device's. The two
+/// overlap, so a run costs the proofs plus one preparation instead of both.
+///
+/// The channel has no buffer, so **two epochs are alive at most**: the one in
+/// `each`'s hands and the one waiting to be taken. That bound is the point —
+/// an epoch's traces are the biggest thing here, and a queue would trade the
+/// memory continuations exist to save.
+pub(crate) fn for_each_epoch_overlapped(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    mut each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
+) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedEpoch>(0);
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            for_each_epoch(
+                elf,
+                private_inputs,
+                epoch_size_log2,
+                artifacts,
+                |prepared, _| {
+                    // The consumer stopping is not this side's failure to
+                    // report: its error is the one that says why.
+                    sender.send(prepared).map_err(|_| {
+                        Error::ContinuationInvariant("the epoch consumer stopped".to_string())
+                    })
+                },
+            )
+        });
+        // The receiver is consumed here, so it is dropped before the join
+        // below — which is what unblocks a producer waiting to hand over the
+        // epoch nobody is going to take.
+        let used = receiver.into_iter().try_for_each(&mut each);
+        let produced = producer
+            .join()
+            .map_err(|_| Error::ContinuationInvariant("the epoch producer panicked".to_string()))?;
+        used?;
+        produced
+    })
+}
+
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
 /// builder pool. Everything sequential (execution, op collection over the
 /// advancing memory image, boundary + register-fini derivation) already
