@@ -141,6 +141,17 @@ pub const MAX_SLOTS: usize = 8192;
 #[cfg(feature = "cuda")]
 const SUMCHECK_THRESHOLD: usize = 1 << 12;
 
+/// How much room handing the input layer back has to save before it is worth
+/// doing.
+///
+/// It cannot fail while it is being carried, and it can fail when it is asked
+/// for again — with the transcript already moved and no host path left. A
+/// table that saves a few megabytes buys a second chance to fail for nothing;
+/// the widest precompiles save gigabytes, and for them it is the difference
+/// between a device and the host.
+#[cfg(feature = "cuda")]
+const WORTH_HANDING_BACK: u64 = 1 << 30;
+
 /// Cells — factors times rows — below which the host wins.
 ///
 /// The precompiles are short and very wide: a thousand factors over four
@@ -1402,6 +1413,33 @@ where
     let full = slots * rows;
     let real = numerators.len() * rows;
     let stream = factors.0.stream().clone();
+
+    // Carrying the layer cannot fail late; handing it back can, and by then
+    // the transcript has moved and there is no host path left. So it is
+    // carried whenever the card has room for it, and handed back only when
+    // that is what the card cannot do **and** the difference is worth the
+    // second chance to fail — which is the widest precompiles, where it is
+    // gigabytes, and nothing else.
+    let eager = (4 * full) as u64 * 24;
+    let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
+    let carried = math_cuda::device::reserve(eager);
+    if carried.is_some() || eager - lazy < WORTH_HANDING_BACK {
+        drop(carried);
+        let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
+        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
+        let output = tree.output().ok()?;
+        let num_layers = tree.num_layers();
+        let input_num_vars = tree.layer_num_vars(num_layers - 1);
+        TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Some(DeviceTree {
+            tree: std::sync::Mutex::new(Some(tree)),
+            rebuild: None,
+            num_layers,
+            input_num_vars,
+            output,
+            _room: None,
+        });
+    }
 
     // One promise for the whole tree, held past it: the layer handed back for
     // the last sumcheck is part of the same structure.
