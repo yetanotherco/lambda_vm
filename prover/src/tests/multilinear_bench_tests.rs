@@ -342,6 +342,108 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     }
 }
 
+/// Where a continuation's time goes: preparing an epoch against proving it.
+///
+/// Replays what [`crate::multilinear_continuation::prove_continuation`] runs,
+/// with a clock on each side of the epoch callback. Preparation is the
+/// executor and the trace builders, and it is the half a pipeline can hide
+/// behind the previous epoch's proof — which is what the univariate driver
+/// does and this one does not. The split is what says whether that is worth
+/// building.
+#[test]
+#[ignore]
+fn continuation_phases() {
+    use crate::multilinear_continuation;
+    use crate::tables::trace_builder::DecodeArtifacts;
+    use executor::elf::Elf;
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let opts = options();
+    let label = if input.is_empty() { &name } else { &input };
+    println!("\n{label} — continuation phases, epoch_size_log2={epoch_size_log2}");
+
+    let whole = Instant::now();
+    let elf = Elf::load(&bytes).expect("load");
+    let decode_commitment =
+        crate::tables::decode::commitment_from_elf(&elf, &opts).expect("decode commitment");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+
+    let mut prepare = Vec::new();
+    let mut prove = Vec::new();
+    let mut epochs = Vec::new();
+    let mut last = Instant::now();
+    let boundaries = crate::continuation::for_each_epoch(
+        &elf,
+        &inputs,
+        epoch_size_log2,
+        &artifacts,
+        |prepared, _| {
+            prepare.push(last.elapsed());
+            let start = Instant::now();
+            epochs.push(multilinear_continuation::prove_epoch(
+                &elf,
+                &bytes,
+                &prepared.register_init,
+                prepared.label,
+                prepared.traces,
+                prepared.is_final,
+                &prepared.boundary,
+                &opts,
+                Some(decode_commitment),
+            )?);
+            prove.push(start.elapsed());
+            last = Instant::now();
+            Ok(())
+        },
+    )
+    .expect("the epochs prepare");
+
+    let start = Instant::now();
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(&elf, &inputs),
+    );
+    let num_private_input_pages = crate::tables::page::private_input_page_count(&inputs);
+    let page_bases = crate::continuation::touched_page_bases(&boundaries);
+    multilinear_continuation::prove_global(
+        &boundaries,
+        &bytes,
+        &init_page_data,
+        &page_bases,
+        num_private_input_pages,
+        &opts,
+    )
+    .expect("the cross-epoch proof");
+    let global = start.elapsed();
+    let total = whole.elapsed();
+
+    let secs = |d: &std::time::Duration| d.as_secs_f64();
+    println!("{:<8} {:>10} {:>10}", "epoch", "prepare", "prove");
+    for (i, (p, q)) in prepare.iter().zip(&prove).enumerate() {
+        println!("{i:<8} {:>9.2}s {:>9.2}s", secs(p), secs(q));
+    }
+    let prepared: f64 = prepare.iter().map(secs).sum();
+    let proved: f64 = prove.iter().map(secs).sum();
+    println!(
+        "{:<8} {:>9.2}s {:>9.2}s   cross-epoch {:.2}s   total {:.2}s",
+        "sum",
+        prepared,
+        proved,
+        secs(&global),
+        secs(&total)
+    );
+    println!(
+        "prepare is {:.0}% of the run — what a pipeline could hide behind the previous proof",
+        100.0 * prepared / secs(&total)
+    );
+}
+
 /// Where the multilinear prover's time goes, phase by phase.
 ///
 /// Replays the same pipeline [`multilinear_prove::prove_with_options_and_inputs`]
