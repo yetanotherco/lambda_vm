@@ -268,6 +268,12 @@ where
 /// The same, over factors a device already holds — the batch's first ones, in
 /// the order the rules read them.
 ///
+/// Returns the proof, the point the rounds drew, and **what every slot was
+/// bound to there**, in slot order. That last one is free on the device path —
+/// the rounds fold the factors where they lie, so the values are already up
+/// there — and empty when the host ran the rounds, which drops each factor as
+/// it folds.
+///
 /// `extra` is what the device does not have (the weight tables), and `absent`
 /// makes what it does. That second one is a builder and not a value because on
 /// the device path it is never called: building a table's factors here is most
@@ -285,7 +291,7 @@ pub fn prove_resident<F, T, B>(
     rules: Vec<Rule<'_, F>>,
     claims: &[FieldElement<F>],
     transcript: &mut T,
-) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>), Error>
+) -> Result<(SumcheckProof<F>, Vec<FieldElement<F>>, Vec<FieldElement<F>>), Error>
 where
     F: IsField + 'static,
     T: IsTranscript<F>,
@@ -300,7 +306,8 @@ where
     let Some(device) = device else {
         let mut polys = absent()?;
         polys.extend(extra);
-        return prove(polys, rules, claims, transcript);
+        let (proof, point) = prove(polys, rules, claims, transcript)?;
+        return Ok((proof, point, Vec::new()));
     };
 
     for claim in claims {
@@ -323,14 +330,15 @@ where
             },
         );
         if let Some(outcome) = attempt {
-            let (rounds, challenges) = outcome?;
-            return Ok((SumcheckProof { rounds }, challenges));
+            let (rounds, challenges, bound) = outcome?;
+            return Ok((SumcheckProof { rounds }, challenges, bound));
         }
     }
     // Declined before the first round: the host runs them, and for that the
     // factors have to be here after all.
     batched.prepend(absent()?)?;
-    sumcheck::prove(batched, transcript)
+    let (proof, point) = sumcheck::prove(batched, transcript)?;
+    Ok((proof, point, Vec::new()))
 }
 
 /// Checks the batched sumcheck against the factor values it reduces to.

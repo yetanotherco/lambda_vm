@@ -553,7 +553,7 @@ where
     // reads it. The closure is what makes them if the device turns the rounds
     // down.
     let resident = trace.device_factors();
-    let (sumcheck, point) = batch::prove_resident(
+    let (sumcheck, point, bound) = batch::prove_resident(
         weights,
         resident,
         || trace.factors(),
@@ -566,16 +566,29 @@ where
     // two steps: reduce every committed factor's value there to a claim about
     // the column it reads, then open each column once. The public factors need
     // neither step.
-    //
-    // A shifted view is rebuilt, read and dropped; an unshifted one is read
-    // where it lies. Either way this costs one column rather than a second
-    // copy of the whole factor list.
-    let factor_values = trace
-        .kinds
-        .iter()
-        .filter_map(FactorKind::source)
-        .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
-        .collect::<Result<Vec<_>, _>>()?;
+    let factor_values = if bound.len() >= trace.kinds.len() {
+        // The rounds folded every factor to exactly this, so reading it back is
+        // the whole of it. Slot order is `kinds` order, and the weight tables
+        // the batch added sit past the end.
+        trace
+            .kinds
+            .iter()
+            .zip(&bound)
+            .filter(|(kind, _)| kind.source().is_some())
+            .map(|(_, value)| value.clone())
+            .collect()
+    } else {
+        // The host ran the rounds and let each factor go as it folded, so the
+        // values have to be built again: a shifted view is rebuilt, read and
+        // dropped; an unshifted one is read where it lies. Either way this
+        // costs one column rather than a second copy of the whole factor list.
+        trace
+            .kinds
+            .iter()
+            .filter_map(FactorKind::source)
+            .map(|source| claim_reduce::evaluate_source(&trace.columns, &source, &point))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let (reduce, reduced_point) = claim_reduce::prove::<F, E, T>(
         &trace.columns,

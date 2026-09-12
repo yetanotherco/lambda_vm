@@ -61,12 +61,12 @@ pub fn reset_call_counters() {
     OPEN_CALLS.store(0, Ordering::Relaxed);
 }
 
-/// A sumcheck's round proofs, the challenges they drew, and the factors the
-/// rounds left bound.
-/// A sumcheck's round proofs and the challenges they drew, with the factors
-/// left where they were folded.
+/// A sumcheck's round proofs, the challenges they drew, and what every slot
+/// was bound to — the factors are folded where they lie, so their values at
+/// the sumcheck's point are already there when the rounds end.
 type ResidentRounds<E> = (
     Vec<crate::sumcheck::RoundProof<E>>,
+    Vec<math::field::element::FieldElement<E>>,
     Vec<math::field::element::FieldElement<E>>,
 );
 
@@ -547,12 +547,27 @@ where
         .ok()?;
 
     let outcome = run_rounds(&mut session, degree, num_vars, challenge, |_| None);
-    let rounds = match outcome {
+    let (rounds, challenges) = match outcome {
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
+    // The rounds folded every factor down to its value at the point they drew.
+    // Reading those three u64 per slot is what spares the caller a pass over
+    // the trace to compute what the device already has.
+    let Ok(bound) = session.bound_values() else {
+        return Some(Err(crate::Error::DeviceFailed {
+            stage: "factor values",
+        }));
+    };
     SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(Ok(rounds))
+    Some(Ok((
+        rounds,
+        challenges,
+        bound
+            .iter()
+            .map(|limbs| ext3_from_raw::<E>(limbs))
+            .collect(),
+    )))
 }
 
 #[cfg(not(feature = "cuda"))]
