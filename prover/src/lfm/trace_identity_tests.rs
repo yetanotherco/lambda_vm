@@ -54,11 +54,16 @@ type E = GoldilocksExtension;
 
 /// One thing to fill traces for: a compiled program, the arenas it reads, and
 /// the hasher both the executor and the trace builder are handed.
-struct Case {
-    name: &'static str,
-    program: LfmProgram,
-    arenas: Vec<Vec<LfmWord>>,
-    hasher: HasherKind,
+///
+/// Visible to the rest of `lfm` so [`super::exec_identity_tests`] gates the
+/// executor over exactly these cases rather than over a second, drifting copy of
+/// them: the two gates are consecutive stages of one pipeline, and a case list
+/// that stopped covering a chip would otherwise go quiet on one of them only.
+pub(super) struct Case {
+    pub(super) name: &'static str,
+    pub(super) program: LfmProgram,
+    pub(super) arenas: Vec<Vec<LfmWord>>,
+    pub(super) hasher: HasherKind,
 }
 
 /// The message the sponge cases run over: byte `i` is `37i + 11`, the generator
@@ -86,7 +91,7 @@ fn fri_arenas(inner: &super::fixture::FriToyProof) -> Vec<Vec<LfmWord>> {
 /// socket filler, the one that reads its domain back off the row) are two
 /// different bodies under test. The two sponge programs are the smallest things
 /// that give `LFM_BLAKE3` and `LFM_KECCAK` rows.
-fn cases() -> Vec<Case> {
+pub(super) fn cases() -> Vec<Case> {
     let msg = message(202);
     vec![
         Case {

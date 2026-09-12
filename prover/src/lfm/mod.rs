@@ -100,6 +100,8 @@ mod epoch_tests;
 #[cfg(test)]
 mod epoch_verify_tests;
 #[cfg(test)]
+mod exec_identity_tests;
+#[cfg(test)]
 mod framework_probe;
 #[cfg(test)]
 mod fri_tests;
