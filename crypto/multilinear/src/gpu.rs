@@ -141,6 +141,31 @@ pub const MAX_SLOTS: usize = 8192;
 #[cfg(feature = "cuda")]
 const SUMCHECK_THRESHOLD: usize = 1 << 12;
 
+/// Device bytes promised for as long as the returned handle lives.
+///
+/// The caller is a structure whose parts are allocated and freed one at a time
+/// — a group of commitments and the working set its commits and openings take
+/// turns with — so what it promises is the turn, not the sum.
+#[cfg(feature = "cuda")]
+pub fn reserve_room(bytes: u64) -> Option<DeviceRoom> {
+    math_cuda::device::reserve(bytes).map(DeviceRoom)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn reserve_room(_bytes: u64) -> Option<DeviceRoom> {
+    None
+}
+
+/// A promise held on someone else's behalf. Dropping it gives the room back.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct DeviceRoom(math_cuda::device::DeviceReservation);
+
+/// A promise no device made. Never constructed.
+#[cfg(not(feature = "cuda"))]
+#[derive(Debug)]
+pub struct DeviceRoom(std::convert::Infallible);
+
 /// How much room handing the input layer back has to save before it is worth
 /// doing.
 ///
@@ -1779,6 +1804,7 @@ pub(crate) fn commit_resident<F>(
     evals: &[math::field::element::FieldElement<F>],
     log_blowup: usize,
     log_folding: usize,
+    transient: bool,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -1797,7 +1823,8 @@ where
     }
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
     let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
-    let (codeword, root) = math_cuda::whir::commit_codeword(raw, log_blowup, log_folding).ok()?;
+    let (codeword, root) =
+        math_cuda::whir::commit_codeword(raw, log_blowup, log_folding, transient).ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -1807,6 +1834,7 @@ pub(crate) fn commit_resident<F>(
     _evals: &[math::field::element::FieldElement<F>],
     _log_blowup: usize,
     _log_folding: usize,
+    _transient: bool,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,

@@ -173,6 +173,7 @@ pub fn commit_codeword(
     evals: &[u64],
     log_blowup: usize,
     log_folding: usize,
+    transient: bool,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
     assert!(
         evals.len().is_power_of_two(),
@@ -193,11 +194,15 @@ pub fn commit_codeword(
     );
 
     let be = backend()?;
-    // What the chain holds from here to its last opening: this codeword, the
-    // folds — the first is `n/2^k` extension elements, a sixth of it, and they
-    // halve from there — and one tree at a time, which is `2n/2^k` hashes.
-    // Twice the codeword covers all three.
-    let Some(room) = be.reserve(n as u64 * 8 * 2) else {
+    // The codeword itself stays until this commitment's opening. On top of it
+    // there is a working set — the tree this commit builds, and later the
+    // folds and the trees the chain's rounds build — which is another
+    // codeword's worth and is **transient**: one commit or one opening uses it
+    // at a time. A caller committing a group of polynomials promises that once
+    // for all of them and passes `transient: false`; one committing alone
+    // promises it here.
+    let promise = if transient { 2 } else { 1 };
+    let Some(room) = be.reserve(n as u64 * 8 * promise) else {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
         ));
@@ -263,7 +268,7 @@ pub fn commit_codeword_to_host(
     log_blowup: usize,
     log_folding: usize,
 ) -> Result<(Vec<u64>, Vec<u8>)> {
-    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding)?;
+    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding, true)?;
     let values = codeword.stream.clone_dtoh(codeword.buffer.as_ref())?;
     codeword.stream.synchronize()?;
     let nodes = codeword.nodes_to_host(log_folding)?;

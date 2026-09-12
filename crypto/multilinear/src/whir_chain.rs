@@ -345,9 +345,15 @@ fn block_size<V: IsField>(openings: &[crate::whir_commit::CosetOpening<V>]) -> u
 ///
 /// The codeword stays in the base field: nothing extension-valued has touched
 /// the trace yet, and this is the biggest allocation in the proof.
+/// Commits one polynomial's codeword.
+///
+/// `transient` says whether this commitment has to promise the device room its
+/// own commit and opening take — true when it stands alone, false when a
+/// caller committing several has promised that turn once for all of them.
 pub fn commit<F>(
     f: &Mle<F>,
     config: &ChainConfig,
+    transient: bool,
 ) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
@@ -358,13 +364,14 @@ where
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
-    let commitment = match crate::gpu::commit_resident(f.evals(), config.log_blowup, first) {
-        Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
-        None => CodewordCommitment::from_codeword(
-            encode::<F, F>(&lift_coefficients(f), &domain)?,
-            first,
-        )?,
-    };
+    let commitment =
+        match crate::gpu::commit_resident(f.evals(), config.log_blowup, first, transient) {
+            Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
+            None => CodewordCommitment::from_codeword(
+                encode::<F, F>(&lift_coefficients(f), &domain)?,
+                first,
+            )?,
+        };
     Ok((commitment, domain))
 }
 
@@ -1081,7 +1088,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg)?;
+        let (commitment, domain) = commit::<F>(&f, &cfg, true)?;
         let proof = prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript())?;
         verify::<F, F, _>(
             &proof,
@@ -1185,7 +1192,7 @@ mod tests {
         let f = pseudo_mle(num_vars, 13);
         let z = point(num_vars);
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let chained =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
 
@@ -1223,7 +1230,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
 
@@ -1249,7 +1256,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         proof.final_value += FE::one();
@@ -1276,7 +1283,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         assert!(proof.rounds.len() >= 3);
@@ -1305,7 +1312,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         assert!(matches!(proof.rounds[0].openings, RoundOpenings::Base(_)));
@@ -1334,7 +1341,7 @@ mod tests {
         let g = pseudo_mle(num_vars, 31);
         let z = point(num_vars);
 
-        let (f_commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (f_commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let proof =
             prove::<F, F, _>(&g, &z, &f_commitment, &domain, &cfg, &mut transcript()).unwrap();
 
@@ -1362,7 +1369,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         proof.rounds[0].next_root = None;
@@ -1389,7 +1396,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
 
@@ -1420,7 +1427,7 @@ mod tests {
         let weight = Mle::new(table).unwrap();
         let y = f.evaluate(&a).unwrap() + gamma * f.evaluate(&b).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let proof =
             prove_weighted::<F, F, _>(&f, weight, &commitment, &domain, &cfg, &mut transcript())
                 .unwrap();
@@ -1462,7 +1469,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
 
@@ -1551,7 +1558,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         proof.rounds[0].ood_value = Some(proof.rounds[0].ood_value.unwrap() + FE::one());
@@ -1578,7 +1585,7 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut proof =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
         proof.rounds[0].ood_value = None;
@@ -1628,7 +1635,7 @@ mod tests {
         let f = pseudo_mle(num_vars, 71);
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
-        let (commitment, domain) = commit::<F>(&f, cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, cfg, true).unwrap();
         let proof = prove::<F, F, _>(&f, &z, &commitment, &domain, cfg, &mut transcript()).unwrap();
         (proof, commitment.root(), domain, y)
     }
@@ -1764,7 +1771,7 @@ mod tests {
         let z: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(101 + i as u64)).collect();
         let y = f.evaluate_in(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
         let proof = prove::<F, Ext, _>(&f, &z, &commitment, &domain, &cfg, &mut prover).unwrap();
 

@@ -55,6 +55,10 @@ where
     polys: Vec<Mle<F>>,
     commitments: Vec<CodewordCommitment<F>>,
     domain: Domain<F>,
+    /// The room the commits and the openings take turns with, promised once
+    /// for the whole group. Lives as long as the commitments do, because the
+    /// openings are the last thing that uses it.
+    _room: Option<crate::gpu::DeviceRoom>,
 }
 
 impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static> StackedCommitment<F>
@@ -72,13 +76,25 @@ where
         config: &ChainConfig,
     ) -> Result<Self, Error> {
         let polys = layout.stack(columns)?;
+        // The commits and the openings take turns with the same working set —
+        // two commits in flight, then one opening at a time — so the group
+        // promises one turn's worth rather than every polynomial promising its
+        // own. For eight of them that is nine codewords of room instead of
+        // sixteen, and what the difference buys is the widest tables getting a
+        // device at all. If the card will not promise it, each commitment
+        // promises its own, which is the conservative accounting.
+        let room = polys.first().and_then(|poly| {
+            let codeword_bytes = (1u64 << (poly.num_vars() + config.log_blowup)) * 8;
+            crate::gpu::reserve_room(codeword_bytes)
+        });
+        let transient = room.is_none();
         // A commit spends most of its wall time waiting on a device — the tree
         // coming back — with the next polynomial's transform not yet launched.
         // Committing in pairs covers that wait and no more: a third in flight
         // has nothing left to hide behind, and each one holds a codeword and a
         // tree on the device while it runs. Every polynomial has the same
         // variable count, so they share a domain.
-        let commit = |poly: &Mle<F>| whir_chain::commit::<F>(poly, config);
+        let commit = |poly: &Mle<F>| whir_chain::commit::<F>(poly, config, transient);
         let mut domain = None;
         let mut commitments = Vec::with_capacity(polys.len());
         for pair in polys.chunks(2) {
@@ -99,6 +115,7 @@ where
             polys,
             commitments,
             domain: domain.ok_or(Error::EmptyPolynomial)?,
+            _room: room,
         })
     }
 
