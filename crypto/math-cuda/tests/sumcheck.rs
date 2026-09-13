@@ -277,3 +277,45 @@ fn a_weight_built_all_at_once_matches_one_share_at_a_time() {
     weight_parity(1 << 12, &[(0, 6), (64, 11), (2112, 5), (2144, 10)]);
     weight_parity(1 << 8, &[(0, 8)]);
 }
+
+/// Columns evaluated together against the same columns evaluated one at a
+/// time, which is what the batched fold replaces.
+#[test]
+fn columns_folded_together_match_one_at_a_time() {
+    let Ok(_) = math_cuda::device::backend() else {
+        eprintln!("no device; skipping");
+        return;
+    };
+    for (vars, width) in [(16usize, 5usize), (17, 12), (16, 1)] {
+        let rows = 1usize << vars;
+        let columns: Vec<Vec<u64>> = (0..width)
+            .map(|k| {
+                (0..rows as u64)
+                    .map(|i| i.wrapping_mul(6364136223846793005 + k as u64) >> 11)
+                    .collect()
+            })
+            .collect();
+        let point: Vec<u64> = (0..vars)
+            .flat_map(|i| {
+                ext3_raw(&FE::new([
+                    FieldElement::<Gl>::from((i + 3) as u64),
+                    FieldElement::<Gl>::from((2 * i + 1) as u64),
+                    FieldElement::<Gl>::from((i * i + 7) as u64),
+                ]))
+                .expect("ext3")
+            })
+            .collect();
+
+        let borrowed: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
+        let together =
+            math_cuda::sumcheck::evaluate_many_base(&borrowed, &point).expect("the batch");
+        assert_eq!(together.len(), width);
+        for (k, column) in borrowed.iter().enumerate() {
+            let alone = math_cuda::sumcheck::evaluate_mle_base(column, &point).expect("one");
+            assert_eq!(
+                together[k], alone,
+                "column {k} of {width} at {vars} vars differs"
+            );
+        }
+    }
+}

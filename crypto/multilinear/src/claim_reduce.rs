@@ -234,10 +234,15 @@ where
         transcript,
     )?;
 
-    let column_values = columns
-        .iter()
-        .map(|c| c.evaluate_in(&point))
-        .collect::<Result<Vec<_>, _>>()?;
+    // All at the same point, so they fold together: one upload and one launch
+    // per level for the table instead of per column.
+    let column_values = match crate::gpu::evaluate_many_base(columns, &point) {
+        Some(values) => values,
+        None => columns
+            .iter()
+            .map(|c| c.evaluate_in(&point))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     for value in &column_values {
         transcript.append_field_element(value);
     }

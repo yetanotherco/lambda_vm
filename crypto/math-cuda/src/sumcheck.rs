@@ -544,6 +544,131 @@ pub fn evaluate_mle_base(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
     Ok([out[0], out[1], out[2]])
 }
 
+/// Every base-field table's value at `point`, in one pass per level.
+///
+/// A table is evaluated by folding it down to one element, which is a launch
+/// per level and an upload of the table. Doing that per column turns a table's
+/// argument into hundreds of round trips over the same trace; here the columns
+/// go up together and every level is one launch for all of them.
+///
+/// `columns` are base-field slices of `2^point.len()/3` values each. Returns
+/// one ext3 value per column, in order.
+pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64; 3]>> {
+    assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
+    let vars = point.len() / 3;
+    let rows = 1usize << vars;
+    assert!(vars > 0, "a point with no coordinates is the table itself");
+    assert!(
+        columns.iter().all(|column| column.len() == rows),
+        "every column spans the point"
+    );
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    // How many go up at a time: the base copy plus the ext3 half it folds to
+    // is 20 bytes a row, and this keeps that transient bounded however wide
+    // the table is.
+    let per_column = rows as u64 * 20;
+    let chunk = (CHUNK_BUDGET_BYTES / per_column.max(1)).clamp(1, columns.len() as u64) as usize;
+
+    let mut out = Vec::with_capacity(columns.len());
+    for group in columns.chunks(chunk) {
+        let half = rows / 2;
+        // Promised before it is used, like everything else that takes a slab
+        // of the card: the caller's fallback is to evaluate the columns one at
+        // a time, which needs almost nothing.
+        let Some(_room) = crate::device::reserve(group.len() as u64 * per_column) else {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            ));
+        };
+        let mut base = unsafe { alloc_or_trim::<u64>(&stream, group.len() * rows) }?;
+        for (k, column) in group.iter().enumerate() {
+            let at = k * rows;
+            let mut slab = base.slice_mut(at..at + rows);
+            stream.memcpy_htod(*column, &mut slab)?;
+        }
+        let r = crate::device::htod_or_trim(&stream, &point[..3])?;
+        // SAFETY: the kernel writes every element of the halves it produces.
+        let mut values = unsafe { alloc_or_trim::<u64>(&stream, group.len() * half * 3) }?;
+        let half_arg = half as u64;
+        let tables = group.len() as u64;
+        let total = half_arg * tables;
+        let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+        unsafe {
+            stream
+                .launch_builder(&be.mle_fold_base_ext3_many)
+                .arg(&base)
+                .arg(&half_arg)
+                .arg(&tables)
+                .arg(&r)
+                .arg(&mut values)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        drop(base);
+
+        // From here every table is ext3 and they all fold together: one launch
+        // per level, over the list of addresses.
+        let addresses: Vec<u64> = {
+            let (at, _guard) = values.device_ptr(&stream);
+            (0..group.len())
+                .map(|k| at + (k * half * 3 * 8) as u64)
+                .collect()
+        };
+        let mut factors = crate::device::htod_or_trim(&stream, &addresses)?;
+        let mut span = half;
+        let mut r_dev = crate::device::htod_or_trim(&stream, &point[3..6.min(point.len())])?;
+        for coordinate in point[3..].chunks_exact(3) {
+            let fold_half = (span / 2) as u64;
+            if fold_half == 0 {
+                break;
+            }
+            stream.memcpy_htod(coordinate, &mut r_dev)?;
+            let width = group.len() as u64;
+            let total = width * fold_half;
+            let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+            unsafe {
+                stream
+                    .launch_builder(&be.sumcheck_fold_ext3)
+                    .arg(&mut factors)
+                    .arg(&fold_half)
+                    .arg(&width)
+                    .arg(&r_dev)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            span /= 2;
+        }
+
+        // Three u64 per column, where each one's fold left it — not the
+        // buffer, which is a level's worth of values nobody needs.
+        for k in 0..group.len() {
+            let at = k * half * 3;
+            let head = stream.clone_dtoh(&values.slice(at..at + 3))?;
+            stream.synchronize()?;
+            out.push([head[0], head[1], head[2]]);
+        }
+    }
+    Ok(out)
+}
+
+/// How much a batched evaluation keeps on the device at once.
+///
+/// Small: what batching saves is the launches, and those dominate for a short
+/// column — a tall one spends its time on the upload either way. Keeping the
+/// slab small leaves the card to everything that has no host path.
+const CHUNK_BUDGET_BYTES: u64 = 64 << 20;
+
 /// Binds every coordinate of `point` in a resident ext3 table of `len`
 /// elements, leaving the value in its first slot.
 fn fold_to_one(

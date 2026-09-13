@@ -439,6 +439,30 @@ extern "C" __global__ void mle_fold_base_ext3(const uint64_t *__restrict__ in, u
     at[2] = scaled.c;
 }
 
+// The same for many base tables at once, laid out end to end: one thread per
+// (table, index) pair, and the output is one ext3 half per table in the same
+// order. Everything above this level is ext3, so the folds that follow are the
+// ordinary ones over a list of factors.
+extern "C" __global__ void mle_fold_base_ext3_many(const uint64_t *__restrict__ in, uint64_t half,
+                                                   uint64_t num_tables,
+                                                   const uint64_t *__restrict__ r,
+                                                   uint64_t *__restrict__ out) {
+    uint64_t total = half * num_tables;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t table = task / half;
+        uint64_t j = task - table * half;
+        const uint64_t *src = in + table * half * 2;
+        uint64_t lo = src[j];
+        uint64_t delta = goldilocks::sub(src[j + half], lo);
+        Fe3 scaled = ext3::mul_base(ext3::make(r[0], r[1], r[2]), delta);
+        uint64_t *at = out + task * 3;
+        at[0] = goldilocks::add(lo, scaled.a);
+        at[1] = scaled.b;
+        at[2] = scaled.c;
+    }
+}
+
 // Binds the round's variable: `f(j) <- f(j) + r·(f(j + half) − f(j))` for every
 // factor, halving the cube. One thread per (factor, index) pair.
 extern "C" __global__ void sumcheck_fold_ext3(uint64_t *const *__restrict__ d_factors,

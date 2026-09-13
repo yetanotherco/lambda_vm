@@ -785,6 +785,67 @@ where
 #[cfg(feature = "cuda")]
 const EVALUATE_THRESHOLD: usize = 1 << 16;
 
+/// Every base-field column's value at one point, folded together.
+///
+/// The columns of a table are evaluated at the same point and one at a time
+/// that is an upload and a launch per level each. Together it is one upload
+/// and one launch per level for all of them.
+#[cfg(feature = "cuda")]
+pub(crate) fn evaluate_many_base<F, E>(
+    columns: &[crate::mle::Mle<F>],
+    point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use std::any::TypeId;
+
+    if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
+        return None;
+    }
+    let rows = columns.first()?.len();
+    if point.is_empty() || rows < EVALUATE_THRESHOLD || rows != 1 << point.len() {
+        return None;
+    }
+    if columns.iter().any(|column| column.len() != rows) {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some()) {
+        return None;
+    }
+
+    let mut raw_point = Vec::with_capacity(point.len() * 3);
+    for coordinate in point {
+        raw_point.extend_from_slice(&ext3_raw(coordinate)?);
+    }
+    // SAFETY: `F == Gl`, a transparent wrapper over one `u64` per element.
+    let raw: Vec<&[u64]> = columns
+        .iter()
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+        })
+        .collect();
+    let values = math_cuda::sumcheck::evaluate_many_base(&raw, &raw_point).ok()?;
+    EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
+    Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn evaluate_many_base<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 /// A multilinear's value at `point`, bound variable by variable on device.
 ///
 /// `evals` may be base-field or ext3; the point is always ext3, which is what
