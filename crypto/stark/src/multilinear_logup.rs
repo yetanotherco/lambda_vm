@@ -42,8 +42,14 @@ fn fingerprint_at<E: IsField>(
 /// `slot_of` maps a main column to the factor that reads it, and is only asked
 /// about columns that turn out to have a nonzero coefficient — so a table's
 /// unread columns never need a factor.
+///
+/// `candidates` are the columns worth asking about, in ascending order: the
+/// coefficient is read by evaluating at each basis vector, so the cost is one
+/// pass over the expression per candidate. Handing it the whole table turns
+/// that into `interactions × columns`, which for a precompile with a thousand
+/// of each is millions of passes for a handful of nonzero terms.
 fn probe<E, S>(
-    num_main_columns: usize,
+    candidates: &[usize],
     slot_of: &mut S,
     eval: impl Fn(&dyn Fn(usize) -> FieldElement<E>) -> FieldElement<E>,
 ) -> Result<Affine<E>, MlError>
@@ -53,7 +59,7 @@ where
 {
     let constant = eval(&|_| FieldElement::<E>::zero());
     let mut terms = Vec::new();
-    for column in 0..num_main_columns {
+    for &column in candidates {
         let coefficient = eval(&|i| {
             if i == column {
                 FieldElement::<E>::one()
@@ -101,11 +107,19 @@ where
     buses
         .iter()
         .map(|bus| {
-            let numerator = probe(num_main_columns, &mut slot_of, |column| {
+            // What this interaction reads, and nothing else: a column it never
+            // touches has coefficient zero, and asking costs a pass over the
+            // expression.
+            let candidates: Vec<usize> = bus
+                .columns_read()
+                .into_iter()
+                .filter(|&column| column < num_main_columns)
+                .collect();
+            let numerator = probe(&candidates, &mut slot_of, |column| {
                 let value = bus.multiplicity.evaluate_with(column);
                 if bus.is_sender { value } else { -value }
             })?;
-            let denominator = probe(num_main_columns, &mut slot_of, |column| {
+            let denominator = probe(&candidates, &mut slot_of, |column| {
                 z - fingerprint_at(bus, &alpha_powers, column)
             })?;
             Ok(Interaction::new(numerator, denominator))

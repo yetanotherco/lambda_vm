@@ -540,6 +540,18 @@ pub enum LinearTerm {
     Constant(i64),
 }
 
+impl LinearTerm {
+    /// The main column this term reads, if it reads one.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            LinearTerm::Column { column, .. } | LinearTerm::ColumnUnsigned { column, .. } => {
+                out.push(*column)
+            }
+            LinearTerm::Constant(_) => {}
+        }
+    }
+}
+
 /// A value that contributes to the bus fingerprint.
 ///
 /// A `BusValue` produces 1, 2, or 4 bus elements for the fingerprint depending
@@ -691,6 +703,21 @@ impl BusValue {
     ///
     /// # Returns
     /// Vector of combined bus elements (length = num_bus_elements())
+    /// The main columns this value reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => out.extend(*start_column..*start_column + packing.num_columns()),
+            BusValue::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
         &self,
         get_column: F,
@@ -1526,6 +1553,21 @@ pub enum Multiplicity {
 }
 
 impl Multiplicity {
+    /// The main columns this expression reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            Multiplicity::One => {}
+            Multiplicity::Column(col) | Multiplicity::Negated(col) => out.push(*col),
+            Multiplicity::Sum(a, b) | Multiplicity::Diff(a, b) => out.extend([*a, *b]),
+            Multiplicity::Sum3(a, b, c) => out.extend([*a, *b, *c]),
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
     #[inline]
@@ -1605,6 +1647,23 @@ pub struct BusInteraction {
 }
 
 impl BusInteraction {
+    /// The main columns this interaction reads — its multiplicity's and its
+    /// values' — sorted and deduplicated.
+    ///
+    /// Everything here is affine in the columns, so a column nobody reads has
+    /// coefficient zero: this is what a caller recovering that affine form has
+    /// to look at, and the rest of the table is not worth asking about.
+    pub fn columns_read(&self) -> Vec<usize> {
+        let mut columns = Vec::new();
+        self.multiplicity.columns_read(&mut columns);
+        for value in &self.values {
+            value.columns_read(&mut columns);
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
     /// Creates a new table interaction.
     ///
     /// # Arguments
