@@ -251,6 +251,7 @@ pub struct Backend {
 
     // sumcheck.cubin
     pub sumcheck_round_ext3: CudaFunction,
+    pub sum_partials_ext3: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
     pub mle_fold_base_ext3: CudaFunction,
     pub eq_expand_level_ext3: CudaFunction,
@@ -627,6 +628,7 @@ impl Backend {
             whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
             gather_cosets: whir_fold.load_function("gather_cosets")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
+            sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
             eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,

@@ -115,7 +115,9 @@ __device__ __forceinline__ Fe3 eval_program(const uint64_t *__restrict__ d_nodes
     return load_slot(slots, stride, root_slot);
 }
 
-extern "C" __global__ void sumcheck_round_ext3(
+// Capped at the block size the launcher uses and two blocks per SM: without a
+// bound the compiler spends 67 registers a thread and occupancy stops at half.
+extern "C" __global__ __launch_bounds__(256, 2) void sumcheck_round_ext3(
     // one device pointer per factor; factor `k` at cube index `j`, component
     // `c`, is `d_factors[k][j*3 + c]`
     const uint64_t *const *__restrict__ d_factors,
@@ -181,6 +183,43 @@ extern "C" __global__ void sumcheck_round_ext3(
             d_partials[at + 2] = shared[2];
         }
         __syncthreads();
+    }
+}
+
+// Sums a round's per-block partials, one block per interpolation node.
+//
+// The round leaves `num_t × blocks` extension values and the transcript wants
+// `num_t`. Reducing them here instead of on the host is what keeps a round's
+// answer at a few dozen bytes: the partials are megabytes for a wide launch,
+// and every round of every sumcheck waits for that copy.
+extern "C" __global__ void sum_partials_ext3(const uint64_t *__restrict__ d_partials,
+                                             uint64_t blocks, uint64_t *__restrict__ out) {
+    const uint64_t *base = d_partials + (uint64_t)blockIdx.x * blocks * 3;
+    Fe3 acc = ext3::make(0, 0, 0);
+    for (uint64_t i = threadIdx.x; i < blocks; i += blockDim.x) {
+        acc = ext3::add(acc, load_ext(base + i * 3));
+    }
+    extern __shared__ uint64_t shared[];
+    shared[threadIdx.x * 3 + 0] = acc.a;
+    shared[threadIdx.x * 3 + 1] = acc.b;
+    shared[threadIdx.x * 3 + 2] = acc.c;
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 x = load_ext(shared + threadIdx.x * 3);
+            Fe3 y = load_ext(shared + (threadIdx.x + width) * 3);
+            Fe3 sum = ext3::add(x, y);
+            shared[threadIdx.x * 3 + 0] = sum.a;
+            shared[threadIdx.x * 3 + 1] = sum.b;
+            shared[threadIdx.x * 3 + 2] = sum.c;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        uint64_t *at = out + (uint64_t)blockIdx.x * 3;
+        at[0] = shared[0];
+        at[1] = shared[1];
+        at[2] = shared[2];
     }
 }
 

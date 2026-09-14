@@ -82,6 +82,9 @@ pub struct SumcheckSession {
     /// rounds need fewer for the cube, and spend the difference on nodes.
     slot_threads: u64,
     partials: CudaSlice<u64>,
+    /// Where the partials are summed, so a round's answer crosses the bus at
+    /// three u64 per interpolation node instead of three per block.
+    sums: CudaSlice<u64>,
     /// The threads this session's program can afford at once. Every round's
     /// launch is shaped out of it and the indices it has left.
     thread_ceiling: u64,
@@ -164,6 +167,7 @@ impl SumcheckSession {
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
         let r_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, 3)?;
+        let sums = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
 
         Ok(Self {
             stream,
@@ -181,6 +185,7 @@ impl SumcheckSession {
             slots,
             slot_threads: num_threads,
             partials,
+            sums,
             thread_ceiling: ceiling,
             t_dev,
             t_host: Vec::new(),
@@ -233,6 +238,7 @@ impl SumcheckSession {
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
         let r_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, 3)?;
+        let sums = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
         let _ = be;
 
         Ok(Self {
@@ -251,6 +257,7 @@ impl SumcheckSession {
             slots,
             slot_threads: num_threads,
             partials,
+            sums,
             thread_ceiling: ceiling,
             t_dev,
             t_host: Vec::new(),
@@ -331,13 +338,27 @@ impl SumcheckSession {
                 .launch(cfg)?;
         }
 
-        // The per-block partials come back and are summed here: it is a few
-        // kilobytes against the cube the kernel just walked, and the round
-        // cannot proceed without the host anyway.
-        let used = num_t * grid as usize * 3;
-        let partials = self.stream.clone_dtoh(&self.partials.slice(0..used))?;
+        // The partials are summed here, on the device, and what crosses the bus
+        // is the round's answer: three u64 per interpolation node. A wide
+        // launch leaves megabytes of them, and every round of every sumcheck
+        // waits for that copy before the transcript can move — which for a
+        // whole proof is more time than the rounds themselves.
+        let reduce_block = 256u32;
+        unsafe {
+            self.stream
+                .launch_builder(&be.sum_partials_ext3)
+                .arg(&self.partials)
+                .arg(&(grid as u64))
+                .arg(&mut self.sums)
+                .launch(LaunchConfig {
+                    grid_dim: (num_t as u32, 1, 1),
+                    block_dim: (reduce_block, 1, 1),
+                    shared_mem_bytes: reduce_block * 3 * 8,
+                })?;
+        }
+        let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
-        Ok(sum_partials(&partials, num_t, grid as usize))
+        Ok(sums)
     }
 
     /// Binds the round's variable to `r` (ext3, three u64) in every factor.
@@ -457,36 +478,6 @@ fn widest_grid(ceiling: u64, first_half: u64) -> u32 {
         work /= 2;
     }
 }
-
-/// Sums the per-block partials of each interpolation node.
-///
-/// Goldilocks addition here mirrors the kernel's: the same EPSILON-corrected
-/// wrap, so a host sum and a device sum of the same values agree as field
-/// elements (they need not agree bit for bit, and nothing looks).
-fn sum_partials(partials: &[u64], num_t: usize, blocks: usize) -> Vec<u64> {
-    let mut out = vec![0u64; num_t * 3];
-    for ti in 0..num_t {
-        let mut acc = [0u64; 3];
-        for b in 0..blocks {
-            let at = (ti * blocks + b) * 3;
-            for c in 0..3 {
-                acc[c] = goldilocks_add(acc[c], partials[at + c]);
-            }
-        }
-        out[ti * 3..ti * 3 + 3].copy_from_slice(&acc);
-    }
-    out
-}
-
-/// `a + b` in Goldilocks, on the raw non-canonical representation both sides
-/// use.
-fn goldilocks_add(a: u64, b: u64) -> u64 {
-    const EPSILON: u64 = 0xFFFF_FFFF;
-    let (sum, over) = a.overflowing_add(b);
-    let (sum, over) = sum.overflowing_add(if over { EPSILON } else { 0 });
-    if over { sum + EPSILON } else { sum }
-}
-
 /// A multilinear's value at `point`, bound one variable at a time on device.
 ///
 /// `table` is `2^point_len` ext3 values interleaved, `point` three u64 per
