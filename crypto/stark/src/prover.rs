@@ -2082,6 +2082,7 @@ pub trait IsStarkProver<
         );
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
+        let __ps_c = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
@@ -2156,6 +2157,8 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "cuda"))]
         let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
 
+        crate::prove_split::add(&crate::prove_split::R2_CONSTRAINTS, __ps_c);
+        let __ps_d = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let constraints_dur = t_sub.elapsed();
         #[cfg(feature = "instruments")]
@@ -2285,6 +2288,7 @@ pub trait IsStarkProver<
             cpu_eval()?
         };
 
+        crate::prove_split::add(&crate::prove_split::R2_DECOMPOSE, __ps_d);
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
 
@@ -2344,6 +2348,7 @@ pub trait IsStarkProver<
             round_1_result.lde_trace.set_gpu_composition_parts(handle);
         }
 
+        let __ps_r2c = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: hash straight from
@@ -2411,6 +2416,7 @@ pub trait IsStarkProver<
                 crate::commitment::ROWS_PER_LEAF,
             )
             .ok_or(ProvingError::EmptyCommitment)?;
+        crate::prove_split::add(&crate::prove_split::R2_COMMIT, __ps_r2c);
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -2620,6 +2626,7 @@ pub trait IsStarkProver<
         // reversed, and folded on device without crossing PCIe. On any miss
         // (gates, cudarc failure — the FRI driver restores the transcript)
         // the host path below recomputes DEEP through its own arms.
+        let __ps_df = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
@@ -2713,6 +2720,8 @@ pub trait IsStarkProver<
             res
         };
 
+        crate::prove_split::add(&crate::prove_split::R4_DEEP_FRI, __ps_df);
+        let __ps_g = crate::prove_split::mark();
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -2735,6 +2744,8 @@ pub trait IsStarkProver<
             nonce = Some(nonce_value);
         }
 
+        crate::prove_split::add(&crate::prove_split::R4_GRIND, __ps_g);
+        let __ps_q = crate::prove_split::mark();
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
@@ -2747,6 +2758,7 @@ pub trait IsStarkProver<
 
         let deep_poly_openings =
             Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
+        crate::prove_split::add(&crate::prove_split::R4_QUERIES, __ps_q);
 
         #[cfg(feature = "instruments")]
         {
@@ -3756,6 +3768,7 @@ pub trait IsStarkProver<
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
+        let __ps = crate::prove_split::begin();
 
         // `debug-checks` reconstructs every table's Round 1 from retained state
         // between the aux and rounds stages, so the recompute mode's dropped
@@ -3788,6 +3801,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("r1_prepass");
 
+        let __ps_prepass = crate::prove_split::mark();
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
@@ -3885,6 +3899,7 @@ pub trait IsStarkProver<
             })?;
         }
 
+        crate::prove_split::add(&crate::prove_split::PREPASS, __ps_prepass);
         #[cfg(feature = "instruments")]
         drop(__sp);
         #[cfg(feature = "instruments")]
@@ -3920,6 +3935,7 @@ pub trait IsStarkProver<
         // the transcript only needs the roots absorbed in index order, done
         // sequentially below once every commit completed — the one ordering
         // Fiat-Shamir requires before sampling the shared challenges.
+        let __ps_mc = crate::prove_split::mark();
         let main_results = run_admitted(
             &main_walk_order,
             &main_estimates,
@@ -3954,6 +3970,8 @@ pub trait IsStarkProver<
                 )
             },
         );
+        crate::prove_split::add(&crate::prove_split::MAIN_COMMIT, __ps_mc);
+        let __ps_abs = crate::prove_split::mark();
         for result in main_results {
             let result = result.expect("run_admitted fills every slot");
             #[cfg(feature = "cuda")]
@@ -3998,6 +4016,7 @@ pub trait IsStarkProver<
         } else {
             Vec::new()
         };
+        crate::prove_split::add(&crate::prove_split::MAIN_ABSORB, __ps_abs);
 
         // =====================================================================
         // Aux build + aux commit + Rounds 2-4: fused per table
@@ -4132,6 +4151,7 @@ pub trait IsStarkProver<
             let domain = &domains[idx];
             let twiddles = &twiddle_caches[idx];
 
+            let __ps_ab = crate::prove_split::mark();
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_build_table");
             let bus_public_inputs = if air.has_aux_trace() {
@@ -4159,7 +4179,9 @@ pub trait IsStarkProver<
             }
             #[cfg(feature = "instruments")]
             drop(__sp);
+            crate::prove_split::add(&crate::prove_split::AUX_BUILD, __ps_ab);
 
+            let __ps_ac = crate::prove_split::mark();
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_commit_table");
             let aux_full: AuxResult<FieldExtension, H> =
@@ -4337,6 +4359,8 @@ pub trait IsStarkProver<
             }
             #[cfg(feature = "instruments")]
             drop(__sp);
+            crate::prove_split::add(&crate::prove_split::AUX_COMMIT, __ps_ac);
+            let __ps_r1a = crate::prove_split::mark();
 
             #[cfg(feature = "cuda")]
             let (aux_commit, cached_aux, gpu_aux) = aux_full;
@@ -4394,6 +4418,7 @@ pub trait IsStarkProver<
                 main: main_lde,
                 aux: cached_aux,
             };
+            crate::prove_split::add(&crate::prove_split::R1_ASSEMBLE, __ps_r1a);
             Ok((commitment, lde))
         };
 
@@ -4413,6 +4438,7 @@ pub trait IsStarkProver<
             #[cfg(feature = "instruments")]
             let table_start = Instant::now();
 
+            let __ps_r1b = crate::prove_split::mark();
             let mut round_1_result =
                 commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
 
@@ -4420,6 +4446,7 @@ pub trait IsStarkProver<
             if let Some(ref bpi) = round_1_result.bus_public_inputs {
                 tguard.append_field_element(&bpi.table_contribution);
             }
+            crate::prove_split::add(&crate::prove_split::R1_ASSEMBLE, __ps_r1b);
 
             let proof = Self::prove_rounds_2_to_4(
                 *air,
@@ -4464,6 +4491,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("rounds_2to4");
 
+        let __ps_fused = crate::prove_split::mark();
         let peak_order = heaviest_first(&peak_walk_weights);
         eprintln!(
             "[prover] table walk rounds 2-4 (walk weight, largest first): {}",
@@ -4534,6 +4562,7 @@ pub trait IsStarkProver<
             )
         };
 
+        crate::prove_split::add(&crate::prove_split::FUSED, __ps_fused);
         let mut proofs = Vec::with_capacity(num_airs);
         for result in table_results {
             proofs.push(result.expect("run_admitted fills every slot")?);
@@ -4554,6 +4583,14 @@ pub trait IsStarkProver<
                 table_timings,
                 heap_snapshots: heap_snaps,
             });
+        }
+
+        if let Some(line) = crate::prove_split::report(
+            __ps,
+            num_airs,
+            domains.iter().map(|d| d.interpolation_domain_size).sum(),
+        ) {
+            println!("{line}");
         }
 
         Ok(MultiProof { proofs })
@@ -5022,6 +5059,7 @@ pub trait IsStarkProver<
             &domain.trace_roots_of_unity,
         );
 
+        let __ps_ood = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_r3 = Instant::now();
         let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
@@ -5031,6 +5069,7 @@ pub trait IsStarkProver<
             &mut round_2_result.lde_composition_poly_evaluations,
             &z,
         );
+        crate::prove_split::add(&crate::prove_split::R3_OOD, __ps_ood);
         #[cfg(feature = "instruments")]
         let round_3_dur = t_r3.elapsed();
 
@@ -5070,6 +5109,7 @@ pub trait IsStarkProver<
         // the current-row block (all columns) and the pruned next-row block
         // (masked columns only), and absorb only the surviving values — the
         // verifier absorbs the identical two blocks in the same order.
+        let __ps_oa = crate::prove_split::mark();
         let (ood_block0, ood_block1) =
             Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
         for block in [&ood_block0, &ood_block1] {
@@ -5084,6 +5124,7 @@ pub trait IsStarkProver<
         for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
             transcript.append_field_element(element);
         }
+        crate::prove_split::add(&crate::prove_split::R3_ABSORB, __ps_oa);
 
         // ===================================
         // ==========|   Round 4   |==========

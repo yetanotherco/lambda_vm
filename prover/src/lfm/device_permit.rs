@@ -71,6 +71,25 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PEAK_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
 static HELD_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Holds since the process started, armed or not — the number the trace line
+/// carries. Separate from `ACQUISITIONS`, which a level clears.
+static TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// `LFM_CARD_TRACE=1` prints one line per hold: the phase, what it waited, what
+/// it held, and the two wall-clock stamps that bracket the window.
+///
+/// ★ The stamps are what make an external sampler attributable. A 10 Hz
+/// `nvidia-smi` log says how busy the card was; it cannot say whose window that
+/// was. Slicing the sample by these two numbers answers "how idle is the card
+/// INSIDE the held windows", which is the question a mutual-exclusion gate
+/// raises and no aggregate can answer.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LFM_CARD_TRACE") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
 
 thread_local! {
     /// ★ HOW LONG THIS THREAD HAS BLOCKED ON THE CARD, cumulative and never
@@ -151,6 +170,10 @@ impl PermitStats {
 pub struct CardPermit {
     guard: Option<std::sync::MutexGuard<'static, ()>>,
     since: Instant,
+    /// Trace-only, `None` unless `LFM_CARD_TRACE` is set: which device phase
+    /// this hold is, the seconds it queued, its sequence number, and the epoch
+    /// second it was acquired.
+    trace: Option<(&'static str, f64, usize, f64)>,
 }
 
 impl Drop for CardPermit {
@@ -159,6 +182,13 @@ impl Drop for CardPermit {
             HELD_NANOS.fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
             IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             HELD_HERE.with(|h| h.set(false));
+        }
+        if let Some((phase, waited, seq, t0)) = self.trace {
+            println!(
+                "CARD HOLD #{seq} {phase}: waited {waited:.3}s · held {:.3}s · t=[{t0:.3},{:.3}]",
+                self.since.elapsed().as_secs_f64(),
+                stark::prove_split::epoch_secs(),
+            );
         }
     }
 }
@@ -174,10 +204,31 @@ impl Drop for CardPermit {
 /// or if two holders are ever observed (the falsifier, caught at the instant it
 /// happens rather than inferred later from a VRAM abort).
 pub fn hold() -> CardPermit {
-    if workers() <= 1 {
+    hold_labeled("card")
+}
+
+/// [`hold`] with the device phase named, for the trace line. The name is the
+/// only thing that tells an artifact commit's window from a `multi_prove`'s in
+/// a log where both are just holds.
+pub fn hold_labeled(phase: &'static str) -> CardPermit {
+    let traced = trace_enabled();
+    if workers() <= 1 && !traced {
         return CardPermit {
             guard: None,
             since: Instant::now(),
+            trace: None,
+        };
+    }
+    // ★ Unarmed BUT traced: there is no card to take (the serial driver holds
+    // it by construction), and the window is still exactly the device phase —
+    // which is the window the sampler has to be sliced by in the K=1 control
+    // too, or the two arms are compared on different definitions.
+    if workers() <= 1 {
+        let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+        return CardPermit {
+            guard: None,
+            since: Instant::now(),
+            trace: Some((phase, 0.0, seq, stark::prove_split::epoch_secs())),
         };
     }
     assert!(
@@ -189,7 +240,11 @@ pub fn hold() -> CardPermit {
     // poison rather than turning one failure into two.
     let blocked_from = Instant::now();
     let guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
-    WAITED_NANOS.with(|w| w.set(w.get() + blocked_from.elapsed().as_nanos() as u64));
+    // Read ONCE. The trace line and `WAITED_NANOS` must carry the same wait, or
+    // a level's accounting and its per-hold log disagree by the bookkeeping
+    // below them.
+    let waited = blocked_from.elapsed();
+    WAITED_NANOS.with(|w| w.set(w.get() + waited.as_nanos() as u64));
     HELD_HERE.with(|h| h.set(true));
     let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     PEAK_IN_FLIGHT.fetch_max(now, Ordering::Relaxed);
@@ -204,6 +259,14 @@ pub fn hold() -> CardPermit {
     CardPermit {
         guard: Some(guard),
         since: Instant::now(),
+        trace: traced.then(|| {
+            (
+                phase,
+                waited.as_secs_f64(),
+                TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+                stark::prove_split::epoch_secs(),
+            )
+        }),
     }
 }
 

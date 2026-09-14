@@ -212,7 +212,7 @@ pub fn build_artifacts_counted(
     // would make a device-bound level look host-bound.
     let t = Instant::now();
     let artifacts = {
-        let _card = super::device_permit::hold();
+        let _card = super::device_permit::hold_labeled("build_artifacts");
         build_artifacts_with_hasher(program, options, hasher)
     };
     let build_nanos = t.elapsed().as_nanos();

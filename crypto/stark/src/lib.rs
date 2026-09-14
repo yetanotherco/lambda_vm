@@ -28,6 +28,7 @@ pub mod ood;
 pub(crate) mod par;
 pub mod profile_markers;
 pub mod proof;
+pub mod prove_split;
 pub mod prover;
 pub mod r4_denoms;
 pub mod residency_mode;

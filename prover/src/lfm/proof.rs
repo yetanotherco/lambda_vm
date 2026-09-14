@@ -284,7 +284,7 @@ pub(crate) fn prove_traces_with_hasher(
     // deliberately — the executor and the trace fill run BEFORE this call and
     // must be free to overlap another proof's device phase, which is the entire
     // point of the lever.
-    let _card = super::device_permit::hold();
+    let _card = super::device_permit::hold_labeled("multi_prove");
     let airs = LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,

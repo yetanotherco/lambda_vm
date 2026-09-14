@@ -1376,6 +1376,47 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// final epoch keeps its remainder and its HALT, so its padding chain is anchored as
 /// usual. A program that fits in one epoch runs as a single final (monolithic-style)
 /// epoch.
+/// `LAMBDA_VM_BASE_SPLIT=1` turns on one `BASE EPOCH` line per pipeline stage.
+///
+/// ★ WHY. The base prints ONE number for nineteen epochs — `base: 19 epochs in
+/// 67.1s` — and behind it is a three-stage pipeline: a single-threaded producer
+/// (execute + collect), a small pool of trace builders, and one prover. Those
+/// are three different machines with three different levers, and an aggregate
+/// cannot say which of them set the wall. The `recv` stage is the one the
+/// aggregate hides hardest: it is the prover thread — the only stage that
+/// reaches the card — sitting idle waiting for a builder.
+///
+/// Runtime-gated rather than `--features instruments` for the reason
+/// [`stark::prove_split`] gives: the record is produced by a binary that does
+/// not enable the feature, and a split taken from a different binary describes
+/// a different run.
+fn base_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAMBDA_VM_BASE_SPLIT") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
+/// Open a timed pipeline stage. `None`, and no clock read, when the knob is off.
+fn base_stage() -> Option<(std::time::Instant, f64)> {
+    base_split_enabled().then(|| (std::time::Instant::now(), stark::prove_split::epoch_secs()))
+}
+
+/// Close a stage opened by [`base_stage`] and print its line.
+///
+/// The two wall-clock stamps are what let an external GPU sampler be sliced by
+/// stage; the duration alone cannot place the stage on the sampler's timeline.
+fn base_stage_done(index: u64, stage: &str, open: Option<(std::time::Instant, f64)>) {
+    if let Some((start, t0)) = open {
+        let secs = start.elapsed().as_secs_f64();
+        println!(
+            "BASE EPOCH {index}: {stage} {secs:.2}s t=[{t0:.3},{:.3}]",
+            stark::prove_split::epoch_secs()
+        );
+    }
+}
+
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -1470,6 +1511,7 @@ pub fn prove_continuation(
     let prove_worker = |rx: std::sync::mpsc::Receiver<Result<PreparedEpoch, Error>>| {
         let mut proved: Vec<EpochResult> = Vec::new();
         loop {
+            let __bs_recv = base_stage();
             let prepared = match rx.recv() {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
@@ -1478,6 +1520,7 @@ pub fn prove_continuation(
                 }
                 Err(_) => return proved, // channel closed: no more epochs
             };
+            base_stage_done(prepared.index, "recv", __bs_recv);
             if first_err.lock().unwrap().is_some() {
                 continue; // an earlier failure is propagating; drain and discard
             }
@@ -1502,6 +1545,7 @@ pub fn prove_continuation(
             // hang instead of failing. Seen once: an aux-build abort slept for
             // 21 minutes under the CLI.
             let index = prepared.index;
+            let __bs_prove = base_stage();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Inside the guard on purpose: a panic raised on this thread
                 // OUTSIDE it reproduces the original wedge (which is what the
@@ -1521,6 +1565,7 @@ pub fn prove_continuation(
                     decode_commitment,
                 )
             }));
+            base_stage_done(index, "prove", __bs_prove);
             match outcome {
                 Ok(Ok(epoch)) => proved.push((index, epoch)),
                 Ok(Err(e)) => {
@@ -1580,6 +1625,7 @@ pub fn prove_continuation(
             // Same reason as the prover's guard: a builder that dies leaves the
             // producer blocked on the build channel once every builder is gone.
             let build_index = job.index;
+            let __bs_build = base_stage();
             let traces = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Traces::build_from_collected(
                     decode_artifacts_ref,
@@ -1602,6 +1648,7 @@ pub fn prove_continuation(
                     panic_message(&*payload)
                 ))),
             };
+            base_stage_done(build_index, "build", __bs_build);
             // Close the build span BEFORE forwarding: the send below blocks
             // on prove-channel backpressure, which is waiting, not building.
             #[cfg(feature = "instruments")]
@@ -1618,7 +1665,9 @@ pub fn prove_continuation(
                         let mut traces = traces;
                         #[cfg(feature = "instruments")]
                         let __sp = stark::instruments::span("p6_trace_preupload");
+                        let __bs_pre = base_stage();
                         traces.preupload_main_traces();
+                        base_stage_done(job.index, "preupload", __bs_pre);
                         traces
                     };
                     let prepared = PreparedEpoch {
@@ -1688,6 +1737,7 @@ pub fn prove_continuation(
                     // clears it).
                     #[cfg(feature = "instruments")]
                     let __sp = stark::instruments::span("epoch_execute");
+                    let __bs_exec = base_stage();
                     let logs = match executor
                         .resume_with_limit(epoch_size)
                         .map_err(|e| Error::Execution(format!("{e}")))?
@@ -1695,6 +1745,7 @@ pub fn prove_continuation(
                         Some(logs) => logs.to_vec(),
                         None => return Ok(()),
                     };
+                    base_stage_done(index, "execute", __bs_exec);
                     #[cfg(feature = "instruments")]
                     drop(__sp);
                     let is_final = executor.pc() == 0;
@@ -1717,6 +1768,7 @@ pub fn prove_continuation(
                         stark::instruments::nvtx_range_fmt(|| format!("epoch_collect[i={index}]"));
                     #[cfg(feature = "instruments")]
                     let __sp = stark::instruments::span("epoch_collect");
+                    let __bs_collect = base_stage();
                     let collected = Traces::collect_epoch(
                         decode_artifacts_ref,
                         &image,
@@ -1736,6 +1788,7 @@ pub fn prove_continuation(
                     // R_{i+1} from the collected register end state — the exact
                     // value the generated REGISTER trace binds (`fini_from_trace`
                     // equivalence pinned by `fini_from_final_state_matches_trace`).
+                    base_stage_done(index, "collect", __bs_collect);
                     prev_fini = Some(collected.register_fini(&register_init));
 
                     // Carry the image forward: this epoch's fini is the next
@@ -1760,7 +1813,10 @@ pub fn prove_continuation(
                     };
                     // A send error means the builder side hung up (its error is
                     // already propagating) — stop preparing quietly.
-                    if build_tx.send(Ok(job)).is_err() || is_final {
+                    let __bs_send = base_stage();
+                    let send_failed = build_tx.send(Ok(job)).is_err();
+                    base_stage_done(index, "handoff", __bs_send);
+                    if send_failed || is_final {
                         return Ok(());
                     }
                     index += 1;
