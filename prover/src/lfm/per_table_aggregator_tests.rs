@@ -1796,6 +1796,20 @@ fn print_prove_split(label: &str) {
             e.residue,
             e.depth_pass + e.setup + e.hash_phase + e.apply + e.residue,
         );
+        // ⓘ A THIRD line, for the two questions a wall cannot answer: how big
+        // the thing `setup` touches is, and what width the pool actually gave.
+        // `ns/perm` is measured on the coalesced levels of THIS proof — same
+        // box, same load, no rayon — so `width` is a reading, not an argument.
+        if e.serial_hashes > 0 {
+            println!(
+                "   {label} LFM EXEC WIDTH: records {:.0} MiB · {} serial hashes at \
+                 {:.0} ns/perm · effective width {:.1}",
+                e.record_bytes as f64 / (1u64 << 20) as f64,
+                e.serial_hashes,
+                e.secs_per_perm() * 1e9,
+                e.effective_width(),
+            );
+        }
     }
 }
 

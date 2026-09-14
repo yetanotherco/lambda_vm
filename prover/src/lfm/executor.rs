@@ -189,85 +189,56 @@ impl LfmRecords {
 }
 
 impl LfmRecords {
-    /// The same vectors, but with every row already present so an arm can write
-    /// its slot instead of appending.
+    /// Publish every slot the level walk wrote.
     ///
-    /// ⛔ **The allocation is not new.** [`LfmRecords::with_capacity`] already
-    /// reserved exactly these counts — the census is exact, not an upper bound —
-    /// so what this costs over it is the zero-fill, one pass of stores over
-    /// memory the push path was going to write anyway.
-    fn with_slots(groups: &LfmColumnGroups) -> Self {
-        let w = |_| FE::zero();
-        let word = || -> LfmWord { core::array::from_fn(w) };
-        LfmRecords {
-            num_consts: 0,
-            balu: vec![
-                BaluRow {
-                    a: FE::zero(),
-                    b: FE::zero(),
-                    c: FE::zero(),
-                    out: FE::zero()
-                };
-                groups.balu.real_rows
-            ],
-            xalu: vec![
-                XaluRow {
-                    a: core::array::from_fn(w),
-                    b: core::array::from_fn(w),
-                    c: core::array::from_fn(w),
-                    out: core::array::from_fn(w),
-                };
-                groups.xalu.real_rows
-            ],
-            select: vec![
-                SelectRow {
-                    bit: FE::zero(),
-                    in_l: word(),
-                    in_r: word(),
-                    out_l: word(),
-                    out_r: word(),
-                };
-                groups.select.real_rows
-            ],
-            bitdec: vec![
-                BitDecRow {
-                    bits: core::array::from_fn(w),
-                    z: FE::zero(),
-                    ginv: FE::zero(),
-                };
-                groups.bitdec.real_rows
-            ],
-            hash: vec![
-                HashRow {
-                    ins: core::array::from_fn(w),
-                    outs: core::array::from_fn(w),
-                };
-                groups.hash.real_rows
-            ],
-            keccak: vec![
-                KeccakRow {
-                    mode: KeccakMode::Permute,
-                    state: [0; 25],
-                    block: [0; 136],
-                    perm_in: [0; 25],
-                    output: [0; 25],
-                };
-                groups.keccak.real_rows
-            ],
-            blake3: vec![
-                Blake3Values {
-                    h: [0; 8],
-                    m: [0; 16],
-                    t: 0,
-                    block_len: 0,
-                    flags: 0,
-                };
-                groups.blake3.real_rows
-            ],
-            lanes: vec![word(); groups.lanes.real_rows],
-            hint: vec![word(); groups.hint.real_rows],
-            public: vec![word(); groups.public.real_rows],
+    /// # Safety
+    ///
+    /// Every row `0..real_rows` of every vector must already have been written
+    /// through [`Sink::Slot`]. Three things establish that together, and the
+    /// third is what makes it an observation rather than a hope:
+    ///
+    /// 1. the schedule hands out exactly one row per instruction, ascending from
+    ///    zero per chip, and `ChipRows::assert_matches_census` fails the run
+    ///    before anything executes unless those per-chip totals equal the
+    ///    `real_rows` this function is about to set;
+    /// 2. `every_instruction_is_scheduled_exactly_once` pins that the level
+    ///    index lists every instruction once, so every row is reached;
+    /// 3. `exec_identity_tests` READS every element of every record vector and
+    ///    compares it to the serial reference's, so a slot that was never
+    ///    written is a failing test rather than a quiet zero.
+    ///
+    /// The caller must also call this ONLY on the success path. It is invoked at
+    /// exactly one place for that reason: any `?` before it drops zero-length
+    /// vectors, which frees the buffer without reading a slot.
+    unsafe fn commit_slots(&mut self, groups: &LfmColumnGroups) {
+        // A `set_len` past the capacity would be the one way to turn the
+        // reasoning above into unsoundness, so it is checked rather than
+        // reasoned about, in every build.
+        macro_rules! commit {
+            ($($v:ident),+ $(,)?) => {$(
+                assert!(
+                    self.$v.capacity() >= groups.$v.real_rows,
+                    concat!("record slots for ", stringify!($v), " were not reserved"),
+                );
+                unsafe { self.$v.set_len(groups.$v.real_rows) };
+            )+};
         }
+        commit!(
+            balu, xalu, select, bitdec, hash, keccak, blake3, lanes, hint, public
+        );
+    }
+
+    /// Bytes the record vectors hold once filled — what `setup` first-touches.
+    fn bytes(groups: &LfmColumnGroups) -> usize {
+        groups.balu.real_rows * size_of::<BaluRow>()
+            + groups.xalu.real_rows * size_of::<XaluRow>()
+            + groups.select.real_rows * size_of::<SelectRow>()
+            + groups.bitdec.real_rows * size_of::<BitDecRow>()
+            + groups.hash.real_rows * size_of::<HashRow>()
+            + groups.keccak.real_rows * size_of::<KeccakRow>()
+            + groups.blake3.real_rows * size_of::<Blake3Values>()
+            + (groups.lanes.real_rows + groups.hint.real_rows + groups.public.real_rows)
+                * size_of::<LfmWord>()
     }
 }
 
@@ -292,7 +263,29 @@ impl Sink {
     fn put<T>(self, v: &mut Vec<T>, value: T) {
         match self {
             Sink::Push => v.push(value),
-            Sink::Slot(n) => v[n as usize] = value,
+            // ⛔ SAFETY, and the whole of it. `v` was built by
+            // `LfmRecords::with_capacity`, so it has capacity for exactly
+            // `real_rows` elements and length ZERO; `n` is a row the schedule
+            // handed out, and `ChipRows::assert_matches_census` has already
+            // failed the run if the schedule's per-chip row count is not that
+            // same `real_rows`. So `n < capacity` and this writes inside the
+            // allocation. It writes rather than assigns because the slot holds
+            // no value yet — assigning would drop whatever bytes are there.
+            //
+            // The vector's LENGTH stays zero until `commit_slots`, which runs at
+            // one place: immediately before the success value is built, after
+            // every instruction has run. Any `?` on the way out therefore drops
+            // a zero-length vector, and a slot written but never committed is
+            // freed without ever being read. That is what makes a partially
+            // executed program safe rather than merely unlikely.
+            Sink::Slot(n) => {
+                debug_assert!(
+                    (n as usize) < v.capacity(),
+                    "row {n} is outside the chip's reserved capacity {}",
+                    v.capacity()
+                );
+                unsafe { v.as_mut_ptr().add(n as usize).write(value) }
+            }
         }
     }
 }
@@ -966,6 +959,38 @@ pub struct ExecSplit {
     pub apply: f64,
     /// Everything that is not a hash instruction.
     pub residue: f64,
+    /// Bytes the record vectors occupy — the size of what `setup` touches.
+    pub record_bytes: usize,
+    /// Hashes run on the calling thread because their level was too narrow to
+    /// hand to rayon, and the seconds they took.
+    ///
+    /// ★ Together these are a per-permutation cost measured IN THIS PROCESS, on
+    /// THIS box, under THIS load, with no rayon in the path — so
+    /// `parallel_hashes × (serial_hash_secs / serial_hashes) / hash_phase` is
+    /// the effective width the pool actually gave, as a reading rather than an
+    /// argument. A wall alone cannot separate "the box is busy" from "the
+    /// schedule is wrong", and those want opposite fixes.
+    pub serial_hashes: usize,
+    pub serial_hash_secs: f64,
+}
+
+impl ExecSplit {
+    /// Seconds per permutation, measured off the coalesced levels.
+    pub fn secs_per_perm(&self) -> f64 {
+        if self.serial_hashes == 0 {
+            return 0.0;
+        }
+        self.serial_hash_secs / self.serial_hashes as f64
+    }
+
+    /// The width the pool actually delivered during the hash phase.
+    pub fn effective_width(&self) -> f64 {
+        let per = self.secs_per_perm();
+        if per <= 0.0 || self.hash_phase <= 0.0 {
+            return 0.0;
+        }
+        self.parallel_hashes as f64 * per / self.hash_phase
+    }
 }
 
 /// The witness, under whichever schedule the caller names.
@@ -1084,20 +1109,21 @@ fn execute_inner(
     // The serial walk IS program order, so it appends into empty vectors exactly
     // as it always did; the level walk is not, so it writes slots that already
     // exist. Same bytes reserved either way.
+    // ⛔ ONE allocation path for both walks, and the records are NOT pre-filled.
+    // They used to be, so the level walk could assign into a live element — and
+    // that cost a full pass of stores over half a gigabyte of rows the walk was
+    // about to overwrite anyway, plus first-touching every one of those pages
+    // here instead of where the work is. The slots are written once, into spare
+    // capacity, and `commit_slots` publishes them.
     let t = Instant::now();
     let mut m = Machine {
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas,
     };
-    let mut records = match &levels {
-        None => LfmRecords::with_capacity(&program.groups),
-        Some(_) => LfmRecords::with_slots(&program.groups),
-    };
-    let mut public_words = match &levels {
-        None => Vec::with_capacity(program.groups.public.real_rows),
-        Some(_) => vec![(0u32, [FE::zero(); 4]); program.groups.public.real_rows],
-    };
+    let mut records = LfmRecords::with_capacity(&program.groups);
+    let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
     split.setup = t.elapsed().as_secs_f64();
+    split.record_bytes = LfmRecords::bytes(&program.groups);
 
     match &levels {
         None => {
@@ -1129,6 +1155,15 @@ fn execute_inner(
                 &mut public_words,
                 &mut split,
             )?;
+            // SAFETY: `run_levels` returned `Ok`, so every instruction ran and
+            // every row the schedule handed out was written — see
+            // `LfmRecords::commit_slots`. This is the one call site, and it is
+            // after the `?` so a failed walk never reaches it.
+            unsafe {
+                records.commit_slots(&program.groups);
+                assert!(public_words.capacity() >= program.groups.public.real_rows);
+                public_words.set_len(program.groups.public.real_rows);
+            }
         }
     }
 
@@ -1238,6 +1273,13 @@ fn run_levels(
                 let instr = &program.instrs[levels.instr_of_row(row)];
                 computed.push(hash_one(&m.memory, hasher, instr));
             }
+            // ★ The same permutation, on this thread, with no pool in the path —
+            // so the ratio of this to the parallel phase is the width the pool
+            // actually gave, measured in the same process on the same box under
+            // the same load. Free: this work runs either way, and it is 1.1% of
+            // the hashes.
+            split.serial_hashes += rows.len();
+            split.serial_hash_secs += t.elapsed().as_secs_f64();
         } else {
             compute_level(&m.memory, hasher, program, levels, rows, &mut computed);
             split.parallel_levels += 1;
@@ -1262,7 +1304,9 @@ fn run_levels(
                 ));
             };
             hash_apply(&mut m.memory, *mode, outs, row_value)?;
-            records.hash[row as usize] = row_value.clone();
+            // The hash chip's row goes through the same slot write as every
+            // other chip's: the vector's length is zero until `commit_slots`.
+            Sink::Slot(row).put(&mut records.hash, row_value.clone());
         }
         split.apply += t.elapsed().as_secs_f64();
 

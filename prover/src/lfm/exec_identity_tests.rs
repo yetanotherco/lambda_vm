@@ -283,6 +283,74 @@ fn a_hash_record_slot_is_192_bytes() {
     );
 }
 
+/// Every record row's width, pinned.
+///
+/// ⛔ These are the multipliers in `LfmRecords::bytes`, and `bytes` is what the
+/// split line reports as the size of what `setup` first-touches — the figure the
+/// campaign will size the phase against. A row that silently grew a column would
+/// move that figure with nothing to say so, and the arithmetic in the handoff
+/// would go on quoting the old one.
+#[test]
+fn the_record_rows_are_the_widths_the_sizing_assumes() {
+    use super::blake3_chip::Blake3Values;
+    use super::executor::{BaluRow, BitDecRow, HashRow, KeccakRow, SelectRow, XaluRow};
+    use super::word::LfmWord;
+    use std::mem::size_of;
+
+    for (name, got, want) in [
+        ("BaluRow", size_of::<BaluRow>(), 32),
+        ("XaluRow", size_of::<XaluRow>(), 96),
+        ("SelectRow", size_of::<SelectRow>(), 136),
+        ("BitDecRow", size_of::<BitDecRow>(), 528),
+        ("HashRow", size_of::<HashRow>(), 192),
+        ("KeccakRow", size_of::<KeccakRow>(), 744),
+        ("Blake3Values", size_of::<Blake3Values>(), 112),
+        ("LfmWord", size_of::<LfmWord>(), 32),
+    ] {
+        assert_eq!(
+            got, want,
+            "{name} is {got} bytes, not the {want} the sizing assumes"
+        );
+    }
+}
+
+/// ★★ The property the `unsafe` in `commit_slots` rests on: a walk that fails
+/// partway NEVER yields records.
+///
+/// The level walk writes rows into spare capacity and leaves every vector at
+/// length zero until `commit_slots`, which runs at one place after the last
+/// instruction. So a program that errors mid-walk returns `Err` and the
+/// half-written buffers are freed without a single slot being read — the
+/// uninitialised state is not merely unlikely to be observed, it is not
+/// reachable through the API at all.
+///
+/// The merged schedule is a walk that fails partway by construction, which is
+/// what makes this checkable rather than assertable: it errors with rows already
+/// written, and there is still no value for a caller to inspect.
+#[test]
+fn a_failed_walk_yields_no_records_at_all() {
+    let mut checked = 0;
+    for case in cases() {
+        if super::reach_profile::profile(&case.program).hash_rows == 0 {
+            continue;
+        }
+        let out = super::executor::execute_with_merged_levels(
+            &case.program,
+            &case.arenas,
+            &case.hasher,
+            GATE_COALESCE_BELOW,
+            2,
+        );
+        assert!(
+            out.is_err(),
+            "{}: this walk must fail partway, or it is not the case this test needs",
+            case.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no case exercised a partial walk");
+}
+
 /// ★★ THE MUTATION. Merge adjacent depth levels and the executor must FAIL — at
 /// the same address, on every run.
 ///
