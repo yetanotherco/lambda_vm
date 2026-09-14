@@ -2498,6 +2498,50 @@ fn rss_marks() -> (Option<f64>, Option<f64>) {
     (read("VmRSS:"), read("VmHWM:"))
 }
 
+/// ★★★ LIVE BYTES vs RESIDENT BYTES, straight from the allocator.
+///
+/// `VmRSS` cannot separate "the prover is holding this" from "the allocator has
+/// not returned it yet", and that ambiguity is the whole of the interior's
+/// rising-peak question: the per-level host peaks climb 43 → 45 → 47 GiB while
+/// the levels SHRINK 10 → 5 → 3 nodes and the node census FALLS
+/// (525.9M → 456.2M → 437.6M cells). Level 2's rounds 1 and 2 hold an IDENTICAL
+/// two live nodes and read 2.45 GiB apart — which residency cannot do, but which
+/// `VmRSS` also cannot prove, because it sees one number.
+///
+/// jemalloc sees both. `stats::allocated` is bytes the program asked for and has
+/// not freed; `stats::resident` is what the allocator is holding in pages.
+/// **`resident − allocated` IS the retention**, directly, with no purge arm and
+/// no inference from a proxy.
+///
+/// ⛔ `epoch::advance()` first, always: jemalloc's statistics are cached and a
+/// read without it returns the values from whenever the epoch last turned — a
+/// number that looks live, updates sometimes, and lags arbitrarily.
+///
+/// ⓘ `#[cfg(test)]`-only by construction: `tikv-jemalloc-ctl` is a
+/// dev-dependency, and `lib.rs`'s `#[global_allocator]` installs jemalloc under
+/// the same cfg, so the numbers describe the allocator that is actually running.
+fn jemalloc_marks() -> Option<(f64, f64)> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    const GIB: f64 = (1u64 << 30) as f64;
+    epoch::advance().ok()?;
+    let allocated = stats::allocated::read().ok()? as f64 / GIB;
+    let resident = stats::resident::read().ok()? as f64 / GIB;
+    Some((allocated, resident))
+}
+
+/// The allocator line a phase boundary prints beside its RSS mark.
+fn jemalloc_line(label: &str) -> String {
+    match jemalloc_marks() {
+        Some((a, r)) => format!(
+            "   {label}: jemalloc allocated {a:.3} GiB · resident {r:.3} · \
+             RETAINED {:.3} ({:.0}% of resident)",
+            r - a,
+            if r > 0.0 { 100.0 * (r - a) / r } else { 0.0 },
+        ),
+        None => format!("   {label}: jemalloc stats unavailable"),
+    }
+}
+
 /// One labelled mark: `live` is what the next phase carries in, `high-water` is
 /// what the process has ever held, `t` is the wall clock the sampler shares.
 ///
@@ -4095,6 +4139,7 @@ fn the_production_tree_composes_to_a_root() {
         },
     );
     mark("AFTER the base (this live figure is L_bundle)");
+    println!("{}", jemalloc_line("AFTER the base"));
 
     let shape = tree_shape(bundle.num_epochs(), fan_in);
     let top = shape.len();
@@ -4332,6 +4377,7 @@ fn the_production_tree_composes_to_a_root() {
     let level0_wall = t_level.elapsed().as_secs_f64();
     let (l0_peak, l0_at) = level0_sampler.stop();
     println!("   level 0: {} wraps in {level0_wall:.1}s", children.len());
+    println!("{}", jemalloc_line("level 0"));
     // ⛔ FALSIFIER 1's OWN LINE. The per-wrap peaks above are process-wide
     // readings inside overlapping windows once wraps run together; this is the
     // level's own window and it is the figure the 52 GiB stop is about.
@@ -5134,6 +5180,11 @@ fn the_production_tree_composes_to_a_root() {
         if permit.acquisitions > 0 {
             println!("   level {level_no}: {}", permit.describe(level_wall));
         }
+        // ★ THE DISCRIMINATOR, at the boundary where the peaks rise. Retention
+        // and residency are indistinguishable in `VmRSS` and trivially apart
+        // here: a level whose RETAINED figure grows while its allocated figure
+        // falls is the allocator, not the prover.
+        println!("{}", jemalloc_line(&format!("level {level_no}")));
         if let Some(stats) = super::program_census::end_level() {
             println!("   {}", stats.describe(&format!("level {level_no}")));
         }
