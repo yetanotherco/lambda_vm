@@ -64,10 +64,14 @@ pub fn reset_call_counters() {
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
 /// was bound to — the factors are folded where they lie, so their values at
 /// the sumcheck's point are already there when the rounds end.
+/// What a resident sumcheck's rounds on device leave: the rounds, the point
+/// they drew, and **every** factor — resident and not — as the last fold left
+/// it. One value each when the device ran the cube out, a cube when it stopped
+/// at the crossover for the caller to finish.
 type ResidentRounds<E> = (
     Vec<crate::sumcheck::RoundProof<E>>,
     Vec<math::field::element::FieldElement<E>>,
-    Vec<math::field::element::FieldElement<E>>,
+    Vec<crate::mle::Mle<E>>,
 );
 
 type SumcheckRounds<E> = (
@@ -348,6 +352,7 @@ pub(crate) fn prove_sumcheck<E>(
     polys: &[crate::mle::Mle<E>],
     program: &crate::program::Program<E>,
     degree: usize,
+    host_cube: usize,
     challenge: impl FnMut(
         &[math::field::element::FieldElement<E>],
     ) -> math::field::element::FieldElement<E>,
@@ -429,19 +434,25 @@ where
         )
     };
 
-    let outcome = run_rounds(&mut session, degree, num_vars, challenge, reference);
+    // The rounds stop where the cube reaches the crossover: past it a round is
+    // one thread walking the whole program, and a core here walks it far
+    // faster. The caller carries on from the factors this leaves folded.
+    let there = num_vars.saturating_sub(host_cube.max(1).trailing_zeros() as usize);
+    let outcome = run_rounds(&mut session, degree, there, challenge, reference);
     let (rounds, challenges) = match outcome {
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    // Every variable is bound, so each factor is one value — read where it
-    // lies, which is the only thing a session over resident factors can say.
-    let Ok(bound) = session.bound_values() else {
+    // Each factor as the last fold left it, read where it lies — which is the
+    // only thing a session over factors it does not own can say.
+    let Ok(values) = session.values() else {
         return Some(Err(crate::Error::DeviceFailed { stage: "download" }));
     };
-    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = bound
+    let folded: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
         .iter()
-        .map(|value| crate::mle::Mle::new(vec![ext3_from_raw::<E>(value)]))
+        .map(|factor| {
+            crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+        })
         .collect();
     let Ok(folded) = folded else {
         return Some(Err(crate::Error::DeviceFailed {
@@ -520,6 +531,7 @@ pub(crate) fn prove_sumcheck<E>(
     _polys: &[crate::mle::Mle<E>],
     _program: &crate::program::Program<E>,
     _degree: usize,
+    _host_cube: usize,
     _challenge: impl FnMut(
         &[math::field::element::FieldElement<E>],
     ) -> math::field::element::FieldElement<E>,
@@ -602,28 +614,36 @@ where
         )
         .ok()?;
 
-    let outcome = run_rounds(&mut session, degree, num_vars, challenge, |_| None);
+    // The rounds stop where the cube reaches the crossover: past it a round is
+    // one thread walking the whole program, and a core here walks it far
+    // faster. The caller finishes from the factors this hands back.
+    let there = num_vars.saturating_sub(crate::HOST_CUBE_COMPILED.trailing_zeros() as usize);
+    let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
     let (rounds, challenges) = match outcome {
         Ok(rounds) => rounds,
         Err(error) => return Some(Err(error)),
     };
-    // The rounds folded every factor down to its value at the point they drew.
-    // Reading those three u64 per slot is what spares the caller a pass over
-    // the trace to compute what the device already has.
-    let Ok(bound) = session.bound_values() else {
+    // The rounds folded every factor where it lies, so reading them back is
+    // what spares the caller a pass over the trace to compute what the device
+    // already has — the values at the point, when the cube ran out here.
+    let Ok(values) = session.values() else {
+        return Some(Err(crate::Error::DeviceFailed {
+            stage: "factor values",
+        }));
+    };
+    let factors: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
+        .iter()
+        .map(|factor| {
+            crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+        })
+        .collect();
+    let Ok(factors) = factors else {
         return Some(Err(crate::Error::DeviceFailed {
             stage: "factor values",
         }));
     };
     SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(Ok((
-        rounds,
-        challenges,
-        bound
-            .iter()
-            .map(|limbs| ext3_from_raw::<E>(limbs))
-            .collect(),
-    )))
+    Some(Ok((rounds, challenges, factors)))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1112,6 +1132,7 @@ impl DeviceTree {
         _point: &[math::field::element::FieldElement<E>],
         _program: &crate::program::Program<E>,
         _degree: usize,
+        _tail: usize,
         _challenge: impl FnMut(
             &[math::field::element::FieldElement<E>],
         ) -> math::field::element::FieldElement<E>,
@@ -1121,14 +1142,28 @@ impl DeviceTree {
     {
         match self.0 {}
     }
+
+    pub(crate) fn layer_to_host<E>(
+        &self,
+        _layer: usize,
+    ) -> Option<(crate::mle::Mle<E>, crate::mle::Mle<E>)>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
 }
 
-/// What a layer's sumcheck leaves: the rounds, the point, and the four values
-/// the layer reduces to.
+/// What a layer's rounds on device leave: the rounds themselves, the point
+/// they drew, and the five factors as the last fold left them.
+///
+/// The factors are one value each when the device ran the layer out, and a
+/// cube when it stopped at the crossover for the host to finish — the caller
+/// carries on from them either way.
 pub type LayerRounds<E> = (
     Vec<crate::sumcheck::RoundProof<E>>,
     Vec<math::field::element::FieldElement<E>>,
-    [math::field::element::FieldElement<E>; 4],
+    Vec<crate::mle::Mle<E>>,
 );
 
 /// Builds the tree on device from an input layer, folding every level there.
@@ -1201,8 +1236,30 @@ impl DeviceTree {
         Ok((ext3_from_raw::<E>(&p), ext3_from_raw::<E>(&q)))
     }
 
+    /// A level's halves back here, for the levels near the output that GKR
+    /// proves on the host.
+    pub(crate) fn layer_to_host<E>(
+        &self,
+        layer: usize,
+    ) -> Option<(crate::mle::Mle<E>, crate::mle::Mle<E>)>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let held = self.tree.lock().ok()?;
+        let (p, q) = held.as_ref()?.layer_to_host(layer).ok()?;
+        let table = |raw: Vec<u64>| {
+            crate::mle::Mle::new(raw.chunks_exact(3).map(ext3_from_raw::<E>).collect()).ok()
+        };
+        Some((table(p)?, table(q)?))
+    }
+
     /// One layer's sumcheck, folded in place: the rounds, the point they drew,
-    /// and the four values the fold leaves behind.
+    /// and the five factors as the last fold left them.
+    ///
+    /// The rounds stop once the cube is down to `tail`, which the caller
+    /// finishes here — below a few hundred indices a round is a launch and a
+    /// wait around a kernel with almost nothing to sum. `tail` of one runs the
+    /// layer out there, and the factors come back as one value each.
     ///
     /// The layer is spent afterwards, which is what makes the halves usable as
     /// factors without copying them: GKR reads each layer once.
@@ -1212,6 +1269,7 @@ impl DeviceTree {
         point: &[math::field::element::FieldElement<E>],
         program: &crate::program::Program<E>,
         degree: usize,
+        tail: usize,
         challenge: impl FnMut(
             &[math::field::element::FieldElement<E>],
         ) -> math::field::element::FieldElement<E>,
@@ -1269,28 +1327,35 @@ impl DeviceTree {
         let Ok(mut session) = session else {
             return None;
         };
+        // What is left for the host: the rounds stop where the cube reaches it.
+        let here = tail.max(1).trailing_zeros() as usize;
+        let there = num_vars.saturating_sub(here);
 
         // Past here the transcript moves: the host path is no longer an option.
         let failed = |stage| crate::Error::DeviceFailed { stage };
-        let outcome = run_rounds(&mut session, degree, num_vars, challenge, |_| None);
+        let outcome = run_rounds(&mut session, degree, there, challenge, |_| None);
         let (rounds, challenges) = match outcome {
             Ok(rounds) => rounds,
             Err(error) => return Some(Err(error)),
         };
-        let Ok(bound) = session.bound_values() else {
+        let Ok(values) = session.values() else {
             return Some(Err(failed("layer values")));
         };
         // Factor 0 is the weight; the four the layer reduces to follow.
-        if bound.len() != 5 {
+        if values.len() != 5 {
             return Some(Err(failed("layer factors")));
         }
-        let value = |k: usize| ext3_from_raw::<E>(&bound[k]);
+        let factors: Result<Vec<crate::mle::Mle<E>>, crate::Error> = values
+            .iter()
+            .map(|factor| {
+                crate::mle::Mle::new(factor.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+            })
+            .collect();
+        let Ok(factors) = factors else {
+            return Some(Err(failed("layer factors")));
+        };
         SUMCHECK_CALLS.fetch_add(1, Ordering::Relaxed);
-        Some(Ok((
-            rounds,
-            challenges,
-            [value(1), value(2), value(3), value(4)],
-        )))
+        Some(Ok((rounds, challenges, factors)))
     }
 }
 

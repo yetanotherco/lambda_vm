@@ -101,6 +101,10 @@ pub struct Batched<'a, F: IsField> {
     /// The whole batch as one program, when every rule is compiled. The round
     /// loop runs this instead of the rules, and it is what a device gets.
     program: Option<Program<F>>,
+    /// Whether the rounds may still go to a device. False once one has handed
+    /// its factors back: what it stopped for is that the cube got too small to
+    /// be worth sending anywhere.
+    dispatch: bool,
 }
 
 impl<'a, F: IsField + 'static> Batched<'a, F> {
@@ -141,6 +145,7 @@ impl<'a, F: IsField + 'static> Batched<'a, F> {
             num_vars,
             degree,
             program,
+            dispatch: true,
         })
     }
 
@@ -165,6 +170,29 @@ impl<'a, F: IsField + 'static> Batched<'a, F> {
         polys.append(&mut self.polys);
         self.polys = polys;
         self.num_vars = num_vars;
+        Ok(())
+    }
+
+    /// The batch's factors, replaced whole by the ones a device folded.
+    ///
+    /// A batch whose leading factors a device holds is built over the rest
+    /// alone; when the device stops part-way it hands back **every** factor,
+    /// resident or not, as its rounds left them — so this replaces the list
+    /// rather than adding to it. The rounds that follow stay here: the cube
+    /// the device stopped at is the one it was no longer worth sending.
+    pub fn adopt(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        let num_vars = polys.first().map(Mle::num_vars).unwrap_or(0);
+        for p in &polys {
+            if p.num_vars() != num_vars {
+                return Err(Error::VariableCountMismatch {
+                    expected: num_vars,
+                    got: p.num_vars(),
+                });
+            }
+        }
+        self.polys = polys;
+        self.num_vars = num_vars;
+        self.dispatch = false;
         Ok(())
     }
 
@@ -216,7 +244,7 @@ impl<F: IsField + 'static> SumcheckPolynomial<F> for Batched<'_, F> {
     }
 
     fn program(&self) -> Option<&Program<F>> {
-        self.program.as_ref()
+        self.program.as_ref().filter(|_| self.dispatch)
     }
 
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
@@ -266,8 +294,8 @@ where
 }
 
 /// A batched sumcheck's proof, the point its rounds drew, and what every
-/// factor slot was bound to there — empty when the factors were the host's and
-/// folded away as they went.
+/// factor slot was bound to there — empty when the factors were the host's own
+/// and folded away as they went.
 type ResidentProof<F> = (SumcheckProof<F>, Vec<FieldElement<F>>, Vec<FieldElement<F>>);
 
 /// The same, over factors a device already holds — the batch's first ones, in
@@ -335,8 +363,23 @@ where
             },
         );
         if let Some(outcome) = attempt {
-            let (rounds, challenges, bound) = outcome?;
-            return Ok((SumcheckProof { rounds }, challenges, bound));
+            let (mut rounds, mut point, factors) = outcome?;
+            // The device stopped where the cube stopped being worth sending;
+            // the rest of the rounds run over the factors it folded.
+            batched.adopt(factors)?;
+            let left = batched.num_vars();
+            let (tail, tail_point) = sumcheck::prove_rounds(&mut batched, left, transcript)?;
+            rounds.extend(tail);
+            point.extend(tail_point);
+            // Binding every variable is evaluating at the point, so the factor
+            // values the caller needs are the factors themselves by now.
+            let bound: Option<Vec<FieldElement<F>>> = batched
+                .polys()
+                .iter()
+                .map(|factor| factor.as_constant().cloned())
+                .collect();
+            let bound = bound.ok_or(Error::NoVariablesLeft)?;
+            return Ok((SumcheckProof { rounds }, point, bound));
         }
     }
     // Declined before the first round: the host runs them, and for that the

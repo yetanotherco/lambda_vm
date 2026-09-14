@@ -37,6 +37,16 @@ use thiserror::Error;
 #[cfg(feature = "parallel")]
 pub(crate) const SERIAL_BELOW: usize = 1 << 12;
 
+/// The cube below which a sumcheck's rounds belong here, for a rule the host
+/// evaluates directly: a device round costs the same whatever the cube — one
+/// thread walks the whole rule at each index — and a host round is linear in it.
+pub(crate) const HOST_CUBE_DIRECT: usize = 1 << 9;
+
+/// The same for a rule the host walks through the program interpreter, which
+/// costs about ten times a multiplication written out per step while the device
+/// round costs the same either way.
+pub(crate) const HOST_CUBE_COMPILED: usize = 1 << 5;
+
 /// `[1, gamma, gamma^2, ..]` — the weights a batching challenge expands into.
 pub(crate) fn challenge_powers<F: IsField>(
     gamma: &FieldElement<F>,

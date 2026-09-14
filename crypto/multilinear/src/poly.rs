@@ -51,6 +51,14 @@ pub trait SumcheckPolynomial<F: IsField + 'static> {
         None
     }
 
+    /// The cube below which this polynomial's rounds stop going to a device.
+    ///
+    /// The default is for a rule the host runs through the program interpreter;
+    /// one that evaluates its rule directly crosses much later.
+    fn host_cube(&self) -> usize {
+        crate::HOST_CUBE_COMPILED
+    }
+
     /// Takes factors bound elsewhere, in the order [`polys`](Self::polys)
     /// returns them.
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {

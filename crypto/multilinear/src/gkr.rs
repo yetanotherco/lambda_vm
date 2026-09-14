@@ -151,7 +151,46 @@ impl<F: IsField + 'static> FractionTree<F> {
     pub fn input_layer(&self) -> &FractionLayer<F> {
         self.layers.last().expect("non-empty")
     }
+
+    /// The levels near the output, back here — `prefix[i]` is layer `i`.
+    ///
+    /// Empty for a tree that already lives here. One download brings the whole
+    /// prefix: the levels above the deepest of them are its folds, and the
+    /// deepest is a few kilobytes.
+    fn host_prefix(&self) -> Vec<FractionLayer<F>>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        let Some(device) = self.device.as_ref() else {
+            return Vec::new();
+        };
+        // Never the input layer: a tree that dropped it writes it again for its
+        // own sumcheck, and it is the one level too big to walk here.
+        let deepest = HOST_LAYER_VARS.min(self.num_layers.saturating_sub(2));
+        let Some((p, q)) = device.layer_to_host::<F>(deepest) else {
+            return Vec::new();
+        };
+        let Ok(layer) = FractionLayer::new(p, q) else {
+            return Vec::new();
+        };
+        if layer.num_vars() != deepest {
+            return Vec::new();
+        }
+        let mut prefix = vec![layer];
+        while prefix.last().expect("non-empty").num_vars() > 0 {
+            let Ok(next) = prefix.last().expect("non-empty").fold() else {
+                return Vec::new();
+            };
+            prefix.push(next);
+        }
+        prefix.reverse();
+        prefix
+    }
 }
+
+/// The deepest level that comes here whole: the one whose halves are already
+/// a cube of [`crate::HOST_CUBE_DIRECT`], so its sumcheck never goes to a device.
+const HOST_LAYER_VARS: usize = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
 
 /// The layer relation: `Σ_x eq(r,x)·[p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi]`,
 /// which equals `p_out(r) + λ·q_out(r)` when the layer really is the fold.
@@ -159,8 +198,10 @@ struct LayerRelation<F: IsField> {
     /// `[eq, p_lo, p_hi, q_lo, q_hi]`.
     polys: Vec<Mle<F>>,
     lambda: FieldElement<F>,
-    /// The same rule as straight-line code, for the device path.
-    program: Program<F>,
+    /// The same rule as straight-line code, for the device path. `None` for a
+    /// relation that is here on purpose — a level the tree handed over, or the
+    /// tail of one — so the dispatch does not send it back.
+    program: Option<Program<F>>,
 }
 
 impl<F: IsField + 'static> LayerRelation<F> {
@@ -174,6 +215,7 @@ impl<F: IsField + 'static> LayerRelation<F> {
         next: &FractionLayer<F>,
         r: &[FieldElement<F>],
         lambda: FieldElement<F>,
+        dispatchable: bool,
     ) -> Result<Self, Error> {
         let half = next.p.len() / 2;
         let split = |m: &Mle<F>| -> Result<(Mle<F>, Mle<F>), Error> {
@@ -186,7 +228,25 @@ impl<F: IsField + 'static> LayerRelation<F> {
         let (q_lo, q_hi) = split(&next.q)?;
         Ok(Self {
             polys: vec![eq_mle(r)?, p_lo, p_hi, q_lo, q_hi],
-            program: Self::program_for(&lambda)?,
+            program: dispatchable
+                .then(|| Self::program_for(&lambda))
+                .transpose()?,
+            lambda,
+        })
+    }
+
+    /// The same relation over factors a device already folded: the weight and
+    /// the four halves as its last round left them.
+    fn from_factors(polys: Vec<Mle<F>>, lambda: FieldElement<F>) -> Result<Self, Error> {
+        if polys.len() != 5 {
+            return Err(Error::VariableCountMismatch {
+                expected: 5,
+                got: polys.len(),
+            });
+        }
+        Ok(Self {
+            polys,
+            program: None,
             lambda,
         })
     }
@@ -242,7 +302,13 @@ impl<F: IsField + 'static> SumcheckPolynomial<F> for LayerRelation<F> {
     }
 
     fn program(&self) -> Option<&Program<F>> {
-        Some(&self.program)
+        self.program.as_ref()
+    }
+
+    /// The layer relation is four multiplications written out, not a program
+    /// the host walks — so its rounds are worth taking back much earlier.
+    fn host_cube(&self) -> usize {
+        crate::HOST_CUBE_DIRECT
     }
 
     fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
@@ -334,48 +400,61 @@ where
     // point and needs no challenge.
     let mut point: Vec<FieldElement<F>> = Vec::new();
     let (mut p_claim, mut q_claim) = tree.output();
+    // The levels near the output, fetched once. Their rounds are over cubes a
+    // core walks in microseconds, and a device pays a launch for each.
+    let prefix = tree.host_prefix();
 
     for i in 0..tree.num_layers() - 1 {
         let lambda: FieldElement<F> = transcript.sample_field_element();
 
-        // A tree the device holds proves its layer where it lies: the halves
-        // are the sumcheck's factors in place, and what the fold leaves behind
-        // is the four values below.
-        if let Some(device) = tree.device() {
-            let program = LayerRelation::program_for(&lambda)?;
-            let attempt = device.prove_layer(i + 1, &point, &program, LAYER_DEGREE, |sent| {
-                for value in sent {
-                    transcript.append_field_element(value);
+        // What the device ran of this layer, and the relation it left behind.
+        // A tree the device holds proves its layer where it lies — the halves
+        // are the sumcheck's factors in place — until the cube reaches the
+        // crossover, and hands the factors over from there.
+        let (mut rounds, mut z, mut relation) = match prefix.get(i + 1) {
+            Some(here) => (
+                Vec::new(),
+                Vec::new(),
+                LayerRelation::new(here, &point, lambda, false)?,
+            ),
+            None => match tree.device() {
+                Some(device) => {
+                    let program = LayerRelation::program_for(&lambda)?;
+                    let attempt = device.prove_layer(
+                        i + 1,
+                        &point,
+                        &program,
+                        LAYER_DEGREE,
+                        crate::HOST_CUBE_DIRECT,
+                        |sent| {
+                            for value in sent {
+                                transcript.append_field_element(value);
+                            }
+                            transcript.sample_field_element()
+                        },
+                    );
+                    let Some(outcome) = attempt else {
+                        return Err(Error::DeviceFailed {
+                            stage: "layer sumcheck",
+                        });
+                    };
+                    let (rounds, z, factors) = outcome?;
+                    (rounds, z, LayerRelation::from_factors(factors, lambda)?)
                 }
-                transcript.sample_field_element()
-            });
-            if let Some(outcome) = attempt {
-                let (rounds, z, [p_lo, p_hi, q_lo, q_hi]) = outcome?;
-                for v in [&p_lo, &p_hi, &q_lo, &q_hi] {
-                    transcript.append_field_element(v);
-                }
-                let c = transcript.sample_field_element();
-                p_claim = combine_halves(&p_lo, &p_hi, &c);
-                q_claim = combine_halves(&q_lo, &q_hi, &c);
-                point = std::iter::once(c).chain(z).collect();
-                layers.push(LayerProof {
-                    sumcheck: SumcheckProof { rounds },
-                    p_lo,
-                    p_hi,
-                    q_lo,
-                    q_hi,
-                });
-                continue;
-            }
-            return Err(Error::DeviceFailed {
-                stage: "layer sumcheck",
-            });
-        }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    LayerRelation::new(tree.layer(i + 1), &point, lambda, true)?,
+                ),
+            },
+        };
 
-        let next = tree.layer(i + 1);
-        let mut relation = LayerRelation::new(next, &point, lambda)?;
-        let half_vars = relation.num_vars();
-        let (rounds, z) = sumcheck::prove_rounds(&mut relation, half_vars, transcript)?;
+        // The tail, however much of it is left: all of it for a level that came
+        // here whole, none for one the device ran out.
+        let left = relation.num_vars();
+        let (tail, tail_z) = sumcheck::prove_rounds(&mut relation, left, transcript)?;
+        rounds.extend(tail);
+        z.extend(tail_z);
         let sumcheck = SumcheckProof { rounds };
 
         // The four restricted values the verifier needs to close the round are
@@ -393,7 +472,6 @@ where
         let p_hi = bound(LayerRelation::<F>::P_HI)?;
         let q_lo = bound(LayerRelation::<F>::Q_LO)?;
         let q_hi = bound(LayerRelation::<F>::Q_HI)?;
-        debug_assert_eq!(z.len(), half_vars);
 
         for v in [&p_lo, &p_hi, &q_lo, &q_hi] {
             transcript.append_field_element(v);
@@ -657,6 +735,34 @@ mod tests {
         verify(&proof, output, &mut transcript()).unwrap();
         let mut other = DefaultTranscript::<F>::new(b"another-statement");
         assert!(verify(&proof, output, &mut other).is_err());
+    }
+
+    #[test]
+    fn a_layer_carries_on_from_its_own_folded_factors() {
+        // What the crossover relies on: a relation rebuilt from the factors a
+        // few rounds left behind is the same relation. On a device those
+        // factors are read back off the layer; here the check is that picking
+        // them up mid-sumcheck changes nothing the verifier sees.
+        let tree = FractionTree::build(balanced_logup_layer(6)).unwrap();
+        let lambda = FE::from(7);
+        let layer = tree.layer(4);
+
+        let whole = {
+            let mut relation = LayerRelation::new(layer, &[FE::from(3)], lambda, true).unwrap();
+            let vars = relation.num_vars();
+            sumcheck::prove_rounds(&mut relation, vars, &mut transcript()).unwrap()
+        };
+
+        let mut relation = LayerRelation::new(layer, &[FE::from(3)], lambda, true).unwrap();
+        let mut t = transcript();
+        let (mut rounds, mut z) = sumcheck::prove_rounds(&mut relation, 1, &mut t).unwrap();
+        let mut carried = LayerRelation::from_factors(relation.polys().to_vec(), lambda).unwrap();
+        let left = carried.num_vars();
+        let (tail, tail_z) = sumcheck::prove_rounds(&mut carried, left, &mut t).unwrap();
+        rounds.extend(tail);
+        z.extend(tail_z);
+
+        assert_eq!(whole, (rounds, z));
     }
 
     #[test]

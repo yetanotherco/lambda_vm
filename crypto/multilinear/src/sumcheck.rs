@@ -258,7 +258,8 @@ where
     let attempt = if rounds == poly.num_vars() {
         match poly.program() {
             Some(program) => {
-                crate::gpu::prove_sumcheck(poly.polys(), program, degree, |evaluations| {
+                let cube = poly.host_cube();
+                crate::gpu::prove_sumcheck(poly.polys(), program, degree, cube, |evaluations| {
                     for e in evaluations {
                         transcript.append_field_element(e);
                     }
@@ -270,14 +271,18 @@ where
     } else {
         None
     };
-    if let Some(outcome) = attempt {
-        let (proofs, challenges, folded) = outcome?;
-        poly.accept_folded(folded)?;
-        return Ok((proofs, challenges));
-    }
-
     let mut proofs = Vec::with_capacity(rounds);
     let mut challenges = Vec::with_capacity(rounds);
+    // What a device ran of this, if it ran any. It stops where the cube stops
+    // being worth sending and hands the factors back folded, so what is left
+    // carries on below from exactly where it left off.
+    if let Some(outcome) = attempt {
+        let (device_proofs, device_challenges, folded) = outcome?;
+        poly.accept_folded(folded)?;
+        proofs = device_proofs;
+        challenges = device_challenges;
+    }
+    let rounds = rounds - proofs.len();
     // The identity the verifier now takes on faith. Checking it costs the pass
     // over the cube the protocol exists to skip, so it runs in debug only —
     // where it turns a silent prover bug into a local failure.
