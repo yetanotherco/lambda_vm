@@ -80,4 +80,13 @@ fn device_commit_matches_the_host_pipeline() {
     parity(16, 2, 4);
     parity(11, 1, 1);
     parity(12, 3, 5);
+
+    // The Mobius windows: below the contiguous kernel (every level on its own),
+    // exactly one contiguous window, one window plus a single tiled level, and
+    // several full tiles with a partial one on top.
+    parity(5, 2, 3);
+    parity(8, 2, 4);
+    parity(9, 1, 2);
+    parity(13, 2, 5);
+    parity(17, 1, 4);
 }

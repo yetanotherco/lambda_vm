@@ -66,6 +66,73 @@ extern "C" __global__ void mobius_level(uint64_t *x,
     x[i] = sub(x[i], x[i ^ stride]);
 }
 
+/// Columns a Mobius tile spans: one warp, so the load and the store coalesce.
+#define MOBIUS_TILE_COLS 32
+
+/// The first `k_levels` Mobius levels, fused through shared memory.
+///
+/// Levels below eight move only the low eight bits of an index, so a block of
+/// 256 consecutive elements already holds both sides of every pair it has to
+/// subtract — no remap, and the load and the store are contiguous.
+extern "C" __global__ void mobius_low_levels(uint64_t *x, uint32_t k_levels) {
+    __shared__ uint64_t tile[256];
+    uint64_t base = (uint64_t)blockIdx.x * 256;
+    tile[threadIdx.x] = x[base + threadIdx.x];
+    __syncthreads();
+
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        uint32_t half = 1u << l;
+        // Only the element with the level's bit set is written; the other is
+        // what it subtracts.
+        if (threadIdx.x & half) {
+            tile[threadIdx.x] = sub(tile[threadIdx.x], tile[threadIdx.x ^ half]);
+        }
+        __syncthreads();
+    }
+
+    x[base + threadIdx.x] = tile[threadIdx.x];
+}
+
+/// `k_levels` Mobius levels from `base`, fused through shared memory.
+///
+/// The elements that interact across levels `base .. base + k_levels - 1` are
+/// exactly those differing only in the middle `k_levels` bits of their index:
+/// write `i = q*2^(base+k) + r*2^base + c` and the levels move `r` while `q`
+/// and `c` stay put. A block takes one `q`, a warp's worth of consecutive `c`,
+/// and every `r` — so `threadIdx.x` walks what is contiguous in memory and
+/// `threadIdx.y` walks the stride the subtractions work on. Gathering along
+/// the stride instead loses more to uncoalesced traffic than the fused passes
+/// save, which is what the NTT's tile is shaped this way for.
+///
+/// Requires `2^base >= MOBIUS_TILE_COLS`; the levels below that are
+/// [`mobius_low_levels`].
+extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_levels) {
+    // rows x (MOBIUS_TILE_COLS + 1): the odd stride keeps a column off one bank.
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = MOBIUS_TILE_COLS;
+    const uint32_t pitch = cols + 1;
+
+    uint64_t low = (uint64_t)1 << base;
+    uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    uint64_t i = (uint64_t)blockIdx.y * (low << k_levels) + (uint64_t)threadIdx.y * low + c;
+
+    tile[threadIdx.y * pitch + threadIdx.x] = x[i];
+    __syncthreads();
+
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        uint32_t half = 1u << l;
+        if (threadIdx.y & half) {
+            uint32_t r1 = threadIdx.y;
+            uint32_t r0 = r1 ^ half;
+            tile[r1 * pitch + threadIdx.x] =
+                sub(tile[r1 * pitch + threadIdx.x], tile[r0 * pitch + threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    x[i] = tile[threadIdx.y * pitch + threadIdx.x];
+}
+
 /// Pointwise multiply: x[i] *= w[i]. Used for coset scaling (w = g^i weights).
 extern "C" __global__ void pointwise_mul(uint64_t *x,
                                          const uint64_t *w,

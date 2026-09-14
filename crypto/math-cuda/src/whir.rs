@@ -215,19 +215,7 @@ pub fn commit_codeword(
     let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, evals.len()) }?;
     stream.memcpy_htod(evals, &mut coeffs)?;
 
-    let half = (evals.len() / 2) as u64;
-    let half_cfg = LaunchConfig::for_num_elems(half as u32);
-    for level in 0..log_evals {
-        let stride = 1u64 << level;
-        unsafe {
-            stream
-                .launch_builder(&be.mobius_level)
-                .arg(&mut coeffs)
-                .arg(&half)
-                .arg(&stride)
-                .launch(half_cfg)?;
-        }
-    }
+    mobius(stream.as_ref(), be, &mut coeffs, evals.len(), log_evals)?;
 
     // The lift's bit-reverse and the NTT's cancel around the zero padding —
     // see `lift_spread`. What was two scattered passes over the codeword plus
@@ -259,6 +247,89 @@ pub fn commit_codeword(
     };
     let root = codeword.commit(log_folding)?;
     Ok((codeword, root))
+}
+
+/// Levels a tile fuses at once: 32 rows of 32 columns is a full block, and the
+/// shared tile it needs is a few kilobytes.
+const MOBIUS_TILE_LEVELS: u32 = 5;
+/// Columns a tile spans — one warp, matching the kernel.
+const MOBIUS_TILE_COLS: u32 = 32;
+/// Levels the contiguous kernel takes: a block of 256 holds both sides of
+/// every pair the first eight levels make.
+const MOBIUS_LOW_LEVELS: u32 = 8;
+
+/// The Mobius transform over `coeffs`, a window of levels at a time.
+///
+/// Each level is one pass over the whole array, so run one per launch and the
+/// transform is bound by how many times it reads the array rather than by the
+/// subtractions. The windows below fuse the levels that share a tile, which is
+/// the shape the NTT's levels are already fused in.
+fn mobius(
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    coeffs: &mut CudaSlice<u64>,
+    len: usize,
+    log_evals: u64,
+) -> Result<()> {
+    let mut level: u64 = 0;
+
+    // The contiguous window, when there is a whole block of elements to hold.
+    if log_evals >= MOBIUS_LOW_LEVELS as u64 && len >= 256 {
+        let k = MOBIUS_LOW_LEVELS;
+        unsafe {
+            stream
+                .launch_builder(&be.mobius_low_levels)
+                .arg(&mut *coeffs)
+                .arg(&k)
+                .launch(LaunchConfig {
+                    grid_dim: ((len / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        level = k as u64;
+    }
+
+    while level < log_evals {
+        let low = 1u64 << level;
+        let k = MOBIUS_TILE_LEVELS.min((log_evals - level) as u32);
+        // A tile needs a warp of consecutive low indices to stay coalesced; a
+        // level below that is left to the one-level kernel.
+        if low < MOBIUS_TILE_COLS as u64 {
+            let half = (len / 2) as u64;
+            let stride = low;
+            unsafe {
+                stream
+                    .launch_builder(&be.mobius_level)
+                    .arg(&mut *coeffs)
+                    .arg(&half)
+                    .arg(&stride)
+                    .launch(LaunchConfig::for_num_elems(half as u32))?;
+            }
+            level += 1;
+            continue;
+        }
+        let rows = 1u32 << k;
+        let pitch = MOBIUS_TILE_COLS + 1;
+        unsafe {
+            stream
+                .launch_builder(&be.mobius_tile)
+                .arg(&mut *coeffs)
+                .arg(&level)
+                .arg(&k)
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        (low / MOBIUS_TILE_COLS as u64) as u32,
+                        (len as u64 / (low << k)) as u32,
+                        1,
+                    ),
+                    block_dim: (MOBIUS_TILE_COLS, rows, 1),
+                    shared_mem_bytes: rows * pitch * 8,
+                })?;
+        }
+        level += k as u64;
+    }
+    Ok(())
 }
 
 /// The same, with the codeword brought back — what a caller that folds on the
