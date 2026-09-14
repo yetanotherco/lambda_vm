@@ -165,7 +165,16 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
         instr.reads_into(&mut scratch);
         let mut d = 0u32;
         for r in &scratch {
-            d = d.max(addr_depth[r.0 as usize]);
+            // ⚠ `get`, not `[]`, and the reason is a real program rather than
+            // caution. An address past `num_addrs` is legal to EMIT — the
+            // executor is what rejects it, a read as `ReadBeforeWrite` and a
+            // write as `Internal("address out of range")`, and
+            // `executor_rejects_addresses_outside_the_program` pins both
+            // directions. A schedule that panicked here would turn that
+            // rejectable program into a crash before the executor ever saw it.
+            // Treating the address as depth 0 leaves the rejection exactly
+            // where it was.
+            d = d.max(addr_depth.get(r.0 as usize).copied().unwrap_or(0));
         }
         let is_hash = matches!(instr, Instr::Hash { .. });
         if is_hash {
@@ -174,7 +183,11 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
         scratch.clear();
         instr.writes_into(&mut scratch);
         for w in &scratch {
-            addr_depth[w.0 as usize] = d;
+            // Same rule: nothing to record for an address the machine has no
+            // cell for, and the executor still errors when it reaches it.
+            if let Some(slot) = addr_depth.get_mut(w.0 as usize) {
+                *slot = d;
+            }
         }
 
         // Rounded UP, so `merge = 2` pairs depths 1+2, 3+4, … and leaves depth 0

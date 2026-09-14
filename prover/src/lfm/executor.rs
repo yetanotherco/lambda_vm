@@ -951,6 +951,15 @@ pub struct ExecSplit {
     pub parallel_hashes: usize,
     /// Building the schedule: one forward pass plus a counting sort.
     pub depth_pass: f64,
+    /// Allocating the machine and the records.
+    ///
+    /// ⚠ Its own field, and not because it is interesting. The level walk writes
+    /// record SLOTS, so its vectors are filled with blanks up front — one extra
+    /// pass of stores over a few hundred MiB that the serial walk never makes.
+    /// Left out of the split, that cost would appear only as the gap between
+    /// `execute` and the sum of the phases below, which is the shape of a number
+    /// nobody can attribute.
+    pub setup: f64,
     /// Computing the permutations, whether on the pool or coalesced.
     pub hash_phase: f64,
     /// Publishing each level's output cells and record rows, on this thread.
@@ -1072,13 +1081,14 @@ fn execute_inner(
         ..ExecSplit::default()
     };
 
+    // The serial walk IS program order, so it appends into empty vectors exactly
+    // as it always did; the level walk is not, so it writes slots that already
+    // exist. Same bytes reserved either way.
+    let t = Instant::now();
     let mut m = Machine {
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas,
     };
-    // The serial walk IS program order, so it appends into empty vectors exactly
-    // as it always did; the level walk is not, so it writes slots that already
-    // exist. Same bytes reserved either way.
     let mut records = match &levels {
         None => LfmRecords::with_capacity(&program.groups),
         Some(_) => LfmRecords::with_slots(&program.groups),
@@ -1087,6 +1097,7 @@ fn execute_inner(
         None => Vec::with_capacity(program.groups.public.real_rows),
         Some(_) => vec![(0u32, [FE::zero(); 4]); program.groups.public.real_rows],
     };
+    split.setup = t.elapsed().as_secs_f64();
 
     match &levels {
         None => {
@@ -1127,6 +1138,13 @@ fn execute_inner(
     // fill. Chip order: const, balu, xalu, select, bitdec, hash, keccak,
     // blake3, lanes, hint, public. (A `?` above returns early with short
     // vectors by design — that program did not finish.)
+    //
+    // ⓘ This is a real check on the SERIAL walk, where the lengths are push
+    // counts. The level walk sizes its vectors up front, so on that path the
+    // nine row counts are true by construction and `num_consts` is the only one
+    // still saying anything; the check that replaces them there is
+    // `ChipRows::assert_matches_census`, which compares the rows the SCHEDULE
+    // hands out against the same census before a single instruction runs.
     debug_assert_eq!(
         [
             records.num_consts,

@@ -1784,14 +1784,17 @@ fn print_prove_split(label: &str) {
         let e = split.exec;
         println!(
             "   {label} LFM EXEC: levels {} · parallel {} levels / {} hashes · \
-             depth pass {:.2}s · hash phase {:.2}s · apply {:.2}s · residue {:.2}s",
+             depth pass {:.2}s · setup {:.2}s · hash phase {:.2}s · apply {:.2}s · \
+             residue {:.2}s · sum {:.2}s",
             e.levels,
             e.parallel_levels,
             e.parallel_hashes,
             e.depth_pass,
+            e.setup,
             e.hash_phase,
             e.apply,
             e.residue,
+            e.depth_pass + e.setup + e.hash_phase + e.apply + e.residue,
         );
     }
 }
