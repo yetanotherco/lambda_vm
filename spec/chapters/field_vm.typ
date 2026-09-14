@@ -10,10 +10,8 @@ extension field arithmetic and program flow.
 = ISA
 
 The central instruction of the ISA is a constraint for a fused multiply-add over the extension field:
-`FMA o == a * b + c`.
-Here all of `o`, `a`, `b` and `c` are arguments following the addressing scheme described below.
-The field VM uses only read-only memory, which is implemented as a committed table,
-together with the multiplicities with which each element is accessed.
+`FMA d == a * b + c`.
+Here all of `d`, `a`, `b` and `c` are arguments following the addressing scheme described below.
 
 == Arguments and addressing
 
@@ -26,12 +24,11 @@ and the extra cost in committed columns and decoding logic that grows with $N$.
 Each argument to the `FMA` constraint has either of the two following forms:
 - $#`imm`_0 dot #`reg` + #`imm`_1$
 - $#`MEM[`#`imm`_0 dot #`reg` + #`imm`_1#`]`$
-where each immediate is a base field element, encoded in the instruction for a specific argument,
-and `MEM[...]` reads memory.
-The `o` argument to the instruction obtains its register value from the _future_ state.
+where each immediate is a base field element, encoded in the instruction for a specific argument.
+The `d` argument to the instruction obtains its register value from the _future_ state.
 That is, the state from which the next instruction will get its input register values.
 The `ZERO` register of the future state contains a bit (as a base field element) that indicates whether or not
-the `o` value was zero for the current instruction.
+the `d` value was zero for the current instruction.
 The `PC` register contains the program counter (as a base field element) and indicates which instruction is to be executed.
 Every other register can hold an arbitrary extension field element.
 
@@ -40,8 +37,8 @@ Every other register can hold an arbitrary extension field element.
 Each general-purpose register in the current state can be marked as _hinted_ in an instruction.
 This means that its value from the current instruction onward can get a new value
 that is independent from the previous value, except as constrained by the instruction.
-Additionally, the _output_ can be marked as hinted, meaning that the register used in the `o` argument ---
-whether wrapped in a `MEM[]` lookup or not --- will change in the future state, and as such in the `o` argument too.
+Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument ---
+whether wrapped in a `MEM[]` lookup or not --- will change in the future state, and as such in the `d` argument too.
 Output hinting is commonly used to assign the result of a computation: `FMA X == X * X, hint out` would
 compute $#`X` dot #`X`$ and assign the result to `X` in the future state.
 The output hint, in contradiction with the input hints, does allow `PC` to be hinted, so as to enable
@@ -78,7 +75,7 @@ FMA [1 * X + 2] == [3 * Y + 4] * (5 * Z) + [W + 6], hint out + Z
 - `[]` indicate memory access
 - `()` indicate grouping to separate the arguments
 - `X, Y, Z, W` are placeholder register names
-- `hint` notation indicates which registers are hinted (default unhinted), `hint out` means hinting `o` as above
+- `hint` notation indicates which registers are hinted (default unhinted), `hint out` means hinting `d` as above
 
 We note that this may be insufficient for the execution/prover side of the program,
 as this provides no information on _which_ value exactly should be hinted,
@@ -92,9 +89,9 @@ This list is meant as an example, rather than an exhaustive enumeration;
 implementers and practitioners are encouraged to discover and use their own,
 as experience may point out further useful abstractions.
 
-/ `ADD o, a, b`: Addition: `FMA o == (0 * X + 1) * a + b, hint out`
-/ `MUL o, a, b`: Multiplication: `FMA o == a * b + (0 * X), hint out`
-/ `INV o, a`: Extension field inversion. Note: `o` and `a` cannot use the same register here: `FMA o == (a + 1) * o - 1, hint <register of o>`
+/ `ADD d, a, b`: Addition: `FMA d == (0 * X + 1) * a + b, hint out`
+/ `MUL d, a, b`: Multiplication: `FMA d == a * b + (0 * X), hint out`
+/ `INV d, a`: Extension field inversion. Note: `d` and `a` cannot use the same register here: `FMA d == (a + 1) * d - 1, hint <register of d>`
 / `J a`: Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC: `FMA PC == a, hint out`
 / `JZA imm`: Jump if ZERO, absolute target address: `FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`
 / `JZR a`: Jump if ZERO, PC-relative target address: `FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`
