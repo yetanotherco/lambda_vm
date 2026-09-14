@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
@@ -246,14 +247,47 @@ pub fn precomputed_tree_cache_entries() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// ★ WHETHER THE TREE CACHE EVER HITS — the reading that decides what it is.
+///
+/// Its own doc says it was built for the BASE's repeating DECODE/BITWISE/range
+/// trees, which are execution-independent. ⚠ In RECURSION the key is the
+/// precomputed ROOT and every level proves N DISTINCT programs (a child's label
+/// is a program constant), so the program-dependent tables would MISS on every
+/// proof forever — one insert per proof per table, never hitting, never evicted.
+///
+/// That is a claim about hit BEHAVIOUR, not about size, so counting hits and
+/// misses tests it directly where an entry count or a byte total only proxies
+/// it. Near-zero hits in the tree levels ⇒ the cache is a proof-count-linear
+/// accumulator and eviction at harvest is a lever; a high hit rate ⇒ it is not,
+/// and the interior's rising floor is something else.
+static PRECOMPUTED_TREE_HITS: AtomicU64 = AtomicU64::new(0);
+static PRECOMPUTED_TREE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// `(hits, misses)` on the precomputed-tree cache since the process started.
+pub fn precomputed_tree_cache_hit_miss() -> (u64, u64) {
+    (
+        PRECOMPUTED_TREE_HITS.load(Ordering::Relaxed),
+        PRECOMPUTED_TREE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
 ) -> Option<Arc<MerkleTree<B>>> {
     let cache = precomputed_tree_cache().lock().unwrap();
-    cache
+    let out = cache
         .get(root)
         .cloned()
-        .and_then(|any| any.downcast::<MerkleTree<B>>().ok())
+        .and_then(|any| any.downcast::<MerkleTree<B>>().ok());
+    // ⛔ Counted on the DOWNCAST result, not on the map lookup: a key that is
+    // present but holds another backend's tree is a miss to the caller, and
+    // counting the lookup would report a hit the caller never got.
+    if out.is_some() {
+        PRECOMPUTED_TREE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRECOMPUTED_TREE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    out
 }
 
 pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(

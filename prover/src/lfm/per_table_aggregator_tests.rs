@@ -2531,11 +2531,12 @@ fn jemalloc_marks() -> Option<(f64, f64)> {
 
 /// The allocator line a phase boundary prints beside its RSS mark.
 fn jemalloc_line(label: &str) -> String {
+    let (hits, misses) = stark::prover::precomputed_tree_cache_hit_miss();
     match jemalloc_marks() {
         Some((a, r)) => format!(
             "   {label}: jemalloc allocated {a:.3} GiB · resident {r:.3} · \
              RETAINED {:.3} ({:.0}% of resident) · caches: twiddles {} · \
-             precomputed trees {}",
+             precomputed trees {} ({hits}h/{misses}m)",
             r - a,
             if r > 0.0 { 100.0 * (r - a) / r } else { 0.0 },
             stark::prover::domain_twiddle_cache_entries(),
