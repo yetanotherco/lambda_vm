@@ -5226,6 +5226,114 @@ fn the_production_tree_composes_to_a_root() {
     // the loop. `None` on every other arm, where one level's output is all the
     // run needs.
     let mut top_level: Option<TreeLevel> = None;
+    type NodeSlot = (
+        RealChild,
+        super::per_table_aggregator::SchemaLayout,
+        Vec<u64>,
+        (usize, usize, u64, usize, f64, f64, f64),
+    );
+    // ★★★ ONE NODE, WITH ITS CHILDREN PASSED IN RATHER THAN SLICED FROM A LEVEL.
+    //
+    // ⛔ The three child slices used to be `&children[g]`, `&layouts[g]` and
+    // `&labels[g]` — captured from the level loop, which is what tied a node to
+    // the level being the unit of scheduling. They are PARAMETERS now, so a
+    // caller that holds one node's children (rather than a whole level's) can
+    // prove it. That is the whole of what `LFM_TREE_LEVEL_POOL` needs, and this
+    // commit is only the naming.
+    //
+    // `siblings` rides along because it decides one PRINT — whether the node's
+    // host-peak line says "process-wide, N proofs in flight" — and a wrong
+    // number there is a reader believing a concurrent reading is a solitary one.
+    #[allow(clippy::too_many_arguments)]
+    let prove_one_node = |level_no: usize,
+                          j: usize,
+                          siblings: usize,
+                          kids: &[RealChild],
+                          kid_layouts: &[super::per_table_aggregator::SchemaLayout],
+                          kid_labels: &[Vec<u64>]|
+     -> NodeSlot {
+        let arity = &kids.len();
+        let label = format!("L{level_no}N{j} (arity {arity})");
+
+        let label_refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
+        let range = (
+            kid_labels[0][0],
+            *kid_labels[arity - 1].last().expect("a label run"),
+        );
+        let out_halves = kid_layouts[arity - 1].out_halves;
+
+        let t_emit = Instant::now();
+        let program = node_program(
+            kids,
+            kid_layouts,
+            &label_refs,
+            range,
+            super::per_table_aggregator::NodePublishSet::Aggregation,
+        );
+        println!(
+            "   {label}: emitted in {:.1}s",
+            t_emit.elapsed().as_secs_f64()
+        );
+        let (cells, instrs) = census_and_panel(&program, &label, fan_in);
+
+        let sampler = HostSampler::start();
+        let t_node = Instant::now();
+        // ⛔ The program the census was taken on, NOT a second emission of
+        // the same thing. See `prove_node_program_as_child`.
+        let (child, layout) = prove_node_program_as_child(
+            &label,
+            &program,
+            kids,
+            out_halves,
+            &wrap_opts,
+            stage_mode(level_no),
+            stage_path(cache_dir.as_deref(), &format!("node-{level_no}-{j}")),
+        );
+        let wall = t_node.elapsed().as_secs_f64();
+        let (peak, at) = sampler.stop();
+        println!(
+            "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s{}",
+            match &ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                Err(_) => String::new(),
+            },
+            // ⚠ `rss_marks` reads the PROCESS, so with a sibling in flight
+            // this figure is the process peak during this node's window and
+            // not this node's own. Said on the line rather than in a note,
+            // because the per-node peak is what the retention law was fitted
+            // on and a concurrent one must never be fed to it.
+            if siblings > 1 {
+                format!(" ⓘ PROCESS-WIDE, {siblings} proofs in flight")
+            } else {
+                String::new()
+            },
+        );
+        // ★★★ THE WITHIN-ROUND SAMPLE, and it is the only thing that can
+        // attribute the FIRST-ROUND SPIKE.
+        //
+        // Every level from 2 up peaks in its first round and drops 2.7-3.4
+        // GiB for the rest — at an IDENTICAL live count (level 2's rounds 1
+        // and 2 both hold two nodes and read 2.45 GiB apart), so it is not
+        // residency. A BOUNDARY snapshot cannot see it: by the end of the
+        // level the spike is over. Sampled per node, the three candidates
+        // separate in one read:
+        //
+        //   allocated spikes      ⇒ LIVE — the prover really holds it
+        //   only resident spikes  ⇒ jemalloc dirty pages, a decay knob
+        //   NEITHER, but RSS does ⇒ OUTSIDE jemalloc: the pinned staging
+        //                           slabs (✓ `Backend::pinned_staging`
+        //                           "grows lazily to the largest LDE the
+        //                           worker has seen" and never shrinks),
+        //                           the retained device pool, the driver.
+        println!("{}", jemalloc_line(&label));
+        (
+            child,
+            layout,
+            vec![range.0, range.1],
+            (level_no, *arity, cells, instrs, peak, at, wall),
+        )
+    };
+
     for (li, level) in shape.iter().enumerate().take(hi) {
         let level_no = li + 1;
         let t_level = Instant::now();
@@ -5260,96 +5368,15 @@ fn the_production_tree_composes_to_a_root() {
         let siblings = super::device_permit::workers().min(groups.len().max(1));
         let level_sampler = HostSampler::start();
 
-        type NodeSlot = (
-            RealChild,
-            super::per_table_aggregator::SchemaLayout,
-            Vec<u64>,
-            (usize, usize, u64, usize, f64, f64, f64),
-        );
         let prove_one = |j: usize| -> NodeSlot {
             let g = &groups[j];
-            let arity = &g.len();
-            let kids = &children[g.clone()];
-            let kid_layouts = &layouts[g.clone()];
-            let kid_labels = &labels[g.clone()];
-            let label = format!("L{level_no}N{j} (arity {arity})");
-
-            let label_refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
-            let range = (
-                kid_labels[0][0],
-                *kid_labels[arity - 1].last().expect("a label run"),
-            );
-            let out_halves = kid_layouts[arity - 1].out_halves;
-
-            let t_emit = Instant::now();
-            let program = node_program(
-                kids,
-                kid_layouts,
-                &label_refs,
-                range,
-                super::per_table_aggregator::NodePublishSet::Aggregation,
-            );
-            println!(
-                "   {label}: emitted in {:.1}s",
-                t_emit.elapsed().as_secs_f64()
-            );
-            let (cells, instrs) = census_and_panel(&program, &label, fan_in);
-
-            let sampler = HostSampler::start();
-            let t_node = Instant::now();
-            // ⛔ The program the census was taken on, NOT a second emission of
-            // the same thing. See `prove_node_program_as_child`.
-            let (child, layout) = prove_node_program_as_child(
-                &label,
-                &program,
-                kids,
-                out_halves,
-                &wrap_opts,
-                stage_mode(level_no),
-                stage_path(cache_dir.as_deref(), &format!("node-{level_no}-{j}")),
-            );
-            let wall = t_node.elapsed().as_secs_f64();
-            let (peak, at) = sampler.stop();
-            println!(
-                "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s{}",
-                match &ceiling {
-                    Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
-                    Err(_) => String::new(),
-                },
-                // ⚠ `rss_marks` reads the PROCESS, so with a sibling in flight
-                // this figure is the process peak during this node's window and
-                // not this node's own. Said on the line rather than in a note,
-                // because the per-node peak is what the retention law was fitted
-                // on and a concurrent one must never be fed to it.
-                if siblings > 1 {
-                    format!(" ⓘ PROCESS-WIDE, {siblings} proofs in flight")
-                } else {
-                    String::new()
-                },
-            );
-            // ★★★ THE WITHIN-ROUND SAMPLE, and it is the only thing that can
-            // attribute the FIRST-ROUND SPIKE.
-            //
-            // Every level from 2 up peaks in its first round and drops 2.7-3.4
-            // GiB for the rest — at an IDENTICAL live count (level 2's rounds 1
-            // and 2 both hold two nodes and read 2.45 GiB apart), so it is not
-            // residency. A BOUNDARY snapshot cannot see it: by the end of the
-            // level the spike is over. Sampled per node, the three candidates
-            // separate in one read:
-            //
-            //   allocated spikes      ⇒ LIVE — the prover really holds it
-            //   only resident spikes  ⇒ jemalloc dirty pages, a decay knob
-            //   NEITHER, but RSS does ⇒ OUTSIDE jemalloc: the pinned staging
-            //                           slabs (✓ `Backend::pinned_staging`
-            //                           "grows lazily to the largest LDE the
-            //                           worker has seen" and never shrinks),
-            //                           the retained device pool, the driver.
-            println!("{}", jemalloc_line(&label));
-            (
-                child,
-                layout,
-                vec![range.0, range.1],
-                (level_no, *arity, cells, instrs, peak, at, wall),
+            prove_one_node(
+                level_no,
+                j,
+                siblings,
+                &children[g.clone()],
+                &layouts[g.clone()],
+                &labels[g.clone()],
             )
         };
 
