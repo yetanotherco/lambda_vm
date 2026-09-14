@@ -1796,6 +1796,27 @@ fn print_prove_split(label: &str) {
             e.residue,
             e.depth_pass + e.setup + e.hash_phase + e.apply + e.residue,
         );
+        // ⓘ A FOURTH line — the two `drop`s that free the executor's memory and
+        // records, which sit in the untimed gaps between the phases on the first
+        // line. Printed only when there is something to print, so every existing
+        // log keeps its shape.
+        //
+        // ⚠ WHAT THIS LINE CANNOT SEE, and the reason to read it next to a
+        // sibling's `fill` rather than on its own: a `munmap` holds the
+        // process's `mmap_lock` for writing while it tears down page tables, and
+        // the other workers' parallel fills are faulting under that lock. The
+        // cost of a free can therefore land in ANOTHER proof's `fill`, on
+        // another thread. Small numbers here alongside a grown sibling `fill`
+        // are the signature of that, not a refutation of it.
+        if split.free_memory + split.free_records > 0.0005 {
+            println!(
+                "   {label} LFM FREE: memory {:.0} ms · records {:.0} ms · \
+                 sum {:.0} ms (this thread only; excludes the stall imposed on siblings)",
+                split.free_memory * 1e3,
+                split.free_records * 1e3,
+                (split.free_memory + split.free_records) * 1e3,
+            );
+        }
         // ⓘ A THIRD line, for the two questions a wall cannot answer: how big
         // the thing `setup` touches is, and what width the pool actually gave.
         // `ns/perm` is measured on the coalesced levels of THIS proof — same

@@ -74,6 +74,28 @@ pub struct ProveSplit {
     /// Seconds spent BLOCKED waiting for the card before `multi_prove` began.
     /// Zero whenever the permit is inert, so a serial line is unchanged.
     pub permit_wait: f64,
+    /// Seconds spent in the two `drop`s that free the executor's memory and its
+    /// records — the untimed gaps between the three phases above.
+    ///
+    /// ⚠⚠ **THIS IS THE COST ON THIS THREAD, NOT THE COST OF THE FREE.** A large
+    /// `free` is a `munmap`, and `munmap` takes the process's `mmap_lock` in
+    /// WRITE mode while it tears down the page tables — whereas every other
+    /// worker's *parallel* fill is faulting pages under that same lock in READ
+    /// mode, across the whole rayon pool. One writer stalls all of them. So
+    /// these two numbers can be small while the free is expensive, because the
+    /// expense lands in a SIBLING's `fill`, on another thread, in another
+    /// proof's split.
+    ///
+    /// ⇒ Read them as a FLOOR, and read them against the siblings: if they are
+    /// small and a concurrent arm's `fill` still grew, that is evidence FOR the
+    /// lock-stall reading, not against it. Nothing on one thread can measure
+    /// what that thread did to another, which is why this field is a lower
+    /// bound by construction and says so.
+    pub free_memory: f64,
+    /// Freeing the ten record vectors. Bigger than [`Self::free_memory`] in
+    /// bytes and in call count — ~10 separate frees, several of them over
+    /// 100 MB — so it is the one to watch. Same caveat, exactly.
+    pub free_records: f64,
     /// The phases INSIDE `execute`. Carried beside it rather than folded into
     /// it: a lever that moves one phase and not another cannot be read off their
     /// sum, which is the lesson the three fields above were split out for in the
@@ -193,7 +215,13 @@ pub(crate) fn lfm_prove_with_residency(
     // wrap. It is a diagnostic surface for tests — nothing on the proving path
     // reads it — so held to the end of this scope it would stay live through the
     // fill AND the whole device phase, on every worker at once, for nothing.
+    // ⓘ TIMED, and deliberately still OUTSIDE both phases' windows: the
+    // measurement brackets the drop where it already stood, so `execute` and
+    // `fill` keep reading exactly what they read before this field existed.
+    // What the gap costs is now a reading instead of "a handful of `munmap`s".
+    let t = Instant::now();
     drop(memory);
+    let free_memory = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
     let mut traces = build_traces_with_hasher(program, &records, hasher);
@@ -202,7 +230,9 @@ pub(crate) fn lfm_prove_with_residency(
     // dead the moment it returns. The traces it produced are the live set from
     // here on; holding the records as well doubles the values through the card
     // phase.
+    let t = Instant::now();
     drop(records);
+    let free_records = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
     let waited_before = super::device_permit::waited_secs();
@@ -226,6 +256,8 @@ pub(crate) fn lfm_prove_with_residency(
             fill: fill_secs,
             multi_prove: multi_prove_secs,
             permit_wait,
+            free_memory,
+            free_records,
             exec: exec_split,
         }))
     });

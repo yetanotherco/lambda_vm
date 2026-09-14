@@ -52,10 +52,12 @@ fn trivial_program_proves_and_verifies() {
 /// ★ THE GATE ON THE PROVE SPLIT — that it is recorded, that it covers the
 /// function rather than a corner of it, and that it is consumed.
 ///
-/// Every one of the three assertions below can fail, and each fails on a
+/// Every one of the assertions below can fail, and each fails on a
 /// different mistake. Drop the recording, or move it above one of the `?`s,
 /// and the `Some` goes. Time two statements instead of three and the coverage
-/// floor goes. Leave the cell set and the second take stops being `None` —
+/// floor goes. Time a span twice — a `free` bracketed inside the phase it
+/// follows rather than in the gap after it — and the sum overruns the wall.
+/// Leave the cell set and the second take stops being `None` —
 /// which is the one that matters in a run with a cache, because a stage that
 /// LOADED would then be reported with the previous stage's numbers, and a
 /// figure attributed to the wrong stage is worse than no figure.
@@ -80,10 +82,23 @@ fn the_prove_split_is_recorded_covers_the_prove_and_is_consumed() {
     // ⓘ The wait belongs in the sum: `multi_prove` is reported NET of it, so
     // without this term the coverage floor would start failing the moment a
     // sibling held the card — the one regime it most needs to hold in.
-    let sum = split.execute + split.fill + split.multi_prove + split.permit_wait;
+    //
+    // ★ The two `free` spans belong in it for a sharper reason: they make
+    // `sum <= wall` a GUARD ON THEIR OWN PLACEMENT. Each free is timed where it
+    // stands, in the untimed gap between two phases. Move one inside `fill`'s
+    // window — the exact mistake a reader suspects when `execute` falls and
+    // `fill` rises by the same amount — and it is counted twice, so the sum can
+    // exceed the wall and this assertion fires. Left in the gap, it cannot.
+    let sum = split.execute
+        + split.fill
+        + split.multi_prove
+        + split.permit_wait
+        + split.free_memory
+        + split.free_records;
     assert!(
         sum <= wall,
-        "three disjoint spans inside the call cannot exceed the call: {sum} > {wall}"
+        "disjoint spans inside the call cannot exceed the call, and a span \
+         counted twice would: {sum} > {wall}"
     );
     assert!(
         sum >= 0.7 * wall,
