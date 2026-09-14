@@ -146,8 +146,16 @@ fi
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
-# Unset PID (WORKLOAD=synthetic) and already-reaped PID both fall through to `|| true`.
-kill_fixture() { kill "${FIXTURE_PID:-}" 2>/dev/null || true; }
+# Kills the whole process GROUP, not just the `make`: signalling the make alone leaves its
+# cargo and rustc children running, reparented and still compiling, which on the shared bench
+# runner is exactly the contention the next batch would measure. `set -m` at the launch below
+# is what gives the job a group of its own. Unset PID (WORKLOAD=synthetic) and an
+# already-reaped one both fall through.
+kill_fixture() {
+  [ -n "${FIXTURE_PID:-}" ] || return 0
+  kill -- "-$FIXTURE_PID" 2>/dev/null || kill "$FIXTURE_PID" 2>/dev/null || true
+  wait "$FIXTURE_PID" 2>/dev/null || true
+}
 if [ ! -f "$ELF_REL" ]; then
   echo "==> Building ethrex guest ELF (missing)"
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
@@ -168,8 +176,13 @@ if [ "$WORKLOAD" = "real" ]; then
   # nothing else. Nothing before the cycle floor reads the fixture, which is where this
   # is waited on.
   echo "==> Building ethrex real-block fixture (from its replay cache; in background)"
+  # Job control on for this launch only, so the job leads its own process group and
+  # kill_fixture can take the whole build tree down. Off again immediately: it also changes
+  # how the shell signals and reports jobs, and nothing else here wants that.
+  set -m
   make ethrex-real-block-fixture > "$WORK/fixture_build.log" 2>&1 &
   FIXTURE_PID=$!
+  set +m
   # A failure below must not leave a cargo build running: on the shared bench runner the
   # next batch would measure against it. No-op once the wait below has reaped it.
   trap kill_fixture EXIT
