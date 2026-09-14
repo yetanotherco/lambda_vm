@@ -2948,8 +2948,10 @@ fn chunk_and_generate<T: Sync>(
 
 /// Like [`chunk_and_generate`], but an empty `ops` yields no table at all: the
 /// chip is left out of the proof instead of costing a padded sub-proof.
-/// `slice::chunks` already yields nothing for an empty slice, so this is the
-/// plain chunking with no special case.
+///
+/// The empty case short-circuits rather than falling through to `ops.chunks`,
+/// which panics on a zero chunk size even for an empty slice. `max_rows` comes
+/// from a caller-supplied [`MaxRowsConfig`] whose fields are public.
 ///
 /// Sound because a chip contributes to the run only through its LogUp bus, and a
 /// chip with no rows contributes zero. A prover that omits a table whose ops did
@@ -2962,8 +2964,13 @@ fn chunk_and_generate_optional<T: Sync>(
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let op_chunks: Vec<&[T]> = if ops.is_empty() {
+        vec![]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
     generate_chunks(
-        ops.chunks(max_rows).collect(),
+        op_chunks,
         generate,
         #[cfg(feature = "disk-spill")]
         storage_mode,

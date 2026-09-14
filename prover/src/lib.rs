@@ -563,6 +563,59 @@ pub(crate) struct VmAirs {
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
+        // Every chunked table is paired by `zip` below, which stops at the shorter
+        // side: an AIR set and a trace set that disagreed would silently prove fewer
+        // tables than the statement declares. They are built from the same
+        // `TableCounts`, so a mismatch is a bug here, not a shape a proof can carry.
+        assert_eq!(
+            [
+                self.cpus.len(),
+                self.lts.len(),
+                self.shifts.len(),
+                self.memws.len(),
+                self.memw_aligneds.len(),
+                self.loads.len(),
+                self.muls.len(),
+                self.dvrms.len(),
+                self.branches.len(),
+                self.commits.len(),
+                self.keccaks.len(),
+                self.keccak_rnds.len(),
+                self.ecsms.len(),
+                self.ecdases.len(),
+                self.hints.len(),
+                self.pages.len(),
+                self.memw_registers.len(),
+                self.eqs.len(),
+                self.bytewises.len(),
+                self.stores.len(),
+                self.cpu32s.len()
+            ],
+            [
+                traces.cpus.len(),
+                traces.lts.len(),
+                traces.shifts.len(),
+                traces.memws.len(),
+                traces.memw_aligneds.len(),
+                traces.loads.len(),
+                traces.muls.len(),
+                traces.dvrms.len(),
+                traces.branches.len(),
+                traces.commits.len(),
+                traces.keccaks.len(),
+                traces.keccak_rnds.len(),
+                traces.ecsms.len(),
+                traces.ecdases.len(),
+                traces.hints.len(),
+                traces.pages.len(),
+                traces.memw_registers.len(),
+                traces.eqs.len(),
+                traces.bytewises.len(),
+                traces.stores.len(),
+                traces.cpu32s.len()
+            ],
+            "AIR set and traces disagree on table counts",
+        );
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
