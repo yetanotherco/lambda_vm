@@ -4010,6 +4010,435 @@ fn the_block_root_proves_over_real_children() {
 ///   lfm::per_table_aggregator_tests::the_production_tree_composes_to_a_root -- \
 ///   --ignored --exact --nocapture
 /// ```
+/// Groups for a fan-in-2 tree over `n` leaves, the shape `level_groups` builds.
+#[cfg(test)]
+fn fanin2_groups(mut n: usize) -> Vec<Vec<std::ops::Range<usize>>> {
+    let mut out = Vec::new();
+    while n > 1 {
+        let mut g = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let hi = (i + 2).min(n);
+            g.push(i..hi);
+            i = hi;
+        }
+        n = g.len();
+        out.push(g);
+    }
+    out
+}
+
+/// ★★★ THE DEPENDENCY GATE, and it FORCES the race it checks.
+///
+/// Every node records the instant it starts and the instant each child finished.
+/// A node that started before either of its children finished is the bug, and the
+/// only bug this scheduler can have that still produces a correct tree on a lucky
+/// run. The children sleep for unequal times so the second leg is genuinely late —
+/// without that the test would pass on a scheduler that happens to finish a pair
+/// together, which is the failure mode the permit's own first test had.
+#[test]
+fn a_node_never_starts_before_both_its_children_are_done() {
+    use std::time::Instant;
+    let groups = fanin2_groups(8);
+    let t0 = Instant::now();
+    let log: std::sync::Mutex<Vec<(usize, usize, u128, u128)>> = std::sync::Mutex::new(Vec::new());
+    let out = prove_in_dependency_order(
+        &groups,
+        (0..8).map(|i| (i, 0u128)).collect(),
+        4,
+        2,
+        |level, j, kids: Vec<(usize, u128)>| {
+            let started = t0.elapsed().as_micros();
+            let newest_child = kids.iter().map(|(_, done)| *done).max().unwrap_or(0);
+            // Unequal sleeps, so one leg of every pair is genuinely late.
+            std::thread::sleep(std::time::Duration::from_millis(10 * (j as u64 % 3 + 1)));
+            let done = t0.elapsed().as_micros();
+            log.lock()
+                .expect("log")
+                .push((level, j, started, newest_child));
+            ((level * 100 + j, done), level * 100 + j)
+        },
+    );
+    for (level, j, started, newest_child) in log.into_inner().expect("log") {
+        assert!(
+            started >= newest_child,
+            "L{level}N{j} started at {started}us but a child finished at {newest_child}us"
+        );
+    }
+    let (top, summaries) = out;
+    assert_eq!(summaries.len(), groups.len());
+    // ★ INDEX ORDER, per level, on the half that survives the take.
+    for (l, lvl) in summaries.iter().enumerate() {
+        assert_eq!(
+            lvl.clone(),
+            (0..groups[l].len())
+                .map(|j| (l + 1) * 100 + j)
+                .collect::<Vec<_>>(),
+            "level {} must drain in INDEX order",
+            l + 1
+        );
+    }
+    assert_eq!(
+        top.len(),
+        1,
+        "a fan-in-2 tree over 8 leaves closes to one node"
+    );
+}
+
+/// ⛔ `levels_in_flight = 1` IS the barrier, and this is what says so: no node of
+/// level `L` may start before EVERY node of level `L-1` has finished. That makes
+/// M=1 a control that isolates the scheduler's own cost from the overlap's
+/// benefit — and a control that is not actually the old schedule would hide a
+/// constant in both arms.
+#[test]
+fn one_level_in_flight_reproduces_the_barrier() {
+    use std::time::Instant;
+    let groups = fanin2_groups(8);
+    let t0 = Instant::now();
+    let starts: std::sync::Mutex<Vec<(usize, u128)>> = std::sync::Mutex::new(Vec::new());
+    let ends: std::sync::Mutex<Vec<(usize, u128)>> = std::sync::Mutex::new(Vec::new());
+    let _ = prove_in_dependency_order(
+        &groups,
+        (0..8).collect::<Vec<usize>>(),
+        4,
+        1,
+        |level, j, _k: Vec<usize>| {
+            starts
+                .lock()
+                .expect("s")
+                .push((level, t0.elapsed().as_micros()));
+            std::thread::sleep(std::time::Duration::from_millis(5 * (j as u64 % 3 + 1)));
+            ends.lock()
+                .expect("e")
+                .push((level, t0.elapsed().as_micros()));
+            (level * 100 + j, ())
+        },
+    );
+    let (starts, ends) = (
+        starts.into_inner().expect("s"),
+        ends.into_inner().expect("e"),
+    );
+    for l in 2..=groups.len() {
+        let first_start = starts
+            .iter()
+            .filter(|(lv, _)| *lv == l)
+            .map(|(_, t)| *t)
+            .min();
+        let last_end = ends
+            .iter()
+            .filter(|(lv, _)| *lv == l - 1)
+            .map(|(_, t)| *t)
+            .max();
+        if let (Some(a), Some(b)) = (first_start, last_end) {
+            assert!(
+                a >= b,
+                "level {l} started at {a}us before level {} ended at {b}us",
+                l - 1
+            );
+        }
+    }
+}
+
+/// ★ AND AT M=2 THE LEVELS MUST ACTUALLY OVERLAP, or the lever is inert and the
+/// test above is the only one passing. Asserted rather than assumed, because a
+/// cap that silently blocked everything would look exactly like a correct barrier.
+#[test]
+fn two_levels_in_flight_actually_overlap() {
+    use std::time::Instant;
+    let groups = fanin2_groups(16);
+    let t0 = Instant::now();
+    let span: std::sync::Mutex<Vec<(usize, u128, u128)>> = std::sync::Mutex::new(Vec::new());
+    let _ = prove_in_dependency_order(
+        &groups,
+        (0..16).collect::<Vec<usize>>(),
+        4,
+        2,
+        |level, j, _k: Vec<usize>| {
+            let a = t0.elapsed().as_micros();
+            std::thread::sleep(std::time::Duration::from_millis(10 * (j as u64 % 4 + 1)));
+            span.lock()
+                .expect("s")
+                .push((level, a, t0.elapsed().as_micros()));
+            (level * 100 + j, ())
+        },
+    );
+    let span = span.into_inner().expect("s");
+    let overlapped = (2..=groups.len()).any(|l| {
+        let first = span
+            .iter()
+            .filter(|(lv, ..)| *lv == l)
+            .map(|(_, a, _)| *a)
+            .min();
+        let last = span
+            .iter()
+            .filter(|(lv, ..)| *lv == l - 1)
+            .map(|(.., b)| *b)
+            .max();
+        matches!((first, last), (Some(a), Some(b)) if a < b)
+    });
+    assert!(
+        overlapped,
+        "no level started before its predecessor finished — the cap blocked everything \
+         and this scheduler is a barrier with extra steps: {span:?}"
+    );
+}
+
+/// A panic in any node must reach the caller with its message, like the level
+/// pool's does — and must not hang the other workers waiting on an empty queue.
+#[test]
+fn a_panicking_node_re_raises_and_does_not_hang() {
+    let groups = fanin2_groups(8);
+    let caught = std::panic::catch_unwind(|| {
+        prove_in_dependency_order(
+            &groups,
+            (0..8).collect::<Vec<usize>>(),
+            3,
+            2,
+            |level, j, _k: Vec<usize>| {
+                assert!(!(level == 2 && j == 0), "L2N0 SAYS SO");
+                (level * 100 + j, ())
+            },
+        )
+    });
+    let payload = caught.expect_err("a panicking node must panic the caller");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<not a string>");
+    assert!(
+        msg.contains("L2N0 SAYS SO"),
+        "the panic lost its message: {msg:?}"
+    );
+}
+
+/// Prove an interior TREE in dependency order rather than level by level.
+///
+/// # What replaces what
+///
+/// The driver's level loop is a barrier: `in_index_order` over one level inside a
+/// `thread::scope` that joins every worker before the next level starts. A node at
+/// level `L+1` needs only its OWN two children, so the join makes every level pay
+/// its own tail — and lane P5 measured that tail at 6.1 s of between-hold idle
+/// over levels 2-5, where 5, 3, 2 and 1 nodes have to fill two workers.
+///
+/// # ⛔ The barrier is also a RETENTION policy, and that is the larger half
+///
+/// Today a level holds ALL of its children until it ends: `children` is a `Vec`
+/// alive across the level and every node borrows a subslice of it. In a TREE each
+/// child has exactly ONE parent, so here a node TAKES its children out of the
+/// previous level's slots and drops them when it returns — 19 wraps released
+/// pairwise as level 1 proceeds, instead of all at once when it finishes.
+/// That is the `floor` term the profile says no purge setting touches.
+///
+/// # The cap, and why `levels_in_flight == 1` is the barrier
+///
+/// A node at level `L` waits until every level at or below `L - levels_in_flight`
+/// is COMPLETE. At 1 that is "level `L-1` complete before any node of `L` starts",
+/// which is the barrier exactly — so `M = 1` runs this scheduler with the old
+/// schedule and isolates the scheduler's own cost from the overlap's benefit.
+/// ⓘ It cannot deadlock: a node at the LOWEST incomplete level is never blocked,
+/// because every level below it is complete by definition, so there is always
+/// work the cap admits.
+///
+/// # ⛔ A node returns TWO things, and that is forced by the take
+///
+/// Taking a child means it is GONE once its parent has run, so a scheduler that
+/// frees children cannot also hand every level's values back — the two are the
+/// same bytes. Each node therefore returns `(value, summary)`: the value is what
+/// its parent consumes, the summary is what the log needs (identity, census, the
+/// report row) and is kept for every level. Only the TOP level's values survive,
+/// because only they have no parent, and those are what the root takes.
+///
+/// ⓘ I got this wrong first and the tests said so: the drain asked every level
+/// for its values and level 1 had none, because level 2 had eaten them.
+///
+/// Returns the top level's values, and one summary `Vec` per level in `groups`
+/// order, each in INDEX order.
+fn prove_in_dependency_order<T: Send, S: Send>(
+    groups: &[Vec<std::ops::Range<usize>>],
+    level0: Vec<T>,
+    workers: usize,
+    levels_in_flight: usize,
+    prove: impl Fn(usize, usize, Vec<T>) -> (T, S) + Sync,
+) -> (Vec<T>, Vec<Vec<S>>) {
+    assert!(
+        levels_in_flight >= 1,
+        "at least one level must be in flight"
+    );
+    let n = groups.len();
+    // levels[0] is level 0's output; levels[L] is level L's, for L in 1..=n.
+    let mut levels: Vec<Vec<std::sync::Mutex<Option<T>>>> = Vec::with_capacity(n + 1);
+    levels.push(
+        level0
+            .into_iter()
+            .map(|t| std::sync::Mutex::new(Some(t)))
+            .collect(),
+    );
+    for g in groups {
+        levels.push((0..g.len()).map(|_| std::sync::Mutex::new(None)).collect());
+    }
+    let summaries: Vec<Vec<std::sync::Mutex<Option<S>>>> = groups
+        .iter()
+        .map(|g| (0..g.len()).map(|_| std::sync::Mutex::new(None)).collect())
+        .collect();
+
+    struct Sched {
+        ready: std::collections::VecDeque<(usize, usize)>,
+        blocked: Vec<(usize, usize)>,
+        pending: Vec<Vec<usize>>,
+        done: Vec<usize>,
+        remaining: usize,
+        panic: Option<Box<dyn std::any::Any + Send>>,
+    }
+    let total: usize = groups.iter().map(Vec::len).sum();
+    let mut sched = Sched {
+        ready: std::collections::VecDeque::new(),
+        blocked: Vec::new(),
+        pending: groups
+            .iter()
+            .map(|g| g.iter().map(|r| r.len()).collect())
+            .collect(),
+        done: vec![0; n + 1],
+        remaining: total,
+        panic: None,
+    };
+    sched.done[0] = levels[0].len();
+    // Level 1's nodes have their children already, so they are the seed.
+    for (j, r) in groups[0].iter().enumerate() {
+        sched.pending[0][j] = 0;
+        let _ = r;
+        sched.ready.push_back((1, j));
+    }
+    let sched = std::sync::Mutex::new(sched);
+    let wake = std::sync::Condvar::new();
+
+    // `L` may run once every level at or below `L - levels_in_flight` is done.
+    let admits = |s: &Sched, level: usize| -> bool {
+        let gate = level.saturating_sub(levels_in_flight);
+        (1..=gate).all(|l| s.done[l] == groups[l - 1].len())
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers.max(1) {
+            let (sched, wake, levels, summaries, prove, groups) =
+                (&sched, &wake, &levels, &summaries, &prove, &groups);
+            scope.spawn(move || {
+                let _enrolled = super::program_census::enrol();
+                loop {
+                    let next = {
+                        let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if s.panic.is_some() || s.remaining == 0 {
+                                break None;
+                            }
+                            if let Some(t) = s.ready.pop_front() {
+                                break Some(t);
+                            }
+                            s = wake.wait(s).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some((level, j)) = next else { break };
+                    // ★ TAKEN, not borrowed: each child has exactly one parent, so
+                    // this is the last reader and the children die with the call.
+                    let kids: Vec<T> = groups[level - 1][j]
+                        .clone()
+                        .map(|i| {
+                            levels[level - 1][i]
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .expect("a child is consumed by exactly one parent")
+                        })
+                        .collect();
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        prove(level, j, kids)
+                    }));
+                    let mut s = sched.lock().unwrap_or_else(|e| e.into_inner());
+                    match out {
+                        Err(payload) => {
+                            if s.panic.is_none() {
+                                s.panic = Some(payload);
+                            }
+                            s.remaining = 0;
+                            wake.notify_all();
+                            break;
+                        }
+                        Ok((value, summary)) => {
+                            *levels[level][j].lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(value);
+                            *summaries[level - 1][j]
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(summary);
+                            s.remaining -= 1;
+                            s.done[level] += 1;
+                            // This node frees its parent by one leg.
+                            if level < groups.len()
+                                && let Some(p) = groups[level].iter().position(|r| r.contains(&j))
+                            {
+                                s.pending[level][p] -= 1;
+                                if s.pending[level][p] == 0 {
+                                    if admits(&s, level + 1) {
+                                        s.ready.push_back((level + 1, p));
+                                    } else {
+                                        s.blocked.push((level + 1, p));
+                                    }
+                                }
+                            }
+                            // A completed level can unblock what the cap held.
+                            if s.done[level] == groups[level - 1].len() {
+                                let still: Vec<_> = std::mem::take(&mut s.blocked);
+                                for (l, p) in still {
+                                    if admits(&s, l) {
+                                        s.ready.push_back((l, p));
+                                    } else {
+                                        s.blocked.push((l, p));
+                                    }
+                                }
+                            }
+                            wake.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let mut sched = sched.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some(payload) = sched.panic.take() {
+        std::panic::resume_unwind(payload);
+    }
+    // Only the top level's values are still here; every level below it was eaten
+    // by the level above, which is the point.
+    let top: Vec<T> = levels
+        .pop()
+        .expect("at least one level")
+        .into_iter()
+        .enumerate()
+        .map(|(j, m)| {
+            m.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| panic!("the top level's node {j} produced no value"))
+        })
+        .collect();
+    let summaries = summaries
+        .into_iter()
+        .enumerate()
+        .map(|(l, slots)| {
+            slots
+                .into_iter()
+                .enumerate()
+                .map(|(j, m)| {
+                    m.into_inner()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(|| panic!("level {} node {j} produced no summary", l + 1))
+                })
+                .collect()
+        })
+        .collect();
+    (top, summaries)
+}
+
 /// The root's EXTRA child: the global memory argument, proved as `k` slices and
 /// folded by a parent.
 ///
