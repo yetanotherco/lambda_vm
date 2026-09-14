@@ -89,8 +89,9 @@ transactions dearer.
 So what this fixture is, is a *real-mix* Amsterdam block — real contract code,
 real calldata, real signatures, real trie depth — and not a replay of mainnet
 economics. For workloads whose gas limits were computed for Amsterdam, use the
-EEST benchmark fixtures; `ETHREX_BENCH_WORKLOAD_AFTER_BUMP.md` in the repository
-root has both sets measured side by side.
+EEST benchmark fixtures upstream publishes with `tests-zkevm-benchmark`: they carry
+`statelessInputBytes` the guest reads as-is, one dimension stressed per fixture,
+which is the part a real block does not give.
 
 Measured on the guest ELF at ethrex `8effcb06`: **37,137,748 cycles**, 6,003
 keccak calls, 164 ECSM calls. Fixture: 549,144 bytes.
