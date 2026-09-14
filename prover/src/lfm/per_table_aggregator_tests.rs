@@ -4398,7 +4398,6 @@ fn prove_global_child(
         println!(
             "   cache directory: {}",
             cache_dir
-                .as_deref()
                 .unwrap_or("<none — NOTHING IS SAVED, this run's proofs die with the process>")
         );
         // ⛔ THE SLICE LAYOUT COMES OFF THE SAME `partition` THE EMITTER BRANCHED
