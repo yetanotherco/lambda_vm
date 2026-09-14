@@ -5937,17 +5937,6 @@ fn the_production_tree_composes_to_a_root() {
                 child.artifacts.blake3_chunk_log_heights,
                 child.public_words.len(),
             );
-            // ⛔ THE SAME SAMPLE THE POOL TAKES, at the same logical point — one
-            // node finished. Here the level still borrows every child, so this
-            // line is FLAT by construction and the pool's is not. The contrast
-            // between the two series IS the take-on-consume measurement; the
-            // BOUNDARY reading cannot be, because `children = next` frees them
-            // before the boundary line prints, so both schedulers agree there
-            // whatever they did on the way.
-            println!(
-                "{}",
-                jemalloc_line(&format!("L{level_no}N{j} after-release"))
-            );
             report.push(row);
             next.push(child);
             next_layouts.push(layout);
@@ -6082,17 +6071,17 @@ fn the_production_tree_composes_to_a_root() {
                     lb.push(b);
                 }
                 let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
-                // ★★★ THE RELEASE, AND THE ONLY POINT IT IS VISIBLE. Dropped
-                // explicitly so the sample below is taken with this node's
-                // children GONE — under the barrier they cannot be, because the
-                // level borrows every child until it ends.
+                // ★ TAKEN, SO RELEASED HERE — the pool's one structural
+                // difference from the barrier, stated where it happens. These
+                // children were moved out of the level below's slots, so this
+                // node owns them alone and they go the moment it is proved,
+                // rather than at the end of a level that borrows every child.
+                // It is worth a handful of lines only because it is the thing
+                // that lets two levels be in flight without two levels of
+                // children being live.
                 drop(ch);
                 drop(la);
                 drop(lb);
-                println!(
-                    "{}",
-                    jemalloc_line(&format!("L{level_no}N{j} after-release"))
-                );
                 // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
                 // The child is about to be eaten by its parent, so the line has
                 // to be taken while it exists; printing it here would put it in
