@@ -10,25 +10,25 @@ pad = 0 # TODO? Make this a reserved address containing the self loop
 [[variables.input]]
 name = "argument_registers"
 type = ["BaseField", 4]
-desc = "The register numbers of the arguments `o`, `a`, `b`, `c`, in that order"
+desc = "The register numbers of the arguments `d`, `a`, `b`, `c`, in that order"
 pad = ["arr", 1, 1, 1, 1]
 
 [[variables.input]]
 name = "argument_scalars"
 type = ["BaseField", 4]
-desc = "The `imm_0` scalars for the arguments `o`, `a`, `b`, `c`, in that order"
+desc = "The `imm_0` scalars for the arguments `d`, `a`, `b`, `c`, in that order"
 pad = ["arr", 1, 0, 0, 1]
 
 [[variables.input]]
 name = "argument_offsets"
 type = ["BaseField", 4]
-desc = "The `imm_1` offsets for the arguments `o`, `a`, `b`, `c`, in that order"
+desc = "The `imm_1` offsets for the arguments `d`, `a`, `b`, `c`, in that order"
 pad = 0
 
 [[variables.input]]
 name = "mem_flags"
 type = ["Bit", 4]
-desc = "Whether the argument (`o`, `a`, `b`, `c`, in that order) comes from a memory lookup"
+desc = "Whether the argument (`d`, `a`, `b`, `c`, in that order) comes from a memory lookup"
 pad = 0
 
 [[variables.input]]
