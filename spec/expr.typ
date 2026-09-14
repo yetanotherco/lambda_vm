@@ -55,10 +55,10 @@
 
 #let PREC = (
   "MIN": -1, // <the most secret heart of any expression>
-  "idx": 0,  // []
-  "pow": 1,  // ^
-  "neg": 2,  // Unary -
-  "next": 3, // var'
+  "next": 0, // var'
+  "idx": 1,  // []
+  "pow": 2,  // ^
+  "neg": 3,  // Unary -
   "cast": 4, // cast
   "mul": 5,  // *
   "div": 6,  // /
@@ -116,7 +116,7 @@
       `⧼` + raw(e.at(1)) + `⧽`
     },
     "arr": (pp, rec, e) => `[` + e.slice(1).map(rec.with(PREC.MAX)).join(`, `) + `]`,
-    "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
+    "idx": (pp, rec, e) => cwrap(rec(PREC.idx, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`, pp < PREC.idx),
     "not": (pp, rec, e) => cwrap(rec(PREC.not, 1) + ` - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
@@ -240,11 +240,11 @@
     },
     "cast": (pp, rec, e) => {
       assert(e.len() == 3, message: "Invalid type cast: " + repr(e))
-      cwrap($#rec(PREC.cast, e.at(1)) colon.double #type_to_math(e.at(2))$, pp < PREC.cast)
+      mwrap($#rec(PREC.cast, e.at(1)) colon.double #type_to_math(e.at(2))$, pp < PREC.cast)
     },
     "next": (pp, rec, e) =>  {
       assert(e.len() == 2 and type(e.at(1)) == str, message: "Invalid transition variable: " + repr(e))
-      cwrap($#rec(PREC.next, e.at(1))'$, pp < PREC.next)
+      mwrap($#rec(PREC.next, e.at(1))'$, pp < PREC.next)
     },
   ),
   var: v => if v.len() == 1 { $#v$ } else { $#raw(v)$ },
