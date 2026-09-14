@@ -3851,6 +3851,534 @@ fn the_block_root_proves_over_real_children() {
 ///   lfm::per_table_aggregator_tests::the_production_tree_composes_to_a_root -- \
 ///   --ignored --exact --nocapture
 /// ```
+/// The root's EXTRA child: the global memory argument, proved as `k` slices and
+/// folded by a parent.
+///
+/// # Why this is a function and not the inline stage it used to be
+///
+/// ✓ VERIFIED it reads nothing any interior level produces — `real_global` takes
+/// the base bundle and nothing else, and the 493 lines below never mention
+/// `children`, `layouts` or `labels` outside a comment. That independence was
+/// always true and always invisible, because the code sat wedged between level 0
+/// and level 1 where only its POSITION said when it could run.
+///
+/// Naming its inputs is what makes the independence checkable: everything it
+/// needs is in this signature, so "can this run beside level 0?" is answered by
+/// reading six parameters instead of 493 lines. `LFM_TREE_TOP_OVERLAP=1` is the
+/// caller that does.
+///
+/// Returns the harvested global and the child the root takes. The caller keeps
+/// `LFM_TREE_STOP_AFTER_GLOBAL`, which ends the RUN and so cannot live in a
+/// function that only produces a value.
+#[allow(clippy::too_many_arguments)]
+fn prove_global_child(
+    elf_bytes: &[u8],
+    bundle: &crate::continuation::ContinuationProof,
+    inner: &crate::ProofOptions,
+    wrap_opts: &crate::ProofOptions,
+    cache_dir: Option<&str>,
+    fan_in: usize,
+    ceiling: &Result<f64, String>,
+    level0_mode: CacheMode,
+) -> Option<(RealGlobal, RealChild)> {
+    use super::program_census::build_artifacts_counted;
+    use super::proof::lfm_prove;
+    use std::time::Instant;
+
+    // ---- level 0, the OTHER child: the GLOBAL WRAP.
+    //
+    // ★ The root takes `fan_in + 1` children and this is the extra one. It is
+    // not an epoch wrap and never appears at an interior level, so a cache that
+    // holds `bundle` + N epoch wraps + every node is complete for the INTERIOR
+    // and missing exactly the child that makes a root a root.
+    //
+    // ✓ Everything it needs is already in the bundle: `ContinuationProof` carries
+    // `global`, `num_private_input_pages` and `touched_page_bases`
+    // (`continuation.rs:581-591`), and `real_global` harvests straight from it —
+    // so no re-prove of the base is ever required to produce this.
+    // ⚠ But the global wrap PROOF is new work: `the_global_verifier_leg_runs_and_
+    // rejects_tampers` only EXECUTES this program, it has never proved it.
+    let t = Instant::now();
+    let g = real_global(elf_bytes, bundle, inner);
+
+    // ★★ THE GO/NO-GO ON SLICING, and it proves NOTHING so it cannot abort.
+    //
+    // The unsliced global wrap aborts at `LFM_HASH` 2^21 x 329 = 26.22 GiB — over
+    // the 16000 budget AND over the 80% default of 25.12, which is why no budget
+    // change alone could clear it. Halving the WALKS should halve that to
+    // 13.11 GiB, under 15.625. ⇒ Whether it does is one emission away, and the
+    // whole partial-bus-sum story rests on it.
+    //
+    // ⛔ FALSIFIER, as registered: `LFM_HASH` still at 2^21 at k = 2 means the
+    // walks are NOT what dominates and the mechanism is wrong. Report the miss;
+    // do not repair the estimate.
+    if std::env::var("LFM_TREE_SIZE_GLOBAL").is_ok() {
+        println!(
+            "\n★★★ SIZING THE GLOBAL WRAP — emitted, never proved. {} tables \
+             ({} L2G), {} epochs.",
+            g.tables.len(),
+            g.num_l2g,
+            bundle.num_epochs(),
+        );
+        for k in [1usize, 2] {
+            let partition = super::global_split::SlicePartition::even(g.tables.len(), k);
+            for slice in 0..k {
+                let (lo, hi) = partition.slice(slice);
+                let t = Instant::now();
+                let program = global_slice_program(&g, &partition, slice);
+                let label = format!("global k={k} slice {slice} (tables {lo}..{hi})");
+                println!("\n── {label}: emitted in {:.1}s", t.elapsed().as_secs_f64());
+                census_and_panel(&program, &label, fan_in);
+            }
+        }
+        println!(
+            "\n⇒ COMPARE `LFM_HASH`'s COMMITTED HEIGHT at k=1 against k=2. 2^21 -> \
+             2^20 confirms the mechanism and clears the budget (26.22 -> 13.11 GiB \
+             against 15.625). Still 2^21 REFUTES it."
+        );
+
+        // ★★ PROVE ONE SLICE, STANDALONE — the measurement the emit cannot make.
+        //
+        // The emit says the R1 barrier should be 12.98 GiB against 15.625. Whether
+        // that PLUS the slice's own incremental PLUS the ~5 GiB floor clears a
+        // 32 GiB card is a different question, and this campaign has been wrong
+        // about exactly that arithmetic in both directions today.
+        //
+        // ✓ Nothing about it needs the parent: a slice is a program, `lfm_prove`
+        // takes a program, and the arenas are unchanged — `per_table` declares for
+        // ALL tables and only the LEGS are restricted, so `global_arena_words`
+        // still matches declaration order exactly. The unread declarations cost
+        // hint words, not chip rows, which is why the census halved.
+        if let Ok(which) = std::env::var("LFM_TREE_PROVE_SLICE") {
+            let slice: usize = which
+                .parse()
+                .expect("LFM_TREE_PROVE_SLICE must be an integer");
+            let partition = super::global_split::SlicePartition::even(g.tables.len(), 2);
+            assert!(
+                slice < partition.k(),
+                "slice {slice} does not exist at k={}",
+                partition.k()
+            );
+            let (lo, hi) = partition.slice(slice);
+            let program = global_slice_program(&g, &partition, slice);
+            let arenas = global_arena_words(&g);
+            let t = Instant::now();
+            let artifacts =
+                build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            println!(
+                "\n★ PROVING global slice {slice} (tables {lo}..{hi}): \
+                 build_artifacts {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+            let sampler = HostSampler::start();
+            #[cfg(feature = "cuda")]
+            stark::gpu_lde::reset_all_gpu_call_counters();
+            let t = Instant::now();
+            let proved = lfm_prove(&program, &artifacts, &arenas, wrap_opts)
+                .expect("★ THE GLOBAL SLICE MUST PROVE");
+            let prove_secs = t.elapsed().as_secs_f64();
+            let (peak, at) = sampler.stop();
+            #[cfg(feature = "cuda")]
+            {
+                let total: u64 = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    total > 0,
+                    "the slice prove reached the device ZERO times — it ran on the \
+                     host even though cuda is compiled in, so the peak is not the \
+                     production figure"
+                );
+                println!("   GPU dispatches during the SLICE prove: {total}");
+            }
+            let t = Instant::now();
+            assert!(
+                super::proof::verify_against_artifacts(
+                    &artifacts,
+                    &proved.proof,
+                    &proved.public_words,
+                    wrap_opts
+                ),
+                "the global slice's proof must verify"
+            );
+            println!(
+                "\n★★★ GLOBAL SLICE {slice} PROVED AND VERIFIED\n   prove \
+                 {prove_secs:.1}s · verify {:.2}s · {} published words\n   host \
+                 peak {peak:.3} GiB at t={at:.1}",
+                t.elapsed().as_secs_f64(),
+                proved.public_words.len(),
+            );
+        }
+        // ⛔ A NAMED STOP, NOT A FAILURE — and it has to travel as a VALUE now.
+        // This arm sizes (and optionally proves) a slice and ends the run; as an
+        // inline stage it could just `return`, but a function that produces the
+        // root's child cannot return nothing and be read as having produced it.
+        // `None` is that stop, and the caller re-raises it as the same `return`.
+        return None;
+    }
+
+    // ⛔ `k` IS A STAGE INPUT, AND ITS DEFAULT IS THE STAGE THAT RAN BEFORE IT.
+    //
+    // The unsliced wrap ABORTS on the device: `LFM_HASH` at 2^21 x 329 cols wants
+    // 26.22 GiB of a 32 GiB card, which no budget change clears. At k = 2
+    // `LFM_HASH` lands at 2^20 and one slice PROVED AND VERIFIED at 18,663 MiB
+    // (57.2% of the card) — measured by the `LFM_TREE_PROVE_SLICE` arm above, not
+    // projected.
+    //
+    // ⛔ BUT THE PARENT THAT FOLDS k SLICES DOES NOT EXIST. So k > 1 proves and
+    // CACHES the slices and then REFUSES to continue, rather than feeding a slice
+    // into a path built for the k = 1 wrap; see the refusal after the loop.
+    // ⇒ Unset means k = 1, which is this stage exactly as it was: one program
+    // with the bus closed against zero, one cache entry named `global-wrap`, one
+    // child handed onward.
+    let global_k: usize = match std::env::var("LFM_TREE_GLOBAL_K") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("LFM_TREE_GLOBAL_K must be an integer: {e}")),
+        Err(_) => 1,
+    };
+    // ⛔ AND NO SECOND BOUND CHECK HERE. `SlicePartition::even` refuses a `k`
+    // outside `1..=num_tables` and refuses any partition that does not tile — it
+    // IS the single source for every bound, and a `k` this stage validated
+    // separately would be a second copy of the rule the constructor enforces.
+    let partition = super::global_split::SlicePartition::even(g.tables.len(), global_k);
+    // ⛔ THE GLOBAL WRAP NEEDS ITS OWN MODE, and it is NOT cache-if-present.
+    //
+    // Every other level-0 stage shares one mode, which is right: the bundle and
+    // the 19 wraps are produced together. The global wrap is not — it was added
+    // to the driver after a cache had already been built, so a populated cache
+    // can legitimately hold every wrap and lack this one. Loading the wraps while
+    // proving this stage is therefore a real, nameable experiment, and the only
+    // alternatives were both wrong: `all` refuses at the bundle (Prove mode, file
+    // exists) and a load-everything arm refuses here.
+    // ⇒ `LFM_TREE_GLOBAL_MODE=prove|load` NAMES it. Unset, it follows level 0, so
+    // a fresh `all` proves it and a sizing arm loads it, exactly as before. What
+    // it must never become is "prove it if it happens to be missing" — that is
+    // the harness picking its own experiment off the disk.
+    let global_mode = match std::env::var("LFM_TREE_GLOBAL_MODE").ok().as_deref() {
+        None => level0_mode,
+        Some("prove") => CacheMode::Prove,
+        Some("load") => CacheMode::Load,
+        Some(other) => panic!("LFM_TREE_GLOBAL_MODE must be `prove` or `load`, got `{other}`"),
+    };
+    // ⛔ THE PARENT NEEDS ITS OWN MODE, for the global stage's reason and a
+    // sharper one: the launch line that produces a parent LOADS the k slices an
+    // earlier run cached (`LFM_TREE_GLOBAL_MODE=load`) and must PROVE the parent.
+    // Sharing one mode would send it to load a `global-parent.rkyv` that has
+    // never existed, and the refusal would name the wrong stage.
+    // ⇒ `LFM_TREE_PARENT_MODE=prove|load` NAMES it. Unset, it proves and saves
+    // wherever a cache directory exists — the only experiment a run with no
+    // parent on disk can be running — and `CacheMode::Prove` still REFUSES to
+    // overwrite, so a second run over a populated cache is a refusal rather than
+    // a silent re-prove or a silent load.
+    let parent_mode = match std::env::var("LFM_TREE_PARENT_MODE").ok().as_deref() {
+        None if cache_dir.is_some() => CacheMode::Prove,
+        None => CacheMode::Off,
+        Some("prove") => CacheMode::Prove,
+        Some("load") => CacheMode::Load,
+        Some(other) => panic!("LFM_TREE_PARENT_MODE must be `prove` or `load`, got `{other}`"),
+    };
+    // ★ ONE ARENA SET SERVES EVERY SLICE. `global_slice_program` declares arenas
+    // for ALL tables and restricts only the verification LEGS, so declaration
+    // order is identical at every `k` and for every slice. The unread
+    // declarations cost hint words, not chip rows — which is why the census halves
+    // while the arenas do not change at all.
+    let arenas = global_arena_words(&g);
+    // ⛔ ONE LAYOUT PER SHAPE, SELECTED BY THE PARTITION THE EMITTER WAS HANDED —
+    // NOT one assert widened until both shapes pass. A slice publishes a partial
+    // bus sum the k = 1 set does not contain, and every index the root's L2G
+    // compare reads is shifted by a wrong layout, so a wrong layout is silent and
+    // downstream. See `block_root::GlobalPublishes`, which reads the shape off the
+    // same `partition.k()` the emitter branches on.
+    let g_publishes = super::block_root::GlobalPublishes::of(
+        &partition,
+        super::block_root::GlobalLayout {
+            num_epochs: g.num_l2g,
+            lanes_per_root: super::proof_arena::lanes_per_root(),
+        },
+    );
+    let mut global_stages: Vec<(super::registry::LfmArtifacts, super::proof::LfmProof)> =
+        Vec::with_capacity(partition.k());
+    let mut slice_report: Vec<String> = Vec::with_capacity(partition.k());
+    for i in 0..partition.k() {
+        let (lo_t, hi_t) = partition.slice(i);
+        // ⚠ AT k = 1 THIS *IS* `global_verifier_program`, which is defined as
+        // exactly this call — so the default path emits the program it always
+        // emitted rather than a second spelling of it.
+        let program = global_slice_program(&g, &partition, i);
+        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        // ⛔ ONE CACHE NAME PER SHAPE, for the same reason there is one layout per
+        // shape. The k = 1 wrap closes its bus against zero and a slice does not,
+        // so they are DIFFERENT PROGRAMS with different `program_id`s: a slice
+        // loaded from `global-wrap`, or a wrap loaded from `global-wrap-0`, would
+        // be a proof of a statement nobody asked for.
+        // ⇒ k = 1 KEEPS THE LEGACY NAME, so every cache already on disk still
+        // resolves — and it must, because `LFM_TREE_GLOBAL_MODE=load` REFUSES a
+        // missing entry rather than quietly proving one.
+        let stage = if partition.k() == 1 {
+            "global-wrap".to_string()
+        } else {
+            format!("global-wrap-{i}")
+        };
+        // ⛔ Its own message. A root that cannot find its GLOBAL child is a
+        // different failure from one that cannot find a node child, and a generic
+        // cache miss would report the reader's hypothesis rather than what
+        // happened.
+        let label = if partition.k() == 1 {
+            "the GLOBAL wrap (the root's extra child)".to_string()
+        } else {
+            format!(
+                "the GLOBAL slice {i} of {} (tables {lo_t}..{hi_t})",
+                partition.k()
+            )
+        };
+        #[cfg(feature = "cuda")]
+        stark::gpu_lde::reset_all_gpu_call_counters();
+        let sampler = HostSampler::start();
+        let t_stage = Instant::now();
+        let proved = cached_stage(global_mode, stage_path(cache_dir, &stage), &label, || {
+            lfm_prove(&program, &artifacts, &arenas, wrap_opts)
+                .unwrap_or_else(|e| panic!("★ {label} MUST PROVE: {e:?}"))
+        });
+        let stage_secs = t_stage.elapsed().as_secs_f64();
+        let (peak, at) = sampler.stop();
+        assert_eq!(
+            proved.public_words.len(),
+            g_publishes.total(),
+            "{label}: ITS LAYOUT DOES NOT DESCRIBE IT. It published {} words, the \
+             layout says {} — {}. Every index the root's L2G compare reads is \
+             shifted by this, so it must abort here rather than compare the wrong \
+             words",
+            proved.public_words.len(),
+            g_publishes.total(),
+            g_publishes.describe(),
+        );
+        // ⛔ EVERY GLOBAL STAGE IS VERIFIED **HERE**, AND NOT BY A CALL FURTHER
+        // DOWN. At k = 1 `real_child` also verifies — its doc is right that
+        // nothing downstream may read a proof the verifier would reject — so this
+        // is one extra verify on the default path, and it is worth its seconds:
+        //
+        // - at k > 1 there IS no `real_child` call (the stage refuses below), so
+        //   without this the slices would be CACHED and REPORTED unverified;
+        // - under `LFM_TREE_GLOBAL_MODE=load` the proof came off the disk through
+        //   `rkyv` and has never been checked in this process at all;
+        // - and an invariant that lives in a call this stage merely happens to
+        //   make is one somebody can delete without noticing. This one is the
+        //   stage's own.
+        let t_verify = Instant::now();
+        assert!(
+            super::proof::verify_against_artifacts(
+                &artifacts,
+                &proved.proof,
+                &proved.public_words,
+                wrap_opts
+            ),
+            "{label}: ITS PROOF DOES NOT VERIFY. Nothing may be cached, reported \
+             or handed onward from a proof production would reject"
+        );
+        let verify_secs = t_verify.elapsed().as_secs_f64();
+        // ⚠ ONLY WHERE THIS PROCESS ACTUALLY PROVED. Under `load` no kernel runs
+        // and a zero count is the correct observation, so a blanket assert here
+        // would fire on a legitimate load arm.
+        #[cfg(feature = "cuda")]
+        {
+            if global_mode != CacheMode::Load {
+                let calls = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    calls > 0,
+                    "{label} reached the device ZERO times — it proved on the HOST \
+                     with cuda compiled in, so its peak is not a production figure"
+                );
+                println!("     GPU dispatches during {label}: {calls}");
+            }
+        }
+        println!(
+            "     {label}: stage {stage_secs:.1}s · verify {verify_secs:.1}s · {} \
+             published words{} · host peak {peak:.3} GiB at t={at:.1}",
+            proved.public_words.len(),
+            match g_publishes.partial_sum_word() {
+                Some(w) => format!(" (partial bus sum at index {w})"),
+                None => String::new(),
+            },
+        );
+        slice_report.push(format!(
+            "   slice {i} of {k}: tables {lo_t}..{hi_t} · stage {stage_secs:.1}s · \
+             verify {verify_secs:.1}s · {} published words · host peak {peak:.3} \
+             GiB at t={at:.1} · cache entry {stage}.rkyv",
+            proved.public_words.len(),
+            k = partition.k(),
+        ));
+        global_stages.push((artifacts, proved));
+    }
+
+    // ---- THE PARENT of the k slices.
+    //
+    // ★ AT k > 1 NO SLICE IS THE ROOT'S GLOBAL CHILD. A slice publishes a PARTIAL
+    // bus sum the k = 1 layout does not contain, and every index the root's L2G
+    // compare reads would be shifted by that one word. What IS the global child
+    // is the PARENT: it verifies the k slice proofs, pins the partition through
+    // the `program_id`s it embeds as constants, asserts every slice published the
+    // same `(z, alpha)` and the same L2G roots, sums the partials, asserts ZERO,
+    // and republishes the prefix.
+    //
+    // ⇒ Its published set is `2 + epochs x lanes` = `GlobalLayout::total()`,
+    // exactly what the unsliced wrap published — a COINCIDENCE of arithmetic, not
+    // a design (see `block_root::RootInputs`'s `global_child_layout`) — and that
+    // is what lets everything below this point take ONE global child with no
+    // branch of its own at either k.
+    let (artifacts, proved) = if partition.k() > 1 {
+        println!(
+            "\n★★★ {} GLOBAL SLICES PROVED AND VERIFIED — folding them into the PARENT",
+            partition.k()
+        );
+        for line in &slice_report {
+            println!("{line}");
+        }
+        println!(
+            "   cache directory: {}",
+            cache_dir
+                .as_deref()
+                .unwrap_or("<none — NOTHING IS SAVED, this run's proofs die with the process>")
+        );
+        // ⛔ THE SLICE LAYOUT COMES OFF THE SAME `partition` THE EMITTER BRANCHED
+        // ON, through the same `GlobalPublishes` the slices were asserted against.
+        // A `k` this stage re-derived would be a second copy of the rule the
+        // constructor enforces, and a layout picked independently of the program
+        // it describes is exactly the silent-and-downstream failure
+        // `GlobalPublishes` exists to prevent.
+        let slice_layout = g_publishes
+            .as_slice()
+            .expect("k > 1 IS the slice shape, chosen by this same partition");
+        let t_harvest = Instant::now();
+        let slices: Vec<RealChild> = global_stages
+            .into_iter()
+            .map(|(a, p)| real_child(a, wrap_opts.clone(), &p))
+            .collect();
+        let harvest_secs = t_harvest.elapsed().as_secs_f64();
+        let t_emit = Instant::now();
+        // ⛔ THE SAME `partition`, not a second one built from the same numbers.
+        let program = global_parent_program(&slices, &partition, slice_layout);
+        println!(
+            "   the GLOBAL PARENT: harvest {harvest_secs:.1}s · emitted in {:.1}s",
+            t_emit.elapsed().as_secs_f64()
+        );
+        // ★ THE PANEL, AT THE PARENT TOO. The pre-registration says the parent's
+        // census should be SMALL — k legs over slice proofs plus the sum — and
+        // that a parent bigger than a level-1 node means the parent has become
+        // the problem. That is read off `LFM_HASH`'s committed height here, not
+        // inferred from a ratio.
+        census_and_panel(&program, "the GLOBAL PARENT", fan_in);
+        let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
+        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        #[cfg(feature = "cuda")]
+        stark::gpu_lde::reset_all_gpu_call_counters();
+        let sampler = HostSampler::start();
+        let t_stage = Instant::now();
+        let proved = cached_stage(
+            parent_mode,
+            stage_path(cache_dir, "global-parent"),
+            "the GLOBAL PARENT",
+            || {
+                lfm_prove(&program, &artifacts, &arenas, wrap_opts)
+                    .unwrap_or_else(|e| panic!("★ THE GLOBAL PARENT MUST PROVE: {e:?}"))
+            },
+        );
+        let stage_secs = t_stage.elapsed().as_secs_f64();
+        let (peak, at) = sampler.stop();
+        // ⛔ AGAINST THE PARENT'S OWN SHAPE — the SHARED prefix, with NO partial.
+        // The parent asserts zero rather than publishing a sum, so it publishes
+        // one word FEWER than each of its children. Checked against the slice
+        // layout this would be off by exactly that word, and every L2G index the
+        // root reads would shift by it: the wrong-layout failure is silent, and
+        // it lands downstream.
+        assert_eq!(
+            proved.public_words.len(),
+            slice_layout.shared.total(),
+            "the GLOBAL PARENT published {} words, but it republishes the SHARED \
+             prefix and NOTHING for the sum — z, alpha, then {} L2G roots x {} \
+             lanes = {} words. Every index the root's L2G compare reads is \
+             shifted by this, so it must abort here rather than compare the \
+             wrong words",
+            proved.public_words.len(),
+            slice_layout.shared.num_epochs,
+            slice_layout.shared.lanes_per_root,
+            slice_layout.shared.total(),
+        );
+        // ⛔ VERIFIED HERE, for the reasons the slice loop gives: under
+        // `LFM_TREE_PARENT_MODE=load` the proof came off the disk through `rkyv`
+        // and has never been checked in this process, and an invariant living in
+        // a call this stage merely happens to make is one somebody can delete
+        // without noticing.
+        let t_verify = Instant::now();
+        assert!(
+            super::proof::verify_against_artifacts(
+                &artifacts,
+                &proved.proof,
+                &proved.public_words,
+                wrap_opts
+            ),
+            "the GLOBAL PARENT's proof DOES NOT VERIFY. Nothing may be cached, \
+             reported or handed onward from a proof production would reject"
+        );
+        let verify_secs = t_verify.elapsed().as_secs_f64();
+        // ⚠ ONLY WHERE THIS PROCESS ACTUALLY PROVED — under `load` no kernel runs
+        // and zero is the correct observation.
+        #[cfg(feature = "cuda")]
+        {
+            if parent_mode != CacheMode::Load {
+                let calls = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    calls > 0,
+                    "the GLOBAL PARENT reached the device ZERO times — it proved \
+                     on the HOST with cuda compiled in, so its peak is not a \
+                     production figure"
+                );
+                println!("     GPU dispatches during the GLOBAL PARENT: {calls}");
+            }
+        }
+        println!(
+            "\n★★★ THE GLOBAL PARENT PROVED AND VERIFIED over {} slices\n   stage \
+             {stage_secs:.1}s · verify {verify_secs:.1}s · {} published words \
+             (the shared prefix, NO partial)\n   host peak {peak:.3} GiB at \
+             t={at:.1}{}\n   cache entry global-parent.rkyv",
+            partition.k(),
+            proved.public_words.len(),
+            match ceiling {
+                Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
+                Err(_) => String::new(),
+            },
+        );
+        (artifacts, proved)
+    } else {
+        // k = 1: the loop ran once and its one stage IS the wrap the rest of the
+        // tree expects, target zero and all.
+        global_stages
+            .pop()
+            .expect("k = 1 ran the loop once and pushed its wrap")
+    };
+    println!(
+        "   ★ THE ROOT'S GLOBAL CHILD is {}: {:.1}s to here, {} published words \
+         ({} L2G roots), {} global sub-proofs, {} touched pages in the bundle",
+        if partition.k() == 1 {
+            "the UNSLICED global wrap".to_string()
+        } else {
+            format!("the PARENT of {} slices", partition.k())
+        },
+        t.elapsed().as_secs_f64(),
+        proved.public_words.len(),
+        g.num_l2g,
+        g.tables.len(),
+        bundle.touched_pages().len(),
+    );
+    let global_child = real_child(artifacts, wrap_opts.clone(), &proved);
+    mark("AFTER the global child");
+    Some((g, global_child))
+}
+
 #[test]
 #[ignore = "box tier, production scale: composes the whole interior tree"]
 fn the_production_tree_composes_to_a_root() {
@@ -4399,499 +4927,34 @@ fn the_production_tree_composes_to_a_root() {
         println!("   {}", stats.describe("level 0"));
     }
 
-    // ---- level 0, the OTHER child: the GLOBAL WRAP.
+    // ---- level 0's OTHER child: the GLOBAL WRAP.
     //
-    // ★ The root takes `fan_in + 1` children and this is the extra one. It is
-    // not an epoch wrap and never appears at an interior level, so a cache that
-    // holds `bundle` + N epoch wraps + every node is complete for the INTERIOR
-    // and missing exactly the child that makes a root a root.
-    //
-    // ✓ Everything it needs is already in the bundle: `ContinuationProof` carries
-    // `global`, `num_private_input_pages` and `touched_page_bases`
-    // (`continuation.rs:581-591`), and `real_global` harvests straight from it —
-    // so no re-prove of the base is ever required to produce this.
-    // ⚠ But the global wrap PROOF is new work: `the_global_verifier_leg_runs_and_
-    // rejects_tampers` only EXECUTES this program, it has never proved it.
-    let t = Instant::now();
-    let g = real_global(&inputs.elf_bytes, &bundle, &inner);
-
-    // ★★ THE GO/NO-GO ON SLICING, and it proves NOTHING so it cannot abort.
-    //
-    // The unsliced global wrap aborts at `LFM_HASH` 2^21 x 329 = 26.22 GiB — over
-    // the 16000 budget AND over the 80% default of 25.12, which is why no budget
-    // change alone could clear it. Halving the WALKS should halve that to
-    // 13.11 GiB, under 15.625. ⇒ Whether it does is one emission away, and the
-    // whole partial-bus-sum story rests on it.
-    //
-    // ⛔ FALSIFIER, as registered: `LFM_HASH` still at 2^21 at k = 2 means the
-    // walks are NOT what dominates and the mechanism is wrong. Report the miss;
-    // do not repair the estimate.
-    if std::env::var("LFM_TREE_SIZE_GLOBAL").is_ok() {
-        println!(
-            "\n★★★ SIZING THE GLOBAL WRAP — emitted, never proved. {} tables \
-             ({} L2G), {} epochs.",
-            g.tables.len(),
-            g.num_l2g,
-            bundle.num_epochs(),
-        );
-        for k in [1usize, 2] {
-            let partition = super::global_split::SlicePartition::even(g.tables.len(), k);
-            for slice in 0..k {
-                let (lo, hi) = partition.slice(slice);
-                let t = Instant::now();
-                let program = global_slice_program(&g, &partition, slice);
-                let label = format!("global k={k} slice {slice} (tables {lo}..{hi})");
-                println!("\n── {label}: emitted in {:.1}s", t.elapsed().as_secs_f64());
-                census_and_panel(&program, &label, fan_in);
-            }
-        }
-        println!(
-            "\n⇒ COMPARE `LFM_HASH`'s COMMITTED HEIGHT at k=1 against k=2. 2^21 -> \
-             2^20 confirms the mechanism and clears the budget (26.22 -> 13.11 GiB \
-             against 15.625). Still 2^21 REFUTES it."
-        );
-
-        // ★★ PROVE ONE SLICE, STANDALONE — the measurement the emit cannot make.
-        //
-        // The emit says the R1 barrier should be 12.98 GiB against 15.625. Whether
-        // that PLUS the slice's own incremental PLUS the ~5 GiB floor clears a
-        // 32 GiB card is a different question, and this campaign has been wrong
-        // about exactly that arithmetic in both directions today.
-        //
-        // ✓ Nothing about it needs the parent: a slice is a program, `lfm_prove`
-        // takes a program, and the arenas are unchanged — `per_table` declares for
-        // ALL tables and only the LEGS are restricted, so `global_arena_words`
-        // still matches declaration order exactly. The unread declarations cost
-        // hint words, not chip rows, which is why the census halved.
-        if let Ok(which) = std::env::var("LFM_TREE_PROVE_SLICE") {
-            let slice: usize = which
-                .parse()
-                .expect("LFM_TREE_PROVE_SLICE must be an integer");
-            let partition = super::global_split::SlicePartition::even(g.tables.len(), 2);
-            assert!(
-                slice < partition.k(),
-                "slice {slice} does not exist at k={}",
-                partition.k()
-            );
-            let (lo, hi) = partition.slice(slice);
-            let program = global_slice_program(&g, &partition, slice);
-            let arenas = global_arena_words(&g);
-            let t = Instant::now();
-            let artifacts =
-                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-            println!(
-                "\n★ PROVING global slice {slice} (tables {lo}..{hi}): \
-                 build_artifacts {:.1}s",
-                t.elapsed().as_secs_f64()
-            );
-            let sampler = HostSampler::start();
-            #[cfg(feature = "cuda")]
-            stark::gpu_lde::reset_all_gpu_call_counters();
-            let t = Instant::now();
-            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-                .expect("★ THE GLOBAL SLICE MUST PROVE");
-            let prove_secs = t.elapsed().as_secs_f64();
-            let (peak, at) = sampler.stop();
-            #[cfg(feature = "cuda")]
-            {
-                let total: u64 = stark::gpu_lde::gpu_lde_calls()
-                    + stark::gpu_lde::gpu_merkle_tree_calls()
-                    + stark::gpu_lde::gpu_fri_calls();
-                assert!(
-                    total > 0,
-                    "the slice prove reached the device ZERO times — it ran on the \
-                     host even though cuda is compiled in, so the peak is not the \
-                     production figure"
-                );
-                println!("   GPU dispatches during the SLICE prove: {total}");
-            }
-            let t = Instant::now();
-            assert!(
-                super::proof::verify_against_artifacts(
-                    &artifacts,
-                    &proved.proof,
-                    &proved.public_words,
-                    &wrap_opts
-                ),
-                "the global slice's proof must verify"
-            );
-            println!(
-                "\n★★★ GLOBAL SLICE {slice} PROVED AND VERIFIED\n   prove \
-                 {prove_secs:.1}s · verify {:.2}s · {} published words\n   host \
-                 peak {peak:.3} GiB at t={at:.1}",
-                t.elapsed().as_secs_f64(),
-                proved.public_words.len(),
-            );
-        }
+    // ⓘ Its WORK may already be done. Under `LFM_TREE_TOP_OVERLAP=1` this value
+    // was produced by a task inside level 0's own pool; unset, it is proved
+    // right here, exactly where the stage always ran. Either way it is consumed
+    // at this point in the program, so nothing downstream can tell which.
+    // ⓘ `None` until the overlap lands — this commit is the extraction alone, and
+    // a refactor that changes behaviour in the same diff cannot be reviewed as a
+    // no-op.
+    let overlapped_global: Option<Option<(RealGlobal, RealChild)>> = None;
+    let produced = match overlapped_global {
+        Some(done) => done,
+        None => prove_global_child(
+            &inputs.elf_bytes,
+            &bundle,
+            &inner,
+            &wrap_opts,
+            cache_dir.as_deref(),
+            fan_in,
+            &ceiling,
+            stage_mode(0),
+        ),
+    };
+    // ⓘ `None` is `LFM_TREE_SIZE_GLOBAL`'s named stop, re-raised here as the
+    // `return` it used to be when the stage was inline.
+    let Some((g, global_child)) = produced else {
         return;
-    }
-
-    // ⛔ `k` IS A STAGE INPUT, AND ITS DEFAULT IS THE STAGE THAT RAN BEFORE IT.
-    //
-    // The unsliced wrap ABORTS on the device: `LFM_HASH` at 2^21 x 329 cols wants
-    // 26.22 GiB of a 32 GiB card, which no budget change clears. At k = 2
-    // `LFM_HASH` lands at 2^20 and one slice PROVED AND VERIFIED at 18,663 MiB
-    // (57.2% of the card) — measured by the `LFM_TREE_PROVE_SLICE` arm above, not
-    // projected.
-    //
-    // ⛔ BUT THE PARENT THAT FOLDS k SLICES DOES NOT EXIST. So k > 1 proves and
-    // CACHES the slices and then REFUSES to continue, rather than feeding a slice
-    // into a path built for the k = 1 wrap; see the refusal after the loop.
-    // ⇒ Unset means k = 1, which is this stage exactly as it was: one program
-    // with the bus closed against zero, one cache entry named `global-wrap`, one
-    // child handed onward.
-    let global_k: usize = match std::env::var("LFM_TREE_GLOBAL_K") {
-        Ok(v) => v
-            .parse()
-            .unwrap_or_else(|e| panic!("LFM_TREE_GLOBAL_K must be an integer: {e}")),
-        Err(_) => 1,
     };
-    // ⛔ AND NO SECOND BOUND CHECK HERE. `SlicePartition::even` refuses a `k`
-    // outside `1..=num_tables` and refuses any partition that does not tile — it
-    // IS the single source for every bound, and a `k` this stage validated
-    // separately would be a second copy of the rule the constructor enforces.
-    let partition = super::global_split::SlicePartition::even(g.tables.len(), global_k);
-    // ⛔ THE GLOBAL WRAP NEEDS ITS OWN MODE, and it is NOT cache-if-present.
-    //
-    // Every other level-0 stage shares one mode, which is right: the bundle and
-    // the 19 wraps are produced together. The global wrap is not — it was added
-    // to the driver after a cache had already been built, so a populated cache
-    // can legitimately hold every wrap and lack this one. Loading the wraps while
-    // proving this stage is therefore a real, nameable experiment, and the only
-    // alternatives were both wrong: `all` refuses at the bundle (Prove mode, file
-    // exists) and a load-everything arm refuses here.
-    // ⇒ `LFM_TREE_GLOBAL_MODE=prove|load` NAMES it. Unset, it follows level 0, so
-    // a fresh `all` proves it and a sizing arm loads it, exactly as before. What
-    // it must never become is "prove it if it happens to be missing" — that is
-    // the harness picking its own experiment off the disk.
-    let global_mode = match std::env::var("LFM_TREE_GLOBAL_MODE").ok().as_deref() {
-        None => stage_mode(0),
-        Some("prove") => CacheMode::Prove,
-        Some("load") => CacheMode::Load,
-        Some(other) => panic!("LFM_TREE_GLOBAL_MODE must be `prove` or `load`, got `{other}`"),
-    };
-    // ⛔ THE PARENT NEEDS ITS OWN MODE, for the global stage's reason and a
-    // sharper one: the launch line that produces a parent LOADS the k slices an
-    // earlier run cached (`LFM_TREE_GLOBAL_MODE=load`) and must PROVE the parent.
-    // Sharing one mode would send it to load a `global-parent.rkyv` that has
-    // never existed, and the refusal would name the wrong stage.
-    // ⇒ `LFM_TREE_PARENT_MODE=prove|load` NAMES it. Unset, it proves and saves
-    // wherever a cache directory exists — the only experiment a run with no
-    // parent on disk can be running — and `CacheMode::Prove` still REFUSES to
-    // overwrite, so a second run over a populated cache is a refusal rather than
-    // a silent re-prove or a silent load.
-    let parent_mode = match std::env::var("LFM_TREE_PARENT_MODE").ok().as_deref() {
-        None if cache_dir.is_some() => CacheMode::Prove,
-        None => CacheMode::Off,
-        Some("prove") => CacheMode::Prove,
-        Some("load") => CacheMode::Load,
-        Some(other) => panic!("LFM_TREE_PARENT_MODE must be `prove` or `load`, got `{other}`"),
-    };
-    // ★ ONE ARENA SET SERVES EVERY SLICE. `global_slice_program` declares arenas
-    // for ALL tables and restricts only the verification LEGS, so declaration
-    // order is identical at every `k` and for every slice. The unread
-    // declarations cost hint words, not chip rows — which is why the census halves
-    // while the arenas do not change at all.
-    let arenas = global_arena_words(&g);
-    // ⛔ ONE LAYOUT PER SHAPE, SELECTED BY THE PARTITION THE EMITTER WAS HANDED —
-    // NOT one assert widened until both shapes pass. A slice publishes a partial
-    // bus sum the k = 1 set does not contain, and every index the root's L2G
-    // compare reads is shifted by a wrong layout, so a wrong layout is silent and
-    // downstream. See `block_root::GlobalPublishes`, which reads the shape off the
-    // same `partition.k()` the emitter branches on.
-    let g_publishes = super::block_root::GlobalPublishes::of(
-        &partition,
-        super::block_root::GlobalLayout {
-            num_epochs: g.num_l2g,
-            lanes_per_root: super::proof_arena::lanes_per_root(),
-        },
-    );
-    let mut global_stages: Vec<(super::registry::LfmArtifacts, super::proof::LfmProof)> =
-        Vec::with_capacity(partition.k());
-    let mut slice_report: Vec<String> = Vec::with_capacity(partition.k());
-    for i in 0..partition.k() {
-        let (lo_t, hi_t) = partition.slice(i);
-        // ⚠ AT k = 1 THIS *IS* `global_verifier_program`, which is defined as
-        // exactly this call — so the default path emits the program it always
-        // emitted rather than a second spelling of it.
-        let program = global_slice_program(&g, &partition, i);
-        let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-        // ⛔ ONE CACHE NAME PER SHAPE, for the same reason there is one layout per
-        // shape. The k = 1 wrap closes its bus against zero and a slice does not,
-        // so they are DIFFERENT PROGRAMS with different `program_id`s: a slice
-        // loaded from `global-wrap`, or a wrap loaded from `global-wrap-0`, would
-        // be a proof of a statement nobody asked for.
-        // ⇒ k = 1 KEEPS THE LEGACY NAME, so every cache already on disk still
-        // resolves — and it must, because `LFM_TREE_GLOBAL_MODE=load` REFUSES a
-        // missing entry rather than quietly proving one.
-        let stage = if partition.k() == 1 {
-            "global-wrap".to_string()
-        } else {
-            format!("global-wrap-{i}")
-        };
-        // ⛔ Its own message. A root that cannot find its GLOBAL child is a
-        // different failure from one that cannot find a node child, and a generic
-        // cache miss would report the reader's hypothesis rather than what
-        // happened.
-        let label = if partition.k() == 1 {
-            "the GLOBAL wrap (the root's extra child)".to_string()
-        } else {
-            format!(
-                "the GLOBAL slice {i} of {} (tables {lo_t}..{hi_t})",
-                partition.k()
-            )
-        };
-        #[cfg(feature = "cuda")]
-        stark::gpu_lde::reset_all_gpu_call_counters();
-        let sampler = HostSampler::start();
-        let t_stage = Instant::now();
-        let proved = cached_stage(
-            global_mode,
-            stage_path(cache_dir.as_deref(), &stage),
-            &label,
-            || {
-                lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-                    .unwrap_or_else(|e| panic!("★ {label} MUST PROVE: {e:?}"))
-            },
-        );
-        let stage_secs = t_stage.elapsed().as_secs_f64();
-        let (peak, at) = sampler.stop();
-        assert_eq!(
-            proved.public_words.len(),
-            g_publishes.total(),
-            "{label}: ITS LAYOUT DOES NOT DESCRIBE IT. It published {} words, the \
-             layout says {} — {}. Every index the root's L2G compare reads is \
-             shifted by this, so it must abort here rather than compare the wrong \
-             words",
-            proved.public_words.len(),
-            g_publishes.total(),
-            g_publishes.describe(),
-        );
-        // ⛔ EVERY GLOBAL STAGE IS VERIFIED **HERE**, AND NOT BY A CALL FURTHER
-        // DOWN. At k = 1 `real_child` also verifies — its doc is right that
-        // nothing downstream may read a proof the verifier would reject — so this
-        // is one extra verify on the default path, and it is worth its seconds:
-        //
-        // - at k > 1 there IS no `real_child` call (the stage refuses below), so
-        //   without this the slices would be CACHED and REPORTED unverified;
-        // - under `LFM_TREE_GLOBAL_MODE=load` the proof came off the disk through
-        //   `rkyv` and has never been checked in this process at all;
-        // - and an invariant that lives in a call this stage merely happens to
-        //   make is one somebody can delete without noticing. This one is the
-        //   stage's own.
-        let t_verify = Instant::now();
-        assert!(
-            super::proof::verify_against_artifacts(
-                &artifacts,
-                &proved.proof,
-                &proved.public_words,
-                &wrap_opts
-            ),
-            "{label}: ITS PROOF DOES NOT VERIFY. Nothing may be cached, reported \
-             or handed onward from a proof production would reject"
-        );
-        let verify_secs = t_verify.elapsed().as_secs_f64();
-        // ⚠ ONLY WHERE THIS PROCESS ACTUALLY PROVED. Under `load` no kernel runs
-        // and a zero count is the correct observation, so a blanket assert here
-        // would fire on a legitimate load arm.
-        #[cfg(feature = "cuda")]
-        {
-            if global_mode != CacheMode::Load {
-                let calls = stark::gpu_lde::gpu_lde_calls()
-                    + stark::gpu_lde::gpu_merkle_tree_calls()
-                    + stark::gpu_lde::gpu_fri_calls();
-                assert!(
-                    calls > 0,
-                    "{label} reached the device ZERO times — it proved on the HOST \
-                     with cuda compiled in, so its peak is not a production figure"
-                );
-                println!("     GPU dispatches during {label}: {calls}");
-            }
-        }
-        println!(
-            "     {label}: stage {stage_secs:.1}s · verify {verify_secs:.1}s · {} \
-             published words{} · host peak {peak:.3} GiB at t={at:.1}",
-            proved.public_words.len(),
-            match g_publishes.partial_sum_word() {
-                Some(w) => format!(" (partial bus sum at index {w})"),
-                None => String::new(),
-            },
-        );
-        slice_report.push(format!(
-            "   slice {i} of {k}: tables {lo_t}..{hi_t} · stage {stage_secs:.1}s · \
-             verify {verify_secs:.1}s · {} published words · host peak {peak:.3} \
-             GiB at t={at:.1} · cache entry {stage}.rkyv",
-            proved.public_words.len(),
-            k = partition.k(),
-        ));
-        global_stages.push((artifacts, proved));
-    }
-
-    // ---- THE PARENT of the k slices.
-    //
-    // ★ AT k > 1 NO SLICE IS THE ROOT'S GLOBAL CHILD. A slice publishes a PARTIAL
-    // bus sum the k = 1 layout does not contain, and every index the root's L2G
-    // compare reads would be shifted by that one word. What IS the global child
-    // is the PARENT: it verifies the k slice proofs, pins the partition through
-    // the `program_id`s it embeds as constants, asserts every slice published the
-    // same `(z, alpha)` and the same L2G roots, sums the partials, asserts ZERO,
-    // and republishes the prefix.
-    //
-    // ⇒ Its published set is `2 + epochs x lanes` = `GlobalLayout::total()`,
-    // exactly what the unsliced wrap published — a COINCIDENCE of arithmetic, not
-    // a design (see `block_root::RootInputs`'s `global_child_layout`) — and that
-    // is what lets everything below this point take ONE global child with no
-    // branch of its own at either k.
-    let (artifacts, proved) = if partition.k() > 1 {
-        println!(
-            "\n★★★ {} GLOBAL SLICES PROVED AND VERIFIED — folding them into the PARENT",
-            partition.k()
-        );
-        for line in &slice_report {
-            println!("{line}");
-        }
-        println!(
-            "   cache directory: {}",
-            cache_dir
-                .as_deref()
-                .unwrap_or("<none — NOTHING IS SAVED, this run's proofs die with the process>")
-        );
-        // ⛔ THE SLICE LAYOUT COMES OFF THE SAME `partition` THE EMITTER BRANCHED
-        // ON, through the same `GlobalPublishes` the slices were asserted against.
-        // A `k` this stage re-derived would be a second copy of the rule the
-        // constructor enforces, and a layout picked independently of the program
-        // it describes is exactly the silent-and-downstream failure
-        // `GlobalPublishes` exists to prevent.
-        let slice_layout = g_publishes
-            .as_slice()
-            .expect("k > 1 IS the slice shape, chosen by this same partition");
-        let t_harvest = Instant::now();
-        let slices: Vec<RealChild> = global_stages
-            .into_iter()
-            .map(|(a, p)| real_child(a, wrap_opts.clone(), &p))
-            .collect();
-        let harvest_secs = t_harvest.elapsed().as_secs_f64();
-        let t_emit = Instant::now();
-        // ⛔ THE SAME `partition`, not a second one built from the same numbers.
-        let program = global_parent_program(&slices, &partition, slice_layout);
-        println!(
-            "   the GLOBAL PARENT: harvest {harvest_secs:.1}s · emitted in {:.1}s",
-            t_emit.elapsed().as_secs_f64()
-        );
-        // ★ THE PANEL, AT THE PARENT TOO. The pre-registration says the parent's
-        // census should be SMALL — k legs over slice proofs plus the sum — and
-        // that a parent bigger than a level-1 node means the parent has become
-        // the problem. That is read off `LFM_HASH`'s committed height here, not
-        // inferred from a ratio.
-        census_and_panel(&program, "the GLOBAL PARENT", fan_in);
-        let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
-        let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
-        #[cfg(feature = "cuda")]
-        stark::gpu_lde::reset_all_gpu_call_counters();
-        let sampler = HostSampler::start();
-        let t_stage = Instant::now();
-        let proved = cached_stage(
-            parent_mode,
-            stage_path(cache_dir.as_deref(), "global-parent"),
-            "the GLOBAL PARENT",
-            || {
-                lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
-                    .unwrap_or_else(|e| panic!("★ THE GLOBAL PARENT MUST PROVE: {e:?}"))
-            },
-        );
-        let stage_secs = t_stage.elapsed().as_secs_f64();
-        let (peak, at) = sampler.stop();
-        // ⛔ AGAINST THE PARENT'S OWN SHAPE — the SHARED prefix, with NO partial.
-        // The parent asserts zero rather than publishing a sum, so it publishes
-        // one word FEWER than each of its children. Checked against the slice
-        // layout this would be off by exactly that word, and every L2G index the
-        // root reads would shift by it: the wrong-layout failure is silent, and
-        // it lands downstream.
-        assert_eq!(
-            proved.public_words.len(),
-            slice_layout.shared.total(),
-            "the GLOBAL PARENT published {} words, but it republishes the SHARED \
-             prefix and NOTHING for the sum — z, alpha, then {} L2G roots x {} \
-             lanes = {} words. Every index the root's L2G compare reads is \
-             shifted by this, so it must abort here rather than compare the \
-             wrong words",
-            proved.public_words.len(),
-            slice_layout.shared.num_epochs,
-            slice_layout.shared.lanes_per_root,
-            slice_layout.shared.total(),
-        );
-        // ⛔ VERIFIED HERE, for the reasons the slice loop gives: under
-        // `LFM_TREE_PARENT_MODE=load` the proof came off the disk through `rkyv`
-        // and has never been checked in this process, and an invariant living in
-        // a call this stage merely happens to make is one somebody can delete
-        // without noticing.
-        let t_verify = Instant::now();
-        assert!(
-            super::proof::verify_against_artifacts(
-                &artifacts,
-                &proved.proof,
-                &proved.public_words,
-                &wrap_opts
-            ),
-            "the GLOBAL PARENT's proof DOES NOT VERIFY. Nothing may be cached, \
-             reported or handed onward from a proof production would reject"
-        );
-        let verify_secs = t_verify.elapsed().as_secs_f64();
-        // ⚠ ONLY WHERE THIS PROCESS ACTUALLY PROVED — under `load` no kernel runs
-        // and zero is the correct observation.
-        #[cfg(feature = "cuda")]
-        {
-            if parent_mode != CacheMode::Load {
-                let calls = stark::gpu_lde::gpu_lde_calls()
-                    + stark::gpu_lde::gpu_merkle_tree_calls()
-                    + stark::gpu_lde::gpu_fri_calls();
-                assert!(
-                    calls > 0,
-                    "the GLOBAL PARENT reached the device ZERO times — it proved \
-                     on the HOST with cuda compiled in, so its peak is not a \
-                     production figure"
-                );
-                println!("     GPU dispatches during the GLOBAL PARENT: {calls}");
-            }
-        }
-        println!(
-            "\n★★★ THE GLOBAL PARENT PROVED AND VERIFIED over {} slices\n   stage \
-             {stage_secs:.1}s · verify {verify_secs:.1}s · {} published words \
-             (the shared prefix, NO partial)\n   host peak {peak:.3} GiB at \
-             t={at:.1}{}\n   cache entry global-parent.rkyv",
-            partition.k(),
-            proved.public_words.len(),
-            match &ceiling {
-                Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
-                Err(_) => String::new(),
-            },
-        );
-        (artifacts, proved)
-    } else {
-        // k = 1: the loop ran once and its one stage IS the wrap the rest of the
-        // tree expects, target zero and all.
-        global_stages
-            .pop()
-            .expect("k = 1 ran the loop once and pushed its wrap")
-    };
-    println!(
-        "   ★ THE ROOT'S GLOBAL CHILD is {}: {:.1}s to here, {} published words \
-         ({} L2G roots), {} global sub-proofs, {} touched pages in the bundle",
-        if partition.k() == 1 {
-            "the UNSLICED global wrap".to_string()
-        } else {
-            format!("the PARENT of {} slices", partition.k())
-        },
-        t.elapsed().as_secs_f64(),
-        proved.public_words.len(),
-        g.num_l2g,
-        g.tables.len(),
-        bundle.touched_pages().len(),
-    );
-    let global_child = real_child(artifacts, wrap_opts.clone(), &proved);
-    mark("AFTER the global child");
 
     // ⛔ A NAMED STOP, AND NOT A REFUSAL.
     //
