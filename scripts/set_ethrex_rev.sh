@@ -40,6 +40,7 @@ TOOLING_MANIFESTS=(
   tooling/ethrex-tests/Cargo.toml
   tooling/ethrex-block-converter/Cargo.toml
   tooling/ethrex-fixtures/Cargo.toml
+  tooling/ethrex-ssz-input/Cargo.toml
 )
 
 MANIFESTS=("${GUEST_MANIFESTS[@]}" "${TOOLING_MANIFESTS[@]}")

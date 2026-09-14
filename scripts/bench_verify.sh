@@ -31,13 +31,13 @@
 #        n=4 it is 0.125 and the arm can only ever report BORDERLINE, however large and
 #        clean the effect.
 #        WORKLOAD=real|synthetic (default real) which BLOCK both arms prove.
-#        `real` fetches the real-block fixture (identity lives in the Makefile) and runs
+#        `real` builds the real-block fixture (identity lives in the Makefile) and runs
 #        the continuation arm ONLY — a real block is hundreds of GB monolithically, so
 #        that arm is skipped rather than left to OOM. See "Workload" below.
 #        CONT_EPOCH_LOG2=<n> continuation epoch size (default 20, min 18). 20 is the
 #        laptop-safe setting, not the fast one: prefer the calibrated tier for the box
 #        you are on — 2^22 on the bench runner or a 64 GiB machine, 2^23 on a 128 GiB
-#        one (see tooling/ethrex-block-converter/README.md, "Choosing the epoch size"),
+#        one (see tooling/ethrex-fixtures/README.md, "Choosing the epoch size"),
 #        which is what /bench and /bench-abba pin. (`cli prove --epoch-size-log2 --help`
 #        measured ethrex 10tx at ~9.5 GB for 2^20 vs ~15.8 GB for 2^21.) Note this does
 #        NOT match bench_recursion_cycles.sh's BLOCK_EPOCH_LOG2=21: that arm needs FEW
@@ -181,12 +181,13 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ "$WORKLOAD" = "real" ]; then
-  # ~1 MB, gitignored, never in a fresh checkout. Fetched by URL + sha256, not built:
-  # no converter and no ethrex host dependency tree on this path. Unconditional on
-  # purpose: the target hashes whatever is already on disk on every invocation, which
-  # is how a stale copy left by an earlier block or an interrupted fetch gets caught.
-  # A match costs ~35 ms, so there is nothing to gate it on.
-  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  # 549 KB, gitignored, never in a fresh checkout. GENERATED from the block's replay
+  # cache (the cache is what gets fetched, by URL + sha256), so a miss here is a cargo
+  # build of tooling/ethrex-fixtures and not a download. Unconditional on purpose: the
+  # target hashes whatever is already on disk on every invocation, which is how a stale
+  # copy left by an earlier block or an interrupted write gets caught. A match costs
+  # ~35 ms, so there is nothing to gate it on.
+  echo "==> Verifying ethrex real-block fixture (regenerates on a digest miss)"
   make ethrex-real-block-fixture
 elif [ ! -f "$INPUT_REL" ]; then
   echo "==> Generating ethrex 20-transfer fixture (missing)"
