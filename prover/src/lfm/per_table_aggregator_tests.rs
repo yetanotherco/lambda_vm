@@ -3200,6 +3200,104 @@ fn in_index_order_returns_index_order_when_completion_is_reversed() {
     );
 }
 
+/// ★★★ THE HETEROGENEOUS POOL'S ORDERING GATE, with completion FORCED to the
+/// reverse of the index order and the odd task in the middle rather than at an
+/// end — where an off-by-one in the index shift would still look right.
+///
+/// This is `in_index_order`'s own ordering test, extended to the shape level 0
+/// takes under `LFM_TREE_TOP_OVERLAP`: `n + 1` tasks, one of them a different
+/// kind, drained by [`split_pool_out`]. The claim is that the wraps come out in
+/// INDEX order regardless of when they finished, because the interior indexes
+/// `children`, `layouts` and `labels` by position.
+#[test]
+fn split_pool_out_keeps_index_order_when_completion_is_reversed() {
+    const N: usize = 9;
+    const ODD: usize = 4;
+    let finished: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    let out = in_index_order(N, 4, |j| {
+        std::thread::sleep(std::time::Duration::from_millis(20 * (N - j) as u64));
+        finished.lock().expect("the order log").push(j);
+        if j == ODD {
+            PoolOut::Global(format!("global at {j}"))
+        } else {
+            PoolOut::Wrap(j * 10)
+        }
+    });
+    let (wraps, global) = split_pool_out(out, true);
+    assert_eq!(
+        wraps,
+        (0..N)
+            .filter(|j| *j != ODD)
+            .map(|j| j * 10)
+            .collect::<Vec<_>>(),
+        "the wraps must arrive in INDEX order with the odd task removed"
+    );
+    assert_eq!(global.as_deref(), Some("global at 4"));
+    let finished = finished.into_inner().expect("the order log");
+    assert_ne!(
+        finished,
+        (0..N).collect::<Vec<_>>(),
+        "the test did not force a reordering, so it proved nothing: {finished:?}"
+    );
+}
+
+/// ★ THE CONTROL AND THE CANDIDATE MUST AGREE ON THE WRAPS.
+///
+/// The same nine wrap values, once as a plain pool of 9 and once as a pool of 10
+/// whose task 0 is the global — which is exactly the difference the knob makes.
+/// The wrap sequence must be identical, because the IDENTITY lines are compared
+/// byte for byte against a run with the knob unset.
+#[test]
+fn the_overlap_does_not_move_a_single_wrap() {
+    let control: Vec<usize> = in_index_order(9, 3, |j| j * 7);
+    let candidate = in_index_order(10, 3, |j| {
+        if j == 0 {
+            PoolOut::Global(())
+        } else {
+            PoolOut::Wrap((j - 1) * 7)
+        }
+    });
+    let (wraps, global) = split_pool_out(candidate, true);
+    assert_eq!(wraps, control, "the overlap changed the wrap sequence");
+    assert!(global.is_some());
+}
+
+/// ⚠ A panic in the GLOBAL task must reach the caller with its message, like any
+/// other task's. Level 0's pool is where the global now runs, so a failure there
+/// used to abort a `K=1` stage with its own message and must not become "a
+/// scoped thread panicked" by moving.
+#[test]
+fn a_panicking_global_task_re_raises_with_its_message() {
+    let caught = std::panic::catch_unwind(|| {
+        in_index_order(5, 2, |j| {
+            if j == 0 {
+                panic!("THE GLOBAL PARENT SAYS SO");
+            }
+            PoolOut::<usize, ()>::Wrap(j)
+        })
+    });
+    let payload = caught.expect_err("a panicking global task must panic the caller");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<not a string>");
+    assert!(
+        msg.contains("THE GLOBAL PARENT SAYS SO"),
+        "the panic lost its message: {msg:?}"
+    );
+}
+
+/// ⛔ And the knob's OFF arm must carry no global at all — the assert inside
+/// `split_pool_out` is what stops a run that quietly stopped scheduling the task
+/// from reaching the root with no child to give it.
+#[test]
+#[should_panic(expected = "exactly when the overlap is on")]
+fn a_missing_global_task_is_caught_at_the_drain() {
+    let out: Vec<PoolOut<usize, ()>> = (0..4).map(PoolOut::Wrap).collect();
+    let _ = split_pool_out(out, true);
+}
+
 /// One worker, and the same answer — the control arm runs `task` inline and
 /// must not be a different computation from the parallel one.
 #[test]
@@ -3284,6 +3382,67 @@ fn tree_siblings() -> usize {
 /// (`LFM_TREE_SIBLINGS=2,4`). That spelling makes the common case need
 /// punctuation and lets a typo arm level 0 silently — the one thing this must
 /// never do.
+/// Whether the root's extra child — the global slices and their parent — runs as
+/// a TASK INSIDE level 0's pool instead of as a `K=1` stage between level 0 and
+/// level 1.
+///
+/// Unset is today's shape, so the control arm and the candidate arm are the same
+/// binary. `LFM_TREE_TOP_OVERLAP=1` turns it on; an empty value reads as unset,
+/// for `resolve_siblings`' reason.
+/// One slot of a pool whose tasks are not all the same kind.
+///
+/// Level 0's pool proves epoch wraps; under `LFM_TREE_TOP_OVERLAP` one of its
+/// tasks proves the root's extra child instead. `in_index_order` is homogeneous
+/// in `T`, so the two kinds travel as one type and are separated on the way out.
+#[derive(Debug)]
+enum PoolOut<W, G> {
+    Wrap(W),
+    Global(G),
+}
+
+/// Split a heterogeneous pool's output: the wraps IN INDEX ORDER, and the odd
+/// one out if it ran.
+///
+/// ⛔ THE ORDER IS THE POINT, not the split. `children`, `layouts` and `labels`
+/// are three parallel vectors the interior indexes by position, so a wrap
+/// arriving at the wrong index is a node built over the wrong subtree — and the
+/// IDENTITY lines would still print, just about a different tree. `filter_map`
+/// over an already-index-ordered vector preserves the relative order of what
+/// survives, which is why this is safe and why it is written once with a test
+/// rather than inline at the call site.
+///
+/// `expect_global` is asserted rather than inferred so a knob that silently
+/// stopped scheduling the task fails here instead of much later, where the
+/// symptom would be a missing root child.
+fn split_pool_out<W, G>(out: Vec<PoolOut<W, G>>, expect_global: bool) -> (Vec<W>, Option<G>) {
+    let mut global = None;
+    let wraps: Vec<W> = out
+        .into_iter()
+        .filter_map(|o| match o {
+            PoolOut::Wrap(w) => Some(w),
+            PoolOut::Global(g) => {
+                assert!(global.is_none(), "a pool may carry at most ONE global task");
+                global = Some(g);
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        global.is_some(),
+        expect_global,
+        "the global task runs in this pool exactly when the overlap is on"
+    );
+    (wraps, global)
+}
+
+fn tree_top_overlap() -> bool {
+    match std::env::var("LFM_TREE_TOP_OVERLAP").ok().as_deref() {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("LFM_TREE_TOP_OVERLAP must be `0` or `1`, got `{other}`"),
+    }
+}
+
 fn tree_siblings_l0() -> usize {
     let k = std::env::var("LFM_TREE_K_L0").ok();
     let s = std::env::var("LFM_TREE_SIBLINGS_L0").ok();
@@ -4880,11 +5039,61 @@ fn the_production_tree_composes_to_a_root() {
     // ★★★ THE WRAPS' BYTE-IDENTITY LINES, at the join and so in index order —
     // the same gate the interior levels carry, in the same shape, so one grep
     // covers the whole tree.
-    for (k, (child, layout, lbl, cells, instrs)) in
-        in_index_order(bundle.num_epochs(), l0_siblings, prove_one_wrap)
-            .into_iter()
-            .enumerate()
-    {
+    // ★★★ THE ROOT'S EXTRA CHILD, AS ONE MORE TASK IN THIS POOL.
+    //
+    // ✓ `prove_global_child` reads only the base bundle — its signature says so —
+    // so it can run beside any wrap. Under `LFM_TREE_TOP_OVERLAP=1` it becomes
+    // task 0 of level 0's existing pool instead of a `K=1` stage afterwards.
+    //
+    // ⛔ ONE MORE TASK, NOT ONE MORE WORKER, and that is the whole memory
+    // argument. A thread beside the level would put `l0_siblings + 1` host
+    // working sets on a 57.53 GiB box with a 52 GiB stop; as an item in the SAME
+    // pool at most `l0_siblings` are ever live and one of them is a slice
+    // INSTEAD of a wrap. The card is unaffected either way — the global task
+    // takes the same permit every wrap takes.
+    //
+    // ⛔ INDEX 0 so a free worker picks it up immediately. It is ~10 s against a
+    // wrap's ~14.6 worker-seconds; queued last it would BE the tail and the
+    // lever would pay for itself twice.
+    let top_overlap = tree_top_overlap();
+    let l0_offset = usize::from(top_overlap);
+    if top_overlap {
+        println!(
+            "   ★ TOP OVERLAP: the global slices + parent run as task 0 of level \
+             0's pool (LFM_TREE_TOP_OVERLAP=1; unset = the K=1 stage after \
+             level 0)"
+        );
+    }
+    type L0Out = PoolOut<Box<WrapSlot>, Box<Option<(RealGlobal, RealChild)>>>;
+    let level0_mode = stage_mode(0);
+    let l0_out = in_index_order(bundle.num_epochs() + l0_offset, l0_siblings, |j| -> L0Out {
+        if top_overlap && j == 0 {
+            PoolOut::Global(Box::new(prove_global_child(
+                &inputs.elf_bytes,
+                &bundle,
+                &inner,
+                &wrap_opts,
+                cache_dir.as_deref(),
+                fan_in,
+                &ceiling,
+                level0_mode,
+            )))
+        } else {
+            PoolOut::Wrap(Box::new(prove_one_wrap(j - l0_offset)))
+        }
+    });
+    // ⓘ Drained in index order, so the wraps arrive exactly as the serial loop
+    // built them and the global — if it ran here — is lifted out of slot 0. The
+    // IDENTITY lines below are therefore byte-identical in content AND order to
+    // a run with the knob unset; that is the gate this lever is measured under.
+    let (l0_wraps, overlapped_global) = split_pool_out(l0_out, top_overlap);
+    let overlapped_global = overlapped_global.map(|g| *g);
+    assert_eq!(
+        l0_wraps.len(),
+        bundle.num_epochs(),
+        "level 0's pool must yield one slot per epoch; the global task is not a wrap"
+    );
+    for (k, (child, layout, lbl, cells, instrs)) in l0_wraps.into_iter().map(|w| *w).enumerate() {
         println!(
             "   wrap {k} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
              · published {} words · {cells} cells ({instrs} instructions)",
@@ -4936,7 +5145,6 @@ fn the_production_tree_composes_to_a_root() {
     // ⓘ `None` until the overlap lands — this commit is the extraction alone, and
     // a refactor that changes behaviour in the same diff cannot be reviewed as a
     // no-op.
-    let overlapped_global: Option<Option<(RealGlobal, RealChild)>> = None;
     let produced = match overlapped_global {
         Some(done) => done,
         None => prove_global_child(
@@ -4947,7 +5155,7 @@ fn the_production_tree_composes_to_a_root() {
             cache_dir.as_deref(),
             fan_in,
             &ceiling,
-            stage_mode(0),
+            level0_mode,
         ),
     };
     // ⓘ `None` is `LFM_TREE_SIZE_GLOBAL`'s named stop, re-raised here as the
