@@ -146,6 +146,8 @@ fi
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
+# Unset PID (WORKLOAD=synthetic) and already-reaped PID both fall through to `|| true`.
+kill_fixture() { kill "${FIXTURE_PID:-}" 2>/dev/null || true; }
 if [ ! -f "$ELF_REL" ]; then
   echo "==> Building ethrex guest ELF (missing)"
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
@@ -169,8 +171,8 @@ if [ "$WORKLOAD" = "real" ]; then
   make ethrex-real-block-fixture > "$WORK/fixture_build.log" 2>&1 &
   FIXTURE_PID=$!
   # A failure below must not leave a cargo build running: on the shared bench runner the
-  # next batch would measure against it.
-  trap 'kill "${FIXTURE_PID:-}" 2>/dev/null || true' EXIT
+  # next batch would measure against it. No-op once the wait below has reaped it.
+  trap kill_fixture EXIT
 elif [ ! -f "$INPUT_REL" ]; then
   echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
   ( cd tooling/ethrex-fixtures && cargo build --release )
@@ -214,13 +216,12 @@ elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A $BENCH_FEATURES" ] || \
   need_build=1
 fi
 if [ "$need_build" = "1" ]; then
-  # Takes the backgrounded fixture build with it: `trap cleanup EXIT` replaces the trap
-  # set for it in step 1, so this is what stops it when a build here fails.
-  cleanup() {
-    git worktree remove --force "$WT" 2>/dev/null || true
-    kill "${FIXTURE_PID:-}" 2>/dev/null || true
-  }
-  trap cleanup EXIT
+  # `cleanup` removes the worktree and NOTHING else, because it is also called on the
+  # success path below, where the fixture build must survive. Killing it belongs to the
+  # EXIT trap only -- which has to name both, since `trap ... EXIT` here replaces the one
+  # step 1 set for the fixture.
+  cleanup() { git worktree remove --force "$WT" 2>/dev/null || true; }
+  trap 'cleanup; kill_fixture' EXIT
   git worktree remove --force "$WT" 2>/dev/null || true
   echo "==> Building both prover binaries in isolated worktree $WT"
   git worktree add --detach "$WT" "$SHA_B" >/dev/null
@@ -249,7 +250,9 @@ if [ "$need_build" = "1" ]; then
   build_cli "$SHA_B" cli_B
   build_cli "$SHA_A" cli_A
   cleanup
-  trap - EXIT
+  # Back to step 1's trap, not `trap - EXIT`: the fixture build is still running and an
+  # abort between here and the wait below should still take it down.
+  trap kill_fixture EXIT
 else
   echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
