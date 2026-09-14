@@ -158,8 +158,14 @@ pub fn build_stateless_input(
     Ok(bytes)
 }
 
-/// The guest's public output: `state_root(32) || successful_validation(1) ||
+/// The guest's public output: the fields of ethrex's `SszStatelessValidationResult` in
+/// declaration order — `new_payload_request_root(32) || successful_validation(1) ||
 /// chain_id(8) || schema_id(2)`.
+///
+/// Those first 32 bytes are the payload request's `hash_tree_root`, not a state root. The
+/// post-state root is checked inside `validate_stateless_execution`, and what the guest
+/// publishes about it is the flag at [`VALIDATION_FLAG`] — so the flag is the whole verdict,
+/// and there is no root in the output worth comparing against the block.
 pub const GUEST_OUTPUT_LEN: usize = 43;
 /// Offset of `successful_validation` within that output.
 pub const VALIDATION_FLAG: usize = 32;
