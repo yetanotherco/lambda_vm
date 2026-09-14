@@ -824,11 +824,11 @@ pub struct AirWithBuses<
     constraint_set: CS,
     /// The LogUp layout: the framework generates the LogUp (extension)
     /// constraints from this and appends them after the `constraint_set` ones.
-    /// Detras de `Arc` por el mismo motivo que `constraint_program`: clonar un
-    /// `AirWithBuses` copiaba las interacciones DOS veces (aca y en
-    /// `auxiliary_trace_build_data`), y el verificador en-VM clona un AIR por
-    /// tabla por epoca. Medido en el guest de recursion: clone+drop de
-    /// `Vec<BusInteraction>` eran el 9,2% de sus ciclos, sin hacer matematica.
+    /// Behind `Arc` for the same reason as `constraint_program`: cloning an
+    /// `AirWithBuses` copied the interaction list TWICE (here and in
+    /// `auxiliary_trace_build_data`), and the in-VM verifier clones one AIR per
+    /// table per epoch. Measured on the recursion guest, clone+drop of
+    /// `Vec<BusInteraction>` was 9.2% of its cycles while computing nothing.
     logup: std::sync::Arc<LogUpLayout>,
     /// Idx-ordered metadata for all transition constraints, DERIVED at
     /// construction: `constraint_set.meta()` (base prefix) followed by the

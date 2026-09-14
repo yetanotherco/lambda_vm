@@ -397,12 +397,12 @@ pub trait IsStarkVerifier<
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        // `1/(z^N − 1)` es el mismo para TODAS las constraints de este AIR: se
-        // calcula una vez acá en vez de una vez por constraint adentro del loop.
-        let zerofier_base_inv = crate::constraints::zerofier::zerofier_base_inv::<Field, FieldExtension>(
-            &challenges.z,
-            trace_length,
-        );
+        // `1/(z^N - 1)` is the same for EVERY constraint of this AIR, so it is
+        // computed once here instead of once per constraint inside the loop.
+        let zerofier_base_inv = crate::constraints::zerofier::zerofier_base_inv::<
+            Field,
+            FieldExtension,
+        >(&challenges.z, trace_length);
         air.constraints_meta().iter().for_each(|m| {
             denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
                 m,
