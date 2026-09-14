@@ -204,12 +204,104 @@ where
 /// same DECODE/BITWISE/range tables once per epoch — those trees are
 /// execution-independent; only the multiplicity columns change per run.
 /// Type-erased so one static serves every field instantiation.
-fn precomputed_tree_cache()
--> &'static Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>> {
-    static CACHE: OnceLock<
-        Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>>,
-    > = OnceLock::new();
+///
+/// # ⚠ It is CAPPED in recursion, and why
+///
+/// The cache was built for the BASE, where the same execution-independent
+/// DECODE/BITWISE/range trees recur every epoch and hit. ✓ Measured on the
+/// block tree (2026-09-14): the recursion inserts **7–9 program-dependent trees
+/// per proof** whose roots never recur — a child's label is a program constant,
+/// so every node proves a distinct program — while still hitting ~35% on the
+/// shared tables. Unbounded, that reached **357 entries at ~99.7 MiB each =
+/// essentially ALL of the 34.2 GiB of live host allocation at the end of a
+/// block**, and it is what made the interior's host peaks rise while the levels
+/// shrank.
+///
+/// ⇒ [`PRECOMPUTED_TREE_CACHE_CAP_ENV`] bounds it, LRU by recency of use.
+/// ✓ Eviction is **semantically free**: the doc above is the argument — the
+/// lookup key IS the root a rebuild would be checked against, so a hit needs no
+/// re-verification and a miss is only a rebuild. Nothing a proof commits to can
+/// move.
+///
+/// The value carries a recency tick beside the tree. The cap is small (tens), so
+/// the O(n) scan for the least-recently-used entry costs less than any ordering
+/// structure would.
+type PrecomputedTreeMap =
+    std::collections::HashMap<Commitment, (u64, Arc<dyn std::any::Any + Send + Sync>)>;
+
+fn precomputed_tree_cache() -> &'static Mutex<PrecomputedTreeMap> {
+    static CACHE: OnceLock<Mutex<PrecomputedTreeMap>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Entries to keep. **Unset = unbounded = the behaviour before the cap
+/// existed**, so a control arm is the same binary with the knob absent.
+pub const PRECOMPUTED_TREE_CACHE_CAP_ENV: &str = "LFM_PRECOMPUTED_TREE_CACHE_CAP";
+
+/// The cap, read once. `None` = unbounded. A value of `0` is treated as unset
+/// rather than as "cache nothing": a zero-size cache would evict on every insert
+/// and turn every lookup into a miss, which is a configuration nobody wants and
+/// a typo everybody makes.
+fn precomputed_tree_cache_cap() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var(PRECOMPUTED_TREE_CACHE_CAP_ENV)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
+/// Monotone recency clock. Bumped on every hit and every insert, so "least
+/// recently USED" means used, not merely inserted — which is the whole point:
+/// the shared tables that hit must survive eviction of the program-dependent
+/// ones that never do.
+static PRECOMPUTED_TREE_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Evictions performed, for the line that reports the cache. ★ The falsifier's
+/// own counter: a run whose MISSES rise with the cap in place has a cap below
+/// its working set, and these two numbers are what say so.
+static PRECOMPUTED_TREE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// `(entries, hits, misses, evictions)` for the cache.
+pub fn precomputed_tree_cache_stats() -> (usize, u64, u64, u64) {
+    let (hits, misses) = precomputed_tree_cache_hit_miss();
+    (
+        precomputed_tree_cache_entries(),
+        hits,
+        misses,
+        PRECOMPUTED_TREE_EVICTIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// Insert into `map`, evicting the least recently used entry while the map is
+/// over `cap`.
+///
+/// ⛔ Split out from [`precomputed_tree_cache_put`] and taking `cap` as an
+/// ARGUMENT so the tests can exercise a real cap. The live cap is a process-wide
+/// `OnceLock` read from the environment; a test that could only reach it through
+/// that would exercise the UNBOUNDED path and pass whatever the eviction did —
+/// a check that cannot fail.
+fn precomputed_tree_insert_capped(
+    map: &mut PrecomputedTreeMap,
+    root: Commitment,
+    tree: Arc<dyn std::any::Any + Send + Sync>,
+    cap: Option<usize>,
+) {
+    let tick = PRECOMPUTED_TREE_TICK.fetch_add(1, Ordering::Relaxed);
+    map.insert(root, (tick, tree));
+    let Some(cap) = cap else { return };
+    while map.len() > cap {
+        // The cap is tens of entries, so this scan is cheaper than maintaining
+        // an order. `expect` is unreachable: the loop condition implies len > 0.
+        let lru = map
+            .iter()
+            .min_by_key(|(_, (t, _))| *t)
+            .map(|(k, _)| *k)
+            .expect("a map with len > cap >= 1 is non-empty");
+        map.remove(&lru);
+        PRECOMPUTED_TREE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// ★★ HOW MANY DISTINCT SHAPES THE TWO PROCESS-GLOBAL CACHES HOLD.
@@ -274,11 +366,19 @@ pub fn precomputed_tree_cache_hit_miss() -> (u64, u64) {
 pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
 ) -> Option<Arc<MerkleTree<B>>> {
-    let cache = precomputed_tree_cache().lock().unwrap();
+    let mut cache = precomputed_tree_cache().lock().unwrap();
     let out = cache
         .get(root)
-        .cloned()
+        .map(|(_, any)| Arc::clone(any))
         .and_then(|any| any.downcast::<MerkleTree<B>>().ok());
+    // ★ A HIT REFRESHES RECENCY. Without this the cap would evict by insertion
+    // order, which throws away exactly the shared tables that keep hitting and
+    // keeps the program-dependent ones that never will.
+    if out.is_some()
+        && let Some(slot) = cache.get_mut(root)
+    {
+        slot.0 = PRECOMPUTED_TREE_TICK.fetch_add(1, Ordering::Relaxed);
+    }
     // ⛔ Counted on the DOWNCAST result, not on the map lookup: a key that is
     // present but holds another backend's tree is a miss to the caller, and
     // counting the lookup would report a hit the caller never got.
@@ -294,10 +394,12 @@ pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     root: Commitment,
     tree: Arc<MerkleTree<B>>,
 ) {
-    precomputed_tree_cache()
-        .lock()
-        .unwrap()
-        .insert(root, tree as Arc<dyn std::any::Any + Send + Sync>);
+    precomputed_tree_insert_capped(
+        &mut precomputed_tree_cache().lock().unwrap(),
+        root,
+        tree as Arc<dyn std::any::Any + Send + Sync>,
+        precomputed_tree_cache_cap(),
+    );
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
@@ -5424,5 +5526,141 @@ mod walk_tests {
     #[test]
     fn ties_keep_registry_order() {
         assert_eq!(heaviest_first(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod precomputed_tree_cache_tests {
+    use super::*;
+    use crate::config::COMMITMENT_SIZE;
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    /// A backend with no hashing at all: the tests here are about the CACHE's
+    /// eviction, not about Merkle construction, and a real hasher would only
+    /// make them slower and their failures harder to read.
+    #[derive(Debug)]
+    struct TestBackend;
+    impl IsMerkleTreeBackend for TestBackend {
+        type Node = u64;
+        type Data = u64;
+        fn hash_data(leaf: &u64) -> u64 {
+            *leaf
+        }
+        fn hash_new_parent(a: &u64, b: &u64) -> u64 {
+            a.wrapping_add(*b)
+        }
+    }
+
+    fn root(n: u8) -> Commitment {
+        let mut c = [0u8; COMMITMENT_SIZE];
+        c[0] = n;
+        c
+    }
+    fn tree(n: u64) -> Arc<MerkleTree<TestBackend>> {
+        Arc::new(MerkleTree::<TestBackend>::build(&[n, n + 1]).expect("two leaves build a tree"))
+    }
+    fn erased(n: u64) -> Arc<dyn std::any::Any + Send + Sync> {
+        tree(n) as Arc<dyn std::any::Any + Send + Sync>
+    }
+    fn keys(m: &PrecomputedTreeMap) -> Vec<u8> {
+        let mut k: Vec<u8> = m.keys().map(|c| c[0]).collect();
+        k.sort_unstable();
+        k
+    }
+
+    /// ⛔ THE CAP EVICTS THE LEAST RECENTLY USED, NOT THE OLDEST INSERTED.
+    ///
+    /// Written against the bug it would otherwise have: evicting by insertion
+    /// order throws away exactly the shared tables that keep hitting and keeps
+    /// the program-dependent ones that never will — the opposite of the point.
+    /// Key 1 is TOUCHED after 2 and 3 land, so insertion order would evict it
+    /// and recency must not.
+    #[test]
+    fn the_cap_evicts_by_recency_of_use_not_by_insertion_order() {
+        let mut m = PrecomputedTreeMap::new();
+        let cap = Some(3);
+        for n in 1..=3u8 {
+            precomputed_tree_insert_capped(&mut m, root(n), erased(n as u64), cap);
+        }
+        assert_eq!(keys(&m), vec![1, 2, 3]);
+
+        // Touch 1, the way a hit does.
+        m.get_mut(&root(1)).expect("1 is present").0 =
+            PRECOMPUTED_TREE_TICK.fetch_add(1, Ordering::Relaxed);
+
+        precomputed_tree_insert_capped(&mut m, root(4), erased(4), cap);
+        assert_eq!(
+            keys(&m),
+            vec![1, 3, 4],
+            "★ 2 is the least recently USED and must be the one evicted; \
+             seeing 1 gone means eviction is by insertion order"
+        );
+        assert_eq!(m.len(), 3, "the cap holds");
+    }
+
+    /// The property the cap exists to preserve: a key that keeps being used
+    /// survives unrelated traffic, as long as the working set fits.
+    #[test]
+    fn a_repeatedly_used_key_survives_unrelated_inserts_under_the_cap() {
+        let mut m = PrecomputedTreeMap::new();
+        let cap = Some(4);
+        precomputed_tree_insert_capped(&mut m, root(99), erased(99), cap);
+        for n in 1..=12u8 {
+            precomputed_tree_insert_capped(&mut m, root(n), erased(n as u64), cap);
+            m.get_mut(&root(99)).expect("99 is still present").0 =
+                PRECOMPUTED_TREE_TICK.fetch_add(1, Ordering::Relaxed);
+        }
+        assert!(
+            m.contains_key(&root(99)),
+            "the hot key was evicted despite being used between every insert"
+        );
+        assert_eq!(m.len(), 4, "and the cap still holds");
+    }
+
+    /// ⛔ A hit must hand back the SAME allocation, not an equal one: the whole
+    /// saving is not rebuilding the tree.
+    #[test]
+    fn a_hit_returns_the_identical_tree() {
+        let t = tree(7);
+        let mut m = PrecomputedTreeMap::new();
+        precomputed_tree_insert_capped(
+            &mut m,
+            root(7),
+            Arc::clone(&t) as Arc<dyn std::any::Any + Send + Sync>,
+            Some(2),
+        );
+        let got = m
+            .get(&root(7))
+            .map(|(_, any)| Arc::clone(any))
+            .and_then(|any| any.downcast::<MerkleTree<TestBackend>>().ok())
+            .expect("the entry is present and is this backend's tree");
+        assert!(
+            Arc::ptr_eq(&t, &got),
+            "a hit returned a different allocation"
+        );
+    }
+
+    /// ⛔ THE CONTROL ARM. Unset, the cap must leave the map exactly as it was
+    /// before the cap existed — otherwise every A/B on this knob compares two
+    /// changed things.
+    #[test]
+    fn no_cap_leaves_the_map_unbounded() {
+        let mut m = PrecomputedTreeMap::new();
+        for n in 0..=200u8 {
+            precomputed_tree_insert_capped(&mut m, root(n), erased(n as u64), None);
+        }
+        assert_eq!(m.len(), 201, "an unset cap must not evict anything");
+    }
+
+    /// ⓘ `0` is read as UNSET, not as "cache nothing" — a zero-size cache would
+    /// miss on every lookup, which is a typo nobody means to make.
+    #[test]
+    fn a_zero_cap_is_read_as_unset() {
+        // The live knob is a process-wide OnceLock, so this asserts the parse
+        // rule the knob applies rather than the knob itself.
+        let parse = |v: &str| v.parse::<usize>().ok().filter(|&n| n > 0);
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("64"), Some(64));
+        assert_eq!(parse("notanumber"), None);
     }
 }
