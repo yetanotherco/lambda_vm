@@ -297,22 +297,18 @@ mod tests {
 
     #[test]
     fn legacy_cache_is_rejected_without_amsterdam_fields() {
-        let result = stateless_input_from_cache(CACHE);
-        let Err(error) = result else {
+        // Fail on the missing cache instead of accepting its I/O error as the rejection:
+        // every error reads as a pass otherwise, and this test would go green on a clean
+        // checkout having asserted nothing. `unmappable_network_is_rejected` reports the
+        // same condition the same way.
+        assert!(std::path::Path::new(CACHE).exists(), "{CACHE_MISSING}");
+        let Err(error) = stateless_input_from_cache(CACHE) else {
             panic!("the checked-in replay cache unexpectedly has Amsterdam fields");
         };
-        if !std::path::Path::new(CACHE).exists() {
-            assert!(
-                error.to_string().contains("No such file")
-                    || error.to_string().contains("os error"),
-                "{CACHE_MISSING}: {error}"
-            );
-        } else {
-            assert!(
-                error.to_string().contains("Amsterdam"),
-                "unexpected error: {error}"
-            );
-        }
+        assert!(
+            error.to_string().contains("Amsterdam"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
