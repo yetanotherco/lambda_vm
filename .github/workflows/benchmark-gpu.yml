@@ -176,7 +176,15 @@ jobs:
             // Per-prove wall varies with the rented host's CPU
             // (the prover is partly host-CPU-bound), so the slope is the measured one
             // and the intercept carries slack for a colder box.
-            const mins = 12 + Number(process.env.PAIRS) * 4;
+            // The intercept also has to cover the real-block fixture, which this box
+            // BUILDS rather than downloads -- it is generated from the block's replay
+            // cache, and a rented box is always a fresh checkout -- i.e. a cold cargo
+            // build of tooling/ethrex-fixtures, ethrex host tree and C dependencies
+            // included, at CARGO_BUILD_JOBS=8. bench_abba.sh backgrounds it so it runs
+            // under the dual cuda build rather than before it, so what reaches the ETA is
+            // only the part that outlasts that build. Neither has been measured, which is
+            // why this is 18 and not a number with a decimal point.
+            const mins = 18 + Number(process.env.PAIRS) * 4;
             const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) of ${process.env.WORKLOAD} on the CUDA prover path. Rough ETA ~${mins} min. The result will replace this comment.`;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,

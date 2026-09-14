@@ -156,8 +156,21 @@ if [ "$WORKLOAD" = "real" ]; then
   # checkout. Built from the block's replay cache (fetched by URL + sha256): ethrex 25's
   # guest decodes only the Amsterdam schema, so no hosted artifact for this block can be
   # valid. The generator validates the block through the guest before writing.
-  echo "==> Building ethrex real-block fixture (from its replay cache)"
-  make ethrex-real-block-fixture
+  #
+  # Backgrounded so it runs UNDER step 2's prover builds instead of before them. On a
+  # persistent runner the fixture is already on disk and this is a ~35 ms digest check;
+  # on a freshly rented, hourly-billed box it is a cold cargo build of the ethrex host
+  # tree, and that is minutes the two builds would otherwise pay one after the other.
+  # Separate workspace and target dir, so they compile in parallel -- what they do share
+  # is cargo's package-cache lock, which serialises downloads for a few seconds and
+  # nothing else. Nothing before the cycle floor reads the fixture, which is where this
+  # is waited on.
+  echo "==> Building ethrex real-block fixture (from its replay cache; in background)"
+  make ethrex-real-block-fixture > "$WORK/fixture_build.log" 2>&1 &
+  FIXTURE_PID=$!
+  # A failure below must not leave a cargo build running: on the shared bench runner the
+  # next batch would measure against it.
+  trap 'kill "${FIXTURE_PID:-}" 2>/dev/null || true' EXIT
 elif [ ! -f "$INPUT_REL" ]; then
   echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
   ( cd tooling/ethrex-fixtures && cargo build --release )
@@ -201,7 +214,12 @@ elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A $BENCH_FEATURES" ] || \
   need_build=1
 fi
 if [ "$need_build" = "1" ]; then
-  cleanup() { git worktree remove --force "$WT" 2>/dev/null || true; }
+  # Takes the backgrounded fixture build with it: `trap cleanup EXIT` replaces the trap
+  # set for it in step 1, so this is what stops it when a build here fails.
+  cleanup() {
+    git worktree remove --force "$WT" 2>/dev/null || true
+    kill "${FIXTURE_PID:-}" 2>/dev/null || true
+  }
   trap cleanup EXIT
   git worktree remove --force "$WT" 2>/dev/null || true
   echo "==> Building both prover binaries in isolated worktree $WT"
@@ -238,6 +256,13 @@ else
 fi
 
 if [ "$WORKLOAD" = "real" ]; then
+  if ! wait "$FIXTURE_PID"; then
+    echo "ERROR: the real-block fixture could not be built:" >&2
+    cat "$WORK/fixture_build.log" >&2
+    exit 1
+  fi
+  trap - EXIT
+  echo "==> Fixture ready: $INPUT_REL"
   # `|| workload_cycles=""` keeps the failure inside a compound: a bare assignment from a
   # failing command substitution aborts under `set -e` before the diagnostic below can
   # print, which is fail-closed but silent.
