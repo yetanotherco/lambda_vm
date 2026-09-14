@@ -49,7 +49,35 @@
 //! | reading, intrinsics vs baseline | conclusion |
 //! |---|---|
 //! | **≥ 1.5×** | D′a is OPEN — the headroom is in the multiply; an 8-way structure-of-arrays permutation is worth pricing |
-//! | **< 1.5×** | D′a is closed FOR THE MULTIPLY on this box. It is *not* a verdict on an 8-way permutation, whose win would come from throughput over latency — read the 4-chain control before writing that down |
+//! | **< 1.5×** | D′a is closed FOR THE MULTIPLY on this box. It is *not* a verdict on an 8-way permutation, whose win would come from throughput over latency — read the `BEST scalar vs BEST vector` line before writing that down |
+//!
+//! # What it answered, 2026-09-14 (ns/mul, 9950X then 7950X)
+//!
+//! baseline 0.553 / 0.683 · attribute 1.304 / 1.078 · **intrinsics 1.041 /
+//! 1.036** · plain loop-in-feature 0.473 / 0.630 · intrinsics loop-in-feature
+//! 0.819 / 0.765 · plain 4 chains 0.740 / 0.837 · **intrinsics 4 chains 0.240 /
+//! 0.367**. Kernel check 71,289/71,289 on both boxes.
+//!
+//! The pre-registered arm read **0.53× / 0.66×**, so D′a is closed for the
+//! multiply as this probe poses it. The number that survives off this page is
+//! **best scalar ÷ best vector = 1.97× / 1.72×** — above the bar, at the
+//! throughput shape a permutation has. Both are true; neither substitutes for
+//! the other. ⛔ The printed 4-chain ratio (3.08× / 2.28×) is NOT that number:
+//! its denominator is the scalar kernel at a shape that costs it 56% for
+//! reasons unrelated to vectorisation. See the comment above `best_scalar` in
+//! [`tests::goldilocks_simd_headroom`].
+//!
+//! ⚠ One 09-12 sentence above does not survive: "the attribute made things
+//! worse". Call-free, the attribute makes things BETTER — 0.553 → 0.473 on Zen
+//! 5, 0.683 → 0.630 on Zen 4 — and the baseline loop holds zero vector
+//! instructions where the attributed one holds 51 of 80. The auto-vectoriser
+//! vectorised the REDUCTION and left the multiply scalar, exactly as the
+//! instruction set forces; the 0.830 ns/mul call boundary is what buried it.
+//!
+//! The campaign disposition on this result was **no stage 2**: an 8-way
+//! permutation presupposes lane C's depth levels, and C took the target to
+//! ≈0.75 core-s per proof ≈ 0.4% of the block. This file stays a test-only
+//! probe.
 //!
 //! Run it with
 //! `cargo test --release -p lambda-vm-prover --lib goldilocks_simd -- --ignored --nocapture`.
@@ -286,6 +314,18 @@ unsafe fn mul_batch_avx512_intrinsics(state: &mut [u64; LANES], k: &[u64; LANES]
 ///   chain and is LATENCY-bound. A real permutation has twelve independent
 ///   state lanes per round, so `CHAINS > 1` is the representative shape, not
 ///   the generous one.
+///
+/// ⛔ **`CHAINS > 1` is representative for the VECTOR kernel and a penalty for
+/// the SCALAR one, so the two are not both at their best in the same arm.**
+/// Eight lanes already give `mul_batch` eight independent chains, which
+/// saturates the multiplier port; further chains buy it no ILP, and because the
+/// 64×64→128 product has no vector form, every multiply round-trips out of a
+/// vector register into a GPR and back. Staging 32 accumulators through 16 GPRs
+/// costs more of that traffic than staging 8 does — measured 09-14, `plain, 4
+/// chains` is 56% SLOWER than `plain, loop in the feature` on the 9950X with
+/// ZERO stack spills. Compare each kernel at its own best shape; the
+/// `best_scalar` comment in [`tests::goldilocks_simd_headroom`] carries the
+/// assembly evidence.
 ///
 /// `rounds · CHAINS` multiplies of work are done per lane, so every arm is
 /// called with `ROUNDS / CHAINS` and reports over the same total.
@@ -689,17 +729,41 @@ mod tests {
                     plain_in / intr_in
                 );
                 println!(
-                    "  ⇒ call-free, 4 chains  intrinsics vs plain: {:.2}×  ← the shape a \
-                     permutation has",
+                    "  ⇒ call-free, 4 chains  intrinsics vs plain: {:.2}×  ← each kernel at \
+                     ITS OWN 4-chain shape; see below before quoting it",
                     plain_c / intr_c
+                );
+
+                // ⛔ Do NOT quote the 4-chain ratio. It divides the vector kernel
+                // at its best shape by the SCALAR kernel at a shape that is not
+                // the scalar kernel's best, and the gap is not about
+                // vectorisation. Measured 09-14 on the 9950X: `plain, 4 chains`
+                // is 0.740 against `plain, loop in the feature` 0.473, 56%
+                // SLOWER, with ZERO stack spills — 32 accumulators live in
+                // vector registers and every multiply has to round-trip through
+                // a GPR because the 64×64→128 product has no vector form, so the
+                // loop is 72% pure data movement and costs 12.97 instructions
+                // per multiply against 10.00 at one chain. Eight lanes already
+                // give the scalar kernel eight independent chains, which
+                // saturates the multiplier port; more chains buy it no ILP and
+                // charge it that traffic.
+                //
+                // So compare each kernel at its OWN best measured shape. That is
+                // the defensible number and the only one to carry off this page.
+                let best_scalar = base.min(plain_in).min(plain_c);
+                let best_vector = intr.min(intr_in).min(intr_c);
+                let honest = best_scalar / best_vector;
+                println!(
+                    "  ⇒ BEST scalar {best_scalar:.3} vs BEST vector {best_vector:.3}: \
+                     {honest:.2}×  ← QUOTE THIS ONE"
                 );
 
                 // What the prize would be, at lane E's measured shares: the
                 // permutation is ~83% of `execute`, and `execute` is 1.82 s of a
-                // serial wrap. Taken at the best CALL-FREE ratio, because a
-                // rewritten permutation would not re-enter the feature per
-                // multiply.
-                let best = (plain_c / intr_c).max(plain_in / intr_in).max(1.0);
+                // serial wrap. Taken at `honest`, because a rewritten permutation
+                // would neither re-enter the feature per multiply nor hold the
+                // scalar kernel at a shape that penalises it.
+                let best = honest.max(1.0);
                 println!(
                     "  ⇒ at 83% of a 1.82 s wrap executor and {best:.2}×: {:.2} s → {:.2} s",
                     1.82,
