@@ -227,10 +227,17 @@ fn public_output_length_prefix_prevents_collision() {
 }
 
 fn epoch_state(elf: &[u8], label: u64) -> [u8; 32] {
+    epoch_state_with_role(elf, label, true)
+}
+
+fn epoch_state_with_role(elf: &[u8], label: u64, is_final: bool) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut t,
-        StatementKind::ContinuationEpoch { epoch_label: label },
+        StatementKind::ContinuationEpoch {
+            epoch_label: label,
+            is_final,
+        },
         elf,
         b"out",
         &sample_counts(),
@@ -251,6 +258,20 @@ fn continuation_epoch_state_binds_label_and_program() {
     assert_ne!(baseline, epoch_state(b"elf", 2), "must bind epoch_label");
     // Pinned to the program.
     assert_ne!(baseline, epoch_state(b"other-elf", 1), "must bind the ELF");
+}
+
+/// `is_final` decides whether HALT is in the epoch's AIR set, so a final and a
+/// non-final epoch that declare the same counts describe two different AIR sets.
+/// The verifier derives the flag from the epoch's position in the bundle, so
+/// re-reading an epoch under the other role has to move the transcript — or the
+/// two sets would be told apart by the sub-proof count alone.
+#[test]
+fn continuation_epoch_state_binds_is_final() {
+    assert_ne!(
+        epoch_state_with_role(b"elf", 1, true),
+        epoch_state_with_role(b"elf", 1, false),
+        "must bind is_final",
+    );
 }
 
 #[test]

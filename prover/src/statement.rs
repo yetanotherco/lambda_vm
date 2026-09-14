@@ -36,8 +36,9 @@ pub(crate) fn elf_digest(elf: &[u8]) -> [u8; 32] {
 pub(crate) enum StatementKind {
     /// Whole-program (monolithic) proof.
     Monolithic,
-    /// One continuation epoch proof, pinned to its position by `epoch_label`.
-    ContinuationEpoch { epoch_label: u64 },
+    /// One continuation epoch proof, pinned to its position by `epoch_label` and
+    /// to its role by `is_final`.
+    ContinuationEpoch { epoch_label: u64, is_final: bool },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,16 +159,28 @@ pub(crate) fn absorb_statement_with_digest(
         t.append_bytes(&count.to_le_bytes());
     }
 
-    // Continuation epochs additionally bind their position (replay protection).
-    // Monolithic proofs append nothing here, so their encoding is unchanged.
-    if let StatementKind::ContinuationEpoch { epoch_label } = kind {
+    // Continuation epochs additionally bind their position (replay protection)
+    // and whether they are the final one. `is_final` decides whether HALT is in
+    // the epoch's AIR set, so without it the transcripts of a final and a
+    // non-final epoch carrying the same counts are identical, and the only thing
+    // separating the two AIR sets is the sub-proof count arithmetic in
+    // `verify_epoch`. The verifier derives `is_final` from the epoch's position
+    // in the bundle, so a spliced bundle re-reads an epoch under the other role
+    // and diverges here. Monolithic proofs append nothing, so their encoding is
+    // unchanged.
+    if let StatementKind::ContinuationEpoch {
+        epoch_label,
+        is_final,
+    } = kind
+    {
         t.append_bytes(&epoch_label.to_le_bytes());
+        t.append_bytes(&[is_final as u8]);
     }
 }
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V3";
+const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V4";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

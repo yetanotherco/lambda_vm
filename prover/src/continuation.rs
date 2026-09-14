@@ -84,21 +84,26 @@ type E = GoldilocksExtension;
 type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 
 /// Fresh transcript seeded with the epoch's statement (ELF, public output, table
-/// layout) and `epoch_label` (its position). The epoch's prove, verify, and
-/// bus-balance replay all seed via this so their challenges match; the seeding
-/// pins each epoch proof to its program and position (replay protection).
+/// layout), `epoch_label` (its position) and `is_final` (whether it carries
+/// HALT). The epoch's prove, verify, and bus-balance replay all seed via this so
+/// their challenges match; the seeding pins each epoch proof to its program,
+/// position and role (replay protection).
 fn epoch_transcript(
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     epoch_label: u64,
+    is_final: bool,
     fri_final_poly_log_degree: u8,
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
-        StatementKind::ContinuationEpoch { epoch_label },
+        StatementKind::ContinuationEpoch {
+            epoch_label,
+            is_final,
+        },
         elf_bytes,
         public_output,
         table_counts,
@@ -734,6 +739,7 @@ fn prove_epoch(
             &table_counts,
             &runtime_page_ranges,
             label,
+            is_final,
             opts.fri_final_poly_log_degree,
         )
     };
@@ -848,6 +854,7 @@ fn verify_epoch(
             &table_counts,
             &runtime_page_ranges,
             label,
+            is_final,
             opts.fri_final_poly_log_degree,
         )
     };
