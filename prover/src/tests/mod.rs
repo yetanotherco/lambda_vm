@@ -61,6 +61,8 @@ pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
 #[cfg(test)]
+pub mod memmove_tests;
+#[cfg(test)]
 pub mod memw_aligned_tests;
 #[cfg(test)]
 pub mod memw_register_tests;
