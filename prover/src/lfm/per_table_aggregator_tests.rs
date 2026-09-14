@@ -4013,6 +4013,20 @@ fn the_production_tree_composes_to_a_root() {
     // ---- the base. It is needed by EVERY arm: a level-k node's program is a
     // function of its children's shapes, so even a top-level arm re-derives the
     // whole chain from the epochs. Only the PROVES are skippable.
+    // ★★ THE BASE'S OWN PEAK — the one stage in this driver that never had a
+    // window of its own.
+    //
+    // Level 0, every interior level and every node are bracketed by a
+    // `HostSampler`; the base is followed by `mark()`, which is a LIVE figure
+    // and is labelled `L_bundle` precisely because that is what it measures —
+    // the RETAINED bundle, after the prove's transients are gone. So the base's
+    // PEAK has never been measured here, and it is the missing term in the only
+    // arithmetic that can decide whether the base and level 0 may overlap:
+    // `base peak + K × (the in-phase wrap footprint) ≤ the 52 GiB stop`.
+    //
+    // ⓘ Unconditional, not behind a knob: one thread sampling `rss_marks` at
+    // 100 Hz for 67 s, which is what every other stage already pays.
+    let base_sampler = HostSampler::start();
     let t = Instant::now();
     let bundle = cached_bundle(
         if lo == 0 {
@@ -4031,10 +4045,23 @@ fn the_production_tree_composes_to_a_root() {
             .expect("the block must prove")
         },
     );
+    let base_secs = t.elapsed().as_secs_f64();
+    let (base_peak, base_at) = base_sampler.stop();
+    println!("   base: {} epochs in {base_secs:.1}s", bundle.num_epochs());
+    // ⚠ On a LOADED base this window brackets a deserialize, not a prove, and
+    // the peak means nothing about proving. The stage mode is on the line so a
+    // reader cannot mistake one for the other.
     println!(
-        "   base: {} epochs in {:.1}s",
-        bundle.num_epochs(),
-        t.elapsed().as_secs_f64()
+        "   base: host peak {base_peak:.3} GiB at t={base_at:.1}{} ({})",
+        match &ceiling {
+            Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * base_peak / g),
+            Err(_) => String::new(),
+        },
+        if lo == 0 {
+            "proved"
+        } else {
+            "LOADED — this is a deserialize, not a prove"
+        },
     );
     mark("AFTER the base (this live figure is L_bundle)");
 
