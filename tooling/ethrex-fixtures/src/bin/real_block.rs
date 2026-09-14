@@ -275,7 +275,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gas_ceil: GAS_CEIL,
     };
     let skeleton = create_payload(&payload_args, &store, Bytes::new())?;
-    let mut block_hash_cache = BTreeMap::new();
+    // Every ancestor the witness carries, not just the parent: a transaction reading
+    // BLOCKHASH at any of the other 255 depths would otherwise see zero where mainnet gave
+    // it a hash, and the fixture would quietly execute something else. The local head
+    // overwrites the real ancestor at its own height, because that is the block this one
+    // builds on. If the guest disagreed with any of it the generator would fail below, at
+    // the post-state-root check.
+    let mut block_hash_cache: BTreeMap<u64, H256> = decoded_headers
+        .iter()
+        .map(|header| (header.number, header.compute_block_hash(&NativeCrypto)))
+        .collect();
     block_hash_cache.insert(head_number, head_hash);
     let (result, rejected, t8n_error) = blockchain.build_payload_t8n(
         skeleton,
