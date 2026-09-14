@@ -5937,6 +5937,17 @@ fn the_production_tree_composes_to_a_root() {
                 child.artifacts.blake3_chunk_log_heights,
                 child.public_words.len(),
             );
+            // ⛔ THE SAME SAMPLE THE POOL TAKES, at the same logical point — one
+            // node finished. Here the level still borrows every child, so this
+            // line is FLAT by construction and the pool's is not. The contrast
+            // between the two series IS the take-on-consume measurement; the
+            // BOUNDARY reading cannot be, because `children = next` frees them
+            // before the boundary line prints, so both schedulers agree there
+            // whatever they did on the way.
+            println!(
+                "{}",
+                jemalloc_line(&format!("L{level_no}N{j} after-release"))
+            );
             report.push(row);
             next.push(child);
             next_layouts.push(layout);
@@ -6024,6 +6035,143 @@ fn the_production_tree_composes_to_a_root() {
             println!("   {}", stats.describe(&format!("level {level_no}")));
         }
     }
+    // ---- the POOLED span, when the knob asks for it.
+    //
+    // Everything the barrier loop above would have done for levels
+    // `barrier_levels+1..=hi`, in dependency order instead.
+    //
+    // ⚠ WHAT THIS SPAN CANNOT PRINT, and it is a real loss rather than an
+    // oversight: a PER-LEVEL host peak. Two levels running at once share one
+    // process, so "level 3's peak" stops being a quantity — the span reports ONE
+    // window and the per-NODE peaks the nodes print themselves. The stop
+    // condition therefore reads off the node lines and this span line, not off a
+    // per-level maximum that no longer exists.
+    if pool_on && barrier_levels < hi {
+        let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
+            .iter()
+            .take(hi)
+            .skip(barrier_levels)
+            .map(|level| level_groups(&level.arities))
+            .collect();
+        let workers = super::device_permit::workers().max(1);
+        let span_sampler = HostSampler::start();
+        let t_span = Instant::now();
+        super::program_census::begin_level();
+        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
+            .into_iter()
+            .zip(layouts)
+            .zip(labels)
+            .map(|((c, l), b)| (c, l, b))
+            .collect();
+        let first_level = barrier_levels + 1;
+        let (top, summaries) = prove_in_dependency_order(
+            &pool_groups,
+            seed,
+            workers,
+            levels_in_flight,
+            |depth, j, kids| {
+                let level_no = first_level + depth - 1;
+                let (mut ch, mut la, mut lb) = (
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                );
+                for (c, l, b) in kids {
+                    ch.push(c);
+                    la.push(l);
+                    lb.push(b);
+                }
+                let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
+                // ★★★ THE RELEASE, AND THE ONLY POINT IT IS VISIBLE. Dropped
+                // explicitly so the sample below is taken with this node's
+                // children GONE — under the barrier they cannot be, because the
+                // level borrows every child until it ends.
+                drop(ch);
+                drop(la);
+                drop(lb);
+                println!(
+                    "{}",
+                    jemalloc_line(&format!("L{level_no}N{j} after-release"))
+                );
+                // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
+                // The child is about to be eaten by its parent, so the line has
+                // to be taken while it exists; printing it here would put it in
+                // completion order, which is the thing the gate is not allowed to
+                // depend on.
+                let (_, arity, cells, instrs, ..) = row;
+                let line = format!(
+                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
+                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                     ({instrs} instructions)",
+                    child
+                        .artifacts
+                        .program_id
+                        .iter()
+                        .take(8)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    child.artifacts.log_heights,
+                    child.artifacts.blake3_chunk_log_heights,
+                    child.public_words.len(),
+                );
+                ((child, layout, lbl), (line, row))
+            },
+            |depth| {
+                // ★ THE FLOOR FALSIFIER'S OWN INSTRUMENT. Lane P5's boundary
+                // snapshots showed the interior's rising floor is LIVE bytes, not
+                // jemalloc retention (resident − allocated is 0.37–0.79 GiB at
+                // every boundary), and that the 19 wraps are still allocated after
+                // level 1 ends. Take-on-consume says they should be gone here.
+                // ⓘ The barrier loop prints this per level; the pooled span has to
+                // print it from inside, because a level's completion is a moment
+                // in the middle of the span rather than the end of a loop body.
+                println!(
+                    "{}",
+                    jemalloc_line(&format!("level {} (pooled)", first_level + depth - 1))
+                );
+            },
+        );
+        // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
+        // ordered IDENTITY diff against a barrier run is empty rather than
+        // merely sortable. Scheduling stays invisible to the bytes AND to the log.
+        for level in &summaries {
+            for (line, row) in level {
+                println!("{line}");
+                report.push(*row);
+            }
+        }
+        let (span_peak, span_at) = span_sampler.stop();
+        println!(
+            "   levels {first_level}..={hi} POOLED: {} nodes in {:.1}s, {levels_in_flight} \
+             level(s) in flight, {workers} worker(s)",
+            summaries.iter().map(Vec::len).sum::<usize>(),
+            t_span.elapsed().as_secs_f64(),
+        );
+        println!(
+            "   levels {first_level}..={hi}: host peak {span_peak:.3} GiB at t={span_at:.1}{} \
+             ⓘ ONE WINDOW — overlapped levels have no separate peaks",
+            match &ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * span_peak / g),
+                Err(_) => String::new(),
+            },
+        );
+        if let Some(stats) = super::program_census::end_level() {
+            println!(
+                "   {}",
+                stats.describe(&format!("levels {first_level}..={hi}"))
+            );
+        }
+        let (mut c, mut l, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for (child, layout, lbl) in top {
+            c.push(child);
+            l.push(layout);
+            b.push(lbl);
+        }
+        children = c;
+        layouts = l;
+        labels = b;
+    }
+
     // The interior is done; level 0 and everything after it run serial.
     super::device_permit::arm(1);
     // ⛔ AND THE CAPTURE IS CHECKED HERE, in the driver, rather than being left
@@ -6120,132 +6268,6 @@ fn the_production_tree_composes_to_a_root() {
              whether the root resembles a proven-to-fit node or the fan-in-3 node \
              that aborted at 97.4% of the card."
         );
-    }
-
-    // ---- the POOLED span, when the knob asks for it.
-    //
-    // Everything the barrier loop above would have done for levels
-    // `barrier_levels+1..=hi`, in dependency order instead.
-    //
-    // ⚠ WHAT THIS SPAN CANNOT PRINT, and it is a real loss rather than an
-    // oversight: a PER-LEVEL host peak. Two levels running at once share one
-    // process, so "level 3's peak" stops being a quantity — the span reports ONE
-    // window and the per-NODE peaks the nodes print themselves. The stop
-    // condition therefore reads off the node lines and this span line, not off a
-    // per-level maximum that no longer exists.
-    if pool_on && barrier_levels < hi {
-        let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
-            .iter()
-            .take(hi)
-            .skip(barrier_levels)
-            .map(|level| level_groups(&level.arities))
-            .collect();
-        let workers = super::device_permit::workers().max(1);
-        let span_sampler = HostSampler::start();
-        let t_span = Instant::now();
-        super::program_census::begin_level();
-        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
-            .into_iter()
-            .zip(layouts)
-            .zip(labels)
-            .map(|((c, l), b)| (c, l, b))
-            .collect();
-        let first_level = barrier_levels + 1;
-        let (top, summaries) = prove_in_dependency_order(
-            &pool_groups,
-            seed,
-            workers,
-            levels_in_flight,
-            |depth, j, kids| {
-                let level_no = first_level + depth - 1;
-                let (mut ch, mut la, mut lb) = (
-                    Vec::with_capacity(kids.len()),
-                    Vec::with_capacity(kids.len()),
-                    Vec::with_capacity(kids.len()),
-                );
-                for (c, l, b) in kids {
-                    ch.push(c);
-                    la.push(l);
-                    lb.push(b);
-                }
-                let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
-                // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
-                // The child is about to be eaten by its parent, so the line has
-                // to be taken while it exists; printing it here would put it in
-                // completion order, which is the thing the gate is not allowed to
-                // depend on.
-                let (_, arity, cells, instrs, ..) = row;
-                let line = format!(
-                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
-                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
-                     ({instrs} instructions)",
-                    child
-                        .artifacts
-                        .program_id
-                        .iter()
-                        .take(8)
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
-                    child.artifacts.log_heights,
-                    child.artifacts.blake3_chunk_log_heights,
-                    child.public_words.len(),
-                );
-                ((child, layout, lbl), (line, row))
-            },
-            |depth| {
-                // ★ THE FLOOR FALSIFIER'S OWN INSTRUMENT. Lane P5's boundary
-                // snapshots showed the interior's rising floor is LIVE bytes, not
-                // jemalloc retention (resident − allocated is 0.37–0.79 GiB at
-                // every boundary), and that the 19 wraps are still allocated after
-                // level 1 ends. Take-on-consume says they should be gone here.
-                // ⓘ The barrier loop prints this per level; the pooled span has to
-                // print it from inside, because a level's completion is a moment
-                // in the middle of the span rather than the end of a loop body.
-                println!(
-                    "{}",
-                    jemalloc_line(&format!("level {} (pooled)", first_level + depth - 1))
-                );
-            },
-        );
-        // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
-        // ordered IDENTITY diff against a barrier run is empty rather than
-        // merely sortable. Scheduling stays invisible to the bytes AND to the log.
-        for level in &summaries {
-            for (line, row) in level {
-                println!("{line}");
-                report.push(*row);
-            }
-        }
-        let (span_peak, span_at) = span_sampler.stop();
-        println!(
-            "   levels {first_level}..={hi} POOLED: {} nodes in {:.1}s, {levels_in_flight} \
-             level(s) in flight, {workers} worker(s)",
-            summaries.iter().map(Vec::len).sum::<usize>(),
-            t_span.elapsed().as_secs_f64(),
-        );
-        println!(
-            "   levels {first_level}..={hi}: host peak {span_peak:.3} GiB at t={span_at:.1}{} \
-             ⓘ ONE WINDOW — overlapped levels have no separate peaks",
-            match &ceiling {
-                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * span_peak / g),
-                Err(_) => String::new(),
-            },
-        );
-        if let Some(stats) = super::program_census::end_level() {
-            println!(
-                "   {}",
-                stats.describe(&format!("levels {first_level}..={hi}"))
-            );
-        }
-        let (mut c, mut l, mut b) = (Vec::new(), Vec::new(), Vec::new());
-        for (child, layout, lbl) in top {
-            c.push(child);
-            l.push(layout);
-            b.push(lbl);
-        }
-        children = c;
-        layouts = l;
-        labels = b;
     }
 
     // ⚠ THE TOP LEVEL'S COUNT, WHICH UNDER SIZING IS NOT `children`. The sizing
