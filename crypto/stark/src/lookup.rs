@@ -824,7 +824,12 @@ pub struct AirWithBuses<
     constraint_set: CS,
     /// The LogUp layout: the framework generates the LogUp (extension)
     /// constraints from this and appends them after the `constraint_set` ones.
-    logup: LogUpLayout,
+    /// Detras de `Arc` por el mismo motivo que `constraint_program`: clonar un
+    /// `AirWithBuses` copiaba las interacciones DOS veces (aca y en
+    /// `auxiliary_trace_build_data`), y el verificador en-VM clona un AIR por
+    /// tabla por epoca. Medido en el guest de recursion: clone+drop de
+    /// `Vec<BusInteraction>` eran el 9,2% de sus ciclos, sin hacer matematica.
+    logup: std::sync::Arc<LogUpLayout>,
     /// Idx-ordered metadata for all transition constraints, DERIVED at
     /// construction: `constraint_set.meta()` (base prefix) followed by the
     /// LogUp emission's derived metadata (ext).
@@ -838,7 +843,7 @@ pub struct AirWithBuses<
     /// program (16-25K nodes on the big tables) per epoch/shard instance.
     constraint_program:
         std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
-    auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    auxiliary_trace_build_data: std::sync::Arc<AuxiliaryTraceBuildData>,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
     preprocessed_commitment: Option<crate::config::Commitment>,
@@ -913,7 +918,10 @@ impl<
         // Base-field (table) constraints come from the constraint set; LogUp
         // (extension) constraints are appended by the framework from the layout.
         let num_interactions = auxiliary_trace_build_data.interactions.len();
-        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
+        let logup = std::sync::Arc::new(LogUpLayout::from_interactions(
+            auxiliary_trace_build_data.interactions.clone(),
+        ));
+        let auxiliary_trace_build_data = std::sync::Arc::new(auxiliary_trace_build_data);
         let num_term_columns = logup.num_term_columns;
 
         // meta = constraint_set base-prefix meta + appended LogUp ext meta,
