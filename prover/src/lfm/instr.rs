@@ -304,78 +304,112 @@ pub enum Instr {
 }
 
 impl Instr {
-    /// The addresses this instruction writes, in ascending order.
-    pub fn writes(&self) -> Vec<Addr> {
+    /// The addresses this instruction writes, appended to `out` in ascending
+    /// order.
+    ///
+    /// ⛔ **This, not [`Instr::writes`], is where the operand conventions are
+    /// written down.** A whole-program dataflow pass visits every instruction
+    /// once and cannot afford a `Vec` per visit — 5.3–7.4 M allocations per
+    /// recursion proof — but a private copy of "which operands are live under
+    /// which selector" is exactly the kind of duplicate that drifts and then
+    /// reports a dependency structure the machine does not have. So the caller
+    /// brings its own buffer and there is still only one transcription.
+    ///
+    /// Does NOT clear `out`; the caller owns it.
+    pub fn writes_into(&self, out: &mut Vec<Addr>) {
         match self {
-            Instr::Const { out, .. }
-            | Instr::BaseAlu { out, .. }
-            | Instr::ExtAlu { out, .. }
-            | Instr::Hint { out, .. }
-            | Instr::Pack { out, .. } => vec![*out],
-            Instr::Unpack { outs, .. } => outs.to_vec(),
+            Instr::Const { out: a, .. }
+            | Instr::BaseAlu { out: a, .. }
+            | Instr::ExtAlu { out: a, .. }
+            | Instr::Hint { out: a, .. }
+            | Instr::Pack { out: a, .. } => out.push(*a),
+            Instr::Unpack { outs, .. } => out.extend_from_slice(outs),
             Instr::KeccakF(k) => {
-                let mut v = k.outs.to_vec();
+                out.extend_from_slice(&k.outs);
                 if let Some(rev) = &k.rev {
-                    v.extend_from_slice(&rev.outs);
+                    out.extend_from_slice(&rev.outs);
                 }
-                v
             }
             Instr::Blake3(k) => {
-                let mut v = k.outs.to_vec();
+                out.extend_from_slice(&k.outs);
                 if let Some(rev) = &k.rev {
-                    v.extend_from_slice(&rev.outs);
+                    out.extend_from_slice(&rev.outs);
                 }
-                v
             }
-            Instr::Select { out_l, out_r, .. } => vec![*out_l, *out_r],
-            Instr::BitDec { bits, halves, .. } => bits
-                .iter()
-                .map(|(a, _)| *a)
-                .chain(halves.iter().flat_map(|hs| hs.iter().map(|(a, _)| *a)))
-                .collect(),
-            Instr::Hash { mode, outs, .. } => outs[..mode.num_output_cells()].to_vec(),
-            Instr::Public { .. } => vec![],
+            Instr::Select { out_l, out_r, .. } => {
+                out.push(*out_l);
+                out.push(*out_r);
+            }
+            Instr::BitDec { bits, halves, .. } => {
+                out.extend(bits.iter().map(|(a, _)| *a));
+                out.extend(halves.iter().flat_map(|hs| hs.iter().map(|(a, _)| *a)));
+            }
+            Instr::Hash { mode, outs, .. } => {
+                out.extend_from_slice(&outs[..mode.num_output_cells()])
+            }
+            Instr::Public { .. } => {}
         }
+    }
+
+    /// The addresses this instruction reads (meaningful operands only, per the
+    /// field conventions above), appended to `out`.
+    ///
+    /// The read half of [`Instr::writes_into`], and the same rule applies: this
+    /// is the transcription, [`Instr::reads`] is the convenience wrapper.
+    /// Does NOT clear `out`.
+    pub fn reads_into(&self, out: &mut Vec<Addr>) {
+        match self {
+            Instr::Const { .. } | Instr::Hint { .. } => {}
+            Instr::BaseAlu { op, a, b, c, .. } => {
+                out.push(*a);
+                out.push(*b);
+                if *op == BaseOp::MulAdd {
+                    out.push(*c);
+                }
+            }
+            Instr::ExtAlu { op, a, b, c, .. } => {
+                out.push(*a);
+                out.push(*b);
+                if *op == ExtOp::MulAdd {
+                    out.push(*c);
+                }
+            }
+            Instr::Select {
+                bit, in_l, in_r, ..
+            } => {
+                out.push(*bit);
+                out.push(*in_l);
+                out.push(*in_r);
+            }
+            Instr::BitDec { input, .. } => out.push(*input),
+            Instr::Hash { mode, ins, .. } => out.extend_from_slice(&ins[..mode.num_input_cells()]),
+            Instr::Pack { lanes, .. } => out.extend_from_slice(lanes),
+            Instr::Unpack { input, .. } => out.push(*input),
+            Instr::KeccakF(k) => {
+                out.extend_from_slice(&k.ins);
+                if k.mode == KeccakMode::Absorb {
+                    out.extend_from_slice(&k.block);
+                }
+            }
+            // Every input word is read on every row: the chip has one mode, so
+            // there is no gated operand and no placeholder to exclude.
+            Instr::Blake3(k) => out.extend_from_slice(&k.ins),
+            Instr::Public { addr, .. } => out.push(*addr),
+        }
+    }
+
+    /// The addresses this instruction writes, in ascending order.
+    pub fn writes(&self) -> Vec<Addr> {
+        let mut v = Vec::new();
+        self.writes_into(&mut v);
+        v
     }
 
     /// The addresses this instruction reads (meaningful operands only, per
     /// the field conventions above).
     pub fn reads(&self) -> Vec<Addr> {
-        match self {
-            Instr::Const { .. } | Instr::Hint { .. } => vec![],
-            Instr::BaseAlu { op, a, b, c, .. } => {
-                if *op == BaseOp::MulAdd {
-                    vec![*a, *b, *c]
-                } else {
-                    vec![*a, *b]
-                }
-            }
-            Instr::ExtAlu { op, a, b, c, .. } => {
-                if *op == ExtOp::MulAdd {
-                    vec![*a, *b, *c]
-                } else {
-                    vec![*a, *b]
-                }
-            }
-            Instr::Select {
-                bit, in_l, in_r, ..
-            } => vec![*bit, *in_l, *in_r],
-            Instr::BitDec { input, .. } => vec![*input],
-            Instr::Hash { mode, ins, .. } => ins[..mode.num_input_cells()].to_vec(),
-            Instr::Pack { lanes, .. } => lanes.to_vec(),
-            Instr::Unpack { input, .. } => vec![*input],
-            Instr::KeccakF(k) => match k.mode {
-                KeccakMode::Permute => k.ins.to_vec(),
-                KeccakMode::Absorb => {
-                    let mut v = k.ins.to_vec();
-                    v.extend_from_slice(&k.block);
-                    v
-                }
-            },
-            // Every input word is read on every row: the chip has one mode, so
-            // there is no gated operand and no placeholder to exclude.
-            Instr::Blake3(k) => k.ins.to_vec(),
-            Instr::Public { addr, .. } => vec![*addr],
-        }
+        let mut v = Vec::new();
+        self.reads_into(&mut v);
+        v
     }
 }

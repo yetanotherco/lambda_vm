@@ -74,6 +74,11 @@ pub struct ProveSplit {
     /// Seconds spent BLOCKED waiting for the card before `multi_prove` began.
     /// Zero whenever the permit is inert, so a serial line is unchanged.
     pub permit_wait: f64,
+    /// The phases INSIDE `execute`. Carried beside it rather than folded into
+    /// it: a lever that moves one phase and not another cannot be read off their
+    /// sum, which is the lesson the three fields above were split out for in the
+    /// first place.
+    pub exec: super::executor::ExecSplit,
 }
 
 thread_local! {
@@ -181,6 +186,7 @@ pub(crate) fn lfm_prove_with_residency(
         records,
         public_words,
         memory,
+        split: exec_split,
     } = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
     let execute_secs = t.elapsed().as_secs_f64();
     // The final write-once array: 32 bytes per address, a few hundred MB for a
@@ -220,6 +226,7 @@ pub(crate) fn lfm_prove_with_residency(
             fill: fill_secs,
             multi_prove: multi_prove_secs,
             permit_wait,
+            exec: exec_split,
         }))
     });
 

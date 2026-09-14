@@ -33,6 +33,7 @@ pub mod device_permit;
 pub mod edsl;
 pub mod epoch;
 pub mod epoch_verify;
+pub mod exec_schedule;
 pub mod executor;
 pub mod fixture;
 pub mod fri;

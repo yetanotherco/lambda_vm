@@ -1773,6 +1773,26 @@ fn print_prove_split(label: &str) {
                 String::new()
             },
         );
+        // ⛔ A SECOND LINE, never extra fields on the first. Every log the
+        // campaign has compared greps `LFM PROVE:` and reads its three numbers
+        // positionally; widening that line would re-baseline every one of them.
+        //
+        // ⓘ `parallel 0 levels` beside a large `levels` is the reading this line
+        // exists to make visible: it means every level was coalesced onto the
+        // calling thread and the parallel path never ran, which a wall alone
+        // would show only as a lever that did nothing.
+        let e = split.exec;
+        println!(
+            "   {label} LFM EXEC: levels {} · parallel {} levels / {} hashes · \
+             depth pass {:.2}s · hash phase {:.2}s · apply {:.2}s · residue {:.2}s",
+            e.levels,
+            e.parallel_levels,
+            e.parallel_hashes,
+            e.depth_pass,
+            e.hash_phase,
+            e.apply,
+            e.residue,
+        );
     }
 }
 

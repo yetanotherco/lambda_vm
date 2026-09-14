@@ -11,13 +11,9 @@
 //! ## The two arms
 //!
 //! [`reference`] is the serial `for instr in &program.instrs` loop the file has
-//! always had. [`candidate`] is the schedule under test. **Today they are the
-//! same call**, so this gate passes by construction and proves only that the
-//! comparison itself is total and non-vacuous — which is the point: the
-//! comparator, the case list and the coverage guard are what a schedule change
-//! has to land against, and they are cheaper to get right before there is a
-//! second schedule than after. When the level-parallel executor arrives,
-//! [`candidate`] is the one line that moves.
+//! always had. [`candidate`] is [`Schedule::LevelParallel`]: each depth level's
+//! mutually independent hash instructions on rayon's global pool, everything
+//! else serial and in program order.
 //!
 //! ⚠ The knob that selects the schedule in production cannot be the thing this
 //! test flips. The precedent (`LFM_ARTIFACT_PARALLEL`, `commit.rs:35`) caches
@@ -44,21 +40,36 @@
 //! record type is transcribed here — a row that grows a column is compared on
 //! its new column the day it grows one, with no edit to this file.
 
-use super::executor::{LfmExecution, execute};
+use super::executor::{LfmExecError, LfmExecution, Schedule, execute_scheduled};
 use super::instr::Addr;
 use super::trace_identity_tests::{Case, cases};
 
+/// The cut-off the candidate arm runs at, and it is not the production one.
+///
+/// ⛔ The laptop cases are 15 wide at their widest level (printed by the gate
+/// below). Anything at or above 16 — which `PRODUCTION_COALESCE_BELOW` is —
+/// would send every level of every case down the serial branch, and this file
+/// would then pass whatever the parallel path did, on every run, forever. At 2,
+/// every level of width ≥ 2 really forks.
+const GATE_COALESCE_BELOW: usize = 2;
+
 /// The serial reference: the interpreter as it stands.
 fn reference(case: &Case) -> LfmExecution {
-    execute(&case.program, &case.arenas, &case.hasher)
+    execute_scheduled(&case.program, &case.arenas, &case.hasher, Schedule::Serial)
         .unwrap_or_else(|e| panic!("{}: the reference must execute: {e:?}", case.name))
 }
 
-/// The schedule under test. ⓘ Identical to [`reference`] until the
-/// level-parallel executor lands; this is the single call site that changes.
+/// The schedule under test: levels, on rayon's global pool.
 fn candidate(case: &Case) -> LfmExecution {
-    execute(&case.program, &case.arenas, &case.hasher)
-        .unwrap_or_else(|e| panic!("{}: the candidate must execute: {e:?}", case.name))
+    execute_scheduled(
+        &case.program,
+        &case.arenas,
+        &case.hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{}: the candidate must execute: {e:?}", case.name))
 }
 
 /// Two record vectors, element for element, with the first divergence named.
@@ -127,6 +138,24 @@ fn the_parallel_executor_is_byte_identical_to_the_serial_reference() {
         let a = reference(&case);
         let b = candidate(&case);
         assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+
+        // ★ The candidate must have USED the path under test. Without this the
+        // whole file is satisfied by a candidate that coalesced every level onto
+        // the calling thread and ran the serial code twice.
+        assert_eq!(
+            a.split.parallel_levels, 0,
+            "{}: the reference arm must not schedule levels at all",
+            case.name
+        );
+        if b.split.levels > 1 {
+            assert!(
+                b.split.parallel_levels > 0 && b.split.parallel_hashes > 0,
+                "{}: the candidate coalesced all {} levels onto the calling \
+                 thread, so nothing this test compares went through rayon",
+                case.name,
+                b.split.levels
+            );
+        }
 
         let r = &a.records;
         for (chip, rows) in [
@@ -251,5 +280,79 @@ fn a_hash_record_slot_is_192_bytes() {
         std::mem::size_of::<crate::tables::types::FE>(),
         8,
         "a Goldilocks felt is one u64, which is what the 192 above is built on"
+    );
+}
+
+/// ★★ THE MUTATION. Merge adjacent depth levels and the executor must FAIL — at
+/// the same address, on every run.
+///
+/// This is what makes the gate above a gate rather than a green light. The level
+/// boundary is the only thing separating a hash from the input another hash
+/// produces; `merge = 2` removes it, and if the executor still produced a
+/// correct witness that would mean the boundary was never doing anything and the
+/// identity assertion was passing for some other reason.
+///
+/// ⓘ It fails deterministically because the workers hold `&WriteOnceMemory` and
+/// nothing holds `&mut` during a level: the premature read finds an unwritten
+/// cell, which is [`LfmExecError::ReadBeforeWrite`], never a race. Three runs,
+/// asserted to name one address, is how that claim is checked rather than
+/// asserted.
+#[test]
+fn merging_adjacent_levels_fails_at_one_address_every_run() {
+    let mut checked = 0;
+    for case in cases() {
+        // A case with no hashes has no level structure to break.
+        if super::reach_profile::profile(&case.program).hash_rows == 0 {
+            continue;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for run in 0..3 {
+            let err = super::executor::execute_with_merged_levels(
+                &case.program,
+                &case.arenas,
+                &case.hasher,
+                GATE_COALESCE_BELOW,
+                2,
+            )
+            .expect_err("a merged schedule launches a hash before its input exists");
+            let LfmExecError::ReadBeforeWrite(addr) = err else {
+                panic!(
+                    "{}: run {run} failed with {err:?}, not ReadBeforeWrite — \
+                     the merged schedule has to fail for the schedule's reason",
+                    case.name
+                );
+            };
+            // ★ And it has to fail for the RIGHT reason: the cell it read too
+            // early must be one a HASH writes. A merge that collapsed the
+            // constants into the first hash level would also raise
+            // ReadBeforeWrite, and would prove nothing about whether a hash can
+            // be launched before the hash it depends on.
+            let writer = case
+                .program
+                .instrs
+                .iter()
+                .find(|i| i.writes().iter().any(|a| a.0 == addr));
+            assert!(
+                matches!(writer, Some(super::instr::Instr::Hash { .. })),
+                "{}: the premature read was of address {addr}, which is written \
+                 by {writer:?} rather than by a hash — the mutation broke some \
+                 other ordering",
+                case.name
+            );
+            seen.push(format!("{err:?}"));
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "{}: three runs of the merged schedule named different addresses \
+             ({seen:?}) — the failure is timing-dependent, which is exactly what \
+             this design is supposed to make impossible",
+            case.name
+        );
+        println!("{:<18} merged levels -> {}", case.name, seen[0]);
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no case had a hash to mis-schedule, so the mutation proved nothing"
     );
 }
