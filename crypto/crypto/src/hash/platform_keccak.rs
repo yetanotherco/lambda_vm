@@ -58,7 +58,62 @@ mod imp {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+// Host, `hash-metrics` feature ON: `sha3::Keccak256` plus a finalize counter for
+// [`crate::hash_metrics`]. The counter is a PURE SIDE EFFECT — every method
+// forwards to the inner hasher (byte-identical digest) and is `#[inline(always)]`,
+// so no cross-crate call is added over the bare alias.
+#[cfg(all(not(target_arch = "riscv64"), feature = "hash-metrics"))]
+mod imp {
+    use digest::{
+        FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update,
+    };
+
+    #[derive(Clone, Default)]
+    pub struct PlatformKeccak256(sha3::Keccak256);
+
+    impl HashMarker for PlatformKeccak256 {}
+
+    impl OutputSizeUser for PlatformKeccak256 {
+        type OutputSize = digest::typenum::U32;
+    }
+
+    impl Update for PlatformKeccak256 {
+        #[inline(always)]
+        fn update(&mut self, data: &[u8]) {
+            // Absorption — the guest's dominant keccak cost (many small
+            // `stream_bytes` absorbs), which no finalize counter would see.
+            crate::hash_metrics::count_absorb(data.len());
+            Update::update(&mut self.0, data);
+        }
+    }
+
+    impl FixedOutput for PlatformKeccak256 {
+        #[inline(always)]
+        fn finalize_into(self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_total();
+            FixedOutput::finalize_into(self.0, out);
+        }
+    }
+
+    impl Reset for PlatformKeccak256 {
+        #[inline(always)]
+        fn reset(&mut self) {
+            Reset::reset(&mut self.0);
+        }
+    }
+
+    impl FixedOutputReset for PlatformKeccak256 {
+        #[inline(always)]
+        fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_total();
+            FixedOutputReset::finalize_into_reset(&mut self.0, out);
+        }
+    }
+}
+
+// Default host build (no `hash-metrics` feature): the plain alias, provably
+// unchanged from upstream.
+#[cfg(all(not(target_arch = "riscv64"), not(feature = "hash-metrics")))]
 mod imp {
     pub type PlatformKeccak256 = sha3::Keccak256;
 }

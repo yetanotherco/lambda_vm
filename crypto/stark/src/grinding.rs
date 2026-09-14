@@ -65,6 +65,9 @@ pub fn generate_nonce(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
 /// when interpreted as `u64`.
 #[inline(always)]
 fn is_valid_nonce_for_inner_hash(inner_hash: &[u8; 32], candidate_nonce: u64, limit: u64) -> bool {
+    // Tag this finalize as grinding so a verify-hash metric can report it apart
+    // (see `crypto::hash_metrics`); no-op unless the `hash-metrics` feature is on.
+    crypto::hash_metrics::count_grinding();
     let mut data = [0; 40];
     data[..32].copy_from_slice(inner_hash);
     data[32..].copy_from_slice(&candidate_nonce.to_be_bytes());
@@ -79,6 +82,8 @@ fn is_valid_nonce_for_inner_hash(inner_hash: &[u8; 32], candidate_nonce: u64, li
 /// Hash(prefix || seed || grinding_factor)
 /// `prefix` is the bit-string `0x123456789abcded`
 fn get_inner_hash(seed: &[u8; 32], grinding_factor: u8) -> [u8; 32] {
+    // Grinding finalize (see `crypto::hash_metrics`); no-op unless enabled.
+    crypto::hash_metrics::count_grinding();
     let mut inner_data = [0u8; 41];
     inner_data[0..8].copy_from_slice(&PREFIX);
     inner_data[8..40].copy_from_slice(seed);
