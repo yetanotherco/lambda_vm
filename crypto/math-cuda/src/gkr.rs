@@ -224,6 +224,23 @@ impl DeviceFractionTree {
         Ok(([p[0], p[1], p[2]], [q[0], q[1], q[2]]))
     }
 
+    /// A level's halves back on the host, interleaved ext3.
+    ///
+    /// Only the levels near the output are worth asking for: a round over a
+    /// cube of a few hundred is a launch and a wait around a kernel with
+    /// almost nothing to sum, and the whole level is a few kilobytes. The
+    /// input layer is never one of them — it is the biggest thing here, and a
+    /// tree that dropped it has nothing to hand over.
+    pub fn layer_to_host(&self, layer: usize) -> Result<(Vec<u64>, Vec<u64>)> {
+        let level = self.layers.get(layer).ok_or(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ))?;
+        let p = self.stream.clone_dtoh(&level.p.slice(0..level.p.len()))?;
+        let q = self.stream.clone_dtoh(&level.q.slice(0..level.q.len()))?;
+        self.stream.synchronize()?;
+        Ok((p, q))
+    }
+
     /// A sumcheck over layer `layer`, with `eq(point, ·)` as factor 0 and the
     /// layer's four halves — `p_lo`, `p_hi`, `q_lo`, `q_hi` — as factors 1..5.
     ///

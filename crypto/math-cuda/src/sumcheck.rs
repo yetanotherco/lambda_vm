@@ -395,30 +395,39 @@ impl SumcheckSession {
         self.uploaded
     }
 
-    /// What each factor has been bound to, once every variable is gone.
-    ///
-    /// Reads the factors where they lie rather than through their buffers: a
-    /// session over a fraction tree's layer does not own them, and three u64
-    /// per factor is not worth a view for.
-    pub fn bound_values(&self) -> Result<Vec<[u64; 3]>> {
-        assert_eq!(self.len, 1, "a factor is bound once every variable is");
+    /// What every factor has left, read where it lies rather than through the
+    /// buffer it sits in: a session over a fraction tree's layer does not own
+    /// one, and the fold writes each factor back over its own base — so what
+    /// is left of a factor is the first `len` elements at its address,
+    /// whatever wrote them.
+    pub fn values(&self) -> Result<Vec<Vec<u64>>> {
         self.stream.synchronize()?;
         let mut out = Vec::with_capacity(self.addresses.len());
         for address in &self.addresses {
-            let mut value = [0u64; 3];
-            // SAFETY: the address is a factor's base, which holds at least one
-            // ext3 element, and the stream is idle (synchronized above).
+            let mut values = vec![0u64; self.len * 3];
+            // SAFETY: the address is a factor's base and the cube it spans is
+            // `len` elements wide, the stream being idle (synchronized above).
             unsafe {
                 cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    value.as_mut_ptr() as *mut core::ffi::c_void,
+                    values.as_mut_ptr() as *mut core::ffi::c_void,
                     *address,
-                    24,
+                    self.len * 24,
                 )
                 .result()?;
             }
-            out.push(value);
+            out.push(values);
         }
         Ok(out)
+    }
+
+    /// What each factor has been bound to, once every variable is gone.
+    pub fn bound_values(&self) -> Result<Vec<[u64; 3]>> {
+        assert_eq!(self.len, 1, "a factor is bound once every variable is");
+        Ok(self
+            .values()?
+            .into_iter()
+            .map(|value| [value[0], value[1], value[2]])
+            .collect())
     }
 
     /// Every factor's remaining values, interleaved as three u64 per element —
