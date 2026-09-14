@@ -3435,6 +3435,47 @@ fn split_pool_out<W, G>(out: Vec<PoolOut<W, G>>, expect_global: bool) -> (Vec<W>
     (wraps, global)
 }
 
+/// Whether the interior runs as a dependency-ordered POOL over the tree instead
+/// of level by level behind a barrier.
+///
+/// Unset is today's loop — the ORIGINAL path, not this scheduler at one level in
+/// flight — so the control arm is the code that shipped rather than the new code
+/// wearing a cap.
+fn tree_level_pool() -> bool {
+    match std::env::var("LFM_TREE_LEVEL_POOL").ok().as_deref() {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("LFM_TREE_LEVEL_POOL must be `0` or `1`, got `{other}`"),
+    }
+}
+
+/// How many interior levels may have running nodes at once. Default 2.
+///
+/// ⛔ `1` runs the pool on the BARRIER's schedule and is the diagnostic that
+/// separates the scheduler's own cost from the overlap's benefit: a regression at
+/// M=1 is the scheduler, a regression only at M=2 is the overlap.
+fn tree_levels_in_flight() -> usize {
+    parse_positive("LFM_TREE_LEVELS_IN_FLIGHT", 2)
+}
+
+/// The lowest interior level the pool may own. Default 1 (the whole interior).
+///
+/// `2` is the insurance row: levels 1 keeps its barrier and the pool takes 2..=hi.
+fn tree_level_pool_from() -> usize {
+    parse_positive("LFM_TREE_LEVEL_POOL_FROM", 1)
+}
+
+fn parse_positive(var: &str, default: usize) -> usize {
+    match std::env::var(var).ok().as_deref() {
+        None | Some("") => default,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| panic!("{var} must be a positive integer, got `{v}`")),
+    }
+}
+
 fn tree_top_overlap() -> bool {
     match std::env::var("LFM_TREE_TOP_OVERLAP").ok().as_deref() {
         None | Some("") | Some("0") => false,
@@ -5763,7 +5804,36 @@ fn the_production_tree_composes_to_a_root() {
         )
     };
 
-    for (li, level) in shape.iter().enumerate().take(hi) {
+    // ★★★ WHERE THE BARRIER STOPS AND THE POOL STARTS.
+    //
+    // Unset, `barrier_levels == hi` and the loop below is the whole interior,
+    // byte for byte as it shipped. With `LFM_TREE_LEVEL_POOL=1` the loop runs
+    // levels 1..`pool_from` and the dependency pool takes the rest — so the
+    // insurance row (`LFM_TREE_LEVEL_POOL_FROM=2`) is the same code with a
+    // different boundary rather than a second implementation.
+    let pool_on = tree_level_pool();
+    let pool_from = tree_level_pool_from();
+    let levels_in_flight = tree_levels_in_flight();
+    // ⛔ REFUSED, NOT SILENTLY DISABLED. The sizing arm holds TWO levels' outputs
+    // at the top and picks them by level index; a pool that frees a level into
+    // its parent has no such index to hand out, and the failure would be a root
+    // built over the wrong children — which `emit_l2g_compare`'s count guard
+    // catches only when the shapes happen to differ.
+    assert!(
+        !(pool_on && size_root),
+        "LFM_TREE_LEVEL_POOL and LFM_TREE_SIZE_ROOT are incompatible: the sizing \
+         arm needs two levels' outputs held by index, and the pool consumes a \
+         level into its parent. Run them as separate arms"
+    );
+    let barrier_levels = if pool_on { (pool_from - 1).min(hi) } else { hi };
+    if pool_on {
+        println!(
+            "   ★ LEVEL POOL: levels {}..={hi} run in dependency order, {levels_in_flight} \
+             level(s) in flight (LFM_TREE_LEVEL_POOL=1; unset = the per-level barrier)",
+            barrier_levels + 1
+        );
+    }
+    for (li, level) in shape.iter().enumerate().take(barrier_levels) {
         let level_no = li + 1;
         let t_level = Instant::now();
         // ★ HOW MANY DISTINCT PROGRAMS THIS LEVEL ACTUALLY HAS. The artifact
@@ -6032,6 +6102,118 @@ fn the_production_tree_composes_to_a_root() {
              whether the root resembles a proven-to-fit node or the fan-in-3 node \
              that aborted at 97.4% of the card."
         );
+    }
+
+    // ---- the POOLED span, when the knob asks for it.
+    //
+    // Everything the barrier loop above would have done for levels
+    // `barrier_levels+1..=hi`, in dependency order instead.
+    //
+    // ⚠ WHAT THIS SPAN CANNOT PRINT, and it is a real loss rather than an
+    // oversight: a PER-LEVEL host peak. Two levels running at once share one
+    // process, so "level 3's peak" stops being a quantity — the span reports ONE
+    // window and the per-NODE peaks the nodes print themselves. The stop
+    // condition therefore reads off the node lines and this span line, not off a
+    // per-level maximum that no longer exists.
+    if pool_on && barrier_levels < hi {
+        let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
+            .iter()
+            .take(hi)
+            .skip(barrier_levels)
+            .map(|level| level_groups(&level.arities))
+            .collect();
+        let workers = super::device_permit::workers().max(1);
+        let span_sampler = HostSampler::start();
+        let t_span = Instant::now();
+        super::program_census::begin_level();
+        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
+            .into_iter()
+            .zip(layouts)
+            .zip(labels)
+            .map(|((c, l), b)| (c, l, b))
+            .collect();
+        let first_level = barrier_levels + 1;
+        let (top, summaries) = prove_in_dependency_order(
+            &pool_groups,
+            seed,
+            workers,
+            levels_in_flight,
+            |depth, j, kids| {
+                let level_no = first_level + depth - 1;
+                let (mut ch, mut la, mut lb) = (
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                );
+                for (c, l, b) in kids {
+                    ch.push(c);
+                    la.push(l);
+                    lb.push(b);
+                }
+                let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
+                // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
+                // The child is about to be eaten by its parent, so the line has
+                // to be taken while it exists; printing it here would put it in
+                // completion order, which is the thing the gate is not allowed to
+                // depend on.
+                let (_, arity, cells, instrs, ..) = row;
+                let line = format!(
+                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
+                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                     ({instrs} instructions)",
+                    child
+                        .artifacts
+                        .program_id
+                        .iter()
+                        .take(8)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    child.artifacts.log_heights,
+                    child.artifacts.blake3_chunk_log_heights,
+                    child.public_words.len(),
+                );
+                ((child, layout, lbl), (line, row))
+            },
+        );
+        // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
+        // ordered IDENTITY diff against a barrier run is empty rather than
+        // merely sortable. Scheduling stays invisible to the bytes AND to the log.
+        for level in &summaries {
+            for (line, row) in level {
+                println!("{line}");
+                report.push(*row);
+            }
+        }
+        let (span_peak, span_at) = span_sampler.stop();
+        println!(
+            "   levels {first_level}..={hi} POOLED: {} nodes in {:.1}s, {levels_in_flight} \
+             level(s) in flight, {workers} worker(s)",
+            summaries.iter().map(Vec::len).sum::<usize>(),
+            t_span.elapsed().as_secs_f64(),
+        );
+        println!(
+            "   levels {first_level}..={hi}: host peak {span_peak:.3} GiB at t={span_at:.1}{} \
+             ⓘ ONE WINDOW — overlapped levels have no separate peaks",
+            match &ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * span_peak / g),
+                Err(_) => String::new(),
+            },
+        );
+        if let Some(stats) = super::program_census::end_level() {
+            println!(
+                "   {}",
+                stats.describe(&format!("levels {first_level}..={hi}"))
+            );
+        }
+        let (mut c, mut l, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for (child, layout, lbl) in top {
+            c.push(child);
+            l.push(layout);
+            b.push(lbl);
+        }
+        children = c;
+        layouts = l;
+        labels = b;
     }
 
     // ⚠ THE TOP LEVEL'S COUNT, WHICH UNDER SIZING IS NOT `children`. The sizing
