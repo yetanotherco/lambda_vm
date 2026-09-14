@@ -5054,6 +5054,24 @@ fn the_production_tree_composes_to_a_root() {
                     String::new()
                 },
             );
+            // ★★★ THE WITHIN-ROUND SAMPLE, and it is the only thing that can
+            // attribute the FIRST-ROUND SPIKE.
+            //
+            // Every level from 2 up peaks in its first round and drops 2.7-3.4
+            // GiB for the rest — at an IDENTICAL live count (level 2's rounds 1
+            // and 2 both hold two nodes and read 2.45 GiB apart), so it is not
+            // residency. A BOUNDARY snapshot cannot see it: by the end of the
+            // level the spike is over. Sampled per node, the three candidates
+            // separate in one read:
+            //
+            //   allocated spikes      ⇒ LIVE — the prover really holds it
+            //   only resident spikes  ⇒ jemalloc dirty pages, a decay knob
+            //   NEITHER, but RSS does ⇒ OUTSIDE jemalloc: the pinned staging
+            //                           slabs (✓ `Backend::pinned_staging`
+            //                           "grows lazily to the largest LDE the
+            //                           worker has seen" and never shrinks),
+            //                           the retained device pool, the driver.
+            println!("{}", jemalloc_line(&label));
             (
                 child,
                 layout,
