@@ -115,13 +115,36 @@ pub fn zerofier_evaluations_on_extended_domain<F: IsFFTField>(
         .collect()
 }
 
+/// `1/(z^N − 1)`, the half of the zerofier that does NOT depend on the
+/// constraint.
+///
+/// Hoisted out of [`evaluate_zerofier`] because the caller evaluates every
+/// constraint of an AIR at the SAME `z` and `trace_length`: computing it inside
+/// meant one extension-field `pow` and one extension-field `inv` **per
+/// constraint** instead of one per AIR. Measured in the recursion guest, where
+/// that loop is hot: `evaluate_zerofier` was 15.8% of the guest's cycles and
+/// 88% of that was exactly this `inv` + `pow`.
+pub fn zerofier_base_inv<F, E>(z: &FieldElement<E>, trace_length: usize) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    (-FieldElement::<F>::one() + z.pow(trace_length))
+        .inv()
+        .unwrap()
+}
+
 /// Evaluation of the constraint's zerofier at some point `z`, which may be in
 /// a field extension.
+///
+/// `base_inv` is [`zerofier_base_inv`] for this `z`/`trace_length` — the caller
+/// computes it once and passes it for every constraint of the AIR.
 pub fn evaluate_zerofier<F, E>(
     meta: &ConstraintMeta,
     z: &FieldElement<E>,
     trace_primitive_root: &FieldElement<F>,
     trace_length: usize,
+    base_inv: &FieldElement<E>,
 ) -> FieldElement<E>
 where
     F: IsSubFieldOf<E>,
@@ -134,9 +157,5 @@ where
         acc * -(root.clone() - z.clone())
     });
 
-    // 1/(z^N − 1), times the end-exemptions correction.
-    (-FieldElement::<F>::one() + z.pow(trace_length))
-        .inv()
-        .unwrap()
-        * &end_exemptions_eval
+    base_inv * &end_exemptions_eval
 }
