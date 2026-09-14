@@ -4099,6 +4099,7 @@ fn a_node_never_starts_before_both_its_children_are_done() {
                 .push((level, j, started, newest_child));
             ((level * 100 + j, done), level * 100 + j)
         },
+        |_| {},
     );
     for (level, j, started, newest_child) in log.into_inner().expect("log") {
         assert!(
@@ -4154,6 +4155,7 @@ fn one_level_in_flight_reproduces_the_barrier() {
                 .push((level, t0.elapsed().as_micros()));
             (level * 100 + j, ())
         },
+        |_| {},
     );
     let (starts, ends) = (
         starts.into_inner().expect("s"),
@@ -4202,6 +4204,7 @@ fn two_levels_in_flight_actually_overlap() {
                 .push((level, a, t0.elapsed().as_micros()));
             (level * 100 + j, ())
         },
+        |_| {},
     );
     let span = span.into_inner().expect("s");
     let overlapped = (2..=groups.len()).any(|l| {
@@ -4239,6 +4242,7 @@ fn a_panicking_node_re_raises_and_does_not_hang() {
                 assert!(!(level == 2 && j == 0), "L2N0 SAYS SO");
                 (level * 100 + j, ())
             },
+            |_| {},
         )
     });
     let payload = caught.expect_err("a panicking node must panic the caller");
@@ -4302,6 +4306,7 @@ fn prove_in_dependency_order<T: Send, S: Send>(
     workers: usize,
     levels_in_flight: usize,
     prove: impl Fn(usize, usize, Vec<T>) -> (T, S) + Sync,
+    on_level_done: impl Fn(usize) + Sync,
 ) -> (Vec<T>, Vec<Vec<S>>) {
     assert!(
         levels_in_flight >= 1,
@@ -4362,8 +4367,15 @@ fn prove_in_dependency_order<T: Send, S: Send>(
 
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
-            let (sched, wake, levels, summaries, prove, groups) =
-                (&sched, &wake, &levels, &summaries, &prove, &groups);
+            let (sched, wake, levels, summaries, prove, groups, on_level_done) = (
+                &sched,
+                &wake,
+                &levels,
+                &summaries,
+                &prove,
+                &groups,
+                &on_level_done,
+            );
             scope.spawn(move || {
                 let _enrolled = super::program_census::enrol();
                 loop {
@@ -4428,6 +4440,12 @@ fn prove_in_dependency_order<T: Send, S: Send>(
                             }
                             // A completed level can unblock what the cap held.
                             if s.done[level] == groups[level - 1].len() {
+                                // ⛔ CALLED UNDER THE LOCK, deliberately: the hook
+                                // reads a process-wide number whose whole meaning is
+                                // "at the moment this level finished", and letting a
+                                // worker start the next node first would price a
+                                // different moment. It is a read and a print.
+                                on_level_done(level);
                                 let still: Vec<_> = std::mem::take(&mut s.blocked);
                                 for (l, p) in still {
                                     if admits(&s, l) {
@@ -6173,6 +6191,20 @@ fn the_production_tree_composes_to_a_root() {
                     child.public_words.len(),
                 );
                 ((child, layout, lbl), (line, row))
+            },
+            |depth| {
+                // ★ THE FLOOR FALSIFIER'S OWN INSTRUMENT. Lane P5's boundary
+                // snapshots showed the interior's rising floor is LIVE bytes, not
+                // jemalloc retention (resident − allocated is 0.37–0.79 GiB at
+                // every boundary), and that the 19 wraps are still allocated after
+                // level 1 ends. Take-on-consume says they should be gone here.
+                // ⓘ The barrier loop prints this per level; the pooled span has to
+                // print it from inside, because a level's completion is a moment
+                // in the middle of the span rather than the end of a loop body.
+                println!(
+                    "{}",
+                    jemalloc_line(&format!("level {} (pooled)", first_level + depth - 1))
+                );
             },
         );
         // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
