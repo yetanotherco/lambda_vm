@@ -26,11 +26,10 @@ use ethrex_common::types::block_execution_witness::{
     ExecutionWitness, RpcExecutionWitness, amsterdam_chain_config, decode_witness_headers,
 };
 use ethrex_common::types::{AccountState, Block, ELASTICITY_MULTIPLIER, Genesis};
-use ethrex_fixtures::build_stateless_input;
 use ethrex_guest_program::crypto::{Crypto, NativeCrypto};
-use ethrex_guest_program::l1::run_stateless_guest;
 use ethrex_rlp::decode::RLPDecode;
 use ethrex_rlp::encode::RLPEncode;
+use ethrex_ssz_input::{build_stateless_input, validate_natively};
 use ethrex_storage::{EngineType, Store};
 use ethrex_trie::{Nibbles, Node, NodeRef};
 use std::collections::BTreeMap;
@@ -344,10 +343,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.block_access_list.as_ref(),
         CHAIN_ID,
     )?;
-    let output = run_stateless_guest(&bytes, std::sync::Arc::new(NativeCrypto));
-    if output.len() != 43 || output[32] == 0 {
-        return Err("rebuilt block failed native stateless validation".into());
-    }
+    validate_natively(&bytes)
+        .map_err(|e| format!("rebuilt block failed native stateless validation: {e}"))?;
     std::fs::write(&out_path, &bytes)?;
 
     // --- 5. report ---------------------------------------------------------

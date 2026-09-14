@@ -17,6 +17,7 @@ on:
     paths:
       - 'tooling/ethrex-fixtures/**'
       - 'tooling/ethrex-block-converter/**'
+      - 'tooling/ethrex-ssz-input/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
       - '.github/workflows/ethrex-block-converter.yml'
@@ -25,6 +26,7 @@ on:
     paths:
       - 'tooling/ethrex-fixtures/**'
       - 'tooling/ethrex-block-converter/**'
+      - 'tooling/ethrex-ssz-input/**'
       - 'tooling/ethrex-tests/**'
       - 'Makefile'
 

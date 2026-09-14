@@ -13,6 +13,8 @@ default-run = "ethrex-fixtures"
 [workspace]
 
 [dependencies]
+# The SSZ encoder and the native validation check, shared with ethrex-block-converter.
+ethrex-ssz-input = { path = "../ethrex-ssz-input" }
 # Pinned to the SAME ethrex rev as the guest so generated SSZ inputs match what
 # the stateless guest deserializes. Re-pin every manifest together with
 # scripts/set_ethrex_rev.sh.

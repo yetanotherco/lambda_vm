@@ -12,6 +12,7 @@ on:
       - 'executor/**'
       - 'bin/cli/**'
       - 'tooling/ethrex-fixtures/**'
+      - 'tooling/ethrex-ssz-input/**'
       # syscalls is linked into the guest ELF this job builds, so a change confined to
       # it changes the bytes proven — a guest allocator swap moves cycles on every
       # workload. Without it main's baseline would stay stale until some prover file

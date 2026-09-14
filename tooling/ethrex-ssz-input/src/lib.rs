@@ -1,9 +1,12 @@
-//! Shared SSZ input construction for this crate's two generators.
+//! The encoder that turns a block into the schema-prefixed SSZ stateless input, and the
+//! check that the guest accepts what came out.
 //!
-//! `build_stateless_input` is the encoder both binaries need — `ethrex-fixtures` for the
-//! synthetic blocks it builds from a funded genesis, and `real_block` for a real mainnet
-//! block rebuilt as an Amsterdam one. It used to be copied into each, which meant the
-//! copies had to be moved together on every ethrex rev bump with nothing enforcing it.
+//! Three copies of this used to exist — `ethrex-fixtures` for the synthetic blocks it
+//! builds from a funded genesis, its `real_block` binary for a real mainnet block rebuilt
+//! as an Amsterdam one, and `ethrex-block-converter` for an ethrex-replay cache — which
+//! meant they had to move together on every ethrex rev bump with nothing enforcing it.
+//! They differ in where the block comes FROM, not in how it is encoded, so only the
+//! sourcing stays in each.
 
 use ethrex_common::types::Block;
 use ethrex_common::types::block_access_list::BlockAccessList;
@@ -13,6 +16,7 @@ use ethrex_common::types::stateless_ssz::{
     STATELESS_INPUT_SCHEMA_ID, SszExecutionWitness, SszPublicKeys, SszStatelessInput,
 };
 use ethrex_guest_program::crypto::NativeCrypto;
+use ethrex_guest_program::l1::run_stateless_guest;
 use libssz::SszEncode;
 use libssz_types::{ProgressiveList, SszList, SszVector};
 
@@ -152,4 +156,30 @@ pub fn build_stateless_input(
     let mut bytes = STATELESS_INPUT_SCHEMA_ID.to_be_bytes().to_vec();
     input.ssz_append(&mut bytes);
     Ok(bytes)
+}
+
+/// The guest's public output: `state_root(32) || successful_validation(1) ||
+/// chain_id(8) || schema_id(2)`.
+pub const GUEST_OUTPUT_LEN: usize = 43;
+/// Offset of `successful_validation` within that output.
+pub const VALIDATION_FLAG: usize = 32;
+
+/// Run an encoded input through the stateless guest on the host, and report whether the
+/// block validated.
+///
+/// This is the check every producer owes its output before writing it: a guest that cannot
+/// decode the input does not fail, it commits an all-zero result and exits cleanly, so an
+/// unvalidated fixture benchmarks nothing while looking like a 99% improvement.
+pub fn validate_natively(bytes: &[u8]) -> Result<(), String> {
+    let output = run_stateless_guest(bytes, std::sync::Arc::new(NativeCrypto));
+    if output.len() != GUEST_OUTPUT_LEN {
+        return Err(format!(
+            "guest returned {} bytes, expected {GUEST_OUTPUT_LEN}",
+            output.len()
+        ));
+    }
+    if output[VALIDATION_FLAG] == 0 {
+        return Err("the guest rejected the block (successful_validation = 0)".into());
+    }
+    Ok(())
 }

@@ -1064,6 +1064,7 @@ dependencies = [
  "ethrex-guest-program",
  "ethrex-l2-rpc",
  "ethrex-rlp",
+ "ethrex-ssz-input",
  "ethrex-storage",
  "ethrex-trie",
  "hex",
@@ -1274,6 +1275,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "ethrex-ssz-input"
+version = "0.1.0"
+dependencies = [
+ "ethrex-common",
+ "ethrex-guest-program",
+ "ethrex-rlp",
+ "libssz",
+ "libssz-types",
 ]
 
 [[package]]

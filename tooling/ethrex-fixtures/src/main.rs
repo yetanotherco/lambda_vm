@@ -29,10 +29,8 @@ use ethrex_common::types::{
     EIP1559Transaction, ELASTICITY_MULTIPLIER, Genesis, GenesisAccount, Transaction, TxKind,
 };
 use ethrex_common::{Address, H256, U256};
-use ethrex_fixtures::build_stateless_input;
-use ethrex_guest_program::crypto::NativeCrypto;
-use ethrex_guest_program::l1::run_stateless_guest;
 use ethrex_l2_rpc::signer::{LocalSigner, Signable, Signer};
+use ethrex_ssz_input::{build_stateless_input, validate_natively};
 use ethrex_storage::{EngineType, Store};
 use secp256k1::SecretKey;
 
@@ -217,10 +215,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let witness: RpcExecutionWitness = witness.try_into()?;
     let bytes = build_stateless_input(&block, &witness, block_access_list.as_ref(), chain_id)?;
-    let output = run_stateless_guest(&bytes, std::sync::Arc::new(NativeCrypto));
-    if output.len() != 43 || output[32] == 0 {
-        return Err("generated stateless fixture failed native validation".into());
-    }
+    validate_natively(&bytes)
+        .map_err(|e| format!("generated stateless fixture failed native validation: {e}"))?;
     std::fs::write(&out_path, &bytes)?;
 
     let mode_label = match mode {

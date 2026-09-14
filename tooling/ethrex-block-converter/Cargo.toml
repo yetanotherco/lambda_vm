@@ -7,6 +7,9 @@ edition = "2024"
 [workspace]
 
 [dependencies]
+# The SSZ encoder and the native validation check, shared with ethrex-fixtures: the block
+# is sourced here, encoded there.
+ethrex-ssz-input = { path = "../ethrex-ssz-input" }
 # Pinned to the SAME ethrex rev as the guest so the generated SSZ input matches
 # what the stateless guest deserializes.
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-common", default-features = false, features = ["secp256k1"] }
