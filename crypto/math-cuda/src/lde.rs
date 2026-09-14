@@ -1217,6 +1217,45 @@ fn coset_lde_row_major_inner(
     ))
 }
 
+/// The row-major coset LDE **alone** — no leaf hashing, no Merkle tree.
+///
+/// ★ This is exactly what a Round-1 RESIDENCY RELEASE would re-run. At the
+/// Round-1 barrier a table's tree is already built and its root already
+/// absorbed, so dropping the LDE buffer and rebuilding it later costs this and
+/// nothing else. The entry exists so that cost can be PRICED before anyone
+/// builds the release: lane P5's arithmetic puts the break-even at 24 ms per
+/// rebuild for an all-tables policy and 423 ms for the heaviest table only, and
+/// those are decided by a measurement, not by a model.
+///
+/// ⛔ IT SYNCHRONISES, and that is the whole point. The launches below are
+/// asynchronous, so a caller that timed this without the sync would time a
+/// queue submission — microseconds — and report that the rebuild is free. A
+/// probe that cannot fail is worse than no probe.
+///
+/// Nothing on the proving path calls this today.
+pub fn coset_lde_row_major_no_tree(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let (buf, _) = expand_row_major_on_stream(
+        &stream,
+        be,
+        InnerInput::Host(row_major),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        false,
+    )?;
+    stream.synchronize()?;
+    Ok(buf)
+}
+
 /// Row-major LDE + leaf hashing + Merkle, all on-device, keeping the Merkle
 /// tree
 /// resident on device (in the handle's `tree`). The host tree is not built, so
