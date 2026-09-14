@@ -2534,9 +2534,12 @@ fn jemalloc_line(label: &str) -> String {
     match jemalloc_marks() {
         Some((a, r)) => format!(
             "   {label}: jemalloc allocated {a:.3} GiB · resident {r:.3} · \
-             RETAINED {:.3} ({:.0}% of resident)",
+             RETAINED {:.3} ({:.0}% of resident) · caches: twiddles {} · \
+             precomputed trees {}",
             r - a,
             if r > 0.0 { 100.0 * (r - a) / r } else { 0.0 },
+            stark::prover::domain_twiddle_cache_entries(),
+            stark::prover::precomputed_tree_cache_entries(),
         ),
         None => format!("   {label}: jemalloc stats unavailable"),
     }

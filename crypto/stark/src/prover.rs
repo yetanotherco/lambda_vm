@@ -211,6 +211,41 @@ fn precomputed_tree_cache()
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// ★★ HOW MANY DISTINCT SHAPES THE TWO PROCESS-GLOBAL CACHES HOLD.
+///
+/// Both are insert-only — ✓ nothing removes from either — so **the entry count
+/// IS the cumulative miss count**, and the pair is the falsifier for a specific
+/// hypothesis: that the interior's rising host floor is these caches rather than
+/// retained children. Measured, `allocated` rises 19.3 → 28.9 → 31.5 → 32.7 →
+/// 33.7 → 34.2 GiB across levels holding 19 → 10 → 5 → 3 → 2 → 1 children, and
+/// neither "all children freed" nor "none freed" reproduces that shape, while a
+/// monotone insert-only shape-keyed accumulator does.
+///
+/// ⇒ **Entries plateauing while `allocated` keeps rising REFUTES the cache
+/// hypothesis.** Entries and `allocated` rising together, with both increments
+/// shrinking, supports it. Either way the reading is a subtraction, not an
+/// argument.
+///
+/// ⓘ `crate::tests::domain_cache_stats` already counts hits and misses and
+/// cannot answer this: it is `#[cfg(test)]` on THIS crate, so it is compiled out
+/// whenever `stark` is a dependency — which is every LFM run. These are always
+/// compiled.
+pub fn domain_twiddle_cache_entries() -> usize {
+    domain_twiddle_cache()
+        .lock()
+        .map(|c| c.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Companion to [`domain_twiddle_cache_entries`], for the precomputed Merkle
+/// trees. Keyed by root, so one entry per distinct preprocessed table shape.
+pub fn precomputed_tree_cache_entries() -> usize {
+    precomputed_tree_cache()
+        .lock()
+        .map(|c| c.len())
+        .unwrap_or(usize::MAX)
+}
+
 pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
 ) -> Option<Arc<MerkleTree<B>>> {
