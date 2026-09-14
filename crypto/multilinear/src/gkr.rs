@@ -63,7 +63,11 @@ impl<F: IsField + 'static> FractionLayer<F> {
             )
         };
         #[cfg(feature = "parallel")]
-        let (next_p, next_q): (Vec<_>, Vec<_>) = (0..half).into_par_iter().map(both).unzip();
+        let (next_p, next_q): (Vec<_>, Vec<_>) = if half >= crate::SERIAL_BELOW {
+            (0..half).into_par_iter().map(both).unzip()
+        } else {
+            (0..half).map(both).unzip()
+        };
         #[cfg(not(feature = "parallel"))]
         let (next_p, next_q): (Vec<_>, Vec<_>) = (0..half).map(both).unzip();
 

@@ -94,14 +94,15 @@ impl<F: IsField + 'static> Mle<F> {
         let (lo, hi) = self.evals.split_at_mut(half);
         // Every index is independent, and the halves are disjoint slices, so the
         // split is what lets the rows go out to the pool at all.
+        let fold = |(a, b): (&mut FieldElement<F>, &FieldElement<F>)| *a = &*a + r * &(b - &*a);
         #[cfg(feature = "parallel")]
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+        if half >= crate::SERIAL_BELOW {
+            lo.par_iter_mut().zip(hi.par_iter()).for_each(fold);
+        } else {
+            lo.iter_mut().zip(hi.iter()).for_each(fold);
+        }
         #[cfg(not(feature = "parallel"))]
-        lo.iter_mut()
-            .zip(hi.iter())
-            .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+        lo.iter_mut().zip(hi.iter()).for_each(fold);
         self.evals.truncate(half);
         self.num_vars -= 1;
         Ok(())
@@ -166,22 +167,26 @@ impl<F: IsField + 'static> Mle<F> {
         let (lo, hi) = evals.split_at(half);
         let combine = |(l, h): (&FieldElement<F>, &FieldElement<F>)| l + first * &(h - l);
         #[cfg(feature = "parallel")]
-        let mut current: Vec<FieldElement<F>> =
-            lo.par_iter().zip(hi.par_iter()).map(combine).collect();
+        let mut current: Vec<FieldElement<F>> = if half >= crate::SERIAL_BELOW {
+            lo.par_iter().zip(hi.par_iter()).map(combine).collect()
+        } else {
+            lo.iter().zip(hi.iter()).map(combine).collect()
+        };
         #[cfg(not(feature = "parallel"))]
         let mut current: Vec<FieldElement<F>> = lo.iter().zip(hi.iter()).map(combine).collect();
 
         for r in rest {
             let half = current.len() / 2;
             let (lo, hi) = current.split_at_mut(half);
+            let fold = |(a, b): (&mut FieldElement<F>, &FieldElement<F>)| *a = &*a + r * &(b - &*a);
             #[cfg(feature = "parallel")]
-            lo.par_iter_mut()
-                .zip(hi.par_iter())
-                .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+            if half >= crate::SERIAL_BELOW {
+                lo.par_iter_mut().zip(hi.par_iter()).for_each(fold);
+            } else {
+                lo.iter_mut().zip(hi.iter()).for_each(fold);
+            }
             #[cfg(not(feature = "parallel"))]
-            lo.iter_mut()
-                .zip(hi.iter())
-                .for_each(|(a, b)| *a = &*a + r * &(b - &*a));
+            lo.iter_mut().zip(hi.iter()).for_each(fold);
             current.truncate(half);
         }
         Ok(current.swap_remove(0))

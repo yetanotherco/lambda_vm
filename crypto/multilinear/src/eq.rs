@@ -60,7 +60,11 @@ where
             *l = &*l * &one_minus;
         };
         #[cfg(feature = "parallel")]
-        lo.par_iter_mut().zip(hi.par_iter_mut()).for_each(scale);
+        if half >= crate::SERIAL_BELOW {
+            lo.par_iter_mut().zip(hi.par_iter_mut()).for_each(scale);
+        } else {
+            lo.iter_mut().zip(hi.iter_mut()).for_each(scale);
+        }
         #[cfg(not(feature = "parallel"))]
         lo.iter_mut().zip(hi.iter_mut()).for_each(scale);
     }

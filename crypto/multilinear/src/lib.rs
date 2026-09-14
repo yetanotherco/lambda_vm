@@ -31,6 +31,12 @@ pub mod zerocheck;
 use math::field::{element::FieldElement, traits::IsField};
 use thiserror::Error;
 
+/// Below this a pass stays on the thread that asked for it: handing a slice to
+/// the pool costs tens of microseconds whatever is in it, and a sumcheck's last
+/// rounds are over a few hundred values.
+#[cfg(feature = "parallel")]
+pub(crate) const SERIAL_BELOW: usize = 1 << 12;
+
 /// `[1, gamma, gamma^2, ..]` — the weights a batching challenge expands into.
 pub(crate) fn challenge_powers<F: IsField>(
     gamma: &FieldElement<F>,

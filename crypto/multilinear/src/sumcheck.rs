@@ -165,9 +165,7 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        // Below this the pool costs more than the round does.
-        const SERIAL_BELOW: usize = 1 << 10;
-        if half < SERIAL_BELOW {
+        if half < crate::SERIAL_BELOW {
             return slice(0..half);
         }
         let chunk = half.div_ceil(rayon::current_num_threads().max(1));
