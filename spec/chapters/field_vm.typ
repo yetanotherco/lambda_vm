@@ -9,12 +9,32 @@ extension field arithmetic and program flow.
 
 = ISA
 
+The field VM is a machine that has access to a read-only memory `MEM`, modeled as a flat array
+that can be indexed by base field elements.
+This `MEM` can be implemented as a committed table containing the memory as well as the multiplicities for
+the number of times each cell was accessed.
+As additional memory, the VM has a set of $N + 2$ mutable registers that are not part of the `MEM` array.
+
 The central instruction of the ISA is a constraint for a fused multiply-add over the extension field:
 `FMA d == a * b + c`.
 Here all of `d`, `a`, `b` and `c` are arguments following the addressing scheme described below.
 
+This constraint-based view generally goes well with a read-only memory.
+The memory system gives us that guarantee that whenever we access `MEM` at the same index,
+we get the same value back, and the constraint allows us to enforce that these
+values in memory are consistent with the structure we want it to have.#footnote[
+  In the most central application of the VM, we check that the memory consists of a correct proof
+  and any auxiliary data needed for this verification.
+]
+For the mutable registers, however, this approach is insufficient, as the instruction does not have
+a way to actually mutate a register.
+We deal with this through a system we call _register hinting_ --- which can be further distinguished
+into _input hinting_ and _output hinting_ --- described further below.
+
+
 == Arguments and addressing
 
+#rj[Clarify state and registers being part of the state; state vs instruction]
 The VM has a state consisting of $N$ general purpose extension field registers,
 a base-field `PC` register, and a bit-register `ZERO`.
 The number of registers was chosen as a tradeoff between the versatility of having more mutable state,
