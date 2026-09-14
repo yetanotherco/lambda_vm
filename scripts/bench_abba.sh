@@ -38,7 +38,7 @@
 #          large continuation trace where GPU-residency wins are visible).
 #          Ignored when WORKLOAD=real.
 #        WORKLOAD=real|synthetic (default real) which block to prove. `real`
-#          fetches the real-block fixture (block identity lives in the Makefile) and
+#          builds the real-block fixture (block identity lives in the Makefile) and
 #          forces --continuations; TX_COUNT and CONTINUATIONS do not apply to it.
 #
 #   On WORKLOAD: a real block is keccak- and trie-bound, while the synthetic option is
