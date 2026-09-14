@@ -133,10 +133,35 @@ pub static R3_ABSORB: Slot = Slot::new();
 /// Round 4: DEEP composition + the FRI commit phase.
 pub static R4_DEEP_FRI: Slot = Slot::new();
 /// Round 4: the proof-of-work grind.
+///
+/// ⛔ READ THIS PER TABLE, NOT PER CALL — it is a Σ like every slot under the
+/// `tables[Σ]` prefix, and a per-call threshold read against it is meaningless.
+/// The scale that settles which arm ran: one 2^20 grind costs **~105 ms/table**
+/// on the host at BLAKE3's 100 ns, and **~5,830 s/table** at RPX's measured
+/// 5,561 ns. Single-digit milliseconds is the device.
+///
+/// ⇒ and the line no longer makes anyone infer it: `on device` below counts the
+/// device dispatches this call actually made.
 pub static R4_GRIND: Slot = Slot::new();
 /// Round 4: query sampling, the FRI query phase and the DEEP openings.
 pub static R4_QUERIES: Slot = Slot::new();
 
+/// `gpu_lde::GPU_GRIND_CALLS` as of the last report, so each line carries the
+/// device grinds of ITS OWN call rather than the process total.
+static GRIND_GPU_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// This call's share of a monotone process-wide counter: read the previous mark
+/// and replace it in ONE swap, then subtract.
+///
+/// ⛔ Its own first draft swapped and then LOADED the same cell, which returns
+/// the value just stored and makes the delta identically zero — a counter that
+/// reads 0 on every line, which is exactly what "the device arm never fired"
+/// looks like. A check that cannot fail is worse than no check. The test below
+/// is written so that bug fails it.
+#[inline]
+fn grind_delta(seen: &AtomicU64, now: u64) -> u64 {
+    now.saturating_sub(seen.swap(now, Ordering::Relaxed))
+}
 /// Proves that have started; the sequence number the line carries.
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// Proves inside `multi_prove` right now — the overlap falsifier.
@@ -209,6 +234,19 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
     let r4_deep_fri = R4_DEEP_FRI.take();
     let r4_grind = R4_GRIND.take();
     let r4_queries = R4_QUERIES.take();
+    // ★ THE GRIND'S ARM, COUNTED RATHER THAN INFERRED. `GPU_GRIND_CALLS` counts
+    // one per table whose round-4 nonce search ran on device AND passed the host
+    // validity check — a device miss falls back to the CPU search and is NOT
+    // counted. So `n/airs on device` reading n = airs is the device arm firing
+    // on every table, and anything less names exactly how many fell back.
+    // ONE path, so the helper and its mark are live on every build: a non-cuda
+    // build simply never grinds on device, and `0/airs` is the true reading
+    // there rather than a cfg-ed-out field.
+    #[cfg(feature = "cuda")]
+    let grind_now = crate::gpu_lde::gpu_grind_calls();
+    #[cfg(not(feature = "cuda"))]
+    let grind_now = 0u64;
+    let grind_gpu = grind_delta(&GRIND_GPU_SEEN, grind_now);
 
     let table_sum = aux_build
         + aux_commit
@@ -236,7 +274,8 @@ pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Optio
          r1_assemble {r1_assemble:.2} · r2_constraints {r2_constraints:.2} · \
          r2_decompose {r2_decompose:.2} · r2_commit {r2_commit:.2} · \
          r3_ood {r3_ood:.2} · r3_absorb {r3_absorb:.3} · r4_deep_fri {r4_deep_fri:.2} · \
-         r4_grind {r4_grind:.2} · r4_queries {r4_queries:.2} · Σ {table_sum:.2}",
+         r4_grind {r4_grind:.2} ({grind_gpu}/{num_airs} on device) · \
+         r4_queries {r4_queries:.2} · Σ {table_sum:.2}",
         seq = m.seq,
         tainted = if OVERLAPPED.load(Ordering::Relaxed) == 0 {
             ""
@@ -267,6 +306,21 @@ mod tests {
         assert_eq!(S.0.load(Ordering::Relaxed), 0, "and no slot moved");
         assert!(begin().is_none(), "and no prove is opened");
         assert!(report(None, 3, 1024).is_none(), "and no line is produced");
+    }
+
+    /// ⛔ THE DELTA MUST REPORT THIS CALL, NOT ZERO AND NOT THE PROCESS TOTAL.
+    ///
+    /// Written against the bug it had: a swap followed by a load of the same
+    /// cell returns what was just stored, so the delta is identically zero and
+    /// every line reads "0 on device" whatever the device did. The second
+    /// assertion is the one that fires on it.
+    #[test]
+    fn the_grind_delta_is_per_call_and_a_swap_then_load_would_fail_it() {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        assert_eq!(grind_delta(&SEEN, 27), 27, "the first call sees all of it");
+        assert_eq!(grind_delta(&SEEN, 41), 14, "the second sees only its own");
+        assert_eq!(grind_delta(&SEEN, 41), 0, "and a call that ground nothing");
+        assert_eq!(grind_delta(&SEEN, 7), 0, "a reset counter never underflows");
     }
 
     /// A slot accumulates across threads and `take` CLEARS it — the property
