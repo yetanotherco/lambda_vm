@@ -148,11 +148,24 @@ static OVERLAPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// What [`begin`] hands back, so [`report`] can price the whole prove without
 /// the caller threading a second timer.
-#[derive(Clone, Copy, Debug)]
+///
+/// ⛔ It releases the concurrency count on DROP, not in [`report`]. `multi_prove`
+/// has `?` early-returns, and a release that only ran on the success path would
+/// leave the count stuck at one forever — every later line would then be stamped
+/// `OVERLAPPED` by a prove that failed rather than by two that overlapped. A
+/// false alarm on the falsifier is worse than no falsifier, because it reads as
+/// evidence.
+#[derive(Debug)]
 pub struct ProveMark {
     seq: usize,
     start: Instant,
     start_epoch: f64,
+}
+
+impl Drop for ProveMark {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Open a prove. Cheap and inert when the knob is off.
@@ -177,7 +190,6 @@ pub fn begin() -> Option<ProveMark> {
 /// prints.
 pub fn report(m: Option<ProveMark>, num_airs: usize, total_rows: usize) -> Option<String> {
     let m = m?;
-    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     let wall = m.start.elapsed().as_secs_f64();
     let end_epoch = epoch_secs();
 
