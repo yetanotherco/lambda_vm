@@ -32,8 +32,8 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
     let elf_bytes = asm_elf_bytes("fib_iterative_372k");
 
     let max_rows = MaxRowsConfig::default();
-    let lengths =
-        count_table_lengths(&elf, &logs, &max_rows, &[]).expect("count_table_lengths succeeds");
+    let lengths = count_table_lengths(&elf, &logs, &max_rows, &[], &[])
+        .expect("count_table_lengths succeeds");
 
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
     let predicted =
