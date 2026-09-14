@@ -324,12 +324,14 @@ fn dma_memset_rejects_every_gap_but_one() {
     }
 }
 
-/// The predicate the guest stub's fallback branch is written against.
+/// The boundary guard's arithmetic.
 ///
-/// That branch is assembly and never runs on the host, so this is what pins its
-/// logic: the stub takes the plain store loop exactly when this says the range
-/// crosses, and the executor refuses the ecall on the same condition. If the two ever
-/// disagree, an honest `memset` either aborts or produces an unprovable trace.
+/// The guard exists because the AIR needs `dst = src + 8` to hold on every row, not
+/// just the first, and the executor is where that is enforced. Nothing is expected to
+/// trip it — see `dma_memset_crosses_limb_boundary` for why no well-formed object can —
+/// so this pins the arithmetic rather than a reachable path: the predicate must agree
+/// with "some row of this chain has a carrying low limb", exactly, or the guard would
+/// either refuse honest calls or let through ones the prover cannot build.
 #[test]
 fn the_memset_limb_boundary_predicate_matches_the_rows_the_air_can_pin() {
     // Brute force: for every low limb near the boundary and every legal length, the
@@ -350,10 +352,19 @@ fn the_memset_limb_boundary_predicate_matches_the_rows_the_air_can_pin() {
         }
     }
 
-    // The stack top is the reachable case, and it is `main`'s own frame.
+    // The stack is the only region whose low limb comes near the boundary, and it does
+    // not reach it: a real object satisfies `buf + n <= STACK_TOP`, so `low + n` tops
+    // out at 0xFFFF_FFF0 and the 8-byte gap still fits. Only a pointer past the stack
+    // top — already undefined behaviour — crosses.
     const STACK_TOP: u64 = 0xFFFF_FFFF_FFFF_FFF0;
-    assert!(dma_memset_crosses_limb_boundary(STACK_TOP - 8, 256));
-    assert!(!dma_memset_crosses_limb_boundary(STACK_TOP - 264, 256));
+    assert!(
+        !dma_memset_crosses_limb_boundary(STACK_TOP - 256, 256),
+        "a buffer that ends exactly at STACK_TOP must be accepted"
+    );
+    assert!(
+        dma_memset_crosses_limb_boundary(STACK_TOP - 8, 256),
+        "only a range running past STACK_TOP crosses"
+    );
     // Ordinary heap buffers are nowhere near it.
     assert!(!dma_memset_crosses_limb_boundary(0x1_0000, 256));
 }

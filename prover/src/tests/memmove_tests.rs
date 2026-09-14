@@ -413,16 +413,19 @@ fn memmove_constraints_pin_the_memset_gap() {
 /// Constraint 13, `(1 - tail) * lt8 = 0`, in both directions.
 ///
 /// This is the constraint that replaced the old DMA table's hard pin of
-/// `tail = (count < 8)`. Erik asked for exactly this relaxation so the prover may
-/// take one-byte rows at any count and reach the aligned `MEMW_A` path, so both
-/// directions matter: the narrow-at-high-count row must be ACCEPTED (it is the
-/// alignment prologue `memmove_row_width` emits), and the wide-at-low-count row must
-/// be REJECTED (it would move eight bytes where fewer were authorised).
+/// `tail = (count < 8)`, so that a one-byte row is legal at any count and a prover may
+/// walk one-byte rows to reach eight-byte alignment and keep the body on `MEMW_A`.
+///
+/// Both directions matter, and the accepting one is the point: the builder does NOT
+/// emit narrow rows at a high count today — the alignment split was measured and
+/// removed — so nothing else in the tree exercises the freedom this constraint grants.
+/// Without a test, tightening it back to `tail == lt8` would look like a harmless
+/// cleanup and would silently remove the capability.
 ///
 /// Neither case is expressible through `row()` or `set_row()`, which derive width
 /// from count and so can only ever produce `tail == lt8`.
 #[test]
-fn memmove_constraint_14_frees_narrow_rows_but_not_wide_ones() {
+fn memmove_constraint_13_frees_narrow_rows_but_not_wide_ones() {
     use crate::tables::memmove::Functionality::Copy;
     let air = busless_air(
         cols::NUM_COLUMNS,
@@ -440,7 +443,7 @@ fn memmove_constraint_14_frees_narrow_rows_but_not_wide_ones() {
     ]);
     assert!(
         validate_busless(&air, &prologue),
-        "a one-byte row at count >= 8 is legal: it is the alignment prologue"
+        "a one-byte row at count >= 8 must be legal, whether or not the builder emits one"
     );
 
     // REJECTED: an eight-byte row with fewer than eight bytes left. `tail = 0`,

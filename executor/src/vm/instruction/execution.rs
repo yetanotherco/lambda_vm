@@ -105,10 +105,11 @@ pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64, to_com
 
 /// Total MEMMOVE rows one ecall produces: its data rows plus the terminal row.
 ///
-/// A pure function of `(dst, count)` — the width now depends on the destination's
-/// alignment, not on `count` alone. Every consumer that needs a row count (the
-/// trace builder, the sizing pass, the CLI's accelerator report) goes through this
-/// function, so none of them can drift from the trace the prover actually builds.
+/// The width follows from `count` alone today, so this is `count / 8 + count % 8 + 1`.
+/// It is still written as a loop over `memmove_row_width` because that function is what
+/// the trace builder and the sizing pass call, and a future schedule that reads the
+/// addresses would otherwise silently diverge from the rows actually built. Every
+/// consumer that needs a row count goes through here for the same reason.
 pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u64 {
     let mut rows = 1;
     let mut offset = 0u64;
@@ -152,13 +153,18 @@ pub const DMA_MEMSET_GAP: u64 = 8;
 /// Whether a memset over `[dst, dst + n)` would straddle the 2^32 limb boundary.
 ///
 /// The AIR pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
-/// limb carries has no representable successor. The executor refuses such a call and
-/// the guest stub steers around it with a plain store loop; this is the single
-/// predicate both sides are written against, so they cannot drift.
+/// limb carries has no representable successor and the executor refuses the call.
 ///
-/// It is not a theoretical case. The stack starts at `STACK_TOP = 0xFFFF_FFFF_FFFF_FFF0`,
-/// whose low limb is `0xFFFF_FFF0`, so a buffer within `n + 8` bytes of the stack top
-/// crosses — which is `main`'s own frame.
+/// No well-formed object can produce one. Every non-stack address lives below
+/// `MAX_MEMORY_SIZE` (0xC000_0000), and a stack object satisfies `buf + n <= STACK_TOP`,
+/// whose low limb is `0xFFFF_FFF0` — so `low(buf) + n <= 0xFFFF_FFF0`, leaving 15 bytes
+/// of headroom for the 8-byte gap. The margin comes from STACK_TOP's 16-byte ABI
+/// alignment, and `syscalls::allocator` holds the matching `MAX_MEMORY_SIZE < 1 << 32`
+/// assertion. A guest that computes a pointer past the stack top is already undefined
+/// behaviour in C and gets a clean error here rather than an unprovable trace.
+///
+/// So this is a guard, not a path anything takes. It exists because the AIR needs the
+/// operand relation to hold on every row, and the executor is where that is enforced.
 pub const fn dma_memset_crosses_limb_boundary(dst: u64, n: u64) -> bool {
     // `n` is bounded by DMA_MEMCPY_MAX_BYTES on the ecall path, so this cannot wrap.
     (dst & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF

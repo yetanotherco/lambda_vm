@@ -56,8 +56,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 /// Column definitions for the COMMIT table.
 ///
-/// Layout follows the spec order: timestamp, index, address, address_incr,
-/// count, count_decr, first, end, value, mu.
+/// Layout follows the spec order: timestamp, index, address, count, mu.
 pub mod cols {
     // Timestamp (DWordWL: 2 cols)
     /// timestamp[0]: low 32 bits
