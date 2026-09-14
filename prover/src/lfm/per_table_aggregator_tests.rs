@@ -1905,6 +1905,31 @@ fn cached_stage(
 /// the base residue, and therefore how much of any high peak belongs to this
 /// harness rather than to the tree. The deserialise path is production's own
 /// (`bin/cli/src/main.rs:877-886`).
+/// A stamped wall-clock window for a stretch no `TIMING` line covers.
+///
+/// ★★ WHY THESE EXIST. The pass-5 profile found **10.4 s at 3.8% GPU
+/// utilisation** between the global L2G prove and the first wrap's device hold —
+/// the largest contiguous idle block in the whole run — and NOTHING measured it.
+/// It could only be decomposed by subtracting assumed terms, which is the exact
+/// move this campaign keeps having to retract. Three stamps end that.
+///
+/// Reuses `LFM_CARD_TRACE` rather than adding a knob, because it is the same
+/// job: hand an external sampler two wall-clock stamps to slice itself by.
+fn stamped<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if !super::device_permit::trace_enabled() {
+        return f();
+    }
+    let t0 = stark::prove_split::epoch_secs();
+    let t = std::time::Instant::now();
+    let out = f();
+    println!(
+        "STAGE {label}: {:.2}s t=[{t0:.3},{:.3}]",
+        t.elapsed().as_secs_f64(),
+        stark::prove_split::epoch_secs(),
+    );
+    out
+}
+
 fn cached_bundle(
     mode: CacheMode,
     path: Option<std::path::PathBuf>,
@@ -1946,12 +1971,18 @@ fn cached_bundle(
                 p.display()
             );
             let bundle = prove();
-            let bytes =
-                rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).expect("the bundle must serialize");
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).expect("the cache directory must exist");
-            }
-            std::fs::write(&p, &bytes).expect("the bundle must persist");
+            // ⛔ HARNESS-ONLY, AND IT IS INSIDE THE `base:` NUMBER. Serialising
+            // and writing a 19-epoch bundle is multi-second disk work that no
+            // production pipeline does, and until this stamp existed it was
+            // indistinguishable from proving.
+            stamped("bundle cache write (HARNESS-ONLY)", || {
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
+                    .expect("the bundle must serialize");
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir).expect("the cache directory must exist");
+                }
+                std::fs::write(&p, &bytes).expect("the bundle must persist");
+            });
             println!(
                 "   base: PROVED in-process and saved to {} — carries in \
                  L_children + the base residue",
@@ -4123,8 +4154,10 @@ fn the_production_tree_composes_to_a_root() {
     // does — this loop parsed 3.4 MB of ELF nineteen times and built the same
     // commitment thirty-eight. `prove_continuation` hoists exactly this pair and
     // says so; the driver did not inherit it.
-    let epoch_konsts = super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
-        .expect("the inner ELF and its DECODE commitment must build once");
+    let epoch_konsts = stamped("EpochConstants::load (ELF + DECODE commitment)", || {
+        super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
+            .expect("the inner ELF and its DECODE commitment must build once")
+    });
     // ★★★ LEVEL-0 CONCURRENCY. Armed with its OWN count and disarmed straight
     // after, so the interior's knob and this one never reach across.
     //
@@ -4151,6 +4184,12 @@ fn the_production_tree_composes_to_a_root() {
         // node has printed all along, so the two proof classes can be read
         // against each other instead of against a model.
         let t_wrap = Instant::now();
+        // ★ THE RAMP, STAMPED. At K workers the first wrap's reconstruct + emit
+        // is the whole level's card-idle head, and its DURATION was already
+        // printed while its POSITION was not — so it could not be matched to a
+        // sampler window. Every wrap carries it, which also shows the ramp's
+        // shape rather than only its first term.
+        let wrap_t0 = stark::prove_split::epoch_secs();
         let t = Instant::now();
         let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
             .expect("every epoch must reconstruct from proofs alone");
@@ -4180,6 +4219,14 @@ fn the_production_tree_composes_to_a_root() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let t_emit = t.elapsed().as_secs_f64();
+        if super::device_permit::trace_enabled() {
+            println!(
+                "STAGE wrap {k} prologue (reconstruct+emit, pre-device): {:.2}s \
+                 t=[{wrap_t0:.3},{:.3}]",
+                t_recon + t_emit,
+                stark::prove_split::epoch_secs(),
+            );
+        }
         // ★ THE WRAP'S SIZE, in the shape every node already prints. Without it
         // the only way to price a wrap is a clock, and a clock cannot say
         // whether a wrap is dear because of its instruction count or its cells

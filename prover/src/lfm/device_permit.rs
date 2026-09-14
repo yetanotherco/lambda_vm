@@ -83,7 +83,7 @@ static TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
 /// was. Slicing the sample by these two numbers answers "how idle is the card
 /// INSIDE the held windows", which is the question a mutual-exclusion gate
 /// raises and no aggregate can answer.
-fn trace_enabled() -> bool {
+pub fn trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("LFM_CARD_TRACE") {
         Ok(v) => !v.is_empty() && v != "0",
