@@ -70,6 +70,12 @@ pub mod cols {
 // Operation struct
 // =========================================================================
 
+/// Rows one ECSM call can add here, at most: the double-and-add ladder runs at
+/// most one double and one add per bit of a 256-bit scalar. Used to bound the
+/// table's height when sizing storage, which is why it is an upper bound and
+/// not the exact per-call count (that depends on the scalar).
+pub const MAX_STEPS_PER_ECSM: usize = 2 * 256;
+
 /// One ECDAS row: a double/add step witness plus its ECALL timestamp.
 #[derive(Debug, Clone)]
 pub struct EcdasOperation {
