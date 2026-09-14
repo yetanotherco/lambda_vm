@@ -277,24 +277,32 @@ test-rust: compile-programs-rust
 # ===== Real block: the benchmark workload =====
 #
 # A genuine Ethereum block, as opposed to the synthetic N-plain-transfer blocks
-# from tooling/ethrex-fixtures. Two artifacts, both gitignored and both FETCHED
-# rather than built:
+# from tooling/ethrex-fixtures. Two artifacts, both gitignored, and only one of
+# them is fetched:
 #
-#   the fixture   the schema-prefixed SSZ input the benchmarks prove
-#   the cache     the ethrex-replay JSON it was converted from (~2 MB), read only
-#                 by `regen-real-block-fixture`. The converter's TESTS read a
-#                 different, upstream-pinned cache — see below.
+#   the cache     the ethrex-replay JSON (~2 MB), FETCHED by URL + sha256. It is
+#                 fork-independent, which is why it survives a rev bump and the
+#                 fixture does not. The converter's TESTS read a different,
+#                 upstream-pinned cache — see below.
+#   the fixture   the schema-prefixed SSZ input the benchmarks prove, GENERATED
+#                 from that cache by `tooling/ethrex-fixtures --bin real_block`
+#                 and pinned by sha256 like a download would be.
 #
-# Fetching a verified binary is the same contract as prepare-sysroot above, and it
-# keeps the converter, the ~335-package ethrex host dependency tree and an
-# ethrex-replay `rev` pin off the path of everyone who just wants to run a
-# benchmark. It also decouples the block from what upstream happens to host:
-# ethrex-replay publishes a cache for Hoodi and nothing else, so any mainnet block
-# is unreachable by the convert-locally route (its cache takes ~4 minutes and ~700
-# calls against an archive RPC to produce) and trivial by this one.
+# Generating it is what makes a rev bump a re-run rather than an upload: the schema
+# id is the fork declaration, so a hosted fixture would have to be rebuilt and
+# published by hand on every bump, and a stale one benchmarks nothing (496 cycles,
+# exit 0). The cost is that a checkout without the fixture pays a cold build of the
+# ethrex host tree to produce it — real on a rented GPU box, ~35 ms on a persistent
+# runner where the digest already matches. scripts/bench_abba.sh backgrounds that
+# build so it runs under the prover builds.
+#
+# Fetching the cache rather than an RPC replay also decouples the block from what
+# upstream hosts: ethrex-replay publishes a cache for Hoodi and nothing else, so any
+# mainnet block is unreachable by the replay-locally route (~4 minutes and ~700
+# calls against an archive RPC) and trivial by this one.
 #
 # The converter still exists and is still tested — see "Real-block converter"
-# below. It is a regeneration tool for ethrex rev bumps, not a build step.
+# below. It is no longer what regenerates this fixture.
 #
 # ---- Repointing to a different block ----
 # These SIX lines and nothing else. Every path below derives from them, the

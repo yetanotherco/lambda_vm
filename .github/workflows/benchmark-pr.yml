@@ -248,9 +248,10 @@ jobs:
           # BENCH_RUNS_REAL above for the dial if it proves too expensive.
           RUN_REAL=true
 
-          # The fixture is FETCHED from a pinned URL + sha256, not built (see the
-          # Makefile). The guard covers the window after a repoint but before the new
-          # artifact is uploaded: warn instead of failing, so a push to main cannot go
+          # What is fetched from a pinned URL + sha256 is the block's replay CACHE; the
+          # fixture is generated from it (see the Makefile), which is why the guard below
+          # asks for the cache URL. It covers the window after a repoint but before the
+          # new cache is uploaded: warn instead of failing, so a push to main cannot go
           # red over an upload nobody in CI can perform. On push and workflow_dispatch
           # the growth sweep still runs and feeds the baseline artifact (no comment is
           # posted on those events — the Comment step is gated to comment triggers);
