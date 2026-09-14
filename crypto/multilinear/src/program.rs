@@ -70,6 +70,176 @@ impl<E: IsField> Program<E> {
         scratch[self.root as usize].clone()
     }
 
+    /// The same program with each step emitted once and nothing dead in it.
+    ///
+    /// Straight-line code over a field: two steps with the same operator over
+    /// the same operands compute the same value, adding zero or multiplying by
+    /// one computes nothing, and a step the root does not reach is not
+    /// computed at all. A batch's program is spliced together out of pieces
+    /// that share structure — the same alpha powers, the same column read by
+    /// several interactions — so what this removes is not a mistake in any one
+    /// of them, it is the seam between them.
+    ///
+    /// The kernel walks this program once per cube index per interpolation
+    /// node, through a slot file in global memory, so a step removed here is
+    /// removed from every one of those walks.
+    pub fn simplify(&self) -> Self
+    where
+        FieldElement<E>: PartialEq,
+    {
+        use std::collections::HashMap;
+
+        let zero = FieldElement::<E>::zero();
+        let one = FieldElement::<E>::one();
+        let mut steps: Vec<Op<E>> = Vec::with_capacity(self.steps.len());
+        // Where each old step ended up.
+        let mut moved: Vec<u32> = Vec::with_capacity(self.steps.len());
+        // Steps that are not constants, keyed by what they compute.
+        let mut seen: HashMap<(u8, u32, u32), u32> = HashMap::new();
+        // Constants, which have to be compared by value.
+        let mut constants: Vec<(u32, FieldElement<E>)> = Vec::new();
+
+        let constant_of = |steps: &[Op<E>], at: u32| match &steps[at as usize] {
+            Op::Fixed(c) => Some(c.clone()),
+            _ => None,
+        };
+
+        for step in &self.steps {
+            let emit = |steps: &mut Vec<Op<E>>,
+                        seen: &mut HashMap<(u8, u32, u32), u32>,
+                        constants: &mut Vec<(u32, FieldElement<E>)>,
+                        op: Op<E>|
+             -> u32 {
+                if let Op::Fixed(value) = &op {
+                    if let Some((at, _)) = constants.iter().find(|(_, c)| c == value) {
+                        return *at;
+                    }
+                    steps.push(op.clone());
+                    let at = (steps.len() - 1) as u32;
+                    constants.push((at, value.clone()));
+                    return at;
+                }
+                // Addition and multiplication do not care which operand came
+                // first, so the key does not either.
+                let key = match op {
+                    Op::Var(i) => (0, i, 0),
+                    Op::Add(a, b) => (1, a.min(b), a.max(b)),
+                    Op::Sub(a, b) => (2, a, b),
+                    Op::Mul(a, b) => (3, a.min(b), a.max(b)),
+                    Op::Neg(a) => (4, a, 0),
+                    Op::Fixed(_) => unreachable!("handled above"),
+                };
+                if let Some(at) = seen.get(&key) {
+                    return *at;
+                }
+                steps.push(op);
+                let at = (steps.len() - 1) as u32;
+                seen.insert(key, at);
+                at
+            };
+
+            let at = match *step {
+                Op::Fixed(ref c) => {
+                    emit(&mut steps, &mut seen, &mut constants, Op::Fixed(c.clone()))
+                }
+                Op::Var(i) => emit(&mut steps, &mut seen, &mut constants, Op::Var(i)),
+                Op::Neg(a) => {
+                    let a = moved[a as usize];
+                    match constant_of(&steps, a) {
+                        Some(c) => emit(&mut steps, &mut seen, &mut constants, Op::Fixed(-c)),
+                        None => emit(&mut steps, &mut seen, &mut constants, Op::Neg(a)),
+                    }
+                }
+                Op::Add(a, b) => {
+                    let (a, b) = (moved[a as usize], moved[b as usize]);
+                    match (constant_of(&steps, a), constant_of(&steps, b)) {
+                        (Some(x), Some(y)) => {
+                            emit(&mut steps, &mut seen, &mut constants, Op::Fixed(x + y))
+                        }
+                        (Some(x), None) if x == zero => b,
+                        (None, Some(y)) if y == zero => a,
+                        _ => emit(&mut steps, &mut seen, &mut constants, Op::Add(a, b)),
+                    }
+                }
+                Op::Sub(a, b) => {
+                    let (a, b) = (moved[a as usize], moved[b as usize]);
+                    match (constant_of(&steps, a), constant_of(&steps, b)) {
+                        (Some(x), Some(y)) => {
+                            emit(&mut steps, &mut seen, &mut constants, Op::Fixed(x - y))
+                        }
+                        (None, Some(y)) if y == zero => a,
+                        _ => emit(&mut steps, &mut seen, &mut constants, Op::Sub(a, b)),
+                    }
+                }
+                Op::Mul(a, b) => {
+                    let (a, b) = (moved[a as usize], moved[b as usize]);
+                    match (constant_of(&steps, a), constant_of(&steps, b)) {
+                        (Some(x), Some(y)) => {
+                            emit(&mut steps, &mut seen, &mut constants, Op::Fixed(x * y))
+                        }
+                        (Some(x), _) if x == zero => emit(
+                            &mut steps,
+                            &mut seen,
+                            &mut constants,
+                            Op::Fixed(zero.clone()),
+                        ),
+                        (_, Some(y)) if y == zero => emit(
+                            &mut steps,
+                            &mut seen,
+                            &mut constants,
+                            Op::Fixed(zero.clone()),
+                        ),
+                        (Some(x), None) if x == one => b,
+                        (None, Some(y)) if y == one => a,
+                        _ => emit(&mut steps, &mut seen, &mut constants, Op::Mul(a, b)),
+                    }
+                }
+            };
+            moved.push(at);
+        }
+
+        let root = moved[self.root as usize];
+        Self { steps, root }.prune()
+    }
+
+    /// Drops the steps the root does not reach, renumbering the rest.
+    fn prune(self) -> Self {
+        let mut live = vec![false; self.steps.len()];
+        live[self.root as usize] = true;
+        for i in (0..self.steps.len()).rev() {
+            if !live[i] {
+                continue;
+            }
+            match self.steps[i] {
+                Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
+                    live[a as usize] = true;
+                    live[b as usize] = true;
+                }
+                Op::Neg(a) => live[a as usize] = true,
+                Op::Fixed(_) | Op::Var(_) => {}
+            }
+        }
+        let mut moved = vec![0u32; self.steps.len()];
+        let mut steps = Vec::with_capacity(self.steps.len());
+        for (i, step) in self.steps.into_iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            let shifted = match step {
+                Op::Fixed(c) => Op::Fixed(c),
+                Op::Var(v) => Op::Var(v),
+                Op::Add(a, b) => Op::Add(moved[a as usize], moved[b as usize]),
+                Op::Sub(a, b) => Op::Sub(moved[a as usize], moved[b as usize]),
+                Op::Mul(a, b) => Op::Mul(moved[a as usize], moved[b as usize]),
+                Op::Neg(a) => Op::Neg(moved[a as usize]),
+            };
+            steps.push(shifted);
+            moved[i] = (steps.len() - 1) as u32;
+        }
+        let root = moved[self.root as usize];
+        Self { steps, root }
+    }
+
     /// The highest factor slot the program reads, or `None` when it reads none.
     pub fn max_slot(&self) -> Option<u32> {
         self.steps
@@ -172,8 +342,32 @@ impl<E: IsField> Builder<E> {
         self.steps.is_empty()
     }
 
-    /// The program computing `root`.
-    pub fn finish(self, root: u32) -> Result<Program<E>, Error> {
+    /// The program computing `root`, with each step emitted once.
+    ///
+    /// A builder is written for whoever emits — a rule at a time, a piece at a
+    /// time — and the pieces overlap: the same alpha power, the same column,
+    /// the same difference. [`simplify`](Program::simplify) is run here because
+    /// this is where a program stops being written and starts being walked,
+    /// and it is walked once per cube index per interpolation node.
+    pub fn finish(self, root: u32) -> Result<Program<E>, Error>
+    where
+        FieldElement<E>: PartialEq,
+    {
+        if root as usize >= self.steps.len() {
+            return Err(Error::UnknownPolynomial {
+                index: root as usize,
+                len: self.steps.len(),
+            });
+        }
+        Ok(Program {
+            steps: self.steps,
+            root,
+        }
+        .simplify())
+    }
+
+    /// The program as it was emitted, step for step.
+    pub fn finish_verbatim(self, root: u32) -> Result<Program<E>, Error> {
         if root as usize >= self.steps.len() {
             return Err(Error::UnknownPolynomial {
                 index: root as usize,
@@ -184,6 +378,84 @@ impl<E: IsField> Builder<E> {
             steps: self.steps,
             root,
         })
+    }
+}
+
+#[cfg(test)]
+mod simplify_tests {
+    use super::*;
+    use math::field::goldilocks::GoldilocksField as F;
+
+    type FE = FieldElement<F>;
+
+    /// Every simplification has to be invisible to the evaluator: same value at
+    /// every point, fewer steps to get there.
+    fn agrees(program: &Program<F>, slots: usize) {
+        let small = program.simplify();
+        assert!(
+            small.steps().len() <= program.steps().len(),
+            "simplifying grew the program"
+        );
+        let mut scratch = Vec::new();
+        for seed in 0..6u64 {
+            let values: Vec<FE> = (0..slots)
+                .map(|i| FE::from((seed + 1) * (i as u64 + 3) + 7))
+                .collect();
+            let before = program.eval(&values, &mut scratch);
+            let after = small.eval(&values, &mut scratch);
+            assert_eq!(before, after, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_step_is_emitted_once() {
+        let mut b = Builder::<F>::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let first = b.mul(x, y);
+        // The same product again, and the same one with its operands swapped.
+        let second = b.mul(x, y);
+        let third = b.mul(y, x);
+        let sum = b.add(first, second);
+        let root = b.add(sum, third);
+        let program = b.finish_verbatim(root).unwrap();
+
+        agrees(&program, 2);
+        // one var, one var, one product, two sums
+        assert_eq!(program.simplify().steps().len(), 5);
+    }
+
+    #[test]
+    fn constants_fold_and_units_disappear() {
+        let mut b = Builder::<F>::new();
+        let x = b.var(0);
+        let one = b.fixed(FE::one());
+        let zero = b.fixed(FE::zero());
+        let scaled = b.mul(x, one);
+        let shifted = b.add(scaled, zero);
+        let two = b.fixed(FE::from(2));
+        let three = b.fixed(FE::from(3));
+        let six = b.mul(two, three);
+        let root = b.add(shifted, six);
+        let program = b.finish_verbatim(root).unwrap();
+
+        agrees(&program, 1);
+        let small = program.simplify();
+        // `x`, the constant six, and their sum.
+        assert_eq!(small.steps().len(), 3);
+    }
+
+    #[test]
+    fn what_the_root_does_not_reach_is_dropped() {
+        let mut b = Builder::<F>::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let _dead = b.mul(x, y);
+        let root = b.add(x, x);
+        let program = b.finish_verbatim(root).unwrap();
+
+        agrees(&program, 2);
+        assert_eq!(program.simplify().steps().len(), 2);
     }
 }
 
