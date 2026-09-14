@@ -12,11 +12,11 @@ use stark::proof::options::ProofOptions;
 use executor::elf::Elf;
 use executor::vm::execution::ExecutionResult;
 
-use crate::VmAirs;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::GoldilocksExtension;
 use crate::test_utils::run_asm_elf;
 use crate::tests::prove_elfs_tests::{BusOutcome, prove_and_verify_vm_minimal, weigh_the_bus};
+use crate::{TableCounts, VmAirs};
 
 /// Load and run one of the compiled Rust guest programs.
 ///
@@ -126,6 +126,66 @@ fn every_table_participates_in_the_bus() {
     );
 }
 
+/// The tables a prover can declare away, under the names the AIRs carry. The
+/// always-present ones (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT, the PAGEs,
+/// L2G) have no `TableCounts` field, and they legitimately contribute zero when
+/// the run never reaches them — KECCAK_RC does exactly that in a program with no
+/// keccak, which is the padding this change is about and cannot be dropped.
+///
+/// Derived from an exhaustive destructure, and that is the point: a chip added
+/// to `TableCounts` stops this compiling, rather than quietly dropping out of
+/// the check below — which is the one that has to see every droppable chip.
+#[deny(unused_variables)]
+fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
+    let TableCounts {
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
+        keccak,
+        keccak_rnd,
+        ecsm,
+        ecdas,
+        hint,
+        commit,
+    } = counts;
+    [
+        ("CPU", cpu),
+        ("LT", lt),
+        ("MEMW", memw),
+        ("MEMW_A", memw_aligned),
+        ("LOAD", load),
+        ("MUL", mul),
+        ("DVRM", dvrm),
+        ("SHIFT", shift),
+        ("BRANCH", branch),
+        ("MEMW_R", memw_register),
+        ("EQ", eq),
+        ("BYTEWISE", bytewise),
+        ("STORE", store),
+        ("CPU32", cpu32),
+        ("KECCAK", keccak),
+        ("KECCAK_RND", keccak_rnd),
+        ("ECSM", ecsm),
+        ("ECDAS", ecdas),
+        ("HINT", hint),
+        ("COMMIT", commit),
+    ]
+    .into_iter()
+    .map(|(name, _count)| name)
+    .collect()
+}
+
 /// The half the test above cannot reach: declaring interactions is necessary,
 /// but a chip whose bus footprint cancelled against itself would contribute
 /// zero however many rows it carried, and dropping *that* would move the sum by
@@ -134,10 +194,22 @@ fn every_table_participates_in_the_bus() {
 /// telescopes on `CommitNextByte`, KECCAK_RND chains rounds — and each is
 /// supposed to be anchored by a term that does not telescope away with it.
 ///
-/// There is nothing structural to inspect, but there is a cheap dynamic check:
-/// the contribution is a public input of every sub-proof, so proving a program
-/// that reaches a chip says outright what that chip puts on the bus. A zero
-/// here is a table that can be dropped undetected.
+/// The anchor is structural, and it is not the chained bus. Every fingerprint
+/// carries its `bus_id` as its first element (`stark::lookup`), so a term on one
+/// bus cannot cancel a term on another; and each of the three chips puts, on
+/// every row where its row selector is on, range-check terms on buses it never
+/// receives from — ECDAS sends 196 `AreBytes` and 189 `IsHalfword` per row,
+/// COMMIT eight `IsHalfword` plus the `Ecall` receive, KECCAK_RND `KeccakRc` and
+/// some 160 `ByteAlu`. Those are all senders, so they cannot cancel each other
+/// either: two equal fingerprints add. The chip's contribution is zero only if
+/// its selector is zero on every row, which is the empty table this change
+/// drops on purpose.
+///
+/// The dynamic check below is the second half, and it covers what the argument
+/// assumes: that the selector really is on. The contribution is a public input
+/// of every sub-proof, so proving a program that reaches a chip says outright
+/// what that chip puts on the bus. A zero here is a table that can be dropped
+/// undetected.
 #[test]
 fn no_present_table_contributes_zero_to_the_bus() {
     let asm = [
@@ -148,39 +220,13 @@ fn no_present_table_contributes_zero_to_the_bus() {
         "test_commit_4",
     ];
 
-    // Only the tables a prover can declare away are at risk. The always-present
-    // ones (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT, the PAGEs, L2G) have no
-    // `TableCounts` field, and they legitimately contribute zero when the run
-    // never reaches them — KECCAK_RC does exactly that in a program with no
-    // keccak, which is the padding this change is about and cannot be dropped.
-    let droppable = [
-        "CPU",
-        "MEMW_R",
-        "LT",
-        "MEMW",
-        "MEMW_A",
-        "LOAD",
-        "MUL",
-        "DVRM",
-        "SHIFT",
-        "BRANCH",
-        "EQ",
-        "BYTEWISE",
-        "STORE",
-        "CPU32",
-        "KECCAK",
-        "KECCAK_RND",
-        "ECSM",
-        "ECDAS",
-        "HINT",
-        "COMMIT",
-    ];
+    let mut droppable: Vec<&'static str> = Vec::new();
 
     let mut seen: Vec<String> = Vec::new();
     let mut fixed_seen: Vec<String> = Vec::new();
     let mut zero: Vec<(String, String)> = Vec::new();
 
-    let mut weigh = |program: &str, elf: &Elf, traces: &mut Traces| {
+    let mut weigh = |program: &str, elf: &Elf, traces: &mut Traces, droppable: &[&str]| {
         let outcome = weigh_the_bus(elf, traces, false);
         assert!(
             outcome.accepted,
@@ -208,12 +254,15 @@ fn no_present_table_contributes_zero_to_the_bus() {
         let (elf, logs, _instructions) = run_asm_elf(program);
         let mut traces =
             Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
-        weigh(program, &elf, &mut traces);
+        if droppable.is_empty() {
+            droppable = droppable_air_names(&traces.table_counts());
+        }
+        weigh(program, &elf, &mut traces, &droppable);
     }
     let (elf, result) = run_rust_elf("hint_min");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
-    weigh("hint_min", &elf, &mut traces);
+    weigh("hint_min", &elf, &mut traces, &droppable);
 
     assert!(
         zero.is_empty(),
