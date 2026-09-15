@@ -256,7 +256,7 @@ as this represents the output argument, which should take its values from the ne
 #render_constraint_table(chip, config, groups: "mux")
 
 Once we have these values, we can then perform an optional indexing into memory, and copy over the values otherwise.
-The case of the `ExtField` value into `BaseField` is mostly technical here, as a means to make the signature look reasonable.
+The cast of the `ExtField` value into `BaseField` is mostly technical here, as a means to make the signature look reasonable.
 Verification should fail if the value does not fit.
 This failure is automatically satisfied by keeping the `ExtField` value as-is, since the `BaseField` would get reinterpreted as `ExtField`
 in the LogUp, and the memory table should only provide `BaseField` addresses.
