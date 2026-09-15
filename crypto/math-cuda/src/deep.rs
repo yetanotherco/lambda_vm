@@ -113,6 +113,54 @@ pub fn deep_composition_ext3_with_dev_parts(
     )
 }
 
+/// Download an ext3 device handle (3 de-interleaved slabs per column) as
+/// per-column row-major ext3 `u64` vectors, doing the de-interleave on the
+/// DEVICE (`interleave_ext3_slabs`) so the host only pays a contiguous D2H +
+/// split instead of the strided per-row gather it used to run. Byte-identical:
+/// a pure permutation. Used by the parts download on the batched R2 critical
+/// path, where the host de-interleave dominated the D2H.
+pub fn download_parts_interleaved(
+    h: &GpuLdeExt3,
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<Vec<u64>>> {
+    let be = backend()?;
+    let m = h.m;
+    let lde = h.lde_size;
+    h.wait_ready_on(stream)?;
+    let mut out_dev = unsafe { stream.alloc::<u64>(m * lde * 3)? };
+    let total = (m * lde) as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.interleave_ext3_slabs)
+            .arg(h.buf.as_ref())
+            .arg(&mut out_dev)
+            .arg(&(m as u64))
+            .arg(&(lde as u64))
+            .launch(cfg)?;
+    }
+    // Per-part D2H straight into the owning buffer: no host-side copy or memset
+    // (the D2H fills every element, so `set_len` on the uninitialized Vec is
+    // sound). One transfer per part; the total bytes match the old single D2H.
+    let mut parts: Vec<Vec<u64>> = Vec::with_capacity(m);
+    for p in 0..m {
+        let mut host: Vec<u64> = Vec::with_capacity(lde * 3);
+        // SAFETY: the memcpy below writes all `lde * 3` elements before any read.
+        unsafe {
+            host.set_len(lde * 3);
+        }
+        let view = out_dev.slice(p * lde * 3..(p + 1) * lde * 3);
+        stream.memcpy_dtoh(&view, &mut host)?;
+        parts.push(host);
+    }
+    stream.synchronize()?;
+    Ok(parts)
+}
+
 /// Fully device-resident R4 DEEP path: parts LDE and inverse denominators
 /// both arrive as device handles, the caller threads its own stream
 /// through so the inv_denoms producer

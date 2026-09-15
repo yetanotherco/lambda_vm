@@ -130,3 +130,24 @@ extern "C" __global__ void bit_reverse_ext3_interleaved(
         out[i * 3 + 2] = in[j * 3 + 2];
     }
 }
+
+// Re-interleave the 3 de-interleaved ext3 slabs of `m` columns into the
+// per-column row-major ext3 layout the host consumes: for column `p` and row
+// `r`, out[(p*lde + r)*3 + k] = slab[(p*3 + k)*lde + r]. One thread per
+// (column, row). Moves the host D2H's de-interleave onto the device (the host
+// side dominates the parts download; the GPU does the permute at device
+// bandwidth). Byte-identical — a pure data permutation.
+extern "C" __global__ void interleave_ext3_slabs(
+    const uint64_t *__restrict__ slab,
+    uint64_t *__restrict__ out,
+    uint64_t m,
+    uint64_t lde) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * lde) return;
+    uint64_t p = idx / lde;
+    uint64_t r = idx % lde;
+    uint64_t o = (p * lde + r) * 3;
+    out[o + 0] = slab[(p * 3 + 0) * lde + r];
+    out[o + 1] = slab[(p * 3 + 1) * lde + r];
+    out[o + 2] = slab[(p * 3 + 2) * lde + r];
+}

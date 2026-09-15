@@ -415,10 +415,10 @@ where
 /// straight to the aux LDE, no host round-trip) + the table contribution `L`.
 /// Returns `None` to fall back (non Goldilocks, below threshold, no GPU, GPU
 /// error). This is the residency path that avoids the term-column download.
-pub fn try_build_aux_resident_gpu<'a, F, E>(
+pub fn try_build_aux_resident_gpu<F, E>(
     interactions: &[BusInteraction],
     num_cols: usize,
-    main_cols: impl FnOnce() -> &'a [Vec<FieldElement<F>>],
+    main_row_major: &[FieldElement<F>],
     main_dev: Option<(&math_cuda::CudaSlice<u64>, usize)>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
@@ -445,21 +445,20 @@ where
 
     desc.assert_columns_in_bounds(num_cols);
     // Reuse the resident main trace from the R1 main LDE (column-major
-    // `[col*trace_len + row]`, same column order as the host columns) when it
-    // matches this table exactly; otherwise materialize + flatten + upload the
-    // host columns. The resident buffer skips both the host transpose and the
-    // ~3 GB main re-upload.
+    // `[col*trace_len + row]`) when it matches this table exactly. Otherwise use
+    // the trace's native row-major buffer directly: it uploads contiguously and
+    // transposes to column-major on device (`ResidentMain::HostRowMajor`), so no
+    // host row→col transpose runs (the transpose that `columns_main` used to pay).
     let resident_main =
         main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
-    let mut main_flat = Vec::new();
-    if resident_main.is_none() {
-        main_flat = vec![0u64; num_cols * trace_len];
-        for (c, col) in main_cols().iter().enumerate() {
-            for (r, e) in col.iter().enumerate() {
-                main_flat[c * trace_len + r] = unsafe { *(e.value() as *const _ as *const u64) };
-            }
-        }
+    if resident_main.is_none() && main_row_major.len() != num_cols * trace_len {
+        return None;
     }
+    // SAFETY: F == Goldilocks (checked above), repr(u64) — reinterpret the
+    // row-major main as raw u64 for the device upload + transpose.
+    let main_rm_u64: &[u64] = unsafe {
+        std::slice::from_raw_parts(main_row_major.as_ptr() as *const u64, main_row_major.len())
+    };
     let z_arr = unsafe { *(challenges[0].value() as *const _ as *const [u64; 3]) };
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
     let alpha_powers = compute_alpha_powers(alpha, desc.alpha_powers_len);
@@ -477,7 +476,7 @@ where
     let md = desc.as_cuda();
     let main = match resident_main {
         Some((buf, _)) => math_cuda::logup::ResidentMain::Dev(buf),
-        None => math_cuda::logup::ResidentMain::Host(&main_flat),
+        None => math_cuda::logup::ResidentMain::HostRowMajor(main_rm_u64, num_cols),
     };
     let ra = math_cuda::logup::logup_aux_resident(
         main,

@@ -58,6 +58,7 @@ use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
+use stark::batched::proof::BatchedMultiProof;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
 use stark::prover::{IsStarkProver, Prover};
@@ -75,8 +76,8 @@ use crate::tables::trace_builder::{
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
-    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding_view,
+    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs, compute_commit_bus_offset,
+    verify_l2g_commitment_binding_view,
 };
 
 type F = GoldilocksField;
@@ -437,8 +438,11 @@ struct BuildJob {
 /// tables rather than trusting any prover-supplied page config.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct EpochProof {
-    /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
-    proof: MultiProof<F, E, ()>,
+    /// The epoch's STARK proof (its tables + the epoch-local L2G table as the
+    /// CARVED table). Batched (multi-merkle-tree), device-resident on GPU; the
+    /// L2G root is the proof's `carved_main_root` (byte-identical to the per-table
+    /// L2G tree the global proof binds against).
+    proof: BatchedMultiProof<F, E, ()>,
     /// Bytes this epoch committed — the COMMIT-bus receiver reference.
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
@@ -505,13 +509,18 @@ enum EpochProofView<'a> {
 }
 
 impl<'a> EpochProofView<'a> {
-    /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table
-    /// last), as a [`MultiProofView`] — never materialized into an owned
-    /// `MultiProof` on the archived side.
-    fn proof(&self) -> MultiProofView<'a, F, E, ()> {
+    /// The epoch's batched STARK proof, materialized owned — the batched verifier
+    /// reads an owned `BatchedMultiProof`. Deserializes the archived side (the
+    /// guest cutover to a zero-copy batched verifier is a separate effort) and
+    /// clones the owned side.
+    fn proof_owned(&self) -> Result<BatchedMultiProof<F, E, ()>, Error> {
         match self {
-            Self::Owned(e) => MultiProofView::Owned(&e.proof),
-            Self::Archived(e) => MultiProofView::Archived(&e.proof),
+            Self::Owned(e) => Ok(e.proof.clone()),
+            Self::Archived(e) => {
+                rkyv::deserialize::<_, rkyv::rancor::Error>(&e.proof).map_err(|err| {
+                    Error::Execution(format!("rkyv deserialize epoch batched proof failed: {err}"))
+                })
+            }
         }
     }
 
@@ -739,21 +748,26 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let proof = Prover::multi_prove(
-        pairs,
-        &mut seed(),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    // The L2G table (pushed last) is the CARVED table: it keeps a standalone
+    // row-pair tree whose root (`carved_main_root`) is byte-identical to the
+    // per-table L2G tree the global proof binds against.
+    let carved_index = pairs.len() - 1;
+    let (proof, _stats) =
+        stark::batched::prover::multi_prove_batched_carved::<F, E, (), Prover<F, E, ()>>(
+            pairs,
+            &mut seed(),
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+            stark::residency_mode::ResidencyMode::RecomputeLde,
+            Some(carved_index),
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
-    let l2g_root = proof
-        .proofs
-        .last()
-        .ok_or_else(|| {
-            Error::ContinuationInvariant("epoch proof is missing the L2G sub-table".to_string())
-        })?
-        .lde_trace_main_merkle_root;
+    let l2g_root = proof.carved_main_root.ok_or_else(|| {
+        Error::ContinuationInvariant(
+            "epoch batched proof is missing the carved L2G root".to_string(),
+        )
+    })?;
 
     Ok(EpochProof {
         proof,
@@ -802,9 +816,9 @@ fn verify_epoch(
     } else {
         FIXED_TABLE_COUNT - 1
     };
-    let proof = epoch.proof();
+    let proof = epoch.proof_owned()?;
     let expected_proof_count = table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != proof.len() {
+    if expected_proof_count != proof.tables.len() {
         return Ok(false);
     }
 
@@ -844,27 +858,50 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
-    let expected = match compute_expected_commit_bus_balance_view(
+    // The L2G table (pushed last) is the carved table.
+    let carved_index = refs.len() - 1;
+    // Bus balance from the batched transcript replay, over the carried x254
+    // commit index (what binds the epoch's commit slice to its global position).
+    let mut replay_t = seed();
+    let challenges = match stark::batched::verifier::replay_epoch_transcript_carved::<F, E, (), _>(
         &refs,
-        proof,
-        public_output,
-        commit_start_index,
-        &mut seed(),
+        &proof,
+        &mut replay_t,
+        Some(carved_index),
     ) {
-        Some(expected) => expected,
+        Some((_shape, _fri, ch)) => ch,
         None => return Ok(false),
+    };
+    let expected = if challenges.lookup.len() >= 2 {
+        match compute_commit_bus_offset(
+            public_output,
+            commit_start_index,
+            &challenges.lookup[0],
+            &challenges.lookup[1],
+        ) {
+            Some(expected) => expected,
+            None => return Ok(false),
+        }
+    } else {
+        FieldElement::<E>::zero()
     };
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+    if !stark::batched::verifier::multi_verify_batched_carved::<F, E, (), Verifier<F, E, ()>, _>(
+        &refs,
+        &proof,
+        &mut seed(),
+        &expected,
+        Some(carved_index),
+    ) {
         return Ok(false);
     }
 
-    // The claimed L2G root must be the one this proof actually committed (it is what
-    // verify_l2g_commitment_binding_view later ties to the global proof).
-    Ok(proof.last().map(|p| *p.lde_trace_main_merkle_root()) == Some(epoch.l2g_root()))
+    // The claimed L2G root must be the one this proof actually committed (its
+    // carved root), which `verify_l2g_commitment_binding_view` ties to the global.
+    Ok(proof.carved_main_root == Some(epoch.l2g_root()))
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -1860,11 +1897,41 @@ mod tests {
                 }
             }
         }
+        fn diff_batched(label: &str, a: &BatchedMultiProof<F, E, ()>, b: &BatchedMultiProof<F, E, ()>) {
+            let mut d = Vec::new();
+            if a.tables.len() != b.tables.len() {
+                d.push("table_count");
+            }
+            if a.main_root != b.main_root {
+                d.push("main_root");
+            }
+            if a.carved_main_root != b.carved_main_root {
+                d.push("carved_main_root");
+            }
+            if a.aux_root != b.aux_root {
+                d.push("aux_root");
+            }
+            if a.parts_root != b.parts_root {
+                d.push("parts_root");
+            }
+            if a.fri_layer_roots != b.fri_layer_roots {
+                d.push("fri_layer_roots");
+            }
+            if a.fri_final_poly_coeffs != b.fri_final_poly_coeffs {
+                d.push("fri_final");
+            }
+            if a.nonce != b.nonce {
+                d.push("nonce");
+            }
+            if !d.is_empty() {
+                println!("{label}: {d:?}");
+            }
+        }
         let a = load(&std::env::var("PROOF_A").unwrap());
         let b = load(&std::env::var("PROOF_B").unwrap());
         assert_eq!(a.epochs.len(), b.epochs.len(), "epoch count");
         for (e, (ea, eb)) in a.epochs.iter().zip(b.epochs.iter()).enumerate() {
-            diff_multi(&format!("epoch {e}"), &ea.proof, &eb.proof);
+            diff_batched(&format!("epoch {e}"), &ea.proof, &eb.proof);
             if ea.public_output != eb.public_output {
                 println!("epoch {e}: public_output differs");
             }

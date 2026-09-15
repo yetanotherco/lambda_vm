@@ -1187,25 +1187,34 @@ where
         // for the aux LDE (no term-column download). Returns the table
         // contribution; the host set_aux + CPU accumulate below are skipped.
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
-        if trace.resident_aux_ok()
-            && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
-                interactions,
-                trace.num_main_columns,
-                || {
-                    main_cols_cell
-                        .get_or_init(|| trace.columns_main())
-                        .as_slice()
-                },
-                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
-                trace_len,
-                challenges,
-            )
-        {
+        if let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
+            interactions,
+            trace.num_main_columns,
+            trace.main_data_row_major().0,
+            resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
+            trace_len,
+            challenges,
+        ) {
             let table_contribution = crate::gpu_lde::u64_to_ext3_vec::<E>(&ra.table_contribution)
                 .pop()
                 .expect("one ext3 element");
             trace.set_aux_resident(ra);
-            return Some(BusPublicInputs { table_contribution });
+            if trace.resident_aux_ok() {
+                // Per-table prover: the aux LDE reads the device-resident columns
+                // in place (`prover.rs` R1 aux commit), so keep them resident.
+                return Some(BusPublicInputs { table_contribution });
+            }
+            // Batched prover: the aux LDE and the R2/R4 recompute read the HOST aux
+            // table (`aux_data_row_major`), so download the device aux into it in
+            // one D2H + one conversion. The fingerprints, term columns and the
+            // running-sum accumulate still ran on the GPU — only the final buffer
+            // comes back — replacing the host `set_aux` writes and the host
+            // accumulate. On a download failure (rare device error) the resident
+            // handle is cleared and the host build below runs instead.
+            if crate::gpu_lde::materialize_aux_trace_host(trace) {
+                return Some(BusPublicInputs { table_contribution });
+            }
+            trace.aux_resident = None;
         }
 
         let main_segment_cols = main_cols_cell.get_or_init(|| trace.columns_main());
