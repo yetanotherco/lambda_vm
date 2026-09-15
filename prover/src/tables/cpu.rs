@@ -187,7 +187,13 @@ pub struct CpuOperation {
     pub keccak_state_addr: u64,
 
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
+    /// (either the x-only or the full-point variant).
     pub ecall_ecsm: bool,
+
+    /// Whether this ECSM ecall is the full-point variant (full point in / out). Selects the
+    /// `IS_FULL_POINT` column of the ECSM table and, in the trace builder, the yG-read / yR-write
+    /// memory ops. `false` for the x-only variant and for non-ECSM rows.
+    pub ecsm_full_point: bool,
 
     /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
     /// addresses (x10/x11/x12) are recovered from the register state in the trace
@@ -237,9 +243,13 @@ impl CpuOperation {
             f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
-        // in the trace builder.
-        let ecall_ecsm =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
+        // in the trace builder. The x-only and full-point variants share the ECSM table; the
+        // full-point flag selects the yG-read / yR-write memory ops and the IS_FULL_POINT column.
+        let ecsm_full_point = f.ecall
+            && log.src1_val == executor::vm::instruction::execution::ECSM_FULL_POINT_SYSCALL_NUMBER;
+        let ecall_ecsm = ecsm_full_point
+            || (f.ecall
+                && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER);
         let ecall_hint =
             f.ecall && log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 
@@ -360,6 +370,7 @@ impl CpuOperation {
             ecall_keccak,
             keccak_state_addr,
             ecall_ecsm,
+            ecsm_full_point,
             ecall_hint,
         }
     }
