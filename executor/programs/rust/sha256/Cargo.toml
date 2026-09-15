@@ -1,0 +1,9 @@
+[workspace]
+[package]
+name = "sha256"
+version = "0.1.0"
+edition = "2024"
+[profile.release]
+lto = "thin"
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }

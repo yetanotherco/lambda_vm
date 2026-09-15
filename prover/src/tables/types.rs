@@ -359,6 +359,10 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+    ShaRound = 32,
+    ShaM = 33,
+    ShaRot = 34,
+    ShaK = 35,
 }
 
 impl BusId {
@@ -388,6 +392,10 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::ShaRound => "ShaRound",
+            BusId::ShaM => "ShaM",
+            BusId::ShaRot => "ShaRot",
+            BusId::ShaK => "ShaK",
         }
     }
 }
@@ -420,6 +428,10 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::ShaRound),
+            33 => Ok(BusId::ShaM),
+            34 => Ok(BusId::ShaRot),
+            35 => Ok(BusId::ShaK),
             other => Err(other),
         }
     }

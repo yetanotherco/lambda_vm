@@ -1019,3 +1019,72 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         "ECDAS",
     )
 }
+
+pub fn create_sha256_air(
+    options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::sha256::Constraints> {
+    use crate::tables::sha256 as chip;
+    build_air(
+        chip::WIDTH,
+        chip::bus_interactions(),
+        options,
+        1,
+        chip::Constraints,
+        "SHA256",
+    )
+}
+
+pub fn create_sha256_round_air(
+    options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::sha256_round::Constraints> {
+    use crate::tables::sha256_round as chip;
+    build_air(
+        chip::WIDTH,
+        chip::bus_interactions(),
+        options,
+        1,
+        chip::Constraints,
+        "SHA256ROUND",
+    )
+}
+
+pub fn create_sha256_schedule_air(
+    options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::sha256_schedule::Constraints> {
+    use crate::tables::sha256_schedule as chip;
+    build_air(
+        chip::WIDTH,
+        chip::bus_interactions(),
+        options,
+        1,
+        chip::Constraints,
+        "SHA256MSGSCHED",
+    )
+}
+
+pub fn create_sha256_rotxor_air(
+    options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::sha256_rotxor::Constraints> {
+    use crate::tables::sha256_rotxor as chip;
+    build_air(
+        chip::WIDTH,
+        chip::bus_interactions(),
+        options,
+        1,
+        chip::Constraints,
+        "ROTXOR",
+    )
+}
+
+pub fn create_sha256_k_air(options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    use crate::tables::sha256_k as chip;
+    build_air(
+        chip::WIDTH,
+        chip::bus_interactions(),
+        options,
+        1,
+        EmptyConstraints,
+        "SHA256_K",
+    )
+    .with_preprocessed(chip::preprocessed_commitment(options), 2)
+}

@@ -348,3 +348,15 @@ fn test_args_panics() {
 fn test_ckzg() {
     run_program_and_check_public_output("./program_artifacts/rust/ckzg.elf", vec![1, 1], vec![]);
 }
+
+#[test]
+fn test_sha256_precompile() {
+    // Independent Python hashlib oracle: concatenate sha256(data[o:o+n]) for
+    // n in [0,1,31,32,55,56,63,64,65,127,128,129,1024], o in range(8),
+    // where data[i] = (17*i+3) mod 256. Covers both padding blocks and alignment.
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/sha256.elf",
+        include_bytes!("sha256_vectors.bin").to_vec(),
+        vec![],
+    );
+}

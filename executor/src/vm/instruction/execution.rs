@@ -19,11 +19,15 @@ pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
     // Non-constraining hint (host computes modular inverse/sqrt, guest verifies).
     Hint = 95,
+    // Placeholder discriminant. The wire value is SHA256_SYSCALL_NUMBER (-1).
+    Sha256 = 96,
 }
 
-/// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
-///
-/// Cannot be an enum discriminant because it exceeds isize::MAX.
+/// SHA256 compression syscall (-1). a0: 32-byte state, a1: 64-byte message.
+/// Both use big-endian bytes; alignment is unrestricted and overlap is allowed.
+pub const SHA256_SYSCALL_NUMBER: u64 = u64::MAX;
+
+/// KeccakPermute syscall (-2); cannot be an enum discriminant above isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
 
@@ -86,6 +90,7 @@ impl TryFrom<u64> for SyscallNumbers {
             2 => Ok(SyscallNumbers::Panic),
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
+            v if v == SHA256_SYSCALL_NUMBER => Ok(SyscallNumbers::Sha256),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
@@ -97,6 +102,7 @@ impl TryFrom<u64> for SyscallNumbers {
 /// A syscall that drives a specialized in-circuit accelerator chip.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
+    Sha256,
     Keccak,
     Ecsm,
 }
@@ -107,6 +113,7 @@ impl SyscallNumbers {
     /// accelerator can't be silently missed by counters that consume this.
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
+            SyscallNumbers::Sha256 => Some(Accelerator::Sha256),
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
@@ -491,6 +498,31 @@ impl Instruction {
                         src2_val = buf_addr;
                         dst_val = count;
                     }
+                    SyscallNumbers::Sha256 => {
+                        let h_addr = registers.read(10)?;
+                        let m_addr = registers.read(11)?;
+                        h_addr
+                            .checked_add(31)
+                            .ok_or(ExecutionError::Sha256AddressOverflow)?;
+                        m_addr
+                            .checked_add(63)
+                            .ok_or(ExecutionError::Sha256AddressOverflow)?;
+                        // Read both operands completely before writing: overlap is allowed.
+                        let mut m = [0u8; 64];
+                        let mut h = [0u8; 32];
+                        for (i, byte) in m.iter_mut().enumerate() {
+                            *byte = memory.load_byte(m_addr + i as u64);
+                        }
+                        for (i, byte) in h.iter_mut().enumerate() {
+                            *byte = memory.load_byte(h_addr + i as u64);
+                        }
+                        crate::sha256::compress(&mut h, &m);
+                        for (i, byte) in h.iter().enumerate() {
+                            memory.store_byte(h_addr + i as u64, *byte);
+                        }
+                        src2_val = h_addr;
+                        dst_val = m_addr;
+                    }
                     SyscallNumbers::KeccakPermute => {
                         // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10
                         let state_addr = registers.read(10)?;
@@ -736,6 +768,8 @@ impl Comparison {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExecutionError {
+    #[error("SHA256 operand address overflow")]
+    Sha256AddressOverflow,
     #[error("Sub immediate instruction is not supported")]
     SubImmNotSupported,
     #[error("Store bytes unsigned instruction is not supported")]

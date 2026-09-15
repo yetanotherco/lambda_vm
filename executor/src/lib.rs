@@ -3,3 +3,5 @@ pub mod flamegraph;
 #[cfg(test)]
 pub mod tests;
 pub mod vm;
+
+pub mod sha256;

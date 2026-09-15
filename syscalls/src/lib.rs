@@ -9,3 +9,5 @@ pub mod entrypoint;
 pub mod keccak;
 pub mod random;
 pub mod syscalls;
+
+pub mod sha256;
