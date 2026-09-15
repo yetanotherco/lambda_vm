@@ -42,12 +42,65 @@ type E = GoldilocksExtension;
 // Prover test helpers
 // =============================================================================
 
+/// Total MEMW rows across the table's chunks. A program that never reaches MEMW
+/// gets no MEMW table at all, so a chunk count of zero is normal.
+fn memw_rows(traces: &Traces) -> usize {
+    traces.memws.iter().map(|t| t.main_table.height).sum()
+}
+
+/// Every `(chunk, row)` of the MEMW table, over however many chunks it has —
+/// including none.
+fn memw_chunk_rows(
+    traces: &Traces,
+) -> impl Iterator<Item = (&stark::trace::TraceTable<F, E>, usize)> {
+    traces
+        .memws
+        .iter()
+        .flat_map(|t| (0..t.num_rows()).map(move |row| (t, row)))
+}
+
 /// Run multi_prove and multi_verify for all VM tables.
 ///
 /// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
-fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+    weigh_the_bus(elf, traces, false).accepted
+}
+
+/// What the verifier did with a proof, split so a negative test can name the
+/// check that rejected it instead of just observing that something did.
+///
+/// `multi_verify_views` returns `false` from about ten places — the
+/// bus_public_inputs presence symmetry, a missing `public_inputs()`, any
+/// table's rounds 2-4 — so a bare `assert!(!verified)` cannot tell "the bus
+/// balance caught the forgery" from "the forged proof fell over somewhere
+/// else". `target_moved` is what separates them.
+pub(crate) struct BusOutcome {
+    /// `multi_verify_views` against the target the verifier computes itself.
+    pub accepted: bool,
+    /// Σ `table_contribution` over the tables the bus sums, exactly as the
+    /// verifier computes it.
+    pub contribution_sum: FieldElement<E>,
+    /// The target that sum has to match.
+    pub target: FieldElement<E>,
+    /// The same proof re-verified with the target moved to `contribution_sum`.
+    /// When this is true and `accepted` is false, every other check passed and
+    /// the balance is the *only* reason for the rejection.
+    pub accepted_with_target_moved: bool,
+    /// Per-table contribution, for the tables the sum above ranges over. A
+    /// table that contributes zero is one the bus cannot notice the absence of.
+    pub per_table: Vec<(String, FieldElement<E>)>,
+}
+
+/// Prove and verify as `prove_and_verify_vm_minimal`, and weigh the bus while
+/// at it. `recheck_with_moved_target` costs a second full verification, so the
+/// plain wrapper above leaves it off.
+pub(crate) fn weigh_the_bus(
+    elf: &Elf,
+    traces: &mut Traces,
+    recheck_with_moved_target: bool,
+) -> BusOutcome {
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
@@ -72,7 +125,9 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let multi_proof = match multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
     {
         Ok(proof) => proof,
-        Err(_) => return false,
+        // Panic rather than return false: `false` is reserved for "the verifier
+        // rejected", so a negative test cannot pass because proving fell over.
+        Err(e) => panic!("prover failed, which is not a verifier rejection: {e:?}"),
     };
 
     // Compute the verifier-side expected COMMIT bus balance from public output bytes
@@ -92,12 +147,42 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify_views(
-        &airs.air_refs(),
+    let air_refs = airs.air_refs();
+    let accepted = Verifier::multi_verify_views(
+        &air_refs,
         &views,
         &mut DefaultTranscript::<E>::new(&[]),
         &expected_bus_balance,
-    )
+    );
+
+    // The verifier's own sum, recomputed here so a test can compare it against
+    // the target instead of guessing why a proof was rejected.
+    let mut contribution_sum = FieldElement::<E>::zero();
+    let mut per_table = Vec::new();
+    for (air, view) in air_refs.iter().zip(views.iter()) {
+        if air.has_trace_interaction()
+            && let Some(contribution) = view.bus_table_contribution()
+        {
+            contribution_sum += contribution;
+            per_table.push((air.name().to_string(), contribution));
+        }
+    }
+
+    let accepted_with_target_moved = recheck_with_moved_target
+        && Verifier::multi_verify_views(
+            &air_refs,
+            &views,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &contribution_sum,
+        );
+
+    BusOutcome {
+        accepted,
+        contribution_sum,
+        target: expected_bus_balance,
+        accepted_with_target_moved,
+        per_table,
+    }
 }
 
 /// Like [`crate::prove_with_options_and_inputs`] but trims the bitwise table to the
@@ -289,11 +374,11 @@ fn test_prove_elfs_sub_neg_result_fast() {
         Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
-        "Fast SUB_NEG: CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows in first), REGISTER {} rows",
+        "Fast SUB_NEG: CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows), REGISTER {} rows",
         traces.cpus[0].main_table.height,
         traces.bitwise.main_table.height,
         traces.memws.len(),
-        traces.memws[0].main_table.height,
+        memw_rows(&traces),
         traces.register.main_table.height,
     );
 
@@ -938,8 +1023,9 @@ fn test_prove_elfs_test_sb_sh_8() {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
-        !traces.memws.is_empty(),
-        "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
+        !traces.stores.is_empty() && !traces.memw_aligneds.is_empty(),
+        "test_sb_sh_8 should produce STORE and MEMW_A rows for its byte/halfword \
+         memory accesses (MEMW carries neither)"
     );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1035,12 +1121,16 @@ fn test_prove_elfs_all_instructions_64() {
     // Includes SLT/SLTU instructions - need LT table
 
     println!(
-        "all_instructions_64 (fast): CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows in first), LOAD {} rows",
+        "all_instructions_64 (fast): CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows), LOAD {} rows",
         traces.cpus[0].main_table.height,
         traces.bitwise.main_table.height,
         traces.memws.len(),
-        traces.memws[0].main_table.height,
-        traces.loads[0].main_table.height
+        memw_rows(&traces),
+        traces
+            .loads
+            .iter()
+            .map(|t| t.main_table.height)
+            .sum::<usize>()
     );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1327,9 +1417,9 @@ fn test_prove_hint_min_inconsistent_output_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Forge the low byte of the output on the (single) real HINT row.
-    let orig = *traces.hint.main_table.get(0, hint_cols::out(0));
+    let orig = *traces.hints[0].main_table.get(0, hint_cols::out(0));
     let forged = orig + FieldElement::<GoldilocksField>::one();
-    traces.hint.main_table.set(0, hint_cols::out(0), forged);
+    traces.hints[0].main_table.set(0, hint_cols::out(0), forged);
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1367,7 +1457,7 @@ fn hint_min_traces() -> (Elf, Traces) {
 fn test_prove_hint_min_forged_selector_rejected() {
     use crate::tables::hint::cols as hint_cols;
     let (elf, mut traces) = hint_min_traces();
-    traces.hint.main_table.set(
+    traces.hints[0].main_table.set(
         0,
         hint_cols::SEL_0,
         FieldElement::<GoldilocksField>::from(3u64),
@@ -1386,7 +1476,7 @@ fn test_prove_hint_min_forged_selector_rejected() {
 fn test_prove_hint_min_forged_input_address_rejected() {
     use crate::tables::hint::cols as hint_cols;
     let (elf, mut traces) = hint_min_traces();
-    traces.hint.main_table.set(
+    traces.hints[0].main_table.set(
         0,
         hint_cols::ADDR_IN_0,
         FieldElement::<GoldilocksField>::from(0xFFFF_FFFFu64),
@@ -1562,9 +1652,9 @@ fn test_prove_elfs_ecsm_forged_result_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Forge the low byte of xR on the (single) real ECSM row.
-    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::xr(0));
+    let orig = *traces.ecsms[0].main_table.get(0, ecsm_cols::xr(0));
     let forged = orig + FieldElement::<GoldilocksField>::one();
-    traces.ecsm.main_table.set(0, ecsm_cols::xr(0), forged);
+    traces.ecsms[0].main_table.set(0, ecsm_cols::xr(0), forged);
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1590,7 +1680,7 @@ fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
         Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
 
     // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
-    traces.ecdas.main_table.set(
+    traces.ecdases[0].main_table.set(
         0,
         ecdas_cols::MU,
         FieldElement::<GoldilocksField>::from(2u64),
@@ -1629,7 +1719,7 @@ fn test_prove_elfs_keccak_unaligned_state_addr() {
     // value outside [0, 256). The new ARE_BYTES bus sender will emit this
     // value with multiplicity MU=1; the ARE_BYTES preprocessed table only
     // contains 0..256, so the bus cannot balance.
-    traces.keccak.main_table.set(
+    traces.keccaks[0].main_table.set(
         0,
         keccak_cols::addr(1),
         FieldElement::<GoldilocksField>::from(257u64),
@@ -1813,11 +1903,10 @@ fn test_debug_memory_bus_tokens() {
     let traces =
         Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
-    let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG TABLE SIZES:");
     println!(
         "  MEMW: {} rows ({} tables)",
-        memw.num_rows(),
+        memw_rows(&traces),
         traces.memws.len()
     );
     println!("  REGISTER: {} rows", traces.register.num_rows());
@@ -1831,7 +1920,7 @@ fn test_debug_memory_bus_tokens() {
 
     // === MEMW tokens (for register rows only) ===
     println!("\n=== MEMW Memory Bus Tokens (register rows) ===");
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue; // Skip memory rows (multiplicity = 0)
@@ -1971,7 +2060,7 @@ fn test_debug_memory_bus_tokens() {
     let mut total_sum: f64 = 0.0;
 
     // MEMW tokens
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue;
@@ -2085,11 +2174,10 @@ fn test_debug_memory_tokens_sb_sh() {
     )
     .unwrap();
 
-    let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!(
         "  MEMW rows: {} ({} tables)",
-        memw.num_rows(),
+        memw_rows(&traces),
         traces.memws.len()
     );
     println!("  REGISTER rows: {}", traces.register.num_rows());
@@ -2153,7 +2241,7 @@ fn test_debug_memory_tokens_sb_sh() {
     println!("\n=== MEMW Memory Bus Tokens (ALL rows) ===");
     let mut memw_register_rows = 0;
     let mut memw_memory_rows = 0;
-    for row in 0..memw.num_rows() {
+    for (memw, row) in memw_chunk_rows(&traces) {
         let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
 
         // Count row types
@@ -2750,6 +2838,12 @@ fn test_verify_rejects_zero_table_counts() {
             bytewise: 0,
             store: 0,
             cpu32: 0,
+            keccak: 0,
+            keccak_rnd: 0,
+            ecsm: 0,
+            ecdas: 0,
+            hint: 0,
+            commit: 0,
         },
         ..vm_proof
     };
@@ -2781,18 +2875,28 @@ fn test_verify_rejects_zero_cpu_count() {
     assert!(result.is_err(), "Got {:?}", result);
 }
 
-/// Verify rejects table_counts with memw=0.
+/// Verify rejects a `table_counts` that under-reports a table the proof carries:
+/// the counts drive the AIR set, so they must match the sub-proof count.
+///
+/// Named for the invariant rather than the table: it zeroes MEMW_A because `sub`
+/// reaches no MEMW rows at all and a count already at zero is not something to
+/// tamper with, and a name tied to one table goes stale the moment that choice
+/// changes.
 #[test]
-fn test_verify_rejects_zero_memw_count() {
+fn test_verify_rejects_undercounted_table_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
     let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
+    assert!(
+        vm_proof.table_counts.memw_aligned > 0,
+        "the program must carry the table this test zeroes out"
+    );
 
     let tampered_proof = crate::VmProof {
         table_counts: crate::TableCounts {
-            memw: 0,
+            memw_aligned: 0,
             ..vm_proof.table_counts.clone()
         },
         ..vm_proof
@@ -2825,6 +2929,12 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
     };
     let airs = VmAirs::new(
         &elf,
