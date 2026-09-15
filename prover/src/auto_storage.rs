@@ -202,6 +202,36 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             2,
         ),
     ];
+    // SHA256 is a fixed set of tables, expanded per compression call. Include
+    // their real widths and lookup columns in the spill decision.
+    use crate::tables::{sha256, sha256_k, sha256_rotxor, sha256_round, sha256_schedule};
+    for (factor, width, buses) in [
+        (1, sha256::WIDTH, sha256::bus_interactions().len()),
+        (
+            64,
+            sha256_round::WIDTH,
+            sha256_round::bus_interactions().len(),
+        ),
+        (
+            48,
+            sha256_schedule::WIDTH,
+            sha256_schedule::bus_interactions().len(),
+        ),
+        (
+            224,
+            sha256_rotxor::WIDTH,
+            sha256_rotxor::bus_interactions().len(),
+        ),
+    ] {
+        let rows = (lengths.sha256_calls * factor).next_power_of_two().max(4);
+        specs.push((rows, width as u64, aux_cols(buses), 1));
+    }
+    specs.push((
+        64,
+        sha256_k::WIDTH as u64,
+        aux_cols(sha256_k::bus_interactions().len()),
+        2,
+    ));
     // Each unique 256 KB page → its own PAGE table at PAGE_SIZE rows.
     for _ in 0..lengths.unique_page_count {
         specs.push((

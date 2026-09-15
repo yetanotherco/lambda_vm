@@ -126,3 +126,36 @@ fn count_table_lengths_matches_nonempty_hint_trace() {
     );
     assert_count_table_lengths_matches(&elf, &result.logs);
 }
+
+#[test]
+fn count_table_lengths_sha256_memory() {
+    let (elf, logs, _) = run_asm_elf("test_sha256_overlap");
+    let predicted = count_table_lengths(&elf, &logs, &MaxRowsConfig::default(), &[]).unwrap();
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &MaxRowsConfig::default(), &[]).unwrap();
+    assert_eq!(predicted.sha256_calls, 3);
+    assert_eq!(
+        predicted.memw_padded_rows,
+        traces
+            .memws
+            .iter()
+            .map(|t| t.num_rows() as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        predicted.memw_aligned_padded_rows,
+        traces
+            .memw_aligneds
+            .iter()
+            .map(|t| t.num_rows() as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        predicted.memw_register_padded_rows,
+        traces
+            .memw_registers
+            .iter()
+            .map(|t| t.num_rows() as u64)
+            .sum::<u64>()
+    );
+}

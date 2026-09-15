@@ -490,6 +490,26 @@ impl ContinuationProof {
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
     }
+
+    /// SCRATCH ANALYSIS HOOK (safe to delete): per-epoch `(proof, table_counts)`
+    /// plus the cross-epoch global proof, so out-of-crate tooling can measure
+    /// proof shape (widths, Merkle depths, FRI layers) without re-deriving it.
+    /// Read-only borrows; nothing here is used by prove/verify.
+    #[allow(clippy::type_complexity)]
+    pub fn shape_parts(
+        &self,
+    ) -> (
+        Vec<(&MultiProof<F, E, ()>, &TableCounts)>,
+        &MultiProof<F, E, ()>,
+    ) {
+        (
+            self.epochs
+                .iter()
+                .map(|e| (&e.proof, &e.table_counts))
+                .collect(),
+            &self.global,
+        )
+    }
 }
 
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
@@ -2134,6 +2154,22 @@ mod tests {
         assert!(
             out.is_some(),
             "an ECSM whose pointer registers were set in an earlier epoch must still verify"
+        );
+    }
+
+    #[test]
+    fn test_sha256_across_epochs_verifies() {
+        let elf_bytes = asm_elf_bytes("test_sha256_overlap");
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            3,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "SHA state and pointer registers must survive epoch boundaries"
         );
     }
 

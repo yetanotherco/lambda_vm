@@ -98,3 +98,5 @@ pub mod templates_tests;
 pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+
+mod sha256_tests;

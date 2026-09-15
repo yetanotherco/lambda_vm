@@ -193,6 +193,7 @@ pub struct CpuOperation {
     /// addresses (x10/x11/x12) are recovered from the register state in the trace
     /// builder, exactly like ECSM.
     pub ecall_hint: bool,
+    pub ecall_sha256: bool,
 }
 
 impl CpuOperation {
@@ -361,6 +362,8 @@ impl CpuOperation {
             keccak_state_addr,
             ecall_ecsm,
             ecall_hint,
+            ecall_sha256: f.ecall
+                && log.src1_val == executor::vm::instruction::execution::SHA256_SYSCALL_NUMBER,
         }
     }
 

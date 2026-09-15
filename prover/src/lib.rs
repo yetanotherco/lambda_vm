@@ -82,8 +82,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, hint.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, register, ecsm, ecdas, hint, and five SHA256 tables.
+pub const FIXED_TABLE_COUNT: usize = 16;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -518,6 +518,12 @@ pub(crate) struct VmAirs {
     pub halt: VmAir,
     pub commit: VmAir,
     pub keccak: VmAir,
+    pub sha256: VmAir,
+    pub sha256_round: VmAir,
+    pub sha256_schedule: VmAir,
+    pub sha256_rotxor: VmAir,
+    pub sha256_k: VmAir,
+
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
@@ -544,6 +550,15 @@ impl VmAirs {
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.commit.as_ref(), &mut traces.commit, &()),
             (self.keccak.as_ref(), &mut traces.keccak, &()),
+            (self.sha256.as_ref(), &mut traces.sha256, &()),
+            (self.sha256_round.as_ref(), &mut traces.sha256_round, &()),
+            (
+                self.sha256_schedule.as_ref(),
+                &mut traces.sha256_schedule,
+                &(),
+            ),
+            (self.sha256_rotxor.as_ref(), &mut traces.sha256_rotxor, &()),
+            (self.sha256_k.as_ref(), &mut traces.sha256_k, &()),
             (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
@@ -619,6 +634,11 @@ impl VmAirs {
             self.decode.as_ref(),
             self.commit.as_ref(),
             self.keccak.as_ref(),
+            self.sha256.as_ref(),
+            self.sha256_round.as_ref(),
+            self.sha256_schedule.as_ref(),
+            self.sha256_rotxor.as_ref(),
+            self.sha256_k.as_ref(),
             self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
@@ -787,6 +807,12 @@ impl VmAirs {
             .collect();
         let halt: VmAir = Box::new(create_halt_air(proof_options));
         let commit: VmAir = Box::new(create_commit_air(proof_options));
+        let sha256: VmAir = Box::new(test_utils::create_sha256_air(proof_options));
+        let sha256_round: VmAir = Box::new(test_utils::create_sha256_round_air(proof_options));
+        let sha256_schedule: VmAir =
+            Box::new(test_utils::create_sha256_schedule_air(proof_options));
+        let sha256_rotxor: VmAir = Box::new(test_utils::create_sha256_rotxor_air(proof_options));
+        let sha256_k: VmAir = Box::new(test_utils::create_sha256_k_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
         let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
@@ -912,6 +938,12 @@ impl VmAirs {
             halt,
             commit,
             keccak,
+            sha256,
+            sha256_round,
+            sha256_schedule,
+            sha256_rotxor,
+            sha256_k,
+
             keccak_rnd,
             keccak_rc,
             ecsm,
