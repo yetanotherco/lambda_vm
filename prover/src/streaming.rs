@@ -105,6 +105,8 @@ impl StreamingProvider {
         }
         let (kind, chunk) = self.slot(idx).expect("shape asked for a resident table");
         let shape = self.routed.chunk_shape(kind, chunk, &self.max_rows);
+        #[cfg(feature = "instruments")]
+        stark::instruments::count_retired_shape_query();
         self.shapes.lock().unwrap().insert(idx, shape);
         shape
     }
@@ -125,6 +127,8 @@ impl TraceProvider<GoldilocksField, GoldilocksExtension> for StreamingProvider {
 
     fn build_main(&self, idx: usize) -> TraceTable<GoldilocksField, GoldilocksExtension> {
         let (kind, chunk) = self.slot(idx).expect("build asked for a resident table");
+        #[cfg(feature = "instruments")]
+        stark::instruments::count_retired_trace_build();
         self.routed.build_chunk(kind, chunk, &self.max_rows)
     }
 }

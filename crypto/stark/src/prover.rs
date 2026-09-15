@@ -1432,6 +1432,8 @@ pub trait IsStarkProver<
             &twiddles.two_half_fwd,
         )
         .expect("row-major coset LDE expansion");
+        #[cfg(feature = "instruments")]
+        crate::instruments::count_main_lde_expansion();
 
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
@@ -1565,6 +1567,8 @@ pub trait IsStarkProver<
             &twiddles.two_half_fwd,
         )
         .expect("row-major coset LDE expansion");
+        #[cfg(feature = "instruments")]
+        crate::instruments::count_main_lde_expansion();
 
         (main_data, total_cols)
     }

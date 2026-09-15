@@ -279,4 +279,17 @@ pub fn print_report(
         eprintln!("  {}", "─".repeat(56));
         eprintln!();
     }
+
+    // What the memory modes actually cost, counted rather than assumed. Printed
+    // always: on the resident path the expansions are the per-table floor and
+    // the retired counters are zero, which is itself the thing to check.
+    let (expansions, trace_builds, shape_queries) = stark::instruments::residency_counts();
+    eprintln!("=== RESIDENCY ===");
+    eprintln!("  {:<36} {:>8}", "Main LDE expansions", expansions);
+    eprintln!("  {:<36} {:>8}", "Retired trace builds", trace_builds);
+    eprintln!(
+        "  {:<36} {:>8}",
+        "Shapes answered without building", shape_queries
+    );
+    eprintln!();
 }
