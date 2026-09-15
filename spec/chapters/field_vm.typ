@@ -150,17 +150,22 @@ This list is meant as an example, rather than an exhaustive enumeration;
 implementers and practitioners are encouraged to discover and use their own,
 as experience may point out further useful abstractions.
 
-/ `ADD d, a, b`: Addition: `FMA d == (0 * X + 1) * a + b, hint out`
-/ `MUL d, a, b`: Multiplication: `FMA d == a * b + (0 * X), hint out`
-/ `INV d, a`: Extension field inversion. Note: `d` and `a` cannot use the same register here: `FMA d == (a + 1) * d - 1, hint <register of d>`
-/ `J a`: Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC: `FMA PC == a, hint out`
-/ `JZA imm`: Jump if ZERO, absolute target address: `FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`
-/ `JZR a`: Jump if ZERO, PC-relative target address: `FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`
-/ `JNZA imm`: Jump if not ZERO, absolute target address: `FMA PC == ZERO * (PC - imm) + (ZERO + imm), hint out`
-/ `JNZR a`: Jump if not ZERO, PC-relative target address: `FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`
+#table(columns: (auto, 2fr, 1fr),
+       stroke: 0pt,
+       inset: (right: .5em),
+       table.header[*Pseudoinstr.*][*Translation*][*Comment*], table.hline(stroke: 1.5pt))[
+  `ADD d, a, b`][`FMA d == (0 * X + 1) * a + b, hint out`][Addition][
+  `MUL d, a, b`][`FMA d == a * b + (0 * X), hint out`][Multiplication][
+  `INV d, a`][`fma d == (a + 1) * d - 1, hint <register of d>`][extension field inversion. note: `d` and `a` cannot use the same register here][
+  `J a`][`FMA PC == a, hint out`][Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC][
+  `JZA imm`][`FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`][Jump if ZERO, absolute target address][
+  `JZR a`][`FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`][Jump if ZERO, PC-relative target address][
+  `JNZA imm`][`FMA PC == ZERO * (PC - imm) + (ZERO + imm), hint out`][Jump if not ZERO, absolute target address][
+  `JNZR a`][`FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`][Jump if not ZERO, PC-relative target address]
 
-Eventually, we hope that a set of common pseudoinstructions can be extracted from actual usage,
-and inform potential optimizations that remove unused capabilities (e.g. reducing the number of immediates involved).
+Eventually, usage may inform a set of common pseudoinstructions,
+along with inform potential optimizations that remove unused capabilities
+(e.g. reducing the number of immediates involved).
 
 == Calling convention<field-VM:sec:calling>
 
