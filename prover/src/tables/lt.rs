@@ -104,7 +104,7 @@ pub mod cols {
 /// from the inverted form (`BGE[U]`).
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LtOperation {
     /// Left operand (64-bit value)
     pub lhs: u64,
@@ -165,7 +165,13 @@ pub fn generate_lt_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    // Hash order is not an order: a `HashMap`'s iteration depends on the map,
+    // not on what is in it, so two runs of the same program laid these rows out
+    // differently and committed to different traces. The argument does not care
+    // which row is which — that is why proofs still verified — but a commitment
+    // has to be a function of the run.
+    let mut unique_ops: Vec<_> = op_map.into_iter().collect();
+    unique_ops.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
