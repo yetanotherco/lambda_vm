@@ -69,7 +69,10 @@ pub struct SumcheckClaim<F: IsField> {
 /// batched inversion instead of one each — and the quadratic numerators are
 /// kept rather than switching to the barycentric form, which would divide by
 /// `x − x_i` and so need a special case for an `x` that lands on a node.
-fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> FieldElement<F> {
+pub(crate) fn interpolate<F: IsField>(
+    values: &[FieldElement<F>],
+    x: &FieldElement<F>,
+) -> FieldElement<F> {
     let n = values.len();
     let node = |j: usize| FieldElement::<F>::from(j as u64);
     let others = |i: usize, at: &FieldElement<F>| {
@@ -104,7 +107,11 @@ fn interpolate<F: IsField>(values: &[FieldElement<F>], x: &FieldElement<F>) -> F
 /// read once per index and the extensions come off `hi - lo`, rather than
 /// re-reading the tables once per `t`. On a real trace the factors are hundreds
 /// of megabytes, so the reads are the cost, not the arithmetic.
-fn round_evaluations<F, P>(poly: &P, degree: usize, with_zero: bool) -> Vec<FieldElement<F>>
+pub(crate) fn round_evaluations<F, P>(
+    poly: &P,
+    degree: usize,
+    with_zero: bool,
+) -> Vec<FieldElement<F>>
 where
     F: IsField + 'static,
     P: SumcheckPolynomial<F> + Sync,

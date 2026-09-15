@@ -19,6 +19,7 @@ pub mod selector;
 pub mod stacked_eval;
 pub mod stacking;
 pub mod sumcheck;
+pub mod uneven;
 pub mod uni_skip;
 pub mod virtual_poly;
 pub mod whir;
