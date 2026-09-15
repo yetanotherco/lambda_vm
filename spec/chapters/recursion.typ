@@ -3,13 +3,15 @@
 // Spaces and instances
 #let (programSpace, program) = ($cal(F)$, $f$)
 #let (inputSpace, input) = ($II$, $bb(i)$)
-#let (instanceSpace, instance) = ($XX$, $bb(x)$)
+#let (instanceSpace, instance, instance2) = ($XX$, $bb(x)$, $bb(y)$)
 #let (witnessSpace, witness) = ($WW$, $bb(w)$)
 #let (proofSpace, proof) = ($bb(Pi)$, $pi$)
 
 #let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
 #let commit(x) = $overline(#x)$
 #let comm(x) = $commit(#x)$
+
+#let hash = $H$
 
 #let relation = $cal(R)$
 #let language = $cal(L)$
@@ -26,7 +28,9 @@
 
 #show math.equation.where(block: false): box
 
-= Notation
+#set list(marker: [---])
+
+= Proof recursion <proof-recursion>
 Let $BB := { zero, one }$ denote the boolean set and let 
 $programSpace := {program: inputSpace times witnessSpace to BB}$ denote 
 the set of functions mapping the (public) input space $inputSpace$ and (private) 
@@ -63,7 +67,7 @@ to construct some proof $proof in proofSpace$ and sends this to the verifier.
 They then use $verify(comm(program(input; dot)), proof)$ to check that the proof is valid, 
 convincing them of the prover's claim.
 
-= Proof recursion
+== Recursively proving proof verification
 Now observe that the verifier $verify$ is itself a function in 
 $verifierSpace := {hat(f): commitmentSpace times proofSpace to BB} subset.eq programSpace$.
 This means that we can use $prove$ to prove that the verification of a proof $proof$ 
@@ -82,7 +86,7 @@ The technique is mostly useful in settings where the extra time spent by the pro
 is outweighed by the time saved by the verifier(s), 
 e.g., a computationally constrained verifier, or multiple verifiers.
 
-= Resolving growing instance complexity
+== Resolving growing instance complexity
 While recursive proving leads to a decrease in proof size, this is naively traded off
 against an increase in instance complexity.
 Looking at a depth-two recursive proof,
@@ -97,86 +101,77 @@ This increase in verifier computation is undesirable and should be avoided.
 
 A solution to this, is to leverage the following variation to the verification algorithm:
 $
-  verify': commitmentSpace^2 times {0, 1} times proofSpace: (overline(r), overline(s), b, proof) mapsto
-  cases(
-    verify(overline(r), proof) &text("if") b=0,
-    verify(overline(s(overline(r), overline(s); dot)), proof) &text("if") b=1,
-  )
+  verify': commitmentSpace^2 times proofSpace: ([comm(x), comm(y)], proof) mapsto
+  verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof)
 $
-where it is assumed that $overline(s(overline(r), overline(s); dot)) in commitmentSpace$ can efficiently be constructed from $(overline(r), overline(s)) in commitmentSpace^2$.
-Now observe that
+where it is assumed that $comm(y([comm(x), comm(y)], dot)) in commitmentSpace$ can be constructed efficiently from $comm(x), comm(y) in commitmentSpace$.
+Now observe that setting $(comm(x), comm(y)) = (commit(instance), commit(verify'))$ yields
 $
-  verify'(comm(instance), comm(verify'), 0, proof) &= verify(comm(instance), proof), text("and")\
-  verify'(comm(instance), comm(verify'), 1, proof) &= verify(comm(verify'((comm(instance), comm(verify')); dot)), proof).
+  verify'([comm(instance), comm(verify')],  proof) 
+  = verify(comm(instance), proof) or verify(comm(verify'([comm(instance), comm(verify')], dot)), proof).
 $
+In words, $verify'([comm(instance), comm(verify')], dot)$ only accepts $proof$ if it is either
+a) proof of $instance in language$, or
+b) proof of the existence of a (different) proof that satisfies $verify'([comm(instance), comm(verify')], dot)$.
+We can now recursively expand the expression, yielding
+$
+  verify'(commit(instance), commit(verify'), proof)
+  &= verify(comm(instance), proof) or verify(comm(verify'([comm(instance), comm(verify')], dot)), proof)\
+  &= verify(comm(instance), proof) or verify(comm(verify(comm(instance), dot) or verify(comm(verify'([comm(instance), comm(verify')]; dot)), dot)), proof)\
+  &= verify(comm(instance), proof) or verify(comm(verify(comm(instance), dot) or verify(comm(verify(comm(instance), dot) or verify(comm(verify'([comm(instance), comm(verify')], dot)), dot)), dot)), proof)\
+  &= verify(comm(instance), proof) or verify(comm(verify(comm(instance), dot) or verify(comm(verify(comm(instance), dot) or verify(comm(verify(comm(instance), dot) or verify(comm(verify'([comm(instance), comm(verify')], dot)), dot)), dot)), dot)), proof),\
+  &&text(italic("etc."))
+$
+This shows us that a prover can use $verify'$ to shrink a proof $proof$ attesting 
+to $instance in language$ recursively any number of times, such that the ultimate 
+verification will still pass; verification is _complete_.
+Secondly, note that the size of the verification input 
+$(comm(instance), comm(verify'))$ is _constant_ in the depth of the recursion.
+In fact, the size of the verification instance is typically fully determined by 
+$comm(instance)$, since $comm(verify')$ can often be precomputed.
 
-In other words, by setting $(commitment_0, commitment_1) = (commit(instance), commit(verify'))$,
-this algorithm can verify a base proof by choosing $b=0$ or a recursive proof when selecting $b=1$.
-Importantly, the verification of some proof $proof$ using $verify'(comm(instance), comm(verify'), 1, dot)$ 
-succeeds only if the prover has used $verify'$ at every step in the proof recursion.
-This fact is illustrated by the following expansion:
-$
-  verify'(commit(instance), commit(verify'), 1, proof^((n)))
-  &= verify(comm(verify'(commit(instance), commit(verify'), dot)), proof^((n)))\
-  &= verify(comm(verify(comm(verify'(comm(instance), comm(verify'), dot)), dot)), proof^((n)))\
-  &= verify(comm(verify(comm(verify(comm(verify'(comm(instance), comm(verify'), dot)), dot)), dot)), proof^((n)))\
-  &= verify(comm(verify(comm(verify(comm(dots.c (comm(verify(comm(instance), dot) dots.c))), dot)), dot)), proof^((n)))\
-$
-Hence, a recursive proof based on $verify'$ attests that $verify'$ was the
-only algorithm used throughout the entire recursion stack.
-
-Lastly, note that the verification of a recursive proof $proof^((n))$ only 
-depends on $comm(instance)$, since $comm(verify')$ can be precomputed.
-We have thus established a recursive proving system that only requires the base
-instance as input to the verification of a recursive proof.
+It is important to note that we have not proven soundness of this construction.
+Specifically, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
+Such a proof would be accepted by $verify'$ even if $instance in.not language$.
+In practice, one might be able to prevent this problem by including a recursion-level counter in the proof.
 
 #aside([$comm(verify')$ absorption])[
-Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
-absorbing it into $verify'$ would imply an object containing a cryptographic commitment of itself, 
-which is theoretically impossible.
+  Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
+  absorbing it into $verify'$ would imply an object containing a cryptographic 
+  commitment of itself at a static location, which is practically impossible.
 ]
 
-#et("illustrate that there comes a termination point, i.e., a proof cannot prove itself.")
-#et("note shakiness of recursion")
+= Split verification <split-verification>
+#let (record, recordSpace) = ($bb(r)$, $Re$)
 
-= Split processing
-#let record = $bb(r)$
+Proof recursion involves executing the verification algorithm _inside_ the VM.
 In practice, we find that the set of operations utilized for verification differs vastly from
 those typically performed by guest programs.
 Specifically, verification primarily involves hashing and (extension) field arithmetic, 
 where especially the second is absent in typical guest programs.
 
-Emulating field arithmetic on a binary arithmetic-oriented VM, typically
+Emulating field arithmetic on a binary arithmetic-oriented VM typically
 incurs significant computational overhead.
-With the aim of avoiding this performance penalty, we introduce a field 
-arithmetic-oriented mini-VM (henceforth referred to as the _field-VM_),
-which will act as a _co-processor_ to the established _binary-VM_.
-Since both VMs are proven using the same proof system, a unified proof can be 
-produced for the parallel execution of both VMs.
+With the aim of avoiding a performance penalty on this front, we show how one 
+might split the verification process in two halves,
+such that either half can be executed on a VM with an instruction set tailored to its needs.
 
-The introduction of this split allows the verification algorithm to be split in two halves,
-with each VM performing the computations it is fastest at.
-The two halves cannot work independently, however.
-In the process of verifying proofs of the current proof system (`DEEP-FRI` + `LogUp`),
-results of binary arithmetic are used to verify field arithmetical constraints 
---- e.g., field challenges extracted from binary hash outputs --- 
-and vice-versa --- e.g., hashing merkle leafs containing field elements during FRI-query proof verification.
-This implies that some form of communication between both VMs is required.
+== Communication
+As a result of executing the two verification-algorithm halves on distinct VMs,
+no direct communication between both algorithms is possible.
+Yet, practice shows that effective algorithm splits requires some form of communication
+between both halves: typically one half performs a verification step to a certain
+point, after which the other half continues verification starting from this
+intermediate state.
 
-Our architecture enables the required communications by introducing a 
-prover-hinted _communication record_ $record$ accessible to both VMs.
-In practice, this record will primarily contain values being reinterpreted 
---- from $FF$ to $ZZ_(2^64)$ and vice-versa --- during verification.
-The two halves of the split verification algorithm are adapted to leverage
-the record: for each value on the record, one of the VMs _verifies_ the value to be correct, 
-while the other _assumes_ its correctness and resumes verification under this assumption.
-
-To ensure correct verification, both verification-algorithm halves must align
-on the interpretation of each value on the proof-record pair.
-To this end, the dimensions of the record must be determined at _verification algorithm design-time_ 
-and parametrized in terms of the proof only.
-Then, both verification algorithm halves can be given the same logic to interpret the record, 
-effectively synchronizing their interpretation.
+To achieve communication between two programs running on different VMs, 
+we introduce the concept of a prover-hinted _communication record_ $record$ 
+provided as _input_ to both processes.
+All values that are to be communicated from one part to another, are stated on this record.
+For each value on the record, the "sending" half _verifies_ that it is as expected, 
+whilst the "receiving" half _assumes_ its correctness and resumes verification under this assumption.
+One can now conclude that the proof satisfies the instance
+when both algorithm-halves produce the same record for this input.
 
 #aside("Coupling")[
   As observed, both verification halves must be synchronized to correctly verify a proof.
@@ -193,16 +188,357 @@ effectively synchronizing their interpretation.
   to accelerate hash-verification) while incurring as little design overhead as possible.
 ]
 
-In theory, any division of tasks between the two VMs would work.
-Moreover, it is unclear what division will lead to optimal performance.
-Yet, it is expected that divisions adhering to these high-level guidelines will 
-be a good first step towards a performant verifier:
-+ have the field-VM perform all verification steps involving field arithmetic,
-+ include all verifier-issued challenges required by these verification steps 
-  in the communication record $record$ as field-elements, so that the field-VM does not have to derive them,
-+ use the binary-VM to verify the challenges hinted by the communication record are indeed correct.
+More formally, we define
+$v_0, v_1: instanceSpace times proofSpace to recordSpace$ as a valid _split_ of verifier $v in verifierSpace$ if
+$
+  forall (instance, proof) in instanceSpace times proofSpace: v(comm(instance), proof) = 1 iff v_0(comm(instance), proof) = v_1(comm(instance), proof),
+$
+where $recordSpace$ denotes the communication record space.
+That is, the two halves agree if and only if the instance-proof verifies succesfully.
+By applying the Kronecker delta function $delta$ #footnote("https://en.wikipedia.org/wiki/Kronecker_delta"),
+we can transform both halves into members of $programSpace$:
+$
+  tilde(v)_0(comm(instance), [proof, record]) := delta_(v_0(comm(instance), proof),record), #h(3em)
+  tilde(v)_1(comm(instance), [proof, record]) := delta_(v_1(comm(instance), proof),record).
+$
+That is, $tilde(v)_0, tilde(v)_1$ indicate whether the provided record $record in recordSpace$
+would indeed be produced by $v_0$ respectively $v_1$ when provided $instance$ and $proof$.
+With this transformation in place, one can express 
+$
+	v(comm(instance), proof) 
+	= tilde(v)_0(comm(instance), [proof, d(comm(instance), proof)]) 
+		dot tilde(v)_1(comm(instance), [proof, d(comm(instance), proof)]).
+$
+where $d(comm(instance), proof) := v_0(comm(instance), proof)$ denotes the
+record deriviation function.
+We introduce the function product $(f || g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
+This then allows us to express
+$
+	prove(verify(comm(instance), dot); proof)
+	&= prove((tilde(v)_0 || tilde(v)_1)(comm(instance), dot); [proof, record])
+	&= proof',
+$
+with $record := d(comm(instance), proof)$.
 
-= Recursive proving and split processing
+Summarizing, we have now expressed recursive verification in terms of a 
+split verifier, where the same instance-proof-record triple was provided to 
+both verification halves.
+The produced proof $proof'$ now attests to $instance in language$ when
+$verify(comm((tilde(v)_0 || tilde(v)_1)(comm(instance), dot)), proof') = 1$.
+
+
+// == Input synchronization
+// By partitioning the verification algorithm and executing the parts on different VMs,
+// we are now creating two _partial_ proofs.
+// For two partials to collectively attest to a statement, they must have been constructed 
+// for _the same instance-proof-record triple_ $(comm(instance), proof, record)$.
+// This means that an algorithm verifying a partitioned proof must check that this is the case, 
+// in addition to verifying the individual parts to be correct.
+// In the context of recursive proving, this verification step must be built into the
+// verification algorithm being used.
+
+
+
+// - stuff about how interpreting this as communication
+
+// to split $v'$, we first observe that
+// $
+//   v^*([instance, instance2], [proof, b])
+//   :&= 
+// $
+// $
+//   v'([comm(x), comm(y)], [proof, b])
+//   &= Delta_BB (v(comm(x), proof), v(comm(y([comm(x), comm(y)], dot)), proof), b)\
+//   &= v(Delta_BB (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)
+// $
+// hence,
+// $
+//   v'_0([comm(x), comm(y)], [[proof, b], r]) 
+//   &= v_0(Delta_BB (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+//   v'_1([comm(x), comm(y)], [[proof, b], r]) 
+//   &= v_1(Delta_BB (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+// $
+
+
+
+// - when verifying a proof-of-split-verification, must ensure the same instance-proof-record triple was provided to both VMs
+// - typical solution: design the level-1 verification subalgorithms such that they commit to their inputs, and then have the level-2 verification check that both l1 subalgorithms committed to the same value.
+
+// - in our recursion stack, the level-1 and level-2 verification algorithms are the same.
+
+// - introduce selectors
+// $
+//   &Delta_cal(A): cal(A)^2 times BB to cal(A): (x, y, b) mapsto cases(x & text("if") b=0, y & text("if") b=1)
+// $
+// - devise verifier that selects a proof hinting what it is. part of proof due to recursion.
+// $
+//   tilde(verify)(Delta_commitmentSpace (comm(x), comm(y), dot), [proof, b])
+//   &:= verify(Delta_commitmentSpace (comm(x), comm(y), b), proof) and b in^? BB
+// $
+// $
+//   tilde(verify)([comm(x), comm(y)], [proof, b])
+//   &:= verify(Delta_commitmentSpace (comm(x), comm(y), b), proof)
+// $
+// $
+//   tilde(verify)'([comm(x), comm(y)], [proof, b]) := tilde(verify)([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])
+// $
+// // $
+// //   tilde(verify)'([comm(x), comm(y)], [proof, 0]) 
+// //   &= tilde(verify)([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, 0])\
+// //   &= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 0)], proof)
+// //   &= verify(comm(x), proof)
+// // $
+// // and
+// // $
+// //   tilde(verify)'([comm(x), comm(y)], [proof, 1]) 
+// //   &= tilde(verify)([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, 1])\
+// //   &= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), 1)], proof)
+// //   &= verify(comm(y([comm(x), comm(y)], dot)), proof)
+// // $
+// // hence,
+// $
+//   &tilde(verify)'([comm(instance), comm(instance2)], [proof, 0]) or tilde(verify)'([comm(instance), comm(instance2)], [proof, 1])\
+//   &=tilde(verify)([comm(instance), comm(instance2([comm(instance), comm(instance2)], dot))], [proof, 0])
+//   or tilde(verify)([comm(instance), comm(instance2([comm(instance), comm(instance2)], dot))], [proof, 1])\
+//   &= verify(Delta_commitmentSpace (comm(instance), comm(instance2([comm(instance), comm(instance2)], dot)), 0), proof)
+//     or verify(Delta_commitmentSpace (comm(instance), comm(instance2([comm(instance), comm(instance2)], dot)), 1), proof)\
+//   &= verify(comm(instance), proof)
+//     or verify(comm(instance2([comm(instance), comm(instance2)], dot)), proof)\
+//   &= verify'([comm(instance), comm(instance2)], proof)
+// $
+// in words: whether it is recursion or not is now "hinted" in the proof (and can thus be kept secret in recursive proving)
+
+// // - use them to modify v' by having the proof hint whether it is base or recursion
+// // $
+// //   verify^*([comm(x), comm(y)], [proof, b])
+// //   :&= Delta_BB (verify(comm(x), proof), verify(comm(y([comm(x), comm(y)], dot)), proof), b)\
+// //    &= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
+// // $
+// // - modify for recursive proving: $b$ must become part of the witness
+// // $
+// //   tilde(verify)(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), dot), [proof, b])
+// //   &:= verify(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)
+// // $
+// - introduce concept of function splitting
+// $
+//   f(x) = 1 iff f_0(x) = f_1(x)
+// $
+// - introduce transformation
+// $
+//   tilde(f)(x, y) = delta_(y = f(x))
+// $
+// - apply transformation to split function
+// $
+//   verify(x, proof) 
+//   = tilde(v)_0(x, proof, v_1(x, proof)) dot tilde(v)_1(x, proof, v_0(x, proof)) 
+// $
+// - introduce function combiner
+// $
+//   dot || dot : programSpace times programSpace to programSpace : (f||g)(x,y) = f(x,y) dot g(x,y)
+// $
+// - split $tilde(verify)'$ into $(tilde(verify)'_0, tilde(verify)'_1)$ s.t.
+// $
+//   tilde(verify)' equiv tilde(verify)'_0 || tilde(verify)'_1
+// $
+// $
+//   tilde(verify)'_0([comm(x), comm(y)], [proof, b])
+//   &= verify_0(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
+//   tilde(verify)'_1([comm(x), comm(y)], [proof, b])
+//   &= verify_1(Delta_commitmentSpace (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
+// $
+
+// - combine into a single prover
+// $
+//   &prove(tilde(verify)'_0([comm(x), comm(y)], dot)
+//   || tilde(verify)'_1([comm(x), comm(y)], dot); [proof, b]) &&= [proof', b]\
+// $
+// that is: prove that both functions are executed on the same input $[proof, b]$.
+
+
+// story:
+// - different types of operations
+// - typically cannot both be executed efficiently in the same environment
+// - hence: split algorithm in parts, such that each part can be executed in a separate VM
+// - q1: how to split?
+//   - design algorithms $v_0$ and $v_1(x, p, r)$ such that there only exists an
+//     $r$ satisfying $v_0(x, p, r ) = v_1(x, p, r) = 1$ if and only if 
+//     $v(instance, proof) = 1$. Let $g(x, p): language times proofSpace to recordSpace$
+//     denote this map for instances in the language.
+//   - hence, $v(x,p) = v_0(x,p,g(x, p)) dot v_1(x,p,g(x, p))$
+//   - in other words, $v(x,p) = 1$ if there exists a record $r = v_0(x, p) = v_1(x, p)$.
+//   - A practical interpretation of $r$ is to view it as a "communication record"
+//     between the two halves: one half may verify part of an execution, and pass that
+//     information on to the other half, and vice versa. Only when both algorithms can
+//     agree on the same record, is the proof valid.    
+
+// - q2: how to recursively verify a proof of split-verification?
+//   - assuming a perfect split, it suffices to verify that a) both partial verifiers are satisfied, and that b) both parts were given the same record.
+//   - this then allows us to make the record part of the witness.
+//     - verifier must ensure both parts were given the same instance-proof-record triple.
+
+
+// - q3: how to split the prover?
+//   - new subsection
+
+
+// = Split proving
+// #et("describe what to do when proving the different VMs using different proof systems -> inner product argument")
+// #let ip(x, y) = $chevron.l #x, #y chevron.r$
+// In the generic setting, input synchronization can be achieved by encapsulating the 
+// split verification with an _inner product argument_.
+
+
+
+// $
+//   verify'(comm(instance), comm(instance2), proof) = verify(comm(instance), proof) or verify(comm(instance2(comm(instance), comm(instance2), dot)), proof)
+// $
+// $
+//   verify(comm(instance), comm(instance2), [proof, b])
+//   &= Delta(verify(comm(instance), proof), verify(comm(instance2(comm(instance), comm(instance2), dot)), proof), b)\
+//   &= verify'(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), [proof, b])\
+// //   &= verify(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), b), proof)\
+//   &= verify^*(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), b), proof) and b in^? BB\
+// $
+
+// $
+//   &verify'_0(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), [proof, b])
+//   dot verify'_1(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), [proof, b])\
+//   &prove(verify'_0(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), dot)
+//   || verify'_1(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), dot); [proof, b]) = [proof', b]\
+//   &prove(verify'_0(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), dot)
+//   || verify'_1(delta(comm(instance), comm(instance2(comm(instance), comm(instance2), dot)), dot), dot); [proof', b]) = [proof'', b]
+// $
+
+= Split proving
+#et("todo")
+
+= Split-recursion
+With proof recursion and split verification formalized, we now combine both concepts into a unified system.
+To this end, we first introduce the selector function
+$
+  &Delta_cal(A): cal(A)^2 times BB to cal(A): (x, y, b) mapsto cases(x & text("if") b=0, y & text("if") b=1),
+$
+which, given a bit $b in BB$ and two elements $x,y$ of some space $cal(A)$, selects 
+an element based on the value of $b$.
+We can now use this selector to define $verify^*$ --- a variation to $verify'$ --- as follows:
+$
+  verify^*([comm(x), comm(y)], [proof, b])
+  :&= Delta_BB (verify(comm(x), proof), verify(comm(y([comm(x), comm(y)], dot)), proof), b)\
+  &= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof).
+$
+Note here that one can reconstruct $verify'$ from $verify^*$ as
+$
+	sum_(b in BB) verify^*([comm(x), comm(y)], [proof, b])
+	&=^((triangle)) or.big_(b in BB) verify^*([comm(x), comm(y)], [proof, b])\
+	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), 0), proof) or verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), 1), proof)\
+	&= verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof)\
+	&= verify'(comm(x), comm(y), proof),\
+$
+where $(triangle)$ holds under the assumption that a single proof $proof$ cannot 
+attest to two distinct instances.
+This makes the `OR` operation ($or$) effectively equivalent to the `XOR` operation,
+which is equivalent to addition in $BB$.
+Hence, $verify^*$ and $verify'$ are effectively equivalent, except that $verify^*$
+has the proof include a bit $b$ indicating whether it is verifying a base proof or recursion proof.
+
+We now observe that
+$
+	tilde(verify)^*_0([comm(x), comm(y)], [[proof, b], r]) 
+	&:= tilde(v)_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+	tilde(verify)^*_1([comm(x), comm(y)], [[proof, b], r]) 
+	&:= tilde(v)_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
+$
+jointly form a valid split of $verify^*$, since
+$
+	verify^*([comm(x), comm(y)], [proof, b])
+	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
+	&= (tilde(verify)_0 || tilde(verify)_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+	&= (tilde(verify)^*_0 || tilde(verify)^*_1)([comm(x), comm(y)], [[proof, b], r]),\
+$
+when
+$r = g([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
+By selecting $(comm(x), comm(y)) = (comm(instance), comm(tilde(v)^*_0 || tilde(v)^*_1))$, 
+we now obtain
+$
+	(tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r])
+	// &= tilde(verify)^*_0([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r]) dot tilde(verify)^*_1([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r])\
+	&= verify^*([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [proof, b])\
+	&= verify(Delta_commitmentSpace (comm(instance), comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), b), proof)\
+	&= Delta_BB (verify(comm(instance), proof), verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof), b)\
+	&= verify(comm(instance), proof) dot (1-b) + verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof) dot b.
+$
+i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does when $b=1$.
+Importantly, this can be achieved recursively, as
+$
+	#h(8em) // alignment purposes
+	&prove(instance; witness) &&to proof_(0),\
+	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(0), 0], r_(0)]) &&to [proof_(1), 1],\
+	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(1), 1], r_(1)]) &&to [proof_(2), 1],\
+	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(2), 1], r_(2)]) &&to [proof_(3), 1],
+  &&#h(8em)text(italic("etc."))
+$
+with
+$
+	r_i :&= g(comm((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot)), [proof_i, 1-delta_(i,0)]).
+$
+
+= Applied to lambda VM
+
+
+When both VMs are proven using the same proof system, the inner product argument is excessive.
+Here, the same commitment to $comm((proof, record))$ can be interpreted by both VMs.
+It therefore suffices for the verifier to verify both partial proofs against
+the same public proof-record commitment.
+
+base level:
+- input: instance, verifier
+- witness: proof, record
+- output: proof
+
+$
+  verify': commitmentSpace^2 times proofSpace: (comm(x), comm(y), proof) mapsto
+  verify(comm(x), proof) or verify(comm(y(comm(x), comm(y); dot)), proof)
+$
+
+how to split $verify'$ into $verify'_0$ and $verify'_1$
+
+$
+  verify': commitmentSpace^2 times proofSpace: (comm(x), comm(y), proof) mapsto
+  verify(comm(x), proof) or verify(comm(y(comm(x), comm(y); dot)), proof)
+$
+
+$
+  &verify'_0: (comm(x), comm(y), proof) mapsto
+  verify_0(comm(x), proof) or verify_0(comm(y(comm(x), comm(y); dot)), proof)\
+  &verify'_1: (comm(x), comm(y), proof) mapsto
+  verify_1(comm(x), proof) or verify_1(comm(y(comm(x), comm(y); dot)), proof)\
+$
+
+$
+  &verify_0(comm(x), proof)\
+  &verify_1(comm(x), proof)
+$
+
+recursion level:
+
+$
+  &verify'_0\
+  &verify'_1\
+$
+
+
+$
+  verify
+$
+
+TODO: 
+We assume that these VMs are proven using the same proof system, 
+yielding a unified proof of the combined execution as a result.
+
+
+= Combining recursive proving and split processing
+
+= Applied to LambdaVM
 We lastly provide some notes on applying the recursive proving and split processing to
 the verification of a proof in the context of this VM.
 
@@ -217,7 +553,7 @@ pertaining to the `DECODE` and `PAGE` tables, as these are already known to the 
 
 When recursing on this process, the prover provides the verifier with this commitment.
 We thus have to demonstrate the commitments the prover provides are as expected.
-This is achieved by having the verificationan  algorithm `COMMIT` (see @commit)
+This is achieved by having the verification  algorithm `COMMIT` (see @commit)
 to the public input it is provided.
 This act produces an imbalance in the LogUp-component of the proof-of-verification, 
 which must be balanced during verification in the _next_ recursion layer.
@@ -229,14 +565,24 @@ provide the initial input to the program as input to verify the recursive proof.
 
 Denoted as pseudo-algorithms, we find:
 
-#set list(marker: [---])
+= Applied to LambdaVM
+
+
+In theory, any division of tasks between the two VMs would work.
+Moreover, it is unclear what division will lead to optimal performance.
+Yet, it is expected that divisions adhering to these high-level guidelines will 
+be a good first step towards a performant verifier:
++ have the field-VM perform all verification steps involving field arithmetic,
++ include all verifier-issued challenges required by these verification steps 
+  in the communication record $record$ as field-elements, so that the field-VM does not have to derive them,
++ use the binary-VM to verify the challenges hinted by the communication record are indeed correct.
+
 *Communication record overview:*
 - the data required according to the chosen verification split,
 - if $b=1$, reconstructed commitment $comm(verify'(comm(instance), comm(verify'); dot))$
 
-*$verify'_b\(comm(instance), (comm(verify'_b), comm(verify'_f)), b, proof, record)$:*
+*$verify'_b\(comm(instance), (comm(verify'_b), comm(verify'_f)), proof, record)$:*
 - `COMMIT` to $comm(instance)$, $comm(verify'_b),$ and $comm(verify'_f)$ 
-- assert that $b in {0, 1}$,
 - verify proof:
   - if $b=0$: execute $verify_b (comm(instance), proof)$
   - if $b=1$:
