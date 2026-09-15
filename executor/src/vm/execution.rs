@@ -41,6 +41,24 @@ pub struct EpochExecution {
     pub end_memory: Memory,
 }
 
+/// The mutable VM state at a cycle boundary: enough, with the program ELF, to
+/// recreate an [`Executor`] that resumes byte-identically.
+///
+/// The instruction cache is rebuilt from the ELF rather than stored. Replay is
+/// deterministic because every nondeterministic input (the private inputs) is
+/// already loaded into `memory` before the first cycle, so a resumed run
+/// produces the same logs the original would have.
+///
+/// This is what lets a prover drop what it built and get it back: re-execution
+/// from a checkpoint is bounded by the distance to the next boundary instead of
+/// restarting at cycle zero.
+#[derive(Clone)]
+pub struct VmSnapshot {
+    memory: Memory,
+    registers: Registers,
+    pc: u64,
+}
+
 /// Executor state for chunked execution
 pub struct Executor {
     memory: Memory,
@@ -61,6 +79,33 @@ impl Executor {
             memory,
             registers: Registers::default(),
             pc: program.entry_point,
+            instructions,
+            logs: Vec::with_capacity(CHUNK_SIZE),
+        })
+    }
+
+    /// Capture the VM state as a [`VmSnapshot`]. Cheap except for the memory
+    /// clone, which copies the touched-cell map.
+    pub fn snapshot(&self) -> VmSnapshot {
+        VmSnapshot {
+            memory: self.memory.clone(),
+            registers: self.registers.clone(),
+            pc: self.pc,
+        }
+    }
+
+    /// Recreate an `Executor` sitting exactly where `snapshot` was taken.
+    ///
+    /// `program` must be the ELF the snapshot was taken under: it rebuilds the
+    /// instruction cache. The program image is NOT reloaded — the snapshot's
+    /// memory already carries it, along with everything execution has written
+    /// since.
+    pub fn from_snapshot(program: &Elf, snapshot: VmSnapshot) -> Result<Self, ExecutorError> {
+        let instructions = InstructionCache::new(&program.data)?;
+        Ok(Self {
+            memory: snapshot.memory,
+            registers: snapshot.registers,
+            pc: snapshot.pc,
             instructions,
             logs: Vec::with_capacity(CHUNK_SIZE),
         })
