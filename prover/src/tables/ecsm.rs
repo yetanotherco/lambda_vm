@@ -2,9 +2,10 @@
 //!
 //! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
-//! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
-//! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
-//! over the `Ecdas`/`Bit` buses.
+//! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR, yR, yG < p`, writes the
+//! 96-byte output `[xR ‖ yR ‖ yG]` back (`yG` is echoed so the guest can tell which root of
+//! `xG` the chip witnessed), serves the scalar bits directly via the `Bit` bus, and delegates
+//! the double-and-add to ECDAS over the `Ecdas`/`Bit` buses.
 //!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
@@ -28,7 +29,7 @@ pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
-// Column indices (667 columns; keep in sync with NUM_COLUMNS below)
+// Column indices (699 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
 
 pub mod cols {
@@ -56,12 +57,20 @@ pub mod cols {
     pub const K_SUB_N: usize = 634; // U256HL (16 halfwords)
     pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
     pub const MU: usize = 666;
+    /// `(yR - p) mod 2^256`, the addend that forces `yR < p` (see `OverflowKind::YrLtP`).
+    pub const YR_SUB_P: usize = 667; // U256HL (16 halfwords)
+    /// `(yG - p) mod 2^256`, the addend that forces `yG < p` (see `OverflowKind::YgLtP`).
+    pub const YG_SUB_P: usize = 683; // U256HL (16 halfwords)
 
-    pub const NUM_COLUMNS: usize = 667;
+    pub const NUM_COLUMNS: usize = 699;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
         XR + i
+    }
+    #[inline]
+    pub const fn yr(i: usize) -> usize {
+        YR + i
     }
     /// Bit `i` of the scalar `k` (0 = LSB, 255 = MSB).
     #[inline]
@@ -107,6 +116,14 @@ pub mod cols {
     #[inline]
     pub const fn xr_sub_p(i: usize) -> usize {
         XR_SUB_P + i
+    }
+    #[inline]
+    pub const fn yr_sub_p(i: usize) -> usize {
+        YR_SUB_P + i
+    }
+    #[inline]
+    pub const fn yg_sub_p(i: usize) -> usize {
+        YG_SUB_P + i
     }
 }
 
@@ -181,6 +198,8 @@ pub fn generate_ecsm_trace(
         write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
         write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
         write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
+        write_halfwords(table, row_idx, cols::YR_SUB_P, &w.y_r_sub_p);
+        write_halfwords(table, row_idx, cols::YG_SUB_P, &w.y_g_sub_p);
 
         for i in 0..64 {
             debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
@@ -420,27 +439,51 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             0,
         ),
     ));
-    // write xR: 4 doublewords at addr_xR + 8i (ts + 2).
-    for i in 0..4 {
-        let base_lo = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ADDR_XR_0,
-            },
-            LinearTerm::Constant((8 * i) as i64),
-        ]);
-        out.push(BusInteraction::sender(
-            BusId::Memw,
-            mu(),
-            memw_write(
-                dword_bytes(cols::XR, i),
-                base_lo,
-                packed(cols::ADDR_XR_1),
-                ts_lo_plus(2),
-                ts_hi(),
-                1,
-            ),
-        ));
+    // Write the 96-byte output buffer [xR ‖ yR ‖ yG] as 12 doublewords at addr_xR + off + 8i.
+    //
+    // `yG` is echoed because the chip may witness EITHER root of xG — the AIR binds only
+    // `yG² ≡ xG³ + b`, so nothing here pins the sign (see the "Two options for y_G" aside in
+    // `spec/ecsm.typ`). `yR` alone would therefore be ambiguous: it is `±y(k·P)` for the
+    // caller's own point P. Handing back the root the chip used lets the guest resolve it
+    // with one comparison, which keeps the root a free choice exactly as the aside argues
+    // while still exposing a usable y — and the echo itself costs no column, since `YR` and
+    // `YG` are already witnessed (YR arrives on the ECDAS bus, YG is proved by the yG
+    // convolution). The `< p` checks below are a separate choice, and those do cost columns.
+    //
+    // Both are range-checked to `< p` here (`OverflowKind::YrLtP` / `YgLtP`), so the guest
+    // compares the echoed root against its own `y` on canonical bytes: nothing lets the prover
+    // publish the second 256-bit representative `y + p`, whose parity is the opposite one.
+    //
+    // xR keeps ts + 2 (grouped with the x10 register read); yR and yG take ts + 3, the free
+    // fourth sub-timestamp of the instruction's stride-4 window. Several doubleword accesses
+    // may share a timestamp as long as their addresses differ, which they do — the three
+    // chunks are disjoint 32-byte ranges of one buffer.
+    for (col, off, ts) in [
+        (cols::XR, 0i64, ts_lo_plus(2)),
+        (cols::YR, 32, ts_lo_plus(3)),
+        (cols::YG, 64, ts_lo_plus(3)),
+    ] {
+        for i in 0..4 {
+            let base_lo = BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ADDR_XR_0,
+                },
+                LinearTerm::Constant(off + (8 * i) as i64),
+            ]);
+            out.push(BusInteraction::sender(
+                BusId::Memw,
+                mu(),
+                memw_write(
+                    dword_bytes(col, i),
+                    base_lo,
+                    packed(cols::ADDR_XR_1),
+                    ts.clone(),
+                    ts_hi(),
+                    1,
+                ),
+            ));
+        }
     }
 
     // IS_BYTE range checks (single byte → AreBytes[x, 0]).
@@ -459,7 +502,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::Q1, 33, &mut out); // q1[0..=32] (all 33 bytes)
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
-    // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
+    // IS_HALF range checks on shifted carries, then xG_sub_p / k_sub_N / xR_sub_p, and
+    // (since the chip publishes them) yR_sub_p / yG_sub_p.
     let half_offset = |col: usize, off: i64| {
         BusValue::linear(vec![
             LinearTerm::Column {
@@ -502,6 +546,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::IsHalfword,
             mu(),
             vec![packed(cols::xr_sub_p(i))],
+        ));
+    }
+    // yR < p and yG < p. Unlike xR these are not read as numbers by this chip — they go from
+    // the ECDAS result / the yG witness straight to memory — but both are published to the
+    // guest, which resolves the root by comparing yG against its own y and then uses yR as a
+    // field element. Bounding them here is what lets the caller do that on bytes: without it
+    // the prover could publish `y + p` (possible for y < 2^256 - p ≈ 2^32, and such points
+    // are constructible), a second representative that agrees mod p but flips the parity.
+    for i in 0..16 {
+        out.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mu(),
+            vec![packed(cols::yr_sub_p(i))],
+        ));
+    }
+    for i in 0..16 {
+        out.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mu(),
+            vec![packed(cols::yg_sub_p(i))],
         ));
     }
 
@@ -618,25 +682,30 @@ pub enum Relation {
     Yg,
 }
 
-/// The addition-overflow range checks (`xG < p`, `k < N`, `xR < p`), whose 8 word-carries
-/// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition
-/// must overflow `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
+/// The addition-overflow range checks (`xG < p`, `k < N`, `xR < p`, `yR < p`, `yG < p`),
+/// whose 8 word-carries `c` are virtual. Each
+/// `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition must overflow
+/// `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
 /// `xG < p` is `p + xg_sub_p = xG + 2^256`; `k < N` is `N + k_sub_N = k + 2^256`;
-/// `xR < p` is `p + xR_sub_p = xR + 2^256`.
+/// `xR < p` is `p + xR_sub_p = xR + 2^256`; and likewise `yR < p` / `yG < p` against `p`.
 #[derive(Clone, Copy)]
 pub enum OverflowKind {
     XgLtP,
     KLtN,
     XrLtP,
+    YrLtP,
+    YgLtP,
 }
 
 impl OverflowKind {
-    /// The constant addend's 32-bit word `i` (`p` for `xG<p`/`xR<p`, `N` for `k<N`).
+    /// The constant addend's 32-bit word `i` (`p` for every `< p` check, `N` for `k < N`).
     fn const_word(self, i: usize) -> u64 {
         let bytes = match self {
-            OverflowKind::XgLtP => &P_BYTES,
             OverflowKind::KLtN => &N_BYTES,
-            OverflowKind::XrLtP => &P_BYTES,
+            OverflowKind::XgLtP
+            | OverflowKind::XrLtP
+            | OverflowKind::YrLtP
+            | OverflowKind::YgLtP => &P_BYTES,
         };
         let mut w = 0u64;
         for b in 0..4 {
@@ -644,12 +713,15 @@ impl OverflowKind {
         }
         w
     }
-    /// Column base of the witnessed halfword addend (`xg_sub_p` / `k_sub_N` / `xR_sub_p`).
+    /// Column base of the witnessed halfword addend (`xg_sub_p` / `k_sub_N` / `xR_sub_p` /
+    /// `yR_sub_p` / `yG_sub_p`).
     fn addend_hl_base(self) -> usize {
         match self {
             OverflowKind::XgLtP => cols::XG_SUB_P,
             OverflowKind::KLtN => cols::K_SUB_N,
             OverflowKind::XrLtP => cols::XR_SUB_P,
+            OverflowKind::YrLtP => cols::YR_SUB_P,
+            OverflowKind::YgLtP => cols::YG_SUB_P,
         }
     }
     /// Column base of the sum.
@@ -658,9 +730,11 @@ impl OverflowKind {
             OverflowKind::XgLtP => cols::XG,
             OverflowKind::KLtN => cols::K,
             OverflowKind::XrLtP => cols::XR,
+            OverflowKind::YrLtP => cols::YR,
+            OverflowKind::YgLtP => cols::YG,
         }
     }
-    /// Whether the sum is stored as individual bits (k) rather than bytes (xG/xR).
+    /// Whether the sum is stored as individual bits (k) rather than bytes (xG/xR/yR/yG).
     fn sum_is_bits(self) -> bool {
         matches!(self, OverflowKind::KLtN)
     }
@@ -671,7 +745,7 @@ impl OverflowKind {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..413:
+// folder, the verifier folder and IR capture. Constraint indices 0..429:
 //   0        : IS_BIT(MU)
 //   1..257   : IS_BIT(k[i]) for the 256 scalar bits
 //   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
@@ -686,10 +760,14 @@ impl OverflowKind {
 //   404      : OverflowRequired(KLtN)
 //   405..412 : CarryBit(XrLtP, 0..7)
 //   412      : OverflowRequired(XrLtP)
+//   413..420 : CarryBit(YrLtP, 0..7)
+//   420      : OverflowRequired(YrLtP)
+//   421..428 : CarryBit(YgLtP, 0..7)
+//   428      : OverflowRequired(YgLtP)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// ECSM transition constraints as a single-source [`ConstraintSet`] (413
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (429
 /// total). No column configuration needed (the layout is fixed via `cols`).
 #[derive(Clone, Copy)]
 pub struct EcsmConstraints;
@@ -880,8 +958,16 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(idx, q1_32.clone() * (one - q1_32));
         idx += 1;
 
-        // xG < p, k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
-        for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
+        // xG < p, k < N, xR < p, yR < p, yG < p: 7 carry bits (deg 3) + overflow-required
+        // (deg 2) each. The last two bound the values this chip publishes to guest memory
+        // alongside xR, so the caller can compare them as bytes.
+        for kind in [
+            OverflowKind::XgLtP,
+            OverflowKind::KLtN,
+            OverflowKind::XrLtP,
+            OverflowKind::YrLtP,
+            OverflowKind::YgLtP,
+        ] {
             let c = Self::carry_chain(b, kind);
             for ci in c.iter().take(7) {
                 // µ · c_i · (1 − c_i)
@@ -897,6 +983,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        debug_assert_eq!(idx, 413);
+        debug_assert_eq!(idx, 429);
     }
 }

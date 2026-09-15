@@ -832,10 +832,13 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 /// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
 /// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
-/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
-/// `xR` memory writes at `T + 2`. Every read advances
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and the four
+/// `xR` memory writes at `T + 2`; the `yR` and `yG` writes at `T + 3`, the fourth and last
+/// sub-timestamp of the instruction's stride-4 window. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
-/// accesses always observe a strictly smaller old timestamp.
+/// accesses always observe a strictly smaller old timestamp — and every write of the
+/// 96-byte output lands strictly after both operand reads, which is what lets the output
+/// buffer alias `xG` or `k` even though it can now cover both.
 #[allow(clippy::needless_range_loop)]
 fn collect_ecsm_ops(
     op: &CpuOperation,
@@ -862,7 +865,7 @@ fn collect_ecsm_ops(
     let witness = ::ecsm::compute_witness(&k, &xg)
         .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
-    let mut memw_ops = Vec::with_capacity(15);
+    let mut memw_ops = Vec::with_capacity(23);
 
     // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
     {
@@ -926,20 +929,30 @@ fn collect_ecsm_ops(
         register_state.write(10, val, t + 2);
     }
 
-    // xR writes at T + 2 (4 doublewords).
-    for i in 0..4 {
-        let addr = addr_xr.wrapping_add((8 * i) as u64);
-        let mut value = [0u32; 8];
-        let mut dword = 0u64;
-        for j in 0..8 {
-            value[j] = witness.x_r[8 * i + j] as u32;
-            dword |= (witness.x_r[8 * i + j] as u64) << (8 * j);
+    // Output buffer [xR ‖ yR ‖ yG] — 12 doubleword writes at addr_xR + off + 8i.
+    // xR at T + 2 (grouped with the x10 register read), yR and yG at T + 3, the free fourth
+    // sub-timestamp of the stride-4 window. The three chunks are disjoint 32-byte ranges, so
+    // sharing T + 3 between the last two never touches an address twice. `yG` is echoed so
+    // the guest can tell which root of xG the chip witnessed; see `ecsm::bus_interactions`.
+    for (bytes, off, ts) in [
+        (&witness.x_r, 0u64, t + 2),
+        (&witness.y_r, 32, t + 3),
+        (&witness.y_g, 64, t + 3),
+    ] {
+        for i in 0..4 {
+            let addr = addr_xr.wrapping_add(off).wrapping_add((8 * i) as u64);
+            let mut value = [0u32; 8];
+            let mut dword = 0u64;
+            for j in 0..8 {
+                value[j] = bytes[8 * i + j] as u32;
+                dword |= (bytes[8 * i + j] as u64) << (8 * j);
+            }
+            let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops.push(
+                MemwOperation::new(false, addr, value, ts, 8, false).with_old(old_vals, old_ts),
+            );
+            memory_state.write_bytes(addr, dword, 8, ts);
         }
-        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 2, 8, false).with_old(old_vals, old_ts),
-        );
-        memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
     let ecdas_ops = witness
@@ -2392,7 +2405,8 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
             out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
-        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N and xR_sub_p.
+        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N, xR_sub_p, yR_sub_p and yG_sub_p.
+        // One receive per send in `ecsm::bus_interactions`, or IsHalfword does not balance.
         for i in 0..16 {
             out.push(is_half_op(
                 w.x_g_sub_p[2 * i] as u16 + ((w.x_g_sub_p[2 * i + 1] as u16) << 8),
@@ -2402,6 +2416,16 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
             ));
             out.push(is_half_op(
                 w.x_r_sub_p[2 * i] as u16 + ((w.x_r_sub_p[2 * i + 1] as u16) << 8),
+            ));
+        }
+        for i in 0..16 {
+            out.push(is_half_op(
+                w.y_r_sub_p[2 * i] as u16 + ((w.y_r_sub_p[2 * i + 1] as u16) << 8),
+            ));
+        }
+        for i in 0..16 {
+            out.push(is_half_op(
+                w.y_g_sub_p[2 * i] as u16 + ((w.y_g_sub_p[2 * i + 1] as u16) << 8),
             ));
         }
         // ZERO: assert k != 0 (sum of k's bytes).
@@ -3891,6 +3915,24 @@ pub fn count_table_lengths(
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
+        }
+
+        if cpu_op.ecall_ecsm {
+            // Mirror `collect_ecsm_ops`: three register reads (a0/a1/a2), four `xG` and four
+            // `k` doubleword reads, and the twelve writes of the `[xR ‖ yR ‖ yG]` output all
+            // go through the memory argument. Replaying it here keeps memory/register state
+            // in sync with generation, exactly like commit/hint. The LT rows those accesses
+            // derive are added by the `lt_from_memw + memw_aligned_count` closing below.
+            let (ecsm_memw, _ecsm_op, _ecdas_ops) =
+                collect_ecsm_ops(&cpu_op, &mut memory_state, &mut register_state);
+            for memw_op in &ecsm_memw {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
         }
 
         if cpu_op.ecall_hint {

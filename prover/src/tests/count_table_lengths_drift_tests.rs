@@ -126,3 +126,37 @@ fn count_table_lengths_matches_nonempty_hint_trace() {
     );
     assert_count_table_lengths_matches(&elf, &result.logs);
 }
+
+/// ECSM routes twenty-three MEMW ops through the memory argument per ecall: three
+/// register reads (`a0`/`a1`/`a2`), four `xG` and four `k` doubleword reads, and the
+/// twelve writes of the `[xR ‖ yR ‖ yG]` output. `count_table_lengths` must replay all
+/// of it, or MEMW / MEMW_A (exact-match tables in the helper above) drift.
+///
+/// Uses the **Rust** guest, not `test_ecsm.s`, and that choice is the whole test. The asm
+/// fixtures put every operand on an 8-aligned stack slot, so all twenty memory accesses
+/// take the MEMW_A route and `padded_chunked_rows` rounds both sides to the same power of
+/// two — a missing replay stays invisible there. The Rust guest spreads accesses across
+/// both routes, and dropping the `ecall_ecsm` branch moves the general MEMW table from 16
+/// rows to 8, which this assertion catches.
+#[test]
+fn count_table_lengths_matches_nonempty_ecsm_trace() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm.elf"))
+        .expect("ecsm.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("valid ECSM guest ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("ECSM guest execution");
+
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER
+        }),
+        "fixture must contain an ECSM ecall"
+    );
+    assert_count_table_lengths_matches(&elf, &result.logs);
+}

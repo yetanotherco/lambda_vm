@@ -120,9 +120,47 @@ pub(crate) fn prepare(
 }
 
 /// Computes the x-coordinate of `k·G` over secp256k1, given `k` and `xG` as little-endian
-/// 32-byte values. This is the executor's entry point — it writes the returned bytes back
-/// to guest memory at `addr_xR`.
+/// 32-byte values.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
+    Ok(scalar_mul_full(k_le, xg_le)?.x_r)
+}
+
+/// The ECSM ecall's memory image: `xR ‖ yR ‖ yG`, three little-endian 32-byte values
+/// written back as one contiguous 96-byte buffer.
+///
+/// Named fields rather than a positional tuple: all three are `[u8; 32]`, so a tuple lets any
+/// producer or consumer transpose `y_r` and `y_g` with nothing for the compiler to catch. The
+/// two mean different things — the product's y versus the root of the *base* point — so a swap
+/// does not fail loudly; it yields a wrong recovered public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcsmOutput {
+    /// x of `k·(xG, yG)`.
+    pub x_r: [u8; 32],
+    /// y of `k·(xG, yG)`.
+    pub y_r: [u8; 32],
+    /// The root of `xG` the multiplication actually used.
+    pub y_g: [u8; 32],
+}
+
+/// The executor's entry point: `(xR, yR, yG)` as little-endian 32-byte values, written back
+/// to guest memory as one contiguous 96-byte buffer at `addr_xR`.
+///
+/// `yG` is echoed because the chip is free to witness *either* root of `xG` — the AIR only
+/// binds `yG² ≡ xG³ + b`, so nothing pins the sign (see `spec/ecsm.typ`, "Two options for
+/// `y_G`"). Returning `yR` alone would therefore be ambiguous: it is the y of `k·(xG, yG)`
+/// for whichever root the prover chose, which is `±y(k·P)` for the caller's own point `P`.
+/// Echoing `yG` resolves it caller-side at no cost: the caller compares `yG` against its own
+/// base point's `y`, so a flipped root just flips the sign it applies to `yR`. That keeps the
+/// root a free choice for the prover, exactly as the spec's aside argues, while still handing
+/// back a usable y. The comparison is safe on bytes because the chip range-checks `yG < p`
+/// and `yR < p` (`OverflowKind::YgLtP` / `YrLtP`): without those the prover could publish the
+/// second representative `y + p`, which agrees mod `p` but carries the opposite parity.
+pub fn scalar_mul_full(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmOutput, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
+    let r = curve::scalar_mul_affine(&k, &g);
+    Ok(EcsmOutput {
+        x_r: to_le_32(&r.x),
+        y_r: to_le_32(&r.y),
+        y_g: to_le_32(&g.y),
+    })
 }
