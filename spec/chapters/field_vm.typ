@@ -172,6 +172,8 @@ along with inform potential optimizations that remove unused capabilities
 Since the VM makes use of read-only memory, traditional usage of a program stack does not work.
 We assume that each function invocation (unless other optimizations apply) will have an associated _frame_,
 pointed to by a _frame pointer_ `fp`, one of the general purpose registers.
+Observe that we let `fp` point into the middle of the frame, such that the information relevant to the callee
+starts at offset 0.
 In this frame, the following data is stored:
 
 / `MEM[fp - k]...MEM[fp - 1]`: `k` saved registers from the calling function
