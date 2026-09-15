@@ -1138,11 +1138,31 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("trace_build");
 
+    // The storage mode and `LAMBDA_STREAM_LDE=auto` read the same analytical
+    // peak estimate, so the log pre-pass behind it is paid once, and only when
+    // something actually asks for it.
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
         let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
+        if stark::prover::streaming_retire_lde_is_auto() {
+            stark::prover::set_retire_lde(auto_storage::decide_retire_lde(
+                &lengths,
+                proof_options.blowup_factor,
+            ));
+        }
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
+
+    // The estimate lives behind `disk-spill` (so do `TableLengths` and the
+    // storage mode it feeds). Say so instead of silently proving with the mode
+    // off, which would read as "auto decided no".
+    #[cfg(not(feature = "disk-spill"))]
+    if stark::prover::streaming_retire_lde_is_auto() {
+        log::warn!(
+            "LAMBDA_STREAM_LDE=auto needs the `disk-spill` feature for the peak-RAM estimate; \
+             proving with the main LDE resident. Pass LAMBDA_STREAM_LDE=1 to force it on."
+        );
+    }
 
     let mut traces = Traces::from_elf_and_logs(
         &program,

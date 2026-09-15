@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
@@ -627,17 +628,53 @@ fn host_cores() -> usize {
 /// peak. Retiring trades one extra LDE expansion (iFFT + coset + FFT) per table
 /// for dropping that term to `O(k x ...)`.
 ///
-/// Opt-in via `LAMBDA_STREAM_LDE=1` (or `true`). Off by default. Inert under
-/// `cuda`, where the LDE lives on the device and the host buffer is already
-/// empty on the device-only path.
+/// Driven by `LAMBDA_STREAM_LDE`: `1`/`true` forces it on, `0`/unset off, and
+/// `auto` lets the caller decide from an estimate of the proof's peak RAM (the
+/// prover crate resolves `auto` through [`set_retire_lde`] before proving, so
+/// the estimate never costs anything on the default path). Inert under `cuda`,
+/// where the LDE lives on the device and the host buffer is already empty on
+/// the device-only path.
 ///
 /// Port of Approach 1 milestone M1 (PR #647, commit 6562c5f4).
 pub fn streaming_retire_lde() -> bool {
-    matches!(
-        std::env::var("LAMBDA_STREAM_LDE").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    match RETIRE_LDE_OVERRIDE.load(Ordering::Relaxed) {
+        RETIRE_OVERRIDE_ON => true,
+        RETIRE_OVERRIDE_OFF => false,
+        _ => matches!(
+            std::env::var("LAMBDA_STREAM_LDE").as_deref(),
+            Ok("1") | Ok("true")
+        ),
+    }
 }
+
+/// Whether `LAMBDA_STREAM_LDE=auto` asked for the decision to be made from a
+/// peak-RAM estimate. Only then does the caller pay for that estimate.
+pub fn streaming_retire_lde_is_auto() -> bool {
+    matches!(std::env::var("LAMBDA_STREAM_LDE").as_deref(), Ok("auto"))
+}
+
+/// Resolve `LAMBDA_STREAM_LDE=auto` to a decision for the rest of the process.
+///
+/// Process-global, like the env var it resolves, and read once per table inside
+/// `multi_prove` — so it must be set before proving starts and must not change
+/// mid-proof, or a table would be rebuilt against a commitment it never
+/// produced. Set it only from the resolution of `auto`: an explicit `0`/`1`
+/// is the operator overriding the estimate, and this must not silently undo it.
+pub fn set_retire_lde(on: bool) {
+    RETIRE_LDE_OVERRIDE.store(
+        if on {
+            RETIRE_OVERRIDE_ON
+        } else {
+            RETIRE_OVERRIDE_OFF
+        },
+        Ordering::Relaxed,
+    );
+}
+
+const RETIRE_OVERRIDE_UNSET: u8 = 0;
+const RETIRE_OVERRIDE_OFF: u8 = 1;
+const RETIRE_OVERRIDE_ON: u8 = 2;
+static RETIRE_LDE_OVERRIDE: AtomicU8 = AtomicU8::new(RETIRE_OVERRIDE_UNSET);
 
 pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(feature = "parallel")]

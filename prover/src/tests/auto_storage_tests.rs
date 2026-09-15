@@ -135,3 +135,39 @@ fn unbounded_k_inflates_peak_bytes_on_many_page_shapes() {
         "expected >20 % inflation, got {bounded} -> {unbounded}"
     );
 }
+
+#[test]
+fn retire_lde_off_when_estimate_below_threshold() {
+    // 10 GB estimated, 32 GB available → threshold 28.8 GB → the main LDE is
+    // affordable, so do not pay ~11% of prove time to retire it.
+    assert!(!crate::auto_storage::retire_lde_for(10 * GB, Some(32 * GB)));
+}
+
+#[test]
+fn retire_lde_on_when_estimate_exceeds_threshold() {
+    // 30 GB estimated, 32 GB available → threshold 28.8 GB → about to swap.
+    assert!(crate::auto_storage::retire_lde_for(30 * GB, Some(32 * GB)));
+}
+
+#[test]
+fn retire_lde_on_when_available_ram_is_unknown() {
+    assert!(crate::auto_storage::retire_lde_for(10 * GB, None));
+}
+
+/// The documented policy: retire-LDE and disk-spill share one trigger, so a
+/// change to the storage threshold can never silently desynchronize them.
+#[test]
+fn retire_lde_agrees_with_disk_spill_on_every_side_of_the_threshold() {
+    for (estimated, available) in [
+        (10 * GB, Some(32 * GB)),
+        (30 * GB, Some(32 * GB)),
+        (GB, Some(2 * GB)),
+        (10 * GB, None),
+    ] {
+        assert_eq!(
+            crate::auto_storage::retire_lde_for(estimated, available),
+            select_storage_mode(estimated, available) == StorageMode::Disk,
+            "policy drifted for estimated={estimated} available={available:?}"
+        );
+    }
+}
