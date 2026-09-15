@@ -617,6 +617,28 @@ fn host_cores() -> usize {
 /// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
 /// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
 /// admission's job (`VramGate`), not this count's.
+/// Retire each table's main LDE right after the Round 1 commit and rebuild it
+/// on demand inside the table's fused chain, instead of holding all N of them
+/// across the Round 1 barrier.
+///
+/// Round 1's main commit is a phase-wide barrier (the shared LogUp challenges
+/// need every root absorbed first), so all N tables' main LDEs are live at once
+/// — `O(N x main_cols x lde_size)`, the largest single term in the prover's
+/// peak. Retiring trades one extra LDE expansion (iFFT + coset + FFT) per table
+/// for dropping that term to `O(k x ...)`.
+///
+/// Opt-in via `LAMBDA_STREAM_LDE=1` (or `true`). Off by default. Inert under
+/// `cuda`, where the LDE lives on the device and the host buffer is already
+/// empty on the device-only path.
+///
+/// Port of Approach 1 milestone M1 (PR #647, commit 6562c5f4).
+pub fn streaming_retire_lde() -> bool {
+    matches!(
+        std::env::var("LAMBDA_STREAM_LDE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
@@ -1410,6 +1432,36 @@ pub trait IsStarkProver<
                 .map_err(|e| ProvingError::DiskSpill(format!("{label}: {e}")))?;
         }
         Ok(())
+    }
+
+    /// Rebuild a table's row-major main LDE from its trace.
+    ///
+    /// Byte-identical to what the Round 1 main commit produced: it runs the same
+    /// production path (row-major copy + cache-blocked two-half coset LDE), not
+    /// the column-wise debug reconstruction. Used by the retire-LDE streaming
+    /// path, which drops this buffer after the commit and rebuilds it here.
+    fn rebuild_main_lde(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> (Vec<FieldElement<Field>>, usize) {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.main_data_row_major();
+
+        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
+        main_data.extend_from_slice(trace_data);
+
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut main_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .expect("row-major coset LDE expansion");
+
+        (main_data, total_cols)
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -3410,6 +3462,10 @@ pub trait IsStarkProver<
 
         let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
+        // Read once: the flag is process-global and must not change mid-proof,
+        // or a table would be rebuilt against a commitment it never produced.
+        #[cfg(not(feature = "cuda"))]
+        let retire_main_lde = streaming_retire_lde();
         // Optional device-side LDE handle per table, populated only when the
         // R1 fused GPU pipeline produced one. Pairing is by index: this vector
         // is moved into the per-table `gpu_main_cells` mutex slots below, and
@@ -3465,6 +3521,16 @@ pub trait IsStarkProver<
             }
             transcript.append_bytes(&commit.root);
             main_commits.push(commit);
+            // Retire-LDE: drop the row-major main LDE here, keeping only its
+            // column count, so the O(N x main_cols x lde_size) cache never
+            // forms across this barrier. `rounds_stage` rebuilds each table's
+            // LDE inside its own fused chain.
+            #[cfg(not(feature = "cuda"))]
+            let cached_main = if retire_main_lde {
+                (Vec::new(), cached_main.1)
+            } else {
+                cached_main
+            };
             main_ldes.push(cached_main);
             #[cfg(feature = "cuda")]
             main_gpu_handles.push(gpu_main);
@@ -3921,6 +3987,20 @@ pub trait IsStarkProver<
             let __sp = crate::instruments::span("rounds_2to4_table");
             #[cfg(feature = "instruments")]
             let table_start = Instant::now();
+
+            // Retire-LDE: the main LDE was dropped right after the Round 1
+            // commit; rebuild it here so at most `k` of them are ever live.
+            #[cfg(not(feature = "cuda"))]
+            let lde = if retire_main_lde {
+                #[cfg(feature = "instruments")]
+                let __sp_rebuild = crate::instruments::span("r1_main_lde_rebuild");
+                let main = Self::rebuild_main_lde(trace, domain, &twiddle_caches[idx]);
+                #[cfg(feature = "instruments")]
+                drop(__sp_rebuild);
+                Lde { main, ..lde }
+            } else {
+                lde
+            };
 
             let mut round_1_result =
                 commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
