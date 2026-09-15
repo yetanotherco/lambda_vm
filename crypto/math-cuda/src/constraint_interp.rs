@@ -502,3 +502,71 @@ pub fn decompose_d2_into_slabs(
     }
     Ok((out, stream, n))
 }
+
+/// Degree-1 (num_parts==1) composition part: `H` is already the single part on
+/// the LDE coset, so there is neither a decompose nor a re-extension — only a
+/// de-interleave of the resident interleaved ext3 evals `h` (`num_rows` rows,
+/// `h[row*3 + k]`) into the 3-slab layout the commit / DEEP / FRI consumers read
+/// (`out[(0*3 + k) * lde_size + row]`, i.e. one column of 3 slabs). Returns a
+/// device-resident [`GpuLdeExt3`] with `m = 1` and `lde_size == h.num_rows`,
+/// kept live on `h`'s stream with a recorded event so cross-stream consumers
+/// wait device-side (no host block).
+pub fn comp_h_to_slabs(h: &GpuCompH) -> Result<GpuLdeExt3> {
+    let lde_size = h.num_rows;
+    assert!(
+        lde_size.is_power_of_two() && lde_size >= 2,
+        "H row count must be a power of two"
+    );
+    let be = backend()?;
+    let stream = h.stream.clone();
+    // The kernel writes every one of the `3 * lde_size` slab u64s, so an
+    // uninitialized allocation is sound (no zero-pad tail, unlike the d=2
+    // decompose which only fills the first `n` rows).
+    let mut out = unsafe { stream.alloc::<u64>(3 * lde_size) }?;
+
+    let grid = (lde_size as u32)
+        .div_ceil(BLOCK_DIM)
+        .clamp(1, MAX_THREADS / BLOCK_DIM);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_rows_u64 = lde_size as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.comp_h_to_slabs_kernel)
+            .arg(&h.buf)
+            .arg(&num_rows_u64)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+
+    Ok(GpuLdeExt3 {
+        buf: Arc::new(out),
+        m: 1,
+        lde_size,
+        tree: None,
+        ready: Some(Arc::new(ready)),
+    })
+}
+
+/// Parity helper: build a resident [`GpuCompH`] from interleaved ext3 evals on
+/// host (`h[row*3 + k]`, `num_rows * 3` u64), uploaded on a fresh stream. On the
+/// prove path `H` is born on device (never uploaded); this exists only so the
+/// de-interleave kernel can be exercised in isolation against a host oracle.
+pub fn comp_h_from_host_interleaved(interleaved: &[u64], num_rows: usize) -> Result<GpuCompH> {
+    assert_eq!(interleaved.len(), num_rows * 3, "interleaved ext3 length");
+    let be = backend()?;
+    let stream = be.next_stream();
+    let buf = stream.clone_htod(interleaved)?;
+    stream.synchronize()?;
+    Ok(GpuCompH {
+        buf,
+        num_rows,
+        stream,
+    })
+}

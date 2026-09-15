@@ -5,15 +5,18 @@
 //! regressions (GPU path fired but produced output that fails verification).
 //!
 //! `#[ignore]`'d so the no-GPU CI path skips it. Run via `make test-cuda-integration`
-//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture`.
+//! or `cargo test -p lambda-vm-prover --release --features cuda --test cuda_path_integration -- --ignored --nocapture --test-threads=1`.
+//! The single test thread is not optional: the counters these tests assert on
+//! are process-global, so parallel proves in one process cross-contaminate them.
 #![cfg(feature = "cuda")]
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
-    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls,
-    gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_grind_calls,
+    gpu_lde_calls, gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls,
+    reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -73,11 +76,14 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 GPU composition-poly LDE. Fires via one of two paths depending on the
+    // R2 GPU composition-poly LDE. Fires via one of three paths depending on the
     // AIR's `number_of_parts`: the fused two-halves quotient decomposition for
     // the common degree-2 case (`== 2`, counted by `gpu_extend_halves_calls`),
-    // or the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`).
-    // fib_iterative_1M only exercises the degree-2 path, so assert on either.
+    // the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`), or the
+    // d=1 de-interleave (`== 1`, counted by `gpu_comp_h_slabs_calls` — covered
+    // separately by `cuda_d1_path.rs`, since no d=1 table here crosses the
+    // default LDE threshold). fib_iterative_1M only exercises the degree-2 path,
+    // so assert on either of the two counted here.
     assert!(
         gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
         "R2 GPU composition LDE did not fire (neither two-halves d2 nor parts>2 path)"
@@ -104,6 +110,15 @@ fn gpu_path_fires_end_to_end() {
     assert!(
         gpu_batch_invert_calls() > 0,
         "GPU batch-invert dispatch did not fire on R3 + R4"
+    );
+
+    // R4 proof-of-work grind: with_blowup(2) grinds at factor 20 (above the
+    // GPU min-factor gate), so the device search fires for every table and a
+    // valid nonce is served. A silent CPU fallback (or an invalid kernel result
+    // rejected by the host check) would drop this to zero.
+    assert!(
+        gpu_grind_calls() > 0,
+        "R4 GPU proof-of-work grind did not fire"
     );
 
     // Counters only prove the dispatches ran; this checks the GPU proof
@@ -179,11 +194,16 @@ fn gpu_opening_gather_fires_and_verifies() {
 
 /// The full-residency Stage-3 device-only path fires: at least one table keeps
 /// its round-1 LDE device-resident (the host D2H is skipped), and the proof
-/// still verifies. This exercises every `host_trace_empty` hard-abort guard on
-/// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
-/// device LDE with no host trace behind them. A regression that silently
-/// reverts to the host D2H drops the counter to 0 (while the proof would still
-/// verify), and a mis-gate that forces a host fallback panics one of the guards.
+/// still verifies. This exercises the GPU-only R2/R3/R4 paths reading the
+/// device LDE with no host trace behind them, plus the `host_trace_empty`
+/// hard-abort guards that remain on the R4 opening path (none may fire). A
+/// regression that silently reverts to the host D2H drops the counter to 0
+/// (while the proof would still verify). A mis-gate that forces a host
+/// fallback does not panic at the R2 commit, R3 or the R4 DEEP loop: those
+/// sites download the resident data and continue host-backed, so the counter
+/// assertions below are the only thing that surfaces one — one per site, since
+/// the R1 counter also covers tables the device-only gate never cleared, and
+/// the parts counter covers the H part evaluations rather than the trace.
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
 fn gpu_device_only_residency_fires_and_verifies() {
@@ -193,6 +213,30 @@ fn gpu_device_only_residency_fires_and_verifies() {
     assert!(
         gpu_device_only_calls() > 0,
         "device-only residency path did not fire (every table kept its host trace)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_device_only_downgrades(),
+        0,
+        "a device-only table was downgraded back to a host trace on the happy \
+         path (its R2 dispatch declined at runtime: the gate should mirror the \
+          missing condition)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_composition_parts_downloads(),
+        0,
+        "a device-only table's composition-poly parts were downloaded back to \
+         the host on the happy path (the R2 commit, the R3 parts OOD or the R4 \
+         DEEP H terms fell back to the host part evals: either the gate should \
+         mirror a missing dispatch condition, or the dispatch declined \
+         transiently under VRAM pressure)"
+    );
+    assert_eq!(
+        stark::gpu_lde::gpu_resident_aux_downgrades(),
+        0,
+        "a table's resident aux trace was downloaded back to the host on the \
+         happy path (the device aux LDE declined and the drain-and-retry did \
+          not recover it — usually VRAM pressure, and not gated on device-only, \
+          so this can fire for a table that was never device-only)"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),

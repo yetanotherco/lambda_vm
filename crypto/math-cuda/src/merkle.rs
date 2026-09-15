@@ -497,6 +497,8 @@ pub fn build_comp_poly_tree_from_slabs_dev(
     m: usize,
     lde_size: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
     assert!(m > 0);
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
     assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
@@ -544,6 +546,8 @@ pub fn build_comp_poly_tree_from_slabs_dev(
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
 ) -> Result<crate::lde::GpuMerkleTree> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
     let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;

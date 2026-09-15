@@ -17,9 +17,8 @@ pub fn main() {
     // It accelerates trait-routed `keccak256` (via the keccak_permute precompile)
     // and `secp256k1_ecrecover` (via the ECSM precompile); everything else uses
     // ethrex's pure-Rust trait defaults. ethrex's trie/RLP keccak that goes
-    // through the free `keccak_hash` fn is still software, and KZG (0x0a) is
-    // unsupported under the `lambdavm` feature (blob txs execute; a point-eval
-    // precompile call reverts).
+    // through the free `keccak_hash` fn is still software. Unsupported, no backend
+    // linked: KZG 0x0a (reverts) and BLS12-381 0x0b-0x11 (aborts on the unwrap below).
     let crypto = Arc::new(LambdaVmEcsmCrypto);
     let output = execution_program(input, crypto).unwrap();
     lambda_vm_syscalls::syscalls::commit(&output.encode());

@@ -72,6 +72,13 @@ fn to_real_arch(arch: &str) -> String {
     }
 }
 
+/// Single source for the barycentric multi-kernel eval-point cap. The CUDA
+/// side sizes a per-thread accumulator array with it (`BARY_MAX_K`, passed via
+/// `-D` below) and the Rust dispatch asserts against it (generated into
+/// `bary_consts.rs`) — defining it twice invites stack corruption in the
+/// kernel the day one side moves without the other.
+const BARY_MAX_EVAL_POINTS: usize = 8;
+
 fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -118,6 +125,7 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
 
     let mut cmd = Command::new(nvcc_path());
     cmd.args(["--cubin", "-O3", "-std=c++17", "-arch", &arch]);
+    cmd.arg(format!("-DBARY_MAX_K={BARY_MAX_EVAL_POINTS}"));
     // SASS→source line mapping for Nsight Compute. Unlike -G this does not
     // change codegen, but keep it opt-in so production cubins stay byte-stable.
     if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
@@ -136,6 +144,19 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
 }
 
 fn main() {
+    // Rust-side mirror of the kernel cap; see BARY_MAX_EVAL_POINTS above.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(
+        out_dir.join("bary_consts.rs"),
+        format!(
+            "/// Compile-time cap of the multi kernels' per-thread accumulator array\n\
+             /// (`BARY_MAX_K` in barycentric.cu — single-sourced from build.rs).\n\
+             /// Callers with more evaluation points fall back to the per-point kernels.\n\
+             pub const BARY_MAX_EVAL_POINTS: usize = {BARY_MAX_EVAL_POINTS};\n"
+        ),
+    )
+    .expect("failed to write bary_consts.rs");
+
     // Headers aren't compiled, so emit rerun-if-changed to rebuild on
     // header edits.
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");

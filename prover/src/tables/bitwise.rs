@@ -411,6 +411,10 @@ pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     ops: &[BitwiseOperation],
 ) {
+    // A pre-uploaded device copy of the main trace would go stale with the
+    // in-place edits below; drop it so the commit re-uploads fresh data.
+    #[cfg(feature = "cuda")]
+    trace.clear_main_rowmajor_dev();
     for op in ops {
         let row = row_index(op.x, op.y, op.z);
         let mu_col = mu_column(op.lookup_type);
