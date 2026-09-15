@@ -121,6 +121,10 @@ where
     pub(crate) precomputed_root: Option<Commitment>,
     /// Preprocessed tables only: number of precomputed columns. Zero otherwise.
     pub(crate) num_precomputed_cols: usize,
+    /// `Some(leaves_len)` when `tree`'s leaf half was freed after committing, so
+    /// the opening path knows to regenerate the one leaf-level sibling it needs.
+    /// `None` on a full tree.
+    pub(crate) leaves_dropped: Option<usize>,
 }
 
 impl<F: IsField> TableCommit<F>
@@ -128,13 +132,38 @@ where
     FieldElement<F>: AsBytes,
 {
     /// Build a `TableCommit` for a plain (non-preprocessed) table.
-    fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
+    fn plain(#[allow(unused_mut)] mut tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
+        let leaves_dropped = Self::retire_leaves(&mut tree);
         Self {
             tree: Arc::new(tree),
             root,
             precomputed_tree: None,
             precomputed_root: None,
             num_precomputed_cols: 0,
+            leaves_dropped,
+        }
+    }
+
+    /// Free the tree's leaf half in streaming mode, returning the `leaves_len`
+    /// the opening path needs to rebuild a path without them.
+    ///
+    /// Halves a committed tree's footprint: every inner node is kept, so the
+    /// only node an opening has to regenerate is the leaf-level sibling, and the
+    /// paths stay byte-identical. Inert under `cuda`, where openings can come
+    /// off the device instead of the host tree.
+    #[allow(unused_variables)]
+    fn retire_leaves(tree: &mut BatchedMerkleTree<F>) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        {
+            None
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            if !streaming_retire_lde() {
+                return None;
+            }
+            let leaves_len = tree.nodes().len().div_ceil(2);
+            tree.drop_leaves(leaves_len).then_some(leaves_len)
         }
     }
 
@@ -148,12 +177,16 @@ where
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
+        #[allow(unused_mut)]
+        let mut tree = tree;
+        let leaves_dropped = Self::retire_leaves(&mut tree);
         Self {
             tree: Arc::new(tree),
             root,
             precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
+            leaves_dropped,
         }
     }
 
@@ -165,6 +198,7 @@ where
             precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
             precomputed_root: self.precomputed_root,
             num_precomputed_cols: self.num_precomputed_cols,
+            leaves_dropped: self.leaves_dropped,
         }
     }
 
@@ -618,6 +652,40 @@ fn host_cores() -> usize {
 /// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
 /// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
 /// admission's job (`VramGate`), not this count's.
+/// Source of truth for a table whose *trace* has been retired.
+///
+/// The retire-LDE mode ([`streaming_retire_lde`]) drops a table's LDE and
+/// rebuilds it from the still-resident trace. This goes one rung further down
+/// the same ladder: drop the trace too, and rebuild it from the compact routed
+/// op lists it was built from. The prover asks for a trace at the two points it
+/// needs one — the Round 1 main commit, and the table's fused chain — and drops
+/// it again after each.
+///
+/// `build_main` MUST be deterministic: the trace rebuilt for the fused chain has
+/// to be byte-identical to the one Round 1 committed, or the root will not match
+/// what the verifier recomputes.
+///
+/// Port of Approach 1 step C.2b (PR #647, commit a7eabd3c).
+pub trait TraceProvider<Field, FieldExtension>: Sync
+where
+    Field: IsSubFieldOf<FieldExtension> + IsField,
+    FieldExtension: IsField,
+{
+    /// Whether table `idx` is retired (built on demand) rather than resident.
+    fn is_retired(&self, idx: usize) -> bool;
+
+    /// Row count of table `idx`'s main trace. Cheap: the pre-pass sizes the LDE
+    /// domain with it, without materializing the trace.
+    fn num_rows(&self, idx: usize) -> usize;
+
+    /// Main-column count of table `idx`. Cheap, like `num_rows`: the memory
+    /// estimates need the table's width before anything is materialized.
+    fn num_main_columns(&self, idx: usize) -> usize;
+
+    /// Build the main-only trace (no auxiliary columns) for retired table `idx`.
+    fn build_main(&self, idx: usize) -> TraceTable<Field, FieldExtension>;
+}
+
 /// Retire each table's main LDE right after the Round 1 commit and rebuild it
 /// on demand inside the table's fused chain, instead of holding all N of them
 /// across the Round 1 barrier.
@@ -2781,23 +2849,65 @@ pub trait IsStarkProver<
         tree: &BatchedMerkleTree<C>,
         challenge: usize,
         gather: G,
+        leaves_dropped: Option<usize>,
     ) -> PolynomialOpenings<C>
     where
         C: IsField,
-        FieldElement<C>: AsBytes + Sync + Send,
+        FieldElement<C>: AsBytes + Sync + Send + math::traits::ByteConversion,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let proof = match leaves_dropped {
+            None => tree
+                .get_proof_by_pos(challenge)
+                .expect("FRI query index in bounds"),
+            // Leaf-dropped tree: every node of the path is retained except the
+            // leaf-level sibling, which is rehashed here from the same rows, in
+            // the same order and byte layout, that the commit hashed.
+            Some(leaves_len) => {
+                let sibling = BatchedMerkleTree::<C>::sibling_leaf_position(challenge);
+                let leaf = Self::hash_row_pair_leaf(&gather, sibling, domain_size);
+                tree.get_proof_by_pos_with_leaf_sibling(challenge, leaves_len, leaf)
+                    .expect("FRI query index in bounds")
+            }
+        };
         // Rows `2·challenge` and `2·challenge+1` are committed together as the
         // single leaf at position `challenge`; one Merkle path authenticates both
         // the queried row and its symmetric counterpart.
         PolynomialOpenings {
-            proof: tree
-                .get_proof_by_pos(challenge)
-                .expect("FRI query index in bounds"),
+            proof,
             evaluations: gather(reverse_index(challenge * 2, domain_size)),
             evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),
         }
+    }
+
+    /// Rehash one Merkle leaf from the LDE rows behind it.
+    ///
+    /// Must mirror `commit_rows_bit_reversed_subset`'s `hash_leaf` exactly: the
+    /// `ROWS_PER_LEAF` bit-reversed rows concatenated, each element big-endian,
+    /// over the same column range — which `gather` already carries, since it is
+    /// the same closure the openings are read with.
+    fn hash_row_pair_leaf<C, G>(gather: &G, leaf_idx: usize, num_rows: u64) -> Commitment
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send + math::traits::ByteConversion,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
+    {
+        use math::traits::ByteConversion;
+        const ROWS_PER_LEAF: usize = crate::commitment::ROWS_PER_LEAF;
+
+        let byte_len = <FieldElement<C> as ByteConversion>::BYTE_LEN;
+        let mut buf = Vec::new();
+        for k in 0..ROWS_PER_LEAF {
+            let row = gather(reverse_index(ROWS_PER_LEAF * leaf_idx + k, num_rows));
+            let start = buf.len();
+            buf.resize(start + row.len() * byte_len, 0u8);
+            for (i, elem) in row.iter().enumerate() {
+                let at = start + i * byte_len;
+                elem.write_bytes_be(&mut buf[at..at + byte_len]);
+            }
+        }
+        BatchedMerkleTreeBackend::<C>::hash_bytes(&buf)
     }
 
     /// Like [`Self::open_polys_with`], but uses a Merkle proof already gathered
@@ -2915,10 +3025,11 @@ pub trait IsStarkProver<
         col_range: std::ops::Range<usize>,
         what: &str,
         gather: G,
+        leaves_dropped: Option<usize>,
     ) -> PolynomialOpenings<C>
     where
         C: IsField,
-        FieldElement<C>: AsBytes + Sync + Send,
+        FieldElement<C>: AsBytes + Sync + Send + math::traits::ByteConversion,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
         let Some(proofs) = dev_proofs else {
@@ -2935,7 +3046,7 @@ pub trait IsStarkProver<
                 !tree.is_root_only(),
                 "R4 {what} opening fell back to a root-only host tree (nodes device-resident)"
             );
-            return Self::open_polys_with(domain, tree, challenge, gather);
+            return Self::open_polys_with(domain, tree, challenge, gather, leaves_dropped);
         };
         let proof = proofs[qi].clone();
         let Some(dev_vals) = dev_values else {
@@ -3168,12 +3279,17 @@ pub trait IsStarkProver<
                         |row| {
                             lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                         },
+                        main_commit.leaves_dropped,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
-                })
+                Self::open_polys_with(
+                    domain,
+                    &main_commit.tree,
+                    *index,
+                    |row| lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols),
+                    main_commit.leaves_dropped,
+                )
             } else {
                 #[cfg(feature = "cuda")]
                 {
@@ -3189,13 +3305,18 @@ pub trait IsStarkProver<
                         0..total_cols,
                         "main",
                         |row| lde_trace.gather_main_row(row),
+                        main_commit.leaves_dropped,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                        lde_trace.gather_main_row(row)
-                    })
+                    Self::open_polys_with(
+                        domain,
+                        &main_commit.tree,
+                        *index,
+                        |row| lde_trace.gather_main_row(row),
+                        main_commit.leaves_dropped,
+                    )
                 }
             };
 
@@ -3248,16 +3369,24 @@ pub trait IsStarkProver<
                                 "R4 precomputed opening fell back to the host gather, \
                                  but it is device-only (empty)"
                             );
-                            Self::open_polys_with(domain, tree, *index, |row| {
-                                lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
-                            })
+                            Self::open_polys_with(
+                                domain,
+                                tree,
+                                *index,
+                                |row| lde_trace.gather_main_row_range(row, 0, num_precomputed_cols),
+                                None,
+                            )
                         }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
-                Self::open_polys_with(domain, tree, *index, |row| {
-                    lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
-                })
+                Self::open_polys_with(
+                    domain,
+                    tree,
+                    *index,
+                    |row| lde_trace.gather_main_row_range(row, 0, num_precomputed_cols),
+                    None,
+                )
             });
 
             let composition_openings = {
@@ -3344,13 +3473,18 @@ pub trait IsStarkProver<
                         0..lde_trace.num_aux_cols(),
                         "aux",
                         |row| lde_trace.gather_aux_row(row),
+                        aux.leaves_dropped,
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                        lde_trace.gather_aux_row(row)
-                    })
+                    Self::open_polys_with(
+                        domain,
+                        &aux.tree,
+                        *index,
+                        |row| lde_trace.gather_aux_row(row),
+                        aux.leaves_dropped,
+                    )
                 }
             });
 
@@ -3386,9 +3520,36 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        Self::multi_prove_with_provider(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            None,
+        )
+    }
+
+    /// `multi_prove`, with the traces of some tables retired: `provider` rebuilds
+    /// them on demand. Passing `None` is byte-for-byte the resident path.
+    #[allow(clippy::too_many_arguments)]
+    fn multi_prove_with_provider(
         #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        provider: Option<&(dyn TraceProvider<Field, FieldExtension> + '_)>,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -3425,8 +3586,13 @@ pub trait IsStarkProver<
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
-        for (air, trace, _pub_inputs) in &*air_trace_pairs {
-            let (domain, twiddles) = domain_and_twiddles(*air, trace.num_rows());
+        for (idx, (air, trace, _pub_inputs)) in air_trace_pairs.iter().enumerate() {
+            // A retired table has no trace yet; its provider knows the shape.
+            let num_rows = match provider {
+                Some(p) if p.is_retired(idx) => p.num_rows(idx),
+                _ => trace.num_rows(),
+            };
+            let (domain, twiddles) = domain_and_twiddles(*air, num_rows);
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
@@ -3462,7 +3628,11 @@ pub trait IsStarkProver<
             .enumerate()
             .map(|(idx, (_, trace, _))| {
                 let lde_size = domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+                let main_cols = match provider {
+                    Some(p) if p.is_retired(idx) => p.num_main_columns(idx),
+                    _ => trace.num_main_columns,
+                };
+                estimate_table_vram_bytes(main_cols, 0, lde_size)
             })
             .collect();
 
@@ -3522,9 +3692,21 @@ pub trait IsStarkProver<
             &vram_gate,
             k,
             |idx| {
-                let (air, trace, _) = &air_trace_pairs[idx];
+                let (air, resident_trace, _) = &air_trace_pairs[idx];
                 let domain = &domains[idx];
                 let twiddles = &twiddle_caches[idx];
+
+                // Retired: build the trace just to commit it, and let it die at
+                // the end of this closure. The table's fused chain builds its own
+                // copy later — `build_main` is deterministic, so both agree.
+                let rebuilt;
+                let trace: &TraceTable<Field, FieldExtension> = match provider {
+                    Some(p) if p.is_retired(idx) => {
+                        rebuilt = p.build_main(idx);
+                        &rebuilt
+                    }
+                    _ => resident_trace,
+                };
 
                 let precomputed = air
                     .is_preprocessed()
@@ -3536,7 +3718,7 @@ pub trait IsStarkProver<
                 let device_only = Self::device_only_for(*air, domain);
 
                 Self::commit_main_trace(
-                    *trace,
+                    trace,
                     domain,
                     twiddles,
                     precomputed,
@@ -3714,6 +3896,16 @@ pub trait IsStarkProver<
             let (air, trace, _) = &mut *pair;
             let domain = &domains[idx];
             let twiddles = &twiddle_caches[idx];
+
+            // Retired: rebuild into the cell, not into a local. The aux columns
+            // are written into this trace below and the LDE rebuild in
+            // `rounds_stage` reads it, so it has to outlive this stage; that
+            // stage drops it again once the table's proof is done.
+            if let Some(p) = provider
+                && p.is_retired(idx)
+            {
+                **trace = p.build_main(idx);
+            }
 
             #[cfg(feature = "instruments")]
             let __sp = crate::instruments::span("r1_aux_build_table");
@@ -4015,9 +4207,9 @@ pub trait IsStarkProver<
                             commitment: Round1Commitments<Field, FieldExtension>,
                             lde: Lde<Field, FieldExtension>|
          -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError> {
-            let pair = pair_cells[idx].lock().unwrap();
-            let (air, trace, pub_inputs) = &*pair;
-            let _ = trace; // used by instruments
+            let mut pair = pair_cells[idx].lock().unwrap();
+            let (air, trace, pub_inputs) = &mut *pair;
+            let _ = &trace; // used by instruments, and dropped below when retired
             let domain = &domains[idx];
 
             #[cfg(feature = "instruments")]
@@ -4049,7 +4241,7 @@ pub trait IsStarkProver<
 
             let proof = Self::prove_rounds_2_to_4(
                 *air,
-                *pub_inputs,
+                pub_inputs,
                 &mut round_1_result,
                 &mut *tguard,
                 domain,
@@ -4066,6 +4258,14 @@ pub trait IsStarkProver<
                     sub_ops,
                 ));
             }
+            // This table is proved: nothing reads its trace again, so a retired
+            // one goes back to being just its op lists.
+            if let Some(p) = provider
+                && p.is_retired(idx)
+            {
+                **trace = TraceTable::from_columns_main(Vec::new(), air.step_size());
+            }
+
             Ok(proof)
         };
 

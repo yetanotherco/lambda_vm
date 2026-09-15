@@ -2951,6 +2951,7 @@ pub(crate) enum TableKind {
 /// built traces: the ops of a table are far smaller than its trace, and the
 /// trace is a pure function of them — `build_table` is deterministic, which
 /// `trace_build_is_deterministic_across_builds` pins.
+#[derive(Default)]
 pub(crate) struct RoutedOps {
     pub(crate) cpu_ops: Vec<CpuOperation>,
     pub(crate) memw_ops: Vec<MemwOperation>,
@@ -2969,6 +2970,190 @@ pub(crate) struct RoutedOps {
 }
 
 impl RoutedOps {
+    /// How many chunks `build_table` would produce for `kind`.
+    ///
+    /// Mirrors `chunk_and_generate`: an empty op list still yields one (padded)
+    /// chunk, so the table exists in the proof with the shape the verifier
+    /// expects.
+    pub(crate) fn num_chunks(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+        let (len, limit) = self.shape_of(kind, max_rows);
+        if len == 0 { 1 } else { len.div_ceil(limit) }
+    }
+
+    /// Op count and chunk limit for `kind`.
+    fn shape_of(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> (usize, usize) {
+        match kind {
+            TableKind::Cpu => (self.cpu_ops.len(), max_rows.cpu),
+            TableKind::Memw => (self.memw_ops.len(), max_rows.memw),
+            TableKind::MemwAligned => (self.memw_aligned_ops.len(), max_rows.memw_aligned),
+            TableKind::MemwRegister => (self.memw_register_rows.len(), max_rows.memw_register),
+            TableKind::Load => (self.load_ops.len(), max_rows.load),
+            TableKind::Lt => (self.lt_ops.len(), max_rows.lt),
+            TableKind::Shift => (self.shift_ops.len(), max_rows.shift),
+            TableKind::Mul => (self.mul_ops.len(), max_rows.mul),
+            TableKind::Dvrm => (self.dvrm_ops.len(), max_rows.dvrm),
+            TableKind::Branch => (self.branch_ops.len(), max_rows.branch),
+            TableKind::Eq => (self.eq_ops.len(), max_rows.eq),
+            TableKind::Bytewise => (self.bytewise_ops.len(), max_rows.bytewise),
+            TableKind::Store => (self.store_ops.len(), max_rows.store),
+            TableKind::Cpu32 => (self.cpu32_ops.len(), max_rows.cpu32),
+        }
+    }
+
+    /// Rows and main columns of one chunk, without building it.
+    ///
+    /// Every generator pads to `count.next_power_of_two().max(4)`, where `count`
+    /// is the chunk's op count — or, for the six tables that deduplicate, the
+    /// number of DISTINCT ops in it. The width is a per-table constant. So the
+    /// shape needs a counting pass at worst, never a trace.
+    ///
+    /// `chunk_shape_matches_the_built_chunk` pins this against real builds for
+    /// every kind; it is what catches a generator that changes its padding.
+    pub(crate) fn chunk_shape(
+        &self,
+        kind: TableKind,
+        chunk: usize,
+        max_rows: &super::MaxRowsConfig,
+    ) -> (usize, usize) {
+        use std::collections::HashSet;
+
+        macro_rules! slice_of {
+            ($ops:expr, $limit:expr) => {{
+                let ops = $ops;
+                let slice: &[_] = if ops.is_empty() {
+                    &[]
+                } else {
+                    ops.chunks($limit).nth(chunk).unwrap_or(&[])
+                };
+                slice
+            }};
+        }
+        // One row per op.
+        macro_rules! plain {
+            ($ops:expr, $limit:expr, $cols:expr) => {
+                (slice_of!($ops, $limit).len(), $cols)
+            };
+        }
+        // One row per DISTINCT op.
+        macro_rules! dedup {
+            ($ops:expr, $limit:expr, $cols:expr) => {
+                (
+                    slice_of!($ops, $limit).iter().collect::<HashSet<_>>().len(),
+                    $cols,
+                )
+            };
+        }
+        // Same, where the op list pairs each op with a flag the dedup folds in.
+        macro_rules! dedup_tagged {
+            ($ops:expr, $limit:expr, $cols:expr) => {
+                (
+                    slice_of!($ops, $limit)
+                        .iter()
+                        .map(|(op, _)| op)
+                        .collect::<HashSet<_>>()
+                        .len(),
+                    $cols,
+                )
+            };
+        }
+
+        let (count, cols) = match kind {
+            TableKind::Cpu => plain!(&self.cpu_ops, max_rows.cpu, cpu::cols::NUM_COLUMNS),
+            TableKind::Memw => plain!(&self.memw_ops, max_rows.memw, memw::cols::NUM_COLUMNS),
+            TableKind::MemwAligned => plain!(
+                &self.memw_aligned_ops,
+                max_rows.memw_aligned,
+                memw_aligned::cols::NUM_COLUMNS
+            ),
+            TableKind::MemwRegister => plain!(
+                &self.memw_register_rows,
+                max_rows.memw_register,
+                memw_register::cols::NUM_COLUMNS
+            ),
+            TableKind::Load => plain!(&self.load_ops, max_rows.load, load::cols::NUM_COLUMNS),
+            TableKind::Shift => plain!(&self.shift_ops, max_rows.shift, shift::cols::NUM_COLUMNS),
+            TableKind::Store => plain!(&self.store_ops, max_rows.store, store::cols::NUM_COLUMNS),
+            TableKind::Cpu32 => plain!(&self.cpu32_ops, max_rows.cpu32, cpu32::cols::NUM_COLUMNS),
+            TableKind::Lt => dedup!(&self.lt_ops, max_rows.lt, lt::cols::NUM_COLUMNS),
+            TableKind::Branch => {
+                dedup!(&self.branch_ops, max_rows.branch, branch::cols::NUM_COLUMNS)
+            }
+            TableKind::Eq => dedup!(&self.eq_ops, max_rows.eq, eq::cols::NUM_COLUMNS),
+            TableKind::Bytewise => dedup!(
+                &self.bytewise_ops,
+                max_rows.bytewise,
+                bytewise::cols::NUM_COLUMNS
+            ),
+            TableKind::Mul => dedup_tagged!(&self.mul_ops, max_rows.mul, mul::cols::NUM_COLUMNS),
+            TableKind::Dvrm => {
+                dedup_tagged!(&self.dvrm_ops, max_rows.dvrm, dvrm::cols::NUM_COLUMNS)
+            }
+        };
+        (count.next_power_of_two().max(4), cols)
+    }
+
+    /// Build exactly one chunk of one table.
+    ///
+    /// Byte-identical to `build_table(kind)[chunk]`: same op slice into the same
+    /// generator. That equality is the whole point — it is what lets the fused
+    /// chain rebuild a trace the Round 1 commit already hashed.
+    pub(crate) fn build_chunk(
+        &self,
+        kind: TableKind,
+        chunk: usize,
+        max_rows: &super::MaxRowsConfig,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        macro_rules! chunk_of {
+            ($ops:expr, $limit:expr, $f:path) => {{
+                let ops = $ops;
+                let slice: &[_] = if ops.is_empty() {
+                    &[]
+                } else {
+                    ops.chunks($limit).nth(chunk).unwrap_or(&[])
+                };
+                $f(slice)
+            }};
+        }
+        match kind {
+            TableKind::Cpu => chunk_of!(&self.cpu_ops, max_rows.cpu, cpu::generate_cpu_trace),
+            TableKind::Memw => chunk_of!(&self.memw_ops, max_rows.memw, memw::generate_memw_trace),
+            TableKind::MemwAligned => chunk_of!(
+                &self.memw_aligned_ops,
+                max_rows.memw_aligned,
+                memw_aligned::generate_memw_aligned_trace
+            ),
+            TableKind::MemwRegister => chunk_of!(
+                &self.memw_register_rows,
+                max_rows.memw_register,
+                memw_register::generate_memw_register_trace_from_rows
+            ),
+            TableKind::Load => chunk_of!(&self.load_ops, max_rows.load, load::generate_load_trace),
+            TableKind::Lt => chunk_of!(&self.lt_ops, max_rows.lt, lt::generate_lt_trace),
+            TableKind::Shift => {
+                chunk_of!(&self.shift_ops, max_rows.shift, shift::generate_shift_trace)
+            }
+            TableKind::Mul => chunk_of!(&self.mul_ops, max_rows.mul, mul::generate_mul_trace),
+            TableKind::Dvrm => chunk_of!(&self.dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace),
+            TableKind::Branch => chunk_of!(
+                &self.branch_ops,
+                max_rows.branch,
+                branch::generate_branch_trace
+            ),
+            TableKind::Eq => chunk_of!(&self.eq_ops, max_rows.eq, eq::generate_eq_trace),
+            TableKind::Bytewise => chunk_of!(
+                &self.bytewise_ops,
+                max_rows.bytewise,
+                bytewise::generate_bytewise_trace
+            ),
+            TableKind::Store => {
+                chunk_of!(&self.store_ops, max_rows.store, store::generate_store_trace)
+            }
+            TableKind::Cpu32 => {
+                chunk_of!(&self.cpu32_ops, max_rows.cpu32, cpu32::generate_cpu32_trace)
+            }
+        }
+    }
+
     /// Build every chunk of one table. Byte-identical whenever it is called,
     /// which is what lets a retired trace be rebuilt against the root its first
     /// build committed.
@@ -3248,7 +3433,10 @@ fn build_traces<I: ImageSource + Sync>(
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
-) -> Result<Traces, Error> {
+    // `true` builds the chunked tables as empty placeholders, leaving the
+    // returned `RoutedOps` as the only way to get their rows.
+    retire_chunked: bool,
+) -> Result<(Traces, RoutedOps), Error> {
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -3491,6 +3679,15 @@ fn build_traces<I: ImageSource + Sync>(
     macro_rules! gen_of {
         ($kind:ident) => {
             || {
+                if retire_chunked {
+                    // Placeholders: the right number of chunks, none of the rows.
+                    // `table_counts` (and so the AIR layout) only reads the chunk
+                    // count, and the prover asks the provider for every shape it
+                    // needs before a trace exists.
+                    return Ok((0..routed.num_chunks(TableKind::$kind, max_rows))
+                        .map(|_| TraceTable::from_columns_main(Vec::new(), 1))
+                        .collect());
+                }
                 routed.build_table(
                     TableKind::$kind,
                     max_rows,
@@ -3727,7 +3924,7 @@ fn build_traces<I: ImageSource + Sync>(
 
     #[cfg(feature = "instruments")]
     drop(__sp);
-    Ok(Traces {
+    let traces = Traces {
         cpus,
         bitwise,
         lts,
@@ -3758,7 +3955,9 @@ fn build_traces<I: ImageSource + Sync>(
         bytewises,
         stores,
         cpu32s,
-    })
+    };
+
+    Ok((traces, routed))
 }
 
 /// Padded row count after chunking.
@@ -4586,6 +4785,37 @@ impl Traces {
         )
     }
 
+    /// `from_elf_and_logs`, retiring the chunked tables.
+    ///
+    /// The returned `Traces` carries an empty placeholder per chunk — the right
+    /// count, none of the rows — and the `RoutedOps` beside it is what rebuilds
+    /// any of them on demand.
+    pub(crate) fn from_elf_and_logs_streaming(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<(Self, RoutedOps), Error> {
+        let initial_image = build_initial_image(elf, private_input);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        let collected =
+            Self::collect_epoch(&artifacts, &initial_image, &register_init, logs, true)?;
+        Self::build_from_collected_streaming(
+            &artifacts,
+            collected,
+            Some(&initial_image),
+            &register_init,
+            max_rows,
+            private_input,
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
     /// Build traces for one execution epoch starting from an explicit
     /// initial-memory image (the epoch's starting memory) rather than the ELF
     /// image. `elf` is still used for the program code (DECODE) and entry point.
@@ -4743,6 +4973,36 @@ impl Traces {
     /// tables and their bitwise lookups, both skipped in continuation mode
     /// (`l2g_memory_bookend`), where callers pass `None`.
     #[allow(clippy::too_many_arguments)]
+    /// `build_from_collected`, retiring the chunked tables: they come back as
+    /// empty placeholders and the returned `RoutedOps` is what rebuilds them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_from_collected_streaming<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        collected: CollectedEpoch,
+        initial_image: Option<&I>,
+        register_init: &[u32],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<(Self, RoutedOps), Error> {
+        Self::build_from_collected_inner(
+            artifacts,
+            collected,
+            initial_image,
+            register_init,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn build_from_collected<I: ImageSource + Sync>(
         artifacts: &DecodeArtifacts,
         collected: CollectedEpoch,
@@ -4754,6 +5014,35 @@ impl Traces {
         l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        Self::build_from_collected_inner(
+            artifacts,
+            collected,
+            initial_image,
+            register_init,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            false,
+        )
+        .map(|(traces, _routed)| traces)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_collected_inner<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        collected: CollectedEpoch,
+        initial_image: Option<&I>,
+        register_init: &[u32],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        retire_chunked: bool,
+    ) -> Result<(Self, RoutedOps), Error> {
         // Phase 0 (cached): the pristine DECODE trace is cloned so
         // `build_traces` can fill this epoch's multiplicities.
         #[cfg(feature = "instruments")]
@@ -4780,6 +5069,7 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
+            retire_chunked,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4854,6 +5144,8 @@ impl Traces {
             &[],
             true,
             false,
+            false,
         )
+        .map(|(traces, _routed)| traces)
     }
 }

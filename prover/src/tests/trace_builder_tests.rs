@@ -1207,3 +1207,115 @@ fn trace_build_is_deterministic_across_builds() {
     eq_chunks(&a.shifts, &b.shifts, "SHIFT");
     eq_chunks(&a.loads, &b.loads, "LOAD");
 }
+
+/// `build_chunk(kind, i)` must equal `build_table(kind)[i]`, byte for byte.
+///
+/// This is the equality the streaming prover rests on: Round 1 commits the
+/// table built one way, and the fused chain rebuilds the chunk it needs the
+/// other way. If they ever diverge, the rebuilt trace hashes to a root the
+/// verifier will not accept.
+#[test]
+fn build_chunk_matches_the_full_table_build() {
+    use crate::tables::trace_builder::{RoutedOps, TableKind};
+
+    // More ops than the chunk limit below, so several chunks exist and the
+    // last one is short.
+    let lt_ops: Vec<_> = (0..10u64)
+        .map(|i| crate::tables::lt::LtOperation::new(i, i * 7 + 1, false))
+        .collect();
+    let routed = RoutedOps {
+        lt_ops,
+        ..Default::default()
+    };
+
+    let max_rows = crate::tables::MaxRowsConfig {
+        lt: 4,
+        ..Default::default()
+    };
+
+    let whole = routed
+        .build_table(
+            TableKind::Lt,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("full build");
+    assert_eq!(
+        whole.len(),
+        routed.num_chunks(TableKind::Lt, &max_rows),
+        "num_chunks disagrees with what build_table produced"
+    );
+
+    for (i, expected) in whole.iter().enumerate() {
+        let one = routed.build_chunk(TableKind::Lt, i, &max_rows);
+        let (a, _) = expected.main_data_row_major();
+        let (b, _) = one.main_data_row_major();
+        assert_eq!(
+            a.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+            b.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+            "chunk {i}: on-demand build differs from the full build"
+        );
+    }
+}
+
+/// `chunk_shape` must agree with the chunk it declines to build, for every kind.
+///
+/// It reads the shape off op counts and a constant width instead of generating
+/// a trace, which is only valid while every generator pads to
+/// `count.next_power_of_two().max(4)`. This is the test that fails if one of
+/// them ever stops.
+#[test]
+fn chunk_shape_matches_the_built_chunk() {
+    use crate::tables::trace_builder::{RoutedOps, TableKind};
+
+    // Ops with deliberate repeats, so the deduplicating kinds and the plain ones
+    // disagree on count and the distinction is actually exercised.
+    // 8 ops, 3 distinct: the deduplicating rule pads to 4 rows where counting
+    // them raw would pad to 8. Without that gap the test would pass even if
+    // `chunk_shape` ignored deduplication entirely.
+    let lt_ops: Vec<_> = (0..8u64)
+        .map(|i| crate::tables::lt::LtOperation::new(i % 3, i % 3 + 1, false))
+        .collect();
+    let routed = RoutedOps {
+        lt_ops,
+        ..Default::default()
+    };
+
+    let max_rows = crate::tables::MaxRowsConfig {
+        lt: 16,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        routed.chunk_shape(TableKind::Lt, 0, &max_rows).0,
+        4,
+        "the LT fixture must exercise deduplication (8 ops, 3 distinct)"
+    );
+
+    for kind in [
+        TableKind::Cpu,
+        TableKind::Memw,
+        TableKind::MemwAligned,
+        TableKind::MemwRegister,
+        TableKind::Load,
+        TableKind::Lt,
+        TableKind::Shift,
+        TableKind::Mul,
+        TableKind::Dvrm,
+        TableKind::Branch,
+        TableKind::Eq,
+        TableKind::Bytewise,
+        TableKind::Store,
+        TableKind::Cpu32,
+    ] {
+        for chunk in 0..routed.num_chunks(kind, &max_rows) {
+            let built = routed.build_chunk(kind, chunk, &max_rows);
+            assert_eq!(
+                routed.chunk_shape(kind, chunk, &max_rows),
+                (built.num_rows(), built.num_main_columns),
+                "{kind:?} chunk {chunk}: declared shape differs from the built one"
+            );
+        }
+    }
+}

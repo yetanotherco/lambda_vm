@@ -19,6 +19,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+pub(crate) mod streaming;
 pub use stark::profile_markers;
 pub mod recursion;
 mod statement;
@@ -1164,14 +1165,32 @@ pub fn prove_with_options_and_inputs(
         );
     }
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
+    // Retiring the LDE also retires the traces: the same flag, one rung further
+    // down the same ladder. The chunked tables come back as placeholders and the
+    // provider rebuilds each chunk at the two points the prover needs it.
+    let retire_traces = stark::prover::streaming_retire_lde();
+    let (mut traces, streaming) = if retire_traces {
+        let (traces, routed) = Traces::from_elf_and_logs_streaming(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        let provider = streaming::StreamingProvider::new(routed, max_rows.clone(), &traces);
+        (traces, Some(provider))
+    } else {
+        let traces = Traces::from_elf_and_logs(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        (traces, None)
+    };
     debug_assert_eq!(
         traces.public_output_bytes, result.return_values.memory_values,
         "public output diverged between executor view and trace reconstruction"
@@ -1237,11 +1256,14 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
+    let proof = Prover::multi_prove_with_provider(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
+        streaming
+            .as_ref()
+            .map(|p| p as &dyn stark::prover::TraceProvider<_, _>),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     #[cfg(feature = "instruments")]
