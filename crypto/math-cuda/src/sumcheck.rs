@@ -652,10 +652,13 @@ pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64;
 
         // Three u64 per column, where each one's fold left it — not the
         // buffer, which is a level's worth of values nobody needs.
-        for k in 0..group.len() {
-            let at = k * half * 3;
-            let head = stream.clone_dtoh(&values.slice(at..at + 3))?;
-            stream.synchronize()?;
+        //
+        // Gathered there and brought back in one copy. A trace has thousands of
+        // columns, and reading each one's head on its own is a transfer and a
+        // stream synchronize apiece for twenty-four bytes.
+        let heads: Vec<u32> = (0..group.len()).map(|k| (k * half) as u32).collect();
+        let packed = crate::fri::gather_ext3_at(&values, &heads, &stream)?;
+        for head in packed.chunks_exact(3) {
             out.push([head[0], head[1], head[2]]);
         }
     }
