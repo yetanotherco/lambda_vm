@@ -14,6 +14,7 @@ use math::field::goldilocks::GoldilocksField as F;
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
+use multilinear::whir_hash::KeccakWhir;
 
 type FE = FieldElement<F>;
 
@@ -35,7 +36,8 @@ fn parity(num_vars: usize, log_blowup: usize, log_folding: usize) {
     let domain = Domain::<F>::new(num_vars + log_blowup).expect("domain");
     let host_codeword =
         whir::encode::<F, F>(&whir::lift_coefficients(&f), &domain).expect("encode");
-    let host = CodewordCommitment::new(&host_codeword, log_folding).expect("host commit");
+    let host =
+        CodewordCommitment::<_, KeccakWhir>::new(&host_codeword, log_folding).expect("host commit");
 
     assert_eq!(device_codeword.len(), host_codeword.len());
     for (i, (device, host)) in device_codeword.iter().zip(&host_codeword).enumerate() {
@@ -51,8 +53,9 @@ fn parity(num_vars: usize, log_blowup: usize, log_folding: usize) {
         .map(|node| node.try_into().expect("32 bytes"))
         .collect();
     let codeword: Vec<FE> = device_codeword.into_iter().map(FE::from_raw).collect();
-    let device = CodewordCommitment::from_precomputed(codeword, nodes, log_folding)
-        .expect("device commitment");
+    let device =
+        CodewordCommitment::<_, KeccakWhir>::from_precomputed(codeword, nodes, log_folding)
+            .expect("device commitment");
     assert_eq!(device.root(), host.root(), "roots differ");
     assert_eq!(device.num_leaves(), host.num_leaves());
 
@@ -61,7 +64,7 @@ fn parity(num_vars: usize, log_blowup: usize, log_folding: usize) {
     for index in [0, 1, device.num_leaves() / 3, device.num_leaves() - 1] {
         let opening = device.open(index).expect("open");
         assert!(
-            verify_opening(&device.root(), index, &opening),
+            verify_opening::<_, KeccakWhir>(&device.root(), index, &opening),
             "device opening at {index} does not verify"
         );
         assert_eq!(

@@ -2286,9 +2286,11 @@ pub trait IsStarkProver<
         let grinding_factor = air.context().proof_options.grinding_factor;
         let mut nonce = None;
         if grinding_factor > 0 {
-            let nonce_value =
-                grinding::generate_nonce_maybe_gpu(&transcript.state(), grinding_factor)
-                    .expect("nonce not found");
+            let nonce_value = grinding::generate_nonce_maybe_gpu::<grinding::StarkGrindingDigest>(
+                &transcript.state(),
+                grinding_factor,
+            )
+            .expect("nonce not found");
             transcript.append_bytes(&nonce_value.to_be_bytes());
             nonce = Some(nonce_value);
         }

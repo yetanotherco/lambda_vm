@@ -16,6 +16,7 @@ use math::field::goldilocks::GoldilocksField as Gl;
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::CodewordCommitment;
+use multilinear::whir_hash::KeccakWhir;
 
 type FE3 = FieldElement<Ext3>;
 type FE = FieldElement<Gl>;
@@ -74,13 +75,19 @@ fn the_device_ext3_commit_matches_the_host() {
     let (folded, _) =
         whir::fold_codeword_k::<Gl, Gl, Ext3>(&cw, &domain, &alphas).expect("device fold");
 
-    let device = CodewordCommitment::from_codeword(folded.clone(), 4).expect("device commit");
-    let host = CodewordCommitment::from_codeword_on_host(folded, 4).expect("host commit");
+    let device = CodewordCommitment::<_, KeccakWhir>::from_codeword(folded.clone(), 4)
+        .expect("device commit");
+    let host =
+        CodewordCommitment::<_, KeccakWhir>::from_codeword_on_host(folded, 4).expect("host commit");
     assert_eq!(device.root(), host.root(), "roots differ");
     for index in [0, 1, device.num_leaves() / 3, device.num_leaves() - 1] {
         let opening = device.open(index).expect("open");
         assert!(
-            multilinear::whir_commit::verify_opening(&device.root(), index, &opening),
+            multilinear::whir_commit::verify_opening::<_, KeccakWhir>(
+                &device.root(),
+                index,
+                &opening
+            ),
             "device opening at {index} does not verify"
         );
     }

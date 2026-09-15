@@ -44,6 +44,7 @@ use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ChainConfig, GrindBits};
+use multilinear::whir_hash::KeccakWhir;
 use stark::multilinear_air::Uniforms;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -262,8 +263,8 @@ pub fn prove_with_options_and_inputs(
 
     // One commitment for every table in the proof: the opening is nearly all of
     // a proof's bytes, and one settles them all.
-    let committed =
-        CommittedTables::commit(committed, &config).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(committed, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -462,7 +463,7 @@ pub fn verify_with_options(
     let sizes = [shapes.len()];
     let (layouts, domains) = stacks(&shapes, &sizes, &config)?;
 
-    Ok(multilinear_table::multi_verify(
+    Ok(multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
         &proof.proof,
         &statements,
         &layouts,

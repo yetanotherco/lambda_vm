@@ -34,6 +34,7 @@ use crate::{
     virtual_poly::{Term, VirtualPolynomial},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
     whir_commit::{CodewordCommitment, Commitment, CosetOpening, fold_coset, verify_opening},
+    whir_hash::WhirHash,
 };
 
 /// Blowup and query count.
@@ -64,13 +65,14 @@ pub struct EvalProof<E: IsField> {
 }
 
 /// Commits to `f`, ready to answer evaluation claims.
-pub fn commit<F, E>(
+pub fn commit<F, E, H>(
     f: &Mle<E>,
     config: &EvalConfig,
-) -> Result<(CodewordCommitment<E>, Domain<F>), Error>
+) -> Result<(CodewordCommitment<E, H>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
@@ -93,10 +95,10 @@ fn weighted<F: IsField>(
 ///
 /// The caller must have absorbed the commitment root and `z` into `transcript`
 /// already; both sides must do the same.
-pub fn prove<F, E, T>(
+pub fn prove<F, E, T, H>(
     f: &Mle<E>,
     z: &[FieldElement<E>],
-    commitment: &CodewordCommitment<E>,
+    commitment: &CodewordCommitment<E, H>,
     domain: &Domain<F>,
     config: &EvalConfig,
     transcript: &mut T,
@@ -106,15 +108,16 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
-    prove_weighted::<F, E, T>(f, eq_mle(z)?, commitment, domain, config, transcript)
+    prove_weighted::<F, E, T, H>(f, eq_mle(z)?, commitment, domain, config, transcript)
 }
 
 /// Proves `Σ_x w(x)·f(x) = y` for a weight the verifier can evaluate itself.
-pub fn prove_weighted<F, E, T>(
+pub fn prove_weighted<F, E, T, H>(
     f: &Mle<E>,
     weight: Mle<E>,
-    commitment: &CodewordCommitment<E>,
+    commitment: &CodewordCommitment<E, H>,
     domain: &Domain<F>,
     config: &EvalConfig,
     transcript: &mut T,
@@ -124,6 +127,7 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let (sumcheck, alphas) = sumcheck::prove(weighted(f, weight)?, transcript)?;
 
@@ -162,7 +166,7 @@ where
 }
 
 /// Verifies `f(z) = y` against a commitment.
-pub fn verify<F, E, T>(
+pub fn verify<F, E, T, H>(
     proof: &EvalProof<E>,
     root: &Commitment,
     z: &[FieldElement<E>],
@@ -176,8 +180,9 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
-    verify_weighted::<F, E, T, _>(
+    verify_weighted::<F, E, T, _, H>(
         proof,
         root,
         |alphas: &[FieldElement<E>]| eq_eval(z, alphas),
@@ -194,7 +199,7 @@ where
 /// `weight_at` is the weight's closed form; the verifier evaluates it at the
 /// sumcheck point rather than holding its table.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_weighted<F, E, T, W>(
+pub fn verify_weighted<F, E, T, W, H>(
     proof: &EvalProof<E>,
     root: &Commitment,
     weight_at: W,
@@ -210,6 +215,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
+    H: WhirHash,
 {
     // The weight raises the degree of the plain `f` term to two.
     let claim = sumcheck::verify(&proof.sumcheck, y, num_vars, 2, transcript)?;
@@ -240,7 +246,7 @@ where
     let queries = sample_queries(transcript, config.num_queries, num_leaves);
 
     for (i, (&q, opening)) in queries.iter().zip(&proof.openings).enumerate() {
-        if !verify_opening::<E>(root, q, opening) {
+        if !verify_opening::<E, H>(root, q, opening) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, E, E>(&opening.values, domain, q, alphas)? != proof.final_value {
@@ -268,6 +274,8 @@ mod tests {
     use super::*;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
+
+    use crate::whir_hash::KeccakWhir;
 
     type FE = FieldElement<F>;
 
@@ -309,12 +317,18 @@ mod tests {
             let z = point(num_vars);
             let y = f.evaluate(&z).unwrap();
 
-            let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-            let proof =
-                prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript())
-                    .unwrap();
+            let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+            let proof = prove::<F, F, _, KeccakWhir>(
+                &f,
+                &z,
+                &commitment,
+                &domain,
+                &config(),
+                &mut transcript(),
+            )
+            .unwrap();
 
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -336,11 +350,18 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-        let proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+        let proof = prove::<F, F, _, KeccakWhir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -361,12 +382,19 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-        let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+        let mut proof = prove::<F, F, _, KeccakWhir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
         proof.final_value += FE::one();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -385,12 +413,19 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-        let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+        let mut proof = prove::<F, F, _, KeccakWhir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
         proof.openings[0].values[0] += FE::one();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -410,12 +445,19 @@ mod tests {
         let g = pseudo_mle(3, 29);
         let z = point(3);
 
-        let (f_commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
+        let (f_commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
         // Argue g's evaluation while presenting f's commitment.
-        let proof =
-            prove::<F, F, _>(&g, &z, &f_commitment, &domain, &config(), &mut transcript()).unwrap();
+        let proof = prove::<F, F, _, KeccakWhir>(
+            &g,
+            &z,
+            &f_commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &f_commitment.root(),
             &z,
@@ -437,13 +479,20 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-        let proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+        let proof = prove::<F, F, _, KeccakWhir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -462,12 +511,19 @@ mod tests {
         let z = point(3);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F, F>(&f, &config()).unwrap();
-        let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &config(), &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &config()).unwrap();
+        let mut proof = prove::<F, F, _, KeccakWhir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
         proof.openings.pop();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -484,7 +540,7 @@ mod tests {
     fn the_commitment_has_one_block_per_fold_target() {
         let f = pseudo_mle(4, 41);
         let cfg = config();
-        let (commitment, domain) = commit::<F, F>(&f, &cfg).unwrap();
+        let (commitment, domain) = commit::<F, F, KeccakWhir>(&f, &cfg).unwrap();
         assert_eq!(commitment.num_leaves(), 1 << cfg.log_blowup);
         assert_eq!(domain.log_size(), 4 + cfg.log_blowup);
     }

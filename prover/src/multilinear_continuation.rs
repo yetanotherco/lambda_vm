@@ -26,6 +26,7 @@ use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::ChainConfig;
+use multilinear::whir_hash::KeccakWhir;
 use stark::config::Commitment;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -108,7 +109,7 @@ pub fn l2g_commitment(
     )];
     let layout =
         multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let stacked = multilinear::stacked_eval::StackedCommitment::<F>::commit(
+    let stacked = multilinear::stacked_eval::StackedCommitment::<F, KeccakWhir>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
         None,
@@ -385,7 +386,7 @@ pub fn prove_global(
         );
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
-    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
@@ -508,7 +509,7 @@ fn verify_global_bookends(
     let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
 
     // The cross-epoch bus has no counterparty in the statement: it must vanish.
-    if multilinear_table::multi_verify(
+    if multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
         &global.proof,
         &statements,
         &stacks,
@@ -617,7 +618,7 @@ pub fn prove_epoch(
         );
     }
     let sizes = epoch_groups(committed.len());
-    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
@@ -961,7 +962,7 @@ fn verify_epoch_bookend(
     // group's — as many as the stack split it into.
     let num_polys = layouts.last().map(|l| l.num_polys()).unwrap_or(0);
 
-    if multilinear_table::multi_verify(
+    if multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
         &epoch.proof,
         &statements,
         &layouts,

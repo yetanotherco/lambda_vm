@@ -35,6 +35,7 @@ use multilinear::{
     whir::Domain,
     whir_chain::ChainConfig,
     whir_commit::Commitment,
+    whir_hash::{KeccakWhir, WhirHash},
 };
 
 use crate::constraint_ir::ir::ConstraintProgram;
@@ -323,10 +324,11 @@ where
 /// ends at its own point.
 ///
 /// [`Claimed::PerColumn`]: multilinear::stacked_eval::Claimed::PerColumn
-pub struct CommittedTables<'a, F, E>
+pub struct CommittedTables<'a, F, E, H = KeccakWhir>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -338,7 +340,7 @@ where
     /// case; more than one exists so a table can have a commitment of its own —
     /// which is what binds the same table across two proofs, since a table has
     /// no root of its own when it shares a stack.
-    groups: Vec<StackedCommitment<F>>,
+    groups: Vec<StackedCommitment<F, H>>,
     /// How many tables each group holds, in order.
     sizes: Vec<usize>,
     roots: Vec<Commitment>,
@@ -415,10 +417,11 @@ pub fn global_layouts(
     Ok(layouts)
 }
 
-impl<'a, F, E> CommittedTables<'a, F, E>
+impl<'a, F, E, H> CommittedTables<'a, F, E, H>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
@@ -479,7 +482,7 @@ where
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            let stacked = StackedCommitment::<F>::commit(
+            let stacked = StackedCommitment::<F, H>::commit(
                 layout,
                 &columns,
                 store.as_ref().map(|store| (&**store, firsts[at])),
@@ -520,7 +523,7 @@ where
     }
 
     /// The stacks, one per group.
-    pub fn groups(&self) -> &[StackedCommitment<F>] {
+    pub fn groups(&self) -> &[StackedCommitment<F, H>] {
         &self.groups
     }
 }
@@ -838,14 +841,15 @@ where
 /// Each table's sumcheck leaves its columns claimed at a point of its own.
 /// Those go into **one** opening at the end, which is what makes a proof of
 /// many tables cost about what a proof of one does.
-pub fn multi_prove<F, E, T>(
-    committed: &CommittedTables<'_, F, E>,
+pub fn multi_prove<F, E, T, H>(
+    committed: &CommittedTables<'_, F, E, H>,
     config: &ChainConfig,
     transcript: &mut T,
 ) -> Result<MultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
@@ -887,7 +891,7 @@ where
             .iter()
             .flat_map(|t| t.trace.columns())
             .collect();
-        columns.push(stacked_eval::prove::<F, E, T>(
+        columns.push(stacked_eval::prove::<F, E, T, H>(
             group,
             &group_columns,
             committed.store.as_ref().map(|store| (&**store, column_at)),
@@ -916,7 +920,7 @@ where
 /// bus carrying the program's public output — `expected` is zero exactly when
 /// the program outputs nothing.
 #[allow(clippy::too_many_arguments)]
-pub fn multi_verify<F, E, T>(
+pub fn multi_verify<F, E, T, H>(
     proof: &MultiProof<F, E>,
     statements: &[TableStatement<'_, F, E>],
     layouts: &[StackedLayout],
@@ -929,6 +933,7 @@ pub fn multi_verify<F, E, T>(
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
@@ -990,7 +995,7 @@ where
                 expected: root_at + layout.num_polys(),
                 got: proof.roots.len(),
             })?;
-        stacked_eval::verify::<F, E, T>(
+        stacked_eval::verify::<F, E, T, H>(
             opening,
             layout,
             roots,
@@ -1173,7 +1178,7 @@ mod tests {
         mul_cols: Vec<Vec<FE>>,
     ) -> Result<(), MlError> {
         let (cpu_air, add_air, mul_air) = airs();
-        let committed = CommittedTables::commit(
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
                 table(&cpu_air, &cpu_cols)?,
                 table(&add_air, &add_cols)?,
@@ -1203,7 +1208,7 @@ mod tests {
             committed.tables().iter().map(|t| t.statement()).collect();
 
         let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        multi_verify(
+        multi_verify::<_, _, _, KeccakWhir>(
             &proof,
             &statements,
             std::slice::from_ref(committed.groups()[0].layout()),

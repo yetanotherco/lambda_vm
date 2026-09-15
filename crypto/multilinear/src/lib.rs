@@ -26,6 +26,7 @@ pub mod whir;
 pub mod whir_chain;
 pub mod whir_commit;
 pub mod whir_eval;
+pub mod whir_hash;
 pub mod whir_round;
 pub mod zerocheck;
 

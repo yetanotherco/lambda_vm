@@ -1,6 +1,6 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
+use crate::fiat_shamir::transcript_hash::{KeccakTranscriptHash, TranscriptHash};
 
-use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use core::marker::PhantomData;
 use digest::Digest;
 use math::{
@@ -16,8 +16,8 @@ use math::{
 /// per squeeze).
 const SQUEEZE_LEN: usize = 32;
 
-/// Keccak-sponge Fiat-Shamir transcript with a Plonky3-style duplex output
-/// buffer.
+/// Sponge Fiat-Shamir transcript with a Plonky3-style duplex output buffer,
+/// over the hash `T` names.
 ///
 /// Challenges are derived by squeezing the sponge and rejection-sampling field
 /// coordinates directly from those bytes — there is **no CSPRNG**. Earlier this
@@ -28,8 +28,14 @@ const SQUEEZE_LEN: usize = 32;
 /// free. The output buffer amortizes one squeeze across up to `SQUEEZE_LEN / 8`
 /// 64-bit candidates, so a cubic-extension element (3 coordinates) usually costs
 /// a single squeeze.
-pub struct DefaultTranscript<F: HasDefaultTranscript> {
-    hasher: Keccak256,
+///
+/// `T` defaults to [`KeccakTranscriptHash`], so `DefaultTranscript::<F>::new(..)`
+/// still names exactly the transcript this system has always produced: every
+/// method body below is hash-agnostic, and the parameter only decides which
+/// `digest::Digest` the sponge is. Nothing about the keccak configuration's
+/// bytes moves.
+pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = KeccakTranscriptHash> {
+    hasher: T::Digest,
     /// Duplex output buffer: bytes squeezed from the sponge, consumed 8 at a
     /// time by field/`u64` sampling. Positions `[out_pos, SQUEEZE_LEN)` are the
     /// bytes not yet handed out; `out_pos == SQUEEZE_LEN` means "empty, squeeze
@@ -37,10 +43,10 @@ pub struct DefaultTranscript<F: HasDefaultTranscript> {
     /// squeeze can never reflect input appended after it was produced.
     out_buf: [u8; SQUEEZE_LEN],
     out_pos: usize,
-    phantom: PhantomData<F>,
+    phantom: PhantomData<(F, T)>,
 }
 
-impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
+impl<F: HasDefaultTranscript, T: TranscriptHash> Clone for DefaultTranscript<F, T> {
     fn clone(&self) -> Self {
         Self {
             hasher: self.hasher.clone(),
@@ -51,14 +57,15 @@ impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
     }
 }
 
-impl<F> DefaultTranscript<F>
+impl<F, T> DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
-            hasher: Keccak256::new(),
+            hasher: T::Digest::new(),
             out_buf: [0u8; SQUEEZE_LEN],
             // Empty: the first sample forces a squeeze.
             out_pos: SQUEEZE_LEN,
@@ -95,9 +102,10 @@ where
     }
 }
 
-impl<F> Default for DefaultTranscript<F>
+impl<F, T> Default for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     fn default() -> Self {
@@ -105,9 +113,10 @@ where
     }
 }
 
-impl<F> IsTranscript<F> for DefaultTranscript<F>
+impl<F, T> IsTranscript<F> for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     fn append_bytes(&mut self, new_bytes: &[u8]) {
@@ -145,9 +154,10 @@ where
     }
 }
 
-impl<F, S> IsStarkTranscript<F, S> for DefaultTranscript<F>
+impl<F, T, S> IsStarkTranscript<F, S> for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
     S: IsField + IsSubFieldOf<F>,
 {

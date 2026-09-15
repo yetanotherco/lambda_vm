@@ -10,6 +10,7 @@ use crate::test_utils::asm_elf_bytes;
 use stark::proof::options::ProofOptions;
 
 use crate::tables::MaxRowsConfig;
+use multilinear::whir_hash::KeccakWhir;
 
 fn prove(elf: &[u8]) -> MultilinearVmProof {
     multilinear_prove::prove_with_options(
@@ -138,7 +139,7 @@ fn a_forged_preprocessed_column_is_rejected() {
     let prove = |columns: Vec<Vec<FieldElement<F>>>| {
         let table =
             CommittedTable::from_layout(layout(), |col| columns[col as usize].clone()).unwrap();
-        let committed = CommittedTables::commit(vec![table], &config).unwrap();
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config).unwrap();
         let mut transcript = DefaultTranscript::<E>::new(b"forged");
         let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript).unwrap();
         (
@@ -162,7 +163,7 @@ fn a_forged_preprocessed_column_is_rejected() {
         multilinear::whir::Domain<F>,
     )| {
         let mut transcript = DefaultTranscript::<E>::new(b"forged");
-        multilinear_table::multi_verify(
+        multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
             &proof,
             &[statement],
             std::slice::from_ref(&stacked),

@@ -44,15 +44,16 @@ use crate::{
     whir::Domain,
     whir_chain::{self, ChainConfig, ChainProof},
     whir_commit::{CodewordCommitment, Commitment},
+    whir_hash::WhirHash,
 };
 
 /// The stacked polynomials, committed. Base-field, like the trace they hold.
-pub struct StackedCommitment<F: IsFFTField + IsPrimeField>
+pub struct StackedCommitment<F: IsFFTField + IsPrimeField + 'static, H: WhirHash>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     layout: StackedLayout,
-    commitments: Vec<CodewordCommitment<F>>,
+    commitments: Vec<CodewordCommitment<F, H>>,
     domain: Domain<F>,
     /// The room the commits and the openings take turns with, promised once
     /// for the whole group. Lives as long as the commitments do, because the
@@ -60,7 +61,7 @@ where
     _room: Option<crate::gpu::DeviceRoom>,
 }
 
-impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static> StackedCommitment<F>
+impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> StackedCommitment<F, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
@@ -118,7 +119,7 @@ where
         // tree on the device while it runs. Every polynomial has the same
         // variable count, so they share a domain.
         let commit = |poly: &whir_chain::Stacked<'_, F>| {
-            whir_chain::commit_stacked::<F>(poly, config, transient)
+            whir_chain::commit_stacked::<F, H>(poly, config, transient)
         };
         let mut domain = None;
         let mut commitments = Vec::with_capacity(sources.len());
@@ -333,8 +334,8 @@ fn claimed<E: IsField>(
 ///
 /// The claims are absorbed before the batching challenge, so the prover cannot
 /// pick them after seeing it.
-pub fn prove<F, E, T>(
-    stacked: &StackedCommitment<F>,
+pub fn prove<F, E, T, H>(
+    stacked: &StackedCommitment<F, H>,
     columns: &[&Mle<F>],
     resident: Option<(&crate::gpu::ResidentColumns, usize)>,
     point: &Claimed<'_, E>,
@@ -348,6 +349,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let layout = &stacked.layout;
     if values.len() != layout.placements().len() {
@@ -385,7 +387,7 @@ where
         };
         // The weight goes down as its shares: a device writes them into its own
         // buffer, and the host materializes the table only if none does.
-        polys.push(whir_chain::prove_shared::<F, E, T>(
+        polys.push(whir_chain::prove_shared::<F, E, T, H>(
             &poly,
             &weight_shares(layout, i, point, &weights)?,
             layout.n_stack(),
@@ -404,7 +406,7 @@ where
 /// The layout is public and derived from the column heights, so it is not part
 /// of the proof.
 #[allow(clippy::too_many_arguments)]
-pub fn verify<F, E, T>(
+pub fn verify<F, E, T, H>(
     proof: &StackedProof<F, E>,
     layout: &StackedLayout,
     roots: &[Commitment],
@@ -420,6 +422,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     if values.len() != layout.placements().len() {
         return Err(Error::QueryCountMismatch {
@@ -439,7 +442,7 @@ where
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
 
     for (i, (eval_proof, root)) in proof.polys.iter().zip(roots).enumerate() {
-        whir_chain::verify_weighted::<F, E, T, _>(
+        whir_chain::verify_weighted::<F, E, T, _, H>(
             eval_proof,
             root,
             |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
@@ -461,7 +464,7 @@ mod tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::whir_chain::GrindBits;
+    use crate::{whir_chain::GrindBits, whir_hash::KeccakWhir};
 
     type FE = FieldElement<F>;
 
@@ -510,7 +513,7 @@ mod tests {
         at: &[FE],
         claimed: &[FE],
     ) -> Result<usize, Error> {
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, KeccakWhir>::commit(
             layout,
             &crate::stacking::borrow(columns),
             None,
@@ -527,7 +530,7 @@ mod tests {
             &mut transcript(),
         )?;
 
-        verify(
+        verify::<F, _, _, KeccakWhir>(
             &proof,
             stacked.layout(),
             &roots,
@@ -673,7 +676,7 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, KeccakWhir>::commit(
             layout,
             &crate::stacking::borrow(&columns),
             None,
@@ -705,7 +708,7 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, KeccakWhir>::commit(
             layout,
             &crate::stacking::borrow(&columns),
             None,
@@ -726,7 +729,7 @@ mod tests {
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(
-            verify(
+            verify::<F, _, _, KeccakWhir>(
                 &proof,
                 stacked.layout(),
                 &roots,
@@ -767,7 +770,7 @@ mod tests {
             .map(|c| c.evaluate_in(&at).unwrap())
             .collect();
 
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, KeccakWhir>::commit(
             layout,
             &crate::stacking::borrow(&columns),
             None,
@@ -778,7 +781,7 @@ mod tests {
         assert_eq!(roots.len(), 1);
 
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
-        let proof = prove::<F, Ext, _>(
+        let proof = prove::<F, Ext, _, KeccakWhir>(
             &stacked,
             &crate::stacking::borrow(&columns),
             None,
@@ -790,7 +793,7 @@ mod tests {
         .unwrap();
 
         let mut verifier = DefaultTranscript::<Ext>::new(b"tower");
-        verify::<F, Ext, _>(
+        verify::<F, Ext, _, KeccakWhir>(
             &proof,
             stacked.layout(),
             &roots,
@@ -828,7 +831,7 @@ mod tests {
             .map(|(c, p)| c.evaluate(p).unwrap())
             .collect();
 
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, KeccakWhir>::commit(
             layout,
             &crate::stacking::borrow(&columns),
             None,
@@ -848,7 +851,7 @@ mod tests {
             &mut transcript(),
         )
         .unwrap();
-        verify(
+        verify::<F, _, _, KeccakWhir>(
             &proof,
             stacked.layout(),
             &roots,
@@ -875,7 +878,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            verify(
+            verify::<F, _, _, KeccakWhir>(
                 &proof,
                 stacked.layout(),
                 &roots,

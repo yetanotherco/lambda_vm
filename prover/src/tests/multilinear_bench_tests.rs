@@ -23,6 +23,7 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 use crate::multilinear_prove;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
+use multilinear::whir_hash::KeccakWhir;
 
 /// Blowup 4, 128 bits, 20 bits of grinding — the parameters the multilinear
 /// path derives its own from, so the two are being asked for the same security.
@@ -579,7 +580,7 @@ fn phases() {
         })
         .collect();
     let count = tables.len();
-    let committed = CommittedTables::commit(tables, &config).expect("commit");
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(tables, &config).expect("commit");
     let commit = start.elapsed();
 
     // `multi_prove`'s own body, so the tables' arguments and the one opening
@@ -613,7 +614,7 @@ fn phases() {
         .iter()
         .flat_map(|t| t.columns())
         .collect();
-    let columns = multilinear::stacked_eval::prove::<F, E, _>(
+    let columns = multilinear::stacked_eval::prove::<F, E, _, KeccakWhir>(
         &committed.groups()[0],
         &group_columns,
         None,
@@ -767,7 +768,7 @@ fn commit_phases() {
         let codeword = whir::encode::<F, F>(&coeffs, &domain).expect("encode");
         encode += start.elapsed();
         let start = Instant::now();
-        let commitment = CodewordCommitment::new(
+        let commitment = CodewordCommitment::<_, KeccakWhir>::new(
             &codeword,
             config
                 .schedule(poly.num_vars())

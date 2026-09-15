@@ -48,6 +48,7 @@ use crate::{
     sumcheck::SumcheckProof,
     whir_chain::ChainConfig,
     whir_commit::Commitment,
+    whir_hash::{KeccakWhir, WhirHash},
 };
 
 /// The stack width that fits every column in a single polynomial.
@@ -139,13 +140,16 @@ fn weave<E: IsField>(
 /// Holds the columns that were committed and, for every trace-level factor,
 /// where its table comes from. Weight tables are not in here: they depend on
 /// challenges drawn after the commitments, so the statements bring their own.
-pub struct CommittedTrace<F: IsFFTField + IsPrimeField + IsSubFieldOf<E>, E: IsField>
-where
+pub struct CommittedTrace<
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField,
+    H: WhirHash = KeccakWhir,
+> where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     data: TraceData<F, E>,
-    stacked: StackedCommitment<F>,
+    stacked: StackedCommitment<F, H>,
 }
 
 /// A table's factors: its columns, the public tables, and what each factor
@@ -350,7 +354,8 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
 impl<
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
-> CommittedTrace<F, E>
+    H: WhirHash,
+> CommittedTrace<F, E, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -413,7 +418,7 @@ where
         layout: StackedLayout,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
-        let stacked = StackedCommitment::<F>::commit(
+        let stacked = StackedCommitment::<F, H>::commit(
             layout,
             &crate::stacking::borrow(&columns),
             None,
@@ -529,8 +534,8 @@ pub struct ConstraintCore<E: IsField> {
 ///
 /// The caller must have absorbed the commitment roots and drawn whatever
 /// challenges its statements need, identically on both sides.
-pub fn prove_statements<F, E, T>(
-    trace: &CommittedTrace<F, E>,
+pub fn prove_statements<F, E, T, H>(
+    trace: &CommittedTrace<F, E, H>,
     weights: Vec<Mle<E>>,
     rules: Vec<Rule<'_, E>>,
     claims: &[FieldElement<E>],
@@ -543,13 +548,14 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let (core, reduced_point) =
         prove_core::<F, E, T>(&trace.data, weights, rules, claims, transcript)?;
 
     // Every column's value at one shared point, so the whole trace is settled
     // against the stack in one go.
-    let columns = stacked_eval::prove::<F, E, T>(
+    let columns = stacked_eval::prove::<F, E, T, H>(
         &trace.stacked,
         &crate::stacking::borrow(trace.columns()),
         trace.data().resident(),
@@ -654,7 +660,7 @@ where
 /// the commitment says the prover is consistent with what it committed, not
 /// that what it committed is right.
 #[must_use = "the column values are the only place a known column can be checked"]
-pub fn verify_statements<F, E, T, P>(
+pub fn verify_statements<F, E, T, P, H>(
     proof: &ConstraintProof<F, E>,
     claim_shape: TraceClaim<'_, F>,
     rules: &[Rule<'_, E>],
@@ -670,6 +676,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
+    H: WhirHash,
 {
     let reduced = verify_core(
         &proof.core,
@@ -682,7 +689,7 @@ where
         transcript,
     )?;
 
-    stacked_eval::verify::<F, E, T>(
+    stacked_eval::verify::<F, E, T, H>(
         &proof.columns,
         claim_shape.layout,
         claim_shape.roots,
@@ -746,8 +753,8 @@ where
 /// Absorbs the roots, draws `r`, and adds `eq(r, ·)` as one more public factor
 /// — so `combine` sees exactly the trace's factors, and the weight costs one
 /// degree.
-pub fn prove<F, E, T, C>(
-    trace: &CommittedTrace<F, E>,
+pub fn prove<F, E, T, C, H>(
+    trace: &CommittedTrace<F, E, H>,
     combine: C,
     degree: usize,
     config: &ChainConfig,
@@ -760,6 +767,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
+    H: WhirHash,
 {
     for root in trace.roots() {
         transcript.append_bytes(&root);
@@ -783,7 +791,7 @@ where
 }
 
 /// Verifies the single-constraint case. See [`prove`].
-pub fn verify<F, E, T, C, P>(
+pub fn verify<F, E, T, C, P, H>(
     proof: &ConstraintProof<F, E>,
     claim_shape: TraceClaim<'_, F>,
     combine: C,
@@ -800,6 +808,7 @@ where
     T: IsTranscript<E>,
     C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
     P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
+    H: WhirHash,
 {
     for root in claim_shape.roots {
         transcript.append_bytes(root);
@@ -812,7 +821,7 @@ where
     let rule = Rule::new(degree + 1, move |v: &[FieldElement<E>]| {
         &v[weight] * combine(&v[..weight])
     });
-    verify_statements(
+    verify_statements::<F, E, T, _, H>(
         proof,
         claim_shape,
         &[rule],
@@ -845,9 +854,67 @@ mod tests {
         gkr::{self, FractionLayer, FractionTree},
         selector::Selector,
         whir_chain::GrindBits,
+        whir_hash::KeccakWhir,
     };
 
     type FE = FieldElement<F>;
+
+    /// ★ These tests are the KECCAK instantiation, stated once.
+    ///
+    /// `prove` and `verify` are generic over [`WhirHash`] on the production
+    /// path, where the caller supplies it. Shadowing them here with pinned
+    /// wrappers keeps every test body reading exactly as it did on PR #988 —
+    /// which is what makes "the existing tests are unchanged and
+    /// byte-identical" a checkable statement rather than a hopeful one — while
+    /// still naming the hash in one visible place.
+    #[allow(clippy::too_many_arguments)]
+    fn prove<F, E, T, C>(
+        trace: &CommittedTrace<F, E>,
+        combine: C,
+        degree: usize,
+        config: &ChainConfig,
+        transcript: &mut T,
+    ) -> Result<ConstraintProof<F, E>, Error>
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+        T: IsTranscript<E>,
+        C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
+    {
+        super::prove::<F, E, T, C, KeccakWhir>(trace, combine, degree, config, transcript)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify<F, E, T, C, P>(
+        proof: &ConstraintProof<F, E>,
+        claim_shape: TraceClaim<'_, F>,
+        combine: C,
+        public_values: P,
+        degree: usize,
+        config: &ChainConfig,
+        transcript: &mut T,
+    ) -> Result<(), Error>
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        E: IsField + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+        T: IsTranscript<E>,
+        C: Fn(&[FieldElement<E>]) -> FieldElement<E> + Sync,
+        P: FnOnce(&[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, Error>,
+    {
+        super::verify::<F, E, T, C, P, KeccakWhir>(
+            proof,
+            claim_shape,
+            combine,
+            public_values,
+            degree,
+            config,
+            transcript,
+        )
+    }
 
     fn transcript() -> DefaultTranscript<F> {
         DefaultTranscript::<F>::new(b"constraint-argument-test")
@@ -1604,7 +1671,7 @@ mod tests {
             .map(|_| verifier.sample_field_element())
             .collect();
 
-        verify_statements(
+        verify_statements::<F, F, _, _, KeccakWhir>(
             &proof,
             TraceClaim {
                 roots: &roots,

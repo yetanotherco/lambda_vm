@@ -1665,7 +1665,11 @@ pub trait IsStarkVerifier<
         let grinding_factor = air.context().proof_options.grinding_factor;
         if grinding_factor > 0 {
             let nonce_is_valid = proof.nonce().is_some_and(|nonce_value| {
-                grinding::is_valid_nonce(&challenges.grinding_seed, nonce_value, grinding_factor)
+                grinding::is_valid_nonce::<grinding::StarkGrindingDigest>(
+                    &challenges.grinding_seed,
+                    nonce_value,
+                    grinding_factor,
+                )
             });
 
             if !nonce_is_valid {
