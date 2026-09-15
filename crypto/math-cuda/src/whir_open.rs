@@ -64,16 +64,44 @@ impl OpeningSession {
         len: usize,
         parts: &[(&[u64], usize)],
     ) -> Result<Self> {
+        Self::from_shares_and_source(shares, len, |stream, base| {
+            for (column, offset) in parts {
+                let mut at = base.slice_mut(*offset..*offset + column.len());
+                stream.memcpy_htod(*column, &mut at)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The same for parts the card already holds: `(column index, offset)` into
+    /// the epoch's columns, so the message is assembled there instead of
+    /// crossing the bus a second time.
+    pub fn from_shares_and_resident(
+        shares: &[(usize, Vec<u64>, [u64; 3])],
+        len: usize,
+        store: &crate::columns::DeviceColumns,
+        parts: &[(usize, usize)],
+    ) -> Result<Self> {
+        Self::from_shares_and_source(shares, len, |stream, base| {
+            for (column, offset) in parts {
+                store.copy_into(*column, base, *offset, stream)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn from_shares_and_source(
+        shares: &[(usize, Vec<u64>, [u64; 3])],
+        len: usize,
+        write: impl FnOnce(&Arc<CudaStream>, &mut CudaSlice<u64>) -> Result<()>,
+    ) -> Result<Self> {
         let be = backend()?;
         let stream = be.next_stream();
         let mut weight = crate::device::alloc_zeros_or_trim::<u64>(&stream, len * 3)?;
         crate::sumcheck::eq_expand_shares_ext3(&stream, &mut weight, shares)?;
         // Zeroed because what the parts do not cover is the stacking's padding.
         let mut base = crate::device::alloc_zeros_or_trim::<u64>(&stream, len)?;
-        for (column, offset) in parts {
-            let mut at = base.slice_mut(*offset..*offset + column.len());
-            stream.memcpy_htod(*column, &mut at)?;
-        }
+        write(&stream, &mut base)?;
         Self::lift_into(stream, weight, len, base)
     }
 

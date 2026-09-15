@@ -553,18 +553,19 @@ pub fn evaluate_mle_base(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
 ///
 /// `columns` are base-field slices of `2^point.len()/3` values each. Returns
 /// one ext3 value per column, in order.
-pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64; 3]>> {
+pub fn evaluate_many_base(
+    columns: crate::columns::Columns<'_>,
+    point: &[u64],
+) -> Result<Vec<[u64; 3]>> {
     assert!(point.len().is_multiple_of(3), "three u64 per coordinate");
     let vars = point.len() / 3;
     let rows = 1usize << vars;
     assert!(vars > 0, "a point with no coordinates is the table itself");
-    assert!(
-        columns.iter().all(|column| column.len() == rows),
-        "every column spans the point"
-    );
     if columns.is_empty() {
         return Ok(Vec::new());
     }
+    assert_eq!(columns.rows(), rows, "every column spans the point");
+    let num_columns = columns.width();
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -572,30 +573,43 @@ pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64;
     // is 20 bytes a row, and this keeps that transient bounded however wide
     // the table is.
     let per_column = rows as u64 * 20;
-    let chunk = (CHUNK_BUDGET_BYTES / per_column.max(1)).clamp(1, columns.len() as u64) as usize;
+    let chunk = (CHUNK_BUDGET_BYTES / per_column.max(1)).clamp(1, num_columns as u64) as usize;
 
-    let mut out = Vec::with_capacity(columns.len());
-    for group in columns.chunks(chunk) {
+    let mut out = Vec::with_capacity(num_columns);
+    for start in (0..num_columns).step_by(chunk) {
+        let group = start..(start + chunk).min(num_columns);
+        let group_len = group.len();
         let half = rows / 2;
         // Promised before it is used, like everything else that takes a slab
         // of the card: the caller's fallback is to evaluate the columns one at
         // a time, which needs almost nothing.
-        let Some(_room) = crate::device::reserve(group.len() as u64 * per_column) else {
+        let Some(_room) = crate::device::reserve(group_len as u64 * per_column) else {
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
-        let mut base = unsafe { alloc_or_trim::<u64>(&stream, group.len() * rows) }?;
-        for (k, column) in group.iter().enumerate() {
-            let at = k * rows;
-            let mut slab = base.slice_mut(at..at + rows);
-            stream.memcpy_htod(*column, &mut slab)?;
-        }
+        // Read where they lie when they are already there; a copy otherwise.
+        let uploaded;
+        let base = match &columns {
+            crate::columns::Columns::Device { store, first, .. } => {
+                store.view(first + group.start, group_len)
+            }
+            crate::columns::Columns::Host(host) => {
+                let mut up = unsafe { alloc_or_trim::<u64>(&stream, group_len * rows) }?;
+                for (k, column) in host[group.clone()].iter().enumerate() {
+                    let at = k * rows;
+                    let mut slab = up.slice_mut(at..at + rows);
+                    stream.memcpy_htod(*column, &mut slab)?;
+                }
+                uploaded = up;
+                uploaded.slice(0..group_len * rows)
+            }
+        };
         let r = crate::device::htod_or_trim(&stream, &point[..3])?;
         // SAFETY: the kernel writes every element of the halves it produces.
-        let mut values = unsafe { alloc_or_trim::<u64>(&stream, group.len() * half * 3) }?;
+        let mut values = unsafe { alloc_or_trim::<u64>(&stream, group_len * half * 3) }?;
         let half_arg = half as u64;
-        let tables = group.len() as u64;
+        let tables = group_len as u64;
         let total = half_arg * tables;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         unsafe {
@@ -612,13 +626,11 @@ pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64;
                     shared_mem_bytes: 0,
                 })?;
         }
-        drop(base);
-
         // From here every table is ext3 and they all fold together: one launch
         // per level, over the list of addresses.
         let addresses: Vec<u64> = {
             let (at, _guard) = values.device_ptr(&stream);
-            (0..group.len())
+            (0..group_len)
                 .map(|k| at + (k * half * 3 * 8) as u64)
                 .collect()
         };
@@ -631,7 +643,7 @@ pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64;
                 break;
             }
             stream.memcpy_htod(coordinate, &mut r_dev)?;
-            let width = group.len() as u64;
+            let width = group_len as u64;
             let total = width * fold_half;
             let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
             unsafe {
@@ -656,7 +668,7 @@ pub fn evaluate_many_base(columns: &[&[u64]], point: &[u64]) -> Result<Vec<[u64;
         // Gathered there and brought back in one copy. A trace has thousands of
         // columns, and reading each one's head on its own is a transfer and a
         // stream synchronize apiece for twenty-four bytes.
-        let heads: Vec<u32> = (0..group.len()).map(|k| (k * half) as u32).collect();
+        let heads: Vec<u32> = (0..group_len).map(|k| (k * half) as u32).collect();
         let packed = crate::fri::gather_ext3_at(&values, &heads, &stream)?;
         for head in packed.chunks_exact(3) {
             out.push([head[0], head[1], head[2]]);
@@ -782,7 +794,7 @@ impl DeviceFactors {
     /// reduced mod `rows`), and the slot it fills; `public` is the extension
     /// tables that are not views of a column, each with the slot it goes to.
     pub fn from_columns(
-        columns: &[&[u64]],
+        columns: crate::columns::Columns<'_>,
         plan: &[u64],
         public: &[(usize, &[u64])],
         rows: usize,
@@ -800,7 +812,7 @@ impl DeviceFactors {
             "every slot is filled once"
         );
         assert!(
-            columns.iter().all(|column| column.len() == rows),
+            columns.is_empty() || columns.rows() == rows,
             "every column spans the cube"
         );
 
@@ -826,13 +838,26 @@ impl DeviceFactors {
         }
 
         if !plan.is_empty() {
-            // SAFETY: every cell is written by the copies below.
-            let mut base = unsafe { alloc_or_trim::<u64>(&stream, columns.len() * rows) }?;
-            for (k, column) in columns.iter().enumerate() {
-                let at = k * rows;
-                let mut slab = base.slice_mut(at..at + rows);
-                stream.memcpy_htod(*column, &mut slab)?;
-            }
+            // Read where they lie when they are already there; a copy otherwise.
+            let uploaded;
+            let base = match &columns {
+                crate::columns::Columns::Device {
+                    store,
+                    first,
+                    width,
+                } => store.view(*first, *width),
+                crate::columns::Columns::Host(host) => {
+                    // SAFETY: every cell is written by the copies below.
+                    let mut up = unsafe { alloc_or_trim::<u64>(&stream, host.len() * rows) }?;
+                    for (k, column) in host.iter().enumerate() {
+                        let at = k * rows;
+                        let mut slab = up.slice_mut(at..at + rows);
+                        stream.memcpy_htod(*column, &mut slab)?;
+                    }
+                    uploaded = up;
+                    uploaded.slice(0..host.len() * rows)
+                }
+            };
             let plan_dev = crate::device::htod_or_trim(&stream, plan)?;
             let num_plan = (plan.len() / 3) as u64;
             let rows_arg = rows as u64;
@@ -853,9 +878,9 @@ impl DeviceFactors {
                     .arg(&mut buffer)
                     .launch(cfg)?;
             }
-            // The columns are spent. Freeing them is stream-ordered, so it
-            // happens behind the kernel that just read them.
-            drop(base);
+            // A copy made here is spent and goes at the end of this block,
+            // which is stream-ordered behind the kernel that just read it; a
+            // view of the epoch's columns frees nothing, because they stay.
         }
 
         let addresses: Vec<u64> = {

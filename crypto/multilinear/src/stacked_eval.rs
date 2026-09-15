@@ -72,6 +72,7 @@ where
     pub fn commit(
         layout: StackedLayout,
         columns: &[&Mle<F>],
+        resident: Option<(&crate::gpu::ResidentColumns, usize)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
         // The stacked polynomials are not built here: each is its columns at
@@ -85,6 +86,16 @@ where
                     .into_iter()
                     .map(|(column, offset)| (columns[column], offset))
                     .collect(),
+                resident: resident.map(|(store, first)| {
+                    (
+                        store,
+                        layout
+                            .parts_of(poly)
+                            .into_iter()
+                            .map(|(column, offset)| (first + column, offset))
+                            .collect(),
+                    )
+                }),
                 num_vars: layout.n_stack(),
             })
             .collect();
@@ -325,6 +336,7 @@ fn claimed<E: IsField>(
 pub fn prove<F, E, T>(
     stacked: &StackedCommitment<F>,
     columns: &[&Mle<F>],
+    resident: Option<(&crate::gpu::ResidentColumns, usize)>,
     point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
     config: &ChainConfig,
@@ -359,6 +371,16 @@ where
                 .into_iter()
                 .map(|(column, offset)| (columns[column], offset))
                 .collect(),
+            resident: resident.map(|(store, first)| {
+                (
+                    store,
+                    layout
+                        .parts_of(i)
+                        .into_iter()
+                        .map(|(column, offset)| (first + column, offset))
+                        .collect(),
+                )
+            }),
             num_vars: layout.n_stack(),
         };
         // The weight goes down as its shares: a device writes them into its own
@@ -488,12 +510,17 @@ mod tests {
         at: &[FE],
         claimed: &[FE],
     ) -> Result<usize, Error> {
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(columns), &config())?;
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(columns),
+            None,
+            &config(),
+        )?;
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
             &crate::stacking::borrow(columns),
+            None,
             &Claimed::Shared(at),
             claimed,
             &config(),
@@ -646,13 +673,18 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
-                .unwrap();
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap();
         assert!(matches!(
             prove(
                 &stacked,
                 &crate::stacking::borrow(&columns),
+                None,
                 &Claimed::Shared(&at),
                 &claimed[..3],
                 &config(),
@@ -673,13 +705,18 @@ mod tests {
         let at = point(num_vars);
         let claimed = values(&columns, &at);
 
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
-                .unwrap();
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap();
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
             &crate::stacking::borrow(&columns),
+            None,
             &Claimed::Shared(&at),
             &claimed,
             &config(),
@@ -730,9 +767,13 @@ mod tests {
             .map(|c| c.evaluate_in(&at).unwrap())
             .collect();
 
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
-                .unwrap();
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap();
         let roots = stacked.roots();
         assert_eq!(roots.len(), 1);
 
@@ -740,6 +781,7 @@ mod tests {
         let proof = prove::<F, Ext, _>(
             &stacked,
             &crate::stacking::borrow(&columns),
+            None,
             &Claimed::Shared(&at),
             &claimed,
             &config(),
@@ -786,15 +828,20 @@ mod tests {
             .map(|(c, p)| c.evaluate(p).unwrap())
             .collect();
 
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), &config())
-                .unwrap();
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(&columns),
+            None,
+            &config(),
+        )
+        .unwrap();
         let roots = stacked.roots();
         let at = Claimed::PerColumn(&points);
 
         let proof = prove(
             &stacked,
             &crate::stacking::borrow(&columns),
+            None,
             &at,
             &claimed,
             &config(),
@@ -820,6 +867,7 @@ mod tests {
         let proof = prove(
             &stacked,
             &crate::stacking::borrow(&columns),
+            None,
             &at,
             &tampered,
             &config(),

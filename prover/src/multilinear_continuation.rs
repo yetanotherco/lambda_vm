@@ -111,6 +111,7 @@ pub fn l2g_commitment(
     let stacked = multilinear::stacked_eval::StackedCommitment::<F>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
+        None,
         config,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;

@@ -166,9 +166,29 @@ pub struct TraceData<F: IsField, E: IsField> {
     /// biggest thing a table's argument holds — uploading them twice would
     /// cost more than either use.
     device: std::sync::Mutex<Option<std::sync::Arc<crate::gpu::DeviceFactors>>>,
+    /// The epoch's columns on the card and the index this table's start at.
+    /// Four things read the same columns; put there once, they are read where
+    /// they lie instead of uploaded again.
+    resident: Option<(std::sync::Arc<crate::gpu::ResidentColumns>, usize)>,
 }
 
 impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
+    /// Points this table's columns at the epoch's device copy of them.
+    pub fn set_resident(
+        &mut self,
+        store: std::sync::Arc<crate::gpu::ResidentColumns>,
+        first: usize,
+    ) {
+        self.resident = Some((store, first));
+    }
+
+    /// The epoch's columns on the card, and where this table's start.
+    pub fn resident(&self) -> Option<(&crate::gpu::ResidentColumns, usize)> {
+        self.resident
+            .as_ref()
+            .map(|(store, first)| (&**store, *first))
+    }
+
     /// Checks the shapes agree and that `kinds` asks for exactly the public
     /// tables given.
     pub fn new(
@@ -203,6 +223,7 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
             columns,
             public,
             device: std::sync::Mutex::new(None),
+            resident: None,
             kinds,
         })
     }
@@ -257,9 +278,15 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
     pub fn reside_from_columns(&self) -> Option<std::sync::Arc<crate::gpu::DeviceFactors>> {
         let mut slot = self.device.lock().ok()?;
         if slot.is_none() {
-            *slot =
-                crate::gpu::upload_factors_from_columns(&self.columns, &self.kinds, &self.public)
-                    .map(std::sync::Arc::new);
+            *slot = crate::gpu::upload_factors_from_columns(
+                &self.columns,
+                &self.kinds,
+                &self.public,
+                self.resident
+                    .as_ref()
+                    .map(|(store, first)| (&**store, *first)),
+            )
+            .map(std::sync::Arc::new);
         }
         slot.clone()
     }
@@ -386,8 +413,12 @@ where
         layout: StackedLayout,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
-        let stacked =
-            StackedCommitment::<F>::commit(layout, &crate::stacking::borrow(&columns), config)?;
+        let stacked = StackedCommitment::<F>::commit(
+            layout,
+            &crate::stacking::borrow(&columns),
+            None,
+            config,
+        )?;
         Ok(Self {
             data: TraceData::new(columns, kinds, public)?,
             stacked,
@@ -521,6 +552,7 @@ where
     let columns = stacked_eval::prove::<F, E, T>(
         &trace.stacked,
         &crate::stacking::borrow(trace.columns()),
+        trace.data().resident(),
         &stacked_eval::Claimed::Shared(&reduced_point),
         &core.reduce.column_values,
         config,
@@ -596,6 +628,7 @@ where
         &sources_of(&trace.kinds),
         &factor_values,
         &point,
+        trace.resident(),
         transcript,
     )?;
 

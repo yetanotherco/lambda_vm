@@ -187,8 +187,14 @@ fn factor_parity(num_vars: usize, columns: usize, offsets: &[usize], publics: us
         .map(|(slot, table)| (*slot, table.as_slice()))
         .collect();
 
-    let built = DeviceFactors::from_columns(&columns_ref, &plan, &public_ref, rows, host.len())
-        .expect("factors on device (needs a GPU)");
+    let built = DeviceFactors::from_columns(
+        math_cuda::columns::Columns::Host(&columns_ref),
+        &plan,
+        &public_ref,
+        rows,
+        host.len(),
+    )
+    .expect("factors on device (needs a GPU)");
 
     // Read them back the only way a `DeviceFactors` can be read: a sumcheck
     // that binds nothing yet, whose session owns the same buffer.
@@ -307,8 +313,11 @@ fn columns_folded_together_match_one_at_a_time() {
             .collect();
 
         let borrowed: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
-        let together =
-            math_cuda::sumcheck::evaluate_many_base(&borrowed, &point).expect("the batch");
+        let together = math_cuda::sumcheck::evaluate_many_base(
+            math_cuda::columns::Columns::Host(&borrowed),
+            &point,
+        )
+        .expect("the batch");
         assert_eq!(together.len(), width);
         for (k, column) in borrowed.iter().enumerate() {
             let alone = math_cuda::sumcheck::evaluate_mle_base(column, &point).expect("one");

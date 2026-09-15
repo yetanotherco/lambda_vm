@@ -191,6 +191,7 @@ pub fn prove<F, E, T>(
     sources: &[FactorSource],
     factor_values: &[FieldElement<E>],
     alpha: &[FieldElement<E>],
+    resident: Option<(&crate::gpu::ResidentColumns, usize)>,
     transcript: &mut T,
 ) -> Result<(ReduceProof<E>, Vec<FieldElement<E>>), Error>
 where
@@ -236,7 +237,7 @@ where
 
     // All at the same point, so they fold together: one upload and one launch
     // per level for the table instead of per column.
-    let column_values = match crate::gpu::evaluate_many_base(columns, &point) {
+    let column_values = match crate::gpu::evaluate_many_base(columns, &point, resident) {
         Some(values) => values,
         None => columns
             .iter()
@@ -408,7 +409,14 @@ mod tests {
         verifier_values: &[FE],
         alpha: &[FE],
     ) -> Result<ReducedClaim<F>, Error> {
-        let (proof, _) = prove(columns, sources, prover_values, alpha, &mut transcript())?;
+        let (proof, _) = prove(
+            columns,
+            sources,
+            prover_values,
+            alpha,
+            None,
+            &mut transcript(),
+        )?;
         verify(
             &proof,
             sources,
@@ -467,7 +475,8 @@ mod tests {
         let alpha = point(num_vars);
         let values = honest_values(&columns, &sources, &alpha);
 
-        let (mut proof, _) = prove(&columns, &sources, &values, &alpha, &mut transcript()).unwrap();
+        let (mut proof, _) =
+            prove(&columns, &sources, &values, &alpha, None, &mut transcript()).unwrap();
         proof.column_values[1] += FE::one();
 
         let err = verify(
@@ -490,7 +499,8 @@ mod tests {
         let alpha = point(num_vars);
         let values = honest_values(&columns, &sources, &alpha);
 
-        let (mut proof, _) = prove(&columns, &sources, &values, &alpha, &mut transcript()).unwrap();
+        let (mut proof, _) =
+            prove(&columns, &sources, &values, &alpha, None, &mut transcript()).unwrap();
         proof.column_values.swap(0, 1);
 
         assert_eq!(
@@ -555,7 +565,8 @@ mod tests {
         let alpha = point(num_vars);
         let values = honest_values(&columns, &sources, &alpha);
 
-        let (proof, _) = prove(&columns, &sources, &values, &alpha, &mut transcript()).unwrap();
+        let (proof, _) =
+            prove(&columns, &sources, &values, &alpha, None, &mut transcript()).unwrap();
         assert_eq!(proof.sumcheck.rounds.len(), num_vars);
         assert_eq!(proof.column_values.len(), 2);
     }
@@ -568,7 +579,8 @@ mod tests {
         let alpha = point(num_vars);
         let values = honest_values(&columns, &sources, &alpha);
 
-        let (proof, _) = prove(&columns, &sources, &values, &alpha, &mut transcript()).unwrap();
+        let (proof, _) =
+            prove(&columns, &sources, &values, &alpha, None, &mut transcript()).unwrap();
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(verify(&proof, &sources, &values, &alpha, columns.len(), &mut other).is_err());
     }
@@ -579,7 +591,15 @@ mod tests {
         let sources = [FactorSource::direct(1)];
         let alpha = point(3);
         assert_eq!(
-            prove(&columns, &sources, &[FE::zero()], &alpha, &mut transcript()).unwrap_err(),
+            prove(
+                &columns,
+                &sources,
+                &[FE::zero()],
+                &alpha,
+                None,
+                &mut transcript()
+            )
+            .unwrap_err(),
             Error::UnknownPolynomial { index: 1, len: 1 }
         );
     }
@@ -590,7 +610,15 @@ mod tests {
         let sources = [FactorSource::direct(0), FactorSource::shifted(0, 1)];
         let alpha = point(3);
         assert_eq!(
-            prove(&columns, &sources, &[FE::zero()], &alpha, &mut transcript()).unwrap_err(),
+            prove(
+                &columns,
+                &sources,
+                &[FE::zero()],
+                &alpha,
+                None,
+                &mut transcript()
+            )
+            .unwrap_err(),
             Error::VariableCountMismatch {
                 expected: 2,
                 got: 1

@@ -19,6 +19,8 @@ use math::{
     },
     traits::AsBytes,
 };
+use std::sync::Arc;
+
 use multilinear::{
     Error as MlError,
     batch::Rule,
@@ -329,6 +331,9 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     tables: Vec<CommittedTable<'a, F, E>>,
+    /// The epoch's columns on the card, alive as long as the tables that read
+    /// them. `None` when there is no device or it would not promise the room.
+    store: Option<Arc<multilinear::gpu::ResidentColumns>>,
     /// The stacks the tables are committed in, in table order. One is the usual
     /// case; more than one exists so a table can have a commitment of its own —
     /// which is what binds the same table across two proofs, since a table has
@@ -436,7 +441,7 @@ where
     /// Everything else is unchanged — the tables are argued in one transcript
     /// against one set of roots, and each group is opened once.
     pub fn commit_grouped(
-        tables: Vec<CommittedTable<'a, F, E>>,
+        mut tables: Vec<CommittedTable<'a, F, E>>,
         sizes: &[usize],
         config: &ChainConfig,
     ) -> Result<Self, MlError> {
@@ -446,6 +451,21 @@ where
                 got: sizes.iter().sum(),
             });
         }
+        // The epoch's columns, on the card once. Four things read them — the
+        // commitment, the sumcheck's factors, the evaluation at the reduction
+        // point and the opening's message — and each used to upload its own
+        // copy.
+        let all: Vec<&Mle<F>> = tables.iter().flat_map(|t| t.columns()).collect();
+        let store = multilinear::gpu::upload_columns(&all).map(Arc::new);
+        // Where each table's columns start in it.
+        let mut firsts = Vec::with_capacity(tables.len());
+        let mut column_at = 0usize;
+        for table in &tables {
+            firsts.push(column_at);
+            column_at += table.num_committed_columns();
+        }
+        drop(all);
+
         let mut groups = Vec::with_capacity(sizes.len());
         let mut roots = Vec::new();
         let mut at = 0usize;
@@ -459,13 +479,26 @@ where
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
-            let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
+            let stacked = StackedCommitment::<F>::commit(
+                layout,
+                &columns,
+                store.as_ref().map(|store| (&**store, firsts[at])),
+                config,
+            )?;
             roots.extend(stacked.roots());
             groups.push(stacked);
             at += size;
         }
+        // Each table points at its own run, so its factors and its reduction
+        // read them where they lie.
+        if let Some(store) = &store {
+            for (table, first) in tables.iter_mut().zip(&firsts) {
+                table.trace.set_resident(store.clone(), *first);
+            }
+        }
         Ok(Self {
             tables,
+            store,
             groups,
             sizes: sizes.to_vec(),
             roots,
@@ -857,6 +890,7 @@ where
         columns.push(stacked_eval::prove::<F, E, T>(
             group,
             &group_columns,
+            committed.store.as_ref().map(|store| (&**store, column_at)),
             &Claimed::PerColumn(&points[column_at..column_at + width]),
             &values[column_at..column_at + width],
             config,

@@ -359,6 +359,10 @@ fn block_size<V: IsField>(openings: &[crate::whir_commit::CosetOpening<V>]) -> u
 pub struct Stacked<'a, F: IsField> {
     /// `(column, offset in elements)`.
     pub parts: Vec<(&'a Mle<F>, usize)>,
+    /// The same parts as `(index into the epoch's columns, offset)`, when the
+    /// card already holds them — then the scatter is a copy at device
+    /// bandwidth instead of the trace crossing the bus again.
+    pub resident: Option<(&'a crate::gpu::ResidentColumns, Vec<(usize, usize)>)>,
     pub num_vars: usize,
 }
 
@@ -391,6 +395,7 @@ where
     commit_stacked(
         &Stacked {
             parts: vec![(f, 0)],
+            resident: None,
             num_vars: f.num_vars(),
         },
         config,
@@ -413,7 +418,12 @@ where
     let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
-    let attempt = crate::gpu::commit_parts(&f.parts, num_vars, config.log_blowup, first, transient);
+    let attempt = match &f.resident {
+        Some((store, parts)) => {
+            crate::gpu::commit_resident(store, parts, num_vars, config.log_blowup, first, transient)
+        }
+        None => crate::gpu::commit_parts(&f.parts, num_vars, config.log_blowup, first, transient),
+    };
     let commitment = match attempt {
         Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
         None => CodewordCommitment::from_codeword(

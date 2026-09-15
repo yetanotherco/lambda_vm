@@ -603,6 +603,7 @@ fn phases() {
     let columns = multilinear::stacked_eval::prove::<F, E, _>(
         &committed.groups()[0],
         &group_columns,
+        None,
         &multilinear::stacked_eval::Claimed::PerColumn(&points),
         &values,
         &config,

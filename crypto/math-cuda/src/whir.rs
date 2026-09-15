@@ -193,6 +193,29 @@ pub fn commit_codeword_parts(
     )
 }
 
+/// The same for parts the card already holds: `(column index, offset)` into the
+/// epoch's columns. The scatter is then a copy at device bandwidth rather than
+/// the trace crossing the bus again.
+pub fn commit_codeword_resident(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_from(
+        Source::Resident {
+            store,
+            parts,
+            log_evals,
+        },
+        log_blowup,
+        log_folding,
+        transient,
+    )
+}
+
 /// Where a commit's coefficients come from: one slab the host holds, or the
 /// columns a stacked polynomial is made of.
 enum Source<'a> {
@@ -201,13 +224,18 @@ enum Source<'a> {
         parts: &'a [(&'a [u64], usize)],
         log_evals: usize,
     },
+    Resident {
+        store: &'a crate::columns::DeviceColumns,
+        parts: &'a [(usize, usize)],
+        log_evals: usize,
+    },
 }
 
 impl Source<'_> {
     fn log_evals(&self) -> u64 {
         match self {
             Self::Whole(evals) => evals.len().trailing_zeros() as u64,
-            Self::Parts { log_evals, .. } => *log_evals as u64,
+            Self::Parts { log_evals, .. } | Self::Resident { log_evals, .. } => *log_evals as u64,
         }
     }
 
@@ -222,6 +250,13 @@ impl Source<'_> {
                 for (column, offset) in *parts {
                     let mut at = coeffs.slice_mut(*offset..*offset + column.len());
                     stream.memcpy_htod(*column, &mut at)?;
+                }
+                Ok(())
+            }
+            Self::Resident { store, parts, .. } => {
+                stream.memset_zeros(coeffs)?;
+                for (column, offset) in *parts {
+                    store.copy_into(*column, coeffs, *offset, stream)?;
                 }
                 Ok(())
             }

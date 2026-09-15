@@ -814,6 +814,7 @@ const EVALUATE_THRESHOLD: usize = 1 << 16;
 pub(crate) fn evaluate_many_base<F, E>(
     columns: &[crate::mle::Mle<F>],
     point: &[math::field::element::FieldElement<E>],
+    resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     F: math::field::traits::IsField + 'static,
@@ -849,7 +850,9 @@ where
             core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
         })
         .collect();
-    let values = math_cuda::sumcheck::evaluate_many_base(&raw, &raw_point).ok()?;
+    let values =
+        math_cuda::sumcheck::evaluate_many_base(columns_at::<F>(resident, &raw), &raw_point)
+            .ok()?;
     EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
     Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
 }
@@ -858,6 +861,7 @@ where
 pub(crate) fn evaluate_many_base<F, E>(
     _columns: &[crate::mle::Mle<F>],
     _point: &[math::field::element::FieldElement<E>],
+    _resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     F: math::field::traits::IsField + 'static,
@@ -1359,6 +1363,78 @@ impl DeviceTree {
     }
 }
 
+/// The epoch's columns on the card, read by everything that would otherwise
+/// upload its own copy of them.
+#[cfg(feature = "cuda")]
+pub struct ResidentColumns(math_cuda::columns::DeviceColumns);
+
+/// One that could not be made. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct ResidentColumns(std::convert::Infallible);
+
+impl std::fmt::Debug for ResidentColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResidentColumns")
+    }
+}
+
+/// Puts every column of an epoch on the card, in the order given.
+///
+/// `None` when there is no device or it will not promise the room, and then
+/// each caller uploads what it needs as before.
+#[cfg(feature = "cuda")]
+pub fn upload_columns<F>(columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_COLUMNS").is_some()) {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw: Vec<&[u64]> = columns
+        .iter()
+        .map(|column| unsafe {
+            core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
+        })
+        .collect();
+    math_cuda::columns::DeviceColumns::upload(&raw).map(ResidentColumns)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_columns<F>(_columns: &[&crate::mle::Mle<F>]) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// Where a run of columns is, for the entry points that take either.
+#[cfg(feature = "cuda")]
+fn columns_at<'a, F>(
+    resident: Option<(&'a ResidentColumns, usize)>,
+    host: &'a [&'a [u64]],
+) -> math_cuda::columns::Columns<'a>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    match resident {
+        Some((store, first)) if store.0.is_run(first, host.len()) => {
+            math_cuda::columns::Columns::Device {
+                store: &store.0,
+                first,
+                width: host.len(),
+            }
+        }
+        _ => math_cuda::columns::Columns::Host(host),
+    }
+}
+
 /// A table's factors, uploaded once for everything that walks them.
 #[cfg(feature = "cuda")]
 pub struct DeviceFactors(math_cuda::sumcheck::DeviceFactors);
@@ -1390,6 +1466,7 @@ pub fn upload_factors_from_columns<F, E>(
     columns: &[crate::mle::Mle<F>],
     kinds: &[crate::constraint_argument::FactorKind],
     public: &[crate::mle::Mle<E>],
+    resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<DeviceFactors>
 where
     F: math::field::traits::IsField + 'static,
@@ -1459,7 +1536,7 @@ where
         .collect();
 
     let uploaded = math_cuda::sumcheck::DeviceFactors::from_columns(
-        &raw_columns,
+        columns_at::<F>(resident, &raw_columns),
         &plan,
         &raw_public,
         rows,
@@ -1475,6 +1552,7 @@ pub fn upload_factors_from_columns<F, E>(
     _columns: &[crate::mle::Mle<F>],
     _kinds: &[crate::constraint_argument::FactorKind],
     _public: &[crate::mle::Mle<E>],
+    _resident: Option<(&ResidentColumns, usize)>,
 ) -> Option<DeviceFactors>
 where
     F: math::field::traits::IsField + 'static,
@@ -1887,13 +1965,20 @@ where
     {
         return None;
     }
-    let parts: Vec<(&[u64], usize)> = message
-        .parts
-        .iter()
-        .map(|(column, offset)| (raw(column), *offset))
-        .collect();
-    let session =
-        math_cuda::whir_open::OpeningSession::from_shares_and_parts(&shares, len, &parts).ok()?;
+    let session = match &message.resident {
+        Some((store, parts)) => math_cuda::whir_open::OpeningSession::from_shares_and_resident(
+            &shares, len, &store.0, parts,
+        ),
+        None => {
+            let parts: Vec<(&[u64], usize)> = message
+                .parts
+                .iter()
+                .map(|(column, offset)| (raw(column), *offset))
+                .collect();
+            math_cuda::whir_open::OpeningSession::from_shares_and_parts(&shares, len, &parts)
+        }
+    }
+    .ok()?;
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(OpeningFactors { session, lowered })
 }
@@ -1988,6 +2073,48 @@ where
             .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
+}
+
+/// The same for parts the card already holds.
+#[cfg(feature = "cuda")]
+pub(crate) fn commit_resident(
+    store: &ResidentColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+) -> Option<(DeviceCodeword, [u8; 32])> {
+    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+        return None;
+    }
+    let (codeword, root) = math_cuda::whir::commit_codeword_resident(
+        &store.0,
+        parts,
+        log_evals,
+        log_blowup,
+        log_folding,
+        transient,
+    )
+    .ok()?;
+    COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((DeviceCodeword(codeword), root))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn commit_resident(
+    _store: &ResidentColumns,
+    _parts: &[(usize, usize)],
+    _log_evals: usize,
+    _log_blowup: usize,
+    _log_folding: usize,
+    _transient: bool,
+) -> Option<(DeviceCodeword, [u8; 32])> {
+    None
 }
 
 #[cfg(not(feature = "cuda"))]
