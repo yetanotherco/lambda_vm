@@ -41,6 +41,10 @@ syscall_numbers! {
     /// `DMA_MEMCPY_SYSCALL_NUMBER`. DMA memcpy chunks are proven by the
     /// dedicated DMA table.
     DmaMemcpy = 96,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `DMA_MEMSET_SYSCALL_NUMBER`. DMA memset chunks are proven by the
+    /// dedicated DMA_SET table.
+    DmaMemset = 97,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -76,6 +80,13 @@ pub fn dma_memcpy_data_rows(count: u64) -> u64 {
 pub fn dma_memcpy_trace_rows(count: u64) -> u64 {
     dma_memcpy_data_rows(count) + 1
 }
+/// DMA memset syscall number. Must match `syscalls/src/syscalls.rs`.
+pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+/// Largest fill value a DMA memset ecall accepts. C's `memset` writes
+/// `(unsigned char)c`, so the guest stub masks `a1` down to this range; a wider
+/// value is a malformed call. Bounding it here lets the DMA_SET AIR prove the
+/// same bound with one ALU LT instead of decomposing the register.
+pub const DMA_MEMSET_MAX_FILL: u64 = 255;
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -132,6 +143,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
+            v if v == DMA_MEMSET_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemset),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
@@ -154,6 +166,7 @@ impl SyscallNumbers {
             SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
             SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
             SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
+            SyscallNumbers::DmaMemset => DMA_MEMSET_SYSCALL_NUMBER,
             SyscallNumbers::Hint => HINT_SYSCALL_NUMBER,
             SyscallNumbers::Print => SyscallNumbers::Print as u64,
             SyscallNumbers::Panic => SyscallNumbers::Panic as u64,
@@ -169,7 +182,7 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
-            SyscallNumbers::DmaMemcpy => Some(Accelerator::Dma),
+            SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -620,7 +633,7 @@ impl Instruction {
                         let src = registers.read(11)?;
                         let n = registers.read(12)?;
                         if n > DMA_MEMCPY_MAX_BYTES {
-                            return Err(ExecutionError::DmaMemcpyChunkTooLarge(n));
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
                         }
                         dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
                         src.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
@@ -635,6 +648,29 @@ impl Instruction {
                             memory.store_byte(dst + i as u64, byte);
                         }
                         src2_val = src;
+                        dst_val = n;
+                    }
+                    SyscallNumbers::DmaMemset => {
+                        // memset(dst = x10, fill = x11, n = x12). No source range
+                        // to snapshot: every byte written is the same constant, so
+                        // the DMA_SET trace carries one fill column instead of the
+                        // eight value columns memcpy needs.
+                        let dst = registers.read(10)?;
+                        let fill = registers.read(11)?;
+                        let n = registers.read(12)?;
+                        if n > DMA_MEMCPY_MAX_BYTES {
+                            return Err(ExecutionError::DmaChunkTooLarge(n));
+                        }
+                        if fill > DMA_MEMSET_MAX_FILL {
+                            return Err(ExecutionError::DmaMemsetFillTooLarge(fill));
+                        }
+                        dst.checked_add(n).ok_or(MemoryError::AddressOverflow)?;
+
+                        let byte = fill as u8;
+                        for i in 0..n {
+                            memory.store_byte(dst + i, byte);
+                        }
+                        src2_val = fill;
                         dst_val = n;
                     }
                     SyscallNumbers::Hint => {
@@ -853,8 +889,10 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
-    #[error("DMA memcpy chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
-    DmaMemcpyChunkTooLarge(u64),
+    #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
+    DmaChunkTooLarge(u64),
+    #[error("DMA memset fill is {0}; maximum is {DMA_MEMSET_MAX_FILL}")]
+    DmaMemsetFillTooLarge(u64),
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,
     #[error("Unknown hint selector: {0}")]

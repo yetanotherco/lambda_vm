@@ -1233,6 +1233,70 @@ fn test_prove_dma_memcpy_rust_guest() {
     );
 }
 
+/// Positive control for the fixture the memset forgery tests tamper with. Those
+/// tests assert that verification FAILS, so without this they would also pass if
+/// the untampered trace never verified in the first place.
+#[test]
+fn test_prove_dma_memset_min_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_min.elf"))
+            .expect("dma_memset_min.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memset guest should verify"
+    );
+    assert_eq!(proof.public_output, [0x3Cu8; 43]);
+}
+
+/// End-to-end memset: the guest exercises every row-schedule boundary (empty,
+/// sub-tail, exact widths, the per-ecall cap, multi-chunk, a masked wide fill,
+/// and an unaligned page-crossing destination), so a passing proof covers the
+/// DMA_SET trace, its bus balance, and the fill-byte bound together.
+#[test]
+fn test_prove_dma_memset_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_cases.elf"))
+            .expect("dma_memset_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memset guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memset-ok");
+}
+
+/// memmove rides the memcpy ecall unchanged. The interesting case is a forward
+/// overlap longer than one 256-byte chunk: the stub must walk chunks backwards,
+/// or an earlier chunk clobbers source bytes a later one still needs.
+#[test]
+fn test_prove_dma_memmove_cases_rust_guest() {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memmove_cases.elf"))
+            .expect("dma_memmove_cases.elf not found — build its make target");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "DMA memmove guest should verify"
+    );
+    assert_eq!(proof.public_output, b"dma-memmove-ok");
+}
+
 #[test]
 fn test_prove_dma_memcpy_cases_rust_guest() {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1327,6 +1391,184 @@ fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
         .set(forged_row, dma_cols::TAIL, FieldElement::one());
 
     assert_dma_forgery_rejected(&elf, &mut traces, "TAIL must equal count < 8");
+}
+
+/// Soundness: the seven high lanes of a wide DMA_SET write cannot carry a byte
+/// other than `fill`. `fill_wide` has no counterpart in the memcpy table — it is
+/// the column that lets one write tuple serve both widths — so it is the one
+/// piece of this AIR with no already-tested ancestor.
+#[test]
+fn test_prove_dma_memset_forged_fill_wide_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
+    let original = *traces
+        .dma_set
+        .main_table
+        .get(forged_row, dma_set_cols::FILL_WIDE);
+    traces.dma_set.main_table.set(
+        forged_row,
+        dma_set_cols::FILL_WIDE,
+        original + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "lanes 1..7 of a wide fill must carry the same byte as lane 0",
+    );
+}
+
+/// Soundness: `fill` rides the DmaSetNext chain, so an intermediate row cannot
+/// switch to a different byte mid-fill. This is the anchor that makes one
+/// register read on the first row bind every subsequent write.
+#[test]
+fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    // `!tail` matters: on a one-byte row `fill_wide` must stay zero, so shifting
+    // both lanes there would trip constraint 9 locally and the test would prove
+    // something else.
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
+    // Shift both lanes so the row stays internally consistent (constraint 10
+    // still holds); only the chain token and the MEMW write disagree.
+    for column in [dma_set_cols::FILL, dma_set_cols::FILL_WIDE] {
+        let original = *traces.dma_set.main_table.get(forged_row, column);
+        traces.dma_set.main_table.set(
+            forged_row,
+            column,
+            original + FieldElement::<GoldilocksField>::one(),
+        );
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate row must keep the fill byte its predecessor sent",
+    );
+}
+
+#[test]
+fn test_prove_dma_memset_forged_early_end_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
+    traces
+        .dma_set
+        .main_table
+        .set(forged_row, dma_set_cols::END, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+}
+
+/// Flipping `tail` rewrites `step` from 8 to 1, so the row's own address and
+/// count arithmetic stop holding. Note this is rejected locally by the ADD
+/// carries, NOT by the ALU LT that pins `tail = (count < 8)` — that bus has no
+/// negative coverage here, the same gap the memcpy sibling has.
+#[test]
+fn test_prove_dma_memset_forged_wide_tail_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
+    traces
+        .dma_set
+        .main_table
+        .set(forged_row, dma_set_cols::TAIL, FieldElement::one());
+
+    assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
+}
+
+/// Soundness: a one-byte row must not broadcast its fill into lanes 1..7. This
+/// is the direction that matters — it is an eight-byte write where a single byte
+/// was authorised. The wide-row test above covers the opposite, harmless case.
+#[test]
+fn test_prove_dma_memset_forged_tail_fill_wide_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && tail);
+    let fill = *traces
+        .dma_set
+        .main_table
+        .get(forged_row, dma_set_cols::FILL);
+    traces
+        .dma_set
+        .main_table
+        .set(forged_row, dma_set_cols::FILL_WIDE, fill);
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a one-byte row must not widen its write to eight lanes",
+    );
+}
+
+/// Soundness: the destination chain. The memcpy suite tampers `src`/`src_incr`
+/// together; this is the memset analogue, and without it no test moves an
+/// address at all.
+#[test]
+fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    let (elf, mut traces) = dma_memset_fixture();
+    let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
+
+    // Shift both the current destination and its locally-consistent successor.
+    // The row's ADD stays valid; the predecessor's DmaSetNext tuple and the
+    // memory write no longer match.
+    for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
+        let original = *traces.dma_set.main_table.get(forged_row, column);
+        traces
+            .dma_set
+            .main_table
+            .set(forged_row, column, original + FieldElement::from(8u64));
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "an intermediate row must stay chained to its predecessor's address",
+    );
+}
+
+fn dma_memset_fixture() -> (Elf, Traces) {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/dma_memset_min.elf"))
+            .expect("dma_memset_min.elf not found — build its make target");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("execution");
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+fn dma_set_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
+    use crate::tables::dma_set::cols as dma_set_cols;
+
+    (0..traces.dma_set.num_rows())
+        .find(|&row| {
+            let active = *traces.dma_set.main_table.get(row, dma_set_cols::MU)
+                == FieldElement::<GoldilocksField>::one();
+            let first = *traces.dma_set.main_table.get(row, dma_set_cols::FIRST)
+                == FieldElement::<GoldilocksField>::one();
+            let end = *traces.dma_set.main_table.get(row, dma_set_cols::END)
+                == FieldElement::<GoldilocksField>::one();
+            let tail = *traces.dma_set.main_table.get(row, dma_set_cols::TAIL)
+                == FieldElement::<GoldilocksField>::one();
+            active && predicate(first, end, tail)
+        })
+        .expect("guest must contain the requested real DMA_SET row")
 }
 
 fn dma_memcpy_fixture() -> (Elf, Traces) {

@@ -1149,6 +1149,7 @@ mod tests {
         (SyscallNumbers::KeccakPermute, Some(Accelerator::Keccak)),
         (SyscallNumbers::Ecsm, Some(Accelerator::Ecsm)),
         (SyscallNumbers::DmaMemcpy, Some(Accelerator::Dma)),
+        (SyscallNumbers::DmaMemset, Some(Accelerator::Dma)),
         (SyscallNumbers::Print, None),
         (SyscallNumbers::Panic, None),
         (SyscallNumbers::Commit, None),
