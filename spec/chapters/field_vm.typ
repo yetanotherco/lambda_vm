@@ -53,39 +53,66 @@ The $N + 2$ registers making up a state of the VM are:
 a `ZERO` bit-register, the base field `PC` register and $N$ general purpose extension field registers.
 The number of registers was chosen as a tradeoff between the versatility of having more mutable state,
 and the extra cost in committed columns and decoding logic that grows with $N$.
-#rj[Register index for `ZERO` = $0$ and `PC` = $1$ and gp register `Ri` = $i + 2$]
+We index the registers from $0$ to $N + 1$ in the order above, so `ZERO` gets index $0$,
+`PC` gets index $1$ and then follow $N$ general purpose registers with indices $2...N+1$.
+
+The `ZERO` register indicates whether the previous instruction had a zero result,
+i.e. $next("ZERO") <=> #`d` = 0$.
+The `PC` register stores the program counter: the address of the current instruction,
+and --- except when branches are taken, through register hinting --- is incremented by one
+for every consecutive state.
+As the name implies, the general purpose registers are available for arbitrary usage.
 
 Each argument to the `FMA` constraint has either of the two following forms:
 - $#`imm`_0 dot #`reg` + #`imm`_1$
 - $#`MEM[`#`imm`_0 dot #`reg` + #`imm`_1#`]`$
 where each immediate is a base field element, encoded in the instruction for a specific argument.
-The `d` argument to the instruction obtains its register value from the _future_ state.
-That is, the state from which the next instruction will get its input register values.
-The `ZERO` register of the future state contains a bit (as a base field element) that indicates whether or not
-the `d` value was zero for the current instruction.
-The `PC` register contains the program counter (as a base field element) and indicates which instruction is to be executed.
-Every other register can hold an arbitrary extension field element.
+The `d` argument to the instruction obtains its register value from the future state.
 
-== Register hints
+== Register hinting
 
 Each general-purpose register in the current state can be marked as _hinted_ by the acting instruction.
 This means that from the current state onwards, the register can take a value
 that is independent from the previous value, except as constrained by the instruction.
-Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument ---
-whether wrapped in a `MEM[]` lookup or not --- will change in the future state, and as such in the `d` argument too.
-Output hinting is commonly used to assign the result of a computation: `FMA X == X * X, hint out` would
-compute $#`X` dot #`X`$ and assign the result to `X` in the future state.
-The output hint, in contradiction with the input hints, does allow `PC` to be hinted, so as to enable
-causal jumps and control flow in the program.
-Any register that is not hinted will have the same value in the future state as in the current state,
+Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument
+will change from the future state onwards, and as such in the `d` argument too.
+This applies to the _register_ of the `d` argument, regardless of the additional immediates and `MEM[]`
+access that may happen in the instruction.
+We distinguish between these two types by naming them respectively _input hinting_ and _output hinting_.
+
+The clearest use of output hinting is to enable the `FMA` instruction to perform computation.
+If, for instance, $#`d` = 1 dot #`reg` + 0$, then we can interpret the instruction
+as computing $#`a` dot #`b` + #`c`$ and assigning the result to $next("reg")$.
+Performing the hint only in the future state ensures that the original value of `reg` remains
+available throughout the computation.
+Additionally, output hinting allows for `PC` to be hinted,#footnote[
+  Note that we disallow this in input hinting, as it would allow for instructions
+  that can effectively hijack program execution.
+] enabling causal jumps and control flow in the program.
+
+In contrast, input hinting does not look like any traditional model of execution,
+instead allowing to update one or more values in the state, as long as the resulting state still satisfies
+the FMA constraint.
+This can, e.g., be used to compute field inverses and square roots, which have a degree 2 constraint
+on the result.
+There may even be situations where hinting multiple values can be chosen simultaneously, such as a decomposition
+$a = b + c$ in a divide-and-conquer algorithm.
+Even hinting registers that are not used in the current instruction may provide useful in limited situations.
+Though we approach it differently in @field-VM:sec:calling, one can imagine a calling convention
+where the frame pointer is updated directly during the jump instruction, without being further involved
+in the computation of the next `PC`.
+
+Any register that is not output hinted in the current instruction nor input hinted in the future instruction
+will have the same value in the future state as in the current state,
 with the appropriate exceptions in behaviour for the `ZERO` and `PC` registers.
+More example uses of register hinting can be found below in our suggested pseudoinstructions.
 
 #aside("Hint collisions")[
 One may observe that an output hint for state `i` and an input hint on state `i + 1` can affect
 the same register in a single state.
 While this is true in theory, it is not a problem in practice, as two successive states are,
-in almost all cases, operated on by two consecutive ---in the program text--- instructions,
-and as such, hinting collisions can be easily identified, and most actual programs
+in almost all cases, operated on by two consecutive --- in the program text --- instructions.
+As such, hinting collisions can be easily identified, and most actual programs
 should have no reason to have hinting collisions.
 The most likely practical collision scenario would be that instruction `i` does not
 output-hint, but instruction `i + 1` input-hints the output register of state `i`.
@@ -135,7 +162,7 @@ as experience may point out further useful abstractions.
 Eventually, we hope that a set of common pseudoinstructions can be extracted from actual usage,
 and inform potential optimizations that remove unused capabilities (e.g. reducing the number of immediates involved).
 
-== Calling convention
+== Calling convention<field-VM:sec:calling>
 
 Since the VM makes use of read-only memory, traditional usage of a program stack does not work.
 We assume that each function invocation (unless other optimizations apply) will have an associated _frame_,
@@ -225,12 +252,13 @@ Finally, we must ensure the consistency between consecutive rows of the table,
 and allow for hinting.
 We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
-- $!#`hint_input`'_r and !#`hint_output` => #`registers`'_r = #`registers`_r$, `r` could not have been hinted,
+- $!#`hint_input`'_r and !#`hint_output` => #`registers`'_r = #`registers`_r$,\ `r` could not have been hinted,
   since it was not input-hinted in the next row, and there was no output hint, so the next `r` should remain the same.
-- $!#`hint_input`'_r and f_(r)(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers`_r$
+- $!#`hint_input`'_r and f_(r)(#`argument_registers`_0) = 0 => #`registers`'_r = #`registers`_r$,\
   `r` was not input-hinted in the next row, and it was not the output register, so it once again stays the same.
 
 Together, these constraints are logically equivalent to $!#`hint_input`'_r and not (#`hint_output` and f_(r)(#`argument_registers`_0) = 1) => #`registers`'_r = #`registers`_r$, but expressed in a way that polynomial constraints can more easily handle.
+
 Naturally, the `PC` and `ZERO` registers are exceptions since we need $#`pc`' = #`pc` + 1$ if it is not (output-)hinted,
 and $#`ZERO`'$ purely depends on $#`args`_0$ and not on `ZERO`.
 
