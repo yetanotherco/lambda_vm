@@ -234,12 +234,24 @@ We denote by $t + 1$ the number of non-zero $f_(i, k)$ for fixed $i$.
 This allows us to first compute the values of
 $#`argument_registers[i]`^(d - 1)$, $#`argument_registers[i]`^(2d - 3)$ and so on
 to `arg_register_powers` with constraints of degree $<= d$,
-and then compute $#`args_premem[i]` = #`argument_scalars[i]` dot sum_(j = 0)^(N + 1) #`registers[j]` dot f_(j)(#`argument_registers[i]`) + #`argument_offsets[i]`$.
-The coefficients for all $f_(i, k)$ are pre-computed once, based on the choices of `N`, `d` and `t`,
+and then compute
+$
+  #`args_premem[i]` &= #`argument_scalars[i]` dot sum_(j = 0)^(N + 1) #`registers[j]` dot f_(j)(#`argument_registers[i]`)\
+                    &+ #`argument_offsets[i]`.
+$
+The coefficients for all $f_(i, k)$ are pre-computed once, based on the choices of $N$, $d$ and $t$,
 and used through the `MUX` constant columns.
-#rj[Analysis of relation between $d$, $N$, $t$; mention current choice of $(d, N, t) = (5, 5, 1)$]
-Observe that the handling for `argument_registers[0]` is separate, as this represents the output argument,
-which should take its values from the next row in the table.
+In this way, $f_(i, 0)$ can have degree at most $d - 2$, as it gets multiplied with $#`imm`_0$ and the register value,
+and the other $f_(i, k)$ can have degree at most $d - 3$, as they also get multiplied with the appropriate power of $x$.
+This leads to a total degree of $op("deg") f_(i) = d - 1 + t dot (d - 2) - 1$ for a maximal number of registers $N + 2 <= op("deg") f_(i) + 1$.
+Hence, for a fixed choice of $d$ and $t$, this scheme can support up to $N <= (t + 1) dot (d - 2) - 1$ general purpose registers.
+Currently, the parametrization is set to be $(d, N, t) = (5, 5, 1)$.
+
+While @field-VM:c:first-mux, and the other constraints using this multiplexing technique, look like they have
+a total degree of $d + 1$, this is purely a syntactical matter.
+Due to our choices to set `arg_register_powers[0] = 1` and `MUX[j][k][5] = 0` for $k != 0$ (by construction of the $f_(j,k)$ polynomials), we stay at a total degree $d$.
+Also observe that the handling for `argument_registers[0]` is separated as @field-VM:c:out-mux,
+as this represents the output argument, which should take its values from the next row in the table.
 
 #render_constraint_table(chip, config, groups: "mux")
 
