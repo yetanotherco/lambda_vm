@@ -366,6 +366,48 @@ fn validate_still_requires_cpu_and_the_register_file() {
 /// one field near `usize::MAX`, pick a second to carry the sum around to
 /// whatever `proofs.len()` is, and pass that check with the huge field intact —
 /// straight into `VmAirs::new`, which sizes a `Vec` from it.
+/// The six accelerators are not chunked — `generate_optional` emits one table or
+/// none — so any count above 1 describes a table set no prover can build. Both
+/// verifiers call `validate` before the counts size anything (`verify_proof_parts`
+/// and `verify_epoch`), so rejecting it here is rejecting it on every path.
+#[test]
+fn an_accelerator_count_above_one_is_rejected() {
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    let honest = traces.table_counts();
+    assert!(honest.validate().is_ok());
+    assert_eq!(
+        honest.keccak, 1,
+        "an accelerator a run reaches carries exactly one table"
+    );
+
+    // Named setters rather than a match with a catch-all: a wrong field would
+    // otherwise pass the assertion below while testing the wrong count.
+    type SetCount = fn(&mut TableCounts);
+    let inflate: [(&str, SetCount); 6] = [
+        ("keccak", |c| c.keccak = 2),
+        ("keccak_rnd", |c| c.keccak_rnd = 2),
+        ("ecsm", |c| c.ecsm = 2),
+        ("ecdas", |c| c.ecdas = 2),
+        ("hint", |c| c.hint = 2),
+        ("commit", |c| c.commit = 2),
+    ];
+    for (name, set_to_two) in inflate {
+        let mut counts = honest.clone();
+        set_to_two(&mut counts);
+        assert!(
+            counts.validate().is_err(),
+            "{name} count of 2 must be rejected: the chip is not chunked"
+        );
+    }
+
+    // The chunked chips keep taking any count: this is a cap on the six, not a
+    // cap on chunking.
+    let mut many_mul = honest.clone();
+    many_mul.mul = 7;
+    assert!(many_mul.validate().is_ok(), "chunked chips still chunk");
+}
+
 #[test]
 fn counts_that_wrap_have_no_total() {
     let (elf, logs, _instructions) = run_asm_elf("test_mul_8");

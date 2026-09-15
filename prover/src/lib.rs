@@ -177,6 +177,26 @@ impl TableCounts {
                 )));
             }
         }
+        // The accelerators are not chunked: `generate_optional` emits one table
+        // or none, so a count above 1 is a shape no prover can produce. Rejected
+        // here rather than left to the sub-proof cross-check, which would only
+        // catch it once the counts had already sized the AIR set. If one of them
+        // ever becomes chunked, this list is what changes.
+        let at_most_one = [
+            ("keccak", self.keccak),
+            ("keccak_rnd", self.keccak_rnd),
+            ("ecsm", self.ecsm),
+            ("ecdas", self.ecdas),
+            ("hint", self.hint),
+            ("commit", self.commit),
+        ];
+        for (name, count) in at_most_one {
+            if count > 1 {
+                return Err(Error::InvalidTableCounts(format!(
+                    "{name} count is {count} — accelerator tables are not chunked"
+                )));
+            }
+        }
         Ok(())
     }
 }
