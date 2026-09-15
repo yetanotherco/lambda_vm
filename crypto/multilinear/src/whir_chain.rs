@@ -350,6 +350,35 @@ fn block_size<V: IsField>(openings: &[crate::whir_commit::CosetOpening<V>]) -> u
 /// `transient` says whether this commitment has to promise the device room its
 /// own commit and opening take — true when it stands alone, false when a
 /// caller committing several has promised that turn once for all of them.
+/// A polynomial to commit and open, which may not exist yet.
+///
+/// A stacked polynomial is its columns written at their offsets and zeros in
+/// between. Assembling it here is a pass over every byte the device is about to
+/// read anyway, so the parts are handed over as they are and whoever needs a
+/// whole one builds it — which on the device path is nobody.
+pub struct Stacked<'a, F: IsField> {
+    /// `(column, offset in elements)`.
+    pub parts: Vec<(&'a Mle<F>, usize)>,
+    pub num_vars: usize,
+}
+
+impl<F: IsField + 'static> Stacked<'_, F> {
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    /// The polynomial itself, assembled here. Only the host paths ask — a
+    /// device writes the parts where they go and never sees a whole one.
+    pub fn assemble(&self) -> Result<Mle<F>, Error> {
+        let mut buffer = vec![FieldElement::<F>::zero(); 1usize << self.num_vars];
+        for (column, offset) in &self.parts {
+            buffer[*offset..*offset + column.len()].clone_from_slice(column.evals());
+        }
+        Mle::new(buffer)
+    }
+}
+
+/// A whole polynomial is a stacked one of a single part at offset zero.
 pub fn commit<F>(
     f: &Mle<F>,
     config: &ChainConfig,
@@ -359,19 +388,39 @@ where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    let schedule = config.schedule(f.num_vars());
+    commit_stacked(
+        &Stacked {
+            parts: vec![(f, 0)],
+            num_vars: f.num_vars(),
+        },
+        config,
+        transient,
+    )
+}
+
+pub fn commit_stacked<F>(
+    f: &Stacked<'_, F>,
+    config: &ChainConfig,
+    transient: bool,
+) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let num_vars = f.num_vars();
+    let schedule = config.schedule(num_vars);
     let first = schedule.first().copied().unwrap_or(0);
-    let domain = Domain::<F>::new(f.num_vars() + config.log_blowup)?;
+    let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
-    let commitment =
-        match crate::gpu::commit_resident(f.evals(), config.log_blowup, first, transient) {
-            Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
-            None => CodewordCommitment::from_codeword(
-                encode::<F, F>(&lift_coefficients(f), &domain)?,
-                first,
-            )?,
-        };
+    let attempt = crate::gpu::commit_parts(&f.parts, num_vars, config.log_blowup, first, transient);
+    let commitment = match attempt {
+        Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
+        None => CodewordCommitment::from_codeword(
+            encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
+            first,
+        )?,
+    };
     Ok((commitment, domain))
 }
 
@@ -429,14 +478,18 @@ where
     /// straight into its buffer, and the host builds the table only if none
     /// takes them.
     fn from_shares(
-        f: &Mle<F>,
+        f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
         n_stack: usize,
     ) -> Result<Self, Error> {
         if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
             return Ok(Self::Device(device));
         }
-        Self::new(f, crate::stacked_eval::weight_table(shares, n_stack)?)
+        // Only here does a stacked polynomial have to exist on the host.
+        Self::new(
+            &f.assemble()?,
+            crate::stacked_eval::weight_table(shares, n_stack)?,
+        )
     }
 
     fn num_vars(&self) -> usize {
@@ -539,7 +592,7 @@ where
 /// materializes only if none does.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_shared<F, E, T>(
-    f: &Mle<F>,
+    f: &Stacked<'_, F>,
     shares: &[crate::stacked_eval::WeightShare<'_, E>],
     n_stack: usize,
     commitment: &CodewordCommitment<F>,
@@ -555,7 +608,14 @@ where
     T: IsTranscript<E>,
 {
     let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
-    prove_with_factors::<F, E, T>(f, factors, commitment, domain, config, transcript)
+    prove_with_factors::<F, E, T>(
+        f.num_vars(),
+        factors,
+        commitment,
+        domain,
+        config,
+        transcript,
+    )
 }
 
 /// Proves `Σ_x w(x)·f(x) = y` for a weight the verifier can evaluate itself.
@@ -575,12 +635,19 @@ where
     T: IsTranscript<E>,
 {
     let factors = Factors::<F, E>::new(f, weight)?;
-    prove_with_factors::<F, E, T>(f, factors, commitment, domain, config, transcript)
+    prove_with_factors::<F, E, T>(
+        f.num_vars(),
+        factors,
+        commitment,
+        domain,
+        config,
+        transcript,
+    )
 }
 
 /// The chain itself, over factors that are wherever they are.
 fn prove_with_factors<F, E, T>(
-    f: &Mle<F>,
+    num_vars: usize,
     mut factors: Factors<F, E>,
     commitment: &CodewordCommitment<F>,
     domain: &Domain<F>,
@@ -594,7 +661,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
 {
-    let schedule = config.schedule(f.num_vars());
+    let schedule = config.schedule(num_vars);
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E>::Base(commitment);

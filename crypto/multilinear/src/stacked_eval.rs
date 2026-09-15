@@ -52,7 +52,6 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     layout: StackedLayout,
-    polys: Vec<Mle<F>>,
     commitments: Vec<CodewordCommitment<F>>,
     domain: Domain<F>,
     /// The room the commits and the openings take turns with, promised once
@@ -75,7 +74,20 @@ where
         columns: &[&Mle<F>],
         config: &ChainConfig,
     ) -> Result<Self, Error> {
-        let polys = layout.stack(columns)?;
+        // The stacked polynomials are not built here: each is its columns at
+        // their offsets, and both the commit and the opening write those
+        // straight into the device's buffer. Assembling a copy on the way is a
+        // pass over every byte about to be uploaded.
+        let sources: Vec<whir_chain::Stacked<'_, F>> = (0..layout.num_polys())
+            .map(|poly| whir_chain::Stacked {
+                parts: layout
+                    .parts_of(poly)
+                    .into_iter()
+                    .map(|(column, offset)| (columns[column], offset))
+                    .collect(),
+                num_vars: layout.n_stack(),
+            })
+            .collect();
         // The commits and the openings take turns with the same working set —
         // two commits in flight, then one opening at a time — so the group
         // promises one turn's worth rather than every polynomial promising its
@@ -83,7 +95,7 @@ where
         // sixteen, and what the difference buys is the widest tables getting a
         // device at all. If the card will not promise it, each commitment
         // promises its own, which is the conservative accounting.
-        let room = polys.first().and_then(|poly| {
+        let room = sources.first().and_then(|poly| {
             let codeword_bytes = (1u64 << (poly.num_vars() + config.log_blowup)) * 8;
             crate::gpu::reserve_room(codeword_bytes)
         });
@@ -94,10 +106,12 @@ where
         // has nothing left to hide behind, and each one holds a codeword and a
         // tree on the device while it runs. Every polynomial has the same
         // variable count, so they share a domain.
-        let commit = |poly: &Mle<F>| whir_chain::commit::<F>(poly, config, transient);
+        let commit = |poly: &whir_chain::Stacked<'_, F>| {
+            whir_chain::commit_stacked::<F>(poly, config, transient)
+        };
         let mut domain = None;
-        let mut commitments = Vec::with_capacity(polys.len());
-        for pair in polys.chunks(2) {
+        let mut commitments = Vec::with_capacity(sources.len());
+        for pair in sources.chunks(2) {
             #[cfg(feature = "parallel")]
             let built = pair
                 .par_iter()
@@ -112,7 +126,6 @@ where
         }
         Ok(Self {
             layout,
-            polys,
             commitments,
             domain: domain.ok_or(Error::EmptyPolynomial)?,
             _room: room,
@@ -311,6 +324,7 @@ fn claimed<E: IsField>(
 /// pick them after seeing it.
 pub fn prove<F, E, T>(
     stacked: &StackedCommitment<F>,
+    columns: &[&Mle<F>],
     point: &Claimed<'_, E>,
     values: &[FieldElement<E>],
     config: &ChainConfig,
@@ -335,12 +349,22 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
 
-    let mut polys = Vec::with_capacity(stacked.polys.len());
-    for (i, (poly, commitment)) in stacked.polys.iter().zip(&stacked.commitments).enumerate() {
+    let mut polys = Vec::with_capacity(stacked.commitments.len());
+    for (i, commitment) in stacked.commitments.iter().enumerate() {
+        // The polynomial is its columns at their offsets, handed over as they
+        // are — see `StackedCommitment::commit`.
+        let poly = whir_chain::Stacked {
+            parts: layout
+                .parts_of(i)
+                .into_iter()
+                .map(|(column, offset)| (columns[column], offset))
+                .collect(),
+            num_vars: layout.n_stack(),
+        };
         // The weight goes down as its shares: a device writes them into its own
         // buffer, and the host materializes the table only if none does.
         polys.push(whir_chain::prove_shared::<F, E, T>(
-            poly,
+            &poly,
             &weight_shares(layout, i, point, &weights)?,
             layout.n_stack(),
             commitment,
@@ -469,6 +493,7 @@ mod tests {
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
+            &crate::stacking::borrow(columns),
             &Claimed::Shared(at),
             claimed,
             &config(),
@@ -627,6 +652,7 @@ mod tests {
         assert!(matches!(
             prove(
                 &stacked,
+                &crate::stacking::borrow(&columns),
                 &Claimed::Shared(&at),
                 &claimed[..3],
                 &config(),
@@ -653,6 +679,7 @@ mod tests {
         let roots = stacked.roots();
         let proof = prove(
             &stacked,
+            &crate::stacking::borrow(&columns),
             &Claimed::Shared(&at),
             &claimed,
             &config(),
@@ -712,6 +739,7 @@ mod tests {
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
         let proof = prove::<F, Ext, _>(
             &stacked,
+            &crate::stacking::borrow(&columns),
             &Claimed::Shared(&at),
             &claimed,
             &config(),
@@ -764,7 +792,15 @@ mod tests {
         let roots = stacked.roots();
         let at = Claimed::PerColumn(&points);
 
-        let proof = prove(&stacked, &at, &claimed, &config(), &mut transcript()).unwrap();
+        let proof = prove(
+            &stacked,
+            &crate::stacking::borrow(&columns),
+            &at,
+            &claimed,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
         verify(
             &proof,
             stacked.layout(),
@@ -781,7 +817,15 @@ mod tests {
         // weight is really tying each claim to its own column.
         let mut tampered = claimed.clone();
         tampered[1] += FE::one();
-        let proof = prove(&stacked, &at, &tampered, &config(), &mut transcript()).unwrap();
+        let proof = prove(
+            &stacked,
+            &crate::stacking::borrow(&columns),
+            &at,
+            &tampered,
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
         assert!(
             verify(
                 &proof,

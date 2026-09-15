@@ -133,6 +133,21 @@ impl StackedLayout {
         self.placements.get(column)
     }
 
+    /// The columns that make up stacked polynomial `poly`, each with the offset
+    /// it sits at.
+    ///
+    /// What a stacked polynomial *is*, without building it: the commit writes
+    /// these straight into the device buffer instead of assembling a copy here
+    /// first, and the opening does the same.
+    pub fn parts_of(&self, poly: usize) -> Vec<(usize, usize)> {
+        self.placements
+            .iter()
+            .enumerate()
+            .filter(|(_, place)| place.poly == poly)
+            .map(|(column, place)| (column, place.offset))
+            .collect()
+    }
+
     /// Cells that carry data, versus the `num_polys · 2^n_stack` committed.
     pub fn occupancy(&self) -> (usize, usize) {
         let used: usize = self.placements.iter().map(|p| 1usize << p.num_vars).sum();

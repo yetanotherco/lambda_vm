@@ -169,17 +169,82 @@ impl DeviceCodeword {
 ///
 /// `log_folding` is the first fold's width: a leaf is the `2^log_folding` coset
 /// that folds onto one position.
+/// The same, over a stacked polynomial that is never assembled on the host.
+///
+/// A stacked polynomial is its columns written at their offsets and zeros
+/// everywhere else, so the parts go straight into the device buffer: what the
+/// host would have built is a copy of them, and building it costs a pass over
+/// every byte the commit is about to upload anyway.
+///
+/// `parts` is `(column, offset in elements)`; `log_evals` is the stacked
+/// polynomial's variable count.
+pub fn commit_codeword_parts(
+    parts: &[(&[u64], usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_from(
+        Source::Parts { parts, log_evals },
+        log_blowup,
+        log_folding,
+        transient,
+    )
+}
+
+/// Where a commit's coefficients come from: one slab the host holds, or the
+/// columns a stacked polynomial is made of.
+enum Source<'a> {
+    Whole(&'a [u64]),
+    Parts {
+        parts: &'a [(&'a [u64], usize)],
+        log_evals: usize,
+    },
+}
+
+impl Source<'_> {
+    fn log_evals(&self) -> u64 {
+        match self {
+            Self::Whole(evals) => evals.len().trailing_zeros() as u64,
+            Self::Parts { log_evals, .. } => *log_evals as u64,
+        }
+    }
+
+    /// Fills `coeffs`, which is `2^log_evals` elements long.
+    fn write(&self, stream: &Arc<CudaStream>, coeffs: &mut CudaSlice<u64>) -> Result<()> {
+        match self {
+            Self::Whole(evals) => stream.memcpy_htod(*evals, coeffs),
+            Self::Parts { parts, .. } => {
+                // Everything the parts do not cover is the stacking's padding,
+                // and that is zero by definition.
+                stream.memset_zeros(coeffs)?;
+                for (column, offset) in *parts {
+                    let mut at = coeffs.slice_mut(*offset..*offset + column.len());
+                    stream.memcpy_htod(*column, &mut at)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn commit_codeword(
     evals: &[u64],
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
-    assert!(
-        evals.len().is_power_of_two(),
-        "evals must be a power of two"
-    );
-    let log_evals = evals.len().trailing_zeros() as u64;
+    commit_from(Source::Whole(evals), log_blowup, log_folding, transient)
+}
+
+fn commit_from(
+    source: Source<'_>,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+) -> Result<(DeviceCodeword, [u8; 32])> {
+    let log_evals = source.log_evals();
     let log_n = log_evals + log_blowup as u64;
     let n = 1usize << log_n;
     assert!(
@@ -212,10 +277,16 @@ pub fn commit_codeword(
     // The coefficients get a buffer of their own: the Möbius transform runs
     // over them, and the spread below reads them while it writes the codeword.
     // SAFETY: every element is written by the copy below.
-    let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, evals.len()) }?;
-    stream.memcpy_htod(evals, &mut coeffs)?;
+    let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
+    source.write(&stream, &mut coeffs)?;
 
-    mobius(stream.as_ref(), be, &mut coeffs, evals.len(), log_evals)?;
+    mobius(
+        stream.as_ref(),
+        be,
+        &mut coeffs,
+        1usize << log_evals,
+        log_evals,
+    )?;
 
     // The lift's bit-reverse and the NTT's cancel around the zero padding —
     // see `lift_spread`. What was two scattered passes over the codeword plus

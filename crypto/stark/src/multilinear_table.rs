@@ -303,6 +303,12 @@ where
     pub fn num_committed_columns(&self) -> usize {
         self.trace.columns().len()
     }
+
+    /// The committed columns themselves. The opening needs them: a stacked
+    /// polynomial is these at their offsets, and it is never assembled.
+    pub fn columns(&self) -> &[Mle<F>] {
+        self.trace.columns()
+    }
 }
 
 /// Every table's columns, committed **once**.
@@ -452,7 +458,7 @@ where
             let layout = global_layout(&shapes)?;
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
-            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.trace.columns()).collect();
+            let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
             let stacked = StackedCommitment::<F>::commit(layout, &columns, config)?;
             roots.extend(stacked.roots());
             groups.push(stacked);
@@ -843,8 +849,14 @@ where
             .iter()
             .map(|t| t.num_committed_columns())
             .sum();
+        // The same columns, in the same order, the group was committed over.
+        let group_columns: Vec<&Mle<F>> = committed.tables()[table_at..table_at + size]
+            .iter()
+            .flat_map(|t| t.trace.columns())
+            .collect();
         columns.push(stacked_eval::prove::<F, E, T>(
             group,
+            &group_columns,
             &Claimed::PerColumn(&points[column_at..column_at + width]),
             &values[column_at..column_at + width],
             config,

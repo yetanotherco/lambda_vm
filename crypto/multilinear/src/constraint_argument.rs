@@ -520,6 +520,7 @@ where
     // against the stack in one go.
     let columns = stacked_eval::prove::<F, E, T>(
         &trace.stacked,
+        &crate::stacking::borrow(trace.columns()),
         &stacked_eval::Claimed::Shared(&reduced_point),
         &core.reduce.column_values,
         config,

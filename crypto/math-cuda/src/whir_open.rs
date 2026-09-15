@@ -57,6 +57,26 @@ impl OpeningSession {
         Self::with_weight(stream, weight, len, message)
     }
 
+    /// The same again with the message given as the columns it is stacked from,
+    /// so it is never assembled on the host — `(column, offset in elements)`.
+    pub fn from_shares_and_parts(
+        shares: &[(usize, Vec<u64>, [u64; 3])],
+        len: usize,
+        parts: &[(&[u64], usize)],
+    ) -> Result<Self> {
+        let be = backend()?;
+        let stream = be.next_stream();
+        let mut weight = crate::device::alloc_zeros_or_trim::<u64>(&stream, len * 3)?;
+        crate::sumcheck::eq_expand_shares_ext3(&stream, &mut weight, shares)?;
+        // Zeroed because what the parts do not cover is the stacking's padding.
+        let mut base = crate::device::alloc_zeros_or_trim::<u64>(&stream, len)?;
+        for (column, offset) in parts {
+            let mut at = base.slice_mut(*offset..*offset + column.len());
+            stream.memcpy_htod(*column, &mut at)?;
+        }
+        Self::lift_into(stream, weight, len, base)
+    }
+
     fn with_weight(
         stream: Arc<CudaStream>,
         weight_dev: CudaSlice<u64>,
@@ -64,10 +84,19 @@ impl OpeningSession {
         message: &[u64],
     ) -> Result<Self> {
         assert_eq!(message.len(), len, "the message spans the weight's cube");
+        let base = crate::device::htod_or_trim(&stream, message)?;
+        Self::lift_into(stream, weight_dev, len, base)
+    }
+
+    fn lift_into(
+        stream: Arc<CudaStream>,
+        weight_dev: CudaSlice<u64>,
+        len: usize,
+        base: CudaSlice<u64>,
+    ) -> Result<Self> {
         assert!(len.is_power_of_two(), "the cube is a power of two");
 
         let be = backend()?;
-        let base = crate::device::htod_or_trim(&stream, message)?;
         // SAFETY: the kernel writes every element it is sized for.
         let mut lifted = unsafe { stream.alloc::<u64>(len * 3) }?;
         let count = len as u64;

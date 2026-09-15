@@ -1838,7 +1838,7 @@ impl OpeningFactors {
 /// more than the rounds that read it.
 #[cfg(feature = "cuda")]
 pub(crate) fn open_shared<F, E>(
-    message: &crate::mle::Mle<F>,
+    message: &crate::whir_chain::Stacked<'_, F>,
     shares: &[crate::stacked_eval::WeightShare<'_, E>],
     n_stack: usize,
     program: &crate::program::Program<E>,
@@ -1854,7 +1854,8 @@ where
     if TypeId::of::<F>() != TypeId::of::<Gl>() || TypeId::of::<E>() != TypeId::of::<Ext3>() {
         return None;
     }
-    if message.num_vars() != n_stack || message.len() < SUMCHECK_THRESHOLD {
+    let len = 1usize << message.num_vars();
+    if message.num_vars() != n_stack || len < SUMCHECK_THRESHOLD {
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1874,19 +1875,32 @@ where
         .collect::<Option<_>>()?;
 
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
-    let raw_message = unsafe {
-        core::slice::from_raw_parts(message.evals().as_ptr() as *const u64, message.len())
+    let raw = |table: &crate::mle::Mle<F>| unsafe {
+        core::slice::from_raw_parts(table.evals().as_ptr() as *const u64, table.len())
     };
+    // The columns go straight into the device buffer: what the host would
+    // assemble first is a copy of the bytes about to be sent.
+    if message
+        .parts
+        .iter()
+        .any(|(column, offset)| offset + column.len() > len)
+    {
+        return None;
+    }
+    let parts: Vec<(&[u64], usize)> = message
+        .parts
+        .iter()
+        .map(|(column, offset)| (raw(column), *offset))
+        .collect();
     let session =
-        math_cuda::whir_open::OpeningSession::from_shares(&shares, message.len(), raw_message)
-            .ok()?;
+        math_cuda::whir_open::OpeningSession::from_shares_and_parts(&shares, len, &parts).ok()?;
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(OpeningFactors { session, lowered })
 }
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn open_shared<F, E>(
-    _message: &crate::mle::Mle<F>,
+    _message: &crate::whir_chain::Stacked<'_, F>,
     _shares: &[crate::stacked_eval::WeightShare<'_, E>],
     _n_stack: usize,
     _program: &crate::program::Program<E>,
@@ -1924,10 +1938,15 @@ impl std::fmt::Debug for DeviceCodeword {
     }
 }
 
-/// Commits a stacked polynomial with the codeword left on device.
+/// The same, over a stacked polynomial given as the columns it is made of.
+///
+/// The parts go straight into the device buffer, so what the host would have
+/// assembled first — a copy of every byte about to be uploaded — is never
+/// built. `parts` is `(column, offset in elements)`.
 #[cfg(feature = "cuda")]
-pub(crate) fn commit_resident<F>(
-    evals: &[math::field::element::FieldElement<F>],
+pub(crate) fn commit_parts<F>(
+    parts: &[(&crate::mle::Mle<F>, usize)],
+    log_evals: usize,
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
@@ -1940,24 +1959,41 @@ where
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
         return None;
     }
-    if !evals.len().is_power_of_two() || evals.len() << log_blowup < COMMIT_THRESHOLD {
+    if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
         return None;
     }
+    // A part past the end would be an out-of-bounds device write.
+    if parts
+        .iter()
+        .any(|(column, offset)| offset + column.len() > (1usize << log_evals))
+    {
+        return None;
+    }
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
-    let raw = unsafe { core::slice::from_raw_parts(evals.as_ptr() as *const u64, evals.len()) };
+    let raw: Vec<(&[u64], usize)> = parts
+        .iter()
+        .map(|(column, offset)| unsafe {
+            (
+                core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len()),
+                *offset,
+            )
+        })
+        .collect();
     let (codeword, root) =
-        math_cuda::whir::commit_codeword(raw, log_blowup, log_folding, transient).ok()?;
+        math_cuda::whir::commit_codeword_parts(&raw, log_evals, log_blowup, log_folding, transient)
+            .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
 
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn commit_resident<F>(
-    _evals: &[math::field::element::FieldElement<F>],
+pub(crate) fn commit_parts<F>(
+    _parts: &[(&crate::mle::Mle<F>, usize)],
+    _log_evals: usize,
     _log_blowup: usize,
     _log_folding: usize,
     _transient: bool,

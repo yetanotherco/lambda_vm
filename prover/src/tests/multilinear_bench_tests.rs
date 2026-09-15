@@ -595,8 +595,14 @@ fn phases() {
     let tables_argued = start.elapsed();
 
     let start = Instant::now();
+    let group_columns: Vec<&multilinear::mle::Mle<F>> = committed
+        .tables()
+        .iter()
+        .flat_map(|t| t.columns())
+        .collect();
     let columns = multilinear::stacked_eval::prove::<F, E, _>(
         &committed.groups()[0],
+        &group_columns,
         &multilinear::stacked_eval::Claimed::PerColumn(&points),
         &values,
         &config,
