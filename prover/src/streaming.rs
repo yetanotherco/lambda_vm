@@ -53,7 +53,17 @@ pub(crate) struct StreamingProvider {
 
 impl StreamingProvider {
     /// Walk the AIR order and record which index each retired chunk answers to.
-    pub(crate) fn new(routed: RoutedOps, max_rows: MaxRowsConfig, traces: &Traces) -> Self {
+    ///
+    /// `include_halt` is not a detail: HALT sits between the fixed tables and
+    /// the chunked groups and is emitted only for a final epoch, so getting it
+    /// wrong shifts every slot by one and hands each table the trace of its
+    /// neighbour. It is taken from the caller's `VmAirs` rather than assumed.
+    pub(crate) fn new(
+        routed: RoutedOps,
+        max_rows: MaxRowsConfig,
+        traces: &Traces,
+        include_halt: bool,
+    ) -> Self {
         let group_lengths = [
             traces.cpus.len(),
             traces.lts.len(),
@@ -72,9 +82,7 @@ impl StreamingProvider {
             traces.cpu32s.len(),
         ];
 
-        // HALT sits between the fixed tables and the groups, and is only emitted
-        // for a final epoch — which is the only kind this path proves.
-        let mut slots = vec![None; NUM_FIXED_AIRS + 1];
+        let mut slots = vec![None; NUM_FIXED_AIRS + usize::from(include_halt)];
         for (kind, len) in GROUP_ORDER.iter().zip(group_lengths.iter()) {
             for chunk in 0..*len {
                 slots.push(kind.map(|k| (k, chunk)));

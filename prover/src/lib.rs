@@ -1178,7 +1178,10 @@ pub fn prove_with_options_and_inputs(
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )?;
-        let provider = streaming::StreamingProvider::new(routed, max_rows.clone(), &traces);
+        // This path always proves a single, final epoch, so HALT is present —
+        // passed explicitly rather than assumed, because the slot map is only
+        // correct if it agrees with `VmAirs::air_trace_pairs`.
+        let provider = streaming::StreamingProvider::new(routed, max_rows.clone(), &traces, true);
         (traces, Some(provider))
     } else {
         let traces = Traces::from_elf_and_logs(
