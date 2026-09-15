@@ -4,7 +4,7 @@
 //! on a single CUDA context; a pool of streams lets rayon-parallel callers
 //! overlap H2D / compute / D2H.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream};
@@ -135,6 +135,8 @@ const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.c
 const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
+const SUMCHECK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sumcheck.cubin"));
+const WHIR_FOLD_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whir_fold.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -158,9 +160,12 @@ pub struct Backend {
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     next: AtomicUsize,
-    /// VRAM budget (bytes) for table-session admission control. See
+    /// VRAM budget (bytes) for admission control. See
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
+    /// Device bytes promised to structures that are still alive. See
+    /// [`Backend::reserve`].
+    reserved: AtomicU64,
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
@@ -174,8 +179,13 @@ pub struct Backend {
 
     // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
+    pub lift_spread: CudaFunction,
+    pub mobius_level: CudaFunction,
+    pub mobius_low_levels: CudaFunction,
+    pub mobius_tile: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
+    pub ntt_dit_tile: CudaFunction,
     pub pointwise_mul: CudaFunction,
     pub scalar_mul: CudaFunction,
     pub bit_reverse_permute_batched: CudaFunction,
@@ -194,6 +204,8 @@ pub struct Backend {
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_base_coset: CudaFunction,
+    pub keccak256_leaves_ext3_coset: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub grind_search: CudaFunction,
@@ -239,6 +251,28 @@ pub struct Backend {
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
 
+    // sumcheck.cubin
+    pub sumcheck_round_ext3: CudaFunction,
+    pub sum_partials_ext3: CudaFunction,
+    pub sumcheck_fold_ext3: CudaFunction,
+    pub mle_fold_base_ext3: CudaFunction,
+    pub eq_expand_level_ext3: CudaFunction,
+    pub eq_seed_shares_ext3: CudaFunction,
+    pub eq_expand_level_shares_ext3: CudaFunction,
+    pub program_map_ext3: CudaFunction,
+    pub factors_from_columns_ext3: CudaFunction,
+    pub mle_lift_base_ext3: CudaFunction,
+    pub add_scaled_ext3: CudaFunction,
+    pub fill_ext3: CudaFunction,
+    pub fraction_fold_ext3: CudaFunction,
+    pub fraction_fold_padded_ext3: CudaFunction,
+    pub mle_fold_base_ext3_many: CudaFunction,
+
+    // whir_fold.cubin
+    pub whir_fold_base_ext3: CudaFunction,
+    pub whir_fold_ext3: CudaFunction,
+    pub gather_cosets: CudaFunction,
+
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
@@ -283,6 +317,121 @@ fn retain_default_mempool(ctx: &CudaContext) {
             &threshold as *const u64 as *mut core::ffi::c_void,
         )
         .result();
+    }
+}
+
+/// Device bytes held for as long as this lives. See [`Backend::reserve`].
+#[derive(Debug)]
+pub struct DeviceReservation {
+    bytes: u64,
+}
+
+impl Drop for DeviceReservation {
+    fn drop(&mut self) {
+        if let Ok(be) = backend() {
+            be.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Hands the device default memory pool's retained blocks back to the OS.
+///
+/// The pool keeps freed stream-ordered allocations forever by design (see
+/// [`retain_default_mempool`]), which is what makes repeated allocations cheap
+/// — and also what makes a *new* shape of allocation fail while the pool sits
+/// on memory it is not using. Best-effort: a failure leaves things as they are.
+fn trim_default_mempool() {
+    use cudarc::driver::sys;
+    let Ok(be) = backend() else { return };
+    // SAFETY: raw driver calls. The device is the backend's, the out-pointer a
+    // stack slot, and the target size is read as a u64. Errors are swallowed.
+    unsafe {
+        let dev = be.ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        let _ = sys::cuMemPoolTrimTo(pool, 0).result();
+    }
+}
+
+/// Lands every stream's pending frees and hands the pool's retained blocks
+/// back.
+///
+/// The frees are stream-ordered, so a buffer dropped on another stream is not
+/// free until that stream reaches the drop — and the pool cannot return what
+/// it has not been given yet. Draining the whole context first is what makes
+/// the trim worth doing.
+fn drain_and_trim() -> Result<()> {
+    let be = backend()?;
+    be.ctx.synchronize()?;
+    trim_default_mempool();
+    Ok(())
+}
+
+/// Promises `bytes` against the budget for a caller whose structure outlives
+/// the type that spends them.
+pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
+    backend().ok()?.reserve(bytes)
+}
+
+/// Allocates on `stream`, and if the device says no, gives the pool's retained
+/// blocks back and asks once more.
+///
+/// "Out of memory" from the stream-ordered allocator usually means the pool is
+/// holding blocks of the wrong shape, not that the device is full — a second
+/// prover on the same card is enough. It is worth one retry: a prove whose
+/// tables are already on the device has nowhere to fall back to, so a failure
+/// here is a failed proof.
+///
+/// # Safety
+/// The caller must write every element before reading it, as with
+/// `CudaStream::alloc`.
+pub unsafe fn alloc_or_trim<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    // SAFETY: the caller's, forwarded.
+    match unsafe { stream.alloc::<T>(len) } {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            // SAFETY: the caller's, forwarded.
+            unsafe { stream.alloc::<T>(len) }
+        }
+    }
+}
+
+/// Uploads on `stream`, with the same one retry as [`alloc_or_trim`]: a copy
+/// to the device allocates too, and the small ones are no less fatal for being
+/// small.
+pub fn htod_or_trim<T: cudarc::driver::DeviceRepr + Unpin>(
+    stream: &Arc<CudaStream>,
+    src: &[T],
+) -> Result<CudaSlice<T>> {
+    match stream.clone_htod(src) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.clone_htod(src)
+        }
+    }
+}
+
+/// The same, zeroed.
+pub fn alloc_zeros_or_trim<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    match stream.alloc_zeros::<T>(len) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.alloc_zeros::<T>(len)
+        }
     }
 }
 
@@ -352,6 +501,8 @@ impl Backend {
         let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
+        let sumcheck = ctx.load_module(Ptx::from_binary(SUMCHECK_CUBIN.to_vec()))?;
+        let whir_fold = ctx.load_module(Ptx::from_binary(WHIR_FOLD_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -410,8 +561,13 @@ impl Backend {
             ext3_add: arith.load_function("ext3_add_kernel")?,
             ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
+            lift_spread: ntt.load_function("lift_spread")?,
+            mobius_level: ntt.load_function("mobius_level")?,
+            mobius_low_levels: ntt.load_function("mobius_low_levels")?,
+            mobius_tile: ntt.load_function("mobius_tile")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
+            ntt_dit_tile: ntt.load_function("ntt_dit_tile")?,
             pointwise_mul: ntt.load_function("pointwise_mul")?,
             scalar_mul: ntt.load_function("scalar_mul")?,
             bit_reverse_permute_batched: ntt.load_function("bit_reverse_permute_batched")?,
@@ -429,6 +585,8 @@ impl Backend {
             keccak256_leaves_base_row_major_row_pair_range: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
+            keccak256_leaves_ext3_coset: keccak.load_function("keccak256_leaves_ext3_coset")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
@@ -470,6 +628,24 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            whir_fold_base_ext3: whir_fold.load_function("whir_fold_base_ext3")?,
+            whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
+            gather_cosets: whir_fold.load_function("gather_cosets")?,
+            sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
+            sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
+            sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
+            mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
+            eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,
+            eq_seed_shares_ext3: sumcheck.load_function("eq_seed_shares_ext3")?,
+            eq_expand_level_shares_ext3: sumcheck.load_function("eq_expand_level_shares_ext3")?,
+            program_map_ext3: sumcheck.load_function("program_map_ext3")?,
+            factors_from_columns_ext3: sumcheck.load_function("factors_from_columns_ext3")?,
+            mle_lift_base_ext3: sumcheck.load_function("mle_lift_base_ext3")?,
+            add_scaled_ext3: sumcheck.load_function("add_scaled_ext3")?,
+            fill_ext3: sumcheck.load_function("fill_ext3")?,
+            fraction_fold_ext3: sumcheck.load_function("fraction_fold_ext3")?,
+            fraction_fold_padded_ext3: sumcheck.load_function("fraction_fold_padded_ext3")?,
+            mle_fold_base_ext3_many: sumcheck.load_function("mle_fold_base_ext3_many")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp
@@ -486,13 +662,44 @@ impl Backend {
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
+            reserved: AtomicU64::new(0),
         })
     }
 
-    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// VRAM budget in bytes for admission control. `u64::MAX`
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
+    }
+
+    /// Promises `bytes` of the device to something about to be built there, or
+    /// refuses.
+    ///
+    /// Asking the driver how much is free does not answer this: two callers
+    /// can both be told yes and both be right at the moment they ask. What a
+    /// structure needs is that the room stays its own until it is done — a
+    /// codeword that is admitted and then cannot fold has nowhere to go, since
+    /// there is no copy on the host by then.
+    ///
+    /// Refusing is cheap wherever it is asked, because everything that asks
+    /// has a host path. The budget binds only when several proofs share a
+    /// card: one of them is enough to fill it.
+    pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        let mut held = self.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(bytes) > self.vram_budget_bytes {
+                return None;
+            }
+            match self.reserved.compare_exchange_weak(
+                held,
+                held + bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(DeviceReservation { bytes }),
+                Err(seen) => held = seen,
+            }
+        }
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different

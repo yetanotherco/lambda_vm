@@ -184,6 +184,14 @@ enum Commands {
         #[arg(long)]
         continuations: bool,
 
+        /// Prove with the multilinear backend (WHIR) instead of FRI.
+        ///
+        /// A different proof format: verify it with `verify --whir`. The
+        /// multilinear path derives its own rate and query count from the
+        /// trace, so `--blowup` does not apply to it.
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
+
         /// Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.
         #[arg(
             long,
@@ -216,6 +224,10 @@ enum Commands {
         /// Verify a continuation proof bundle (produced by `prove --continuations`)
         #[arg(long)]
         continuations: bool,
+
+        /// Verify a multilinear proof (produced by `prove --whir`)
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -264,6 +276,7 @@ fn main() -> ExitCode {
             elements,
             continuations,
             epoch_size_log2,
+            whir,
         } => {
             if continuations {
                 cmd_prove_continuation(
@@ -275,6 +288,8 @@ fn main() -> ExitCode {
                     time,
                     cycles,
                 )
+            } else if whir {
+                cmd_prove_whir(elf, output, private_input, blowup, time)
             } else {
                 cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
             }
@@ -285,9 +300,12 @@ fn main() -> ExitCode {
             blowup,
             time,
             continuations,
+            whir,
         } => {
             if continuations {
                 cmd_verify_continuation(proof, elf, blowup, time)
+            } else if whir {
+                cmd_verify_whir(proof, elf, blowup, time)
             } else {
                 cmd_verify(proof, elf, blowup, time)
             }
@@ -711,6 +729,159 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
     let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
+    let verify_elapsed = start.elapsed();
+    let result = match result {
+        Ok(valid) => valid,
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if result {
+        eprintln!("Verification succeeded!");
+        if time {
+            println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("Verification failed! Ensure --blowup matches the value used for proving.");
+        ExitCode::FAILURE
+    }
+}
+
+/// `prove --whir`: the multilinear backend.
+///
+/// Same executor, same traces, same AIRs as [`cmd_prove`]; each table is argued
+/// in one sumcheck against a WHIR commitment instead of a composition
+/// polynomial committed by FRI. The proof is a different type, so `verify`
+/// needs `--whir` too.
+///
+/// `blowup` reaches the AIRs (it sets the preprocessed commitments) but not the
+/// multilinear argument, which derives its own rate and query count from the
+/// tallest stacked polynomial in the proof.
+fn cmd_prove_whir(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    blowup: u8,
+    time: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Generating proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let proof = prover::multilinear_prove::prove_with_options_and_inputs(
+        &elf_data,
+        &private_inputs,
+        &opts,
+        &Default::default(),
+    );
+    let prove_elapsed = start.elapsed();
+    let proof = match proof {
+        Ok(proof) => proof,
+        Err(e) => {
+            eprintln!("Proof generation failed: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Writing proof...");
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create output file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = BufWriter::new(file).write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("Proof written to {:?}", output_path);
+    println!("Tables: {}", proof.proof.tables.len());
+    println!("Commitments: {}", proof.proof.roots.len());
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    ExitCode::SUCCESS
+}
+
+/// `verify --whir`: the counterpart of [`cmd_prove_whir`].
+fn cmd_verify_whir(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Reading proof...");
+    let proof_bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let proof = match rkyv::from_bytes::<
+        prover::multilinear_prove::MultilinearVmProof,
+        rkyv::rancor::Error,
+    >(&proof_bytes)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {e}");
+            eprintln!("(a proof produced without `--whir` needs `verify` without it)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Verifying proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let result = prover::multilinear_prove::verify_with_options(&proof, &elf_data, &opts);
     let verify_elapsed = start.elapsed();
     let result = match result {
         Ok(valid) => valid,

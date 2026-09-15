@@ -56,7 +56,9 @@ use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, LazyCommitment, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::proof::view::MultiProofView;
@@ -143,7 +145,7 @@ fn global_transcript(
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
 #[derive(Clone, Copy)]
-struct L2gMemoryConstraints;
+pub(crate) struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
@@ -163,7 +165,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// committed trace (equal Merkle roots). So under collision resistance the trace the
 /// global bus runs over already satisfies all those constraints — do not add them
 /// here (it would be redundant, not a missing check).
-fn l2g_global_air(
+pub(crate) fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
@@ -184,7 +186,7 @@ fn l2g_global_air(
 /// check too: this proof has the BITWISE provider, and the global proof commits
 /// the identical trace (the commitment binding compares roots), so checking here
 /// covers both. `epoch_label` is the `fini_epoch` constant used by both.
-fn l2g_memory_air(
+pub(crate) fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
@@ -223,7 +225,7 @@ fn l2g_memory_air(
 /// genesis commitment from `config.init_values` — the recursion guest's
 /// supplied roots skip the in-VM FFT + Merkle build (see `verify_global`).
 /// `None` recomputes from `config` as before.
-fn global_memory_air(
+pub(crate) fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
     preprocessed: Option<Commitment>,
@@ -243,19 +245,37 @@ fn global_memory_air(
         // `address_lo = page_base_lo + OFFSET` is prover-chosen and the genesis
         // token can name an arbitrary address. GLOBAL_MEMORY's OFFSET column is
         // identical to PAGE's, so the same commitment serves both.
-        return air.with_preprocessed(
+        return air.with_preprocessed_columns(
             page::private_page_preprocessed_commitment(opts),
             page::NUM_PREPROCESSED_COLS_PRIVATE,
+            Arc::new(|| vec![page::offset_column()]),
         );
     }
-    let commitment = preprocessed.unwrap_or_else(|| {
-        if config.init_values.is_some() {
-            page::compute_precomputed_commitment(config, opts)
-        } else {
-            page::zero_init_preprocessed_commitment(opts)
+    // The columns as well as the root: the univariate path compares the root
+    // the verifier recomputes, the multilinear one has no second root and
+    // compares these instead. They are PAGE's — GLOBAL_MEMORY's preprocessed
+    // prefix is the same OFFSET and INIT, which is why the same commitment
+    // serves both.
+    let commitment = match preprocessed {
+        Some(commitment) => LazyCommitment::ready(commitment),
+        None => {
+            let config = config.clone();
+            let options = opts.clone();
+            LazyCommitment::deferred(move || {
+                if config.init_values.is_some() {
+                    page::compute_precomputed_commitment(&config, &options)
+                } else {
+                    page::zero_init_preprocessed_commitment(&options)
+                }
+            })
         }
-    });
-    air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
+    };
+    let config = config.clone();
+    air.with_lazy_preprocessed_columns(
+        commitment,
+        global_memory::NUM_PREPROCESSED_COLS,
+        Arc::new(move || page::preprocessed_columns(&config)),
+    )
 }
 
 /// The sorted, deduped set of page bases the touched cells fall on — the SINGLE source
@@ -265,7 +285,7 @@ fn global_memory_air(
 /// and verifier iterate the identical sequence — `multi_verify` matches AIRs to sub-proofs
 /// positionally. Carries page bases ONLY: no cell values, so private-input bytes never
 /// enter the bundle (unlike the full `CellBoundary`, whose `init.value` is a private byte).
-fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
+pub(crate) fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
     boundaries
         .iter()
         .flat_map(|epoch| epoch.iter())
@@ -296,7 +316,7 @@ fn canonical_page_bases(page_bases: &[u64]) -> Vec<u64> {
 /// genesis from the ELF and never needs the raw private bytes. They are identified EXACTLY
 /// as the monolithic verifier does — the first `num_private_input_pages` pages from
 /// `PRIVATE_INPUT_START_INDEX` (see [`page::is_private_input_page`]).
-fn global_memory_configs(
+pub(crate) fn global_memory_configs(
     page_bases: &[u64],
     elf: &Elf,
     num_private_input_pages: usize,
@@ -362,7 +382,7 @@ fn elf_page_has_data(elf: &Elf, page_base: u64) -> bool {
 /// non-preprocessed and never consults `init_values` (and its `init_page_data` is built
 /// from the ELF alone, so there is nothing to load) — the config carries an explicitly
 /// empty vec so no code path can silently start depending on verifier-side private data.
-fn global_memory_configs_from_init_page_data(
+pub(crate) fn global_memory_configs_from_init_page_data(
     page_bases: &[u64],
     init_page_data: &HashMap<u64, Vec<u8>>,
     num_private_input_pages: usize,
@@ -402,13 +422,181 @@ struct EpochStart<'a> {
 /// `boundary` is shared (`Arc`): the same per-epoch boundary feeds both this
 /// epoch's prove and the cross-epoch global prove, which starts as soon as the
 /// producer has prepared the last epoch (see `prove_continuation`).
-struct PreparedEpoch {
-    index: u64,
-    register_init: Vec<u32>,
-    label: u64,
-    traces: Traces,
-    boundary: Arc<Vec<CellBoundary>>,
-    is_final: bool,
+pub(crate) struct PreparedEpoch {
+    pub index: u64,
+    pub register_init: Vec<u32>,
+    pub label: u64,
+    pub traces: Traces,
+    pub boundary: Arc<Vec<CellBoundary>>,
+    pub is_final: bool,
+}
+
+/// Every epoch's proving inputs, prepared in order and handed over one at a
+/// time.
+///
+/// This is the sequential half of [`prove_continuation`]'s pipeline — execution,
+/// op collection over the advancing memory image, the boundary, and the register
+/// carry — run to completion for one epoch before the next. **None of it depends
+/// on a proof, or on how one is made**, so it is the same work whichever
+/// commitment scheme argues the epochs; what differs is only what `each` does
+/// with a [`PreparedEpoch`].
+///
+/// One epoch is alive at a time, which is the whole point of continuations.
+/// `prove_continuation` runs the same steps across three threads instead, to
+/// overlap them; this one is for callers that want them in order.
+///
+/// Returns every epoch's boundary, which is what the cross-epoch global proof
+/// is made of. They stay prover-local: a boundary carries cell values, and for
+/// a private read that value is a byte of the private input.
+pub(crate) fn for_each_epoch(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    mut each: impl FnMut(PreparedEpoch, &[Arc<Vec<CellBoundary>>]) -> Result<(), Error>,
+) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
+    if epoch_size_log2 < 2 {
+        return Err(Error::InvalidContinuationEpochSize(
+            "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
+        ));
+    }
+    let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+        Error::InvalidContinuationEpochSize(format!(
+            "epoch_size_log2 {epoch_size_log2} is too large for this platform"
+        ))
+    })?;
+
+    let mut executor = Executor::new(elf, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let mut image = build_initial_image_paged(elf, private_inputs);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+
+    let mut boundaries: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
+    let mut prev_fini: Option<Vec<u32>> = None;
+    let mut index: u64 = 0;
+    while executor.pc() != 0 {
+        if index >= local_to_global::MAX_EPOCHS {
+            return Err(Error::InvalidContinuationEpochSize(format!(
+                "execution needs more than {} continuation epochs (the IsB20 \
+                 cross-epoch ordering range); use a larger epoch size",
+                local_to_global::MAX_EPOCHS
+            )));
+        }
+        let register_init: Vec<u32> = match (index, prev_fini.take()) {
+            (0, _) => register::register_init_from_entry_point(elf.entry_point),
+            (_, Some(fini)) => fini,
+            (_, None) => {
+                return Err(Error::ContinuationInvariant(
+                    "previous epoch final registers are missing after the first epoch".to_string(),
+                ));
+            }
+        };
+
+        let logs = match executor
+            .resume_with_limit(epoch_size)
+            .map_err(|e| Error::Execution(format!("{e}")))?
+        {
+            Some(logs) => logs.to_vec(),
+            None => break,
+        };
+        let is_final = executor.pc() == 0;
+        if !is_final && logs.len() != epoch_size {
+            return Err(Error::ContinuationInvariant(format!(
+                "intermediate epoch ran {} cycles, expected {epoch_size}",
+                logs.len()
+            )));
+        }
+
+        let label = local_to_global::epoch_label(index);
+        let collected = Traces::collect_epoch(artifacts, &image, &register_init, &logs, is_final)?;
+        let boundary = Arc::new(local_to_global::epoch_boundary(
+            &mut provenance,
+            label,
+            &collected.touched_memory_cells(),
+        ));
+        boundaries.push(Arc::clone(&boundary));
+        prev_fini = Some(collected.register_fini(&register_init));
+        for cell in boundary.iter() {
+            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+        }
+
+        let traces = Traces::build_from_collected(
+            artifacts,
+            collected,
+            // Continuation epochs use the L2G bookend: PAGE tables (the only
+            // image consumers in the build) are skipped.
+            None::<&HashMap<u64, u8>>,
+            &register_init,
+            &MaxRowsConfig::default(),
+            private_inputs,
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )?;
+        each(
+            PreparedEpoch {
+                index,
+                register_init,
+                label,
+                traces,
+                boundary,
+                is_final,
+            },
+            &boundaries,
+        )?;
+        index += 1;
+    }
+
+    Ok(boundaries)
+}
+
+/// [`for_each_epoch`], with the next epoch prepared while `each` still has the
+/// current one.
+///
+/// Preparing an epoch is the executor and the trace builders — host work — and
+/// for a prover `each` is a proof, which is mostly the device's. The two
+/// overlap, so a run costs the proofs plus one preparation instead of both.
+///
+/// The channel has no buffer, so **two epochs are alive at most**: the one in
+/// `each`'s hands and the one waiting to be taken. That bound is the point —
+/// an epoch's traces are the biggest thing here, and a queue would trade the
+/// memory continuations exist to save.
+pub(crate) fn for_each_epoch_overlapped(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    mut each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
+) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedEpoch>(0);
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            for_each_epoch(
+                elf,
+                private_inputs,
+                epoch_size_log2,
+                artifacts,
+                |prepared, _| {
+                    // The consumer stopping is not this side's failure to
+                    // report: its error is the one that says why.
+                    sender.send(prepared).map_err(|_| {
+                        Error::ContinuationInvariant("the epoch consumer stopped".to_string())
+                    })
+                },
+            )
+        });
+        // The receiver is consumed here, so it is dropped before the join
+        // below — which is what unblocks a producer waiting to hand over the
+        // epoch nobody is going to take.
+        let used = receiver.into_iter().try_for_each(&mut each);
+        let produced = producer
+            .join()
+            .map_err(|_| Error::ContinuationInvariant("the epoch producer panicked".to_string()))?;
+        used?;
+        produced
+    })
 }
 
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
@@ -635,7 +823,7 @@ impl<'a> ContinuationProofView<'a> {
 /// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
 #[allow(clippy::too_many_arguments)]
-fn build_epoch_airs(
+pub(crate) fn build_epoch_airs(
     elf: &Elf,
     opts: &ProofOptions,
     page_configs: &[PageConfig],
@@ -739,6 +927,8 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
+    #[cfg(feature = "shape-profile")]
+    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     let proof = Prover::multi_prove(
         pairs,
         &mut seed(),
@@ -929,6 +1119,9 @@ fn prove_global(
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
+
+    #[cfg(feature = "shape-profile")]
+    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
 
     Prover::multi_prove(
         pairs,

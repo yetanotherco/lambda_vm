@@ -6,12 +6,14 @@
 //! pipelines or used by the parity test suite.
 
 pub mod barycentric;
+pub mod columns;
 pub mod constraint_interp;
 pub mod deep;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
@@ -19,6 +21,9 @@ pub mod logup;
 pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
+pub mod sumcheck;
+pub mod whir;
+pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

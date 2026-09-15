@@ -44,6 +44,8 @@ nvtx = ["dep:libloading"]
 
 [dev-dependencies]
 crypto = { path = "../crypto" }
+# The host pipeline the WHIR commit parity test compares against.
+multilinear = { path = "../multilinear" }
 rand = { version = "0.8.5", features = ["std"] }
 rand_chacha = "0.3.1"
 rayon = "1.7"
