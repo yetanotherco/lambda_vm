@@ -1,6 +1,9 @@
 #import "/meta.typ": rj, aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_variable_table, total_nr_variables, total_nr_instantiated_columns, compute_nr_interactions, render_constraint_table
+#import "/expr.typ": expr_to_math
+
+#let next(x) = expr_to_math(("next", x))
 
 This chapter describes, in line with the split between a binary and a field VM from @recursion,
 the ISA and an arithmetization of a dedicated field VM.
@@ -34,9 +37,20 @@ into _input hinting_ and _output hinting_ --- described further below.
 
 == Arguments and addressing
 
-#rj[Clarify state and registers being part of the state; state vs instruction]
-The VM has a state consisting of $N$ general purpose extension field registers,
-a base-field `PC` register, and a bit-register `ZERO`.
+The execution of a guest program can be seen as a succession of _states_ of the machine.
+A state is then the tuple of all values the registers have at a given point in time during the execution.#footnote[
+  If we consider states across different executions, the contents of `MEM` should also be considered part of the state.
+]
+Each instruction acts upon _current state_ to produce the _future state_.#footnote[
+  And since the program counter is part of the current state,
+  each possible state has at most one associated instruction.
+]
+Or rather --- since instructions are constraints --- each instruction constrains
+a correct transition from the current state to the future state.
+We write $next("x")$ for the register `x` in the future state, both in prose and later in the constraints.
+
+The $N + 2$ registers making up a state of the VM are:
+a `ZERO` bit-register, the base field `PC` register and $N$ general purpose extension field registers.
 The number of registers was chosen as a tradeoff between the versatility of having more mutable state,
 and the extra cost in committed columns and decoding logic that grows with $N$.
 #rj[Register index for `ZERO` = $0$ and `PC` = $1$ and gp register `Ri` = $i + 2$]
@@ -54,8 +68,8 @@ Every other register can hold an arbitrary extension field element.
 
 == Register hints
 
-Each general-purpose register in the current state can be marked as _hinted_ in an instruction.
-This means that its value from the current instruction onward can get a new value
+Each general-purpose register in the current state can be marked as _hinted_ by the acting instruction.
+This means that from the current state onwards, the register can take a value
 that is independent from the previous value, except as constrained by the instruction.
 Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument ---
 whether wrapped in a `MEM[]` lookup or not --- will change in the future state, and as such in the `d` argument too.
@@ -68,7 +82,7 @@ with the appropriate exceptions in behaviour for the `ZERO` and `PC` registers.
 
 #aside("Hint collisions")[
 One may observe that an output hint for state `i` and an input hint on state `i + 1` can affect
-an identical register in an identical state.
+the same register in a single state.
 While this is true in theory, it is not a problem in practice, as two successive states are,
 in almost all cases, operated on by two consecutive ---in the program text--- instructions,
 and as such, hinting collisions can be easily identified, and most actual programs
