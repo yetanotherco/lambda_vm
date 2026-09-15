@@ -2919,6 +2919,117 @@ struct CollectedOps {
     hint_ops: Vec<hint::HintOperation>,
 }
 
+/// One log-derived, chunked table — the ones whose trace is a function of a
+/// single routed op list, so it can be rebuilt on demand long after the routing
+/// that produced it.
+///
+/// The preprocessed tables (BITWISE, DECODE, REGISTER, HALT, COMMIT, KECCAK*)
+/// and PAGE are deliberately absent: they are not driven by one op list and the
+/// streaming prover keeps them resident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TableKind {
+    Cpu,
+    Memw,
+    MemwAligned,
+    MemwRegister,
+    Load,
+    Lt,
+    Shift,
+    Mul,
+    Dvrm,
+    Branch,
+    Eq,
+    Bytewise,
+    Store,
+    Cpu32,
+}
+
+/// The op lists after routing (phases 3-4), kept so any one table can be built
+/// from them on demand.
+///
+/// This is the compact intermediate the streaming prover holds instead of the
+/// built traces: the ops of a table are far smaller than its trace, and the
+/// trace is a pure function of them — `build_table` is deterministic, which
+/// `trace_build_is_deterministic_across_builds` pins.
+pub(crate) struct RoutedOps {
+    pub(crate) cpu_ops: Vec<CpuOperation>,
+    pub(crate) memw_ops: Vec<MemwOperation>,
+    pub(crate) memw_aligned_ops: Vec<MemwOperation>,
+    pub(crate) memw_register_rows: Vec<RegRow>,
+    pub(crate) load_ops: Vec<LoadOperation>,
+    pub(crate) lt_ops: Vec<LtOperation>,
+    pub(crate) shift_ops: Vec<ShiftOperation>,
+    pub(crate) branch_ops: Vec<BranchOperation>,
+    pub(crate) mul_ops: Vec<(MulOperation, bool)>,
+    pub(crate) dvrm_ops: Vec<(DvrmOperation, bool)>,
+    pub(crate) eq_ops: Vec<eq::EqOperation>,
+    pub(crate) bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    pub(crate) store_ops: Vec<store::StoreOperation>,
+    pub(crate) cpu32_ops: Vec<cpu32::Cpu32Operation>,
+}
+
+impl RoutedOps {
+    /// Build every chunk of one table. Byte-identical whenever it is called,
+    /// which is what lets a retired trace be rebuilt against the root its first
+    /// build committed.
+    pub(crate) fn build_table(
+        &self,
+        kind: TableKind,
+        max_rows: &super::MaxRowsConfig,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+        macro_rules! build {
+            ($ops:expr, $limit:expr, $f:path) => {
+                chunk_and_generate(
+                    $ops,
+                    $limit,
+                    $f,
+                    #[cfg(feature = "disk-spill")]
+                    storage_mode,
+                )
+            };
+        }
+        match kind {
+            TableKind::Cpu => build!(&self.cpu_ops, max_rows.cpu, cpu::generate_cpu_trace),
+            TableKind::Memw => build!(&self.memw_ops, max_rows.memw, memw::generate_memw_trace),
+            TableKind::MemwAligned => build!(
+                &self.memw_aligned_ops,
+                max_rows.memw_aligned,
+                memw_aligned::generate_memw_aligned_trace
+            ),
+            TableKind::MemwRegister => build!(
+                &self.memw_register_rows,
+                max_rows.memw_register,
+                memw_register::generate_memw_register_trace_from_rows
+            ),
+            TableKind::Load => build!(&self.load_ops, max_rows.load, load::generate_load_trace),
+            TableKind::Lt => build!(&self.lt_ops, max_rows.lt, lt::generate_lt_trace),
+            TableKind::Shift => {
+                build!(&self.shift_ops, max_rows.shift, shift::generate_shift_trace)
+            }
+            TableKind::Mul => build!(&self.mul_ops, max_rows.mul, mul::generate_mul_trace),
+            TableKind::Dvrm => build!(&self.dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace),
+            TableKind::Branch => build!(
+                &self.branch_ops,
+                max_rows.branch,
+                branch::generate_branch_trace
+            ),
+            TableKind::Eq => build!(&self.eq_ops, max_rows.eq, eq::generate_eq_trace),
+            TableKind::Bytewise => build!(
+                &self.bytewise_ops,
+                max_rows.bytewise,
+                bytewise::generate_bytewise_trace
+            ),
+            TableKind::Store => {
+                build!(&self.store_ops, max_rows.store, store::generate_store_trace)
+            }
+            TableKind::Cpu32 => {
+                build!(&self.cpu32_ops, max_rows.cpu32, cpu32::generate_cpu32_trace)
+            }
+        }
+    }
+}
+
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
@@ -3352,138 +3463,58 @@ fn build_traces<I: ImageSource + Sync>(
     // Each build below reads disjoint op lists and writes its own table, so
     // they all run in one rayon scope. Disk-spill stays sequential: its
     // generate→spill order keeps trace memory bounded.
-    let cpu_ops_ref = &cpu_ops;
-    let gen_cpus = || {
-        chunk_and_generate(
-            cpu_ops_ref,
-            max_rows.cpu,
-            cpu::generate_cpu_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+    // Phases 3-4 are settled, so every cross-table coupling is already folded in
+    // and each of these tables is now a pure function of one routed op list.
+    // Pack them into `RoutedOps`: the same intermediate builds them here and can
+    // rebuild any one of them later, which is what a retired trace needs.
+    let routed = RoutedOps {
+        cpu_ops,
+        memw_ops,
+        memw_aligned_ops,
+        memw_register_rows,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        cpu32_ops,
     };
-    let gen_memws = || {
-        chunk_and_generate(
-            &memw_ops,
-            max_rows.memw,
-            memw::generate_memw_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_memw_aligneds = || {
-        chunk_and_generate(
-            &memw_aligned_ops,
-            max_rows.memw_aligned,
-            memw_aligned::generate_memw_aligned_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_memw_registers = || {
-        // Direct-to-column fill from compact RegRows — the register fast path never
-        // materializes a `Vec<MemwOperation>`.
-        chunk_and_generate(
-            &memw_register_rows,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace_from_rows,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_loads = || {
-        chunk_and_generate(
-            &load_ops,
-            max_rows.load,
-            load::generate_load_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_lts = || {
-        chunk_and_generate(
-            &lt_ops,
-            max_rows.lt,
-            lt::generate_lt_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_shifts = || {
-        chunk_and_generate(
-            &shift_ops,
-            max_rows.shift,
-            shift::generate_shift_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_muls = || {
-        chunk_and_generate(
-            &mul_ops,
-            max_rows.mul,
-            mul::generate_mul_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_dvrms = || {
-        chunk_and_generate(
-            &dvrm_ops,
-            max_rows.dvrm,
-            dvrm::generate_dvrm_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_branches = || {
-        chunk_and_generate(
-            &branch_ops,
-            max_rows.branch,
-            branch::generate_branch_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
-    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
-    // contributes nothing to any bus.
-    let gen_eqs = || {
-        chunk_and_generate::<eq::EqOperation>(
-            &eq_ops,
-            max_rows.eq,
-            eq::generate_eq_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_bytewises = || {
-        chunk_and_generate::<bytewise::BytewiseOperation>(
-            &bytewise_ops,
-            max_rows.bytewise,
-            bytewise::generate_bytewise_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_stores = || {
-        chunk_and_generate::<store::StoreOperation>(
-            &store_ops,
-            max_rows.store,
-            store::generate_store_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_cpu32s = || {
-        chunk_and_generate::<cpu32::Cpu32Operation>(
-            &cpu32_ops,
-            max_rows.cpu32,
-            cpu32::generate_cpu32_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
+    let cpu_ops_ref = &routed.cpu_ops;
+
+    // Each build below reads disjoint op lists and writes its own table, so
+    // they all run in one rayon scope. Disk-spill stays sequential: its
+    // generate→spill order keeps trace memory bounded.
+    macro_rules! gen_of {
+        ($kind:ident) => {
+            || {
+                routed.build_table(
+                    TableKind::$kind,
+                    max_rows,
+                    #[cfg(feature = "disk-spill")]
+                    storage_mode,
+                )
+            }
+        };
+    }
+    let gen_cpus = gen_of!(Cpu);
+    let gen_memws = gen_of!(Memw);
+    let gen_memw_aligneds = gen_of!(MemwAligned);
+    let gen_memw_registers = gen_of!(MemwRegister);
+    let gen_loads = gen_of!(Load);
+    let gen_lts = gen_of!(Lt);
+    let gen_shifts = gen_of!(Shift);
+    let gen_muls = gen_of!(Mul);
+    let gen_dvrms = gen_of!(Dvrm);
+    let gen_branches = gen_of!(Branch);
+    let gen_eqs = gen_of!(Eq);
+    let gen_bytewises = gen_of!(Bytewise);
+    let gen_stores = gen_of!(Store);
+    let gen_cpu32s = gen_of!(Cpu32);
+
     let gen_bitwise = || {
         let mut bitwise = bitwise::generate_bitwise_trace();
         // Fill the MU columns (11..=20) from the accumulated histogram.
