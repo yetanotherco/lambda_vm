@@ -76,7 +76,7 @@ mod heap_tracker {
                 // Records the elapsed time of the sample that raised the mark,
                 // so a peak can be placed against the phase timeline instead of
                 // being a number with no location.
-                let mut sample = |peak: &AtomicUsize, at: &AtomicUsize| {
+                let sample = |peak: &AtomicUsize, at: &AtomicUsize| {
                     epoch::advance().ok();
                     if let Ok(allocated) = stats::allocated::read()
                         && allocated > peak.fetch_max(allocated, Ordering::Relaxed)
@@ -250,6 +250,23 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
     },
+
+    /// Build the traces without proving, to compare what each production path
+    /// holds. Peak heap is per process, so each path is measured on its own run.
+    TraceBuild {
+        /// Path to the ELF file
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+
+        /// Walk the execution, committing and retiring each table as it fills
+        /// (Approach 1's Commit phase), instead of building every trace first.
+        #[arg(long)]
+        streaming: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -315,6 +332,11 @@ fn main() -> ExitCode {
             }
         }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+        Commands::TraceBuild {
+            elf,
+            private_input,
+            streaming,
+        } => cmd_trace_build(elf, private_input, streaming),
     }
 }
 
@@ -995,6 +1017,83 @@ fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("--epoch-size-log2 must be an integer, got `{value}`"))?;
     continuation_epoch_size(epoch_size_log2)?;
     Ok(epoch_size_log2)
+}
+
+/// Build the traces one way or the other, so the two production paths can be
+/// compared on what they hold. Nothing is proved: this measures the side of the
+/// prover that Approach 1's Commit phase replaces.
+fn cmd_trace_build(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    streaming: bool,
+) -> ExitCode {
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elf = match executor::elf::Elf::load(&elf_data) {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("Failed to load ELF: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
+    let started = std::time::Instant::now();
+
+    let max_rows = prover::tables::MaxRowsConfig::default();
+    let outcome = if streaming {
+        let options = match stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("bad proof options: {e:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+        prover::commit_phase::run_to_end(&elf, &private_inputs, &max_rows, &options)
+            .map(|committed| committed.chunks.len())
+            .map_err(|e| format!("{e:?}"))
+    } else {
+        prover::commit_phase::build_resident(&elf, &private_inputs, &max_rows)
+            .map(|t| t.cpus.len())
+            .map_err(|e| format!("{e:?}"))
+    };
+
+    let elapsed = started.elapsed();
+    match outcome {
+        Ok(n) => println!(
+            "Trace build ({}): {n} chunks, {:.3}s",
+            if streaming { "streaming" } else { "resident" },
+            elapsed.as_secs_f64()
+        ),
+        Err(e) => {
+            eprintln!("trace build failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let (peak_bytes, peak_at_ms) = tracker.stop();
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

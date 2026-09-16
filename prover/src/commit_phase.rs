@@ -127,6 +127,32 @@ fn walk_and_commit<I: crate::paged_mem::ImageSource + Sync>(
     Ok(CommitPhase { closed, leftover })
 }
 
+/// The ordinary build, for comparison against [`run_to_end`].
+///
+/// The same execution and the same tables, built the way `prove` builds them:
+/// every trace resident at once and nothing committed. It lives beside the
+/// Commit phase so the two arms of the comparison are driven identically, and
+/// so the storage-mode argument stays on this side of the feature gate — the
+/// lint enables `lambda-vm-prover/disk-spill` without enabling the CLI's, and a
+/// caller there would not agree with this signature.
+pub fn build_resident(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+) -> Result<Traces, Error> {
+    let executed = executor::vm::execution::Executor::new(elf, private_input.to_vec())
+        .and_then(|e| e.run())
+        .map_err(|e| Error::Prover(format!("execution failed: {e}")))?;
+    Traces::from_elf_and_logs(
+        elf,
+        &executed.logs,
+        max_rows,
+        private_input,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+}
+
 /// The Commit phase end to end.
 ///
 /// The walk, then the padding of everything it could not close. What comes back
