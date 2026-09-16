@@ -3553,6 +3553,14 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
     // HINT table (all-padding for programs that make no hint ecalls).
     let gen_hint = || hint::generate_hint_trace(&hint_ops);
+    // SHA-256 accelerator traces (all-padding for programs that make no SHA
+    // ecalls). ROTXOR alone is 224 rows of 197 columns per compression call, so
+    // these belong in the parallel section with the other heavy tables.
+    let gen_sha256 = || sha256::generate(&sha256_ops);
+    let gen_sha256_round = || sha256_round::generate(&sha256_ops);
+    let gen_sha256_schedule = || sha256_schedule::generate(&sha256_ops);
+    let gen_sha256_rotxor = || sha256_rotxor::generate(&sha256::rot_ops(&sha256_ops));
+    let gen_sha256_k = || sha256_k::generate(sha256_ops.len());
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3566,6 +3574,8 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsm_slot, mut ecdas_slot) = (None, None);
     let mut hint_slot = None;
+    let (mut sha256_slot, mut sha256_round_slot, mut sha256_schedule_slot) = (None, None, None);
+    let (mut sha256_rotxor_slot, mut sha256_k_slot) = (None, None);
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3608,6 +3618,11 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsm_slot, gen_ecsm);
             spawn_into!(ecdas_slot, gen_ecdas);
             spawn_into!(hint_slot, gen_hint);
+            spawn_into!(sha256_rotxor_slot, gen_sha256_rotxor);
+            spawn_into!(sha256_round_slot, gen_sha256_round);
+            spawn_into!(sha256_schedule_slot, gen_sha256_schedule);
+            spawn_into!(sha256_slot, gen_sha256);
+            spawn_into!(sha256_k_slot, gen_sha256_k);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3636,6 +3651,11 @@ fn build_traces<I: ImageSource + Sync>(
         ecsm_slot = Some(gen_ecsm());
         ecdas_slot = Some(gen_ecdas());
         hint_slot = Some(gen_hint());
+        sha256_slot = Some(gen_sha256());
+        sha256_round_slot = Some(gen_sha256_round());
+        sha256_schedule_slot = Some(gen_sha256_schedule());
+        sha256_rotxor_slot = Some(gen_sha256_rotxor());
+        sha256_k_slot = Some(gen_sha256_k());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3671,6 +3691,11 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
     let hint_trace = hint_slot.expect(PHASE5_RAN);
+    let sha256_trace = sha256_slot.expect(PHASE5_RAN);
+    let sha256_round_trace = sha256_round_slot.expect(PHASE5_RAN);
+    let sha256_schedule_trace = sha256_schedule_slot.expect(PHASE5_RAN);
+    let sha256_rotxor_trace = sha256_rotxor_slot.expect(PHASE5_RAN);
+    let sha256_k_trace = sha256_k_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3734,11 +3759,11 @@ fn build_traces<I: ImageSource + Sync>(
         halt: halt_trace,
         commit: commit_trace,
         keccak: keccak_trace,
-        sha256: sha256::generate(&sha256_ops),
-        sha256_round: sha256_round::generate(&sha256_ops),
-        sha256_schedule: sha256_schedule::generate(&sha256_ops),
-        sha256_rotxor: sha256_rotxor::generate(&sha256::rot_ops(&sha256_ops)),
-        sha256_k: sha256_k::generate(sha256_ops.len()),
+        sha256: sha256_trace,
+        sha256_round: sha256_round_trace,
+        sha256_schedule: sha256_schedule_trace,
+        sha256_rotxor: sha256_rotxor_trace,
+        sha256_k: sha256_k_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
