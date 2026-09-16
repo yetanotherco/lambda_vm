@@ -21,7 +21,7 @@ pad = 0
 name = "src_incr"
 type = "DWordHL"
 desc = "$#`src` + #`step`$"
-pad = 1
+pad = 8
 
 [[variables.auxiliary]]
 name = "dst"
@@ -33,13 +33,13 @@ pad = 0
 name = "dst_incr"
 type = "DWordHL"
 desc = "$#`dst` + #`step`$"
-pad = 1
+pad = 8
 
 [[variables.auxiliary]]
 name = "count"
 type = "DWordWL"
 desc = "Number of bytes that still have to be moved, including those moved by this row"
-pad = 1
+pad = 8
 
 [[variables.auxiliary]]
 name = "count_decr"
@@ -60,16 +60,10 @@ desc = "Whether this is the end of the sequence"
 pad = 0
 
 [[variables.auxiliary]]
-name = "tail"
+name = "single"
 type = "Bit"
 desc = "Whether this row moves a single byte rather than eight"
-pad = 1
-
-[[variables.auxiliary]]
-name = "count_lt8"
-type = "Bit"
-desc = "Whether $#`count` < 8$, i.e. whether this row may not move eight bytes"
-pad = 1
+pad = 0
 
 [[variables.auxiliary]]
 name = "is_set"
@@ -98,13 +92,13 @@ pad = 0
 [[variables.auxiliary]]
 name = "commit_write_wide"
 type = "Bit"
-desc = "$#`commit_write` dot (1 - #`tail`)$; whether this row writes eight bytes to the commitment domain"
+desc = "$#`commit_write` dot (1 - #`single`)$; whether this row writes eight bytes to the commitment domain"
 pad = 0
 
 [[variables.auxiliary]]
 name = "value"
 type = "DWordBL"
-desc = "The bytes moved by this row; only $#`value`_0$ is moved when $#`tail` = 1$. Unconstrained on rows that move nothing"
+desc = "The bytes moved by this row; only $#`value`_0$ is moved when $#`single` = 1$. Unconstrained on rows that move nothing"
 pad = 0
 
 # Virtual
@@ -112,8 +106,8 @@ pad = 0
 [[variables.virtual]]
 name = "step"
 type = "Byte"
-desc = "The stride this row advances by: eight, or one when `tail` is set"
-def = ["-", 8, ["*", 7, "tail"]]
+desc = "The stride this row advances by: eight, or one when `single` is set"
+def = ["-", 8, ["*", 7, "single"]]
 
 [[variables.virtual]]
 name = "first_commit"
@@ -213,8 +207,8 @@ ref = "memmove:c:commit_write"
 
 [[constraints.functionality]]
 kind = "arith"
-constraint = "$#`commit_write_wide` = #`commit_write` dot (1 - #`tail`)$"
-poly = ["-", "commit_write_wide", ["*", "commit_write", ["not", "tail"]]]
+constraint = "$#`commit_write_wide` = #`commit_write` dot (1 - #`single`)$"
+poly = ["-", "commit_write_wide", ["*", "commit_write", ["not", "single"]]]
 ref = "memmove:c:commit_write_wide"
 
 [[constraint_groups]]
@@ -251,14 +245,8 @@ name = "width"
 kind = "interaction"
 tag = "ALU"
 input = ["count", ["cast", 8, "DWordWL"], ["opsel", "LT"]]
-output = ["arr", "count_lt8", 0]
-multiplicity = "μ"
-ref = "memmove:c:short"
-
-[[constraints.width]]
-kind = "arith"
-constraint = "$#`count_lt8` => #`tail` = 1$"
-poly = ["*", ["not", "tail"], "count_lt8"]
+output = ["arr", 0, 0]
+multiplicity = ["-", "μ", "single"]
 ref = "memmove:c:wide_needs_eight"
 
 [[constraints.width]]
@@ -275,7 +263,7 @@ name = "copy"
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "src", "value", ["+", "timestamp", 1, "is_set"], 0, 0, ["not", "tail"]]
+input = [0, "src", "value", ["+", "timestamp", 1, "is_set"], 0, 0, ["not", "single"]]
 output = "value"
 multiplicity = ["-", "μ", "end"]
 ref = "memmove:c:read_value"
@@ -283,16 +271,16 @@ ref = "memmove:c:read_value"
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "tail"]]
+input = [0, "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "single"]]
 multiplicity = "ram_write"
 ref = "memmove:c:write_value"
 
 [[constraints.copy]]
 kind = "arith"
-constraint = "$#`tail` => #`value`_i = 0$"
-poly = ["*", "tail", ["idx", "value", "i"]]
+constraint = "$#`single` => #`value`_i = 0$"
+poly = ["*", "single", ["idx", "value", "i"]]
 iter = ["i", 1, 7]
-ref = "memmove:c:tail_lanes"
+ref = "memmove:c:single_lanes"
 
 [[constraints.copy]]
 kind = "arith"
@@ -404,14 +392,8 @@ ref = "memmove:c:range_end"
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
-input = ["tail"]
-ref = "memmove:c:range_tail"
-
-[[constraints.bits]]
-kind = "template"
-tag = "IS_BIT"
-input = ["count_lt8"]
-ref = "memmove:c:range_count_lt8"
+input = ["single"]
+ref = "memmove:c:range_single"
 
 [[constraints.bits]]
 kind = "template"
@@ -430,6 +412,12 @@ kind = "template"
 tag = "IS_BIT"
 input = ["μ"]
 ref = "memmove:c:range_mu"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`single` => #`μ` = 1$"
+poly = ["*", "single", ["not", "μ"]]
+ref = "memmove:c:single_implies_mu"
 
 [[constraints.bits]]
 kind = "arith"
