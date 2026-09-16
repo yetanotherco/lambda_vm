@@ -25,6 +25,9 @@ pub struct CommitPhase {
     pub leftover: WalkLeftover,
 }
 
+/// One chunked table's commitment, by kind and position.
+pub type ChunkCommitment = (TableKind, usize, Commitment);
+
 /// Run the Commit phase over `elf`.
 ///
 /// Each chunk is committed the moment it fills and its trace is dropped, so
@@ -102,3 +105,100 @@ pub fn run(
 
     Ok(CommitPhase { closed, leftover })
 }
+
+/// The Challenge phase's first half: pad and commit what the walk could not
+/// close.
+///
+/// The spec's step after Commit is "at the end of the execution, the remaining
+/// tables are padded and commited to". That is this: the partial tail of every
+/// table the walk closed, plus every chunk of the tables it could not close
+/// because CPU32 and DVRM keep feeding them.
+///
+/// Finalization comes first, as it does in the ordinary build: HALT appends 33
+/// register MEMW ops, and the MEMW-derived LT ops are collected after them so
+/// those accesses get their timestamp checks.
+///
+/// The preprocessed and accumulator tables — BITWISE, DECODE, REGISTER, PAGE and
+/// the rest — are not here yet. They are built from the ELF and from counts
+/// accumulated across the whole run rather than from an op list, so they need
+/// their own step.
+pub fn commit_remaining(
+    mut leftover: WalkLeftover,
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+) -> Result<Vec<ChunkCommitment>, Error> {
+    leftover.finalize();
+
+    let cpu = crate::test_utils::create_cpu_air(proof_options);
+    let memw = crate::test_utils::create_memw_air(proof_options);
+    let memw_aligned = crate::test_utils::create_memw_aligned_air(proof_options);
+    let memw_register = crate::test_utils::create_memw_register_air(proof_options);
+    let load = crate::test_utils::create_load_air(proof_options);
+    let cpu32 = crate::test_utils::create_cpu32_air(proof_options);
+    let branch = crate::test_utils::create_branch_air(proof_options);
+    let eq = crate::test_utils::create_eq_air(proof_options);
+    let bytewise = crate::test_utils::create_bytewise_air(proof_options);
+    let store = crate::test_utils::create_store_air(proof_options);
+    let lt = crate::test_utils::create_lt_air(proof_options);
+    let mul = crate::test_utils::create_mul_air(proof_options);
+    let dvrm = crate::test_utils::create_dvrm_air(proof_options);
+    let shift = crate::test_utils::create_shift_air(proof_options);
+
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    let mut out = Vec::new();
+    for kind in ALL_CHUNKED {
+        let air: &dyn stark::traits::AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksExtension,
+            PublicInputs = (),
+        > = match kind {
+            TableKind::Cpu => &cpu,
+            TableKind::Memw => &memw,
+            TableKind::MemwAligned => &memw_aligned,
+            TableKind::MemwRegister => &memw_register,
+            TableKind::Load => &load,
+            TableKind::Cpu32 => &cpu32,
+            TableKind::Branch => &branch,
+            TableKind::Eq => &eq,
+            TableKind::Bytewise => &bytewise,
+            TableKind::Store => &store,
+            TableKind::Lt => &lt,
+            TableKind::Mul => &mul,
+            TableKind::Dvrm => &dvrm,
+            TableKind::Shift => &shift,
+        };
+        // Chunks the walk already closed keep their numbering; what is left
+        // continues from there.
+        let first = leftover.emitted(kind);
+        for (offset, table) in leftover
+            .take_remaining(kind, max_rows)
+            .into_iter()
+            .enumerate()
+        {
+            let root =
+                <P as IsStarkProver<_, _, _>>::commit_table_root(air, &table).ok_or_else(|| {
+                    Error::Prover(format!("commit phase: no commitment for a {kind:?} tail"))
+                })?;
+            out.push((kind, first + offset, root));
+        }
+    }
+    Ok(out)
+}
+
+/// Every chunked table, closable mid-walk or not.
+const ALL_CHUNKED: [TableKind; 14] = [
+    TableKind::Cpu,
+    TableKind::Memw,
+    TableKind::MemwAligned,
+    TableKind::MemwRegister,
+    TableKind::Load,
+    TableKind::Cpu32,
+    TableKind::Branch,
+    TableKind::Eq,
+    TableKind::Bytewise,
+    TableKind::Store,
+    TableKind::Lt,
+    TableKind::Mul,
+    TableKind::Dvrm,
+    TableKind::Shift,
+];

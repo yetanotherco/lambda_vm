@@ -1832,3 +1832,106 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
         );
     }
 }
+
+/// Commit plus Challenge must cover every chunked table, each under the root
+/// the ordinary prover gives it.
+///
+/// Together the two passes are supposed to account for the chunked side of the
+/// proof with nothing missing and nothing committed twice: the chunks closed
+/// mid-walk, the tails padded at the end, and the tables the walk could not
+/// close at all. Checked against a real proof's roots, in position, so a table
+/// committed under the wrong root or in the wrong slot fails here.
+#[test]
+fn the_two_phases_cover_every_chunked_table() {
+    use crate::tables::trace_builder::{TableKind, Traces as T};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
+    let closed = phase.closed.clone();
+    let rest = crate::commit_phase::commit_remaining(phase.leftover, &max_rows, &proof_options)
+        .expect("challenge");
+
+    let mut got: HashMap<(TableKind, usize), _> = HashMap::new();
+    for (kind, chunk, root) in closed.into_iter().chain(rest) {
+        assert!(
+            got.insert((kind, chunk), root).is_none(),
+            "{kind:?} chunk {chunk} was committed twice"
+        );
+    }
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    let counts = resident.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        false,
+        &resident.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    type P = stark::prover::Prover<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >;
+    use stark::prover::IsStarkProver;
+
+    let groups: [(TableKind, &Vec<_>, &Vec<_>); 4] = [
+        (TableKind::Cpu, &airs.cpus, &resident.cpus),
+        (TableKind::Branch, &airs.branches, &resident.branches),
+        (TableKind::Lt, &airs.lts, &resident.lts),
+        (TableKind::Memw, &airs.memws, &resident.memws),
+    ];
+    let mut checked = 0usize;
+    for (kind, kind_airs, kind_traces) in groups {
+        assert_eq!(
+            kind_airs.len(),
+            kind_traces.len(),
+            "{kind:?}: AIR and trace counts disagree"
+        );
+        for (chunk, (air, table)) in kind_airs.iter().zip(kind_traces.iter()).enumerate() {
+            let expected = <P as IsStarkProver<_, _, _>>::commit_table_root(air.as_ref(), table)
+                .expect("resident commits");
+            let actual = got
+                .get(&(kind, chunk))
+                .unwrap_or_else(|| panic!("{kind:?} chunk {chunk} was never committed"));
+            assert_eq!(
+                *actual, expected,
+                "{kind:?} chunk {chunk}: committed under a different root"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 4, "the fixture must cover several chunks");
+}

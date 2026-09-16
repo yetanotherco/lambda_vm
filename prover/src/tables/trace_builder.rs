@@ -1264,11 +1264,63 @@ pub struct WalkLeftover {
     /// Chunks already emitted per kind, indexed like [`CHUNKED_KINDS`], so the
     /// tail's chunk numbering continues where the walk stopped.
     pub(crate) emitted: [usize; CHUNKED_KINDS.len()],
+    /// Register state at the last cycle. The end-of-run finalization is driven
+    /// from it — HALT appends 33 register MEMW ops at `u64::MAX` — so the phase
+    /// that pads and commits the tails needs nothing else from the run.
+    ///
+    /// The memory state is not carried: the only thing that reads it is the
+    /// PAGE build, which is part of the preprocessed step that does not exist
+    /// yet, and a field nobody reads is a field that quietly goes wrong.
+    pub(crate) register_state: RegisterState,
     /// Cycles executed.
     pub(crate) cycles: usize,
 }
 
 impl WalkLeftover {
+    /// Apply the end-of-run finalization and the routing that depends on it.
+    ///
+    /// HALT appends 33 register MEMW ops at `u64::MAX`, and those need their
+    /// timestamp checks like any other access, so the MEMW-derived LT ops are
+    /// collected after them — the same order `build_traces` uses, where
+    /// finalization runs before phase 3.
+    pub(crate) fn finalize(&mut self) {
+        let halt = collect_halt_ops(&mut self.register_state);
+        let mut buckets = MemwBuckets::with_register_capacity(halt.len());
+        buckets.extend_ops(halt);
+        self.tail.memw_register_rows.extend(buckets.register_rows);
+        self.tail.memw_aligned_ops.extend(buckets.aligned);
+        self.tail.memw_ops.extend(buckets.general);
+
+        self.tail
+            .lt_ops
+            .extend(collect_lt_from_memw(&self.tail.memw_ops));
+        self.tail
+            .lt_ops
+            .extend(collect_lt_from_memw_aligned(&self.tail.memw_aligned_ops));
+    }
+
+    /// Build every chunk still held for `kind`, draining it.
+    ///
+    /// An empty list still yields one padded chunk when the walk never closed
+    /// any, matching `chunk_and_generate`: the table exists in the proof with
+    /// the shape the verifier expects.
+    pub(crate) fn take_remaining(
+        &mut self,
+        kind: TableKind,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
+        let limit = max_rows_for(kind, max_rows);
+        let mut out = Vec::new();
+        while self.tail.buffered(kind) > limit {
+            out.push(self.tail.take_front(kind, limit, max_rows));
+        }
+        let left = self.tail.buffered(kind);
+        if left > 0 || (out.is_empty() && self.emitted(kind) == 0) {
+            out.push(self.tail.take_front(kind, left, max_rows));
+        }
+        out
+    }
+
     /// Cycles the walk executed.
     pub fn cycles(&self) -> usize {
         self.cycles
@@ -3210,7 +3262,12 @@ impl CollectedOps {
             TableKind::Eq => drain!(self.eq_ops, eq::generate_eq_trace),
             TableKind::Bytewise => drain!(self.bytewise_ops, bytewise::generate_bytewise_trace),
             TableKind::Store => drain!(self.store_ops, store::generate_store_trace),
-            other => unreachable!("{other:?} is not closed mid-walk"),
+            // Not closable mid-walk, but the end-of-run phase builds them the
+            // same way once nothing can append to them any more.
+            TableKind::Lt => drain!(self.lt_ops, lt::generate_lt_trace),
+            TableKind::Mul => drain!(self.mul_ops, mul::generate_mul_trace),
+            TableKind::Dvrm => drain!(self.dvrm_ops, dvrm::generate_dvrm_trace),
+            TableKind::Shift => drain!(self.shift_ops, shift::generate_shift_trace),
         }
     }
 
@@ -3300,7 +3357,7 @@ pub(crate) struct CollectedOps {
 /// The preprocessed tables (BITWISE, DECODE, REGISTER, HALT, COMMIT, KECCAK*)
 /// and PAGE are deliberately absent: they are not driven by one op list and the
 /// streaming prover keeps them resident.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TableKind {
     Cpu,
     Memw,
@@ -5167,13 +5224,11 @@ impl Traces {
         // retired during the walk, and "at the end of the execution, the
         // remaining tables are padded and committed". What is left goes back to
         // the caller so it can do exactly that.
-        // The end state the finalization needs is not carried yet: the Challenge
-        // phase that pads and commits these tails does not exist, and a field
-        // nobody reads is a field that quietly goes wrong.
-        let _ = (&memory_state, &register_state);
+        let _ = memory_state;
         Ok(WalkLeftover {
             tail: buf,
             emitted,
+            register_state,
             cycles: cycles_so_far,
         })
     }
