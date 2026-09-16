@@ -153,9 +153,8 @@ fn logup_matches_the_ordinary_prover() {
     assert_eq!(
         logup.tables.len(),
         vm_proof.proof.proofs.len(),
-        "the LogUp pass accounted for a different number of tables than the proof has"
+        "the pass accounted for a different number of tables than the proof has"
     );
-    let mut with_aux = 0usize;
     for (idx, (got, want)) in logup
         .tables
         .iter()
@@ -163,37 +162,44 @@ fn logup_matches_the_ordinary_prover() {
         .enumerate()
     {
         assert_eq!(
-            got.aux_root, want.lde_trace_aux_merkle_root,
-            "table {idx}: auxiliary trace committed under a different root than the proof carries"
+            got.lde_trace_aux_merkle_root, want.lde_trace_aux_merkle_root,
+            "table {idx}: auxiliary trace committed under a different root"
         );
         assert_eq!(
             got.composition_poly_root, want.composition_poly_root,
             "table {idx}: composition polynomial committed under a different root"
         );
         assert_eq!(
-            got.composition_poly_parts_ood_evaluation, want.composition_poly_parts_ood_evaluation,
-            "table {idx}: composition parts evaluated at a different out-of-domain point"
+            got.fri_layers_merkle_roots, want.fri_layers_merkle_roots,
+            "table {idx}: a different FRI commitment"
         );
-        for (label, got, want) in [
-            ("z", &got.trace_ood_evaluations, &want.trace_ood_evaluations),
-            (
-                "g*z",
-                &got.trace_ood_next_evaluations,
-                &want.trace_ood_next_evaluations,
-            ),
-        ] {
-            assert_eq!(
-                (got.width, got.columns()),
-                (want.width, want.columns()),
-                "table {idx}: different out-of-domain trace evaluations at {label}"
-            );
-        }
-        if got.aux_root.is_some() {
-            with_aux += 1;
-        }
+        assert_eq!(
+            got.fri_final_poly_coeffs, want.fri_final_poly_coeffs,
+            "table {idx}: a different FRI final polynomial"
+        );
     }
+
+    // The decisive one: the pass's own proof, verified. Everything above says
+    // it matches the ordinary prover piece by piece; this says the assembled
+    // whole is a proof.
+    let rebuilt = crate::VmProof {
+        proof: stark::proof::stark::MultiProof {
+            proofs: logup.tables,
+        },
+        runtime_page_ranges: crate::tables::trace_builder::runtime_page_ranges(
+            &logup.resident.page_configs,
+        ),
+        table_counts: vm_proof.table_counts.clone(),
+        public_output: logup.resident.public_output.clone(),
+        num_private_input_pages: logup
+            .resident
+            .page_configs
+            .iter()
+            .filter(|c| c.is_private_input)
+            .count(),
+    };
     assert!(
-        with_aux > 20,
-        "the fixture must cover the tables that carry a bus; saw {with_aux}"
+        crate::verify(&rebuilt, &elf_bytes).expect("verify"),
+        "the proof the pass assembled does not verify"
     );
 }

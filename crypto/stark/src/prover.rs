@@ -668,27 +668,6 @@ pub struct MainRoots {
     pub main: Commitment,
 }
 
-/// One table's rounds 2 and 3, for a pass that rebuilds the table to get them.
-///
-/// No main root: rounds 2 and 3 never read that commitment, and the
-/// composition root already pins the main trace — it is computed from the very
-/// LDE the root would be taken over, so a rebuild that drifted shows up here
-/// too, and more cheaply.
-pub struct TableRounds23<FieldExtension: IsField> {
-    pub aux_root: Option<Commitment>,
-    pub bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
-    pub composition_poly_root: Commitment,
-    /// The current-row block: every trace column at `z`.
-    pub trace_ood_evaluations: Table<FieldExtension>,
-    /// The next-row block, pruned to the columns a transition constraint reads
-    /// at `g·z`. Split here rather than by the caller because the transcript
-    /// absorbs the two blocks in this shape.
-    pub trace_ood_next_evaluations: Table<FieldExtension>,
-    pub composition_poly_parts_ood_evaluation: Vec<FieldElement<FieldExtension>>,
-    /// The out-of-domain point rounds 4 and 5 open against.
-    pub z: FieldElement<FieldExtension>,
-}
-
 /// Source of truth for a table whose *trace* has been retired.
 ///
 /// The retire-LDE mode ([`streaming_retire_lde`]) drops a table's LDE and
@@ -1797,8 +1776,8 @@ pub trait IsStarkProver<
         Some((root, bus_public_inputs))
     }
 
-    /// Rounds 2 and 3 for one table, rebuilt from its trace and dropped with
-    /// the call.
+    /// One table's whole proof, rebuilt from its trace and dropped with the
+    /// call.
     ///
     /// The composition polynomial needs both LDEs at once, so this is where a
     /// pass that holds one table at a time pays its widest moment: main LDE,
@@ -1807,15 +1786,16 @@ pub trait IsStarkProver<
     ///
     /// `transcript` must be the table's own fork — the shared state after the
     /// LogUp challenges, domain-separated by AIR index — with nothing appended
-    /// yet. The auxiliary root goes in here, as it does in the fused path, so
-    /// the challenges of rounds 2 and 3 come out identical.
-    fn rounds_2_to_3_for_table(
+    /// yet. The auxiliary root and the table's bus contribution go in here, as
+    /// they do in the fused path, so every challenge below comes out identical
+    /// and the proof is the one the ordinary prover would have written.
+    fn prove_table_from_trace(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         trace: &mut TraceTable<Field, FieldExtension>,
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-    ) -> Result<TableRounds23<FieldExtension>, ProvingError>
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
@@ -1847,11 +1827,7 @@ pub trait IsStarkProver<
         let (main_src, num_main_cols) = trace.main_data_row_major();
         let main_data =
             expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
-        // No main Merkle tree. Rounds 2 and 3 read the LDE, never the
-        // commitment, and this pass opens nothing — the tree would be built and
-        // thrown away. It is the most expensive thing a sequential pass can do
-        // for nothing, and the composition root already pins the same LDE.
-        let main = TableCommit::plain(BatchedMerkleTree::from_root([0u8; 32]), [0u8; 32]);
+        let main = Self::table_commit_for(air, &main_data, num_main_cols)?;
 
         let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
             let (aux_src, cols) = trace.aux_data_row_major();
@@ -1899,75 +1875,14 @@ pub trait IsStarkProver<
             bus_public_inputs,
         };
 
-        let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air
-            .boundary_constraints(
-                pub_inputs,
-                &round_1_result.rap_challenges,
-                round_1_result.bus_public_inputs.as_ref(),
-                domain.interpolation_domain_size,
-            )
-            .constraints
-            .len();
-        let num_transition_constraints = air.context().num_transition_constraints;
-        let mut coefficients: Vec<_> =
-            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
-                .take(num_boundary_constraints + num_transition_constraints)
-                .collect();
-        let transition_coefficients: Vec<_> =
-            coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coefficients = coefficients;
-
-        let mut round_2_result = Self::round_2_compute_composition_polynomial(
+        Self::prove_rounds_2_to_4(
             air,
             pub_inputs,
+            &mut round_1_result,
+            transcript,
             &domain,
             &twiddles,
-            &mut round_1_result,
-            &transition_coefficients,
-            &boundary_coefficients,
-        )?;
-        transcript.append_bytes(&round_2_result.composition_poly_root);
-
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
-        );
-        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
-            air,
-            &domain,
-            &mut round_1_result,
-            &mut round_2_result,
-            &z,
-        );
-
-        // The fork is left standing where round 4 would pick it up: the two
-        // out-of-domain blocks and then the composition parts, in the order the
-        // verifier absorbs them. A pass that batches the FRI has to fold these
-        // states together, so it needs them advanced this far.
-        let (ood_block0, ood_block1) =
-            Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
-        for block in [&ood_block0, &ood_block1] {
-            for col in block.columns().iter() {
-                for elem in col.iter() {
-                    transcript.append_field_element(elem);
-                }
-            }
-        }
-        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
-            transcript.append_field_element(element);
-        }
-
-        Ok(TableRounds23 {
-            aux_root: round_1_result.aux.as_ref().map(|c| c.root),
-            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
-            composition_poly_root: round_2_result.composition_poly_root,
-            trace_ood_evaluations: ood_block0,
-            trace_ood_next_evaluations: ood_block1,
-            composition_poly_parts_ood_evaluation: round_3_result
-                .composition_poly_parts_ood_evaluation,
-            z,
-        })
+        )
     }
 
     /// The main commitment of an already-expanded LDE, split when the AIR is

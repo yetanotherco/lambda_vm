@@ -83,22 +83,22 @@ pub fn table_parallelism() -> usize {
 /// Collects tables until there are `k` of them, then hands the batch over.
 ///
 /// Sits between the walk and a pass so the pass only says what to do with one
-/// table; the batching, and the bound on how many are alive, live here once.
-pub struct Batched<T, F> {
+/// batch; the batching, and the bound on how many tables are alive, live here
+/// once. The action is boxed so a pass names `Batched<'_, Item>` and not a
+/// closure type.
+pub struct Batched<'a, T> {
     batch: Vec<T>,
     k: usize,
-    run: F,
+    #[allow(clippy::type_complexity)]
+    run: Box<dyn FnMut(Vec<T>) -> Result<(), Error> + 'a>,
 }
 
-impl<T, F> Batched<T, F>
-where
-    F: FnMut(Vec<T>) -> Result<(), Error>,
-{
-    pub fn new(run: F) -> Self {
+impl<'a, T> Batched<'a, T> {
+    pub fn new(run: impl FnMut(Vec<T>) -> Result<(), Error> + 'a) -> Self {
         Self {
             batch: Vec::new(),
             k: table_parallelism(),
-            run,
+            run: Box::new(run),
         }
     }
 

@@ -1,5 +1,5 @@
-//! Approach 1's LogUp pass: walk the execution again and build each table's
-//! auxiliary columns against the challenge the Commit phase produced.
+//! Approach 1's proving pass: walk the execution again and prove each table
+//! against the challenge the Commit phase produced.
 //!
 //! The spec's third step is a re-execution. It has to be: the LogUp columns are
 //! a function of the challenge, and the challenge is not known until every main
@@ -15,7 +15,8 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, TableRounds23};
+use stark::proof::stark::StarkProof;
+use stark::prover::IsStarkProver;
 
 use crate::Error;
 use crate::challenge_phase::Challenge;
@@ -28,10 +29,10 @@ use executor::elf::Elf;
 use math::field::element::FieldElement;
 use stark::trace::TraceTable;
 
-/// What the LogUp pass produced.
+/// What the pass produced.
 pub struct LogUp {
-    /// One entry per table, in `VmAirs::air_trace_pairs` order.
-    pub tables: Vec<TableRounds23<GoldilocksExtension>>,
+    /// One proof per table, in `VmAirs::air_trace_pairs` order.
+    pub tables: Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>,
     /// The tables the pass could not retire, rebuilt by this walk.
     pub resident: Resident,
 }
@@ -42,21 +43,20 @@ type Item = (
     TraceTable<GoldilocksField, GoldilocksExtension>,
 );
 
+/// One table's finished proof, tagged with where it sits in the AIR order.
+type Proved = (usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>);
+
+/// Where a batch of proofs lands. Shared because the batch runs in parallel.
+type Proofs = std::sync::Mutex<Vec<Proved>>;
+
 struct BuildAux<'a> {
-    #[allow(clippy::type_complexity)]
-    batch: pass::Batched<Item, Box<dyn FnMut(Vec<Item>) -> Result<(), Error> + 'a>>,
+    batch: pass::Batched<'a, Item>,
 }
 
 impl<'a> BuildAux<'a> {
-    fn new(
-        airs: &'a ChunkAirs,
-        challenge: &'a Challenge,
-        done: &'a std::sync::Mutex<Vec<(usize, TableRounds23<GoldilocksExtension>)>>,
-    ) -> Self {
+    fn new(airs: &'a ChunkAirs, challenge: &'a Challenge, done: &'a Proofs) -> Self {
         Self {
-            batch: pass::Batched::new(Box::new(move |items| {
-                rounds_batch(airs, challenge, done, items)
-            })),
+            batch: pass::Batched::new(move |items| rounds_batch(airs, challenge, done, items)),
         }
     }
 }
@@ -66,7 +66,7 @@ impl<'a> BuildAux<'a> {
 fn rounds_batch(
     airs: &ChunkAirs,
     challenge: &Challenge,
-    done: &std::sync::Mutex<Vec<(usize, TableRounds23<GoldilocksExtension>)>>,
+    done: &Proofs,
     items: Vec<Item>,
 ) -> Result<(), Error> {
     use rayon::prelude::*;
@@ -81,7 +81,7 @@ fn rounds_batch(
                 ))
             })?;
             let mut transcript = fork(&challenge.transcript, idx, n);
-            let rounds = rounds_2_to_3(
+            let rounds = prove_table(
                 airs.get(kind).as_ref(),
                 &mut trace,
                 &challenge.challenges,
@@ -125,7 +125,7 @@ fn fork(
     t
 }
 
-fn rounds_2_to_3(
+fn prove_table(
     air: &dyn stark::traits::AIR<
         Field = GoldilocksField,
         FieldExtension = GoldilocksExtension,
@@ -134,9 +134,9 @@ fn rounds_2_to_3(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     challenges: &[FieldElement<GoldilocksExtension>],
     transcript: &mut DefaultTranscript<GoldilocksExtension>,
-) -> Result<TableRounds23<GoldilocksExtension>, String> {
+) -> Result<StarkProof<GoldilocksField, GoldilocksExtension, ()>, String> {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    <P as IsStarkProver<_, _, _>>::rounds_2_to_3_for_table(air, &(), trace, challenges, transcript)
+    <P as IsStarkProver<_, _, _>>::prove_table_from_trace(air, &(), trace, challenges, transcript)
         .map_err(|e| format!("{e:?}"))
 }
 
@@ -169,12 +169,12 @@ pub fn run(
 /// tables that stay have theirs built here, as the Challenge phase built their
 /// mains.
 fn assemble(
-    chunks: Vec<(usize, TableRounds23<GoldilocksExtension>)>,
+    chunks: Vec<Proved>,
     resident: &mut Resident,
     elf: &Elf,
     proof_options: &ProofOptions,
     challenge: &Challenge,
-) -> Result<Vec<TableRounds23<GoldilocksExtension>>, Error> {
+) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
     let order = &challenge.order;
     let airs = crate::VmAirs::new(
         elf,
@@ -189,7 +189,7 @@ fn assemble(
         None,
     );
 
-    let mut slots: Vec<Option<TableRounds23<GoldilocksExtension>>> =
+    let mut slots: Vec<Option<StarkProof<GoldilocksField, GoldilocksExtension, ()>>> =
         (0..order.len()).map(|_| None).collect();
     for (idx, rounds) in chunks {
         let slot = slots
@@ -208,9 +208,9 @@ fn assemble(
     let build = |idx: usize,
                  air: &crate::VmAir,
                  trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
-     -> Result<TableRounds23<GoldilocksExtension>, Error> {
+     -> Result<StarkProof<GoldilocksField, GoldilocksExtension, ()>, Error> {
         let mut transcript = fork(&challenge.transcript, idx, n);
-        rounds_2_to_3(air.as_ref(), trace, ch, &mut transcript)
+        prove_table(air.as_ref(), trace, ch, &mut transcript)
             .map_err(|e| Error::Prover(format!("logup phase: table {idx}: {e}")))
     };
 

@@ -39,31 +39,22 @@ pub struct CommitPhase {
     pub walked: pass::Walked,
 }
 
+/// One table on its way to a pass: what it is, where it sits, and its trace.
+type Item = (
+    TableKind,
+    usize,
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+);
+
 /// Commits each table's main trace and drops it, `k` tables at a time.
 struct CommitMain<'a> {
-    batch: pass::Batched<
-        (
-            TableKind,
-            usize,
-            TraceTable<GoldilocksField, GoldilocksExtension>,
-        ),
-        Box<
-            dyn FnMut(
-                    Vec<(
-                        TableKind,
-                        usize,
-                        TraceTable<GoldilocksField, GoldilocksExtension>,
-                    )>,
-                ) -> Result<(), Error>
-                + 'a,
-        >,
-    >,
+    batch: pass::Batched<'a, Item>,
 }
 
 impl<'a> CommitMain<'a> {
     fn new(airs: &'a ChunkAirs, roots: &'a std::sync::Mutex<Vec<ChunkCommitment>>) -> Self {
         Self {
-            batch: pass::Batched::new(Box::new(move |items| commit_batch(airs, roots, items))),
+            batch: pass::Batched::new(move |items| commit_batch(airs, roots, items)),
         }
     }
 }
@@ -74,11 +65,7 @@ impl<'a> CommitMain<'a> {
 fn commit_batch(
     airs: &ChunkAirs,
     roots: &std::sync::Mutex<Vec<ChunkCommitment>>,
-    items: Vec<(
-        TableKind,
-        usize,
-        TraceTable<GoldilocksField, GoldilocksExtension>,
-    )>,
+    items: Vec<Item>,
 ) -> Result<(), Error> {
     use rayon::prelude::*;
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
