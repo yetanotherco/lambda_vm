@@ -84,18 +84,6 @@ desc = "$#`first` dot (1 - #`is_commit`)$; whether this row is the first of a se
 pad = 0
 
 [[variables.auxiliary]]
-name = "commit_write"
-type = "Bit"
-desc = "$(#`μ` - #`end`) dot #`is_commit`$; whether this row writes to the commitment domain"
-pad = 0
-
-[[variables.auxiliary]]
-name = "commit_write_wide"
-type = "Bit"
-desc = "$#`commit_write` dot (1 - #`single`)$; whether this row writes eight bytes to the commitment domain"
-pad = 0
-
-[[variables.auxiliary]]
 name = "value"
 type = "DWordBL"
 desc = "The bytes moved by this row; only $#`value`_0$ is moved when $#`single` = 1$. Unconstrained on rows that move nothing"
@@ -114,21 +102,6 @@ name = "first_commit"
 type = "Bit"
 desc = "$#`first` dot #`is_commit`$; whether this row is the first of a sequence deferred by `COMMIT`"
 def = ["-", "first", "first_ecall"]
-
-[[variables.virtual]]
-name = "ram_write"
-type = "Bit"
-desc = "$(#`μ` - #`end`) dot (1 - #`is_commit`)$; whether this row writes to RAM"
-def = ["-", "μ", "end", "commit_write"]
-
-[[variables.virtual]]
-name = "commit_lane"
-type = ["Bit", 8]
-desc = "Whether lane $i$ reaches the commitment domain: lane $0$ on every committing row, lanes $1$ through $7$ only on a wide one"
-def = {idx = "i", polys = [
-    {iter = 0, poly = "commit_write"},
-    {iter = [1, 7], poly = "commit_write_wide"},
-]}
 
 # Multiplicity
 
@@ -199,18 +172,6 @@ constraint = "$#`first_ecall` = #`first` dot (1 - #`is_commit`)$"
 poly = ["-", "first_ecall", ["*", "first", ["not", "is_commit"]]]
 ref = "memmove:c:first_ecall"
 
-[[constraints.functionality]]
-kind = "arith"
-constraint = "$#`commit_write` = (#`μ` - #`end`) dot #`is_commit`$"
-poly = ["-", "commit_write", ["*", ["-", "μ", "end"], "is_commit"]]
-ref = "memmove:c:commit_write"
-
-[[constraints.functionality]]
-kind = "arith"
-constraint = "$#`commit_write_wide` = #`commit_write` dot (1 - #`single`)$"
-poly = ["-", "commit_write_wide", ["*", "commit_write", ["not", "single"]]]
-ref = "memmove:c:commit_write_wide"
-
 [[constraint_groups]]
 name = "read_input"
 
@@ -271,8 +232,8 @@ ref = "memmove:c:read_value"
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "single"]]
-multiplicity = "ram_write"
+input = [["*", 2, "is_commit"], "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "single"]]
+multiplicity = ["-", "μ", "end"]
 ref = "memmove:c:write_value"
 
 [[constraints.copy]]
@@ -293,25 +254,6 @@ kind = "arith"
 constraint = "$#`is_set` => #`dst`_1 = #`src`_1$"
 poly = ["*", "is_set", ["-", ["idx", "dst", 1], ["idx", "src", 1]]]
 ref = "memmove:c:set_gap_hi"
-
-[[constraint_groups]]
-name = "commit"
-
-[[constraints.commit]]
-kind = "interaction"
-tag = "memory"
-input = [2, ["arr", ["+", ["idx", "dst", 0], "i"], ["idx", "dst", 1]], 0, ["idx", "value", "i"]]
-iter = ["i", 0, 7]
-multiplicity = ["idx", "commit_lane", "i"]
-ref = "memmove:c:commit_value_out"
-
-[[constraints.commit]]
-kind = "interaction"
-tag = "memory"
-input = [2, ["arr", ["+", ["idx", "dst", 0], "i"], ["idx", "dst", 1]], 1, ["idx", "value", "i"]]
-iter = ["i", 0, 7]
-multiplicity = ["-", ["idx", "commit_lane", "i"]]
-ref = "memmove:c:commit_value_in"
 
 [[constraint_groups]]
 name = "incr_decr"
