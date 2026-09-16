@@ -457,6 +457,15 @@ impl<F: IsField> Table<F> {
         self.data[idx] = value;
     }
 
+    /// Whether the row-major data is backed by the spill mmap rather than the
+    /// heap. Exposed so callers can assert that a table they expected to spill
+    /// actually did: nothing else about a spilled table is observable from the
+    /// outside, since every accessor reads through the backing transparently.
+    #[cfg(feature = "disk-spill")]
+    pub fn is_spilled(&self) -> bool {
+        self.mmap_backing.is_some()
+    }
+
     /// Spill the table's row-major data to a temp file and mmap it back.
     /// Frees the heap `data` Vec while preserving access through
     /// [`Self::get`], [`Self::get_row`], and [`Self::columns`].

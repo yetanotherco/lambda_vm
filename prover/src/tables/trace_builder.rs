@@ -3556,11 +3556,38 @@ fn build_traces<I: ImageSource + Sync>(
     // SHA-256 accelerator traces (all-padding for programs that make no SHA
     // ecalls). ROTXOR alone is 224 rows of 197 columns per compression call, so
     // these belong in the parallel section with the other heavy tables.
-    let gen_sha256 = || sha256::generate(&sha256_ops);
-    let gen_sha256_round = || sha256_round::generate(&sha256_ops);
-    let gen_sha256_schedule = || sha256_schedule::generate(&sha256_ops);
-    let gen_sha256_rotxor = || sha256_rotxor::generate(&sha256::rot_ops(&sha256_ops));
-    let gen_sha256_k = || sha256_k::generate(sha256_ops.len());
+    // These are fixed-size tables, so `chunk_and_generate` never sees them and
+    // the fixed-table spill block below would be the only thing that spilled
+    // them — by which point all five are resident at once. Spill each one as it
+    // is built instead, so disk mode peaks at the largest and not at the sum.
+    let spill_now = |t: TraceTable<GoldilocksField, GoldilocksExtension>,
+                     name: &str|
+     -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
+        #[cfg(not(feature = "disk-spill"))]
+        let _ = name;
+        #[cfg(feature = "disk-spill")]
+        let t = {
+            let mut t = t;
+            if storage_mode == StorageMode::Disk {
+                t.main_table
+                    .spill_to_disk()
+                    .map_err(|e| Error::Prover(format!("disk-spill {name}: {e}")))?;
+            }
+            t
+        };
+        Ok(t)
+    };
+    let gen_sha256 = || spill_now(sha256::generate(&sha256_ops), "sha256");
+    let gen_sha256_round = || spill_now(sha256_round::generate(&sha256_ops), "sha256_round");
+    let gen_sha256_schedule =
+        || spill_now(sha256_schedule::generate(&sha256_ops), "sha256_schedule");
+    let gen_sha256_rotxor = || {
+        spill_now(
+            sha256_rotxor::generate(&sha256::rot_ops(&sha256_ops)),
+            "sha256_rotxor",
+        )
+    };
+    let gen_sha256_k = || spill_now(sha256_k::generate(sha256_ops.len()), "sha256_k");
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3691,11 +3718,11 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
     let hint_trace = hint_slot.expect(PHASE5_RAN);
-    let sha256_trace = sha256_slot.expect(PHASE5_RAN);
-    let sha256_round_trace = sha256_round_slot.expect(PHASE5_RAN);
-    let sha256_schedule_trace = sha256_schedule_slot.expect(PHASE5_RAN);
-    let sha256_rotxor_trace = sha256_rotxor_slot.expect(PHASE5_RAN);
-    let sha256_k_trace = sha256_k_slot.expect(PHASE5_RAN);
+    let sha256_trace = sha256_slot.expect(PHASE5_RAN)?;
+    let sha256_round_trace = sha256_round_slot.expect(PHASE5_RAN)?;
+    let sha256_schedule_trace = sha256_schedule_slot.expect(PHASE5_RAN)?;
+    let sha256_rotxor_trace = sha256_rotxor_slot.expect(PHASE5_RAN)?;
+    let sha256_k_trace = sha256_k_slot.expect(PHASE5_RAN)?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
