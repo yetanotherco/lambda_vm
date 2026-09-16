@@ -10,6 +10,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Successful device commits of a stacked polynomial.
 static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// ★ Commits that asked the device and got nothing, and encoded on the host.
+///
+/// The counter H4's arm needed and did not have. A device commit that declines
+/// is INVISIBLE in every other number here: `COMMIT_CALLS` simply does not
+/// rise, and a count that is merely lower than expected says nothing when the
+/// expected count is itself derived. It matters because falling back is not a
+/// slower way to do the same thing — `from_codeword` then retains a host
+/// codeword and a host node array for the rest of the proof, so a card that
+/// fills near the end of an epoch turns into gigabytes of host memory and a
+/// utilisation figure that looks like a scheduling problem.
+static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Sumchecks whose rounds ran on device.
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
@@ -25,6 +36,16 @@ static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn host_fallbacks() -> u64 {
+    HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Called where a commit gives up on the device. Counts in non-cuda builds
+/// too, where every commit takes that path and the number is the commit count.
+pub(crate) fn note_host_fallback() {
+    HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn sumcheck_calls() -> u64 {
@@ -53,6 +74,7 @@ pub fn open_calls() -> u64 {
 
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
+    HOST_FALLBACKS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);

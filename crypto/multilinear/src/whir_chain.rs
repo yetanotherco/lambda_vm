@@ -445,10 +445,20 @@ where
     };
     let commitment = match attempt {
         Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
-        None => CodewordCommitment::from_codeword(
-            encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
-            first,
-        )?,
+        // ⚠ COUNTED, because this arm is otherwise silent. The device declining
+        // is not a slower path to the same place: the codeword is assembled,
+        // lifted and encoded here, and the commitment then holds that codeword
+        // AND its node array on the host until the proof ends. An epoch that
+        // fills the card partway through lands here for every commit after,
+        // and the only visible symptoms are host memory and a utilisation
+        // figure — neither of which names the cause.
+        None => {
+            crate::gpu::note_host_fallback();
+            CodewordCommitment::from_codeword(
+                encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
+                first,
+            )?
+        }
     };
     Ok((commitment, domain))
 }

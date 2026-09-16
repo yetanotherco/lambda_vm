@@ -333,9 +333,10 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         // beside a commit count of thousands says it in one line.
         #[cfg(feature = "cuda")]
         println!(
-            "{:<12} gpu commits {} · keccak grinds {} · rpx grinds {}",
+            "{:<12} gpu commits {} · host fallbacks {} · keccak grinds {} · rpx grinds {}",
             "WHIR",
             multilinear::gpu::commit_calls(),
+            multilinear::gpu::host_fallbacks(),
             crypto::grinding::gpu_grind_calls(),
             crypto::grinding::gpu_grind_calls_rpx(),
         );
@@ -482,6 +483,7 @@ fn continuation_phases() {
     #[cfg(feature = "cuda")]
     for (tag, count) in [
         ("gpu commits", multilinear::gpu::commit_calls()),
+        ("host fallbacks", multilinear::gpu::host_fallbacks()),
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu evals", multilinear::gpu::evaluate_calls()),
         ("gpu trees", multilinear::gpu::tree_calls()),
@@ -701,6 +703,7 @@ fn phases() {
     for (tag, count) in [
         ("gpu grinds", stark::gpu_lde::gpu_grind_calls()),
         ("gpu commits", multilinear::gpu::commit_calls()),
+        ("host fallbacks", multilinear::gpu::host_fallbacks()),
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu rounds", multilinear::gpu::sumcheck_rounds()),
         ("gpu evals", multilinear::gpu::evaluate_calls()),
