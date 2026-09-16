@@ -976,6 +976,36 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakCo
 }
 
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
+/// KECCAK_BRIDGE on the epoch-local `Keccak` bus: stands in for the 24-round
+/// chain inside a continuation epoch proof.
+pub fn create_keccak_bridge_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        crate::tables::keccak_bridge::cols::NUM_COLUMNS,
+        crate::tables::keccak_bridge::epoch_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "KECCAK_BRIDGE",
+    )
+}
+
+/// KECCAK_BRIDGE on the global side: the same committed trace with the bus
+/// polarity flipped, handing every epoch's requests to the run-wide
+/// KECCAK_RND chain. Must stay byte-identical in layout to
+/// [`create_keccak_bridge_air`] — the two proofs' main-trace roots are compared.
+pub fn create_keccak_bridge_global_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        crate::tables::keccak_bridge::cols::NUM_COLUMNS,
+        crate::tables::keccak_bridge::global_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "KECCAK_BRIDGE_G",
+    )
+}
+
 pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakRndConstraints> {
     build_air(
         keccak_rnd_cols::NUM_COLUMNS,

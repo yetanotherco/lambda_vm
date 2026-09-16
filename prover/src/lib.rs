@@ -54,9 +54,9 @@ use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
     create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_keccak_bridge_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air,
+    create_lt_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
+    create_mul_air, create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -84,6 +84,12 @@ pub struct RuntimePageRange {
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
 /// keccak_rc, register, ecsm, ecdas, hint.
 pub const FIXED_TABLE_COUNT: usize = 11;
+
+/// How [`FIXED_TABLE_COUNT`] shrinks when the keccak round chip is hoisted into
+/// a continuation's global proof: KECCAK_RND and KECCAK_RC leave the epoch and
+/// the single KECCAK_BRIDGE arrives, so the epoch carries one table fewer.
+/// See [`VmAirs::with_hoisted_keccak_rounds`].
+pub const HOISTED_KECCAK_TABLE_DELTA: usize = 1;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -520,6 +526,10 @@ pub(crate) struct VmAirs {
     pub keccak: VmAir,
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
+    /// Stand-in for the 24-round chain inside a continuation epoch. Used in
+    /// place of `keccak_rnd` + `keccak_rc` when [`VmAirs::hoist_keccak_rounds`]
+    /// is set.
+    pub keccak_bridge: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
     pub hint: VmAir,
@@ -529,6 +539,13 @@ pub(crate) struct VmAirs {
     /// Whether the HALT table participates in this proof. False for intermediate
     /// continuation epochs, which do not terminate the program.
     pub include_halt: bool,
+    /// Whether the keccak round chip is hoisted out of this proof. True for
+    /// continuation epochs: KECCAK_RND and KECCAK_RC are proved once for the
+    /// whole run in the global proof, and KECCAK_BRIDGE closes the epoch-local
+    /// `Keccak` bus in their place. KECCAK_RND is a pure function — no memory,
+    /// no ordering, no state between calls — so one run-wide instance can serve
+    /// every epoch.
+    pub hoist_keccak_rounds: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
@@ -544,13 +561,21 @@ impl VmAirs {
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.commit.as_ref(), &mut traces.commit, &()),
             (self.keccak.as_ref(), &mut traces.keccak, &()),
-            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
-            (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.hint.as_ref(), &mut traces.hint, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
+        // The keccak round chip, or the bridge that replaces it. Kept adjacent
+        // and in a fixed position so `air_refs` can mirror it exactly and
+        // `keccak_bridge_index` can name it.
+        debug_assert_eq!(pairs.len(), Self::FIXED_PREFIX_TABLES);
+        if self.hoist_keccak_rounds {
+            pairs.push((self.keccak_bridge.as_ref(), &mut traces.keccak_bridge, &()));
+        } else {
+            pairs.push((self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()));
+            pairs.push((self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()));
+        }
         if self.include_halt {
             pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
         }
@@ -619,13 +644,19 @@ impl VmAirs {
             self.decode.as_ref(),
             self.commit.as_ref(),
             self.keccak.as_ref(),
-            self.keccak_rnd.as_ref(),
-            self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
             self.hint.as_ref(),
             self.register.as_ref(),
         ];
+        // Mirrors the same branch in `air_trace_pairs`.
+        debug_assert_eq!(refs.len(), Self::FIXED_PREFIX_TABLES);
+        if self.hoist_keccak_rounds {
+            refs.push(self.keccak_bridge.as_ref());
+        } else {
+            refs.push(self.keccak_rnd.as_ref());
+            refs.push(self.keccak_rc.as_ref());
+        }
         if self.include_halt {
             refs.push(self.halt.as_ref());
         }
@@ -789,6 +820,7 @@ impl VmAirs {
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
         let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let keccak_bridge: VmAir = Box::new(create_keccak_bridge_air(proof_options));
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
@@ -914,6 +946,7 @@ impl VmAirs {
             keccak,
             keccak_rnd,
             keccak_rc,
+            keccak_bridge,
             ecsm,
             ecdas,
             hint,
@@ -921,11 +954,40 @@ impl VmAirs {
             pages,
             memw_registers,
             include_halt,
+            // Off by default: the monolithic path keeps the round chip local.
+            // Continuation epochs opt in via `with_hoisted_keccak_rounds`.
+            hoist_keccak_rounds: false,
             eqs,
             bytewises,
             stores,
             cpu32s,
         }
+    }
+
+    /// Number of tables emitted before the keccak-round branch in both
+    /// [`Self::air_trace_pairs`] and [`Self::air_refs`]. Both assert this at
+    /// the branch point, so reordering the fixed prefix without updating it
+    /// trips in every debug build.
+    const FIXED_PREFIX_TABLES: usize = 8;
+
+    /// Index of KECCAK_BRIDGE in this proof's table list, or `None` when the
+    /// round chip is local. Used to pull the bridge's committed root out of an
+    /// epoch proof so it can be tied to the global proof's copy.
+    pub fn keccak_bridge_index(&self) -> Option<usize> {
+        self.hoist_keccak_rounds
+            .then_some(Self::FIXED_PREFIX_TABLES)
+    }
+
+    /// Hoist the keccak round chip out of this proof: KECCAK_RND and KECCAK_RC
+    /// are dropped from the table set and KECCAK_BRIDGE takes their place on
+    /// the epoch-local `Keccak` bus.
+    ///
+    /// Only valid for a continuation epoch, whose global proof carries the one
+    /// run-wide KECCAK_RND that actually serves the requests. Both the prover
+    /// and the verifier must set this identically — it changes the table list.
+    pub fn with_hoisted_keccak_rounds(mut self) -> Self {
+        self.hoist_keccak_rounds = true;
+        self
     }
 }
 
@@ -1031,11 +1093,30 @@ pub(crate) fn verify_l2g_commitment_binding_view(
     epoch_l2g_roots: &[Commitment],
     final_proof: MultiProofView<'_, F, E, ()>,
 ) -> bool {
-    final_proof.len() >= epoch_l2g_roots.len()
-        && epoch_l2g_roots
-            .iter()
-            .enumerate()
-            .all(|(i, root)| *final_proof.get(i).lde_trace_main_merkle_root() == *root)
+    // The L2G block is the global proof's first `E` sub-tables.
+    verify_epoch_block_binding_view(epoch_l2g_roots, final_proof, 0)
+}
+
+/// Tie one per-epoch table to the global proof's copy of it: the global proof
+/// commits the identical main trace (a different AIR — different bus, opposite
+/// polarity — over the same columns), so equal main-trace roots means equal
+/// data. Only main roots are compared; the aux traces legitimately differ,
+/// since each proof derives its own from its own LogUp challenges.
+///
+/// `block_offset` is where that per-epoch block starts in the global proof's
+/// table list: 0 for L2G, `E` for KECCAK_BRIDGE (see `prove_global`).
+pub(crate) fn verify_epoch_block_binding_view(
+    epoch_roots: &[Commitment],
+    final_proof: MultiProofView<'_, F, E, ()>,
+    block_offset: usize,
+) -> bool {
+    final_proof.len() >= block_offset + epoch_roots.len()
+        && epoch_roots.iter().enumerate().all(|(i, root)| {
+            *final_proof
+                .get(block_offset + i)
+                .lde_trace_main_merkle_root()
+                == *root
+        })
 }
 
 // =============================================================================

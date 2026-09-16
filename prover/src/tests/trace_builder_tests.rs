@@ -598,7 +598,13 @@ mod keccak_tests {
     #[test]
     fn test_keccak_bitwise_ops_count() {
         let (kop, _) = make_keccak_ops();
-        let ops = collect_bitwise_from_keccak(&[kop]);
+        // Both halves together: the core chip's address/state_ptr checks plus
+        // the round chip's replayed lookups. They live in separate proofs for a
+        // continuation, but the union is what a monolithic proof emits.
+        let mut ops = collect_bitwise_from_keccak_core(std::slice::from_ref(&kop));
+        ops.extend(collect_bitwise_from_keccak_rounds(std::slice::from_ref(
+            &kop,
+        )));
 
         let xor = ops
             .iter()

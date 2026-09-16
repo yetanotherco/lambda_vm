@@ -53,6 +53,7 @@ use super::eq;
 use super::halt;
 use super::hint;
 use super::keccak::{self, KeccakOperation};
+use super::keccak_bridge;
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
@@ -2443,10 +2444,16 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
 /// halfword shifts are enforced by inline constraints, not HWSL lookups); the
 /// keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
-#[allow(clippy::needless_range_loop)]
-pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
-    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-
+/// BITWISE lookups emitted by the KECCAK **core** chip: the state-address
+/// byte checks and the 100 IS_HALF state-pointer halfword checks per call.
+///
+/// Split out from the round chip's lookups because the two chips can live in
+/// different proofs: a continuation epoch keeps the core (it does the memory
+/// I/O) but hoists the round chip into the global proof, so each half's
+/// lookups must follow its own chip to the right BITWISE table.
+pub(crate) fn collect_bitwise_from_keccak_core(
+    keccak_ops: &[KeccakOperation],
+) -> Vec<BitwiseOperation> {
     let mut ops = Vec::new();
 
     for kop in keccak_ops {
@@ -2486,7 +2493,24 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 ));
             }
         }
+    }
 
+    ops
+}
+
+/// BITWISE lookups emitted by the KECCAK_RND **round** chip, recovered by
+/// replaying the 24 rounds. These follow the round chip: in a continuation
+/// they are collected into the GLOBAL proof's BITWISE table, not the epoch's.
+/// See [`collect_bitwise_from_keccak_core`] for the other half.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn collect_bitwise_from_keccak_rounds(
+    keccak_ops: &[KeccakOperation],
+) -> Vec<BitwiseOperation> {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+
+    let mut ops = Vec::new();
+
+    for kop in keccak_ops {
         // Replay keccak round computation to extract bitwise lookups
         let mut state = kop.input;
         for round in 0..24 {
@@ -2792,6 +2816,15 @@ impl CollectedEpoch {
         touched_cells_from_memory_state(&self.memory_state)
     }
 
+    /// The epoch's keccak permutation calls, for the global proof: it builds
+    /// this epoch's KECCAK_BRIDGE (whose committed root must equal the one the
+    /// epoch proof publishes) and folds the ops into the run-wide KECCAK_RND
+    /// chain. The epoch's own trace build derives its bridge from the very same
+    /// ops, so the two copies are identical by construction.
+    pub fn keccak_ops(&self) -> Vec<KeccakOperation> {
+        self.ops.keccak_ops.clone()
+    }
+
     /// The epoch's final register file (`R_{i+1}`) in
     /// `register_word_address_list` order: the exact values
     /// [`register::fini_from_trace`] reads off the generated REGISTER trace
@@ -2858,8 +2891,17 @@ pub struct Traces {
     /// KECCAK core table (one row per keccak permutation call)
     pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// KECCAK_RND round table (24 rows per keccak call)
+    /// KECCAK_RND round table (24 rows per keccak call).
+    ///
+    /// In a continuation epoch this is an empty stub: the round chip is hoisted
+    /// out of the epoch and proved once for the whole run, with
+    /// [`Traces::keccak_bridge`] standing in on the epoch-local `Keccak` bus.
     pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// KECCAK_BRIDGE table (one row per keccak call). Only populated for
+    /// continuation epochs; empty on the monolithic path, which keeps
+    /// KECCAK_RND local and so needs no bridge.
+    pub keccak_bridge: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -3161,6 +3203,12 @@ fn build_traces<I: ImageSource + Sync>(
         hint_ops,
     } = ops;
 
+    // Continuation epochs hoist the keccak round chip out of the epoch: the
+    // epoch commits only KECCAK_BRIDGE, and one run-wide KECCAK_RND/KECCAK_RC
+    // pair in the global proof serves every epoch's requests. This is exactly
+    // "is a continuation epoch" — the same condition as the L2G bookend.
+    let hoist_keccak_rounds = l2g_memory_bookend;
+
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
@@ -3242,7 +3290,15 @@ fn build_traces<I: ImageSource + Sync>(
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        // The KECCAK core stays in this proof, so its lookups always belong here.
+        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak_core(&keccak_ops))),
+        // The round chip's lookups follow the round chip: when it is hoisted
+        // they go to the GLOBAL proof's BITWISE table instead of this one.
+        Box::new(|h| {
+            if !hoist_keccak_rounds {
+                h.add_ops(&collect_bitwise_from_keccak_rounds(&keccak_ops));
+            }
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3503,6 +3559,9 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_commit = || commit::generate_commit_trace(&commit_ops);
     let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
     let gen_keccak_rnd = || {
+        if hoist_keccak_rounds {
+            return keccak_rnd::generate_keccak_rnd_trace(&[]);
+        }
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
             .iter()
             .map(|op| KeccakRoundOperation {
@@ -3515,8 +3574,20 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+        let rounds_served = if hoist_keccak_rounds {
+            0
+        } else {
+            keccak_ops.len()
+        };
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, rounds_served);
         keccak_rc_trace
+    };
+    let gen_keccak_bridge = || {
+        if hoist_keccak_rounds {
+            keccak_bridge::generate_keccak_bridge_trace(&keccak_ops)
+        } else {
+            keccak_bridge::generate_keccak_bridge_trace(&[])
+        }
     };
     let gen_pages = || match initial_image {
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
@@ -3542,6 +3613,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
         (None, None, None, None);
+    let mut keccak_bridge_slot = None;
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
@@ -3579,6 +3651,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(keccak_slot, gen_keccak);
             spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
+            spawn_into!(keccak_bridge_slot, gen_keccak_bridge);
             spawn_into!(commit_slot, gen_commit);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
@@ -3607,6 +3680,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_slot = Some(gen_keccak());
         keccak_rnd_slot = Some(gen_keccak_rnd());
         keccak_rc_slot = Some(gen_keccak_rc());
+        keccak_bridge_slot = Some(gen_keccak_bridge());
         pages_slot = Some(gen_pages());
         register_slot = Some(gen_register());
         halt_slot = Some(gen_halt());
@@ -3643,6 +3717,7 @@ fn build_traces<I: ImageSource + Sync>(
     let keccak_trace = keccak_slot.expect(PHASE5_RAN);
     let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
+    let keccak_bridge_trace = keccak_bridge_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
@@ -3717,6 +3792,7 @@ fn build_traces<I: ImageSource + Sync>(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
+        keccak_bridge: keccak_bridge_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
         hint: hint_trace,
@@ -4080,6 +4156,7 @@ impl Traces {
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::hint::cols::NUM_COLUMNS as HINT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
+        use super::keccak_bridge::cols::NUM_COLUMNS as KECCAK_BRIDGE_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
         use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
         use super::keccak_rnd::cols::NUM_COLUMNS as KECCAK_RND_COLS;
@@ -4115,6 +4192,7 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            keccak_bridge,
             ecsm,
             ecdas,
             hint,
@@ -4170,6 +4248,7 @@ impl Traces {
         }
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
+        total += (keccak_bridge.num_rows() * KECCAK_BRIDGE_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
@@ -4220,6 +4299,7 @@ impl Traces {
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
+        let n_keccak_bridge = aux_cols(super::keccak_bridge::epoch_bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
         let n_eq = aux_cols(super::eq::bus_interactions().len());
         let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
@@ -4248,6 +4328,7 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
+            keccak_bridge,
             ecsm,
             ecdas,
             hint,
@@ -4303,6 +4384,7 @@ impl Traces {
         }
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
+        total += (keccak_bridge.num_rows() * n_keccak_bridge) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;

@@ -66,17 +66,26 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
+use crate::tables::keccak::KeccakOperation;
+use crate::tables::keccak_rnd::KeccakRoundOperation;
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
 use crate::tables::trace_builder::{
     DecodeArtifacts, Traces, build_init_page_data, build_initial_image_paged,
+    collect_bitwise_from_keccak_rounds,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
+use crate::tables::{bitwise, keccak_bridge, keccak_rc, keccak_rnd};
+use crate::test_utils::{
+    ConcreteVmAir, create_bitwise_air, create_keccak_bridge_global_air, create_keccak_rc_air,
+    create_keccak_rnd_air,
+};
 use crate::{
-    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding_view,
+    Error, FIXED_TABLE_COUNT, HOISTED_KECCAK_TABLE_DELTA, RuntimePageRange, TableCounts, VmAirs,
+    compute_expected_commit_bus_balance_view, verify_epoch_block_binding_view,
+    verify_l2g_commitment_binding_view,
 };
 
 type F = GoldilocksField;
@@ -453,6 +462,13 @@ struct EpochProof {
     /// The committed L2G table root, tied to the global proof by
     /// [`verify_l2g_commitment_binding_view`].
     l2g_root: Commitment,
+    /// The committed KECCAK_BRIDGE root. The global proof commits the identical
+    /// trace with the bus polarity flipped, so comparing the two roots is what
+    /// forces the run-wide KECCAK_RND to serve *this* epoch's actual requests
+    /// rather than a set of the prover's choosing. Without it the epoch's
+    /// `Keccak` bus would still balance against the bridge and the permutations
+    /// would simply go unproven.
+    keccak_bridge_root: Commitment,
 }
 
 /// A self-contained continuation proof: the per-epoch proofs in execution order, the one
@@ -572,6 +588,13 @@ impl<'a> EpochProofView<'a> {
             Self::Archived(e) => e.l2g_root,
         }
     }
+
+    fn keccak_bridge_root(&self) -> Commitment {
+        match self {
+            Self::Owned(e) => e.keccak_bridge_root,
+            Self::Archived(e) => e.keccak_bridge_root,
+        }
+    }
 }
 
 /// Borrowed view over a [`ContinuationProof`] (owned or archived-in-place),
@@ -632,7 +655,9 @@ impl<'a> ContinuationProofView<'a> {
 /// source of truth for the AIR set, so the two halves can never diverge. The set
 /// is `VmAirs` (HALT included iff `is_final`), with REGISTER preprocessed to
 /// INIT = `register_init` and FINI = `reg_fini`. Continuation epochs
-/// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
+/// use the L2G bookend, so PAGE is skipped and `page_configs` is empty, and
+/// they hoist the keccak round chip into the global proof (KECCAK_RND and
+/// KECCAK_RC are replaced by KECCAK_BRIDGE). The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
 #[allow(clippy::too_many_arguments)]
 fn build_epoch_airs(
@@ -665,6 +690,11 @@ fn build_epoch_airs(
         None,
         register_preprocessed,
     )
+    // KECCAK_RND is a pure function, so it does not need re-proving each epoch.
+    // Every epoch commits only KECCAK_BRIDGE; one run-wide round chip in the
+    // global proof serves all their requests. Set here, in the single source of
+    // truth for the epoch AIR set, so prove and verify can never disagree.
+    .with_hoisted_keccak_rounds()
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -755,6 +785,21 @@ fn prove_epoch(
         })?
         .lde_trace_main_merkle_root;
 
+    let bridge_index = airs.keccak_bridge_index().ok_or_else(|| {
+        Error::ContinuationInvariant(
+            "continuation epochs must hoist the keccak round chip".to_string(),
+        )
+    })?;
+    let keccak_bridge_root = proof
+        .proofs
+        .get(bridge_index)
+        .ok_or_else(|| {
+            Error::ContinuationInvariant(
+                "epoch proof is missing the KECCAK_BRIDGE sub-table".to_string(),
+            )
+        })?
+        .lde_trace_main_merkle_root;
+
     Ok(EpochProof {
         proof,
         public_output,
@@ -762,6 +807,7 @@ fn prove_epoch(
         runtime_page_ranges,
         reg_fini,
         l2g_root,
+        keccak_bridge_root,
     })
 }
 
@@ -796,12 +842,14 @@ fn verify_epoch(
 
     // Cross-check table_counts before building AIRs from bundle data. Continuation
     // epochs have no PAGE proofs, and append one epoch-local L2G proof after the VM
-    // tables. HALT is present only on the final epoch.
+    // tables. HALT is present only on the final epoch, and the keccak round chip is
+    // always hoisted into the global proof (see `build_epoch_airs`), which costs one
+    // fixed table.
     let fixed_tables = if is_final {
         FIXED_TABLE_COUNT
     } else {
         FIXED_TABLE_COUNT - 1
-    };
+    } - HOISTED_KECCAK_TABLE_DELTA;
     let proof = epoch.proof();
     let expected_proof_count = table_counts.total() + fixed_tables + 1;
     if expected_proof_count != proof.len() {
@@ -874,8 +922,65 @@ fn verify_epoch(
 /// non-preprocessed (committed, bus-enforced genesis — see `global_memory_air` / §3.6).
 /// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
 /// matches its source (the ELF for ELF/runtime pages).
+/// The run-wide keccak chip the global proof carries, plus the BITWISE
+/// provider its lookups need. KECCAK_RND is a pure function, so one instance
+/// serves every epoch; each epoch commits only a KECCAK_BRIDGE whose root is
+/// tied to the copy here. Built identically on the prove and verify sides.
+pub(crate) fn global_keccak_airs(
+    opts: &ProofOptions,
+) -> (
+    ConcreteVmAir<crate::tables::keccak_rnd::KeccakRndConstraints>,
+    ConcreteVmAir<EmptyConstraints>,
+    ConcreteVmAir<EmptyConstraints>,
+) {
+    let rnd = create_keccak_rnd_air(opts);
+    let rc = create_keccak_rc_air(opts).with_preprocessed(
+        keccak_rc::preprocessed_commitment(opts),
+        keccak_rc::NUM_PRECOMPUTED_COLS,
+    );
+    let bw = create_bitwise_air(opts).with_preprocessed(
+        bitwise::preprocessed_commitment(opts),
+        bitwise::NUM_PRECOMPUTED_COLS,
+    );
+    (rnd, rc, bw)
+}
+
+/// Traces for [`global_keccak_airs`]: the round chain over EVERY epoch's
+/// permutation calls, the round-constant multiplicities for that total, and
+/// the BITWISE lookups the round chip emits (which left the epochs' BITWISE
+/// tables when the round chip was hoisted — see `trace_builder`'s
+/// `hoist_keccak_rounds`).
+pub(crate) fn global_keccak_traces(
+    keccak_ops_per_epoch: &[Vec<KeccakOperation>],
+) -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
+    let all_ops: Vec<KeccakOperation> = keccak_ops_per_epoch.iter().flatten().cloned().collect();
+
+    let rnd_ops: Vec<KeccakRoundOperation> = all_ops
+        .iter()
+        .map(|op| KeccakRoundOperation {
+            timestamp: op.timestamp,
+            input: op.input,
+            output: op.output,
+        })
+        .collect();
+    let rnd = keccak_rnd::generate_keccak_rnd_trace(&rnd_ops);
+
+    let mut rc = keccak_rc::generate_keccak_rc_trace();
+    keccak_rc::update_multiplicities(&mut rc, all_ops.len());
+
+    let mut bw = bitwise::generate_bitwise_trace();
+    let mut histogram = bitwise::BitwiseHistogram::new();
+    // Only the ROUND chip's lookups: the KECCAK core stays in the epochs, and
+    // its lookups stay with it in the epochs' own BITWISE tables.
+    histogram.add_ops(&collect_bitwise_from_keccak_rounds(&all_ops));
+    histogram.fill_multiplicities(&mut bw);
+
+    (rnd, rc, bw)
+}
+
 fn prove_global(
     boundaries: &[Arc<Vec<CellBoundary>>],
+    keccak_ops_per_epoch: &[Vec<KeccakOperation>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
@@ -921,14 +1026,37 @@ fn prove_global(
         .map(|config| global_memory_air(opts, config, None))
         .collect();
 
+    // The hoisted keccak round chip: one KECCAK_BRIDGE per epoch (the identical
+    // trace each epoch proof commits — the binding compares their roots), plus
+    // the single run-wide KECCAK_RND/KECCAK_RC pair that actually serves every
+    // request, and the BITWISE provider for the round chip's lookups.
+    let mut bridge_traces: Vec<TraceTable<F, E>> = keccak_ops_per_epoch
+        .iter()
+        .map(|ops| keccak_bridge::generate_keccak_bridge_trace(ops))
+        .collect();
+    let bridge_airs: Vec<_> = (0..keccak_ops_per_epoch.len())
+        .map(|_| create_keccak_bridge_global_air(opts))
+        .collect();
+    let (keccak_rnd_air, keccak_rc_air, bitwise_air) = global_keccak_airs(opts);
+    let (mut keccak_rnd_trace, mut keccak_rc_trace, mut bitwise_trace) =
+        global_keccak_traces(keccak_ops_per_epoch);
+
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
         .iter()
         .zip(l2g_traces.iter_mut())
         .map(|(air, t)| (air as AirRef, t, &()))
         .collect();
+    // Bridges sit immediately after the L2G block so both cross-proof root
+    // bindings live at fixed offsets: L2G at `0..E`, bridges at `E..2E`.
+    for (air, trace) in bridge_airs.iter().zip(bridge_traces.iter_mut()) {
+        pairs.push((air as AirRef, trace, &()));
+    }
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
+    pairs.push((&keccak_rnd_air as AirRef, &mut keccak_rnd_trace, &()));
+    pairs.push((&keccak_rc_air as AirRef, &mut keccak_rc_trace, &()));
+    pairs.push((&bitwise_air as AirRef, &mut bitwise_trace, &()));
 
     Prover::multi_prove(
         pairs,
@@ -1012,10 +1140,23 @@ fn verify_global(
         })
         .collect();
 
+    // Mirrors `prove_global`'s order exactly: L2G block, bridge block, GM
+    // block, then the run-wide keccak chip and its BITWISE provider.
+    let bridge_airs: Vec<_> = (0..num_epochs)
+        .map(|_| create_keccak_bridge_global_air(opts))
+        .collect();
+    let (keccak_rnd_air, keccak_rc_air, bitwise_air) = global_keccak_airs(opts);
+
     let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
+    for air in &bridge_airs {
+        refs.push(air as AirRef);
+    }
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
+    refs.push(&keccak_rnd_air as AirRef);
+    refs.push(&keccak_rc_air as AirRef);
+    refs.push(&bitwise_air as AirRef);
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
@@ -1103,7 +1244,11 @@ pub fn prove_continuation(
     // prepared) — the global proof depends only on these execution artifacts,
     // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
     // of serializing after them. Proof bytes are unchanged — only the schedule.
-    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
+    // Carries each epoch's boundary AND its keccak calls: the global proof
+    // needs both (the boundary for the memory argument, the calls for the
+    // hoisted round chip and this epoch's KECCAK_BRIDGE copy).
+    type GlobalInputs = (Arc<Vec<CellBoundary>>, Vec<KeccakOperation>);
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<GlobalInputs>();
 
     // Three-stage epoch pipeline: a producer thread runs the
     // sequential-critical work (execute + op collection over the advancing
@@ -1365,9 +1510,10 @@ pub fn prove_continuation(
                         label,
                         &collected.touched_memory_cells(),
                     ));
-                    // Publish this epoch's boundary for the global prove (in
-                    // epoch order; the channel closes when the producer ends).
-                    let _ = boundary_tx.send(Arc::clone(&boundary));
+                    // Publish this epoch's boundary and keccak calls for the
+                    // global prove (in epoch order; the channel closes when the
+                    // producer ends).
+                    let _ = boundary_tx.send((Arc::clone(&boundary), collected.keccak_ops()));
 
                     // R_{i+1} from the collected register end state — the exact
                     // value the generated REGISTER trace binds (`fini_from_trace`
@@ -1429,8 +1575,10 @@ pub fn prove_continuation(
         let init_page_data_ref = &init_page_data;
         scope.spawn(move || {
             let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
-            while let Ok(b) = boundary_rx.recv() {
-                all.push(b);
+            let mut all_keccak: Vec<Vec<KeccakOperation>> = Vec::new();
+            while let Ok((boundary, keccak_ops)) = boundary_rx.recv() {
+                all.push(boundary);
+                all_keccak.push(keccak_ops);
             }
             // An epoch already failed: its error wins and the bundle is never
             // assembled — skip the (whole-prove-sized) global prove.
@@ -1447,6 +1595,7 @@ pub fn prove_continuation(
                 let touched = touched_page_bases(&all);
                 let global = prove_global(
                     &all,
+                    &all_keccak,
                     elf_bytes,
                     init_page_data_ref,
                     &touched,
@@ -1635,12 +1784,14 @@ fn verify_continuation_view(
     // Derived from the ELF for epoch 0, then from each epoch's bound fini.
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
+    let mut bridge_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
     for (index, epoch) in bundle.epochs().enumerate() {
         let is_final = index == n - 1;
         let label = local_to_global::epoch_label(index as u64);
         let l2g_root = epoch.l2g_root();
+        let keccak_bridge_root = epoch.keccak_bridge_root();
         let epoch_public_output = epoch.public_output();
 
         if !verify_epoch(
@@ -1657,6 +1808,7 @@ fn verify_continuation_view(
         }
 
         epoch_roots.push(l2g_root);
+        bridge_roots.push(keccak_bridge_root);
         public_output.extend_from_slice(epoch_public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
@@ -1719,6 +1871,15 @@ fn verify_continuation_view(
 
     // Each epoch's committed L2G table is the same one the global proof used.
     if !verify_l2g_commitment_binding_view(&epoch_roots, global_proof) {
+        return Ok(None);
+    }
+
+    // Same for each epoch's KECCAK_BRIDGE. Without this the global proof could
+    // serve a permutation set of the prover's choosing: the epoch's `Keccak`
+    // bus balances against *its* bridge either way, so nothing else forces the
+    // run-wide round chip to have done this epoch's actual work. The bridge
+    // block sits immediately after the L2G block in `prove_global`.
+    if !verify_epoch_block_binding_view(&bridge_roots, global_proof, n) {
         return Ok(None);
     }
 
@@ -2777,6 +2938,37 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a global proof spliced in from a different run must be rejected"
+        );
+    }
+
+    /// The KECCAK_BRIDGE root binding must bite on its own. The epoch's `Keccak`
+    /// bus balances against its bridge whatever that bridge contains, and the
+    /// global proof's bus balances against whatever *it* commits — so the only
+    /// thing forcing the run-wide KECCAK_RND to have done this epoch's actual
+    /// permutations is that the two proofs commit the same bridge trace.
+    /// Corrupting the claimed root must therefore be rejected.
+    #[test]
+    fn test_verify_rejects_a_tampered_keccak_bridge_root() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = ProofOptions::default_test_options();
+
+        let mut bundle =
+            prove_continuation(&elf_bytes, &(0u8..16).collect::<Vec<_>>(), 2, &opts).unwrap();
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "the honest bundle must verify before tampering"
+        );
+
+        bundle.epochs[0].keccak_bridge_root[0] ^= 1;
+
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_none(),
+            "a claimed KECCAK_BRIDGE root that the global proof did not commit must be rejected"
         );
     }
 
