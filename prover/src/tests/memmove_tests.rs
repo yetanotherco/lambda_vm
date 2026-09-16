@@ -14,7 +14,7 @@ fn set_row(count: u64, first: bool, end: bool, src: u64, dst: u64) -> MemmoveOpe
         count,
         first,
         end,
-        // A narrow row must leave lanes 1..7 clear (constraints 25-31), and the
+        // A narrow row must leave lanes 1..7 clear (the `single * value[i] = 0` set), and the
         // terminal row copies nothing at all.
         value: if end {
             [0; 8]
@@ -28,7 +28,7 @@ fn set_row(count: u64, first: bool, end: bool, src: u64, dst: u64) -> MemmoveOpe
 
 /// A row whose width is chosen independently of `count`, so a test can express
 /// `tail != (count < 8)`. `row()` and `set_row()` both derive width from count, which
-/// makes `(1 - tail) * lt8` identically zero and constraint 13 impossible to state.
+/// makes `single == (count < 8)` identically, so the width rule cannot be stated.
 fn row_of_width(
     functionality: crate::tables::memmove::Functionality,
     count: u64,
@@ -223,7 +223,7 @@ fn memmove_constraints_count_and_indices() {
 
 #[test]
 fn memmove_padding_row_cannot_claim_first_or_end() {
-    // Constraint 4, `(first + end) * (1 - mu) = 0`, is the sole guard that a
+    // `(first + end) * (1 - mu) = 0` is the sole guard that a
     // padding row (mu = 0) cannot masquerade as the first or terminal row of a
     // copy — bitness alone accepts first = 1 or end = 1, so nothing else rejects
     // it. A padding row claiming `first` would forge an ECALL receive; claiming
@@ -331,7 +331,7 @@ fn memmove_commit_sends_one_pair_per_byte() {
 ///
 /// `dst == src` is the degenerate case: read and write address the same cell at
 /// adjacent timestamps, so the memory argument closes on `value == value` and every
-/// value lane becomes a free field element. Constraints 32 and 33 are the only thing
+/// value lane becomes a free field element. The two `is_set` gap constraints are the only thing
 /// that rejects it, so both are tested here in both directions, and a `Copy` row is
 /// tested to confirm the gate is `is_set` and does not leak onto the copy path (a
 /// memcpy with `dst == src` is harmless -- its read is at `T+1` and pins `value` to
@@ -406,7 +406,7 @@ fn memmove_constraints_pin_the_memset_gap() {
     ]);
     assert!(
         validate_busless(&air, &copy_aliased),
-        "constraints 30-31 must not fire on Copy rows, even with dst == src"
+        "the memset gap pin must not fire on Copy rows, even with dst == src"
     );
 }
 
@@ -500,7 +500,7 @@ fn the_wide_row_check_is_a_lookup_fired_only_on_wide_rows() {
 /// !IS_COMMIT`), so the accepting direction is exercised end to end but nothing ever
 /// tried to break the COMMIT-domain gating.
 ///
-/// Covers constraints 12 (one-hot), 13 (no selector on a padding row) and 18
+/// Covers the one-hot `is_set * is_commit = 0`, the no-selector-on-padding rule, and
 /// (`mu_com_wide = mu_com * (1 - tail)`), the last being the structural successor of
 /// the deleted DMA_SET `FILL_WIDE`, which had four negative tests and lost them all.
 #[test]
@@ -526,12 +526,12 @@ fn memmove_constraints_gate_the_commit_functionality() {
         "an honest commit chain must be accepted"
     );
 
-    // Constraint 11: a row cannot claim two functionalities. Setting `is_set` on a
+    // One-hot (`is_set * is_commit = 0`): a row cannot claim two functionalities. Setting `is_set` on a
     // commit row would buy the inverted timestamp order on a chain the COMMIT chip
     // authorised.
     //
     // This case has to be built on a chain whose addresses already satisfy the memset
-    // gap pin (constraints 30-31), or those reject it first and the assertion passes
+    // memset gap pin, or those reject it first and the assertion passes
     // for the wrong reason — verified by mutation: neutering 12 alone left an earlier
     // version of this test green.
     let gap_clean = generate_memmove_trace(&[
@@ -546,10 +546,10 @@ fn memmove_constraints_gate_the_commit_functionality() {
     one_hot.main_table.set_fe(0, cols::IS_SET, FE::one());
     assert!(
         !validate_busless(&air, &one_hot),
-        "is_set and is_commit must not both be set (constraint 11)"
+        "is_set and is_commit must not both be set (the one-hot constraint)"
     );
 
-    // Constraint 16: widen a one-byte commit row. `mu_com_wide` is what stops it
+    // `mu_com_wide = mu_com * (1 - single)`: widen a one-byte commit row. It is what stops it
     // broadcasting seven spurious `(index, 0)` pairs onto the COMMIT bus, which the
     // verifier rebuilds from `public_output` — so a forgery here corrupts the output
     // fingerprint rather than merely wasting a row.
@@ -557,10 +557,10 @@ fn memmove_constraints_gate_the_commit_functionality() {
     trace.main_table.set_fe(1, cols::MU_COM_WIDE, FE::one());
     assert!(
         !validate_busless(&air, &trace),
-        "a one-byte commit row must not claim the wide lanes (constraint 16)"
+        "a one-byte commit row must not claim the wide lanes (mu_com_wide)"
     );
 
-    // Constraint 12: no selector on a padding row. The chain above is six rows, so
+    // `(is_set + is_commit) * (1 - mu) = 0`: no selector on a padding row. The chain above is six rows, so
     // the trace pads to eight and row 7 is padding with mu = 0.
     let mut trace = honest.clone();
     assert_eq!(
@@ -571,7 +571,7 @@ fn memmove_constraints_gate_the_commit_functionality() {
     trace.main_table.set_fe(7, cols::IS_COMMIT, FE::one());
     assert!(
         !validate_busless(&air, &trace),
-        "a padding row must not carry a functionality selector (constraint 12)"
+        "a padding row must not carry a functionality selector"
     );
 
     // There is deliberately no "commit row also claims the RAM write" case here any

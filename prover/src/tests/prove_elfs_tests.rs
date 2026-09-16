@@ -1405,12 +1405,12 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
     use crate::tables::memmove::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
-    // `!tail` matters: on a one-byte row `fill_wide` must stay zero, so shifting
-    // both lanes there would trip constraint 9 locally and the test would prove
-    // something else.
+    // A wide row matters here: on a one-byte row the unused lanes must stay zero, so
+    // shifting both lanes there would trip the `single * value[i] = 0` set locally and
+    // the test would prove something else.
     let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
-    // Shift both lanes so the row stays internally consistent (constraint 10
-    // still holds); only the chain token and the MEMW write disagree.
+    // Shift both lanes so the row stays internally consistent locally; only the chain
+    // token and the MEMW write disagree.
     for column in [dma_set_cols::VALUE[0], dma_set_cols::VALUE[1]] {
         let original = *traces.memmove.main_table.get(forged_row, column);
         traces.memmove.main_table.set(

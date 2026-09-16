@@ -38,8 +38,10 @@
 //!
 //! ## Width is chosen per row
 //!
-//! `tail` is free except that an eight-byte row is illegal when fewer than eight
-//! bytes remain (`(1 - tail) * lt8 = 0`, with `lt8` pinned by the ALU). A schedule can
+//! `single` is free upward: a one-byte row is legal at any count. A wide row needs
+//! eight bytes remaining, and that is the ALU `LT` lookup fired at multiplicity
+//! `mu - single` with its answer pinned to 0 -- so a narrow row is not checked at all
+//! and the rule costs no column. A schedule can
 //! therefore walk one-byte rows until `dst` is eight-aligned and take eight-byte rows
 //! through the body, which keeps those rows in MEMW_A rather than MEMW.
 //!
@@ -49,10 +51,10 @@
 //! - `dst` DWordWL (2) — for `commit` this is the COMMIT-domain address, i.e. the
 //!   running global byte index — `dst_incr` DWordHL (4)
 //! - `count` DWordWL (2), `count_decr` DWordHL (4)
-//! - `first`, `end`, `tail`, `value[8]`, `mu`
+//! - `first`, `end`, `single`, `value[8]`, `mu`
 //! - `is_set`, `is_commit` — the decoded functionality
 //! - `f_ncommit = first * (1 - is_commit)`, `mu_com = (mu - end) * is_commit`,
-//!   `mu_com_wide = mu_com * (1 - tail)` — multiplicities are strictly linear in this
+//!   `mu_com_wide = mu_com * (1 - single)` — multiplicities are strictly linear in this
 //!   framework, so an op-specific gate that is not already linear needs a column and a
 //!   degree-2 constraint. The RAM write needs none: it rides `mu - end - mu_com`
 //!   directly, which is `(mu - end) * (1 - is_commit)` expanded.
@@ -129,7 +131,7 @@ pub mod cols {
     pub const F_NCOMMIT: usize = 34;
     /// `(mu - end) * is_commit` — the COMMIT-domain write.
     pub const MU_COM: usize = 35;
-    /// `mu_com * (1 - tail)` — lanes 1..7 of the COMMIT-domain write. Without it a
+    /// `mu_com * (1 - single)` — lanes 1..7 of the COMMIT-domain write. Without it a
     /// one-byte commit row would send seven spurious `(index, 0)` pairs and corrupt
     /// the public-output fingerprint.
     pub const MU_COM_WIDE: usize = 36;
@@ -790,7 +792,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // standing between the chip and an arbitrary memory write.
         //
         // `is_set` alone is the correct gate. `step` advances `src` and `dst` together
-        // (constraints 17 and 19), so `dst - src` is invariant along a chain and the
+        // (the two `ADDNW` position updates), so `dst - src` is invariant along a chain and the
         // relation holds on the terminal row as well; padding rows leave `is_set = 0`.
         // Gating on the RAM-write multiplicity instead would exempt terminal rows at
         // the cost of a degree, and the table is asserted to stay at degree 2.

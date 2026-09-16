@@ -701,7 +701,7 @@ fn collect_ops_from_cpu(
         // read/write order inverted — write at T+1, read at T+2. There IS a source
         // phase, and the self-overlap is the point: the stub seeds eight bytes and
         // calls with `dst = src + 8`, so each row's read observes the write eight
-        // bytes back and the seed propagates. That is what constraints 30/31 pin.
+        // bytes back and the seed propagates. That is what the two `is_set` gap constraints pin.
         if op.ecall_dma_memset {
             // memset is a memmove call whose only distinguishing feature is the
             // inverted timestamp order; the stub already seeded the first eight
