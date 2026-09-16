@@ -59,9 +59,10 @@ fn memw_chunk_rows(
         .flat_map(|t| (0..t.num_rows()).map(move |row| (t, row)))
 }
 
-/// Run multi_prove and multi_verify for all VM tables.
+/// Run multi_prove and multi_verify over the tables this run actually carries.
 ///
-/// Includes: CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT + REGISTER + PAGEs
+/// The AIR set comes from `traces.table_counts()`, so a chip the program never
+/// reaches is absent from both sides rather than proved as a padded table.
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 pub(crate) fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {

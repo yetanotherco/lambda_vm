@@ -1735,8 +1735,8 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// and IS_B20 lookups for carry range checks.
 ///
 /// IS_HALF and IS_B20 are emitted once per raw op. MSB16 is deduplicated
-/// per `max_rows_mul` chunk, mirroring `chunk_and_generate` — a unique signed
-/// op that spans two instances is sent twice and must be tallied twice.
+/// per `max_rows_mul` chunk, mirroring `chunk_and_generate_optional` — a unique
+/// signed op that spans two instances is sent twice and must be tallied twice.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_mul(
@@ -1833,7 +1833,7 @@ pub(crate) fn collect_bitwise_from_mul(
 ///
 /// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16 and the
 /// NEG-template ZERO lookups (C3/C5) are deduplicated per `max_rows_dvrm`
-/// chunk, mirroring `chunk_and_generate`.
+/// chunk, mirroring `chunk_and_generate_optional`.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_dvrm(
@@ -2803,6 +2803,14 @@ impl CollectedEpoch {
 }
 
 /// All generated trace tables.
+///
+/// Every `Vec` field here may be **empty**: a chip the run never reaches carries
+/// no table at all, so indexing one without checking panics on a program that
+/// happens not to use it. The only exceptions are `cpus` and `memw_registers`,
+/// which are built through `chunk_and_generate` and always carry at least one
+/// (padded) chunk — the same two `TableCounts::validate` requires. Several
+/// fields below spell this out individually; the rule is the struct's, not
+/// theirs.
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
     pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3619,7 +3627,8 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_register = || register::generate_register_trace(&register_final_state, register_init);
     let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
-    // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
+    // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
+    // and no ECDAS table at all — not a padded one.
     let gen_ecsms = || {
         generate_optional(
             &ecsm_ops,
@@ -3636,7 +3645,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    // HINT table (all-padding for programs that make no hint ecalls).
+    // HINT table. Absent entirely for programs that make no hint ecalls.
     let gen_hints = || {
         generate_optional(
             &hint_ops,

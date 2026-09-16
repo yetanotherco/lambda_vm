@@ -361,15 +361,18 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check compares only their sum. A plain `+` wraps silently in
-/// release (the workspace sets no `overflow-checks`), so an attacker can park
-/// one field near `usize::MAX`, pick a second to carry the sum around to
-/// whatever `proofs.len()` is, and pass that check with the huge field intact —
-/// straight into `VmAirs::new`, which sizes a `Vec` from it.
-/// The six accelerators are not chunked — `generate_optional` emits one table or
-/// none — so any count above 1 describes a table set no prover can build. Both
-/// verifiers call `validate` before the counts size anything (`verify_proof_parts`
-/// and `verify_epoch`), so rejecting it here is rejecting it on every path.
+/// sub-proof cross-check constrains only their *sum*. The six accelerators are
+/// not chunked — `generate_optional` emits one table or none — so any count
+/// above 1 describes a table set no prover can build, and the sum alone does not
+/// catch it: lower another count by the same amount and the total still matches.
+/// This pins the per-field shape.
+///
+/// It is a shape restriction, not a memory-safety guard. Both verifiers run the
+/// cross-check *before* any count sizes an AIR set (`verify_proof_parts`:
+/// `validate` → total-vs-`proofs.len()` → `VmAirs::new`; `verify_epoch` the
+/// same), and `total()` is checked, so an astronomical count cannot reach
+/// `VmAirs::new` by wrapping the sum either — that is
+/// [`counts_that_wrap_have_no_total`]'s property, not this one's.
 #[test]
 fn an_accelerator_count_above_one_is_rejected() {
     let (elf, logs, _instructions) = run_asm_elf("test_keccak");
