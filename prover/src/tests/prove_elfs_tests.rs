@@ -1395,7 +1395,7 @@ fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
     traces
         .memmove
         .main_table
-        .set(forged_row, dma_cols::TAIL, FieldElement::one());
+        .set(forged_row, dma_cols::SINGLE, FieldElement::one());
 
     assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
 }
@@ -1454,7 +1454,7 @@ fn test_prove_dma_memset_forged_wide_tail_rejected() {
     traces
         .memmove
         .main_table
-        .set(forged_row, dma_set_cols::TAIL, FieldElement::one());
+        .set(forged_row, dma_set_cols::SINGLE, FieldElement::one());
 
     assert_dma_forgery_rejected(&elf, &mut traces, "a row's width must match its step");
 }
@@ -1534,7 +1534,7 @@ fn dma_set_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) ->
             let get = |column| *traces.memmove.main_table.get(row, column) == one;
             get(mm_cols::MU)
                 && get(mm_cols::IS_SET)
-                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::SINGLE))
         })
         .expect("guest must contain the requested real memset row")
 }
@@ -1568,7 +1568,7 @@ fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> boo
             let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_COMMIT);
             get(mm_cols::MU)
                 && is_copy
-                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::TAIL))
+                && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::SINGLE))
         })
         .expect("guest must contain the requested real MEMMOVE copy row")
 }

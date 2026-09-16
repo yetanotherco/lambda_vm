@@ -79,7 +79,7 @@ fn memmove_trace_uses_eight_byte_rows_then_a_byte_tail() {
     ]);
 
     let wide = trace.main_table.get_row(0);
-    assert_eq!(wide[cols::TAIL], FE::zero());
+    assert_eq!(wide[cols::SINGLE], FE::zero());
     assert_eq!(wide[cols::SRC_INCR_0], FE::from(0x1008u64));
     assert_eq!(wide[cols::COUNT_DECR_0], FE::from(2u64));
     for (i, &byte) in b"abcdefgh".iter().enumerate() {
@@ -87,7 +87,7 @@ fn memmove_trace_uses_eight_byte_rows_then_a_byte_tail() {
     }
 
     let tail = trace.main_table.get_row(1);
-    assert_eq!(tail[cols::TAIL], FE::one());
+    assert_eq!(tail[cols::SINGLE], FE::one());
     assert_eq!(tail[cols::SRC_INCR_0], FE::from(0x1001u64));
     assert_eq!(tail[cols::COUNT_DECR_0], FE::one());
     assert_eq!(tail[cols::VALUE[0]], FE::from(b'i' as u64));
@@ -95,7 +95,7 @@ fn memmove_trace_uses_eight_byte_rows_then_a_byte_tail() {
 
     let terminal = trace.main_table.get_row(3);
     assert_eq!(terminal[cols::END], FE::one());
-    assert_eq!(terminal[cols::TAIL], FE::one());
+    assert_eq!(terminal[cols::SINGLE], FE::one());
     assert_eq!(terminal[cols::COUNT_DECR_0], FE::from(0xFFFFu64));
     assert_eq!(terminal[cols::COUNT_DECR_0 + 1], FE::from(0xFFFFu64));
     assert_eq!(terminal[cols::COUNT_DECR_0 + 2], FE::from(0xFFFFu64));
@@ -212,7 +212,7 @@ fn memmove_constraints_count_and_indices() {
     use crate::tables::memmove::MemmoveConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = MemmoveConstraints.meta();
-    assert_eq!(meta.len(), 32);
+    assert_eq!(meta.len(), 31);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -410,30 +410,25 @@ fn memmove_constraints_pin_the_memset_gap() {
     );
 }
 
-/// Constraint 13, `(1 - tail) * lt8 = 0`, in both directions.
+/// The width rule, now that it lives in a lookup rather than a constraint.
 ///
-/// This is the constraint that replaced the old DMA table's hard pin of
-/// `tail = (count < 8)`, so that a one-byte row is legal at any count and a prover may
-/// walk one-byte rows to reach eight-byte alignment and keep the body on `MEMW_A`.
-///
-/// Both directions matter, and the accepting one is the point: the builder does NOT
-/// emit narrow rows at a high count today — the alignment split was measured and
-/// removed — so nothing else in the tree exercises the freedom this constraint grants.
-/// Without a test, tightening it back to `tail == lt8` would look like a harmless
-/// cleanup and would silently remove the capability.
-///
-/// Neither case is expressible through `row()` or `set_row()`, which derive width
-/// from count and so can only ever produce `tail == lt8`.
+/// A one-byte row is legal at any count, and a wide row needs eight bytes remaining.
+/// The second half used to be the polynomial `(1 - tail) * lt8 = 0`; it is now the
+/// ALU lookup fired at multiplicity `mu - single` with its answer pinned to "not
+/// less than eight". That is cheaper — it drops the `lt8` column — but it means the
+/// rejecting direction is no longer visible to a busless test, so it is pinned here
+/// by asserting the lookup's shape instead.
 #[test]
-fn memmove_constraint_13_frees_narrow_rows_but_not_wide_ones() {
+fn a_narrow_row_is_legal_at_any_count() {
     use crate::tables::memmove::Functionality::Copy;
     let air = busless_air(
         cols::NUM_COLUMNS,
         crate::tables::memmove::MemmoveConstraints,
     );
 
-    // ACCEPTED: a one-byte row with eight bytes still to go — the prologue that
-    // walks `dst` up to eight-byte alignment. `tail = 1`, `lt8 = 0`.
+    // The freedom the relaxation buys: one-byte rows with plenty of bytes left. The
+    // builder does not emit these today, so nothing else in the tree covers it, and
+    // re-tightening the rule would look like a harmless cleanup.
     let prologue = generate_memmove_trace(&[
         row_of_width(Copy, 16, 1, true, false, 0x1001, 0x2001),
         row_of_width(Copy, 15, 1, false, false, 0x1002, 0x2002),
@@ -445,16 +440,57 @@ fn memmove_constraint_13_frees_narrow_rows_but_not_wide_ones() {
         validate_busless(&air, &prologue),
         "a one-byte row at count >= 8 must be legal, whether or not the builder emits one"
     );
+}
 
-    // REJECTED: an eight-byte row with fewer than eight bytes left. `tail = 0`,
-    // `lt8 = 1`, so `(1 - tail) * lt8 = 1`.
-    let overrun = generate_memmove_trace(&[
-        row_of_width(Copy, 7, 8, true, false, 0x1000, 0x2000),
-        row_of_width(Copy, 0, 1, false, true, 0x1008, 0x2008),
-    ]);
+/// The other half: a wide row must have eight bytes remaining.
+///
+/// This is an ALU lookup now, not a polynomial, so it cannot be exercised busless.
+/// What is pinned here is that the lookup is wired the way the argument needs: fired
+/// at `mu - single`, so it is skipped on narrow rows and can never go negative, and
+/// asking for the answer "not less than eight" rather than storing it in a column.
+#[test]
+fn the_wide_row_check_is_a_lookup_fired_only_on_wide_rows() {
+    use crate::tables::memmove::bus_interactions;
+    use crate::tables::types::{BusId, alu_op};
+    use stark::lookup::{BusValue, LinearTerm, Multiplicity, Packing};
+
+    // A constant BusValue is a Linear with a single Constant term.
+    let is_const = |v: &BusValue, want: i64| {
+        matches!(v, BusValue::Linear(terms)
+            if matches!(terms.as_slice(), [LinearTerm::Constant(c)] if *c == want))
+    };
+
+    let checks: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| {
+            i.bus_id == BusId::Alu as u64
+                && matches!(i.multiplicity, Multiplicity::Diff(a, b)
+                    if a == cols::MU && b == cols::SINGLE)
+        })
+        .collect();
+
+    assert_eq!(
+        checks.len(),
+        1,
+        "exactly one ALU lookup rides `mu - single`, so it is skipped on narrow rows \
+         and its multiplicity can never go negative"
+    );
+    let c = &checks[0];
+
     assert!(
-        !validate_busless(&air, &overrun),
-        "an eight-byte row must be illegal when only seven bytes remain"
+        matches!(c.values[0], BusValue::Packed { start_column, packing: Packing::DWordWL }
+            if start_column == cols::COUNT_0),
+        "it compares `count`"
+    );
+    assert!(is_const(&c.values[1], 8), "against 8");
+    assert!(
+        is_const(&c.values[3], alu_op::LT as i64),
+        "with the LT opcode"
+    );
+    assert!(
+        is_const(&c.values[4], 0),
+        "and demands the answer be 0, i.e. NOT less than eight -- pinned as a \
+         constant rather than stored in a column, which is where the saving is"
     );
 }
 

@@ -43,7 +43,7 @@
 //! therefore walk one-byte rows until `dst` is eight-aligned and take eight-byte rows
 //! through the body, which keeps those rows in MEMW_A rather than MEMW.
 //!
-//! ## Columns (38)
+//! ## Columns (37)
 //!
 //! - `timestamp` DWordWL (2), `src` DWordWL (2), `src_incr` DWordHL (4)
 //! - `dst` DWordWL (2) — for `commit` this is the COMMIT-domain address, i.e. the
@@ -51,7 +51,6 @@
 //! - `count` DWordWL (2), `count_decr` DWordHL (4)
 //! - `first`, `end`, `tail`, `value[8]`, `mu`
 //! - `is_set`, `is_commit` — the decoded functionality
-//! - `lt8` — `count < 8`, pinned by the ALU
 //! - `f_ncommit = first * (1 - is_commit)`, `mu_com = (mu - end) * is_commit`,
 //!   `mu_com_wide = mu_com * (1 - tail)` — multiplicities are strictly linear in this
 //!   framework, so an op-specific gate that is not already linear needs a column and a
@@ -102,7 +101,14 @@ pub mod cols {
 
     pub const FIRST: usize = 20;
     pub const END: usize = 21;
-    pub const TAIL: usize = 22;
+    /// `1` when this row moves a single byte rather than eight.
+    ///
+    /// Free upward: a one-byte row is legal at any count. The only restriction is
+    /// that a wide row needs eight bytes remaining, and that is enforced by firing
+    /// the `count < 8` ALU lookup at multiplicity `mu - single` and demanding the
+    /// answer be "no" — so a narrow row is simply not checked, and the check needs
+    /// no column of its own.
+    pub const SINGLE: usize = 22;
     pub const VALUE_0: usize = 23;
     pub const VALUE: [usize; 8] = [
         VALUE_0,
@@ -119,22 +125,20 @@ pub mod cols {
     /// Decoded functionality. `is_cpy = mu - is_set - is_commit` is implied.
     pub const IS_SET: usize = 32;
     pub const IS_COMMIT: usize = 33;
-    /// `count < 8`, pinned by the ALU; blocks an eight-byte row on a short count.
-    pub const LT8: usize = 34;
     /// `first * (1 - is_commit)` — the ecall receive and the register reads.
-    pub const F_NCOMMIT: usize = 35;
+    pub const F_NCOMMIT: usize = 34;
     /// `(mu - end) * is_commit` — the COMMIT-domain write.
-    pub const MU_COM: usize = 36;
+    pub const MU_COM: usize = 35;
     /// `mu_com * (1 - tail)` — lanes 1..7 of the COMMIT-domain write. Without it a
     /// one-byte commit row would send seven spurious `(index, 0)` pairs and corrupt
     /// the public-output fingerprint.
-    pub const MU_COM_WIDE: usize = 37;
+    pub const MU_COM_WIDE: usize = 36;
 
     /// The RAM write rides `mu - end - mu_com`, which is `(mu - end) * (1 - is_commit)`
     /// expanded. It needs no column of its own: `Multiplicity::Linear` takes the
     /// expression directly, and the product form was only ever a column because the
     /// framework requires multiplicities to be linear.
-    pub const NUM_COLUMNS: usize = 38;
+    pub const NUM_COLUMNS: usize = 37;
 }
 
 /// Which functionality a row is running.
@@ -206,7 +210,7 @@ pub fn generate_memmove_trace(
 
         table.set_bool(row_idx, cols::FIRST, op.first);
         table.set_bool(row_idx, cols::END, op.end);
-        table.set_bool(row_idx, cols::TAIL, op.width == 1);
+        table.set_bool(row_idx, cols::SINGLE, op.width == 1);
         for (column, &byte) in cols::VALUE.iter().zip(&op.value) {
             table.set_byte(row_idx, *column, byte);
         }
@@ -216,7 +220,6 @@ pub fn generate_memmove_trace(
         let is_commit = op.functionality == Functionality::Commit;
         table.set_bool(row_idx, cols::IS_SET, is_set);
         table.set_bool(row_idx, cols::IS_COMMIT, is_commit);
-        table.set_bool(row_idx, cols::LT8, op.count < 8);
         table.set_bool(row_idx, cols::F_NCOMMIT, op.first && !is_commit);
         table.set_bool(row_idx, cols::MU_COM, !op.end && is_commit);
         table.set_bool(
@@ -227,11 +230,11 @@ pub fn generate_memmove_trace(
     }
 
     for row_idx in n..num_rows {
-        table.set_fe(row_idx, cols::COUNT_0, FE::one());
-        table.set_fe(row_idx, cols::SRC_INCR_0, FE::one());
-        table.set_fe(row_idx, cols::DST_INCR_0, FE::one());
-        table.set_fe(row_idx, cols::TAIL, FE::one());
-        table.set_fe(row_idx, cols::LT8, FE::one());
+        // `single = 0` on padding now: a narrow row implies an active row, so the
+        // padding takes the wide step and the values follow from it.
+        table.set_fe(row_idx, cols::COUNT_0, FE::from(8u64));
+        table.set_fe(row_idx, cols::SRC_INCR_0, FE::from(8u64));
+        table.set_fe(row_idx, cols::DST_INCR_0, FE::from(8u64));
     }
 
     trace
@@ -324,7 +327,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             LinearTerm::Constant(1),
             LinearTerm::Column {
                 coefficient: -1,
-                column: cols::TAIL,
+                column: cols::SINGLE,
             },
         ])
     };
@@ -518,10 +521,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::F_NCOMMIT),
             memw_register_read(24, cols::COUNT_0, cols::COUNT_1),
         ),
-        // 21. `lt8 = (count < 8)`. Width is otherwise the prover's choice.
+        // 21. A wide row needs eight bytes remaining. Fired at `mu - single`, so a
+        //     narrow row is not checked at all -- which is what leaves the width a
+        //     free choice at any count. The answer is pinned to "no", so this needs
+        //     no column to hold it.
         BusInteraction::sender(
             BusId::Alu,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::Diff(cols::MU, cols::SINGLE),
             vec![
                 BusValue::Packed {
                     start_column: cols::COUNT_0,
@@ -530,10 +536,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(8),
                 BusValue::constant(0),
                 BusValue::constant(alu_op::LT as u64),
-                BusValue::Packed {
-                    start_column: cols::LT8,
-                    packing: Packing::Direct,
-                },
+                BusValue::constant(0),
                 BusValue::constant(0),
             ],
         ),
@@ -683,51 +686,50 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         emit_is_bit(b, 0, cols::FIRST, None);
         emit_is_bit(b, 1, cols::END, None);
-        emit_is_bit(b, 2, cols::TAIL, None);
+        emit_is_bit(b, 2, cols::SINGLE, None);
         emit_is_bit(b, 3, cols::MU, None);
         emit_is_bit(b, 4, cols::IS_SET, None);
         emit_is_bit(b, 5, cols::IS_COMMIT, None);
-        emit_is_bit(b, 6, cols::LT8, None);
-        emit_is_bit(b, 7, cols::F_NCOMMIT, None);
-        emit_is_bit(b, 8, cols::MU_COM, None);
-        emit_is_bit(b, 9, cols::MU_COM_WIDE, None);
+        emit_is_bit(b, 6, cols::F_NCOMMIT, None);
+        emit_is_bit(b, 7, cols::MU_COM, None);
+        emit_is_bit(b, 8, cols::MU_COM_WIDE, None);
 
         let one = b.one();
         let first = b.main(0, cols::FIRST);
         let end = b.main(0, cols::END);
         let mu = b.main(0, cols::MU);
-        let tail = b.main(0, cols::TAIL);
-        let lt8 = b.main(0, cols::LT8);
+        let single = b.main(0, cols::SINGLE);
         let is_set = b.main(0, cols::IS_SET);
         let is_commit = b.main(0, cols::IS_COMMIT);
 
         // An active row is implied by first or end.
         b.emit_base(
-            10,
+            9,
             (first.clone() + end.clone()) * (one.clone() - mu.clone()),
         );
         // The functionality is one-hot and only set on active rows.
-        b.emit_base(11, is_set.clone() * is_commit.clone());
+        b.emit_base(10, is_set.clone() * is_commit.clone());
         b.emit_base(
-            12,
+            11,
             (is_set.clone() + is_commit.clone()) * (one.clone() - mu.clone()),
         );
-        // An eight-byte row is illegal when fewer than eight bytes remain.
-        b.emit_base(13, (one.clone() - tail.clone()) * lt8);
+        // A narrow row only exists on an active row. Needed so the `count < 8`
+        // lookup's multiplicity `mu - single` can never go negative.
+        b.emit_base(12, single.clone() * (one.clone() - mu.clone()));
 
         // The two remaining gate columns.
         b.emit_base(
-            14,
+            13,
             b.main(0, cols::F_NCOMMIT) - first.clone() * (one.clone() - is_commit.clone()),
         );
         b.emit_base(
-            15,
+            14,
             b.main(0, cols::MU_COM) - (mu.clone() - end.clone()) * is_commit,
         );
         let mu_com = b.main(0, cols::MU_COM);
         b.emit_base(
-            16,
-            b.main(0, cols::MU_COM_WIDE) - mu_com * (one.clone() - tail.clone()),
+            15,
+            b.main(0, cols::MU_COM_WIDE) - mu_com * (one.clone() - single.clone()),
         );
 
         let step = AddOperand::linear(
@@ -735,7 +737,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
                 AddLinearTerm::Constant(8),
                 AddLinearTerm::Column {
                     coefficient: -7,
-                    column: cols::TAIL,
+                    column: cols::SINGLE,
                 },
             ],
             &[],
@@ -743,7 +745,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         emit_add_pair_no_overflow(
             b,
-            17,
+            16,
             cols::MU,
             cols::END,
             &AddOperand::dword(cols::SRC_0),
@@ -752,7 +754,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         );
         emit_add_pair_no_overflow(
             b,
-            19,
+            18,
             cols::MU,
             cols::END,
             &AddOperand::dword(cols::DST_0),
@@ -761,7 +763,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         );
         emit_add_pair(
             b,
-            21,
+            20,
             &[],
             &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
             &step,
@@ -770,7 +772,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         // Unused lanes are zero on one-byte rows.
         for (i, &column) in cols::VALUE.iter().enumerate().skip(1) {
-            b.emit_base(23 + i - 1, tail.clone() * b.main(0, column));
+            b.emit_base(22 + i - 1, single.clone() * b.main(0, column));
         }
 
         // memset's operand contract: `dst = src + 8`, limb-wise.
@@ -816,11 +818,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // boundary, so the honest trace never has to rely on that argument.
         let gap = b.const_base(DMA_MEMSET_GAP);
         b.emit_base(
-            30,
+            29,
             is_set.clone() * (b.main(0, cols::DST_0) - b.main(0, cols::SRC_0) - gap),
         );
         b.emit_base(
-            31,
+            30,
             is_set.clone() * (b.main(0, cols::DST_1) - b.main(0, cols::SRC_1)),
         );
     }
@@ -834,7 +836,7 @@ mod shape_tests {
     /// the column count was only ever printed, and it is the number readers check
     /// against the spec.
     ///
-    /// **The spec says 37 and this says 38, and both are right.** The spec types
+    /// **The spec says 36 and this says 37, and both are right.** The spec types
     /// `timestamp` as a `Word` — one column — where this code uses a `DWordWL`, which
     /// is two. The high limb is provably zero (the CPU sends `constant(0)` in the
     /// `Ecall` tuple and `MemmoveNext` propagates it), so the extra column carries no
@@ -842,14 +844,13 @@ mod shape_tests {
     /// applies to COMMIT, where the spec says 7 and the code has 8, and to `memw.toml`.
     /// Three readers have now reported this as a bug, so it is written down here.
     ///
-    /// Unrelated trap for anyone grepping: `cpu_tests.rs` also asserts 38, for the CPU
-    /// table. Coincidence.
+    /// (`cpu_tests.rs` asserts 38 for the CPU table -- unrelated.)
     #[test]
     fn the_committed_shape_is_pinned() {
         assert_eq!(
             super::cols::NUM_COLUMNS,
-            38,
-            "MEMMOVE columns (spec: 37 + 1)"
+            37,
+            "MEMMOVE columns (spec: 36 + 1)"
         );
 
         let n = super::bus_interactions().len();

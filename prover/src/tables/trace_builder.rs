@@ -3365,10 +3365,12 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-    // MEMMOVE: `lt8` on every row, and the per-ecall byte bound on the first row.
+    // MEMMOVE: the wide-row check, fired only on wide rows (multiplicity
+    // `mu - single`), and the per-ecall byte bound on the first row.
     lt_ops.extend(
         memmove_ops
             .iter()
+            .filter(|op| op.width == 8)
             .map(|op| LtOperation::new(op.count, 8, false)),
     );
     lt_ops.extend(
