@@ -579,19 +579,19 @@ macro_rules! algebraic_transcript_hash {
 }
 
 algebraic_transcript_hash!(
-    RpoTranscriptHash,
+    AlgebraicRpoTranscriptHash,
     RpoCommit,
     "rpo256",
     "The RPO256 Fiat–Shamir configuration."
 );
 algebraic_transcript_hash!(
-    RpxTranscriptHash,
+    AlgebraicRpxTranscriptHash,
     RpxCommit,
     "rpx256",
     "The RPX256 (XHash12) Fiat–Shamir configuration."
 );
 algebraic_transcript_hash!(
-    PoseidonTranscriptHash,
+    AlgebraicPoseidonTranscriptHash,
     PoseidonCommit,
     "poseidon-goldilocks",
     "⚠ The Poseidon Fiat–Shamir configuration — UNSHIPPABLE, reference only."
@@ -663,19 +663,19 @@ macro_rules! algebraic_stark_hash {
 algebraic_stark_hash!(
     RpoStarkHash,
     RpoCommit,
-    RpoTranscriptHash,
+    AlgebraicRpoTranscriptHash,
     "The RPO256 commitment configuration."
 );
 algebraic_stark_hash!(
     RpxStarkHash,
     RpxCommit,
-    RpxTranscriptHash,
+    AlgebraicRpxTranscriptHash,
     "The RPX256 (XHash12) commitment configuration."
 );
 algebraic_stark_hash!(
     PoseidonStarkHash,
     PoseidonCommit,
-    PoseidonTranscriptHash,
+    AlgebraicPoseidonTranscriptHash,
     "⚠ The Poseidon commitment configuration — UNSHIPPABLE, reference only."
 );
 

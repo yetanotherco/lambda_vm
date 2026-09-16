@@ -2876,6 +2876,7 @@ fn the_production_leaf_node_measures() {
         ];
         let total: u64 = calls.iter().map(|(_, n)| *n).sum();
         println!("   GPU dispatches during the NODE prove: {calls:?} (total {total})");
+        assert_the_rpx_grind_reached_the_device("NODE prove");
         assert!(
             total > 0,
             "the node prove reached the device ZERO times — it ran on the host \
@@ -2932,20 +2933,31 @@ fn the_tree_shape_matches_the_epoch_count() {
     use super::per_table_aggregator::{tree_node_count, tree_shape};
 
     // The real block, both postures. Epoch counts are `ceil(cycles / 2^k)` for
-    // block 25368371's **39,631,559** cycles, re-measured 2026-09-07.
+    // block 25368371's **30,498,818** cycles, the guest PR #894 bumped the
+    // ethrex rev to.
     //
-    // ⚠ NOT 74,819,518. That figure is the JULY prebuilt guest; thin-LTO and the
-    // accelerators made it ~47% cheaper at identical work — same block, same
-    // keccak 10,478, same ECSM 116. The stale figure still sits in a table in
+    // ⚠ TWO stale figures now, and they went stale the same way.
+    //
+    // 74,819,518 is the JULY prebuilt guest; thin-LTO and the accelerators made
+    // it ~47% cheaper at identical work — same block, same keccak 10,478, same
+    // ECSM 116. The stale figure still sits in a table in
     // `real_block_benchmark_selection.md`, with the correction in an addendum
-    // BELOW it saying in terms that every epochs-per-block number derived from
-    // 74.8M is stale. Reading the table row and stopping gives 18/36 epochs and
-    // a tree two levels too deep.
+    // BELOW it. Reading the table row and stopping gives 18/36 epochs and a
+    // tree two levels too deep.
+    //
+    // 39,631,559 is the 2026-09-07 guest, and it is what THIS comment said
+    // until #894. That bump cost another ~23% at identical work, so the 2^21
+    // posture went from 19 epochs to 15 and the 2^22 posture from 10 to 8 —
+    // one whole level off the fan-in-2 tree in both. Nothing failed when it
+    // changed: every number below is a literal, so the test went on passing
+    // while describing a block this repository no longer proves. Any epoch
+    // count, tree shape or IDENTITY-line count derived from either old figure
+    // is stale, and that includes saved run logs.
     for (epochs, fan_in, levels, nodes) in [
-        (10usize, 2usize, 4usize, 11usize), // 2^22: 10 -> 5 -> 3 -> 2 -> 1
-        (10, 3, 3, 7),                      // 2^22: 10 -> 4 -> 2 -> 1
-        (19, 2, 5, 21),                     // 2^21: 19 -> 10 -> 5 -> 3 -> 2 -> 1
-        (19, 3, 3, 11),                     // 2^21: 19 -> 7 -> 3 -> 1
+        (8usize, 2usize, 3usize, 7usize), // 2^22: 8 -> 4 -> 2 -> 1
+        (8, 3, 2, 4),                     // 2^22: 8 -> 3 -> 1
+        (15, 2, 4, 15),                   // 2^21: 15 -> 8 -> 4 -> 2 -> 1
+        (15, 3, 3, 8),                    // 2^21: 15 -> 5 -> 2 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -2981,15 +2993,79 @@ fn the_tree_shape_matches_the_epoch_count() {
     // the root and the interior is empty.
     assert!(tree_shape(1, 2).is_empty(), "one epoch needs no interior");
 
-    // ★ The leftover rule is EXERCISED, not merely permitted. 19 at fan-in 2
-    // leaves one over at three levels (19, 5 and 3); a shape that never produced
-    // a short node would pass every assertion above while testing nothing about
-    // wrap-versus-carry.
-    let short: usize = tree_shape(19, 2)
-        .iter()
-        .filter(|l| l.arities.iter().any(|a| *a < 2))
-        .count();
-    assert_eq!(short, 3, "19 at fan-in 2 must exercise the leftover rule");
+    // ★ The leftover rule is EXERCISED, not merely permitted: a shape that
+    // never produced a short node would pass every assertion above while
+    // testing nothing about wrap-versus-carry.
+    let short_levels = |epochs: usize, fan_in: usize| -> usize {
+        tree_shape(epochs, fan_in)
+            .iter()
+            .filter(|l| l.arities.iter().any(|a| *a < fan_in))
+            .count()
+    };
+
+    // The shipped posture. ⚠ It is WEAKER than it was: at 19 epochs this was 3
+    // short levels (19, 5 and 3 all left one over), and at 15 it is 1 — the
+    // 15 -> 8 level — because 8, 4 and 2 are all even. At the 2^22 posture it
+    // is 0: `8 -> 4 -> 2 -> 1` never leaves a leftover at all. So the real
+    // block no longer covers this rule on its own.
+    assert_eq!(
+        short_levels(15, 2),
+        1,
+        "15 at fan-in 2 must still exercise the leftover rule at least once"
+    );
+    assert_eq!(
+        short_levels(8, 2),
+        0,
+        "8 at fan-in 2 is a perfect binary tree — recorded so the row below is \
+         understood as necessary rather than redundant"
+    );
+
+    // ⇒ A SYNTHETIC row carries the coverage the guest bump took away. 19 is
+    // kept as the shape, not because any block has 19 epochs now, but because
+    // it is the smallest one that makes three separate levels carry a leftover,
+    // which is what distinguishes wrapping from carrying.
+    assert_eq!(
+        short_levels(19, 2),
+        3,
+        "the synthetic shape must exercise the leftover rule on three levels"
+    );
+    assert!(
+        short_levels(15, 3) >= 2,
+        "fan-in 3 at the shipped epoch count must leave a short node on at \
+         least two levels"
+    );
+}
+
+/// ★ THE GRIND FALSIFIER — the one observation that separates a block proved on
+/// the device from one proved on the host.
+///
+/// Proof-of-work grinding has a correct host arm, so a run whose every grind
+/// fell back produces the same proofs, the same IDENTITY lines and the same
+/// verify result as one that reached the kernel. It is only slower: ~2^20 RPX
+/// permutations per table per epoch, thousands of grinds per block. That is
+/// what a closed dispatch list silently caused once already, and it is worth
+/// hundreds of seconds with nothing failing.
+///
+/// So the count is ASSERTED, not printed. Printing is what it did before, and
+/// a number nobody reads is not a gate.
+///
+/// ⚠ Only under an RPX pin. The counter is per-kernel, and a keccak-pinned
+/// build increments the other one — reading this one there would assert zero
+/// against zero, which is a check that cannot fail.
+#[cfg(feature = "cuda")]
+fn assert_the_rpx_grind_reached_the_device(stage: &str) {
+    let grinds = stark::gpu_lde::gpu_grind_calls_rpx();
+    println!("     RPX device grinds during the {stage}: {grinds}");
+    if crate::hash_pin::BLOCK_COMMITMENT_HASH == stark::config::CommitmentHash::Rpx256 {
+        assert!(
+            grinds > 0,
+            "the {stage} did ZERO RPX grinds on the device under an RPX pin — every \
+             grind fell to the host rayon search. The proofs are valid and nothing \
+             else would have said so; this run's TIME is not a production figure. \
+             (`LAMBDA_VM_NO_GPU_GRIND` set, or a configuration whose digest \
+             declares no `GrindDigest::DEVICE_GRIND` arm.)"
+        );
+    }
 }
 
 // ======================= the production tree driver =======================
@@ -4637,6 +4713,7 @@ fn prove_global_child(
                      production figure"
                 );
                 println!("   GPU dispatches during the SLICE prove: {total}");
+                assert_the_rpx_grind_reached_the_device("SLICE prove");
             }
             let t = Instant::now();
             assert!(
@@ -4839,6 +4916,7 @@ fn prove_global_child(
                      with cuda compiled in, so its peak is not a production figure"
                 );
                 println!("     GPU dispatches during {label}: {calls}");
+                assert_the_rpx_grind_reached_the_device(&label);
             }
         }
         println!(
@@ -4984,6 +5062,7 @@ fn prove_global_child(
                      production figure"
                 );
                 println!("     GPU dispatches during the GLOBAL PARENT: {calls}");
+                assert_the_rpx_grind_reached_the_device("GLOBAL PARENT");
             }
         }
         println!(
@@ -6411,6 +6490,7 @@ fn the_production_tree_composes_to_a_root() {
                      accelerating anything"
                 );
                 println!("     GPU dispatches during the BLOCK-ARTIFACT ROOT: {calls}");
+                assert_the_rpx_grind_reached_the_device("BLOCK-ARTIFACT ROOT");
             }
         }
         println!(

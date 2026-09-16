@@ -1384,7 +1384,7 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
         // cannot miss. All three algebraic configurations share it, which is
         // why one arm serves them (`SOUNDNESS.md` §6.4).
         WrapHash::Algebraic => {
-            super::algebraic_commit::RpoTranscriptHash::CANDIDATES_PER_COORDINATE
+            super::algebraic_commit::AlgebraicRpoTranscriptHash::CANDIDATES_PER_COORDINATE
         }
     };
     schedule.map_or(1, core::num::NonZeroUsize::get)

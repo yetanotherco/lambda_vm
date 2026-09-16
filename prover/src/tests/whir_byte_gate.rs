@@ -124,8 +124,18 @@ fn canonically_sorted_columns() -> Vec<Vec<FieldElement<Fp>>> {
         .collect()
 }
 
-/// The keccak arm's line, and the constant the other arm must NOT equal.
+/// The keccak arm's line.
 const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982336436e6dd3";
+
+/// The RPX arm's line.
+///
+/// ⚠ Pinned, not merely required to DIFFER from keccak's. `assert_ne!` passes
+/// for every wrong answer except one, so it cannot tell "the RPX hash ran" from
+/// "something else ran": a third hash, a half-flip with RPX trees under a
+/// keccak sponge, or a transcript whose sampling schedule moved would all clear
+/// it. Measured on the merged branch, twice per arm, and equal at
+/// `0cbc9623` — which is what says the merge left the WHIR path's bytes alone.
+const RPX_LINE: &str = "5226e4cfffac7eb2ba629470a0c5ebf879421078b389e3a8065ae63768031adb";
 
 /// The serialized length, which neither arm may move: 32-byte digests either
 /// way and no proof struct gains a field.
@@ -197,9 +207,15 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
             line, KECCAK_LINE,
             "the keccak arm's bytes moved: this commit changed the proof PR #988 produces"
         ),
-        crate::whir_hash_knob::Setting::Rpx => assert_ne!(
-            line, KECCAK_LINE,
-            "the rpx arm produced KECCAK's line — the proof never reached the RPX hash"
-        ),
+        crate::whir_hash_knob::Setting::Rpx => {
+            assert_ne!(
+                line, KECCAK_LINE,
+                "the rpx arm produced KECCAK's line — the proof never reached the RPX hash"
+            );
+            assert_eq!(
+                line, RPX_LINE,
+                "the rpx arm's bytes moved: this commit changed the proof the RPX seam produces"
+            );
+        }
     }
 }

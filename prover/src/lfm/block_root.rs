@@ -798,23 +798,31 @@ mod tests {
         };
 
         // ---- the real tree, with the real numbers from the box log.
-        let real = outputs(19, 2);
+        //
+        // ⚠ 15 epochs, not 19: PR #894's guest runs block 25368371 in
+        // 30,498,818 cycles, so the 2^21 posture lost a level. Every number in
+        // this block moved with it, and NONE of them would have failed — they
+        // are literals about a tree the repository no longer builds.
+        let real = outputs(15, 2);
         assert_eq!(
             real,
-            vec![19, 10, 5, 3, 2, 1],
-            "19 epochs at fan-in 2 is the tree that is proved and cached; if this              moved, every number below is about a different tree"
+            vec![15, 8, 4, 2, 1],
+            "15 epochs at fan-in 2 is the tree that is proved and cached; if this              moved, every number below is about a different tree"
         );
         let top = real.len() - 1;
-        assert_eq!(top, 5, "five node levels");
-        assert_eq!(RootOption::A.child_level(top), 4, "A replaces level 5");
-        assert_eq!(RootOption::B.child_level(top), 5, "B sits above it");
+        assert_eq!(top, 4, "four node levels");
+        assert_eq!(RootOption::A.child_level(top), 3, "A replaces level 4");
+        assert_eq!(RootOption::B.child_level(top), 4, "B sits above it");
         assert_eq!(real[RootOption::A.child_level(top)], 2, "A takes 2 nodes");
         assert_eq!(real[RootOption::B.child_level(top)], 1, "B takes 1 node");
         // ⛔ The mis-capture, named: one level below A's is a DIFFERENT count.
+        // It was 3 at 19 epochs and is 4 at 15 — the POINT is that it differs
+        // from A's 2, which is what the emitter's guard compares, and that
+        // survives the bump.
         assert_eq!(
             real[RootOption::A.child_level(top) - 1],
-            3,
-            "level 4's INPUT is 3 nodes — what the old capture held, and what the              emitter's guard reported as `right: 3` against its `left: 2`"
+            4,
+            "level 3's INPUT is 4 nodes — the shape the emitter's guard reports as              `right` against its `left: 2`"
         );
 
         // ---- and the rule generally: the level an option names carries exactly
