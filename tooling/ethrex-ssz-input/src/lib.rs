@@ -20,7 +20,7 @@ use ethrex_guest_program::l1::run_stateless_guest;
 use libssz::SszEncode;
 use libssz_types::{ProgressiveList, SszList, SszVector};
 
-pub fn empty_execution_requests() -> ExecutionRequests {
+fn empty_execution_requests() -> ExecutionRequests {
     ExecutionRequests {
         deposits: ProgressiveList::new(),
         withdrawals: ProgressiveList::new(),

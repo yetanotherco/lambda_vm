@@ -5,6 +5,7 @@
 
 use ethrex_guest_program::crypto::NativeCrypto;
 use ethrex_guest_program::l1::run_stateless_guest;
+use ethrex_ssz_input::{GUEST_OUTPUT_LEN, VALIDATION_FLAG};
 use executor::elf::Elf;
 use executor::vm::execution::{Executor, ExecutorError, ReturnValues};
 use std::sync::Arc;
@@ -24,8 +25,15 @@ fn run_program_without_expect(
 
 fn native_output(inputs: &[u8]) -> Vec<u8> {
     let output = run_stateless_guest(inputs, Arc::new(NativeCrypto));
-    assert_eq!(output.len(), 43, "unexpected stateless output length");
-    assert_eq!(output[32], 1, "native stateless validation failed");
+    assert_eq!(
+        output.len(),
+        GUEST_OUTPUT_LEN,
+        "unexpected stateless output length"
+    );
+    assert_eq!(
+        output[VALIDATION_FLAG], 1,
+        "native stateless validation failed"
+    );
     output
 }
 
