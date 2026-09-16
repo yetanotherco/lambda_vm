@@ -12,7 +12,7 @@ use stark::prover::TraceProvider;
 use stark::trace::TraceTable;
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::{RoutedOps, TableKind, Traces};
+use crate::tables::trace_builder::{CollectedOps, TableKind, Traces};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 /// The groups of chunked tables, in the order `VmAirs::air_trace_pairs` emits
@@ -41,7 +41,7 @@ const GROUP_ORDER: [Option<TableKind>; 15] = [
 const NUM_FIXED_AIRS: usize = 10;
 
 pub(crate) struct StreamingProvider {
-    routed: RoutedOps,
+    routed: CollectedOps,
     max_rows: MaxRowsConfig,
     /// AIR index -> the chunk that rebuilds it, or `None` when it is resident.
     slots: Vec<Option<(TableKind, usize)>>,
@@ -59,7 +59,7 @@ impl StreamingProvider {
     /// wrong shifts every slot by one and hands each table the trace of its
     /// neighbour. It is taken from the caller's `VmAirs` rather than assumed.
     pub(crate) fn new(
-        routed: RoutedOps,
+        routed: CollectedOps,
         max_rows: MaxRowsConfig,
         traces: &Traces,
         include_halt: bool,

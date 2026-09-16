@@ -81,7 +81,7 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
-struct MemoryState {
+pub(crate) struct MemoryState {
     /// Per byte-address `(value, timestamp)`, as a dense per-page store. This is
     /// the hot structure — `read_byte`/`write_byte` hit it on every memory access
     /// during the replay, and it's rebuilt each epoch — so a per-page array (small
@@ -154,7 +154,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
-struct RegisterState {
+pub(crate) struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
     /// Synthetic x254 commit index register: (value, last_write_timestamp)
@@ -2810,6 +2810,12 @@ impl CollectedEpoch {
     /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
     /// [`touched_cells_from_memory_state`] over the same immutable
     /// `memory_state`), available before any table is built.
+    /// Ops collected for `kind`. Mirrors [`CollectedOps::buffered`] so a walk's
+    /// output and a finished run's can be compared on the same footing.
+    pub fn op_count(&self, kind: TableKind) -> usize {
+        self.ops.buffered(kind)
+    }
+
     pub fn touched_memory_cells(&self) -> local_to_global::EpochTouches {
         touched_cells_from_memory_state(&self.memory_state)
     }
@@ -2914,308 +2920,7 @@ pub struct Traces {
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
 /// Phases 3-5 (LT extension, bitwise, trace generation).
-struct CollectedOps {
-    cpu_ops: Vec<CpuOperation>,
-    memw_ops: Vec<MemwOperation>,
-    memw_aligned_ops: Vec<MemwOperation>,
-    /// Direct-fill MEMW_R rows (register fast path).
-    memw_register_rows: Vec<RegRow>,
-    load_ops: Vec<LoadOperation>,
-    lt_ops: Vec<LtOperation>,
-    shift_ops: Vec<ShiftOperation>,
-    bitwise_ops: Vec<BitwiseOperation>,
-    branch_ops: Vec<BranchOperation>,
-    mul_ops: Vec<(MulOperation, bool)>,
-    dvrm_ops: Vec<(DvrmOperation, bool)>,
-    commit_ops: Vec<CommitOperation>,
-    keccak_ops: Vec<KeccakOperation>,
-    // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
-    eq_ops: Vec<eq::EqOperation>,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
-    store_ops: Vec<store::StoreOperation>,
-    cpu32_ops: Vec<cpu32::Cpu32Operation>,
-    // EC scalar-multiplication accelerator chips.
-    ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ecdas_ops: Vec<ecdas::EcdasOperation>,
-    // Non-constraining hint ecall.
-    hint_ops: Vec<hint::HintOperation>,
-}
-
-/// One log-derived, chunked table — the ones whose trace is a function of a
-/// single routed op list, so it can be rebuilt on demand long after the routing
-/// that produced it.
-///
-/// The preprocessed tables (BITWISE, DECODE, REGISTER, HALT, COMMIT, KECCAK*)
-/// and PAGE are deliberately absent: they are not driven by one op list and the
-/// streaming prover keeps them resident.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TableKind {
-    Cpu,
-    Memw,
-    MemwAligned,
-    MemwRegister,
-    Load,
-    Lt,
-    Shift,
-    Mul,
-    Dvrm,
-    Branch,
-    Eq,
-    Bytewise,
-    Store,
-    Cpu32,
-}
-
-/// The op lists after routing (phases 3-4), kept so any one table can be built
-/// from them on demand.
-///
-/// This is the compact intermediate the streaming prover holds instead of the
-/// built traces: the ops of a table are far smaller than its trace, and the
-/// trace is a pure function of them — `build_table` is deterministic, which
-/// `trace_build_is_deterministic_across_builds` pins.
-#[derive(Default)]
-pub(crate) struct RoutedOps {
-    pub(crate) cpu_ops: Vec<CpuOperation>,
-    pub(crate) memw_ops: Vec<MemwOperation>,
-    pub(crate) memw_aligned_ops: Vec<MemwOperation>,
-    pub(crate) memw_register_rows: Vec<RegRow>,
-    pub(crate) load_ops: Vec<LoadOperation>,
-    pub(crate) lt_ops: Vec<LtOperation>,
-    pub(crate) shift_ops: Vec<ShiftOperation>,
-    pub(crate) branch_ops: Vec<BranchOperation>,
-    pub(crate) mul_ops: Vec<(MulOperation, bool)>,
-    pub(crate) dvrm_ops: Vec<(DvrmOperation, bool)>,
-    pub(crate) eq_ops: Vec<eq::EqOperation>,
-    pub(crate) bytewise_ops: Vec<bytewise::BytewiseOperation>,
-    pub(crate) store_ops: Vec<store::StoreOperation>,
-    pub(crate) cpu32_ops: Vec<cpu32::Cpu32Operation>,
-}
-
-/// The tables that are a pure per-op function of the CPU ops, with no later
-/// source appending to them.
-///
-/// Extracted so the all-at-once path and the Commit-phase walk derive them with
-/// the same code: a table closed mid-walk has to be the table the finished run
-/// would have produced, and two copies of a filter+map drift.
-///
-/// DVRM, MUL and LT are deliberately not here. Each takes ops from more than
-/// one source — CPU32 appends to DVRM and MUL, DVRM appends to MUL and LT — and
-/// the finished run concatenates those sources whole, so deriving them per
-/// segment would interleave them differently and cut the chunks elsewhere.
-struct DerivedFromCpu {
-    branch_ops: Vec<BranchOperation>,
-    eq_ops: Vec<eq::EqOperation>,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
-    store_ops: Vec<store::StoreOperation>,
-    mul_ops: Vec<(MulOperation, bool)>,
-    dvrm_ops: Vec<(DvrmOperation, bool)>,
-}
-
-fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
-    // BRANCH: CPU ops where branch_cond = true.
-    let branch_ops: Vec<BranchOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.branch_cond)
-        .map(|op| {
-            BranchOperation::new(
-                op.decode.pc,
-                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
-            )
-        })
-        .collect();
-    // EQ: BEQ/BNE (invert = alu_flags bit 6).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
-        .collect();
-    // BYTEWISE: AND/OR/XOR (op = alu_op).
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
-        .filter(|op| {
-            let f = &op.decode.fields;
-            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
-        })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
-        .collect();
-    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
-    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
-    // table row). The MEMORY bus and the STORE chip's MEMW write share the base
-    // timestamp (spec store.toml uses one `timestamp` for both).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
-            )
-        })
-        .collect();
-
-    // MUL: non-word MUL instructions. lhs_signed = `signed` (alu_flags bit 5);
-    // rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
-    let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
-    // DVRM: non-word DIV/REM instructions.
-    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
-
-    DerivedFromCpu {
-        branch_ops,
-        eq_ops,
-        bytewise_ops,
-        store_ops,
-        mul_ops,
-        dvrm_ops,
-    }
-}
-
-/// The tables this walk can close mid-execution: their ops come straight out of
-/// `collect_ops_from_cpu` and nothing appends to them afterwards.
-pub const CHUNKED_KINDS: [TableKind; 10] = [
-    TableKind::Cpu,
-    TableKind::Memw,
-    TableKind::MemwAligned,
-    TableKind::MemwRegister,
-    TableKind::Load,
-    TableKind::Cpu32,
-    TableKind::Branch,
-    TableKind::Eq,
-    TableKind::Bytewise,
-    TableKind::Store,
-];
-
-/// Chunk limit for one kind.
-pub fn max_rows_for(kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
-    match kind {
-        TableKind::Cpu => max_rows.cpu,
-        TableKind::Memw => max_rows.memw,
-        TableKind::MemwAligned => max_rows.memw_aligned,
-        TableKind::MemwRegister => max_rows.memw_register,
-        TableKind::Load => max_rows.load,
-        TableKind::Shift => max_rows.shift,
-        TableKind::Mul => max_rows.mul,
-        TableKind::Dvrm => max_rows.dvrm,
-        TableKind::Branch => max_rows.branch,
-        TableKind::Lt => max_rows.lt,
-        TableKind::Eq => max_rows.eq,
-        TableKind::Bytewise => max_rows.bytewise,
-        TableKind::Store => max_rows.store,
-        TableKind::Cpu32 => max_rows.cpu32,
-    }
-}
-
-impl RoutedOps {
-    /// Ops buffered for `kind` and not yet emitted.
-    fn buffered(&self, kind: TableKind) -> usize {
-        match kind {
-            TableKind::Cpu => self.cpu_ops.len(),
-            TableKind::Memw => self.memw_ops.len(),
-            TableKind::MemwAligned => self.memw_aligned_ops.len(),
-            TableKind::MemwRegister => self.memw_register_rows.len(),
-            TableKind::Load => self.load_ops.len(),
-            TableKind::Cpu32 => self.cpu32_ops.len(),
-            TableKind::Branch => self.branch_ops.len(),
-            TableKind::Eq => self.eq_ops.len(),
-            TableKind::Bytewise => self.bytewise_ops.len(),
-            TableKind::Store => self.store_ops.len(),
-            _ => 0,
-        }
-    }
-
-    /// Build a trace from the first `n` buffered ops of `kind` and drop them.
-    ///
-    /// Draining is the point: this is what keeps the walk's buffers from
-    /// growing with the run.
-    fn take_front(
-        &mut self,
-        kind: TableKind,
-        n: usize,
-        max_rows: &super::MaxRowsConfig,
-    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-        macro_rules! drain {
-            ($ops:expr, $f:path) => {{
-                let front: Vec<_> = $ops.drain(..n).collect();
-                $f(&front)
-            }};
-        }
-        let _ = max_rows;
-        match kind {
-            TableKind::Cpu => drain!(self.cpu_ops, cpu::generate_cpu_trace),
-            TableKind::Memw => drain!(self.memw_ops, memw::generate_memw_trace),
-            TableKind::MemwAligned => {
-                drain!(
-                    self.memw_aligned_ops,
-                    memw_aligned::generate_memw_aligned_trace
-                )
-            }
-            TableKind::MemwRegister => drain!(
-                self.memw_register_rows,
-                memw_register::generate_memw_register_trace_from_rows
-            ),
-            TableKind::Load => drain!(self.load_ops, load::generate_load_trace),
-            TableKind::Cpu32 => drain!(self.cpu32_ops, cpu32::generate_cpu32_trace),
-            TableKind::Branch => drain!(self.branch_ops, branch::generate_branch_trace),
-            TableKind::Eq => drain!(self.eq_ops, eq::generate_eq_trace),
-            TableKind::Bytewise => drain!(self.bytewise_ops, bytewise::generate_bytewise_trace),
-            TableKind::Store => drain!(self.store_ops, store::generate_store_trace),
-            other => unreachable!("{other:?} is not closed mid-walk"),
-        }
-    }
-
-    /// How many chunks `build_table` would produce for `kind`.
-    ///
-    /// Mirrors `chunk_and_generate`: an empty op list still yields one (padded)
-    /// chunk, so the table exists in the proof with the shape the verifier
-    /// expects.
-    pub(crate) fn num_chunks(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
-        let (len, limit) = self.shape_of(kind, max_rows);
-        if len == 0 { 1 } else { len.div_ceil(limit) }
-    }
-
-    /// Op count and chunk limit for `kind`.
-    fn shape_of(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> (usize, usize) {
-        match kind {
-            TableKind::Cpu => (self.cpu_ops.len(), max_rows.cpu),
-            TableKind::Memw => (self.memw_ops.len(), max_rows.memw),
-            TableKind::MemwAligned => (self.memw_aligned_ops.len(), max_rows.memw_aligned),
-            TableKind::MemwRegister => (self.memw_register_rows.len(), max_rows.memw_register),
-            TableKind::Load => (self.load_ops.len(), max_rows.load),
-            TableKind::Lt => (self.lt_ops.len(), max_rows.lt),
-            TableKind::Shift => (self.shift_ops.len(), max_rows.shift),
-            TableKind::Mul => (self.mul_ops.len(), max_rows.mul),
-            TableKind::Dvrm => (self.dvrm_ops.len(), max_rows.dvrm),
-            TableKind::Branch => (self.branch_ops.len(), max_rows.branch),
-            TableKind::Eq => (self.eq_ops.len(), max_rows.eq),
-            TableKind::Bytewise => (self.bytewise_ops.len(), max_rows.bytewise),
-            TableKind::Store => (self.store_ops.len(), max_rows.store),
-            TableKind::Cpu32 => (self.cpu32_ops.len(), max_rows.cpu32),
-        }
-    }
-
+impl CollectedOps {
     /// Rows and main columns of one chunk, without building it.
     ///
     /// Every generator pads to `count.next_power_of_two().max(4)`, where `count`
@@ -3429,6 +3134,286 @@ impl RoutedOps {
             }
         }
     }
+
+    /// Build a trace from the first `n` buffered ops of `kind` and drop them.
+    ///
+    /// Draining is the point: this is what keeps the walk's buffers from
+    /// growing with the run.
+    fn take_front(
+        &mut self,
+        kind: TableKind,
+        n: usize,
+        max_rows: &super::MaxRowsConfig,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        macro_rules! drain {
+            ($ops:expr, $f:path) => {{
+                let front: Vec<_> = $ops.drain(..n).collect();
+                $f(&front)
+            }};
+        }
+        let _ = max_rows;
+        match kind {
+            TableKind::Cpu => drain!(self.cpu_ops, cpu::generate_cpu_trace),
+            TableKind::Memw => drain!(self.memw_ops, memw::generate_memw_trace),
+            TableKind::MemwAligned => {
+                drain!(
+                    self.memw_aligned_ops,
+                    memw_aligned::generate_memw_aligned_trace
+                )
+            }
+            TableKind::MemwRegister => drain!(
+                self.memw_register_rows,
+                memw_register::generate_memw_register_trace_from_rows
+            ),
+            TableKind::Load => drain!(self.load_ops, load::generate_load_trace),
+            TableKind::Cpu32 => drain!(self.cpu32_ops, cpu32::generate_cpu32_trace),
+            TableKind::Branch => drain!(self.branch_ops, branch::generate_branch_trace),
+            TableKind::Eq => drain!(self.eq_ops, eq::generate_eq_trace),
+            TableKind::Bytewise => drain!(self.bytewise_ops, bytewise::generate_bytewise_trace),
+            TableKind::Store => drain!(self.store_ops, store::generate_store_trace),
+            other => unreachable!("{other:?} is not closed mid-walk"),
+        }
+    }
+
+    /// How many chunks `build_table` would produce for `kind`.
+    ///
+    /// Mirrors `chunk_and_generate`: an empty op list still yields one (padded)
+    /// chunk, so the table exists in the proof with the shape the verifier
+    /// expects.
+    pub(crate) fn num_chunks(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+        let (len, limit) = self.shape_of(kind, max_rows);
+        if len == 0 { 1 } else { len.div_ceil(limit) }
+    }
+
+    /// Op count and chunk limit for `kind`.
+    fn shape_of(&self, kind: TableKind, max_rows: &super::MaxRowsConfig) -> (usize, usize) {
+        match kind {
+            TableKind::Cpu => (self.cpu_ops.len(), max_rows.cpu),
+            TableKind::Memw => (self.memw_ops.len(), max_rows.memw),
+            TableKind::MemwAligned => (self.memw_aligned_ops.len(), max_rows.memw_aligned),
+            TableKind::MemwRegister => (self.memw_register_rows.len(), max_rows.memw_register),
+            TableKind::Load => (self.load_ops.len(), max_rows.load),
+            TableKind::Lt => (self.lt_ops.len(), max_rows.lt),
+            TableKind::Shift => (self.shift_ops.len(), max_rows.shift),
+            TableKind::Mul => (self.mul_ops.len(), max_rows.mul),
+            TableKind::Dvrm => (self.dvrm_ops.len(), max_rows.dvrm),
+            TableKind::Branch => (self.branch_ops.len(), max_rows.branch),
+            TableKind::Eq => (self.eq_ops.len(), max_rows.eq),
+            TableKind::Bytewise => (self.bytewise_ops.len(), max_rows.bytewise),
+            TableKind::Store => (self.store_ops.len(), max_rows.store),
+            TableKind::Cpu32 => (self.cpu32_ops.len(), max_rows.cpu32),
+        }
+    }
+
+    /// Ops collected for `kind`, for the kinds a Commit-phase walk can close.
+    pub(crate) fn buffered(&self, kind: TableKind) -> usize {
+        match kind {
+            TableKind::Cpu => self.cpu_ops.len(),
+            TableKind::Memw => self.memw_ops.len(),
+            TableKind::MemwAligned => self.memw_aligned_ops.len(),
+            TableKind::MemwRegister => self.memw_register_rows.len(),
+            TableKind::Load => self.load_ops.len(),
+            TableKind::Cpu32 => self.cpu32_ops.len(),
+            TableKind::Branch => self.branch_ops.len(),
+            TableKind::Eq => self.eq_ops.len(),
+            TableKind::Bytewise => self.bytewise_ops.len(),
+            TableKind::Store => self.store_ops.len(),
+            TableKind::Shift => self.shift_ops.len(),
+            TableKind::Lt => self.lt_ops.len(),
+            TableKind::Mul => self.mul_ops.len(),
+            TableKind::Dvrm => self.dvrm_ops.len(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CollectedOps {
+    pub(crate) cpu_ops: Vec<CpuOperation>,
+    pub(crate) memw_ops: Vec<MemwOperation>,
+    pub(crate) memw_aligned_ops: Vec<MemwOperation>,
+    /// Direct-fill MEMW_R rows (register fast path).
+    pub(crate) memw_register_rows: Vec<RegRow>,
+    pub(crate) load_ops: Vec<LoadOperation>,
+    pub(crate) lt_ops: Vec<LtOperation>,
+    pub(crate) shift_ops: Vec<ShiftOperation>,
+    pub(crate) bitwise_ops: Vec<BitwiseOperation>,
+    pub(crate) branch_ops: Vec<BranchOperation>,
+    pub(crate) mul_ops: Vec<(MulOperation, bool)>,
+    pub(crate) dvrm_ops: Vec<(DvrmOperation, bool)>,
+    pub(crate) commit_ops: Vec<CommitOperation>,
+    pub(crate) keccak_ops: Vec<KeccakOperation>,
+    // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
+    pub(crate) eq_ops: Vec<eq::EqOperation>,
+    pub(crate) bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    pub(crate) store_ops: Vec<store::StoreOperation>,
+    pub(crate) cpu32_ops: Vec<cpu32::Cpu32Operation>,
+    // EC scalar-multiplication accelerator chips.
+    pub(crate) ecsm_ops: Vec<ecsm::EcsmOperation>,
+    pub(crate) ecdas_ops: Vec<ecdas::EcdasOperation>,
+    // Non-constraining hint ecall.
+    pub(crate) hint_ops: Vec<hint::HintOperation>,
+}
+
+/// One log-derived, chunked table — the ones whose trace is a function of a
+/// single routed op list, so it can be rebuilt on demand long after the routing
+/// that produced it.
+///
+/// The preprocessed tables (BITWISE, DECODE, REGISTER, HALT, COMMIT, KECCAK*)
+/// and PAGE are deliberately absent: they are not driven by one op list and the
+/// streaming prover keeps them resident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableKind {
+    Cpu,
+    Memw,
+    MemwAligned,
+    MemwRegister,
+    Load,
+    Lt,
+    Shift,
+    Mul,
+    Dvrm,
+    Branch,
+    Eq,
+    Bytewise,
+    Store,
+    Cpu32,
+}
+
+/// The tables that are a pure per-op function of the CPU ops, with no later
+/// source appending to them.
+///
+/// Extracted so the all-at-once path and the Commit-phase walk derive them with
+/// the same code: a table closed mid-walk has to be the table the finished run
+/// would have produced, and two copies of a filter+map drift.
+///
+/// DVRM, MUL and LT are deliberately not here. Each takes ops from more than
+/// one source — CPU32 appends to DVRM and MUL, DVRM appends to MUL and LT — and
+/// the finished run concatenates those sources whole, so deriving them per
+/// segment would interleave them differently and cut the chunks elsewhere.
+struct DerivedFromCpu {
+    branch_ops: Vec<BranchOperation>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+    mul_ops: Vec<(MulOperation, bool)>,
+    dvrm_ops: Vec<(DvrmOperation, bool)>,
+}
+
+fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
+    // BRANCH: CPU ops where branch_cond = true.
+    let branch_ops: Vec<BranchOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.branch_cond)
+        .map(|op| {
+            BranchOperation::new(
+                op.decode.pc,
+                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                op.rv1,        // register value must match the CPU's BRANCH bus signature
+                op.decode.fields.jalr(),
+            )
+        })
+        .collect();
+    // EQ: BEQ/BNE (invert = alu_flags bit 6).
+    let eq_ops: Vec<eq::EqOperation> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+        .collect();
+    // BYTEWISE: AND/OR/XOR (op = alu_op).
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+        .collect();
+    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
+    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
+    // table row). The MEMORY bus and the STORE chip's MEMW write share the base
+    // timestamp (spec store.toml uses one `timestamp` for both).
+    let store_ops: Vec<store::StoreOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.fields.is_store())
+        .map(|op| {
+            store::StoreOperation::new(
+                op.res,
+                op.timestamp,
+                op.rv2,
+                op.decode.fields.mem_bytes() as u8,
+            )
+        })
+        .collect();
+
+    // MUL: non-word MUL instructions. lhs_signed = `signed` (alu_flags bit 5);
+    // rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
+    let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
+        .map(|op| {
+            let f = op.decode.fields;
+            (
+                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+                f.alu_muldiv(),
+            )
+        })
+        .collect();
+    // DVRM: non-word DIV/REM instructions.
+    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
+        .map(|op| {
+            let f = op.decode.fields;
+            (
+                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+                f.alu_muldiv(),
+            )
+        })
+        .collect();
+
+    DerivedFromCpu {
+        branch_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+        mul_ops,
+        dvrm_ops,
+    }
+}
+
+/// The tables this walk can close mid-execution: their ops come straight out of
+/// `collect_ops_from_cpu` and nothing appends to them afterwards.
+pub const CHUNKED_KINDS: [TableKind; 10] = [
+    TableKind::Cpu,
+    TableKind::Memw,
+    TableKind::MemwAligned,
+    TableKind::MemwRegister,
+    TableKind::Load,
+    TableKind::Cpu32,
+    TableKind::Branch,
+    TableKind::Eq,
+    TableKind::Bytewise,
+    TableKind::Store,
+];
+
+/// Chunk limit for one kind.
+pub fn max_rows_for(kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+    match kind {
+        TableKind::Cpu => max_rows.cpu,
+        TableKind::Memw => max_rows.memw,
+        TableKind::MemwAligned => max_rows.memw_aligned,
+        TableKind::MemwRegister => max_rows.memw_register,
+        TableKind::Load => max_rows.load,
+        TableKind::Shift => max_rows.shift,
+        TableKind::Mul => max_rows.mul,
+        TableKind::Dvrm => max_rows.dvrm,
+        TableKind::Branch => max_rows.branch,
+        TableKind::Lt => max_rows.lt,
+        TableKind::Eq => max_rows.eq,
+        TableKind::Bytewise => max_rows.bytewise,
+        TableKind::Store => max_rows.store,
+        TableKind::Cpu32 => max_rows.cpu32,
+    }
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -3585,9 +3570,9 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
     // `true` builds the chunked tables as empty placeholders, leaving the
-    // returned `RoutedOps` as the only way to get their rows.
+    // returned `CollectedOps` as the only way to get their rows.
     retire_chunked: bool,
-) -> Result<(Traces, RoutedOps), Error> {
+) -> Result<(Traces, CollectedOps), Error> {
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -3804,9 +3789,9 @@ fn build_traces<I: ImageSource + Sync>(
     // generate→spill order keeps trace memory bounded.
     // Phases 3-4 are settled, so every cross-table coupling is already folded in
     // and each of these tables is now a pure function of one routed op list.
-    // Pack them into `RoutedOps`: the same intermediate builds them here and can
+    // Pack them into `CollectedOps`: the same intermediate builds them here and can
     // rebuild any one of them later, which is what a retired trace needs.
-    let routed = RoutedOps {
+    let routed = CollectedOps {
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
@@ -3821,6 +3806,9 @@ fn build_traces<I: ImageSource + Sync>(
         bytewise_ops,
         store_ops,
         cpu32_ops,
+        // The accumulators stay with the phase-5 closures below: this value
+        // exists to rebuild the chunked tables, which do not read them.
+        ..Default::default()
     };
     let cpu_ops_ref = &routed.cpu_ops;
 
@@ -4939,14 +4927,14 @@ impl Traces {
     /// `from_elf_and_logs`, retiring the chunked tables.
     ///
     /// The returned `Traces` carries an empty placeholder per chunk — the right
-    /// count, none of the rows — and the `RoutedOps` beside it is what rebuilds
+    /// count, none of the rows — and the `CollectedOps` beside it is what rebuilds
     /// any of them on demand.
     pub(crate) fn from_elf_and_logs_streaming(
         elf: &Elf,
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<(Self, RoutedOps), Error> {
+    ) -> Result<(Self, CollectedOps), Error> {
         let initial_image = build_initial_image(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
         let artifacts = DecodeArtifacts::from_elf(elf)?;
@@ -5092,7 +5080,7 @@ impl Traces {
         let mut memory_state = MemoryState::from_image(initial_image);
         let mut register_state = RegisterState::from_init(register_init);
 
-        let mut buf = RoutedOps::default();
+        let mut buf = CollectedOps::default();
         let mut emitted = [0usize; CHUNKED_KINDS.len()];
         let _ = &emitted;
         let mut cycles_so_far = 0usize;
@@ -5139,7 +5127,8 @@ impl Traces {
         // land in MEMW — so a partial chunk is not final until the execution
         // is over. That is the spec's own split: full tables are committed and
         // retired during the walk, and "at the end of the execution, the
-        // remaining tables are padded and committed".
+        // remaining tables are padded and committed". What is left goes back to
+        // the caller so it can do exactly that.
         Ok(())
     }
 
@@ -5305,7 +5294,7 @@ impl Traces {
     /// (`l2g_memory_bookend`), where callers pass `None`.
     #[allow(clippy::too_many_arguments)]
     /// `build_from_collected`, retiring the chunked tables: they come back as
-    /// empty placeholders and the returned `RoutedOps` is what rebuilds them.
+    /// empty placeholders and the returned `CollectedOps` is what rebuilds them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_from_collected_streaming<I: ImageSource + Sync>(
         artifacts: &DecodeArtifacts,
@@ -5317,7 +5306,7 @@ impl Traces {
         is_final: bool,
         l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<(Self, RoutedOps), Error> {
+    ) -> Result<(Self, CollectedOps), Error> {
         Self::build_from_collected_inner(
             artifacts,
             collected,
@@ -5373,7 +5362,7 @@ impl Traces {
         l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         retire_chunked: bool,
-    ) -> Result<(Self, RoutedOps), Error> {
+    ) -> Result<(Self, CollectedOps), Error> {
         // Phase 0 (cached): the pristine DECODE trace is cloned so
         // `build_traces` can fill this epoch's multiplicities.
         #[cfg(feature = "instruments")]

@@ -1216,14 +1216,14 @@ fn trace_build_is_deterministic_across_builds() {
 /// verifier will not accept.
 #[test]
 fn build_chunk_matches_the_full_table_build() {
-    use crate::tables::trace_builder::{RoutedOps, TableKind};
+    use crate::tables::trace_builder::{CollectedOps, TableKind};
 
     // More ops than the chunk limit below, so several chunks exist and the
     // last one is short.
     let lt_ops: Vec<_> = (0..10u64)
         .map(|i| crate::tables::lt::LtOperation::new(i, i * 7 + 1, false))
         .collect();
-    let routed = RoutedOps {
+    let routed = CollectedOps {
         lt_ops,
         ..Default::default()
     };
@@ -1267,7 +1267,7 @@ fn build_chunk_matches_the_full_table_build() {
 /// them ever stops.
 #[test]
 fn chunk_shape_matches_the_built_chunk() {
-    use crate::tables::trace_builder::{RoutedOps, TableKind};
+    use crate::tables::trace_builder::{CollectedOps, TableKind};
 
     // Ops with deliberate repeats, so the deduplicating kinds and the plain ones
     // disagree on count and the distinction is actually exercised.
@@ -1277,7 +1277,7 @@ fn chunk_shape_matches_the_built_chunk() {
     let lt_ops: Vec<_> = (0..8u64)
         .map(|i| crate::tables::lt::LtOperation::new(i % 3, i % 3 + 1, false))
         .collect();
-    let routed = RoutedOps {
+    let routed = CollectedOps {
         lt_ops,
         ..Default::default()
     };
