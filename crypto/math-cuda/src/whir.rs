@@ -9,8 +9,49 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 use crate::Result;
 use crate::device::{alloc_or_trim, backend};
+
+/// Leaf-hash passes over a codeword — one per tree actually built.
+///
+/// The quantity H4 is about: a commitment that is opened used to cost TWO of
+/// these, one for the root and one for the paths. It counts launches, not
+/// leaves, because "how many times was this codeword's leaf layer hashed" is
+/// the question, and a test can assert an integer.
+static LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn leaf_hash_calls() -> u64 {
+    LEAF_HASH_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn reset_leaf_hash_calls() {
+    LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// ⚠ Escape hatch for the mutation check, and for a run that would rather
+/// rebuild than hold the memory: `LAMBDA_VM_NO_WHIR_TREE_CACHE` restores the
+/// rebuild-every-time behaviour. Read once, cached.
+fn cache_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_TREE_CACHE").is_some())
+}
+
+/// A built tree, kept for the openings that follow the root.
+struct CachedTree {
+    nodes: CudaSlice<u8>,
+    num_leaves: usize,
+    /// What it was built FOR. A tree is only valid for the blocking and the
+    /// hash it was built with, so both are part of the key — "they happen to
+    /// match at every call site today" is an invariant about callers, not
+    /// about this type.
+    log_folding: usize,
+    hash: crate::DeviceHash,
+    /// Bytes promised to [`DeviceReservation`] for it, given back on eviction.
+    bytes: u64,
+}
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -24,10 +65,18 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
+    /// ★ The tree this codeword was committed through, kept so the openings
+    /// need not hash its leaves a second time (H4).
+    ///
+    /// Behind an `Arc<Mutex<..>>` because `DeviceCodeword` is `Clone` and the
+    /// clones are the same codeword: a cache that cloned would be rebuilt per
+    /// clone, which is the cost this exists to remove.
+    tree: Arc<Mutex<Option<CachedTree>>>,
     /// The room the chain promised itself: this codeword, the folds that halve
     /// it, and the tree each of them is committed and opened through. Shared
-    /// with the folds, which live inside it.
-    _room: Arc<crate::device::DeviceReservation>,
+    /// with the folds, which live inside it, and GROWN by the cached tree
+    /// above so that one number still answers what this chain holds.
+    room: Arc<crate::device::DeviceReservation>,
 }
 
 impl DeviceCodeword {
@@ -95,39 +144,110 @@ impl DeviceCodeword {
             }
         }
         build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+        LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
         Ok((nodes, num_leaves))
+    }
+
+    /// ★ Run `f` against this codeword's tree, building it at most ONCE.
+    ///
+    /// The commit builds it and keeps it; the openings that follow read the
+    /// same buffer. That is the whole of H4, and what it buys is half the
+    /// device hashing of every commitment that is opened — which is all of
+    /// them.
+    ///
+    /// # What the cache is keyed on, and what happens when it misses
+    ///
+    /// `(log_folding, hash)`. A tree is only valid for the blocking and the
+    /// hash it was built with, and a miss **REBUILDS** rather than refusing:
+    /// both are legitimate parameters of the call, a rebuild is always correct,
+    /// and refusing would turn an unusual-but-valid call into an error. What
+    /// the key rules out is the dangerous outcome — serving a tree that answers
+    /// a different question, which no assertion downstream would catch because
+    /// the paths would be internally consistent and wrong.
+    ///
+    /// # When the budget says no
+    ///
+    /// The tree is served for this call and NOT cached. Holding device memory
+    /// the reservation cannot see is the one thing this must never do, so the
+    /// cost of a full budget is the old behaviour rather than a silent
+    /// over-commit.
+    fn with_tree<R>(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+        f: impl FnOnce(&CudaSlice<u8>, usize) -> Result<R>,
+    ) -> Result<R> {
+        if cache_disabled() {
+            let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
+            return f(&nodes, num_leaves);
+        }
+        // Poisoning is ignored: the slot holds a device buffer and a byte
+        // count, and a panic in `f` leaves both consistent.
+        let mut slot = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = slot.as_ref() {
+            if cached.log_folding == log_folding && cached.hash == hash {
+                return f(&cached.nodes, cached.num_leaves);
+            }
+            // A different shape. Give its bytes back before building another,
+            // so the reservation never counts two trees for one codeword.
+            self.room.shrink(cached.bytes);
+            *slot = None;
+        }
+
+        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
+        let bytes = (2 * num_leaves as u64 - 1) * 32;
+        if self.room.grow(bytes) {
+            let cached = slot.insert(CachedTree {
+                nodes,
+                num_leaves,
+                log_folding,
+                hash,
+                bytes,
+            });
+            f(&cached.nodes, cached.num_leaves)
+        } else {
+            f(&nodes, num_leaves)
+        }
+    }
+
+    /// Bytes this codeword's chain has promised the device budget, including
+    /// any cached tree. For tests and diagnostics.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.room.bytes()
     }
 
     /// The root of that tree, which is the commitment.
     ///
-    /// The tree itself is dropped: the only other thing anyone wants from it
-    /// is a path per query, and by then the queries are known — see
-    /// [`paths`](Self::paths).
+    /// ★ The tree is KEPT (H4). The other thing anyone wants from it is a path
+    /// per query, and rebuilding it then cost a second leaf-hash pass over the
+    /// whole codeword — half of this path's device hashing, for a buffer that
+    /// was already in hand.
     pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
-        let (nodes, _) = self.build_tree(log_folding, hash)?;
-        let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
-        self.stream.synchronize()?;
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&head);
-        Ok(root)
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
+            self.stream.synchronize()?;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&head);
+            Ok(root)
+        })
     }
 
     /// The whole tree in the host node layout — what a caller that walks it
     /// here needs, and what the parity test compares against.
     pub fn nodes_to_host(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<Vec<u8>> {
-        let (nodes, _) = self.build_tree(log_folding, hash)?;
-        let out = self.stream.clone_dtoh(&nodes)?;
-        self.stream.synchronize()?;
-        Ok(out)
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let out = self.stream.clone_dtoh(nodes)?;
+            self.stream.synchronize()?;
+            Ok(out)
+        })
     }
 
     /// The authentication paths of `positions`, against the same tree.
     ///
-    /// Rebuilt rather than kept or carried home. Keeping it costs half a
-    /// gigabyte of device memory per commitment for the whole proof; bringing
-    /// it back costs ten times the rehash, because a pageable copy of half a
-    /// gigabyte is the slowest thing in the commit. What the host needs of a
-    /// tree is a kilobyte per query.
+    /// ★ Read from the tree the commit kept, not rebuilt (H4). Bringing the
+    /// tree home is still not done — a pageable copy of half a gigabyte is the
+    /// slowest thing in the commit, and what the host needs of a tree is a
+    /// kilobyte per query.
     pub fn paths(
         &self,
         log_folding: usize,
@@ -375,7 +495,8 @@ fn commit_from(
         stream,
         elements: n,
         base: true,
-        _room: Arc::new(room),
+        tree: Arc::new(Mutex::new(None)),
+        room: Arc::new(room),
     };
     let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
@@ -618,9 +739,13 @@ pub fn fold_resident(
         stream,
         elements: half,
         base: false,
+        // A fold is its OWN codeword and gets its own cache slot: it is
+        // committed and opened in its own right, and sharing the parent's slot
+        // would make one of them evict the other every round.
+        tree: Arc::new(Mutex::new(None)),
         // The fold lives inside the room the codeword it came from promised:
         // it is half of it, and that one is still alive.
-        _room: codeword._room.clone(),
+        room: codeword.room.clone(),
     })
 }
 

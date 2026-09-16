@@ -334,15 +334,71 @@ fn retain_default_mempool(ctx: &CudaContext) {
 }
 
 /// Device bytes held for as long as this lives. See [`Backend::reserve`].
+///
+/// ★ The count is atomic and the reservation is GROWABLE, because a chain
+/// promises its room once and then discovers more of it: the tree a commitment
+/// caches is not known when the codeword reserves, and it is shared through an
+/// `Arc` by the time it is. Growing this rather than taking a second
+/// reservation is what keeps ONE number answering "what does this chain hold" —
+/// two accountings for one working set is a shape this codebase has paid for
+/// before.
 #[derive(Debug)]
 pub struct DeviceReservation {
-    bytes: u64,
+    bytes: AtomicU64,
+}
+
+impl DeviceReservation {
+    /// Bytes this reservation currently accounts for.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Promise `extra` more against the same budget, under this reservation.
+    ///
+    /// Returns false and changes nothing if the budget will not take it — the
+    /// caller then does without whatever it wanted the bytes for, rather than
+    /// holding memory the accounting cannot see.
+    pub fn grow(&self, extra: u64) -> bool {
+        let Ok(be) = backend() else { return false };
+        let mut held = be.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(extra) > be.vram_budget_bytes {
+                return false;
+            }
+            match be.reserved.compare_exchange_weak(
+                held,
+                held + extra,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.bytes.fetch_add(extra, Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => held = seen,
+            }
+        }
+    }
+
+    /// Give `given` of them back, when what they were promised for is dropped
+    /// before the reservation is.
+    pub fn shrink(&self, given: u64) {
+        let given = given.min(self.bytes.load(Ordering::Relaxed));
+        if given == 0 {
+            return;
+        }
+        self.bytes.fetch_sub(given, Ordering::Relaxed);
+        if let Ok(be) = backend() {
+            be.reserved.fetch_sub(given, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for DeviceReservation {
     fn drop(&mut self) {
         if let Ok(be) = backend() {
-            be.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+            be.reserved
+                .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 }
@@ -715,10 +771,21 @@ impl Backend {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(DeviceReservation { bytes }),
+                Ok(_) => {
+                    return Some(DeviceReservation {
+                        bytes: AtomicU64::new(bytes),
+                    });
+                }
                 Err(seen) => held = seen,
             }
         }
+    }
+
+    /// Bytes promised across every live reservation — what `reserve` checks
+    /// the budget against. Exposed so a test can assert the number rather than
+    /// assert that nothing crashed.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved.load(Ordering::Relaxed)
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
