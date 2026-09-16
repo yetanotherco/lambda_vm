@@ -123,13 +123,17 @@ pub fn run(
 /// the rest — are not here yet. They are built from the ELF and from counts
 /// accumulated across the whole run rather than from an op list, so they need
 /// their own step.
-pub fn commit_remaining(
+#[allow(clippy::too_many_arguments)]
+pub fn commit_remaining<I: crate::paged_mem::ImageSource + Sync>(
     mut leftover: WalkLeftover,
     artifacts: &crate::tables::trace_builder::DecodeArtifacts,
+    initial_image: &I,
+    register_init: &[u32],
+    private_input: &[u8],
     max_rows: &MaxRowsConfig,
     proof_options: &ProofOptions,
 ) -> Result<Remaining, Error> {
-    leftover.finalize();
+    leftover.finalize(max_rows);
 
     let cpu = crate::test_utils::create_cpu_air(proof_options);
     let memw = crate::test_utils::create_memw_air(proof_options);
@@ -145,6 +149,11 @@ pub fn commit_remaining(
     let mul = crate::test_utils::create_mul_air(proof_options);
     let dvrm = crate::test_utils::create_dvrm_air(proof_options);
     let shift = crate::test_utils::create_shift_air(proof_options);
+
+    // HALT and REGISTER first: REGISTER's final PC token is derived from the CPU
+    // padding, and the padding of the tail cannot be counted once the tail has
+    // been drained into a chunk below.
+    let (halt, register) = leftover.build_halt_and_register(register_init)?;
 
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
     let mut out = Vec::new();
@@ -188,17 +197,26 @@ pub fn commit_remaining(
     // preprocessed, so its commitment splits into two trees, and that path does
     // not exist here yet. The lookups are what this phase is responsible for
     // having kept — the chunks that owed them are long gone.
-    let bitwise = leftover.build_bitwise();
     let accumulated = leftover.build_accumulated();
     let decode = leftover.build_decode(
         artifacts.decode_trace.clone(),
         &artifacts.decode_pc_to_row,
         max_rows,
     );
+    // PAGE last: it owes BITWISE lookups of its own, so BITWISE is written only
+    // once those are in.
+    let mut hist = leftover.bitwise_histogram();
+    let (pages, page_configs) = leftover.build_pages(initial_image, private_input, &mut hist);
+    let bitwise = WalkLeftover::build_bitwise_from(&hist);
+
     Ok(Remaining {
         chunks: out,
         bitwise,
         decode,
+        halt,
+        register,
+        pages,
+        page_configs,
         accumulated,
     })
 }
@@ -212,6 +230,13 @@ pub struct Remaining {
     /// The DECODE table, with one lookup counted per executed cycle and per
     /// padding row.
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// HALT, from the run's terminating ECALL.
+    pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// REGISTER, whose final PC token has to match the last padding write.
+    pub register: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// The PAGE tables and their configs.
+    pub pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub page_configs: Vec<crate::tables::page::PageConfig>,
     /// The tables written once from an accumulated op list.
     pub accumulated: crate::tables::trace_builder::AccumulatedTables,
 }

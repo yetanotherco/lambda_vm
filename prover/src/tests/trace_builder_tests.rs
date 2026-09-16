@@ -1864,9 +1864,14 @@ fn the_two_phases_cover_every_chunked_table() {
     let closed = phase.closed.clone();
     let artifacts =
         crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = crate::tables::trace_builder::build_initial_image(&elf, &[]);
+    let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
     let rest = crate::commit_phase::commit_remaining(
         phase.leftover,
         &artifacts,
+        &image,
+        &register_init,
+        &[],
         &max_rows,
         &proof_options,
     )
@@ -1948,13 +1953,18 @@ fn the_two_phases_cover_every_chunked_table() {
 ///
 /// BITWISE counts lookups from tables the Commit phase closes and drops, so the
 /// contribution has to be taken while the chunk still exists. If it is not, the
-/// BITWISE table comes out short and the bus stops balancing — a failure that
-/// surfaces at verification, far from the chunk that caused it.
+/// table comes out short and the bus stops balancing — a failure that surfaces
+/// at verification, far from the chunk that caused it.
+///
+/// The limits here are small for the kinds that owe BITWISE, so most of their
+/// lookups belong to chunks that were closed and dropped rather than to the
+/// tail. Removing the fold that runs before a chunk is drained fails this.
 #[test]
 fn retiring_a_chunk_keeps_its_bitwise_lookups() {
-    use crate::tables::bitwise::BitwiseHistogram;
     use crate::tables::register::register_init_from_entry_point;
-    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use crate::tables::trace_builder::{
+        DecodeArtifacts, TableKind, Traces as T, WalkLeftover, build_initial_image,
+    };
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
 
@@ -1963,15 +1973,17 @@ fn retiring_a_chunk_keeps_its_bitwise_lookups() {
     let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
     let image = build_initial_image(&elf, &[]);
     let register_init = register_init_from_entry_point(elf.entry_point);
-    // Small limits for the three kinds that feed BITWISE, so chunks of them
-    // actually close mid-walk and their lookups have to be folded in early.
     let max_rows = crate::tables::MaxRowsConfig {
         memw_aligned: 1 << 10,
         memw_register: 1 << 10,
         branch: 1 << 10,
+        eq: 1 << 10,
+        bytewise: 1 << 10,
+        store: 1 << 10,
         ..Default::default()
     };
 
+    let mut retired = 0usize;
     let mut leftover = T::walk_and_emit_chunks(
         &artifacts,
         &elf,
@@ -1979,36 +1991,57 @@ fn retiring_a_chunk_keeps_its_bitwise_lookups() {
         &image,
         &register_init,
         &max_rows,
-        |_, _, _| {},
+        |kind, _, _| {
+            if matches!(
+                kind,
+                TableKind::MemwAligned
+                    | TableKind::MemwRegister
+                    | TableKind::Branch
+                    | TableKind::Eq
+                    | TableKind::Bytewise
+                    | TableKind::Store
+            ) {
+                retired += 1;
+            }
+        },
     )
     .expect("walk");
+    assert!(
+        retired > 1,
+        "the fixture must retire chunks that owe BITWISE, or this proves nothing"
+    );
+    leftover.finalize(&max_rows);
 
-    // The same three sources over the finished run, whole.
+    let mut hist = leftover.bitwise_histogram();
+    leftover.build_pages(&image, &[], &mut hist);
+    let built = WalkLeftover::build_bitwise_from(&hist);
+
     let logs = Executor::new(&elf, vec![])
         .expect("executor")
         .run()
         .expect("run")
         .logs;
-    let whole = T::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collect");
-    let mut expected = BitwiseHistogram::new();
-    whole.fold_bitwise_for_test(&mut expected);
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
 
-    // Finalization first, as the Challenge phase does it: HALT's register
-    // writes are part of the run and land in these same tables.
-    leftover.finalize();
-
-    // What the walk retired plus what it still holds, read off the table the
-    // phase actually builds.
-    let mut reference = crate::tables::bitwise::generate_bitwise_trace();
-    expected.fill_multiplicities(&mut reference);
-    let built = leftover.build_bitwise();
-
-    let (a, _) = reference.main_data_row_major();
-    let (b, _) = built.main_data_row_major();
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
     assert_eq!(
-        a.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
-        b.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
-        "the lookups of the retired chunks plus the tail do not add up to the run's"
+        flat(&built),
+        flat(&resident.bitwise),
+        "the lookups of the retired chunks are missing from BITWISE"
     );
 }
 
@@ -2044,7 +2077,7 @@ fn the_accumulated_tables_match_the_ordinary_build() {
         |_, _, _| {},
     )
     .expect("walk");
-    leftover.finalize();
+    leftover.finalize(&max_rows);
     let built = leftover.build_accumulated();
 
     let logs = Executor::new(&elf, vec![])
@@ -2114,7 +2147,7 @@ fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
     };
 
     let mut closed_cpu = 0usize;
-    let leftover = T::walk_and_emit_chunks(
+    let mut leftover = T::walk_and_emit_chunks(
         &artifacts,
         &elf,
         vec![],
@@ -2128,6 +2161,9 @@ fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
         },
     )
     .expect("walk");
+    // DECODE is built in the end-of-run phase, after finalization freezes the
+    // padding count; building it before would read a tail that is still growing.
+    leftover.finalize(&max_rows);
     assert!(
         closed_cpu > 1,
         "the fixture must drop several CPU chunks, or the counting is untested"
@@ -2165,4 +2201,106 @@ fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
         flat(&resident.decode),
         "DECODE's multiplicities differ from the ordinary build"
     );
+}
+
+/// The end-of-run phase must produce every non-chunked table the ordinary build
+/// produces, identically.
+///
+/// These are the tables that cannot be closed while the run continues: HALT
+/// comes from the terminating ECALL, REGISTER's final PC token has to match the
+/// last padding write, PAGE reads the memory image at the last cycle, and
+/// BITWISE owes lookups that include PAGE's. Each depends on state the walk had
+/// to carry rather than on an op list it could keep.
+#[test]
+fn the_end_of_run_tables_match_the_ordinary_build() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    // Not a power of two, so the CPU chunks pad and REGISTER's final PC token
+    // depends on a padding count the walk had to accumulate.
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 10_000,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
+    let rest = crate::commit_phase::commit_remaining(
+        phase.leftover,
+        &artifacts,
+        &image,
+        &register_init,
+        &[],
+        &max_rows,
+        &proof_options,
+    )
+    .expect("challenge");
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(flat(&rest.halt), flat(&resident.halt), "HALT differs");
+    {
+        let a = flat(&rest.register);
+        let b = flat(&resident.register);
+        let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+        eprintln!(
+            "REGISTER: len {} vs {}, first diff at {:?} -> {:?} vs {:?}",
+            a.len(),
+            b.len(),
+            first,
+            first.map(|i| a[i]),
+            first.map(|i| b[i])
+        );
+    }
+    assert_eq!(
+        flat(&rest.register),
+        flat(&resident.register),
+        "REGISTER differs"
+    );
+    assert_eq!(flat(&rest.decode), flat(&resident.decode), "DECODE differs");
+    assert_eq!(
+        flat(&rest.bitwise),
+        flat(&resident.bitwise),
+        "BITWISE differs"
+    );
+    assert_eq!(
+        rest.pages.len(),
+        resident.pages.len(),
+        "a different number of PAGE tables"
+    );
+    assert!(
+        !rest.pages.is_empty(),
+        "the fixture must produce PAGE tables"
+    );
+    for (i, (a, b)) in rest.pages.iter().zip(resident.pages.iter()).enumerate() {
+        assert_eq!(flat(a), flat(b), "PAGE {i} differs");
+    }
 }

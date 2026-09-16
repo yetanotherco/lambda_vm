@@ -1272,6 +1272,13 @@ pub struct WalkLeftover {
     /// Padding rows the CPU chunks closed so far added, each of which looks
     /// DECODE up at the padding pc.
     pub(crate) padding_rows: usize,
+    /// CPU padding rows over the whole run, frozen by `finalize` while the tail
+    /// is still intact.
+    pub(crate) total_cpu_padding: Option<usize>,
+    /// Timestamp and next pc of the run's last ECALL, which HALT is built from.
+    pub(crate) last_ecall: Option<(u64, u64)>,
+    /// Memory at the last cycle, which the PAGE build reads.
+    pub(crate) memory_state: MemoryState,
     /// Register state at the last cycle. The end-of-run finalization is driven
     /// from it — HALT appends 33 register MEMW ops at `u64::MAX` — so the phase
     /// that pads and commits the tails needs nothing else from the run.
@@ -1291,7 +1298,20 @@ impl WalkLeftover {
     /// timestamp checks like any other access, so the MEMW-derived LT ops are
     /// collected after them — the same order `build_traces` uses, where
     /// finalization runs before phase 3.
-    pub(crate) fn finalize(&mut self) {
+    pub(crate) fn finalize(&mut self, max_rows: &super::MaxRowsConfig) {
+        // Freeze the CPU padding here, while the tail is still whole. Both HALT's
+        // register token and DECODE's padding lookups are derived from it, and
+        // both are built after the tails have been drained into chunks — reading
+        // it then would count a tail that no longer exists.
+        let tail = self.tail.cpu_ops.len();
+        self.total_cpu_padding = Some(if tail == 0 && self.emitted(TableKind::Cpu) > 0 {
+            // An empty tail is not a chunk: `ops.chunks(n)` over a length that
+            // divides evenly yields no trailing empty one.
+            self.padding_rows
+        } else {
+            self.padding_rows + tail.next_power_of_two().max(4) - tail
+        });
+
         let halt = collect_halt_ops(&mut self.register_state);
         let mut buckets = MemwBuckets::with_register_capacity(halt.len());
         buckets.extend_ops(halt);
@@ -1305,6 +1325,41 @@ impl WalkLeftover {
         self.tail
             .lt_ops
             .extend(collect_lt_from_memw_aligned(&self.tail.memw_aligned_ops));
+
+        // Fold the tail's own BITWISE lookups in now, while the tail is whole.
+        // The retired chunks contributed theirs as they closed; from here the
+        // histogram is complete and draining the tail cannot change it.
+        let mut hist =
+            std::mem::replace(&mut self.retired_bitwise, bitwise::BitwiseHistogram::new());
+        for kind in [
+            TableKind::MemwAligned,
+            TableKind::MemwRegister,
+            TableKind::Branch,
+            TableKind::Bytewise,
+            TableKind::Eq,
+            TableKind::Store,
+        ] {
+            let n = self.tail.buffered(kind);
+            self.tail.fold_bitwise_from_front(kind, n, &mut hist);
+        }
+        // The sources nothing ever retires, so their whole list is here.
+        hist.add_ops(&collect_bitwise_from_lt(&self.tail.lt_ops));
+        hist.add_ops(&collect_bitwise_from_mul(&self.tail.mul_ops, max_rows.mul));
+        hist.add_ops(&collect_bitwise_from_dvrm(
+            &self.tail.dvrm_ops,
+            max_rows.dvrm,
+        ));
+        hist.add_ops(&shift::collect_bitwise_from_shift(&self.tail.shift_ops));
+        hist.add_ops(&collect_bitwise_from_commit(&self.tail.commit_ops));
+        hist.add_ops(&collect_bitwise_from_keccak(&self.tail.keccak_ops));
+        hist.add_ops(&collect_bitwise_from_ecsm(&self.tail.ecsm_ops));
+        hist.add_ops(&collect_bitwise_from_ecdas(&self.tail.ecdas_ops));
+        hist.add_ops(&collect_bitwise_from_hint(&self.tail.hint_ops));
+        // CPU padding rows send ARE_BYTES with all-zero values.
+        add_padding_byte_checks(&mut hist, self.cpu_padding_rows());
+        // The lookups the walk itself collected while routing.
+        hist.add_ops(&self.tail.bitwise_ops);
+        self.retired_bitwise = hist;
     }
 
     /// Build every chunk still held for `kind`, draining it.
@@ -1339,22 +1394,23 @@ impl WalkLeftover {
     /// Only the three sources a walk can retire are folded so far. The rest —
     /// LT, MUL, DVRM, SHIFT, the accelerators, PAGE — feed BITWISE too and are
     /// not here yet.
-    pub(crate) fn build_bitwise(&self) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    /// Every BITWISE lookup the run owes, from the retired chunks and from the
+    /// tail — `finalize` folded both in, so this is complete whatever has been
+    /// drained since. PAGE's own lookups are added by `build_pages`.
+    pub(crate) fn bitwise_histogram(&self) -> bitwise::BitwiseHistogram {
         let mut hist = bitwise::BitwiseHistogram::new();
         hist.merge(&self.retired_bitwise);
-        self.tail.fold_bitwise_from_front(
-            TableKind::MemwAligned,
-            self.tail.memw_aligned_ops.len(),
-            &mut hist,
-        );
-        self.tail.fold_bitwise_from_front(
-            TableKind::MemwRegister,
-            self.tail.memw_register_rows.len(),
-            &mut hist,
-        );
-        self.tail
-            .fold_bitwise_from_front(TableKind::Branch, self.tail.branch_ops.len(), &mut hist);
+        hist
+    }
 
+    /// Fill BITWISE's multiplicity columns from a histogram.
+    ///
+    /// Taken separately from [`bitwise_histogram`](Self::bitwise_histogram) so
+    /// PAGE — which owes BITWISE its own lookups and is built later, from the
+    /// memory image — can fold them in before the table is written.
+    pub(crate) fn build_bitwise_from(
+        hist: &bitwise::BitwiseHistogram,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
         let mut table = bitwise::generate_bitwise_trace();
         hist.fill_multiplicities(&mut table);
         table
@@ -1408,14 +1464,64 @@ impl WalkLeftover {
         max_rows: &super::MaxRowsConfig,
     ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
         let mut counts = self.decode_counts.clone();
-        let tail = self.tail.cpu_ops.len();
-        let padding = self.padding_rows + tail.next_power_of_two().max(4) - tail;
+        let padding = self.cpu_padding_rows();
         let _ = max_rows;
         *counts.entry(cpu::CPU_PADDING_PC).or_insert(0) += padding as u64;
 
         let mut decode = decode_trace;
         decode::add_multiplicities(&mut decode, pc_to_row, &counts);
         decode
+    }
+
+    /// Total padding rows the CPU table adds, over the closed chunks and the
+    /// tail.
+    fn cpu_padding_rows(&self) -> usize {
+        self.total_cpu_padding
+            .expect("finalize must run before the end-of-run tables are built")
+    }
+
+    /// Build HALT and REGISTER, in that order because the second depends on the
+    /// first.
+    ///
+    /// HALT comes from the run's terminating ECALL. REGISTER then has to finalize
+    /// the PC: the CPU padding rows chain inline-PC tokens at a +4 cadence from
+    /// the HALT chip's emit at `halt_timestamp + 1`, so the last write lands at
+    /// `halt_timestamp + 4 * padding + 1` and REGISTER's final token must match
+    /// it or the memory argument does not balance. Both numbers were counted
+    /// during the walk, since the ops that carry them are long dropped.
+    pub(crate) fn build_halt_and_register(
+        &mut self,
+        register_init: &[u32],
+    ) -> Result<HaltAndRegister, Error> {
+        let (halt_timestamp, halt_next_pc) = self.last_ecall.ok_or(Error::MissingHaltEcall)?;
+        let padding = self.cpu_padding_rows();
+        self.register_state
+            .write_pc(1, halt_timestamp + 4 * padding as u64 + 1);
+        let register_final_state = self.register_state.to_final_state_map();
+
+        Ok((
+            halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+            register::generate_register_trace(&register_final_state, register_init),
+        ))
+    }
+
+    /// Build the PAGE tables from the run's end memory.
+    ///
+    /// PAGE also owes BITWISE its lookups, so they are folded into `hist` here
+    /// rather than left for a caller to remember.
+    pub(crate) fn build_pages<I: ImageSource + Sync>(
+        &self,
+        initial_image: &I,
+        private_input: &[u8],
+        hist: &mut bitwise::BitwiseHistogram,
+    ) -> (
+        Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+        Vec<page::PageConfig>,
+    ) {
+        let (tables, configs) =
+            generate_page_tables(initial_image, &self.memory_state, private_input, false);
+        collect_bitwise_from_page(initial_image, &self.memory_state, false, hist);
+        (tables, configs)
     }
 
     /// Cycles the walk executed.
@@ -1438,6 +1544,13 @@ impl WalkLeftover {
             .map_or(0, |slot| self.emitted[slot])
     }
 }
+
+/// HALT and REGISTER, which are built together because the second depends on
+/// the first.
+pub type HaltAndRegister = (
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+);
 
 /// The tables built once, at the end, from an accumulated op list.
 pub struct AccumulatedTables {
@@ -3009,24 +3122,6 @@ impl CollectedEpoch {
     /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
     /// [`touched_cells_from_memory_state`] over the same immutable
     /// `memory_state`), available before any table is built.
-    /// The same three BITWISE sources over a finished run, for comparison with
-    /// what a walk retired plus what it kept.
-    #[cfg(test)]
-    pub(crate) fn fold_bitwise_for_test(&self, hist: &mut bitwise::BitwiseHistogram) {
-        self.ops.fold_bitwise_from_front(
-            TableKind::MemwAligned,
-            self.ops.memw_aligned_ops.len(),
-            hist,
-        );
-        self.ops.fold_bitwise_from_front(
-            TableKind::MemwRegister,
-            self.ops.memw_register_rows.len(),
-            hist,
-        );
-        self.ops
-            .fold_bitwise_from_front(TableKind::Branch, self.ops.branch_ops.len(), hist);
-    }
-
     /// Ops collected for `kind`. Mirrors [`CollectedOps::buffered`] so a walk's
     /// output and a finished run's can be compared on the same footing.
     pub fn op_count(&self, kind: TableKind) -> usize {
@@ -3376,6 +3471,21 @@ impl CollectedOps {
                 hist,
             ),
             TableKind::Branch => hist.add_ops(&collect_bitwise_from_branch(&self.branch_ops[..n])),
+            TableKind::Bytewise => {
+                for op in &self.bytewise_ops[..n] {
+                    hist.add_ops(&op.collect_bitwise_ops());
+                }
+            }
+            TableKind::Eq => {
+                for op in &self.eq_ops[..n] {
+                    hist.add_ops(&op.collect_bitwise_ops());
+                }
+            }
+            TableKind::Store => {
+                for op in &self.store_ops[..n] {
+                    hist.add_ops(&op.collect_bitwise_ops());
+                }
+            }
             _ => {}
         }
     }
@@ -5334,6 +5444,9 @@ impl Traces {
         let mut bitwise_hist = bitwise::BitwiseHistogram::new();
         let mut decode_counts: HashMap<u64, u64> = HashMap::new();
         let mut padding_rows = 0usize;
+        // HALT is built from the run's terminating ECALL, and the CPU ops that
+        // carry it are dropped as their chunk closes, so it is noted in passing.
+        let mut last_ecall: Option<(u64, u64)> = None;
         let mut emitted = [0usize; CHUNKED_KINDS.len()];
         let mut cycles_so_far = 0usize;
 
@@ -5353,6 +5466,9 @@ impl Traces {
             // lets the CPU ops be dropped at all.
             for op in &cpu {
                 *decode_counts.entry(op.decode.pc).or_insert(0) += 1;
+                if op.decode.fields.ecall {
+                    last_ecall = Some((op.timestamp, op.next_pc));
+                }
             }
             let derived = derive_from_cpu(&cpu);
             buf.branch_ops.extend(derived.branch_ops);
@@ -5403,12 +5519,14 @@ impl Traces {
         // retired during the walk, and "at the end of the execution, the
         // remaining tables are padded and committed". What is left goes back to
         // the caller so it can do exactly that.
-        let _ = memory_state;
         Ok(WalkLeftover {
             tail: buf,
             retired_bitwise: bitwise_hist,
             decode_counts,
             padding_rows,
+            total_cpu_padding: None,
+            last_ecall,
+            memory_state,
             emitted,
             register_state,
             cycles: cycles_so_far,
