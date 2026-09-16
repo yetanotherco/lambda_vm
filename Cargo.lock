@@ -283,6 +283,7 @@ dependencies = [
  "executor",
  "lambda-vm-prover",
  "rkyv",
+ "serde_cbor",
  "stark",
  "tempfile",
  "tikv-jemalloc-ctl",

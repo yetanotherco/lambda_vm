@@ -1063,7 +1063,53 @@ fn run_approach_1(
     }
     let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
         .map_err(|e| format!("{e:?}"))?;
+    report_fri_shape(&logup.tables);
     Ok(logup.tables.len())
+}
+
+/// What one FRI per table costs, and what batching by height would collapse.
+///
+/// Step 0 of the batched-FRI analysis: the prize is the per-table FRI data, and
+/// batching can only merge tables that share a domain exactly — Lambda's fold
+/// squares the coset offset each layer, so a short table over `offset·<w>` does
+/// not line up with a tall fold over `offset²·<w>`. So the number worth knowing
+/// is how many tables collapse into how many distinct heights, against the
+/// bytes that would be saved.
+fn report_fri_shape(
+    proofs: &[stark::proof::stark::StarkProof<
+        prover::tables::types::GoldilocksField,
+        prover::tables::types::GoldilocksExtension,
+        (),
+    >],
+) {
+    use std::collections::BTreeMap;
+
+    let mut by_height: BTreeMap<usize, usize> = BTreeMap::new();
+    let (mut fri_bytes, mut total_bytes) = (0usize, 0usize);
+    for p in proofs {
+        *by_height.entry(p.trace_length).or_default() += 1;
+        fri_bytes += serde_cbor::to_vec(&p.fri_layers_merkle_roots)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&p.fri_final_poly_coeffs)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&p.query_list)
+                .map(|v| v.len())
+                .unwrap_or(0);
+        total_bytes += serde_cbor::to_vec(p).map(|v| v.len()).unwrap_or(0);
+    }
+    println!(
+        "FRI: {} tables over {} distinct heights; per-table FRI data {} MB of {} MB ({:.1}%)",
+        proofs.len(),
+        by_height.len(),
+        fri_bytes / (1024 * 1024),
+        total_bytes / (1024 * 1024),
+        100.0 * fri_bytes as f64 / total_bytes.max(1) as f64,
+    );
+    for (rows, tables) in by_height.iter().rev() {
+        println!("  {rows:>9} rows x{tables}");
+    }
 }
 
 /// Build the traces one way or the other, so the two production paths can be
