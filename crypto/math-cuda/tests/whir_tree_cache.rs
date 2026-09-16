@@ -47,13 +47,26 @@ use std::sync::Mutex;
 
 type FE = FieldElement<F>;
 
-/// Held across any window that reads the process-wide counter. Poisoning is
-/// ignored so one failure does not cascade into unrelated tests — a lesson this
-/// branch learned once already, in `hash_metrics_tests`.
-static GLOBAL_COUNTER: Mutex<()> = Mutex::new(());
+/// ★ Taken by EVERY test in this file, because every one of them commits, and a
+/// commit moves two process-wide quantities: the leaf-hash counter and the
+/// device reservation total.
+///
+/// The per-codeword counts added earlier make the *counting* assertions immune
+/// to the scheduler, but one proposition is irreducibly global — "dropping a
+/// codeword gives its promised bytes BACK" is a statement about
+/// `Backend::reserved_bytes()`, and there is no per-codeword handle left to ask
+/// once the codeword is gone. So these tests take turns.
+///
+/// That costs nothing real: they share one card and serialise on it regardless.
+/// What the lock buys over `--test-threads=1` is that the property holds however
+/// the suite is invoked, rather than only when someone remembers the flag.
+///
+/// Poisoning is ignored so one failure does not cascade into unrelated tests —
+/// a lesson this branch learned once already, in `hash_metrics_tests`.
+static DEVICE_GLOBALS: Mutex<()> = Mutex::new(());
 
-fn global_counter_window() -> std::sync::MutexGuard<'static, ()> {
-    GLOBAL_COUNTER.lock().unwrap_or_else(|e| e.into_inner())
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    DEVICE_GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Mirror of `DeviceHashKey::into_math_cuda`, which is cuda-gated on
@@ -95,6 +108,7 @@ fn commit_on_device(
 /// restores the old behaviour and is how the mutation is run.
 #[test]
 fn a_commitment_hashes_its_leaves_once() {
+    let _exclusive = exclusive();
     for (name, hash) in [("keccak", key::<KeccakWhir>()), ("rpx", key::<RpxWhir>())] {
         let (codeword, _root) = commit_on_device(14, 4, hash);
         assert_eq!(
@@ -128,6 +142,7 @@ fn a_commitment_hashes_its_leaves_once() {
 /// nodes: the paths would be internally consistent and wrong.
 #[test]
 fn the_cached_paths_are_the_ones_a_fresh_tree_gives() {
+    let _exclusive = exclusive();
     for (name, hash) in [("keccak", key::<KeccakWhir>()), ("rpx", key::<RpxWhir>())] {
         let num_vars = 12;
         let log_folding = 4;
@@ -169,6 +184,7 @@ fn the_cached_paths_are_the_ones_a_fresh_tree_gives() {
 /// the verifier rather than only compared to each other.
 #[test]
 fn the_cached_openings_verify_against_the_commitment() {
+    let _exclusive = exclusive();
     fn check<H: WhirHash>(name: &str) {
         let num_vars = 12;
         let log_folding = 4;
@@ -205,11 +221,16 @@ fn the_cached_openings_verify_against_the_commitment() {
 /// shares the card. The number is asserted, not the absence of a crash.
 #[test]
 fn the_cached_tree_is_inside_the_reservation() {
+    let _exclusive = exclusive();
     let be = math_cuda::device::backend().expect("a device");
     let hash = key::<RpxWhir>();
     let num_vars = 14;
     let log_folding = 4;
 
+    // ⚠ Read under the lock, and it is a BASELINE rather than an assumed zero:
+    // a sibling's reservation was what failed this test the first time it ran
+    // on a card (786,400 B of someone else's tree). What is asserted below is
+    // the DELTA this codeword is responsible for.
     let before = be.reserved_bytes();
     let (codeword, _root) = commit_on_device(num_vars, log_folding, hash);
 
@@ -217,21 +238,32 @@ fn the_cached_tree_is_inside_the_reservation() {
     let leaves = ((1usize << num_vars) << 2) >> log_folding;
     let tree_bytes = (2 * leaves as u64 - 1) * 32;
 
+    // (a) This codeword's OWN promise covers its tree — no global involved, so
+    // this half would hold even without the lock.
     let held = codeword.reserved_bytes();
     assert!(
         held >= tree_bytes,
         "the reservation holds {held} B, which does not cover the {tree_bytes} B tree"
     );
+
+    // (b) …and the global grew by at least that much, as a delta.
+    let grown = be.reserved_bytes() - before;
     assert!(
-        be.reserved_bytes() >= before + tree_bytes,
-        "the global accounting did not grow by the tree"
+        grown >= tree_bytes,
+        "the global accounting grew by {grown} B, less than the {tree_bytes} B tree"
+    );
+    assert_eq!(
+        grown, held,
+        "this codeword's promise and the global's growth must be the same bytes"
     );
 
+    // (c) Dropping it gives every one of them back. The irreducibly global
+    // proposition, and the reason this test holds the lock.
     drop(codeword);
     assert_eq!(
         be.reserved_bytes(),
         before,
-        "dropping the codeword must give every promised byte back"
+        "dropping the codeword must return the accounting to its baseline"
     );
 }
 
@@ -244,6 +276,7 @@ fn the_cached_tree_is_inside_the_reservation() {
 /// question, whose paths would be internally consistent and wrong.
 #[test]
 fn a_tree_built_for_one_blocking_does_not_serve_another() {
+    let _exclusive = exclusive();
     let hash = key::<RpxWhir>();
     let (codeword, _root) = commit_on_device(14, 4, hash);
     assert_eq!(codeword.tree_builds(), 1);
@@ -270,6 +303,7 @@ fn a_tree_built_for_one_blocking_does_not_serve_another() {
 /// two different trees, or the dispatch key is being ignored one level up.
 #[test]
 fn the_two_hashes_build_different_trees() {
+    let _exclusive = exclusive();
     let f = poly(12);
     let raw: Vec<u64> = f.evals().iter().map(|v| *v.value()).collect();
     let (_k, keccak_root) =
@@ -288,7 +322,7 @@ fn the_two_hashes_build_different_trees() {
 /// counting. That is exactly why the assertions above do not use it.
 #[test]
 fn the_process_wide_counter_tracks_the_same_passes() {
-    let _window = global_counter_window();
+    let _exclusive = exclusive();
     let hash = key::<KeccakWhir>();
 
     reset_leaf_hash_calls();
