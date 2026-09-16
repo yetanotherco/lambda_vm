@@ -30,6 +30,7 @@ pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
+pub mod whir_hash_knob;
 pub mod whir_identity;
 
 use std::fmt;
