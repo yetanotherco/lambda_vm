@@ -527,12 +527,20 @@ impl digest::OutputSizeUser for Rpx256Digest {
 
 impl digest::Update for Rpx256Digest {
     fn update(&mut self, data: &[u8]) {
+        // ⚠ The GENERIC counters were keccak-only: `count_absorb` is bumped
+        // from the keccak wrapper's `update` and nothing bumped it here, so
+        // `absorb_calls` read ZERO for an RPX proof and `total`'s own
+        // documentation — which says it counts transcript squeezes — was false
+        // for this sponge. The same trap this module's sibling header describes
+        // for Merkle, which the transcript and the absorb counters never got.
+        crate::hash_metrics::count_absorb(data.len());
         self.buf.extend_from_slice(data);
     }
 }
 
 impl digest::FixedOutput for Rpx256Digest {
     fn finalize_into(self, out: &mut digest::Output<Self>) {
+        crate::hash_metrics::count_total();
         out.copy_from_slice(&self.finalize_digest());
     }
 }
@@ -545,6 +553,7 @@ impl digest::Reset for Rpx256Digest {
 
 impl digest::FixedOutputReset for Rpx256Digest {
     fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
+        crate::hash_metrics::count_total();
         out.copy_from_slice(&self.finalize_digest());
         self.buf.clear();
     }

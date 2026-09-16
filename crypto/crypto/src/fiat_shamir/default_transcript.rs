@@ -96,6 +96,10 @@ where
     /// straight-line code — the keccak arm keeps the instruction sequence it
     /// had before this became a choice.
     pub fn sample(&mut self) -> [u8; 32] {
+        // ★ Hash-agnostic, and deliberately here rather than inside a digest:
+        // a counter that lives in keccak reads ZERO for an algebraic
+        // transcript, which is indistinguishable from "no transcript ran".
+        crate::hash_metrics::count_transcript_squeeze::<T::Digest>();
         let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
         if T::REVERSES_SQUEEZE {
             result_hash.reverse();
@@ -151,14 +155,26 @@ where
         // subsequent challenge must depend on this input, so drop the bytes
         // squeezed before it.
         self.out_pos = SQUEEZE_LEN;
+        crate::hash_metrics::count_transcript_absorb::<T::Digest>();
         self.hasher.update(new_bytes);
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
         // Absorb, same invalidation as `append_bytes` (the field element's bytes
         // are streamed straight into the sponge with no intermediate `Vec`).
+        //
+        // ⚠ Counted PER `update` rather than once per call, because that is the
+        // unit `absorb_calls` has always used and the dimension a block-
+        // absorption change moves. Today the degree-3 extension writes one
+        // 24-byte buffer and calls the sink once, so the two happen to agree —
+        // a field or a serialisation that streams in pieces would not, and the
+        // counter should follow the sponge rather than the argument list.
         self.out_pos = SQUEEZE_LEN;
-        element.stream_bytes(&mut |b| self.hasher.update(b));
+        let hasher = &mut self.hasher;
+        element.stream_bytes(&mut |b| {
+            crate::hash_metrics::count_transcript_absorb::<T::Digest>();
+            hasher.update(b);
+        });
     }
 
     fn state(&self) -> [u8; 32] {

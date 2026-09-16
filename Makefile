@@ -549,6 +549,11 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	# own tests only execute here. See the `lint` target for why an instrument
 	# nobody runs is worth a line in the build.
 	cargo test -p crypto --features hash-metrics
+	# The transcript counters answer "which sponge ran". Their own integration
+	# binary, because the counters are process-global and a parallel neighbour's
+	# reset lands inside another test's measurement window — moving them out of
+	# the lib binary left four of five failing until they also took a lock.
+	cargo test -p crypto --features hash-metrics --test transcript_counters
 	$(MAKE) test-rpx-host-kat
 
 # === Quick test shortcuts ===
@@ -723,6 +728,10 @@ lint:
 	# the arm whose whole purpose was to change the hashing. Lints, does not run:
 	# its tests are in the `test` target.
 	cargo clippy -p crypto --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
+	# The prover's own `hash-metrics` passthrough gates the per-arm transcript
+	# line and the system test that reads it; without this line neither compiles
+	# in any pass, which is how an instrument rots.
+	cargo clippy -p lambda-vm-prover --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

@@ -311,6 +311,10 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
             crypto::grinding::reset_gpu_grind_calls();
             multilinear::gpu::reset_call_counters();
         }
+        // ★ Same reason, for the transcript counters: the line printed below
+        // must be THIS arm's and not the process's running total.
+        #[cfg(feature = "hash-metrics")]
+        crypto::hash_metrics::reset();
         let start = Instant::now();
         let bundle = crate::multilinear_continuation::prove_continuation(
             &bytes,
@@ -340,6 +344,34 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
             crypto::grinding::gpu_grind_calls(),
             crypto::grinding::gpu_grind_calls_rpx(),
         );
+        // ★★ WHICH SPONGE THE TRANSCRIPT RAN ON, per arm and on BOTH sides.
+        //
+        // The line above says which KERNELS ran; this one says which sponge the
+        // Fiat-Shamir transcript used, and they are not the same claim. For
+        // four measured A/Bs the RPX arm ran an RPX Merkle backend, an RPX
+        // grind and a KECCAK transcript, and nothing printed here disagreed.
+        //
+        // Both sides are printed because one is not evidence. A counter on the
+        // RPX side alone reads "rpx > 0, keccak 0" — and that keccak zero is
+        // equally true when the keccak transcript ran and nobody instrumented
+        // it, which is exactly the state that hid. `unattributed` is printed
+        // for the same reason one level out: a third configuration arriving
+        // with no counter of its own would otherwise look like silence.
+        #[cfg(feature = "hash-metrics")]
+        {
+            let c = crypto::hash_metrics::snapshot();
+            let (ua, us) = c.transcript_unattributed();
+            println!(
+                "{:<12} transcript absorbs {}/{} · squeezes {}/{} (keccak/rpx) · unattributed {}/{}",
+                "WHIR",
+                c.transcript_absorbs_keccak,
+                c.transcript_absorbs_rpx,
+                c.transcript_squeezes_keccak,
+                c.transcript_squeezes_rpx,
+                ua,
+                us,
+            );
+        }
         let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
             .expect("serialize")
             .len();
