@@ -1089,5 +1089,8 @@ pub fn create_sha256_k_air(options: &ProofOptions) -> ConcreteVmAir<EmptyConstra
         EmptyConstraints,
         "SHA256_K",
     )
-    .with_preprocessed(chip::preprocessed_commitment(options), 2)
+    .with_preprocessed(
+        chip::preprocessed_commitment(options),
+        chip::NUM_PRECOMPUTED_COLS,
+    )
 }

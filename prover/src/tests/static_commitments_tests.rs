@@ -1,11 +1,11 @@
 //! Drift-detection and lookup-dispatch tests for the static preprocessed-table
-//! commitments shipped in `bitwise`, `keccak_rc`, and `page` (the shared
+//! commitments shipped in `bitwise`, `keccak_rc`, `sha256_k`, and `page` (the shared
 //! zero-init page commitment).
 //!
 //! - The drift tests recompute the commitment for every blowup in
 //!   `STATIC_BLOWUP_FACTORS` (the list shared with the generator binary) and
 //!   compare against the value the table-module's wrapper returns
-//!   (`preprocessed_commitment` for `bitwise`/`keccak_rc`,
+//!   (`preprocessed_commitment` for `bitwise`/`keccak_rc`/`sha256_k`,
 //!   `zero_init_preprocessed_commitment` for `page`). This catches AIR or
 //!   FFT-pipeline drift; the page test additionally pins the static bytes
 //!   against the recompute directly.
@@ -22,7 +22,7 @@
 
 use stark::proof::options::GoldilocksCubicProofOptions;
 
-use crate::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page};
+use crate::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page, sha256_k};
 
 fn options_for(blowup: u8) -> stark::proof::options::ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(blowup).expect("blowup must be a valid power of 2")
@@ -71,6 +71,20 @@ fn keccak_rc_static_matches_recompute_for_all_blowups() {
         assert_eq!(
             from_wrapper, recomputed,
             "keccak_rc commitment drifted (or wrapper dispatch broke) for blowup={blowup}; \
+             regenerate constants via `cargo run --bin compute_static_commitments --release`",
+        );
+    }
+}
+
+#[test]
+fn sha256_k_static_matches_recompute_for_all_blowups() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        let options = options_for(blowup);
+        let from_wrapper = sha256_k::preprocessed_commitment(&options);
+        let recomputed = sha256_k::compute_preprocessed_commitment(&options);
+        assert_eq!(
+            from_wrapper, recomputed,
+            "sha256_k commitment drifted (or wrapper dispatch broke) for blowup={blowup}; \
              regenerate constants via `cargo run --bin compute_static_commitments --release`",
         );
     }
@@ -292,6 +306,46 @@ fn bitwise_non_three_coset_recomputes_and_differs_from_static() {
         assert_ne!(
             from_wrapper_7, from_wrapper_3,
             "bitwise commitment at coset {NON_STANDARD_COSET} must differ from coset \
+             {STANDARD_COSET} static value (blowup={blowup})",
+        );
+    }
+}
+
+/// SHA256_K counterpart of the two keccak_rc dispatch tests. Both are cheap:
+/// the table is 64 rows of 2 columns.
+#[test]
+fn sha256_k_non_static_blowup_recomputes_via_fallback() {
+    assert!(
+        !STATIC_BLOWUP_FACTORS.contains(&NON_STATIC_BLOWUP),
+        "test relies on NON_STATIC_BLOWUP not being in STATIC_BLOWUP_FACTORS",
+    );
+    let options = options_for(NON_STATIC_BLOWUP);
+    let from_wrapper = sha256_k::preprocessed_commitment(&options);
+    let recomputed = sha256_k::compute_preprocessed_commitment(&options);
+    assert_eq!(
+        from_wrapper, recomputed,
+        "sha256_k fallback returned a value that doesn't match direct compute at blowup={NON_STATIC_BLOWUP}",
+    );
+}
+
+#[test]
+fn sha256_k_non_three_coset_recomputes_and_differs_from_static() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        let opts_coset3 = options_with_coset(blowup, STANDARD_COSET);
+        let opts_coset7 = options_with_coset(blowup, NON_STANDARD_COSET);
+
+        let from_wrapper_7 = sha256_k::preprocessed_commitment(&opts_coset7);
+        let recomputed_7 = sha256_k::compute_preprocessed_commitment(&opts_coset7);
+        let from_wrapper_3 = sha256_k::preprocessed_commitment(&opts_coset3);
+
+        assert_eq!(
+            from_wrapper_7, recomputed_7,
+            "sha256_k wrapper at coset {NON_STANDARD_COSET} must take the recompute path \
+             (blowup={blowup})",
+        );
+        assert_ne!(
+            from_wrapper_7, from_wrapper_3,
+            "sha256_k commitment at coset {NON_STANDARD_COSET} must differ from coset \
              {STANDARD_COSET} static value (blowup={blowup})",
         );
     }
