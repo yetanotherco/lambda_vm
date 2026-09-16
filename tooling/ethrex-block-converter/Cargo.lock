@@ -844,8 +844,6 @@ dependencies = [
  "ethrex-guest-program",
  "ethrex-rlp",
  "ethrex-ssz-input",
- "libssz",
- "libssz-types",
  "serde",
  "serde_json",
 ]

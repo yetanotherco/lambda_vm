@@ -1068,8 +1068,6 @@ dependencies = [
  "ethrex-storage",
  "ethrex-trie",
  "hex",
- "libssz",
- "libssz-types",
  "secp256k1",
  "serde_json",
  "tokio",

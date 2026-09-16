@@ -32,8 +32,5 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0
 # Closing it means dropping `ethrex-config` and sourcing `ChainConfig` another way.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program", default-features = false }
 
-# Exact pin: keep the SSZ implementation in sync with the guest's ethrex rev.
-libssz = "=0.3.0"
-libssz-types = "=0.3.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
