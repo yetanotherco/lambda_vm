@@ -175,6 +175,27 @@ pub fn generate_decode_trace(
 /// Updates multiplicities in the DECODE trace table.
 ///
 /// For each PC in `lookups`, increments the MU column in the corresponding row.
+/// Add `count` lookups of `pc` at once.
+///
+/// The per-lookup form needs one entry per executed cycle, which a prover that
+/// walks the execution and drops what it has proved cannot keep. Counting by pc
+/// costs one entry per distinct program counter instead — bounded by the
+/// program, not by how long it runs.
+pub fn add_multiplicities(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    pc_to_row: &PcToRow,
+    counts: &std::collections::HashMap<u64, u64>,
+) {
+    for (pc, count) in counts {
+        if let Some(&row_idx) = pc_to_row.get(pc) {
+            let current = trace.main_table.get(row_idx, cols::MU);
+            trace
+                .main_table
+                .set_fe(row_idx, cols::MU, current + FE::from(*count));
+        }
+    }
+}
+
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     pc_to_row: &PcToRow,

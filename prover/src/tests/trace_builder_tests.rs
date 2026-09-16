@@ -1862,9 +1862,16 @@ fn the_two_phases_cover_every_chunked_table() {
 
     let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
     let closed = phase.closed.clone();
-    let rest = crate::commit_phase::commit_remaining(phase.leftover, &max_rows, &proof_options)
-        .expect("challenge")
-        .chunks;
+    let artifacts =
+        crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let rest = crate::commit_phase::commit_remaining(
+        phase.leftover,
+        &artifacts,
+        &max_rows,
+        &proof_options,
+    )
+    .expect("challenge")
+    .chunks;
 
     let mut got: HashMap<(TableKind, usize), _> = HashMap::new();
     for (kind, chunk, root) in closed.into_iter().chain(rest) {
@@ -2076,5 +2083,86 @@ fn the_accumulated_tables_match_the_ordinary_build() {
     assert!(
         flat(&built.keccak).iter().any(|v| *v != 0),
         "the fixture must exercise KECCAK, or this proves nothing"
+    );
+}
+
+/// DECODE's multiplicities must survive the chunks being dropped.
+///
+/// Every executed cycle looks DECODE up at its pc, and every padding row looks
+/// it up at the padding pc. The Commit phase drops the CPU ops that carry those
+/// pcs, so the lookups have to be counted while they still exist — by pc, since
+/// listing them costs one entry per cycle, which is the thing being avoided.
+#[test]
+fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    // Several CPU chunks, so most of the lookups belong to chunks that were
+    // closed and dropped rather than to the tail. Deliberately NOT a power of
+    // two: a full chunk then pads, and the padding lookups are a term that a
+    // power-of-two limit would leave at zero and therefore untested.
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 10_000,
+        ..Default::default()
+    };
+
+    let mut closed_cpu = 0usize;
+    let leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |kind, _, _| {
+            if kind == crate::tables::trace_builder::TableKind::Cpu {
+                closed_cpu += 1;
+            }
+        },
+    )
+    .expect("walk");
+    assert!(
+        closed_cpu > 1,
+        "the fixture must drop several CPU chunks, or the counting is untested"
+    );
+    let built = leftover.build_decode(
+        artifacts.decode_trace.clone(),
+        &artifacts.decode_pc_to_row,
+        &max_rows,
+    );
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(
+        flat(&built),
+        flat(&resident.decode),
+        "DECODE's multiplicities differ from the ordinary build"
     );
 }

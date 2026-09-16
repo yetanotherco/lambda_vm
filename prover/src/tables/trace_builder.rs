@@ -1267,6 +1267,11 @@ pub struct WalkLeftover {
     /// BITWISE lookups owed by the chunks the walk closed and dropped. The
     /// end-of-run phase folds the rest in on top of this.
     pub(crate) retired_bitwise: bitwise::BitwiseHistogram,
+    /// DECODE lookups per program counter, counted rather than listed.
+    pub(crate) decode_counts: HashMap<u64, u64>,
+    /// Padding rows the CPU chunks closed so far added, each of which looks
+    /// DECODE up at the padding pc.
+    pub(crate) padding_rows: usize,
     /// Register state at the last cycle. The end-of-run finalization is driven
     /// from it — HALT appends 33 register MEMW ops at `u64::MAX` — so the phase
     /// that pads and commits the tails needs nothing else from the run.
@@ -1384,6 +1389,33 @@ impl WalkLeftover {
             ecdas: ecdas::generate_ecdas_trace(&self.tail.ecdas_ops),
             hint: hint::generate_hint_trace(&self.tail.hint_ops),
         }
+    }
+
+    /// Build the DECODE table for the run.
+    ///
+    /// One lookup per executed cycle at that cycle's pc, plus one per padding
+    /// row at the padding pc. The walk counted both as it went — the cycles
+    /// because their CPU ops are long gone, the padding because each chunk's
+    /// share is known when the chunk closes — so this only has to add the tail's
+    /// own cycles and its padding.
+    ///
+    /// `decode_trace` is the pristine table from the ELF; the multiplicities are
+    /// the only part that depends on the run.
+    pub(crate) fn build_decode(
+        &self,
+        decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+        pc_to_row: &decode::PcToRow,
+        max_rows: &super::MaxRowsConfig,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        let mut counts = self.decode_counts.clone();
+        let tail = self.tail.cpu_ops.len();
+        let padding = self.padding_rows + tail.next_power_of_two().max(4) - tail;
+        let _ = max_rows;
+        *counts.entry(cpu::CPU_PADDING_PC).or_insert(0) += padding as u64;
+
+        let mut decode = decode_trace;
+        decode::add_multiplicities(&mut decode, pc_to_row, &counts);
+        decode
     }
 
     /// Cycles the walk executed.
@@ -2936,9 +2968,9 @@ fn generate_page_tables<I: ImageSource>(
 /// build ([`Traces::from_image_and_logs_with_decode`]) instead of re-parsing
 /// the ELF and regenerating the trace per epoch.
 pub struct DecodeArtifacts {
-    instructions: U64HashMap<Instruction>,
-    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: decode::PcToRow,
+    pub(crate) instructions: U64HashMap<Instruction>,
+    pub(crate) decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub(crate) decode_pc_to_row: decode::PcToRow,
 }
 
 impl DecodeArtifacts {
@@ -5300,6 +5332,8 @@ impl Traces {
 
         let mut buf = CollectedOps::default();
         let mut bitwise_hist = bitwise::BitwiseHistogram::new();
+        let mut decode_counts: HashMap<u64, u64> = HashMap::new();
+        let mut padding_rows = 0usize;
         let mut emitted = [0usize; CHUNKED_KINDS.len()];
         let mut cycles_so_far = 0usize;
 
@@ -5314,6 +5348,12 @@ impl Traces {
             // Derived from THIS segment's ops, before they are moved into the
             // buffer — the buffer is drained as chunks close, so it is not the
             // segment.
+            // DECODE counts one lookup per executed cycle. Counting by pc keeps
+            // that bounded by the program instead of by the run, which is what
+            // lets the CPU ops be dropped at all.
+            for op in &cpu {
+                *decode_counts.entry(op.decode.pc).or_insert(0) += 1;
+            }
             let derived = derive_from_cpu(&cpu);
             buf.branch_ops.extend(derived.branch_ops);
             buf.eq_ops.extend(derived.eq_ops);
@@ -5344,6 +5384,11 @@ impl Traces {
                     // Before the ops go: BITWISE counts them across the whole
                     // run, and this chunk is about to stop existing.
                     buf.fold_bitwise_from_front(*kind, limit, &mut bitwise_hist);
+                    if *kind == TableKind::Cpu {
+                        // Each CPU chunk pads to a power of two, and every
+                        // padding row looks DECODE up at the padding pc.
+                        padding_rows += limit.next_power_of_two().max(4) - limit;
+                    }
                     let table = buf.take_front(*kind, limit, max_rows);
                     on_chunk(*kind, emitted[slot], table);
                     emitted[slot] += 1;
@@ -5362,6 +5407,8 @@ impl Traces {
         Ok(WalkLeftover {
             tail: buf,
             retired_bitwise: bitwise_hist,
+            decode_counts,
+            padding_rows,
             emitted,
             register_state,
             cycles: cycles_so_far,

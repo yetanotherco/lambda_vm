@@ -125,6 +125,7 @@ pub fn run(
 /// their own step.
 pub fn commit_remaining(
     mut leftover: WalkLeftover,
+    artifacts: &crate::tables::trace_builder::DecodeArtifacts,
     max_rows: &MaxRowsConfig,
     proof_options: &ProofOptions,
 ) -> Result<Remaining, Error> {
@@ -189,9 +190,15 @@ pub fn commit_remaining(
     // having kept — the chunks that owed them are long gone.
     let bitwise = leftover.build_bitwise();
     let accumulated = leftover.build_accumulated();
+    let decode = leftover.build_decode(
+        artifacts.decode_trace.clone(),
+        &artifacts.decode_pc_to_row,
+        max_rows,
+    );
     Ok(Remaining {
         chunks: out,
         bitwise,
+        decode,
         accumulated,
     })
 }
@@ -202,6 +209,9 @@ pub struct Remaining {
     pub chunks: Vec<ChunkCommitment>,
     /// The BITWISE table, carrying the lookups of every retired chunk.
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// The DECODE table, with one lookup counted per executed cycle and per
+    /// padding row.
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
     /// The tables written once from an accumulated op list.
     pub accumulated: crate::tables::trace_builder::AccumulatedTables,
 }
