@@ -20,35 +20,36 @@ pub const CARRY: usize = 327;
 pub const MU: usize = 333;
 pub const WIDTH: usize = 334;
 pub fn generate(ops: &[super::sha256::Operation]) -> TraceTable<F, E> {
-    let mut rows = vec![];
+    let mut rows = TraceRows::new(ops.len() * 64, WIDTH);
     for op in ops {
         let w = executor::sha256::schedule(&op.message);
         let mut s = op.state_words();
         for (i, &word) in w.iter().enumerate() {
-            let mut r = vec![0; WIDTH];
-            r[0] = op.timestamp & 0xffffffff;
-            r[1] = op.timestamp >> 32;
-            r[2] = i as u64;
-            for (j, &state_word) in s.iter().enumerate() {
-                put_bits(&mut r, STATE + j * 32, state_word as u64, 32);
-            }
             let out = executor::sha256::round(s, word, executor::sha256::K[i]);
-            put_bits(&mut r, OUT, out[0] as u64, 32);
-            put_bits(&mut r, OUT + 32, out[4] as u64, 32);
-            r[S0] = executor::sha256::sigma(s[0], 2) as u64;
-            r[S1] = executor::sha256::sigma(s[4], 3) as u64;
-            r[W] = word as u64;
-            r[K] = executor::sha256::K[i] as u64;
-            let t1 = s[7] as u64 + r[S1] + ((s[4] & s[5]) ^ (!s[4] & s[6])) as u64 + r[W] + r[K];
-            let t2 = r[S0] + ((s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2])) as u64;
-            put_bits(&mut r, CARRY, (t1 + t2) >> 32, 3);
-            put_bits(&mut r, CARRY + 3, (s[3] as u64 + t1) >> 32, 3);
-            r[MU] = 1;
-            rows.push(r);
+            rows.push(|r| {
+                r[0] = op.timestamp & 0xffffffff;
+                r[1] = op.timestamp >> 32;
+                r[2] = i as u64;
+                for (j, &state_word) in s.iter().enumerate() {
+                    put_bits(r, STATE + j * 32, state_word as u64, 32);
+                }
+                put_bits(r, OUT, out[0] as u64, 32);
+                put_bits(r, OUT + 32, out[4] as u64, 32);
+                r[S0] = executor::sha256::sigma(s[0], 2) as u64;
+                r[S1] = executor::sha256::sigma(s[4], 3) as u64;
+                r[W] = word as u64;
+                r[K] = executor::sha256::K[i] as u64;
+                let t1 =
+                    s[7] as u64 + r[S1] + ((s[4] & s[5]) ^ (!s[4] & s[6])) as u64 + r[W] + r[K];
+                let t2 = r[S0] + ((s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2])) as u64;
+                put_bits(r, CARRY, (t1 + t2) >> 32, 3);
+                put_bits(r, CARRY + 3, (s[3] as u64 + t1) >> 32, 3);
+                r[MU] = 1;
+            });
             s = out;
         }
     }
-    trace(rows, WIDTH)
+    rows.finish()
 }
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut input = vec![col(0), col(1), col(2)];

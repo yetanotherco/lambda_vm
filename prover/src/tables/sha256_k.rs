@@ -17,12 +17,15 @@ pub const NUM_ROWS: usize = 64;
 /// is the prover's multiplicity.
 pub const NUM_PRECOMPUTED_COLS: usize = 2;
 pub fn generate(n: usize) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    trace(
-        (0..NUM_ROWS)
-            .map(|i| vec![i as u64, executor::sha256::K[i] as u64, n as u64])
-            .collect(),
-        WIDTH,
-    )
+    let mut rows = TraceRows::new(NUM_ROWS, WIDTH);
+    for i in 0..NUM_ROWS {
+        rows.push(|r| {
+            r[0] = i as u64;
+            r[1] = executor::sha256::K[i] as u64;
+            r[2] = n as u64;
+        });
+    }
+    rows.finish()
 }
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![recv(BusId::ShaK, 2, vec![col(0), col(1)])]

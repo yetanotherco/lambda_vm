@@ -13,30 +13,27 @@ pub const WIDTH: usize = 197;
 pub const MU: usize = 68;
 pub const PARAMS: [[u64; 4]; 4] = [[2, 11, 3, 0], [3, 2, 10, 0], [6, 9, 2, 1], [9, 14, 6, 1]];
 pub fn generate(ops: &[(u32, usize)]) -> TraceTable<F, E> {
-    trace(
-        ops.iter()
-            .map(|&(x, k)| {
-                let mut r = vec![0; WIDTH];
-                put_bits(&mut r, 0, x as u64, 32);
-                put_bits(&mut r, 32, executor::sha256::sigma(x, k) as u64, 32);
-                r[64 + k] = 1;
-                r[MU] = 1;
-                for (j, (a, b)) in [(7, 18), (17, 19), (2, 13), (6, 11)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    put_bits(
-                        &mut r,
-                        69 + 32 * j,
-                        (x.rotate_right(a) ^ x.rotate_right(b)) as u64,
-                        32,
-                    );
-                }
-                r
-            })
-            .collect(),
-        WIDTH,
-    )
+    let mut rows = TraceRows::new(ops.len(), WIDTH);
+    for &(x, k) in ops {
+        rows.push(|r| {
+            put_bits(r, 0, x as u64, 32);
+            put_bits(r, 32, executor::sha256::sigma(x, k) as u64, 32);
+            r[64 + k] = 1;
+            r[MU] = 1;
+            for (j, (a, b)) in [(7, 18), (17, 19), (2, 13), (6, 11)]
+                .into_iter()
+                .enumerate()
+            {
+                put_bits(
+                    r,
+                    69 + 32 * j,
+                    (x.rotate_right(a) ^ x.rotate_right(b)) as u64,
+                    32,
+                );
+            }
+        });
+    }
+    rows.finish()
 }
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut v = vec![bits(0, 32)];

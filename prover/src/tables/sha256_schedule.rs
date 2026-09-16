@@ -21,29 +21,29 @@ pub fn amount(i: usize) -> u64 {
         .count() as u64
 }
 pub fn generate(ops: &[super::sha256::Operation]) -> TraceTable<F, E> {
-    let mut rows = vec![];
+    let mut rows = TraceRows::new(ops.len() * 48, WIDTH);
     for op in ops {
         let w = executor::sha256::schedule(&op.message);
         for i in 16..64 {
-            let mut r = vec![0; WIDTH];
-            r[0] = op.timestamp & 0xffffffff;
-            r[1] = op.timestamp >> 32;
-            r[2] = i as u64;
-            for (j, d) in [2, 7, 15, 16].into_iter().enumerate() {
-                r[3 + j] = w[i - d] as u64;
-            }
-            r[7] = executor::sha256::sigma(w[i - 15], 0) as u64;
-            r[8] = executor::sha256::sigma(w[i - 2], 1) as u64;
-            put_bits(&mut r, 9, w[i] as u64, 32);
-            let sum = r[6] + r[7] + r[4] + r[8];
-            put_bits(&mut r, 41, sum >> 32, 2);
-            r[43] = amount(i);
-            r[44] = (i - 16) as u64;
-            r[MU] = 1;
-            rows.push(r);
+            rows.push(|r| {
+                r[0] = op.timestamp & 0xffffffff;
+                r[1] = op.timestamp >> 32;
+                r[2] = i as u64;
+                for (j, d) in [2, 7, 15, 16].into_iter().enumerate() {
+                    r[3 + j] = w[i - d] as u64;
+                }
+                r[7] = executor::sha256::sigma(w[i - 15], 0) as u64;
+                r[8] = executor::sha256::sigma(w[i - 2], 1) as u64;
+                put_bits(r, 9, w[i] as u64, 32);
+                let sum = r[6] + r[7] + r[4] + r[8];
+                put_bits(r, 41, sum >> 32, 2);
+                r[43] = amount(i);
+                r[44] = (i - 16) as u64;
+                r[MU] = 1;
+            });
         }
     }
-    trace(rows, WIDTH)
+    rows.finish()
 }
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut v = vec![];

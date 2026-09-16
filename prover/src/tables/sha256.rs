@@ -44,46 +44,43 @@ impl Operation {
     }
 }
 pub fn generate(ops: &[Operation]) -> TraceTable<F, E> {
-    trace(
-        ops.iter()
-            .map(|op| {
-                let mut r = vec![0; WIDTH];
-                r[0] = op.timestamp & 0xffffffff;
-                r[1] = op.timestamp >> 32;
-                r[2] = (op.timestamp + 1) & 0xffffffff;
-                r[3] = (op.timestamp + 1) >> 32;
-                for (i, p) in op.pointers().iter().enumerate() {
-                    for j in 0..4 {
-                        r[PTR + 4 * i + j] = (p >> (16 * j)) & 65535;
-                    }
+    let mut rows = TraceRows::new(ops.len(), WIDTH);
+    for op in ops {
+        rows.push(|r| {
+            r[0] = op.timestamp & 0xffffffff;
+            r[1] = op.timestamp >> 32;
+            r[2] = (op.timestamp + 1) & 0xffffffff;
+            r[3] = (op.timestamp + 1) >> 32;
+            for (i, p) in op.pointers().iter().enumerate() {
+                for j in 0..4 {
+                    r[PTR + 4 * i + j] = (p >> (16 * j)) & 65535;
                 }
-                for i in 0..32 {
-                    r[H + i] = op.state[i] as u64;
-                }
-                for i in 0..64 {
-                    r[M + i] = op.message[i] as u64;
-                }
-                let mut out = op.state;
-                executor::sha256::compress(&mut out, &op.message);
-                for i in 0..32 {
-                    r[OUT + i] = out[i] as u64;
-                }
-                let w = executor::sha256::schedule(&op.message);
-                let init = op.state_words();
-                let mut s = init;
-                for (&word, &constant) in w.iter().zip(&executor::sha256::K) {
-                    s = executor::sha256::round(s, word, constant);
-                }
-                for i in 0..8 {
-                    r[LAST + i] = s[i] as u64;
-                    r[CARRY + i] = (s[i] as u64 + init[i] as u64) >> 32;
-                }
-                r[MU] = 1;
-                r
-            })
-            .collect(),
-        WIDTH,
-    )
+            }
+            for i in 0..32 {
+                r[H + i] = op.state[i] as u64;
+            }
+            for i in 0..64 {
+                r[M + i] = op.message[i] as u64;
+            }
+            let mut out = op.state;
+            executor::sha256::compress(&mut out, &op.message);
+            for i in 0..32 {
+                r[OUT + i] = out[i] as u64;
+            }
+            let w = executor::sha256::schedule(&op.message);
+            let init = op.state_words();
+            let mut s = init;
+            for (&word, &constant) in w.iter().zip(&executor::sha256::K) {
+                s = executor::sha256::round(s, word, constant);
+            }
+            for i in 0..8 {
+                r[LAST + i] = s[i] as u64;
+                r[CARRY + i] = (s[i] as u64 + init[i] as u64) >> 32;
+            }
+            r[MU] = 1;
+        });
+    }
+    rows.finish()
 }
 fn mem(
     ptr: usize,
