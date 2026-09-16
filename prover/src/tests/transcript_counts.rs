@@ -543,6 +543,56 @@ fn continuation_transcript_counts(
             gc.absorb_bytes,
             gc.state_finalizes
         );
+        // The cross-epoch proof's own shape line. It was missing, and that is
+        // where a guest difference lands: the epoch rows are execution-derived
+        // and matched across two ELFs to the unit, while this proof's
+        // GLOBAL_MEMORY tables are built from the ELF's genesis image.
+        let sum_m: usize = gtables.iter().map(|t| t.m).sum();
+        let gkr_rounds: usize = gtables.iter().map(|t| t.m * (t.m - 1) / 2).sum();
+        let sum_n: usize = gtables.iter().map(|t| t.n).sum();
+        let cols: usize = gtables.iter().map(|t| t.columns).sum();
+        let facs: usize = gtables.iter().map(|t| t.factors).sum();
+        let degs: usize = gtables.iter().map(|t| t.n * t.degree).sum();
+        let groots: usize = ggroups.iter().map(|g| g.num_polys).sum();
+        let chain_rounds: usize = ggroups
+            .iter()
+            .map(|g| g.num_polys * g.n_stack.div_ceil(gconfig.log_folding))
+            .sum();
+        println!(
+            "          tables {} sum_m {} gkr_rounds {} sum_n {} cols {} factors {} n*deg {} roots {} chain_rounds {} Q {}",
+            gtables.len(),
+            sum_m,
+            gkr_rounds,
+            sum_n,
+            cols,
+            facs,
+            degs,
+            groots,
+            chain_rounds,
+            gconfig.num_queries
+        );
+        // These AIRs carry no name, so the rows identify themselves: the first
+        // `num_epochs` are the bookends in epoch order, the rest are the
+        // global-memory tables in `page_bases` order, labelled by page base.
+        println!("\n-- cross-epoch per-table census --");
+        println!(
+            "{:<22} {:>7} {:>10} {:>6} {:>5} {:>14}",
+            "table", "width", "rows", "vars", "m", "cells"
+        );
+        let num_bookends = boundaries.len();
+        for (i, ((_, w, v), t)) in gtriples.iter().zip(&gtables).enumerate() {
+            let label = if i < num_bookends {
+                format!("L2G[epoch {i}]")
+            } else {
+                format!("GM[page {:#012x}]", page_bases[i - num_bookends])
+            };
+            println!(
+                "{label:<22} {w:>7} {:>10} {v:>6} {:>5} {:>14}",
+                1usize << v,
+                t.m,
+                (*w as u64) << v
+            );
+        }
     }
     add(gc, &mut total);
     proofs += 1;
