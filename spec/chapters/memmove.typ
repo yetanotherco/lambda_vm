@@ -68,7 +68,7 @@ void *memcpy(size_t count; void dest[restrict count], const void src[restrict co
 
 That is to say, `A0` contains the address of the first byte to write, `A1` the address of the first byte to read, and `A2` the number of bytes to move; `memset` uses the same three registers for the same three roles.
 Each read writes back the value it read, so the operation leaves the registers untouched and the guest produces the return value.
-These are conditioned on `first_ecall`, since a deferred commitment sequence takes its operands from `COMMIT`.
+These are conditioned on `first_ecall`, since a deferred commitment sequence takes its operands from `COMMIT_DEFER`.
 #render_constraint_table(chip, config, groups: "read_input")
 
 == Chunk width
