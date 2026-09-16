@@ -130,13 +130,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     // --- 2. a local Amsterdam chain to host the block ----------------------
     // The committed genesis carries the system contracts and the two EIP-8282
-    // predeploys Amsterdam needs; only the chain id and fee floor change. The
-    // block's own accounts do NOT go in the alloc — they are installed into the
-    // tries below, which needs no key preimages.
+    // predeploys Amsterdam needs; its fork schedule is replaced wholesale by the
+    // one the guest itself uses, so the two cannot drift. That includes the blob
+    // schedule: `amsterdam_chain_config` activates BPO1/BPO2, and EIP-7892 has
+    // Amsterdam inherit the highest activated BPO entry (target 14 / max 21),
+    // which is what `get_fork_blob_schedule` resolves. Carrying genesis.json's
+    // own `blobSchedule` over it would be a no-op — its two entries are the
+    // serde defaults — so it is not carried over at all. The block's accounts do
+    // NOT go in the alloc either; they are installed into the tries below, which
+    // needs no key preimages.
     let mut genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;
-    let blob_schedule = genesis.config.blob_schedule;
     genesis.config = amsterdam_chain_config(CHAIN_ID);
-    genesis.config.blob_schedule = blob_schedule;
     // `REAL_BLOCK_FORK=osaka` executes the same block under the rules it was
     // built for. The guest cannot consume the result (it only decodes the
     // Amsterdam schema), so this exists purely to attribute a gas difference to
