@@ -177,7 +177,12 @@ impl ConstraintSet<F, E> for Constraints {
     }
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         let mut id = 0;
-        check_bits(b, &mut id, CARRY, 9);
+        // The eight feed-forward carries, then MU on its own. MU is the
+        // multiplicity of the ECALL receive, of all fourteen MEMW sends and of
+        // both SHA256ROUND interactions, so its range check must not depend on
+        // it happening to sit in the column right after the carries.
+        check_bits(b, &mut id, CARRY, 8);
+        check_bits(b, &mut id, MU, 1);
         emit_add_pair(
             b,
             id,
