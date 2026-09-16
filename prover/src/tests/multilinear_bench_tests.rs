@@ -304,6 +304,13 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     }
 
     if backend != "fri" {
+        // ★ Zeroed per arm, so the counts below belong to THIS prove and not to
+        // whatever ran before it in the process.
+        #[cfg(feature = "cuda")]
+        {
+            crypto::grinding::reset_gpu_grind_calls();
+            multilinear::gpu::reset_call_counters();
+        }
         let start = Instant::now();
         let bundle = crate::multilinear_continuation::prove_continuation(
             &bytes,
@@ -313,6 +320,25 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         )
         .expect("multilinear continuation");
         let prove = start.elapsed();
+
+        // ★★ READ 0 FOR EVERY WHIR ARM — which dispatches actually reached the
+        // card. The `★ WHIR HASH:` banner says which hash was SELECTED; these
+        // say which kernels RAN, and the two are not the same claim.
+        //
+        // A measured RPX arm once came in 14.5x slower than keccak with a
+        // correct, KAT-pinned grind kernel sitting unused, because the host-side
+        // dispatch had no arm for it. Nothing in this bench's output named the
+        // cause: prove time, verify time, proof size and epoch count were all
+        // consistent with "the hash is just expensive". A grind count of ZERO
+        // beside a commit count of thousands says it in one line.
+        #[cfg(feature = "cuda")]
+        println!(
+            "{:<12} gpu commits {} · keccak grinds {} · rpx grinds {}",
+            "WHIR",
+            multilinear::gpu::commit_calls(),
+            crypto::grinding::gpu_grind_calls(),
+            crypto::grinding::gpu_grind_calls_rpx(),
+        );
         let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
             .expect("serialize")
             .len();
