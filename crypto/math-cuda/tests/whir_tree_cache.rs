@@ -313,10 +313,23 @@ fn the_codeword_is_inside_the_reservation_and_gives_it_back() {
 /// first opening — and the driver's own free-memory count is the instrument
 /// that cannot be fooled by where the retention is written.
 ///
-/// Numbers, from the shapes: a codeword is `2^20 << 2` u64 = 32 MiB, its tree
-/// `(2*2^18 - 1) * 32` B = 16 MiB. Four codewords = 128 MiB; four codewords and
-/// their kept trees = 192 MiB. The bound is 160 MiB, a full codeword of slack
-/// above the first and a full codeword below the second.
+/// # The margin, and why it is this wide
+///
+/// A codeword here is `2^20 << 2` u64 = 32 MiB. At `log_folding = 2` its tree
+/// is `2^20` leaves, `(2*2^20 - 1) * 32` B = **64 MiB** — two codewords, not
+/// half of one, which is the whole reason for that blocking. So four
+/// codewords are 128 MiB and four codewords with their kept trees are 384 MiB,
+/// and the bound sits at 256 MiB: 128 MiB of slack above the passing case and
+/// 128 MiB below the failing one.
+///
+/// ⚠ The slack is not decoration. `free_vram_bytes` reports what the PROCESS
+/// has taken from the driver, which includes whatever one-time workspace and
+/// twiddle caches the first commit of this size sets up, and those are counted
+/// identically in both cases. A bound only a codeword above the passing case
+/// would turn any such allocation into a false failure — and a wider blocking,
+/// where the tree is half a codeword, would leave no room for one. The warm-up
+/// commit below pays those costs before the sample, and the margin absorbs what
+/// it misses.
 ///
 /// Keccak because this is a memory proposition and the two hash families build
 /// identically shaped trees; the cheaper kernel keeps the test short.
@@ -326,11 +339,20 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     let be = math_cuda::device::backend().expect("a device");
     let hash = key::<KeccakWhir>();
     let num_vars = 20;
-    let log_folding = 4;
+    // ⚠ Not 4. At `log_folding = 2` the tree is TWO codewords rather than half
+    // of one, which is what puts 128 MiB between the passing and failing cases
+    // instead of 32.
+    let log_folding = 2;
 
-    // ⚠ Without this the measurement is the POOL's, not the caller's: the
-    // stream-ordered allocator keeps freed blocks, and a sibling test's 32 MiB
-    // would silently serve one of the four commits below. Drain, then sample.
+    // One commit of this exact shape before the sample, so the one-time costs
+    // of the first — twiddles, workspaces, whatever the pool grows to hold them
+    // — are paid outside the window and not attributed to retention.
+    drop(commit_on_device(num_vars, log_folding, hash));
+
+    // ⚠ And without this the measurement is the POOL's, not the caller's: the
+    // stream-ordered allocator keeps freed blocks, and the warm-up's own
+    // codeword would silently serve one of the four commits below. Drain, then
+    // sample.
     math_cuda::device::drain_and_trim().expect("drain");
     let free_before = be.free_vram_bytes().expect("cuMemGetInfo");
 
@@ -342,16 +364,20 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     let taken = free_before.saturating_sub(free_after);
 
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
-    let bound = 5 * codeword_bytes;
+    let leaves = ((1u64 << num_vars) << 2) >> log_folding;
+    let tree_bytes = (2 * leaves - 1) * 32;
+    let bound = 8 * codeword_bytes;
+    let mib = |b: u64| b / (1 << 20);
     assert!(
         taken < bound,
-        "four unopened commitments took {} MiB from the device; four codewords \
-         are {} MiB and the bound is {} MiB, so something is being kept per \
-         commitment — a tree is {} MiB",
-        taken / (1 << 20),
-        (4 * codeword_bytes) / (1 << 20),
-        bound / (1 << 20),
-        ((2 * ((1u64 << num_vars) << 2 >> log_folding) - 1) * 32) / (1 << 20),
+        "four unopened commitments took {} MiB from the device. Four codewords \
+         are {} MiB and the bound is {} MiB; a tree is {} MiB, so four of those \
+         kept would read {} MiB. Something is held per commitment.",
+        mib(taken),
+        mib(4 * codeword_bytes),
+        mib(bound),
+        mib(tree_bytes),
+        mib(4 * (codeword_bytes + tree_bytes)),
     );
 
     // The commitments are alive up to here, which is the whole point: a `drop`
