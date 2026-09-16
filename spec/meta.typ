@@ -19,7 +19,7 @@
       ("is_bit", [`IS_BIT` template], <isbit>),
       ("is_byte", [`IS_BYTE` template], <isbyte>),
       ("sign", [`SIGN` template], <sign>),
-      ("add", [`ADD`/`SUB` template], <add>),
+      ("add", [`ADD`/`SUB`/`ADDNW` templates], <add>),
       ("neg", [`NEG` template], <neg>),
       ("reg", [`REG`/`REGW` template], <reg>),
     )),
@@ -51,6 +51,7 @@
       ("keccak", [`KECCAK` accelerator], <keccak>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
+      ("memmove", [`MEMMOVE` accelerator], <memmove>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
