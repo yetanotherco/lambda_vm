@@ -44,7 +44,28 @@ pub fn run(
     let image = build_initial_image(elf, private_input);
     let register_init = register::register_init_from_entry_point(elf.entry_point);
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(elf)?;
+    walk_and_commit(
+        &artifacts,
+        elf,
+        private_input,
+        &image,
+        &register_init,
+        max_rows,
+        proof_options,
+    )
+}
 
+/// The walk itself, over an already-built image and decode table.
+#[allow(clippy::too_many_arguments)]
+fn walk_and_commit<I: crate::paged_mem::ImageSource + Sync>(
+    artifacts: &crate::tables::trace_builder::DecodeArtifacts,
+    elf: &Elf,
+    private_input: &[u8],
+    image: &I,
+    register_init: &[u32],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+) -> Result<CommitPhase, Error> {
     let cpu = crate::test_utils::create_cpu_air(proof_options);
     let memw = crate::test_utils::create_memw_air(proof_options);
     let memw_aligned = crate::test_utils::create_memw_aligned_air(proof_options);
@@ -59,11 +80,11 @@ pub fn run(
     let mut closed = Vec::new();
     let mut failed: Option<TableKind> = None;
     let leftover = Traces::walk_and_emit_chunks(
-        &artifacts,
+        artifacts,
         elf,
         private_input.to_vec(),
-        &image,
-        &register_init,
+        image,
+        register_init,
         max_rows,
         |kind, chunk, table| {
             let air: &dyn stark::traits::AIR<
@@ -104,6 +125,54 @@ pub fn run(
     }
 
     Ok(CommitPhase { closed, leftover })
+}
+
+/// The Commit phase end to end.
+///
+/// The walk, then the padding of everything it could not close. What comes back
+/// is a root per chunk of every chunked table and, still resident, only the
+/// tables that are not built from an op list: the preprocessed ones and the
+/// accumulators. That is the state the Challenge phase starts from.
+pub fn run_to_end(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+) -> Result<Committed, Error> {
+    let image = build_initial_image(elf, private_input);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(elf)?;
+
+    let phase = walk_and_commit(
+        &artifacts,
+        elf,
+        private_input,
+        &image,
+        &register_init,
+        max_rows,
+        proof_options,
+    )?;
+    let mut chunks = phase.closed;
+    let mut remaining = commit_remaining(
+        phase.leftover,
+        &artifacts,
+        &image,
+        &register_init,
+        private_input,
+        max_rows,
+        proof_options,
+    )?;
+    chunks.append(&mut remaining.chunks);
+
+    Ok(Committed { chunks, remaining })
+}
+
+/// Every chunk committed, and what the Commit phase leaves resident.
+pub struct Committed {
+    /// A root per chunk of every chunked table, walk-closed and tail alike.
+    pub chunks: Vec<ChunkCommitment>,
+    /// The tables the walk could not commit, still as traces.
+    pub remaining: Remaining,
 }
 
 /// The Challenge phase's first half: pad and commit what the walk could not
@@ -225,6 +294,8 @@ pub fn commit_remaining<I: crate::paged_mem::ImageSource + Sync>(
 /// What the end-of-run phase produced.
 pub struct Remaining {
     /// The tails, and every chunk of the tables the walk could not close.
+    ///
+    /// [`run_to_end`] drains this into [`Committed::chunks`]; read it there.
     pub chunks: Vec<ChunkCommitment>,
     /// The bytes the run committed, which the statement binds into the
     /// transcript before any root is absorbed.
