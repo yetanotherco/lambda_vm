@@ -192,7 +192,13 @@ fn a_cubic_element_costs_exactly_three_draws_under_rpx() {
         "a cubic element took {draws} draws, so CANDIDATES_PER_COORDINATE = {:?} is wrong",
         RpxTranscriptHash::CANDIDATES_PER_COORDINATE
     );
-    assert_eq!(RpxTranscriptHash::CANDIDATES_PER_COORDINATE, Some(1));
+    // `NonZeroUsize`, not `usize`: the schedule's type on this branch cannot
+    // spell `Some(0)`, which is a draw count that returns an uninitialised
+    // candidate. Same assertion, one constructor deeper.
+    assert_eq!(
+        RpxTranscriptHash::CANDIDATES_PER_COORDINATE,
+        core::num::NonZeroUsize::new(1)
+    );
 
     // The element is the first three groups, in order — which is what makes the
     // draw count meaningful rather than a count of a loop that did nothing.
