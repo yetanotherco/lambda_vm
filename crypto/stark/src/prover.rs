@@ -670,11 +670,11 @@ pub struct MainRoots {
 
 /// One table's rounds 2 and 3, for a pass that rebuilds the table to get them.
 ///
-/// Carries the round 1 roots too: the same rebuild produced them, and a caller
-/// that already has them from an earlier pass can check the two agree — which
-/// is what says the rebuild was deterministic.
+/// No main root: rounds 2 and 3 never read that commitment, and the
+/// composition root already pins the main trace — it is computed from the very
+/// LDE the root would be taken over, so a rebuild that drifted shows up here
+/// too, and more cheaply.
 pub struct TableRounds23<FieldExtension: IsField> {
-    pub main_roots: MainRoots,
     pub aux_root: Option<Commitment>,
     pub bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
     pub composition_poly_root: Commitment,
@@ -1847,7 +1847,11 @@ pub trait IsStarkProver<
         let (main_src, num_main_cols) = trace.main_data_row_major();
         let main_data =
             expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
-        let main = Self::table_commit_for(air, &main_data, num_main_cols)?;
+        // No main Merkle tree. Rounds 2 and 3 read the LDE, never the
+        // commitment, and this pass opens nothing — the tree would be built and
+        // thrown away. It is the most expensive thing a sequential pass can do
+        // for nothing, and the composition root already pins the same LDE.
+        let main = TableCommit::plain(BatchedMerkleTree::from_root([0u8; 32]), [0u8; 32]);
 
         let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
             let (aux_src, cols) = trace.aux_data_row_major();
@@ -1955,10 +1959,6 @@ pub trait IsStarkProver<
         }
 
         Ok(TableRounds23 {
-            main_roots: MainRoots {
-                precomputed: round_1_result.main.precomputed_root,
-                main: round_1_result.main.root,
-            },
             aux_root: round_1_result.aux.as_ref().map(|c| c.root),
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             composition_poly_root: round_2_result.composition_poly_root,

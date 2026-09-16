@@ -167,10 +167,6 @@ fn logup_matches_the_ordinary_prover() {
             "table {idx}: auxiliary trace committed under a different root than the proof carries"
         );
         assert_eq!(
-            got.main_roots.main, want.lde_trace_main_merkle_root,
-            "table {idx}: the rebuild produced a different main trace than the Commit phase did"
-        );
-        assert_eq!(
             got.composition_poly_root, want.composition_poly_root,
             "table {idx}: composition polynomial committed under a different root"
         );
