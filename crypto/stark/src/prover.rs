@@ -1651,6 +1651,45 @@ pub trait IsStarkProver<
         ))
     }
 
+    /// Commit one table and return its main-trace Merkle root.
+    ///
+    /// Approach 1's Commit phase closes a table mid-execution and commits it
+    /// right there, before the tables after it exist. This is that step alone:
+    /// the same row-major coset LDE and the same row-pair leaf layout Round 1
+    /// uses, so a table committed during the walk carries the root Round 1
+    /// would have given it.
+    ///
+    /// Only the root comes back. The tree is what the openings later read, and
+    /// a caller that just has to put a commitment in the transcript should not
+    /// pay to hold it.
+    fn commit_table_root(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &TraceTable<Field, FieldExtension>,
+    ) -> Option<Commitment>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (data, cols) = trace.main_data_row_major();
+        if cols == 0 || data.is_empty() {
+            return None;
+        }
+        let mut lde: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * cols);
+        lde.extend_from_slice(data);
+        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+            &mut lde,
+            cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .ok()?;
+        Self::commit_rows_bit_reversed::<Field>(&lde, cols).map(|(_, root)| root)
+    }
+
     /// Reconstruct Round1 for every table, print the bus balance report, and
     /// validate each trace. Called once after every table's aux commit, which
     /// under `debug-checks` means between the fused chain's two admitted

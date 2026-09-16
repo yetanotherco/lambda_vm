@@ -2941,7 +2941,7 @@ struct CollectedOps {
 /// and PAGE are deliberately absent: they are not driven by one op list and the
 /// streaming prover keeps them resident.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TableKind {
+pub enum TableKind {
     Cpu,
     Memw,
     MemwAligned,
@@ -2983,7 +2983,90 @@ pub(crate) struct RoutedOps {
     pub(crate) cpu32_ops: Vec<cpu32::Cpu32Operation>,
 }
 
+/// The tables this walk can close mid-execution: their ops come straight out of
+/// `collect_ops_from_cpu` and nothing appends to them afterwards.
+pub const CHUNKED_KINDS: [TableKind; 7] = [
+    TableKind::Cpu,
+    TableKind::Memw,
+    TableKind::MemwAligned,
+    TableKind::MemwRegister,
+    TableKind::Load,
+    TableKind::Shift,
+    TableKind::Cpu32,
+];
+
+/// Chunk limit for one kind.
+pub fn max_rows_for(kind: TableKind, max_rows: &super::MaxRowsConfig) -> usize {
+    match kind {
+        TableKind::Cpu => max_rows.cpu,
+        TableKind::Memw => max_rows.memw,
+        TableKind::MemwAligned => max_rows.memw_aligned,
+        TableKind::MemwRegister => max_rows.memw_register,
+        TableKind::Load => max_rows.load,
+        TableKind::Shift => max_rows.shift,
+        TableKind::Mul => max_rows.mul,
+        TableKind::Dvrm => max_rows.dvrm,
+        TableKind::Branch => max_rows.branch,
+        TableKind::Lt => max_rows.lt,
+        TableKind::Eq => max_rows.eq,
+        TableKind::Bytewise => max_rows.bytewise,
+        TableKind::Store => max_rows.store,
+        TableKind::Cpu32 => max_rows.cpu32,
+    }
+}
+
 impl RoutedOps {
+    /// Ops buffered for `kind` and not yet emitted.
+    fn buffered(&self, kind: TableKind) -> usize {
+        match kind {
+            TableKind::Cpu => self.cpu_ops.len(),
+            TableKind::Memw => self.memw_ops.len(),
+            TableKind::MemwAligned => self.memw_aligned_ops.len(),
+            TableKind::MemwRegister => self.memw_register_rows.len(),
+            TableKind::Load => self.load_ops.len(),
+            TableKind::Shift => self.shift_ops.len(),
+            TableKind::Cpu32 => self.cpu32_ops.len(),
+            _ => 0,
+        }
+    }
+
+    /// Build a trace from the first `n` buffered ops of `kind` and drop them.
+    ///
+    /// Draining is the point: this is what keeps the walk's buffers from
+    /// growing with the run.
+    fn take_front(
+        &mut self,
+        kind: TableKind,
+        n: usize,
+        max_rows: &super::MaxRowsConfig,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        macro_rules! drain {
+            ($ops:expr, $f:path) => {{
+                let front: Vec<_> = $ops.drain(..n).collect();
+                $f(&front)
+            }};
+        }
+        let _ = max_rows;
+        match kind {
+            TableKind::Cpu => drain!(self.cpu_ops, cpu::generate_cpu_trace),
+            TableKind::Memw => drain!(self.memw_ops, memw::generate_memw_trace),
+            TableKind::MemwAligned => {
+                drain!(
+                    self.memw_aligned_ops,
+                    memw_aligned::generate_memw_aligned_trace
+                )
+            }
+            TableKind::MemwRegister => drain!(
+                self.memw_register_rows,
+                memw_register::generate_memw_register_trace_from_rows
+            ),
+            TableKind::Load => drain!(self.load_ops, load::generate_load_trace),
+            TableKind::Shift => drain!(self.shift_ops, shift::generate_shift_trace),
+            TableKind::Cpu32 => drain!(self.cpu32_ops, cpu32::generate_cpu32_trace),
+            other => unreachable!("{other:?} is not closed mid-walk"),
+        }
+    }
+
     /// How many chunks `build_table` would produce for `kind`.
     ///
     /// Mirrors `chunk_and_generate`: an empty op list still yields one (padded)
@@ -4915,6 +4998,85 @@ impl Traces {
     /// order (the image advances between epochs); the table generation that
     /// consumes the result ([`Self::build_from_collected`]) is epoch-local and
     /// can run on another thread.
+    /// Walk the execution and hand each chunked table's chunk to `on_chunk` as
+    /// soon as it is full, dropping its ops right after.
+    ///
+    /// This is Approach 1's Commit phase seen from the producer side: the spec
+    /// has the prover commit tables "once the memory pressure becomes too
+    /// large" and drop them, which it can only do if the tables arrive while
+    /// the execution is still being walked. Buffers here never exceed one
+    /// chunk per table, so what the walk holds does not grow with the run.
+    ///
+    /// The chunks come out exactly as `ops.chunks(max_rows)` would cut them and
+    /// each is built by the same generator, so a consumer sees byte-identical
+    /// traces to the all-at-once path — `commit_walk_emits_the_same_chunks`
+    /// pins that.
+    ///
+    /// Only the tables whose ops leave `collect_ops_from_cpu` final are emitted.
+    /// LT and MUL are not among them — later derivations append to both (DVRM
+    /// contributes range checks to LT and a product to MUL) — and neither are
+    /// the tables `collect_all_ops` derives from the CPU ops, nor the
+    /// accumulators (BITWISE), nor PAGE/DECODE/REGISTER, which are only final
+    /// once the run is over. Those are the spec's "remaining tables are padded
+    /// and committed" at the end; extracting the per-op derivations so they can
+    /// be emitted mid-walk too is the next step, not a guess to make here.
+    pub fn walk_and_emit_chunks(
+        artifacts: &DecodeArtifacts,
+        elf: &Elf,
+        private_input: Vec<u8>,
+        initial_image: &impl ImageSource,
+        register_init: &[u32],
+        max_rows: &super::MaxRowsConfig,
+        mut on_chunk: impl FnMut(TableKind, usize, TraceTable<GoldilocksField, GoldilocksExtension>),
+    ) -> Result<(), Error> {
+        let mut executor = executor::vm::execution::Executor::new(elf, private_input)
+            .map_err(|e| Error::Prover(format!("executor: {e}")))?;
+        let mut memory_state = MemoryState::from_image(initial_image);
+        let mut register_state = RegisterState::from_init(register_init);
+
+        let mut buf = RoutedOps::default();
+        let mut emitted = [0usize; CHUNKED_KINDS.len()];
+        let _ = &emitted;
+        let mut cycles_so_far = 0usize;
+
+        while let Some(logs) = executor
+            .resume()
+            .map_err(|e| Error::Prover(format!("executor: {e}")))?
+        {
+            let cpu = collect_cpu_ops(logs, &artifacts.instructions, cycles_so_far)?;
+            cycles_so_far += cpu.len();
+            let (memw, ld, lt, sh, _bw, _cm, _kc, c32, _ec, _ed, _hn) =
+                collect_ops_from_cpu(&cpu, &mut memory_state, &mut register_state);
+            buf.cpu_ops.extend(cpu);
+            buf.memw_register_rows.extend(memw.register_rows);
+            buf.memw_aligned_ops.extend(memw.aligned);
+            buf.memw_ops.extend(memw.general);
+            buf.load_ops.extend(ld);
+            buf.lt_ops.extend(lt);
+            buf.shift_ops.extend(sh);
+            buf.cpu32_ops.extend(c32);
+
+            // Emit every chunk that is now full, and only those: a partial chunk
+            // may still grow, so it waits for the end.
+            for (slot, kind) in CHUNKED_KINDS.iter().enumerate() {
+                while buf.buffered(*kind) >= max_rows_for(*kind, max_rows) {
+                    let limit = max_rows_for(*kind, max_rows);
+                    let table = buf.take_front(*kind, limit, max_rows);
+                    on_chunk(*kind, emitted[slot], table);
+                    emitted[slot] += 1;
+                }
+            }
+        }
+
+        // The tail is deliberately NOT emitted. End-of-run finalization still
+        // appends to these op lists — the terminating ECALL's register writes
+        // land in MEMW — so a partial chunk is not final until the execution
+        // is over. That is the spec's own split: full tables are committed and
+        // retired during the walk, and "at the end of the execution, the
+        // remaining tables are padded and committed".
+        Ok(())
+    }
+
     /// `collect_epoch`, driving the executor itself and consuming its logs one
     /// chunk at a time instead of taking them all at once.
     ///
