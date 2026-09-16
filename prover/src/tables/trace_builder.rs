@@ -3007,6 +3007,8 @@ struct DerivedFromCpu {
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
+    mul_ops: Vec<(MulOperation, bool)>,
+    dvrm_ops: Vec<(DvrmOperation, bool)>,
 }
 
 fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
@@ -3055,11 +3057,39 @@ fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
         })
         .collect();
 
+    // MUL: non-word MUL instructions. lhs_signed = `signed` (alu_flags bit 5);
+    // rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
+    let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
+        .map(|op| {
+            let f = op.decode.fields;
+            (
+                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
+                f.alu_muldiv(),
+            )
+        })
+        .collect();
+    // DVRM: non-word DIV/REM instructions.
+    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
+        .map(|op| {
+            let f = op.decode.fields;
+            (
+                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
+                f.alu_muldiv(),
+            )
+        })
+        .collect();
+
     DerivedFromCpu {
         branch_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
+        mul_ops,
+        dvrm_ops,
     }
 }
 
@@ -3482,34 +3512,9 @@ fn collect_all_ops(
         eq_ops,
         bytewise_ops,
         store_ops,
+        mut mul_ops,
+        mut dvrm_ops,
     } = derive_from_cpu(&cpu_ops);
-
-    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
-    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
-    let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
-
-    // Collect DVRM operations from non-word DIV/REM instructions.
-    let mut dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
-        .map(|op| {
-            let f = op.decode.fields;
-            (
-                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
-                f.alu_muldiv(),
-            )
-        })
-        .collect();
 
     // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
     // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
