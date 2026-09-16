@@ -41,8 +41,8 @@ The #memmove chip is comprised of #nr_variables variables that are expressed usi
 #render_chip_assumptions(chip, config)
 
 These concern the _first_ row of a sequence, where the values come from the register file or from `COMMIT`; every later row receives them over `MEMMOVE_NEXT`, where @memmove:c:range_src_incr, @memmove:c:range_dst_incr, @memmove:c:range_src_incr_top, @memmove:c:range_dst_incr_top and @memmove:c:range_count_decr range-check three of the four on the sending side.
-`timestamp` is range-checked by neither side and holds only because it travels unchanged from the `ECALL` at the root.
-@memmove:a:dst is not discharged at all on a commitment sequence (@memmove:aside:index).
+Nothing range-checks `timestamp` on either side; it stays a `Word` only because it travels unchanged from the `ECALL` at the root of the sequence.
+On a commitment sequence nothing guarantees @memmove:a:dst at all (@memmove:aside:index).
 
 = Constraints
 In this VM, we assign syscall number -30 to the copy functionality of the #memmove accelerator, and -32 to `memset`.
@@ -113,7 +113,7 @@ The verifier initializes and finalizes this domain as it does any other (@memory
 ]
 
 #aside(ref: <memmove:aside:index>)[Note on the commitment index][
-  @memmove:a:dst is undischarged here, and the reconstruction of `dst_incr_top` leans on it, so a denormalized index weakens the no-wraparound argument below to a field statement.
+  Nothing here guarantees @memmove:a:dst, and the reconstruction of `dst_incr_top` relies on it, so a denormalized index weakens the no-wraparound argument below to a field statement.
   This is not a prover gain, since such a token has no receiver, but range-checking `index` where it enters `COMMIT` would settle it --- and would also stop @commit:c:read_index writing past the `Word` range into `x254`.
 ]
 
