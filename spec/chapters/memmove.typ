@@ -57,7 +57,7 @@ Note that the low limb of that tuple is a line in `is_set` and so reaches every 
 Both selectors ride inside the `MEMMOVE_NEXT` tuple in either direction, so a sequence cannot change functionality half way through it.
 #render_constraint_table(chip, config, groups: "functionality")
 
-The last three define nothing new --- they are a selector combined with `first`, with $#`μ` - #`end`$ and with `tail` --- and exist as columns only because a multiplicity must be linear in the columns of the chip (@logup).
+The last three define nothing new --- they are a selector combined with `first`, with $#`μ` - #`end`$ and with `single` --- and exist as columns only because a multiplicity must be linear in the columns of the chip (@logup).
 
 == Reading the operands
 The guest-side `memcpy` this chip accelerates has the following signature:
@@ -72,8 +72,10 @@ These are conditioned on `first_ecall`, since a deferred commitment sequence tak
 #render_constraint_table(chip, config, groups: "read_input")
 
 == Chunk width
-A row moves eight bytes, or a single byte when `tail` is set.
-@memmove:c:short pins $#`count_lt8` = (#`count` < 8)$ to `LT` (@lt) and @memmove:c:wide_needs_eight forbids a wide row when fewer than eight bytes remain; the other direction is deliberately free, so the prover may cut any row to a single byte.
+A row moves eight bytes, or a single byte when `single` is set.
+The width itself is left free --- the prover may cut any row to a single byte at any count --- but a wide row must have the bytes to fill it, and @memmove:c:wide_needs_eight is what asks for them: it puts $#`count` < 8$ to `LT` (@lt) and pins the answer to "no", at multiplicity $#`μ` - #`single`$.
+A wide row therefore fires the lookup and must have at least eight bytes left, while a narrow row does not fire it at all.
+Note that this obligation is carried by a lookup rather than by a polynomial, so there is no constraint in the table below that enforces it.
 That freedom decides which memory chip a row reaches: `MEMW_A` (@memw) admits an access that does not cross a $2^16$ limb boundary and whose bytes share one old timestamp, and a buffer last written in eight-byte groups has one timestamp per group, so a schedule can spend narrow rows to land its wide rows on those groups.
 @memmove:c:bound proves $#`count` < 257$ on the first row of every `ECALL`-entered sequence, capping it at $257$ rows; the guest stubs chunk larger operations.
 #render_constraint_table(chip, config, groups: "width")
@@ -85,7 +87,7 @@ No prover gain follows --- the commitment bus must balance against the committed
 The bytes are read at $#`timestamp` + 1 + #`is_set`$ and written at $#`timestamp` + 2 - #`is_set`$, one timestamp apart, with `is_set` deciding which comes first.
 The `CPU`'s preprocessed timestamp column holds $4 dot (i + 1)$ at row $i$ (@vars), so neither expression leaves the `Word` range.
 Both interactions are expressed over the _same_ `value` variable, which is what makes the moved bytes equal, and the read carries `value` as input and output, pinning it to whatever the memory argument (@memory) holds at `src`.
-@memmove:c:tail_lanes canonicalises a narrow row, whose seven unused lanes `MEMW` gates out of the memory argument but not out of its own tuple.
+@memmove:c:single_lanes canonicalises a narrow row, whose seven unused lanes `MEMW` gates out of the memory argument but not out of its own tuple.
 #render_constraint_table(chip, config, groups: "copy")
 
 Every row of a sequence carries the same `timestamp`, so an entire sequence reads at one instant and writes at another.
@@ -120,7 +122,7 @@ The first two of @memmove:c:range_src_incr, @memmove:c:range_dst_incr and @memmo
 
 The positions use `ADDNW` (@add), which forbids wraparound modulo $2^64$: without it a sequence could walk `src` past the end of the address space, or close into a ring that balances every bus while moving nothing that was asked for.
 The count uses plain `SUB`, which permits it, because the terminal row holds $#`count` = 0$ and hence $#`count_decr` = 2^64 - 1$.
-That is safe because $#`step` <= #`count`$ on every row with $#`count` >= 1$: a wide row needs $#`count_lt8` = 0$ and hence $#`count` >= 8 = #`step`$, and a narrow row has $#`step` = 1$.
+That is safe because $#`step` <= #`count`$ on every active row with $#`count` >= 1$: a wide row is checked by @memmove:c:wide_needs_eight and hence has $#`count` >= 8 = #`step`$, and a narrow row has $#`step` = 1$.
 
 == Terminating the sequence
 When `count` hits $0$ we stop recursing, which the `end` bit indicates.
@@ -130,7 +132,7 @@ When `count` hits $0$ we stop recursing, which the `end` bit indicates.
 + We set $#`end` = 1$ when $#`count_decr` = -1$ rather than when $#`count` = 0$, which allows `count` to be stored in a `DWordWL` rather than a `DWordHL`.
 + $forall i in [0, 3]: 65535 - #`count_decr`_i >= 0$ as a result of @memmove:c:range_count_decr, hence $sum_(i=0)^3 65535 - #`count_decr`_i = 0 arrow.l.r.double.long forall i: #`count_decr`_i = 65535$.
   Without those range checks one limb could compensate another and `end` would be claimable at a nonzero count --- a silently truncated operation with every bus balanced, since every memory interaction vanishes with `end`.
-+ $#`end` = 1$ still forces $#`count` = 0$ even though the prover picks the width: the other candidate, $#`count` = 7$ with a wide row, gives $#`count_lt8` = 1$ and is rejected by @memmove:c:wide_needs_eight.
++ $#`end` = 1$ still forces $#`count` = 0$ even though the prover picks the width: the other candidate, $#`count` = 7$ with a wide row, is rejected by @memmove:c:wide_needs_eight.
 + An operation on zero bytes is a single row with $#`first` = #`end` = 1$.
 
 == Chaining the rows
@@ -146,16 +148,19 @@ This chip contributes the following to the lookup argument.
 ]
 
 == Bits
-Lastly, the seven independent bits must be bits, and $#`first` = 1$ or $#`end` = 1$ must imply $#`μ` = 1$, to keep the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ binary.
+Lastly, the six independent bits must be bits, and each of `first`, `end` and `single` must imply $#`μ` = 1$, to keep the multiplicities $-(#`μ` - #`first`)$, $#`μ` - #`end`$ and $#`μ` - #`single`$ binary.
 `first_ecall`, `commit_write` and `commit_write_wide` need no range check, being already equated to products of bits.
+@memmove:c:single_implies_mu is worth singling out, since it looks like bookkeeping for the padding row and is not: at $#`μ` = 0$ with $#`single` = 1$ the width lookup would carry multiplicity $-1$, which would make this chip a _provider_ on the `ALU` bus and let any consumer take an unwitnessed $#`count` >= 8$ from it.
 #render_constraint_table(chip, config, groups: "bits")
 
 = Padding
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
 
-This padding row is not all-zero: @memmove:c:count_decr is unconditional, so $#`tail` = 1$ makes $#`step` = 1$, which $#`count` = 1$ and $#`count_decr` = 0$ satisfy, and $#`tail` = 1$ also satisfies @memmove:c:wide_needs_eight.
-The low-limb carry of the two position updates is constrained on every row (@addnw:c:carry), which $#`src_incr` = #`dst_incr` = 1$ satisfies with a zero carry.
+This padding row is not all-zero.
+@memmove:c:single_implies_mu forces $#`single` = 0$ here, so $#`step` = 8$; @memmove:c:count_decr is unconditional, which $#`count` = 8$ and $#`count_decr` = 0$ then satisfy.
+The low-limb carry of the two position updates is constrained on every row (@addnw:c:carry), which $#`src_incr` = #`dst_incr` = 8$ satisfies with a zero carry.
+@memmove:c:wide_needs_eight is inert, its multiplicity being $0 - 0$.
 
 = The Accelerated Memory Operations standard
 The Ethereum Foundation's Accelerated Memory Operations standard fixes what an accelerated `memcpy`, `memmove` and `memset` must provide.
@@ -167,7 +172,7 @@ Its two remaining requirements fall outside this chapter: that the accelerated s
 = Notes/optimizations
 - `count` need not be a full `DWordWL` on the `ECALL` path, where @memmove:c:bound already proves $#`count` < 257$; the commitment path has no such bound, so this costs a range check where the value enters from `COMMIT`.
 - @memmove:c:range_src_incr and @memmove:c:range_dst_incr carry multiplicity $#`μ`$ while `src_incr` and `dst_incr` are consumed only at $#`μ` - #`end`$. Lowering both would drop eight `IS_HALF` lookups per terminal row, though not shrink the proof, that table being preprocessed at a fixed height.
-- Selecting between exactly two widths keeps `tail` a single bit, so $#`step` = 8 - 7 dot #`tail`$ stays linear and every constraint stays of degree 2. Four-, two- and one-byte chunks would save at most eight rows per sequence, at the cost of a two-bit selector.
+- Selecting between exactly two widths keeps `single` a single bit, so $#`step` = 8 - 7 dot #`single`$ stays linear and, more to the point, so does @memmove:c:wide_needs_eight's multiplicity $#`μ` - #`single`$. With a two-bit selector the corresponding "fire only on the widest row" multiplicity is a product, and would need a gate column and a degree-2 constraint of its own, as `first_ecall` and `commit_write` do. Four-, two- and one-byte chunks would save at most eight rows per sequence.
 - A row could move sixteen or thirty-two bytes, at the cost of a wider `MEMW` signature, but `MEMW_A` needs every byte of an access to share one old timestamp, which a wider row only manages where the buffer was written in groups at least that wide.
 - `COMMIT` could send its deferral on `MEMMOVE_NEXT` directly, retiring the `COMMIT_DEFER` bus and the `first_ecall` column, at the cost of `first` no longer meaning "head of the sequence" and of an added $#`first` dot #`is_commit` = 0$.
 - The `memmove` property belongs to one `ECALL`: past 256 bytes the stub splits into several at distinct timestamps, and chunk $k+1$ reads what chunk $k$ wrote. That is in-contract for `memcpy`, whose buffers may not overlap.
