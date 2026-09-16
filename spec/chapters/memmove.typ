@@ -100,20 +100,22 @@ The gate is `is_set` alone rather than a product, which would cost a degree.
 Being limb-wise, the pair admits no carry out of the low limb, so a `memset` whose range crosses the $2^32$ boundary has no satisfying assignment at all --- a precondition on the caller, which the executor enforces.
 
 == Writing to the commitment domain
-When `is_commit` is set, `dst` is the index of the byte in the committed output rather than an address, and the write goes to a domain-separated part of memory with separator $2$, which the verifier initializes and finalizes itself (@memory, @streaming).#footnote[
+The destination domain is the one thing `commit` changes about the write, and @memmove:c:write_value takes it straight from the selector: the domain it passes to `MEMW` is $2 dot #`is_commit`$, so a copy writes to RAM and a commitment writes to the domain-separated part of memory reserved for committed values (@memory).
+Nothing else differs --- same `value` lanes, same width flag, same multiplicity --- which is what lets one interaction serve both.
+
+The committed bytes therefore reach the memory argument as ordinary `MEMW` accesses, one token per byte at $#`dst` + i$, on `MEMW`'s rows rather than on this chip's.
+That the tokens are per byte is what decouples the verifier from the prover's row schedule: the verifier rebuilds this side of the bus from the committed output alone, where it sees only the concatenation of every commitment the program made, and the schedule restarts at every system call.
+`MEMW`'s width flags do the rest, so a narrow committing row writes the one byte it read and no more.
+
+The verifier initializes and finalizes this domain as it does any other (@memory, @streaming).#footnote[
   In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward" all commitments from earlier epochs, similar to padded values, in the `L2G` table.
   Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
 ]
-@memmove:c:write_value is gated on `ram_write` and does not fire; these take its place, and need no `MEMW`, since a commitment cell is written once and read by nobody.
-#render_constraint_table(chip, config, groups: "commit")
 
 #aside(ref: <memmove:aside:index>)[Note on the commitment index][
-  @memmove:a:dst is undischarged here, and @memmove:c:dst_incr leans on it through @addnw:a:lhs, so a denormalized index weakens that `ADDNW` to a field statement; the per-lane addresses below are likewise not carry-normalized as `MEMW`'s are.
-  Neither is a prover gain, since such a token has no receiver, but range-checking `index` where it enters `COMMIT` would settle both --- and would also stop @commit:c:read_index writing past the `Word` range into `x254`.
+  @memmove:a:dst is undischarged here, and @memmove:c:dst_incr leans on it through @addnw:a:lhs, so a denormalized index weakens that `ADDNW` to a field statement.
+  This is not a prover gain, since such a token has no receiver, but range-checking `index` where it enters `COMMIT` would settle it --- and would also stop @commit:c:read_index writing past the `Word` range into `x254`.
 ]
-
-A committing row emits one interaction per _byte_, at index $#`dst` + i$, because the verifier rebuilds this side of the bus from the committed output alone and cannot reproduce the prover's row schedule, which restarts at every system call.
-Addressing every byte by its own index removes the grouping; `commit_lane` keeps a narrow row from committing the seven bytes it never read.
 
 == Advancing to the next chunk
 In parallel, we compute $#`src_incr` = #`src` + #`step`$ and $#`dst_incr` = #`dst` + #`step`$ as the positions at which the next chunk starts, and $#`count_decr` = #`count` - #`step`$ as the number of bytes still to move.
@@ -149,7 +151,7 @@ This chip contributes the following to the lookup argument.
 
 == Bits
 Lastly, the six independent bits must be bits, and each of `first`, `end` and `single` must imply $#`μ` = 1$, to keep the multiplicities $-(#`μ` - #`first`)$, $#`μ` - #`end`$ and $#`μ` - #`single`$ binary.
-`first_ecall`, `commit_write` and `commit_write_wide` need no range check, being already equated to products of bits.
+`first_ecall` needs no range check, being already equated to a product of bits.
 @memmove:c:single_implies_mu is worth singling out, since it looks like bookkeeping for the padding row and is not: at $#`μ` = 0$ with $#`single` = 1$ the width lookup would carry multiplicity $-1$, which would make this chip a _provider_ on the `ALU` bus and let any consumer take an unwitnessed $#`count` >= 8$ from it.
 #render_constraint_table(chip, config, groups: "bits")
 
@@ -172,7 +174,7 @@ Its two remaining requirements fall outside this chapter: that the accelerated s
 = Notes/optimizations
 - `count` need not be a full `DWordWL` on the `ECALL` path, where @memmove:c:bound already proves $#`count` < 257$; the commitment path has no such bound, so this costs a range check where the value enters from `COMMIT`.
 - @memmove:c:range_src_incr and @memmove:c:range_dst_incr carry multiplicity $#`μ`$ while `src_incr` and `dst_incr` are consumed only at $#`μ` - #`end`$. Lowering both would drop eight `IS_HALF` lookups per terminal row, though not shrink the proof, that table being preprocessed at a fixed height.
-- Selecting between exactly two widths keeps `single` a single bit, so $#`step` = 8 - 7 dot #`single`$ stays linear and, more to the point, so does @memmove:c:wide_needs_eight's multiplicity $#`μ` - #`single`$. With a two-bit selector the corresponding "fire only on the widest row" multiplicity is a product, and would need a gate column and a degree-2 constraint of its own, as `first_ecall` and `commit_write` do. Four-, two- and one-byte chunks would save at most eight rows per sequence.
+- Selecting between exactly two widths keeps `single` a single bit, so $#`step` = 8 - 7 dot #`single`$ stays linear and, more to the point, so does @memmove:c:wide_needs_eight's multiplicity $#`μ` - #`single`$. With a two-bit selector the corresponding "fire only on the widest row" multiplicity is a product, and would need a gate column and a degree-2 constraint of its own, as `first_ecall` does. Four-, two- and one-byte chunks would save at most eight rows per sequence.
 - A row could move sixteen or thirty-two bytes, at the cost of a wider `MEMW` signature, but `MEMW_A` needs every byte of an access to share one old timestamp, which a wider row only manages where the buffer was written in groups at least that wide.
 - `COMMIT` could send its deferral on `MEMMOVE_NEXT` directly, retiring the `COMMIT_DEFER` bus and the `first_ecall` column, at the cost of `first` no longer meaning "head of the sequence" and of an added $#`first` dot #`is_commit` = 0$.
 - The `memmove` property belongs to one `ECALL`: past 256 bytes the stub splits into several at distinct timestamps, and chunk $k+1$ reads what chunk $k$ wrote. That is in-contract for `memcpy`, whose buffers may not overlap.
