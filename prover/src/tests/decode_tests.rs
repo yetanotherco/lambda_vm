@@ -261,6 +261,14 @@ fn decode_commitment_zero_bytes_rejects() {
 /// Taking either side's constant would have failed, and for a reason the other
 /// side could not see. Regenerated here rather than copied.
 ///
+/// ★ **Run the helper TWICE and diff its output against what you wrote.** The
+/// first transcription of this value read `0x55` where the helper had printed
+/// `85`; the second run is what caught it. A one-nibble error here is a
+/// constant that is wrong in a way no reasoning finds — the test fails, the
+/// value looks plausible, and the obvious conclusion is that the code drifted
+/// rather than that the pin was mistyped. The second run costs nothing and is
+/// the only check that covers the transcription step at all.
+///
 /// The pc sort is why the row order half can no longer move for a reason nobody
 /// chose: it was hashbrown's — a function of the hasher, the map's capacity and
 /// the insertion sequence rather than of the ELF. Under the sort it is a
