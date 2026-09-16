@@ -40,6 +40,81 @@ pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
 /// DECODE, COMMIT, KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS, HINT, REGISTER.
 pub(crate) const NUM_FIXED_AIRS: usize = 10;
 
+/// Where each table sits in `VmAirs::air_trace_pairs`.
+///
+/// The order is the protocol — the transcript absorbs roots in it, and each
+/// table's own fork is domain-separated by its index — so every pass has to
+/// agree on it. A pass that walks the execution produces chunks in the order
+/// they close, which is not this order, so it needs to be able to ask.
+///
+/// Knowable before the second walk because the first one already counted the
+/// chunks.
+pub(crate) struct AirOrder {
+    counts: crate::TableCounts,
+    include_halt: bool,
+    num_pages: usize,
+}
+
+impl AirOrder {
+    pub(crate) fn new(counts: crate::TableCounts, include_halt: bool, num_pages: usize) -> Self {
+        Self {
+            counts,
+            include_halt,
+            num_pages,
+        }
+    }
+
+    /// The index of the first chunked table, after the fixed ones and HALT.
+    fn first_chunked(&self) -> usize {
+        NUM_FIXED_AIRS + usize::from(self.include_halt)
+    }
+
+    fn group_len(&self, group: Option<TableKind>) -> usize {
+        match group {
+            None => self.num_pages,
+            Some(kind) => crate::challenge_phase::count_for(&self.counts, kind),
+        }
+    }
+
+    /// The AIR index of a chunk, or `None` when the layout has no such chunk.
+    pub(crate) fn index_of(&self, kind: TableKind, chunk: usize) -> Option<usize> {
+        let mut idx = self.first_chunked();
+        for group in GROUP_ORDER {
+            let len = self.group_len(group);
+            if group == Some(kind) {
+                return (chunk < len).then_some(idx + chunk);
+            }
+            idx += len;
+        }
+        None
+    }
+
+    /// The AIR index of the `i`th PAGE table.
+    pub(crate) fn page_index(&self, i: usize) -> Option<usize> {
+        let mut idx = self.first_chunked();
+        for group in GROUP_ORDER {
+            if group.is_none() {
+                return (i < self.num_pages).then_some(idx + i);
+            }
+            idx += self.group_len(group);
+        }
+        None
+    }
+
+    pub(crate) fn counts(&self) -> &crate::TableCounts {
+        &self.counts
+    }
+
+    /// How many tables the layout has in total.
+    pub(crate) fn len(&self) -> usize {
+        self.first_chunked()
+            + GROUP_ORDER
+                .iter()
+                .map(|g| self.group_len(*g))
+                .sum::<usize>()
+    }
+}
+
 pub(crate) struct StreamingProvider {
     routed: CollectedOps,
     max_rows: MaxRowsConfig,

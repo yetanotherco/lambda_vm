@@ -1063,7 +1063,7 @@ fn run_approach_1(
     }
     let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
         .map_err(|e| format!("{e:?}"))?;
-    Ok(logup.aux.len())
+    Ok(logup.tables.len())
 }
 
 /// Build the traces one way or the other, so the two production paths can be

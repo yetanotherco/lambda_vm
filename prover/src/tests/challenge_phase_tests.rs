@@ -151,23 +151,48 @@ fn logup_matches_the_ordinary_prover() {
         .expect("logup phase");
 
     assert_eq!(
-        logup.aux.len(),
+        logup.tables.len(),
         vm_proof.proof.proofs.len(),
         "the LogUp pass accounted for a different number of tables than the proof has"
     );
     let mut with_aux = 0usize;
     for (idx, (got, want)) in logup
-        .aux
+        .tables
         .iter()
         .zip(vm_proof.proof.proofs.iter())
         .enumerate()
     {
         assert_eq!(
-            got.as_ref().map(|a| a.root),
-            want.lde_trace_aux_merkle_root,
+            got.aux_root, want.lde_trace_aux_merkle_root,
             "table {idx}: auxiliary trace committed under a different root than the proof carries"
         );
-        if got.is_some() {
+        assert_eq!(
+            got.main_roots.main, want.lde_trace_main_merkle_root,
+            "table {idx}: the rebuild produced a different main trace than the Commit phase did"
+        );
+        assert_eq!(
+            got.composition_poly_root, want.composition_poly_root,
+            "table {idx}: composition polynomial committed under a different root"
+        );
+        assert_eq!(
+            got.composition_poly_parts_ood_evaluation, want.composition_poly_parts_ood_evaluation,
+            "table {idx}: composition parts evaluated at a different out-of-domain point"
+        );
+        for (label, got, want) in [
+            ("z", &got.trace_ood_evaluations, &want.trace_ood_evaluations),
+            (
+                "g*z",
+                &got.trace_ood_next_evaluations,
+                &want.trace_ood_next_evaluations,
+            ),
+        ] {
+            assert_eq!(
+                (got.width, got.columns()),
+                (want.width, want.columns()),
+                "table {idx}: different out-of-domain trace evaluations at {label}"
+            );
+        }
+        if got.aux_root.is_some() {
             with_aux += 1;
         }
     }

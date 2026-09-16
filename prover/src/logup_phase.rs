@@ -12,15 +12,15 @@
 //! chunk gets here is byte-identical to the one the Commit phase committed, and
 //! the aux columns are therefore the ones that root answers for.
 
-use stark::config::Commitment;
-use stark::lookup::BusPublicInputs;
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::proof::options::ProofOptions;
-use stark::prover::IsStarkProver;
+use stark::prover::{IsStarkProver, TableRounds23};
 
 use crate::Error;
 use crate::challenge_phase::Challenge;
 use crate::pass::{self, ChunkAirs, Resident, Visitor};
-use crate::streaming::{GROUP_ORDER, NUM_FIXED_AIRS};
+use crate::streaming::NUM_FIXED_AIRS;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::TableKind;
 use crate::tables::types::*;
@@ -28,45 +28,63 @@ use executor::elf::Elf;
 use math::field::element::FieldElement;
 use stark::trace::TraceTable;
 
-/// A table's auxiliary commitment.
-///
-/// `bus` is what the aux build reported for the LogUp bus; the proof carries it
-/// per table, so it travels with the root rather than being recomputed.
-pub struct AuxRoot {
-    pub root: Commitment,
-    pub bus: Option<BusPublicInputs<GoldilocksExtension>>,
-}
-
 /// What the LogUp pass produced.
 pub struct LogUp {
-    /// One entry per table, in `VmAirs::air_trace_pairs` order. `None` for a
-    /// table with no auxiliary trace.
-    pub aux: Vec<Option<AuxRoot>>,
+    /// One entry per table, in `VmAirs::air_trace_pairs` order.
+    pub tables: Vec<TableRounds23<GoldilocksExtension>>,
     /// The tables the pass could not retire, rebuilt by this walk.
     pub resident: Resident,
 }
 
-struct CommitAux<'a> {
+struct BuildAux<'a> {
     airs: &'a ChunkAirs,
     challenges: &'a [FieldElement<GoldilocksExtension>],
-    roots: Vec<(TableKind, usize, Option<AuxRoot>)>,
+    shared: &'a DefaultTranscript<GoldilocksExtension>,
+    order: &'a crate::streaming::AirOrder,
+    done: Vec<(usize, TableRounds23<GoldilocksExtension>)>,
 }
 
-impl Visitor for CommitAux<'_> {
+impl Visitor for BuildAux<'_> {
     fn table(
         &mut self,
         kind: TableKind,
         chunk: usize,
         trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     ) -> Result<(), Error> {
-        let aux = commit_aux(self.airs.get(kind).as_ref(), trace, self.challenges)
-            .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
-        self.roots.push((kind, chunk, aux));
+        let idx = self.order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
+            ))
+        })?;
+        let mut transcript = fork(self.shared, idx, self.order.len());
+        let rounds = rounds_2_to_3(
+            self.airs.get(kind).as_ref(),
+            trace,
+            self.challenges,
+            &mut transcript,
+        )
+        .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
+        self.done.push((idx, rounds));
         Ok(())
     }
 }
 
-fn commit_aux(
+/// A table's own transcript: the shared state after the challenge, separated by
+/// AIR index. Reproduces the fused prover's forking exactly — a single-table
+/// proof takes no index, and getting that wrong shifts every challenge.
+fn fork(
+    shared: &DefaultTranscript<GoldilocksExtension>,
+    idx: usize,
+    num_airs: usize,
+) -> DefaultTranscript<GoldilocksExtension> {
+    let mut t = shared.clone();
+    if num_airs > 1 {
+        t.append_bytes(&(idx as u64).to_le_bytes());
+    }
+    t
+}
+
+fn rounds_2_to_3(
     air: &dyn stark::traits::AIR<
         Field = GoldilocksField,
         FieldExtension = GoldilocksExtension,
@@ -74,14 +92,11 @@ fn commit_aux(
     >,
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     challenges: &[FieldElement<GoldilocksExtension>],
-) -> Result<Option<AuxRoot>, String> {
-    if !air.has_aux_trace() {
-        return Ok(None);
-    }
+    transcript: &mut DefaultTranscript<GoldilocksExtension>,
+) -> Result<TableRounds23<GoldilocksExtension>, String> {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    let (root, bus) = <P as IsStarkProver<_, _, _>>::commit_aux_root(air, trace, challenges)
-        .ok_or_else(|| "no auxiliary commitment".to_string())?;
-    Ok(Some(AuxRoot { root, bus }))
+    <P as IsStarkProver<_, _, _>>::rounds_2_to_3_for_table(air, &(), trace, challenges, transcript)
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Run the LogUp pass over `elf`, against the challenge `challenge` sampled.
@@ -97,40 +112,38 @@ pub fn run(
     challenge: &Challenge,
 ) -> Result<LogUp, Error> {
     let airs = ChunkAirs::new(proof_options);
-    let mut visitor = CommitAux {
+    let mut visitor = BuildAux {
         airs: &airs,
         challenges: &challenge.challenges,
-        roots: Vec::new(),
+        shared: &challenge.transcript,
+        order: &challenge.order,
+        done: Vec::new(),
     };
     let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
 
-    let aux = assemble(visitor.roots, &mut resident, elf, proof_options, challenge)?;
-    Ok(LogUp { aux, resident })
+    let tables = assemble(visitor.done, &mut resident, elf, proof_options, challenge)?;
+    Ok(LogUp { tables, resident })
 }
 
-/// Every auxiliary root in `VmAirs::air_trace_pairs` order.
+/// Every table's rounds 2-3 in `VmAirs::air_trace_pairs` order.
 ///
-/// The chunked tables come back in the order the walk produced them; the tables
-/// that stay have their aux built here, as the Challenge phase built their
+/// The chunked tables come back keyed by the index the walk resolved; the
+/// tables that stay have theirs built here, as the Challenge phase built their
 /// mains.
 fn assemble(
-    chunks: Vec<(TableKind, usize, Option<AuxRoot>)>,
+    chunks: Vec<(usize, TableRounds23<GoldilocksExtension>)>,
     resident: &mut Resident,
     elf: &Elf,
     proof_options: &ProofOptions,
     challenge: &Challenge,
-) -> Result<Vec<Option<AuxRoot>>, Error> {
-    use std::collections::HashMap;
-
-    let counts = crate::challenge_phase::count_chunks_by_kind(
-        chunks.iter().map(|(kind, chunk, _)| (*kind, *chunk)),
-    );
+) -> Result<Vec<TableRounds23<GoldilocksExtension>>, Error> {
+    let order = &challenge.order;
     let airs = crate::VmAirs::new(
         elf,
         proof_options,
         false,
         &resident.page_configs,
-        &counts,
+        order.counts(),
         None,
         true,
         None,
@@ -138,21 +151,35 @@ fn assemble(
         None,
     );
 
-    let mut by_slot: HashMap<(TableKind, usize), Option<AuxRoot>> = HashMap::new();
-    for (kind, chunk, aux) in chunks {
-        if by_slot.insert((kind, chunk), aux).is_some() {
+    let mut slots: Vec<Option<TableRounds23<GoldilocksExtension>>> =
+        (0..order.len()).map(|_| None).collect();
+    for (idx, rounds) in chunks {
+        let slot = slots
+            .get_mut(idx)
+            .ok_or_else(|| Error::Prover(format!("logup phase: table {idx} is past the layout")))?;
+        if slot.is_some() {
             return Err(Error::Prover(format!(
-                "logup phase: {kind:?} chunk {chunk} built twice"
+                "logup phase: table {idx} was built twice"
             )));
         }
+        *slot = Some(rounds);
     }
 
     let ch = &challenge.challenges;
-    let mut out = Vec::new();
+    let n = order.len();
+    let build = |idx: usize,
+                 air: &crate::VmAir,
+                 trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+     -> Result<TableRounds23<GoldilocksExtension>, Error> {
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        rounds_2_to_3(air.as_ref(), trace, ch, &mut transcript)
+            .map_err(|e| Error::Prover(format!("logup phase: table {idx}: {e}")))
+    };
+
     let fixed: [(
         &crate::VmAir,
         &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    ); 10] = [
+    ); NUM_FIXED_AIRS] = [
         (&airs.bitwise, &mut resident.bitwise),
         (&airs.decode, &mut resident.decode),
         (&airs.commit, &mut resident.accumulated.commit),
@@ -164,33 +191,24 @@ fn assemble(
         (&airs.hint, &mut resident.accumulated.hint),
         (&airs.register, &mut resident.register),
     ];
-    debug_assert_eq!(fixed.len(), NUM_FIXED_AIRS);
-    for (air, trace) in fixed {
-        out.push(commit_aux(air.as_ref(), trace, ch).map_err(Error::Prover)?);
+    for (idx, (air, trace)) in fixed.into_iter().enumerate() {
+        slots[idx] = Some(build(idx, air, trace)?);
     }
     if airs.include_halt {
-        out.push(commit_aux(airs.halt.as_ref(), &mut resident.halt, ch).map_err(Error::Prover)?);
+        slots[NUM_FIXED_AIRS] = Some(build(NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?);
+    }
+    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+        let idx = order
+            .page_index(i)
+            .ok_or_else(|| Error::Prover(format!("logup phase: page {i} is not in the layout")))?;
+        slots[idx] = Some(build(idx, air, trace)?);
     }
 
-    let mut page_airs = airs.pages.iter().zip(resident.pages.iter_mut());
-    for group in GROUP_ORDER {
-        let Some(kind) = group else {
-            for (air, trace) in page_airs.by_ref() {
-                out.push(commit_aux(air.as_ref(), trace, ch).map_err(Error::Prover)?);
-            }
-            continue;
-        };
-        for chunk in 0..crate::challenge_phase::count_for(&counts, kind) {
-            out.push(by_slot.remove(&(kind, chunk)).ok_or_else(|| {
-                Error::Prover(format!("logup phase: no aux for {kind:?} chunk {chunk}"))
-            })?);
-        }
-    }
-    if let Some(((kind, chunk), _)) = by_slot.into_iter().next() {
-        return Err(Error::Prover(format!(
-            "logup phase: {kind:?} chunk {chunk} has an aux root but no AIR"
-        )));
-    }
-
-    Ok(out)
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            slot.ok_or_else(|| Error::Prover(format!("logup phase: table {idx} was never built")))
+        })
+        .collect()
 }

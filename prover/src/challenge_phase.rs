@@ -40,6 +40,14 @@ pub struct Challenge {
     pub challenges: Vec<FieldElement<GoldilocksExtension>>,
     /// Every root absorbed, in AIR order.
     pub roots: Vec<MainRoots>,
+    /// The transcript right after the sampling, which every later pass forks
+    /// per table. Kept rather than rebuilt: re-absorbing 227 roots to get back
+    /// to this state is both slower and a second place for the order to be
+    /// wrong.
+    pub transcript: DefaultTranscript<GoldilocksExtension>,
+    /// The layout the roots were assembled in, so a later pass can ask where a
+    /// chunk sits without recounting.
+    pub(crate) order: crate::streaming::AirOrder,
 }
 
 /// Sample the shared LogUp challenges from a finished Commit phase.
@@ -101,7 +109,16 @@ pub fn run(
         .map(|_| transcript.sample_field_element())
         .collect();
 
-    Ok(Challenge { challenges, roots })
+    Ok(Challenge {
+        challenges,
+        roots,
+        transcript,
+        order: crate::streaming::AirOrder::new(
+            table_counts,
+            airs.include_halt,
+            remaining.page_configs.len(),
+        ),
+    })
 }
 
 /// Every root the transcript absorbs, in `VmAirs::air_trace_pairs` order.

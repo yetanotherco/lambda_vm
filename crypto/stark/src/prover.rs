@@ -668,6 +668,27 @@ pub struct MainRoots {
     pub main: Commitment,
 }
 
+/// One table's rounds 2 and 3, for a pass that rebuilds the table to get them.
+///
+/// Carries the round 1 roots too: the same rebuild produced them, and a caller
+/// that already has them from an earlier pass can check the two agree — which
+/// is what says the rebuild was deterministic.
+pub struct TableRounds23<FieldExtension: IsField> {
+    pub main_roots: MainRoots,
+    pub aux_root: Option<Commitment>,
+    pub bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
+    pub composition_poly_root: Commitment,
+    /// The current-row block: every trace column at `z`.
+    pub trace_ood_evaluations: Table<FieldExtension>,
+    /// The next-row block, pruned to the columns a transition constraint reads
+    /// at `g·z`. Split here rather than by the caller because the transcript
+    /// absorbs the two blocks in this shape.
+    pub trace_ood_next_evaluations: Table<FieldExtension>,
+    pub composition_poly_parts_ood_evaluation: Vec<FieldElement<FieldExtension>>,
+    /// The out-of-domain point rounds 4 and 5 open against.
+    pub z: FieldElement<FieldExtension>,
+}
+
 /// Source of truth for a table whose *trace* has been retired.
 ///
 /// The retire-LDE mode ([`streaming_retire_lde`]) drops a table's LDE and
@@ -1774,6 +1795,214 @@ pub trait IsStarkProver<
         .ok()?;
         let (_, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)?;
         Some((root, bus_public_inputs))
+    }
+
+    /// Rounds 2 and 3 for one table, rebuilt from its trace and dropped with
+    /// the call.
+    ///
+    /// The composition polynomial needs both LDEs at once, so this is where a
+    /// pass that holds one table at a time pays its widest moment: main LDE,
+    /// auxiliary LDE and the composition parts, for one table. The ordinary
+    /// prover keeps all three for every table simultaneously.
+    ///
+    /// `transcript` must be the table's own fork — the shared state after the
+    /// LogUp challenges, domain-separated by AIR index — with nothing appended
+    /// yet. The auxiliary root goes in here, as it does in the fused path, so
+    /// the challenges of rounds 2 and 3 come out identical.
+    fn rounds_2_to_3_for_table(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Result<TableRounds23<FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        PI: Send + Sync + Clone,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+
+        let bus_public_inputs = if air.has_aux_trace() {
+            air.build_auxiliary_trace(trace, challenges)
+        } else {
+            None
+        };
+
+        let expand_main = |data: &[FieldElement<Field>], cols: usize| {
+            let mut out: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * cols);
+            out.extend_from_slice(data);
+            Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+                &mut out,
+                cols,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.two_half_inv,
+                &twiddles.two_half_fwd,
+            )
+            .map(|_| out)
+        };
+
+        let (main_src, num_main_cols) = trace.main_data_row_major();
+        let main_data =
+            expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
+        let main = Self::table_commit_for(air, &main_data, num_main_cols)?;
+
+        let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
+            let (aux_src, cols) = trace.aux_data_row_major();
+            let mut out: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(lde_size * cols);
+            out.extend_from_slice(aux_src);
+            Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+                &mut out,
+                cols,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.two_half_inv,
+                &twiddles.two_half_fwd,
+            )
+            .map_err(|_| ProvingError::EmptyCommitment)?;
+            let (tree, root) =
+                Self::commit_rows_bit_reversed(&out, cols).ok_or(ProvingError::EmptyCommitment)?;
+            (out, cols, Some(TableCommit::plain(tree, root)))
+        } else {
+            (Vec::new(), 0, None)
+        };
+
+        // The fork takes the auxiliary root, then the table's bus contribution,
+        // before round 2 samples anything. Both, in that order — the
+        // contribution is what ties this table's share of the LogUp bus into
+        // its own challenges, and leaving it out moves every one of them.
+        if let Some(ref c) = aux {
+            transcript.append_bytes(&c.root);
+        }
+        if let Some(ref bpi) = bus_public_inputs {
+            transcript.append_field_element(&bpi.table_contribution);
+        }
+
+        let mut round_1_result = Round1 {
+            lde_trace: LDETraceTable::from_row_major(
+                main_data,
+                num_main_cols,
+                aux_data,
+                num_aux_cols,
+                air.step_size(),
+                domain.blowup_factor,
+            ),
+            main,
+            aux,
+            rap_challenges: challenges.to_vec(),
+            bus_public_inputs,
+        };
+
+        let beta = transcript.sample_field_element();
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                pub_inputs,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                domain.interpolation_domain_size,
+            )
+            .constraints
+            .len();
+        let num_transition_constraints = air.context().num_transition_constraints;
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                .take(num_boundary_constraints + num_transition_constraints)
+                .collect();
+        let transition_coefficients: Vec<_> =
+            coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coefficients = coefficients;
+
+        let mut round_2_result = Self::round_2_compute_composition_polynomial(
+            air,
+            pub_inputs,
+            &domain,
+            &twiddles,
+            &mut round_1_result,
+            &transition_coefficients,
+            &boundary_coefficients,
+        )?;
+        transcript.append_bytes(&round_2_result.composition_poly_root);
+
+        let z = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+            air,
+            &domain,
+            &mut round_1_result,
+            &mut round_2_result,
+            &z,
+        );
+
+        // The fork is left standing where round 4 would pick it up: the two
+        // out-of-domain blocks and then the composition parts, in the order the
+        // verifier absorbs them. A pass that batches the FRI has to fold these
+        // states together, so it needs them advanced this far.
+        let (ood_block0, ood_block1) =
+            Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+        for block in [&ood_block0, &ood_block1] {
+            for col in block.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
+            }
+        }
+        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+            transcript.append_field_element(element);
+        }
+
+        Ok(TableRounds23 {
+            main_roots: MainRoots {
+                precomputed: round_1_result.main.precomputed_root,
+                main: round_1_result.main.root,
+            },
+            aux_root: round_1_result.aux.as_ref().map(|c| c.root),
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+            composition_poly_root: round_2_result.composition_poly_root,
+            trace_ood_evaluations: ood_block0,
+            trace_ood_next_evaluations: ood_block1,
+            composition_poly_parts_ood_evaluation: round_3_result
+                .composition_poly_parts_ood_evaluation,
+            z,
+        })
+    }
+
+    /// The main commitment of an already-expanded LDE, split when the AIR is
+    /// preprocessed. Shares [`Self::commit_table_root`]'s rule, but keeps the
+    /// trees, which rounds 2-4 need.
+    fn table_commit_for(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde: &[FieldElement<Field>],
+        cols: usize,
+    ) -> Result<TableCommit<Field>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+    {
+        if !air.is_preprocessed() {
+            let (tree, root) =
+                Self::commit_rows_bit_reversed(lde, cols).ok_or(ProvingError::EmptyCommitment)?;
+            return Ok(TableCommit::plain(tree, root));
+        }
+        let num_precomputed = air.num_precomputed_columns();
+        let (precomputed_tree, precomputed_root) =
+            Self::commit_rows_bit_reversed_subset(lde, cols, 0, num_precomputed)
+                .ok_or(ProvingError::EmptyCommitment)?;
+        if precomputed_root != air.precomputed_commitment() {
+            return Err(ProvingError::PrecomputedCommitmentMismatch);
+        }
+        let (mult_tree, mult_root) =
+            Self::commit_rows_bit_reversed_subset(lde, cols, num_precomputed, cols)
+                .ok_or(ProvingError::EmptyCommitment)?;
+        Ok(TableCommit::preprocessed(
+            mult_tree,
+            mult_root,
+            std::sync::Arc::new(precomputed_tree),
+            precomputed_root,
+            num_precomputed,
+        ))
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and
