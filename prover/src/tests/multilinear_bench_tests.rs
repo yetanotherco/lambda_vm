@@ -1019,3 +1019,218 @@ fn constraint_program_sizes() {
     println!("\nfactores de todas las tablas juntos: {factors_total:.2} GiB");
     println!("arbol de fracciones mas grande:      {tree_max:.2} GiB");
 }
+
+/// ★ M2 (lane V1, uncommitted measurement): the exact WHIR stack shape of a real
+/// epoch — per-table `(name, width, rows)`, then `n_stack` / `num_polys` per
+/// commitment group, the rounds each chain runs and the query count the config
+/// derives. Pure shape logic on top of the executor; no card, no proof.
+#[test]
+#[ignore]
+fn whir_epoch_shapes() {
+    use crate::multilinear_continuation::{epoch_groups, global_groups};
+    use crate::multilinear_prove::{chain_config, stacks};
+    use crate::tables::trace_builder::DecodeArtifacts;
+    use executor::elf::Elf;
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21);
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let opts = options();
+    let elf = Elf::load(&bytes).expect("load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    println!("\n== M2 shapes: {input} epoch_size_log2={epoch_size_log2} ==");
+
+    let mut totals: Vec<(u64, usize, usize, usize, usize, usize)> = Vec::new();
+    let boundaries = crate::continuation::for_each_epoch(
+        &elf,
+        &inputs,
+        epoch_size_log2,
+        &artifacts,
+        |prepared, _| {
+            let mut traces = prepared.traces;
+            crate::tables::bitwise::update_multiplicities(
+                &mut traces.bitwise,
+                &crate::tables::local_to_global::collect_bitwise_from_l2g(&prepared.boundary),
+            );
+            let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
+            let table_counts = traces.table_counts();
+            let airs = crate::continuation::build_epoch_airs(
+                &elf,
+                &opts,
+                &[],
+                &table_counts,
+                &prepared.register_init,
+                &reg_fini,
+                prepared.is_final,
+                None,
+            );
+            let l2g_air = crate::continuation::l2g_memory_air(&opts, prepared.label);
+            let mut l2g_trace =
+                crate::tables::local_to_global::generate_local_to_global_trace(&prepared.boundary);
+            let mut pairs = airs.air_trace_pairs(&mut traces);
+            pairs.push((&l2g_air, &mut l2g_trace, &()));
+
+            let shapes: Vec<(usize, usize)> = pairs
+                .iter()
+                .map(|(_, t, _)| {
+                    (
+                        t.main_table.width,
+                        t.main_table.height.trailing_zeros() as usize,
+                    )
+                })
+                .collect();
+            if prepared.index == 0 {
+                println!("\n-- epoch 0 per-table census --");
+                println!("{:<16} {:>7} {:>10} {:>6} {:>14}", "table", "width", "rows", "vars", "cells");
+                for ((air, _, _), &(w, v)) in pairs.iter().zip(&shapes) {
+                    println!(
+                        "{:<16} {w:>7} {:>10} {v:>6} {:>14}",
+                        air.name(),
+                        1usize << v,
+                        (w as u64) << v
+                    );
+                }
+            }
+            let config = chain_config(&shapes);
+            let sizes = epoch_groups(shapes.len());
+            let (layouts, _d) = stacks(&shapes, &sizes, &config).expect("stacks");
+            let cells: u64 = shapes.iter().map(|&(w, v)| (w as u64) << v).sum();
+            let chains: usize = layouts.iter().map(|l| l.num_polys()).sum();
+            let rounds: usize = layouts
+                .iter()
+                .map(|l| l.num_polys() * l.n_stack().div_ceil(config.log_folding))
+                .sum();
+            println!(
+                "epoch {:>2}: tables {:>2} cells {:>12} | group0 n_stack {:>2} polys {:>2} | bookend n_stack {:>2} polys {:>2} | chains {:>2} rounds {:>3} | Q {}",
+                prepared.index,
+                shapes.len(),
+                cells,
+                layouts[0].n_stack(),
+                layouts[0].num_polys(),
+                layouts[1].n_stack(),
+                layouts[1].num_polys(),
+                chains,
+                rounds,
+                config.num_queries,
+            );
+            totals.push((
+                prepared.index,
+                shapes.len(),
+                cells as usize,
+                chains,
+                rounds,
+                config.num_queries,
+            ));
+            Ok(())
+        },
+    )
+    .expect("epochs prepare");
+
+    // The cross-epoch proof's groups: one per bookend, then the global-memory tables.
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(&elf, &inputs),
+    );
+    let num_private_input_pages = crate::tables::page::private_input_page_count(&inputs);
+    let page_bases = crate::continuation::touched_page_bases(&boundaries);
+    let gm_configs = crate::continuation::global_memory_configs_from_init_page_data(
+        &page_bases,
+        &init_page_data,
+        num_private_input_pages,
+        true,
+    );
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| {
+            crate::continuation::l2g_global_air(
+                &opts,
+                crate::tables::local_to_global::epoch_label(i as u64),
+            )
+        })
+        .collect();
+    let gm_airs: Vec<_> = gm_configs
+        .iter()
+        .map(|c| crate::continuation::global_memory_air(&opts, c, None))
+        .collect();
+    let mut l2g_traces: Vec<_> = boundaries
+        .iter()
+        .map(|e| crate::tables::local_to_global::generate_local_to_global_trace(e.as_slice()))
+        .collect();
+    let mut final_state: crate::tables::global_memory::FiniStateMap =
+        std::collections::HashMap::new();
+    for epoch in &boundaries {
+        for b in epoch.iter() {
+            final_state.insert(
+                b.address,
+                crate::tables::global_memory::FiniState {
+                    value: (b.fini.value & 0xFF) as u8,
+                    epoch: b.fini.epoch,
+                },
+            );
+        }
+    }
+    let mut gm_traces: Vec<_> = gm_configs
+        .iter()
+        .map(|c| crate::tables::global_memory::generate_global_trace(c, &final_state))
+        .collect();
+    let mut gpairs: Vec<crate::AirTracePair<'_>> = Vec::new();
+    for (a, t) in l2g_airs.iter().zip(l2g_traces.iter_mut()) {
+        gpairs.push((a, t, &()));
+    }
+    for (a, t) in gm_airs.iter().zip(gm_traces.iter_mut()) {
+        gpairs.push((a, t, &()));
+    }
+    let gshapes: Vec<(usize, usize)> = gpairs
+        .iter()
+        .map(|(_, t, _)| {
+            (
+                t.main_table.width,
+                t.main_table.height.trailing_zeros() as usize,
+            )
+        })
+        .collect();
+    let gconfig = chain_config(&gshapes);
+    let gsizes = global_groups(boundaries.len(), gm_configs.len());
+    let (glayouts, _gd) = stacks(&gshapes, &gsizes, &gconfig).expect("global stacks");
+    let gchains: usize = glayouts.iter().map(|l| l.num_polys()).sum();
+    let grounds: usize = glayouts
+        .iter()
+        .map(|l| l.num_polys() * l.n_stack().div_ceil(gconfig.log_folding))
+        .sum();
+    println!(
+        "\nGLOBAL: pages {} tables {} groups {} chains {} rounds {} Q {}",
+        gm_configs.len(),
+        gshapes.len(),
+        gsizes.len(),
+        gchains,
+        grounds,
+        gconfig.num_queries
+    );
+    for (i, l) in glayouts.iter().enumerate().take(3) {
+        println!(
+            "   group {i}: n_stack {} polys {}",
+            l.n_stack(),
+            l.num_polys()
+        );
+    }
+    if let Some(l) = glayouts.last() {
+        println!(
+            "   group {} (global memory): n_stack {} polys {}",
+            glayouts.len() - 1,
+            l.n_stack(),
+            l.num_polys()
+        );
+    }
+    let ec: usize = totals.iter().map(|t| t.3).sum();
+    let er: usize = totals.iter().map(|t| t.4).sum();
+    println!(
+        "\n★ TOTAL over {} epochs + global: chains {} rounds {} | grinds (3R-1 per chain) {}",
+        totals.len(),
+        ec + gchains,
+        er + grounds,
+        3 * (er + grounds) - (ec + gchains)
+    );
+}

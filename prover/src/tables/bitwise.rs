@@ -35,6 +35,9 @@ use stark::trace::TraceTable;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+use math::field::element::FieldElement;
+use math::field::traits::IsField;
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -241,6 +244,135 @@ pub fn preprocessed_columns() -> Vec<Vec<FE>> {
         }
         cols
     }
+}
+
+// =========================================================================
+// The precomputed columns' multilinear extensions, in closed form
+// =========================================================================
+
+/// Variables in the precomputed table's hypercube: NUM_ROWS is 2^NUM_VARS.
+pub const NUM_VARS: usize = 20;
+const _: () = assert!(1usize << NUM_VARS == NUM_ROWS);
+
+/// ★ Every precomputed column's multilinear extension, evaluated at one point
+/// in O(NUM_VARS) field operations instead of a 2^20 fold.
+///
+/// # Why a closed form exists at all
+///
+/// [`generate_bitwise_row`] reads its row index as three disjoint bit fields,
+/// index = X + 256*Y + 65536*Z, and every column it returns is a MULTILINEAR
+/// polynomial in the twenty index bits:
+///
+/// - X, Y and Z are linear forms over disjoint bit ranges.
+/// - AND, OR and XOR are per-bit functions of ONE bit of X and ONE bit of Y.
+///   Two distinct variables, so each of x*y, x+y-x*y and x+y-2*x*y has degree
+///   one in each of them.
+/// - MSB8 is bit 7, and MSB16 is bit 15 (bit 15 of X + 256*Y is bit 7 of Y).
+/// - ZERO is the product over all twenty bits of (1 - b), i.e. eq(0, .).
+/// - SLL and SLLC are sums over the sixteen values of Z of an indicator in the
+///   four Z bits times a linear form in the sixteen halfword bits. The two
+///   variable sets are disjoint, so each product is again multilinear.
+///
+/// The multilinear extension of a function that is ALREADY multilinear in the
+/// index bits is that same polynomial, so this is an identity rather than an
+/// approximation. It is what lets a recursive verifier bind these columns
+/// without the 2^20 pass that [`preprocessed_columns`] plus an MLE fold costs.
+///
+/// # The variable convention, which is the easy thing to get backwards
+///
+/// Mle::evaluate_in binds its first coordinate to the HIGH half of the table,
+/// so coordinate i carries index bit NUM_VARS - 1 - i. The two run in opposite
+/// directions, and this function is the only place that reversal is written.
+///
+/// Returns None if the point is not NUM_VARS long. Column order is
+/// [`generate_bitwise_row`]'s.
+pub fn preprocessed_mle_at<E>(
+    point: &[FieldElement<E>],
+) -> Option<[FieldElement<E>; NUM_PRECOMPUTED_COLS]>
+where
+    E: IsField,
+{
+    if point.len() != NUM_VARS {
+        return None;
+    }
+    let zero = FieldElement::<E>::zero();
+    let one = FieldElement::<E>::one();
+    // vs[k] is the variable carried by index bit k.
+    let vs: Vec<&FieldElement<E>> = (0..NUM_VARS).map(|k| &point[NUM_VARS - 1 - k]).collect();
+
+    // Powers of two by doubling: a generic field has no From<u64>.
+    let mut pow2 = Vec::with_capacity(16);
+    let mut p = one.clone();
+    for _ in 0..16 {
+        pow2.push(p.clone());
+        p = &p + &p;
+    }
+
+    // A linear form over a run of bits: sum over i of 2^i * bit(lo + i).
+    let lin = |lo: usize, len: usize| -> FieldElement<E> {
+        (0..len).fold(zero.clone(), |acc, i| &acc + &(&pow2[i] * vs[lo + i]))
+    };
+    let x = lin(0, 8);
+    let y = lin(8, 8);
+    let z = lin(16, 4);
+
+    // AND, OR, XOR: one product of two DISTINCT variables per bit.
+    let mut and = zero.clone();
+    let mut or = zero.clone();
+    let mut xor = zero.clone();
+    for i in 0..8 {
+        let (a, b) = (vs[i], vs[8 + i]);
+        let ab = a * b;
+        let sum = a + b;
+        and = &and + &(&pow2[i] * &ab);
+        or = &or + &(&pow2[i] * &(&sum - &ab));
+        xor = &xor + &(&pow2[i] * &(&(&sum - &ab) - &ab));
+    }
+
+    let msb8 = vs[7].clone();
+    // Bit 15 of X + 256*Y is bit 7 of Y, which is index bit 15.
+    let msb16 = vs[15].clone();
+
+    // ZERO is eq(0, .): the product over every bit of (1 - b).
+    let is_zero = (0..NUM_VARS).fold(one.clone(), |acc, k| &acc * &(&one - vs[k]));
+
+    // Halfword bit i is index bit i for i in 0..16, so one prefix sweep serves
+    // both shifts. prefix[m] = sum over i <= m of 2^i * bit(i).
+    let mut prefix = Vec::with_capacity(16);
+    let mut running = zero.clone();
+    for i in 0..16 {
+        running = &running + &(&pow2[i] * vs[i]);
+        prefix.push(running.clone());
+    }
+
+    let mut sll = zero.clone();
+    let mut sllc = zero.clone();
+    // suffix holds halfword >> (16 - j) on entry to iteration j, advanced by
+    // suffix_{j+1} = 2*suffix_j + bit(15 - j). It is zero for j = 0.
+    let mut suffix = zero.clone();
+    for j in 0..16usize {
+        // eq(j, the four Z bits).
+        let indicator = (0..4).fold(one.clone(), |acc, b| {
+            let bit = vs[16 + b];
+            if (j >> b) & 1 == 1 {
+                &acc * bit
+            } else {
+                &acc * &(&one - bit)
+            }
+        });
+        // (halfword << j) mod 2^16 keeps bits 0 ..= 15 - j at weight 2^(i + j).
+        // generate_bitwise_row's Z = 0 branch is this same value: a halfword is
+        // already below 2^16, so masking it changes nothing.
+        sll = &sll + &(&indicator * &(&prefix[15 - j] * &pow2[j]));
+        if j > 0 {
+            // SLLC is zero at Z = 0 and halfword >> (16 - Z) otherwise.
+            sllc = &sllc + &(&indicator * &suffix);
+        }
+        let doubled = &suffix + &suffix;
+        suffix = &doubled + vs[15 - j];
+    }
+
+    Some([x, y, z, and, or, xor, msb8, msb16, is_zero, sll, sllc])
 }
 
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
