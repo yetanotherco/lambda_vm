@@ -16,7 +16,7 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::types::GoldilocksExtension;
 use crate::test_utils::run_asm_elf;
 use crate::tests::prove_elfs_tests::{BusOutcome, prove_and_verify_vm_minimal, weigh_the_bus};
-use crate::{TableCounts, VmAirs};
+use crate::{Error, TableCounts, VmAirs};
 
 /// Load and run one of the compiled Rust guest programs.
 ///
@@ -364,6 +364,101 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
         !crate::verify_with_options(&forged, &elf_bytes, &opts, None, None)
             .expect("a balanced forgery must be a verification failure, not an error"),
         "a proof with its MUL table deleted and declared away must not verify"
+    );
+}
+
+/// A constant multiplicity would break the equivalence the skip rests on: it
+/// makes a padding row contribute, so "present but empty" would stop matching
+/// "absent" on the bus and an honest proof would balance differently depending
+/// on whether an unused chip shipped. The tables that do use one — CPU, HALT,
+/// PAGE, REGISTER, GLOBAL_MEMORY — are exactly the mandatory ones, and nothing
+/// enforced that this stays true.
+#[test]
+fn no_optional_table_uses_a_constant_multiplicity() {
+    use crate::tables::{
+        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt,
+        memw, memw_aligned, mul, shift, store,
+    };
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
+        ("LT", lt::bus_interactions()),
+        ("MEMW", memw::bus_interactions()),
+        ("MEMW_A", memw_aligned::bus_interactions()),
+        ("LOAD", load::bus_interactions()),
+        ("MUL", mul::bus_interactions()),
+        ("DVRM", dvrm::bus_interactions()),
+        ("SHIFT", shift::bus_interactions()),
+        ("BRANCH", branch::bus_interactions()),
+        ("EQ", eq::bus_interactions()),
+        ("BYTEWISE", bytewise::bus_interactions()),
+        ("STORE", store::bus_interactions()),
+        ("CPU32", cpu32::bus_interactions()),
+        ("KECCAK", keccak::bus_interactions()),
+        ("KECCAK_RND", keccak_rnd::bus_interactions()),
+        ("ECSM", ecsm::bus_interactions()),
+        ("ECDAS", ecdas::bus_interactions()),
+        ("HINT", hint::bus_interactions()),
+        ("COMMIT", commit::bus_interactions()),
+    ];
+    for (name, interactions) in optional {
+        assert!(
+            !interactions.is_empty(),
+            "{name} declares no bus interactions"
+        );
+        for (i, interaction) in interactions.iter().enumerate() {
+            assert!(
+                !matches!(interaction.multiplicity, stark::lookup::Multiplicity::One),
+                "{name} interaction {i} uses a constant multiplicity, so its padding rows \
+                 contribute and dropping the table stops being equivalent to shipping it empty"
+            );
+        }
+    }
+}
+
+/// The cross-check is redundant with the transcript for soundness — the counts
+/// are absorbed, so a wrong one diverges every challenge — and its one
+/// non-redundant job is refusing a count before it sizes anything. These pin
+/// that job in both directions, and pin it by *how* the proof is refused:
+/// `Err` is the statement guard, `Ok(false)` would be verification.
+#[test]
+fn counts_the_proof_cannot_back_are_refused_before_verification() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_mul_8");
+    let opts = ProofOptions::default_test_options();
+    let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &Default::default())
+        .expect("the fixture must prove");
+
+    // Non-overflowing but far past what the proof carries.
+    let huge = crate::VmProof {
+        table_counts: crate::TableCounts {
+            cpu: 1_000_000_000,
+            ..vm_proof.table_counts.clone()
+        },
+        proof: vm_proof.proof.clone(),
+        runtime_page_ranges: vm_proof.runtime_page_ranges.clone(),
+        public_output: vm_proof.public_output.clone(),
+        num_private_input_pages: vm_proof.num_private_input_pages,
+    };
+    assert!(
+        matches!(
+            crate::verify_with_options(&huge, &elf_bytes, &opts, None, None),
+            Err(Error::InvalidTableCounts(_))
+        ),
+        "a count the sub-proofs cannot back must be refused as a malformed statement"
+    );
+
+    // And the branch above it: a sum that wraps has no total at all.
+    let wrapped = crate::VmProof {
+        table_counts: crate::TableCounts {
+            mul: usize::MAX,
+            ..vm_proof.table_counts.clone()
+        },
+        ..vm_proof
+    };
+    assert!(
+        matches!(
+            crate::verify_with_options(&wrapped, &elf_bytes, &opts, None, None),
+            Err(Error::InvalidTableCounts(_))
+        ),
+        "a wrapped total must be refused, not silently compared as a small number"
     );
 }
 

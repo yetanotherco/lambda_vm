@@ -2451,6 +2451,30 @@ mod tests {
         );
     }
 
+    /// The epoch counterpart of the overflow branch: `verify_epoch` swallows a
+    /// total that wraps as `Ok(false)` where the monolithic verifier returns
+    /// `Err`, so a regression there is silent. Nothing reached that arm before.
+    #[test]
+    fn test_split_verify_rejects_an_epoch_whose_counts_overflow() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(!bundle.epochs.is_empty());
+
+        bundle.epochs[0].table_counts.lt = usize::MAX;
+        assert!(
+            bundle.epochs[0].table_counts.total().is_none(),
+            "the tampered counts must actually wrap, or this tests the wrong branch"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_none(),
+            "an epoch whose declared counts have no total must be rejected"
+        );
+    }
+
     /// The continuation counterpart of the monolithic
     /// `test_verify_rejects_undercounted_table_count`: an epoch that declares
     /// away a table it actually carries. Both branches of the cross-check are
