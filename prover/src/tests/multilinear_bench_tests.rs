@@ -27,11 +27,11 @@ use crate::tables::trace_builder::Traces;
 
 /// Blowup 4, 128 bits, 20 bits of grinding — the parameters the multilinear
 /// path derives its own from, so the two are being asked for the same security.
-fn options() -> stark::proof::options::ProofOptions {
+pub(super) fn options() -> stark::proof::options::ProofOptions {
     GoldilocksCubicProofOptions::with_params(4, 128, 20).expect("valid options")
 }
 
-fn elf_bytes(name: &str) -> Vec<u8> {
+pub(super) fn elf_bytes(name: &str) -> Vec<u8> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -62,7 +62,7 @@ const PROGRAMS: &[(&str, &str)] = &[
 
 /// A private-input fixture from `executor/tests`, empty for a program that
 /// takes none.
-fn input_bytes(name: &str) -> Vec<u8> {
+pub(super) fn input_bytes(name: &str) -> Vec<u8> {
     if name.is_empty() {
         return Vec::new();
     }
