@@ -22,7 +22,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementBackend<F, D,
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementBackend<F, D, NUM_BYTES>
 where
     F: IsField,
@@ -33,12 +33,20 @@ where
     type Data = FieldElement<F>;
 
     fn hash_data(input: &FieldElement<F>) -> [u8; NUM_BYTES] {
+        // Merkle leaf finalize (see `crate::hash_metrics`); counts only when `D`
+        // is the platform keccak (so `merkle ⊆ total`), no-op without the feature.
+        crate::hash_metrics::count_merkle::<D>();
         let mut hasher = D::new();
         input.stream_bytes(&mut |b| hasher.update(b));
         hasher.finalize().into()
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
+        // Merkle auth-path (node) compression; keccak-only guard, no-op without
+        // the feature. Unlike `field_element_vector`, this backend does not route
+        // through `hash_streamed`, so count BOTH here to keep `nodes ⊆ merkle`.
+        crate::hash_metrics::count_merkle::<D>();
+        crate::hash_metrics::count_merkle_node::<D>();
         let mut hasher = D::new();
         hasher.update(left);
         hasher.update(right);

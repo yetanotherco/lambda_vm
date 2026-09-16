@@ -1118,6 +1118,109 @@ fn test_dump_recursion_input() {
     }
 }
 
+/// Count the keccak hashes done to VERIFY the dumped recursion blob — a
+/// prover-change metric: fewer hashes ⇒ a cheaper recursion guest. Runs the exact
+/// guest verify (`verify_continuation_and_attest`) on `/tmp/recursion_input.bin`
+/// (override with `RECURSION_INPUT_PATH`) with `crypto::hash_metrics` counting
+/// every keccak-256 finalize, and reports the grinding proof-of-work hashes apart
+/// so the headline `total` excludes them.
+///
+/// Requires:
+/// * the `hash-metrics` cargo feature — without it counting is a no-op (all zeros
+///   → this test asserts and tells you to add the feature);
+/// * a CONTINUATION dump: `test_dump_recursion_input` with `RECURSION_DUMP_EPOCH_LOG2`
+///   set (this path verifies via `verify_continuation_and_attest`);
+/// * `RECURSION_DUMP_PRESET` matching the dump (default `min`), else the verify fails.
+///
+/// Loop: change the prover → re-run `test_dump_recursion_input` (re-proves + dumps
+/// the new blob) → run this (fast, verify-only) → compare `total`.
+///
+///   RECURSION_DUMP_PRESET=blowup4 cargo test --release --features hash-metrics \
+///     -p lambda-vm-prover --lib test_count_recursion_hashes -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic: counts keccak hashes verifying the dumped recursion blob"]
+fn test_count_recursion_hashes() {
+    let preset_name = std::env::var("RECURSION_DUMP_PRESET").unwrap_or_else(|_| "min".to_string());
+    let preset = Preset::ALL
+        .into_iter()
+        .find(|p| p.name() == preset_name)
+        .unwrap_or_else(|| panic!("unknown RECURSION_DUMP_PRESET '{preset_name}'"));
+    let path = std::env::var("RECURSION_INPUT_PATH")
+        .unwrap_or_else(|_| "/tmp/recursion_input.bin".to_string());
+    let blob = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("read {path} (run test_dump_recursion_input first): {e}"));
+
+    // Counting is always-on under the `hash-metrics` feature, so just zero the
+    // counters, verify, and read — no enable/disable, nothing in the verifier.
+    crypto::hash_metrics::reset();
+    let attestation = recursion::verify_continuation_and_attest(&blob, &preset.options()).expect(
+        "verify_continuation_and_attest errored — needs a CONTINUATION dump \
+         (RECURSION_DUMP_EPOCH_LOG2 set) under a matching RECURSION_DUMP_PRESET",
+    );
+    let c = crypto::hash_metrics::snapshot();
+
+    assert!(
+        attestation.is_some(),
+        "the blob must verify under preset '{}' — does it match the dump's RECURSION_DUMP_PRESET?",
+        preset.name()
+    );
+    assert!(
+        c.total > 0,
+        "hash counters are zero — build with `--features hash-metrics`"
+    );
+    // `merkle` and `grinding` are disjoint subsets of `total`; `nodes` ⊆ `merkle`.
+    // (Holds for the keccak recursion verify; flags a backend/counter mismatch.)
+    assert!(
+        c.merkle_nodes <= c.merkle && c.merkle + c.grinding <= c.total,
+        "inconsistent counters: {c:?}"
+    );
+
+    assert!(
+        c.perms > 0,
+        "perm counter is zero — build with `--features hash-metrics`"
+    );
+
+    // keccak_permute census (guest cost) measured for the standard <preset> proof;
+    // `perms` here matches it when this test verifies that same proof (it is the
+    // env-configurable dump, so a different workload legitimately differs).
+    let census = match preset.name() {
+        "min" => Some(3_595u64),
+        "blowup2" => Some(448_737),
+        "blowup4" => Some(241_052),
+        _ => None,
+    };
+    let census_note = match census {
+        Some(n) if n == c.perms => format!(" — matches census {n} ✓"),
+        Some(n) => format!(" — census {n} (differs → different workload than the census)"),
+        None => String::new(),
+    };
+
+    // Three dimensions. PERMS: keccak-f permutations = the unit the guest pays
+    // (one `keccak_permute` syscall each), guest-faithful and self-validatable.
+    // FINALIZES: one keccak output per leaf/node/squeeze. ABSORB (host-side): the
+    // `Update::update` calls a block-absorption change would move (perms unchanged).
+    println!(
+        "[hash-count] preset={} blob={}B fri_queries={}\n  \
+         PERMS (keccak_permute, guest cost)={}{}\n  \
+         finalizes: total(excl. grinding)={} merkle={} (nodes={} leaves={}) \
+         transcript+other={} grinding={}\n  \
+         absorb (host): calls={} bytes={}",
+        preset.name(),
+        blob.len(),
+        preset.options().fri_number_of_queries,
+        c.perms,
+        census_note,
+        c.total - c.grinding,
+        c.merkle,
+        c.merkle_nodes,
+        c.merkle - c.merkle_nodes,
+        c.total - c.merkle - c.grinding,
+        c.grinding,
+        c.absorb_calls,
+        c.absorb_bytes,
+    );
+}
+
 /// Cycle count only of the recursion guest verifying a 1-query inner proof.
 #[test]
 #[ignore = "diagnostic: fast; recursion guest cycle count (1 query)"]

@@ -45,3 +45,6 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# Host-only diagnostic: count keccak finalizes during verify (see `hash_metrics`).
+# Off by default → `PlatformKeccak256 = sha3::Keccak256`, provably unchanged.
+hash-metrics = []
