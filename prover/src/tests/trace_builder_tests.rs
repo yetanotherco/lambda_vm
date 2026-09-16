@@ -1404,8 +1404,7 @@ fn collect_streaming_matches_collect_epoch() {
 /// It is the same equality `build_chunk` rests on, one level up: a table closed
 /// mid-execution and a table built from the finished op list have to be the
 /// same table, or committing early means committing something else.
-#[test]
-fn commit_walk_emits_the_same_chunks() {
+fn assert_walk_matches(fixture: &str, max_rows: crate::tables::MaxRowsConfig, min_split: usize) {
     use crate::tables::register::register_init_from_entry_point;
     use crate::tables::trace_builder::{
         DecodeArtifacts, TableKind, Traces as T, build_initial_image,
@@ -1413,28 +1412,13 @@ fn commit_walk_emits_the_same_chunks() {
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
 
-    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf_bytes = crate::test_utils::asm_elf_bytes(fixture);
     let elf = Elf::load(&elf_bytes).expect("ELF load");
     let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
     let image = build_initial_image(&elf, &[]);
     let register_init = register_init_from_entry_point(elf.entry_point);
     // Small enough that the walk closes several chunks before the run ends,
     // which is the case that matters — a single tail chunk would prove nothing.
-    // Small enough that every table under test closes chunks mid-walk. Without
-    // that, a table with a single chunk would compare an empty prefix and the
-    // check would pass while proving nothing about it.
-    let max_rows = crate::tables::MaxRowsConfig {
-        cpu: 1 << 15,
-        memw: 1 << 10,
-        load: 1 << 10,
-        shift: 1 << 15,
-        branch: 1 << 12,
-        eq: 1 << 12,
-        bytewise: 1 << 12,
-        store: 1 << 12,
-        ..Default::default()
-    };
-
     let logs = Executor::new(&elf, vec![])
         .expect("executor")
         .run()
@@ -1505,7 +1489,6 @@ fn commit_walk_emits_the_same_chunks() {
         ("MEMW_A", expected.memw_aligneds.len()),
         ("MEMW_R", expected.memw_registers.len()),
         ("LOAD", expected.loads.len()),
-        ("SHIFT", expected.shifts.len()),
         ("BRANCH", expected.branches.len()),
         ("EQ", expected.eqs.len()),
         ("BYTEWISE", expected.bytewises.len()),
@@ -1516,8 +1499,8 @@ fn commit_walk_emits_the_same_chunks() {
     .map(|(name, _)| name)
     .collect();
     assert!(
-        chunked.len() >= 3,
-        "the fixture must split at least three tables mid-walk, split: {chunked:?}"
+        chunked.len() >= min_split,
+        "{fixture} must split at least {min_split} tables mid-walk, split: {chunked:?}"
     );
 
     check(TableKind::Cpu, &expected.cpus);
@@ -1525,12 +1508,41 @@ fn commit_walk_emits_the_same_chunks() {
     check(TableKind::MemwAligned, &expected.memw_aligneds);
     check(TableKind::MemwRegister, &expected.memw_registers);
     check(TableKind::Load, &expected.loads);
-    check(TableKind::Shift, &expected.shifts);
     check(TableKind::Cpu32, &expected.cpu32s);
     check(TableKind::Branch, &expected.branches);
     check(TableKind::Eq, &expected.eqs);
     check(TableKind::Bytewise, &expected.bytewises);
     check(TableKind::Store, &expected.stores);
+}
+
+#[test]
+fn commit_walk_emits_the_same_chunks() {
+    // Limits small enough that several tables close chunks mid-walk.
+    assert_walk_matches(
+        "fib_iterative_160k",
+        crate::tables::MaxRowsConfig {
+            cpu: 1 << 15,
+            memw: 1 << 10,
+            load: 1 << 10,
+            branch: 1 << 12,
+            eq: 1 << 12,
+            bytewise: 1 << 12,
+            store: 1 << 12,
+            ..Default::default()
+        },
+        3,
+    );
+}
+
+/// The same, on a program that uses the word instructions.
+///
+/// `cpu32_chip_op` appends to SHIFT, MUL and DVRM for every `*W` op, so those
+/// tables are not final when a segment ends. A fibonacci fixture has no word
+/// instructions and would let a table that is closed too early pass unnoticed;
+/// this one would not.
+#[test]
+fn commit_walk_emits_the_same_chunks_with_word_instructions() {
+    assert_walk_matches("basic_arith_32", crate::tables::MaxRowsConfig::small(), 1);
 }
 
 /// A chunk committed during the walk must carry the root the normal prover
@@ -1598,7 +1610,6 @@ fn chunks_committed_during_the_walk_carry_the_normal_roots() {
         TableKind::MemwAligned => airs.memw_aligneds.get(chunk).map(|a| a.as_ref()),
         TableKind::MemwRegister => airs.memw_registers.get(chunk).map(|a| a.as_ref()),
         TableKind::Load => airs.loads.get(chunk).map(|a| a.as_ref()),
-        TableKind::Shift => airs.shifts.get(chunk).map(|a| a.as_ref()),
         TableKind::Cpu32 => airs.cpu32s.get(chunk).map(|a| a.as_ref()),
         TableKind::Branch => airs.branches.get(chunk).map(|a| a.as_ref()),
         TableKind::Eq => airs.eqs.get(chunk).map(|a| a.as_ref()),
@@ -1641,7 +1652,6 @@ fn chunks_committed_during_the_walk_carry_the_normal_roots() {
                 TableKind::MemwAligned => &traces.memw_aligneds[chunk],
                 TableKind::MemwRegister => &traces.memw_registers[chunk],
                 TableKind::Load => &traces.loads[chunk],
-                TableKind::Shift => &traces.shifts[chunk],
                 TableKind::Cpu32 => &traces.cpu32s[chunk],
                 TableKind::Branch => &traces.branches[chunk],
                 TableKind::Eq => &traces.eqs[chunk],
@@ -1663,4 +1673,27 @@ fn chunks_committed_during_the_walk_carry_the_normal_roots() {
         checked > 0,
         "the fixture must close at least one chunk mid-walk"
     );
+}
+
+/// No table CPU32 feeds may be closed early by the Commit-phase walk.
+///
+/// `cpu32_chip_op` appends to SHIFT, MUL and DVRM once per word instruction, so
+/// those are not final when a segment ends — closing one early would cut its
+/// chunks somewhere the finished run does not.
+///
+/// Stated as an invariant rather than left to a fixture: catching it by data
+/// needs a program with word instructions AND enough of the affected ops to
+/// split a chunk, and a fixture that stops meeting that quietly stops testing
+/// it. SHIFT was in fact closed early until this was noticed.
+#[test]
+fn cpu32_appends_are_excluded_from_early_closing() {
+    use crate::tables::trace_builder::{CHUNKED_KINDS, CPU32_APPENDS_TO};
+
+    for kind in CPU32_APPENDS_TO {
+        assert!(
+            !CHUNKED_KINDS.contains(&kind),
+            "{kind:?} takes ops from cpu32_chip_op after a segment ends, so the walk \
+             must not close it early"
+        );
+    }
 }

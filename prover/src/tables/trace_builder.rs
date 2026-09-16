@@ -1251,6 +1251,14 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
 
 /// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
 /// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
+/// The tables `cpu32_chip_op` appends to.
+///
+/// Kept beside it because it is load-bearing elsewhere: a table listed here is
+/// NOT final when a segment ends, so the Commit-phase walk must not close it
+/// early — `cpu32_appends_are_excluded_from_early_closing` enforces that. If
+/// this function starts feeding another table, add it here.
+pub const CPU32_APPENDS_TO: [TableKind; 3] = [TableKind::Shift, TableKind::Mul, TableKind::Dvrm];
+
 #[allow(clippy::type_complexity)]
 fn cpu32_chip_op(
     c: &cpu32::Cpu32Operation,
@@ -3057,13 +3065,12 @@ fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
 
 /// The tables this walk can close mid-execution: their ops come straight out of
 /// `collect_ops_from_cpu` and nothing appends to them afterwards.
-pub const CHUNKED_KINDS: [TableKind; 11] = [
+pub const CHUNKED_KINDS: [TableKind; 10] = [
     TableKind::Cpu,
     TableKind::Memw,
     TableKind::MemwAligned,
     TableKind::MemwRegister,
     TableKind::Load,
-    TableKind::Shift,
     TableKind::Cpu32,
     TableKind::Branch,
     TableKind::Eq,
@@ -3100,7 +3107,6 @@ impl RoutedOps {
             TableKind::MemwAligned => self.memw_aligned_ops.len(),
             TableKind::MemwRegister => self.memw_register_rows.len(),
             TableKind::Load => self.load_ops.len(),
-            TableKind::Shift => self.shift_ops.len(),
             TableKind::Cpu32 => self.cpu32_ops.len(),
             TableKind::Branch => self.branch_ops.len(),
             TableKind::Eq => self.eq_ops.len(),
@@ -3141,7 +3147,6 @@ impl RoutedOps {
                 memw_register::generate_memw_register_trace_from_rows
             ),
             TableKind::Load => drain!(self.load_ops, load::generate_load_trace),
-            TableKind::Shift => drain!(self.shift_ops, shift::generate_shift_trace),
             TableKind::Cpu32 => drain!(self.cpu32_ops, cpu32::generate_cpu32_trace),
             TableKind::Branch => drain!(self.branch_ops, branch::generate_branch_trace),
             TableKind::Eq => drain!(self.eq_ops, eq::generate_eq_trace),
@@ -5056,7 +5061,11 @@ impl Traces {
     /// traces to the all-at-once path — `commit_walk_emits_the_same_chunks`
     /// pins that.
     ///
-    /// Only the tables whose ops leave `collect_ops_from_cpu` final are emitted.
+    /// Only the tables whose ops are final when the segment ends are emitted.
+    /// SHIFT is not one of them despite coming out of `collect_ops_from_cpu`:
+    /// `cpu32_chip_op` appends to it for every word instruction, so a program
+    /// with `*W` ops would have its SHIFT chunks cut elsewhere than the
+    /// finished run cuts them.
     /// LT and MUL are not among them — later derivations append to both (DVRM
     /// contributes range checks to LT and a product to MUL) — and neither are
     /// the tables `collect_all_ops` derives from the CPU ops, nor the
