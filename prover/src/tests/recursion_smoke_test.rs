@@ -750,6 +750,72 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
     );
 }
 
+/// The recursion path over a bundle whose epochs carry *different* table sets.
+///
+/// Every other continuation fixture here proves fibonacci, whose epochs all do
+/// the same work and therefore all declare the same tables. A uniform bundle
+/// cannot tell a per-epoch table set from a whole-run one, and it never
+/// exercises `verify_epoch`'s cross-check against a count that changes from one
+/// epoch to the next — which is the arithmetic this change rewrote.
+/// `all_loadstore_32` at 8-cycle epochs has a table that is present, goes away
+/// and comes back.
+#[test]
+fn test_recursion_accepts_a_bundle_whose_epochs_carry_different_tables() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_loadstore_32");
+
+    let bundle = crate::continuation::prove_continuation(&elf_bytes, &[], 3, &MIN_PROOF_OPTIONS)
+        .expect("continuation prove should succeed");
+    assert!(
+        bundle.num_epochs() > 1,
+        "8-cycle epochs must split all_loadstore_32 for this test to bite"
+    );
+
+    // The premise: the epochs really do disagree. Without this the test is the
+    // fibonacci one again, with a slower program.
+    let present_per_epoch: Vec<Vec<bool>> = bundle
+        .epoch_table_counts()
+        .iter()
+        .map(|c| vec![c.load > 0, c.store > 0, c.memw > 0, c.lt > 0, c.branch > 0])
+        .collect();
+    let disagrees = (0..present_per_epoch[0].len()).any(|i| {
+        present_per_epoch
+            .iter()
+            .any(|row| row[i] != present_per_epoch[0][i])
+    });
+    assert!(
+        disagrees,
+        "every epoch declares the same tables, so this bundle does not exercise \
+         a variable table set: {present_per_epoch:?}"
+    );
+
+    // Ground truth from the host path, then the same bundle through the guest's.
+    let expected_output =
+        crate::continuation::verify_continuation(&elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
+            .expect("verify_continuation errored")
+            .expect("a mixed-shape bundle must verify");
+    let (expected_decode, expected_pages) =
+        crate::continuation::continuation_precomputed_commitments(
+            &elf_bytes,
+            &bundle,
+            &MIN_PROOF_OPTIONS,
+        )
+        .expect("continuation_precomputed_commitments errored");
+    let expected_id = recursion::program_id_from_elf(&elf_bytes, &expected_decode, &expected_pages)
+        .expect("program_id_from_elf errored");
+
+    let blob = recursion::encode_continuation_guest_input(bundle, &elf_bytes, &MIN_PROOF_OPTIONS)
+        .expect("encode_continuation_guest_input failed");
+    let attestation = recursion::verify_continuation_and_attest(&blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_continuation_and_attest errored")
+        .expect("a mixed-shape bundle must survive the guest path too");
+    let (id, output) = recursion::split_attestation(&attestation).expect("attestation too short");
+    assert_eq!(
+        id, expected_id,
+        "attested id must match the honest recompute"
+    );
+    assert_eq!(output, &expected_output[..], "attested output must match");
+}
+
 /// Corrupting a private-input commitment on an *honest* proof makes
 /// verification fail (`Ok(false)`). Necessary but not sufficient alone — a
 /// custom prover can supply consistent mismatched roots (see
