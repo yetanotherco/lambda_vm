@@ -266,7 +266,23 @@ enum Commands {
         /// (Approach 1's Commit phase), instead of building every trace first.
         #[arg(long)]
         streaming: bool,
+
+        /// How far down Approach 1's pipeline to run. Only meaningful with
+        /// --streaming; each stage includes the ones before it.
+        #[arg(long, value_enum, default_value = "logup", requires = "streaming")]
+        through: Stage,
     },
+}
+
+/// Approach 1's passes, in order.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum Stage {
+    /// Walk and commit every chunk's main trace.
+    Commit,
+    /// Also commit the tables that stay, and sample the shared challenge.
+    Challenge,
+    /// Also walk again to build and commit the auxiliary columns.
+    Logup,
 }
 
 fn main() -> ExitCode {
@@ -336,7 +352,8 @@ fn main() -> ExitCode {
             elf,
             private_input,
             streaming,
-        } => cmd_trace_build(elf, private_input, streaming),
+            through,
+        } => cmd_trace_build(elf, private_input, streaming, through),
     }
 }
 
@@ -1019,6 +1036,36 @@ fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
     Ok(epoch_size_log2)
 }
 
+/// Approach 1's pipeline, as far as `through`.
+///
+/// Each stage is measured in its own process because peak heap is per process,
+/// and reported as the number of tables it accounted for — chunks for the
+/// Commit phase, every table in AIR order once the later passes have run.
+fn run_approach_1(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    max_rows: &prover::tables::MaxRowsConfig,
+    options: &stark::proof::options::ProofOptions,
+    through: Stage,
+) -> Result<usize, String> {
+    let committed = prover::commit_phase::run_to_end(elf, private_inputs, max_rows, options)
+        .map_err(|e| format!("{e:?}"))?;
+    if through == Stage::Commit {
+        return Ok(committed.chunks.len());
+    }
+    let challenge = prover::challenge_phase::run(&committed, elf, elf_bytes, options)
+        .map_err(|e| format!("{e:?}"))?;
+    // The mains are committed; nothing downstream reads their traces again.
+    drop(committed);
+    if through == Stage::Challenge {
+        return Ok(challenge.roots.len());
+    }
+    let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(logup.aux.len())
+}
+
 /// Build the traces one way or the other, so the two production paths can be
 /// compared on what they hold. Nothing is proved: this measures the side of the
 /// prover that Approach 1's Commit phase replaces.
@@ -1026,6 +1073,7 @@ fn cmd_trace_build(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
     streaming: bool,
+    through: Stage,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -1062,9 +1110,14 @@ fn cmd_trace_build(
                 return ExitCode::FAILURE;
             }
         };
-        prover::commit_phase::run_to_end(&elf, &private_inputs, &max_rows, &options)
-            .map(|committed| committed.chunks.len())
-            .map_err(|e| format!("{e:?}"))
+        run_approach_1(
+            &elf,
+            &elf_data,
+            &private_inputs,
+            &max_rows,
+            &options,
+            through,
+        )
     } else {
         prover::commit_phase::build_resident(&elf, &private_inputs, &max_rows)
             .map(|t| t.cpus.len())
@@ -1074,7 +1127,7 @@ fn cmd_trace_build(
     let elapsed = started.elapsed();
     match outcome {
         Ok(n) => println!(
-            "Trace build ({}): {n} chunks, {:.3}s",
+            "Trace build ({}): {n} tables, {:.3}s",
             if streaming { "streaming" } else { "resident" },
             elapsed.as_secs_f64()
         ),
