@@ -167,20 +167,39 @@ where
         });
 }
 
-/// Successful GPU grind dispatches — one per nonce search that ran on device
-/// and produced a nonce the host check accepted (a device miss or an invalid
-/// kernel result falls back to the CPU search and is not counted).
+/// Successful KECCAK GPU grind dispatches — one per nonce search that ran on
+/// device and produced a nonce the host check accepted (a device miss or an
+/// invalid kernel result falls back to the CPU search and is not counted).
 #[cfg(feature = "cuda")]
 static GPU_GRIND_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ★ The same for RPX, counted SEPARATELY.
+///
+/// Two counters rather than one, because the question an assertion needs to
+/// answer is not "did a grind reach the device" but "did the RIGHT kernel run".
+/// A single counter is satisfied by the keccak arm firing under an RPX
+/// configuration — which is the precise failure this dispatch exists to make
+/// impossible, so it must not also be the failure the test cannot see.
+#[cfg(feature = "cuda")]
+static GPU_GRIND_CALLS_RPX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(feature = "cuda")]
 pub fn gpu_grind_calls() -> u64 {
     GPU_GRIND_CALLS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Successful RPX device grinds. Zero under a keccak configuration.
+#[cfg(feature = "cuda")]
+pub fn gpu_grind_calls_rpx() -> u64 {
+    GPU_GRIND_CALLS_RPX.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zeroes BOTH counters — a measuring caller resets once and reads both, so an
+/// arm cannot inherit the previous arm's count.
 #[cfg(feature = "cuda")]
 pub fn reset_gpu_grind_calls() {
     GPU_GRIND_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+    GPU_GRIND_CALLS_RPX.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Grind on the GPU when a CUDA backend is up, falling back to the CPU search
@@ -190,14 +209,21 @@ pub fn reset_gpu_grind_calls() {
 /// the verifier accepts any nonce passing [`is_valid_nonce`], and nothing
 /// downstream depends on the choice.
 ///
-/// ★ The device search is keccak's, so the dispatch is guarded on `D` being the
-/// platform keccak digest — the same `TypeId` discipline the Merkle backends'
-/// guest fast paths use. A configuration whose hash has no device kernel takes
-/// the CPU search and is CORRECT there, rather than being handed a nonce some
-/// other hash's kernel found: `is_valid_nonce::<D>` would reject such a nonce
-/// anyway, but only after the search had already cost the run, and a silent
-/// permanent fallback is exactly the failure `inner_hash_lanes`'s own note
-/// describes.
+/// ★ The dispatch is keyed on WHICH DEVICE KERNEL `D` HAS, by `TypeId` — the
+/// same discipline the Merkle backends' guest fast paths use, and the host twin
+/// of the `DeviceHash` key the commit path carries.
+///
+/// Two arms, and the endianness differs between them: keccak's kernel takes the
+/// inner hash as four LITTLE-endian lanes, RPX's as four BIG-endian felts. A
+/// hash with no kernel takes the CPU search and is correct there, rather than
+/// being handed a nonce another hash's kernel found.
+///
+/// ⚠ **This guard is load-bearing on the measurement, not only on correctness.**
+/// While it read "is `D` keccak", an RPX configuration fell to the host search:
+/// ~2^20 RPX permutations per grind, thousands of grinds per block proof. A
+/// measured WHIR block arm came in at 571 s against keccak's 39 s, and ~510 s of
+/// that was this line — the device idle, 31 host threads at 90%, with a
+/// correct, KAT-pinned `rpx_grind_search` sitting in the cubin unused.
 #[cfg(feature = "cuda")]
 pub fn generate_nonce_maybe_gpu<D>(seed: &[u8; 32], grinding_factor: u8) -> Option<u64>
 where
@@ -221,18 +247,39 @@ where
     if deterministic() {
         return generate_nonce::<D>(seed, grinding_factor);
     }
-    if core::any::TypeId::of::<D>()
-        != core::any::TypeId::of::<crate::hash::platform_keccak::PlatformKeccak256>()
-    {
+    // A hash with no device kernel takes the CPU search.
+    if !has_device_kernel::<D>() {
         return generate_nonce::<D>(seed, grinding_factor);
     }
-    let inner_lanes = inner_hash_lanes::<D>(seed, grinding_factor);
-    if let Some(nonce) = math_cuda::grinding::generate_nonce_gpu(&inner_lanes, grinding_factor) {
+    let is_keccak = core::any::TypeId::of::<D>()
+        == core::any::TypeId::of::<crate::hash::platform_keccak::PlatformKeccak256>();
+
+    // Each arm reads the SAME 32 bytes in its own byte order — see
+    // `math_cuda::grinding`'s header for what crossing them does.
+    let found = if is_keccak {
+        math_cuda::grinding::generate_nonce_gpu(
+            &inner_hash_lanes::<D>(seed, grinding_factor),
+            grinding_factor,
+        )
+    } else {
+        math_cuda::grinding::generate_nonce_rpx_gpu(
+            &inner_hash_felts::<D>(seed, grinding_factor),
+            grinding_factor,
+        )
+    };
+
+    if let Some(nonce) = found {
         // Validate unconditionally (one host hash against the ~2^grinding_factor
         // device search): a kernel/driver defect must degrade to the CPU search,
-        // never append an unverifiable nonce to the transcript.
+        // never append an unverifiable nonce to the transcript. This is also
+        // what would catch the two byte orders being crossed — the nonce would
+        // be valid under a message the host never hashed.
         if is_valid_nonce::<D>(seed, nonce, grinding_factor) {
-            GPU_GRIND_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if is_keccak {
+                GPU_GRIND_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                GPU_GRIND_CALLS_RPX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             return Some(nonce);
         }
         // eprintln, not log::warn: the CLI initialises env_logger with no
@@ -309,4 +356,39 @@ where
 {
     let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
     core::array::from_fn(|i| u64::from_le_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
+/// ★ The inner hash as the four BIG-endian `u64`s an ALGEBRAIC sponge absorbs —
+/// the form the RPX device search takes as input.
+///
+/// ⚠ The endianness is the whole difference from [`inner_hash_lanes`], and it is
+/// not cosmetic. `felts_from_bytes` reads consecutive eight-byte groups
+/// big-endian, so these four `u64`s ARE the felts the host sponge absorbs;
+/// keccak reads its lanes little-endian. Crossing the two compiles and runs, and
+/// produces a device search for a nonce under a message the host never hashes —
+/// every returned nonce rejected, the fallback taken on every grind, and nothing
+/// louder than one warning line to say so. That is why there are two named
+/// functions and not one with a flag.
+///
+/// The four values are already canonical: the inner hash is an algebraic
+/// digest's own output, which `digest_to_commitment` writes as four canonical
+/// big-endian `u64`s. Nothing here reduces them, and the device does not either.
+pub fn inner_hash_felts<D>(seed: &[u8; 32], grinding_factor: u8) -> [u64; 4]
+where
+    D: Digest + OutputSizeUser<OutputSize = U32> + 'static,
+{
+    let inner_hash = get_inner_hash::<D>(seed, grinding_factor);
+    core::array::from_fn(|i| u64::from_be_bytes(inner_hash[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
+/// Does `D` have a device grind kernel, and therefore an arm above?
+///
+/// The one place the supported set is written down. A hash added to
+/// `math_cuda::grinding` without a line here silently keeps grinding on the
+/// host, which is the failure that cost a measured block arm 510 seconds.
+#[cfg(feature = "cuda")]
+fn has_device_kernel<D: 'static>() -> bool {
+    let id = core::any::TypeId::of::<D>();
+    id == core::any::TypeId::of::<crate::hash::platform_keccak::PlatformKeccak256>()
+        || id == core::any::TypeId::of::<crate::hash::rpx::Rpx256Digest>()
 }
