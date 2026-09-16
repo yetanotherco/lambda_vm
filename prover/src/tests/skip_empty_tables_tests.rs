@@ -303,6 +303,70 @@ fn no_present_table_contributes_zero_to_the_bus() {
     println!("always-present tables, not at risk here: {fixed_seen:?}");
 }
 
+/// The forgery the tests above describe, driven through the real entry point.
+/// `weigh_the_bus` stops at `multi_verify_views` with a bare transcript: no
+/// statement absorbed, no `validate`, no sub-proof cross-check. A real attacker
+/// deletes the sub-proof *and* zeroes the count, which leaves the cross-check
+/// balanced — both sides drop by one — so the forgery passes every earlier gate
+/// and arrives at the bus. That is the path this pins, and nothing else did.
+#[test]
+fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_mul_8");
+    let opts = ProofOptions::default_test_options();
+    let vm_proof = crate::prove_with_options(&elf_bytes, &opts, &Default::default())
+        .expect("the fixture must prove");
+    assert!(
+        crate::verify_with_options(&vm_proof, &elf_bytes, &opts, None, None)
+            .expect("honest verify must not error"),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+    assert_eq!(
+        vm_proof.table_counts.mul, 1,
+        "the fixture must carry exactly one MUL table"
+    );
+
+    // Ask the AIR set where MUL sits rather than recomputing the table order by
+    // hand here — that order is exactly what a stale copy would get wrong.
+    let elf = Elf::load(&elf_bytes).expect("valid ELF");
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &elf,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+        vm_proof.proof.proofs.len(),
+    )
+    .expect("page configs");
+    let airs = VmAirs::new(
+        &elf,
+        &opts,
+        false,
+        &page_configs,
+        &vm_proof.table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let mul_at = airs
+        .air_refs()
+        .iter()
+        .position(|air| air.name().starts_with("MUL"))
+        .expect("MUL is in the AIR set of a program that multiplies");
+
+    let mut forged = vm_proof;
+    forged.proof.proofs.remove(mul_at);
+    forged.table_counts.mul = 0;
+
+    // `Ok(false)` rather than `Err` is the point: the statement is well formed
+    // and the cross-check balances, so what refused this proof is the
+    // verification itself, not a malformed-input guard.
+    assert!(
+        !crate::verify_with_options(&forged, &elf_bytes, &opts, None, None)
+            .expect("a balanced forgery must be a verification failure, not an error"),
+        "a proof with its MUL table deleted and declared away must not verify"
+    );
+}
+
 /// A program that never multiplies or divides gets no MUL and no DVRM table,
 /// and still verifies.
 #[test]
