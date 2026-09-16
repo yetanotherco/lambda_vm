@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-rpx-host-kat test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -549,6 +549,7 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	# own tests only execute here. See the `lint` target for why an instrument
 	# nobody runs is worth a line in the build.
 	cargo test -p crypto --features hash-metrics
+	$(MAKE) test-rpx-host-kat
 
 # === Quick test shortcuts ===
 
@@ -556,6 +557,28 @@ test: compile-programs test-syscalls test-ethrex-crypto
 # prebuilt guest ELFs, so build them first.
 test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
+
+# ★ The RPX device kernel's arithmetic, checked WITHOUT a GPU.
+#
+# `kernels/rpx.cu` is compiled as ordinary host C++ through `cuda_host_shim.h`,
+# so its field primitives, MDS, S-boxes, cubic extension, seven-round schedule,
+# leaf sponge, Merkle parent and every leaf kernel's read pattern are pinned in
+# seconds on a laptop. That matters here because GPU CI runs only on
+# merge_group, so without this the two WHIR coset kernels — which exist nowhere
+# else — would reach a GPU unchecked.
+#
+# ⚠ Necessary, never sufficient: it cannot tell you whether nvcc accepts the
+# file, nor anything about execution rather than arithmetic (grid indexing,
+# register pressure, local-memory spills). Those still belong to the GPU tests.
+HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
+
+test-rpx-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
+	./target/host_kat/rpx_host_kat
 
 # Prover tests only
 test-prover: compile-recursion-elfs

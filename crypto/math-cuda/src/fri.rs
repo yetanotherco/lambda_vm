@@ -182,7 +182,13 @@ impl FriCommitState {
                     .launch(kcfg)?;
             }
         }
-        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        build_inner_tree_levels(
+            self.stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+            crate::DeviceHash::Keccak256,
+        )?;
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into

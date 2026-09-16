@@ -425,10 +425,23 @@ where
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
     let attempt = match &f.resident {
-        Some((store, parts)) => {
-            crate::gpu::commit_resident(store, parts, num_vars, config.log_blowup, first, transient)
-        }
-        None => crate::gpu::commit_parts(&f.parts, num_vars, config.log_blowup, first, transient),
+        Some((store, parts)) => crate::gpu::commit_resident(
+            store,
+            parts,
+            num_vars,
+            config.log_blowup,
+            first,
+            transient,
+            H::DEVICE,
+        ),
+        None => crate::gpu::commit_parts(
+            &f.parts,
+            num_vars,
+            config.log_blowup,
+            first,
+            transient,
+            H::DEVICE,
+        ),
     };
     let commitment = match attempt {
         Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
@@ -831,7 +844,7 @@ where
         Codeword::Host(values) => CodewordCommitment::from_codeword(values, log_folding),
         Codeword::Device(device) => {
             let nodes = device
-                .commit(log_folding)
+                .commit(log_folding, H::DEVICE)
                 .ok_or(Error::DeviceFailed { stage: "fold tree" })?;
             CodewordCommitment::from_device(device, nodes, log_folding)
         }

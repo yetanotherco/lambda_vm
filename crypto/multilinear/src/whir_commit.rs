@@ -162,7 +162,7 @@ where
             });
         }
 
-        if let Some(nodes) = crate::gpu::commit_tree_ext3(&codeword, log_folding) {
+        if let Some(nodes) = crate::gpu::commit_tree_ext3(&codeword, log_folding, H::DEVICE) {
             let tree = Tree::<F, H>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
             return Ok(Self {
                 tree,
@@ -361,7 +361,7 @@ where
                 // device: the tree has to be rebuilt there because that is
                 // where the codeword is.
                 Ok(device
-                    .paths(self.log_folding, indices)
+                    .paths(self.log_folding, indices, H::DEVICE)
                     .ok_or(Error::DeviceFailed {
                         stage: "opening paths",
                     })?

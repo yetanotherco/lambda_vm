@@ -128,6 +128,7 @@ impl Drop for PinnedStaging {
 const ARITH_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arith.cubin"));
 const NTT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
 const KECCAK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keccak.cubin"));
+const RPX_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpx.cubin"));
 const BARY_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/barycentric.cubin"));
 const DEEP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deep.cubin"));
 const FRI_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fri.cubin"));
@@ -214,6 +215,18 @@ pub struct Backend {
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
+
+    // rpx.cubin — the algebraic hash's twins of the keccak entries above.
+    // Only the ones the WHIR path reaches are bound: the coset leaves, the two
+    // tree compressors and the grind. The row-group leaf kernels the per-table
+    // branch uses are in the cubin but are not loaded here, because nothing on
+    // this path launches them and an unused handle is a claim that something
+    // does.
+    pub rpx_leaves_base_coset: CudaFunction,
+    pub rpx_leaves_ext3_coset: CudaFunction,
+    pub rpx_merkle_level: CudaFunction,
+    pub rpx_merkle_tail: CudaFunction,
+    pub rpx_grind_search: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -494,6 +507,7 @@ impl Backend {
         let arith = ctx.load_module(Ptx::from_binary(ARITH_CUBIN.to_vec()))?;
         let ntt = ctx.load_module(Ptx::from_binary(NTT_CUBIN.to_vec()))?;
         let keccak = ctx.load_module(Ptx::from_binary(KECCAK_CUBIN.to_vec()))?;
+        let rpx = ctx.load_module(Ptx::from_binary(RPX_CUBIN.to_vec()))?;
         let bary = ctx.load_module(Ptx::from_binary(BARY_CUBIN.to_vec()))?;
         let deep = ctx.load_module(Ptx::from_binary(DEEP_CUBIN.to_vec()))?;
         let fri = ctx.load_module(Ptx::from_binary(FRI_CUBIN.to_vec()))?;
@@ -596,6 +610,11 @@ impl Backend {
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            rpx_leaves_base_coset: rpx.load_function("rpx_leaves_base_coset")?,
+            rpx_leaves_ext3_coset: rpx.load_function("rpx_leaves_ext3_coset")?,
+            rpx_merkle_level: rpx.load_function("rpx_merkle_level")?,
+            rpx_merkle_tail: rpx.load_function("rpx_merkle_tail")?,
+            rpx_grind_search: rpx.load_function("rpx_grind_search")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary

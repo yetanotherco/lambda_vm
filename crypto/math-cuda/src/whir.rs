@@ -56,7 +56,11 @@ impl DeviceCodeword {
     /// A leaf is the `2^log_folding` coset that folds onto one position, and
     /// the layout is the host's: `2*num_leaves - 1` nodes of 32 bytes, root
     /// first.
-    fn build_tree(&self, log_folding: usize) -> Result<(CudaSlice<u8>, usize)> {
+    fn build_tree(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<(CudaSlice<u8>, usize)> {
         let num_leaves = self.elements >> log_folding;
         assert!(num_leaves >= 2, "tree needs at least two leaves");
         let be = backend()?;
@@ -70,10 +74,15 @@ impl DeviceCodeword {
             let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
             let num_leaves_u64 = num_leaves as u64;
             let block = 1u64 << log_folding;
-            let kernel = if self.base {
-                &be.keccak256_leaves_base_coset
-            } else {
-                &be.keccak256_leaves_ext3_coset
+            // ★ The hash is chosen HERE, not by the host backend that will
+            // label the result. `hash` is the key the caller's `WhirHash`
+            // supplied, so a tree labelled RPX was hashed by RPX's kernels or
+            // was not built here at all.
+            let kernel = match (hash, self.base) {
+                (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
+                (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
+                (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
+                (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
             };
             unsafe {
                 self.stream
@@ -85,7 +94,7 @@ impl DeviceCodeword {
                     .launch(keccak_launch_cfg(num_leaves_u64))?;
             }
         }
-        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves)?;
+        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
         Ok((nodes, num_leaves))
     }
 
@@ -94,8 +103,8 @@ impl DeviceCodeword {
     /// The tree itself is dropped: the only other thing anyone wants from it
     /// is a path per query, and by then the queries are known — see
     /// [`paths`](Self::paths).
-    pub fn commit(&self, log_folding: usize) -> Result<[u8; 32]> {
-        let (nodes, _) = self.build_tree(log_folding)?;
+    pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
+        let (nodes, _) = self.build_tree(log_folding, hash)?;
         let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
         self.stream.synchronize()?;
         let mut root = [0u8; 32];
@@ -105,8 +114,8 @@ impl DeviceCodeword {
 
     /// The whole tree in the host node layout — what a caller that walks it
     /// here needs, and what the parity test compares against.
-    pub fn nodes_to_host(&self, log_folding: usize) -> Result<Vec<u8>> {
-        let (nodes, _) = self.build_tree(log_folding)?;
+    pub fn nodes_to_host(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<Vec<u8>> {
+        let (nodes, _) = self.build_tree(log_folding, hash)?;
         let out = self.stream.clone_dtoh(&nodes)?;
         self.stream.synchronize()?;
         Ok(out)
@@ -119,8 +128,13 @@ impl DeviceCodeword {
     /// it back costs ten times the rehash, because a pageable copy of half a
     /// gigabyte is the slowest thing in the commit. What the host needs of a
     /// tree is a kilobyte per query.
-    pub fn paths(&self, log_folding: usize, positions: &[u32]) -> Result<Vec<u8>> {
-        let (nodes, num_leaves) = self.build_tree(log_folding)?;
+    pub fn paths(
+        &self,
+        log_folding: usize,
+        positions: &[u32],
+        hash: crate::DeviceHash,
+    ) -> Result<Vec<u8>> {
+        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
         crate::merkle::gather_merkle_paths_dev(&nodes, num_leaves, positions, &self.stream)
     }
 
@@ -184,12 +198,14 @@ pub fn commit_codeword_parts(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
     commit_from(
         Source::Parts { parts, log_evals },
         log_blowup,
         log_folding,
         transient,
+        hash,
     )
 }
 
@@ -203,6 +219,7 @@ pub fn commit_codeword_resident(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
     commit_from(
         Source::Resident {
@@ -213,6 +230,7 @@ pub fn commit_codeword_resident(
         log_blowup,
         log_folding,
         transient,
+        hash,
     )
 }
 
@@ -269,8 +287,15 @@ pub fn commit_codeword(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
-    commit_from(Source::Whole(evals), log_blowup, log_folding, transient)
+    commit_from(
+        Source::Whole(evals),
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+    )
 }
 
 fn commit_from(
@@ -278,6 +303,7 @@ fn commit_from(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
     let log_evals = source.log_evals();
     let log_n = log_evals + log_blowup as u64;
@@ -351,7 +377,7 @@ fn commit_from(
         base: true,
         _room: Arc::new(room),
     };
-    let root = codeword.commit(log_folding)?;
+    let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
 }
 
@@ -444,11 +470,12 @@ pub fn commit_codeword_to_host(
     evals: &[u64],
     log_blowup: usize,
     log_folding: usize,
+    hash: crate::DeviceHash,
 ) -> Result<(Vec<u64>, Vec<u8>)> {
-    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding, true)?;
+    let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding, true, hash)?;
     let values = codeword.stream.clone_dtoh(codeword.buffer.as_ref())?;
     codeword.stream.synchronize()?;
-    let nodes = codeword.nodes_to_host(log_folding)?;
+    let nodes = codeword.nodes_to_host(log_folding, hash)?;
     Ok((values, nodes))
 }
 
@@ -650,7 +677,11 @@ pub fn fold_codeword_ext3(
 ///
 /// The codeword itself stays where the caller has it: a folded codeword is the
 /// next round's input on the host side, so only the tree comes back.
-pub fn commit_codeword_ext3(codeword: &[u64], log_folding: usize) -> Result<Vec<u8>> {
+pub fn commit_codeword_ext3(
+    codeword: &[u64],
+    log_folding: usize,
+    hash: crate::DeviceHash,
+) -> Result<Vec<u8>> {
     assert!(
         codeword.len().is_multiple_of(3),
         "three u64 per ext3 element"
@@ -679,7 +710,10 @@ pub fn commit_codeword_ext3(codeword: &[u64], log_folding: usize) -> Result<Vec<
         let block = 1u64 << log_folding;
         unsafe {
             stream
-                .launch_builder(&be.keccak256_leaves_ext3_coset)
+                .launch_builder(match hash {
+                    crate::DeviceHash::Keccak256 => &be.keccak256_leaves_ext3_coset,
+                    crate::DeviceHash::Rpx256 => &be.rpx_leaves_ext3_coset,
+                })
                 .arg(&values)
                 .arg(&num_leaves_u64)
                 .arg(&block)
@@ -687,7 +721,7 @@ pub fn commit_codeword_ext3(codeword: &[u64], log_folding: usize) -> Result<Vec<
                 .launch(keccak_launch_cfg(num_leaves_u64))?;
         }
     }
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves)?;
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
 
     let out = stream.clone_dtoh(&nodes)?;
     stream.synchronize()?;

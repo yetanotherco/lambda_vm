@@ -764,6 +764,7 @@ where
 pub(crate) fn commit_tree_ext3<F>(
     codeword: &[math::field::element::FieldElement<F>],
     log_folding: usize,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<Vec<[u8; 32]>>
 where
     F: math::field::traits::IsField + 'static,
@@ -783,7 +784,8 @@ where
     // SAFETY: `F == Ext3`, three transparent `u64` limbs per element.
     let raw =
         unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
-    let nodes = math_cuda::whir::commit_codeword_ext3(raw, log_folding).ok()?;
+    let nodes =
+        math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda()).ok()?;
     let nodes = nodes_in_place(nodes)?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(nodes)
@@ -793,6 +795,7 @@ where
 pub(crate) fn commit_tree_ext3<F>(
     _codeword: &[math::field::element::FieldElement<F>],
     _log_folding: usize,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<Vec<[u8; 32]>>
 where
     F: math::field::traits::IsField + 'static,
@@ -2035,6 +2038,7 @@ pub(crate) fn commit_parts<F>(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -2068,9 +2072,15 @@ where
             )
         })
         .collect();
-    let (codeword, root) =
-        math_cuda::whir::commit_codeword_parts(&raw, log_evals, log_blowup, log_folding, transient)
-            .ok()?;
+    let (codeword, root) = math_cuda::whir::commit_codeword_parts(
+        &raw,
+        log_evals,
+        log_blowup,
+        log_folding,
+        transient,
+        hash.into_math_cuda(),
+    )
+    .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -2084,6 +2094,7 @@ pub(crate) fn commit_resident(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
@@ -2099,6 +2110,7 @@ pub(crate) fn commit_resident(
         log_blowup,
         log_folding,
         transient,
+        hash.into_math_cuda(),
     )
     .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2113,6 +2125,7 @@ pub(crate) fn commit_resident(
     _log_blowup: usize,
     _log_folding: usize,
     _transient: bool,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     None
 }
@@ -2124,6 +2137,7 @@ pub(crate) fn commit_parts<F>(
     _log_blowup: usize,
     _log_folding: usize,
     _transient: bool,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -2157,8 +2171,12 @@ impl DeviceCodeword {
     /// The tree is not kept: the only other thing a proof wants from it is a
     /// path per query, and [`paths`](Self::paths) rebuilds it then, when the
     /// queries are known — see the note there.
-    pub(crate) fn commit(&self, log_folding: usize) -> Option<[u8; 32]> {
-        let root = self.0.commit(log_folding).ok()?;
+    pub(crate) fn commit(
+        &self,
+        log_folding: usize,
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<[u8; 32]> {
+        let root = self.0.commit(log_folding, hash.into_math_cuda()).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(root)
     }
@@ -2168,13 +2186,17 @@ impl DeviceCodeword {
         &self,
         log_folding: usize,
         indices: &[usize],
+        hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
         let leaves = self.0.elements() >> log_folding;
         if indices.iter().any(|index| *index >= leaves) {
             return None;
         }
         let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
-        let bytes = self.0.paths(log_folding, &positions).ok()?;
+        let bytes = self
+            .0
+            .paths(log_folding, &positions, hash.into_math_cuda())
+            .ok()?;
         let depth = leaves.trailing_zeros() as usize;
         let nodes = nodes_in_place(bytes)?;
         Some(nodes.chunks_exact(depth).map(<[_]>::to_vec).collect())
@@ -2297,7 +2319,11 @@ impl DeviceCodeword {
         match self.0 {}
     }
 
-    pub(crate) fn commit(&self, _log_folding: usize) -> Option<[u8; 32]> {
+    pub(crate) fn commit(
+        &self,
+        _log_folding: usize,
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<[u8; 32]> {
         match self.0 {}
     }
 
@@ -2305,6 +2331,7 @@ impl DeviceCodeword {
         &self,
         _log_folding: usize,
         _indices: &[usize],
+        _hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
         match self.0 {}
     }

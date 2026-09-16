@@ -23,15 +23,21 @@
 //! swap is not a proof-format change**, and `stacked_eval`'s
 //! `the_two_hashes_serialize_to_the_same_length` is what holds that to it.
 //!
-//! # The device, and what is NOT here yet
+//! # The device
 //!
-//! Under `cuda` the leaf and parent hashing happens in kernels, and the host
-//! backend is only the label on the tree they built — so a second hash needs a
-//! device dispatch key on this trait, and the `math-cuda` entry points need to
-//! read it. That arrives with the kernels themselves (H2). It is deliberately
-//! absent here: a dispatch key with one variant that nothing branches on is a
-//! knob no test can observe, and the guard and the thing it guards belong in
-//! one commit.
+//! Under `cuda` the leaf and parent hashing happens in KERNELS, and the host
+//! backend is only the label on the tree they built. So a configuration must
+//! also name which kernel family the device has to run:
+//! [`WhirHash::DEVICE`] is that name, handed down to `math-cuda`'s tree entry
+//! points, which match on it exhaustively. A tree labelled `Self` was therefore
+//! hashed by `Self`'s kernels or was not built on the device at all — never by
+//! another hash's kernels wearing this name.
+//!
+//! The key is a type of this crate's own rather than `math_cuda::DeviceHash`
+//! directly, because `math-cuda` is an optional dependency and the trait has to
+//! exist on a build without it. [`DeviceHashKey::into_math_cuda`] is the bridge,
+//! and it is total in both directions with the pairing asserted at compile time,
+//! so the two enums cannot drift apart or be cross-wired.
 
 use crypto::fiat_shamir::transcript_hash::{
     KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
@@ -47,6 +53,57 @@ use crate::whir_commit::Commitment;
 /// grinding seed is `transcript.state()`.
 pub type GrindingDigest<H> = <<H as WhirHash>::Transcript as TranscriptHash>::Digest;
 
+/// ★ Which kernel family the device must run for a configuration's trees.
+///
+/// Mirrors `math_cuda::DeviceHash` and exists separately only so this trait
+/// compiles without the optional `math-cuda` dependency. The two are kept in
+/// step by [`DeviceHashKey::into_math_cuda`] plus the compile-time pairing
+/// assertion beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceHashKey {
+    /// Keccak-256 at both the leaf and the parent layer.
+    Keccak256,
+    /// RPX256 (XHash12) at both layers.
+    Rpx256,
+}
+
+impl DeviceHashKey {
+    /// The key `math-cuda` dispatches on.
+    ///
+    /// Total, and exhaustive in both directions: a variant added on either side
+    /// without its twin is a compile error here rather than a silent
+    /// fallthrough to whichever hash happened to be first.
+    #[cfg(feature = "cuda")]
+    pub const fn into_math_cuda(self) -> math_cuda::DeviceHash {
+        match self {
+            Self::Keccak256 => math_cuda::DeviceHash::Keccak256,
+            Self::Rpx256 => math_cuda::DeviceHash::Rpx256,
+        }
+    }
+
+    /// The name a tree built under this key may be called by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Keccak256 => "keccak256",
+            Self::Rpx256 => "rpx256",
+        }
+    }
+}
+
+/// ✓ The bridge is a bijection, checked at compile time rather than by reading
+/// it: every key maps to the twin of the same name, and the names agree.
+#[cfg(feature = "cuda")]
+const _: () = {
+    const fn paired(key: DeviceHashKey, twin: math_cuda::DeviceHash) -> bool {
+        key.into_math_cuda() as u8 == twin as u8
+    }
+    assert!(paired(
+        DeviceHashKey::Keccak256,
+        math_cuda::DeviceHash::Keccak256
+    ));
+    assert!(paired(DeviceHashKey::Rpx256, math_cuda::DeviceHash::Rpx256));
+};
+
 /// ★ One WHIR hash configuration.
 ///
 /// Implementing it is the whole of adding a hash to this path: a unit struct, a
@@ -58,6 +115,13 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
     /// hash, so two configurations' challenge streams diverge at the first
     /// squeeze and a tag would separate nothing that is not already separate.
     const NAME: &'static str;
+
+    /// The kernel family the device must run for trees labelled `Self`.
+    ///
+    /// Not `#[cfg(feature = "cuda")]`: a configuration names its device hash on
+    /// every build, so a non-cuda build cannot define a configuration that would
+    /// have had nothing to dispatch on.
+    const DEVICE: DeviceHashKey;
 
     /// The Fiat-Shamir configuration this commitment hash is paired with — the
     /// sponge's hash, and the one the proof-of-work grind computes over.
@@ -77,6 +141,8 @@ pub struct KeccakWhir;
 
 impl WhirHash for KeccakWhir {
     const NAME: &'static str = "keccak256";
+
+    const DEVICE: DeviceHashKey = DeviceHashKey::Keccak256;
 
     type Transcript = KeccakTranscriptHash;
 
@@ -101,6 +167,8 @@ pub struct RpxWhir;
 
 impl WhirHash for RpxWhir {
     const NAME: &'static str = "rpx256";
+
+    const DEVICE: DeviceHashKey = DeviceHashKey::Rpx256;
 
     type Transcript = RpxTranscriptHash;
 
@@ -148,4 +216,29 @@ const _: fn() = || {
     assert_same::<RpxTranscriptHash>(
         core::marker::PhantomData::<(RpxTranscriptHash, <RpxWhir as WhirHash>::Transcript)>,
     );
+};
+
+/// ✓ A configuration and its device key answer to the SAME name.
+///
+/// Both are string constants written by hand, so nothing but this stops
+/// `RpxWhir::NAME` from saying `rpx256` while its kernels are filed under
+/// `keccak256` — which is precisely the mislabelling the key exists to prevent,
+/// reintroduced one level up.
+const _: () = {
+    const fn same(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(same(KeccakWhir::NAME, KeccakWhir::DEVICE.name()));
+    assert!(same(RpxWhir::NAME, RpxWhir::DEVICE.name()));
 };
