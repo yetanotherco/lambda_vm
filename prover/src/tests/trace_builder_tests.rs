@@ -1799,7 +1799,7 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
     // the end-of-run finalization; a bound elsewhere, since that finalization
     // appends after the last cycle and can spill the tail into another chunk.
     assert_eq!(
-        phase.leftover.cycles(),
+        phase.walked.leftover.cycles(),
         logs.len(),
         "the walk executed a different number of cycles than the straight run"
     );
@@ -1821,7 +1821,7 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
         (TableKind::Store, resident.stores.len()),
     ] {
         assert_eq!(
-            phase.leftover.emitted(kind),
+            phase.walked.leftover.emitted(kind),
             closed_of(kind),
             "{kind:?}: the leftover disagrees with what was committed"
         );
@@ -1862,21 +1862,9 @@ fn the_two_phases_cover_every_chunked_table() {
 
     let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
     let closed = phase.closed.clone();
-    let artifacts =
-        crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
-    let image = crate::tables::trace_builder::build_initial_image(&elf, &[]);
-    let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
-    let rest = crate::commit_phase::commit_remaining(
-        phase.leftover,
-        &artifacts,
-        &image,
-        &register_init,
-        &[],
-        &max_rows,
-        &proof_options,
-    )
-    .expect("challenge")
-    .chunks;
+    let (rest, _) =
+        crate::commit_phase::commit_remaining(phase.walked, &[], &max_rows, &proof_options)
+            .expect("challenge");
 
     let mut got: HashMap<(TableKind, usize), _> = HashMap::new();
     for (kind, chunk, root) in closed.into_iter().chain(rest) {
@@ -2213,16 +2201,12 @@ fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
 /// to carry rather than on an op list it could keep.
 #[test]
 fn the_end_of_run_tables_match_the_ordinary_build() {
-    use crate::tables::register::register_init_from_entry_point;
-    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use crate::tables::trace_builder::Traces as T;
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
-    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
-    let image = build_initial_image(&elf, &[]);
-    let register_init = register_init_from_entry_point(elf.entry_point);
     // Not a power of two, so the CPU chunks pad and REGISTER's final PC token
     // depends on a padding count the walk had to accumulate.
     let max_rows = crate::tables::MaxRowsConfig {
@@ -2233,16 +2217,9 @@ fn the_end_of_run_tables_match_the_ordinary_build() {
         .expect("blowup 2 is valid");
 
     let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
-    let rest = crate::commit_phase::commit_remaining(
-        phase.leftover,
-        &artifacts,
-        &image,
-        &register_init,
-        &[],
-        &max_rows,
-        &proof_options,
-    )
-    .expect("challenge");
+    let (_, rest) =
+        crate::commit_phase::commit_remaining(phase.walked, &[], &max_rows, &proof_options)
+            .expect("challenge");
 
     let logs = Executor::new(&elf, vec![])
         .expect("executor")

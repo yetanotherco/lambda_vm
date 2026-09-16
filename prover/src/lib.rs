@@ -21,6 +21,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+pub mod pass;
 pub(crate) mod streaming;
 pub use stark::profile_markers;
 pub mod recursion;
