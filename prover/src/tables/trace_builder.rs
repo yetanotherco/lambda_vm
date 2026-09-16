@@ -2983,9 +2983,81 @@ pub(crate) struct RoutedOps {
     pub(crate) cpu32_ops: Vec<cpu32::Cpu32Operation>,
 }
 
+/// The tables that are a pure per-op function of the CPU ops, with no later
+/// source appending to them.
+///
+/// Extracted so the all-at-once path and the Commit-phase walk derive them with
+/// the same code: a table closed mid-walk has to be the table the finished run
+/// would have produced, and two copies of a filter+map drift.
+///
+/// DVRM, MUL and LT are deliberately not here. Each takes ops from more than
+/// one source — CPU32 appends to DVRM and MUL, DVRM appends to MUL and LT — and
+/// the finished run concatenates those sources whole, so deriving them per
+/// segment would interleave them differently and cut the chunks elsewhere.
+struct DerivedFromCpu {
+    branch_ops: Vec<BranchOperation>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+}
+
+fn derive_from_cpu(cpu_ops: &[CpuOperation]) -> DerivedFromCpu {
+    // BRANCH: CPU ops where branch_cond = true.
+    let branch_ops: Vec<BranchOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.branch_cond)
+        .map(|op| {
+            BranchOperation::new(
+                op.decode.pc,
+                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                op.rv1,        // register value must match the CPU's BRANCH bus signature
+                op.decode.fields.jalr(),
+            )
+        })
+        .collect();
+    // EQ: BEQ/BNE (invert = alu_flags bit 6).
+    let eq_ops: Vec<eq::EqOperation> = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+        .collect();
+    // BYTEWISE: AND/OR/XOR (op = alu_op).
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+        .collect();
+    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
+    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
+    // table row). The MEMORY bus and the STORE chip's MEMW write share the base
+    // timestamp (spec store.toml uses one `timestamp` for both).
+    let store_ops: Vec<store::StoreOperation> = cpu_ops
+        .iter()
+        .filter(|op| op.decode.fields.is_store())
+        .map(|op| {
+            store::StoreOperation::new(
+                op.res,
+                op.timestamp,
+                op.rv2,
+                op.decode.fields.mem_bytes() as u8,
+            )
+        })
+        .collect();
+
+    DerivedFromCpu {
+        branch_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+    }
+}
+
 /// The tables this walk can close mid-execution: their ops come straight out of
 /// `collect_ops_from_cpu` and nothing appends to them afterwards.
-pub const CHUNKED_KINDS: [TableKind; 7] = [
+pub const CHUNKED_KINDS: [TableKind; 11] = [
     TableKind::Cpu,
     TableKind::Memw,
     TableKind::MemwAligned,
@@ -2993,6 +3065,10 @@ pub const CHUNKED_KINDS: [TableKind; 7] = [
     TableKind::Load,
     TableKind::Shift,
     TableKind::Cpu32,
+    TableKind::Branch,
+    TableKind::Eq,
+    TableKind::Bytewise,
+    TableKind::Store,
 ];
 
 /// Chunk limit for one kind.
@@ -3026,6 +3102,10 @@ impl RoutedOps {
             TableKind::Load => self.load_ops.len(),
             TableKind::Shift => self.shift_ops.len(),
             TableKind::Cpu32 => self.cpu32_ops.len(),
+            TableKind::Branch => self.branch_ops.len(),
+            TableKind::Eq => self.eq_ops.len(),
+            TableKind::Bytewise => self.bytewise_ops.len(),
+            TableKind::Store => self.store_ops.len(),
             _ => 0,
         }
     }
@@ -3063,6 +3143,10 @@ impl RoutedOps {
             TableKind::Load => drain!(self.load_ops, load::generate_load_trace),
             TableKind::Shift => drain!(self.shift_ops, shift::generate_shift_trace),
             TableKind::Cpu32 => drain!(self.cpu32_ops, cpu32::generate_cpu32_trace),
+            TableKind::Branch => drain!(self.branch_ops, branch::generate_branch_trace),
+            TableKind::Eq => drain!(self.eq_ops, eq::generate_eq_trace),
+            TableKind::Bytewise => drain!(self.bytewise_ops, bytewise::generate_bytewise_trace),
+            TableKind::Store => drain!(self.store_ops, store::generate_store_trace),
             other => unreachable!("{other:?} is not closed mid-walk"),
         }
     }
@@ -3388,19 +3472,12 @@ fn collect_all_ops(
         general: memw_ops,
     } = memw;
 
-    // Collect BRANCH operations from CPU ops where branch_cond = true
-    let branch_ops: Vec<BranchOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.branch_cond)
-        .map(|op| {
-            BranchOperation::new(
-                op.decode.pc,
-                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
-            )
-        })
-        .collect();
+    let DerivedFromCpu {
+        branch_ops,
+        eq_ops,
+        bytewise_ops,
+        store_ops,
+    } = derive_from_cpu(&cpu_ops);
 
     // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
     // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
@@ -3425,39 +3502,6 @@ fn collect_all_ops(
             (
                 DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
                 f.alu_muldiv(),
-            )
-        })
-        .collect();
-
-    // Collect the ALU/MEMORY chip ops (non-word rows).
-    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
-        .collect();
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
-        .filter(|op| {
-            let f = &op.decode.fields;
-            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
-        })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
-        .collect();
-    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
-    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
-    // table row).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            // The MEMORY bus and the STORE chip's MEMW write share the base
-            // timestamp (spec store.toml uses one `timestamp` for both).
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
             )
         })
         .collect();
@@ -5047,6 +5091,14 @@ impl Traces {
             cycles_so_far += cpu.len();
             let (memw, ld, lt, sh, _bw, _cm, _kc, c32, _ec, _ed, _hn) =
                 collect_ops_from_cpu(&cpu, &mut memory_state, &mut register_state);
+            // Derived from THIS segment's ops, before they are moved into the
+            // buffer — the buffer is drained as chunks close, so it is not the
+            // segment.
+            let derived = derive_from_cpu(&cpu);
+            buf.branch_ops.extend(derived.branch_ops);
+            buf.eq_ops.extend(derived.eq_ops);
+            buf.bytewise_ops.extend(derived.bytewise_ops);
+            buf.store_ops.extend(derived.store_ops);
             buf.cpu_ops.extend(cpu);
             buf.memw_register_rows.extend(memw.register_rows);
             buf.memw_aligned_ops.extend(memw.aligned);

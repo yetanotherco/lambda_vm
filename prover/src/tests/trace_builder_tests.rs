@@ -1420,11 +1420,18 @@ fn commit_walk_emits_the_same_chunks() {
     let register_init = register_init_from_entry_point(elf.entry_point);
     // Small enough that the walk closes several chunks before the run ends,
     // which is the case that matters — a single tail chunk would prove nothing.
+    // Small enough that every table under test closes chunks mid-walk. Without
+    // that, a table with a single chunk would compare an empty prefix and the
+    // check would pass while proving nothing about it.
     let max_rows = crate::tables::MaxRowsConfig {
         cpu: 1 << 15,
-        memw: 1 << 15,
-        load: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
         shift: 1 << 15,
+        branch: 1 << 12,
+        eq: 1 << 12,
+        bytewise: 1 << 12,
+        store: 1 << 12,
         ..Default::default()
     };
 
@@ -1490,10 +1497,29 @@ fn commit_walk_emits_the_same_chunks() {
             assert_eq!(*data, flat(&want[i]), "{kind:?} chunk {i} differs");
         }
     };
+    // Only the tables this fixture actually splits are worth asserting on: a
+    // table with one chunk compares an empty prefix and proves nothing.
+    let chunked: Vec<&str> = [
+        ("CPU", expected.cpus.len()),
+        ("MEMW", expected.memws.len()),
+        ("MEMW_A", expected.memw_aligneds.len()),
+        ("MEMW_R", expected.memw_registers.len()),
+        ("LOAD", expected.loads.len()),
+        ("SHIFT", expected.shifts.len()),
+        ("BRANCH", expected.branches.len()),
+        ("EQ", expected.eqs.len()),
+        ("BYTEWISE", expected.bytewises.len()),
+        ("STORE", expected.stores.len()),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 1)
+    .map(|(name, _)| name)
+    .collect();
     assert!(
-        expected.cpus.len() > 1,
-        "the fixture must close at least one chunk mid-walk"
+        chunked.len() >= 3,
+        "the fixture must split at least three tables mid-walk, split: {chunked:?}"
     );
+
     check(TableKind::Cpu, &expected.cpus);
     check(TableKind::Memw, &expected.memws);
     check(TableKind::MemwAligned, &expected.memw_aligneds);
@@ -1501,6 +1527,10 @@ fn commit_walk_emits_the_same_chunks() {
     check(TableKind::Load, &expected.loads);
     check(TableKind::Shift, &expected.shifts);
     check(TableKind::Cpu32, &expected.cpu32s);
+    check(TableKind::Branch, &expected.branches);
+    check(TableKind::Eq, &expected.eqs);
+    check(TableKind::Bytewise, &expected.bytewises);
+    check(TableKind::Store, &expected.stores);
 }
 
 /// A chunk committed during the walk must carry the root the normal prover
@@ -1570,6 +1600,10 @@ fn chunks_committed_during_the_walk_carry_the_normal_roots() {
         TableKind::Load => airs.loads.get(chunk).map(|a| a.as_ref()),
         TableKind::Shift => airs.shifts.get(chunk).map(|a| a.as_ref()),
         TableKind::Cpu32 => airs.cpu32s.get(chunk).map(|a| a.as_ref()),
+        TableKind::Branch => airs.branches.get(chunk).map(|a| a.as_ref()),
+        TableKind::Eq => airs.eqs.get(chunk).map(|a| a.as_ref()),
+        TableKind::Bytewise => airs.bytewises.get(chunk).map(|a| a.as_ref()),
+        TableKind::Store => airs.stores.get(chunk).map(|a| a.as_ref()),
         _ => None,
     };
 
@@ -1609,6 +1643,10 @@ fn chunks_committed_during_the_walk_carry_the_normal_roots() {
                 TableKind::Load => &traces.loads[chunk],
                 TableKind::Shift => &traces.shifts[chunk],
                 TableKind::Cpu32 => &traces.cpu32s[chunk],
+                TableKind::Branch => &traces.branches[chunk],
+                TableKind::Eq => &traces.eqs[chunk],
+                TableKind::Bytewise => &traces.bytewises[chunk],
+                TableKind::Store => &traces.stores[chunk],
                 _ => unreachable!(),
             };
             let expected = commit_root(air, resident).expect("the resident chunk commits");
