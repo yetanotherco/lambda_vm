@@ -19,8 +19,8 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "src_incr"
-type = "DWordHL"
-desc = "$#`src` + #`step`$"
+type = ["Half", 3]
+desc = "The low three halfwords of $#`src` + #`step`$; the top one is derived by #`src_incr_top`"
 pad = 8
 
 [[variables.auxiliary]]
@@ -31,8 +31,8 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "dst_incr"
-type = "DWordHL"
-desc = "$#`dst` + #`step`$"
+type = ["Half", 3]
+desc = "The low three halfwords of $#`dst` + #`step`$; the top one is derived by #`dst_incr_top`"
 pad = 8
 
 [[variables.auxiliary]]
@@ -96,6 +96,30 @@ name = "step"
 type = "Byte"
 desc = "The stride this row advances by: eight, or one when `single` is set"
 def = ["-", 8, ["*", 7, "single"]]
+
+[[variables.virtual]]
+name = "src_carry"
+type = "Bit"
+desc = "Carry out of the least significant limb of $#`src` + #`step`$"
+def = ["*", ["^", 2, -32], ["-", ["+", ["idx", "src", 0], "step"], ["idx", "src_incr", 0], ["*", ["^", 2, 16], ["idx", "src_incr", 1]]]]
+
+[[variables.virtual]]
+name = "src_incr_top"
+type = "Half"
+desc = "The most significant halfword of $#`src` + #`step`$, reconstructed rather than stored"
+def = ["*", ["^", 2, -16], ["-", ["+", ["idx", "src", 1], "src_carry"], ["idx", "src_incr", 2]]]
+
+[[variables.virtual]]
+name = "dst_carry"
+type = "Bit"
+desc = "Carry out of the least significant limb of $#`dst` + #`step`$"
+def = ["*", ["^", 2, -32], ["-", ["+", ["idx", "dst", 0], "step"], ["idx", "dst_incr", 0], ["*", ["^", 2, 16], ["idx", "dst_incr", 1]]]]
+
+[[variables.virtual]]
+name = "dst_incr_top"
+type = "Half"
+desc = "The most significant halfword of $#`dst` + #`step`$, reconstructed rather than stored"
+def = ["*", ["^", 2, -16], ["-", ["+", ["idx", "dst", 1], "dst_carry"], ["idx", "dst_incr", 2]]]
 
 [[variables.virtual]]
 name = "first_commit"
@@ -260,35 +284,45 @@ name = "incr_decr"
 
 [[constraints.incr_decr]]
 kind = "template"
-tag = "ADDNW"
-input = ["src", ["arr", "step", 0]]
-output = ["cast", "src_incr", "DWordWL"]
-cond = ["-", "μ", "end"]
+tag = "IS_BIT"
+input = ["src_carry"]
 ref = "memmove:c:src_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "src_incr", "i"]]
-iter = ["i", 0, 3]
+iter = ["i", 0, 2]
 multiplicity = "μ"
 ref = "memmove:c:range_src_incr"
 
 [[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = ["src_incr_top"]
+multiplicity = "μ"
+ref = "memmove:c:range_src_incr_top"
+
+[[constraints.incr_decr]]
 kind = "template"
-tag = "ADDNW"
-input = ["dst", ["arr", "step", 0]]
-output = ["cast", "dst_incr", "DWordWL"]
-cond = ["-", "μ", "end"]
+tag = "IS_BIT"
+input = ["dst_carry"]
 ref = "memmove:c:dst_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "dst_incr", "i"]]
-iter = ["i", 0, 3]
+iter = ["i", 0, 2]
 multiplicity = "μ"
 ref = "memmove:c:range_dst_incr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = ["dst_incr_top"]
+multiplicity = "μ"
+ref = "memmove:c:range_dst_incr_top"
 
 [[constraints.incr_decr]]
 kind = "template"
@@ -373,7 +407,7 @@ name = "lookups"
 [[constraints.lookups]]
 kind = "interaction"
 tag = "MEMMOVE_NEXT"
-input = ["timestamp", ["cast", "src_incr", "DWordWL"], ["cast", "dst_incr", "DWordWL"], ["cast", "count_decr", "DWordWL"], "is_set", "is_commit"]
+input = ["timestamp", ["arr", ["+", ["idx", "src_incr", 0], ["*", ["^", 2, 16], ["idx", "src_incr", 1]]], ["+", ["idx", "src", 1], "src_carry"]], ["arr", ["+", ["idx", "dst_incr", 0], ["*", ["^", 2, 16], ["idx", "dst_incr", 1]]], ["+", ["idx", "dst", 1], "dst_carry"]], ["cast", "count_decr", "DWordWL"], "is_set", "is_commit"]
 multiplicity = ["-", "μ", "end"]
 ref = "memmove:c:send_next_chunk"
 

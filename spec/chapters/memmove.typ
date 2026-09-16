@@ -40,7 +40,7 @@ The #memmove chip is comprised of #nr_variables variables that are expressed usi
 = Assumptions
 #render_chip_assumptions(chip, config)
 
-These concern the _first_ row of a sequence, where the values come from the register file or from `COMMIT`; every later row receives them over `MEMMOVE_NEXT`, where @memmove:c:range_src_incr, @memmove:c:range_dst_incr and @memmove:c:range_count_decr range-check three of the four on the sending side.
+These concern the _first_ row of a sequence, where the values come from the register file or from `COMMIT`; every later row receives them over `MEMMOVE_NEXT`, where @memmove:c:range_src_incr, @memmove:c:range_dst_incr, @memmove:c:range_src_incr_top, @memmove:c:range_dst_incr_top and @memmove:c:range_count_decr range-check three of the four on the sending side.
 `timestamp` is range-checked by neither side and holds only because it travels unchanged from the `ECALL` at the root.
 @memmove:a:dst is not discharged at all on a commitment sequence (@memmove:aside:index).
 
@@ -113,16 +113,20 @@ The verifier initializes and finalizes this domain as it does any other (@memory
 ]
 
 #aside(ref: <memmove:aside:index>)[Note on the commitment index][
-  @memmove:a:dst is undischarged here, and @memmove:c:dst_incr leans on it through @addnw:a:lhs, so a denormalized index weakens that `ADDNW` to a field statement.
+  @memmove:a:dst is undischarged here, and the reconstruction of `dst_incr_top` leans on it, so a denormalized index weakens the no-wraparound argument below to a field statement.
   This is not a prover gain, since such a token has no receiver, but range-checking `index` where it enters `COMMIT` would settle it --- and would also stop @commit:c:read_index writing past the `Word` range into `x254`.
 ]
 
 == Advancing to the next chunk
 In parallel, we compute $#`src_incr` = #`src` + #`step`$ and $#`dst_incr` = #`dst` + #`step`$ as the positions at which the next chunk starts, and $#`count_decr` = #`count` - #`step`$ as the number of bytes still to move.
-The first two of @memmove:c:range_src_incr, @memmove:c:range_dst_incr and @memmove:c:range_count_decr are included to satisfy @addnw:a:sum, and the last to satisfy @sub:a:diff.
+Only the low three halfwords of each position are stored: the fourth is reconstructed as `src_incr_top` and `dst_incr_top` from the carry out of the low limb, which is what @memmove:c:src_incr and @memmove:c:dst_incr pin to a bit.
+@memmove:c:range_count_decr is included to satisfy @sub:a:diff.
 #render_constraint_table(chip, config, groups: "incr_decr")
 
-The positions use `ADDNW` (@add), which forbids wraparound modulo $2^64$: without it a sequence could walk `src` past the end of the address space, or close into a ring that balances every bus while moving nothing that was asked for.
+The positions must not wrap modulo $2^64$, or a sequence could walk `src` past the end of the address space, or close into a ring that balances every bus while moving nothing that was asked for.
+No constraint says so. With the top halfword reconstructed, the relation it used to be pinned by holds by construction and would prove nothing; what carries the property instead are the range checks @memmove:c:range_src_incr_top and @memmove:c:range_dst_incr_top, together with the third halfword's.
+Both below $2^16$ is exactly $#`src`_1 + #`src_carry` < 2^32$, which is the no-wraparound statement.
+They are therefore load-bearing rather than bookkeeping.
 The count uses plain `SUB`, which permits it, because the terminal row holds $#`count` = 0$ and hence $#`count_decr` = 2^64 - 1$.
 That is safe because $#`step` <= #`count`$ on every active row with $#`count` >= 1$: a wide row is checked by @memmove:c:wide_needs_eight and hence has $#`count` >= 8 = #`step`$, and a narrow row has $#`step` = 1$.
 
@@ -143,10 +147,12 @@ Both tuples carry the `timestamp`, which is what separates one sequence from ano
 This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "lookups")
 
+Note that the two positions are sent as written-out expressions rather than as a packing of their columns, since their top halfword is not a column: the low element is $#`src_incr`_0 + 2^16 dot #`src_incr`_1$ and the high one is $#`src`_1 + #`src_carry`$, in which $#`src_incr`_2$ cancels. That halfword survives only to carry its range check.
+
 #aside("Why no termination constraint is needed")[
   Fix a timestamp. Balancing `MEMMOVE_NEXT` forces the number of rows claiming `end` to equal the number claiming `first`, and $#`first` = #`first_ecall` + #`first_commit`$ caps that at one, since the `CPU` sends one `ECALL` per timestamp and that `ECALL` cannot be both a copy and a `write`.
   That rules out an _open_ sequence and nothing more: a ring of rows with neither `first` nor `end` set sends and receives one tuple each, so it balances while consuming no entry.
-  What forbids the ring is @memmove:c:src_incr, since `ADDNW` forces $#`src_incr` = #`src` + #`step`$ over the integers with $#`step` >= 1$, so `src` strictly increases and can never return to a value it held.
+  What forbids the ring is @memmove:c:range_src_incr_top: with no wraparound, $#`src_incr` = #`src` + #`step`$ holds over the integers with $#`step` >= 1$, so `src` strictly increases and can never return to a value it held.
 ]
 
 == Bits
@@ -161,7 +167,7 @@ To pad this chip, use the below data.
 
 This padding row is not all-zero.
 @memmove:c:single_implies_mu forces $#`single` = 0$ here, so $#`step` = 8$; @memmove:c:count_decr is unconditional, which $#`count` = 8$ and $#`count_decr` = 0$ then satisfy.
-The low-limb carry of the two position updates is constrained on every row (@addnw:c:carry), which $#`src_incr` = #`dst_incr` = 8$ satisfies with a zero carry.
+The low-limb carry of the two position updates is constrained on every row (@memmove:c:src_incr, @memmove:c:dst_incr), which $#`src_incr` = #`dst_incr` = 8$ satisfies with a zero carry.
 @memmove:c:wide_needs_eight is inert, its multiplicity being $0 - 0$.
 
 = The Accelerated Memory Operations standard
@@ -173,7 +179,7 @@ Its two remaining requirements fall outside this chapter: that the accelerated s
 
 = Notes/optimizations
 - `count` need not be a full `DWordWL` on the `ECALL` path, where @memmove:c:bound already proves $#`count` < 257$; the commitment path has no such bound, so this costs a range check where the value enters from `COMMIT`.
-- @memmove:c:range_src_incr and @memmove:c:range_dst_incr carry multiplicity $#`μ`$ while `src_incr` and `dst_incr` are consumed only at $#`μ` - #`end`$. Lowering both would drop eight `IS_HALF` lookups per terminal row, though not shrink the proof, that table being preprocessed at a fixed height.
+- The eight `IS_HALF` checks on the two positions carry multiplicity $#`μ`$ while `src_incr` and `dst_incr` are consumed only at $#`μ` - #`end`$. Lowering them would drop eight lookups per terminal row, though not shrink the proof, that table being preprocessed at a fixed height. They cannot be dropped altogether: two of the eight are the no-wraparound argument.
 - Selecting between exactly two widths keeps `single` a single bit, so $#`step` = 8 - 7 dot #`single`$ stays linear and, more to the point, so does @memmove:c:wide_needs_eight's multiplicity $#`μ` - #`single`$. With a two-bit selector the corresponding "fire only on the widest row" multiplicity is a product, and would need a gate column and a degree-2 constraint of its own, as `first_ecall` does. Four-, two- and one-byte chunks would save at most eight rows per sequence.
 - A row could move sixteen or thirty-two bytes, at the cost of a wider `MEMW` signature, but `MEMW_A` needs every byte of an access to share one old timestamp, which a wider row only manages where the buffer was written in groups at least that wide.
 - `COMMIT` could send its deferral on `MEMMOVE_NEXT` directly, retiring the `COMMIT_DEFER` bus and the `first_ecall` column, at the cost of `first` no longer meaning "head of the sequence" and of an added $#`first` dot #`is_commit` = 0$.
