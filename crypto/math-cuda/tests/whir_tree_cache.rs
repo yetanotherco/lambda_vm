@@ -15,6 +15,19 @@
 //! for two leaf-hash passes over its codeword — measured at ~25 s of RPX device
 //! hashing on a real block, about half of it that second pass.
 //!
+//! # ⚠ Why the counts are PER CODEWORD
+//!
+//! The first run of this file failed two tests for a reason that was not the
+//! cache: `leaf_hash_calls()` is process-wide, the six tests share one binary,
+//! and cargo runs them in parallel — so one test read 5 where it expected 1
+//! purely because its neighbours were committing at the same time. An assertion
+//! on a global counter is an assertion about every test in the binary.
+//!
+//! So the counting assertions use `DeviceCodeword::tree_builds()`, which counts
+//! only that codeword's own leaf-hash passes. It is immune to the scheduler and
+//! it localises a failure to the codeword that caused it. The process-wide
+//! counter keeps one test of its own, and that one takes a lock.
+//!
 //! # Why the assertions are counts and bytes, not seconds
 //!
 //! A timing test would pass on a cache that returned the wrong tree, and fail
@@ -30,8 +43,18 @@ use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
 use multilinear::whir_hash::{DeviceHashKey, KeccakWhir, RpxWhir, WhirHash};
+use std::sync::Mutex;
 
 type FE = FieldElement<F>;
+
+/// Held across any window that reads the process-wide counter. Poisoning is
+/// ignored so one failure does not cascade into unrelated tests — a lesson this
+/// branch learned once already, in `hash_metrics_tests`.
+static GLOBAL_COUNTER: Mutex<()> = Mutex::new(());
+
+fn global_counter_window() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_COUNTER.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Mirror of `DeviceHashKey::into_math_cuda`, which is cuda-gated on
 /// `multilinear` and so unreachable from this crate's dev-dependency. The
@@ -73,17 +96,16 @@ fn commit_on_device(
 #[test]
 fn a_commitment_hashes_its_leaves_once() {
     for (name, hash) in [("keccak", key::<KeccakWhir>()), ("rpx", key::<RpxWhir>())] {
-        reset_leaf_hash_calls();
         let (codeword, _root) = commit_on_device(14, 4, hash);
         assert_eq!(
-            leaf_hash_calls(),
+            codeword.tree_builds(),
             1,
             "{name}: the commit itself must hash the leaves exactly once"
         );
 
         let _ = codeword.paths(4, &[0, 1, 7], hash).expect("paths");
         assert_eq!(
-            leaf_hash_calls(),
+            codeword.tree_builds(),
             1,
             "{name}: opening must read the tree the commit kept, not rebuild it"
         );
@@ -91,7 +113,11 @@ fn a_commitment_hashes_its_leaves_once() {
         // …and again, because a cache that served once and then evicted would
         // pass the line above.
         let _ = codeword.paths(4, &[2, 3], hash).expect("paths");
-        assert_eq!(leaf_hash_calls(), 1, "{name}: still one, on a second open");
+        assert_eq!(
+            codeword.tree_builds(),
+            1,
+            "{name}: still one, on a second open"
+        );
     }
 }
 
@@ -219,14 +245,13 @@ fn the_cached_tree_is_inside_the_reservation() {
 #[test]
 fn a_tree_built_for_one_blocking_does_not_serve_another() {
     let hash = key::<RpxWhir>();
-    reset_leaf_hash_calls();
     let (codeword, _root) = commit_on_device(14, 4, hash);
-    assert_eq!(leaf_hash_calls(), 1);
+    assert_eq!(codeword.tree_builds(), 1);
 
     // Same codeword, different blocking: a miss, so it rebuilds.
     let at_two = codeword.paths(2, &[0, 1], hash).expect("paths at k=2");
     assert_eq!(
-        leaf_hash_calls(),
+        codeword.tree_builds(),
         2,
         "a different log_folding must rebuild, not serve the cached tree"
     );
@@ -253,4 +278,33 @@ fn the_two_hashes_build_different_trees() {
     let (_r, rpx_root) = math_cuda::whir::commit_codeword(&raw, 2, 4, false, key::<RpxWhir>())
         .expect("device commit");
     assert_ne!(keccak_root, rpx_root, "the two kernel families agreed");
+}
+
+/// ✓ The PROCESS-WIDE counter still tracks the same thing — it is what the
+/// bench prints, so it needs a test of its own.
+///
+/// Takes [`GLOBAL_COUNTER`] across the whole window, because every other test
+/// in this binary commits too and the counter cannot tell whose work it is
+/// counting. That is exactly why the assertions above do not use it.
+#[test]
+fn the_process_wide_counter_tracks_the_same_passes() {
+    let _window = global_counter_window();
+    let hash = key::<KeccakWhir>();
+
+    reset_leaf_hash_calls();
+    let (codeword, _root) = commit_on_device(12, 4, hash);
+    let after_commit = leaf_hash_calls();
+    assert_eq!(after_commit, 1, "one commit, one leaf-hash pass");
+
+    let _ = codeword.paths(4, &[0, 1], hash).expect("paths");
+    assert_eq!(
+        leaf_hash_calls(),
+        after_commit,
+        "an opening adds no pass, so the global counter must not move"
+    );
+    assert_eq!(
+        codeword.tree_builds(),
+        leaf_hash_calls(),
+        "with one codeword in flight the two counters must agree"
+    );
 }

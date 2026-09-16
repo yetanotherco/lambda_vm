@@ -39,6 +39,17 @@ fn cache_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_TREE_CACHE").is_some())
 }
 
+/// Leaf-hash passes over ONE codeword.
+///
+/// ⚠ The global [`LEAF_HASH_CALLS`] is a diagnostic: it is process-wide, so a
+/// test asserting on it is asserting about every other test sharing the binary
+/// too. That is not a hypothetical — the first gate run of this file had a
+/// counting test read 5 instead of 1 purely because its neighbours were
+/// committing at the same time. A per-codeword count is what an assertion can
+/// actually be about, and it localises a failure to the codeword that caused
+/// it rather than to whoever ran alongside.
+type BuildCount = Arc<AtomicU64>;
+
 /// A built tree, kept for the openings that follow the root.
 struct CachedTree {
     nodes: CudaSlice<u8>,
@@ -65,6 +76,8 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
+    /// Leaf-hash passes this codeword has paid for. One, after H4.
+    builds: BuildCount,
     /// ★ The tree this codeword was committed through, kept so the openings
     /// need not hash its leaves a second time (H4).
     ///
@@ -145,6 +158,7 @@ impl DeviceCodeword {
         }
         build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
         LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.builds.fetch_add(1, Ordering::Relaxed);
         Ok((nodes, num_leaves))
     }
 
@@ -216,6 +230,15 @@ impl DeviceCodeword {
         self.room.bytes()
     }
 
+    /// ★ How many times THIS codeword's leaf layer has been hashed.
+    ///
+    /// One after a commit, and still one after any number of openings — that is
+    /// the whole of H4, and unlike the process-wide counter this number is
+    /// unaffected by whatever else shares the test binary.
+    pub fn tree_builds(&self) -> u64 {
+        self.builds.load(Ordering::Relaxed)
+    }
+
     /// The root of that tree, which is the commitment.
     ///
     /// ★ The tree is KEPT (H4). The other thing anyone wants from it is a path
@@ -254,8 +277,9 @@ impl DeviceCodeword {
         positions: &[u32],
         hash: crate::DeviceHash,
     ) -> Result<Vec<u8>> {
-        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
-        crate::merkle::gather_merkle_paths_dev(&nodes, num_leaves, positions, &self.stream)
+        self.with_tree(log_folding, hash, |nodes, num_leaves| {
+            crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)
+        })
     }
 
     /// The fold blocks `indices` open — `block` values at stride `num_leaves`
@@ -495,6 +519,7 @@ fn commit_from(
         stream,
         elements: n,
         base: true,
+        builds: BuildCount::default(),
         tree: Arc::new(Mutex::new(None)),
         room: Arc::new(room),
     };
@@ -739,9 +764,10 @@ pub fn fold_resident(
         stream,
         elements: half,
         base: false,
-        // A fold is its OWN codeword and gets its own cache slot: it is
-        // committed and opened in its own right, and sharing the parent's slot
-        // would make one of them evict the other every round.
+        // A fold is its OWN codeword: its own cache slot and its own count. It
+        // is committed and opened in its own right, and sharing the parent's
+        // slot would make one of them evict the other every round.
+        builds: BuildCount::default(),
         tree: Arc::new(Mutex::new(None)),
         // The fold lives inside the room the codeword it came from promised:
         // it is half of it, and that one is still alive.
