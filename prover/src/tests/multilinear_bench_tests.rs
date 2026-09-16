@@ -18,12 +18,12 @@ use std::time::Instant;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use multilinear::whir_chain::GrindBits;
+use multilinear::whir_hash::KeccakWhir;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 use crate::multilinear_prove;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
-use multilinear::whir_hash::KeccakWhir;
 
 /// Blowup 4, 128 bits, 20 bits of grinding — the parameters the multilinear
 /// path derives its own from, so the two are being asked for the same security.
@@ -580,6 +580,19 @@ fn phases() {
         })
         .collect();
     let count = tables.len();
+    // ⚠ KECCAK ONLY, and it refuses rather than mislabels.
+    //
+    // The committed tables escape into the rest of this function, so the hash
+    // cannot be a `match` here — both arms would have to return the same type
+    // and they do not. Rather than print `★ WHIR HASH: rpx256` over keccak's
+    // seconds, this bench asserts the knob agrees with what it actually runs.
+    // The hash-arm split lives in `commit_phases`, whose `merkle` pass isolates
+    // the hashing anyway, which is the number a hash comparison wants.
+    assert_eq!(
+        crate::whir_hash_knob::selected(),
+        crate::whir_hash_knob::Setting::Keccak,
+        "`phases` commits with keccak; run `commit_phases` for the hash arms"
+    );
     let committed = CommittedTables::<_, _, KeccakWhir>::commit(tables, &config).expect("commit");
     let commit = start.elapsed();
 
@@ -768,17 +781,26 @@ fn commit_phases() {
         let codeword = whir::encode::<F, F>(&coeffs, &domain).expect("encode");
         encode += start.elapsed();
         let start = Instant::now();
-        let commitment = CodewordCommitment::<_, KeccakWhir>::new(
-            &codeword,
-            config
-                .schedule(poly.num_vars())
-                .first()
-                .copied()
-                .unwrap_or(0),
-        )
-        .expect("commit");
+        // ★ The `merkle` pass is the LEAF AND TREE HASHING, alone — stack,
+        // lift and encode are clocked apart above. So this line is the hash
+        // term itself, and it has to follow the knob or the two arms are not
+        // comparable.
+        crate::with_whir_hash!(|H| {
+            let commitment = CodewordCommitment::<_, H>::new(
+                &codeword,
+                config
+                    .schedule(poly.num_vars())
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
+            )
+            .expect("commit");
+            // Dropped inside the arm: the commitment's type names `H`, so it
+            // cannot leave the block. That is also why this is the bench the
+            // hash arms run through — nothing here escapes.
+            drop(commitment);
+        });
         merkle += start.elapsed();
-        drop(commitment);
     }
 
     let label = if input.is_empty() { &name } else { &input };
