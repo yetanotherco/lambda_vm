@@ -1251,6 +1251,45 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
 
 /// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
 /// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
+/// What a Commit-phase walk still holds when the execution ends.
+///
+/// The chunks it closed are gone — committed and dropped as they filled. This
+/// is the rest: every table's partial tail, the tables the walk cannot close,
+/// and the end state the finalization needs. The spec's "remaining tables are
+/// padded and committed" operates on exactly this.
+pub struct WalkLeftover {
+    /// Ops not yet turned into a committed chunk, including the lists the walk
+    /// never closes: the accumulators, and the tables CPU32 and DVRM still feed.
+    pub(crate) tail: CollectedOps,
+    /// Chunks already emitted per kind, indexed like [`CHUNKED_KINDS`], so the
+    /// tail's chunk numbering continues where the walk stopped.
+    pub(crate) emitted: [usize; CHUNKED_KINDS.len()],
+    /// Cycles executed.
+    pub(crate) cycles: usize,
+}
+
+impl WalkLeftover {
+    /// Cycles the walk executed.
+    pub fn cycles(&self) -> usize {
+        self.cycles
+    }
+
+    /// Ops still held for `kind` — the tail that the end-of-run phase pads and
+    /// commits.
+    pub fn buffered(&self, kind: TableKind) -> usize {
+        self.tail.buffered(kind)
+    }
+
+    /// Chunks the walk closed for `kind`, so the tail can be numbered after
+    /// them.
+    pub fn emitted(&self, kind: TableKind) -> usize {
+        CHUNKED_KINDS
+            .iter()
+            .position(|k| *k == kind)
+            .map_or(0, |slot| self.emitted[slot])
+    }
+}
+
 /// The tables `cpu32_chip_op` appends to.
 ///
 /// Kept beside it because it is load-bearing elsewhere: a table listed here is
@@ -5074,7 +5113,7 @@ impl Traces {
         register_init: &[u32],
         max_rows: &super::MaxRowsConfig,
         mut on_chunk: impl FnMut(TableKind, usize, TraceTable<GoldilocksField, GoldilocksExtension>),
-    ) -> Result<(), Error> {
+    ) -> Result<WalkLeftover, Error> {
         let mut executor = executor::vm::execution::Executor::new(elf, private_input)
             .map_err(|e| Error::Prover(format!("executor: {e}")))?;
         let mut memory_state = MemoryState::from_image(initial_image);
@@ -5082,7 +5121,6 @@ impl Traces {
 
         let mut buf = CollectedOps::default();
         let mut emitted = [0usize; CHUNKED_KINDS.len()];
-        let _ = &emitted;
         let mut cycles_so_far = 0usize;
 
         while let Some(logs) = executor
@@ -5129,7 +5167,15 @@ impl Traces {
         // retired during the walk, and "at the end of the execution, the
         // remaining tables are padded and committed". What is left goes back to
         // the caller so it can do exactly that.
-        Ok(())
+        // The end state the finalization needs is not carried yet: the Challenge
+        // phase that pads and commits these tails does not exist, and a field
+        // nobody reads is a field that quietly goes wrong.
+        let _ = (&memory_state, &register_state);
+        Ok(WalkLeftover {
+            tail: buf,
+            emitted,
+            cycles: cycles_so_far,
+        })
     }
 
     /// `collect_epoch`, driving the executor itself and consuming its logs one

@@ -1697,3 +1697,138 @@ fn cpu32_appends_are_excluded_from_early_closing() {
         );
     }
 }
+
+/// The Commit phase must commit every chunk it closes under the root the
+/// ordinary prover gives that chunk, and hand back the rest of the run.
+///
+/// This is the pass end to end: it walks the execution, commits and drops each
+/// table as it fills, and returns what it could not close. Two things have to
+/// hold for that to be a prover and not just a producer — the commitments have
+/// to be the right ones, and nothing may fall between the chunks it closed and
+/// the tail it kept.
+#[test]
+fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
+    use crate::tables::trace_builder::{TableKind, Traces as T};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase =
+        crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit phase");
+    assert!(
+        !phase.closed.is_empty(),
+        "the fixture must close at least one chunk mid-walk"
+    );
+
+    // Every commitment must be the one the resident chunk carries.
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    let counts = resident.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        false,
+        &resident.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    type P = stark::prover::Prover<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >;
+    use stark::prover::IsStarkProver;
+    for (kind, chunk, root) in &phase.closed {
+        let (air, table) = match kind {
+            TableKind::Cpu => (airs.cpus[*chunk].as_ref(), &resident.cpus[*chunk]),
+            TableKind::Memw => (airs.memws[*chunk].as_ref(), &resident.memws[*chunk]),
+            TableKind::MemwAligned => (
+                airs.memw_aligneds[*chunk].as_ref(),
+                &resident.memw_aligneds[*chunk],
+            ),
+            TableKind::MemwRegister => (
+                airs.memw_registers[*chunk].as_ref(),
+                &resident.memw_registers[*chunk],
+            ),
+            TableKind::Load => (airs.loads[*chunk].as_ref(), &resident.loads[*chunk]),
+            TableKind::Cpu32 => (airs.cpu32s[*chunk].as_ref(), &resident.cpu32s[*chunk]),
+            TableKind::Branch => (airs.branches[*chunk].as_ref(), &resident.branches[*chunk]),
+            TableKind::Eq => (airs.eqs[*chunk].as_ref(), &resident.eqs[*chunk]),
+            TableKind::Bytewise => (airs.bytewises[*chunk].as_ref(), &resident.bytewises[*chunk]),
+            TableKind::Store => (airs.stores[*chunk].as_ref(), &resident.stores[*chunk]),
+            other => unreachable!("{other:?} is not closed mid-walk"),
+        };
+        let expected =
+            <P as IsStarkProver<_, _, _>>::commit_table_root(air, table).expect("resident commits");
+        assert_eq!(
+            *root, expected,
+            "{kind:?} chunk {chunk}: the Commit phase used a different root"
+        );
+    }
+
+    // And nothing falls between what it closed and what it kept: the chunks it
+    // closed plus the tail it kept are the chunks the resident build produced.
+    // Exact for CPU, which is one op per executed cycle and takes nothing from
+    // the end-of-run finalization; a bound elsewhere, since that finalization
+    // appends after the last cycle and can spill the tail into another chunk.
+    assert_eq!(
+        phase.leftover.cycles(),
+        logs.len(),
+        "the walk executed a different number of cycles than the straight run"
+    );
+    let closed_of = |kind: TableKind| phase.closed.iter().filter(|(k, _, _)| *k == kind).count();
+    assert_eq!(
+        closed_of(TableKind::Cpu) + 1,
+        resident.cpus.len(),
+        "CPU: the closed chunks plus the tail are not the run's chunks"
+    );
+    for (kind, produced) in [
+        (TableKind::Memw, resident.memws.len()),
+        (TableKind::MemwAligned, resident.memw_aligneds.len()),
+        (TableKind::MemwRegister, resident.memw_registers.len()),
+        (TableKind::Load, resident.loads.len()),
+        (TableKind::Cpu32, resident.cpu32s.len()),
+        (TableKind::Branch, resident.branches.len()),
+        (TableKind::Eq, resident.eqs.len()),
+        (TableKind::Bytewise, resident.bytewises.len()),
+        (TableKind::Store, resident.stores.len()),
+    ] {
+        assert_eq!(
+            phase.leftover.emitted(kind),
+            closed_of(kind),
+            "{kind:?}: the leftover disagrees with what was committed"
+        );
+        assert!(
+            closed_of(kind) < produced,
+            "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
+            closed_of(kind)
+        );
+    }
+}
