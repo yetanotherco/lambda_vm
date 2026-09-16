@@ -1625,9 +1625,9 @@ pub trait IsStarkVerifier<
         }
 
         // Receive grinding value
-        let security_bits = air.context().proof_options.grinding_factor;
+        let grinding_factor = air.context().proof_options.grinding_factor;
         let mut grinding_seed = [0u8; 32];
-        if security_bits > 0
+        if grinding_factor > 0
             && let Some(nonce_value) = proof.nonce()
         {
             grinding_seed = transcript.state();
@@ -1708,13 +1708,13 @@ pub trait IsStarkVerifier<
         );
 
         // verify grinding
-        let security_bits = air.context().proof_options.grinding_factor;
-        if security_bits > 0 {
+        let grinding_factor = air.context().proof_options.grinding_factor;
+        if grinding_factor > 0 {
             let nonce_is_valid = proof.nonce().is_some_and(|nonce_value| {
                 grinding::is_valid_nonce::<crate::config::GrindingDigest<H>>(
                     &challenges.grinding_seed,
                     nonce_value,
-                    security_bits,
+                    grinding_factor,
                 )
             });
 
