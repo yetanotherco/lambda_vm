@@ -109,4 +109,6 @@ pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
 #[cfg(test)]
+pub mod whir_hash_tests;
+#[cfg(test)]
 pub mod whir_identity_tests;

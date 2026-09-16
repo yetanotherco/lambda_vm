@@ -33,8 +33,10 @@
 //! knob no test can observe, and the guard and the thing it guards belong in
 //! one commit.
 
-use crypto::fiat_shamir::transcript_hash::{KeccakTranscriptHash, TranscriptHash};
-use crypto::merkle_tree::backends::types::BatchKeccak256Backend;
+use crypto::fiat_shamir::transcript_hash::{
+    KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
+};
+use crypto::merkle_tree::backends::types::{BatchKeccak256Backend, BatchRpx256Backend};
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::{element::FieldElement, traits::IsField};
 use math::traits::AsBytes;
@@ -84,3 +86,66 @@ impl WhirHash for KeccakWhir {
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
 }
+
+/// ★ The RPX256 configuration — the algebraic hash, and the only reason this
+/// trait exists.
+///
+/// Slower than keccak on a host by a wide margin, and that is not a defect to
+/// be fixed: the lever it pulls is elsewhere. A keccak-f[1600] costs roughly
+/// 73,700 trace cells in a field-native verifier against RPX's 325, so a WHIR
+/// proof verified inside another proof pays about 227x less for its hashing
+/// under this configuration. A proof that will only ever be checked by a host
+/// should use [`KeccakWhir`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpxWhir;
+
+impl WhirHash for RpxWhir {
+    const NAME: &'static str = "rpx256";
+
+    type Transcript = RpxTranscriptHash;
+
+    type Backend<F>
+        = BatchRpx256Backend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+}
+
+/// ✓ Both configurations are INHABITED at the fields the prover actually
+/// commits over — the base field for traces, the cubic extension for the folded
+/// codewords — within one proof.
+///
+/// A `WhirHash` impl that type-checks in isolation can still be unusable: the
+/// associated type is generic over `F`, and the bound that matters is the one
+/// the prover instantiates it at. This is that instantiation, as a compile-time
+/// check rather than a comment claiming it holds.
+const _: fn() = || {
+    fn assert_usable<H: WhirHash>()
+    where
+        H::Backend<math::field::goldilocks::GoldilocksField>:
+            IsMerkleTreeBackend<Node = Commitment>,
+        H::Backend<math::field::extensions_goldilocks::Degree3GoldilocksExtensionField>:
+            IsMerkleTreeBackend<Node = Commitment>,
+    {
+    }
+
+    assert_usable::<KeccakWhir>();
+    assert_usable::<RpxWhir>();
+};
+
+/// ✓ Each configuration's transcript is ITS OWN, not the other's.
+///
+/// The half-flip is unspellable because one trait supplies both halves — but
+/// only if the two impls actually name different transcripts. A copy-paste that
+/// left `RpxWhir` on `KeccakTranscriptHash` would be exactly the silent
+/// configuration this design exists to rule out, so it is made a compile error.
+const _: fn() = || {
+    fn assert_same<T>(_: core::marker::PhantomData<(T, T)>) {}
+
+    assert_same::<KeccakTranscriptHash>(
+        core::marker::PhantomData::<(KeccakTranscriptHash, <KeccakWhir as WhirHash>::Transcript)>,
+    );
+    assert_same::<RpxTranscriptHash>(
+        core::marker::PhantomData::<(RpxTranscriptHash, <RpxWhir as WhirHash>::Transcript)>,
+    );
+};

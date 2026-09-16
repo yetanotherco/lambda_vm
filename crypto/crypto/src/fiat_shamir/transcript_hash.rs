@@ -23,6 +23,7 @@
 use digest::{Digest, FixedOutputReset, OutputSizeUser, typenum::U32};
 
 use crate::hash::platform_keccak::PlatformKeccak256;
+use crate::hash::rpx::Rpx256Digest;
 
 /// One Fiat-Shamir configuration: the digest the sponge runs on.
 pub trait TranscriptHash: 'static {
@@ -52,4 +53,30 @@ impl TranscriptHash for KeccakTranscriptHash {
     type Digest = PlatformKeccak256;
 
     const NAME: &'static str = "keccak256";
+}
+
+/// The RPX256 configuration — the algebraic sponge, for a transcript a
+/// field-native verifier has to replay.
+///
+/// ⚠ **Why this has no `CANDIDATES_PER_COORDINATE`, when the per-table branch's
+/// RPX transcript sets it to `Some(1)`.** That branch's argument is that a
+/// squeeze yields four felts which are canonical by construction, so a single
+/// `u64` candidate can never miss. The argument does not survive this
+/// transcript's plumbing: [`DefaultTranscript::sample`] REVERSES all 32 bytes
+/// of the squeeze before handing them out
+/// (`default_transcript.rs`, `result_hash.reverse()`), so the first eight bytes
+/// a sampler reads are the LAST felt's canonical bytes in reverse order — a
+/// number with no canonicality property at all. Adopting `Some(1)` here would
+/// have been a constant whose stated justification is false and whose failure
+/// mode (a rejected candidate with nowhere to go) no test in this workspace
+/// could reach. The fixed schedule is an LFM-replay requirement; it belongs
+/// with the emitter that needs it, alongside whatever makes the canonicality
+/// argument true again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpxTranscriptHash;
+
+impl TranscriptHash for RpxTranscriptHash {
+    type Digest = Rpx256Digest;
+
+    const NAME: &'static str = "rpx256";
 }

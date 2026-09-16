@@ -1,5 +1,13 @@
-//! Host-only keccak-hash counters for measuring the cost of VERIFYING a proof
-//! (a proxy for the recursion guest's dominant work: keccak hashing).
+//! Host-only hash counters for measuring the cost of VERIFYING a proof — a
+//! proxy for a recursive verifier's dominant work, which is hashing.
+//!
+//! ⚠ **The counters follow the proof's CONFIGURATION, not one hash.** They were
+//! keccak-only when keccak was the only hash on the multilinear path. Under
+//! [`crate::hash::rpx`] every Merkle counter would then have read ZERO — a
+//! measurement that cannot fail, reporting "no hashing" for the arm whose whole
+//! purpose is to change the hashing. The algebraic backend bumps them through
+//! [`count_merkle_direct`] / [`count_merkle_node_direct`] instead, which also
+//! bump `total`, because unlike the byte backends nothing downstream will.
 //!
 //! Behind the `hash-metrics` cargo feature: a normal build keeps
 //! `PlatformKeccak256 = sha3::Keccak256` and every counter call compiles to
@@ -59,6 +67,11 @@ mod imp {
     /// [`count_total`]. This keeps `merkle` a strict subset of `total` for ANY
     /// `D` (a non-keccak backend, as in the crypto tests, does not go through the
     /// counted wrapper, so counting it here would let `merkle` exceed `total`).
+    ///
+    /// A hash that does not route its Merkle work through a `digest::Digest` at
+    /// all — the algebraic backend sponges felts directly — uses
+    /// [`count_merkle_direct`] instead, which keeps the same invariant by
+    /// bumping both counters itself.
     #[inline(always)]
     pub fn count_merkle<D: 'static>() {
         if core::any::TypeId::of::<D>()
@@ -93,6 +106,31 @@ mod imp {
     pub fn count_absorb(nbytes: usize) {
         ABSORB_CALLS.fetch_add(1, Ordering::Relaxed);
         ABSORB_BYTES.fetch_add(nbytes as u64, Ordering::Relaxed);
+    }
+
+    /// ★ A Merkle LEAF finalize by a hash whose Merkle work does not pass
+    /// through a `digest::Digest` — the algebraic backend, which sponges felts
+    /// directly and never builds a digest object.
+    ///
+    /// Bumps `total` as well as `merkle`, because nothing downstream will: for
+    /// the byte backends `total` comes from the digest's own `finalize`, and
+    /// there is no such call here. Doing both in one function is what keeps
+    /// `merkle ⊆ total` true by construction rather than by two call sites
+    /// agreeing.
+    #[inline(always)]
+    pub fn count_merkle_direct() {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        MERKLE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ★ A Merkle PARENT by such a hash. Bumps `total`, `merkle` and
+    /// `merkle_nodes`, so `merkle - merkle_nodes` is the leaf count on this path
+    /// exactly as it is on the byte path.
+    #[inline(always)]
+    pub fn count_merkle_node_direct() {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        MERKLE.fetch_add(1, Ordering::Relaxed);
+        MERKLE_NODES.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Zero all counters.
@@ -131,6 +169,10 @@ mod imp {
     #[inline(always)]
     pub fn count_grinding() {}
     #[inline(always)]
+    pub fn count_merkle_direct() {}
+    #[inline(always)]
+    pub fn count_merkle_node_direct() {}
+    #[inline(always)]
     pub fn count_absorb(_nbytes: usize) {}
     pub fn reset() {}
     pub fn snapshot() -> Counts {
@@ -139,5 +181,6 @@ mod imp {
 }
 
 pub use imp::{
-    count_absorb, count_grinding, count_merkle, count_merkle_node, count_total, reset, snapshot,
+    count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
+    count_merkle_node_direct, count_total, reset, snapshot,
 };
