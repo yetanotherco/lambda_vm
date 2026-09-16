@@ -490,26 +490,6 @@ impl ContinuationProof {
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
     }
-
-    /// SCRATCH ANALYSIS HOOK (safe to delete): per-epoch `(proof, table_counts)`
-    /// plus the cross-epoch global proof, so out-of-crate tooling can measure
-    /// proof shape (widths, Merkle depths, FRI layers) without re-deriving it.
-    /// Read-only borrows; nothing here is used by prove/verify.
-    #[allow(clippy::type_complexity)]
-    pub fn shape_parts(
-        &self,
-    ) -> (
-        Vec<(&MultiProof<F, E, ()>, &TableCounts)>,
-        &MultiProof<F, E, ()>,
-    ) {
-        (
-            self.epochs
-                .iter()
-                .map(|e| (&e.proof, &e.table_counts))
-                .collect(),
-            &self.global,
-        )
-    }
 }
 
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
