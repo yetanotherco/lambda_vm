@@ -652,6 +652,22 @@ fn host_cores() -> usize {
 /// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
 /// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
 /// admission's job (`VramGate`), not this count's.
+/// A table's Round 1 roots, in the order Fiat-Shamir absorbs them.
+///
+/// A plain table contributes one root. A preprocessed one contributes two: its
+/// precomputed columns commit separately from the multiplicities, and the
+/// transcript takes the precomputed root first. Getting that order or that
+/// count wrong yields different challenges from the same execution, which is
+/// why the pair travels together instead of as a bare `Commitment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainRoots {
+    /// The precomputed columns' root — `Some` iff the AIR is preprocessed.
+    pub precomputed: Option<Commitment>,
+    /// The root of the columns that depend on the execution: the whole trace
+    /// for a plain AIR, the multiplicities for a preprocessed one.
+    pub main: Commitment,
+}
+
 /// Source of truth for a table whose *trace* has been retired.
 ///
 /// The retire-LDE mode ([`streaming_retire_lde`]) drops a table's LDE and
@@ -1665,7 +1681,7 @@ pub trait IsStarkProver<
     fn commit_table_root(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
-    ) -> Option<Commitment>
+    ) -> Option<MainRoots>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
@@ -1687,7 +1703,31 @@ pub trait IsStarkProver<
             &twiddles.two_half_fwd,
         )
         .ok()?;
-        Self::commit_rows_bit_reversed::<Field>(&lde, cols).map(|(_, root)| root)
+        if !air.is_preprocessed() {
+            return Self::commit_rows_bit_reversed::<Field>(&lde, cols).map(|(_, root)| {
+                MainRoots {
+                    precomputed: None,
+                    main: root,
+                }
+            });
+        }
+        // A preprocessed table commits as two trees, and the transcript absorbs
+        // both. The precomputed half is a constant of the AIR, so it is derived
+        // here only to be checked against that constant — the same check
+        // `commit_main_trace` makes, and the one that catches a table whose
+        // precomputed columns were built wrong.
+        let num_precomputed = air.num_precomputed_columns();
+        let (_, precomputed_root) =
+            Self::commit_rows_bit_reversed_subset::<Field>(&lde, cols, 0, num_precomputed)?;
+        if precomputed_root != air.precomputed_commitment() {
+            return None;
+        }
+        let (_, main) =
+            Self::commit_rows_bit_reversed_subset::<Field>(&lde, cols, num_precomputed, cols)?;
+        Some(MainRoots {
+            precomputed: Some(precomputed_root),
+            main,
+        })
     }
 
     /// Reconstruct Round1 for every table, print the bus balance report, and

@@ -7,9 +7,8 @@
 //! closed chunk and, at the end, whatever the walk could not close — which the
 //! Challenge phase pads and commits, as the spec's next step.
 
-use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
-use stark::prover::IsStarkProver;
+use stark::prover::{IsStarkProver, MainRoots};
 
 use crate::Error;
 use crate::tables::MaxRowsConfig;
@@ -21,13 +20,13 @@ use stark::trace::TraceTable;
 /// What the Commit phase produced.
 pub struct CommitPhase {
     /// One entry per chunk closed during the walk, in the order they closed.
-    pub closed: Vec<(TableKind, usize, Commitment)>,
+    pub closed: Vec<ChunkCommitment>,
     /// Everything the walk still held when the execution ended.
     pub leftover: WalkLeftover,
 }
 
 /// One chunked table's commitment, by kind and position.
-pub type ChunkCommitment = (TableKind, usize, Commitment);
+pub type ChunkCommitment = (TableKind, usize, MainRoots);
 
 /// Run the Commit phase over `elf`.
 ///
