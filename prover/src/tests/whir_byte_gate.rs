@@ -53,9 +53,27 @@
 //! 29fbb45d  7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982336436e6dd3   6880 bytes
 //! ```
 //!
+//! ✓ Machine-independent: three runs on a 9950X + RTX 5090 box gave the same
+//! line as this laptop.
+//!
+//! Under `LAMBDA_VM_WHIR_HASH=rpx` the line is
+//! `5226e4cfffac7eb2ba629470a0c5ebf879421078b389e3a8065ae63768031adb` — a
+//! DIFFERENT digest at the SAME 6880 bytes, which is the whole claim of the
+//! seam in one line: the hash moved, the format did not.
+//!
 //! That is the gate: **the keccak arm's bytes do not move.** A commit that
 //! changes this line has changed the proof PR #988 produces, and owes an
 //! explanation.
+//!
+//! # ⛔ AND THE TRAP THIS TEST ITSELF FELL INTO
+//!
+//! The first version pinned `KeccakWhir` at its prove site, so it never reached
+//! a dispatch. Run under `LAMBDA_VM_WHIR_HASH=rpx` on the box it printed **the
+//! keccak line and no banner** — a measurement wearing the wrong arm's label,
+//! the third instance of that class on this branch and the first inside the
+//! instrument meant to catch it. Two lessons, both now enforced below rather
+//! than described: a bench that does not print `★ WHIR HASH:` **did not reach a
+//! dispatch**, and an arm that cannot produce a different answer is not an arm.
 //!
 //! # What it does NOT cover
 //!
@@ -74,7 +92,6 @@ use math::field::{
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use multilinear::whir_chain::{ChainConfig, GrindBits};
-use multilinear::whir_hash::KeccakWhir;
 use stark::multilinear_air::Uniforms;
 use stark::multilinear_table::{self, CommittedTable, CommittedTables, TableLayout};
 use stark::proof::options::ProofOptions;
@@ -107,7 +124,15 @@ fn canonically_sorted_columns() -> Vec<Vec<FieldElement<Fp>>> {
         .collect()
 }
 
-/// Prints the identity line and the serialized length. See the module header.
+/// The keccak arm's line, and the constant the other arm must NOT equal.
+const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982336436e6dd3";
+
+/// The serialized length, which neither arm may move: 32-byte digests either
+/// way and no proof struct gains a field.
+const SERIALIZED_LEN: usize = 6880;
+
+/// Prints the identity line and the serialized length, and ASSERTS what each
+/// arm owes. See the module header.
 #[test]
 #[ignore = "a printing measurement: run it on two revisions and compare the output"]
 fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
@@ -134,12 +159,18 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
     .expect("layout");
     let table = CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
         .expect("committed table");
-    let committed =
-        CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config).expect("commit");
 
-    let mut transcript = DefaultTranscript::<Ext>::new(b"whir-identity");
-    let proof =
-        multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove");
+    // ★ Through the knob, like every production site. `MultiProof` does not
+    // mention the hash in its type — that is the whole point of a 32-byte
+    // digest either way — so the proof can leave the dispatch arm and both
+    // arms unify. Reaching a dispatch is also what makes the `★ WHIR HASH:`
+    // banner print, and its absence from a log is how this test's own trap was
+    // found.
+    let proof = crate::with_whir_hash!(|H| {
+        let committed = CommittedTables::<_, _, H>::commit(vec![table], &config).expect("commit");
+        let mut transcript = DefaultTranscript::<Ext>::new(b"whir-identity");
+        multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove")
+    });
 
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
     let line: String = crypto::hash::platform_keccak::PlatformKeccak256::digest(bytes.as_ref())
@@ -149,4 +180,26 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
 
     println!("IDENTITY-LINE {line}");
     println!("IDENTITY-LEN  {}", bytes.len());
+
+    // ★★ The assertions that make this an arm rather than a print.
+    //
+    // The length is the strict one: it may not move under either hash, because
+    // a hash swap is not a proof-format change. The line is the opposite — it
+    // MUST move, or the rpx label is on a keccak proof, which is exactly what
+    // this test printed before it went through a dispatch.
+    assert_eq!(
+        bytes.len(),
+        SERIALIZED_LEN,
+        "a hash swap must not change the serialized length"
+    );
+    match crate::whir_hash_knob::selected() {
+        crate::whir_hash_knob::Setting::Keccak => assert_eq!(
+            line, KECCAK_LINE,
+            "the keccak arm's bytes moved: this commit changed the proof PR #988 produces"
+        ),
+        crate::whir_hash_knob::Setting::Rpx => assert_ne!(
+            line, KECCAK_LINE,
+            "the rpx arm produced KECCAK's line — the proof never reached the RPX hash"
+        ),
+    }
 }
