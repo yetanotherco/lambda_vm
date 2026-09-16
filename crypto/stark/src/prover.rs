@@ -668,6 +668,26 @@ pub struct MainRoots {
     pub main: Commitment,
 }
 
+/// One table's contribution to a batched FRI.
+pub struct TableDeep<FieldExtension: IsField> {
+    /// The domain the codeword lives on. Only tables that agree on this can be
+    /// folded together: the fold squares the coset offset each layer, so a
+    /// short codeword over `offset·<w>` never lines up with a tall fold over
+    /// `offset²·<w>`.
+    pub lde_size: usize,
+    /// Rows before the blowup. Carried rather than divided out of `lde_size`,
+    /// because the batch has to rebuild the very domain the codeword was
+    /// computed on and a wrong one gives wrong twiddles and a silently wrong
+    /// fold.
+    pub trace_rows: usize,
+    /// The DEEP composition codeword, `lde_size` long.
+    pub deep: Vec<FieldElement<FieldExtension>>,
+    /// The fork's state once this table is done with it. The batch's
+    /// coefficient is drawn from every one of these, in AIR order, which is
+    /// what binds the fold to all the data it folds.
+    pub fork_state: Vec<u8>,
+}
+
 /// Source of truth for a table whose *trace* has been retired.
 ///
 /// The retire-LDE mode ([`streaming_retire_lde`]) drops a table's LDE and
@@ -1802,6 +1822,35 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        Self::prove_rounds_2_to_4(
+            air,
+            pub_inputs,
+            &mut round_1_result,
+            transcript,
+            &domain,
+            &twiddles,
+        )
+    }
+
+    /// Round 1 for one table, rebuilt from its trace.
+    ///
+    /// Both LDEs and both commitments, and the two things the table's own fork
+    /// takes before round 2 samples anything: the auxiliary root, then the bus
+    /// contribution. Leaving the contribution out moves beta and everything
+    /// below it, while the main and auxiliary roots still match — a symptom
+    /// that points nowhere near the transcript.
+    fn round_1_from_trace(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
         let bus_public_inputs = if air.has_aux_trace() {
@@ -1860,7 +1909,7 @@ pub trait IsStarkProver<
             transcript.append_field_element(&bpi.table_contribution);
         }
 
-        let mut round_1_result = Round1 {
+        let round_1_result = Round1 {
             lde_trace: LDETraceTable::from_row_major(
                 main_data,
                 num_main_cols,
@@ -1875,14 +1924,221 @@ pub trait IsStarkProver<
             bus_public_inputs,
         };
 
-        Self::prove_rounds_2_to_4(
+        Ok(round_1_result)
+    }
+
+    /// Rounds 2 and 3 for one table, against its own fork.
+    ///
+    /// Returns the out-of-domain point with them: rounds 4 and 5 open against
+    /// it, and re-deriving it would mean re-running round 2 to get the
+    /// composition root the transcript needs first.
+    #[allow(clippy::type_complexity)]
+    fn rounds_2_and_3(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &mut Round1<Field, FieldExtension>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> Result<
+        (
+            Round2<FieldExtension>,
+            Round3<FieldExtension>,
+            FieldElement<FieldExtension>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        PI: Send + Sync + Clone,
+    {
+        let beta = transcript.sample_field_element();
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                pub_inputs,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                domain.interpolation_domain_size,
+            )
+            .constraints
+            .len();
+        let num_transition_constraints = air.context().num_transition_constraints;
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                .take(num_boundary_constraints + num_transition_constraints)
+                .collect();
+        let transition_coefficients: Vec<_> =
+            coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coefficients = coefficients;
+
+        let mut round_2_result = Self::round_2_compute_composition_polynomial(
+            air,
+            pub_inputs,
+            domain,
+            twiddles,
+            round_1_result,
+            &transition_coefficients,
+            &boundary_coefficients,
+        )?;
+        transcript.append_bytes(&round_2_result.composition_poly_root);
+
+        let z = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+            air,
+            domain,
+            round_1_result,
+            &mut round_2_result,
+            &z,
+        );
+
+        // The fork is left standing where round 4 would pick it up: the two
+        // out-of-domain blocks and then the composition parts, in the order the
+        // verifier absorbs them. A pass that batches the FRI has to fold these
+        // states together, so it needs them advanced this far.
+        let (ood_block0, ood_block1) =
+            Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+        for block in [&ood_block0, &ood_block1] {
+            for col in block.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
+            }
+        }
+        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+            transcript.append_field_element(element);
+        }
+
+        Ok((round_2_result, round_3_result, z))
+    }
+
+    /// One table taken as far as a batched FRI lets it go on its own.
+    ///
+    /// Rounds 1 to 3, then the DEEP composition codeword — and there it stops,
+    /// because the next thing is a fold whose coefficient binds every table in
+    /// the batch and so cannot be known yet.
+    ///
+    /// The codeword is kept rather than the LDEs it came from. That is the
+    /// whole reason this split is affordable: on the ethrex block the trace and
+    /// composition LDEs of all 227 tables are tens of gigabytes, while their
+    /// DEEP codewords together are about 6.5 GB — one extension element per row
+    /// instead of every column. Holding them is what saves walking the
+    /// execution again just to recompute them once the coefficient is known.
+    fn deep_for_table(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Result<TableDeep<FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        PI: Send + Sync + Clone,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        let (mut round_2_result, round_3_result, z) = Self::rounds_2_and_3(
             air,
             pub_inputs,
             &mut round_1_result,
             transcript,
             &domain,
             &twiddles,
-        )
+        )?;
+
+        // Round 4's opening move, up to the point where the batch takes over:
+        // gamma is this table's own, sampled from its own fork.
+        let gamma = transcript.sample_field_element();
+        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let layout = Self::ood_layout(air);
+        let num_terms_trace = layout.num_surviving();
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(n_terms_composition_poly + num_terms_trace)
+                .collect();
+        let trace_term_powers: Vec<_> = coefficients.drain(..num_terms_trace).collect();
+        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
+
+        let deep = Self::compute_deep_composition_poly_evaluations(
+            &mut round_1_result.lde_trace,
+            &mut round_2_result,
+            &round_3_result,
+            &z,
+            &domain,
+            &domain.trace_primitive_root,
+            &coefficients,
+            &trace_term_coeffs,
+        );
+
+        // Bit-reversed here rather than at fold time. FRI wants it that way, and
+        // the permutation depends only on the length — which every member of a
+        // group shares — so permuting each codeword before the fold gives the
+        // same result as permuting the sum, one pass earlier.
+        let mut deep = deep;
+        in_place_bit_reverse_permute(&mut deep);
+
+        Ok(TableDeep {
+            lde_size: domain.interpolation_domain_size * domain.blowup_factor,
+            trace_rows: domain.interpolation_domain_size,
+            deep,
+            fork_state: transcript.state().to_vec(),
+        })
+    }
+
+    /// One FRI over a whole group of tables.
+    ///
+    /// The members share a domain, so their codewords add directly: the batch
+    /// is `Σ αᵏ·deepₖ` with `k` running in AIR order. Accumulating in place is
+    /// the point — a member is folded in and dropped, so what this holds is one
+    /// codeword, not the group's worth of them.
+    ///
+    /// `transcript` is the batch's, not any member's, and `alpha` must have
+    /// been drawn from it after every member's fork state went in. That is what
+    /// binds the fold to all the data it folds.
+    fn batch_fri(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        members: Vec<TableDeep<FieldExtension>>,
+        alpha: &FieldElement<FieldExtension>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Option<Vec<Commitment>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let lde_size = members.first()?.lde_size;
+        let trace_rows = members.first()?.trace_rows;
+        if members
+            .iter()
+            .any(|m| m.lde_size != lde_size || m.trace_rows != trace_rows)
+        {
+            return None;
+        }
+        let mut acc = vec![FieldElement::<FieldExtension>::zero(); lde_size];
+        let mut power = FieldElement::<FieldExtension>::one();
+
+        for member in members {
+            for (dst, src) in acc.iter_mut().zip(member.deep.iter()) {
+                *dst = &*dst + &power * src;
+            }
+            power *= alpha;
+        }
+
+        let (domain, _) = domain_and_twiddles(air, trace_rows);
+        let coset_offset = FieldElement::<Field>::from(air.context().proof_options.coset_offset);
+        let (_, layers) = fri::commit_phase_from_evaluations(
+            acc,
+            transcript,
+            &coset_offset,
+            domain.lde_roots_of_unity_coset.len(),
+            domain.blowup_factor.trailing_zeros(),
+            air.options().fri_final_poly_log_degree as u32,
+            domain.fri_inv_twiddles(),
+        );
+        Some(layers.iter().map(|l| l.merkle_tree.root).collect())
     }
 
     /// The main commitment of an already-expanded LDE, split when the AIR is

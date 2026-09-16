@@ -113,6 +113,37 @@ impl Visitor for BuildAux<'_> {
 /// A table's own transcript: the shared state after the challenge, separated by
 /// AIR index. Reproduces the fused prover's forking exactly — a single-table
 /// proof takes no index, and getting that wrong shifts every challenge.
+#[cfg(test)]
+pub(crate) fn fork_for(
+    challenge: &Challenge,
+    idx: usize,
+    num_airs: usize,
+) -> DefaultTranscript<GoldilocksExtension> {
+    fork(&challenge.transcript, idx, num_airs)
+}
+
+/// Rebuild only the tables a pass cannot retire, for a caller that wants one of
+/// them without proving the run.
+#[cfg(test)]
+pub(crate) fn resident_tables(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+) -> Result<pass::Resident, Error> {
+    struct Skip;
+    impl Visitor for Skip {
+        fn table(
+            &mut self,
+            _kind: TableKind,
+            _chunk: usize,
+            _trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    pass::run(elf, private_input, max_rows, &mut Skip)
+}
+
 fn fork(
     shared: &DefaultTranscript<GoldilocksExtension>,
     idx: usize,

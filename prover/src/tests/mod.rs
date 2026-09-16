@@ -1,5 +1,6 @@
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
+mod batched_fri_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
