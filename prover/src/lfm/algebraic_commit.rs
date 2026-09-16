@@ -508,6 +508,23 @@ impl<H: AlgebraicHasher> AlgebraicDigest<H> {
     }
 }
 
+/// ★ The device grind arm, derived from the name the configuration already
+/// declares — so the two cannot disagree and there is nothing extra to forget.
+///
+/// This impl is why the seam is an associated constant rather than a list in
+/// `crypto`: `AlgebraicDigest` lives here, `crypto` depends on nothing in this
+/// crate, and a `TypeId` list down there could never name it. Before this,
+/// every RPX grind on the block path fell to the host rayon search — ~2^20 RPX
+/// permutations per table per epoch — with valid proofs and no failure.
+impl<H: AlgebraicHasher> stark::grinding::GrindDigest for AlgebraicDigest<H> {
+    const DEVICE_GRIND: Option<stark::grinding::DeviceGrindKey> = match H::COMMITMENT_HASH {
+        CommitmentHash::Rpx256 => Some(stark::grinding::DeviceGrindKey::Rpx256),
+        // RPO and Poseidon have leaf and parent kernels but no nonce search,
+        // so the host is not a fallback here, it is the only arm.
+        _ => None,
+    };
+}
+
 impl<H> digest::HashMarker for AlgebraicDigest<H> {}
 
 impl<H> digest::OutputSizeUser for AlgebraicDigest<H> {

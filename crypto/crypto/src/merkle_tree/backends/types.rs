@@ -31,3 +31,8 @@ pub type BatchBlake3Backend<F> = FieldElementVectorBackend<F, Blake3Chain, 32>;
 /// The FRI-layer twin of [`BatchBlake3Backend`] — one leaf per fixed pair, no
 /// `Vec` per leaf. See there.
 pub type PairBlake3Backend<F> = FieldElementPairBackend<F, Blake3Chain, 32>;
+/// RPX256 over a vector of field elements — the algebraic backend, for a proof
+/// that is going to be verified inside another proof. See
+/// [`crate::hash::rpx`] for why an algebraic hash is worth its host cost, and
+/// only there.
+pub type BatchRpx256Backend<F> = super::rpx::RpxVectorBackend<F>;

@@ -20,5 +20,7 @@ env_logger = "0.11"
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
 disk-spill = ["prover/disk-spill"]
 instruments = ["prover/instruments", "stark/instruments"]
+# Emit a segment-shape profile per proof (see LAMBDA_VM_SHAPE_PROFILE).
+shape-profile = ["prover/shape-profile"]
 # GPU profiling build (Nsight): CUDA prover + instruments spans + NVTX ranges.
 nvtx = ["prover/nvtx", "instruments"]

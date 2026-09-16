@@ -857,6 +857,85 @@ void ext3_leaf_kernels_read_the_specified_felts() {
     printf("ext3 + comp-poly leaf kernels: read pattern + node encoding match the CPU leaf spec\n");
 }
 
+// ★ COSET leaves — the WHIR shape, and the only two kernels in this file that
+// the per-table branch has no twin for, so this is the ONLY place their read
+// pattern is pinned without a GPU.
+//
+// Leaf `j` holds the fold coset of `j`: the `block` codeword positions strided
+// by `num_leaves`. Every other leaf kernel here reads a ROW; these read a
+// STRIDE, which is exactly the kind of index arithmetic that compiles, runs and
+// silently hashes the wrong elements. The expectation below is built from the
+// definition — `codeword[j + t * num_leaves]` — not from a second call to the
+// kernel.
+void coset_leaf_kernels_read_the_specified_felts() {
+    // `block` is `2^log_folding`; 16 is the shipped posture, the others bracket
+    // it. `num_leaves` deliberately includes a value that is not a multiple of
+    // any block, to catch a bound computed from the wrong quantity.
+    for (uint64_t block : {2ull, 4ull, 16ull}) {
+        for (uint64_t num_leaves : {1ull, 2ull, 8ull, 13ull}) {
+            // --- base field -------------------------------------------------
+            {
+                std::vector<uint64_t> codeword(num_leaves * block);
+                uint64_t seed = 0xC05E7;
+                for (size_t i = 0; i < codeword.size(); ++i) codeword[i] = sample(seed, i);
+                std::vector<uint8_t> out(num_leaves * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                    rpx_leaves_base_coset(codeword.data(), num_leaves, block, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(num_leaves);
+                for (uint64_t j = 0; j < num_leaves; ++j) {
+                    for (uint64_t t = 0; t < block; ++t) {
+                        want[j].push_back(codeword[j + t * num_leaves]);
+                    }
+                }
+                check_leaves(out, want, "rpx_leaves_base_coset");
+            }
+            // --- cubic extension --------------------------------------------
+            {
+                std::vector<uint64_t> codeword(num_leaves * block * 3);
+                uint64_t seed = 0xC05E8;
+                for (size_t i = 0; i < codeword.size(); ++i) codeword[i] = sample(seed, i);
+                std::vector<uint8_t> out(num_leaves * 32, 0);
+                CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+                    rpx_leaves_ext3_coset(codeword.data(), num_leaves, block, out.data());
+                }
+                std::vector<std::vector<uint64_t>> want(num_leaves);
+                for (uint64_t j = 0; j < num_leaves; ++j) {
+                    for (uint64_t t = 0; t < block; ++t) {
+                        const uint64_t *at = codeword.data() + (j + t * num_leaves) * 3;
+                        for (int k = 0; k < 3; ++k) want[j].push_back(at[k]);
+                    }
+                }
+                check_leaves(out, want, "rpx_leaves_ext3_coset");
+            }
+        }
+    }
+
+    // ✓ A coset is NOT a contiguous run. At block > 1 the strided read and the
+    // contiguous one differ, so a kernel that had dropped the stride would have
+    // passed everything above only if `num_leaves == 1`. This is the control
+    // that says the stride is really being exercised.
+    {
+        const uint64_t num_leaves = 4, block = 4;
+        std::vector<uint64_t> codeword(num_leaves * block);
+        uint64_t seed = 0xC05E9;
+        for (size_t i = 0; i < codeword.size(); ++i) codeword[i] = sample(seed, i);
+        std::vector<uint8_t> out(num_leaves * 32, 0);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) {
+            rpx_leaves_base_coset(codeword.data(), num_leaves, block, out.data());
+        }
+        std::vector<uint64_t> contiguous(codeword.begin(), codeword.begin() + block);
+        uint8_t as_contiguous[32];
+        expected_leaf(contiguous, as_contiguous);
+        if (memcmp(out.data(), as_contiguous, 32) == 0) {
+            printf("FAIL rpx_leaves_base_coset: leaf 0 equals the CONTIGUOUS run, so the "
+                   "stride is not being read\n");
+            ++failures;
+        }
+    }
+    printf("coset leaf kernels: strided read pattern + node encoding match the WHIR leaf spec\n");
+}
+
 // FRI leaves: two consecutive ext3 values from an interleaved vector, six felts,
 // no bit reversal — the Pair backend's `hash_data`.
 void fri_leaf_kernel_reads_the_specified_felts() {
@@ -1102,6 +1181,7 @@ int main() {
     base_leaf_kernels_read_the_specified_felts();
     ext3_leaf_kernels_read_the_specified_felts();
     fri_leaf_kernel_reads_the_specified_felts();
+    coset_leaf_kernels_read_the_specified_felts();
     row_major_leaf_kernels_read_the_specified_felts();
     merkle_compressors_match_the_host_parent();
     permute_probe_matches_the_oracle_table();

@@ -114,13 +114,11 @@ fn static_commitment(blowup_factor: u8) -> Option<Commitment> {
     }
 }
 
-/// Exposed for the `compute_static_commitments` binary and the
-/// drift-detection tests in `static_commitments_tests`. Production callers
-/// should go through [`preprocessed_commitment`] so the static const-table
-/// shortcut is used when applicable.
-#[doc(hidden)]
-pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    // Generate precomputed columns
+/// The precomputed columns themselves, one per column, `NUM_ROWS` tall.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+pub fn preprocessed_columns() -> Vec<Vec<FE>> {
     let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
         .map(|_| Vec::with_capacity(NUM_ROWS))
         .collect();
@@ -130,6 +128,16 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
             columns[col_idx].push(FE::from(value));
         }
     }
+    columns
+}
+
+/// Exposed for the `compute_static_commitments` binary and the
+/// drift-detection tests in `static_commitments_tests`. Production callers
+/// should go through [`preprocessed_commitment`] so the static const-table
+/// shortcut is used when applicable.
+#[doc(hidden)]
+pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    let columns = preprocessed_columns();
 
     // Interpolate each column to a polynomial
     let polys: Vec<Polynomial<FE>> = columns

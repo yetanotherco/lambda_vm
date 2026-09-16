@@ -540,6 +540,18 @@ pub enum LinearTerm {
     Constant(i64),
 }
 
+impl LinearTerm {
+    /// The main column this term reads, if it reads one.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            LinearTerm::Column { column, .. } | LinearTerm::ColumnUnsigned { column, .. } => {
+                out.push(*column)
+            }
+            LinearTerm::Constant(_) => {}
+        }
+    }
+}
+
 /// A value that contributes to the bus fingerprint.
 ///
 /// A `BusValue` produces 1, 2, or 4 bus elements for the fingerprint depending
@@ -691,6 +703,21 @@ impl BusValue {
     ///
     /// # Returns
     /// Vector of combined bus elements (length = num_bus_elements())
+    /// The main columns this value reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => out.extend(*start_column..*start_column + packing.num_columns()),
+            BusValue::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
         &self,
         get_column: F,
@@ -810,6 +837,56 @@ impl BusValue {
 /// table's base-field transition constraints, and the framework appends the
 /// LogUp constraints (generated from [`Self::logup`]) after them. One body
 /// serves the compiled prover folder, the verifier folder, and IR capture.
+/// A preprocessed table's commitment, computed when someone asks for it.
+///
+/// The univariate path compares it against the proof's root and so always
+/// does; the multilinear one has no separate root and checks the claimed
+/// openings against [`precomputed_columns`] instead, so on that path nobody
+/// ever asks. On a real program the ones that are not compiled-in constants —
+/// the ELF's data pages and its instruction table — are an LDE and a Merkle
+/// tree each, and there are two dozen of them.
+///
+/// [`precomputed_columns`]: crate::traits::AIR::precomputed_columns
+#[derive(Clone)]
+pub struct LazyCommitment {
+    value: std::sync::Arc<std::sync::OnceLock<crate::config::Commitment>>,
+    #[allow(clippy::type_complexity)]
+    build: std::sync::Arc<dyn Fn() -> crate::config::Commitment + Send + Sync>,
+}
+
+impl std::fmt::Debug for LazyCommitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyCommitment")
+            .field("computed", &self.value.get().is_some())
+            .finish()
+    }
+}
+
+impl LazyCommitment {
+    /// One that is already known — a compiled-in constant, or a caller's.
+    pub fn ready(value: crate::config::Commitment) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            value: std::sync::Arc::new(cell),
+            build: std::sync::Arc::new(|| [0u8; 32]),
+        }
+    }
+
+    /// One that costs something, computed on the first [`get`](Self::get) and
+    /// shared by every clone of the AIR from then on.
+    pub fn deferred(build: impl Fn() -> crate::config::Commitment + Send + Sync + 'static) -> Self {
+        Self {
+            value: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build: std::sync::Arc::new(build),
+        }
+    }
+
+    pub fn get(&self) -> crate::config::Commitment {
+        *self.value.get_or_init(|| (self.build)())
+    }
+}
+
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
@@ -848,10 +925,17 @@ pub struct AirWithBuses<
     precaptured_program: Option<crate::constraint_ir::ConstraintProgram<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
-    /// Commitment to precomputed columns (if this is a preprocessed table)
-    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Commitment to precomputed columns (if this is a preprocessed table),
+    /// computed on demand — see [`LazyCommitment`].
+    preprocessed_commitment: Option<LazyCommitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Builds the precomputed columns on demand. Only the multilinear path asks
+    /// for them, and only on the verifying side, so they are generated rather
+    /// than carried — BITWISE's are 2^20 rows.
+    #[allow(clippy::type_complexity)]
+    precomputed_columns:
+        Option<std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
     /// Maximum number of bus elements across all interactions.
@@ -885,8 +969,9 @@ impl<
             precaptured_program: self.precaptured_program.clone(),
             auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
             boundary_constraint_builder: PhantomData,
-            preprocessed_commitment: self.preprocessed_commitment,
+            preprocessed_commitment: self.preprocessed_commitment.clone(),
             num_precomputed_cols: self.num_precomputed_cols,
+            precomputed_columns: self.precomputed_columns.clone(),
             name: self.name.clone(),
             max_bus_elements: self.max_bus_elements,
         }
@@ -974,6 +1059,7 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            precomputed_columns: None,
             name: None,
             max_bus_elements,
         }
@@ -996,8 +1082,17 @@ impl<
     ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
     /// ```
     pub fn with_preprocessed(
-        mut self,
+        self,
         commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.with_lazy_preprocessed(LazyCommitment::ready(commitment), num_precomputed_cols)
+    }
+
+    /// The same for a commitment nobody may end up needing.
+    pub fn with_lazy_preprocessed(
+        mut self,
+        commitment: LazyCommitment,
         num_precomputed_cols: usize,
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
@@ -1040,6 +1135,37 @@ impl<
         );
         self.precaptured_program = Some(program);
         self
+    }
+
+    /// The same, plus a generator for the columns themselves.
+    ///
+    /// Needed by the multilinear path, which checks the claimed openings of the
+    /// precomputed columns instead of comparing a commitment. Without it that
+    /// path cannot tell a real preprocessed table from a forged one.
+    pub fn with_preprocessed_columns(
+        self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        self.with_lazy_preprocessed_columns(
+            LazyCommitment::ready(commitment),
+            num_precomputed_cols,
+            columns,
+        )
+    }
+
+    /// The same with the commitment deferred: the multilinear path checks the
+    /// columns and never forces it.
+    pub fn with_lazy_preprocessed_columns(
+        self,
+        commitment: LazyCommitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        let mut air = self.with_lazy_preprocessed(commitment, num_precomputed_cols);
+        air.precomputed_columns = Some(columns);
+        air
     }
 
     /// Set a debug name for this AIR (for per-table bus sum tracking).
@@ -1107,15 +1233,21 @@ where
         self.max_bus_elements
     }
 
-    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        // Only the per-table MAX degree is consumed. Base constraints declare it
-        // once via `ConstraintSet::max_degree()`; the framework's LogUp
-        // constraints contribute their own known max (batched terms degree 3,
-        // accumulator `1 + absorbed`).
-        let max_degree = self
-            .constraint_set
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &self.auxiliary_trace_build_data.interactions
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        // Base constraints declare their max once via `ConstraintSet::max_degree()`;
+        // the framework's LogUp constraints contribute their own known max
+        // (batched terms degree 3, accumulator `1 + absorbed`).
+        self.constraint_set
             .max_degree()
-            .max(logup_max_degree(&self.logup));
+            .max(logup_max_degree(&self.logup))
+    }
+
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        let max_degree = self.max_constraint_degree();
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1414,7 +1546,17 @@ where
     }
 
     fn precomputed_commitment(&self) -> crate::config::Commitment {
-        self.preprocessed_commitment.unwrap_or([0u8; 32])
+        self.preprocessed_commitment
+            .as_ref()
+            .map(LazyCommitment::get)
+            .unwrap_or([0u8; 32])
+    }
+
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<F>>> {
+        self.precomputed_columns
+            .as_ref()
+            .map(|build| build())
+            .unwrap_or_default()
     }
 }
 
@@ -1472,10 +1614,25 @@ pub enum Multiplicity {
 }
 
 impl Multiplicity {
+    /// The main columns this expression reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            Multiplicity::One => {}
+            Multiplicity::Column(col) | Multiplicity::Negated(col) => out.push(*col),
+            Multiplicity::Sum(a, b) | Multiplicity::Diff(a, b) => out.extend([*a, *b]),
+            Multiplicity::Sum3(a, b, c) => out.extend([*a, *b, *c]),
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
     #[inline]
-    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    pub(crate) fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,
@@ -1551,6 +1708,23 @@ pub struct BusInteraction {
 }
 
 impl BusInteraction {
+    /// The main columns this interaction reads — its multiplicity's and its
+    /// values' — sorted and deduplicated.
+    ///
+    /// Everything here is affine in the columns, so a column nobody reads has
+    /// coefficient zero: this is what a caller recovering that affine form has
+    /// to look at, and the rest of the table is not worth asking about.
+    pub fn columns_read(&self) -> Vec<usize> {
+        let mut columns = Vec::new();
+        self.multiplicity.columns_read(&mut columns);
+        for value in &self.values {
+            value.columns_read(&mut columns);
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
     /// Creates a new table interaction.
     ///
     /// # Arguments
@@ -2542,12 +2716,12 @@ mod logup_single_source_tests {
         for i in 0..n_rows {
             let mut row_sum = Fp3::zero();
             for col in &term_columns {
-                row_sum = row_sum + &col[i];
+                row_sum += col[i];
             }
             let acc_i = *trace.get_aux(i, acc_col_idx);
             let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
-            let lhs = (acc_next - acc_i) * &n_fe;
-            let rhs = row_sum * &n_fe - &l;
+            let lhs = (acc_next - acc_i) * n_fe;
+            let rhs = row_sum * n_fe - l;
             assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");
         }
     }

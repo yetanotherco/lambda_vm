@@ -2901,14 +2901,16 @@ pub trait IsStarkProver<
         let grinding_factor = air.context().proof_options.grinding_factor;
         let mut nonce = None;
         if grinding_factor > 0 {
+            // ★ `H`'s own digest, never a fixed one: the block path proves
+            // under a separately pinned configuration, and a hard-coded
+            // `StarkGrindingDigest` here would grind on keccak for a proof that
+            // had moved everything else. Which device arm that digest takes is
+            // the digest's own `GrindDigest::DEVICE_GRIND`, so there is no list
+            // anywhere that a new hash can be missing from.
             let nonce_value =
                 grinding::generate_nonce_maybe_gpu::<crate::config::GrindingDigest<H>>(
                     &transcript.state(),
                     grinding_factor,
-                    // ★ `H`'s own hash, not the global `config::COMMITMENT_HASH`:
-                    // the block path proves under a separately pinned
-                    // configuration, and the global would not follow it.
-                    <H as crate::config::StarkHash>::COMMITMENT_HASH,
                 )
                 .expect("nonce not found");
             transcript.append_bytes(&nonce_value.to_be_bytes());

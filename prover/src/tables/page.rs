@@ -463,33 +463,46 @@ pub(crate) fn static_private_page_commitment(blowup_factor: u8) -> Option<Commit
 /// returns a compile-time constant for the standard proof options instead
 /// of rebuilding the FFT + Merkle tree.
 pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
+    commit_preprocessed_columns(&preprocessed_columns(config), DEFAULT_PAGE_SIZE, options)
+}
+
+/// The precomputed columns themselves, `DEFAULT_PAGE_SIZE` tall.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+///
+/// OFFSET (col 0): deterministic row index 0..page_size-1, the same for every
+///   page of a given size regardless of the program being proven.
+///
+/// INIT (col 1): the initial byte value at each offset. For zero-init pages
+///   (stack, heap, BSS) this is all zeros. For ELF data pages it holds the
+///   bytes loaded from the binary. Either way the column is fully determined
+///   before execution, so the verifier can check it rather than trust it.
+pub fn preprocessed_columns(config: &PageConfig) -> Vec<Vec<FE>> {
     let page_size = DEFAULT_PAGE_SIZE;
-    let num_rows = page_size;
+    let mut init_col = crate::tables::types::zeroed_fe_vec(page_size);
 
-    // Precomputed columns: OFFSET and INIT.
-    //
-    // OFFSET (col 0): deterministic row index 0..page_size-1, the same for every
-    //   page of a given size regardless of the program being proven.
-    //
-    // INIT (col 1): the initial byte value at each offset. For zero-init pages
-    //   (stack, heap, BSS) this is all zeros. For ELF data pages it holds the
-    //   bytes loaded from the binary. Either way the column is fully determined
-    //   before execution, so the verifier can check it against a preprocessed
-    //   commitment instead of including it in the main trace.
-    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
-    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
-
-    for i in 0..page_size {
-        offset_col[i] = FE::from(i as u64);
+    for (i, slot) in init_col.iter_mut().enumerate() {
         let init_byte = config
             .init_values
             .as_ref()
             .and_then(|v| v.get(i).copied())
             .unwrap_or(0);
-        init_col[i] = FE::from(init_byte as u64);
+        *slot = FE::from(init_byte as u64);
     }
 
-    commit_preprocessed_columns(&[offset_col, init_col], num_rows, options)
+    vec![offset_column(), init_col]
+}
+
+/// OFFSET alone: the dense `0..page_size-1` enumeration, byte-identical for
+/// every page regardless of program or input.
+///
+/// A **private-input** page's INIT holds the private input and stays a main
+/// column nobody recomputes, but its OFFSET is still preprocessed and still has
+/// to be pinned — nothing else constrains it, and a row pointed at another
+/// address forges a second memory history for it.
+pub fn offset_column() -> Vec<FE> {
+    (0..DEFAULT_PAGE_SIZE as u64).map(FE::from).collect()
 }
 
 /// LDE + Merkle-commit a set of preprocessed PAGE columns. Shared by

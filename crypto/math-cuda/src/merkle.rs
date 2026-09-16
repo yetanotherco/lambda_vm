@@ -152,12 +152,31 @@ pub(crate) fn keccak_launch_cfg(num_rows: u64) -> LaunchConfig {
 /// `log2(leaves_len)` times invoking `keccak_merkle_level` to fill in the
 /// inner nodes from the bottom up. Mirrors the CPU `build(nodes, leaves_len)`
 /// scan in `crypto/crypto/src/merkle_tree/merkle.rs`.
+/// Build every inner level of a Merkle tree, under the hash `hash` names.
+///
+/// The two kernel families have identical signatures and identical node layout,
+/// so the dispatch is a choice of handle and nothing else — which is the whole
+/// reason an algebraic hash costs two kernels here rather than a second tree
+/// builder.
 pub(crate) fn build_inner_tree_levels(
     stream: &CudaStream,
     be: &Backend,
     nodes_dev: &mut CudaSlice<u8>,
     leaves_len: usize,
+    hash: crate::DeviceHash,
 ) -> Result<()> {
+    let (level_fn, tail_fn) = match hash {
+        crate::DeviceHash::Keccak256 => (&be.keccak_merkle_level, &be.keccak_merkle_tail),
+        crate::DeviceHash::Rpx256 => (&be.rpx_merkle_level, &be.rpx_merkle_tail),
+        // ⚠ REFUSE rather than fall through. BLAKE3 does have inner-tree
+        // kernels, but they are walked by `crate::blake3` with its own tail
+        // geometry; reaching them from here would build a second, differently
+        // shaped tree under the same name. RPO and Poseidon have none at all.
+        other => unimplemented!(
+            "no device Merkle kernels reachable here for {} ({other:?})",
+            other.name()
+        ),
+    };
     // Once a level fits this many pairs, one single-block launch
     // (`keccak_merkle_tail`) builds all remaining levels with barriers
     // between them: the top levels of a big tree are each smaller than the
@@ -186,7 +205,7 @@ pub(crate) fn build_inner_tree_levels(
             };
             unsafe {
                 stream
-                    .launch_builder(&be.keccak_merkle_tail)
+                    .launch_builder(tail_fn)
                     .arg(&mut *nodes_dev)
                     .arg(&level_begin)
                     .launch(cfg)?;
@@ -196,7 +215,7 @@ pub(crate) fn build_inner_tree_levels(
         let cfg = keccak_launch_cfg(n_pairs);
         unsafe {
             stream
-                .launch_builder(&be.keccak_merkle_level)
+                .launch_builder(level_fn)
                 .arg(&mut *nodes_dev)
                 .arg(&new_begin)
                 .arg(&n_pairs)
@@ -341,7 +360,13 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
         stream.memcpy_htod(hashed_leaves, &mut slice)?;
     }
 
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
+    build_inner_tree_levels(
+        stream.as_ref(),
+        be,
+        &mut nodes_dev,
+        leaves_len,
+        crate::DeviceHash::Keccak256,
+    )?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
@@ -483,7 +508,13 @@ fn build_comp_poly_tree_nodes_dev(
         }
     }
 
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    build_inner_tree_levels(
+        stream.as_ref(),
+        be,
+        &mut nodes_dev,
+        num_leaves,
+        crate::DeviceHash::Keccak256,
+    )?;
     Ok((nodes_dev, num_leaves, stream))
 }
 
@@ -528,7 +559,13 @@ pub fn build_comp_poly_tree_from_slabs_dev(
                 .launch(cfg)?;
         }
     }
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    build_inner_tree_levels(
+        stream.as_ref(),
+        be,
+        &mut nodes_dev,
+        num_leaves,
+        crate::DeviceHash::Keccak256,
+    )?;
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
@@ -598,7 +635,13 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         }
     }
 
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    build_inner_tree_levels(
+        stream.as_ref(),
+        be,
+        &mut nodes_dev,
+        num_leaves,
+        crate::DeviceHash::Keccak256,
+    )?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;

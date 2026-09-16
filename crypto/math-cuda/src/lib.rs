@@ -7,12 +7,14 @@
 
 pub mod barycentric;
 pub mod blake3;
+pub mod columns;
 pub mod constraint_interp;
 pub mod deep;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
@@ -21,6 +23,9 @@ pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
 pub mod rpx;
+pub mod sumcheck;
+pub mod whir;
+pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.
@@ -51,7 +56,13 @@ pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
 /// hash under `cuda`: a tree labelled RPO is then built by RPO kernels or not
 /// built at all. Porting a family means replacing those arms with launches,
 /// and the set of arms is the checklist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ★ **Why the key travels with the request at all.** On the host a Merkle
+/// backend both NAMES a hash and computes it, so a tree cannot wear a name its
+/// own code did not produce. On the device the backend only names it — the
+/// kernels hash — so without a key travelling alongside, a tree labelled RPX
+/// could be built by keccak's kernels and nothing would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceHash {
     /// Keccak-256 leaves and parents.
     Keccak256,
@@ -66,6 +77,19 @@ pub enum DeviceHash {
     /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
     /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
     Poseidon,
+}
+
+impl DeviceHash {
+    /// The name a tree built under this key may be called by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Keccak256 => "keccak256",
+            Self::Blake3 => "blake3-chain",
+            Self::Rpo256 => "rpo256",
+            Self::Rpx256 => "rpx256",
+            Self::Poseidon => "poseidon-goldilocks",
+        }
+    }
 }
 
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.

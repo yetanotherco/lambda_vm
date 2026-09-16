@@ -73,6 +73,13 @@ pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod multilinear_bench_tests;
+#[cfg(test)]
+pub mod multilinear_continuation_tests;
+pub mod multilinear_prove_tests;
+#[cfg(test)]
+pub mod multilinear_table_tests;
+#[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]
 pub mod page_layout_tests;
@@ -89,6 +96,9 @@ pub mod recursion_soundness_gap_poc;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
+#[cfg(feature = "shape-profile")]
+pub mod shape_profile_tests;
+
 pub mod shift_tests;
 #[cfg(test)]
 pub mod statement_tests;
@@ -102,3 +112,9 @@ pub mod templates_tests;
 pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+#[cfg(test)]
+pub mod whir_byte_gate;
+#[cfg(test)]
+pub mod whir_hash_tests;
+#[cfg(test)]
+pub mod whir_identity_tests;

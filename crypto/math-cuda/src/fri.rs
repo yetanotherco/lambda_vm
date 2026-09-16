@@ -224,6 +224,7 @@ impl FriCommitState {
                 be,
                 &mut nodes_dev,
                 num_leaves,
+                DeviceHash::Keccak256,
             )?,
             DeviceHash::Blake3 => crate::blake3::build_inner_tree_levels(
                 self.stream.as_ref(),

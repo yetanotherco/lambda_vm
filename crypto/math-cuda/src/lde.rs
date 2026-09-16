@@ -1048,9 +1048,13 @@ fn build_inner_tree_levels_for(
     leaves_len: usize,
 ) -> Result<()> {
     match hash {
-        DeviceHash::Keccak256 => {
-            crate::merkle::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
-        }
+        DeviceHash::Keccak256 => crate::merkle::build_inner_tree_levels(
+            stream,
+            be,
+            nodes_dev,
+            leaves_len,
+            DeviceHash::Keccak256,
+        ),
         DeviceHash::Blake3 => {
             crate::blake3::build_inner_tree_levels(stream, be, nodes_dev, leaves_len)
         }

@@ -28,6 +28,9 @@ rkyv = { version = "0.8.10", default-features = false, features = [
     "pointer_width_64",
 ], optional = true }
 
+# GPU dispatch for the proof-of-work grind — only linked when `cuda` is enabled.
+math-cuda = { path = "../math-cuda", optional = true }
+
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 lambda-vm-syscalls = { path = "../../syscalls" }
 
@@ -92,3 +95,8 @@ blake3-6round = []
 # own switch means flipping `blake3-6round` to a default cannot turn the absorb
 # path on by accident.
 blake3-absorb = ["blake3-6round"]
+# The device nonce search behind `generate_nonce_maybe_gpu`.
+cuda = ["dep:math-cuda", "std"]
+# Host-only diagnostic: count keccak finalizes during verify (see `hash_metrics`).
+# Off by default → `PlatformKeccak256 = sha3::Keccak256`, provably unchanged.
+hash-metrics = []

@@ -228,6 +228,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Precomputed commitment
 // =========================================================================
 
+/// The precomputed columns themselves, `0..NUM_PRECOMPUTED_COLS` of the DECODE
+/// trace: the program's instruction table.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+/// This is what binds a proof to the program it claims to run.
+pub fn preprocessed_columns(instructions: &U64HashMap<Instruction>) -> Vec<Vec<FE>> {
+    // MU=0: only the precomputed columns are wanted.
+    let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let num_rows = trace.num_rows();
+    (0..NUM_PRECOMPUTED_COLS)
+        .map(|col_idx| {
+            (0..num_rows)
+                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
+                .collect()
+        })
+        .collect()
+}
+
 /// Computes the LDE commitment for DECODE precomputed columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
@@ -259,20 +278,10 @@ pub fn compute_precomputed_commitment(
     instructions: &U64HashMap<Instruction>,
     options: &ProofOptions,
 ) -> Commitment {
-    // Step 1: Generate trace (MU=0, we only need precomputed columns)
-    let (trace, _pc_to_row) = generate_decode_trace(instructions);
-    let num_rows = trace.num_rows();
+    let columns = preprocessed_columns(instructions);
+    let num_rows = columns[0].len();
 
-    // Step 2: Extract precomputed columns (0..NUM_PRECOMPUTED_COLS)
-    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|col_idx| {
-            (0..num_rows)
-                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
-                .collect()
-        })
-        .collect();
-
-    // Step 3: Interpolate each column to a polynomial
+    // Interpolate each column to a polynomial
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -281,7 +290,7 @@ pub fn compute_precomputed_commitment(
         })
         .collect();
 
-    // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    // Evaluate polynomials on LDE domain (N * blowup_factor points)
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
     let lde_columns: Vec<Vec<FE>> = polys

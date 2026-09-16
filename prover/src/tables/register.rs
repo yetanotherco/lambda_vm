@@ -299,6 +299,16 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 /// OFFSET encodes the Word address (0..63 for x0-x31, 508 for x254, 510-511 for x255).
 /// INIT holds the initial value (SP=STACK_TOP, PC=entry_point, rest=0).
 pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
+    commit_register_columns(options, preprocessed_columns(init))
+}
+
+/// The precomputed columns themselves: OFFSET and INIT, padded to a power of
+/// two.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+/// This is where the **entry point** enters the statement: `x255`'s INIT is it.
+pub fn preprocessed_columns(init: &[u32]) -> Vec<Vec<FE>> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
 
@@ -310,7 +320,7 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> C
         init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
     }
 
-    commit_register_columns(options, vec![offset_col, init_col])
+    vec![offset_col, init_col]
 }
 
 /// Continuation variant: commits OFFSET + INIT + FINI, so the verifier recomputes

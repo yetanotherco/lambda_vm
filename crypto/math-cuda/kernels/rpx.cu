@@ -747,6 +747,61 @@ extern "C" __global__ void rpx_leaves_base_row_major_row_pair_range(
 }
 
 // ---------------------------------------------------------------------------
+// COSET leaf hashing — the WHIR shape, and the two kernels the per-table branch
+// has no twin for.
+//
+// Every other leaf kernel in this file hashes a ROW GROUP: a leaf is a row (or
+// a row pair) read across the columns. WHIR's leaf is a fold COSET: leaf `j`
+// holds the `2^log_folding` codeword positions that fold onto `j`, which are
+// strided by `num_leaves`. Twins of `keccak256_leaves_base_coset` /
+// `keccak256_leaves_ext3_coset` (`keccak.cu`), argument for argument, with the
+// sponge swapped.
+//
+// The felt count is known before the loop, which the overwrite duplex needs for
+// its padding flag: a base leaf is `block` felts, an ext3 leaf `3 * block`. Raw
+// `[0, 2^64)` storage is absorbed as is — the permutation is
+// representation-independent and the host canonicalises before serialising, so
+// the same field value gives the same digest either way.
+// ---------------------------------------------------------------------------
+
+// Goldilocks BASE-FIELD coset leaves: leaf `tid` hashes
+// `codeword[tid + t * num_leaves]` for `t` in `[0, block)`.
+extern "C" __global__ void rpx_leaves_base_coset(const uint64_t *__restrict__ codeword,
+                                                 uint64_t num_leaves, uint64_t block,
+                                                 uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    rpx::Sponge sp;
+    sp.init(block);
+    for (uint64_t t = 0; t < block; ++t) sp.absorb(codeword[tid + t * num_leaves]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, out + tid * 32);
+}
+
+// EXT3 coset leaves: the same stride, each element as its three components in
+// order — what `element_felts` produces for a cubic-extension element, and what
+// the base kernel above does one component at a time.
+extern "C" __global__ void rpx_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
+                                                 uint64_t num_leaves, uint64_t block,
+                                                 uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    rpx::Sponge sp;
+    sp.init(block * 3);
+    for (uint64_t t = 0; t < block; ++t) {
+        const uint64_t *at = codeword + (tid + t * num_leaves) * 3;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) sp.absorb(at[k]);
+    }
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
 // Merkle level / tail. Same launch split as BLAKE3's: one thread per pair per
 // level while a level is wide, then ONE single-block launch that grid-strides
 // every remaining level with a barrier between them.

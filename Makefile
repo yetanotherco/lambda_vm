@@ -559,6 +559,11 @@ test-ethrex-crypto:
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
+	# The hash counters compile to nothing unless the feature is on, so their
+	# own tests only execute here. See the `lint` target for why an instrument
+	# nobody runs is worth a line in the build.
+	cargo test -p crypto --features hash-metrics
+	$(MAKE) test-rpx-host-kat
 
 # === Quick test shortcuts ===
 
@@ -566,6 +571,28 @@ test: compile-programs test-syscalls test-ethrex-crypto
 # prebuilt guest ELFs, so build them first.
 test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
+
+# ★ The RPX device kernel's arithmetic, checked WITHOUT a GPU.
+#
+# `kernels/rpx.cu` is compiled as ordinary host C++ through `cuda_host_shim.h`,
+# so its field primitives, MDS, S-boxes, cubic extension, seven-round schedule,
+# leaf sponge, Merkle parent and every leaf kernel's read pattern are pinned in
+# seconds on a laptop. That matters here because GPU CI runs only on
+# merge_group, so without this the two WHIR coset kernels — which exist nowhere
+# else — would reach a GPU unchecked.
+#
+# ⚠ Necessary, never sufficient: it cannot tell you whether nvcc accepts the
+# file, nor anything about execution rather than arithmetic (grid indexing,
+# register pressure, local-memory spills). Those still belong to the GPU tests.
+HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
+
+test-rpx-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
+	./target/host_kat/rpx_host_kat
 
 # Prover tests only
 test-prover: compile-recursion-elfs
@@ -842,6 +869,12 @@ lint:
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
+	# `hash-metrics` is host-only and off by default, so no pass above compiles it.
+	# Without this line the feature can rot untouched — which is how its Merkle
+	# counters stayed keccak-only after a second hash arrived, reporting ZERO for
+	# the arm whose whole purpose was to change the hashing. Lints, does not run:
+	# its tests are in the `test` target.
+	cargo clippy -p crypto --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

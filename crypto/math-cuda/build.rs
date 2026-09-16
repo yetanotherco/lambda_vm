@@ -215,4 +215,8 @@ fn main() {
         &[]
     };
     compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
+    // The WHIR path's own kernels. They carry no compile-time knob, so they
+    // take the empty define list rather than gaining a second signature.
+    compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
+    compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
 }

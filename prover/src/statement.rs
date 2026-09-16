@@ -98,9 +98,36 @@ pub(crate) fn absorb_statement_with_digest(
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
     t.append_bytes(public_output);
 
-    // table_counts: fixed-width u64s in declared order. The exhaustive
-    // destructure makes any field added to TableCounts a compile error here —
-    // that's the signal to extend the loop below and bump DOMAIN_TAG.
+    absorb_table_counts(t, table_counts);
+
+    t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+
+    // fri_final_poly_log_degree: single byte, no endianness concern.
+    t.append_bytes(&[fri_final_poly_log_degree]);
+
+    // runtime_page_ranges: count-prefixed; each entry fixed width.
+    t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
+    for r in runtime_page_ranges {
+        // Exhaustive destructure: any field added to RuntimePageRange becomes
+        // a compile error here.
+        let &RuntimePageRange { base, count } = r;
+        t.append_bytes(&base.to_le_bytes());
+        t.append_bytes(&count.to_le_bytes());
+    }
+
+    // Continuation epochs additionally bind their position (replay protection).
+    // Monolithic proofs append nothing here, so their encoding is unchanged.
+    if let StatementKind::ContinuationEpoch { epoch_label } = kind {
+        t.append_bytes(&epoch_label.to_le_bytes());
+    }
+}
+
+/// The table layout, as fixed-width u64s in declared order.
+///
+/// The exhaustive destructure makes any field added to [`TableCounts`] a
+/// compile error here — that's the signal to extend the loop and bump the
+/// domain tag of every statement that absorbs it.
+pub(crate) fn absorb_table_counts(t: &mut impl IsTranscript<E>, table_counts: &TableCounts) {
     let &TableCounts {
         cpu,
         lt,
@@ -140,28 +167,11 @@ pub(crate) fn absorb_statement_with_digest(
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
     }
-
-    t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
-
-    // fri_final_poly_log_degree: single byte, no endianness concern.
-    t.append_bytes(&[fri_final_poly_log_degree]);
-
-    // runtime_page_ranges: count-prefixed; each entry fixed width.
-    t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
-    for r in runtime_page_ranges {
-        // Exhaustive destructure: any field added to RuntimePageRange becomes
-        // a compile error here.
-        let &RuntimePageRange { base, count } = r;
-        t.append_bytes(&base.to_le_bytes());
-        t.append_bytes(&count.to_le_bytes());
-    }
-
-    // Continuation epochs additionally bind their position (replay protection).
-    // Monolithic proofs append nothing here, so their encoding is unchanged.
-    if let StatementKind::ContinuationEpoch { epoch_label } = kind {
-        t.append_bytes(&epoch_label.to_le_bytes());
-    }
 }
+
+/// Domain tag for the multilinear path. A WHIR proof and a FRI proof must
+/// never share a transcript prefix.
+pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V1";
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.

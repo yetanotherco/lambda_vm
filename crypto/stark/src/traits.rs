@@ -7,8 +7,10 @@ use math::field::{
 };
 
 use crate::{
-    constraint_ir::ConstraintProgram, constraints::builder::ConstraintMeta, domain::Domain,
-    lookup::BusPublicInputs,
+    constraint_ir::ConstraintProgram,
+    constraints::builder::ConstraintMeta,
+    domain::Domain,
+    lookup::{BusInteraction, BusPublicInputs},
 };
 
 use super::{
@@ -171,6 +173,20 @@ pub trait AIR: Send + Sync {
         0
     }
 
+    /// The table's bus interactions, in declaration order.
+    ///
+    /// Shape-only consumers (profiling, cost models) read this; the proving
+    /// path consumes the `LogUpLayout` built from the same list.
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &[]
+    }
+
+    /// Highest degree among this table's transition constraints, counting both
+    /// the table's own constraints and the framework-emitted LogUp ones.
+    fn max_constraint_degree(&self) -> usize {
+        1
+    }
+
     /// Returns true if this AIR has preprocessed (precomputed) columns.
     ///
     /// Preprocessed tables have columns that are fully deterministic and known
@@ -192,6 +208,17 @@ pub trait AIR: Send + Sync {
     /// Only meaningful if `is_preprocessed()` returns true.
     fn precomputed_commitment(&self) -> Commitment {
         [0u8; 32]
+    }
+
+    /// The precomputed columns themselves, `0..num_precomputed_columns()`.
+    ///
+    /// Empty unless `is_preprocessed()`. The univariate path never needs these
+    /// — it compares [`precomputed_commitment`](Self::precomputed_commitment)
+    /// against the proof's root — but the multilinear one has no separate root
+    /// to compare, so it checks the claimed openings against these directly.
+    /// Generating them is the same work recomputing that commitment costs.
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
+        Vec::new()
     }
 
     fn num_auxiliary_rap_columns(&self) -> usize {

@@ -212,6 +212,37 @@ fn static_commitment(blowup_factor: u8) -> Option<Commitment> {
     }
 }
 
+/// The precomputed columns themselves, one per column, `NUM_ROWS` tall.
+///
+/// The multilinear path checks a proof's claimed openings against these instead
+/// of comparing a commitment, so it needs the values and not just their root.
+pub fn preprocessed_columns() -> Vec<Vec<FE>> {
+    // Each column is generated independently by iterating over all row indices.
+    #[cfg(feature = "parallel")]
+    return (0..NUM_PRECOMPUTED_COLS)
+        .into_par_iter()
+        .map(|col_idx| {
+            (0..NUM_ROWS)
+                .map(|idx| FE::from(generate_bitwise_row(idx)[col_idx]))
+                .collect()
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut cols: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+            .map(|_| Vec::with_capacity(NUM_ROWS))
+            .collect();
+        for idx in 0..NUM_ROWS {
+            let row = generate_bitwise_row(idx);
+            for (col_idx, &value) in row.iter().enumerate() {
+                cols[col_idx].push(FE::from(value));
+            }
+        }
+        cols
+    }
+}
+
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
@@ -229,36 +260,9 @@ fn static_commitment(blowup_factor: u8) -> Option<Commitment> {
 /// shortcut is used when applicable.
 #[doc(hidden)]
 pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    // Step 1: Generate precomputed columns in parallel
-    // Each column is generated independently by iterating over all row indices
-    #[cfg(feature = "parallel")]
-    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .into_par_iter()
-        .map(|col_idx| {
-            (0..NUM_ROWS)
-                .map(|idx| {
-                    let row = generate_bitwise_row(idx);
-                    FE::from(row[col_idx])
-                })
-                .collect()
-        })
-        .collect();
+    let columns = preprocessed_columns();
 
-    #[cfg(not(feature = "parallel"))]
-    let columns: Vec<Vec<FE>> = {
-        let mut cols: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-            .map(|_| Vec::with_capacity(NUM_ROWS))
-            .collect();
-        for idx in 0..NUM_ROWS {
-            let row = generate_bitwise_row(idx);
-            for (col_idx, &value) in row.iter().enumerate() {
-                cols[col_idx].push(FE::from(value));
-            }
-        }
-        cols
-    };
-
-    // Step 2: Interpolate each column to a polynomial (parallel)
+    // Interpolate each column to a polynomial (parallel)
     #[cfg(feature = "parallel")]
     let polys: Vec<Polynomial<FE>> = columns
         .par_iter()
@@ -277,7 +281,7 @@ pub fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
         })
         .collect();
 
-    // Step 3: Evaluate polynomials on LDE domain (parallel)
+    // Evaluate polynomials on LDE domain (parallel)
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
 
