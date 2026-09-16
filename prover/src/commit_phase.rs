@@ -16,6 +16,7 @@ use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::{TableKind, Traces, WalkLeftover, build_initial_image};
 use crate::tables::{register, types::*};
 use executor::elf::Elf;
+use stark::trace::TraceTable;
 
 /// What the Commit phase produced.
 pub struct CommitPhase {
@@ -126,7 +127,7 @@ pub fn commit_remaining(
     mut leftover: WalkLeftover,
     max_rows: &MaxRowsConfig,
     proof_options: &ProofOptions,
-) -> Result<Vec<ChunkCommitment>, Error> {
+) -> Result<Remaining, Error> {
     leftover.finalize();
 
     let cpu = crate::test_utils::create_cpu_air(proof_options);
@@ -182,7 +183,23 @@ pub fn commit_remaining(
             out.push((kind, first + offset, root));
         }
     }
-    Ok(out)
+    // BITWISE comes back as a table rather than a commitment: it is
+    // preprocessed, so its commitment splits into two trees, and that path does
+    // not exist here yet. The lookups are what this phase is responsible for
+    // having kept — the chunks that owed them are long gone.
+    let bitwise = leftover.build_bitwise();
+    Ok(Remaining {
+        chunks: out,
+        bitwise,
+    })
+}
+
+/// What the end-of-run phase produced.
+pub struct Remaining {
+    /// The tails, and every chunk of the tables the walk could not close.
+    pub chunks: Vec<ChunkCommitment>,
+    /// The BITWISE table, carrying the lookups of every retired chunk.
+    pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Every chunked table, closable mid-walk or not.

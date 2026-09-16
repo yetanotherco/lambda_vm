@@ -1264,6 +1264,9 @@ pub struct WalkLeftover {
     /// Chunks already emitted per kind, indexed like [`CHUNKED_KINDS`], so the
     /// tail's chunk numbering continues where the walk stopped.
     pub(crate) emitted: [usize; CHUNKED_KINDS.len()],
+    /// BITWISE lookups owed by the chunks the walk closed and dropped. The
+    /// end-of-run phase folds the rest in on top of this.
+    pub(crate) retired_bitwise: bitwise::BitwiseHistogram,
     /// Register state at the last cycle. The end-of-run finalization is driven
     /// from it — HALT appends 33 register MEMW ops at `u64::MAX` — so the phase
     /// that pads and commits the tails needs nothing else from the run.
@@ -1319,6 +1322,37 @@ impl WalkLeftover {
             out.push(self.tail.take_front(kind, left, max_rows));
         }
         out
+    }
+
+    /// Build the BITWISE table from what the run owes it.
+    ///
+    /// The lookups of the chunks the walk retired were folded in as they were
+    /// dropped; the tables still held contribute here. BITWISE is a fixed table
+    /// whose rows are the lookup space — only its multiplicity columns depend
+    /// on the run — so it is built once, at the end, and never chunked.
+    ///
+    /// Only the three sources a walk can retire are folded so far. The rest —
+    /// LT, MUL, DVRM, SHIFT, the accelerators, PAGE — feed BITWISE too and are
+    /// not here yet.
+    pub(crate) fn build_bitwise(&self) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        let mut hist = bitwise::BitwiseHistogram::new();
+        hist.merge(&self.retired_bitwise);
+        self.tail.fold_bitwise_from_front(
+            TableKind::MemwAligned,
+            self.tail.memw_aligned_ops.len(),
+            &mut hist,
+        );
+        self.tail.fold_bitwise_from_front(
+            TableKind::MemwRegister,
+            self.tail.memw_register_rows.len(),
+            &mut hist,
+        );
+        self.tail
+            .fold_bitwise_from_front(TableKind::Branch, self.tail.branch_ops.len(), &mut hist);
+
+        let mut table = bitwise::generate_bitwise_trace();
+        hist.fill_multiplicities(&mut table);
+        table
     }
 
     /// Cycles the walk executed.
@@ -2901,6 +2935,24 @@ impl CollectedEpoch {
     /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
     /// [`touched_cells_from_memory_state`] over the same immutable
     /// `memory_state`), available before any table is built.
+    /// The same three BITWISE sources over a finished run, for comparison with
+    /// what a walk retired plus what it kept.
+    #[cfg(test)]
+    pub(crate) fn fold_bitwise_for_test(&self, hist: &mut bitwise::BitwiseHistogram) {
+        self.ops.fold_bitwise_from_front(
+            TableKind::MemwAligned,
+            self.ops.memw_aligned_ops.len(),
+            hist,
+        );
+        self.ops.fold_bitwise_from_front(
+            TableKind::MemwRegister,
+            self.ops.memw_register_rows.len(),
+            hist,
+        );
+        self.ops
+            .fold_bitwise_from_front(TableKind::Branch, self.ops.branch_ops.len(), hist);
+    }
+
     /// Ops collected for `kind`. Mirrors [`CollectedOps::buffered`] so a walk's
     /// output and a finished run's can be compared on the same footing.
     pub fn op_count(&self, kind: TableKind) -> usize {
@@ -3223,6 +3275,34 @@ impl CollectedOps {
             TableKind::Cpu32 => {
                 build!(&self.cpu32_ops, max_rows.cpu32, cpu32::generate_cpu32_trace)
             }
+        }
+    }
+
+    /// Fold the BITWISE lookups the first `n` ops of `kind` imply into `hist`.
+    ///
+    /// Must run before those ops are drained. BITWISE accumulates across the
+    /// whole run from tables the Commit phase retires, so a chunk's
+    /// contribution has to be taken while the chunk still exists — otherwise
+    /// the table it lands in comes out short and the bus does not balance.
+    ///
+    /// Only three of the kinds the walk closes feed BITWISE; the others have no
+    /// collector and contribute nothing.
+    pub(crate) fn fold_bitwise_from_front(
+        &self,
+        kind: TableKind,
+        n: usize,
+        hist: &mut bitwise::BitwiseHistogram,
+    ) {
+        match kind {
+            TableKind::MemwAligned => hist.add_ops(&collect_bitwise_from_memw_aligned(
+                &self.memw_aligned_ops[..n],
+            )),
+            TableKind::MemwRegister => memw_register::collect_bitwise_from_memw_register(
+                &self.memw_register_rows[..n],
+                hist,
+            ),
+            TableKind::Branch => hist.add_ops(&collect_bitwise_from_branch(&self.branch_ops[..n])),
+            _ => {}
         }
     }
 
@@ -5177,6 +5257,7 @@ impl Traces {
         let mut register_state = RegisterState::from_init(register_init);
 
         let mut buf = CollectedOps::default();
+        let mut bitwise_hist = bitwise::BitwiseHistogram::new();
         let mut emitted = [0usize; CHUNKED_KINDS.len()];
         let mut cycles_so_far = 0usize;
 
@@ -5210,6 +5291,9 @@ impl Traces {
             for (slot, kind) in CHUNKED_KINDS.iter().enumerate() {
                 while buf.buffered(*kind) >= max_rows_for(*kind, max_rows) {
                     let limit = max_rows_for(*kind, max_rows);
+                    // Before the ops go: BITWISE counts them across the whole
+                    // run, and this chunk is about to stop existing.
+                    buf.fold_bitwise_from_front(*kind, limit, &mut bitwise_hist);
                     let table = buf.take_front(*kind, limit, max_rows);
                     on_chunk(*kind, emitted[slot], table);
                     emitted[slot] += 1;
@@ -5227,6 +5311,7 @@ impl Traces {
         let _ = memory_state;
         Ok(WalkLeftover {
             tail: buf,
+            retired_bitwise: bitwise_hist,
             emitted,
             register_state,
             cycles: cycles_so_far,

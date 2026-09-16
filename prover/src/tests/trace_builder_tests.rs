@@ -1863,7 +1863,8 @@ fn the_two_phases_cover_every_chunked_table() {
     let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
     let closed = phase.closed.clone();
     let rest = crate::commit_phase::commit_remaining(phase.leftover, &max_rows, &proof_options)
-        .expect("challenge");
+        .expect("challenge")
+        .chunks;
 
     let mut got: HashMap<(TableKind, usize), _> = HashMap::new();
     for (kind, chunk, root) in closed.into_iter().chain(rest) {
@@ -1934,4 +1935,72 @@ fn the_two_phases_cover_every_chunked_table() {
         }
     }
     assert!(checked > 4, "the fixture must cover several chunks");
+}
+
+/// A retired chunk must leave its BITWISE lookups behind.
+///
+/// BITWISE counts lookups from tables the Commit phase closes and drops, so the
+/// contribution has to be taken while the chunk still exists. If it is not, the
+/// BITWISE table comes out short and the bus stops balancing — a failure that
+/// surfaces at verification, far from the chunk that caused it.
+#[test]
+fn retiring_a_chunk_keeps_its_bitwise_lookups() {
+    use crate::tables::bitwise::BitwiseHistogram;
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    // Small limits for the three kinds that feed BITWISE, so chunks of them
+    // actually close mid-walk and their lookups have to be folded in early.
+    let max_rows = crate::tables::MaxRowsConfig {
+        memw_aligned: 1 << 10,
+        memw_register: 1 << 10,
+        branch: 1 << 10,
+        ..Default::default()
+    };
+
+    let mut leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |_, _, _| {},
+    )
+    .expect("walk");
+
+    // The same three sources over the finished run, whole.
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let whole = T::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collect");
+    let mut expected = BitwiseHistogram::new();
+    whole.fold_bitwise_for_test(&mut expected);
+
+    // Finalization first, as the Challenge phase does it: HALT's register
+    // writes are part of the run and land in these same tables.
+    leftover.finalize();
+
+    // What the walk retired plus what it still holds, read off the table the
+    // phase actually builds.
+    let mut reference = crate::tables::bitwise::generate_bitwise_trace();
+    expected.fill_multiplicities(&mut reference);
+    let built = leftover.build_bitwise();
+
+    let (a, _) = reference.main_data_row_major();
+    let (b, _) = built.main_data_row_major();
+    assert_eq!(
+        a.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+        b.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+        "the lookups of the retired chunks plus the tail do not add up to the run's"
+    );
 }
