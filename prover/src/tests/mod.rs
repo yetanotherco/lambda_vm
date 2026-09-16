@@ -100,6 +100,7 @@ pub mod rpx_two_implementations;
 #[cfg(test)]
 #[cfg(feature = "shape-profile")]
 pub mod shape_profile_tests;
+pub mod transcript_counts;
 
 pub mod shift_tests;
 #[cfg(test)]
