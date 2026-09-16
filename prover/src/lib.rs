@@ -1169,10 +1169,17 @@ pub fn prove_with_options_and_inputs(
     // down the same ladder. The chunked tables come back as placeholders and the
     // provider rebuilds each chunk at the two points the prover needs it.
     let retire_traces = stark::prover::streaming_retire_lde();
+    // The public output is all this path still needs from the run above; keeping
+    // it lets the logs go before the build, which is the phase that peaks.
+    let executor_output = result.return_values.memory_values.clone();
     let (mut traces, streaming) = if retire_traces {
+        // The collector walks the execution itself, one chunk of logs at a time,
+        // so this run's logs are dead weight from here on. Freeing them costs a
+        // second execution and is the shape the Commit phase needs: a prover
+        // that walks an execution instead of being handed it whole.
+        drop(result);
         let (traces, routed) = Traces::from_elf_and_logs_streaming(
             &program,
-            &result.logs,
             max_rows,
             private_inputs,
             #[cfg(feature = "disk-spill")]
@@ -1192,13 +1199,13 @@ pub fn prove_with_options_and_inputs(
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )?;
+        drop(result);
         (traces, None)
     };
     debug_assert_eq!(
-        traces.public_output_bytes, result.return_values.memory_values,
+        traces.public_output_bytes, executor_output,
         "public output diverged between executor view and trace reconstruction"
     );
-    drop(result);
 
     #[cfg(feature = "instruments")]
     drop(__sp);

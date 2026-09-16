@@ -336,6 +336,11 @@ fn pack_register_value(value: u64) -> [u32; 8] {
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
+    // Index of `logs[0]` within the whole execution. Zero when the caller holds
+    // every log; the running count when it is walking the execution in pieces,
+    // since the timestamp comes from the cycle's position and restarting it per
+    // piece would silently rewind time.
+    first_cycle: usize,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
@@ -345,7 +350,7 @@ fn collect_cpu_ops(
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = ((first_cycle + i) as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -409,6 +414,15 @@ struct MemwBuckets {
 }
 
 impl MemwBuckets {
+    /// Append another segment's buckets. Order is preserved, so collecting an
+    /// execution in pieces and appending them yields exactly what collecting it
+    /// whole would have.
+    fn append(&mut self, mut other: Self) {
+        self.register_rows.append(&mut other.register_rows);
+        self.aligned.append(&mut other.aligned);
+        self.general.append(&mut other.general);
+    }
+
     fn with_register_capacity(n: usize) -> Self {
         Self {
             register_rows: Vec::with_capacity(n),
@@ -2161,7 +2175,7 @@ pub(crate) fn epoch_touched_cells<I: ImageSource>(
 ) -> Result<Vec<(u64, u64, u64)>, Error> {
     let instructions = decode::instructions_from_elf(elf)
         .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-    let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+    let cpu_ops = collect_cpu_ops(logs, &instructions, 0)?;
 
     let mut memory_state = MemoryState::from_image(initial_image);
     let mut register_state = RegisterState::from_init(register_init);
@@ -4792,7 +4806,6 @@ impl Traces {
     /// any of them on demand.
     pub(crate) fn from_elf_and_logs_streaming(
         elf: &Elf,
-        logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -4800,8 +4813,15 @@ impl Traces {
         let initial_image = build_initial_image(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
         let artifacts = DecodeArtifacts::from_elf(elf)?;
-        let collected =
-            Self::collect_epoch(&artifacts, &initial_image, &register_init, logs, true)?;
+        // Drives its own executor: no caller holds the logs for it.
+        let collected = Self::collect_epoch_streaming(
+            &artifacts,
+            elf,
+            private_input.to_vec(),
+            &initial_image,
+            &register_init,
+            true,
+        )?;
         Self::build_from_collected_streaming(
             &artifacts,
             collected,
@@ -4895,6 +4915,89 @@ impl Traces {
     /// order (the image advances between epochs); the table generation that
     /// consumes the result ([`Self::build_from_collected`]) is epoch-local and
     /// can run on another thread.
+    /// `collect_epoch`, driving the executor itself and consuming its logs one
+    /// chunk at a time instead of taking them all at once.
+    ///
+    /// Approach 1's Commit phase walks the execution and retires what it has
+    /// finished with; it cannot start by materializing every log. Phases 1-3 are
+    /// segment-local given the carried state — `MemoryState` and `RegisterState`
+    /// thread through, and the LT ops a MEMW access implies come from the
+    /// timestamps that access already carries, not from a global ordering — so
+    /// the same ops come out in the same order, and only one chunk of logs is
+    /// ever resident.
+    ///
+    /// `collect_streaming_matches_collect_epoch` pins that equality.
+    pub(crate) fn collect_epoch_streaming<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        elf: &Elf,
+        private_input: Vec<u8>,
+        initial_image: &I,
+        register_init: &[u32],
+        is_final: bool,
+    ) -> Result<CollectedEpoch, Error> {
+        let mut executor = executor::vm::execution::Executor::new(elf, private_input)
+            .map_err(|e| Error::Prover(format!("executor: {e}")))?;
+
+        let mut memory_state = MemoryState::from_image(initial_image);
+        let mut register_state = RegisterState::from_init(register_init);
+
+        let mut cpu_ops: Vec<CpuOperation> = Vec::new();
+        let mut memw = MemwBuckets::with_register_capacity(0);
+        let (mut load_ops, mut lt_ops, mut shift_ops, mut bitwise_ops) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut commit_ops, mut keccak_ops, mut cpu32_ops) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ecsm_ops, mut ecdas_ops, mut hint_ops) = (Vec::new(), Vec::new(), Vec::new());
+
+        let mut cycles_so_far = 0usize;
+        while let Some(chunk) = executor
+            .resume()
+            .map_err(|e| Error::Prover(format!("executor: {e}")))?
+        {
+            if !is_final && chunk.iter().any(|log| log.next_pc == 0) {
+                return Err(Error::HaltInNonFinalEpoch);
+            }
+            let chunk_cpu = collect_cpu_ops(chunk, &artifacts.instructions, cycles_so_far)?;
+            let (m, ld, lt, sh, bw, cm, kc, c32, ec, ed, hn) =
+                collect_ops_from_cpu(&chunk_cpu, &mut memory_state, &mut register_state);
+            memw.append(m);
+            load_ops.extend(ld);
+            lt_ops.extend(lt);
+            shift_ops.extend(sh);
+            bitwise_ops.extend(bw);
+            commit_ops.extend(cm);
+            keccak_ops.extend(kc);
+            cpu32_ops.extend(c32);
+            ecsm_ops.extend(ec);
+            ecdas_ops.extend(ed);
+            hint_ops.extend(hn);
+            cycles_so_far += chunk_cpu.len();
+            cpu_ops.extend(chunk_cpu);
+        }
+
+        let ops = collect_all_ops(
+            cpu_ops,
+            memw,
+            load_ops,
+            lt_ops,
+            shift_ops,
+            bitwise_ops,
+            commit_ops,
+            keccak_ops,
+            cpu32_ops,
+            ecsm_ops,
+            ecdas_ops,
+            hint_ops,
+            &mut register_state,
+            is_final,
+        );
+
+        Ok(CollectedEpoch {
+            ops,
+            memory_state,
+            register_state,
+        })
+    }
+
     pub fn collect_epoch<I: ImageSource + Sync>(
         artifacts: &DecodeArtifacts,
         initial_image: &I,
@@ -4913,7 +5016,7 @@ impl Traces {
         // Phase 1: Logs → CPU operations
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p1_cpu_ops");
-        let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &artifacts.instructions, 0)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -5088,7 +5191,7 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Phase 1: Logs → CPU operations
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, &instructions, 0)?;
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::new();

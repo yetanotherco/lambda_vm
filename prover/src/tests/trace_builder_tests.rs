@@ -1319,3 +1319,81 @@ fn chunk_shape_matches_the_built_chunk() {
         }
     }
 }
+
+/// Collecting an execution chunk by chunk must produce exactly what collecting
+/// it all at once produces.
+///
+/// This is what lets the prover walk an execution instead of starting from a
+/// materialized log of the whole thing. It holds because phases 1-3 are
+/// segment-local once `MemoryState` and `RegisterState` are carried: the LT ops
+/// a memory access implies come from the timestamps that access already
+/// carries, not from an ordering over the whole run.
+///
+/// Compared through the built traces rather than the op lists, since that is
+/// what the commitment is taken over.
+#[test]
+fn collect_streaming_matches_collect_epoch() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig::default();
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let at_once =
+        T::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collect at once");
+    let streamed =
+        T::collect_epoch_streaming(&artifacts, &elf, vec![], &image, &register_init, true)
+            .expect("collect streaming");
+
+    let build = |collected| {
+        T::build_from_collected(
+            &artifacts,
+            collected,
+            Some(&image),
+            &register_init,
+            &max_rows,
+            &[],
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("build")
+    };
+    let a = build(at_once);
+    let b = build(streamed);
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<_>>()
+    };
+    let same = |x: &[_], y: &[_], name: &str| {
+        assert_eq!(x.len(), y.len(), "{name}: chunk count differs");
+        for (i, (p, q)) in x.iter().zip(y.iter()).enumerate() {
+            assert_eq!(flat(p), flat(q), "{name} chunk {i} differs");
+        }
+    };
+    same(&a.cpus, &b.cpus, "CPU");
+    same(&a.memws, &b.memws, "MEMW");
+    same(&a.lts, &b.lts, "LT");
+    same(&a.loads, &b.loads, "LOAD");
+    same(&a.shifts, &b.shifts, "SHIFT");
+    same(&a.branches, &b.branches, "BRANCH");
+    same(&a.memw_registers, &b.memw_registers, "MEMW_R");
+    assert_eq!(flat(&a.bitwise), flat(&b.bitwise), "BITWISE differs");
+    assert_eq!(flat(&a.register), flat(&b.register), "REGISTER differs");
+}

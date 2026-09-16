@@ -4334,6 +4334,13 @@ pub trait IsStarkProver<
         for result in table_results {
             proofs.push(result.expect("run_admitted fills every slot")?);
         }
+        // Every table is proved and its transients are gone, so whatever is
+        // still held here is retained, not in flight. Read against the peak,
+        // this says how much of the peak a residency mode could ever reach.
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After rounds 2-4") {
+            heap_snaps.push(s);
+        }
         #[cfg(feature = "instruments")]
         drop(__sp);
         #[cfg(feature = "instruments")]

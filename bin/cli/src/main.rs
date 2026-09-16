@@ -37,6 +37,14 @@ fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>>
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
 /// thread-local caches — `epoch::advance()` just merges cached counters.
+///
+/// `stats.allocated` is live bytes, not resident pages, so the mark is real
+/// simultaneous residency rather than an allocator watermark that freed memory
+/// keeps propping up. What it does not say on its own is *when* the mark was
+/// set, which is what makes a peak actionable — a peak inside one table's work
+/// and a peak spread across every table call for opposite fixes. The tracker
+/// therefore also records how far into the run the mark was set, to be read
+/// against the phase timeline.
 #[cfg(feature = "jemalloc-stats")]
 mod heap_tracker {
     use std::sync::Arc;
@@ -49,6 +57,8 @@ mod heap_tracker {
     pub struct HeapTracker {
         stop: Arc<AtomicBool>,
         peak: Arc<AtomicUsize>,
+        /// Milliseconds from `start()` to the sample that set `peak`.
+        peak_at_ms: Arc<AtomicUsize>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -56,35 +66,47 @@ mod heap_tracker {
         pub fn start() -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let peak = Arc::new(AtomicUsize::new(0));
+            let peak_at_ms = Arc::new(AtomicUsize::new(0));
             let stop_clone = stop.clone();
             let peak_clone = peak.clone();
+            let peak_at_clone = peak_at_ms.clone();
+            let started = std::time::Instant::now();
 
             let handle = thread::spawn(move || {
-                while !stop_clone.load(Ordering::Relaxed) {
-                    // Refresh jemalloc's cached stats
+                // Records the elapsed time of the sample that raised the mark,
+                // so a peak can be placed against the phase timeline instead of
+                // being a number with no location.
+                let mut sample = |peak: &AtomicUsize, at: &AtomicUsize| {
                     epoch::advance().ok();
-                    if let Ok(allocated) = stats::allocated::read() {
-                        peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                    if let Ok(allocated) = stats::allocated::read()
+                        && allocated > peak.fetch_max(allocated, Ordering::Relaxed)
+                    {
+                        at.store(started.elapsed().as_millis() as usize, Ordering::Relaxed);
                     }
+                };
+                while !stop_clone.load(Ordering::Relaxed) {
+                    sample(&peak_clone, &peak_at_clone);
                     thread::sleep(Duration::from_millis(10));
                 }
                 // One final sample after stop signal
-                epoch::advance().ok();
-                if let Ok(allocated) = stats::allocated::read() {
-                    peak_clone.fetch_max(allocated, Ordering::Relaxed);
-                }
+                sample(&peak_clone, &peak_at_clone);
             });
 
             Self {
                 stop,
                 peak,
+                peak_at_ms,
                 handle: Some(handle),
             }
         }
 
-        pub fn stop(mut self) -> usize {
+        /// `(peak bytes, milliseconds into the run when it was set)`.
+        pub fn stop(mut self) -> (usize, usize) {
             self.shutdown();
-            self.peak.load(Ordering::Relaxed)
+            (
+                self.peak.load(Ordering::Relaxed),
+                self.peak_at_ms.load(Ordering::Relaxed),
+            )
         }
 
         fn shutdown(&mut self) {
@@ -669,7 +691,12 @@ fn cmd_prove(
     #[cfg(feature = "jemalloc-stats")]
     {
         let peak_bytes = tracker.stop();
-        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
+        let (peak_bytes, peak_at_ms) = peak_bytes;
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
     }
     ExitCode::SUCCESS
 }
@@ -843,7 +870,12 @@ fn cmd_prove_continuation(
     #[cfg(feature = "jemalloc-stats")]
     {
         let peak_bytes = tracker.stop();
-        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
+        let (peak_bytes, peak_at_ms) = peak_bytes;
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
     }
     ExitCode::SUCCESS
 }
