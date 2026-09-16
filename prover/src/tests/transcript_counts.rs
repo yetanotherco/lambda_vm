@@ -19,6 +19,21 @@ impl TranscriptCounts {
     pub fn finalizes(&self) -> u64 {
         self.squeezes + self.state_finalizes
     }
+
+    /// `transcript_absorbs` as A2a counts it: the APPEND calls only.
+    ///
+    /// `absorb_calls` here includes the chaining re-absorb a squeeze performs,
+    /// which A2a attributes to squeezing rather than to an absorb anyone asked
+    /// for. Subtracting it is A2a's own non-vacuity identity read backwards:
+    /// `absorb_calls == transcript_absorbs + transcript_squeezes`.
+    pub fn transcript_absorbs(&self) -> u64 {
+        self.absorb_calls - self.squeezes
+    }
+
+    /// `transcript_squeezes` as A2a counts it: one per `sample()`.
+    pub fn transcript_squeezes(&self) -> u64 {
+        self.squeezes
+    }
 }
 
 struct Sim {
@@ -425,8 +440,13 @@ fn continuation_transcript_counts(
                     .map(|g| g.num_polys * g.n_stack.div_ceil(config.log_folding))
                     .sum();
                 println!(
-                    "epoch {:>2}: absorb_calls {:>9} bytes {:>11} squeezes {:>8} states {:>6}",
-                    prepared.index, c.absorb_calls, c.absorb_bytes, c.squeezes, c.state_finalizes
+                    "epoch {:>2}: transcript_absorbs {:>8} transcript_squeezes {:>7} | absorb_calls {:>9} bytes {:>11} states {:>6}",
+                    prepared.index,
+                    c.transcript_absorbs(),
+                    c.transcript_squeezes(),
+                    c.absorb_calls,
+                    c.absorb_bytes,
+                    c.state_finalizes
                 );
                 println!(
                     "          tables {} sum_m {} gkr_rounds {} sum_n {} cols {} factors {} n*deg {} roots {} chain_rounds {} Q {}",
@@ -516,8 +536,12 @@ fn continuation_transcript_counts(
     );
     if verbose {
         println!(
-            "global  : absorb_calls {:>9} bytes {:>11} squeezes {:>8} states {:>6}",
-            gc.absorb_calls, gc.absorb_bytes, gc.squeezes, gc.state_finalizes
+            "global  : transcript_absorbs {:>8} transcript_squeezes {:>7} | absorb_calls {:>9} bytes {:>11} states {:>6}",
+            gc.transcript_absorbs(),
+            gc.transcript_squeezes(),
+            gc.absorb_calls,
+            gc.absorb_bytes,
+            gc.state_finalizes
         );
     }
     add(gc, &mut total);
@@ -639,8 +663,12 @@ fn whir_transcript_counts_for_the_block() {
     let (c, proofs, eager_calls, eager_bytes) =
         continuation_transcript_counts(&bytes, &inputs, epoch_size_log2, &opts, true);
     println!(
-        "\nTOTAL over {proofs} proofs: absorb_calls {} absorb_bytes {} squeezes {} state finalizes {}",
-        c.absorb_calls, c.absorb_bytes, c.squeezes, c.state_finalizes
+        "\nTOTAL over {proofs} proofs:\n  transcript_absorbs   {}\n  transcript_squeezes  {}\n  absorb_calls         {}  (= the two above, A2a's non-vacuity identity)\n  absorb_bytes         {}\n  state finalizes      {}  <- NEITHER bucket: `state()` is a finalize on a clone",
+        c.transcript_absorbs(),
+        c.transcript_squeezes(),
+        c.absorb_calls,
+        c.absorb_bytes,
+        c.state_finalizes
     );
     println!(
         "eager REGISTER commitment, outside the transcript: {eager_calls} absorbs, {eager_bytes} bytes"
