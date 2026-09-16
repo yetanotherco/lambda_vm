@@ -545,6 +545,10 @@ test-ethrex-crypto:
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
+	# The hash counters compile to nothing unless the feature is on, so their
+	# own tests only execute here. See the `lint` target for why an instrument
+	# nobody runs is worth a line in the build.
+	cargo test -p crypto --features hash-metrics
 
 # === Quick test shortcuts ===
 
@@ -690,6 +694,12 @@ lint:
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
+	# `hash-metrics` is host-only and off by default, so no pass above compiles it.
+	# Without this line the feature can rot untouched — which is how its Merkle
+	# counters stayed keccak-only after a second hash arrived, reporting ZERO for
+	# the arm whose whole purpose was to change the hashing. Lints, does not run:
+	# its tests are in the `test` target.
+	cargo clippy -p crypto --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
