@@ -211,13 +211,13 @@ impl ChainConfig {
         grind: GrindBits,
     ) -> Self {
         let rounds = num_vars.div_ceil(log_folding.max(1)).max(1);
-        let rate = 1.0 / (1u64 << log_blowup) as f64;
-        let proximity = 1.0 - rate.sqrt() - 1.0 / 300.0;
-        let bits_per_query = -(1.0 - proximity).log2();
-
-        let target = security_bits as f64 + (rounds as f64).log2();
-        let left = (target - grind.query as f64).max(0.0);
-        let num_queries = (left / bits_per_query).ceil().max(1.0) as usize;
+        // ★ Integers, not `f64`. The arithmetic and its provenance are in
+        // [`crate::query_count`]; what matters here is that the count a
+        // verifier has to reproduce no longer needs floating point to
+        // reproduce it, and that the answers did not move — the shipped
+        // posture's 110 / 112 / 113 are pinned in both places.
+        let num_queries =
+            crate::query_count::num_queries(log_blowup, rounds, security_bits, grind.query);
 
         Self {
             log_blowup,

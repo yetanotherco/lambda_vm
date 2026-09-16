@@ -15,6 +15,7 @@ pub mod logup;
 pub mod mle;
 pub mod poly;
 pub mod program;
+pub mod query_count;
 pub mod selector;
 pub mod stacked_eval;
 pub mod stacking;
