@@ -54,7 +54,12 @@ pub fn run(
     proof_options: &ProofOptions,
 ) -> Result<Challenge, Error> {
     let remaining = &committed.remaining;
-    let table_counts = count_chunks(&committed.chunks);
+    let table_counts = count_chunks_by_kind(
+        committed
+            .chunks
+            .iter()
+            .map(|(kind, chunk, _)| (*kind, *chunk)),
+    );
     let airs = VmAirs::new(
         elf,
         proof_options,
@@ -183,8 +188,14 @@ fn commit_resident(
         .ok_or_else(|| Error::Prover(format!("challenge phase: no commitment for {name}")))
 }
 
-/// How many chunks the Commit phase produced per kind.
-fn count_chunks(chunks: &[crate::commit_phase::ChunkCommitment]) -> TableCounts {
+/// How many chunks a pass produced per kind.
+///
+/// Taken as `(kind, chunk)` pairs rather than as a phase's own output, because
+/// every pass over the execution produces the same layout and each has its own
+/// per-chunk payload.
+pub(crate) fn count_chunks_by_kind(
+    chunks: impl Iterator<Item = (TableKind, usize)>,
+) -> TableCounts {
     let mut counts = TableCounts {
         cpu: 0,
         lt: 0,
@@ -201,14 +212,14 @@ fn count_chunks(chunks: &[crate::commit_phase::ChunkCommitment]) -> TableCounts 
         store: 0,
         cpu32: 0,
     };
-    for (kind, chunk, _) in chunks {
-        let slot = slot_for(&mut counts, *kind);
+    for (kind, chunk) in chunks {
+        let slot = slot_for(&mut counts, kind);
         *slot = (*slot).max(chunk + 1);
     }
     counts
 }
 
-fn count_for(counts: &TableCounts, kind: TableKind) -> usize {
+pub(crate) fn count_for(counts: &TableCounts, kind: TableKind) -> usize {
     match kind {
         TableKind::Cpu => counts.cpu,
         TableKind::Lt => counts.lt,

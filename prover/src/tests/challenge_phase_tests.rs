@@ -115,3 +115,64 @@ fn challenge_matches_the_ordinary_prover() {
         "the Challenge phase sampled a different challenge from the same execution"
     );
 }
+
+/// The LogUp pass must commit the auxiliary columns the proof carries.
+///
+/// The pass rebuilds every table from scratch — the ones the Commit phase
+/// dropped no longer exist — and builds their auxiliary columns against the
+/// challenge that phase produced. Three separate things have to hold for the
+/// root to land: the rebuild is byte-identical to what was committed, the
+/// challenge is the prover's, and the table is in the slot the proof expects.
+/// Any one of them failing changes the bus the verifier checks, so all three
+/// are pinned here at once against a real proof.
+#[test]
+fn logup_matches_the_ordinary_prover() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let vm_proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &proof_options, &max_rows)
+        .expect("ordinary prove");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let logup = crate::logup_phase::run(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("logup phase");
+
+    assert_eq!(
+        logup.aux.len(),
+        vm_proof.proof.proofs.len(),
+        "the LogUp pass accounted for a different number of tables than the proof has"
+    );
+    let mut with_aux = 0usize;
+    for (idx, (got, want)) in logup
+        .aux
+        .iter()
+        .zip(vm_proof.proof.proofs.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            got.as_ref().map(|a| a.root),
+            want.lde_trace_aux_merkle_root,
+            "table {idx}: auxiliary trace committed under a different root than the proof carries"
+        );
+        if got.is_some() {
+            with_aux += 1;
+        }
+    }
+    assert!(
+        with_aux > 20,
+        "the fixture must cover the tables that carry a bus; saw {with_aux}"
+    );
+}

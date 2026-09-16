@@ -1730,6 +1730,52 @@ pub trait IsStarkProver<
         })
     }
 
+    /// A table's auxiliary commitment, built against the shared challenges and
+    /// dropped with the call.
+    ///
+    /// [`Self::commit_table_root`]'s counterpart for the LogUp pass. The aux
+    /// columns are written into `trace`, expanded and committed, and everything
+    /// this allocated dies here — which is the point: a prover that holds one
+    /// table at a time cannot keep the aux LDE around for later rounds, so it
+    /// re-derives it when it needs it again.
+    ///
+    /// Returns the root together with the bus public inputs the aux build
+    /// produced, since the proof carries them. A table with no aux trace has
+    /// nothing to commit; callers ask `air.has_aux_trace()` rather than reading
+    /// that off a `None`, which also means a failed commit.
+    fn commit_aux_root(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+    ) -> Option<(Commitment, Option<BusPublicInputs<FieldExtension>>)>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let bus_public_inputs = air.build_auxiliary_trace(trace, challenges);
+
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+        if total_cols == 0 || trace_data.is_empty() {
+            return None;
+        }
+        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(lde_size * total_cols);
+        aux_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )
+        .ok()?;
+        let (_, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)?;
+        Some((root, bus_public_inputs))
+    }
+
     /// Reconstruct Round1 for every table, print the bus balance report, and
     /// validate each trace. Called once after every table's aux commit, which
     /// under `debug-checks` means between the fused chain's two admitted

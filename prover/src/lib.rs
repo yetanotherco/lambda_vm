@@ -20,6 +20,7 @@ pub mod continuation;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod logup_phase;
 mod paged_mem;
 pub mod pass;
 pub(crate) mod streaming;
