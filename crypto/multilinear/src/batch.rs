@@ -572,6 +572,48 @@ mod tests {
     /// The design decision this module exists for: the constraint's zerocheck
     /// and the bus's input-layer claim share one sumcheck, so every column is
     /// folded once.
+    /// **The claims are bound to the batching challenge.**
+    ///
+    /// Absorbing them before drawing `lambda` is what stops a prover from
+    /// picking a statement after seeing it. **No proof can show that**: take
+    /// the absorption out of both sides and everything still verifies, because
+    /// both sides stay in step — what is gone is the soundness, not the
+    /// agreement. The transcript is what shows it, so that is what this tests:
+    /// two batches alike but for a claim must not draw the same challenge, and
+    /// a proof drawn from a different challenge is a different proof.
+    #[test]
+    fn the_claims_are_bound_to_the_batching_challenge() {
+        let polys = columns(4).to_vec();
+        let alpha = FE::from(97);
+        let eq_r = eq_mle(&[FE::from(3), FE::from(5), FE::from(7), FE::from(11)]).unwrap();
+        let eq_z = eq_mle(&[FE::from(13), FE::from(17), FE::from(19), FE::from(23)]).unwrap();
+        let all = || {
+            let mut v = polys.clone();
+            v.push(eq_r.clone());
+            v.push(eq_z.clone());
+            v
+        };
+        let claims = [FE::zero(), FE::from(41), FE::from(43)];
+        let (first, _) = prove(all(), statements(alpha), &claims, &mut transcript()).unwrap();
+
+        // One claim moved, nothing else.
+        let moved = [FE::zero(), FE::from(41) + FE::one(), FE::from(43)];
+        let (second, _) = prove(all(), statements(alpha), &moved, &mut transcript()).unwrap();
+
+        let rounds = |p: &SumcheckProof<F>| {
+            p.rounds
+                .iter()
+                .map(|r| r.evaluations.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            rounds(&first),
+            rounds(&second),
+            "the claims are not bound to the challenge: a prover could pick one \
+             after seeing it"
+        );
+    }
+
     #[test]
     fn a_bus_claim_settles_in_the_constraint_s_sumcheck() {
         for num_vars in 1..=4usize {

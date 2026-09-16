@@ -495,6 +495,35 @@ mod tests {
         }
     }
 
+    /// **The statement is bound to the batching challenge**, both halves of it.
+    ///
+    /// The claims and the heights are absorbed before `lambda` is drawn — the
+    /// claims so a prover cannot pick a statement after seeing the challenge,
+    /// the heights because they scale the claims. **No proof can show this**:
+    /// take an absorption out of both sides and everything still verifies,
+    /// because both sides stay in step; what is gone is the soundness, not the
+    /// agreement. The transcript shows it, so the test is against
+    /// [`absorb_statement`], which is the one place both sides go through.
+    #[test]
+    fn the_statement_is_bound_to_the_batching_challenge() {
+        let draw = |heights: &[usize], claims: &[FE]| {
+            absorb_statement(heights, claims, &mut transcript())[1]
+        };
+        let claims = [FE::from(41), FE::from(43)];
+        let base = draw(&[4, 3], &claims);
+
+        // A claim restated.
+        let moved = [claims[0], claims[1] + FE::one()];
+        assert_ne!(base, draw(&[4, 3], &moved), "the claims are not bound");
+
+        // A height restated. They scale the claims, so they are statement too.
+        assert_ne!(base, draw(&[4, 4], &claims), "the heights are not bound");
+
+        // And the same statement draws the same challenge, or the two sides
+        // would never agree in the first place.
+        assert_eq!(base, draw(&[4, 3], &claims));
+    }
+
     #[test]
     fn a_wrong_claim_is_rejected() {
         let mut parts = vec![part(4, 1), part(2, 2)];

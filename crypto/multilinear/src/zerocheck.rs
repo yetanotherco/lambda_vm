@@ -2,6 +2,14 @@
 //!
 //! The multilinear replacement for a quotient argument. `eq` adds one degree.
 //! The residual claim about `f` is returned, not decided.
+//!
+//! **This is the reference, not the path.** The prover's zerocheck does not
+//! come through here: a table's constraints go in as a compiled
+//! [`batch::Rule`](crate::batch::Rule) alongside its two bus claims, so all
+//! three share one pass over one factor list — which is the whole point of
+//! batching them. What this module is for is saying the argument once, in the
+//! shape it has on paper, and being the thing the batched version is checked
+//! against. Nothing outside tests calls it.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};

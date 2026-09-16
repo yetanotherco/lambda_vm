@@ -293,6 +293,12 @@ where
     // The identity the verifier now takes on faith. Checking it costs the pass
     // over the cube the protocol exists to skip, so it runs in debug only —
     // where it turns a silent prover bug into a local failure.
+    //
+    // What that trades, and it is worth knowing which way: **in release a
+    // prover that produces a wrong round polynomial is not caught here**. It
+    // surfaces as a proof that does not verify, which for a real trace is
+    // minutes and fifty tables later and says nothing about where. Reach for a
+    // debug build when a proof stops verifying and you do not know why.
     #[cfg(debug_assertions)]
     let mut running: Option<FieldElement<F>> = None;
 
