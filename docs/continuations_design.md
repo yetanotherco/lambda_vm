@@ -575,7 +575,9 @@ becomes an **explicit verifier action**:
   while any different set is rejected.
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
-- The verifier also `validate()`s `table_counts` and never trusts a prover-supplied
+- The verifier also `validate()`s `table_counts` — which since per-epoch table skipping
+  means *only* that CPU and MEMW_R are present and that no accelerator claims more than
+  one table, not that every table is there — and never trusts a prover-supplied
   page config (continuation epochs have none — PAGE is skipped under the L2G
   bookend, so `page_configs` is always empty).
 

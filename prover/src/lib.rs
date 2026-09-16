@@ -167,13 +167,27 @@ impl TableCounts {
     /// costs a full commitment, FRI chain and OOD opening set.
     ///
     /// What keeps a zero count honest is the LogUp bus, not this check. A chip
-    /// influences the run only through its bus interactions, and no chip carries
-    /// boundary constraints of its own, so a chip with no rows contributes zero
-    /// to the bus and removing it changes nothing. A prover that omits a table
-    /// whose operations *did* execute leaves the CPU's sends unmatched, and the
-    /// bus-balance check — summed over the tables that are present — rejects the
-    /// proof. That argument needs each omitted table to be a bus participant;
-    /// `every_table_participates_in_the_bus` pins it down for the whole AIR set.
+    /// influences the run only through its bus interactions, and none of the
+    /// eighteen optional chips carries boundary constraints of its own, so one
+    /// with no rows contributes zero to the bus and removing it changes nothing.
+    /// (The mandatory tables do constrain boundaries — that is part of why they
+    /// are mandatory.) A prover that omits a table whose operations *did*
+    /// execute leaves its counterparty's sends unmatched, and the bus-balance
+    /// check — summed over the tables that are present — rejects the proof.
+    ///
+    /// Two things that argument needs, both pinned by tests. Each omitted table
+    /// must be a bus participant (`every_table_participates_in_the_bus`), and
+    /// the term left unmatched must sit on a bus whose other participants all
+    /// have constrained multiplicities — a term whose counterparty is a free
+    /// witness, like every range check received by BITWISE, can be cancelled by
+    /// lowering that witness (`no_present_table_contributes_zero_to_the_bus`
+    /// carries the argument).
+    ///
+    /// MEMW and MEMW_A are the exception to read carefully: they post the same
+    /// receiver on the same bus and the split between them is a host-side
+    /// routing decision, so `memw_aligned = 0` with everything routed through
+    /// MEMW balances and is an honest, wider proof. What keeps that trio sound
+    /// is constraint equivalence, not this count.
     pub fn validate(&self) -> Result<(), Error> {
         let required = [("cpu", self.cpu), ("memw_register", self.memw_register)];
         for (name, count) in required {

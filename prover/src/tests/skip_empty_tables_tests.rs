@@ -194,16 +194,35 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
 /// telescopes on `CommitNextByte`, KECCAK_RND chains rounds — and each is
 /// supposed to be anchored by a term that does not telescope away with it.
 ///
-/// The anchor is structural, and it is not the chained bus. Every fingerprint
-/// carries its `bus_id` as its first element (`stark::lookup`), so a term on one
-/// bus cannot cancel a term on another; and each of the three chips puts, on
-/// every row where its row selector is on, range-check terms on buses it never
-/// receives from — ECDAS sends 196 `AreBytes` and 189 `IsHalfword` per row,
-/// COMMIT eight `IsHalfword` plus the `Ecall` receive, KECCAK_RND `KeccakRc` and
-/// some 160 `ByteAlu`. Those are all senders, so they cannot cancel each other
-/// either: two equal fingerprints add. The chip's contribution is zero only if
-/// its selector is zero on every row, which is the empty table this change
-/// drops on purpose.
+/// The anchor is structural, but it is *not* the range checks. Whether a term
+/// can be cancelled depends on its counterparty: BITWISE is built with
+/// `EmptyConstraints`, so its multiplicity columns are free witnesses and a
+/// forger that drops a chip can lower the histogram by exactly what went
+/// missing. Every `AreBytes`, `IsHalfword` and `ByteAlu` term a chip sends is
+/// cancellable that way — for ECDAS that is 385 of its ~388 terms.
+///
+/// What anchors a chip is a term on a bus whose *other* participants all have
+/// constrained multiplicities, because then nobody is free to absorb it. The
+/// dispatch buses are those: ECDAS receives and re-sends on `BusId::Ecdas`,
+/// COMMIT receives on `Ecall` and telescopes on `CommitNextByte`, KECCAK_RND
+/// chains rounds on `BusId::Keccak`, and in each case the counterparty is a
+/// chip whose own constraints fix what it may put there. Drop the chip and that
+/// term has no receiver and no witness anywhere that can be lowered to hide it.
+/// Cross-bus cancellation is not available either: every fingerprint carries
+/// its `bus_id` at α⁰ (`stark::lookup`), so a term on one bus cannot cancel a
+/// term on another.
+///
+/// One case the bus does not decide, and should not be read as if it did: MEMW
+/// and MEMW_A post the identical `receiver(BusId::Memw,
+/// Multiplicity::Column(MU_READ))`, and which one an access goes to is a
+/// host-side routing decision (`classify_memw`) with no AIR constraint behind
+/// it. Declaring `memw_aligned = 0` and routing everything through MEMW
+/// balances just as well — a wider, slower, honest proof rather than a forgery.
+/// The reverse is what matters and it is blocked by shape: MEMW_A spends its
+/// single `old_timestamp` across all eight per-byte Memory tokens, so it cannot
+/// take an access MEMW would have to describe. That trio rests on constraint
+/// equivalence, not on this count, and a drop test shaped like the MUL one
+/// would pass here while proving nothing.
 ///
 /// The dynamic check below is the second half, and it covers what the argument
 /// assumes: that the selector really is on. The contribution is a public input
