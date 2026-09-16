@@ -232,6 +232,13 @@ else
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
+# A fixture the guest REJECTS still proves and still verifies -- a program that read two
+# bytes and gave up. The digest check above catches a stale real-block file, but not the
+# other half of the pair (an ELF whose ethrex rev moved on its own), and the synthetic
+# fixture is generated only when missing, so a pre-bump file is reused as-is. Shared with
+# bench_abba.sh and perf_diff.sh; the floors and the reasoning live there.
+"$ROOT/scripts/assert_workload_cycles.sh" "$WORK/cli_B" "$ELF" "$INPUT" "$WORKLOAD"
+
 # --- 3. Prove, then interleaved A/B/B/A verify measurement ---
 # Default: both sides verify ONE shared proof (proved by the baseline), which gives
 # ABBA the tightest precision (no proof-specific variance). That only works when both

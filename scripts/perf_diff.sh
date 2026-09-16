@@ -136,6 +136,12 @@ else
   echo "==> Reusing cached binaries (cli_A=${SHA_A:0:10} cli_B=${SHA_B:0:10})"
 fi
 
+# Five flamegraphs of a guest that rejected its input look exactly like five flamegraphs
+# of one that ran: the profile is just very short. The digest check above pins the
+# real-block fixture but not the ELF's ethrex rev, and the synthetic fixture is whatever
+# was left on disk. Shared with bench_abba.sh and bench_verify.sh.
+"$ROOT/scripts/assert_workload_cycles.sh" "$WORK/cli_B" "$ELF_REL" "$INPUT_REL" "$WORKLOAD"
+
 # --- Record: warmup, then B A B A (interleaved so drift hits both sides) ---
 record() { # $1=binary $2=out.data
   # shellcheck disable=SC2086  # CONT_ARGS is a deliberate multi-word flag list (empty when synthetic)

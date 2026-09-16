@@ -329,6 +329,17 @@ jobs:
           make ethrex-real-block-fixture
           ls -l "$REAL_INPUT"
 
+      - name: Check the real block executes before measuring it
+        if: steps.config.outputs.run_real == 'true'
+        run: |
+          # The digest above pins the fixture, not the pair: an ELF whose ethrex rev moved
+          # on its own (scripts/set_ethrex_rev.sh --guest-only) still matches it, and a
+          # rejected input is committed as `successful_validation = 0` in ~500 cycles
+          # rather than failing -- which every run below would then report as a ~99%
+          # improvement, in green. One execution, both sides: the baseline job proves this
+          # same ELF and this same fixture (it survives its `git checkout origin/main`).
+          scripts/assert_workload_cycles.sh ./target/release/cli "$ELF" "$REAL_INPUT" real
+
       - name: Memory growth (PR)
         id: pr-growth
         if: steps.config.outputs.run_growth == 'true'
