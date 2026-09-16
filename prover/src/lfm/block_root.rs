@@ -19,6 +19,12 @@
 //! `LFM_HASH` crosses a power of two — so it is settled by emitting both and
 //! reading the panels, not by a preference stated in a doc.
 //!
+//! ⚠ **The worked numbers in this header are the pre-#894 guest (19 epochs at 2^21); the shipped guest is 15.** They are left as
+//! measured rather than restated, because the ARGUMENT is about which node the
+//! root is, not about how many levels there happen to be; the shapes below are
+//! the ones the panels were read from. `the_root_takes_its_children_from_the_level_its_option_names`
+//! carries the shipped shape and is the thing that fails if the rule moves.
+//!
 //! - **A** — run the interior until `<= fan_in` nodes remain; the root takes
 //!   those plus the global child. At 19 epochs and fan-in 2 the interior is
 //!   levels 1..4 (10 + 5 + 3 + 2 = 20 nodes) and the root is level 5 with
@@ -194,7 +200,9 @@ impl RootOption {
     /// That is **not** the same thing as "what `children` holds while level
     /// `top - 1` is running", which is level `top - 1`'s INPUT — one level lower
     /// again. A driver capture taken before a level's swap holds the input, and
-    /// at 19 epochs / fan-in 2 the two are **3 nodes and 2**.
+    /// at 19 epochs / fan-in 2 — the pre-#894 guest (19 epochs at 2^21); the shipped guest is 15 the bug was found on — the two are
+    /// **3 nodes and 2**. At 15 they are 4 and 2: the counts move, the fact that
+    /// they DIFFER does not, and that is what the guard compares.
     ///
     /// ⇒ That mis-capture sent a box run into [`emit_l2g_compare`]'s count guard
     /// thirteen minutes downstream: the root refolded to 2 digests and was handed

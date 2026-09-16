@@ -572,28 +572,6 @@ test: compile-programs test-syscalls test-ethrex-crypto
 test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
-# ★ The RPX device kernel's arithmetic, checked WITHOUT a GPU.
-#
-# `kernels/rpx.cu` is compiled as ordinary host C++ through `cuda_host_shim.h`,
-# so its field primitives, MDS, S-boxes, cubic extension, seven-round schedule,
-# leaf sponge, Merkle parent and every leaf kernel's read pattern are pinned in
-# seconds on a laptop. That matters here because GPU CI runs only on
-# merge_group, so without this the two WHIR coset kernels — which exist nowhere
-# else — would reach a GPU unchecked.
-#
-# ⚠ Necessary, never sufficient: it cannot tell you whether nvcc accepts the
-# file, nor anything about execution rather than arithmetic (grid indexing,
-# register pressure, local-memory spills). Those still belong to the GPU tests.
-HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
-HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
-    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
-
-test-rpx-host-kat:
-	@mkdir -p target/host_kat
-	$(CXX) $(HOST_KAT_CXXFLAGS) \
-	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
-	./target/host_kat/rpx_host_kat
-
 # Prover tests only
 test-prover: compile-recursion-elfs
 	cargo test -p lambda-vm-prover
@@ -669,6 +647,10 @@ test-blake3-host-kat:
 # leaf and the parent compress against vectors printed from the Rust oracle
 # (`prover/tests/rpx_host_kat_vectors.rs`), plus miden-crypto's 19 RPO vectors
 # through the shared FB round.
+#
+# ★ It also covers the two WHIR COSET kernels, which exist nowhere else and
+# which GPU CI would not see until merge_group. That is why this target is a
+# per-PR gate and not a GPU one.
 test-rpx-host-kat:
 	@mkdir -p target/host_kat
 	$(CXX) $(HOST_KAT_CXXFLAGS) \

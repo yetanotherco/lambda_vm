@@ -2626,9 +2626,15 @@ fn the_production_leaf_node_measures() {
 
     // ★ FAN-IN IS AN INPUT, because it is the decision this run exists to make.
     //
-    // The tree's shape at 19 epochs is 5 levels / 21 nodes at fan-in 2 and
-    // 3 levels / 11 nodes at fan-in 3, so the choice is worth a factor of two in
-    // total tree work — and the old argument against fan-in 3 was a VRAM argument
+    // ⚠ The shape quoted here is the pre-#894 guest (19 epochs at 2^21); the shipped guest is 15: 5 levels / 21 nodes at fan-in 2
+    // and 3 levels / 11 nodes at fan-in 3. The shipped guest gives 4 / 15 and
+    // 3 / 8. The RATIO the argument rests on barely moves — 15 against 8 is
+    // still close to a factor of two in total tree work — which is why the
+    // conclusion survives the bump even though every number in it changed.
+    // The measurement below was taken at the old shape; a re-run cuts a NEW
+    // record rather than a comparable one.
+    //
+    // So the choice is worth a factor of two in total tree work — and the old argument against fan-in 3 was a VRAM argument
     // that turned out to be about concurrency, not size. What remains is a HOST
     // argument (`L_children` and the node's own `W` both grow with a third leg)
     // and a CARD argument (a third leg's rows may cross a padding step), and both
