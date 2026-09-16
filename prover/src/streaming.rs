@@ -18,7 +18,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// The groups of chunked tables, in the order `VmAirs::air_trace_pairs` emits
 /// them. `None` marks a group that stays resident (PAGE), which still consumes
 /// AIR indices and so must be walked over.
-const GROUP_ORDER: [Option<TableKind>; 15] = [
+pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
     Some(TableKind::Cpu),
     Some(TableKind::Lt),
     Some(TableKind::Shift),
@@ -38,7 +38,7 @@ const GROUP_ORDER: [Option<TableKind>; 15] = [
 
 /// Number of singleton tables emitted before the chunked groups: BITWISE,
 /// DECODE, COMMIT, KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS, HINT, REGISTER.
-const NUM_FIXED_AIRS: usize = 10;
+pub(crate) const NUM_FIXED_AIRS: usize = 10;
 
 pub(crate) struct StreamingProvider {
     routed: CollectedOps,

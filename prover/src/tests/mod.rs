@@ -10,6 +10,7 @@ pub mod branch_bus_tests;
 pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod bytewise_tests;
+mod challenge_phase_tests;
 #[cfg(test)]
 pub mod commit_tests;
 #[cfg(test)]
