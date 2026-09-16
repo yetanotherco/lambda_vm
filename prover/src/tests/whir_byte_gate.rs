@@ -131,10 +131,32 @@ const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982
 ///
 /// ⚠ Pinned, not merely required to DIFFER from keccak's. `assert_ne!` passes
 /// for every wrong answer except one, so it cannot tell "the RPX hash ran" from
-/// "something else ran": a third hash, a half-flip with RPX trees under a
-/// keccak sponge, or a transcript whose sampling schedule moved would all clear
-/// it. Measured on the merged branch, twice per arm, and equal at
-/// `0cbc9623` — which is what says the merge left the WHIR path's bytes alone.
+/// "something else ran": a third hash, or a transcript whose sampling schedule
+/// moved, would both clear it. Measured on the merged branch, twice per arm,
+/// and equal at `0cbc9623` — which is what says the merge left the WHIR path's
+/// bytes alone.
+///
+/// ⛔ **WHAT THIS LINE IS A PROOF OF, exactly: RPX TREES UNDER A KECCAK
+/// SPONGE.** The RPX arm is a half-flip at this revision, and that is a
+/// property of the branch rather than of this test. ✓ VERIFIED: every WHIR
+/// prove site builds `DefaultTranscript::<E>::new(..)` — the DEFAULT type
+/// parameter, which is `KeccakTranscriptHash` — at `multilinear_prove.rs:226`
+/// and `:415` and at four sites in `multilinear_continuation.rs`, and so does
+/// the fixture below. `WhirHash::Transcript` is reached only through
+/// `GrindingDigest<H>` (`whir_hash.rs:54`) and a compile-time `PhantomData`
+/// assertion. So under `LAMBDA_VM_WHIR_HASH=rpx` the Merkle backend, the device
+/// kernels and the proof-of-work digest are RPX while Fiat–Shamir is keccak.
+///
+/// This is the configuration W1's design note called unspellable, and the
+/// reason it is spellable anyway is that the transcript was never wired — not
+/// that the seam failed. Two consequences worth carrying:
+///
+/// 1. **This constant WILL move when the wiring lands**, and that move is the
+///    expected result, not drift. Re-pin it there; do not reconcile it here.
+/// 2. **Any cost attributed to "RPX" on this branch excludes the sponge.** The
+///    measured +38.8 s on a 39.7 s keccak prove is trees, kernels and grind
+///    only, so it is a LOWER bound on the full swap rather than a measurement
+///    of it.
 const RPX_LINE: &str = "5226e4cfffac7eb2ba629470a0c5ebf879421078b389e3a8065ae63768031adb";
 
 /// The serialized length, which neither arm may move: 32-byte digests either
