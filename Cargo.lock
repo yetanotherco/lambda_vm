@@ -860,6 +860,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
+ "sha2",
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
