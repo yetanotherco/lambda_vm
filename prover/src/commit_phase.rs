@@ -196,6 +196,7 @@ pub fn commit_remaining<I: crate::paged_mem::ImageSource + Sync>(
     // preprocessed, so its commitment splits into two trees, and that path does
     // not exist here yet. The lookups are what this phase is responsible for
     // having kept — the chunks that owed them are long gone.
+    let public_output = leftover.public_output_bytes();
     let accumulated = leftover.build_accumulated();
     let decode = leftover.build_decode(
         artifacts.decode_trace.clone(),
@@ -210,6 +211,7 @@ pub fn commit_remaining<I: crate::paged_mem::ImageSource + Sync>(
 
     Ok(Remaining {
         chunks: out,
+        public_output,
         bitwise,
         decode,
         halt,
@@ -224,6 +226,9 @@ pub fn commit_remaining<I: crate::paged_mem::ImageSource + Sync>(
 pub struct Remaining {
     /// The tails, and every chunk of the tables the walk could not close.
     pub chunks: Vec<ChunkCommitment>,
+    /// The bytes the run committed, which the statement binds into the
+    /// transcript before any root is absorbed.
+    pub public_output: Vec<u8>,
     /// The BITWISE table, carrying the lookups of every retired chunk.
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
     /// The DECODE table, with one lookup counted per executed cycle and per

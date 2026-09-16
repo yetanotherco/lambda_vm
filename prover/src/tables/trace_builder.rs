@@ -1422,6 +1422,22 @@ impl WalkLeftover {
     /// tables. None of them is ever closed mid-walk — they are written once, at
     /// the end, from everything the run produced — so this is where they
     /// belong rather than in the chunk machinery.
+    /// The committed public output, in the order the run wrote it.
+    ///
+    /// COMMIT is an accumulator — the walk never closes it — so every op is
+    /// still here at the end of the run, and this is the same fold over the
+    /// same list that the ordinary build does. The statement absorbed into the
+    /// transcript carries these bytes, so the Challenge phase cannot sample
+    /// without them.
+    pub(crate) fn public_output_bytes(&self) -> Vec<u8> {
+        self.tail
+            .commit_ops
+            .iter()
+            .filter(|op| !op.end)
+            .map(|op| op.value)
+            .collect()
+    }
+
     pub(crate) fn build_accumulated(&self) -> AccumulatedTables {
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = self
             .tail
@@ -2438,6 +2454,45 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
 /// Build the initial-memory image (byte address -> value) from the ELF segments
 /// and the private-input region. Single source of "what memory starts as", read
 /// by both `MemoryState` seeding and PAGE/bitwise init.
+/// Run-length encode the runtime (non-ELF) page bases into `(base, count)`.
+///
+/// Zero-init pages are the runtime ones, so `init_values == None` identifies
+/// them without rescanning the ELF segments. The result goes into the statement
+/// the transcript absorbs, which is why it takes the configs rather than a
+/// built `Traces`: the Commit phase has the configs and no `Traces`.
+pub(crate) fn runtime_page_ranges(
+    page_configs: &[page::PageConfig],
+) -> Vec<crate::RuntimePageRange> {
+    let page_size = page::DEFAULT_PAGE_SIZE as u64;
+
+    let runtime_bases: Vec<u64> = page_configs
+        .iter()
+        .filter(|config| config.init_values.is_none())
+        .map(|config| config.page_base)
+        .collect();
+
+    let mut ranges = Vec::new();
+    if runtime_bases.is_empty() {
+        return ranges;
+    }
+
+    let mut start = runtime_bases[0];
+    let mut count = 1u64;
+
+    for &base in &runtime_bases[1..] {
+        if base == start + count * page_size {
+            count += 1;
+        } else {
+            ranges.push(crate::RuntimePageRange { base: start, count });
+            start = base;
+            count = 1;
+        }
+    }
+    ranges.push(crate::RuntimePageRange { base: start, count });
+
+    ranges
+}
+
 pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
     let mut image: HashMap<u64, u8> = HashMap::new();
     for segment in &elf.data {
@@ -5219,37 +5274,7 @@ impl Traces {
     /// Runtime (non-ELF) pages are identified by `init_values == None`
     /// (zero-init), avoiding a redundant ELF segment scan.
     pub fn runtime_page_ranges(&self) -> Vec<crate::RuntimePageRange> {
-        let page_size = page::DEFAULT_PAGE_SIZE as u64;
-
-        // Collect sorted non-ELF page bases (zero-init pages are runtime pages)
-        let runtime_bases: Vec<u64> = self
-            .page_configs
-            .iter()
-            .filter(|config| config.init_values.is_none())
-            .map(|config| config.page_base)
-            .collect();
-
-        // Run-length encode contiguous pages into (base, count) ranges
-        let mut ranges = Vec::new();
-        if runtime_bases.is_empty() {
-            return ranges;
-        }
-
-        let mut start = runtime_bases[0];
-        let mut count = 1u64;
-
-        for &base in &runtime_bases[1..] {
-            if base == start + count * page_size {
-                count += 1;
-            } else {
-                ranges.push(crate::RuntimePageRange { base: start, count });
-                start = base;
-                count = 1;
-            }
-        }
-        ranges.push(crate::RuntimePageRange { base: start, count });
-
-        ranges
+        runtime_page_ranges(&self.page_configs)
     }
 
     /// Generates all traces from ELF and execution logs using phased collection.
