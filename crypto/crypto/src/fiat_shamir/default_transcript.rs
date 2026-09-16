@@ -133,6 +133,14 @@ where
     }
 }
 
+impl<F, T> crate::fiat_shamir::transcript_hash::HasTranscriptHash for DefaultTranscript<F, T>
+where
+    F: HasDefaultTranscript,
+    T: TranscriptHash,
+{
+    type Hash = T;
+}
+
 impl<F, T> Default for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,

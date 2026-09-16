@@ -87,7 +87,7 @@ fn prove<H: WhirHash>(columns: &Columns) -> Proof {
     let table = CommittedTable::from_layout(layout(columns), |col| columns[col as usize].clone())
         .expect("committed table");
     let committed = CommittedTables::<_, _, H>::commit(vec![table], &config()).expect("commit");
-    let mut transcript = DefaultTranscript::<Ext>::new(b"whir-hash-seam");
+    let mut transcript = DefaultTranscript::<Ext, H::Transcript>::new(b"whir-hash-seam");
     multilinear_table::multi_prove(&committed, &config(), &mut transcript).expect("prove")
 }
 
@@ -102,7 +102,7 @@ fn verify<H: WhirHash>(proof: &Proof, columns: &Columns) -> Result<(), multiline
         .ok_or(multilinear::Error::BusImbalance)?;
     let verifier_layout = layout(columns);
     let statement = verifier_layout.statement();
-    let mut transcript = DefaultTranscript::<Ext>::new(b"whir-hash-seam");
+    let mut transcript = DefaultTranscript::<Ext, H::Transcript>::new(b"whir-hash-seam");
     multilinear_table::multi_verify::<_, _, _, H>(
         proof,
         &[statement],
@@ -240,12 +240,23 @@ fn the_grind_follows_the_configuration() {
     );
 }
 
-/// ★ The TRANSCRIPT follows the configuration too — the second consumer, and
-/// the one whose divergence is silent if it is got wrong.
+/// ★ The two transcript TYPES draw different challenges.
 ///
-/// Two sponges over the same absorbed bytes must draw different challenges.
+/// ⚠ RENAMED. This was called `the_transcript_follows_the_configuration`, which
+/// is a claim about the PROVER — and this body never mentions the prover. It
+/// constructs both transcript types itself and compares them, so it was true
+/// for the whole period in which no WHIR call site built an RPX transcript at
+/// all, and it would have stayed true if none ever did.
+///
+/// What it does check is worth keeping: that the two configurations are not
+/// accidentally the same sponge. The claim its old name made is now checked two
+/// ways — by the compiler, via the `HasTranscriptHash` bound on `multi_prove`
+/// and `multi_verify`, which makes a mismatched transcript unspellable rather
+/// than merely untested; and at runtime by
+/// `prover/tests/whir_transcript_configuration.rs`, which runs a real prove and
+/// reads the Fiat-Shamir counters afterwards.
 #[test]
-fn the_transcript_follows_the_configuration() {
+fn the_two_transcript_types_draw_different_challenges() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use crypto::fiat_shamir::transcript_hash::TranscriptHash;
 

@@ -852,7 +852,22 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
-    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+    // ★★ The transcript's hash must BE the configuration's. Not "should": a
+    // caller that passes a keccak transcript under an RPX `H` does not compile.
+    //
+    // `DefaultTranscript`'s hash parameter has a default, so `DefaultTranscript::<E>`
+    // is a keccak transcript that looks like it names no hash. Every call site
+    // wrote exactly that, and the RPX configuration therefore ran an RPX Merkle
+    // backend, an RPX grind and a KECCAK sponge — through four measured A/Bs,
+    // with no instrument disagreeing, because nothing failed: the proofs were
+    // valid and the arms did differ from each other.
+    //
+    // Requiring each site to NAME a hash would not have caught it; a site can
+    // name the wrong one. An equality the compiler checks is what makes the
+    // half-configured arm unspellable, and it costs the several hundred STARK
+    // call sites nothing, because they are not generic over `H`.
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
     for root in committed.roots() {
         transcript.append_bytes(root);
@@ -936,7 +951,22 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
-    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+    // ★★ The transcript's hash must BE the configuration's. Not "should": a
+    // caller that passes a keccak transcript under an RPX `H` does not compile.
+    //
+    // `DefaultTranscript`'s hash parameter has a default, so `DefaultTranscript::<E>`
+    // is a keccak transcript that looks like it names no hash. Every call site
+    // wrote exactly that, and the RPX configuration therefore ran an RPX Merkle
+    // backend, an RPX grind and a KECCAK sponge — through four measured A/Bs,
+    // with no instrument disagreeing, because nothing failed: the proofs were
+    // valid and the arms did differ from each other.
+    //
+    // Requiring each site to NAME a hash would not have caught it; a site can
+    // name the wrong one. An equality the compiler checks is what makes the
+    // half-configured arm unspellable, and it costs the several hundred STARK
+    // call sites nothing, because they are not generic over `H`.
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
     if proof.tables.len() != statements.len() {
         return Err(MlError::QueryCountMismatch {

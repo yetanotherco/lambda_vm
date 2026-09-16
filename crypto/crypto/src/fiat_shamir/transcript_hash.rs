@@ -27,6 +27,34 @@ use digest::{Digest, FixedOutputReset, OutputSizeUser, typenum::U32};
 use crate::hash::platform_keccak::PlatformKeccak256;
 use crate::hash::rpx::Rpx256Digest;
 
+/// ★★ Which [`TranscriptHash`] a concrete transcript type is running on.
+///
+/// The type-level answer to "what hash is this transcript", so a caller that
+/// needs a transcript to match something else can say so in a `where` clause
+/// and have the compiler check it.
+///
+/// # Why this exists
+///
+/// `DefaultTranscript`'s hash parameter has a default, so `DefaultTranscript::<E>`
+/// is a keccak transcript and looks like it names no hash at all. Every WHIR
+/// call site wrote exactly that, under a dispatch that selects the hash for the
+/// Merkle backend and the grind — so the RPX configuration ran an RPX backend,
+/// an RPX grind and a KECCAK transcript, for four measured A/Bs, without one
+/// instrument disagreeing. Nothing failed: the proofs were valid and the two
+/// arms genuinely differed.
+///
+/// Naming the hash at every call site would not have prevented it — a site can
+/// name the wrong one as easily as it can take a default. What prevents it is
+/// an equality the compiler checks, which is what this trait makes sayable:
+/// `T: HasTranscriptHash<Hash = <H as WhirHash>::Transcript>` on the WHIR entry
+/// points turns a mismatched transcript into a build error, and leaves the
+/// several hundred STARK call sites — for which keccak is not a default but the
+/// answer — untouched.
+pub trait HasTranscriptHash {
+    /// The configuration this transcript's sponge runs on.
+    type Hash: TranscriptHash;
+}
+
 /// One Fiat-Shamir configuration: the digest the sponge runs on.
 pub trait TranscriptHash: 'static {
     /// The sponge's hash.

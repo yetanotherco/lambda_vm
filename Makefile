@@ -554,6 +554,10 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	# reset lands inside another test's measurement window — moving them out of
 	# the lib binary left four of five failing until they also took a lock.
 	cargo test -p crypto --features hash-metrics --test transcript_counters
+	# And the system test that reads them through a real prove: it is the one
+	# that says the PROVER picked the configuration's sponge, which the
+	# type-level test next to it cannot observe.
+	cargo test -p lambda-vm-prover --features hash-metrics --test whir_transcript_configuration
 	$(MAKE) test-rpx-host-kat
 
 # === Quick test shortcuts ===
