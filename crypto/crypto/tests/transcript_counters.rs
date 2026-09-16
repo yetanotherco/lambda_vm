@@ -97,7 +97,7 @@ fn a_keccak_transcript_counts_as_keccak_and_nothing_else() {
     assert_eq!(c.transcript_squeezes_rpx, 0);
     assert_eq!(c.transcript_absorbs, absorbs);
     assert_eq!(c.transcript_squeezes, squeezes);
-    assert_eq!(c.transcript_unattributed(), (0, 0));
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn an_rpx_transcript_counts_as_rpx_and_nothing_else() {
     assert_eq!(c.transcript_squeezes_keccak, 0);
     assert_eq!(c.transcript_absorbs, absorbs);
     assert_eq!(c.transcript_squeezes, squeezes);
-    assert_eq!(c.transcript_unattributed(), (0, 0));
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
 
 /// ★ The two configurations do the SAME amount of transcript work.
@@ -163,6 +163,17 @@ fn the_two_configurations_do_the_same_transcript_work() {
 /// This is the assertion that makes the new counters non-vacuous against
 /// something that predates them, and it fails if either counter is moved,
 /// double-counted, or attached to the wrong call.
+///
+/// ⚠ SCOPE: state reads are deliberately NOT a term here, and adding one would
+/// be wrong rather than more complete. `state()` finalizes a clone; it issues
+/// no `update`, so it cannot move `absorb_calls` and has no business in an
+/// identity about absorbs. It is counted separately by
+/// [`a_state_read_is_counted_separately_from_a_squeeze`], where its own control
+/// is the grind count.
+///
+/// Lane V1's closed form for the block, in these terms and satisfying this
+/// identity by construction: 582,703 absorbs + 182,734 squeezes == 765,437
+/// `absorb_calls`, with the 2,996 state finalizes outside all three.
 ///
 /// ⚠ An earlier version of this test asserted a cubic element absorbs in
 /// "several chunks". It does not: `stream_bytes` for the degree-3 extension
@@ -256,4 +267,76 @@ fn the_rpx_digest_bumps_the_generic_counters() {
         "an RPX finalize did not reach `total`, whose own doc says it counts \
          every finalize"
     );
+}
+
+/// ★★★ A `state()` IS COUNTED, AND IT IS NOT A SQUEEZE.
+///
+/// The distinction lane V1's closed form turns on. `sample` is a
+/// `finalize_reset` whose output is chained back in, so it advances the
+/// transcript; `state` finalizes a CLONE and changes nothing. On a block proof
+/// they are 182,734 and 2,996 — a counter hooked only to `finalize_reset`
+/// misses every one of the 2,996, which is precisely what this file's first
+/// version did.
+///
+/// Both directions are asserted, because either conflation is a live failure
+/// mode: a state must not appear as a squeeze, AND a squeeze must not appear as
+/// a state. Counting their sum would satisfy neither of V1's two numbers.
+#[test]
+fn a_state_read_is_counted_separately_from_a_squeeze() {
+    let _serialised = serialise();
+
+    hash_metrics::reset();
+    let mut t = DefaultTranscript::<Ext, RpxTranscriptHash>::new(b"state");
+    let before = t.state();
+    let c = hash_metrics::snapshot();
+    assert_eq!(
+        (c.transcript_states, c.transcript_states_rpx),
+        (1, 1),
+        "a state() read was not counted"
+    );
+    assert_eq!(
+        c.transcript_squeezes, 0,
+        "a state() read was counted as a squeeze — it finalizes a clone and \
+         advances nothing, so a squeeze count including it cannot be checked \
+         against a closed form"
+    );
+
+    // …and it really did not advance the chain, which is why it is a different
+    // number rather than a different name for the same one.
+    let again = t.state();
+    assert_eq!(before, again, "state() advanced the transcript");
+    assert_eq!(hash_metrics::snapshot().transcript_states, 2);
+
+    // The converse: a squeeze is not counted as a state.
+    hash_metrics::reset();
+    let _ = t.sample();
+    let c = hash_metrics::snapshot();
+    assert_eq!(
+        (c.transcript_squeezes, c.transcript_squeezes_rpx),
+        (1, 1),
+        "a squeeze was not counted"
+    );
+    assert_eq!(
+        c.transcript_states, 0,
+        "a squeeze was counted as a state read"
+    );
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
+}
+
+/// ★ …and the keccak arm tags its state reads too.
+///
+/// One side is not evidence: "rpx states > 0, keccak 0" is equally true when
+/// the keccak path was never instrumented.
+#[test]
+fn a_keccak_state_read_is_tagged_as_keccak() {
+    let _serialised = serialise();
+
+    hash_metrics::reset();
+    let t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(b"state");
+    let _ = t.state();
+    let c = hash_metrics::snapshot();
+
+    assert_eq!((c.transcript_states, c.transcript_states_keccak), (1, 1));
+    assert_eq!(c.transcript_states_rpx, 0);
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }

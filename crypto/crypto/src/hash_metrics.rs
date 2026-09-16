@@ -49,12 +49,32 @@ pub struct Counts {
     pub transcript_absorbs_keccak: u64,
     /// Of those, the ones whose sponge is RPX256.
     pub transcript_absorbs_rpx: u64,
-    /// ★★ Fiat-Shamir squeezes, ALL configurations.
+    /// ★★ Fiat-Shamir SQUEEZES, ALL configurations — `finalize_reset`, which
+    /// advances the chain (the output is re-absorbed).
     pub transcript_squeezes: u64,
     /// Of those, the ones whose sponge is keccak.
     pub transcript_squeezes_keccak: u64,
     /// Of those, the ones whose sponge is RPX256.
     pub transcript_squeezes_rpx: u64,
+    /// ★★ Fiat-Shamir STATE reads, ALL configurations — `state()`, a finalize
+    /// on a CLONE. No reset and no re-absorb, so it does NOT advance the chain.
+    ///
+    /// ⚠ A DIFFERENT OPERATION from a squeeze, counted separately because
+    /// conflating them makes a number unfalsifiable. On a block proof the two
+    /// are 182,734 and 2,996 (lane V1's closed form, pinned to a measured
+    /// verify with difference 0): a counter hooked only to `finalize_reset`
+    /// misses every one of the 2,996, and a counter reporting their sum —
+    /// 185,730 — cannot be checked against either.
+    ///
+    /// ★ The state reads are a CONTROL that costs nothing: there is exactly one
+    /// per grind check, so this must equal the grind count the same run prints.
+    /// Two independent instruments on one quantity, and a disagreement names
+    /// which of them is wrong.
+    pub transcript_states: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_states_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_states_rpx: u64,
 }
 
 impl Counts {
@@ -65,12 +85,13 @@ impl Counts {
     /// is a hash nobody instrumented reading as a zero that looks like
     /// "nothing ran". A third configuration arriving un-instrumented shows up
     /// here instead of being silently folded into one of the two above.
-    pub fn transcript_unattributed(&self) -> (u64, u64) {
+    pub fn transcript_unattributed(&self) -> (u64, u64, u64) {
         (
             self.transcript_absorbs - self.transcript_absorbs_keccak - self.transcript_absorbs_rpx,
             self.transcript_squeezes
                 - self.transcript_squeezes_keccak
                 - self.transcript_squeezes_rpx,
+            self.transcript_states - self.transcript_states_keccak - self.transcript_states_rpx,
         )
     }
 }
@@ -92,6 +113,9 @@ mod imp {
     static T_SQUEEZES: AtomicU64 = AtomicU64::new(0);
     static T_SQUEEZES_KECCAK: AtomicU64 = AtomicU64::new(0);
     static T_SQUEEZES_RPX: AtomicU64 = AtomicU64::new(0);
+    static T_STATES: AtomicU64 = AtomicU64::new(0);
+    static T_STATES_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_STATES_RPX: AtomicU64 = AtomicU64::new(0);
 
     /// Which known sponge `D` is, if any: `Some(true)` keccak, `Some(false)`
     /// RPX256, `None` a configuration nobody has instrumented.
@@ -217,6 +241,22 @@ mod imp {
         };
     }
 
+    /// ★★ One `state()` — a finalize on a CLONE of the sponge.
+    ///
+    /// Not a squeeze: no reset, no re-absorb, the chain does not advance. It is
+    /// its own counter because the two are different operations and a sum
+    /// cannot be checked against either. One of these per grind check, which is
+    /// what makes it a free control against the grind count.
+    #[inline(always)]
+    pub fn count_transcript_state<D: 'static>() {
+        T_STATES.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_STATES_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_STATES_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
     /// Zero all counters.
     pub fn reset() {
         TOTAL.store(0, Ordering::Relaxed);
@@ -231,6 +271,9 @@ mod imp {
         T_SQUEEZES.store(0, Ordering::Relaxed);
         T_SQUEEZES_KECCAK.store(0, Ordering::Relaxed);
         T_SQUEEZES_RPX.store(0, Ordering::Relaxed);
+        T_STATES.store(0, Ordering::Relaxed);
+        T_STATES_KECCAK.store(0, Ordering::Relaxed);
+        T_STATES_RPX.store(0, Ordering::Relaxed);
     }
 
     pub fn snapshot() -> Counts {
@@ -247,6 +290,9 @@ mod imp {
             transcript_squeezes: T_SQUEEZES.load(Ordering::Relaxed),
             transcript_squeezes_keccak: T_SQUEEZES_KECCAK.load(Ordering::Relaxed),
             transcript_squeezes_rpx: T_SQUEEZES_RPX.load(Ordering::Relaxed),
+            transcript_states: T_STATES.load(Ordering::Relaxed),
+            transcript_states_keccak: T_STATES_KECCAK.load(Ordering::Relaxed),
+            transcript_states_rpx: T_STATES_RPX.load(Ordering::Relaxed),
         }
     }
 }
@@ -274,6 +320,8 @@ mod imp {
     pub fn count_transcript_absorb<D: 'static>() {}
     #[inline(always)]
     pub fn count_transcript_squeeze<D: 'static>() {}
+    #[inline(always)]
+    pub fn count_transcript_state<D: 'static>() {}
     pub fn reset() {}
     pub fn snapshot() -> Counts {
         Counts::default()
@@ -283,5 +331,5 @@ mod imp {
 pub use imp::{
     count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
     count_merkle_node_direct, count_total, count_transcript_absorb, count_transcript_squeeze,
-    reset, snapshot,
+    count_transcript_state, reset, snapshot,
 };

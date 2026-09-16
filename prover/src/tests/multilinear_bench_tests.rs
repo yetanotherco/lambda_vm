@@ -262,6 +262,36 @@ fn whir_against_fri() {
 /// `LAMBDA_VM_BENCH_EPOCH_LOG2` is the epoch length in cycles, the CLI's
 /// default (2^20) unless it is set. It is a resource knob, not a property of
 /// either prover: both sides get the same one.
+/// One transcript-counter line, labelled with the WINDOW it covers.
+///
+/// ⚠ The window is part of the number. The prover and the verifier each run a
+/// transcript, over different work, and only the verifier's is what a recursive
+/// verifier replays — so a count quoted without its side cannot be checked
+/// against anything.
+///
+/// ⚠ `states` is NOT part of `squeezes`: a squeeze is a `finalize_reset` that
+/// chains its output back in, a state read finalizes a CLONE and advances
+/// nothing. There is one state read per grind check, so on the verify line the
+/// states column must equal the grind-check count — two independent instruments
+/// on one quantity.
+#[cfg(feature = "hash-metrics")]
+fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
+    let (ua, us, ut) = c.transcript_unattributed();
+    println!(
+        "{:<12} transcript absorbs {}/{} · squeezes {}/{} · states {}/{} (keccak/rpx) · unattributed {}/{}/{}",
+        window,
+        c.transcript_absorbs_keccak,
+        c.transcript_absorbs_rpx,
+        c.transcript_squeezes_keccak,
+        c.transcript_squeezes_rpx,
+        c.transcript_states_keccak,
+        c.transcript_states_rpx,
+        ua,
+        us,
+        ut,
+    );
+}
+
 #[test]
 #[ignore]
 fn continuations() {
@@ -360,26 +390,25 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         #[cfg(feature = "hash-metrics")]
         {
             let c = crypto::hash_metrics::snapshot();
-            let (ua, us) = c.transcript_unattributed();
-            println!(
-                "{:<12} transcript absorbs {}/{} · squeezes {}/{} (keccak/rpx) · unattributed {}/{}",
-                "WHIR",
-                c.transcript_absorbs_keccak,
-                c.transcript_absorbs_rpx,
-                c.transcript_squeezes_keccak,
-                c.transcript_squeezes_rpx,
-                ua,
-                us,
-            );
+            print_transcript_counts("WHIR prove", &c);
         }
         let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
             .expect("serialize")
             .len();
         let epochs = bundle.num_epochs();
+        // ★★ The VERIFY side gets its own window, and it is the side that
+        // matters for recursion: an LFM replays the VERIFIER's transcript, not
+        // the prover's. The two are different numbers over different work —
+        // differencing one against a closed form derived for the other is the
+        // same category error as comparing a prove stopwatch to a verify one.
+        #[cfg(feature = "hash-metrics")]
+        crypto::hash_metrics::reset();
         let start = Instant::now();
         let ok = crate::multilinear_continuation::verify_continuation(&bytes, &bundle, &opts)
             .expect("multilinear verify");
         assert!(ok, "the multilinear continuation must verify");
+        #[cfg(feature = "hash-metrics")]
+        print_transcript_counts("WHIR verify", &crypto::hash_metrics::snapshot());
         whir = Some((prove, start.elapsed(), size, epochs));
     }
 
