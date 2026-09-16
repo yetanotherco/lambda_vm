@@ -10,7 +10,6 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::Result;
 use crate::device::{alloc_or_trim, backend};
@@ -31,14 +30,6 @@ pub fn reset_leaf_hash_calls() {
     LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
 }
 
-/// ⚠ Escape hatch for the mutation check, and for a run that would rather
-/// rebuild than hold the memory: `LAMBDA_VM_NO_WHIR_TREE_CACHE` restores the
-/// rebuild-every-time behaviour. Read once, cached.
-fn cache_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_TREE_CACHE").is_some())
-}
-
 /// Leaf-hash passes over ONE codeword.
 ///
 /// ⚠ The global [`LEAF_HASH_CALLS`] is a diagnostic: it is process-wide, so a
@@ -50,19 +41,6 @@ fn cache_disabled() -> bool {
 /// it rather than to whoever ran alongside.
 type BuildCount = Arc<AtomicU64>;
 
-/// A built tree, kept for the openings that follow the root.
-struct CachedTree {
-    nodes: CudaSlice<u8>,
-    num_leaves: usize,
-    /// What it was built FOR. A tree is only valid for the blocking and the
-    /// hash it was built with, so both are part of the key — "they happen to
-    /// match at every call site today" is an invariant about callers, not
-    /// about this type.
-    log_folding: usize,
-    hash: crate::DeviceHash,
-    /// Bytes promised to [`DeviceReservation`] for it, given back on eviction.
-    bytes: u64,
-}
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -76,19 +54,14 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
-    /// Leaf-hash passes this codeword has paid for. One, after H4.
+    /// Leaf-hash passes this codeword has paid for: one per tree built, so
+    /// two for a commitment that is opened — the root's and the paths'.
     builds: BuildCount,
-    /// ★ The tree this codeword was committed through, kept so the openings
-    /// need not hash its leaves a second time (H4).
+    /// The room the chain promised itself: this codeword and the folds that
+    /// halve it, shared with those folds because they live inside it.
     ///
-    /// Behind an `Arc<Mutex<..>>` because `DeviceCodeword` is `Clone` and the
-    /// clones are the same codeword: a cache that cloned would be rebuilt per
-    /// clone, which is the cost this exists to remove.
-    tree: Arc<Mutex<Option<CachedTree>>>,
-    /// The room the chain promised itself: this codeword, the folds that halve
-    /// it, and the tree each of them is committed and opened through. Shared
-    /// with the folds, which live inside it, and GROWN by the cached tree
-    /// above so that one number still answers what this chain holds.
+    /// A tree is NOT in this number, because a tree is never held past the
+    /// call that builds it — see [`with_tree`](Self::with_tree).
     room: Arc<crate::device::DeviceReservation>,
 }
 
@@ -162,79 +135,58 @@ impl DeviceCodeword {
         Ok((nodes, num_leaves))
     }
 
-    /// ★ Run `f` against this codeword's tree, building it at most ONCE.
+    /// Run `f` against this codeword's tree, built here and freed on return.
     ///
-    /// The commit builds it and keeps it; the openings that follow read the
-    /// same buffer. That is the whole of H4, and what it buys is half the
-    /// device hashing of every commitment that is opened — which is all of
-    /// them.
+    /// # Why the tree is not kept
     ///
-    /// # What the cache is keyed on, and what happens when it misses
+    /// A commitment that is opened pays for its leaf layer twice — once for
+    /// the root, once for the paths — and keeping the first tree would remove
+    /// the second pass. H4 built that cache and measured it: it returned the
+    /// hashing it promised and cost more than it returned, ~+15 s in both
+    /// hashes, because the retention is not one tree but one per commitment
+    /// in the group.
     ///
-    /// `(log_folding, hash)`. A tree is only valid for the blocking and the
-    /// hash it was built with, and a miss **REBUILDS** rather than refusing:
-    /// both are legitimate parameters of the call, a rebuild is always correct,
-    /// and refusing would turn an unusual-but-valid call into an error. What
-    /// the key rules out is the dangerous outcome — serving a tree that answers
-    /// a different question, which no assertion downstream would catch because
-    /// the paths would be internally consistent and wrong.
+    /// The window is forced by the protocol, not by this file.
+    /// `StackedCommitment::commit` builds EVERY chain's commitment before it
+    /// returns, because all the roots go into the transcript before any query
+    /// index is drawn; the openings come afterwards, one chain at a time. So
+    /// the last chain's tree would live from its commit to its opening — the
+    /// whole proof — and no placement of an eviction call bounds that peak,
+    /// since all N trees exist before the first opening. Ten chains at half a
+    /// gigabyte put the card at 96%, after which device allocations fail,
+    /// commits silently fall back to the host, and the host grows by ~1.5 GiB
+    /// per fallen-back chain.
     ///
-    /// # When the budget says no
+    /// `crypto/multilinear/src/whir_commit.rs`'s `paths` said this in its doc
+    /// comment before any of it was built, and `StackedCommitment::commit`'s
+    /// reservation — "nine codewords of room instead of sixteen" — budgets a
+    /// retained codeword per commitment and no tree. Both were right.
     ///
-    /// The tree is served for this call and NOT cached. Holding device memory
-    /// the reservation cannot see is the one thing this must never do, so the
-    /// cost of a full budget is the old behaviour rather than a silent
-    /// over-commit.
+    /// What is left of H4 is the counters: [`tree_builds`](Self::tree_builds)
+    /// and [`leaf_hash_calls`] make the two passes visible, and the group-scale
+    /// test in `tests/whir_tree_cache.rs` fails if a tree is ever held past
+    /// this call again.
     fn with_tree<R>(
         &self,
         log_folding: usize,
         hash: crate::DeviceHash,
         f: impl FnOnce(&CudaSlice<u8>, usize) -> Result<R>,
     ) -> Result<R> {
-        if cache_disabled() {
-            let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
-            return f(&nodes, num_leaves);
-        }
-        // Poisoning is ignored: the slot holds a device buffer and a byte
-        // count, and a panic in `f` leaves both consistent.
-        let mut slot = self.tree.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = slot.as_ref() {
-            if cached.log_folding == log_folding && cached.hash == hash {
-                return f(&cached.nodes, cached.num_leaves);
-            }
-            // A different shape. Give its bytes back before building another,
-            // so the reservation never counts two trees for one codeword.
-            self.room.shrink(cached.bytes);
-            *slot = None;
-        }
-
         let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
-        let bytes = (2 * num_leaves as u64 - 1) * 32;
-        if self.room.grow(bytes) {
-            let cached = slot.insert(CachedTree {
-                nodes,
-                num_leaves,
-                log_folding,
-                hash,
-                bytes,
-            });
-            f(&cached.nodes, cached.num_leaves)
-        } else {
-            f(&nodes, num_leaves)
-        }
+        f(&nodes, num_leaves)
     }
 
-    /// Bytes this codeword's chain has promised the device budget, including
-    /// any cached tree. For tests and diagnostics.
+    /// Bytes this codeword's chain has promised the device budget. For tests
+    /// and diagnostics.
     pub fn reserved_bytes(&self) -> u64 {
         self.room.bytes()
     }
 
     /// ★ How many times THIS codeword's leaf layer has been hashed.
     ///
-    /// One after a commit, and still one after any number of openings — that is
-    /// the whole of H4, and unlike the process-wide counter this number is
-    /// unaffected by whatever else shares the test binary.
+    /// One after a commit, and one more for each round that opens it. Unlike
+    /// the process-wide counter this number is unaffected by whatever else
+    /// shares the test binary, so an assertion on it is about this codeword.
     pub fn tree_builds(&self) -> u64 {
         self.builds.load(Ordering::Relaxed)
     }
@@ -520,7 +472,6 @@ fn commit_from(
         elements: n,
         base: true,
         builds: BuildCount::default(),
-        tree: Arc::new(Mutex::new(None)),
         room: Arc::new(room),
     };
     let root = codeword.commit(log_folding, hash)?;
@@ -768,7 +719,6 @@ pub fn fold_resident(
         // is committed and opened in its own right, and sharing the parent's
         // slot would make one of them evict the other every round.
         builds: BuildCount::default(),
-        tree: Arc::new(Mutex::new(None)),
         // The fold lives inside the room the codeword it came from promised:
         // it is half of it, and that one is still alive.
         room: codeword.room.clone(),
