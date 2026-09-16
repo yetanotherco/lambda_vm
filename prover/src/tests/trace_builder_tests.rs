@@ -2004,3 +2004,77 @@ fn retiring_a_chunk_keeps_its_bitwise_lookups() {
         "the lookups of the retired chunks plus the tail do not add up to the run's"
     );
 }
+
+/// The tables built from accumulated op lists must match the ordinary build.
+///
+/// COMMIT, KECCAK and its round tables, and the accelerator tables are written
+/// once at the end from everything the run produced. The Commit phase drops the
+/// chunked tables as it goes but has to keep feeding these, so the risk is the
+/// opposite one: an op list quietly not accumulated comes out as an empty table
+/// that still looks well-formed.
+#[test]
+fn the_accumulated_tables_match_the_ordinary_build() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    // Uses keccak and the commit ecall, so the tables under test are not empty.
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig::default();
+
+    let mut leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |_, _, _| {},
+    )
+    .expect("walk");
+    leftover.finalize();
+    let built = leftover.build_accumulated();
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    for (name, a, b) in [
+        ("COMMIT", &built.commit, &resident.commit),
+        ("KECCAK", &built.keccak, &resident.keccak),
+        ("KECCAK_RND", &built.keccak_rnd, &resident.keccak_rnd),
+        ("KECCAK_RC", &built.keccak_rc, &resident.keccak_rc),
+        ("ECSM", &built.ecsm, &resident.ecsm),
+        ("ECDAS", &built.ecdas, &resident.ecdas),
+        ("HINT", &built.hint, &resident.hint),
+    ] {
+        assert_eq!(flat(a), flat(b), "{name} differs from the ordinary build");
+    }
+    assert!(
+        flat(&built.keccak).iter().any(|v| *v != 0),
+        "the fixture must exercise KECCAK, or this proves nothing"
+    );
+}

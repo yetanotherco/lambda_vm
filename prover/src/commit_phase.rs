@@ -188,9 +188,11 @@ pub fn commit_remaining(
     // not exist here yet. The lookups are what this phase is responsible for
     // having kept — the chunks that owed them are long gone.
     let bitwise = leftover.build_bitwise();
+    let accumulated = leftover.build_accumulated();
     Ok(Remaining {
         chunks: out,
         bitwise,
+        accumulated,
     })
 }
 
@@ -200,6 +202,8 @@ pub struct Remaining {
     pub chunks: Vec<ChunkCommitment>,
     /// The BITWISE table, carrying the lookups of every retired chunk.
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// The tables written once from an accumulated op list.
+    pub accumulated: crate::tables::trace_builder::AccumulatedTables,
 }
 
 /// Every chunked table, closable mid-walk or not.

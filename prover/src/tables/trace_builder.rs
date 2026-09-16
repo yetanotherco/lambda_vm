@@ -1355,6 +1355,37 @@ impl WalkLeftover {
         table
     }
 
+    /// Build the tables that are a function of one accumulated op list.
+    ///
+    /// COMMIT, KECCAK and its two round tables, and the three accelerator
+    /// tables. None of them is ever closed mid-walk — they are written once, at
+    /// the end, from everything the run produced — so this is where they
+    /// belong rather than in the chunk machinery.
+    pub(crate) fn build_accumulated(&self) -> AccumulatedTables {
+        let keccak_rnd_ops: Vec<KeccakRoundOperation> = self
+            .tail
+            .keccak_ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect();
+        let mut keccak_rc = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut keccak_rc, self.tail.keccak_ops.len());
+
+        AccumulatedTables {
+            commit: commit::generate_commit_trace(&self.tail.commit_ops),
+            keccak: keccak::generate_keccak_trace(&self.tail.keccak_ops),
+            keccak_rnd: keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops),
+            keccak_rc,
+            ecsm: ecsm::generate_ecsm_trace(&self.tail.ecsm_ops),
+            ecdas: ecdas::generate_ecdas_trace(&self.tail.ecdas_ops),
+            hint: hint::generate_hint_trace(&self.tail.hint_ops),
+        }
+    }
+
     /// Cycles the walk executed.
     pub fn cycles(&self) -> usize {
         self.cycles
@@ -1374,6 +1405,17 @@ impl WalkLeftover {
             .position(|k| *k == kind)
             .map_or(0, |slot| self.emitted[slot])
     }
+}
+
+/// The tables built once, at the end, from an accumulated op list.
+pub struct AccumulatedTables {
+    pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// The tables `cpu32_chip_op` appends to.
@@ -5267,7 +5309,7 @@ impl Traces {
         {
             let cpu = collect_cpu_ops(logs, &artifacts.instructions, cycles_so_far)?;
             cycles_so_far += cpu.len();
-            let (memw, ld, lt, sh, _bw, _cm, _kc, c32, _ec, _ed, _hn) =
+            let (memw, ld, lt, sh, bw, cm, kc, c32, ec, ed, hn) =
                 collect_ops_from_cpu(&cpu, &mut memory_state, &mut register_state);
             // Derived from THIS segment's ops, before they are moved into the
             // buffer — the buffer is drained as chunks close, so it is not the
@@ -5285,6 +5327,14 @@ impl Traces {
             buf.lt_ops.extend(lt);
             buf.shift_ops.extend(sh);
             buf.cpu32_ops.extend(c32);
+            // Never closed mid-walk: these are accumulators or accelerator
+            // tables built once, at the end, from the whole run.
+            buf.bitwise_ops.extend(bw);
+            buf.commit_ops.extend(cm);
+            buf.keccak_ops.extend(kc);
+            buf.ecsm_ops.extend(ec);
+            buf.ecdas_ops.extend(ed);
+            buf.hint_ops.extend(hn);
 
             // Emit every chunk that is now full, and only those: a partial chunk
             // may still grow, so it waits for the end.
