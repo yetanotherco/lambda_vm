@@ -434,15 +434,71 @@ fn retain_default_mempool(ctx: &CudaContext) {
 }
 
 /// Device bytes held for as long as this lives. See [`Backend::reserve`].
+///
+/// ★ The count is atomic and the reservation is GROWABLE, because a chain
+/// promises its room once and then discovers more of it: the tree a commitment
+/// caches is not known when the codeword reserves, and it is shared through an
+/// `Arc` by the time it is. Growing this rather than taking a second
+/// reservation is what keeps ONE number answering "what does this chain hold" —
+/// two accountings for one working set is a shape this codebase has paid for
+/// before.
 #[derive(Debug)]
 pub struct DeviceReservation {
-    bytes: u64,
+    bytes: AtomicU64,
+}
+
+impl DeviceReservation {
+    /// Bytes this reservation currently accounts for.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Promise `extra` more against the same budget, under this reservation.
+    ///
+    /// Returns false and changes nothing if the budget will not take it — the
+    /// caller then does without whatever it wanted the bytes for, rather than
+    /// holding memory the accounting cannot see.
+    pub fn grow(&self, extra: u64) -> bool {
+        let Ok(be) = backend() else { return false };
+        let mut held = be.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(extra) > be.vram_budget_bytes {
+                return false;
+            }
+            match be.reserved.compare_exchange_weak(
+                held,
+                held + extra,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.bytes.fetch_add(extra, Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => held = seen,
+            }
+        }
+    }
+
+    /// Give `given` of them back, when what they were promised for is dropped
+    /// before the reservation is.
+    pub fn shrink(&self, given: u64) {
+        let given = given.min(self.bytes.load(Ordering::Relaxed));
+        if given == 0 {
+            return;
+        }
+        self.bytes.fetch_sub(given, Ordering::Relaxed);
+        if let Ok(be) = backend() {
+            be.reserved.fetch_sub(given, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for DeviceReservation {
     fn drop(&mut self) {
         if let Ok(be) = backend() {
-            be.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+            be.reserved
+                .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 }
@@ -478,7 +534,11 @@ fn trim_default_mempool() {
 /// free until that stream reaches the drop — and the pool cannot return what
 /// it has not been given yet. Draining the whole context first is what makes
 /// the trim worth doing.
-fn drain_and_trim() -> Result<()> {
+///
+/// Public because a test that asks the driver how much memory this process has
+/// taken needs the pool empty first, or it is measuring the pool's retention
+/// instead of the caller's — see `a_group_holds_only_its_codewords_before_any_open`.
+pub fn drain_and_trim() -> Result<()> {
     let be = backend()?;
     be.ctx.synchronize()?;
     trim_default_mempool();
@@ -856,6 +916,31 @@ impl Backend {
         }
     }
 
+    /// Bytes the device reports free, right now.
+    ///
+    /// The driver's own accounting rather than this module's: [`reserve`]
+    /// counts what callers PROMISED, which is silent about anything allocated
+    /// without a reservation. A test that wants to know whether a structure is
+    /// holding device memory it never declared has to ask the device, and this
+    /// is how — see `a_group_holds_only_its_codewords_before_any_open`.
+    ///
+    /// ⚠ The stream-ordered pool retains freed blocks, so this falls as memory
+    /// is used and does not always rise as it is released. It answers "how
+    /// much has this process taken from the device", not "how much is live",
+    /// which is the question a retention test is asking.
+    pub fn free_vram_bytes(&self) -> Result<u64> {
+        use cudarc::driver::sys;
+        self.ctx.bind_to_thread()?;
+        // SAFETY: a raw driver query writing into two stack slots, with the
+        // context bound to this thread on the line above.
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize).result()?;
+            Ok(free as u64)
+        }
+    }
+
     /// Promises `bytes` of the device to something about to be built there, or
     /// refuses.
     ///
@@ -880,10 +965,21 @@ impl Backend {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(DeviceReservation { bytes }),
+                Ok(_) => {
+                    return Some(DeviceReservation {
+                        bytes: AtomicU64::new(bytes),
+                    });
+                }
                 Err(seen) => held = seen,
             }
         }
+    }
+
+    /// Bytes promised across every live reservation — what `reserve` checks
+    /// the budget against. Exposed so a test can assert the number rather than
+    /// assert that nothing crashed.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved.load(Ordering::Relaxed)
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different

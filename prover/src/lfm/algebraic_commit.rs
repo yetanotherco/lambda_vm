@@ -572,6 +572,16 @@ macro_rules! algebraic_transcript_hash {
 
         impl TranscriptHash for $name {
             type Digest = AlgebraicDigest<$tag>;
+            /// ⚠ **`true`, and it is load-bearing rather than inherited.** The
+            /// reversal became a per-configuration choice so the WHIR RPX
+            /// transcript could drop it, on the argument that an unreversed
+            /// squeeze hands out canonical felts. That argument applies to
+            /// these sponges too — but every proof this pipeline has produced
+            /// came from a `sample()` that reversed, so dropping it here would
+            /// move the challenges of the STARK pipeline, its wraps and its
+            /// block root. The saving is real and it is a separate change with
+            /// its own re-baseline, not a consequence of the WHIR one.
+            const REVERSES_SQUEEZE: bool = true;
             const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(1);
             const NAME: &'static str = $label;
         }

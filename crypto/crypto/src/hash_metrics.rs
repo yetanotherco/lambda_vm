@@ -42,6 +42,37 @@ pub struct Counts {
     pub absorb_calls: u64,
     /// Bytes fed through absorb (`Sum of data.len()`).
     pub absorb_bytes: u64,
+    /// ★★ Fiat-Shamir absorbs, ALL configurations. Counted in
+    /// `DefaultTranscript`'s own append methods, not in a hash.
+    pub transcript_absorbs: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_absorbs_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_absorbs_rpx: u64,
+    /// ★★ Fiat-Shamir squeezes, ALL configurations.
+    pub transcript_squeezes: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_squeezes_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_squeezes_rpx: u64,
+}
+
+impl Counts {
+    /// Transcript work this build could not attribute to a known sponge.
+    ///
+    /// ★ Zero on every configuration that exists, and it is REPORTED rather
+    /// than assumed: the failure this whole group of counters exists to catch
+    /// is a hash nobody instrumented reading as a zero that looks like
+    /// "nothing ran". A third configuration arriving un-instrumented shows up
+    /// here instead of being silently folded into one of the two above.
+    pub fn transcript_unattributed(&self) -> (u64, u64) {
+        (
+            self.transcript_absorbs - self.transcript_absorbs_keccak - self.transcript_absorbs_rpx,
+            self.transcript_squeezes
+                - self.transcript_squeezes_keccak
+                - self.transcript_squeezes_rpx,
+        )
+    }
 }
 
 #[cfg(all(not(target_arch = "riscv64"), feature = "hash-metrics"))]
@@ -55,6 +86,25 @@ mod imp {
     static GRINDING: AtomicU64 = AtomicU64::new(0);
     static ABSORB_CALLS: AtomicU64 = AtomicU64::new(0);
     static ABSORB_BYTES: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS_RPX: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES_RPX: AtomicU64 = AtomicU64::new(0);
+
+    /// Which known sponge `D` is, if any: `Some(true)` keccak, `Some(false)`
+    /// RPX256, `None` a configuration nobody has instrumented.
+    fn sponge<D: 'static>() -> Option<bool> {
+        let id = core::any::TypeId::of::<D>();
+        if id == core::any::TypeId::of::<crate::hash::platform_keccak::PlatformKeccak256>() {
+            Some(true)
+        } else if id == core::any::TypeId::of::<crate::hash::rpx::Rpx256Digest>() {
+            Some(false)
+        } else {
+            None
+        }
+    }
 
     /// Every keccak-256 finalize, from any site (host `PlatformKeccak256`).
     #[inline(always)]
@@ -133,6 +183,40 @@ mod imp {
         MERKLE_NODES.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// ★★ One Fiat-Shamir ABSORB, tagged by the sponge that will consume it.
+    ///
+    /// Called from `DefaultTranscript`'s append methods — the transcript, not
+    /// the hash. Two reasons, and the second is the one that matters:
+    ///
+    /// 1. It is hash-agnostic by construction. A counter living inside keccak
+    ///    reads ZERO for an algebraic transcript, which is indistinguishable
+    ///    from "no transcript ran" — the trap this module's header describes
+    ///    for Merkle, which the transcript never got.
+    /// 2. It counts TRANSCRIPT absorbs only. [`count_absorb`] is bumped from a
+    ///    digest's `update`, so it mixes Merkle leaf bytes with Fiat-Shamir
+    ///    bytes and cannot answer "how much did the transcript absorb" for
+    ///    either hash.
+    #[inline(always)]
+    pub fn count_transcript_absorb<D: 'static>() {
+        T_ABSORBS.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_ABSORBS_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_ABSORBS_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
+    /// ★★ One Fiat-Shamir SQUEEZE, tagged the same way.
+    #[inline(always)]
+    pub fn count_transcript_squeeze<D: 'static>() {
+        T_SQUEEZES.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_SQUEEZES_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_SQUEEZES_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
     /// Zero all counters.
     pub fn reset() {
         TOTAL.store(0, Ordering::Relaxed);
@@ -141,6 +225,12 @@ mod imp {
         GRINDING.store(0, Ordering::Relaxed);
         ABSORB_CALLS.store(0, Ordering::Relaxed);
         ABSORB_BYTES.store(0, Ordering::Relaxed);
+        T_ABSORBS.store(0, Ordering::Relaxed);
+        T_ABSORBS_KECCAK.store(0, Ordering::Relaxed);
+        T_ABSORBS_RPX.store(0, Ordering::Relaxed);
+        T_SQUEEZES.store(0, Ordering::Relaxed);
+        T_SQUEEZES_KECCAK.store(0, Ordering::Relaxed);
+        T_SQUEEZES_RPX.store(0, Ordering::Relaxed);
     }
 
     pub fn snapshot() -> Counts {
@@ -151,6 +241,12 @@ mod imp {
             grinding: GRINDING.load(Ordering::Relaxed),
             absorb_calls: ABSORB_CALLS.load(Ordering::Relaxed),
             absorb_bytes: ABSORB_BYTES.load(Ordering::Relaxed),
+            transcript_absorbs: T_ABSORBS.load(Ordering::Relaxed),
+            transcript_absorbs_keccak: T_ABSORBS_KECCAK.load(Ordering::Relaxed),
+            transcript_absorbs_rpx: T_ABSORBS_RPX.load(Ordering::Relaxed),
+            transcript_squeezes: T_SQUEEZES.load(Ordering::Relaxed),
+            transcript_squeezes_keccak: T_SQUEEZES_KECCAK.load(Ordering::Relaxed),
+            transcript_squeezes_rpx: T_SQUEEZES_RPX.load(Ordering::Relaxed),
         }
     }
 }
@@ -174,6 +270,10 @@ mod imp {
     pub fn count_merkle_node_direct() {}
     #[inline(always)]
     pub fn count_absorb(_nbytes: usize) {}
+    #[inline(always)]
+    pub fn count_transcript_absorb<D: 'static>() {}
+    #[inline(always)]
+    pub fn count_transcript_squeeze<D: 'static>() {}
     pub fn reset() {}
     pub fn snapshot() -> Counts {
         Counts::default()
@@ -182,5 +282,6 @@ mod imp {
 
 pub use imp::{
     count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
-    count_merkle_node_direct, count_total, reset, snapshot,
+    count_merkle_node_direct, count_total, count_transcript_absorb, count_transcript_squeeze,
+    reset, snapshot,
 };

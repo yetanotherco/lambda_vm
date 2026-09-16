@@ -9,8 +9,38 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::Result;
 use crate::device::{alloc_or_trim, backend};
+
+/// Leaf-hash passes over a codeword — one per tree actually built.
+///
+/// The quantity H4 is about: a commitment that is opened used to cost TWO of
+/// these, one for the root and one for the paths. It counts launches, not
+/// leaves, because "how many times was this codeword's leaf layer hashed" is
+/// the question, and a test can assert an integer.
+static LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn leaf_hash_calls() -> u64 {
+    LEAF_HASH_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn reset_leaf_hash_calls() {
+    LEAF_HASH_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// Leaf-hash passes over ONE codeword.
+///
+/// ⚠ The global [`LEAF_HASH_CALLS`] is a diagnostic: it is process-wide, so a
+/// test asserting on it is asserting about every other test sharing the binary
+/// too. That is not a hypothetical — the first gate run of this file had a
+/// counting test read 5 instead of 1 purely because its neighbours were
+/// committing at the same time. A per-codeword count is what an assertion can
+/// actually be about, and it localises a failure to the codeword that caused
+/// it rather than to whoever ran alongside.
+type BuildCount = Arc<AtomicU64>;
+
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
 /// A codeword the device holds, base-field or ext3.
@@ -24,10 +54,15 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
-    /// The room the chain promised itself: this codeword, the folds that halve
-    /// it, and the tree each of them is committed and opened through. Shared
-    /// with the folds, which live inside it.
-    _room: Arc<crate::device::DeviceReservation>,
+    /// Leaf-hash passes this codeword has paid for: one per tree built, so
+    /// two for a commitment that is opened — the root's and the paths'.
+    builds: BuildCount,
+    /// The room the chain promised itself: this codeword and the folds that
+    /// halve it, shared with those folds because they live inside it.
+    ///
+    /// A tree is NOT in this number, because a tree is never held past the
+    /// call that builds it — see [`with_tree`](Self::with_tree).
+    room: Arc<crate::device::DeviceReservation>,
 }
 
 impl DeviceCodeword {
@@ -98,47 +133,108 @@ impl DeviceCodeword {
             }
         }
         build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+        LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.builds.fetch_add(1, Ordering::Relaxed);
         Ok((nodes, num_leaves))
+    }
+
+    /// Run `f` against this codeword's tree, built here and freed on return.
+    ///
+    /// # Why the tree is not kept
+    ///
+    /// A commitment that is opened pays for its leaf layer twice — once for
+    /// the root, once for the paths — and keeping the first tree would remove
+    /// the second pass. H4 built that cache and measured it: it returned the
+    /// hashing it promised and cost more than it returned, ~+15 s in both
+    /// hashes, because the retention is not one tree but one per commitment
+    /// in the group.
+    ///
+    /// The window is forced by the protocol, not by this file.
+    /// `StackedCommitment::commit` builds EVERY chain's commitment before it
+    /// returns, because all the roots go into the transcript before any query
+    /// index is drawn; the openings come afterwards, one chain at a time. So
+    /// the last chain's tree would live from its commit to its opening — the
+    /// whole proof — and no placement of an eviction call bounds that peak,
+    /// since all N trees exist before the first opening. Ten chains at half a
+    /// gigabyte put the card at 96%, after which device allocations fail,
+    /// commits silently fall back to the host, and the host grows by ~1.5 GiB
+    /// per fallen-back chain.
+    ///
+    /// `crypto/multilinear/src/whir_commit.rs`'s `paths` said this in its doc
+    /// comment before any of it was built, and `StackedCommitment::commit`'s
+    /// reservation — "nine codewords of room instead of sixteen" — budgets a
+    /// retained codeword per commitment and no tree. Both were right.
+    ///
+    /// What is left of H4 is the counters: [`tree_builds`](Self::tree_builds)
+    /// and [`leaf_hash_calls`] make the two passes visible, and the group-scale
+    /// test in `tests/whir_tree_cache.rs` fails if a tree is ever held past
+    /// this call again.
+    fn with_tree<R>(
+        &self,
+        log_folding: usize,
+        hash: crate::DeviceHash,
+        f: impl FnOnce(&CudaSlice<u8>, usize) -> Result<R>,
+    ) -> Result<R> {
+        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
+        f(&nodes, num_leaves)
+    }
+
+    /// Bytes this codeword's chain has promised the device budget. For tests
+    /// and diagnostics.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.room.bytes()
+    }
+
+    /// ★ How many times THIS codeword's leaf layer has been hashed.
+    ///
+    /// One after a commit, and one more for each round that opens it. Unlike
+    /// the process-wide counter this number is unaffected by whatever else
+    /// shares the test binary, so an assertion on it is about this codeword.
+    pub fn tree_builds(&self) -> u64 {
+        self.builds.load(Ordering::Relaxed)
     }
 
     /// The root of that tree, which is the commitment.
     ///
-    /// The tree itself is dropped: the only other thing anyone wants from it
-    /// is a path per query, and by then the queries are known — see
-    /// [`paths`](Self::paths).
+    /// ★ The tree is KEPT (H4). The other thing anyone wants from it is a path
+    /// per query, and rebuilding it then cost a second leaf-hash pass over the
+    /// whole codeword — half of this path's device hashing, for a buffer that
+    /// was already in hand.
     pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
-        let (nodes, _) = self.build_tree(log_folding, hash)?;
-        let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
-        self.stream.synchronize()?;
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&head);
-        Ok(root)
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
+            self.stream.synchronize()?;
+            let mut root = [0u8; 32];
+            root.copy_from_slice(&head);
+            Ok(root)
+        })
     }
 
     /// The whole tree in the host node layout — what a caller that walks it
     /// here needs, and what the parity test compares against.
     pub fn nodes_to_host(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<Vec<u8>> {
-        let (nodes, _) = self.build_tree(log_folding, hash)?;
-        let out = self.stream.clone_dtoh(&nodes)?;
-        self.stream.synchronize()?;
-        Ok(out)
+        self.with_tree(log_folding, hash, |nodes, _| {
+            let out = self.stream.clone_dtoh(nodes)?;
+            self.stream.synchronize()?;
+            Ok(out)
+        })
     }
 
     /// The authentication paths of `positions`, against the same tree.
     ///
-    /// Rebuilt rather than kept or carried home. Keeping it costs half a
-    /// gigabyte of device memory per commitment for the whole proof; bringing
-    /// it back costs ten times the rehash, because a pageable copy of half a
-    /// gigabyte is the slowest thing in the commit. What the host needs of a
-    /// tree is a kilobyte per query.
+    /// ★ Read from the tree the commit kept, not rebuilt (H4). Bringing the
+    /// tree home is still not done — a pageable copy of half a gigabyte is the
+    /// slowest thing in the commit, and what the host needs of a tree is a
+    /// kilobyte per query.
     pub fn paths(
         &self,
         log_folding: usize,
         positions: &[u32],
         hash: crate::DeviceHash,
     ) -> Result<Vec<u8>> {
-        let (nodes, num_leaves) = self.build_tree(log_folding, hash)?;
-        crate::merkle::gather_merkle_paths_dev(&nodes, num_leaves, positions, &self.stream)
+        self.with_tree(log_folding, hash, |nodes, num_leaves| {
+            crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)
+        })
     }
 
     /// The fold blocks `indices` open — `block` values at stride `num_leaves`
@@ -378,7 +474,8 @@ fn commit_from(
         stream,
         elements: n,
         base: true,
-        _room: Arc::new(room),
+        builds: BuildCount::default(),
+        room: Arc::new(room),
     };
     let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
@@ -621,9 +718,13 @@ pub fn fold_resident(
         stream,
         elements: half,
         base: false,
+        // A fold is its OWN codeword: its own cache slot and its own count. It
+        // is committed and opened in its own right, and sharing the parent's
+        // slot would make one of them evict the other every round.
+        builds: BuildCount::default(),
         // The fold lives inside the room the codeword it came from promised:
         // it is half of it, and that one is still alive.
-        _room: codeword._room.clone(),
+        room: codeword.room.clone(),
     })
 }
 

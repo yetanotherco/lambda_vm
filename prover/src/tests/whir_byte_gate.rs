@@ -57,9 +57,14 @@
 //! line as this laptop.
 //!
 //! Under `LAMBDA_VM_WHIR_HASH=rpx` the line is
-//! `5226e4cfffac7eb2ba629470a0c5ebf879421078b389e3a8065ae63768031adb` — a
+//! `dcc0e8d52a80a6c9ee4ed9911d54b41e7df132d209fbf91e43018b0ac01c4985` — a
 //! DIFFERENT digest at the SAME 6880 bytes, which is the whole claim of the
 //! seam in one line: the hash moved, the format did not.
+//!
+//! ⚠ The RPX line was `5226e4cf…031adb` until W1-A2b wired the Fiat-Shamir
+//! transcript to the configuration. Until then the RPX arm ran an RPX Merkle
+//! backend, an RPX grind and a KECCAK sponge, and this line was the digest of
+//! that mixture. Both lines are now PINNED; see [`RPX_LINE`].
 //!
 //! That is the gate: **the keccak arm's bytes do not move.** A commit that
 //! changes this line has changed the proof PR #988 produces, and owes an
@@ -124,40 +129,23 @@ fn canonically_sorted_columns() -> Vec<Vec<FieldElement<Fp>>> {
         .collect()
 }
 
-/// The keccak arm's line.
+/// The keccak arm's line. It has never moved and must not.
 const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982336436e6dd3";
 
-/// The RPX arm's line.
+/// ★★ The RPX arm's line, PINNED rather than merely required to differ.
 ///
-/// ⚠ Pinned, not merely required to DIFFER from keccak's. `assert_ne!` passes
-/// for every wrong answer except one, so it cannot tell "the RPX hash ran" from
-/// "something else ran": a third hash, or a transcript whose sampling schedule
-/// moved, would both clear it. Measured on the merged branch, twice per arm,
-/// and equal at `0cbc9623` — which is what says the merge left the WHIR path's
-/// bytes alone.
+/// It was `5226e4cf…031adb` from the seam landing until the transcript was
+/// wired to the configuration (W1-A2b). That earlier value is worth keeping in
+/// view, because of how the missing wiring was found: W1-A removed the squeeze
+/// reversal for RPX, which alters the challenge stream from the first squeeze
+/// onward and therefore HAD to move this line — and it did not. The line's
+/// refusal to move is what carried the information.
 ///
-/// ⛔ **WHAT THIS LINE IS A PROOF OF, exactly: RPX TREES UNDER A KECCAK
-/// SPONGE.** The RPX arm is a half-flip at this revision, and that is a
-/// property of the branch rather than of this test. ✓ VERIFIED: every WHIR
-/// prove site builds `DefaultTranscript::<E>::new(..)` — the DEFAULT type
-/// parameter, which is `KeccakTranscriptHash` — at `multilinear_prove.rs:226`
-/// and `:415` and at four sites in `multilinear_continuation.rs`, and so does
-/// the fixture below. `WhirHash::Transcript` is reached only through
-/// `GrindingDigest<H>` (`whir_hash.rs:54`) and a compile-time `PhantomData`
-/// assertion. So under `LAMBDA_VM_WHIR_HASH=rpx` the Merkle backend, the device
-/// kernels and the proof-of-work digest are RPX while Fiat–Shamir is keccak.
-///
-/// This is the configuration W1's design note called unspellable, and the
-/// reason it is spellable anyway is that the transcript was never wired — not
-/// that the seam failed. Two consequences worth carrying:
-///
-/// 1. **This constant WILL move when the wiring lands**, and that move is the
-///    expected result, not drift. Re-pin it there; do not reconcile it here.
-/// 2. **Any cost attributed to "RPX" on this branch excludes the sponge.** The
-///    measured +38.8 s on a 39.7 s keccak prove is trees, kernels and grind
-///    only, so it is a LOWER bound on the full swap rather than a measurement
-///    of it.
-const RPX_LINE: &str = "5226e4cfffac7eb2ba629470a0c5ebf879421078b389e3a8065ae63768031adb";
+/// An `assert_ne!` against [`KECCAK_LINE`], which is what this arm had before,
+/// would have passed on that run and said nothing. A pinned constant is the
+/// difference between an instrument that can report a surprise and one that can
+/// only report a category.
+const RPX_LINE: &str = "dcc0e8d52a80a6c9ee4ed9911d54b41e7df132d209fbf91e43018b0ac01c4985";
 
 /// The serialized length, which neither arm may move: 32-byte digests either
 /// way and no proof struct gains a field.
@@ -200,7 +188,10 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
     // found.
     let proof = crate::with_whir_hash!(|H| {
         let committed = CommittedTables::<_, _, H>::commit(vec![table], &config).expect("commit");
-        let mut transcript = DefaultTranscript::<Ext>::new(b"whir-identity");
+        let mut transcript = DefaultTranscript::<
+            Ext,
+            <H as multilinear::whir_hash::WhirHash>::Transcript,
+        >::new(b"whir-identity");
         multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove")
     });
 
@@ -230,13 +221,18 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
             "the keccak arm's bytes moved: this commit changed the proof PR #988 produces"
         ),
         crate::whir_hash_knob::Setting::Rpx => {
+            // Both, and in this order: the pin is the real assertion, and the
+            // inequality below is what makes a failure legible when the two
+            // arms collapse into one.
             assert_ne!(
                 line, KECCAK_LINE,
                 "the rpx arm produced KECCAK's line — the proof never reached the RPX hash"
             );
             assert_eq!(
                 line, RPX_LINE,
-                "the rpx arm's bytes moved: this commit changed the proof the RPX seam produces"
+                "the rpx arm's bytes moved. If that was intended, say which \
+                 change moved them and re-pin; if not, the configuration \
+                 reaching the prove is not the one this constant was taken from"
             );
         }
     }
