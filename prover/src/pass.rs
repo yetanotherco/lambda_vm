@@ -32,8 +32,90 @@ pub trait Visitor {
         &mut self,
         kind: TableKind,
         chunk: usize,
-        trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     ) -> Result<(), Error>;
+
+    /// Called once after the last table. A visitor that holds tables back to
+    /// work on several at a time deals with the remainder here.
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// How many tables a pass works on at a time.
+///
+/// The walk hands tables over one by one, and doing the work right there means
+/// one table's worth of parallelism on a machine with far more of it. Holding
+/// `k` back costs `k` times one table's working set and no more, which is the
+/// bargain the whole approach is built on — bounded residency, not minimal.
+///
+/// Measured on the ethrex mainnet block, 96 cores, through the LogUp pass:
+///
+/// | k | time | peak |
+/// |---|---|---|
+/// | 1 | 233.4s | 21550 MB |
+/// | 4 | 143.5s | 21554 MB |
+/// | 8 | 129.9s | 21550 MB |
+/// | 16 | 123.5s | 21550 MB |
+/// | 32 | 122.3s | 26640 MB |
+///
+/// Up to 16 the peak does not move at all, because it is set at the end of the
+/// run by the tables that cannot be retired — BITWISE, DECODE, the pages — and
+/// a batch of chunks is small beside them. At 32 the batch itself becomes the
+/// peak (it moves to halfway through the run) and buys 1% of time for 5 GB.
+///
+/// So the knee is 16 on that machine, and the bound is memory rather than
+/// cores: a smaller run has a smaller resident set for a batch to hide behind.
+/// `A1_TABLE_PARALLELISM` overrides it.
+pub fn table_parallelism() -> usize {
+    if let Some(k) = std::env::var("A1_TABLE_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| *k > 0)
+    {
+        return k;
+    }
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 6).clamp(1, 16))
+        .unwrap_or(1)
+}
+
+/// Collects tables until there are `k` of them, then hands the batch over.
+///
+/// Sits between the walk and a pass so the pass only says what to do with one
+/// table; the batching, and the bound on how many are alive, live here once.
+pub struct Batched<T, F> {
+    batch: Vec<T>,
+    k: usize,
+    run: F,
+}
+
+impl<T, F> Batched<T, F>
+where
+    F: FnMut(Vec<T>) -> Result<(), Error>,
+{
+    pub fn new(run: F) -> Self {
+        Self {
+            batch: Vec::new(),
+            k: table_parallelism(),
+            run,
+        }
+    }
+
+    pub fn push(&mut self, item: T) -> Result<(), Error> {
+        self.batch.push(item);
+        if self.batch.len() >= self.k {
+            return self.drain();
+        }
+        Ok(())
+    }
+
+    pub fn drain(&mut self) -> Result<(), Error> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        (self.run)(std::mem::take(&mut self.batch))
+    }
 }
 
 /// The tables a pass cannot retire, still as traces.
@@ -107,9 +189,9 @@ pub fn walk<V: Visitor>(
         &image,
         &register_init,
         max_rows,
-        |kind, chunk, mut table| {
+        |kind, chunk, table| {
             if failed.is_none()
-                && let Err(e) = visitor.table(kind, chunk, &mut table)
+                && let Err(e) = visitor.table(kind, chunk, table)
             {
                 failed = Some(e);
             }
@@ -157,14 +239,15 @@ pub fn finish<V: Visitor>(
         // Chunks the walk already closed keep their numbering; what is left
         // continues from there.
         let first = leftover.emitted(kind);
-        for (offset, mut table) in leftover
+        for (offset, table) in leftover
             .take_remaining(kind, max_rows)
             .into_iter()
             .enumerate()
         {
-            visitor.table(kind, first + offset, &mut table)?;
+            visitor.table(kind, first + offset, table)?;
         }
     }
+    visitor.flush()?;
 
     let public_output = leftover.public_output_bytes();
     let accumulated = leftover.build_accumulated();

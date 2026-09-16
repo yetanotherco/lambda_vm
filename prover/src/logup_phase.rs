@@ -36,12 +36,63 @@ pub struct LogUp {
     pub resident: Resident,
 }
 
+type Item = (
+    TableKind,
+    usize,
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+);
+
 struct BuildAux<'a> {
-    airs: &'a ChunkAirs,
-    challenges: &'a [FieldElement<GoldilocksExtension>],
-    shared: &'a DefaultTranscript<GoldilocksExtension>,
-    order: &'a crate::streaming::AirOrder,
-    done: Vec<(usize, TableRounds23<GoldilocksExtension>)>,
+    #[allow(clippy::type_complexity)]
+    batch: pass::Batched<Item, Box<dyn FnMut(Vec<Item>) -> Result<(), Error> + 'a>>,
+}
+
+impl<'a> BuildAux<'a> {
+    fn new(
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        done: &'a std::sync::Mutex<Vec<(usize, TableRounds23<GoldilocksExtension>)>>,
+    ) -> Self {
+        Self {
+            batch: pass::Batched::new(Box::new(move |items| {
+                rounds_batch(airs, challenge, done, items)
+            })),
+        }
+    }
+}
+
+/// One batch, in parallel. Each table runs against its own transcript fork, so
+/// nothing crosses between them — the shared state is only where results land.
+fn rounds_batch(
+    airs: &ChunkAirs,
+    challenge: &Challenge,
+    done: &std::sync::Mutex<Vec<(usize, TableRounds23<GoldilocksExtension>)>>,
+    items: Vec<Item>,
+) -> Result<(), Error> {
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let n = order.len();
+    let built: Result<Vec<_>, Error> = items
+        .into_par_iter()
+        .map(|(kind, chunk, mut trace)| {
+            let idx = order.index_of(kind, chunk).ok_or_else(|| {
+                Error::Prover(format!(
+                    "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
+                ))
+            })?;
+            let mut transcript = fork(&challenge.transcript, idx, n);
+            let rounds = rounds_2_to_3(
+                airs.get(kind).as_ref(),
+                &mut trace,
+                &challenge.challenges,
+                &mut transcript,
+            )
+            .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
+            Ok((idx, rounds))
+        })
+        .collect();
+    done.lock().expect("logup results").extend(built?);
+    Ok(())
 }
 
 impl Visitor for BuildAux<'_> {
@@ -49,23 +100,13 @@ impl Visitor for BuildAux<'_> {
         &mut self,
         kind: TableKind,
         chunk: usize,
-        trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     ) -> Result<(), Error> {
-        let idx = self.order.index_of(kind, chunk).ok_or_else(|| {
-            Error::Prover(format!(
-                "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
-            ))
-        })?;
-        let mut transcript = fork(self.shared, idx, self.order.len());
-        let rounds = rounds_2_to_3(
-            self.airs.get(kind).as_ref(),
-            trace,
-            self.challenges,
-            &mut transcript,
-        )
-        .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
-        self.done.push((idx, rounds));
-        Ok(())
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
     }
 }
 
@@ -112,16 +153,13 @@ pub fn run(
     challenge: &Challenge,
 ) -> Result<LogUp, Error> {
     let airs = ChunkAirs::new(proof_options);
-    let mut visitor = BuildAux {
-        airs: &airs,
-        challenges: &challenge.challenges,
-        shared: &challenge.transcript,
-        order: &challenge.order,
-        done: Vec::new(),
-    };
+    let done = std::sync::Mutex::new(Vec::new());
+    let mut visitor = BuildAux::new(&airs, challenge, &done);
     let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
+    drop(visitor);
 
-    let tables = assemble(visitor.done, &mut resident, elf, proof_options, challenge)?;
+    let chunks = done.into_inner().expect("logup results");
+    let tables = assemble(chunks, &mut resident, elf, proof_options, challenge)?;
     Ok(LogUp { tables, resident })
 }
 

@@ -32,16 +32,68 @@ pub struct Committed {
 
 /// What the walk alone produced.
 pub struct CommitPhase {
-    /// One entry per chunk closed during the walk, in the order they closed.
+    /// One entry per chunk closed during the walk. Unordered: the batch runs
+    /// its tables in parallel, so what reads this indexes by `(kind, chunk)`.
     pub closed: Vec<ChunkCommitment>,
     /// Everything the walk still held when the execution ended.
     pub walked: pass::Walked,
 }
 
-/// Commits each table's main trace and drops it.
+/// Commits each table's main trace and drops it, `k` tables at a time.
 struct CommitMain<'a> {
-    airs: &'a ChunkAirs,
-    roots: Vec<ChunkCommitment>,
+    batch: pass::Batched<
+        (
+            TableKind,
+            usize,
+            TraceTable<GoldilocksField, GoldilocksExtension>,
+        ),
+        Box<
+            dyn FnMut(
+                    Vec<(
+                        TableKind,
+                        usize,
+                        TraceTable<GoldilocksField, GoldilocksExtension>,
+                    )>,
+                ) -> Result<(), Error>
+                + 'a,
+        >,
+    >,
+}
+
+impl<'a> CommitMain<'a> {
+    fn new(airs: &'a ChunkAirs, roots: &'a std::sync::Mutex<Vec<ChunkCommitment>>) -> Self {
+        Self {
+            batch: pass::Batched::new(Box::new(move |items| commit_batch(airs, roots, items))),
+        }
+    }
+}
+
+/// One batch, in parallel. The tables in a batch are independent — each commits
+/// its own trace against its own AIR — so the only shared thing is where the
+/// roots land.
+fn commit_batch(
+    airs: &ChunkAirs,
+    roots: &std::sync::Mutex<Vec<ChunkCommitment>>,
+    items: Vec<(
+        TableKind,
+        usize,
+        TraceTable<GoldilocksField, GoldilocksExtension>,
+    )>,
+) -> Result<(), Error> {
+    use rayon::prelude::*;
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    let done: Result<Vec<ChunkCommitment>, Error> = items
+        .into_par_iter()
+        .map(|(kind, chunk, trace)| {
+            <P as IsStarkProver<_, _, _>>::commit_table_root(airs.get(kind).as_ref(), &trace)
+                .map(|root| (kind, chunk, root))
+                .ok_or_else(|| {
+                    Error::Prover(format!("commit phase: no commitment for a {kind:?} chunk"))
+                })
+        })
+        .collect();
+    roots.lock().expect("roots").extend(done?);
+    Ok(())
 }
 
 impl Visitor for CommitMain<'_> {
@@ -49,16 +101,13 @@ impl Visitor for CommitMain<'_> {
         &mut self,
         kind: TableKind,
         chunk: usize,
-        trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     ) -> Result<(), Error> {
-        type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-        let root =
-            <P as IsStarkProver<_, _, _>>::commit_table_root(self.airs.get(kind).as_ref(), trace)
-                .ok_or_else(|| {
-                Error::Prover(format!("commit phase: no commitment for a {kind:?} chunk"))
-            })?;
-        self.roots.push((kind, chunk, root));
-        Ok(())
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
     }
 }
 
@@ -73,13 +122,13 @@ pub fn run(
     proof_options: &ProofOptions,
 ) -> Result<CommitPhase, Error> {
     let airs = ChunkAirs::new(proof_options);
-    let mut visitor = CommitMain {
-        airs: &airs,
-        roots: Vec::new(),
-    };
+    let roots = std::sync::Mutex::new(Vec::new());
+    let mut visitor = CommitMain::new(&airs, &roots);
     let walked = pass::walk(elf, private_input, max_rows, &mut visitor)?;
+    visitor.flush()?;
+    drop(visitor);
     Ok(CommitPhase {
-        closed: visitor.roots,
+        closed: roots.into_inner().expect("roots"),
         walked,
     })
 }
@@ -97,13 +146,12 @@ pub fn run_to_end(
     proof_options: &ProofOptions,
 ) -> Result<Committed, Error> {
     let airs = ChunkAirs::new(proof_options);
-    let mut visitor = CommitMain {
-        airs: &airs,
-        roots: Vec::new(),
-    };
+    let roots = std::sync::Mutex::new(Vec::new());
+    let mut visitor = CommitMain::new(&airs, &roots);
     let remaining = pass::run(elf, private_input, max_rows, &mut visitor)?;
+    drop(visitor);
     Ok(Committed {
-        chunks: visitor.roots,
+        chunks: roots.into_inner().expect("roots"),
         remaining,
     })
 }
@@ -119,12 +167,11 @@ pub fn commit_remaining(
     proof_options: &ProofOptions,
 ) -> Result<(Vec<ChunkCommitment>, Resident), Error> {
     let airs = ChunkAirs::new(proof_options);
-    let mut visitor = CommitMain {
-        airs: &airs,
-        roots: Vec::new(),
-    };
+    let roots = std::sync::Mutex::new(Vec::new());
+    let mut visitor = CommitMain::new(&airs, &roots);
     let resident = pass::finish(walked, private_input, max_rows, &mut visitor)?;
-    Ok((visitor.roots, resident))
+    drop(visitor);
+    Ok((roots.into_inner().expect("roots"), resident))
 }
 
 /// The ordinary build, for comparison against [`run_to_end`].
