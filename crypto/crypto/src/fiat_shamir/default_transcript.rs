@@ -76,12 +76,30 @@ where
     }
 
     /// Raw squeeze: finalize the current sponge state, advance the hash chain by
-    /// absorbing the (reversed) output, and return it. Also invalidates the
-    /// duplex output buffer, so interleaving raw `sample()` calls with buffered
-    /// field/`u64` sampling can never reuse stale squeeze bytes.
+    /// absorbing the output, and return it. Also invalidates the duplex output
+    /// buffer, so interleaving raw `sample()` calls with buffered field/`u64`
+    /// sampling can never reuse stale squeeze bytes.
+    ///
+    /// ★ The byte order is the configuration's, via
+    /// [`TranscriptHash::REVERSES_SQUEEZE`] — `true` for keccak, which is the
+    /// convention every proof on this branch has been produced under, and
+    /// `false` for an algebraic sponge, whose squeeze is already four canonical
+    /// felts and whose consumer is a field-native verifier that would otherwise
+    /// spend rows undoing the reversal.
+    ///
+    /// ⚠ The returned bytes and the chained bytes are the SAME value, and that
+    /// is deliberate: a replaying verifier reproducing this chain would
+    /// otherwise have two byte conventions to carry instead of none. Whichever
+    /// order the constant selects applies to both.
+    ///
+    /// The constant is associated, so each configuration monomorphises to
+    /// straight-line code — the keccak arm keeps the instruction sequence it
+    /// had before this became a choice.
     pub fn sample(&mut self) -> [u8; 32] {
         let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
-        result_hash.reverse();
+        if T::REVERSES_SQUEEZE {
+            result_hash.reverse();
+        }
         self.hasher.update(result_hash);
         self.out_pos = SQUEEZE_LEN;
         result_hash
@@ -90,6 +108,15 @@ where
     /// Next 64-bit candidate from the duplex output buffer, refilling with one
     /// squeeze when fewer than 8 bytes remain. Big-endian, matching the byte
     /// order `sample_u64` used when it read directly from `sample()`.
+    ///
+    /// ★ `SQUEEZE_LEN` is 32 and every read is 8, so `out_pos` only ever takes
+    /// the values `0, 8, 16, 24, 32` and a candidate is always a whole 8-byte
+    /// group — never two halves of adjacent ones. That is what lets a
+    /// configuration whose squeeze is four canonical felts promise
+    /// `CANDIDATES_PER_COORDINATE = Some(1)`: the felt boundaries and the read
+    /// boundaries are the same boundaries. `append_bytes` invalidates the
+    /// buffer wholesale rather than partially, so the alignment survives
+    /// interleaved absorbs.
     fn next_sample_u64(&mut self) -> u64 {
         if self.out_pos + 8 > SQUEEZE_LEN {
             self.out_buf = self.sample();
