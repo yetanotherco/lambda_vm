@@ -136,7 +136,7 @@ fn a_keccak_prove_squeezes_only_keccak() {
         (c.transcript_absorbs_rpx, c.transcript_squeezes_rpx),
         (0, 0)
     );
-    assert_eq!(c.transcript_unattributed(), (0, 0));
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn an_rpx_prove_squeezes_only_rpx() {
         c.transcript_absorbs_keccak,
         c.transcript_squeezes_keccak
     );
-    assert_eq!(c.transcript_unattributed(), (0, 0));
+    assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
 
 /// ★ The two configurations do the same amount of transcript WORK.

@@ -238,17 +238,37 @@ fn decode_commitment_zero_bytes_rejects() {
 
 /// DECODE preprocessed commitment for the `sub` asm test ELF at blowup=2,
 /// computed offline once UNDER THE BLOCK PIN (`hash_pin::BLOCK_STARK_HASH`,
-/// RPX256 here). Mirrors how the recursion guest embeds the commitment as a
-/// compile-time constant for its inner program.
+/// RPX256 here), over rows in PC ORDER. Mirrors how the recursion guest embeds
+/// the commitment as a compile-time constant for its inner program.
 ///
 /// ⚠ A fifth blessed constant, outside the four families
 /// `compute_static_commitments` regenerates: it moves with the pin exactly as
 /// they do, and `HASH-PINNING.md` lists it with them. If the pin, the AIR or the
 /// FFT pipeline changes, this drifts and the test fails — regenerate via the
 /// `print_decode_commitment_for_sub` helper below (`--ignored --nocapture`).
+///
+/// ⚠⚠ **THREE earlier values exist and none of them is this one.** The two
+/// inputs to this merge each carried their own, and the merged branch needs a
+/// fourth because it combines both changes:
+///
+/// | value | row order | commit hash |
+/// |---|---|---|
+/// | `e97168d6…` | `instructions.iter()` | stark's default aliases |
+/// | `0a710a9c…` | **pc order** | stark's default aliases |
+/// | `e6a99f70…` | `instructions.iter()` | **the block pin, RPX256** |
+/// | `858a103e…` (this one) | **pc order** | **the block pin, RPX256** |
+///
+/// Taking either side's constant would have failed, and for a reason the other
+/// side could not see. Regenerated here rather than copied.
+///
+/// The pc sort is why the row order half can no longer move for a reason nobody
+/// chose: it was hashbrown's — a function of the hasher, the map's capacity and
+/// the insertion sequence rather than of the ELF. Under the sort it is a
+/// function of the ELF alone, which is what a constant pinned in a guest has to
+/// be. See [`the_decode_trace_does_not_depend_on_the_map_that_carried_it`].
 const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
-    0xe6, 0xa9, 0x9f, 0x70, 0xfd, 0xdc, 0x7a, 0x0a, 0x65, 0xe1, 0x00, 0x56, 0x03, 0x0a, 0xe5, 0xc9,
-    0x25, 0xef, 0xa9, 0x02, 0xe1, 0xd9, 0xd9, 0xd7, 0x62, 0xb1, 0x64, 0x11, 0x65, 0xe3, 0xa1, 0x5e,
+    0x85, 0x8a, 0x10, 0x3e, 0xe4, 0xe2, 0xe7, 0x9b, 0x08, 0x0b, 0x67, 0xf1, 0xa6, 0x38, 0x5a, 0xfe,
+    0x6d, 0xd9, 0x55, 0x7b, 0x5a, 0x0e, 0xac, 0xde, 0xa0, 0x9b, 0xd5, 0xe3, 0x99, 0xb6, 0xe7, 0x74,
 ];
 
 #[test]
@@ -283,4 +303,126 @@ fn print_decode_commitment_for_sub() {
     let c = commitment_from_elf(&elf, &options).expect("decode commitment");
     eprintln!("SUB_DECODE_COMMITMENT_BLOWUP_2 (sub.elf, blowup=2):");
     eprintln!("{c:02x?}");
+}
+
+// =========================================================================
+// Row order is a function of the ELF alone
+// =========================================================================
+
+/// A distinct instruction per pc, so a permuted trace cannot match a sorted one
+/// by accident — every row differs from every other in PACKED_DECODE and IMM.
+fn instr_for(pc: u64) -> Instruction {
+    Instruction::ArithImm {
+        dst: ((pc / 4) % 30) as u32 + 1,
+        src: ((pc / 4) % 7) as u32 + 1,
+        imm: (pc % 2048) as i32 - 1024,
+        op: ArithOp::Add,
+    }
+}
+
+/// The same instruction set, reached through two independently-constructed
+/// maps: ascending with no reserve, descending with a large one.
+///
+/// Different insertion order and different capacity means a different hashbrown
+/// bucket layout, hence a different `iter()` order — which is exactly the
+/// variation a hashbrown version bump, an added `reserve`, or a change of hasher
+/// would introduce, expressed as something a test can construct today.
+fn two_maps_of(n: u64) -> (U64HashMap<Instruction>, U64HashMap<Instruction>) {
+    let pcs: Vec<u64> = (0..n).map(|i| 0x1000 + i * 4).collect();
+
+    let mut ascending: U64HashMap<Instruction> = U64HashMap::default();
+    for &pc in &pcs {
+        ascending.insert(pc, instr_for(pc));
+    }
+
+    let mut descending: U64HashMap<Instruction> = U64HashMap::default();
+    descending.reserve(1024);
+    for &pc in pcs.iter().rev() {
+        descending.insert(pc, instr_for(pc));
+    }
+
+    (ascending, descending)
+}
+
+/// ★★★ THE PROPERTY: the DECODE trace is a function of the instruction SET,
+/// not of the map that carried it.
+///
+/// Sorting by pc is the mechanism; this is the thing that must be true, and it
+/// is stated that way on purpose. A test asserting "the rows are sorted" would
+/// pass on any total order and would not say why the order matters — whereas a
+/// root pinned as a program constant needs exactly this: two parties holding
+/// the same ELF, and nothing else in common, produce the same rows.
+///
+/// ⚠ This is what fails without the sort. The two maps differ in insertion
+/// order and capacity, so `instructions.iter()` walks them differently and the
+/// traces come out permuted. Nothing in the system notices today, because
+/// prover and verifier both build their map through `instructions_from_elf` and
+/// so make the same arbitrary choice — they agree on a construction procedure
+/// rather than on the ELF. A hashbrown bump breaks that agreement with no ELF
+/// change and no failing test.
+#[test]
+fn the_decode_trace_does_not_depend_on_the_map_that_carried_it() {
+    let (ascending, descending) = two_maps_of(300);
+
+    // The premise: the two maps really are walked differently. If hashbrown ever
+    // made iteration order insertion- and capacity-independent, this test would
+    // still pass below while testing nothing, so the premise is asserted.
+    let order_a: Vec<u64> = ascending.iter().map(|(&pc, _)| pc).collect();
+    let order_b: Vec<u64> = descending.iter().map(|(&pc, _)| pc).collect();
+    assert_ne!(
+        order_a, order_b,
+        "the two maps iterate identically, so this test cannot detect a \
+         map-dependent trace — rebuild the maps so they differ"
+    );
+
+    let (trace_a, pc_to_row_a) = generate_decode_trace(&ascending);
+    let (trace_b, pc_to_row_b) = generate_decode_trace(&descending);
+
+    assert_eq!(trace_a.num_rows(), trace_b.num_rows());
+    for row in 0..trace_a.num_rows() {
+        assert_eq!(
+            trace_a.main_table.get_row(row),
+            trace_b.main_table.get_row(row),
+            "row {row} differs between two maps holding the same instructions"
+        );
+    }
+
+    // …and the index agrees too, or `update_multiplicities` would write the
+    // right counts to the wrong rows.
+    for (&pc, &row) in pc_to_row_a.iter() {
+        assert_eq!(
+            pc_to_row_b.get(&pc),
+            Some(&row),
+            "pc {pc:#x} maps to a different row in the two maps"
+        );
+    }
+}
+
+/// ★ THE MECHANISM, pinned separately so the reason stays visible.
+///
+/// The property above holds for any canonical order; this says which one, so a
+/// future change that keeps determinism but moves the rows has to come here and
+/// re-baseline the pins rather than sliding past.
+#[test]
+fn decode_rows_are_in_ascending_pc_order() {
+    let (ascending, _) = two_maps_of(64);
+    let (trace, _) = generate_decode_trace(&ascending);
+
+    // The instruction rows come first, then the CPU padding row, then zeroed
+    // padding to the next power of two — so only the first `n` are ordered.
+    let pcs: Vec<u64> = (0..64)
+        .map(|row| {
+            let lo = *trace.main_table.get(row, cols::PC_0).value();
+            let hi = *trace.main_table.get(row, cols::PC_1).value();
+            lo | (hi << 32)
+        })
+        .collect();
+
+    let mut sorted = pcs.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        pcs, sorted,
+        "the instruction rows are not in ascending pc order"
+    );
+    assert_eq!(pcs[0], 0x1000, "the first row is not the lowest pc");
 }

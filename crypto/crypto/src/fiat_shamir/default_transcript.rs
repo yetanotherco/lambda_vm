@@ -230,6 +230,12 @@ where
     }
 
     fn state(&self) -> [u8; 32] {
+        // ★ Counted, and NOT as a squeeze. This finalizes a CLONE: no reset and
+        // no re-absorb, so the chain does not advance and a counter hooked to
+        // `sample` cannot see it. There is one per grind check — 2,996 on a
+        // block proof against 182,734 squeezes — so a counter that reported
+        // only their sum could be checked against neither.
+        crate::hash_metrics::count_transcript_state::<T::Digest>();
         self.hasher.clone().finalize().into()
     }
 

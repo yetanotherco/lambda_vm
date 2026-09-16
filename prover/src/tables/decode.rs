@@ -99,13 +99,38 @@ pub type PcToRow = U64HashMap<usize>;
 pub fn generate_decode_trace(
     instructions: &U64HashMap<Instruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
-    // Build entries and PC-to-row mapping
+    // ★★ ROWS GO IN PC ORDER, and the sort is the whole point of this block.
+    //
+    // The rows used to come out of `instructions.iter()`, so their order was
+    // hashbrown's: a function of the hasher, the capacity the map happened to
+    // grow to, and the insertion sequence. Every one of those is stable for a
+    // given binary, which is why nothing has ever failed — prover and verifier
+    // both reach this through `instructions_from_elf`, so they agree with each
+    // other. What they agree on is a CONSTRUCTION PROCEDURE, not the ELF.
+    //
+    // That distinction is about to start mattering. These five columns are
+    // ELF-derived and their Merkle root is on its way to being a program
+    // constant pinned in a recursion guest (W1-B). A pinned root must be a
+    // function of the ELF ALONE: sorted by pc it is, and a hashbrown version
+    // bump, a capacity change or a reserve added upstream cannot move it.
+    // Unsorted it is not, and the failure mode is the bad kind — a toolchain
+    // update silently invalidates the pin, with no ELF change, no code change
+    // and no test that fails until a verifier rejects a valid proof.
+    //
+    // pc is unique (it is the map's key), so the order is total and the sort is
+    // not merely deterministic but canonical.
+    let mut entries: Vec<(u64, Instruction)> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, instr))
+        .collect();
+    entries.sort_unstable_by_key(|(pc, _)| *pc);
+
     let mut pc_to_row = PcToRow::default();
     pc_to_row.reserve(instructions.len() + 1);
-    let entries: Vec<_> = instructions
-        .iter()
+    let entries: Vec<_> = entries
+        .into_iter()
         .enumerate()
-        .map(|(row_idx, (&pc, &instr))| {
+        .map(|(row_idx, (pc, instr))| {
             pc_to_row.insert(pc, row_idx);
             // instruction_length = 4 (RV64C compressed decode is a separate workstream).
             DecodeEntry::from_instruction(pc, instr, 4)
