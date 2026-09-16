@@ -162,12 +162,21 @@ pub(crate) fn absorb_statement_with_digest(
     // Continuation epochs additionally bind their position (replay protection)
     // and whether they are the final one. `is_final` decides whether HALT is in
     // the epoch's AIR set, so without it the transcripts of a final and a
-    // non-final epoch carrying the same counts are identical, and the only thing
-    // separating the two AIR sets is the sub-proof count arithmetic in
-    // `verify_epoch`. The verifier derives `is_final` from the epoch's position
-    // in the bundle, so a spliced bundle re-reads an epoch under the other role
-    // and diverges here. Monolithic proofs append nothing, so their encoding is
-    // unchanged.
+    // non-final epoch carrying the same counts are identical. The verifier
+    // derives `is_final` from the epoch's position in the bundle, so a spliced
+    // bundle re-reads an epoch under the other role and diverges here.
+    //
+    // Defense in depth, not a plugged hole: a role flip is already rejected
+    // without this byte, and by more than one check. Re-reading an epoch under
+    // the other role moves the expected sub-proof count by one (`verify_epoch`'s
+    // `FIXED_TABLE_COUNT - 1` arm); deleting HALT's sub-proof to compensate
+    // drops its main Merkle root from the Phase A absorption and re-randomizes
+    // every downstream challenge; and HALT's own bus interactions are hardcoded
+    // `Multiplicity::One`, so its contribution cannot be absent from a balanced
+    // sum. Binding the role here makes it an explicit statement field instead of
+    // an emergent consequence of those three — do not weaken any of them on the
+    // strength of this byte. Monolithic proofs append nothing, so their encoding
+    // is unchanged.
     if let StatementKind::ContinuationEpoch {
         epoch_label,
         is_final,

@@ -80,14 +80,20 @@ pub struct RuntimePageRange {
     pub count: u64,
 }
 
-/// Number of tables that always contribute exactly one sub-proof, regardless
-/// of `TableCounts`: bitwise, decode, halt, keccak_rc, register. The
-/// accelerator chips are counted instead — a run that never calls one carries
-/// no table for it.
+/// Number of tables that contribute exactly one sub-proof regardless of
+/// `TableCounts`: bitwise, decode, halt, keccak_rc, register. The accelerator
+/// chips are counted instead — a run that never calls one carries no table for
+/// it.
+///
+/// HALT is the exception, and the reason this is not simply "always": a
+/// continuation epoch carries it only when it is the final one, so `verify_epoch`
+/// sizes non-final epochs with `FIXED_TABLE_COUNT - 1`. Any caller computing an
+/// expected sub-proof count for a continuation epoch must do the same.
 pub const FIXED_TABLE_COUNT: usize = 5;
 
-/// Number of chunks for each split table.
-/// The verifier needs this to reconstruct matching AIRs.
+/// How many sub-proofs each counted table contributes. Chunked chips report
+/// their chunk count; the six accelerators are not chunked and report 0 or 1
+/// (see `validate`). The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
@@ -178,10 +184,13 @@ impl TableCounts {
             }
         }
         // The accelerators are not chunked: `generate_optional` emits one table
-        // or none, so a count above 1 is a shape no prover can produce. Rejected
-        // here rather than left to the sub-proof cross-check, which would only
-        // catch it once the counts had already sized the AIR set. If one of them
-        // ever becomes chunked, this list is what changes.
+        // or none, so a count above 1 is a shape no prover can produce. The
+        // sub-proof cross-check constrains only the *total*, so on its own it
+        // lets an inflated accelerator count through whenever another count is
+        // lowered to match; this pins the per-field shape instead. It is not
+        // load-bearing for memory safety — both verifiers run the cross-check
+        // before any count sizes an AIR set — and if one of them ever becomes
+        // chunked, this list is what changes.
         let at_most_one = [
             ("keccak", self.keccak),
             ("keccak_rnd", self.keccak_rnd),
@@ -1510,8 +1519,11 @@ fn verify_proof_parts(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
-    // Validate table_counts before constructing AIRs.
-    // A malicious prover could set counts to 0, removing entire constraint sets.
+    // Validate table_counts before constructing AIRs. A zero count is legitimate
+    // for every chip but CPU and MEMW_R — what keeps it honest is the LogUp bus,
+    // not this call (see `TableCounts::validate`). This rejects the two counts
+    // whose absence describes no execution at all, and the accelerator shapes no
+    // prover can produce.
     table_counts.validate()?;
 
     // Bound num_private_input_pages before allocating PageConfigs — the tight honest

@@ -371,7 +371,8 @@ fn test_mul_range_checks_input_halves() {
 
 /// Regression test for the `Msb16` LogUp over-send bug.
 ///
-/// MUL is split into chip instances of `max_rows.mul` raw ops (`chunk_and_generate`)
+/// MUL is split into chip instances of `max_rows.mul` raw ops
+/// (`chunk_and_generate_optional`)
 /// and each instance deduplicates only its own chunk, sending the MSB16 sign lookup
 /// once per unique signed op *per instance* (multiplicity = the `SIGNED` bit). So
 /// `collect_bitwise_from_mul`, which feeds the BITWISE MSB16 multiplicity, must use
