@@ -173,7 +173,7 @@ The low-limb carry of the two position updates is constrained on every row (@mem
 
 = The Accelerated Memory Operations standard
 The Ethereum Foundation's Accelerated Memory Operations standard fixes what an accelerated `memcpy`, `memmove` and `memset` must provide.
-#footnote([Accelerated Memory Operations; eth-act/zkevm-standards, commit `e6a4cc0`. #link("https://github.com/eth-act/zkevm-standards/tree/e6a4cc0/standards/accelerated-memory-operations")[[src]]])
+#footnote([Accelerated Memory Operations; eth-act/zkevm-standards, commit `a97934c`, 2026-08-11. #link("https://github.com/eth-act/zkevm-standards/blob/a97934cae02693d3b69f07a7cd6e3ed6fb5e8053/standards/accelerated-memory-operations/README.md")[[src]]])
 Of the chip itself it asks that operands of arbitrary alignment be accepted, which they are: no constraint here refers to the alignment of `src`, `dst` or `count`, and a row's width is tied to none of them.
 The one restriction this chip does impose is not an alignment --- a `memset` may not straddle the $2^32$ limb boundary --- and the standard's fourth operation, `memcmp`, is not covered, as it does not copy.
 Its two remaining requirements fall outside this chapter: that the accelerated symbol behave identically to the C library function, which the guest stub is responsible for, and that it be a strong definition in an unconditionally linked object, which is a matter of linking.
