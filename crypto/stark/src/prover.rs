@@ -1822,15 +1822,24 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        #[cfg(feature = "instruments")]
+        let __r1 = crate::instruments::span("a1_round_1");
         let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
-        Self::prove_rounds_2_to_4(
+        #[cfg(feature = "instruments")]
+        drop(__r1);
+        #[cfg(feature = "instruments")]
+        let __r24 = crate::instruments::span("a1_rounds_2_to_4");
+        let out = Self::prove_rounds_2_to_4(
             air,
             pub_inputs,
             &mut round_1_result,
             transcript,
             &domain,
             &twiddles,
-        )
+        );
+        #[cfg(feature = "instruments")]
+        drop(__r24);
+        out
     }
 
     /// Round 1 for one table, rebuilt from its trace.
@@ -1873,11 +1882,17 @@ pub trait IsStarkProver<
             .map(|_| out)
         };
 
+        #[cfg(feature = "instruments")]
+        let __m = crate::instruments::span("a1_r1_main");
         let (main_src, num_main_cols) = trace.main_data_row_major();
         let main_data =
             expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
         let main = Self::table_commit_for(air, &main_data, num_main_cols)?;
 
+        #[cfg(feature = "instruments")]
+        drop(__m);
+        #[cfg(feature = "instruments")]
+        let __a = crate::instruments::span("a1_r1_aux");
         let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
             let (aux_src, cols) = trace.aux_data_row_major();
             let mut out: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(lde_size * cols);
@@ -1898,6 +1913,8 @@ pub trait IsStarkProver<
             (Vec::new(), 0, None)
         };
 
+        #[cfg(feature = "instruments")]
+        drop(__a);
         // The fork takes the auxiliary root, then the table's bus contribution,
         // before round 2 samples anything. Both, in that order — the
         // contribution is what ties this table's share of the LogUp bus into

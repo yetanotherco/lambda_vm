@@ -1049,22 +1049,63 @@ fn run_approach_1(
     options: &stark::proof::options::ProofOptions,
     through: Stage,
 ) -> Result<usize, String> {
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    let t0 = std::time::Instant::now();
     let committed = prover::commit_phase::run_to_end(elf, private_inputs, max_rows, options)
         .map_err(|e| format!("{e:?}"))?;
+    let t_commit = t0.elapsed();
     if through == Stage::Commit {
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
         return Ok(committed.chunks.len());
     }
+    let t1 = std::time::Instant::now();
     let challenge = prover::challenge_phase::run(&committed, elf, elf_bytes, options)
         .map_err(|e| format!("{e:?}"))?;
     // The mains are committed; nothing downstream reads their traces again.
     drop(committed);
+    let t_challenge = t1.elapsed();
     if through == Stage::Challenge {
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+        println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
         return Ok(challenge.roots.len());
     }
+    let t2 = std::time::Instant::now();
     let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
         .map_err(|e| format!("{e:?}"))?;
+    let t_prove = t2.elapsed();
+    println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+    println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
+    println!("  pass 3 (prove)     {:>8.2}s", t_prove.as_secs_f64());
+    report_span_totals();
     report_fri_shape(&logup.tables);
     Ok(logup.tables.len())
+}
+
+/// Where the time went, summed per span label.
+///
+/// The prover's own spans are per table and there are 227 of them, so the raw
+/// timeline is unreadable; what answers "where is the time" is the total per
+/// label. Sums exceed wall time, because tables run concurrently — the ratios
+/// between labels are the point, not the absolute figures.
+fn report_span_totals() {
+    #[cfg(feature = "instruments")]
+    {
+        use std::collections::BTreeMap;
+        let spans = stark::instruments::take_timeline();
+        let mut by_label: BTreeMap<&str, (std::time::Duration, usize)> = BTreeMap::new();
+        for s in &spans {
+            let e = by_label.entry(s.label).or_default();
+            e.0 += s.wall;
+            e.1 += 1;
+        }
+        let mut rows: Vec<_> = by_label.into_iter().collect();
+        rows.sort_by_key(|(_, (d, _))| std::cmp::Reverse(*d));
+        println!("  --- summed over tables (concurrent, so > wall) ---");
+        for (label, (d, n)) in rows.into_iter().take(12) {
+            println!("  {label:<28} {:>8.2}s  x{n}", d.as_secs_f64());
+        }
+    }
 }
 
 /// What one FRI per table costs, and what batching by height would collapse.
