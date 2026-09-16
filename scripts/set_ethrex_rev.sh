@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Re-pin every ethrex git dependency in this repo to one rev, atomically.
 #
-# The guest and the host-side tooling exchange ethrex types (the rkyv stateless
-# input the converter writes and the guest decodes), so a rev that differs
+# The guest and the host-side tooling exchange ethrex types (the SSZ stateless
+# input the fixture tooling writes and the guest decodes), so a rev that differs
 # between them is not a version skew that fails to build -- it is a fixture the
-# guest silently decodes as the all-zero default. Keeping every pin on one rev
-# is what makes that impossible, which is why this rewrites all of them together
-# rather than leaving them to be bumped by hand.
+# guest does not recognise, which it reports by committing
+# `successful_validation = 0` after ~500 cycles instead of failing. Keeping every
+# pin on one rev is what makes that impossible, which is why this rewrites all of
+# them together rather than leaving them to be bumped by hand.
 #
 # Usage:
 #   scripts/set_ethrex_rev.sh <40-char-sha>              re-pin everything

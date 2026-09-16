@@ -13,7 +13,7 @@ https://github.com/lambdaclass/ethrex.git
 8effcb0671c5d0b12fe0161ea37c174ec4466b6a
 ```
 
-Five manifests carry that pin, not one. `scripts/set_ethrex_rev.sh --show` prints
+Six manifests carry that pin, not one. `scripts/set_ethrex_rev.sh --show` prints
 it and fails if they ever disagree.
 
 The generator enables Amsterdam in its synthetic genesis and includes the two
@@ -43,7 +43,7 @@ regenerated and checksummed with them — a rev bump makes every one of these
 undecodable, not just the three the executor reads.
 
 To regenerate after an ethrex rev bump, re-pin with
-`scripts/set_ethrex_rev.sh <40-char-sha>` (all five manifests at once), regenerate
+`scripts/set_ethrex_rev.sh <40-char-sha>` (all six manifests at once), regenerate
 the five locks, then run `make regen-ethrex-fixtures`.
 
 The checksums below are refreshed by that same run, so they catch a hand-edited

@@ -60,12 +60,14 @@ jobs:
           workspaces: |
             tooling/ethrex-block-converter -> target
 
-      # Downloads the pinned ethrex-replay cache (the converter's test input) and
-      # runs the crate's tests: host-side parity through the guest's own
-      # `LambdaVmEcsmCrypto`, the unmappable-network rejection, and the
-      # reproducibility digest. Note these do NOT screen KZG — this crate's graph
-      # links c-kzg via ethrex-config, so point evaluation (0x0a) resolves here and
-      # to nothing in the guest. The block-usability job below is what covers that.
+      # Downloads the pinned ethrex-replay cache (the converter's test input) and runs
+      # the crate's tests. Both of them assert a REJECTION, because every published
+      # cache is pre-Amsterdam and the one path that can succeed has no cache to run on
+      # yet: they pin the Amsterdam gate and the unmappable-network gate, and until such
+      # a cache exists the job's value is that the crate still compiles and still refuses
+      # against the pinned ethrex rev. Note these do NOT screen KZG — this crate's graph
+      # links c-kzg via ethrex-config, so point evaluation (0x0a) resolves here and to
+      # nothing in the guest. The block-usability job below is what covers that.
       - name: Run converter tests
         run: make test-ethrex-real-block-converter
 
