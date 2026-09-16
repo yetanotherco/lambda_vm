@@ -52,7 +52,8 @@ There are two entries --- an `ECALL` from the `CPU`, or the byte loop `COMMIT` d
 
 == Selecting the functionality
 @memmove:c:receive_ecall receives the system call number as $2^32 - 30 - 2 dot #`is_set`$, so `is_set` is decoded from the `ECALL` the guest executed rather than chosen.
-Note that the low limb of that tuple is a line in `is_set` and so reaches every system call number in the negative range: @memmove:c:range_is_set is what excludes them, and it therefore carries the whole decoding argument.
+That number is a linear function of `is_set`, and the tuple's high limb is the constant $2^32 - 1$, so as `is_set` ranges over the whole field the pair reproduces _every_ system call number in the negative range.
+What rules those out is @memmove:c:range_is_set, which restricts `is_set` to $0$ and $1$ and so leaves only $-30$ and $-32$; it carries the whole decoding argument.
 `is_commit` is decoded instead from _which_ bus the first row accepted from, `COMMIT_DEFER` having exactly one sender.
 Both selectors ride inside the `MEMMOVE_NEXT` tuple in either direction, so a sequence cannot change functionality half way through it.
 #render_constraint_table(chip, config, groups: "functionality")
