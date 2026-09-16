@@ -45,7 +45,7 @@
 //! therefore walk one-byte rows until `dst` is eight-aligned and take eight-byte rows
 //! through the body, which keeps those rows in MEMW_A rather than MEMW.
 //!
-//! ## Columns (37)
+//! ## Columns (35)
 //!
 //! - `timestamp` DWordWL (2), `src` DWordWL (2), `src_incr` DWordHL (4)
 //! - `dst` DWordWL (2) — for `commit` this is the COMMIT-domain address, i.e. the
@@ -62,9 +62,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{
-    AddLinearTerm, AddOperand, emit_add_pair, emit_add_pair_no_overflow, emit_is_bit,
-};
+use crate::constraints::templates::{AddLinearTerm, AddOperand, emit_add_pair, emit_is_bit};
 
 use executor::vm::instruction::execution::{
     DMA_MEMCPY_MAX_BYTES as EXECUTOR_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP,
@@ -89,20 +87,32 @@ pub mod cols {
     pub const SRC_0: usize = 2;
     pub const SRC_1: usize = 3;
 
+    /// The low three halfwords of `src + step`.
+    ///
+    /// Only three: `ADDNW` forces the carry out of the high limb to zero, so the top
+    /// halfword is determined by `src_1`, that carry and `src_incr_2`, and is derived
+    /// rather than witnessed. See [`incr_top_halfword`]. The price is that the high
+    /// element of `MEMMOVE_NEXT` is a written-out expression instead of a packing.
     pub const SRC_INCR_0: usize = 4;
 
-    pub const DST_0: usize = 8;
-    pub const DST_1: usize = 9;
+    pub const DST_0: usize = 7;
+    pub const DST_1: usize = 8;
 
-    pub const DST_INCR_0: usize = 10;
+    /// The low three halfwords of `dst + step`; see [`SRC_INCR_0`].
+    pub const DST_INCR_0: usize = 9;
 
-    pub const COUNT_0: usize = 14;
-    pub const COUNT_1: usize = 15;
+    pub const COUNT_0: usize = 12;
+    pub const COUNT_1: usize = 13;
 
-    pub const COUNT_DECR_0: usize = 16;
+    /// `count - step`, all four halfwords.
+    ///
+    /// Unlike the two positions this keeps its top halfword: it uses plain `ADD`, so
+    /// the carry out is not forced to zero -- the terminal row relies on the
+    /// wraparound to `-1` -- and the top halfword is genuinely free.
+    pub const COUNT_DECR_0: usize = 14;
 
-    pub const FIRST: usize = 20;
-    pub const END: usize = 21;
+    pub const FIRST: usize = 18;
+    pub const END: usize = 19;
     /// `1` when this row moves a single byte rather than eight.
     ///
     /// Free upward: a one-byte row is legal at any count. The only restriction is
@@ -110,8 +120,8 @@ pub mod cols {
     /// the `count < 8` ALU lookup at multiplicity `mu - single` and demanding the
     /// answer be "no" — so a narrow row is simply not checked, and the check needs
     /// no column of its own.
-    pub const SINGLE: usize = 22;
-    pub const VALUE_0: usize = 23;
+    pub const SINGLE: usize = 20;
+    pub const VALUE_0: usize = 21;
     pub const VALUE: [usize; 8] = [
         VALUE_0,
         VALUE_0 + 1,
@@ -122,25 +132,25 @@ pub mod cols {
         VALUE_0 + 6,
         VALUE_0 + 7,
     ];
-    pub const MU: usize = 31;
+    pub const MU: usize = 29;
 
     /// Decoded functionality. `is_cpy = mu - is_set - is_commit` is implied.
-    pub const IS_SET: usize = 32;
-    pub const IS_COMMIT: usize = 33;
+    pub const IS_SET: usize = 30;
+    pub const IS_COMMIT: usize = 31;
     /// `first * (1 - is_commit)` — the ecall receive and the register reads.
-    pub const F_NCOMMIT: usize = 34;
+    pub const F_NCOMMIT: usize = 32;
     /// `(mu - end) * is_commit` — the COMMIT-domain write.
-    pub const MU_COM: usize = 35;
+    pub const MU_COM: usize = 33;
     /// `mu_com * (1 - single)` — lanes 1..7 of the COMMIT-domain write. Without it a
     /// one-byte commit row would send seven spurious `(index, 0)` pairs and corrupt
     /// the public-output fingerprint.
-    pub const MU_COM_WIDE: usize = 36;
+    pub const MU_COM_WIDE: usize = 34;
 
     /// The RAM write rides `mu - end - mu_com`, which is `(mu - end) * (1 - is_commit)`
     /// expanded. It needs no column of its own: `Multiplicity::Linear` takes the
     /// expression directly, and the product form was only ever a column because the
     /// framework requires multiplicities to be linear.
-    pub const NUM_COLUMNS: usize = 37;
+    pub const NUM_COLUMNS: usize = 35;
 }
 
 /// Which functionality a row is running.
@@ -202,10 +212,25 @@ pub fn generate_memmove_trace(
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         table.set_dword_wl(row_idx, cols::SRC_0, op.src);
-        table.set_dword_hl(row_idx, cols::SRC_INCR_0, op.src.wrapping_add(width));
+        // Three halfwords only; the top one is derived by the AIR.
+        let src_incr = op.src.wrapping_add(width);
+        for k in 0..3 {
+            table.set_fe(
+                row_idx,
+                cols::SRC_INCR_0 + k,
+                FE::from((src_incr >> (16 * k)) & 0xFFFF),
+            );
+        }
 
         table.set_dword_wl(row_idx, cols::DST_0, op.dst);
-        table.set_dword_hl(row_idx, cols::DST_INCR_0, op.dst.wrapping_add(width));
+        let dst_incr = op.dst.wrapping_add(width);
+        for k in 0..3 {
+            table.set_fe(
+                row_idx,
+                cols::DST_INCR_0 + k,
+                FE::from((dst_incr >> (16 * k)) & 0xFFFF),
+            );
+        }
 
         table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
         table.set_dword_hl(row_idx, cols::COUNT_DECR_0, op.count.wrapping_sub(width));
@@ -307,6 +332,14 @@ fn value_columns() -> Vec<BusValue> {
         .collect()
 }
 
+fn halfword_value(value: BusValue) -> BusInteraction {
+    BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::Column(cols::MU),
+        vec![value],
+    )
+}
+
 fn halfword(column: usize) -> BusInteraction {
     BusInteraction::sender(
         BusId::IsHalfword,
@@ -316,6 +349,136 @@ fn halfword(column: usize) -> BusInteraction {
             packing: Packing::Direct,
         }],
     )
+}
+
+/// `-1 / 2^32` and `-1 / 2^16` in the field, plus `8 / 2^32` and `-7 / 2^32`.
+///
+/// These exist because the top halfword of a position increment is derived rather
+/// than witnessed; see [`incr_bus_elements`].
+mod incr_consts {
+    use crate::constraints::templates::INV_SHIFT_32;
+    const P: u128 = 0xFFFF_FFFF_0000_0001;
+    const fn neg(x: u64) -> u64 {
+        (P - x as u128) as u64
+    }
+    const fn mul(a: u64, b: u64) -> u64 {
+        ((a as u128 * b as u128) % P) as u64
+    }
+    pub const INV_2_32: u64 = INV_SHIFT_32;
+    pub const NEG_INV_2_32: u64 = neg(INV_2_32);
+    /// `-2^16 / 2^32 = -1 / 2^16`.
+    pub const NEG_INV_2_16: u64 = neg(mul(1 << 16, INV_2_32));
+    pub const EIGHT_INV_2_32: u64 = mul(8, INV_2_32);
+    pub const NEG_SEVEN_INV_2_32: u64 = neg(mul(7, INV_2_32));
+
+    // …and the same scaled by another 2^-16, for the derived top halfword itself.
+    pub const INV_2_16: u64 = mul(1 << 16, INV_2_32);
+    pub const NEG_INV_2_16_B: u64 = neg(INV_2_16);
+    pub const INV_2_48: u64 = mul(INV_2_16, INV_2_32);
+    pub const NEG_INV_2_48: u64 = neg(INV_2_48);
+    pub const NEG_INV_2_32_B: u64 = neg(INV_2_32);
+    pub const NEG_SEVEN_INV_2_48: u64 = neg(mul(7, INV_2_48));
+    pub const EIGHT_INV_2_48: u64 = mul(8, INV_2_48);
+}
+
+/// The two `MEMMOVE_NEXT` elements carrying `position + step`, low half then high.
+///
+/// The low half is the packing it always was. The high half is where the saved column
+/// shows up: `ADDNW` forces the carry out of the high limb to zero, so
+///
+/// ```text
+/// high = incr_2 + 2^16 * incr_3 = position_1 + carry_0
+/// ```
+///
+/// and `carry_0` is itself `(position_0 + step - incr_0 - 2^16*incr_1) / 2^32`. Writing
+/// that out is what replaces a one-line `Packing::DWordHL`, and it is the cost of not
+/// storing `incr_3`. `incr_2` does not appear here at all -- it survives only to carry
+/// the range check that bounds `position_1 + carry_0` below `2^32`, which is the
+/// no-wraparound statement itself.
+///
+/// The `8 / 2^32` term rides `mu` because a bus value's constant must fit an `i64` and
+/// this one does not; `mu` is 1 wherever these interactions fire.
+fn incr_bus_elements(position_0: usize, position_1: usize, incr_0: usize) -> [BusValue; 2] {
+    use incr_consts::*;
+    [
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: incr_0,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << 16,
+                column: incr_0 + 1,
+            },
+        ]),
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: position_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_32,
+                column: position_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_32,
+                column: incr_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_16,
+                column: incr_0 + 1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_SEVEN_INV_2_32,
+                column: cols::SINGLE,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: EIGHT_INV_2_32,
+                column: cols::MU,
+            },
+        ]),
+    ]
+}
+
+/// The derived top halfword of `position + step`.
+///
+/// `incr_3 = (position_1 + carry_0 - incr_2) / 2^16`, written out. This still has to
+/// reach `IS_HALF`: with `incr_3` derived the old `carry_1 = 0` constraint is
+/// definitional and proves nothing, so the range checks on `incr_2` and on this are
+/// the whole no-wraparound argument -- both below `2^16` is exactly
+/// `position_1 + carry_0 < 2^32`.
+fn incr_top_halfword(position_0: usize, position_1: usize, incr_0: usize) -> BusValue {
+    use incr_consts::*;
+    BusValue::linear(vec![
+        LinearTerm::ColumnUnsigned {
+            coefficient: INV_2_16,
+            column: position_1,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: NEG_INV_2_16_B,
+            column: incr_0 + 2,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: INV_2_48,
+            column: position_0,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: NEG_INV_2_48,
+            column: incr_0,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: NEG_INV_2_32_B,
+            column: incr_0 + 1,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: NEG_SEVEN_INV_2_48,
+            column: cols::SINGLE,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: EIGHT_INV_2_48,
+            column: cols::MU,
+        },
+    ])
 }
 
 /// The MEMMOVE bus interactions.
@@ -333,6 +496,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ])
     };
+
+    let src_next = incr_bus_elements(cols::SRC_0, cols::SRC_1, cols::SRC_INCR_0);
+    let dst_next = incr_bus_elements(cols::DST_0, cols::DST_1, cols::DST_INCR_0);
 
     let mut interactions = vec![
         // 1. Receive the ECALL for the two RAM-to-RAM functionalities. The syscall
@@ -407,14 +573,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_1,
                     packing: Packing::Direct,
                 },
-                BusValue::Packed {
-                    start_column: cols::SRC_INCR_0,
-                    packing: Packing::DWordHL,
-                },
-                BusValue::Packed {
-                    start_column: cols::DST_INCR_0,
-                    packing: Packing::DWordHL,
-                },
+                src_next[0].clone(),
+                src_next[1].clone(),
+                dst_next[0].clone(),
+                dst_next[1].clone(),
                 BusValue::Packed {
                     start_column: cols::COUNT_DECR_0,
                     packing: Packing::DWordHL,
@@ -472,11 +634,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         halfword(cols::SRC_INCR_0),
         halfword(cols::SRC_INCR_0 + 1),
         halfword(cols::SRC_INCR_0 + 2),
-        halfword(cols::SRC_INCR_0 + 3),
+        halfword_value(incr_top_halfword(
+            cols::SRC_0,
+            cols::SRC_1,
+            cols::SRC_INCR_0,
+        )),
         halfword(cols::DST_INCR_0),
         halfword(cols::DST_INCR_0 + 1),
         halfword(cols::DST_INCR_0 + 2),
-        halfword(cols::DST_INCR_0 + 3),
+        halfword_value(incr_top_halfword(
+            cols::DST_0,
+            cols::DST_1,
+            cols::DST_INCR_0,
+        )),
         // 17. `end == 1` iff every count_decr halfword is 0xFFFF.
         BusInteraction::sender(
             BusId::Zero,
@@ -745,27 +915,34 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
             &[],
         );
 
-        emit_add_pair_no_overflow(
-            b,
-            16,
-            cols::MU,
-            cols::END,
-            &AddOperand::dword(cols::SRC_0),
-            &step,
-            &AddOperand::from_dword_hl(cols::SRC_INCR_0),
-        );
-        emit_add_pair_no_overflow(
-            b,
-            18,
-            cols::MU,
-            cols::END,
-            &AddOperand::dword(cols::DST_0),
-            &step,
-            &AddOperand::from_dword_hl(cols::DST_INCR_0),
-        );
+        // The two position updates cannot use `ADDNW`: its sum operand wants four
+        // halfwords and these carry three, the top one being derived. What is left of
+        // the template here is the low-limb carry bit --
+        //
+        //     carry_0 = (position_0 + step - incr_0 - 2^16*incr_1) / 2^32
+        //
+        // -- and that is all that is needed. The old `carry_1 = 0` constraint is now
+        // definitional (the derived halfword is *defined* so that it holds), so it
+        // would prove nothing; the no-wraparound property is carried instead by the
+        // `IS_HALF` checks on `incr_2` and on the derived halfword, which together say
+        // `position_1 + carry_0 < 2^32`. See `incr_top_halfword`.
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        let step_expr = b.const_base(8) - b.const_base(7) * single.clone();
+        let mut carry_bit = |idx: usize, position_0: usize, incr_0: usize| {
+            let low = b.main(0, incr_0) + b.const_base(1 << 16) * b.main(0, incr_0 + 1);
+            let carry = (b.main(0, position_0) + step_expr.clone() - low) * inv_2_32.clone();
+            let one = b.one();
+            b.emit_base(idx, carry.clone() * (one - carry));
+        };
+        carry_bit(16, cols::SRC_0, cols::SRC_INCR_0);
+        carry_bit(17, cols::DST_0, cols::DST_INCR_0);
+
+        // `count_decr` keeps all four halfwords and plain `ADD`: the terminal row
+        // relies on the wraparound to -1, so its carry out is not forced to zero and
+        // the top halfword is genuinely free.
         emit_add_pair(
             b,
-            20,
+            18,
             &[],
             &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
             &step,
@@ -774,7 +951,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
 
         // Unused lanes are zero on one-byte rows.
         for (i, &column) in cols::VALUE.iter().enumerate().skip(1) {
-            b.emit_base(22 + i - 1, single.clone() * b.main(0, column));
+            b.emit_base(20 + i - 1, single.clone() * b.main(0, column));
         }
 
         // memset's operand contract: `dst = src + 8`, limb-wise.
@@ -820,11 +997,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemmoveConstraints 
         // boundary, so the honest trace never has to rely on that argument.
         let gap = b.const_base(DMA_MEMSET_GAP);
         b.emit_base(
-            29,
+            27,
             is_set.clone() * (b.main(0, cols::DST_0) - b.main(0, cols::SRC_0) - gap),
         );
         b.emit_base(
-            30,
+            28,
             is_set.clone() * (b.main(0, cols::DST_1) - b.main(0, cols::SRC_1)),
         );
     }
@@ -838,7 +1015,7 @@ mod shape_tests {
     /// the column count was only ever printed, and it is the number readers check
     /// against the spec.
     ///
-    /// **The spec says 36 and this says 37, and both are right.** The spec types
+    /// **The spec says 34 and this says 35, and both are right.** The spec types
     /// `timestamp` as a `Word` — one column — where this code uses a `DWordWL`, which
     /// is two. The high limb is provably zero (the CPU sends `constant(0)` in the
     /// `Ecall` tuple and `MemmoveNext` propagates it), so the extra column carries no
@@ -851,8 +1028,8 @@ mod shape_tests {
     fn the_committed_shape_is_pinned() {
         assert_eq!(
             super::cols::NUM_COLUMNS,
-            37,
-            "MEMMOVE columns (spec: 36 + 1)"
+            35,
+            "MEMMOVE columns (spec: 34 + 1)"
         );
 
         let n = super::bus_interactions().len();

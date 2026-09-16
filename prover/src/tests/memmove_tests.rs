@@ -131,43 +131,98 @@ fn memmove_constraints_accept_valid_rows_and_reject_nonzero_tail_lanes() {
     );
 }
 
+/// No-wraparound, which now lives in a range check rather than a constraint.
+///
+/// `src_incr`/`dst_incr` carry three halfwords; the top one is derived so that the
+/// high-limb carry is zero by construction. That makes the old `carry_1 = 0`
+/// constraint vacuous, and the property is carried instead by `IS_HALF` on `incr_2`
+/// and on the derived halfword: both below `2^16` is exactly
+/// `position_1 + carry_0 < 2^32`.
+///
+/// So a wrapping increment is no longer rejected by a polynomial and a busless test
+/// cannot see it. What this does instead is evaluate the production `IS_HALF` value
+/// -- the real `LinearTerm`s from `bus_interactions()`, not a copy of the formula --
+/// against real rows, and check it lands in range for an honest increment and out of
+/// range for a wrapping one.
 #[test]
-fn memmove_constraints_reject_active_source_or_destination_wrap() {
-    let air = busless_air(
-        cols::NUM_COLUMNS,
-        crate::tables::memmove::MemmoveConstraints,
-    );
+fn a_wrapping_increment_pushes_the_derived_halfword_out_of_range() {
+    use crate::tables::memmove::{Functionality, bus_interactions};
+    use crate::tables::types::{BusId, FE};
+    use stark::lookup::{BusValue, LinearTerm};
 
-    let source_wrap = generate_memmove_trace(&[MemmoveOperation {
-        width: 8,
-        functionality: crate::tables::memmove::Functionality::Copy,
-        timestamp: 100,
-        src: u64::MAX - 3,
-        dst: 0x2000,
-        count: 8,
-        first: true,
-        end: false,
-        value: [0; 8],
-    }]);
-    assert!(
-        !validate_busless(&air, &source_wrap),
-        "an active source increment must not wrap modulo 2^64"
-    );
+    // The IS_HALF senders carrying a computed value are exactly the two derived
+    // halfwords; the other range checks send plain columns.
+    let derived: Vec<BusValue> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == BusId::IsHalfword as u64)
+        .filter_map(|i| match i.values.into_iter().next() {
+            Some(v @ BusValue::Linear(_)) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(derived.len(), 2, "one derived halfword per position");
 
-    let destination_wrap = generate_memmove_trace(&[MemmoveOperation {
-        width: 8,
-        functionality: crate::tables::memmove::Functionality::Copy,
-        timestamp: 100,
-        src: 0x1000,
-        dst: u64::MAX - 3,
-        count: 8,
-        first: true,
-        end: false,
-        value: [0; 8],
-    }]);
-    assert!(
-        !validate_busless(&air, &destination_wrap),
-        "an active destination increment must not wrap modulo 2^64"
+    let eval = |value: &BusValue, row: &[FE]| -> FE {
+        match value {
+            BusValue::Linear(terms) => terms.iter().fold(FE::zero(), |acc, t| match t {
+                LinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
+                    let c = FE::from(coefficient.unsigned_abs());
+                    if *coefficient < 0 {
+                        acc - c * row[*column]
+                    } else {
+                        acc + c * row[*column]
+                    }
+                }
+                LinearTerm::ColumnUnsigned {
+                    coefficient,
+                    column,
+                } => acc + FE::from(*coefficient) * row[*column],
+                LinearTerm::Constant(c) => acc + FE::from(c.unsigned_abs()),
+            }),
+            _ => unreachable!("filtered to Linear above"),
+        }
+    };
+
+    let row_of = |src: u64, dst: u64| {
+        generate_memmove_trace(&[MemmoveOperation {
+            width: 8,
+            functionality: Functionality::Copy,
+            timestamp: 100,
+            src,
+            dst,
+            count: 8,
+            first: true,
+            end: false,
+            value: [0; 8],
+        }])
+    };
+
+    // Honest: both derived halfwords are genuine halfwords.
+    let honest = row_of(0x1234_5678_9ABC, 0x2000);
+    let row: Vec<FE> = (0..cols::NUM_COLUMNS)
+        .map(|c| *honest.main_table.get(0, c))
+        .collect();
+    for (i, value) in derived.iter().enumerate() {
+        let v = eval(value, &row);
+        assert!(
+            (0..1u64 << 16).any(|h| FE::from(h) == v),
+            "derived halfword {i} must be in [0, 2^16) on an honest row"
+        );
+    }
+
+    // Wrapping source: `src + 8` rolls over 2^64, and the derived halfword lands at
+    // 2^16 -- one past the top of the range, so IS_HALF has no such entry.
+    let wrapped = row_of(u64::MAX - 3, 0x2000);
+    let row: Vec<FE> = (0..cols::NUM_COLUMNS)
+        .map(|c| *wrapped.main_table.get(0, c))
+        .collect();
+    assert_eq!(
+        eval(&derived[0], &row),
+        FE::from(1u64 << 16),
+        "a wrapping source increment must push the derived halfword out of range"
     );
 }
 
@@ -212,7 +267,7 @@ fn memmove_constraints_count_and_indices() {
     use crate::tables::memmove::MemmoveConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = MemmoveConstraints.meta();
-    assert_eq!(meta.len(), 31);
+    assert_eq!(meta.len(), 29);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -591,4 +646,90 @@ fn memmove_constraints_gate_the_commit_functionality() {
         validate_busless(&air, &copy_ok),
         "Copy baseline must be clean"
     );
+}
+
+/// The chain bus still carries `position + step`, in both halves.
+///
+/// This is the one that matters. `MEMMOVE_NEXT`'s send side used to be a
+/// `Packing::DWordHL` over four columns; with the top halfword derived it is a
+/// written-out linear form, and the receive side still reads a plain `DWordWL`. If the
+/// two ever disagree nothing errors -- the bus simply stops balancing, on some fixture,
+/// far from here. So evaluate the production `LinearTerm`s against real rows and check
+/// they reproduce the low and high halves of `position + step` exactly.
+#[test]
+fn the_chain_bus_still_sends_position_plus_step() {
+    use crate::tables::memmove::{Functionality, bus_interactions};
+    use crate::tables::types::{BusId, FE};
+    use stark::lookup::{BusValue, LinearTerm};
+
+    let chain = bus_interactions()
+        .into_iter()
+        .find(|i| i.bus_id == BusId::MemmoveNext as u64 && i.is_sender)
+        .expect("the forward chain sender");
+    // [ts_lo, ts_hi, src_lo, src_hi, dst_lo, dst_hi, count_decr(2), is_set, is_commit]
+    let (src_lo, src_hi) = (&chain.values[2], &chain.values[3]);
+    let (dst_lo, dst_hi) = (&chain.values[4], &chain.values[5]);
+
+    let eval = |value: &BusValue, row: &[FE]| -> FE {
+        match value {
+            BusValue::Linear(terms) => terms.iter().fold(FE::zero(), |acc, t| match t {
+                LinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
+                    let c = FE::from(coefficient.unsigned_abs());
+                    if *coefficient < 0 {
+                        acc - c * row[*column]
+                    } else {
+                        acc + c * row[*column]
+                    }
+                }
+                LinearTerm::ColumnUnsigned {
+                    coefficient,
+                    column,
+                } => acc + FE::from(*coefficient) * row[*column],
+                LinearTerm::Constant(c) => acc + FE::from(c.unsigned_abs()),
+            }),
+            other => panic!("expected a written-out linear form, got {other:?}"),
+        }
+    };
+
+    // Alignments, widths and a high limb that is genuinely non-zero, plus a case whose
+    // low limb carries into the high one.
+    for (src, dst, width) in [
+        (0x1000u64, 0x2000u64, 8u8),
+        (0x1001, 0x2007, 8),
+        (0x1000, 0x2000, 1),
+        (0x1234_5678_9ABC, 0xFEDC_BA98_7654, 8),
+        (0x0000_0000_FFFF_FFFC, 0x0000_0001_FFFF_FFFF, 8),
+    ] {
+        let trace = generate_memmove_trace(&[MemmoveOperation {
+            width,
+            functionality: Functionality::Copy,
+            timestamp: 100,
+            src,
+            dst,
+            count: 64,
+            first: true,
+            end: false,
+            value: [0; 8],
+        }]);
+        let row: Vec<FE> = (0..cols::NUM_COLUMNS)
+            .map(|c| *trace.main_table.get(0, c))
+            .collect();
+
+        for (name, base, lo, hi) in [("src", src, src_lo, src_hi), ("dst", dst, dst_lo, dst_hi)] {
+            let want = base.wrapping_add(width as u64);
+            assert_eq!(
+                eval(lo, &row),
+                FE::from(want & 0xFFFF_FFFF),
+                "{name} low half, base {base:#x} width {width}"
+            );
+            assert_eq!(
+                eval(hi, &row),
+                FE::from(want >> 32),
+                "{name} high half, base {base:#x} width {width}"
+            );
+        }
+    }
 }
