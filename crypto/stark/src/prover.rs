@@ -1958,8 +1958,12 @@ pub trait IsStarkProver<
                 &twiddles.two_half_fwd,
             )
             .map_err(|_| ProvingError::EmptyCommitment)?;
+            #[cfg(feature = "instruments")]
+            let __am = crate::instruments::span("a1_aux_merkle");
             let (tree, root) =
                 Self::commit_rows_bit_reversed(&out, cols).ok_or(ProvingError::EmptyCommitment)?;
+            #[cfg(feature = "instruments")]
+            drop(__am);
             (out, cols, Some(TableCommit::plain(tree, root)))
         } else {
             (Vec::new(), 0, None)
@@ -2112,8 +2116,14 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        #[cfg(feature = "instruments")]
+        let __f1 = crate::instruments::span("a1_fold_r1");
         let mut round_1_result =
             Self::round_1_from_trace(air, trace, challenges, transcript, known_main)?;
+        #[cfg(feature = "instruments")]
+        drop(__f1);
+        #[cfg(feature = "instruments")]
+        let __f23 = crate::instruments::span("a1_fold_r23");
         let (mut round_2_result, round_3_result, z, trace_ood, trace_ood_next) =
             Self::rounds_2_and_3(
                 air,
@@ -2124,6 +2134,10 @@ pub trait IsStarkProver<
                 &twiddles,
             )?;
 
+        #[cfg(feature = "instruments")]
+        drop(__f23);
+        #[cfg(feature = "instruments")]
+        let __fd = crate::instruments::span("a1_fold_deep");
         // Round 4's opening move, up to the point where the batch takes over:
         // gamma is this table's own, sampled from its own fork.
         let gamma = transcript.sample_field_element();
@@ -2155,6 +2169,8 @@ pub trait IsStarkProver<
         let mut deep = deep;
         in_place_bit_reverse_permute(&mut deep);
 
+        #[cfg(feature = "instruments")]
+        drop(__fd);
         Ok(TableDeep {
             lde_size: domain.interpolation_domain_size * domain.blowup_factor,
             trace_rows: domain.interpolation_domain_size,
@@ -2190,32 +2206,67 @@ pub trait IsStarkProver<
     /// Drawing `alpha` from all of it is what makes the fold binding: a table
     /// cannot be swapped after the fact without moving the coefficient that
     /// folded it.
-    fn batch_alpha(
-        pre_fork: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
-        tables: &[TableDeep<FieldExtension>],
+    fn fold_coefficient(
+        seed: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        table: &TableDeep<FieldExtension>,
     ) -> FieldElement<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let mut seed = pre_fork.clone();
-        for t in tables {
-            if let Some(ref c) = t.bus_contribution {
-                seed.append_field_element(c);
-            }
-            seed.append_bytes(&t.composition_poly_root);
-            for block in [&t.trace_ood, &t.trace_ood_next] {
-                for col in block.columns().iter() {
-                    for elem in col.iter() {
-                        seed.append_field_element(elem);
-                    }
+        if let Some(ref c) = table.bus_contribution {
+            seed.append_field_element(c);
+        }
+        seed.append_bytes(&table.composition_poly_root);
+        for block in [&table.trace_ood, &table.trace_ood_next] {
+            for col in block.columns().iter() {
+                for elem in col.iter() {
+                    seed.append_field_element(elem);
                 }
             }
-            for elem in t.parts_ood.iter() {
-                seed.append_field_element(elem);
-            }
+        }
+        for elem in table.parts_ood.iter() {
+            seed.append_field_element(elem);
         }
         seed.sample_field_element()
+    }
+
+    /// Every table's coefficient, in the order they are folded.
+    ///
+    /// Only for reasoning about the sequence as a whole; the prover draws them
+    /// one at a time, as it folds.
+    fn fold_coefficients(
+        pre_fork: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        tables: &[TableDeep<FieldExtension>],
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let mut seed = pre_fork.clone();
+        tables
+            .iter()
+            .map(|t| Self::fold_coefficient(&mut seed, t))
+            .collect()
+    }
+
+    /// Add `coefficient * codeword` into a group's running accumulator.
+    ///
+    /// The accumulator is the batch polynomial the spec describes. A member is
+    /// added and dropped, so what is held is one codeword per distinct domain
+    /// rather than one per table — which on the ethrex block is 13 instead of
+    /// 227, and about a gigabyte instead of eight and a half.
+    fn accumulate(
+        acc: &mut Vec<FieldElement<FieldExtension>>,
+        coefficient: &FieldElement<FieldExtension>,
+        codeword: &[FieldElement<FieldExtension>],
+    ) {
+        if acc.is_empty() {
+            acc.resize(codeword.len(), FieldElement::<FieldExtension>::zero());
+        }
+        for (dst, src) in acc.iter_mut().zip(codeword.iter()) {
+            *dst = &*dst + coefficient * src;
+        }
     }
 
     /// One table's openings, at the indices its group decided.
@@ -2242,8 +2293,14 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        #[cfg(feature = "instruments")]
+        let __o1 = crate::instruments::span("a1_open_r1");
         let mut round_1_result =
             Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
+        #[cfg(feature = "instruments")]
+        drop(__o1);
+        #[cfg(feature = "instruments")]
+        let __o23 = crate::instruments::span("a1_open_r23");
         let (round_2_result, _, _, _, _) = Self::rounds_2_and_3(
             air,
             pub_inputs,
@@ -2252,52 +2309,34 @@ pub trait IsStarkProver<
             &domain,
             &twiddles,
         )?;
-        Ok(Self::open_deep_composition_poly(
-            &domain,
-            &round_1_result,
-            &round_2_result,
-            iotas,
-        ))
+        #[cfg(feature = "instruments")]
+        drop(__o23);
+        #[cfg(feature = "instruments")]
+        let __od = crate::instruments::span("a1_open_deep");
+        let out =
+            Self::open_deep_composition_poly(&domain, &round_1_result, &round_2_result, iotas);
+        #[cfg(feature = "instruments")]
+        drop(__od);
+        Ok(out)
     }
 
-    /// One FRI over a whole group of tables.
+    /// One FRI over a group's finished accumulator.
     ///
-    /// The members share a domain, so their codewords add directly: the batch
-    /// is `Σ αᵏ·deepₖ` with `k` running in AIR order. Accumulating in place is
-    /// the point — a member is folded in and dropped, so what this holds is one
-    /// codeword, not the group's worth of them.
-    ///
-    /// `transcript` is the batch's, not any member's, and `alpha` must have
-    /// been drawn from it after every member's fork state went in. That is what
-    /// binds the fold to all the data it folds.
+    /// The members were folded in as they were produced, so by here the group
+    /// is a single codeword and nothing of the tables remains.
     fn batch_fri(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        members: Vec<TableDeep<FieldExtension>>,
-        alpha: &FieldElement<FieldExtension>,
+        acc: Vec<FieldElement<FieldExtension>>,
+        trace_rows: usize,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Option<GroupFri<FieldExtension>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let lde_size = members.first()?.lde_size;
-        let trace_rows = members.first()?.trace_rows;
-        if members
-            .iter()
-            .any(|m| m.lde_size != lde_size || m.trace_rows != trace_rows)
-        {
+        if acc.is_empty() {
             return None;
         }
-        let mut acc = vec![FieldElement::<FieldExtension>::zero(); lde_size];
-        let mut power = FieldElement::<FieldExtension>::one();
-
-        for member in members {
-            for (dst, src) in acc.iter_mut().zip(member.deep.iter()) {
-                *dst = &*dst + &power * src;
-            }
-            power *= alpha;
-        }
-
         let (domain, _) = domain_and_twiddles(air, trace_rows);
         let coset_offset = FieldElement::<Field>::from(air.context().proof_options.coset_offset);
         let (final_poly_coeffs, layers) = fri::commit_phase_from_evaluations(
@@ -2310,9 +2349,6 @@ pub trait IsStarkProver<
             domain.fri_inv_twiddles(),
         );
 
-        // Grinding, then the queries — both from the batch's transcript, so the
-        // whole group answers the same indices. That sharing is the point: the
-        // openings a member owes are at the group's iotas, not at its own.
         let grinding_factor = air.context().proof_options.grinding_factor;
         let mut nonce = None;
         if grinding_factor > 0 {

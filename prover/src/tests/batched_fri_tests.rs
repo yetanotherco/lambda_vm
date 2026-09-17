@@ -75,11 +75,15 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
     )
     .expect("deep");
 
+    // A batch of one: the accumulator is the codeword itself, folded with a
+    // coefficient of one.
     let one = math::field::element::FieldElement::<GoldilocksExtension>::one();
+    let mut acc = Vec::new();
+    <P as IsStarkProver<_, _, _>>::accumulate(&mut acc, &one, &deep.deep);
     let fri = <P as IsStarkProver<_, _, _>>::batch_fri(
         airs.bitwise.as_ref(),
-        vec![deep],
-        &one,
+        acc,
+        deep.trace_rows,
         &mut fork,
     )
     .expect("batched fri");
@@ -114,13 +118,17 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
     );
 }
 
-/// The batch's coefficient must depend on every table it folds.
+/// Every table's coefficient must depend on every table folded before it.
 ///
-/// `alpha` is what makes a batched fold binding: if it could be drawn without
-/// some table's round-3 data, that table could be swapped after the coefficient
-/// was fixed and the fold would still check out. So the property to pin is not
-/// that the derivation runs — it is that moving any single field any table
-/// contributes moves the result.
+/// The coefficients are what make a batched fold binding: if one could be drawn
+/// without some table's round-3 data, that table could be swapped after the
+/// coefficient was fixed and the fold would still check out. So the property to
+/// pin is not that the derivation runs — it is that moving any single field any
+/// table contributes moves the sequence.
+///
+/// Drawn one per table, after that table's data goes in, which is what the spec
+/// asks for and what lets a codeword be folded and dropped as it is produced
+/// instead of every codeword being held to the end.
 ///
 /// Built from data rather than from a proof on purpose: this is about the byte
 /// order, and a synthetic table exercises every field including the ones a real
@@ -153,7 +161,7 @@ fn alpha_moves_when_any_table_moves() {
 
     let pre_fork = DefaultTranscript::<E>::new(&[7, 7, 7]);
     let base = vec![table(1), table(2)];
-    let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&pre_fork, &base);
+    let alphas = <P as IsStarkProver<_, _, _>>::fold_coefficients(&pre_fork, &base);
 
     // Every field of every table, one at a time.
     type Mutation = (&'static str, Box<dyn Fn(&mut Vec<TableDeep<E>>)>);
@@ -191,9 +199,9 @@ fn alpha_moves_when_any_table_moves() {
         let mut moved = base.clone();
         f(&mut moved);
         assert_ne!(
-            alpha,
-            <P as IsStarkProver<_, _, _>>::batch_alpha(&pre_fork, &moved),
-            "alpha ignores {what}, so that data is not bound to the fold"
+            alphas,
+            <P as IsStarkProver<_, _, _>>::fold_coefficients(&pre_fork, &moved),
+            "the coefficients ignore {what}, so that data is not bound to the fold"
         );
     }
 
@@ -201,9 +209,9 @@ fn alpha_moves_when_any_table_moves() {
     // different batch.
     let swapped = vec![base[1].clone(), base[0].clone()];
     assert_ne!(
-        alpha,
-        <P as IsStarkProver<_, _, _>>::batch_alpha(&pre_fork, &swapped),
-        "alpha ignores the table order, which the verifier replays"
+        alphas,
+        <P as IsStarkProver<_, _, _>>::fold_coefficients(&pre_fork, &swapped),
+        "the coefficients ignore the table order, which the verifier replays"
     );
 }
 

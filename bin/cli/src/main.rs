@@ -1100,6 +1100,7 @@ fn run_approach_1(
         println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
         println!("  pass 3-4 (deep+fold) {:>7.2}s", t_fold.as_secs_f64());
         println!("  pass 5 (open)      {:>8.2}s", t_open.as_secs_f64());
+        report_span_totals();
         report_batched_size(&proof, tables, groups);
         return Ok(tables);
     }

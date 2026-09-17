@@ -313,11 +313,31 @@ pub struct Batched {
     /// Which group each table belongs to, by AIR index — the group whose query
     /// indices its openings answer.
     pub group_of: Vec<usize>,
+    /// The AIR indices in the order they were folded. The coefficient of a
+    /// table depends on every table folded before it, so the verifier has to
+    /// replay this order and the proof carries it.
+    pub fold_order: Vec<usize>,
     pub resident: Resident,
 }
 
 type Deep = stark::prover::TableDeep<GoldilocksExtension>;
-type Deeps = std::sync::Mutex<Vec<(usize, Deep)>>;
+/// What the fold walk carries between batches.
+///
+/// The seed and the accumulators are advanced sequentially — the coefficient of
+/// a table depends on every table folded before it — while the codewords that
+/// feed them are computed in parallel. So the expensive half stays concurrent
+/// and only the folding is serialised.
+struct FoldState {
+    seed: DefaultTranscript<GoldilocksExtension>,
+    /// One accumulator per distinct domain, and the rows behind it.
+    acc: std::collections::BTreeMap<usize, (Vec<FieldElement<GoldilocksExtension>>, usize, usize)>,
+    /// The AIR indices in the order they were folded, which the proof carries
+    /// so a verifier can replay the same sequence of coefficients.
+    order: Vec<usize>,
+    tables: Vec<(usize, TablePublic)>,
+}
+
+type Deeps = std::sync::Mutex<FoldState>;
 
 struct BuildDeep<'a> {
     batch: pass::Batched<'a, Item>,
@@ -360,8 +380,43 @@ fn deep_batch(
             Ok((idx, deep))
         })
         .collect();
-    done.lock().expect("deeps").extend(built?);
+    // Folded in a fixed order within the batch, so the sequence is a function
+    // of the walk and not of which thread finished first.
+    let mut built = built?;
+    built.sort_by_key(|(idx, _)| *idx);
+    let mut state = done.lock().expect("fold state");
+    for (idx, deep) in built {
+        fold_one(&mut state, idx, deep);
+    }
     Ok(())
+}
+
+/// Absorb a table, draw its coefficient, add it to its group, drop it.
+fn fold_one(state: &mut FoldState, idx: usize, deep: Deep) {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    let coefficient = <P as IsStarkProver<_, _, _>>::fold_coefficient(&mut state.seed, &deep);
+    let entry = state
+        .acc
+        .entry(deep.lde_size)
+        .or_insert_with(|| (Vec::new(), deep.trace_rows, 0));
+    <P as IsStarkProver<_, _, _>>::accumulate(&mut entry.0, &coefficient, &deep.deep);
+    entry.2 += 1;
+    state.order.push(idx);
+    state.tables.push((
+        idx,
+        TablePublic {
+            trace_rows: deep.trace_rows,
+            main_root: deep.main_roots.main,
+            precomputed_root: deep.main_roots.precomputed,
+            aux_root: deep.aux_root,
+            composition_poly_root: deep.composition_poly_root,
+            trace_ood: deep.trace_ood,
+            trace_ood_next: deep.trace_ood_next,
+            parts_ood: deep.parts_ood,
+            bus_public_inputs: deep.bus_public_inputs,
+        },
+    ));
+    // `deep` dies here, which is the whole point.
 }
 
 fn deep_of(
@@ -417,18 +472,20 @@ pub fn run_batched(
     proof_options: &ProofOptions,
     challenge: &Challenge,
 ) -> Result<Batched, Error> {
-    use std::collections::BTreeMap;
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
 
     let chunk_airs = ChunkAirs::new(proof_options);
-    let done = std::sync::Mutex::new(Vec::new());
+    let done = std::sync::Mutex::new(FoldState {
+        seed: challenge.transcript.clone(),
+        acc: std::collections::BTreeMap::new(),
+        order: Vec::new(),
+        tables: Vec::new(),
+    });
     let mut visitor = BuildDeep::new(&chunk_airs, challenge, &done);
     let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
     drop(visitor);
-    let mut deeps = done.into_inner().expect("deeps");
 
-    // The tables the walk could not retire, in the same AIR order, exactly as
-    // `assemble` walks them for the per-table path.
+    // The tables the walk could not retire, folded after it in AIR order.
     let order = &challenge.order;
     let airs = crate::VmAirs::new(
         elf,
@@ -443,111 +500,97 @@ pub fn run_batched(
         None,
     );
     let n = order.len();
-    let build = |idx: usize,
-                 air: &crate::VmAir,
-                 trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
-     -> Result<(usize, Deep), Error> {
-        let mut transcript = fork(&challenge.transcript, idx, n);
-        let deep = deep_of(
-            air.as_ref(),
-            trace,
-            &challenge.challenges,
-            &mut transcript,
-            challenge.roots.get(idx).cloned(),
-        )
-        .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
-        Ok((idx, deep))
-    };
-    let fixed: [(
-        &crate::VmAir,
-        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    ); NUM_FIXED_AIRS] = [
-        (&airs.bitwise, &mut resident.bitwise),
-        (&airs.decode, &mut resident.decode),
-        (&airs.commit, &mut resident.accumulated.commit),
-        (&airs.keccak, &mut resident.accumulated.keccak),
-        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
-        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-        (&airs.ecsm, &mut resident.accumulated.ecsm),
-        (&airs.ecdas, &mut resident.accumulated.ecdas),
-        (&airs.hint, &mut resident.accumulated.hint),
-        (&airs.register, &mut resident.register),
-    ];
-    for (idx, (air, trace)) in fixed.into_iter().enumerate() {
-        deeps.push(build(idx, air, trace)?);
-    }
-    if airs.include_halt {
-        deeps.push(build(NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?);
-    }
-    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
-        let idx = order.page_index(i).ok_or_else(|| {
-            Error::Prover(format!("batched phase: page {i} is not in the layout"))
-        })?;
-        deeps.push(build(idx, air, trace)?);
-    }
-
-    // AIR order: the seed is absorbed in it and the verifier replays it.
-    deeps.sort_by_key(|(idx, _)| *idx);
-    if deeps.len() != n {
-        return Err(Error::Prover(format!(
-            "batched phase: {} tables for a layout of {n}",
-            deeps.len()
-        )));
-    }
-    let ordered: Vec<Deep> = deeps
-        .into_iter()
-        .map(|(idx, mut d)| {
-            d.air_index = idx;
-            d
-        })
-        .collect();
-    let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&challenge.transcript, &ordered);
-
-    // Taken before the fold, which consumes the codewords: this is the half of
-    // each table that survives into the proof.
-    let tables: Vec<TablePublic> = ordered
-        .iter()
-        .map(|d| TablePublic {
-            trace_rows: d.trace_rows,
-            main_root: d.main_roots.main,
-            precomputed_root: d.main_roots.precomputed,
-            aux_root: d.aux_root,
-            composition_poly_root: d.composition_poly_root,
-            trace_ood: d.trace_ood.clone(),
-            trace_ood_next: d.trace_ood_next.clone(),
-            parts_ood: d.parts_ood.clone(),
-            bus_public_inputs: d.bus_public_inputs.clone(),
-        })
-        .collect();
-
-    let mut by_height: BTreeMap<usize, Vec<Deep>> = BTreeMap::new();
-    for d in ordered {
-        by_height.entry(d.lde_size).or_default().push(d);
-    }
-
-    // Any AIR serves for a group: `domain_and_twiddles` keys on the proof
-    // options alone, and every table in a prove shares them.
-    let any = chunk_airs.get(TableKind::Cpu).as_ref();
-    let mut transcript = challenge.transcript.clone();
-    let (mut groups, mut members) = (Vec::new(), Vec::new());
-    let mut group_of = vec![usize::MAX; n];
-    for (g, (_, group)) in by_height.iter().enumerate() {
-        for d in group.iter() {
-            group_of[d.air_index] = g;
+    {
+        let mut state = done.lock().expect("fold state");
+        let build = |state: &mut FoldState,
+                     idx: usize,
+                     air: &crate::VmAir,
+                     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+         -> Result<(), Error> {
+            let mut transcript = fork(&challenge.transcript, idx, n);
+            let deep = deep_of(
+                air.as_ref(),
+                trace,
+                &challenge.challenges,
+                &mut transcript,
+                challenge.roots.get(idx).cloned(),
+            )
+            .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
+            fold_one(state, idx, deep);
+            Ok(())
+        };
+        let fixed: [(
+            &crate::VmAir,
+            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        ); NUM_FIXED_AIRS] = [
+            (&airs.bitwise, &mut resident.bitwise),
+            (&airs.decode, &mut resident.decode),
+            (&airs.commit, &mut resident.accumulated.commit),
+            (&airs.keccak, &mut resident.accumulated.keccak),
+            (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
+            (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
+            (&airs.ecsm, &mut resident.accumulated.ecsm),
+            (&airs.ecdas, &mut resident.accumulated.ecdas),
+            (&airs.hint, &mut resident.accumulated.hint),
+            (&airs.register, &mut resident.register),
+        ];
+        for (idx, (air, trace)) in fixed.into_iter().enumerate() {
+            build(&mut state, idx, air, trace)?;
+        }
+        if airs.include_halt {
+            build(&mut state, NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?;
+        }
+        for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+            let idx = order.page_index(i).ok_or_else(|| {
+                Error::Prover(format!("batched phase: page {i} is not in the layout"))
+            })?;
+            build(&mut state, idx, air, trace)?;
         }
     }
-    for (lde_size, group) in by_height {
-        let count = group.len();
-        let roots = <P as IsStarkProver<_, _, _>>::batch_fri(any, group, &alpha, &mut transcript)
-            .ok_or_else(|| {
-            Error::Prover(format!("batched phase: no FRI for size {lde_size}"))
+
+    let FoldState {
+        mut seed,
+        acc,
+        order: fold_order,
+        mut tables,
+    } = done.into_inner().expect("fold state");
+    if tables.len() != n {
+        return Err(Error::Prover(format!(
+            "batched phase: {} tables for a layout of {n}",
+            tables.len()
+        )));
+    }
+
+    // One FRI per accumulator, and the mapping from table to group.
+    let mut group_of = vec![usize::MAX; n];
+    let sizes: Vec<usize> = acc.keys().copied().collect();
+    for (&idx, _) in tables.iter().map(|(i, t)| (i, t)) {
+        let rows = tables
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, t)| t.trace_rows)
+            .expect("table just listed");
+        let lde = rows * proof_options.blowup_factor as usize;
+        group_of[idx] = sizes.iter().position(|s| *s == lde).ok_or_else(|| {
+            Error::Prover(format!(
+                "batched phase: table {idx} has no group of size {lde}"
+            ))
         })?;
-        groups.push((lde_size, roots));
+    }
+
+    let any = chunk_airs.get(TableKind::Cpu).as_ref();
+    let (mut groups, mut members) = (Vec::new(), Vec::new());
+    for (lde_size, (codeword, trace_rows, count)) in acc {
+        let fri = <P as IsStarkProver<_, _, _>>::batch_fri(any, codeword, trace_rows, &mut seed)
+            .ok_or_else(|| Error::Prover(format!("batched phase: no FRI for size {lde_size}")))?;
+        groups.push((lde_size, fri));
         members.push(count);
     }
 
+    tables.sort_by_key(|(idx, _)| *idx);
     Ok(Batched {
-        tables,
+        tables: tables.into_iter().map(|(_, t)| t).collect(),
+        fold_order,
         groups,
         members,
         group_of,
