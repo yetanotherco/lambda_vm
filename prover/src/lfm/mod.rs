@@ -64,6 +64,7 @@ pub mod trace;
 pub mod transcript_replay;
 pub mod validator;
 pub mod whir_gkr;
+pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
 pub mod whir_stacked;
@@ -137,6 +138,8 @@ mod poseidon_chip_tests;
 mod preprocessed_tests;
 #[cfg(test)]
 mod whir_gkr_tests;
+#[cfg(test)]
+mod whir_open_tests;
 #[cfg(test)]
 mod whir_poly_tests;
 #[cfg(test)]
