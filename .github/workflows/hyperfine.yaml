@@ -11,6 +11,10 @@ on:
       # hashes it; both lists must agree on what rebuilds the guest, or a syscalls-only
       # change (a guest allocator swap, say) never gets benchmarked at all.
       - 'syscalls/**'
+      # Same rule for the guest's cargo config: it carries the rustflags every guest
+      # ELF is built with, so a change confined to it recompiles the programs this job
+      # measures. The cache key below already hashes it.
+      - '.cargo/config.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
