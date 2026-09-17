@@ -72,13 +72,13 @@ pub struct Observed {
     pub state: [u8; 32],
 }
 
-fn bytes_from(seed: u8, len: usize) -> Vec<u8> {
+pub fn bytes_from(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| seed.wrapping_mul(31).wrapping_add(i as u8))
         .collect()
 }
 
-fn ext_from(seed: u64) -> FEE {
+pub fn ext_from(seed: u64) -> FEE {
     FEE::new([
         FE::from(seed),
         FE::from(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),

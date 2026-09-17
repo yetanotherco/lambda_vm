@@ -66,6 +66,7 @@ pub mod validator;
 pub mod whir_gkr;
 pub mod whir_poly;
 pub mod whir_stacked;
+pub mod whir_transcript;
 pub mod whir_transcript_kats;
 pub mod word;
 
@@ -141,6 +142,8 @@ mod whir_poly_tests;
 mod whir_stacked_tests;
 #[cfg(test)]
 mod whir_transcript_kat_tests;
+#[cfg(test)]
+mod whir_transcript_replay_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]

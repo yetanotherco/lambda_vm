@@ -104,6 +104,12 @@ const K4_OFFSET: Script = Script {
 
 const SCRIPTS: &[&Script] = &[&K1_ORDER, &K2_WIDTH, &K3_CHAIN, &K4_OFFSET];
 
+/// The same four scripts, for the machine replay's gates: the emitter is
+/// checked against the host on exactly the sequences these vectors pin.
+pub fn scripts() -> &'static [&'static Script] {
+    SCRIPTS
+}
+
 /// Prints the vectors in the form the table below takes. Run after a
 /// deliberate change to the transcript, never to make a red test green.
 #[test]
