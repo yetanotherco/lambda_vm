@@ -390,3 +390,172 @@ fn state_costs_the_hash_without_the_unpack() {
         assert_eq!(transcript.squeezes(), 0, "state must not advance the chain");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The grind check: the machine's only reject in this file.
+// ---------------------------------------------------------------------------
+
+/// A program that absorbs `seed_felts` hinted felts, grinds at `bits` with a
+/// hinted nonce, and publishes the transcript state afterwards.
+///
+/// The nonce is hinted, which is what a forger controls; the check is what
+/// stops one choosing it freely.
+fn grind_program(seed_felts: usize, bits: u8) -> (LfmProgram, usize) {
+    let mut b = builder();
+    let arena = b.declare_arena((seed_felts + 1) as u32);
+    let felts: Vec<Felt> = (0..seed_felts)
+        .map(|index| b.hint_felt(arena, index as u32))
+        .collect();
+    let nonce = b.hint_felt(arena, seed_felts as u32);
+    let mut transcript = WhirTranscript::new();
+    transcript.absorb_felts(&mut b, &felts);
+    let before = transcript.squeezes();
+    super::whir_transcript::emit_grind_check(&mut b, &mut transcript, bits, nonce);
+    assert_eq!(
+        transcript.squeezes(),
+        before,
+        "a grind reads the state; it must not advance the chain"
+    );
+    let after = transcript.state(&mut b);
+    b.public(after);
+    let program = compile(b.finish());
+    validate(&program).expect("admissible");
+    (program, seed_felts + 1)
+}
+
+/// ★ THE GATE AND THE TAMPER ARM IN ONE. The machine accepts exactly the nonces
+/// `crypto::grinding::is_valid_nonce` accepts, and the transcript it leaves is
+/// the host's.
+///
+/// The valid nonce comes from the host's own search, so nothing here decides
+/// what "valid" means; the machine only has to agree. The invalid arm walks
+/// nonces the host rejects and requires every one of them to fail to execute —
+/// the grind is a real reject, exactly like the GKR layer relation.
+#[test]
+fn the_grind_accepts_what_the_host_accepts_and_refuses_the_rest() {
+    use crate::tables::types::GoldilocksExtension;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
+    use crypto::hash::rpx::Rpx256Digest;
+
+    // A few bits: the search is cheap and the arm below can find rejects.
+    let bits = 8u8;
+    let seed_felts = 4usize;
+    let values: Vec<FE> = (0..seed_felts)
+        .map(|i| FE::from(7 + i as u64 * 31))
+        .collect();
+
+    // The host's transcript over the same absorbs, and its state — the grind's
+    // seed.
+    let mut host = DefaultTranscript::<GoldilocksExtension, RpxTranscriptHash>::new(&[]);
+    let mut seed_bytes = Vec::new();
+    for value in &values {
+        seed_bytes.extend_from_slice(&value.to_raw().to_be_bytes());
+    }
+    host.append_bytes(&seed_bytes);
+    let seed = host.state();
+
+    let nonce = crypto::grinding::generate_nonce_smallest::<Rpx256Digest>(&seed, bits)
+        .expect("a nonce exists at eight bits");
+    assert!(
+        crypto::grinding::is_valid_nonce::<Rpx256Digest>(&seed, nonce, bits),
+        "the host's own search must produce a nonce the host accepts"
+    );
+
+    let (program, _) = grind_program(seed_felts, bits);
+    let mut arena: Vec<LfmWord> = values
+        .iter()
+        .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+        .collect();
+    arena.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
+    let words = run_program(&program, &[arena.clone()]);
+
+    // The host's transcript absorbs the nonce, exactly as `check_grind` does.
+    host.append_bytes(&nonce.to_be_bytes());
+    let want = host.state();
+    let left = words[0];
+    assert_eq!(
+        digest_to_commitment(&[left[0], left[1], left[2], left[3]]),
+        want,
+        "after the grind the machine's transcript must be the host's"
+    );
+
+    // ★ The tamper arm: every nonce the host rejects must fail to execute.
+    let mut refused = 0usize;
+    for candidate in 0..64u64 {
+        if crypto::grinding::is_valid_nonce::<Rpx256Digest>(&seed, candidate, bits) {
+            continue;
+        }
+        let mut forged = arena.clone();
+        forged[seed_felts] = [FE::from(candidate), FE::zero(), FE::zero(), FE::zero()];
+        assert!(
+            execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "nonce {candidate}: the host rejects it, so the machine must refuse to execute"
+        );
+        refused += 1;
+    }
+    assert!(
+        refused >= 32,
+        "the arm must actually exercise rejects; it found only {refused}"
+    );
+    println!("grind at {bits} bits: nonce {nonce} accepted, {refused} rejects refused");
+}
+
+/// ★ `bits == 0` does nothing at all — no state read, no absorb.
+///
+/// The host returns before touching the transcript (`whir_chain.rs:131-133`),
+/// and both halves are observable: an absorb would move every later challenge,
+/// and a state read is counted apart from a squeeze. A grind that "does nothing"
+/// but still absorbs is a desync that no value in the round itself would show.
+#[test]
+fn a_zero_bit_grind_touches_nothing() {
+    let (with_zero, _) = grind_program(4, 0);
+    let mut b = builder();
+    let arena = b.declare_arena(5);
+    let felts: Vec<Felt> = (0..4).map(|index| b.hint_felt(arena, index)).collect();
+    let _unused = b.hint_felt(arena, 4);
+    let mut transcript = WhirTranscript::new();
+    transcript.absorb_felts(&mut b, &felts);
+    let state = transcript.state(&mut b);
+    b.public(state);
+    let without = compile(b.finish());
+    validate(&without).expect("admissible");
+    assert_eq!(
+        with_zero.instrs.len(),
+        without.instrs.len(),
+        "a zero-bit grind must emit nothing"
+    );
+    assert_eq!(super::whir_transcript::grind_check_rows(0), 0);
+}
+
+/// ★ F1 for the grind: every row named, at three factors.
+///
+/// The program hashes buffers of four felts (the state the grind seeds from),
+/// six and five (the grind's two preimages) and five again (the state it
+/// publishes) — three distinct capacity words, shared across those hashes,
+/// plus the grind's own two constant felts.
+#[test]
+fn the_grind_costs_its_closed_form() {
+    for bits in [1u8, 8, 20] {
+        let seed_felts = 4usize;
+        let (program, plumbing) = grind_program(seed_felts, bits);
+        let distinct_capacities = 3; // widths 4, 5 and 6
+        let predicted = plumbing
+            + leaf_hash_consts(distinct_capacities)
+            + super::whir_transcript::grind_check_const_felts()
+            + state_rows(seed_felts)
+            + super::whir_transcript::grind_check_rows(bits as usize)
+            + state_rows(seed_felts + 1)
+            + 1;
+        println!(
+            "grind at {bits:>2} bits: {:>3} rows emitted, {predicted:>3} predicted",
+            program.instrs.len()
+        );
+        assert_eq!(
+            program.instrs.len(),
+            predicted,
+            "a {bits}-bit grind must emit its closed form"
+        );
+    }
+}

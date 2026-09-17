@@ -296,3 +296,74 @@ pub const fn sample_u64_rows() -> usize {
 pub fn ext_from_lanes(a0: FE, a1: FE, a2: FE) -> FEE {
     FEE::new([a0, a1, a2])
 }
+
+/// ★ `whir_chain::check_grind` (`crypto/multilinear/src/whir_chain.rs:125-139`),
+/// emitted — and it is a REUSE, not a port.
+///
+/// The check is
+/// `is_valid_nonce::<GrindingDigest<H>>(&transcript.state(), nonce, bits)`, and
+/// `GrindingDigest<H>` is the TRANSCRIPT's digest (`whir_hash.rs:54`), which on
+/// this arm is `Rpx256Digest` — the same leaf-domain sponge the replay above
+/// uses. So `H(H(PREFIX ‖ seed ‖ factor) ‖ nonce_be)` is exactly what
+/// [`super::epoch::emit_grinding_check`]'s algebraic arm already computes: both
+/// preimages are already felts (41 bytes is six big-endian groups, 40 is five),
+/// the inner digest cell IS the outer preimage's first rate cell so nothing
+/// repacks it, and the range check is one `BitDec` whose top `bits` bits are
+/// asserted zero. ⚠ My own sizing note called this "a port, not a reuse"; that
+/// was wrong, and reusing it is also what keeps ONE definition of the lane
+/// placement rather than two.
+///
+/// `bits == 0` returns immediately, as the host does — with NO state read and
+/// NO nonce absorb. Both are observable: a state read is counted separately
+/// from a squeeze, and an absorb would move every later challenge.
+///
+/// ⚠ A nonce at or above `p` reduces, on both sides: the host's sponge reads the
+/// eight big-endian bytes through `Fp::from(u64)` exactly as the machine holds
+/// the felt. It is a completeness restriction, not a disagreement — and search
+/// returns small nonces, so it is unreachable in practice.
+pub fn emit_grind_check(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    bits: u8,
+    nonce: Felt,
+) {
+    if bits == 0 {
+        return;
+    }
+    let seed = transcript.state(b);
+    super::epoch::emit_grinding_check(b, super::edsl::WrapDigest::from_cell(seed), nonce, bits);
+    // `append_bytes(&nonce.to_be_bytes())`: eight big-endian bytes are one felt.
+    transcript.absorb_felts(b, &[nonce]);
+}
+
+/// INSTRUCTIONS [`emit_grind_check`] emits beyond the transcript state's own
+/// hash, which costs [`state_rows`] of whatever the buffer holds.
+///
+/// One `Unpack` of the seed; two `Pack`s and one permutation for the inner
+/// hash; one `Pack` and one permutation for the outer hash; one `Unpack` of the
+/// result; and the range check, one `BitDec` plus two rows per asserted zero
+/// bit. The nonce absorb is free — it is already a felt. So `8 + 2·bits`.
+///
+/// ★ The inner digest is NEVER unpacked, and that is the shape's one real
+/// saving: it IS the outer preimage's first rate cell, so nothing repacks it
+/// (`epoch.rs:624-626`). An earlier version of this form charged an `Unpack`
+/// for it, and F1 said so.
+pub const fn grind_check_rows(bits: usize) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    let seed_unpack = 1;
+    let inner = 2 + 1;
+    let outer = 1 + 1;
+    let digest_unpack = 1;
+    let range = 1 + 2 * bits;
+    seed_unpack + inner + outer + digest_unpack + range
+}
+
+/// `LFM_CONST` rows the grind interns BEYOND the capacity words of its two
+/// hashes (which are `leaf_capacity(6)` for the 41-byte inner preimage and
+/// `leaf_capacity(5)` for the 40-byte outer one, and are shared with any other
+/// hash of those widths): the PREFIX felt and the factor felt.
+pub const fn grind_check_const_felts() -> usize {
+    2
+}
