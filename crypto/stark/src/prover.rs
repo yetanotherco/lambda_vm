@@ -695,11 +695,7 @@ pub struct GroupFri<FieldExtension: IsField> {
 
 /// One table's contribution to a batched FRI.
 #[derive(Clone)]
-pub struct TableDeep<Field: IsField, FieldExtension: IsField>
-where
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
+pub struct TableDeep<FieldExtension: IsField> {
     /// The domain the codeword lives on. Only tables that agree on this can be
     /// folded together: the fold squares the coset offset each layer, so a
     /// short codeword over `offset·<w>` never lines up with a tall fold over
@@ -712,9 +708,6 @@ where
     pub trace_rows: usize,
     /// The DEEP composition codeword, `lde_size` long.
     pub deep: Vec<FieldElement<FieldExtension>>,
-    /// The trees this table's Round 1 built, for the Open pass to use instead
-    /// of hashing them a second time. The spec's one named optimization.
-    pub kept: KeptCommits<Field, FieldExtension>,
     /// Where the table sits in the AIR order, carried so the batch can say
     /// which group each table ended up in once the codewords are sorted by
     /// domain rather than by position.
@@ -735,97 +728,6 @@ where
     pub trace_ood: Table<FieldExtension>,
     pub trace_ood_next: Table<FieldExtension>,
     pub parts_ood: Vec<FieldElement<FieldExtension>>,
-}
-
-impl<Field, FieldExtension> Round1<Field, FieldExtension>
-where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
-    FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
-    /// The trees this round built, to hand to the pass that opens.
-    pub fn keep_commits(&self) -> KeptCommits<Field, FieldExtension> {
-        KeptCommits {
-            main: self.main.share(),
-            aux: self.aux.as_ref().map(TableCommit::share),
-        }
-    }
-}
-
-/// What a table contributes to the batch's seed.
-///
-/// Split out of [`TableDeep`] because the seed is a function of public data
-/// only — the codeword and the trees have no business in it, and a caller that
-/// wants to reason about the seed alone should not have to build either.
-#[derive(Clone)]
-pub struct SeedData<FieldExtension: IsField> {
-    pub bus_contribution: Option<FieldElement<FieldExtension>>,
-    pub composition_poly_root: Commitment,
-    pub trace_ood: Table<FieldExtension>,
-    pub trace_ood_next: Table<FieldExtension>,
-    pub parts_ood: Vec<FieldElement<FieldExtension>>,
-}
-
-/// A table's Round 1 trees, kept so a later pass opens against them instead of
-/// rebuilding them.
-///
-/// The spec's one named optimization for the Open phase: "keeping the internal
-/// nodes of the merkle tree in memory, obviating the need to recompute it;
-/// while still dropping the biggest memory cost (the leaves)". `TableCommit`
-/// already drops the leaves where it can, so what is held here is the inner
-/// nodes — and a profile says Merkle hashing is the single hottest thing in a
-/// prove, so not hashing it twice is the saving the spec was pointing at.
-impl<Field: IsField, FieldExtension: IsField> TableDeep<Field, FieldExtension>
-where
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
-    /// This table's share of the batch seed.
-    pub fn seed_data(&self) -> SeedData<FieldExtension> {
-        SeedData {
-            bus_contribution: self.bus_contribution.clone(),
-            composition_poly_root: self.composition_poly_root,
-            trace_ood: self.trace_ood.clone(),
-            trace_ood_next: self.trace_ood_next.clone(),
-            parts_ood: self.parts_ood.clone(),
-        }
-    }
-}
-
-impl<Field: IsField, FieldExtension: IsField> Clone for KeptCommits<Field, FieldExtension>
-where
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
-    /// Cheap: `TableCommit::share` only bumps refcounts.
-    fn clone(&self) -> Self {
-        Self {
-            main: self.main.share(),
-            aux: self.aux.as_ref().map(TableCommit::share),
-        }
-    }
-}
-
-pub struct KeptCommits<Field: IsField, FieldExtension: IsField>
-where
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
-    main: TableCommit<Field>,
-    aux: Option<TableCommit<FieldExtension>>,
-}
-
-impl<Field: IsField, FieldExtension: IsField> KeptCommits<Field, FieldExtension>
-where
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
-{
-    /// Roughly what holding this costs — the inner nodes of both trees.
-    pub fn bytes(&self) -> usize {
-        self.main.tree.nodes().len() * 32
-            + self.aux.as_ref().map_or(0, |c| c.tree.nodes().len() * 32)
-    }
 }
 
 /// Source of truth for a table whose *trace* has been retired.
@@ -1965,7 +1867,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __r1 = crate::instruments::span("a1_round_1");
         let mut round_1_result =
-            Self::round_1_from_trace(air, trace, challenges, transcript, None, None)?;
+            Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
         #[cfg(feature = "instruments")]
         drop(__r1);
         #[cfg(feature = "instruments")]
@@ -1996,7 +1898,6 @@ pub trait IsStarkProver<
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         known_main: Option<MainRoots>,
-        kept: Option<KeptCommits<Field, FieldExtension>>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
@@ -2035,10 +1936,9 @@ pub trait IsStarkProver<
         // can hand them over instead. Building the tree is the hottest thing in
         // a prove (keccak is 17.6% of the profile), so not building one that
         // nothing will ask a question of is the cheapest saving there is.
-        let main = match (&kept, known_main) {
-            (Some(k), _) => k.main.share(),
-            (None, Some(roots)) => TableCommit::known_roots(roots.main, roots.precomputed),
-            (None, None) => Self::table_commit_for(air, &main_data, num_main_cols)?,
+        let main = match known_main {
+            Some(roots) => TableCommit::known_roots(roots.main, roots.precomputed),
+            None => Self::table_commit_for(air, &main_data, num_main_cols)?,
         };
 
         #[cfg(feature = "instruments")]
@@ -2205,7 +2105,7 @@ pub trait IsStarkProver<
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         known_main: Option<MainRoots>,
-    ) -> Result<TableDeep<Field, FieldExtension>, ProvingError>
+    ) -> Result<TableDeep<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
@@ -2213,7 +2113,7 @@ pub trait IsStarkProver<
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let mut round_1_result =
-            Self::round_1_from_trace(air, trace, challenges, transcript, known_main, None)?;
+            Self::round_1_from_trace(air, trace, challenges, transcript, known_main)?;
         let (mut round_2_result, round_3_result, z, trace_ood, trace_ood_next) =
             Self::rounds_2_and_3(
                 air,
@@ -2259,7 +2159,6 @@ pub trait IsStarkProver<
             lde_size: domain.interpolation_domain_size * domain.blowup_factor,
             trace_rows: domain.interpolation_domain_size,
             deep,
-            kept: round_1_result.keep_commits(),
             air_index: usize::MAX,
             bus_contribution: round_1_result
                 .bus_public_inputs
@@ -2293,7 +2192,7 @@ pub trait IsStarkProver<
     /// folded it.
     fn batch_alpha(
         pre_fork: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
-        tables: &[SeedData<FieldExtension>],
+        tables: &[TableDeep<FieldExtension>],
     ) -> FieldElement<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -2336,7 +2235,6 @@ pub trait IsStarkProver<
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         iotas: &[usize],
-        kept: Option<KeptCommits<Field, FieldExtension>>,
     ) -> Result<DeepPolynomialOpenings<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
@@ -2345,7 +2243,7 @@ pub trait IsStarkProver<
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let mut round_1_result =
-            Self::round_1_from_trace(air, trace, challenges, transcript, None, kept)?;
+            Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
         let (round_2_result, _, _, _, _) = Self::rounds_2_and_3(
             air,
             pub_inputs,
@@ -2374,7 +2272,7 @@ pub trait IsStarkProver<
     /// binds the fold to all the data it folds.
     fn batch_fri(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        members: Vec<TableDeep<Field, FieldExtension>>,
+        members: Vec<TableDeep<FieldExtension>>,
         alpha: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Option<GroupFri<FieldExtension>>
