@@ -109,7 +109,7 @@ fn prove<H: WhirHash>() {
         Ext,
         H::Transcript,
     >::new(b"whir-transcript-configuration");
-    multilinear_table::multi_prove(&committed, &config(), &mut transcript).expect("prove");
+    multilinear_table::multi_prove(&committed, &config(), &mut transcript, None).expect("prove");
 }
 
 #[test]

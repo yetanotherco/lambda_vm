@@ -300,7 +300,7 @@ pub fn prove_with_options_and_inputs(
         );
         let committed = CommittedTables::<_, _, H>::commit(committed, &config)
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
     });
 

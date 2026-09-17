@@ -231,7 +231,7 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
             Ext,
             <H as multilinear::whir_hash::WhirHash>::Transcript,
         >::new(b"whir-identity");
-        multilinear_table::multi_prove(&committed, &config, &mut transcript).expect("prove")
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None).expect("prove")
     });
 
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");

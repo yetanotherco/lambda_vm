@@ -579,6 +579,33 @@ pub struct TableProof<E: IsField> {
     pub constraint: ConstraintCore<E>,
 }
 
+/// A commitment built OUTSIDE this proof, to be opened at one table's point.
+///
+/// DECODE's five preprocessed columns are ELF-derived: the same bytes in every
+/// epoch of every run of that program. Committing them per epoch and then
+/// re-evaluating their MLEs per epoch is work that depends on nothing the epoch
+/// chose. This carries a commitment built once per ELF, so the epoch pays an
+/// opening instead of five 2^20 folds.
+///
+/// ⚠ The `table` index is part of the statement, not a hint. The opening binds
+/// these columns to ONE table's reduced point, and which table that is must be
+/// asserted rather than inferred from position — a prover who could aim the
+/// pinned columns at a different table's point would be settling them against
+/// challenges they were never bound to.
+pub struct Prepared<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// Built once per ELF, outside this proof.
+    pub commitment: &'a StackedCommitment<F, H>,
+    /// The columns it was committed over, in that order.
+    pub columns: &'a [&'a Mle<F>],
+    /// Whose reduced point the opening is at.
+    pub table: usize,
+}
+
 /// Every table's argument, and the **one** opening that settles all of them.
 #[derive(
     Clone,
@@ -860,6 +887,7 @@ pub fn multi_prove<F, E, T, H>(
     committed: &CommittedTables<'_, F, E, H>,
     config: &ChainConfig,
     transcript: &mut T,
+    prepared: Option<Prepared<'_, F, H>>,
 ) -> Result<MultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -887,6 +915,22 @@ where
     for root in committed.roots() {
         transcript.append_bytes(root);
     }
+    // ★★ LAST IN THE ROOTS BLOCK, and still before the first challenge.
+    //
+    // "Last" means last among the roots, NOT after the table arguments: every
+    // root must be in the transcript before `z` is drawn, or it binds nothing.
+    // Absorbing after a challenge is indistinguishable IN THAT CHALLENGE from
+    // not absorbing at all, which is the failure
+    // `the_derived_root_is_absorbed_after_the_carried_ones` pins.
+    //
+    // ⚠ This root is NOT added to `MultiProof::roots`. The verifier derives it
+    // from the ELF and absorbs the derived value; a copy carried in the proof
+    // would be a field a reader assumes is checked.
+    if let Some(prepared) = prepared.as_ref() {
+        for root in prepared.commitment.roots() {
+            transcript.append_bytes(&root[..]);
+        }
+    }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
     let beta: FieldElement<E> = transcript.sample_field_element();
@@ -896,7 +940,14 @@ where
     // order the stack was built in.
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
-    for table in committed.tables() {
+    // Where the prepared columns' table starts in the global column order. Its
+    // columns all share one reduced point, so the offset is all the opening
+    // needs to find both the point and the claimed values.
+    let mut prepared_at: Option<usize> = None;
+    for (index, table) in committed.tables().iter().enumerate() {
+        if prepared.as_ref().is_some_and(|p| p.table == index) {
+            prepared_at = Some(points.len());
+        }
         let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
         for _ in 0..table.num_committed_columns() {
             points.push(point.clone());
@@ -934,14 +985,41 @@ where
         column_at += width;
     }
 
+    // The out-of-band opening, at the target table's reduced point. `Shared`
+    // rather than `PerColumn` because every one of these columns is settled at
+    // the SAME point — the one that table's argument reduced to — which is what
+    // makes the opened values comparable to that table's own claimed values.
+    let preprocessed = match prepared {
+        Some(prepared) => {
+            let at = prepared_at.ok_or(MlError::UnknownPolynomial {
+                index: prepared.table,
+                len: committed.tables().len(),
+            })?;
+            let width = prepared.columns.len();
+            if at + width > values.len() {
+                return Err(MlError::QueryCountMismatch {
+                    expected: at + width,
+                    got: values.len(),
+                });
+            }
+            Some(stacked_eval::prove::<F, E, T, H>(
+                prepared.commitment,
+                prepared.columns,
+                None,
+                &Claimed::Shared(&points[at]),
+                &values[at..at + width],
+                config,
+                transcript,
+            )?)
+        }
+        None => None,
+    };
+
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
         tables,
         columns,
-        // Step 2 fills this when a prepared commitment is supplied. Until then
-        // every proof carries `None` and the verifier's preprocessed path is
-        // the MLE evaluation it has always been.
-        preprocessed: None,
+        preprocessed,
     })
 }
 
@@ -1237,7 +1315,7 @@ mod tests {
         )?;
 
         let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        let proof = multi_prove(&committed, &config(), &mut prover)?;
+        let proof = multi_prove(&committed, &config(), &mut prover, None)?;
 
         // Three tables of different heights, and **one** commitment with one
         // opening for all of them.

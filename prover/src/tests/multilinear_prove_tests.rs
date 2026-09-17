@@ -141,7 +141,8 @@ fn a_forged_preprocessed_column_is_rejected() {
             CommittedTable::from_layout(layout(), |col| columns[col as usize].clone()).unwrap();
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config).unwrap();
         let mut transcript = DefaultTranscript::<E>::new(b"forged");
-        let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript).unwrap();
+        let proof =
+            multilinear_table::multi_prove(&committed, &config, &mut transcript, None).unwrap();
         (
             proof,
             committed.groups()[0].layout().clone(),

@@ -451,7 +451,7 @@ pub fn prove_global(
         );
         let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
     });
 
@@ -692,7 +692,7 @@ pub fn prove_epoch(
         );
         let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
     });
 
