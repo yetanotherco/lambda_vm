@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-rpx-host-kat test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -545,6 +545,20 @@ test-ethrex-crypto:
 
 test: compile-programs test-syscalls test-ethrex-crypto
 	cargo test
+	# The hash counters compile to nothing unless the feature is on, so their
+	# own tests only execute here. See the `lint` target for why an instrument
+	# nobody runs is worth a line in the build.
+	cargo test -p crypto --features hash-metrics
+	# The transcript counters answer "which sponge ran". Their own integration
+	# binary, because the counters are process-global and a parallel neighbour's
+	# reset lands inside another test's measurement window — moving them out of
+	# the lib binary left four of five failing until they also took a lock.
+	cargo test -p crypto --features hash-metrics --test transcript_counters
+	# And the system test that reads them through a real prove: it is the one
+	# that says the PROVER picked the configuration's sponge, which the
+	# type-level test next to it cannot observe.
+	cargo test -p lambda-vm-prover --features hash-metrics --test whir_transcript_configuration
+	$(MAKE) test-rpx-host-kat
 
 # === Quick test shortcuts ===
 
@@ -552,6 +566,28 @@ test: compile-programs test-syscalls test-ethrex-crypto
 # prebuilt guest ELFs, so build them first.
 test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
+
+# ★ The RPX device kernel's arithmetic, checked WITHOUT a GPU.
+#
+# `kernels/rpx.cu` is compiled as ordinary host C++ through `cuda_host_shim.h`,
+# so its field primitives, MDS, S-boxes, cubic extension, seven-round schedule,
+# leaf sponge, Merkle parent and every leaf kernel's read pattern are pinned in
+# seconds on a laptop. That matters here because GPU CI runs only on
+# merge_group, so without this the two WHIR coset kernels — which exist nowhere
+# else — would reach a GPU unchecked.
+#
+# ⚠ Necessary, never sufficient: it cannot tell you whether nvcc accepts the
+# file, nor anything about execution rather than arithmetic (grid indexing,
+# register pressure, local-memory spills). Those still belong to the GPU tests.
+HOST_KAT_DIR := crypto/math-cuda/tests/host_kat
+HOST_KAT_CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unknown-pragmas \
+    -I$(HOST_KAT_DIR) -Icrypto/math-cuda/kernels
+
+test-rpx-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
+	./target/host_kat/rpx_host_kat
 
 # Prover tests only
 test-prover: compile-recursion-elfs
@@ -690,6 +726,16 @@ lint:
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
+	# `hash-metrics` is host-only and off by default, so no pass above compiles it.
+	# Without this line the feature can rot untouched — which is how its Merkle
+	# counters stayed keccak-only after a second hash arrived, reporting ZERO for
+	# the arm whose whole purpose was to change the hashing. Lints, does not run:
+	# its tests are in the `test` target.
+	cargo clippy -p crypto --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
+	# The prover's own `hash-metrics` passthrough gates the per-arm transcript
+	# line and the system test that reads it; without this line neither compiles
+	# in any pass, which is how an instrument rots.
+	cargo clippy -p lambda-vm-prover --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

@@ -603,7 +603,13 @@ fn coset_lde_row_major_inner(
             &mut leaves_view,
         )?;
     }
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    crate::merkle::build_inner_tree_levels(
+        stream.as_ref(),
+        be,
+        &mut nodes_dev,
+        num_leaves,
+        crate::DeviceHash::Keccak256,
+    )?;
 
     // Copy the 32-byte root BEFORE queueing the big drain/transpose: this
     // pageable copy host-blocks until everything queued so far lands, so
@@ -779,7 +785,13 @@ pub fn coset_lde_row_major_split_trees(
                 &mut leaves_view,
             )?;
         }
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        crate::merkle::build_inner_tree_levels(
+            stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+            crate::DeviceHash::Keccak256,
+        )?;
         Ok(nodes_dev)
     };
 
@@ -1570,7 +1582,13 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 
     if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        crate::merkle::build_inner_tree_levels(
+            stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+            crate::DeviceHash::Keccak256,
+        )?;
     }
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -1788,7 +1806,13 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
                     .launch(cfg)?;
             }
         }
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        crate::merkle::build_inner_tree_levels(
+            stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+            crate::DeviceHash::Keccak256,
+        )?;
         Some((nodes_dev, nodes_out))
     } else {
         None

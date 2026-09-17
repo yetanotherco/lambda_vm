@@ -17,6 +17,7 @@ use crate::{
     Error,
     whir::Domain,
     whir_commit::{CodewordCommitment, Commitment, CosetOpening, fold_coset, leaf_and_slot},
+    whir_hash::WhirHash,
 };
 
 /// How hard a round is to cheat.
@@ -78,9 +79,9 @@ where
 ///
 /// `current` and `next` must already be committed, and `next` must be the fold
 /// of `current` by `alphas` — [`verify`] is what checks that claim.
-pub fn prove<C, N, T>(
-    current: &CodewordCommitment<C>,
-    next: &CodewordCommitment<N>,
+pub fn prove<C, N, T, H>(
+    current: &CodewordCommitment<C, H>,
+    next: &CodewordCommitment<N, H>,
     config: &RoundConfig,
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
@@ -90,6 +91,7 @@ where
     FieldElement<C>: AsBytes + Sync + Send,
     FieldElement<N>: AsBytes + Sync + Send,
     T: IsTranscript<N>,
+    H: WhirHash,
 {
     let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
 
@@ -108,7 +110,7 @@ where
 ///
 /// Re-derives the queries from the transcript, so the prover could not have
 /// chosen them.
-pub fn verify<F, C, N, T>(
+pub fn verify<F, C, N, T, H>(
     proof: &RoundProof<C, N>,
     commitments: RoundCommitments<'_>,
     domain: &Domain<F>,
@@ -123,6 +125,7 @@ where
     FieldElement<C>: AsBytes + Sync + Send,
     FieldElement<N>: AsBytes + Sync + Send,
     T: IsTranscript<N>,
+    H: WhirHash,
 {
     if alphas.len() != config.log_folding {
         return Err(Error::VariableCountMismatch {
@@ -145,11 +148,11 @@ where
         .zip(proof.current.iter().zip(&proof.next))
         .enumerate()
     {
-        if !crate::whir_commit::verify_opening::<C>(commitments.current_root, q, cur) {
+        if !crate::whir_commit::verify_opening::<C, H>(commitments.current_root, q, cur) {
             return Err(Error::OpeningRejected { query: i });
         }
         let (leaf, slot) = leaf_and_slot(q, commitments.next_num_leaves);
-        if !crate::whir_commit::verify_opening::<N>(commitments.next_root, leaf, nxt) {
+        if !crate::whir_commit::verify_opening::<N, H>(commitments.next_root, leaf, nxt) {
             return Err(Error::OpeningRejected { query: i });
         }
 
@@ -175,6 +178,7 @@ mod tests {
     use crate::{
         mle::Mle,
         whir::{encode, fold_codeword_k, monomial_coefficients},
+        whir_hash::KeccakWhir,
     };
 
     type FE = FieldElement<F>;
@@ -216,7 +220,7 @@ mod tests {
     }
 
     fn run(fx: &Fixture, proof: &RoundProof<F, F>) -> Result<(), Error> {
-        verify::<F, F, F, _>(
+        verify::<F, F, F, _, KeccakWhir>(
             proof,
             RoundCommitments {
                 current_root: &fx.current.root(),
@@ -314,7 +318,7 @@ mod tests {
         run(&fx, &proof).unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
-        let result = verify::<F, F, F, _>(
+        let result = verify::<F, F, F, _, KeccakWhir>(
             &proof,
             RoundCommitments {
                 current_root: &fx.current.root(),

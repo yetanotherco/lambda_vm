@@ -56,6 +56,7 @@ use crate::{
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
     whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening},
+    whir_hash::{GrindingDigest, WhirHash},
     whir_round::{self, RoundCommitments, RoundConfig, RoundProof},
 };
 
@@ -103,31 +104,34 @@ where
 ///
 /// Retrying that challenge then costs `2^bits` hashes. Zero bits is a no-op, so
 /// a caller that has not chosen its parameters yet pays nothing.
-fn grind<E, T>(transcript: &mut T, bits: u8) -> Result<u64, Error>
+fn grind<E, T, H>(transcript: &mut T, bits: u8) -> Result<u64, Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     if bits == 0 {
         return Ok(0);
     }
-    let nonce = crypto::grinding::generate_nonce_maybe_gpu(&transcript.state(), bits)
-        .ok_or(Error::GrindingFailed { bits })?;
+    let nonce =
+        crypto::grinding::generate_nonce_maybe_gpu::<GrindingDigest<H>>(&transcript.state(), bits)
+            .ok_or(Error::GrindingFailed { bits })?;
     transcript.append_bytes(&nonce.to_be_bytes());
     Ok(nonce)
 }
 
 /// The verifier's half: the nonce must pass against the same state, and it is
 /// absorbed the same way.
-fn check_grind<E, T>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
+fn check_grind<E, T, H>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     if bits == 0 {
         return Ok(());
     }
-    if !crypto::grinding::is_valid_nonce(&transcript.state(), nonce, bits) {
+    if !crypto::grinding::is_valid_nonce::<GrindingDigest<H>>(&transcript.state(), nonce, bits) {
         return Err(Error::GrindingRejected { bits });
     }
     transcript.append_bytes(&nonce.to_be_bytes());
@@ -207,13 +211,13 @@ impl ChainConfig {
         grind: GrindBits,
     ) -> Self {
         let rounds = num_vars.div_ceil(log_folding.max(1)).max(1);
-        let rate = 1.0 / (1u64 << log_blowup) as f64;
-        let proximity = 1.0 - rate.sqrt() - 1.0 / 300.0;
-        let bits_per_query = -(1.0 - proximity).log2();
-
-        let target = security_bits as f64 + (rounds as f64).log2();
-        let left = (target - grind.query as f64).max(0.0);
-        let num_queries = (left / bits_per_query).ceil().max(1.0) as usize;
+        // ★ Integers, not `f64`. The arithmetic and its provenance are in
+        // [`crate::query_count`]; what matters here is that the count a
+        // verifier has to reproduce no longer needs floating point to
+        // reproduce it, and that the answers did not move — the shipped
+        // posture's 110 / 112 / 113 are pinned in both places.
+        let num_queries =
+            crate::query_count::num_queries(log_blowup, rounds, security_bits, grind.query);
 
         Self {
             log_blowup,
@@ -383,13 +387,14 @@ impl<F: IsField + 'static> Stacked<'_, F> {
 }
 
 /// A whole polynomial is a stacked one of a single part at offset zero.
-pub fn commit<F>(
+pub fn commit<F, H>(
     f: &Mle<F>,
     config: &ChainConfig,
     transient: bool,
-) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
+) -> Result<(CodewordCommitment<F, H>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     commit_stacked(
@@ -403,13 +408,14 @@ where
     )
 }
 
-pub fn commit_stacked<F>(
+pub fn commit_stacked<F, H>(
     f: &Stacked<'_, F>,
     config: &ChainConfig,
     transient: bool,
-) -> Result<(CodewordCommitment<F>, Domain<F>), Error>
+) -> Result<(CodewordCommitment<F, H>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let num_vars = f.num_vars();
@@ -419,17 +425,40 @@ where
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
     let attempt = match &f.resident {
-        Some((store, parts)) => {
-            crate::gpu::commit_resident(store, parts, num_vars, config.log_blowup, first, transient)
-        }
-        None => crate::gpu::commit_parts(&f.parts, num_vars, config.log_blowup, first, transient),
+        Some((store, parts)) => crate::gpu::commit_resident(
+            store,
+            parts,
+            num_vars,
+            config.log_blowup,
+            first,
+            transient,
+            H::DEVICE,
+        ),
+        None => crate::gpu::commit_parts(
+            &f.parts,
+            num_vars,
+            config.log_blowup,
+            first,
+            transient,
+            H::DEVICE,
+        ),
     };
     let commitment = match attempt {
         Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
-        None => CodewordCommitment::from_codeword(
-            encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
-            first,
-        )?,
+        // ⚠ COUNTED, because this arm is otherwise silent. The device declining
+        // is not a slower path to the same place: the codeword is assembled,
+        // lifted and encoded here, and the commitment then holds that codeword
+        // AND its node array on the host until the proof ends. An epoch that
+        // fills the card partway through lands here for every commit after,
+        // and the only visible symptoms are host memory and a utilisation
+        // figure — neither of which names the cause.
+        None => {
+            crate::gpu::note_host_fallback();
+            CodewordCommitment::from_codeword(
+                encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
+                first,
+            )?
+        }
     };
     Ok((commitment, domain))
 }
@@ -569,20 +598,20 @@ where
 ///
 /// Only the first round's is base-field. Folding it with an extension challenge
 /// is what lifts it, so every later round is `Extension`.
-enum Current<'a, F: IsField, E: IsField>
+enum Current<'a, F: IsField + 'static, E: IsField + 'static, H: WhirHash>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    Base(&'a CodewordCommitment<F>),
-    Extension(CodewordCommitment<E>),
+    Base(&'a CodewordCommitment<F, H>),
+    Extension(CodewordCommitment<E, H>),
 }
 
 /// Proves `f(z) = y`.
-pub fn prove<F, E, T>(
+pub fn prove<F, E, T, H>(
     f: &Mle<F>,
     z: &[FieldElement<E>],
-    commitment: &CodewordCommitment<F>,
+    commitment: &CodewordCommitment<F, H>,
     domain: &Domain<F>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -593,19 +622,20 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
-    prove_weighted::<F, E, T>(f, eq_mle(z)?, commitment, domain, config, transcript)
+    prove_weighted::<F, E, T, H>(f, eq_mle(z)?, commitment, domain, config, transcript)
 }
 
 /// The same for a weight given as the shares of a stacked polynomial's
 /// columns, which a device writes into its own buffer and the host
 /// materializes only if none does.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_shared<F, E, T>(
+pub fn prove_shared<F, E, T, H>(
     f: &Stacked<'_, F>,
     shares: &[crate::stacked_eval::WeightShare<'_, E>],
     n_stack: usize,
-    commitment: &CodewordCommitment<F>,
+    commitment: &CodewordCommitment<F, H>,
     domain: &Domain<F>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -616,9 +646,10 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let factors = Factors::<F, E>::from_shares(f, shares, n_stack)?;
-    prove_with_factors::<F, E, T>(
+    prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
         commitment,
@@ -629,10 +660,10 @@ where
 }
 
 /// Proves `Σ_x w(x)·f(x) = y` for a weight the verifier can evaluate itself.
-pub fn prove_weighted<F, E, T>(
+pub fn prove_weighted<F, E, T, H>(
     f: &Mle<F>,
     weight: Mle<E>,
-    commitment: &CodewordCommitment<F>,
+    commitment: &CodewordCommitment<F, H>,
     domain: &Domain<F>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -643,9 +674,10 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let factors = Factors::<F, E>::new(f, weight)?;
-    prove_with_factors::<F, E, T>(
+    prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
         commitment,
@@ -656,10 +688,10 @@ where
 }
 
 /// The chain itself, over factors that are wherever they are.
-fn prove_with_factors<F, E, T>(
+fn prove_with_factors<F, E, T, H>(
     num_vars: usize,
     mut factors: Factors<F, E>,
-    commitment: &CodewordCommitment<F>,
+    commitment: &CodewordCommitment<F, H>,
     domain: &Domain<F>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -670,11 +702,12 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
     let schedule = config.schedule(num_vars);
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
-    let mut current = Current::<F, E>::Base(commitment);
+    let mut current = Current::<F, E, H>::Base(commitment);
     let mut current_domain = domain.clone();
 
     let mut rounds = Vec::with_capacity(schedule.len());
@@ -682,7 +715,7 @@ where
 
     for (r, &k) in schedule.iter().enumerate() {
         let mut nonces = RoundNonces {
-            folding: grind(transcript, config.grind.folding)?,
+            folding: grind::<E, T, H>(transcript, config.grind.folding)?,
             ..RoundNonces::default()
         };
 
@@ -702,7 +735,7 @@ where
         // be chosen to match them.
         let next = match schedule.get(r + 1) {
             Some(&next_k) => {
-                let next = commit_folded::<E>(folded, next_k)?;
+                let next = commit_folded::<E, H>(folded, next_k)?;
                 transcript.append_bytes(&next.root());
                 Some(next)
             }
@@ -723,7 +756,7 @@ where
             let y0 = factors.evaluate_message(&point)?;
             transcript.append_field_element(&y0);
 
-            nonces.ood = grind(transcript, config.grind.ood)?;
+            nonces.ood = grind::<E, T, H>(transcript, config.grind.ood)?;
             let gamma: FieldElement<E> = transcript.sample_field_element();
             factors.add_scaled_eq(&point, &gamma)?;
             Some(y0)
@@ -731,7 +764,7 @@ where
             None
         };
 
-        nonces.query = grind(transcript, config.grind.query)?;
+        nonces.query = grind::<E, T, H>(transcript, config.grind.query)?;
         let round_config = RoundConfig {
             num_queries: config.num_queries,
             log_folding: k,
@@ -740,15 +773,21 @@ where
             (Current::Base(held), Some(next)) => {
                 RoundOpenings::Base(whir_round::prove(*held, next, &round_config, transcript)?)
             }
-            (Current::Base(held), None) => {
-                RoundOpenings::Base(final_openings::<F, E, T>(held, &round_config, transcript)?)
-            }
+            (Current::Base(held), None) => RoundOpenings::Base(final_openings::<F, E, T, H>(
+                held,
+                &round_config,
+                transcript,
+            )?),
             (Current::Extension(held), Some(next)) => {
                 RoundOpenings::Extension(whir_round::prove(held, next, &round_config, transcript)?)
             }
-            (Current::Extension(held), None) => RoundOpenings::Extension(
-                final_openings::<E, E, T>(held, &round_config, transcript)?,
-            ),
+            (Current::Extension(held), None) => {
+                RoundOpenings::Extension(final_openings::<E, E, T, H>(
+                    held,
+                    &round_config,
+                    transcript,
+                )?)
+            }
         };
 
         rounds.push(ChainRound {
@@ -802,19 +841,20 @@ where
 }
 
 /// Commits a folded codeword where it is.
-fn commit_folded<N>(
+fn commit_folded<N, H>(
     codeword: Codeword<N>,
     log_folding: usize,
-) -> Result<CodewordCommitment<N>, Error>
+) -> Result<CodewordCommitment<N, H>, Error>
 where
     N: IsField + 'static,
+    H: WhirHash,
     FieldElement<N>: AsBytes + Sync + Send,
 {
     match codeword {
         Codeword::Host(values) => CodewordCommitment::from_codeword(values, log_folding),
         Codeword::Device(device) => {
             let nodes = device
-                .commit(log_folding)
+                .commit(log_folding, H::DEVICE)
                 .ok_or(Error::DeviceFailed { stage: "fold tree" })?;
             CodewordCommitment::from_device(device, nodes, log_folding)
         }
@@ -839,8 +879,8 @@ where
 ///
 /// Mirrors [`whir_round`]'s query draw, so both sides sample the same
 /// positions.
-fn final_openings<C, N, T>(
-    current: &CodewordCommitment<C>,
+fn final_openings<C, N, T, H>(
+    current: &CodewordCommitment<C, H>,
     config: &RoundConfig,
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
@@ -849,6 +889,7 @@ where
     N: IsField,
     FieldElement<C>: AsBytes + Sync + Send,
     T: IsTranscript<N>,
+    H: WhirHash,
 {
     let queries: Vec<usize> = (0..config.num_queries)
         .map(|_| transcript.sample_u64(current.num_leaves() as u64) as usize)
@@ -860,7 +901,7 @@ where
 }
 
 /// Verifies `f(z) = y`.
-pub fn verify<F, E, T>(
+pub fn verify<F, E, T, H>(
     proof: &ChainProof<F, E>,
     root: &Commitment,
     z: &[FieldElement<E>],
@@ -875,8 +916,9 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
+    H: WhirHash,
 {
-    verify_weighted::<F, E, T, _>(
+    verify_weighted::<F, E, T, _, H>(
         proof,
         root,
         |alphas: &[FieldElement<E>]| eq_eval(z, alphas),
@@ -893,7 +935,7 @@ where
 /// `weight_at` is the weight's closed form, evaluated at the concatenation of
 /// every round's challenges.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_weighted<F, E, T, W>(
+pub fn verify_weighted<F, E, T, W, H>(
     proof: &ChainProof<F, E>,
     root: &Commitment,
     weight_at: W,
@@ -910,6 +952,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: IsTranscript<E>,
     W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
+    H: WhirHash,
 {
     let schedule = config.schedule(num_vars);
     if proof.rounds.len() != schedule.len() {
@@ -943,7 +986,7 @@ where
                 got: r,
             });
         }
-        check_grind(transcript, config.grind.folding, round.nonces.folding)?;
+        check_grind::<E, T, H>(transcript, config.grind.folding, round.nonces.folding)?;
         // The weight raises the degree of the plain `f` term to two.
         let group = sumcheck::verify_rounds(&round.sumcheck, claim, 2, transcript)?;
         claim = group.expected_evaluation;
@@ -971,19 +1014,19 @@ where
                 let point = ood_point(&z0, num_vars - bound);
                 transcript.append_field_element(y0);
 
-                check_grind(transcript, config.grind.ood, round.nonces.ood)?;
+                check_grind::<E, T, H>(transcript, config.grind.ood, round.nonces.ood)?;
                 let gamma: FieldElement<E> = transcript.sample_field_element();
                 claim += &gamma * y0;
                 ood.push((gamma, point, bound));
 
-                check_grind(transcript, config.grind.query, round.nonces.query)?;
+                check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
                 let commitments = RoundCommitments {
                     current_root: &current_root,
                     next_root,
                     next_num_leaves: next_domain.size() >> next_k,
                 };
                 match &round.openings {
-                    RoundOpenings::Base(openings) => whir_round::verify::<F, F, E, T>(
+                    RoundOpenings::Base(openings) => whir_round::verify::<F, F, E, T, H>(
                         openings,
                         commitments,
                         &current_domain,
@@ -991,7 +1034,7 @@ where
                         &round_config,
                         transcript,
                     )?,
-                    RoundOpenings::Extension(openings) => whir_round::verify::<F, E, E, T>(
+                    RoundOpenings::Extension(openings) => whir_round::verify::<F, E, E, T, H>(
                         openings,
                         commitments,
                         &current_domain,
@@ -1004,9 +1047,9 @@ where
             }
             (None, None, None) => {
                 transcript.append_field_element(&proof.final_value);
-                check_grind(transcript, config.grind.query, round.nonces.query)?;
+                check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
                 match &round.openings {
-                    RoundOpenings::Base(openings) => verify_final::<F, F, E, T>(
+                    RoundOpenings::Base(openings) => verify_final::<F, F, E, T, H>(
                         openings,
                         &current_root,
                         &current_domain,
@@ -1015,7 +1058,7 @@ where
                         &proof.final_value,
                         transcript,
                     )?,
-                    RoundOpenings::Extension(openings) => verify_final::<F, E, E, T>(
+                    RoundOpenings::Extension(openings) => verify_final::<F, E, E, T, H>(
                         openings,
                         &current_root,
                         &current_domain,
@@ -1062,7 +1105,7 @@ where
 }
 
 /// The last round: every queried block must fold to the constant that was sent.
-fn verify_final<F, C, N, T>(
+fn verify_final<F, C, N, T, H>(
     openings: &RoundProof<C, N>,
     current_root: &Commitment,
     current_domain: &Domain<F>,
@@ -1077,6 +1120,7 @@ where
     N: IsField + 'static,
     FieldElement<C>: AsBytes + Sync + Send,
     T: IsTranscript<N>,
+    H: WhirHash,
 {
     if openings.current.len() != config.num_queries || !openings.next.is_empty() {
         return Err(Error::QueryCountMismatch {
@@ -1088,7 +1132,7 @@ where
 
     for (i, opening) in openings.current.iter().enumerate() {
         let q = transcript.sample_u64(num_leaves as u64) as usize;
-        if !verify_opening::<C>(current_root, q, opening) {
+        if !verify_opening::<C, H>(current_root, q, opening) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != *final_value {
@@ -1105,7 +1149,7 @@ mod tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::{eq::eq_evals, whir_eval};
+    use crate::{eq::eq_evals, whir_eval, whir_hash::KeccakWhir};
 
     type FE = FieldElement<F>;
 
@@ -1165,9 +1209,10 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true)?;
-        let proof = prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript())?;
-        verify::<F, F, _>(
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true)?;
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())?;
+        verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -1269,16 +1314,18 @@ mod tests {
         let f = pseudo_mle(num_vars, 13);
         let z = point(num_vars);
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let chained =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
 
         let one_round_cfg = whir_eval::EvalConfig {
             log_blowup: cfg.log_blowup,
             num_queries: cfg.num_queries,
         };
-        let (one_commitment, one_domain) = whir_eval::commit::<F, F>(&f, &one_round_cfg).unwrap();
-        let one_round = whir_eval::prove::<F, F, _>(
+        let (one_commitment, one_domain) =
+            whir_eval::commit::<F, F, KeccakWhir>(&f, &one_round_cfg).unwrap();
+        let one_round = whir_eval::prove::<F, F, _, KeccakWhir>(
             &f,
             &z,
             &one_commitment,
@@ -1307,12 +1354,13 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1333,13 +1381,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         proof.final_value += FE::one();
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1360,13 +1409,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         assert!(proof.rounds.len() >= 3);
         current_blocks_mut(&mut proof.rounds[1].openings)[0].values[0] += FE::one();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -1389,13 +1439,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         assert!(matches!(proof.rounds[0].openings, RoundOpenings::Base(_)));
         current_blocks_mut(&mut proof.rounds[0].openings)[0].values[0] += FE::one();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,
@@ -1418,11 +1469,12 @@ mod tests {
         let g = pseudo_mle(num_vars, 31);
         let z = point(num_vars);
 
-        let (f_commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (f_commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let proof =
-            prove::<F, F, _>(&g, &z, &f_commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&g, &z, &f_commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
 
-        let err = verify::<F, F, _>(
+        let err = verify::<F, F, _, KeccakWhir>(
             &proof,
             &f_commitment.root(),
             &z,
@@ -1446,13 +1498,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         proof.rounds[0].next_root = None;
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1473,14 +1526,23 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
 
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
         assert!(
-            verify::<F, F, _>(&proof, &commitment.root(), &z, y, &domain, &cfg, &mut other)
-                .is_err()
+            verify::<F, F, _, KeccakWhir>(
+                &proof,
+                &commitment.root(),
+                &z,
+                y,
+                &domain,
+                &cfg,
+                &mut other
+            )
+            .is_err()
         );
     }
 
@@ -1504,12 +1566,18 @@ mod tests {
         let weight = Mle::new(table).unwrap();
         let y = f.evaluate(&a).unwrap() + gamma * f.evaluate(&b).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
-        let proof =
-            prove_weighted::<F, F, _>(&f, weight, &commitment, &domain, &cfg, &mut transcript())
-                .unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
+        let proof = prove_weighted::<F, F, _, KeccakWhir>(
+            &f,
+            weight,
+            &commitment,
+            &domain,
+            &cfg,
+            &mut transcript(),
+        )
+        .unwrap();
 
-        verify_weighted::<F, F, _, _>(
+        verify_weighted::<F, F, _, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             |at: &[FE]| Ok(eq_eval(&a, at)? + gamma * eq_eval(&b, at)?),
@@ -1546,9 +1614,10 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
 
         // `F` and `E` coincide here, so the same blocks fit the other variant.
         if let RoundOpenings::Base(openings) = proof.rounds[0].openings.clone() {
@@ -1556,7 +1625,7 @@ mod tests {
         }
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1635,13 +1704,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         proof.rounds[0].ood_value = Some(proof.rounds[0].ood_value.unwrap() + FE::one());
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1662,13 +1732,14 @@ mod tests {
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut proof =
-            prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
         proof.rounds[0].ood_value = None;
 
         assert!(
-            verify::<F, F, _>(
+            verify::<F, F, _, KeccakWhir>(
                 &proof,
                 &commitment.root(),
                 &z,
@@ -1712,8 +1783,10 @@ mod tests {
         let f = pseudo_mle(num_vars, 71);
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
-        let (commitment, domain) = commit::<F>(&f, cfg, true).unwrap();
-        let proof = prove::<F, F, _>(&f, &z, &commitment, &domain, cfg, &mut transcript()).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, cfg, true).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, cfg, &mut transcript())
+                .unwrap();
         (proof, commitment.root(), domain, y)
     }
 
@@ -1725,7 +1798,7 @@ mod tests {
         cfg: &ChainConfig,
         num_vars: usize,
     ) -> Result<(), Error> {
-        verify::<F, F, _>(
+        verify::<F, F, _, KeccakWhir>(
             proof,
             root,
             &point(num_vars),
@@ -1848,12 +1921,13 @@ mod tests {
         let z: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(101 + i as u64)).collect();
         let y = f.evaluate_in(&z).unwrap();
 
-        let (commitment, domain) = commit::<F>(&f, &cfg, true).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
         let mut prover = DefaultTranscript::<Ext>::new(b"tower");
-        let proof = prove::<F, Ext, _>(&f, &z, &commitment, &domain, &cfg, &mut prover).unwrap();
+        let proof = prove::<F, Ext, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut prover)
+            .unwrap();
 
         let mut verifier = DefaultTranscript::<Ext>::new(b"tower");
-        verify::<F, Ext, _>(
+        verify::<F, Ext, _, KeccakWhir>(
             &proof,
             &commitment.root(),
             &z,

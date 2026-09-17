@@ -3,10 +3,7 @@
 //! The pre-image of folded index `j` is the stride-`N/2^k` coset
 //! `{ j, j + N/2^k, …, j + (2^k - 1)·N/2^k }`.
 
-use crypto::merkle_tree::{
-    backends::types::BatchKeccak256Backend, merkle::MerkleTree, proof::Proof,
-    traits::IsMerkleTreeBackend,
-};
+use crypto::merkle_tree::{merkle::MerkleTree, proof::Proof, traits::IsMerkleTreeBackend};
 use math::{
     field::{
         element::FieldElement,
@@ -18,19 +15,29 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::{Error, whir::Domain};
+use crate::{
+    Error,
+    whir::Domain,
+    whir_hash::{KeccakWhir, WhirHash},
+};
 
-/// 32-byte Keccak commitments, matching the rest of the prover.
+/// 32-byte commitments, matching the rest of the prover.
+///
+/// ★ **The width is the same for every [`WhirHash`]** — a keccak digest is 32
+/// bytes and an algebraic digest is four canonical Goldilocks felts, which is
+/// also 32 bytes. That is what keeps a hash swap out of the proof format: every
+/// type below and above this one keeps its layout, its rkyv derives and its
+/// serialized length.
 pub type Commitment = [u8; 32];
-type Backend<F> = BatchKeccak256Backend<F>;
-type Tree<F> = MerkleTree<Backend<F>>;
+type Backend<F, H> = <H as WhirHash>::Backend<F>;
+type Tree<F, H> = MerkleTree<Backend<F, H>>;
 
 /// A committed codeword and the tree needed to open it.
-pub struct CodewordCommitment<F: IsField>
+pub struct CodewordCommitment<F: IsField + 'static, H: WhirHash = KeccakWhir>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    tree: Tree<F>,
+    tree: Tree<F, H>,
     codeword: Codeword<F>,
     log_folding: usize,
     log_domain_size: usize,
@@ -113,7 +120,7 @@ pub fn leaf_and_slot(position: usize, num_leaves: usize) -> (usize, usize) {
     (position % num_leaves, position / num_leaves)
 }
 
-impl<F: IsField + 'static> std::fmt::Debug for CodewordCommitment<F>
+impl<F: IsField + 'static, H: WhirHash> std::fmt::Debug for CodewordCommitment<F, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
@@ -127,7 +134,7 @@ where
     }
 }
 
-impl<F: IsField + 'static> CodewordCommitment<F>
+impl<F: IsField + 'static, H: WhirHash> CodewordCommitment<F, H>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
@@ -155,8 +162,8 @@ where
             });
         }
 
-        if let Some(nodes) = crate::gpu::commit_tree_ext3(&codeword, log_folding) {
-            let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
+        if let Some(nodes) = crate::gpu::commit_tree_ext3(&codeword, log_folding, H::DEVICE) {
+            let tree = Tree::<F, H>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
             return Ok(Self {
                 tree,
                 codeword: Codeword::Host(codeword),
@@ -190,7 +197,7 @@ where
         let hash_leaf = |buffer: &mut Vec<FieldElement<F>>, j: usize| {
             buffer.clear();
             buffer.extend((0..block).map(|t| codeword[j + t * num_leaves].clone()));
-            Backend::<F>::hash_data(buffer)
+            Backend::<F, H>::hash_data(buffer)
         };
         #[cfg(feature = "parallel")]
         let hashed: Vec<_> = (0..num_leaves)
@@ -203,7 +210,7 @@ where
             (0..num_leaves).map(|j| hash_leaf(&mut buffer, j)).collect()
         };
 
-        let tree = Tree::<F>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
+        let tree = Tree::<F, H>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
             codeword: Codeword::Host(codeword),
@@ -231,7 +238,7 @@ where
                 n_stack: log_domain_size,
             });
         }
-        let tree = Tree::<F>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
+        let tree = Tree::<F, H>::from_precomputed_nodes(nodes).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
             codeword: Codeword::Host(codeword),
@@ -262,7 +269,7 @@ where
             });
         }
         Ok(Self {
-            tree: Tree::<F>::from_root(root),
+            tree: Tree::<F, H>::from_root(root),
             codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
@@ -354,7 +361,7 @@ where
                 // device: the tree has to be rebuilt there because that is
                 // where the codeword is.
                 Ok(device
-                    .paths(self.log_folding, indices)
+                    .paths(self.log_folding, indices, H::DEVICE)
                     .ok_or(Error::DeviceFailed {
                         stage: "opening paths",
                     })?
@@ -399,15 +406,22 @@ where
     }
 }
 
-/// Checks an opening against a root.
-pub fn verify_opening<F>(root: &Commitment, index: usize, opening: &CosetOpening<F>) -> bool
+/// Checks an opening against a root, under `H`'s hash.
+///
+/// `H` is explicit at every call site rather than defaulted, because a free
+/// function's type parameter cannot carry a default and — more to the point —
+/// because "which hash authenticated this path" is the whole content of the
+/// call. A verifier reading a proof under the wrong `H` gets `false` here, not
+/// a different-but-plausible answer.
+pub fn verify_opening<F, H>(root: &Commitment, index: usize, opening: &CosetOpening<F>) -> bool
 where
     F: IsField + 'static,
+    H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     opening
         .proof
-        .verify::<Backend<F>>(root, index, &opening.values)
+        .verify::<Backend<F, H>>(root, index, &opening.values)
 }
 
 /// One level of a block's fold.
@@ -504,6 +518,7 @@ mod tests {
     use crate::{
         mle::Mle,
         whir::{encode, fold_codeword_k, monomial_coefficients},
+        whir_hash::KeccakWhir,
     };
 
     type FE = FieldElement<F>;
@@ -529,7 +544,7 @@ mod tests {
     #[test]
     fn leaves_cover_the_codeword_exactly_once() {
         let (cw, _) = pseudo_codeword(3, 2, 1);
-        let commitment = CodewordCommitment::new(&cw, 2).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 2).unwrap();
         assert_eq!(commitment.num_leaves(), cw.len() / 4);
 
         let mut seen = vec![0usize; cw.len()];
@@ -544,40 +559,43 @@ mod tests {
     #[test]
     fn an_opening_verifies_against_the_root() {
         let (cw, _) = pseudo_codeword(3, 2, 7);
-        let commitment = CodewordCommitment::new(&cw, 1).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 1).unwrap();
         let root = commitment.root();
 
         for j in 0..commitment.num_leaves() {
             let opening = commitment.open(j).unwrap();
             assert_eq!(opening.values.len(), 2);
-            assert!(verify_opening::<F>(&root, j, &opening), "leaf {j}");
+            assert!(
+                verify_opening::<F, KeccakWhir>(&root, j, &opening),
+                "leaf {j}"
+            );
         }
     }
 
     #[test]
     fn a_tampered_opening_is_rejected() {
         let (cw, _) = pseudo_codeword(3, 2, 9);
-        let commitment = CodewordCommitment::new(&cw, 1).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 1).unwrap();
         let root = commitment.root();
 
         let mut opening = commitment.open(2).unwrap();
         opening.values[0] += FE::one();
-        assert!(!verify_opening::<F>(&root, 2, &opening));
+        assert!(!verify_opening::<F, KeccakWhir>(&root, 2, &opening));
     }
 
     #[test]
     fn an_opening_does_not_verify_at_another_index() {
         let (cw, _) = pseudo_codeword(3, 2, 11);
-        let commitment = CodewordCommitment::new(&cw, 1).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 1).unwrap();
         let root = commitment.root();
         let opening = commitment.open(2).unwrap();
-        assert!(!verify_opening::<F>(&root, 3, &opening));
+        assert!(!verify_opening::<F, KeccakWhir>(&root, 3, &opening));
     }
 
     #[test]
     fn a_query_beyond_the_leaves_is_an_error() {
         let (cw, _) = pseudo_codeword(2, 1, 3);
-        let commitment = CodewordCommitment::new(&cw, 1).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 1).unwrap();
         let out = commitment.num_leaves();
         assert!(matches!(
             commitment.open(out).unwrap_err(),
@@ -595,7 +613,7 @@ mod tests {
             let alphas: Vec<FE> = (0..k).map(|i| FE::from(13 + i as u64)).collect();
 
             let (folded, _) = fold_codeword_k(&cw, &domain, &alphas).unwrap();
-            let commitment = CodewordCommitment::new(&cw, k).unwrap();
+            let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, k).unwrap();
 
             for (j, expected) in folded.iter().enumerate() {
                 let opening = commitment.open(j).unwrap();
@@ -618,7 +636,7 @@ mod tests {
     #[test]
     fn folding_by_zero_returns_the_single_value() {
         let (cw, domain) = pseudo_codeword(3, 2, 5);
-        let commitment = CodewordCommitment::new(&cw, 0).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 0).unwrap();
         assert_eq!(commitment.num_leaves(), cw.len());
         let opening = commitment.open(6).unwrap();
         assert_eq!(fold_coset(&opening.values, &domain, 6, &[]).unwrap(), cw[6]);
@@ -628,7 +646,7 @@ mod tests {
     fn a_codeword_that_is_not_a_power_of_two_is_rejected() {
         let values = vec![FE::one(); 6];
         assert!(matches!(
-            CodewordCommitment::new(&values, 1).unwrap_err(),
+            CodewordCommitment::<F, KeccakWhir>::new(&values, 1).unwrap_err(),
             Error::NotPowerOfTwo(6)
         ));
     }
@@ -647,7 +665,7 @@ mod tests {
     #[test]
     fn a_position_resolves_to_the_value_it_holds() {
         let (cw, _) = pseudo_codeword(3, 2, 21);
-        let commitment = CodewordCommitment::new(&cw, 2).unwrap();
+        let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 2).unwrap();
         let num_leaves = commitment.num_leaves();
 
         for (position, value) in cw.iter().enumerate() {

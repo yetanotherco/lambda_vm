@@ -10,6 +10,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Successful device commits of a stacked polynomial.
 static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// ★ Commits that asked the device and got nothing, and encoded on the host.
+///
+/// The counter H4's arm needed and did not have. A device commit that declines
+/// is INVISIBLE in every other number here: `COMMIT_CALLS` simply does not
+/// rise, and a count that is merely lower than expected says nothing when the
+/// expected count is itself derived. It matters because falling back is not a
+/// slower way to do the same thing — `from_codeword` then retains a host
+/// codeword and a host node array for the rest of the proof, so a card that
+/// fills near the end of an epoch turns into gigabytes of host memory and a
+/// utilisation figure that looks like a scheduling problem.
+static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// Sumchecks whose rounds ran on device.
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
@@ -25,6 +36,16 @@ static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn host_fallbacks() -> u64 {
+    HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Called where a commit gives up on the device. Counts in non-cuda builds
+/// too, where every commit takes that path and the number is the commit count.
+pub(crate) fn note_host_fallback() {
+    HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn sumcheck_calls() -> u64 {
@@ -53,6 +74,7 @@ pub fn open_calls() -> u64 {
 
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
+    HOST_FALLBACKS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
@@ -160,10 +182,27 @@ pub fn reserve_room(_bytes: u64) -> Option<DeviceRoom> {
     None
 }
 
+/// What a device sumcheck that runs to the end hands back: the round proofs,
+/// and the challenges the rounds were bound at.
+///
+/// A named type rather than the tuple written out, because the tuple appears in
+/// a return position wrapped in a `Result` and reads as punctuation there. The
+/// sibling [`ResidentRounds`] carries a third member — the tables left folded
+/// at the crossover — for the path that stops early.
+#[cfg(feature = "cuda")]
+type ClosedRounds<E> = (
+    Vec<crate::sumcheck::RoundProof<E>>,
+    Vec<math::field::element::FieldElement<E>>,
+);
+
 /// A promise held on someone else's behalf. Dropping it gives the room back.
+///
+/// The field is never read, and that is the design: it is an RAII guard whose
+/// `Drop` returns the reservation, so holding it IS the behaviour. Deleting it
+/// to satisfy the lint would delete the promise.
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
-pub struct DeviceRoom(math_cuda::device::DeviceReservation);
+pub struct DeviceRoom(#[allow(dead_code)] math_cuda::device::DeviceReservation);
 
 /// A promise no device made. Never constructed.
 #[cfg(not(feature = "cuda"))]
@@ -479,13 +518,7 @@ fn run_rounds<E>(
     mut reference: impl FnMut(
         &math_cuda::sumcheck::SumcheckSession,
     ) -> Option<Vec<math::field::element::FieldElement<E>>>,
-) -> Result<
-    (
-        Vec<crate::sumcheck::RoundProof<E>>,
-        Vec<math::field::element::FieldElement<E>>,
-    ),
-    crate::Error,
->
+) -> Result<ClosedRounds<E>, crate::Error>
 where
     E: math::field::traits::IsField + 'static,
 {
@@ -764,6 +797,7 @@ where
 pub(crate) fn commit_tree_ext3<F>(
     codeword: &[math::field::element::FieldElement<F>],
     log_folding: usize,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<Vec<[u8; 32]>>
 where
     F: math::field::traits::IsField + 'static,
@@ -783,7 +817,8 @@ where
     // SAFETY: `F == Ext3`, three transparent `u64` limbs per element.
     let raw =
         unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
-    let nodes = math_cuda::whir::commit_codeword_ext3(raw, log_folding).ok()?;
+    let nodes =
+        math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda()).ok()?;
     let nodes = nodes_in_place(nodes)?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(nodes)
@@ -793,6 +828,7 @@ where
 pub(crate) fn commit_tree_ext3<F>(
     _codeword: &[math::field::element::FieldElement<F>],
     _log_folding: usize,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<Vec<[u8; 32]>>
 where
     F: math::field::traits::IsField + 'static,
@@ -851,8 +887,7 @@ where
         })
         .collect();
     let values =
-        math_cuda::sumcheck::evaluate_many_base(columns_at::<F>(resident, &raw), &raw_point)
-            .ok()?;
+        math_cuda::sumcheck::evaluate_many_base(columns_at(resident, &raw), &raw_point).ok()?;
     EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
     Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
 }
@@ -930,141 +965,6 @@ where
     E: math::field::traits::IsField + 'static,
 {
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::program::Builder;
-    use math::field::element::FieldElement;
-    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
-    use math::field::goldilocks::GoldilocksField as Gl;
-
-    type FE = FieldElement<Ext3>;
-
-    /// The kernel's walk, in Rust: the same slot file, the same node encoding.
-    ///
-    /// This is what pins the lowering without a device — a slot freed too early
-    /// or an operand read from the wrong class shows up here as a wrong value,
-    /// not as a proof that does not verify an hour later.
-    fn run_lowered(lowered: &Lowered, values: &[FE]) -> FE {
-        let mut slots = vec![FE::zero(); lowered.num_slots];
-        for node in lowered.nodes.chunks_exact(2) {
-            let op = (node[0] & 0xFFFF_FFFF) as u32;
-            let a = (node[0] >> 32) as u32 as usize;
-            let b = (node[1] & 0xFFFF_FFFF) as u32 as usize;
-            let res = (node[1] >> 32) as u32 as usize;
-            slots[res] = match op {
-                op::FIXED => ext3_from_raw::<Ext3>(&lowered.consts[a * 3..a * 3 + 3]),
-                op::VAR => values[a],
-                op::ADD => slots[a] + slots[b],
-                op::SUB => slots[a] - slots[b],
-                op::MUL => slots[a] * slots[b],
-                op::NEG => -slots[a],
-                _ => panic!("unknown op {op}"),
-            };
-        }
-        slots[lowered.root_slot as usize]
-    }
-
-    fn values(n: usize) -> Vec<FE> {
-        (0..n as u64)
-            .map(|i| {
-                FE::new([
-                    FieldElement::<Gl>::from(i * 31 + 7),
-                    FieldElement::<Gl>::from(i * 17 + 2),
-                    FieldElement::<Gl>::from(i + 5),
-                ])
-            })
-            .collect()
-    }
-
-    /// Every op, a constant, and a chain long enough that slots have to be
-    /// recycled.
-    fn sample_program() -> crate::program::Program<Ext3> {
-        let mut b = Builder::<Ext3>::new();
-        let mut acc = b.var(0);
-        for slot in 1..6 {
-            let v = b.var(slot);
-            let doubled = b.add(v, v);
-            let scaled = b.mul(doubled, acc);
-            let shifted = b.sub(scaled, v);
-            acc = b.neg(shifted);
-        }
-        let seven = b.fixed(FE::from(7u64));
-        let root = b.add(acc, seven);
-        b.finish(root).unwrap()
-    }
-
-    #[test]
-    fn the_lowered_program_computes_what_the_program_does() {
-        let program = sample_program();
-        let lowered = lower(&program).expect("lowers");
-        let v = values(6);
-        let mut scratch = Vec::new();
-        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
-    }
-
-    /// A value read twice in the step that kills it — `x·x` — must not free its
-    /// slot twice, or two later values are handed the same one and the second
-    /// clobbers the first. Squarings are everywhere in a real constraint
-    /// program, so this is the shape that matters.
-    #[test]
-    fn a_value_read_twice_frees_its_slot_once() {
-        let mut b = Builder::<Ext3>::new();
-        let mut acc = b.var(0);
-        // Each square kills its operand, and the sums below keep enough values
-        // live that a doubly-freed slot gets reused while it is still needed.
-        let mut squares = Vec::new();
-        for slot in 1..8 {
-            let v = b.var(slot);
-            let squared = b.mul(v, v);
-            let with_acc = b.add(squared, acc);
-            squares.push(with_acc);
-            acc = b.mul(with_acc, with_acc);
-        }
-        squares.push(acc);
-        let root = b.sum(&squares);
-        let program = b.finish(root).unwrap();
-
-        let lowered = lower(&program).expect("lowers");
-        let v = values(8);
-        let mut scratch = Vec::new();
-        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
-    }
-
-    /// The point of the slot file: a long chain of dead intermediates does not
-    /// widen it.
-    #[test]
-    fn slots_are_reused_once_a_value_is_dead() {
-        let lowered = lower(&sample_program()).expect("lowers");
-        assert!(
-            lowered.num_slots < lowered.nodes.len() / 2,
-            "{} slots for {} steps is no reuse at all",
-            lowered.num_slots,
-            lowered.nodes.len() / 2
-        );
-    }
-
-    /// A program wider than the slot file declines rather than asking a device
-    /// for scratch it cannot have.
-    #[test]
-    fn a_program_past_the_slot_ceiling_declines() {
-        let mut b = Builder::<Ext3>::new();
-        // Every value stays live to the end, so the slots cannot be recycled.
-        let terms: Vec<u32> = (0..=MAX_SLOTS).map(|slot| b.var(slot)).collect();
-        let root = b.sum(&terms);
-        let program = b.finish(root).unwrap();
-        assert!(lower(&program).is_none());
-    }
-
-    #[test]
-    fn a_field_the_kernel_does_not_cover_declines() {
-        let mut b = Builder::<Gl>::new();
-        let root = b.var(0);
-        let program = b.finish(root).unwrap();
-        assert!(lower(&program).is_none());
-    }
 }
 
 /// Input-layer size below which the host tree wins: the levels are a launch
@@ -1416,13 +1316,10 @@ where
 
 /// Where a run of columns is, for the entry points that take either.
 #[cfg(feature = "cuda")]
-fn columns_at<'a, F>(
+fn columns_at<'a>(
     resident: Option<(&'a ResidentColumns, usize)>,
     host: &'a [&'a [u64]],
-) -> math_cuda::columns::Columns<'a>
-where
-    F: math::field::traits::IsField + 'static,
-{
+) -> math_cuda::columns::Columns<'a> {
     match resident {
         Some((store, first)) if store.0.is_run(first, host.len()) => {
             math_cuda::columns::Columns::Device {
@@ -1536,7 +1433,7 @@ where
         .collect();
 
     let uploaded = math_cuda::sumcheck::DeviceFactors::from_columns(
-        columns_at::<F>(resident, &raw_columns),
+        columns_at(resident, &raw_columns),
         &plan,
         &raw_public,
         rows,
@@ -2035,6 +1932,7 @@ pub(crate) fn commit_parts<F>(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -2068,9 +1966,15 @@ where
             )
         })
         .collect();
-    let (codeword, root) =
-        math_cuda::whir::commit_codeword_parts(&raw, log_evals, log_blowup, log_folding, transient)
-            .ok()?;
+    let (codeword, root) = math_cuda::whir::commit_codeword_parts(
+        &raw,
+        log_evals,
+        log_blowup,
+        log_folding,
+        transient,
+        hash.into_math_cuda(),
+    )
+    .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -2084,6 +1988,7 @@ pub(crate) fn commit_resident(
     log_blowup: usize,
     log_folding: usize,
     transient: bool,
+    hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
@@ -2099,6 +2004,7 @@ pub(crate) fn commit_resident(
         log_blowup,
         log_folding,
         transient,
+        hash.into_math_cuda(),
     )
     .ok()?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2113,6 +2019,7 @@ pub(crate) fn commit_resident(
     _log_blowup: usize,
     _log_folding: usize,
     _transient: bool,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     None
 }
@@ -2124,6 +2031,7 @@ pub(crate) fn commit_parts<F>(
     _log_blowup: usize,
     _log_folding: usize,
     _transient: bool,
+    _hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -2157,8 +2065,12 @@ impl DeviceCodeword {
     /// The tree is not kept: the only other thing a proof wants from it is a
     /// path per query, and [`paths`](Self::paths) rebuilds it then, when the
     /// queries are known — see the note there.
-    pub(crate) fn commit(&self, log_folding: usize) -> Option<[u8; 32]> {
-        let root = self.0.commit(log_folding).ok()?;
+    pub(crate) fn commit(
+        &self,
+        log_folding: usize,
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<[u8; 32]> {
+        let root = self.0.commit(log_folding, hash.into_math_cuda()).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(root)
     }
@@ -2168,13 +2080,17 @@ impl DeviceCodeword {
         &self,
         log_folding: usize,
         indices: &[usize],
+        hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
         let leaves = self.0.elements() >> log_folding;
         if indices.iter().any(|index| *index >= leaves) {
             return None;
         }
         let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
-        let bytes = self.0.paths(log_folding, &positions).ok()?;
+        let bytes = self
+            .0
+            .paths(log_folding, &positions, hash.into_math_cuda())
+            .ok()?;
         let depth = leaves.trailing_zeros() as usize;
         let nodes = nodes_in_place(bytes)?;
         Some(nodes.chunks_exact(depth).map(<[_]>::to_vec).collect())
@@ -2297,7 +2213,11 @@ impl DeviceCodeword {
         match self.0 {}
     }
 
-    pub(crate) fn commit(&self, _log_folding: usize) -> Option<[u8; 32]> {
+    pub(crate) fn commit(
+        &self,
+        _log_folding: usize,
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<[u8; 32]> {
         match self.0 {}
     }
 
@@ -2305,6 +2225,7 @@ impl DeviceCodeword {
         &self,
         _log_folding: usize,
         _indices: &[usize],
+        _hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
         match self.0 {}
     }
@@ -2326,5 +2247,140 @@ impl DeviceCodeword {
         F: math::field::traits::IsField + 'static,
     {
         match self.0 {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::Builder;
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type FE = FieldElement<Ext3>;
+
+    /// The kernel's walk, in Rust: the same slot file, the same node encoding.
+    ///
+    /// This is what pins the lowering without a device — a slot freed too early
+    /// or an operand read from the wrong class shows up here as a wrong value,
+    /// not as a proof that does not verify an hour later.
+    fn run_lowered(lowered: &Lowered, values: &[FE]) -> FE {
+        let mut slots = vec![FE::zero(); lowered.num_slots];
+        for node in lowered.nodes.chunks_exact(2) {
+            let op = (node[0] & 0xFFFF_FFFF) as u32;
+            let a = (node[0] >> 32) as u32 as usize;
+            let b = (node[1] & 0xFFFF_FFFF) as u32 as usize;
+            let res = (node[1] >> 32) as u32 as usize;
+            slots[res] = match op {
+                op::FIXED => ext3_from_raw::<Ext3>(&lowered.consts[a * 3..a * 3 + 3]),
+                op::VAR => values[a],
+                op::ADD => slots[a] + slots[b],
+                op::SUB => slots[a] - slots[b],
+                op::MUL => slots[a] * slots[b],
+                op::NEG => -slots[a],
+                _ => panic!("unknown op {op}"),
+            };
+        }
+        slots[lowered.root_slot as usize]
+    }
+
+    fn values(n: usize) -> Vec<FE> {
+        (0..n as u64)
+            .map(|i| {
+                FE::new([
+                    FieldElement::<Gl>::from(i * 31 + 7),
+                    FieldElement::<Gl>::from(i * 17 + 2),
+                    FieldElement::<Gl>::from(i + 5),
+                ])
+            })
+            .collect()
+    }
+
+    /// Every op, a constant, and a chain long enough that slots have to be
+    /// recycled.
+    fn sample_program() -> crate::program::Program<Ext3> {
+        let mut b = Builder::<Ext3>::new();
+        let mut acc = b.var(0);
+        for slot in 1..6 {
+            let v = b.var(slot);
+            let doubled = b.add(v, v);
+            let scaled = b.mul(doubled, acc);
+            let shifted = b.sub(scaled, v);
+            acc = b.neg(shifted);
+        }
+        let seven = b.fixed(FE::from(7u64));
+        let root = b.add(acc, seven);
+        b.finish(root).unwrap()
+    }
+
+    #[test]
+    fn the_lowered_program_computes_what_the_program_does() {
+        let program = sample_program();
+        let lowered = lower(&program).expect("lowers");
+        let v = values(6);
+        let mut scratch = Vec::new();
+        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
+    }
+
+    /// A value read twice in the step that kills it — `x·x` — must not free its
+    /// slot twice, or two later values are handed the same one and the second
+    /// clobbers the first. Squarings are everywhere in a real constraint
+    /// program, so this is the shape that matters.
+    #[test]
+    fn a_value_read_twice_frees_its_slot_once() {
+        let mut b = Builder::<Ext3>::new();
+        let mut acc = b.var(0);
+        // Each square kills its operand, and the sums below keep enough values
+        // live that a doubly-freed slot gets reused while it is still needed.
+        let mut squares = Vec::new();
+        for slot in 1..8 {
+            let v = b.var(slot);
+            let squared = b.mul(v, v);
+            let with_acc = b.add(squared, acc);
+            squares.push(with_acc);
+            acc = b.mul(with_acc, with_acc);
+        }
+        squares.push(acc);
+        let root = b.sum(&squares);
+        let program = b.finish(root).unwrap();
+
+        let lowered = lower(&program).expect("lowers");
+        let v = values(8);
+        let mut scratch = Vec::new();
+        assert_eq!(run_lowered(&lowered, &v), program.eval(&v, &mut scratch));
+    }
+
+    /// The point of the slot file: a long chain of dead intermediates does not
+    /// widen it.
+    #[test]
+    fn slots_are_reused_once_a_value_is_dead() {
+        let lowered = lower(&sample_program()).expect("lowers");
+        assert!(
+            lowered.num_slots < lowered.nodes.len() / 2,
+            "{} slots for {} steps is no reuse at all",
+            lowered.num_slots,
+            lowered.nodes.len() / 2
+        );
+    }
+
+    /// A program wider than the slot file declines rather than asking a device
+    /// for scratch it cannot have.
+    #[test]
+    fn a_program_past_the_slot_ceiling_declines() {
+        let mut b = Builder::<Ext3>::new();
+        // Every value stays live to the end, so the slots cannot be recycled.
+        let terms: Vec<u32> = (0..=MAX_SLOTS).map(|slot| b.var(slot)).collect();
+        let root = b.sum(&terms);
+        let program = b.finish(root).unwrap();
+        assert!(lower(&program).is_none());
+    }
+
+    #[test]
+    fn a_field_the_kernel_does_not_cover_declines() {
+        let mut b = Builder::<Gl>::new();
+        let root = b.var(0);
+        let program = b.finish(root).unwrap();
+        assert!(lower(&program).is_none());
     }
 }

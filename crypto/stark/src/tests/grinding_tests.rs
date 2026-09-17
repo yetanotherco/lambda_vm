@@ -1,4 +1,4 @@
-use crate::grinding::is_valid_nonce;
+use crate::grinding::{StarkGrindingDigest as GrindDigest, is_valid_nonce};
 
 #[test]
 fn test_invalid_nonce_grinding_factor_6() {
@@ -10,7 +10,11 @@ fn test_invalid_nonce_grinding_factor_6() {
     ];
     let nonce = 4;
     let grinding_factor = 6;
-    assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(!is_valid_nonce::<GrindDigest>(
+        &seed,
+        nonce,
+        grinding_factor
+    ));
 }
 
 #[test]
@@ -23,7 +27,11 @@ fn test_invalid_nonce_grinding_factor_9() {
     ];
     let nonce = 287;
     let grinding_factor = 9;
-    assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(!is_valid_nonce::<GrindDigest>(
+        &seed,
+        nonce,
+        grinding_factor
+    ));
 }
 
 #[test]
@@ -34,7 +42,7 @@ fn test_is_valid_nonce_grinding_factor_10() {
     ];
     let nonce = 0x5ba;
     let grinding_factor = 10;
-    assert!(is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(is_valid_nonce::<GrindDigest>(&seed, nonce, grinding_factor));
 }
 
 #[test]
@@ -45,7 +53,7 @@ fn test_is_valid_nonce_grinding_factor_20() {
     ];
     let nonce = 0x2c5db8;
     let grinding_factor = 20;
-    assert!(is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(is_valid_nonce::<GrindDigest>(&seed, nonce, grinding_factor));
 }
 
 #[test]
@@ -59,7 +67,11 @@ fn test_invalid_nonce_grinding_factor_19() {
     ];
     let nonce = 0x2c5db8;
     let grinding_factor = 19;
-    assert!(!is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(!is_valid_nonce::<GrindDigest>(
+        &seed,
+        nonce,
+        grinding_factor
+    ));
 }
 
 #[test]
@@ -70,7 +82,7 @@ fn test_is_valid_nonce_grinding_factor_30() {
     ];
     let nonce = 0x1ae839e1;
     let grinding_factor = 30;
-    assert!(is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(is_valid_nonce::<GrindDigest>(&seed, nonce, grinding_factor));
 }
 
 #[test]
@@ -81,5 +93,5 @@ fn test_is_valid_nonce_grinding_factor_33() {
     ];
     let nonce = 0x4cc3123f;
     let grinding_factor = 33;
-    assert!(is_valid_nonce(&seed, nonce, grinding_factor));
+    assert!(is_valid_nonce::<GrindDigest>(&seed, nonce, grinding_factor));
 }

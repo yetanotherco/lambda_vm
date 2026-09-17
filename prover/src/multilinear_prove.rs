@@ -98,9 +98,15 @@ pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
 /// The univariate encoding, under a tag of its own — a WHIR proof and a FRI
 /// proof must never share a transcript prefix — followed by what only this path
 /// states: the table heights and the parameters the argument runs at.
+///
+/// ⚠ Padded like the continuation statements, and for the same reason: the
+/// roots absorbed next have to start on a field element boundary, and two
+/// variable-length fields (`public_output`, `table_num_vars`) sit between them
+/// and the fixed prefix. `runtime_page_ranges` is sixteen bytes an entry and
+/// does not move the alignment.
 #[allow(clippy::too_many_arguments)]
-fn absorb(
-    t: &mut DefaultTranscript<E>,
+pub(crate) fn absorb(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
     elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
@@ -109,26 +115,38 @@ fn absorb(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    let mut len = 0usize;
+
     t.append_bytes(MULTILINEAR_TAG);
+    len += MULTILINEAR_TAG.len();
     t.append_bytes(elf_digest);
+    len += elf_digest.len();
 
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(public_output);
+    len += public_output.len();
 
-    statement::absorb_table_counts(t, table_counts);
+    len += statement::absorb_table_counts(t, table_counts);
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+    len += size_of::<u64>();
 
     t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     for r in runtime_page_ranges {
         let &RuntimePageRange { base, count } = r;
         t.append_bytes(&base.to_le_bytes());
+        len += size_of_val(&base);
         t.append_bytes(&count.to_le_bytes());
+        len += size_of_val(&count);
     }
 
     // Every table's height. A prover who shrank a table would have to state the
     // smaller height here, which moves every challenge.
     t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(table_num_vars);
+    len += table_num_vars.len();
 
     // The parameters the argument runs at: derived from the heights above, but
     // absorbed rather than assumed, so the two sides agree in the transcript and
@@ -141,8 +159,22 @@ fn absorb(
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
+        len += size_of_val(&value);
     }
-    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+    let trailer = [grind.folding, grind.ood, grind.query];
+    t.append_bytes(&trailer);
+    len += trailer.len();
+
+    statement::absorb_statement_padding(
+        t,
+        "monolithic",
+        len,
+        &[
+            ("public_output", public_output.len()),
+            ("runtime_page_ranges", runtime_page_ranges.len()),
+            ("table_num_vars", table_num_vars.len()),
+        ],
+    );
 }
 
 /// Every table's `(main width, height in variables)`, checked to be what the
@@ -223,18 +255,6 @@ pub fn prove_with_options_and_inputs(
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        &public_output,
-        &table_counts,
-        num_private_input_pages,
-        &runtime_page_ranges,
-        &table_num_vars,
-        &config,
-    );
-
     // Commit every table against the layout the verifier will rebuild.
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
@@ -262,10 +282,27 @@ pub fn prove_with_options_and_inputs(
 
     // One commitment for every table in the proof: the opening is nearly all of
     // a proof's bytes, and one settles them all.
-    let committed =
-        CommittedTables::commit(committed, &config).map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            &public_output,
+            &table_counts,
+            num_private_input_pages,
+            &runtime_page_ranges,
+            &table_num_vars,
+            &config,
+        );
+        let committed = CommittedTables::<_, _, H>::commit(committed, &config)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?
+    });
 
     Ok(MultilinearVmProof {
         proof,
@@ -410,18 +447,6 @@ pub fn verify_with_options(
         .collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        &proof.public_output,
-        &proof.table_counts,
-        proof.num_private_input_pages,
-        &proof.runtime_page_ranges,
-        &proof.table_num_vars,
-        &config,
-    );
-
     let layouts: Vec<TableLayout<'_, F, E>> = air_refs
         .iter()
         .zip(&shapes)
@@ -443,34 +468,56 @@ pub fn verify_with_options(
         .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
         .collect();
 
-    // What the tables owe: the COMMIT bus's counterparty is the statement, and
-    // its offset depends on the very challenges `multi_verify` is about to draw
-    // — so the transcript is replayed to that point on a fork.
-    let mut probe = transcript.clone();
-    for root in &proof.proof.roots {
-        probe.append_bytes(root);
-    }
-    let z: FieldElement<E> = probe.sample_field_element();
-    let alpha: FieldElement<E> = probe.sample_field_element();
-    // `start_index` is the carried x254: zero for a monolithic proof.
-    let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha) else {
-        return Ok(false);
-    };
-
     // The stack every table's columns share, rebuilt from the shapes alone. A
     // monolithic proof commits them all together, so there is one group.
     let sizes = [shapes.len()];
     let (layouts, domains) = stacks(&shapes, &sizes, &config)?;
 
-    Ok(multilinear_table::multi_verify(
-        &proof.proof,
-        &statements,
-        &layouts,
-        &domains,
-        &sizes,
-        &owed,
-        &config,
-        &mut transcript,
-    )
-    .is_ok())
+    Ok(crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            &proof.public_output,
+            &proof.table_counts,
+            proof.num_private_input_pages,
+            &proof.runtime_page_ranges,
+            &proof.table_num_vars,
+            &config,
+        );
+        // What the tables owe: the COMMIT bus's counterparty is the statement,
+        // and its offset depends on the very challenges `multi_verify` is about
+        // to draw — so the transcript is replayed to that point on a fork.
+        //
+        // ★ Inside the dispatch with the transcript it forks. Those challenges
+        // are a function of the configuration's sponge, so computing them
+        // against a transcript of a different hash is the same defect one level
+        // down, and just as quiet.
+        let mut probe = transcript.clone();
+        for root in &proof.proof.roots {
+            probe.append_bytes(root);
+        }
+        let z: FieldElement<E> = probe.sample_field_element();
+        let alpha: FieldElement<E> = probe.sample_field_element();
+        // `start_index` is the carried x254: zero for a monolithic proof.
+        let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
+        else {
+            return Ok(false);
+        };
+        multilinear_table::multi_verify::<_, _, _, H>(
+            &proof.proof,
+            &statements,
+            &layouts,
+            &domains,
+            &sizes,
+            &owed,
+            &config,
+            &mut transcript,
+        )
+        .is_ok()
+    }))
 }

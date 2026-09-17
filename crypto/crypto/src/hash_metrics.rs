@@ -1,5 +1,13 @@
-//! Host-only keccak-hash counters for measuring the cost of VERIFYING a proof
-//! (a proxy for the recursion guest's dominant work: keccak hashing).
+//! Host-only hash counters for measuring the cost of VERIFYING a proof — a
+//! proxy for a recursive verifier's dominant work, which is hashing.
+//!
+//! ⚠ **The counters follow the proof's CONFIGURATION, not one hash.** They were
+//! keccak-only when keccak was the only hash on the multilinear path. Under
+//! [`crate::hash::rpx`] every Merkle counter would then have read ZERO — a
+//! measurement that cannot fail, reporting "no hashing" for the arm whose whole
+//! purpose is to change the hashing. The algebraic backend bumps them through
+//! [`count_merkle_direct`] / [`count_merkle_node_direct`] instead, which also
+//! bump `total`, because unlike the byte backends nothing downstream will.
 //!
 //! Behind the `hash-metrics` cargo feature: a normal build keeps
 //! `PlatformKeccak256 = sha3::Keccak256` and every counter call compiles to
@@ -34,6 +42,58 @@ pub struct Counts {
     pub absorb_calls: u64,
     /// Bytes fed through absorb (`Sum of data.len()`).
     pub absorb_bytes: u64,
+    /// ★★ Fiat-Shamir absorbs, ALL configurations. Counted in
+    /// `DefaultTranscript`'s own append methods, not in a hash.
+    pub transcript_absorbs: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_absorbs_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_absorbs_rpx: u64,
+    /// ★★ Fiat-Shamir SQUEEZES, ALL configurations — `finalize_reset`, which
+    /// advances the chain (the output is re-absorbed).
+    pub transcript_squeezes: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_squeezes_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_squeezes_rpx: u64,
+    /// ★★ Fiat-Shamir STATE reads, ALL configurations — `state()`, a finalize
+    /// on a CLONE. No reset and no re-absorb, so it does NOT advance the chain.
+    ///
+    /// ⚠ A DIFFERENT OPERATION from a squeeze, counted separately because
+    /// conflating them makes a number unfalsifiable. On a block proof the two
+    /// are 182,734 and 2,996 (lane V1's closed form, pinned to a measured
+    /// verify with difference 0): a counter hooked only to `finalize_reset`
+    /// misses every one of the 2,996, and a counter reporting their sum —
+    /// 185,730 — cannot be checked against either.
+    ///
+    /// ★ The state reads are a CONTROL that costs nothing: there is exactly one
+    /// per grind check, so this must equal the grind count the same run prints.
+    /// Two independent instruments on one quantity, and a disagreement names
+    /// which of them is wrong.
+    pub transcript_states: u64,
+    /// Of those, the ones whose sponge is keccak.
+    pub transcript_states_keccak: u64,
+    /// Of those, the ones whose sponge is RPX256.
+    pub transcript_states_rpx: u64,
+}
+
+impl Counts {
+    /// Transcript work this build could not attribute to a known sponge.
+    ///
+    /// ★ Zero on every configuration that exists, and it is REPORTED rather
+    /// than assumed: the failure this whole group of counters exists to catch
+    /// is a hash nobody instrumented reading as a zero that looks like
+    /// "nothing ran". A third configuration arriving un-instrumented shows up
+    /// here instead of being silently folded into one of the two above.
+    pub fn transcript_unattributed(&self) -> (u64, u64, u64) {
+        (
+            self.transcript_absorbs - self.transcript_absorbs_keccak - self.transcript_absorbs_rpx,
+            self.transcript_squeezes
+                - self.transcript_squeezes_keccak
+                - self.transcript_squeezes_rpx,
+            self.transcript_states - self.transcript_states_keccak - self.transcript_states_rpx,
+        )
+    }
 }
 
 #[cfg(all(not(target_arch = "riscv64"), feature = "hash-metrics"))]
@@ -47,6 +107,28 @@ mod imp {
     static GRINDING: AtomicU64 = AtomicU64::new(0);
     static ABSORB_CALLS: AtomicU64 = AtomicU64::new(0);
     static ABSORB_BYTES: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_ABSORBS_RPX: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_SQUEEZES_RPX: AtomicU64 = AtomicU64::new(0);
+    static T_STATES: AtomicU64 = AtomicU64::new(0);
+    static T_STATES_KECCAK: AtomicU64 = AtomicU64::new(0);
+    static T_STATES_RPX: AtomicU64 = AtomicU64::new(0);
+
+    /// Which known sponge `D` is, if any: `Some(true)` keccak, `Some(false)`
+    /// RPX256, `None` a configuration nobody has instrumented.
+    fn sponge<D: 'static>() -> Option<bool> {
+        let id = core::any::TypeId::of::<D>();
+        if id == core::any::TypeId::of::<crate::hash::platform_keccak::PlatformKeccak256>() {
+            Some(true)
+        } else if id == core::any::TypeId::of::<crate::hash::rpx::Rpx256Digest>() {
+            Some(false)
+        } else {
+            None
+        }
+    }
 
     /// Every keccak-256 finalize, from any site (host `PlatformKeccak256`).
     #[inline(always)]
@@ -59,6 +141,11 @@ mod imp {
     /// [`count_total`]. This keeps `merkle` a strict subset of `total` for ANY
     /// `D` (a non-keccak backend, as in the crypto tests, does not go through the
     /// counted wrapper, so counting it here would let `merkle` exceed `total`).
+    ///
+    /// A hash that does not route its Merkle work through a `digest::Digest` at
+    /// all — the algebraic backend sponges felts directly — uses
+    /// [`count_merkle_direct`] instead, which keeps the same invariant by
+    /// bumping both counters itself.
     #[inline(always)]
     pub fn count_merkle<D: 'static>() {
         if core::any::TypeId::of::<D>()
@@ -95,6 +182,81 @@ mod imp {
         ABSORB_BYTES.fetch_add(nbytes as u64, Ordering::Relaxed);
     }
 
+    /// ★ A Merkle LEAF finalize by a hash whose Merkle work does not pass
+    /// through a `digest::Digest` — the algebraic backend, which sponges felts
+    /// directly and never builds a digest object.
+    ///
+    /// Bumps `total` as well as `merkle`, because nothing downstream will: for
+    /// the byte backends `total` comes from the digest's own `finalize`, and
+    /// there is no such call here. Doing both in one function is what keeps
+    /// `merkle ⊆ total` true by construction rather than by two call sites
+    /// agreeing.
+    #[inline(always)]
+    pub fn count_merkle_direct() {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        MERKLE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ★ A Merkle PARENT by such a hash. Bumps `total`, `merkle` and
+    /// `merkle_nodes`, so `merkle - merkle_nodes` is the leaf count on this path
+    /// exactly as it is on the byte path.
+    #[inline(always)]
+    pub fn count_merkle_node_direct() {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        MERKLE.fetch_add(1, Ordering::Relaxed);
+        MERKLE_NODES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ★★ One Fiat-Shamir ABSORB, tagged by the sponge that will consume it.
+    ///
+    /// Called from `DefaultTranscript`'s append methods — the transcript, not
+    /// the hash. Two reasons, and the second is the one that matters:
+    ///
+    /// 1. It is hash-agnostic by construction. A counter living inside keccak
+    ///    reads ZERO for an algebraic transcript, which is indistinguishable
+    ///    from "no transcript ran" — the trap this module's header describes
+    ///    for Merkle, which the transcript never got.
+    /// 2. It counts TRANSCRIPT absorbs only. [`count_absorb`] is bumped from a
+    ///    digest's `update`, so it mixes Merkle leaf bytes with Fiat-Shamir
+    ///    bytes and cannot answer "how much did the transcript absorb" for
+    ///    either hash.
+    #[inline(always)]
+    pub fn count_transcript_absorb<D: 'static>() {
+        T_ABSORBS.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_ABSORBS_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_ABSORBS_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
+    /// ★★ One Fiat-Shamir SQUEEZE, tagged the same way.
+    #[inline(always)]
+    pub fn count_transcript_squeeze<D: 'static>() {
+        T_SQUEEZES.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_SQUEEZES_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_SQUEEZES_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
+    /// ★★ One `state()` — a finalize on a CLONE of the sponge.
+    ///
+    /// Not a squeeze: no reset, no re-absorb, the chain does not advance. It is
+    /// its own counter because the two are different operations and a sum
+    /// cannot be checked against either. One of these per grind check, which is
+    /// what makes it a free control against the grind count.
+    #[inline(always)]
+    pub fn count_transcript_state<D: 'static>() {
+        T_STATES.fetch_add(1, Ordering::Relaxed);
+        match sponge::<D>() {
+            Some(true) => T_STATES_KECCAK.fetch_add(1, Ordering::Relaxed),
+            Some(false) => T_STATES_RPX.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+    }
+
     /// Zero all counters.
     pub fn reset() {
         TOTAL.store(0, Ordering::Relaxed);
@@ -103,6 +265,15 @@ mod imp {
         GRINDING.store(0, Ordering::Relaxed);
         ABSORB_CALLS.store(0, Ordering::Relaxed);
         ABSORB_BYTES.store(0, Ordering::Relaxed);
+        T_ABSORBS.store(0, Ordering::Relaxed);
+        T_ABSORBS_KECCAK.store(0, Ordering::Relaxed);
+        T_ABSORBS_RPX.store(0, Ordering::Relaxed);
+        T_SQUEEZES.store(0, Ordering::Relaxed);
+        T_SQUEEZES_KECCAK.store(0, Ordering::Relaxed);
+        T_SQUEEZES_RPX.store(0, Ordering::Relaxed);
+        T_STATES.store(0, Ordering::Relaxed);
+        T_STATES_KECCAK.store(0, Ordering::Relaxed);
+        T_STATES_RPX.store(0, Ordering::Relaxed);
     }
 
     pub fn snapshot() -> Counts {
@@ -113,6 +284,15 @@ mod imp {
             grinding: GRINDING.load(Ordering::Relaxed),
             absorb_calls: ABSORB_CALLS.load(Ordering::Relaxed),
             absorb_bytes: ABSORB_BYTES.load(Ordering::Relaxed),
+            transcript_absorbs: T_ABSORBS.load(Ordering::Relaxed),
+            transcript_absorbs_keccak: T_ABSORBS_KECCAK.load(Ordering::Relaxed),
+            transcript_absorbs_rpx: T_ABSORBS_RPX.load(Ordering::Relaxed),
+            transcript_squeezes: T_SQUEEZES.load(Ordering::Relaxed),
+            transcript_squeezes_keccak: T_SQUEEZES_KECCAK.load(Ordering::Relaxed),
+            transcript_squeezes_rpx: T_SQUEEZES_RPX.load(Ordering::Relaxed),
+            transcript_states: T_STATES.load(Ordering::Relaxed),
+            transcript_states_keccak: T_STATES_KECCAK.load(Ordering::Relaxed),
+            transcript_states_rpx: T_STATES_RPX.load(Ordering::Relaxed),
         }
     }
 }
@@ -131,7 +311,17 @@ mod imp {
     #[inline(always)]
     pub fn count_grinding() {}
     #[inline(always)]
+    pub fn count_merkle_direct() {}
+    #[inline(always)]
+    pub fn count_merkle_node_direct() {}
+    #[inline(always)]
     pub fn count_absorb(_nbytes: usize) {}
+    #[inline(always)]
+    pub fn count_transcript_absorb<D: 'static>() {}
+    #[inline(always)]
+    pub fn count_transcript_squeeze<D: 'static>() {}
+    #[inline(always)]
+    pub fn count_transcript_state<D: 'static>() {}
     pub fn reset() {}
     pub fn snapshot() -> Counts {
         Counts::default()
@@ -139,5 +329,7 @@ mod imp {
 }
 
 pub use imp::{
-    count_absorb, count_grinding, count_merkle, count_merkle_node, count_total, reset, snapshot,
+    count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
+    count_merkle_node_direct, count_total, count_transcript_absorb, count_transcript_squeeze,
+    count_transcript_state, reset, snapshot,
 };

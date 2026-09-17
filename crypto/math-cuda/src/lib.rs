@@ -5,6 +5,35 @@
 //! Everything else (`ntt`, element-wise arith) is either internal to those
 //! pipelines or used by the parity test suite.
 
+/// ★ Which hash family a device tree entry point must run.
+///
+/// The dispatch key the callers hand down, and the reason it exists: on the
+/// host a Merkle backend both NAMES a hash and computes it, so a tree cannot
+/// wear a name its own code did not produce. On the device the backend only
+/// names it — the kernels do the hashing — so without a key travelling with the
+/// request, a tree labelled RPX could be built by keccak's kernels and nothing
+/// would notice. Every entry point that hashes takes one of these, and every
+/// launch site matches on it exhaustively, so a hash added here is a compile
+/// error at each site rather than a silent fallthrough to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceHash {
+    /// Keccak-256 at both the leaf and the parent layer.
+    Keccak256,
+    /// RPX256 (XHash12) at both layers — the rate-8 overwrite duplex for
+    /// leaves, one permutation of `[l || r || 0^4]` for parents.
+    Rpx256,
+}
+
+impl DeviceHash {
+    /// The name a tree built under this key may be called by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Keccak256 => "keccak256",
+            Self::Rpx256 => "rpx256",
+        }
+    }
+}
+
 pub mod barycentric;
 pub mod columns;
 pub mod constraint_interp;

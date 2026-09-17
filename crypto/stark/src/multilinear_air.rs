@@ -1666,6 +1666,7 @@ mod tests {
         use multilinear::{
             constraint_argument::{self, CommittedTrace, TraceClaim},
             whir_chain::{ChainConfig, GrindBits},
+            whir_hash::KeccakWhir,
         };
 
         let (prog, meta) = fib_program();
@@ -1699,7 +1700,7 @@ mod tests {
         let betas = beta_powers(&ExtE::from(5), shape.num_roots());
 
         let mut prover_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
-        let proof = constraint_argument::prove::<Fp, Ext, _, _>(
+        let proof = constraint_argument::prove::<Fp, Ext, _, _, KeccakWhir>(
             &trace,
             |v: &[ExtE]| shape.combine(&betas, v),
             degree,
@@ -1708,7 +1709,7 @@ mod tests {
         )?;
 
         let mut verifier_transcript = DefaultTranscript::<Ext>::new(b"air-argument");
-        constraint_argument::verify::<Fp, Ext, _, _, _>(
+        constraint_argument::verify::<Fp, Ext, _, _, _, KeccakWhir>(
             &proof,
             TraceClaim {
                 roots: &roots,

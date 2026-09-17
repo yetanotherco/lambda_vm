@@ -17,7 +17,7 @@
 //! prover makes — building them here instead would leave the production
 //! conversion untested.
 
-use stark::grinding::{inner_hash_lanes, is_valid_nonce};
+use stark::grinding::{StarkGrindingDigest as GrindDigest, inner_hash_lanes, is_valid_nonce};
 
 /// At a moderate factor the kernel returns a valid nonce, and it is the
 /// smallest one (the exhaustive CPU scan below it is cheap at factor 14).
@@ -33,14 +33,17 @@ use stark::grinding::{inner_hash_lanes, is_valid_nonce};
 fn gpu_grind_returns_smallest_valid_nonce() {
     let seed = [14u8; 32];
     let factor = 14u8;
-    let nonce = math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, factor), factor)
-        .expect("GPU grind (needs a GPU)");
+    let nonce = math_cuda::grinding::generate_nonce_gpu(
+        &inner_hash_lanes::<GrindDigest>(&seed, factor),
+        factor,
+    )
+    .expect("GPU grind (needs a GPU)");
     assert!(
-        is_valid_nonce(&seed, nonce, factor),
+        is_valid_nonce::<GrindDigest>(&seed, nonce, factor),
         "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
     );
     assert!(
-        (0..nonce).all(|n| !is_valid_nonce(&seed, n, factor)),
+        (0..nonce).all(|n| !is_valid_nonce::<GrindDigest>(&seed, n, factor)),
         "GPU nonce {nonce} is not the smallest valid nonce (factor {factor})"
     );
 }
@@ -51,10 +54,13 @@ fn gpu_grind_returns_smallest_valid_nonce() {
 fn gpu_grind_valid_at_production_factor() {
     let seed = [20u8; 32];
     let factor = 20u8;
-    let nonce = math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, factor), factor)
-        .expect("GPU grind (needs a GPU)");
+    let nonce = math_cuda::grinding::generate_nonce_gpu(
+        &inner_hash_lanes::<GrindDigest>(&seed, factor),
+        factor,
+    )
+    .expect("GPU grind (needs a GPU)");
     assert!(
-        is_valid_nonce(&seed, nonce, factor),
+        is_valid_nonce::<GrindDigest>(&seed, nonce, factor),
         "GPU nonce {nonce} fails is_valid_nonce (factor {factor})"
     );
 }
@@ -65,7 +71,8 @@ fn gpu_grind_valid_at_production_factor() {
 fn gpu_grind_declines_below_min_factor() {
     let seed = [1u8; 32];
     assert!(
-        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes(&seed, 1), 1).is_none(),
+        math_cuda::grinding::generate_nonce_gpu(&inner_hash_lanes::<GrindDigest>(&seed, 1), 1)
+            .is_none(),
         "GPU grind should decline factor 1"
     );
 }

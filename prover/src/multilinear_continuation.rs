@@ -45,7 +45,7 @@ use crate::{Error, TableCounts};
 ///
 /// Distinct from both the univariate epoch tag and the monolithic multilinear
 /// one: no two of the three may ever share a transcript prefix.
-const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
+pub(crate) const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
 
 /// One epoch's proof and everything a standalone verifier re-binds.
 ///
@@ -108,14 +108,17 @@ pub fn l2g_commitment(
     )];
     let layout =
         multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let stacked = multilinear::stacked_eval::StackedCommitment::<F>::commit(
-        layout,
-        &multilinear::stacking::borrow(&columns),
-        None,
-        config,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let roots = stacked.roots().to_vec();
+    let roots = crate::with_whir_hash!(|H| {
+        multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+            layout,
+            &multilinear::stacking::borrow(&columns),
+            None,
+            config,
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?
+        .roots()
+        .to_vec()
+    });
     if roots.is_empty() {
         return Err(Error::Prover("the bookend commits to nothing".to_string()));
     }
@@ -127,8 +130,14 @@ pub fn l2g_commitment(
 /// The monolithic multilinear statement plus the epoch's position. A
 /// continuation epoch never has private-input pages (the bookend replaces
 /// PAGE), so that count is not stated — it is zero by construction.
-fn absorb_epoch(
-    t: &mut DefaultTranscript<E>,
+///
+/// ★ The length is accumulated beside the absorbs, never written as a constant:
+/// a `FIXED` the caller has to keep in step is the same class of defect as the
+/// pad this function exists to compute. See
+/// [`statement::absorb_statement_padding`] for why the roots that follow have to
+/// start on a field element boundary and why the pad cannot be a literal.
+pub(crate) fn absorb_epoch(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
     elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
@@ -136,17 +145,26 @@ fn absorb_epoch(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    let mut len = 0usize;
+
     t.append_bytes(MULTILINEAR_EPOCH_TAG);
+    len += MULTILINEAR_EPOCH_TAG.len();
     t.append_bytes(elf_digest);
+    len += elf_digest.len();
     t.append_bytes(&epoch_label.to_le_bytes());
+    len += size_of_val(&epoch_label);
 
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(public_output);
+    len += public_output.len();
 
-    statement::absorb_table_counts(t, table_counts);
+    len += statement::absorb_table_counts(t, table_counts);
 
     t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(table_num_vars);
+    len += table_num_vars.len();
 
     let &ChainConfig {
         log_blowup,
@@ -156,8 +174,21 @@ fn absorb_epoch(
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
+        len += size_of_val(&value);
     }
-    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+    let trailer = [grind.folding, grind.ood, grind.query];
+    t.append_bytes(&trailer);
+    len += trailer.len();
+
+    statement::absorb_statement_padding(
+        t,
+        "epoch",
+        len,
+        &[
+            ("public_output", public_output.len()),
+            ("table_num_vars", table_num_vars.len()),
+        ],
+    );
 }
 
 /// How an epoch's tables are split across commitments: everything together,
@@ -189,11 +220,11 @@ fn layout_of<'a>(
 
 /// What the epoch's tables owe the statement: the COMMIT bus's counterparty,
 /// counted from the commit index this epoch carried in.
-fn owed(
+fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     public_output: &[u8],
     register_init: &[u32],
     roots: &[Commitment],
-    transcript: &DefaultTranscript<E>,
+    transcript: &DefaultTranscript<E, T>,
 ) -> Option<FieldElement<E>> {
     let start_index = *register_init.get(register::X254_INDEX)? as u64;
     let mut probe = transcript.clone();
@@ -206,7 +237,7 @@ fn owed(
 }
 
 /// Domain tag for the multilinear cross-epoch proof.
-const MULTILINEAR_GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
+pub(crate) const MULTILINEAR_GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
 
 /// The one cross-epoch proof: every epoch's bookend and the global-memory
 /// tables, in one transcript.
@@ -242,8 +273,14 @@ impl GlobalProof {
 }
 
 /// Binds the cross-epoch statement: what the run was, not what any epoch was.
-fn absorb_global(
-    t: &mut DefaultTranscript<E>,
+///
+/// ⚠ This statement is padded for the same reason the epoch statement is, and
+/// it needs it for the same reason: `table_num_vars` is one byte per table
+/// (every epoch's bookend plus the global-memory tables), so it is a
+/// variable-length field sitting between the fixed prefix and the roots.
+/// `page_bases` is eight bytes an entry and does not move the alignment.
+pub(crate) fn absorb_global(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
     elf_digest: &[u8; 32],
     num_epochs: usize,
     num_private_input_pages: usize,
@@ -251,16 +288,26 @@ fn absorb_global(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    let mut len = 0usize;
+
     t.append_bytes(MULTILINEAR_GLOBAL_TAG);
+    len += MULTILINEAR_GLOBAL_TAG.len();
     t.append_bytes(elf_digest);
+    len += elf_digest.len();
     t.append_bytes(&(num_epochs as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(&(page_bases.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     for base in page_bases {
         t.append_bytes(&base.to_le_bytes());
+        len += size_of_val(base);
     }
     t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(table_num_vars);
+    len += table_num_vars.len();
     let &ChainConfig {
         log_blowup,
         log_folding,
@@ -269,8 +316,21 @@ fn absorb_global(
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
+        len += size_of_val(&value);
     }
-    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+    let trailer = [grind.folding, grind.ood, grind.query];
+    t.append_bytes(&trailer);
+    len += trailer.len();
+
+    statement::absorb_statement_padding(
+        t,
+        "global",
+        len,
+        &[
+            ("page_bases", page_bases.len()),
+            ("table_num_vars", table_num_vars.len()),
+        ],
+    );
 }
 
 /// How the cross-epoch proof's tables are split: every bookend alone — so its
@@ -355,17 +415,6 @@ pub fn prove_global(
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_global(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        boundaries.len(),
-        num_private_input_pages,
-        page_bases,
-        &table_num_vars,
-        &config,
-    );
-
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
         let layout = layout_of(*air, width, num_vars)
@@ -385,10 +434,26 @@ pub fn prove_global(
         );
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
-    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_global(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            boundaries.len(),
+            num_private_input_pages,
+            page_bases,
+            &table_num_vars,
+            &config,
+        );
+        let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?
+    });
 
     Ok(GlobalProof {
         proof,
@@ -468,17 +533,6 @@ fn verify_global_bookends(
         .collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_global(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        num_epochs,
-        num_private_input_pages,
-        page_bases,
-        &global.table_num_vars,
-        &config,
-    );
-
     let layouts: Vec<TableLayout<'_, F, E>> = air_refs
         .iter()
         .zip(&shapes)
@@ -508,18 +562,33 @@ fn verify_global_bookends(
     let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
 
     // The cross-epoch bus has no counterparty in the statement: it must vanish.
-    if multilinear_table::multi_verify(
-        &global.proof,
-        &statements,
-        &stacks,
-        &domains,
-        &sizes,
-        &FieldElement::<E>::zero(),
-        &config,
-        &mut transcript,
-    )
-    .is_err()
-    {
+    let verdict = crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_global(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            num_epochs,
+            num_private_input_pages,
+            page_bases,
+            &global.table_num_vars,
+            &config,
+        );
+        multilinear_table::multi_verify::<_, _, _, H>(
+            &global.proof,
+            &statements,
+            &stacks,
+            &domains,
+            &sizes,
+            &FieldElement::<E>::zero(),
+            &config,
+            &mut transcript,
+        )
+    });
+    if verdict.is_err() {
         return Ok(None);
     }
     Ok(global
@@ -585,17 +654,6 @@ pub fn prove_epoch(
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_epoch(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        &public_output,
-        &table_counts,
-        label,
-        &table_num_vars,
-        &config,
-    );
-
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
         let layout = layout_of(*air, width, num_vars)
@@ -617,10 +675,26 @@ pub fn prove_epoch(
         );
     }
     let sizes = epoch_groups(committed.len());
-    let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
-        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_epoch(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            &public_output,
+            &table_counts,
+            label,
+            &table_num_vars,
+            &config,
+        );
+        let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+            .map_err(|e| Error::Prover(format!("{e:?}")))?
+    });
 
     Ok(EpochProof {
         proof,
@@ -913,17 +987,6 @@ fn verify_epoch_bookend(
         .collect();
     let config = chain_config(&shapes);
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_epoch(
-        &mut transcript,
-        &statement::elf_digest(elf_bytes),
-        &epoch.public_output,
-        &epoch.table_counts,
-        label,
-        &epoch.table_num_vars,
-        &config,
-    );
-
     let layouts: Vec<TableLayout<'_, F, E>> = air_refs
         .iter()
         .zip(&shapes)
@@ -946,33 +1009,51 @@ fn verify_epoch_bookend(
         .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
         .collect();
 
-    let Some(owed) = owed(
-        &epoch.public_output,
-        register_init,
-        &epoch.proof.roots,
-        &transcript,
-    ) else {
-        return Ok(None);
-    };
-
     let sizes = epoch_groups(shapes.len());
     let (layouts, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
     // The bookend is committed in the last group, alone, so its roots are that
     // group's — as many as the stack split it into.
     let num_polys = layouts.last().map(|l| l.num_polys()).unwrap_or(0);
 
-    if multilinear_table::multi_verify(
-        &epoch.proof,
-        &statements,
-        &layouts,
-        &domains,
-        &sizes,
-        &owed,
-        &config,
-        &mut transcript,
-    )
-    .is_err()
-    {
+    let verdict = crate::with_whir_hash!(|H| {
+        // ★ Inside the dispatch, because the transcript's hash is part of
+        // the configuration and `H` does not exist outside this block. The
+        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+        let mut transcript =
+            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        absorb_epoch(
+            &mut transcript,
+            &statement::elf_digest(elf_bytes),
+            &epoch.public_output,
+            &epoch.table_counts,
+            label,
+            &epoch.table_num_vars,
+            &config,
+        );
+        // ★ Inside the dispatch with the transcript it forks: `owed` replays
+        // this transcript to draw `z` and `alpha`, which are a function of the
+        // configuration's sponge. Computing them against a transcript of a
+        // different hash is the same defect one level down, and just as quiet.
+        let Some(owed) = owed(
+            &epoch.public_output,
+            register_init,
+            &epoch.proof.roots,
+            &transcript,
+        ) else {
+            return Ok(None);
+        };
+        multilinear_table::multi_verify::<_, _, _, H>(
+            &epoch.proof,
+            &statements,
+            &layouts,
+            &domains,
+            &sizes,
+            &owed,
+            &config,
+            &mut transcript,
+        )
+    });
+    if verdict.is_err() {
         return Ok(None);
     }
     Ok(epoch.l2g_roots(num_polys).map(<[_]>::to_vec))

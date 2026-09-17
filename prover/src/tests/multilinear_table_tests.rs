@@ -42,6 +42,7 @@ use crate::test_utils::{
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
+use multilinear::whir_hash::KeccakWhir;
 
 type ExtE = FieldElement<Ext>;
 
@@ -113,7 +114,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     };
     // The trace goes in as it is: base-field. Only the challenges are not.
     let table = CommittedTable::from_layout(layout()?, |col| columns[col as usize].clone())?;
-    let committed = CommittedTables::commit(vec![table], &config())?;
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config())?;
 
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-table");
     let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)?;
@@ -135,7 +136,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     let owed = multilinear_table::contribution(&proof.tables[0].bus_output)
         .ok_or(multilinear::Error::BusImbalance)?;
     let mut verifier = DefaultTranscript::<Ext>::new(b"vm-table");
-    multilinear_table::multi_verify(
+    multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
         &proof,
         &[statement],
         std::slice::from_ref(committed.groups()[0].layout()),
@@ -308,7 +309,8 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     }
     let count = tables.len();
     // Every table's columns in one commitment: 55 of them still open once.
-    let committed = CommittedTables::commit(tables, &config()).expect("commit every table");
+    let committed =
+        CommittedTables::<_, _, KeccakWhir>::commit(tables, &config()).expect("commit every table");
 
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-sweep");
     let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)
@@ -346,7 +348,7 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         .expect("the commit fingerprints are invertible");
 
     let mut verifier = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    multilinear_table::multi_verify(
+    multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
         &proof,
         &statements,
         std::slice::from_ref(&stacked),
@@ -425,7 +427,7 @@ fn a_real_table_proof_survives_serialization() {
     };
 
     let table = CommittedTable::from_layout(layout(), |col| columns[col as usize].clone()).unwrap();
-    let committed = CommittedTables::commit(vec![table], &config()).unwrap();
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config()).unwrap();
     let mut prover = DefaultTranscript::<Ext>::new(b"serialized");
     let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover).unwrap();
 
@@ -446,7 +448,7 @@ fn a_real_table_proof_survives_serialization() {
         // The roots travel in the proof, so a format that dropped them would
         // fail here rather than pass on the original's.
         let mut verifier = DefaultTranscript::<Ext>::new(b"serialized");
-        multilinear_table::multi_verify(
+        multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
             round_tripped,
             &[statement],
             std::slice::from_ref(committed.groups()[0].layout()),
@@ -524,6 +526,6 @@ fn a_real_table_is_one_commitment_for_its_main_columns() {
 
     assert_eq!(table.num_committed_columns(), lt::cols::NUM_COLUMNS);
     // And they all ride in one stacked polynomial, alone or alongside others.
-    let committed = CommittedTables::commit(vec![table], &config()).unwrap();
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config()).unwrap();
     assert_eq!(committed.roots().len(), 1);
 }

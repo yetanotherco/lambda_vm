@@ -18,6 +18,7 @@ use std::time::Instant;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use multilinear::whir_chain::GrindBits;
+use multilinear::whir_hash::KeccakWhir;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 use crate::multilinear_prove;
@@ -109,14 +110,20 @@ fn shapes() {
                 continue;
             }
         };
-        let mut traces =
-            match Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs) {
-                Ok(traces) => traces,
-                Err(e) => {
-                    println!("{label:<22} trace failed: {e:?}");
-                    continue;
-                }
-            };
+        let mut traces = match Traces::from_elf_and_logs(
+            &elf,
+            &logs,
+            &MaxRowsConfig::default(),
+            &inputs,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        ) {
+            Ok(traces) => traces,
+            Err(e) => {
+                println!("{label:<22} trace failed: {e:?}");
+                continue;
+            }
+        };
         let table_counts = traces.table_counts();
         let airs = crate::VmAirs::new(
             &elf,
@@ -255,6 +262,531 @@ fn whir_against_fri() {
 /// `LAMBDA_VM_BENCH_EPOCH_LOG2` is the epoch length in cycles, the CLI's
 /// default (2^20) unless it is set. It is a resource knob, not a property of
 /// either prover: both sides get the same one.
+/// One transcript-counter line, labelled with the WINDOW it covers.
+///
+/// ⚠ The window is part of the number. The prover and the verifier each run a
+/// transcript, over different work, and only the verifier's is what a recursive
+/// verifier replays — so a count quoted without its side cannot be checked
+/// against anything.
+///
+/// ⚠ `states` is NOT part of `squeezes`: a squeeze is a `finalize_reset` that
+/// chains its output back in, a state read finalizes a CLONE and advances
+/// nothing. There is one state read per grind check, so on the verify line the
+/// states column must equal the grind-check count — two independent instruments
+/// on one quantity.
+#[cfg(feature = "hash-metrics")]
+fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
+    let (ua, us, ut) = c.transcript_unattributed();
+    println!(
+        "{:<12} transcript absorbs {}/{} · squeezes {}/{} · states {}/{} (keccak/rpx) · unattributed {}/{}/{}",
+        window,
+        c.transcript_absorbs_keccak,
+        c.transcript_absorbs_rpx,
+        c.transcript_squeezes_keccak,
+        c.transcript_squeezes_rpx,
+        c.transcript_states_keccak,
+        c.transcript_states_rpx,
+        ua,
+        us,
+        ut,
+    );
+}
+
+/// ★★ THE TRANSCRIPT PAIR, PINNED — one configuration, both sides.
+///
+/// # Why a pair and not just the verify line
+///
+/// The verify line alone is the number recursion cares about, but pinning both
+/// makes their DIFFERENCE mutation-checkable, and that difference is a derived
+/// quantity rather than a measurement: the verifier runs `owed`, the prover does
+/// not, and `owed` is `Sum roots.len()` absorbs and `2 x epochs` squeezes. So a
+/// change that moves one side without the other fails loudly here instead of
+/// silently re-opening a question that took two lanes and a wrong candidate to
+/// close.
+///
+/// The 2 squeezes per `owed` call are not "two samples, two squeezes": a cubic
+/// element is three 8-byte draws from a 32-byte buffer, so the first sample
+/// squeezes once and leaves a group over, and the second spends the leftover and
+/// squeezes again. Three not dividing four is the whole reason it is two.
+///
+/// # WARNING: the guard is the ELF's sha256, not its name
+///
+/// Two builds of the same guest, from the same sources, in two worktrees, share
+/// a name and differ in bytes. That is not hypothetical: a 0.23% difference in
+/// these very counts was read as a model error before it was traced to a
+/// different build of "the same" guest — the arms' ELF touches genesis pages
+/// (`0x280000`, `0x680000`) that another build does not, which moves the
+/// GLOBAL_MEMORY set and with it the chain shapes these counts are made of.
+///
+/// So a rebuild must not fail this assert — it must SKIP it, out loud, naming
+/// the sha it saw. A silent pass and an absent assert are the same thing.
+///
+/// # Configuration is part of the constant
+///
+/// The counts are a function of the ELF, the input and the epoch size, so all
+/// three are in the guard. Measured on FAST under `cuda,hash-metrics`, and
+/// independently reproduced by lane V1's shape-derived closed form, which
+/// predicts the verify triple exactly from the table shapes — two derivations,
+/// one number.
+///
+/// # ...and so is the BRANCH, which is why the absorbs are not one number
+///
+/// The absorb columns carry a term that differs between lineages — one `u64`
+/// per per-table count, per epoch statement — so they are pinned as a base plus
+/// `EPOCHS * NUM_TABLE_KINDS`, with the kind count read from the struct. The
+/// bases were taken on the seam branch (`whir/rpx`, the `c73568f4` measurement
+/// plus this branch's computed statement padding); the merged lineage, which
+/// binds one count more, gets its own totals from the same bases without
+/// editing anything here. See [`transcript_pin::PROVE_BASE_ABSORBS`].
+#[cfg(feature = "hash-metrics")]
+mod transcript_pin {
+    /// sha256 of the guest ELF these counts were measured against.
+    ///
+    /// MEASURED, and it has to say where: `sha256sum` on the box fixture
+    /// `ethrex_8f826601.elf`. The previous value agreed with this one for
+    /// exactly 16 hex characters and was invented for the other 48 — every
+    /// message that carried the sha carried a 16-char prefix, and the tail was
+    /// written to look like a measurement. The guard then skipped on the pinned
+    /// guest itself, and the skip line printed `[..16]` of both sides, which is
+    /// precisely the width at which a fabricated tail still agrees.
+    ///
+    /// A guard on a value nobody measured to full width is a guard on a guess.
+    /// Anything shortened for a message is a display; the constant is the
+    /// measurement.
+    pub const ELF_SHA256: &str = "8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a";
+    pub const ELF_LEN: usize = 3_948_504;
+    pub const EPOCH_LOG2: u32 = 21;
+
+    /// Epoch proofs in the pinned run. Part of the measured shape, like the ELF
+    /// and the epoch size: 2^21 epochs over this guest is fifteen of them, which
+    /// is also where `OWED`'s thirty squeezes come from (two per epoch call).
+    pub const EPOCHS: u64 = 15;
+
+    /// ★★ THE ABSORB COUNTS ARE A BASE PLUS A PER-BRANCH TERM, and the term is
+    /// read from the struct rather than written down.
+    ///
+    /// Every epoch statement binds one `u64` per per-table count
+    /// (`statement::absorb_table_counts`), so the absorb total carries
+    /// `EPOCHS * NUM_TABLE_KINDS`. That count is **not a constant of the
+    /// protocol**: the per-table campaign adds `TableCounts::blake3`, so this
+    /// lineage absorbs fourteen per epoch and the merged one fifteen. The box
+    /// discovered that as a pin FAILURE (+15 on both sides at the merged base),
+    /// and the term was legitimate — the BLAKE3 table is conditional and its
+    /// count is the one entry a verifier cannot derive, which is why per-table
+    /// bumped both domain tags for it.
+    ///
+    /// A pin carrying `583_940` would therefore be a constant describing one
+    /// branch while claiming to describe the protocol. The bases below are
+    /// branch-independent; the branch supplies its own kind count.
+    ///
+    /// ⚠ PROVENANCE, and one half of it is a PREDICTION. The box measured
+    /// `583_924 / 584_061` at `c73568f4` (run a2q, both hashes, against the
+    /// `8f826601` fixture). The computed statement padding adds exactly one
+    /// absorb per statement — fifteen epoch statements and one cross-epoch
+    /// statement, sixteen — giving `583_940 / 584_077`, from which
+    /// `EPOCHS * 14 = 210` is subtracted here. The `+16` has not been measured
+    /// yet; these constants are what will say so if it is wrong.
+    pub const PROVE_BASE_ABSORBS: u64 = 583_730;
+    /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
+    pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
+
+    /// Absorbs the per-table counts contribute to a whole continuation proof.
+    pub const fn table_count_absorbs() -> u64 {
+        EPOCHS * crate::statement::NUM_TABLE_KINDS as u64
+    }
+
+    /// (absorbs, squeezes, states) after `prove_continuation`.
+    pub const PROVE: (u64, u64, u64) = (PROVE_BASE_ABSORBS + table_count_absorbs(), 183_226, 2_996);
+    /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
+    pub const VERIFY: (u64, u64, u64) =
+        (VERIFY_BASE_ABSORBS + table_count_absorbs(), 183_256, 2_996);
+
+    /// `owed`'s own cost, stated rather than left as a subtraction: 137 absorbs
+    /// is `Sum roots.len()` over the 15 epoch calls, 30 squeezes is `2 x 15`,
+    /// and it reads no state.
+    pub const OWED: (u64, u64, u64) = (137, 30, 0);
+}
+
+/// Whether the pinned counts describe THIS run.
+///
+/// Pure, and taking the sha as a string so the refusal can be tested without
+/// forging an ELF: a sha that agrees on a prefix and differs in the tail is one
+/// `format!` away, which is the case that actually occurred.
+#[cfg(feature = "hash-metrics")]
+fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
+    sha == transcript_pin::ELF_SHA256
+        && len == transcript_pin::ELF_LEN
+        && epoch_size_log2 == transcript_pin::EPOCH_LOG2
+}
+
+/// The line a skipped pin prints.
+///
+/// FULL 64 hex on BOTH sides, never a prefix. The truncated version of this
+/// line is why a wrong constant survived a box run: it showed `[..16]` of each,
+/// the two agreed there, and the mismatch it existed to report was invisible in
+/// its own output. A diagnostic that can agree while the values differ is not a
+/// diagnostic.
+#[cfg(feature = "hash-metrics")]
+fn pin_skip_line(sha: &str, len: usize, epoch_size_log2: u32) -> String {
+    format!(
+        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}); \
+         pinned {} ({} bytes, epoch 2^{})",
+        "WHIR",
+        sha,
+        len,
+        epoch_size_log2,
+        transcript_pin::ELF_SHA256,
+        transcript_pin::ELF_LEN,
+        transcript_pin::EPOCH_LOG2,
+    )
+}
+
+/// Asserts the pinned pair, or says out loud why it did not.
+#[cfg(feature = "hash-metrics")]
+fn check_transcript_pins(
+    elf: &[u8],
+    epoch_size_log2: u32,
+    prove: &crypto::hash_metrics::Counts,
+    verify: &crypto::hash_metrics::Counts,
+) {
+    use sha2::{Digest, Sha256};
+
+    let sha: String = Sha256::digest(elf)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+        // Never silent. A skipped assert that prints nothing is
+        // indistinguishable from one that passed, which is the failure this
+        // whole pin exists against.
+        println!("{}", pin_skip_line(&sha, elf.len(), epoch_size_log2));
+        return;
+    }
+
+    let triple = |c: &crypto::hash_metrics::Counts| {
+        (
+            c.transcript_absorbs,
+            c.transcript_squeezes,
+            c.transcript_states,
+        )
+    };
+    assert_pinned_pair(triple(prove), triple(verify));
+    println!(
+        "{:<12} transcript pin OK (both sides, and the owed delta)",
+        "WHIR"
+    );
+}
+
+/// The assertions themselves, split from the guard so they can be reached
+/// without the pinned guest.
+///
+/// ⚠ This split is the point, not tidiness. With the guard and the assertions
+/// in one function, the assertions ran on the box and NOWHERE ELSE: a mistyped
+/// constant, a swapped pair or a broken delta would have been discovered by a
+/// GPU run rather than by `cargo test`. Taking the triples as arguments makes
+/// every branch reachable from a laptop, which is why the four tests below
+/// exist and why three of them are `should_panic`.
+#[cfg(feature = "hash-metrics")]
+fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
+    // Only the state columns are destructured: the two lines are compared whole
+    // against their pins, and the delta between them is a property of the
+    // CONSTANTS rather than of a measurement — see
+    // `the_pinned_constants_differ_by_owed`.
+    let (_, _, pt) = prove;
+    let (_, _, vt) = verify;
+
+    assert_eq!(
+        prove,
+        transcript_pin::PROVE,
+        "the PROVE-side transcript counts moved"
+    );
+    assert_eq!(
+        verify,
+        transcript_pin::VERIFY,
+        "the VERIFY-side transcript counts moved"
+    );
+
+    // ⚠ NO `owed` ASSERTION HERE, and its absence is deliberate. Once both
+    // lines match their pins, their difference is forced — `OWED` is
+    // `VERIFY - PROVE` by construction, so a third runtime assertion could
+    // never fire. Writing its test is what exposed that: the constructed
+    // counter-example was rejected by the VERIFY assertion two lines up,
+    // never reaching the delta.
+    //
+    // The delta is a statement about the CONSTANTS, not about a measurement,
+    // so it is checked where it can fail — see
+    // [`the_pinned_constants_differ_by_owed`].
+
+    // The control that costs nothing: one `state()` per grind check, so this
+    // column and the grind count are two instruments on one quantity.
+    assert_eq!(
+        pt, vt,
+        "the two sides disagree on state reads, which are grind checks on both"
+    );
+}
+
+/// ★★ The constants are the measurement — asserted against LITERALS.
+///
+/// Passing `transcript_pin::PROVE` here would be a check that cannot fail: a
+/// mutated constant would move the input and the expectation together and the
+/// test would pass on any value. The numbers below are written out so that a
+/// constant which drifts, is mistyped, or has its two lines swapped fails here,
+/// on a laptop, rather than on the box an hour later.
+///
+/// ⚠ The literals are the BASES, and the per-branch term is recomputed from the
+/// struct — because that term is what differs between this lineage and the
+/// merged one. Writing the totals out would make this test the thing that has
+/// to be edited on every branch, which is precisely the property the split
+/// removed from the pin.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pinned_pair_is_the_measurement() {
+    let counts = 15 * crate::statement::NUM_TABLE_KINDS as u64;
+    assert_pinned_pair(
+        (583_730 + counts, 183_226, 2_996),
+        (583_867 + counts, 183_256, 2_996),
+    );
+}
+
+/// ★ One unit on the prove line fails on the prove assertion.
+#[cfg(feature = "hash-metrics")]
+#[test]
+#[should_panic(expected = "the PROVE-side transcript counts moved")]
+fn a_prove_count_off_by_one_is_rejected() {
+    let (a, s, t) = transcript_pin::PROVE;
+    assert_pinned_pair((a + 1, s, t), transcript_pin::VERIFY);
+}
+
+/// ★ One unit on the verify line fails on the verify assertion.
+#[cfg(feature = "hash-metrics")]
+#[test]
+#[should_panic(expected = "the VERIFY-side transcript counts moved")]
+fn a_verify_count_off_by_one_is_rejected() {
+    let (a, s, t) = transcript_pin::VERIFY;
+    assert_pinned_pair(transcript_pin::PROVE, (a + 1, s, t));
+}
+
+/// ★★ The per-branch term is a TERM, not a re-baseline.
+///
+/// The pin's absorb totals are `base + EPOCHS * NUM_TABLE_KINDS`, and this says
+/// the split is the one the protocol makes: the kind count is the length of the
+/// list `absorb_table_counts` walks, and an epoch statement absorbs exactly that
+/// many counts.
+///
+/// It can fail. `NUM_TABLE_KINDS` is checked against the array
+/// `statement::table_count_values` actually returns — which is the one place the
+/// destructure of `TableCounts` is written — so a field added to `TableCounts`
+/// and pushed into the array without bumping the constant fails to compile, and
+/// a constant bumped without the field fails here.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_per_branch_term_is_the_table_kind_count() {
+    let zero = crate::TableCounts {
+        cpu: 0,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+    };
+    let kinds = crate::statement::table_count_values(&zero).len();
+    assert_eq!(
+        kinds,
+        crate::statement::NUM_TABLE_KINDS,
+        "NUM_TABLE_KINDS is not the number of counts a statement absorbs"
+    );
+    assert_eq!(
+        transcript_pin::table_count_absorbs(),
+        transcript_pin::EPOCHS * kinds as u64,
+        "the pin's per-branch term is not `epochs x kinds`"
+    );
+    assert_eq!(
+        transcript_pin::PROVE.0 - transcript_pin::PROVE_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs(),
+    );
+    assert_eq!(
+        transcript_pin::VERIFY.0 - transcript_pin::VERIFY_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs(),
+    );
+}
+
+/// ★★ THE DERIVED DELTA, checked where it can actually fail: on the constants.
+///
+/// `owed` is the only thing the verifier does that the prover does not, so the
+/// two pinned lines must differ by exactly it — `Sum roots.len()` absorbs,
+/// `2 x epochs` squeezes, no state reads. That is a claim about the pair of
+/// constants, and it is the claim that survives a re-baseline: if someone
+/// measures a new run and updates PROVE and VERIFY together, this fires unless
+/// `owed` is still `owed`, forcing them to look at why the difference moved
+/// rather than carrying a changed protocol into two numbers that agree with
+/// each other.
+///
+/// ⚠ It lives here rather than inside [`assert_pinned_pair`] because there it
+/// could never fire: with both lines asserted against their pins, their
+/// difference is forced. That was found by writing the test — the constructed
+/// counter-example never reached the delta, because the VERIFY assertion
+/// rejected it first.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pinned_constants_differ_by_owed() {
+    let (pa, ps, pt) = transcript_pin::PROVE;
+    let (va, vs, vt) = transcript_pin::VERIFY;
+    assert_eq!(
+        (va - pa, vs - ps, vt - pt),
+        transcript_pin::OWED,
+        "the two pinned lines no longer differ by `owed` — one was re-baselined \
+         without the other, or the protocol changed"
+    );
+
+    // …and `owed` is itself derived, not observed: 137 absorbs is one per root
+    // over the 15 epoch calls, 30 squeezes is two per call. Stating the shape
+    // means a future epoch count cannot silently keep the old constant.
+    let (oa, os, ot) = transcript_pin::OWED;
+    assert_eq!(
+        os,
+        2 * transcript_pin::EPOCHS,
+        "`owed` samples twice per epoch call"
+    );
+    assert_eq!(ot, 0, "`owed` reads no transcript state");
+    // ⚠ The absorb count gets no assertion of its own. It is `Sum roots.len()`
+    // over the epochs — data from the table shapes, not something derivable
+    // here — so any predicate this test could write about it would be either
+    // circular (comparing the constant to itself) or vacuous. An earlier draft
+    // had `oa % 1 == 0`, which is true of every integer. It is pinned by
+    // `VERIFY - PROVE` above and by V1's closed form, which is where it belongs.
+    let _ = oa;
+}
+
+/// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
+///
+/// The defect this is written against: the constant's last 48 hex were
+/// fabricated, so the guard skipped on the pinned guest itself — and the skip
+/// line printed 16 characters of each side, the exact width at which the real
+/// sha and the invented one agreed. The failure was invisible in the output of
+/// the thing that existed to report it.
+///
+/// Both halves are needed. The refusal alone would pass with a truncated
+/// diagnostic; the diagnostic alone would pass with a comparison that only
+/// looked at a prefix.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
+    // Same first 16 hex, different tail — one `format!`, no ELF to forge.
+    let near_miss = format!("{}{}", &transcript_pin::ELF_SHA256[..16], "0".repeat(48));
+    assert_eq!(near_miss.len(), 64);
+    assert_eq!(
+        near_miss[..16],
+        transcript_pin::ELF_SHA256[..16],
+        "the near miss must agree on the prefix, or it tests nothing"
+    );
+    assert_ne!(near_miss, transcript_pin::ELF_SHA256);
+
+    assert!(
+        !pin_applies(
+            &near_miss,
+            transcript_pin::ELF_LEN,
+            transcript_pin::EPOCH_LOG2
+        ),
+        "a sha differing only after position 16 was accepted: the comparison is \
+         looking at a prefix"
+    );
+
+    // …and the line it prints must make the difference visible.
+    let line = pin_skip_line(
+        &near_miss,
+        transcript_pin::ELF_LEN,
+        transcript_pin::EPOCH_LOG2,
+    );
+    assert!(
+        line.contains(&near_miss),
+        "the skip line does not carry the found sha in full: {line}"
+    );
+    assert!(
+        line.contains(transcript_pin::ELF_SHA256),
+        "the skip line does not carry the pinned sha in full: {line}"
+    );
+
+    // The property in one assertion: whatever the line shows of each side, the
+    // two shown values must differ. A prefix display fails here.
+    let shown: Vec<&str> = line.split_whitespace().filter(|w| w.len() == 64).collect();
+    assert_eq!(
+        shown.len(),
+        2,
+        "expected two 64-hex values in the skip line, found {}: {line}",
+        shown.len()
+    );
+    assert_ne!(
+        shown[0], shown[1],
+        "the skip line shows the same value twice for a genuine mismatch"
+    );
+}
+
+/// ★ The pinned constant is a full-width sha, not a truncation.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pinned_sha_is_full_width() {
+    assert_eq!(
+        transcript_pin::ELF_SHA256.len(),
+        64,
+        "a sha256 is 64 hex characters; anything shorter is a display that got \
+         pinned"
+    );
+    assert!(
+        transcript_pin::ELF_SHA256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "the pinned sha is not lowercase hex"
+    );
+}
+
+/// ★ The guard skips rather than fires on a guest that is not the pinned one.
+///
+/// Card-free and not `#[ignore]`d, because the skip path is the half that runs
+/// on every other invocation of the bench and the half that would fail silently
+/// if it were wrong. If the guard were inverted — asserting on the wrong ELF —
+/// every run on any other program would panic on counts that were never about
+/// it; if it were absent, the pin would be decorative.
+///
+/// The counts passed in are deliberately absurd. Reaching the assertions with
+/// them would panic, so a test that returns at all proves the guard returned
+/// first.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_transcript_pin_skips_a_guest_it_does_not_recognise() {
+    let nonsense = crypto::hash_metrics::Counts {
+        transcript_absorbs: 1,
+        transcript_squeezes: 2,
+        transcript_states: 3,
+        ..Default::default()
+    };
+
+    // Wrong bytes, wrong length.
+    check_transcript_pins(
+        b"not an elf",
+        transcript_pin::EPOCH_LOG2,
+        &nonsense,
+        &nonsense,
+    );
+
+    // ⚠ Right length, wrong bytes — the guard must be the sha and not the size,
+    // which is the whole point of preferring it to the ELF's name.
+    let same_length = vec![0u8; transcript_pin::ELF_LEN];
+    check_transcript_pins(
+        &same_length,
+        transcript_pin::EPOCH_LOG2,
+        &nonsense,
+        &nonsense,
+    );
+}
+
 #[test]
 #[ignore]
 fn continuations() {
@@ -297,6 +829,24 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     }
 
     if backend != "fri" {
+        // Held from the prove window to the verify one so the pair - and the
+        // `owed` delta between them - can be asserted together. Uninitialised
+        // and assigned exactly once: an `Option` here would carry a `None` the
+        // compiler can prove is never read, since the assignment dominates the
+        // use and both sit in this one branch.
+        #[cfg(feature = "hash-metrics")]
+        let prove_counts;
+        // ★ Zeroed per arm, so the counts below belong to THIS prove and not to
+        // whatever ran before it in the process.
+        #[cfg(feature = "cuda")]
+        {
+            crypto::grinding::reset_gpu_grind_calls();
+            multilinear::gpu::reset_call_counters();
+        }
+        // ★ Same reason, for the transcript counters: the line printed below
+        // must be THIS arm's and not the process's running total.
+        #[cfg(feature = "hash-metrics")]
+        crypto::hash_metrics::reset();
         let start = Instant::now();
         let bundle = crate::multilinear_continuation::prove_continuation(
             &bytes,
@@ -306,14 +856,66 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         )
         .expect("multilinear continuation");
         let prove = start.elapsed();
+
+        // ★★ READ 0 FOR EVERY WHIR ARM — which dispatches actually reached the
+        // card. The `★ WHIR HASH:` banner says which hash was SELECTED; these
+        // say which kernels RAN, and the two are not the same claim.
+        //
+        // A measured RPX arm once came in 14.5x slower than keccak with a
+        // correct, KAT-pinned grind kernel sitting unused, because the host-side
+        // dispatch had no arm for it. Nothing in this bench's output named the
+        // cause: prove time, verify time, proof size and epoch count were all
+        // consistent with "the hash is just expensive". A grind count of ZERO
+        // beside a commit count of thousands says it in one line.
+        #[cfg(feature = "cuda")]
+        println!(
+            "{:<12} gpu commits {} · host fallbacks {} · keccak grinds {} · rpx grinds {}",
+            "WHIR",
+            multilinear::gpu::commit_calls(),
+            multilinear::gpu::host_fallbacks(),
+            crypto::grinding::gpu_grind_calls(),
+            crypto::grinding::gpu_grind_calls_rpx(),
+        );
+        // ★★ WHICH SPONGE THE TRANSCRIPT RAN ON, per arm and on BOTH sides.
+        //
+        // The line above says which KERNELS ran; this one says which sponge the
+        // Fiat-Shamir transcript used, and they are not the same claim. For
+        // four measured A/Bs the RPX arm ran an RPX Merkle backend, an RPX
+        // grind and a KECCAK transcript, and nothing printed here disagreed.
+        //
+        // Both sides are printed because one is not evidence. A counter on the
+        // RPX side alone reads "rpx > 0, keccak 0" — and that keccak zero is
+        // equally true when the keccak transcript ran and nobody instrumented
+        // it, which is exactly the state that hid. `unattributed` is printed
+        // for the same reason one level out: a third configuration arriving
+        // with no counter of its own would otherwise look like silence.
+        #[cfg(feature = "hash-metrics")]
+        {
+            let c = crypto::hash_metrics::snapshot();
+            print_transcript_counts("WHIR prove", &c);
+            prove_counts = c;
+        }
         let size = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
             .expect("serialize")
             .len();
         let epochs = bundle.num_epochs();
+        // ★★ The VERIFY side gets its own window, and it is the side that
+        // matters for recursion: an LFM replays the VERIFIER's transcript, not
+        // the prover's. The two are different numbers over different work —
+        // differencing one against a closed form derived for the other is the
+        // same category error as comparing a prove stopwatch to a verify one.
+        #[cfg(feature = "hash-metrics")]
+        crypto::hash_metrics::reset();
         let start = Instant::now();
         let ok = crate::multilinear_continuation::verify_continuation(&bytes, &bundle, &opts)
             .expect("multilinear verify");
         assert!(ok, "the multilinear continuation must verify");
+        #[cfg(feature = "hash-metrics")]
+        {
+            let verify_counts = crypto::hash_metrics::snapshot();
+            print_transcript_counts("WHIR verify", &verify_counts);
+            check_transcript_pins(&bytes, epoch_size_log2, &prove_counts, &verify_counts);
+        }
         whir = Some((prove, start.elapsed(), size, epochs));
     }
 
@@ -449,6 +1051,7 @@ fn continuation_phases() {
     #[cfg(feature = "cuda")]
     for (tag, count) in [
         ("gpu commits", multilinear::gpu::commit_calls()),
+        ("host fallbacks", multilinear::gpu::host_fallbacks()),
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu evals", multilinear::gpu::evaluate_calls()),
         ("gpu trees", multilinear::gpu::tree_calls()),
@@ -496,8 +1099,15 @@ fn phases() {
     let execute = start.elapsed();
 
     let start = Instant::now();
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).expect("traces");
+    let mut traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        &MaxRowsConfig::default(),
+        &inputs,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
     let trace_build = start.elapsed();
 
     let table_counts = traces.table_counts();
@@ -566,7 +1176,20 @@ fn phases() {
         })
         .collect();
     let count = tables.len();
-    let committed = CommittedTables::commit(tables, &config).expect("commit");
+    // ⚠ KECCAK ONLY, and it refuses rather than mislabels.
+    //
+    // The committed tables escape into the rest of this function, so the hash
+    // cannot be a `match` here — both arms would have to return the same type
+    // and they do not. Rather than print `★ WHIR HASH: rpx256` over keccak's
+    // seconds, this bench asserts the knob agrees with what it actually runs.
+    // The hash-arm split lives in `commit_phases`, whose `merkle` pass isolates
+    // the hashing anyway, which is the number a hash comparison wants.
+    assert_eq!(
+        crate::whir_hash_knob::selected(),
+        crate::whir_hash_knob::Setting::Keccak,
+        "`phases` commits with keccak; run `commit_phases` for the hash arms"
+    );
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(tables, &config).expect("commit");
     let commit = start.elapsed();
 
     // `multi_prove`'s own body, so the tables' arguments and the one opening
@@ -600,7 +1223,7 @@ fn phases() {
         .iter()
         .flat_map(|t| t.columns())
         .collect();
-    let columns = multilinear::stacked_eval::prove::<F, E, _>(
+    let columns = multilinear::stacked_eval::prove::<F, E, _, KeccakWhir>(
         &committed.groups()[0],
         &group_columns,
         None,
@@ -648,6 +1271,7 @@ fn phases() {
     for (tag, count) in [
         ("gpu grinds", stark::gpu_lde::gpu_grind_calls()),
         ("gpu commits", multilinear::gpu::commit_calls()),
+        ("host fallbacks", multilinear::gpu::host_fallbacks()),
         ("gpu sumchecks", multilinear::gpu::sumcheck_calls()),
         ("gpu rounds", multilinear::gpu::sumcheck_rounds()),
         ("gpu evals", multilinear::gpu::evaluate_calls()),
@@ -686,8 +1310,15 @@ fn commit_phases() {
         .and_then(Executor::run)
         .expect("run")
         .logs;
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).expect("trace");
+    let mut traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        &MaxRowsConfig::default(),
+        &inputs,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("trace");
     let table_counts = traces.table_counts();
     let airs = crate::VmAirs::new(
         &elf,
@@ -747,17 +1378,26 @@ fn commit_phases() {
         let codeword = whir::encode::<F, F>(&coeffs, &domain).expect("encode");
         encode += start.elapsed();
         let start = Instant::now();
-        let commitment = CodewordCommitment::new(
-            &codeword,
-            config
-                .schedule(poly.num_vars())
-                .first()
-                .copied()
-                .unwrap_or(0),
-        )
-        .expect("commit");
+        // ★ The `merkle` pass is the LEAF AND TREE HASHING, alone — stack,
+        // lift and encode are clocked apart above. So this line is the hash
+        // term itself, and it has to follow the knob or the two arms are not
+        // comparable.
+        crate::with_whir_hash!(|H| {
+            let commitment = CodewordCommitment::<_, H>::new(
+                &codeword,
+                config
+                    .schedule(poly.num_vars())
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
+            )
+            .expect("commit");
+            // Dropped inside the arm: the commitment's type names `H`, so it
+            // cannot leave the block. That is also why this is the bench the
+            // hash arms run through — nothing here escapes.
+            drop(commitment);
+        });
         merkle += start.elapsed();
-        drop(commitment);
     }
 
     let label = if input.is_empty() { &name } else { &input };
@@ -879,8 +1519,15 @@ fn constraint_program_sizes() {
         .and_then(Executor::run)
         .unwrap()
         .logs;
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        &MaxRowsConfig::default(),
+        &inputs,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
     let table_counts = traces.table_counts();
     let airs = crate::VmAirs::new(
         &elf,

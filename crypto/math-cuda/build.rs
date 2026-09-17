@@ -181,6 +181,7 @@ fn main() {
     compile_kernel("arith.cu", "arith.cubin", have_nvcc);
     compile_kernel("ntt.cu", "ntt.cubin", have_nvcc);
     compile_kernel("keccak.cu", "keccak.cubin", have_nvcc);
+    compile_kernel("rpx.cu", "rpx.cubin", have_nvcc);
     compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc);
     compile_kernel("deep.cu", "deep.cubin", have_nvcc);
     compile_kernel("fri.cu", "fri.cubin", have_nvcc);

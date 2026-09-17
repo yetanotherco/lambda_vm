@@ -15,6 +15,7 @@ pub mod logup;
 pub mod mle;
 pub mod poly;
 pub mod program;
+pub mod query_count;
 pub mod selector;
 pub mod stacked_eval;
 pub mod stacking;
@@ -26,6 +27,7 @@ pub mod whir;
 pub mod whir_chain;
 pub mod whir_commit;
 pub mod whir_eval;
+pub mod whir_hash;
 pub mod whir_round;
 pub mod zerocheck;
 

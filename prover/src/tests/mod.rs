@@ -97,6 +97,8 @@ pub mod shape_profile_tests;
 
 pub mod shift_tests;
 #[cfg(test)]
+pub mod statement_alignment_tests;
+#[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
 pub mod static_commitments_tests;
@@ -108,3 +110,9 @@ pub mod templates_tests;
 pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+#[cfg(test)]
+pub mod whir_byte_gate;
+#[cfg(test)]
+pub mod whir_hash_tests;
+#[cfg(test)]
+pub mod whir_identity_tests;
