@@ -53,7 +53,6 @@ use super::eq;
 use super::halt;
 use super::hint;
 use super::keccak::{self, KeccakOperation};
-use super::keccak_bridge;
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
@@ -2898,11 +2897,6 @@ pub struct Traces {
     /// [`Traces::keccak_bridge`] standing in on the epoch-local `Keccak` bus.
     pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// KECCAK_BRIDGE table (one row per keccak call). Only populated for
-    /// continuation epochs; empty on the monolithic path, which keeps
-    /// KECCAK_RND local and so needs no bridge.
-    pub keccak_bridge: TraceTable<GoldilocksField, GoldilocksExtension>,
-
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -3582,13 +3576,6 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, rounds_served);
         keccak_rc_trace
     };
-    let gen_keccak_bridge = || {
-        if hoist_keccak_rounds {
-            keccak_bridge::generate_keccak_bridge_trace(&keccak_ops)
-        } else {
-            keccak_bridge::generate_keccak_bridge_trace(&[])
-        }
-    };
     let gen_pages = || match initial_image {
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
         // every touched cell's Memory init/fini, and every untouched PAGE row
@@ -3613,7 +3600,6 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
         (None, None, None, None);
-    let mut keccak_bridge_slot = None;
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
@@ -3651,7 +3637,6 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(keccak_slot, gen_keccak);
             spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
-            spawn_into!(keccak_bridge_slot, gen_keccak_bridge);
             spawn_into!(commit_slot, gen_commit);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
@@ -3680,7 +3665,6 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_slot = Some(gen_keccak());
         keccak_rnd_slot = Some(gen_keccak_rnd());
         keccak_rc_slot = Some(gen_keccak_rc());
-        keccak_bridge_slot = Some(gen_keccak_bridge());
         pages_slot = Some(gen_pages());
         register_slot = Some(gen_register());
         halt_slot = Some(gen_halt());
@@ -3717,7 +3701,6 @@ fn build_traces<I: ImageSource + Sync>(
     let keccak_trace = keccak_slot.expect(PHASE5_RAN);
     let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
-    let keccak_bridge_trace = keccak_bridge_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
@@ -3792,7 +3775,6 @@ fn build_traces<I: ImageSource + Sync>(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
-        keccak_bridge: keccak_bridge_trace,
         ecsm: ecsm_trace,
         ecdas: ecdas_trace,
         hint: hint_trace,
@@ -4156,7 +4138,6 @@ impl Traces {
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::hint::cols::NUM_COLUMNS as HINT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
-        use super::keccak_bridge::cols::NUM_COLUMNS as KECCAK_BRIDGE_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
         use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
         use super::keccak_rnd::cols::NUM_COLUMNS as KECCAK_RND_COLS;
@@ -4192,7 +4173,6 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
-            keccak_bridge,
             ecsm,
             ecdas,
             hint,
@@ -4248,7 +4228,6 @@ impl Traces {
         }
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
-        total += (keccak_bridge.num_rows() * KECCAK_BRIDGE_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
@@ -4299,7 +4278,6 @@ impl Traces {
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
-        let n_keccak_bridge = aux_cols(super::keccak_bridge::epoch_bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
         let n_eq = aux_cols(super::eq::bus_interactions().len());
         let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
@@ -4328,7 +4306,6 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
-            keccak_bridge,
             ecsm,
             ecdas,
             hint,
@@ -4384,7 +4361,6 @@ impl Traces {
         }
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
-        total += (keccak_bridge.num_rows() * n_keccak_bridge) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;

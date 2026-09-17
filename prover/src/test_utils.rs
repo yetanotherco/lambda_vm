@@ -976,33 +976,35 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakCo
 }
 
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
-/// KECCAK_BRIDGE on the epoch-local `Keccak` bus: stands in for the 24-round
-/// chain inside a continuation epoch proof.
-pub fn create_keccak_bridge_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+/// KECCAK core for a continuation epoch: everything except the `Keccak` bus
+/// pair, which is hoisted into the global proof along with the round chip.
+pub fn create_keccak_air_without_rounds(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<KeccakConstraints> {
     build_air(
-        crate::tables::keccak_bridge::cols::NUM_COLUMNS,
-        crate::tables::keccak_bridge::epoch_bus_interactions(),
+        keccak_cols::NUM_COLUMNS,
+        crate::tables::keccak::bus_interactions_without_rounds(),
         proof_options,
         1,
-        EmptyConstraints,
-        "KECCAK_BRIDGE",
+        KeccakConstraints,
+        "KECCAK_NR",
     )
 }
 
-/// KECCAK_BRIDGE on the global side: the same committed trace with the bus
-/// polarity flipped, handing every epoch's requests to the run-wide
-/// KECCAK_RND chain. Must stay byte-identical in layout to
-/// [`create_keccak_bridge_air`] — the two proofs' main-trace roots are compared.
-pub fn create_keccak_bridge_global_air(
+/// The global proof's view of one epoch's KECCAK core table: the SAME committed
+/// columns, carrying only the `Keccak` bus pair, so the single run-wide
+/// KECCAK_RND answers that epoch's requests. No constraints — the epoch proof
+/// owns those, and the two are tied by comparing main-trace Merkle roots.
+pub fn create_keccak_rounds_request_air(
     proof_options: &ProofOptions,
 ) -> ConcreteVmAir<EmptyConstraints> {
     build_air(
-        crate::tables::keccak_bridge::cols::NUM_COLUMNS,
-        crate::tables::keccak_bridge::global_bus_interactions(),
+        keccak_cols::NUM_COLUMNS,
+        crate::tables::keccak::rounds_request_bus_interactions(),
         proof_options,
         1,
         EmptyConstraints,
-        "KECCAK_BRIDGE_G",
+        "KECCAK_REQ",
     )
 }
 

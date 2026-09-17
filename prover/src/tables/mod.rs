@@ -36,7 +36,6 @@ pub mod global_memory;
 pub mod halt;
 pub mod hint;
 pub mod keccak;
-pub mod keccak_bridge;
 pub mod keccak_rc;
 pub mod keccak_rnd;
 pub mod load;

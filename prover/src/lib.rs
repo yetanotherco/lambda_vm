@@ -54,7 +54,7 @@ use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
     create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_bridge_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air,
+    create_keccak_air_without_rounds, create_keccak_rc_air, create_keccak_rnd_air, create_load_air,
     create_lt_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
     create_mul_air, create_page_air, create_register_air, create_shift_air, create_store_air,
 };
@@ -87,9 +87,9 @@ pub const FIXED_TABLE_COUNT: usize = 11;
 
 /// How [`FIXED_TABLE_COUNT`] shrinks when the keccak round chip is hoisted into
 /// a continuation's global proof: KECCAK_RND and KECCAK_RC leave the epoch and
-/// the single KECCAK_BRIDGE arrives, so the epoch carries one table fewer.
+/// nothing replaces them — the core stays, minus its `Keccak` bus pair.
 /// See [`VmAirs::with_hoisted_keccak_rounds`].
-pub const HOISTED_KECCAK_TABLE_DELTA: usize = 1;
+pub const HOISTED_KECCAK_TABLE_DELTA: usize = 2;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -526,10 +526,10 @@ pub(crate) struct VmAirs {
     pub keccak: VmAir,
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
-    /// Stand-in for the 24-round chain inside a continuation epoch. Used in
-    /// place of `keccak_rnd` + `keccak_rc` when [`VmAirs::hoist_keccak_rounds`]
-    /// is set.
-    pub keccak_bridge: VmAir,
+    /// KECCAK core without the `Keccak` bus pair — used in place of `keccak`
+    /// when [`VmAirs::hoist_keccak_rounds`] is set, since the round chip that
+    /// would answer those requests lives in the global proof.
+    pub keccak_without_rounds: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
     pub hint: VmAir,
@@ -541,9 +541,9 @@ pub(crate) struct VmAirs {
     pub include_halt: bool,
     /// Whether the keccak round chip is hoisted out of this proof. True for
     /// continuation epochs: KECCAK_RND and KECCAK_RC are proved once for the
-    /// whole run in the global proof, and KECCAK_BRIDGE closes the epoch-local
-    /// `Keccak` bus in their place. KECCAK_RND is a pure function — no memory,
-    /// no ordering, no state between calls — so one run-wide instance can serve
+    /// whole run in the global proof, and the epoch's core simply omits its
+    /// `Keccak` bus pair. KECCAK_RND is a pure function — no memory, no
+    /// ordering, no state between calls — so one run-wide instance can serve
     /// every epoch.
     pub hoist_keccak_rounds: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
@@ -560,19 +560,20 @@ impl VmAirs {
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.commit.as_ref(), &mut traces.commit, &()),
-            (self.keccak.as_ref(), &mut traces.keccak, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.hint.as_ref(), &mut traces.hint, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
-        // The keccak round chip, or the bridge that replaces it. Kept adjacent
-        // and in a fixed position so `air_refs` can mirror it exactly and
-        // `keccak_bridge_index` can name it.
-        debug_assert_eq!(pairs.len(), Self::FIXED_PREFIX_TABLES);
+        // The keccak block. Kept in a fixed position so `air_refs` mirrors it
+        // exactly and `keccak_core_index` can name it: when the round chip is
+        // hoisted, the core's committed root is what ties this epoch to the
+        // global proof.
+        assert_eq!(pairs.len(), Self::FIXED_PREFIX_TABLES);
         if self.hoist_keccak_rounds {
-            pairs.push((self.keccak_bridge.as_ref(), &mut traces.keccak_bridge, &()));
+            pairs.push((self.keccak_without_rounds.as_ref(), &mut traces.keccak, &()));
         } else {
+            pairs.push((self.keccak.as_ref(), &mut traces.keccak, &()));
             pairs.push((self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()));
             pairs.push((self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()));
         }
@@ -643,17 +644,17 @@ impl VmAirs {
             self.bitwise.as_ref(),
             self.decode.as_ref(),
             self.commit.as_ref(),
-            self.keccak.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
             self.hint.as_ref(),
             self.register.as_ref(),
         ];
         // Mirrors the same branch in `air_trace_pairs`.
-        debug_assert_eq!(refs.len(), Self::FIXED_PREFIX_TABLES);
+        assert_eq!(refs.len(), Self::FIXED_PREFIX_TABLES);
         if self.hoist_keccak_rounds {
-            refs.push(self.keccak_bridge.as_ref());
+            refs.push(self.keccak_without_rounds.as_ref());
         } else {
+            refs.push(self.keccak.as_ref());
             refs.push(self.keccak_rnd.as_ref());
             refs.push(self.keccak_rc.as_ref());
         }
@@ -820,7 +821,8 @@ impl VmAirs {
         let commit: VmAir = Box::new(create_commit_air(proof_options));
         let keccak: VmAir = Box::new(create_keccak_air(proof_options));
         let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
-        let keccak_bridge: VmAir = Box::new(create_keccak_bridge_air(proof_options));
+        let keccak_without_rounds: VmAir =
+            Box::new(create_keccak_air_without_rounds(proof_options));
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
@@ -946,7 +948,7 @@ impl VmAirs {
             keccak,
             keccak_rnd,
             keccak_rc,
-            keccak_bridge,
+            keccak_without_rounds,
             ecsm,
             ecdas,
             hint,
@@ -964,23 +966,26 @@ impl VmAirs {
         }
     }
 
-    /// Number of tables emitted before the keccak-round branch in both
+    /// Number of tables emitted before the keccak branch in both
     /// [`Self::air_trace_pairs`] and [`Self::air_refs`]. Both assert this at
-    /// the branch point, so reordering the fixed prefix without updating it
-    /// trips in every debug build.
-    const FIXED_PREFIX_TABLES: usize = 8;
+    /// the branch point — a plain `assert!`, not `debug_assert!`, because
+    /// `keccak_core_index` is derived from it and a silent mismatch in release
+    /// extracts the wrong table's root, which surfaces only as a continuation
+    /// that fails to verify.
+    const FIXED_PREFIX_TABLES: usize = 7;
 
-    /// Index of KECCAK_BRIDGE in this proof's table list, or `None` when the
-    /// round chip is local. Used to pull the bridge's committed root out of an
-    /// epoch proof so it can be tied to the global proof's copy.
-    pub fn keccak_bridge_index(&self) -> Option<usize> {
+    /// Index of the KECCAK core table in this proof's table list, when the
+    /// round chip is hoisted. Used to pull the core's committed root out of an
+    /// epoch proof so it can be tied to the global proof's copy of that trace.
+    pub fn keccak_core_index(&self) -> Option<usize> {
         self.hoist_keccak_rounds
             .then_some(Self::FIXED_PREFIX_TABLES)
     }
 
     /// Hoist the keccak round chip out of this proof: KECCAK_RND and KECCAK_RC
-    /// are dropped from the table set and KECCAK_BRIDGE takes their place on
-    /// the epoch-local `Keccak` bus.
+    /// are dropped, and the core stops emitting its `Keccak` bus pair (nothing
+    /// here would answer it). The global proof re-emits that pair over the same
+    /// committed core trace, against one run-wide round chip.
     ///
     /// Only valid for a continuation epoch, whose global proof carries the one
     /// run-wide KECCAK_RND that actually serves the requests. Both the prover

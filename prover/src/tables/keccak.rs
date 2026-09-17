@@ -157,7 +157,81 @@ pub fn generate_keccak_trace(
 // Bus interactions
 // =========================================================================
 
+/// The `Keccak` bus pair: send `(timestamp, 0, input_state)`, receive
+/// `(timestamp, 24, output_state)` — the request the 24-round chain answers.
+///
+/// KECCAK_RND is a pure function (no memory, no ordering, no state between
+/// calls), so a continuation proves ONE run-wide instance instead of one per
+/// epoch. The epoch omits this pair entirely
+/// ([`bus_interactions_without_rounds`]); the global proof re-emits it over the
+/// SAME committed core trace ([`rounds_request_bus_interactions`]), where the
+/// single round chain answers every epoch's requests. The polarity is identical
+/// in both — the core is always the one asking — so this takes no flag. The two
+/// proofs are tied by comparing the core table's main-trace Merkle root.
+fn keccak_bus_pair() -> Vec<BusInteraction> {
+    let ts = || {
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+        ]
+    };
+    // Per spec keccak.toml: input = ["timestamp", 0, "input_state"], where
+    // input_state is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own bus
+    // element (no packing).
+    let state = |base: fn(usize, usize, usize) -> usize| {
+        let mut v = Vec::with_capacity(200);
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    v.push(BusValue::Packed {
+                        start_column: base(x, y, b),
+                        packing: Packing::Direct,
+                    });
+                }
+            }
+        }
+        v
+    };
+    let mut request = ts();
+    request.push(BusValue::constant(0)); // round = 0
+    request.extend(state(cols::input_state));
+
+    let mut response = ts();
+    response.push(BusValue::constant(24)); // round = 24
+    response.extend(state(cols::output_state));
+
+    let mu = || Multiplicity::Column(cols::MU);
+    vec![
+        BusInteraction::sender(BusId::Keccak, mu(), request),
+        BusInteraction::receiver(BusId::Keccak, mu(), response),
+    ]
+}
+
+/// Only the `Keccak` bus pair: the global proof's view of an epoch's core
+/// table. Same committed columns, nothing else — the memory, dispatch and
+/// range-check interactions stay in the epoch.
+pub fn rounds_request_bus_interactions() -> Vec<BusInteraction> {
+    keccak_bus_pair()
+}
+
+/// Everything except the `Keccak` bus pair — a continuation epoch's core, whose
+/// round chip lives in the global proof.
+pub fn bus_interactions_without_rounds() -> Vec<BusInteraction> {
+    build_bus_interactions(false)
+}
+
+/// The full set: the monolithic path, where the round chip shares this proof.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    build_bus_interactions(true)
+}
+
+fn build_bus_interactions(with_rounds: bool) -> Vec<BusInteraction> {
     let syscall_lo = KECCAK_SYSCALL_NUMBER & 0xFFFF_FFFF;
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
     let mut interactions = Vec::with_capacity(160);
@@ -261,67 +335,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 2. Keccak bus: send (timestamp, 0, input_state[200])
-    // Per spec keccak.toml: input = ["timestamp", 0, "input_state"] where
-    // input_state is [[[Byte, 8], 5], 5] — 200 Byte elements, each its own
-    // bus element (no packing).
-    {
-        let mut values = vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0), // round = 0
-        ];
-        for x in 0..5 {
-            for y in 0..5 {
-                for b in 0..8 {
-                    values.push(BusValue::Packed {
-                        start_column: cols::input_state(x, y, b),
-                        packing: Packing::Direct,
-                    });
-                }
-            }
-        }
-        interactions.push(BusInteraction::sender(
-            BusId::Keccak,
-            Multiplicity::Column(cols::MU),
-            values,
-        ));
-    }
-
-    // 3. Keccak bus: receive (timestamp, 24, output_state[200])
-    {
-        let mut values = vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(24), // round = 24
-        ];
-        for x in 0..5 {
-            for y in 0..5 {
-                for b in 0..8 {
-                    values.push(BusValue::Packed {
-                        start_column: cols::output_state(x, y, b),
-                        packing: Packing::Direct,
-                    });
-                }
-            }
-        }
-        interactions.push(BusInteraction::receiver(
-            BusId::Keccak,
-            Multiplicity::Column(cols::MU),
-            values,
-        ));
+    // 2-3. Keccak bus: the permutation request. Emitted here only when the round
+    // chip shares this proof; a continuation epoch hoists it into the global
+    // proof via `rounds_request_bus_interactions` (see `keccak_bus_pair`).
+    if with_rounds {
+        interactions.extend(keccak_bus_pair());
     }
 
     // 4. IS_HALF range checks on state_ptr (100 interactions)
