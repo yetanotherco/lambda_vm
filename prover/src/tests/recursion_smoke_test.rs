@@ -750,6 +750,72 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
     );
 }
 
+/// The recursion path over a bundle whose epochs carry *different* table sets.
+///
+/// Every other continuation fixture here proves fibonacci, whose epochs all do
+/// the same work and therefore all declare the same tables. A uniform bundle
+/// cannot tell a per-epoch table set from a whole-run one, and it never
+/// exercises `verify_epoch`'s cross-check against a count that changes from one
+/// epoch to the next — which is the arithmetic this change rewrote.
+/// `all_loadstore_32` at 8-cycle epochs has a table that is present, goes away
+/// and comes back.
+#[test]
+fn test_recursion_accepts_a_bundle_whose_epochs_carry_different_tables() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_loadstore_32");
+
+    let bundle = crate::continuation::prove_continuation(&elf_bytes, &[], 3, &MIN_PROOF_OPTIONS)
+        .expect("continuation prove should succeed");
+    assert!(
+        bundle.num_epochs() > 1,
+        "8-cycle epochs must split all_loadstore_32 for this test to bite"
+    );
+
+    // The premise: the epochs really do disagree. Without this the test is the
+    // fibonacci one again, with a slower program.
+    let present_per_epoch: Vec<Vec<bool>> = bundle
+        .epoch_table_counts()
+        .iter()
+        .map(|c| vec![c.load > 0, c.store > 0, c.memw > 0, c.lt > 0, c.branch > 0])
+        .collect();
+    let disagrees = (0..present_per_epoch[0].len()).any(|i| {
+        present_per_epoch
+            .iter()
+            .any(|row| row[i] != present_per_epoch[0][i])
+    });
+    assert!(
+        disagrees,
+        "every epoch declares the same tables, so this bundle does not exercise \
+         a variable table set: {present_per_epoch:?}"
+    );
+
+    // Ground truth from the host path, then the same bundle through the guest's.
+    let expected_output =
+        crate::continuation::verify_continuation(&elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
+            .expect("verify_continuation errored")
+            .expect("a mixed-shape bundle must verify");
+    let (expected_decode, expected_pages) =
+        crate::continuation::continuation_precomputed_commitments(
+            &elf_bytes,
+            &bundle,
+            &MIN_PROOF_OPTIONS,
+        )
+        .expect("continuation_precomputed_commitments errored");
+    let expected_id = recursion::program_id_from_elf(&elf_bytes, &expected_decode, &expected_pages)
+        .expect("program_id_from_elf errored");
+
+    let blob = recursion::encode_continuation_guest_input(bundle, &elf_bytes, &MIN_PROOF_OPTIONS)
+        .expect("encode_continuation_guest_input failed");
+    let attestation = recursion::verify_continuation_and_attest(&blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_continuation_and_attest errored")
+        .expect("a mixed-shape bundle must survive the guest path too");
+    let (id, output) = recursion::split_attestation(&attestation).expect("attestation too short");
+    assert_eq!(
+        id, expected_id,
+        "attested id must match the honest recompute"
+    );
+    assert_eq!(output, &expected_output[..], "attested output must match");
+}
+
 /// Corrupting a private-input commitment on an *honest* proof makes
 /// verification fail (`Ok(false)`). Necessary but not sufficient alone — a
 /// custom prover can supply consistent mismatched roots (see
@@ -1050,6 +1116,109 @@ fn test_dump_recursion_input() {
             sidecar_data.len()
         );
     }
+}
+
+/// Count the keccak hashes done to VERIFY the dumped recursion blob — a
+/// prover-change metric: fewer hashes ⇒ a cheaper recursion guest. Runs the exact
+/// guest verify (`verify_continuation_and_attest`) on `/tmp/recursion_input.bin`
+/// (override with `RECURSION_INPUT_PATH`) with `crypto::hash_metrics` counting
+/// every keccak-256 finalize, and reports the grinding proof-of-work hashes apart
+/// so the headline `total` excludes them.
+///
+/// Requires:
+/// * the `hash-metrics` cargo feature — without it counting is a no-op (all zeros
+///   → this test asserts and tells you to add the feature);
+/// * a CONTINUATION dump: `test_dump_recursion_input` with `RECURSION_DUMP_EPOCH_LOG2`
+///   set (this path verifies via `verify_continuation_and_attest`);
+/// * `RECURSION_DUMP_PRESET` matching the dump (default `min`), else the verify fails.
+///
+/// Loop: change the prover → re-run `test_dump_recursion_input` (re-proves + dumps
+/// the new blob) → run this (fast, verify-only) → compare `total`.
+///
+///   RECURSION_DUMP_PRESET=blowup4 cargo test --release --features hash-metrics \
+///     -p lambda-vm-prover --lib test_count_recursion_hashes -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic: counts keccak hashes verifying the dumped recursion blob"]
+fn test_count_recursion_hashes() {
+    let preset_name = std::env::var("RECURSION_DUMP_PRESET").unwrap_or_else(|_| "min".to_string());
+    let preset = Preset::ALL
+        .into_iter()
+        .find(|p| p.name() == preset_name)
+        .unwrap_or_else(|| panic!("unknown RECURSION_DUMP_PRESET '{preset_name}'"));
+    let path = std::env::var("RECURSION_INPUT_PATH")
+        .unwrap_or_else(|_| "/tmp/recursion_input.bin".to_string());
+    let blob = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("read {path} (run test_dump_recursion_input first): {e}"));
+
+    // Counting is always-on under the `hash-metrics` feature, so just zero the
+    // counters, verify, and read — no enable/disable, nothing in the verifier.
+    crypto::hash_metrics::reset();
+    let attestation = recursion::verify_continuation_and_attest(&blob, &preset.options()).expect(
+        "verify_continuation_and_attest errored — needs a CONTINUATION dump \
+         (RECURSION_DUMP_EPOCH_LOG2 set) under a matching RECURSION_DUMP_PRESET",
+    );
+    let c = crypto::hash_metrics::snapshot();
+
+    assert!(
+        attestation.is_some(),
+        "the blob must verify under preset '{}' — does it match the dump's RECURSION_DUMP_PRESET?",
+        preset.name()
+    );
+    assert!(
+        c.total > 0,
+        "hash counters are zero — build with `--features hash-metrics`"
+    );
+    // `merkle` and `grinding` are disjoint subsets of `total`; `nodes` ⊆ `merkle`.
+    // (Holds for the keccak recursion verify; flags a backend/counter mismatch.)
+    assert!(
+        c.merkle_nodes <= c.merkle && c.merkle + c.grinding <= c.total,
+        "inconsistent counters: {c:?}"
+    );
+
+    assert!(
+        c.perms > 0,
+        "perm counter is zero — build with `--features hash-metrics`"
+    );
+
+    // keccak_permute census (guest cost) measured for the standard <preset> proof;
+    // `perms` here matches it when this test verifies that same proof (it is the
+    // env-configurable dump, so a different workload legitimately differs).
+    let census = match preset.name() {
+        "min" => Some(3_595u64),
+        "blowup2" => Some(448_737),
+        "blowup4" => Some(241_052),
+        _ => None,
+    };
+    let census_note = match census {
+        Some(n) if n == c.perms => format!(" — matches census {n} ✓"),
+        Some(n) => format!(" — census {n} (differs → different workload than the census)"),
+        None => String::new(),
+    };
+
+    // Three dimensions. PERMS: keccak-f permutations = the unit the guest pays
+    // (one `keccak_permute` syscall each), guest-faithful and self-validatable.
+    // FINALIZES: one keccak output per leaf/node/squeeze. ABSORB (host-side): the
+    // `Update::update` calls a block-absorption change would move (perms unchanged).
+    println!(
+        "[hash-count] preset={} blob={}B fri_queries={}\n  \
+         PERMS (keccak_permute, guest cost)={}{}\n  \
+         finalizes: total(excl. grinding)={} merkle={} (nodes={} leaves={}) \
+         transcript+other={} grinding={}\n  \
+         absorb (host): calls={} bytes={}",
+        preset.name(),
+        blob.len(),
+        preset.options().fri_number_of_queries,
+        c.perms,
+        census_note,
+        c.total - c.grinding,
+        c.merkle,
+        c.merkle_nodes,
+        c.merkle - c.merkle_nodes,
+        c.total - c.merkle - c.grinding,
+        c.grinding,
+        c.absorb_calls,
+        c.absorb_bytes,
+    );
 }
 
 /// Cycle count only of the recursion guest verifying a 1-query inner proof.

@@ -1963,8 +1963,8 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// and IS_B20 lookups for carry range checks.
 ///
 /// IS_HALF and IS_B20 are emitted once per raw op. MSB16 is deduplicated
-/// per `max_rows_mul` chunk, mirroring `chunk_and_generate` — a unique signed
-/// op that spans two instances is sent twice and must be tallied twice.
+/// per `max_rows_mul` chunk, mirroring `chunk_and_generate_optional` — a unique
+/// signed op that spans two instances is sent twice and must be tallied twice.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_mul(
@@ -2061,7 +2061,7 @@ pub(crate) fn collect_bitwise_from_mul(
 ///
 /// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16 and the
 /// NEG-template ZERO lookups (C3/C5) are deduplicated per `max_rows_dvrm`
-/// chunk, mirroring `chunk_and_generate`.
+/// chunk, mirroring `chunk_and_generate_optional`.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_dvrm(
@@ -2993,6 +2993,14 @@ impl CollectedEpoch {
 }
 
 /// All generated trace tables.
+///
+/// Every `Vec` field here may be **empty**: a chip the run never reaches carries
+/// no table at all, so indexing one without checking panics on a program that
+/// happens not to use it. The only exceptions are `cpus` and `memw_registers`,
+/// which are built through `chunk_and_generate` and always carry at least one
+/// (padded) chunk — the same two `TableCounts::validate` requires. Several
+/// fields below spell this out individually; the rule is the struct's, not
+/// theirs.
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
     pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3042,30 +3050,35 @@ pub struct Traces {
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
-    pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// COMMIT table for write syscall (byte-by-byte commit with recursive bus).
+    /// Empty when the run commits no bytes.
+    pub commits: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// KECCAK core table (one row per keccak permutation call)
-    pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// KECCAK core table (one row per keccak permutation call). Empty when the
+    /// run makes no keccak call.
+    pub keccaks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// KECCAK_RND round table (24 rows per keccak call)
-    pub keccak_rnd: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// KECCAK_RND round table (24 rows per keccak call). Empty alongside KECCAK.
+    pub keccak_rnds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// ECSM core table (one row per scalar-multiplication ecall)
-    pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// ECSM core table (one row per scalar-multiplication ecall). Empty when the
+    /// run makes no ECSM call.
+    pub ecsms: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// ECDAS double/add table (variable rows per ecall)
-    pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// ECDAS double/add table (variable rows per ecall). Empty alongside ECSM.
+    pub ecdases: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// HINT table (one row per non-constraining hint ecall). Empty when the run
+    /// makes no hint ecall.
+    pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// Unified MEMMOVE table: one streaming copy primitive for memcpy/memmove,
     /// memset and the commit byte loop, selected by decoded functionality columns.
+    /// Always present: the COMMIT byte loop is deferred to it.
     pub memmove: TraceTable<GoldilocksField, GoldilocksExtension>,
-
-    /// HINT table (one row per non-constraining hint ecall).
-    pub hint: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3115,9 +3128,10 @@ struct CollectedOps {
     hint_ops: Vec<hint::HintOperation>,
 }
 
-/// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
-/// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
-/// is built so peak heap usage stays bounded.
+/// Chunk raw ops and generate one trace table per chunk, padding an empty `ops`
+/// to a single chunk so the table is always present in the proof.
+///
+/// For tables that may be omitted entirely, use [`chunk_and_generate_optional`].
 fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
@@ -3129,6 +3143,73 @@ fn chunk_and_generate<T: Sync>(
     } else {
         ops.chunks(max_rows).collect()
     };
+    generate_chunks(
+        op_chunks,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// Like [`chunk_and_generate`], but an empty `ops` yields no table at all: the
+/// chip is left out of the proof instead of costing a padded sub-proof.
+///
+/// The empty case short-circuits rather than falling through to `ops.chunks`,
+/// which panics on a zero chunk size even for an empty slice. `max_rows` comes
+/// from a caller-supplied [`MaxRowsConfig`] whose fields are public.
+///
+/// Sound because a chip contributes to the run only through its LogUp bus, and a
+/// chip with no rows contributes zero. A prover that omits a table whose ops did
+/// execute leaves its counterparty's sends unmatched, and the bus-balance check
+/// over the tables that *are* present rejects the proof. See
+/// `TableCounts::validate`.
+fn chunk_and_generate_optional<T: Sync>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let op_chunks: Vec<&[T]> = if ops.is_empty() {
+        vec![]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    generate_chunks(
+        op_chunks,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// Generate a single trace table for `ops`, or none at all when `ops` is empty.
+///
+/// The accelerator chips are not chunked: one call means one table. What they do
+/// share with the chunked chips is that an empty op list should cost nothing, so
+/// this returns an empty `Vec` and the table drops out of the proof. Soundness
+/// rests on the same LogUp argument as [`chunk_and_generate_optional`].
+fn generate_optional<T: Sync>(
+    ops: &[T],
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
+    generate_chunks(
+        op_chunks,
+        generate,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+}
+
+/// Generate one trace table per already-chunked op slice. When `storage_mode` is
+/// `Disk`, each chunk's main table is spilled to mmap before the next chunk is
+/// built so peak heap usage stays bounded.
+fn generate_chunks<T: Sync>(
+    op_chunks: Vec<&[T]>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     // Disk mode generates one chunk at a time so each spills before the next
     // allocates, keeping trace memory bounded.
     #[cfg(feature = "disk-spill")]
@@ -3584,7 +3665,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memws = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &memw_ops,
             max_rows.memw,
             memw::generate_memw_trace,
@@ -3593,7 +3674,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_aligneds = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &memw_aligned_ops,
             max_rows.memw_aligned,
             memw_aligned::generate_memw_aligned_trace,
@@ -3613,7 +3694,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_loads = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &load_ops,
             max_rows.load,
             load::generate_load_trace,
@@ -3622,7 +3703,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_lts = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &lt_ops,
             max_rows.lt,
             lt::generate_lt_trace,
@@ -3631,7 +3712,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_shifts = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &shift_ops,
             max_rows.shift,
             shift::generate_shift_trace,
@@ -3640,7 +3721,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_muls = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
             mul::generate_mul_trace,
@@ -3649,7 +3730,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_dvrms = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
             dvrm::generate_dvrm_trace,
@@ -3658,7 +3739,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_branches = || {
-        chunk_and_generate(
+        chunk_and_generate_optional(
             &branch_ops,
             max_rows.branch,
             branch::generate_branch_trace,
@@ -3666,11 +3747,10 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
-    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
-    // contributes nothing to any bus.
+    // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
+    // ops above.
     let gen_eqs = || {
-        chunk_and_generate::<eq::EqOperation>(
+        chunk_and_generate_optional::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
             eq::generate_eq_trace,
@@ -3679,7 +3759,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_bytewises = || {
-        chunk_and_generate::<bytewise::BytewiseOperation>(
+        chunk_and_generate_optional::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
             bytewise::generate_bytewise_trace,
@@ -3688,7 +3768,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_stores = || {
-        chunk_and_generate::<store::StoreOperation>(
+        chunk_and_generate_optional::<store::StoreOperation>(
             &store_ops,
             max_rows.store,
             store::generate_store_trace,
@@ -3697,7 +3777,7 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_cpu32s = || {
-        chunk_and_generate::<cpu32::Cpu32Operation>(
+        chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
             cpu32::generate_cpu32_trace,
@@ -3721,9 +3801,23 @@ fn build_traces<I: ImageSource + Sync>(
         decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
         decode
     };
-    let gen_commit = || commit::generate_commit_trace(&commit_ops);
-    let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
-    let gen_keccak_rnd = || {
+    let gen_commits = || {
+        generate_optional(
+            &commit_ops,
+            commit::generate_commit_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_keccaks = || {
+        generate_optional(
+            &keccak_ops,
+            keccak::generate_keccak_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_keccak_rnds = || {
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
             .iter()
             .map(|op| KeccakRoundOperation {
@@ -3732,7 +3826,12 @@ fn build_traces<I: ImageSource + Sync>(
                 output: op.output,
             })
             .collect();
-        keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
+        generate_optional(
+            &keccak_rnd_ops,
+            keccak_rnd::generate_keccak_rnd_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
     };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
@@ -3750,26 +3849,49 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_register = || register::generate_register_trace(&register_final_state, register_init);
     let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
-    // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
-    let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
-    let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
+    // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
+    // and no ECDAS table at all — not a padded one.
+    let gen_ecsms = || {
+        generate_optional(
+            &ecsm_ops,
+            ecsm::generate_ecsm_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_ecdases = || {
+        generate_optional(
+            &ecdas_ops,
+            ecdas::generate_ecdas_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    // HINT table. Absent entirely for programs that make no hint ecalls.
+    let gen_hints = || {
+        generate_optional(
+            &hint_ops,
+            hint::generate_hint_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    // MEMMOVE is not optional: COMMIT defers its byte loop here.
     let gen_memmove = || memmove::generate_memmove_trace(&memmove_ops);
-    // HINT table (all-padding for programs that make no hint ecalls).
-    let gen_hint = || hint::generate_hint_trace(&hint_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
     let (mut loads_slot, mut lts_slot, mut shifts_slot, mut muls_slot) = (None, None, None, None);
     let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
         (None, None, None, None);
-    let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
+    let (mut commits_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
         (None, None, None, None);
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
-    let (mut ecsm_slot, mut ecdas_slot) = (None, None);
+    let (mut ecsms_slot, mut ecdases_slot) = (None, None);
+    let mut hints_slot = None;
     let mut memmove_slot = None;
-    let mut hint_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3799,20 +3921,20 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(shifts_slot, gen_shifts);
             spawn_into!(dvrms_slot, gen_dvrms);
             spawn_into!(pages_slot, gen_pages);
-            spawn_into!(keccak_slot, gen_keccak);
-            spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
+            spawn_into!(keccaks_slot, gen_keccaks);
+            spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
-            spawn_into!(commit_slot, gen_commit);
+            spawn_into!(commits_slot, gen_commits);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
             spawn_into!(eqs_slot, gen_eqs);
             spawn_into!(bytewises_slot, gen_bytewises);
             spawn_into!(stores_slot, gen_stores);
             spawn_into!(cpu32s_slot, gen_cpu32s);
-            spawn_into!(ecsm_slot, gen_ecsm);
-            spawn_into!(ecdas_slot, gen_ecdas);
+            spawn_into!(ecsms_slot, gen_ecsms);
+            spawn_into!(ecdases_slot, gen_ecdases);
+            spawn_into!(hints_slot, gen_hints);
             spawn_into!(memmove_slot, gen_memmove);
-            spawn_into!(hint_slot, gen_hint);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3827,9 +3949,9 @@ fn build_traces<I: ImageSource + Sync>(
         branches_slot = Some(gen_branches());
         bitwise_slot = Some(gen_bitwise());
         decode_slot = Some(gen_decode());
-        commit_slot = Some(gen_commit());
-        keccak_slot = Some(gen_keccak());
-        keccak_rnd_slot = Some(gen_keccak_rnd());
+        commits_slot = Some(gen_commits());
+        keccaks_slot = Some(gen_keccaks());
+        keccak_rnds_slot = Some(gen_keccak_rnds());
         keccak_rc_slot = Some(gen_keccak_rc());
         pages_slot = Some(gen_pages());
         register_slot = Some(gen_register());
@@ -3838,10 +3960,10 @@ fn build_traces<I: ImageSource + Sync>(
         bytewises_slot = Some(gen_bytewises());
         stores_slot = Some(gen_stores());
         cpu32s_slot = Some(gen_cpu32s());
-        ecsm_slot = Some(gen_ecsm());
-        ecdas_slot = Some(gen_ecdas());
+        ecsms_slot = Some(gen_ecsms());
+        ecdases_slot = Some(gen_ecdases());
+        hints_slot = Some(gen_hints());
         memmove_slot = Some(gen_memmove());
-        hint_slot = Some(gen_hint());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3863,10 +3985,9 @@ fn build_traces<I: ImageSource + Sync>(
     let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut decode = decode_slot.expect(PHASE5_RAN);
-    #[allow(unused_mut)]
-    let mut commit_trace = commit_slot.expect(PHASE5_RAN);
-    let keccak_trace = keccak_slot.expect(PHASE5_RAN);
-    let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
+    let commits = commits_slot.expect(PHASE5_RAN)?;
+    let keccaks = keccaks_slot.expect(PHASE5_RAN)?;
+    let keccak_rnds = keccak_rnds_slot.expect(PHASE5_RAN)?;
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
@@ -3874,10 +3995,10 @@ fn build_traces<I: ImageSource + Sync>(
     let mut register_trace = register_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut halt_trace = halt_slot.expect(PHASE5_RAN);
-    let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
-    let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
+    let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
+    let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
+    let hints = hints_slot.expect(PHASE5_RAN)?;
     let memmove_trace = memmove_slot.expect(PHASE5_RAN);
-    let hint_trace = hint_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3891,10 +4012,6 @@ fn build_traces<I: ImageSource + Sync>(
             .main_table
             .spill_to_disk()
             .map_err(|e| Error::Prover(format!("disk-spill decode: {e}")))?;
-        commit_trace
-            .main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill commit: {e}")))?;
         register_trace
             .main_table
             .spill_to_disk()
@@ -3939,14 +4056,14 @@ fn build_traces<I: ImageSource + Sync>(
         public_output_bytes,
         branches,
         halt: halt_trace,
-        commit: commit_trace,
-        keccak: keccak_trace,
-        keccak_rnd: keccak_rnd_trace,
+        commits,
+        keccaks,
+        keccak_rnds,
         keccak_rc: keccak_rc_trace,
-        ecsm: ecsm_trace,
-        ecdas: ecdas_trace,
+        ecsms,
+        ecdases,
+        hints,
         memmove: memmove_trace,
-        hint: hint_trace,
         memw_registers,
         local_to_global,
         touched_memory_cells,
@@ -3957,14 +4074,19 @@ fn build_traces<I: ImageSource + Sync>(
     })
 }
 
-/// Padded row count after chunking.
+/// Padded row count after chunking, for a table that is always present: an
+/// empty op list still allocates one 4-row padded chunk.
 #[cfg(feature = "disk-spill")]
 fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
+    padded_chunked_rows_optional(ops_count, max_rows).max(4)
+}
+
+/// Padded row count after chunking, for a table left out of the proof when
+/// unused. Mirrors [`chunk_and_generate_optional`]: no ops, no rows.
+#[cfg(feature = "disk-spill")]
+fn padded_chunked_rows_optional(ops_count: usize, max_rows: usize) -> u64 {
     // `max_rows <= 0` would loop forever. Called internally with const values > 0.
     assert!(max_rows > 0, "max_rows must be positive");
-    if ops_count == 0 {
-        return 4; // empty-chunk tables still allocate one 4-row padded chunk
-    }
     let mut total: u64 = 0;
     let mut remaining = ops_count;
     while remaining > 0 {
@@ -4246,19 +4368,26 @@ pub fn count_table_lengths(
 
     Ok(TableLengths {
         cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
-        memw_padded_rows: padded_chunked_rows(memw_count, max_rows.memw),
-        memw_aligned_padded_rows: padded_chunked_rows(memw_aligned_count, max_rows.memw_aligned),
+        memw_padded_rows: padded_chunked_rows_optional(memw_count, max_rows.memw),
+        memw_aligned_padded_rows: padded_chunked_rows_optional(
+            memw_aligned_count,
+            max_rows.memw_aligned,
+        ),
         memw_register_padded_rows: padded_chunked_rows(memw_register_count, max_rows.memw_register),
-        load_padded_rows: padded_chunked_rows(load_count, max_rows.load),
-        lt_padded_rows: padded_chunked_rows(lt_count, max_rows.lt),
-        shift_padded_rows: padded_chunked_rows(shift_count, max_rows.shift),
-        mul_padded_rows: padded_chunked_rows(mul_count, max_rows.mul),
-        dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
-        branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
-        commit_padded_rows: commit_count
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
-            .max(4) as u64,
+        load_padded_rows: padded_chunked_rows_optional(load_count, max_rows.load),
+        lt_padded_rows: padded_chunked_rows_optional(lt_count, max_rows.lt),
+        shift_padded_rows: padded_chunked_rows_optional(shift_count, max_rows.shift),
+        mul_padded_rows: padded_chunked_rows_optional(mul_count, max_rows.mul),
+        dvrm_padded_rows: padded_chunked_rows_optional(dvrm_count, max_rows.dvrm),
+        branch_padded_rows: padded_chunked_rows_optional(branch_count, max_rows.branch),
+        commit_padded_rows: if commit_count == 0 {
+            0
+        } else {
+            commit_count
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+                .max(4) as u64
+        },
         memmove_padded_rows: memmove_count.next_power_of_two().max(4) as u64,
         decode_rows,
         unique_page_count,
@@ -4322,10 +4451,10 @@ impl Traces {
         // place (L2G range-check lookups) after the build, which would leave
         // a stale device copy to be committed.
         tables.push(&mut self.decode);
-        tables.push(&mut self.keccak);
-        tables.push(&mut self.keccak_rnd);
-        tables.push(&mut self.ecsm);
-        tables.push(&mut self.ecdas);
+        tables.extend(self.keccaks.iter_mut());
+        tables.extend(self.keccak_rnds.iter_mut());
+        tables.extend(self.ecsms.iter_mut());
+        tables.extend(self.ecdases.iter_mut());
         // MEMMOVE qualifies on the same criterion as ECSM/ECDAS: of the tables left
         // out, it is the only one whose height scales with the workload rather than
         // being one row per event. Nothing mutates it after the build, so unlike
@@ -4405,13 +4534,13 @@ impl Traces {
             register,
             branches,
             halt,
-            commit,
-            keccak,
-            keccak_rnd,
+            commits,
+            keccaks,
+            keccak_rnds,
             keccak_rc,
-            ecsm,
-            ecdas,
-            hint,
+            ecsms,
+            ecdases,
+            hints,
             memmove,
             memw_registers,
             eqs,
@@ -4455,7 +4584,9 @@ impl Traces {
             total += (t.num_rows() * BRANCH_COLS) as u64;
         }
         total += (halt.num_rows() * HALT_COLS) as u64;
-        total += (commit.num_rows() * COMMIT_COLS) as u64;
+        for t in commits {
+            total += (t.num_rows() * COMMIT_COLS) as u64;
+        }
         total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
         for t in pages {
             total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
@@ -4463,8 +4594,12 @@ impl Traces {
         for t in memw_registers {
             total += (t.num_rows() * MEMW_R_COLS) as u64;
         }
-        total += (keccak.num_rows() * KECCAK_COLS) as u64;
-        total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
+        for t in keccaks {
+            total += (t.num_rows() * KECCAK_COLS) as u64;
+        }
+        for t in keccak_rnds {
+            total += (t.num_rows() * KECCAK_RND_COLS) as u64;
+        }
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         for t in eqs {
             total += (t.num_rows() * EQ_COLS) as u64;
@@ -4478,10 +4613,16 @@ impl Traces {
         for t in cpu32s {
             total += (t.num_rows() * CPU32_COLS) as u64;
         }
-        total += (ecsm.num_rows() * ECSM_COLS) as u64;
-        total += (ecdas.num_rows() * ECDAS_COLS) as u64;
+        for t in ecsms {
+            total += (t.num_rows() * ECSM_COLS) as u64;
+        }
+        for t in ecdases {
+            total += (t.num_rows() * ECDAS_COLS) as u64;
+        }
+        for t in hints {
+            total += (t.num_rows() * HINT_COLS) as u64;
+        }
         total += (memmove.num_rows() * super::memmove::cols::NUM_COLUMNS) as u64;
-        total += (hint.num_rows() * HINT_COLS) as u64;
         total
     }
 
@@ -4541,13 +4682,13 @@ impl Traces {
             register,
             branches,
             halt,
-            commit,
-            keccak,
-            keccak_rnd,
+            commits,
+            keccaks,
+            keccak_rnds,
             keccak_rc,
-            ecsm,
-            ecdas,
-            hint,
+            ecsms,
+            ecdases,
+            hints,
             memmove,
             memw_registers,
             eqs,
@@ -4591,7 +4732,9 @@ impl Traces {
             total += (t.num_rows() * n_branch) as u64;
         }
         total += (halt.num_rows() * n_halt) as u64;
-        total += (commit.num_rows() * n_commit) as u64;
+        for t in commits {
+            total += (t.num_rows() * n_commit) as u64;
+        }
         total += (register.num_rows() * n_register) as u64;
         for t in pages {
             total += (t.num_rows() * n_page) as u64;
@@ -4599,8 +4742,12 @@ impl Traces {
         for t in memw_registers {
             total += (t.num_rows() * n_memw_r) as u64;
         }
-        total += (keccak.num_rows() * n_keccak) as u64;
-        total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
+        for t in keccaks {
+            total += (t.num_rows() * n_keccak) as u64;
+        }
+        for t in keccak_rnds {
+            total += (t.num_rows() * n_keccak_rnd) as u64;
+        }
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
@@ -4614,10 +4761,16 @@ impl Traces {
         for t in cpu32s {
             total += (t.num_rows() * n_cpu32) as u64;
         }
-        total += (ecsm.num_rows() * n_ecsm) as u64;
-        total += (ecdas.num_rows() * n_ecdas) as u64;
+        for t in ecsms {
+            total += (t.num_rows() * n_ecsm) as u64;
+        }
+        for t in ecdases {
+            total += (t.num_rows() * n_ecdas) as u64;
+        }
+        for t in hints {
+            total += (t.num_rows() * n_hint) as u64;
+        }
         total += (memmove.num_rows() * n_memmove) as u64;
-        total += (hint.num_rows() * n_hint) as u64;
         total
     }
 
@@ -4638,6 +4791,12 @@ impl Traces {
             bytewise: self.bytewises.len(),
             store: self.stores.len(),
             cpu32: self.cpu32s.len(),
+            keccak: self.keccaks.len(),
+            keccak_rnd: self.keccak_rnds.len(),
+            ecsm: self.ecsms.len(),
+            ecdas: self.ecdases.len(),
+            hint: self.hints.len(),
+            commit: self.commits.len(),
         }
     }
 

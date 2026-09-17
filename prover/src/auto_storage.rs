@@ -107,7 +107,12 @@ fn aux_cols(bus_count: usize) -> u64 {
     bus_count.div_ceil(2) as u64
 }
 
-/// Per-table specs in the same order as `air_trace_pairs` in `prove`.
+/// Per-table specs for the heap estimate. The order is not meaningful — every
+/// consumer sums or sorts — and it does not track `air_trace_pairs`.
+///
+/// Note this list models only the tables `TableLengths` carries: there is no
+/// entry for eq, bytewise, store, cpu32, keccak, keccak_rnd, ecsm, ecdas or
+/// hint, so a run dominated by one of those is under-estimated.
 fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
