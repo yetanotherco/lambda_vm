@@ -705,6 +705,11 @@ pub struct TableDeep<FieldExtension: IsField> {
     /// verifier has no forks, only a proof. Everything here is carried in the
     /// proof, so the verifier rebuilds the same seed from the same bytes.
     pub bus_contribution: Option<FieldElement<FieldExtension>>,
+    /// The round 1 roots and the full bus inputs, which the proof carries even
+    /// though only the contribution goes into the seed.
+    pub main_roots: MainRoots,
+    pub aux_root: Option<Commitment>,
+    pub bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
     pub composition_poly_root: Commitment,
     pub trace_ood: Table<FieldExtension>,
     pub trace_ood_next: Table<FieldExtension>,
@@ -2133,6 +2138,12 @@ pub trait IsStarkProver<
                 .bus_public_inputs
                 .as_ref()
                 .map(|b| b.table_contribution.clone()),
+            main_roots: MainRoots {
+                precomputed: round_1_result.main.precomputed_root,
+                main: round_1_result.main.root,
+            },
+            aux_root: round_1_result.aux.as_ref().map(|c| c.root),
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             composition_poly_root: round_2_result.composition_poly_root,
             trace_ood,
             trace_ood_next,

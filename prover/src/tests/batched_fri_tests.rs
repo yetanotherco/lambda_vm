@@ -138,6 +138,12 @@ fn alpha_moves_when_any_table_moves() {
         deep: Vec::new(),
         air_index: seed as usize,
         bus_contribution: Some(FieldElement::<E>::from(seed)),
+        main_roots: stark::prover::MainRoots {
+            precomputed: None,
+            main: [0u8; 32],
+        },
+        aux_root: None,
+        bus_public_inputs: None,
         composition_poly_root: [seed as u8; 32],
         trace_ood: Table::new(vec![FieldElement::<E>::from(seed + 1)], 1),
         trace_ood_next: Table::new(vec![FieldElement::<E>::from(seed + 2)], 1),
@@ -363,4 +369,95 @@ fn the_open_pass_serves_every_table_at_its_group() {
             );
         }
     }
+}
+
+/// The batched proof must carry, per table, what the per-table proof carries —
+/// minus exactly the FRI.
+///
+/// The claim behind the whole format is that nothing is lost by moving the FRI
+/// to the group: a table still answers for its own roots, its own out-of-domain
+/// values and its own rows. So every one of those is compared against a real
+/// per-table proof, table by table. What is absent is the four things that
+/// became the group's, and those are what the size saving is made of.
+#[test]
+fn the_batched_proof_keeps_everything_but_the_fri() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let vm_proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &proof_options, &max_rows)
+        .expect("ordinary prove");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let batched = crate::logup_phase::run_batched(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("batched phase");
+    let opened =
+        crate::logup_phase::run_open(&elf, &[], &max_rows, &proof_options, &challenge, &batched)
+            .expect("open pass");
+    let proof = crate::logup_phase::assemble_batched_proof(batched, opened).expect("assemble");
+
+    assert_eq!(
+        proof.tables.len(),
+        vm_proof.proof.proofs.len(),
+        "the batched proof covers a different number of tables"
+    );
+    for (idx, (got, want)) in proof
+        .tables
+        .iter()
+        .zip(vm_proof.proof.proofs.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            got.main_root, want.lde_trace_main_merkle_root,
+            "table {idx}: a different main root"
+        );
+        assert_eq!(
+            got.aux_root, want.lde_trace_aux_merkle_root,
+            "table {idx}: a different auxiliary root"
+        );
+        assert_eq!(
+            got.precomputed_root, want.lde_trace_precomputed_merkle_root,
+            "table {idx}: a different precomputed root"
+        );
+        assert_eq!(
+            got.composition_poly_root, want.composition_poly_root,
+            "table {idx}: a different composition root"
+        );
+        assert_eq!(
+            got.parts_ood, want.composition_poly_parts_ood_evaluation,
+            "table {idx}: different composition parts at z"
+        );
+        assert_eq!(
+            (got.trace_ood.width, got.trace_ood.columns()),
+            (
+                want.trace_ood_evaluations.width,
+                want.trace_ood_evaluations.columns()
+            ),
+            "table {idx}: different out-of-domain evaluations at z"
+        );
+        assert_eq!(
+            got.trace_rows, want.trace_length,
+            "table {idx}: a different trace length"
+        );
+    }
+
+    // And the FRI is where it should be: nowhere per table, once per domain.
+    assert!(
+        proof.groups.len() < proof.tables.len(),
+        "{} groups for {} tables is no collapse",
+        proof.groups.len(),
+        proof.tables.len()
+    );
 }
