@@ -77,9 +77,12 @@ env:
   # against its 13:1. That is the whole point — a prover change can move the
   # synthetic number and the real one in opposite directions.
   #
-  # Those three counts are deterministic for a given ELF and input, so they are the
-  # check that the workload is what this job thinks it is; every figure below that
-  # carries seconds or bytes is machine-dependent and was measured on THIS runner.
+  # Those three counts are deterministic for a given ELF and input, so they are worth
+  # recording -- but they are documentation, not a gate: nothing in this job compares a
+  # run against them. What does check the workload is the fixture's sha256 (Makefile) plus
+  # the cycle floor a few steps below, which refuses a run the guest rejected. Every
+  # figure that carries seconds or bytes is machine-dependent and was measured on THIS
+  # runner.
   # All three move with the ethrex rev, so re-measure on a bump rather than carrying
   # them across one.
   #
@@ -101,7 +104,7 @@ env:
   # needs rkyv `pointer_width_64` in the PROVER's bundle serialisation; a PR branch
   # predating that fix fails at write time rather than mismeasuring.
   #
-  # Epoch 2^22, measured on THIS runner on 2026-09-08 (box idle): mean 125.17 s over
+  # Epoch 2^22, measured on THIS runner on 2026-09-08 (box idle): mean 125.33 s over
   # 14 proves, sd 1.58 s, CV 1.26%, 44.81 GiB peak RSS, 790 MB bundle; verifying one
   # bundle is 12.0 s.
   #
@@ -133,7 +136,9 @@ env:
   # turn down (2, or 1) before reaching for anything else.
   #
   # What 3 runs can actually resolve, from that sd: a two-sided 95% delta of ~2.00%.
-  # Five per side gets to ~1.00% and ten to ~0.58%, so a sub-2% claim needs `/bench N`
+  # These are 1.96 x sd x sqrt(2/n): two independent samples, which is what this job
+  # takes, since the PR side and the baseline side are separate sweeps and not pairs.
+  # Five per side gets to ~1.56% and ten to ~1.10%, so a sub-2% claim needs `/bench N`
   # (clamped to 5) or the ABBA tiebreaker, not a re-read of a 3-run table.
   # `/bench N` overrides this, clamped to [1,5]. Past 5 the cached comparison can't
   # beat the ~1% session-drift wall anyway — that is what /bench-abba is for, and it
@@ -286,9 +291,10 @@ jobs:
 
           # Clamp to 1-5. Beyond 5 the single-session cached comparison barely improves
           # (it can't beat the ~1% drift wall); use /bench-abba for finer deltas — it
-          # resolves ~0.5% over the same block in ~58 min at its default 12 pairs.
+          # resolves ~1.0% on a shared box (0.28% on a quiet one) over the same block in ~58 min
+          # at its default 12 pairs.
           # At 125.17 s a run this is also the difference between a ~10 min and a ~20 min
-          # occupancy of the one bench runner. Three runs resolve ~2.00%, five ~1.00%.
+          # occupancy of the one bench runner. Three runs resolve ~2.00%, five ~1.56%.
           if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 5 ] 2>/dev/null; then
             echo "::warning::Run count $RUNS out of range [1,5], defaulting to $BENCH_RUNS_REAL"
             RUNS=$BENCH_RUNS_REAL

@@ -48,8 +48,10 @@
 #   WORKLOAD=synthetic to reproduce a number recorded against that fixture.
 #
 #   Sizing at WORKLOAD=real, from the paired t-test (resolvable 95% delta =
-#   t* x sd / sqrt(N)). The two columns are the same runner under two conditions, not a
-#   guess bracketing an unknown: its variance is contention, so the single-run CV is
+#   1.96 x sd / sqrt(N), the normal approximation -- the exact t* at these pair counts is
+#   10-20% larger, so read every cell below as a floor). The two columns are the same
+#   runner under two conditions, not a guess bracketing an unknown: its variance is
+#   contention, so the single-run CV is
 #   0.34% across the proves that got the most CPU and 1.26% across all of a 14-prove
 #   baseline. sd of a pair delta is sqrt(2) x that. Keep this table in sync with the one
 #   in .github/workflows/bench-abba.yml:
@@ -186,8 +188,16 @@ if [ "$WORKLOAD" = "real" ]; then
   # A failure below must not leave a cargo build running: on the shared bench runner the
   # next batch would measure against it. No-op once the wait below has reaped it.
   trap kill_fixture EXIT
-elif [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
+else
+  # UNCONDITIONAL, unlike the real block's digest check: these names carry neither the rev
+  # nor the schema (`ethrex_<n>_transfers.bin` is untracked, `ethrex_bench_20.bin` is
+  # gitignored), so a copy left by an earlier ethrex rev is reused byte for byte and no
+  # digest anywhere would notice. The floor below catches the rev bumps that make the
+  # guest REJECT the file; it cannot catch a file that is merely a different valid block.
+  # Regenerating is what makes that impossible, and it is nearly free: the generator is
+  # deterministic, so a fixture that was already right is rewritten identically, and the
+  # cargo build is a no-op on a warm target dir.
+  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture"
   ( cd tooling/ethrex-fixtures && cargo build --release )
   tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
 fi
@@ -239,6 +249,26 @@ if [ "$need_build" = "1" ]; then
     echo "$1 $BENCH_FEATURES" > "$WORK/$2.sha"
   }
   build_cli "$SHA_B" cli_B
+  # Surface a fixture-build failure after the FIRST prover build instead of after both. A
+  # bad cache URL or a broken generator takes seconds to fail while the build takes tens of
+  # minutes, and on an hourly-billed rental those minutes are paid twice before anything
+  # says so. Non-blocking on purpose: still running means the parallelism is working, and
+  # the wait further down handles that case. Reaping here also RETIRES the pid -- the EXIT
+  # trap must not `kill -- -$FIXTURE_PID` a number the kernel may have handed to someone
+  # else, and the wait below must not wait on a child that no longer exists.
+  if [ -n "${FIXTURE_PID:-}" ] && ! kill -0 "$FIXTURE_PID" 2>/dev/null; then
+    if ! wait "$FIXTURE_PID"; then
+      # Retire the pid before exiting too: the EXIT trap below would otherwise signal a
+      # process group this build no longer owns.
+      unset FIXTURE_PID
+      echo "ERROR: the real-block fixture could not be built (it failed while the first" >&2
+      echo "       prover binary was building):" >&2
+      cat "$WORK/fixture_build.log" >&2
+      exit 1
+    fi
+    FIXTURE_DONE=1
+    unset FIXTURE_PID
+  fi
   build_cli "$SHA_A" cli_A
   cleanup
   # Back to step 1's trap, not `trap - EXIT`: the fixture build is still running and an
@@ -250,7 +280,9 @@ else
 fi
 
 if [ "$WORKLOAD" = "real" ]; then
-  if ! wait "$FIXTURE_PID"; then
+  # `FIXTURE_DONE` means the build above already reaped it; waiting again would be a wait
+  # on a non-child, which reports failure for a build that succeeded.
+  if [ -z "${FIXTURE_DONE:-}" ] && ! wait "$FIXTURE_PID"; then
     echo "ERROR: the real-block fixture could not be built:" >&2
     cat "$WORK/fixture_build.log" >&2
     exit 1
@@ -323,8 +355,17 @@ done
 # the box can give, so a run well under it met a neighbour. No box-specific
 # constant, which matters because this script also runs on rented 16-32 core GPU
 # hosts where an absolute percentage means nothing.
+#
+# ALWAYS prints one `==> Exclusivity:` line, including when there is nothing to report.
+# Two reasons. The comment posted by bench-abba.yml and benchmark-gpu.yml starts at this
+# marker, and the table below tells the reader to pick a column by it, so a run that
+# printed nothing would send them to a line they never see. And silence here is
+# ambiguous: a box with no `/usr/bin/time` (the rented GPU images are minimal -- they do
+# not even ship python3) records no share at all, which would read exactly like a quiet
+# box.
+excl=""
 if [ -s "$CPU_SHARES" ]; then
-  awk '
+  excl="$(awk '
     { n++; s[n]=$1; if ($1>mx) mx=$1; if (mn==0 || $1<mn) mn=$1 }
     END {
       if (n < 2 || mx == 0) exit 0
@@ -339,8 +380,18 @@ if [ -s "$CPU_SHARES" ]; then
       } else {
         printf ", all within 10%% of the best\n"
       }
-    }' "$CPU_SHARES"
+    }' "$CPU_SHARES")"
 fi
+if [ -z "$excl" ]; then
+  if [ -z "$TIME_BIN" ]; then
+    excl="==> Exclusivity: NOT MEASURED -- no \`/usr/bin/time -f %P\` on this box, so no
+    CPU share was recorded. Install it (\`apt-get install -y time\`) to get the report;
+    until then read the batch spread as unqualified."
+  else
+    excl="==> Exclusivity: NOT MEASURED -- fewer than two proves reported a CPU share."
+  fi
+fi
+printf '%s\n' "$excl"
 
 # --- 4. Paired t-test + robust median/Wilcoxon ---
 python3 - "$WORK/pairs.csv" <<'PY'

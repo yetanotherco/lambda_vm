@@ -27,15 +27,34 @@
 # .github/workflows/benchmark-pr.yml calls it straight from a `run:` block.
 set -euo pipefail
 
-# Far above a rejected run (496 cycles) and far below the smallest honest one. The real
-# block is ~37M cycles today. The synthetic floor is an order of magnitude lower because a
-# small TX_COUNT is a legitimate workload: a 1-transfer block ran 1.80M cycles before the
-# bump and an empty one 0.99M.
-MIN_CYCLES_REAL=1000000
+# Far above a rejected run (496 cycles) and far below the smallest honest one.
+#
+# The real block runs 37.1M cycles today, so 20M is ~45% of margin: enough for a guest
+# change that genuinely gets cheaper, and still 40,000x above a rejection. A floor of 1M
+# would have tolerated a 97% collapse, which is the only kind of breakage this can see --
+# WHICH block is being proven is pinned by the fixture's sha256 and by the ethrex rev, not
+# by a cycle count, so this is not the place to re-pin the workload's identity.
+#
+# The synthetic floor stays two orders of magnitude lower because a small TX_COUNT is a
+# legitimate workload: a 1-transaction block ran 1.80M cycles before the bump and an empty
+# one 0.99M, and TX_COUNT is a knob, so nothing here knows which size to expect.
+MIN_CYCLES_REAL=20000000
 MIN_CYCLES_SYNTHETIC=100000
+
+# A caller that already has the count (scripts/bench_recursion_scaling.sh records one per
+# block size) asks for the floor instead of paying a second execution, so the constants
+# above stay the only copy.
+if [ "${1:-}" = "--floor" ]; then
+  case "${2:-}" in
+    real)      echo "$MIN_CYCLES_REAL"; exit 0 ;;
+    synthetic) echo "$MIN_CYCLES_SYNTHETIC"; exit 0 ;;
+    *) echo "usage: ${0##*/} --floor real|synthetic" >&2; exit 2 ;;
+  esac
+fi
 
 if [ "$#" -ne 4 ]; then
   echo "usage: ${0##*/} <cli> <elf> <input> real|synthetic" >&2
+  echo "       ${0##*/} --floor real|synthetic" >&2
   exit 2
 fi
 CLI="$1"; ELF="$2"; INPUT="$3"; WORKLOAD="$4"

@@ -8,7 +8,9 @@ name: Bench ABBA tiebreaker
 #
 # Syntax: "/bench-abba [N]", where N is the pair count (default 12).
 #
-# Resolution, from the paired t-test (resolvable 95% delta = t* x sd / sqrt(N)). The
+# Resolution, from the paired t-test (resolvable 95% delta = 1.96 x sd / sqrt(N), the
+# normal approximation; the exact t* at these pair counts is 10-20% larger, so the
+# cells below are floors). The
 # two columns are not a guess bracketing an unknown: they are the same runner under
 # two conditions, because its variance is contention and not prover jitter. Over a
 # 14-prove baseline (tooling/ethrex-fixtures/README.md) wall time and the share of CPU
@@ -164,7 +166,7 @@ jobs:
           # interleaved pairs, and prints the paired-t CI + exact Wilcoxon test.
           # Pass the head SHA (pinned above) so fork PRs resolve.
           scripts/bench_abba.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/abba_out.txt
-          sed -n '/=== ABBA paired result/,$p' /tmp/abba_out.txt > /tmp/abba_result.txt
+          sed -n '/^==> Exclusivity:/,$p' /tmp/abba_out.txt > /tmp/abba_result.txt
 
       - name: Post result
         if: always()

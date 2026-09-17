@@ -189,8 +189,16 @@ if [ "$WORKLOAD" = "real" ]; then
   # ~35 ms, so there is nothing to gate it on.
   echo "==> Verifying ethrex real-block fixture (regenerates on a digest miss)"
   make ethrex-real-block-fixture
-elif [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 20-transfer fixture (missing)"
+else
+  # UNCONDITIONAL, unlike the real block's digest check: these names carry neither the rev
+  # nor the schema (`ethrex_<n>_transfers.bin` is untracked, `ethrex_bench_20.bin` is
+  # gitignored), so a copy left by an earlier ethrex rev is reused byte for byte and no
+  # digest anywhere would notice. The floor below catches the rev bumps that make the
+  # guest REJECT the file; it cannot catch a file that is merely a different valid block.
+  # Regenerating is what makes that impossible, and it is nearly free: the generator is
+  # deterministic, so a fixture that was already right is rewritten identically, and the
+  # cargo build is a no-op on a warm target dir.
+  echo "==> Generating ethrex 20-transfer fixture"
   ( cd tooling/ethrex-fixtures && cargo build --release )
   tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
 fi
