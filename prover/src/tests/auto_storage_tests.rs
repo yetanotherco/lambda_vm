@@ -29,7 +29,7 @@ fn peak_bytes_per_table_increment_is_exact() {
     let baseline = peak_bytes(&empty_lengths(), blowup, ALL_TABLES);
 
     let mut lengths = empty_lengths();
-    lengths.cpu_padded_rows = 4;
+    lengths.cpu_padded_rows = 8;
     let bumped = peak_bytes(&lengths, blowup, ALL_TABLES);
 
     let cpu_main = CPU_COLS as u64;
@@ -45,11 +45,11 @@ fn peak_bytes_per_table_increment_is_exact() {
         + b * KECCAK_NODE_BYTES; // FRI Merkle (geometric ≈ 1)
     let per_row_domain = (3 + 2 * b) * GOLDILOCKS_BYTES;
 
-    // CPU adds 4 rows of persistent + transient (top-k by ALL_TABLES) +
-    // its 4-row Domain entry (a fresh unique key not previously present).
+    // CPU adds 8 rows of persistent + transient (top-k by ALL_TABLES) +
+    // its 8-row Domain entry (a fresh unique key not previously present).
     assert_eq!(
         bumped - baseline,
-        4 * (per_row_persistent + per_row_transient + per_row_domain)
+        8 * (per_row_persistent + per_row_transient + per_row_domain)
     );
 }
 

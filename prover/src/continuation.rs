@@ -2299,6 +2299,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sha256_across_epochs_verifies() {
+        let elf_bytes = asm_elf_bytes("test_sha256_overlap");
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            3,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "SHA state and pointer registers must survive epoch boundaries"
+        );
+    }
+
     // Guards that the continuation API takes `epoch_size_log2` directly. A log2 of
     // 4 produces 16-cycle epochs over the 33-cycle `test_commit_split`, putting its
     // two commits in different epochs and exercising the cross-epoch x254 carry.

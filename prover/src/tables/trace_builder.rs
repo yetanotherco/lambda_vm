@@ -67,6 +67,7 @@ use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
+use super::{sha256, sha256_k, sha256_rotxor, sha256_round, sha256_schedule};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
@@ -547,6 +548,7 @@ fn collect_ops_from_cpu(
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
+    Vec<sha256::Operation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
@@ -559,6 +561,7 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
+    let mut sha256_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
@@ -649,6 +652,11 @@ fn collect_ops_from_cpu(
         }
 
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
+        if op.ecall_sha256 {
+            let (mem, sha) = collect_sha256_ops(op, memory_state, register_state);
+            memw.extend_ops(mem);
+            sha256_ops.push(sha);
+        }
         if op.ecall_ecsm {
             let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
@@ -716,6 +724,7 @@ fn collect_ops_from_cpu(
         bitwise_ops,
         commit_ops,
         keccak_ops,
+        sha256_ops,
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
@@ -2867,6 +2876,14 @@ pub struct Traces {
     /// KECCAK core table (one row per keccak permutation call). Empty when the
     /// run makes no keccak call.
     pub keccaks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// SHA-256 accelerator tables. Empty when the run makes no SHA ecall: like
+    /// the other accelerators they are counted, not fixed, so a program that
+    /// never hashes carries none of them.
+    pub sha256s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub sha256_rounds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub sha256_schedules: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub sha256_rotxors: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub sha256_ks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// KECCAK_RND round table (24 rows per keccak call). Empty alongside KECCAK.
     pub keccak_rnds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -2919,6 +2936,7 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    sha256_ops: Vec<sha256::Operation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
@@ -3048,6 +3066,7 @@ fn collect_all_ops(
     mut bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
+    sha256_ops: Vec<sha256::Operation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
@@ -3188,6 +3207,7 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        sha256_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3232,6 +3252,7 @@ fn build_traces<I: ImageSource + Sync>(
         dvrm_ops,
         commit_ops,
         keccak_ops,
+        sha256_ops,
         eq_ops,
         bytewise_ops,
         store_ops,
@@ -3323,6 +3344,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| h.add_ops(&sha256::bitwise_ops(&sha256_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
@@ -3654,6 +3676,55 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
+    // SHA-256 accelerator traces. Absent entirely for programs that make no SHA
+    // ecall — which matters more here than for the other accelerators: ROTXOR is
+    // 224 rows of 197 columns per compression call, so it is the heaviest table
+    // the accelerator adds and the one a non-hashing run most wants to skip.
+    // `generate_optional` also spills in disk mode, so these need no separate
+    // spill of their own.
+    let gen_sha256s = || {
+        generate_optional(
+            &sha256_ops,
+            sha256::generate,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_sha256_rounds = || {
+        generate_optional(
+            &sha256_ops,
+            sha256_round::generate,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_sha256_schedules = || {
+        generate_optional(
+            &sha256_ops,
+            sha256_schedule::generate,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_sha256_rotxors = || {
+        let rot_ops = sha256::rot_ops(&sha256_ops);
+        generate_optional(
+            &rot_ops,
+            sha256_rotxor::generate,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    // The constant table's multiplicity column counts the calls, so it is keyed
+    // off the op count rather than the ops themselves.
+    let gen_sha256_ks = || {
+        generate_optional(
+            &sha256_ops,
+            |ops: &[sha256::Operation]| sha256_k::generate(ops.len()),
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3667,6 +3738,8 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
+    let (mut sha256s_slot, mut sha256_rounds_slot, mut sha256_schedules_slot) = (None, None, None);
+    let (mut sha256_rotxors_slot, mut sha256_ks_slot) = (None, None);
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3709,6 +3782,11 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
+            spawn_into!(sha256_rotxors_slot, gen_sha256_rotxors);
+            spawn_into!(sha256_rounds_slot, gen_sha256_rounds);
+            spawn_into!(sha256_schedules_slot, gen_sha256_schedules);
+            spawn_into!(sha256s_slot, gen_sha256s);
+            spawn_into!(sha256_ks_slot, gen_sha256_ks);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3737,6 +3815,11 @@ fn build_traces<I: ImageSource + Sync>(
         ecsms_slot = Some(gen_ecsms());
         ecdases_slot = Some(gen_ecdases());
         hints_slot = Some(gen_hints());
+        sha256s_slot = Some(gen_sha256s());
+        sha256_rounds_slot = Some(gen_sha256_rounds());
+        sha256_schedules_slot = Some(gen_sha256_schedules());
+        sha256_rotxors_slot = Some(gen_sha256_rotxors());
+        sha256_ks_slot = Some(gen_sha256_ks());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3771,6 +3854,11 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
+    let sha256s = sha256s_slot.expect(PHASE5_RAN)?;
+    let sha256_rounds = sha256_rounds_slot.expect(PHASE5_RAN)?;
+    let sha256_schedules = sha256_schedules_slot.expect(PHASE5_RAN)?;
+    let sha256_rotxors = sha256_rotxors_slot.expect(PHASE5_RAN)?;
+    let sha256_ks = sha256_ks_slot.expect(PHASE5_RAN)?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3831,6 +3919,11 @@ fn build_traces<I: ImageSource + Sync>(
         commits,
         keccaks,
         keccak_rnds,
+        sha256s,
+        sha256_rounds,
+        sha256_schedules,
+        sha256_rotxors,
+        sha256_ks,
         keccak_rc: keccak_rc_trace,
         ecsms,
         ecdases,
@@ -3872,6 +3965,7 @@ fn padded_chunked_rows_optional(ops_count: usize, max_rows: usize) -> u64 {
 #[cfg(feature = "disk-spill")]
 #[derive(Debug, Default, Clone)]
 pub struct TableLengths {
+    pub sha256_calls: u64,
     pub cpu_padded_rows: u64,
     pub memw_padded_rows: u64,
     pub memw_aligned_padded_rows: u64,
@@ -3922,6 +4016,7 @@ pub fn count_table_lengths(
     let mut dvrm_count = 0usize;
     let mut branch_count = 0usize;
     let mut commit_count = 0usize;
+    let mut sha256_count = 0u64;
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,
@@ -3987,6 +4082,19 @@ pub fn count_table_lengths(
                 &mut memw_aligned_count,
                 &mut memw_register_count,
             );
+        }
+
+        if cpu_op.ecall_sha256 {
+            sha256_count += 1;
+            let (ops, _) = collect_sha256_ops(&cpu_op, &mut memory_state, &mut register_state);
+            for memw_op in &ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
         }
 
         // ECALL Commit
@@ -4077,6 +4185,7 @@ pub fn count_table_lengths(
     let cycle_count = logs.len() as u64;
 
     Ok(TableLengths {
+        sha256_calls: sha256_count,
         cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
         memw_padded_rows: padded_chunked_rows_optional(memw_count, max_rows.memw),
         memw_aligned_padded_rows: padded_chunked_rows_optional(
@@ -4241,6 +4350,11 @@ impl Traces {
             commits,
             keccaks,
             keccak_rnds,
+            sha256s,
+            sha256_rounds,
+            sha256_schedules,
+            sha256_rotxors,
+            sha256_ks,
             keccak_rc,
             ecsms,
             ecdases,
@@ -4302,6 +4416,21 @@ impl Traces {
         }
         for t in keccak_rnds {
             total += (t.num_rows() * KECCAK_RND_COLS) as u64;
+        }
+        for t in sha256s {
+            total += (t.num_rows() * sha256::WIDTH) as u64;
+        }
+        for t in sha256_rounds {
+            total += (t.num_rows() * sha256_round::WIDTH) as u64;
+        }
+        for t in sha256_schedules {
+            total += (t.num_rows() * sha256_schedule::WIDTH) as u64;
+        }
+        for t in sha256_rotxors {
+            total += (t.num_rows() * sha256_rotxor::WIDTH) as u64;
+        }
+        for t in sha256_ks {
+            total += (t.num_rows() * (sha256_k::WIDTH - sha256_k::NUM_PRECOMPUTED_COLS)) as u64;
         }
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
         for t in eqs {
@@ -4386,6 +4515,11 @@ impl Traces {
             commits,
             keccaks,
             keccak_rnds,
+            sha256s,
+            sha256_rounds,
+            sha256_schedules,
+            sha256_rotxors,
+            sha256_ks,
             keccak_rc,
             ecsms,
             ecdases,
@@ -4448,6 +4582,21 @@ impl Traces {
         for t in keccak_rnds {
             total += (t.num_rows() * n_keccak_rnd) as u64;
         }
+        for t in sha256s {
+            total += (t.num_rows() * aux_cols(sha256::bus_interactions().len())) as u64;
+        }
+        for t in sha256_rounds {
+            total += (t.num_rows() * aux_cols(sha256_round::bus_interactions().len())) as u64;
+        }
+        for t in sha256_schedules {
+            total += (t.num_rows() * aux_cols(sha256_schedule::bus_interactions().len())) as u64;
+        }
+        for t in sha256_rotxors {
+            total += (t.num_rows() * aux_cols(sha256_rotxor::bus_interactions().len())) as u64;
+        }
+        for t in sha256_ks {
+            total += (t.num_rows() * aux_cols(sha256_k::bus_interactions().len())) as u64;
+        }
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
         for t in eqs {
             total += (t.num_rows() * n_eq) as u64;
@@ -4496,6 +4645,11 @@ impl Traces {
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
             commit: self.commits.len(),
+            sha256: self.sha256s.len(),
+            sha256_round: self.sha256_rounds.len(),
+            sha256_schedule: self.sha256_schedules.len(),
+            sha256_rotxor: self.sha256_rotxors.len(),
+            sha256_k: self.sha256_ks.len(),
         }
     }
 
@@ -4826,6 +4980,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            sha256_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4845,6 +5000,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            sha256_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4939,6 +5095,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            sha256_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4954,6 +5111,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
+            sha256_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
@@ -4982,4 +5140,50 @@ impl Traces {
             false,
         )
     }
+}
+
+/// SHA compression memory accesses: registers at T, message at T, then state
+/// read/write at T+1. Snapshot before writes permits arbitrary operand overlap.
+fn collect_sha256_ops(
+    op: &CpuOperation,
+    memory: &mut MemoryState,
+    registers: &mut RegisterState,
+) -> (Vec<MemwOperation>, sha256::Operation) {
+    let t = op.timestamp;
+    let h_addr = registers.read(10).0;
+    let m_addr = registers.read(11).0;
+    let state = std::array::from_fn(|i| memory.read_byte(h_addr + i as u64).0);
+    let message = std::array::from_fn(|i| memory.read_byte(m_addr + i as u64).0);
+    let sha = sha256::Operation {
+        timestamp: t,
+        state_addr: h_addr,
+        message_addr: m_addr,
+        state,
+        message,
+    };
+    let mut output = state;
+    executor::sha256::compress(&mut output, &message);
+    let mut ops = vec![];
+    for reg in [10, 11] {
+        let (val, old) = registers.read(reg);
+        let value = pack_register_value(val);
+        ops.push(
+            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
+                .with_old(value, [old, old, 0, 0, 0, 0, 0, 0]),
+        );
+        registers.write(reg, val, t);
+    }
+    for (addr, bytes, time, read) in [
+        (m_addr, message.as_slice(), t, true),
+        (h_addr, output.as_slice(), t + 1, true),
+    ] {
+        for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+            let addr = addr + 8 * i as u64;
+            let (old, old_ts) = memory.read_bytes(addr, 8);
+            let value = std::array::from_fn(|j| chunk[j] as u32);
+            ops.push(MemwOperation::new(false, addr, value, time, 8, read).with_old(old, old_ts));
+            memory.write_bytes(addr, u64::from_le_bytes(chunk.try_into().unwrap()), 8, time);
+        }
+    }
+    (ops, sha)
 }

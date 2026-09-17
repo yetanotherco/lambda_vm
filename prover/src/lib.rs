@@ -120,6 +120,11 @@ pub struct TableCounts {
     pub ecdas: usize,
     pub hint: usize,
     pub commit: usize,
+    pub sha256: usize,
+    pub sha256_round: usize,
+    pub sha256_schedule: usize,
+    pub sha256_rotxor: usize,
+    pub sha256_k: usize,
 }
 
 impl TableCounts {
@@ -148,6 +153,11 @@ impl TableCounts {
             self.cpu32,
             self.keccak,
             self.keccak_rnd,
+            self.sha256,
+            self.sha256_round,
+            self.sha256_schedule,
+            self.sha256_rotxor,
+            self.sha256_k,
             self.ecsm,
             self.ecdas,
             self.hint,
@@ -212,6 +222,11 @@ impl TableCounts {
             ("ecdas", self.ecdas),
             ("hint", self.hint),
             ("commit", self.commit),
+            ("sha256", self.sha256),
+            ("sha256_round", self.sha256_round),
+            ("sha256_schedule", self.sha256_schedule),
+            ("sha256_rotxor", self.sha256_rotxor),
+            ("sha256_k", self.sha256_k),
         ];
         for (name, count) in at_most_one {
             if count > 1 {
@@ -589,6 +604,11 @@ pub(crate) struct VmAirs {
     pub commits: Vec<VmAir>,
     pub keccaks: Vec<VmAir>,
     pub keccak_rnds: Vec<VmAir>,
+    pub sha256s: Vec<VmAir>,
+    pub sha256_rounds: Vec<VmAir>,
+    pub sha256_schedules: Vec<VmAir>,
+    pub sha256_rotxors: Vec<VmAir>,
+    pub sha256_ks: Vec<VmAir>,
     pub keccak_rc: VmAir,
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
@@ -627,6 +647,11 @@ impl VmAirs {
                 self.commits.len(),
                 self.keccaks.len(),
                 self.keccak_rnds.len(),
+                self.sha256s.len(),
+                self.sha256_rounds.len(),
+                self.sha256_schedules.len(),
+                self.sha256_rotxors.len(),
+                self.sha256_ks.len(),
                 self.ecsms.len(),
                 self.ecdases.len(),
                 self.hints.len(),
@@ -650,6 +675,11 @@ impl VmAirs {
                 traces.commits.len(),
                 traces.keccaks.len(),
                 traces.keccak_rnds.len(),
+                traces.sha256s.len(),
+                traces.sha256_rounds.len(),
+                traces.sha256_schedules.len(),
+                traces.sha256_rotxors.len(),
+                traces.sha256_ks.len(),
                 traces.ecsms.len(),
                 traces.ecdases.len(),
                 traces.hints.len(),
@@ -687,6 +717,33 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.sha256s.iter().zip(traces.sha256s.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self
+            .sha256_rounds
+            .iter()
+            .zip(traces.sha256_rounds.iter_mut())
+        {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self
+            .sha256_schedules
+            .iter()
+            .zip(traces.sha256_schedules.iter_mut())
+        {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self
+            .sha256_rotxors
+            .iter()
+            .zip(traces.sha256_rotxors.iter_mut())
+        {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.sha256_ks.iter().zip(traces.sha256_ks.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
 
@@ -774,6 +831,21 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.hints {
+            refs.push(air.as_ref());
+        }
+        for air in &self.sha256s {
+            refs.push(air.as_ref());
+        }
+        for air in &self.sha256_rounds {
+            refs.push(air.as_ref());
+        }
+        for air in &self.sha256_schedules {
+            refs.push(air.as_ref());
+        }
+        for air in &self.sha256_rotxors {
+            refs.push(air.as_ref());
+        }
+        for air in &self.sha256_ks {
             refs.push(air.as_ref());
         }
 
@@ -952,6 +1024,45 @@ impl VmAirs {
                 ) as VmAir
             })
             .collect();
+        let sha256s: Vec<_> = (0..table_counts.sha256)
+            .map(|i| {
+                Box::new(
+                    test_utils::create_sha256_air(proof_options).with_name(&format!("SHA256[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        let sha256_rounds: Vec<_> = (0..table_counts.sha256_round)
+            .map(|i| {
+                Box::new(
+                    test_utils::create_sha256_round_air(proof_options)
+                        .with_name(&format!("SHA256ROUND[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        let sha256_schedules: Vec<_> = (0..table_counts.sha256_schedule)
+            .map(|i| {
+                Box::new(
+                    test_utils::create_sha256_schedule_air(proof_options)
+                        .with_name(&format!("SHA256MSGSCHED[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        let sha256_rotxors: Vec<_> = (0..table_counts.sha256_rotxor)
+            .map(|i| {
+                Box::new(
+                    test_utils::create_sha256_rotxor_air(proof_options)
+                        .with_name(&format!("ROTXOR[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        let sha256_ks: Vec<_> = (0..table_counts.sha256_k)
+            .map(|i| {
+                Box::new(
+                    test_utils::create_sha256_k_air(proof_options)
+                        .with_name(&format!("SHA256_K[{i}]")),
+                ) as VmAir
+            })
+            .collect();
         let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
@@ -1088,6 +1199,11 @@ impl VmAirs {
             commits,
             keccaks,
             keccak_rnds,
+            sha256s,
+            sha256_rounds,
+            sha256_schedules,
+            sha256_rotxors,
+            sha256_ks,
             keccak_rc,
             ecsms,
             ecdases,

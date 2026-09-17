@@ -8,6 +8,8 @@
 //! Accelerated today:
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
 //!   host it falls back to software keccak for tests).
+//! - `sha256`: the padding wrapper over the SHA-256 compression precompile
+//!   (riscv64; on host it falls back to the trait's own sha2 default).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
 //!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
 //!   the full point from x-only queries; on host / degenerate inputs it falls
@@ -62,6 +64,18 @@ impl Crypto for LambdaVmEcsmCrypto {
         // isn't available off-target.
         #[cfg(not(target_arch = "riscv64"))]
         return keccak_hash(input);
+    }
+
+    fn sha256(&self, input: &[u8]) -> [u8; 32] {
+        // riscv64 guest: IV, padding and the length encoding in the wrapper,
+        // the 64 rounds per block in the compression accelerator.
+        #[cfg(target_arch = "riscv64")]
+        return lambda_vm_syscalls::sha256::sha256(input);
+        // host (tests / non-guest): the ecall isn't available off-target.
+        // `NativeCrypto` takes every trait default, so this is the same sha2
+        // call the default `sha256` would have made, with no extra dependency.
+        #[cfg(not(target_arch = "riscv64"))]
+        return ethrex_crypto::NativeCrypto.sha256(input);
     }
 }
 
