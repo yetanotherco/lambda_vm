@@ -5,7 +5,7 @@ use crate::tables::MaxRowsConfig;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use executor::elf::Elf;
 use stark::prover::IsStarkProver;
-use stark::prover::TableDeep;
+use stark::prover::SeedData;
 
 /// A batch of one must reproduce the proof's FRI exactly.
 ///
@@ -133,18 +133,8 @@ fn alpha_moves_when_any_table_moves() {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
     type E = GoldilocksExtension;
 
-    let table = |seed: u64| TableDeep::<E> {
-        lde_size: 8,
-        trace_rows: 4,
-        deep: Vec::new(),
-        air_index: seed as usize,
+    let table = |seed: u64| SeedData::<E> {
         bus_contribution: Some(FieldElement::<E>::from(seed)),
-        main_roots: stark::prover::MainRoots {
-            precomputed: None,
-            main: [0u8; 32],
-        },
-        aux_root: None,
-        bus_public_inputs: None,
         composition_poly_root: [seed as u8; 32],
         trace_ood: Table::new(vec![FieldElement::<E>::from(seed + 1)], 1),
         trace_ood_next: Table::new(vec![FieldElement::<E>::from(seed + 2)], 1),
@@ -156,35 +146,33 @@ fn alpha_moves_when_any_table_moves() {
     let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&pre_fork, &base);
 
     // Every field of every table, one at a time.
-    type Mutation = (&'static str, Box<dyn Fn(&mut Vec<TableDeep<E>>)>);
+    type Mutation = (&'static str, Box<dyn Fn(&mut Vec<SeedData<E>>)>);
     let mutate: Vec<Mutation> = vec![
         (
             "bus",
-            Box::new(|t: &mut Vec<TableDeep<E>>| {
+            Box::new(|t: &mut Vec<SeedData<E>>| {
                 t[0].bus_contribution = Some(FieldElement::<E>::from(99))
             }),
         ),
         (
             "root",
-            Box::new(|t: &mut Vec<TableDeep<E>>| t[1].composition_poly_root = [9u8; 32]),
+            Box::new(|t: &mut Vec<SeedData<E>>| t[1].composition_poly_root = [9u8; 32]),
         ),
         (
             "ood",
-            Box::new(|t: &mut Vec<TableDeep<E>>| {
+            Box::new(|t: &mut Vec<SeedData<E>>| {
                 t[0].trace_ood = Table::new(vec![FieldElement::<E>::from(99)], 1)
             }),
         ),
         (
             "ood_next",
-            Box::new(|t: &mut Vec<TableDeep<E>>| {
+            Box::new(|t: &mut Vec<SeedData<E>>| {
                 t[1].trace_ood_next = Table::new(vec![FieldElement::<E>::from(99)], 1)
             }),
         ),
         (
             "parts",
-            Box::new(|t: &mut Vec<TableDeep<E>>| {
-                t[0].parts_ood = vec![FieldElement::<E>::from(99)]
-            }),
+            Box::new(|t: &mut Vec<SeedData<E>>| t[0].parts_ood = vec![FieldElement::<E>::from(99)]),
         ),
     ];
     for (what, f) in mutate {

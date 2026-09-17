@@ -313,10 +313,13 @@ pub struct Batched {
     /// Which group each table belongs to, by AIR index — the group whose query
     /// indices its openings answer.
     pub group_of: Vec<usize>,
+    /// Per table, in AIR order: the trees the fold walk built, so the Open pass
+    /// opens against them instead of hashing them again.
+    pub kept: Vec<stark::prover::KeptCommits<GoldilocksField, GoldilocksExtension>>,
     pub resident: Resident,
 }
 
-type Deep = stark::prover::TableDeep<GoldilocksExtension>;
+type Deep = stark::prover::TableDeep<GoldilocksField, GoldilocksExtension>;
 type Deeps = std::sync::Mutex<Vec<(usize, Deep)>>;
 
 struct BuildDeep<'a> {
@@ -354,7 +357,10 @@ fn deep_batch(
                 &mut trace,
                 &challenge.challenges,
                 &mut transcript,
-                challenge.roots.get(idx).cloned(),
+                // The tree this builds is handed to the Open pass, so it has
+                // to be a real one — reusing the Commit phase's roots would
+                // keep a root-only tree that cannot answer an opening.
+                None,
             )
             .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
             Ok((idx, deep))
@@ -453,7 +459,7 @@ pub fn run_batched(
             trace,
             &challenge.challenges,
             &mut transcript,
-            challenge.roots.get(idx).cloned(),
+            None,
         )
         .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
         Ok((idx, deep))
@@ -501,10 +507,12 @@ pub fn run_batched(
             d
         })
         .collect();
-    let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&challenge.transcript, &ordered);
+    let seed: Vec<_> = ordered.iter().map(|d| d.seed_data()).collect();
+    let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&challenge.transcript, &seed);
 
     // Taken before the fold, which consumes the codewords: this is the half of
     // each table that survives into the proof.
+    let kept: Vec<_> = ordered.iter().map(|d| d.kept.clone()).collect();
     let tables: Vec<TablePublic> = ordered
         .iter()
         .map(|d| TablePublic {
@@ -548,6 +556,7 @@ pub fn run_batched(
 
     Ok(Batched {
         tables,
+        kept,
         groups,
         members,
         group_of,
@@ -622,6 +631,7 @@ fn open_batch(
                 &challenge.challenges,
                 &mut transcript,
                 iotas_of(batched, idx)?,
+                batched.kept.get(idx).cloned(),
             )
             .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
             Ok((idx, opening))
@@ -641,10 +651,19 @@ fn open_of(
     challenges: &[FieldElement<GoldilocksExtension>],
     transcript: &mut DefaultTranscript<GoldilocksExtension>,
     iotas: &[usize],
+    kept: Option<stark::prover::KeptCommits<GoldilocksField, GoldilocksExtension>>,
 ) -> Result<Open, String> {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    <P as IsStarkProver<_, _, _>>::open_for_table(air, &(), trace, challenges, transcript, iotas)
-        .map_err(|e| format!("{e:?}"))
+    <P as IsStarkProver<_, _, _>>::open_for_table(
+        air,
+        &(),
+        trace,
+        challenges,
+        transcript,
+        iotas,
+        kept,
+    )
+    .map_err(|e| format!("{e:?}"))
 }
 
 impl Visitor for OpenTables<'_> {
@@ -708,6 +727,7 @@ pub fn run_open(
             &challenge.challenges,
             &mut transcript,
             iotas_of(batched, idx)?,
+            batched.kept.get(idx).cloned(),
         )
         .map_err(|e| Error::Prover(format!("open pass: table {idx}: {e}")))?;
         Ok((idx, opening))
