@@ -136,6 +136,7 @@ fn alpha_moves_when_any_table_moves() {
         lde_size: 8,
         trace_rows: 4,
         deep: Vec::new(),
+        air_index: seed as usize,
         bus_contribution: Some(FieldElement::<E>::from(seed)),
         composition_poly_root: [seed as u8; 32],
         trace_ood: Table::new(vec![FieldElement::<E>::from(seed + 1)], 1),
@@ -269,6 +270,27 @@ fn the_driver_folds_every_table_grouped_by_domain() {
             "a group of {lde_size} sampled no queries for its members to open at"
         );
     }
+    // Every table knows its group, and it is the group of its own domain. The
+    // Open pass reads this to take a table's openings at the right indices, so
+    // a table pointing at the wrong group opens against a FRI that never folded
+    // it.
+    assert_eq!(batched.group_of.len(), folded, "a table has no group");
+    for (idx, g) in batched.group_of.iter().enumerate() {
+        assert!(
+            *g < batched.groups.len(),
+            "table {idx} points at group {g}, past the {} there are",
+            batched.groups.len()
+        );
+    }
+    let mut per_group = vec![0usize; batched.groups.len()];
+    for g in &batched.group_of {
+        per_group[*g] += 1;
+    }
+    assert_eq!(
+        per_group, batched.members,
+        "the tables' groups disagree with what each group says it folded"
+    );
+
     // Domains are distinct: a repeated one would mean two groups that should
     // have been one, which is a fold that did not happen.
     let mut sizes: Vec<usize> = batched.groups.iter().map(|(s, _)| *s).collect();

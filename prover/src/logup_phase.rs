@@ -290,6 +290,9 @@ pub struct Batched {
     pub groups: Vec<(usize, stark::prover::GroupFri<GoldilocksExtension>)>,
     /// How many tables each group folded, so the collapse is visible.
     pub members: Vec<usize>,
+    /// Which group each table belongs to, by AIR index — the group whose query
+    /// indices its openings answer.
+    pub group_of: Vec<usize>,
     pub resident: Resident,
 }
 
@@ -456,7 +459,13 @@ pub fn run_batched(
             deeps.len()
         )));
     }
-    let ordered: Vec<Deep> = deeps.into_iter().map(|(_, d)| d).collect();
+    let ordered: Vec<Deep> = deeps
+        .into_iter()
+        .map(|(idx, mut d)| {
+            d.air_index = idx;
+            d
+        })
+        .collect();
     let alpha = <P as IsStarkProver<_, _, _>>::batch_alpha(&challenge.transcript, &ordered);
 
     let mut by_height: BTreeMap<usize, Vec<Deep>> = BTreeMap::new();
@@ -469,6 +478,12 @@ pub fn run_batched(
     let any = chunk_airs.get(TableKind::Cpu).as_ref();
     let mut transcript = challenge.transcript.clone();
     let (mut groups, mut members) = (Vec::new(), Vec::new());
+    let mut group_of = vec![usize::MAX; n];
+    for (g, (_, group)) in by_height.iter().enumerate() {
+        for d in group.iter() {
+            group_of[d.air_index] = g;
+        }
+    }
     for (lde_size, group) in by_height {
         let count = group.len();
         let roots = <P as IsStarkProver<_, _, _>>::batch_fri(any, group, &alpha, &mut transcript)
@@ -482,6 +497,7 @@ pub fn run_batched(
     Ok(Batched {
         groups,
         members,
+        group_of,
         resident,
     })
 }

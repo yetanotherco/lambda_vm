@@ -694,6 +694,10 @@ pub struct TableDeep<FieldExtension: IsField> {
     pub trace_rows: usize,
     /// The DEEP composition codeword, `lde_size` long.
     pub deep: Vec<FieldElement<FieldExtension>>,
+    /// Where the table sits in the AIR order, carried so the batch can say
+    /// which group each table ended up in once the codewords are sorted by
+    /// domain rather than by position.
+    pub air_index: usize,
     /// What the batch's coefficient is drawn from: this table's public round-3
     /// data, in the order a transcript absorbs it.
     ///
@@ -2124,6 +2128,7 @@ pub trait IsStarkProver<
             lde_size: domain.interpolation_domain_size * domain.blowup_factor,
             trace_rows: domain.interpolation_domain_size,
             deep,
+            air_index: usize::MAX,
             bus_contribution: round_1_result
                 .bus_public_inputs
                 .as_ref()
@@ -2174,6 +2179,47 @@ pub trait IsStarkProver<
             }
         }
         seed.sample_field_element()
+    }
+
+    /// One table's openings, at the indices its group decided.
+    ///
+    /// The Open pass: the batched FRI fixed the query indices for a whole
+    /// group, and every member owes its rows at those indices. The table is
+    /// rebuilt to serve them — round 1 for the trace commitments and round 2
+    /// for the composition ones — and dies with the call, which is the trade
+    /// the approach makes everywhere else too.
+    ///
+    /// `transcript` is the table's own fork again, in the same state round 1
+    /// expects, because rebuilding walks the same rounds it walked before.
+    fn open_for_table(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        iotas: &[usize],
+    ) -> Result<DeepPolynomialOpenings<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        PI: Send + Sync + Clone,
+    {
+        let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
+        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        let (round_2_result, _, _, _, _) = Self::rounds_2_and_3(
+            air,
+            pub_inputs,
+            &mut round_1_result,
+            transcript,
+            &domain,
+            &twiddles,
+        )?;
+        Ok(Self::open_deep_composition_poly(
+            &domain,
+            &round_1_result,
+            &round_2_result,
+            iotas,
+        ))
     }
 
     /// One FRI over a whole group of tables.
