@@ -1,6 +1,6 @@
-#import "/meta.typ": rj, aside
+#import "/meta.typ": aside
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_variable_table, total_nr_variables, total_nr_instantiated_columns, compute_nr_interactions, render_constraint_table
+#import "/chip.typ": render_chip_variable_table, total_nr_variables, total_nr_instantiated_columns, compute_nr_interactions, render_constraint_table, render_chip_padding_table
 #import "/expr.typ": expr_to_math
 
 #let next(x) = expr_to_math(("next", x))
@@ -195,7 +195,9 @@ RET:
   FMA PC == [fp + 1], hint out
 ```
 
-#rj[Figure out halting, can be a simple self-loop, just have to figure out how to have the verifier assert this]
+As a halting state, we choose to let the VM loop to itself at `PC = 0`, hinting all inputs.
+That means the decoding will always contain `FMA PC = PC, hint out, hint R_1, ..., hint R_N` at that address.
+For technical reasons, in @field-VM:sec:boundary, execution of the VM starts at `PC = 1`, with `FMA 0 = 0` and no hinting.
 
 = Arithmetization
 
@@ -245,7 +247,7 @@ Currently, the parametrization is set to be $(d, N, t) = (5, 5, 1)$.
 
 While @field-VM:c:first-mux, and the other constraints using this multiplexing technique, look like they have
 a total degree of $d + 1$, this is purely a syntactical matter.
-Due to our choices to set `arg_register_powers[0] = 1` and `MUX[j][k][5] = 0` for $k != 0$ (by construction of the $f_(j,k)$ polynomials), we stay at a total degree $d$.
+Due to our choices to set `arg_register_powers[0] = 1` and `MUX[j][k][d - 2] = 0` for $k != 0$ (by construction of the $f_(j,k)$ polynomials), we stay at a total degree $d$.
 Also observe that the handling for `argument_registers[0]` is separated as @field-VM:c:out-mux,
 as this represents the output argument, which should take its values from the next row in the table.
 
@@ -306,9 +308,19 @@ is the canonical basis of the extension field over the base field.
 
 #render_constraint_table(chip, config, groups: "decode")
 
+== Boundary constraints<field-VM:sec:boundary>
+
+Besides enforcing the FMA constraints and the correct transitions between states, we also need to ensure that execution
+starts at the correct instruction and ends with a halting instruction.
+This means that the verifier must check that the first row of the table corresponds to a state at `PC = 1` and all other variables set to $0$;
+as well as that the last row of the table corresponds to the halt/padding state.
+This is also why the halt state has all inputs hinted, so that all registers can be set to zero and be known.
+
 == Padding
 
-#rj[...]
+The halting self-loop also functions as a padding state.
+
+#render_chip_padding_table(chip, config)
 
 = Notes and potential optimizations
 
