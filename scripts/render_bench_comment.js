@@ -90,7 +90,7 @@ const context = { repo: { owner: 'o', repo: 'r' }, issue: { number: 1 } };
 const REAL = {
   COMMIT_SHA: 'c4e42b2900', REAL_EPOCH_LOG2: '22', BASELINE_SRC: 'cached',
   PR_REAL_TIME: '281.400', PR_REAL_PEAK: '32980', PR_REAL_EPOCHS: '13',
-  PR_REAL_INPUT: 'ethrex_mainnet_25368371.bin',
+  PR_REAL_INPUT: 'ethrex_mainnet_25453112.bin',
   REAL_RUNS: '3', REAL_TIME_SPREAD: '1.9', REAL_ALL_TIMES: '279.1/281.4/284.4',
 };
 const scenarios = {

@@ -513,7 +513,7 @@ fn poc_negative_control_direct_init_tamper_on_preprocessed_page_fails() {
 
 /// REACHABILITY on the workload that matters.
 ///
-/// The ethrex block guest reads its ENTIRE `ProgramInput` through
+/// The ethrex block guest reads its ENTIRE stateless input through
 /// `get_private_input()` (`executor/programs/rust/ethrex/src/main.rs:8`), so
 /// every real block proof carries private-input pages. This asserts it through
 /// the production function itself — `private_input_page_count` is what the

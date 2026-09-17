@@ -9,15 +9,16 @@ different block inputs:
 | empty block | `executor/tests/ethrex_empty_block.bin` | ~184k |
 | 1 transaction (plain ETH transfer) | `executor/tests/ethrex_simple_tx.bin` | ~4.4M |
 
-Each input is a serialized `ProgramInput` (the block + its execution witness,
-rkyv-encoded) for the ethrex commit pinned (as `rev`) in
-`executor/programs/rust/ethrex/Cargo.toml`. The guest reads it via
-`get_private_input()` and runs ethrex's `execution_program`.
+Each input is a serialized `SszStatelessInput` (the block + its execution witness,
+SSZ-encoded) for the ethrex commit pinned (as `rev`) in
+`executor/programs/rust/ethrex/Cargo.toml`. The guest borrows it in place via
+`get_private_input_slice()` and runs ethrex's `run_stateless_guest`.
 
 Both the fixtures and those instruction counts are therefore a function of that pin: the
-counts above were measured at `156cb8d6` and have not been re-measured since the
-`797df554` bump, which regenerated both fixtures. Treat them as an order of magnitude,
-and re-run the benchmark for real numbers.
+counts above were measured at `156cb8d6` and have not been re-measured since. Two bumps
+have landed on top — `2cb18b0b` (25.0.0) and `8effcb06` (26.0.0) — and between them the
+wire format went from rkyv to SSZ and both fixtures were regenerated. Treat the counts as
+an order of magnitude, and re-run the benchmark for real numbers.
 
 The timing window is **single-shot end-to-end prove** (ELF load + execution +
 trace build + AIR construction + STARK prove); it **excludes** verification.

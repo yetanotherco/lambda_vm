@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Re-pin every ethrex git dependency in this repo to one rev, atomically.
 #
-# The guest and the host-side tooling exchange ethrex types (the rkyv stateless
-# input the converter writes and the guest decodes), so a rev that differs
+# The guest and the host-side tooling exchange ethrex types (the SSZ stateless
+# input the fixture tooling writes and the guest decodes), so a rev that differs
 # between them is not a version skew that fails to build -- it is a fixture the
-# guest silently decodes as the all-zero default. Keeping every pin on one rev
-# is what makes that impossible, which is why this rewrites all of them together
-# rather than leaving them to be bumped by hand.
+# guest does not recognise, which it reports by committing
+# `successful_validation = 0` after ~500 cycles instead of failing. Keeping every
+# pin on one rev is what makes that impossible, which is why this rewrites all of
+# them together rather than leaving them to be bumped by hand.
 #
 # Usage:
 #   scripts/set_ethrex_rev.sh <40-char-sha>              re-pin everything
@@ -27,9 +28,11 @@ cd "$REPO_ROOT"
 # Every manifest carrying an ethrex git dep. Kept explicit rather than globbed so
 # a new one has to be added deliberately -- a manifest silently left behind is
 # exactly the skew described above.
-# The guest ELF's own graph. `crypto/ethrex-crypto` is a path dep of BOTH the
-# guest and the converter, so moving it moves what the converter links too --
-# which is why a `--guest-only` run must come after the fixture already exists.
+# The guest ELF's own graph. `crypto/ethrex-crypto` is the guest's crypto provider
+# and nothing under tooling/ references it, so this pair moves the ELF and only the
+# ELF -- which is what makes `--guest-only` a guest-side change. It still has to come
+# after the fixture exists: the fixture is built by the tooling manifests below, and a
+# guest at a different rev may no longer accept what they wrote.
 GUEST_MANIFESTS=(
   executor/programs/rust/ethrex/Cargo.toml
   crypto/ethrex-crypto/Cargo.toml
@@ -40,6 +43,7 @@ TOOLING_MANIFESTS=(
   tooling/ethrex-tests/Cargo.toml
   tooling/ethrex-block-converter/Cargo.toml
   tooling/ethrex-fixtures/Cargo.toml
+  tooling/ethrex-ssz-input/Cargo.toml
 )
 
 MANIFESTS=("${GUEST_MANIFESTS[@]}" "${TOOLING_MANIFESTS[@]}")

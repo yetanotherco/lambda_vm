@@ -1,0 +1,30 @@
+[package]
+name = "ethrex-ssz-input"
+version = "0.1.0"
+edition = "2024"
+
+# Detached workspace, like its two consumers: it is a path dependency of both, not a
+# member of the root workspace, so the ethrex host tree stays out of the main build.
+[workspace]
+
+# Deliberately the smallest set that encodes a stateless input. `ethrex-fixtures` and
+# `ethrex-block-converter` both reach the encoder through this crate, and neither pays for
+# the other's graph: no blockchain, no storage, no tokio, no RPC.
+#
+# Pinned to the SAME ethrex rev as the guest so the encoded input matches what the
+# stateless guest deserializes. Re-pin every manifest together with
+# scripts/set_ethrex_rev.sh.
+[dependencies]
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-common" }
+# `run_stateless_guest` and `NativeCrypto`, which is what `validate_natively` runs the
+# encoded input through. Deliberately WITH its defaults (`default = ["secp256k1"]`),
+# unlike the guest, which declares the same crate with `default-features = false` and
+# routes ecrecover through the ECSM precompile anyway: this side is the host reference,
+# so it takes the native backend. Note the choice is the whole workspace's, not this
+# manifest's alone -- cargo unifies features, so a consumer declaring this crate with
+# `default-features = false` would not switch them off.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-rlp" }
+# Exact pin: keep the SSZ implementation in sync with the guest's ethrex rev.
+libssz = "=0.3.0"
+libssz-types = "=0.3.0"

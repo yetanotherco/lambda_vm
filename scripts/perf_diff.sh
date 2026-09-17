@@ -16,19 +16,22 @@
 #   Env: WORKLOAD=real|synthetic (default real) picks the block to profile;
 #        EPOCH_SIZE_LOG2=<n> (default 22) sizes the epoch, WORKLOAD=real only.
 #          22 is the calibrated bench-runner tier, matching /bench; use 23 on a
-#          128 GiB box (tooling/ethrex-block-converter/README.md, "Choosing the epoch size").
+#          128 GiB box (tooling/ethrex-fixtures/README.md, "Choosing the epoch size").
 #
-# Pick the workload that matches the run you are localizing, because the symbol
-# mix follows the block: the real default is 50.78M cycles, 10,478 keccak calls and
-# 116 ecsm calls, and the synthetic option (20 plain transfers) inverts that at
-# 8.73M cycles, 411 keccak, 80 ecsm — so a hot symbol in one need not be hot in the other.
-# Both counts are from the same guest ELF (merge fdb92f67, main @ 9ccdaf2, clang 21);
-# they move with guest optimisation (#861's thin LTO) and ~2% with the clang major, so
-# pin the ELF when quoting one.
+# Pick the workload that matches the run you are localizing, because the symbol mix
+# follows the block: the real default is 37,137,748 cycles, 6,003 keccak calls and 164
+# ecsm calls, and the synthetic option (20 plain transfers) shifts that to 7,029,393
+# cycles, 486 keccak, 80 ecsm — a keccak:ecsm ratio of 37:1 against 6:1, so a hot symbol
+# in one need not be hot in the other.
 #
-# WORKLOAD=real also switches to a continuation prove (monolithic would need ~240 GB
-# at that trace length), which is 158.8 s per recording on the bench runner — five
-# recordings, so budget ~13 min of proving, plus ~1.2 GB of disk per bundle and ~52 GB
+# Both counts are deterministic for a given ELF and input, and belong to the ethrex rev
+# in the manifests (`scripts/set_ethrex_rev.sh --show`) — they move with the rev, with
+# guest optimisation, and possibly with the compiler, which the Makefile does not pin.
+# See "Pin the ELF whenever you quote a cycle count" in tooling/ethrex-fixtures/README.md.
+#
+# WORKLOAD=real also switches to a continuation prove (monolithic would need ~182 GB at
+# that trace length), which is ~125 s per recording on the bench runner — five
+# recordings, so budget ~11 min of proving, plus ~790 MB of disk per bundle and ~45 GiB
 # of RAM at the default epoch.
 #
 # Produces:
@@ -49,8 +52,9 @@ REF_A="$1"
 REF_B="${2:-origin/main}"
 WORKLOAD="${WORKLOAD:-real}"
 # 2^22: the calibrated tier for the bench server this script targets, same as
-# /bench's real-block arm. Memory picks it, not speed — that server peaks at ~52 GB on
-# a >=64 GiB floor, and 2^23 measured 60 GiB on a roomier box, so it would not fit here.
+# /bench's real-block arm. Memory picks it, not speed — this workload peaks at 44.81 GiB
+# there against a >=64 GiB floor, and 2^23 would take it past 50 GiB for ~7% of wall
+# (the epoch sweep is in tooling/ethrex-fixtures/README.md).
 EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-22}"
 case "$WORKLOAD" in
   synthetic|real) ;;
@@ -78,11 +82,12 @@ fi
 command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tools)." >&2; exit 1; }
 [ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
 if [ "$WORKLOAD" = "real" ]; then
-  # ~1 MB, gitignored, never in a fresh checkout; fetch rather than abort. This is a
-  # URL + sha256 download, not a build. Unconditional on purpose: the target hashes
-  # whatever is on disk on every invocation, which is how a stale copy gets caught.
-  # A match costs ~35 ms.
-  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
+  # 549 KB, gitignored, never in a fresh checkout; build rather than abort. What is
+  # fetched by URL + sha256 is the block's replay cache; the fixture itself is generated
+  # from it, so a miss here costs a cargo build of tooling/ethrex-fixtures. Unconditional
+  # on purpose: the target hashes whatever is on disk on every invocation, which is how a
+  # stale copy gets caught. A match costs ~35 ms.
+  echo "==> Verifying ethrex real-block fixture (regenerates on a digest miss)"
   make ethrex-real-block-fixture
 elif [ ! -f "$INPUT_REL" ]; then
   echo "ERROR: missing $INPUT_REL — run WORKLOAD=synthetic scripts/bench_abba.sh once (it generates the synthetic fixture; the default workload is real and would not)." >&2
@@ -130,6 +135,12 @@ if [ "$need_build" = "1" ]; then
 else
   echo "==> Reusing cached binaries (cli_A=${SHA_A:0:10} cli_B=${SHA_B:0:10})"
 fi
+
+# Five flamegraphs of a guest that rejected its input look exactly like five flamegraphs
+# of one that ran: the profile is just very short. The digest check above pins the
+# real-block fixture but not the ELF's ethrex rev, and the synthetic fixture is whatever
+# was left on disk. Shared with bench_abba.sh and bench_verify.sh.
+"$ROOT/scripts/assert_workload_cycles.sh" "$WORK/cli_B" "$ELF_REL" "$INPUT_REL" "$WORKLOAD"
 
 # --- Record: warmup, then B A B A (interleaved so drift hits both sides) ---
 record() { # $1=binary $2=out.data
