@@ -501,3 +501,201 @@ pub fn run_batched(
         resident,
     })
 }
+
+/// What the Open pass produced: every table's rows at its group's indices.
+pub struct Opened {
+    /// One entry per table, in AIR order.
+    pub openings:
+        Vec<stark::proof::stark::DeepPolynomialOpenings<GoldilocksField, GoldilocksExtension>>,
+    pub resident: Resident,
+}
+
+type Open = stark::proof::stark::DeepPolynomialOpenings<GoldilocksField, GoldilocksExtension>;
+type Opens = std::sync::Mutex<Vec<(usize, Open)>>;
+
+struct OpenTables<'a> {
+    batch: pass::Batched<'a, Item>,
+}
+
+impl<'a> OpenTables<'a> {
+    fn new(
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        batched: &'a Batched,
+        done: &'a Opens,
+    ) -> Self {
+        Self {
+            batch: pass::Batched::new(move |items| {
+                open_batch(airs, challenge, batched, done, items)
+            }),
+        }
+    }
+}
+
+fn iotas_of(batched: &Batched, idx: usize) -> Result<&[usize], Error> {
+    let g = *batched
+        .group_of
+        .get(idx)
+        .ok_or_else(|| Error::Prover(format!("open pass: table {idx} has no group")))?;
+    let (_, fri) = batched
+        .groups
+        .get(g)
+        .ok_or_else(|| Error::Prover(format!("open pass: table {idx} points at group {g}")))?;
+    Ok(&fri.iotas)
+}
+
+fn open_batch(
+    airs: &ChunkAirs,
+    challenge: &Challenge,
+    batched: &Batched,
+    done: &Opens,
+    items: Vec<Item>,
+) -> Result<(), Error> {
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let n = order.len();
+    let built: Result<Vec<_>, Error> = items
+        .into_par_iter()
+        .map(|(kind, chunk, mut trace)| {
+            let idx = order.index_of(kind, chunk).ok_or_else(|| {
+                Error::Prover(format!(
+                    "open pass: {kind:?} chunk {chunk} is not in the layout"
+                ))
+            })?;
+            let mut transcript = fork(&challenge.transcript, idx, n);
+            let opening = open_of(
+                airs.get(kind).as_ref(),
+                &mut trace,
+                &challenge.challenges,
+                &mut transcript,
+                iotas_of(batched, idx)?,
+            )
+            .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
+            Ok((idx, opening))
+        })
+        .collect();
+    done.lock().expect("openings").extend(built?);
+    Ok(())
+}
+
+fn open_of(
+    air: &dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >,
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    challenges: &[FieldElement<GoldilocksExtension>],
+    transcript: &mut DefaultTranscript<GoldilocksExtension>,
+    iotas: &[usize],
+) -> Result<Open, String> {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    <P as IsStarkProver<_, _, _>>::open_for_table(air, &(), trace, challenges, transcript, iotas)
+        .map_err(|e| format!("{e:?}"))
+}
+
+impl Visitor for OpenTables<'_> {
+    fn table(
+        &mut self,
+        kind: TableKind,
+        chunk: usize,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> Result<(), Error> {
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
+    }
+}
+
+/// Approach 1's fifth pass: walk the execution once more and open every table
+/// at the indices its group settled on.
+///
+/// The last walk, and the one the spec puts last for a reason — the indices do
+/// not exist until the batched FRI is over, so nothing here could have been
+/// folded into an earlier pass.
+pub fn run_open(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+    challenge: &Challenge,
+    batched: &Batched,
+) -> Result<Opened, Error> {
+    let chunk_airs = ChunkAirs::new(proof_options);
+    let done = std::sync::Mutex::new(Vec::new());
+    let mut visitor = OpenTables::new(&chunk_airs, challenge, batched, &done);
+    let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
+    drop(visitor);
+    let mut opens = done.into_inner().expect("openings");
+
+    let order = &challenge.order;
+    let airs = crate::VmAirs::new(
+        elf,
+        proof_options,
+        false,
+        &resident.page_configs,
+        order.counts(),
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let n = order.len();
+    let build = |idx: usize,
+                 air: &crate::VmAir,
+                 trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+     -> Result<(usize, Open), Error> {
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let opening = open_of(
+            air.as_ref(),
+            trace,
+            &challenge.challenges,
+            &mut transcript,
+            iotas_of(batched, idx)?,
+        )
+        .map_err(|e| Error::Prover(format!("open pass: table {idx}: {e}")))?;
+        Ok((idx, opening))
+    };
+    let fixed: [(
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ); NUM_FIXED_AIRS] = [
+        (&airs.bitwise, &mut resident.bitwise),
+        (&airs.decode, &mut resident.decode),
+        (&airs.commit, &mut resident.accumulated.commit),
+        (&airs.keccak, &mut resident.accumulated.keccak),
+        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
+        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
+        (&airs.ecsm, &mut resident.accumulated.ecsm),
+        (&airs.ecdas, &mut resident.accumulated.ecdas),
+        (&airs.hint, &mut resident.accumulated.hint),
+        (&airs.register, &mut resident.register),
+    ];
+    for (idx, (air, trace)) in fixed.into_iter().enumerate() {
+        opens.push(build(idx, air, trace)?);
+    }
+    if airs.include_halt {
+        opens.push(build(NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?);
+    }
+    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+        let idx = order
+            .page_index(i)
+            .ok_or_else(|| Error::Prover(format!("open pass: page {i} is not in the layout")))?;
+        opens.push(build(idx, air, trace)?);
+    }
+
+    opens.sort_by_key(|(idx, _)| *idx);
+    if opens.len() != n {
+        return Err(Error::Prover(format!(
+            "open pass: {} tables for a layout of {n}",
+            opens.len()
+        )));
+    }
+    Ok(Opened {
+        openings: opens.into_iter().map(|(_, o)| o).collect(),
+        resident,
+    })
+}

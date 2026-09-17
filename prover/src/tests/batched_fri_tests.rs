@@ -298,3 +298,69 @@ fn the_driver_folds_every_table_grouped_by_domain() {
     sizes.dedup();
     assert_eq!(before, sizes.len(), "two groups share a domain");
 }
+
+/// The Open pass must serve every table, at its own group's indices.
+///
+/// This is Approach 1's fifth pass and the last one: the query indices do not
+/// exist until the batched FRI is over, so it could not have been folded into
+/// an earlier walk. What it produces is what a verifier will authenticate, so
+/// the two things that matter are that no table is missing and that each opened
+/// as many rows as its group asked for — a table opening the wrong count is a
+/// table answering a different FRI.
+#[test]
+fn the_open_pass_serves_every_table_at_its_group() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let batched = crate::logup_phase::run_batched(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("batched phase");
+    let opened =
+        crate::logup_phase::run_open(&elf, &[], &max_rows, &proof_options, &challenge, &batched)
+            .expect("open pass");
+
+    assert_eq!(
+        opened.openings.len(),
+        batched.group_of.len(),
+        "the Open pass served a different number of tables than the batch folded"
+    );
+    for (idx, opening) in opened.openings.iter().enumerate() {
+        let g = batched.group_of[idx];
+        let wanted = batched.groups[g].1.iotas.len();
+        assert_eq!(
+            opening.len(),
+            wanted,
+            "table {idx} opened {} rows for a group that asked {wanted}",
+            opening.len()
+        );
+    }
+
+    // The count above is weaker than it looks: the number of queries is a
+    // global option, so every group asks for the same number and a table given
+    // the wrong group's indices still opens the right count. What separates the
+    // groups is the indices themselves, which are sampled from different
+    // transcript states and — this is the part that must hold — addressed
+    // against different domains. An index from a taller group is simply not a
+    // row a shorter one has.
+    for (lde_size, fri) in batched.groups.iter() {
+        for iota in fri.iotas.iter() {
+            assert!(
+                iota < lde_size,
+                "a group of {lde_size} sampled index {iota}, which is not a row it has"
+            );
+        }
+    }
+}
