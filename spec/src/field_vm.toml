@@ -104,13 +104,90 @@ type = [[["BaseField", 4], 2], 7] # PARAM: [[["BaseField", d - 1], t + 1], N + 2
 desc = "The MUX polynomial coefficients"
 pad = ["arr", 1, 1, 1, 1, 1, 1, 1] # Slightly hacky way to make the typechecker not crash out on the pc constraint
 
+[[variables.constant]]
+name = "RANGE"
+type = [["BaseField", 5], 2] # PARAM: [["BaseField", d], t + 1]
+desc = "The RANGE polynomial coefficients, to range-check register indices"
+pad = 0
+
+[[variables.constant]]
+name = "X"
+type = "ExtField"
+desc = "A primitive element of the extension field, such that $(1, #`X`, #`X`^2)$ is a basis for the extension field over the base field"
+pad = 0
+
 [[constraint_groups]]
 name = "decode"
 
 [[constraints.decode]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "mem_flags", "i"]]
+iter = ["i", 0, 3]
+
+[[constraints.decode]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "hint_input", "i"]]
+iter = ["i", 0, 4] # PARAM: ["i", 0, N - 1]
+
+[[constraints.decode]]
+kind = "template"
+tag = "IS_BIT"
+input = ["hint_output"]
+
+[[constraints.decode]]
+kind = "arith"
+# PARAM: $limits(sum)_(j = 0)^T #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^(d - 1) #`argument_registers`_i^k dot #`RANGE`_(j,k)$
+constraint = "$limits(sum)_(j = 0)^1 #`arg_register_powers`_(i,j) dot limits(sum)_(k = 0)^4 #`argument_registers`_i^k dot #`RANGE`_(j,k)$"
+# PARAM: ["sum", ["=", "j", 0], T, ["*", ["idx", ["idx", "arg_register_powers", "i"], "j"], ["sum", ["=", "k", 0], ["-", "d", 1], ["*", ["^", ["idx", "argument_registers", "i"], "k"], ["idx", ["idx", "RANGE", "j"], "k"]]]]]
+poly = ["sum", ["=", "j", 0], 1, ["*", ["idx", ["idx", "arg_register_powers", "i"], "j"], ["sum", ["=", "k", 0], 4, ["*", ["^", ["idx", "argument_registers", "i"], "k"], ["idx", ["idx", "RANGE", "j"], "k"]]]]]
+iter = ["i", 0, 3]
+
+[[constraints.decode]]
 kind = "interaction"
 tag = "FIELD_VM_DECODE"
-input = ["pc", "argument_registers", "argument_scalars", "argument_offsets", "mem_flags", "hint_input", "hint_output"]
+input = [
+  ["+",
+    "pc",
+    ["*", "X", ["idx", "argument_scalars", 3]],
+    ["*", ["^", "X", 2], ["idx", "argument_offsets", 3]],
+  ],
+
+  ["+",
+    ["idx", "argument_scalars", 0],
+    ["*", "X", ["idx", "argument_scalars", 1]],
+    ["*", ["^", "X", 2], ["idx", "argument_scalars", 2]],
+  ],
+
+  ["+",
+    ["idx", "argument_offsets", 0],
+    ["*", "X", ["idx", "argument_offsets", 1]],
+    ["*", ["^", "X", 2], ["idx", "argument_offsets", 2]],
+  ],
+
+  ["+",
+    ["idx", "mem_flags", 0],
+    ["*", ["^", 2, 1], ["idx", "mem_flags", 1]],
+    ["*", ["^", 2, 2], ["idx", "mem_flags", 2]],
+    ["*", ["^", 2, 3], ["idx", "mem_flags", 3]],
+
+    ["*", ["^", 2, 4], "hint_output"],
+
+    # PARAM: N rows
+    ["*", ["^", 2, 5], ["idx", "hint_input", 0]],
+    ["*", ["^", 2, 6], ["idx", "hint_input", 1]],
+    ["*", ["^", 2, 7], ["idx", "hint_input", 2]],
+    ["*", ["^", 2, 8], ["idx", "hint_input", 3]],
+    ["*", ["^", 2, 9], ["idx", "hint_input", 4]],
+
+    ["*", "X", ["+",
+      ["idx", "argument_registers", 0],
+      ["*", ["^", 2, 8], ["idx", "argument_registers", 1]],
+      ["*", ["^", 2, 16], ["idx", "argument_registers", 2]],
+      ["*", ["^", 2, 24], ["idx", "argument_registers", 3]]]],
+  ],
+]
 multiplicity = 1
 
 [[constraint_groups]]
