@@ -5,7 +5,7 @@
 //! them per column, and every sumcheck closes against one. So it is worth
 //! emitting once, in the cheapest shape, with its cost written down.
 
-use crate::tables::types::FEE;
+use crate::tables::types::{FE, FEE};
 
 use super::builder::{Ext, LfmBuilder};
 
@@ -82,4 +82,157 @@ pub fn emit_eq_eval(b: &mut LfmBuilder, r: &[Ext], x: &[Ext]) -> Ext {
         acc = if i == 0 { term } else { b.emul(acc, term) };
     }
     acc
+}
+
+/// INSTRUCTIONS one [`emit_sumcheck_round`] emits at degree `d`, once the
+/// program has interned its constants.
+///
+/// One subtract to recover `g(0)`; `d(d+1)/2` subtracts for the forward
+/// difference triangle (`d` at the first level down to one at the last, and
+/// every entry of it is used); `d − 1` `MulAdd`s for the Newton steps `u_1 ..
+/// u_{d−1}` (`u_0` is the challenge itself and costs nothing); and `d` more for
+/// the nest that folds them. So **7 rows at degree 2, 12 at degree 3, and 42 at
+/// degree 7** — the degrees the verifier reaches are 3 in the GKR ladder
+/// (`gkr.rs:522`), 2 in `claim_reduce` (`claim_reduce.rs:291`) and in the WHIR
+/// chain (`whir_chain.rs:991`), and the worst rule's degree in the main batched
+/// sumcheck (`batch.rs:431`, `degree_of`), which is table-dependent.
+///
+/// Pinned as a SLOPE — one more round in the same program — by
+/// `whir_poly_tests::a_sumcheck_round_costs_its_closed_form`, so the constants
+/// below cancel out of it and are pinned separately.
+pub const fn sumcheck_round_rows(degree: usize) -> usize {
+    let d = clamp_degree(degree);
+    let recover_g0 = 1;
+    let triangle = d * (d + 1) / 2;
+    let newton_steps = d - 1; // u_0 is the challenge; only u_1 .. u_{d−1} cost
+    let nest = d; // one MulAdd per level of the nest
+    recover_g0 + triangle + newton_steps + nest
+}
+
+/// `LFM_CONST` rows a degree-`d` round interns, paid once per program however
+/// many rounds share the degree: the pair `(1/(j+1), −j/(j+1))` for each Newton
+/// step `u_1 .. u_{d−1}`.
+pub const fn sumcheck_round_consts(degree: usize) -> usize {
+    2 * (clamp_degree(degree) - 1)
+}
+
+/// `verify_rounds` clamps the degree to at least one (`sumcheck.rs:366`), so a
+/// leg emitted for degree 0 must cost what degree 1 costs rather than underflow
+/// the forms above.
+const fn clamp_degree(degree: usize) -> usize {
+    if degree == 0 { 1 } else { degree }
+}
+
+/// ★ One sumcheck round's claim recursion, as `sumcheck::verify_rounds`
+/// computes it (`crypto/multilinear/src/sumcheck.rs:357-397`).
+///
+/// The round polynomial travels as its evaluations at `1 .. d`; `g(0)` is not
+/// sent, because `g(0) + g(1)` is the claim carried in. So the nodes are
+/// `0 .. d` with values `[claim − e_0, e_0, …, e_{d−1}]`, and the new claim is
+/// that polynomial at the round's challenge.
+///
+/// ★ **Why Newton rather than Lagrange.** The nodes are `0 .. d`, equally
+/// spaced and known at emit time, so
+///
+/// ```text
+///     g(r) = y_0 + u_0·(Δ¹ + u_1·(Δ² + u_2·(Δ³ + …))),   u_j = (r − j)/(j + 1)
+/// ```
+///
+/// with `Δ^k` the forward differences of the values. `u_0 = r`, and every other
+/// `u_j` is `r·(1/(j+1)) + (−j/(j+1))` — one `MulAdd` against two interned
+/// constants, not a subtract and a scale. The host's `interpolate`
+/// (`sumcheck.rs:71-92`) rebuilds Lagrange denominators and batch-inverts them
+/// every round; that is a host inefficiency this does not copy. Newton and
+/// Lagrange are the same polynomial through the same `d + 1` points, so the two
+/// agree identically — and unlike a barycentric form this never divides by
+/// `r − node`, so there is no special case when a challenge lands on one.
+///
+/// ⚠ **The challenge is an INPUT here: this leg neither absorbs nor draws.**
+/// What the transcript replay owes it, stated so the two cannot drift: absorb
+/// `e_0 … e_{d−1}` in that order, as field elements, then draw exactly one
+/// challenge. Until the replay supplies it, a caller's challenge is hinted, and
+/// a hinted challenge is a forgery by the arena rule (`builder.rs:617-620`:
+/// never derive challenges from arenas) — test-only, never a verifier.
+///
+/// The host's length check (`evaluations.len() == degree`) has no counterpart
+/// here and needs none: the emitter reads exactly `d` words at fixed offsets,
+/// so a proof carrying a different count has no way to be supplied. That is the
+/// `epoch_verify.rs:171-179` idiom — the absence of a second value, not an
+/// assert somebody could forget.
+pub fn emit_sumcheck_round(
+    b: &mut LfmBuilder,
+    claim: Ext,
+    evaluations: &[Ext],
+    challenge: Ext,
+) -> Ext {
+    let d = evaluations.len();
+    assert!(
+        d >= 1,
+        "a sumcheck round sends at least one evaluation; the host clamps the degree to 1"
+    );
+
+    // `g(0)` is recovered, not sent.
+    let mut level = Vec::with_capacity(d + 1);
+    level.push(b.esub(claim, evaluations[0]));
+    level.extend_from_slice(evaluations);
+
+    // The difference triangle, keeping `Δ^k y_0` — the head of every level.
+    let mut deltas = Vec::with_capacity(d + 1);
+    deltas.push(level[0]);
+    while level.len() > 1 {
+        let next: Vec<Ext> = level
+            .windows(2)
+            .map(|pair| b.esub(pair[1], pair[0]))
+            .collect();
+        deltas.push(next[0]);
+        level = next;
+    }
+
+    // The nest, from the innermost level out.
+    let mut acc = deltas[d];
+    for k in (0..d).rev() {
+        let u = if k == 0 {
+            challenge
+        } else {
+            emit_newton_step(b, challenge, k)
+        };
+        acc = b.emul_add(u, acc, deltas[k]);
+    }
+    acc
+}
+
+/// A group of rounds against a running claim, which is what every caller of
+/// `sumcheck::verify_rounds` actually asks for. Returns the claim the group
+/// leaves; the point is the challenges it was handed, so there is nothing to
+/// return for it.
+pub fn emit_sumcheck_rounds(
+    b: &mut LfmBuilder,
+    claim: Ext,
+    rounds: &[Vec<Ext>],
+    challenges: &[Ext],
+) -> Ext {
+    assert_eq!(
+        rounds.len(),
+        challenges.len(),
+        "a sumcheck group draws exactly one challenge per round"
+    );
+    let mut current = claim;
+    for (evaluations, &r) in rounds.iter().zip(challenges) {
+        current = emit_sumcheck_round(b, current, evaluations, r);
+    }
+    current
+}
+
+/// `u_j = (r − j)/(j + 1)`, one `MulAdd` against two interned constants.
+fn emit_newton_step(b: &mut LfmBuilder, r: Ext, j: usize) -> Ext {
+    let inv = FE::from((j + 1) as u64)
+        .inv()
+        .expect("j + 1 is a small nonzero Goldilocks element");
+    let scale = b.ext_const(&FEE::new([inv, FE::zero(), FE::zero()]));
+    let shift = b.ext_const(&FEE::new([
+        FE::zero() - FE::from(j as u64) * inv,
+        FE::zero(),
+        FE::zero(),
+    ]));
+    b.emul_add(r, scale, shift)
 }
