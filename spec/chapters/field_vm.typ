@@ -10,7 +10,7 @@ the ISA and an arithmetization of a dedicated field VM.
 The ISA is centered around a single, versatile instruction, that can handle both
 extension field arithmetic and program flow.
 
-= ISA
+= ISA<field-VM:sec:isa>
 
 The field VM is a machine that has access to a read-only memory `MEM`, modeled as a flat array
 that can be indexed by base field elements.
