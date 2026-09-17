@@ -132,6 +132,20 @@ where
     FieldElement<F>: AsBytes,
 {
     /// Build a `TableCommit` for a plain (non-preprocessed) table.
+    /// Roots without a tree, for a pass that will not open against it. The
+    /// tree is the expensive half; a caller that already knows the roots and
+    /// only needs them to travel should not pay for one.
+    fn known_roots(root: Commitment, precomputed: Option<Commitment>) -> Self {
+        Self {
+            tree: Arc::new(BatchedMerkleTree::from_root(root)),
+            root,
+            precomputed_tree: None,
+            precomputed_root: precomputed,
+            num_precomputed_cols: 0,
+            leaves_dropped: None,
+        }
+    }
+
     fn plain(#[allow(unused_mut)] mut tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
         let leaves_dropped = Self::retire_leaves(&mut tree);
         Self {
@@ -1852,7 +1866,8 @@ pub trait IsStarkProver<
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         #[cfg(feature = "instruments")]
         let __r1 = crate::instruments::span("a1_round_1");
-        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        let mut round_1_result =
+            Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
         #[cfg(feature = "instruments")]
         drop(__r1);
         #[cfg(feature = "instruments")]
@@ -1882,6 +1897,7 @@ pub trait IsStarkProver<
         trace: &mut TraceTable<Field, FieldExtension>,
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        known_main: Option<MainRoots>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
@@ -1915,7 +1931,15 @@ pub trait IsStarkProver<
         let (main_src, num_main_cols) = trace.main_data_row_major();
         let main_data =
             expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
-        let main = Self::table_commit_for(air, &main_data, num_main_cols)?;
+        // A caller that already has this table's main roots — the Commit phase
+        // computed every one of them — and that will not open against the tree
+        // can hand them over instead. Building the tree is the hottest thing in
+        // a prove (keccak is 17.6% of the profile), so not building one that
+        // nothing will ask a question of is the cheapest saving there is.
+        let main = match known_main {
+            Some(roots) => TableCommit::known_roots(roots.main, roots.precomputed),
+            None => Self::table_commit_for(air, &main_data, num_main_cols)?,
+        };
 
         #[cfg(feature = "instruments")]
         drop(__m);
@@ -2080,6 +2104,7 @@ pub trait IsStarkProver<
         trace: &mut TraceTable<Field, FieldExtension>,
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        known_main: Option<MainRoots>,
     ) -> Result<TableDeep<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
@@ -2087,7 +2112,8 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
-        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        let mut round_1_result =
+            Self::round_1_from_trace(air, trace, challenges, transcript, known_main)?;
         let (mut round_2_result, round_3_result, z, trace_ood, trace_ood_next) =
             Self::rounds_2_and_3(
                 air,
@@ -2216,7 +2242,8 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
-        let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
+        let mut round_1_result =
+            Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
         let (round_2_result, _, _, _, _) = Self::rounds_2_and_3(
             air,
             pub_inputs,

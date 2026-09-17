@@ -1080,6 +1080,8 @@ fn run_approach_1(
         let batched =
             prover::logup_phase::run_batched(elf, private_inputs, max_rows, options, &challenge)
                 .map_err(|e| format!("{e:?}"))?;
+        let t_fold = t3.elapsed();
+        let t4 = std::time::Instant::now();
         let opened = prover::logup_phase::run_open(
             elf,
             private_inputs,
@@ -1091,14 +1093,13 @@ fn run_approach_1(
         .map_err(|e| format!("{e:?}"))?;
         let tables = batched.tables.len();
         let groups = batched.groups.len();
+        let t_open = t4.elapsed();
         let proof = prover::logup_phase::assemble_batched_proof(batched, opened)
             .map_err(|e| format!("{e:?}"))?;
         println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
         println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
-        println!(
-            "  passes 3-5 (fold+open) {:>6.2}s",
-            t3.elapsed().as_secs_f64()
-        );
+        println!("  pass 3-4 (deep+fold) {:>7.2}s", t_fold.as_secs_f64());
+        println!("  pass 5 (open)      {:>8.2}s", t_open.as_secs_f64());
         report_batched_size(&proof, tables, groups);
         return Ok(tables);
     }

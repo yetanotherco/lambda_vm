@@ -71,6 +71,7 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
         &mut resident.bitwise,
         &challenge.challenges,
         &mut fork,
+        None,
     )
     .expect("deep");
 

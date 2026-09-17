@@ -354,6 +354,7 @@ fn deep_batch(
                 &mut trace,
                 &challenge.challenges,
                 &mut transcript,
+                challenge.roots.get(idx).cloned(),
             )
             .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
             Ok((idx, deep))
@@ -372,10 +373,18 @@ fn deep_of(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     challenges: &[FieldElement<GoldilocksExtension>],
     transcript: &mut DefaultTranscript<GoldilocksExtension>,
+    known_main: Option<stark::prover::MainRoots>,
 ) -> Result<Deep, String> {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    <P as IsStarkProver<_, _, _>>::deep_for_table(air, &(), trace, challenges, transcript)
-        .map_err(|e| format!("{e:?}"))
+    <P as IsStarkProver<_, _, _>>::deep_for_table(
+        air,
+        &(),
+        trace,
+        challenges,
+        transcript,
+        known_main,
+    )
+    .map_err(|e| format!("{e:?}"))
 }
 
 impl Visitor for BuildDeep<'_> {
@@ -439,8 +448,14 @@ pub fn run_batched(
                  trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
      -> Result<(usize, Deep), Error> {
         let mut transcript = fork(&challenge.transcript, idx, n);
-        let deep = deep_of(air.as_ref(), trace, &challenge.challenges, &mut transcript)
-            .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
+        let deep = deep_of(
+            air.as_ref(),
+            trace,
+            &challenge.challenges,
+            &mut transcript,
+            challenge.roots.get(idx).cloned(),
+        )
+        .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
         Ok((idx, deep))
     };
     let fixed: [(
