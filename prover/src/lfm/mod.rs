@@ -48,6 +48,7 @@ pub mod lde;
 pub mod logup;
 pub mod per_table_aggregator;
 pub mod poseidon;
+pub mod preprocessed;
 pub mod program_census;
 pub mod programs;
 pub mod proof;
@@ -126,6 +127,8 @@ mod per_table_aggregator_tests;
 mod per_table_census_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
+#[cfg(test)]
+mod preprocessed_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]
