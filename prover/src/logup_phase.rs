@@ -813,6 +813,9 @@ pub struct BatchedProof {
     pub openings: Vec<Open>,
     /// Which group each table belongs to.
     pub group_of: Vec<usize>,
+    /// The AIR indices in the order they were folded, which the verifier
+    /// replays because a table's coefficient depends on every table before it.
+    pub fold_order: Vec<usize>,
     /// Per group, in ascending domain: the FRI they share.
     pub groups: Vec<(usize, stark::prover::GroupFri<GoldilocksExtension>)>,
     /// The statement, which the verifier binds before absorbing any root.
@@ -834,6 +837,7 @@ pub fn assemble_batched_proof(batched: Batched, opened: Opened) -> Result<Batche
     }
     Ok(BatchedProof {
         tables: batched.tables,
+        fold_order: batched.fold_order,
         openings: opened.openings,
         group_of: batched.group_of,
         groups: batched.groups,

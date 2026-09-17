@@ -470,3 +470,65 @@ fn the_batched_proof_keeps_everything_but_the_fri() {
         proof.tables.len()
     );
 }
+
+/// The verifier must derive the prover's challenges from the proof alone.
+///
+/// This is the floor everything else stands on. A verifier that asks different
+/// questions than the prover answered rejects valid proofs and, worse, may
+/// accept invalid ones — the later checks all assume the challenges are the
+/// ones the data was bound to. So the replay is pinned against the prover's own
+/// values, not against a second implementation of the same idea.
+///
+/// Note what it is NOT: deriving the right challenges does not make a proof
+/// valid. It makes the questions right. Whether the answers are is what the
+/// pieces after this decide.
+#[test]
+fn the_verifier_replays_the_provers_challenges() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let batched = crate::logup_phase::run_batched(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("batched phase");
+    let counts = challenge.order.counts().clone();
+    let opened =
+        crate::logup_phase::run_open(&elf, &[], &max_rows, &proof_options, &challenge, &batched)
+            .expect("open pass");
+    let proof = crate::logup_phase::assemble_batched_proof(batched, opened).expect("assemble");
+
+    let replay = crate::batched_verifier::replay(&proof, &elf_bytes, &counts, &proof_options)
+        .expect("replay");
+
+    assert_eq!(
+        replay.logup, challenge.challenges,
+        "the verifier sampled a different shared challenge than the prover did"
+    );
+    assert_eq!(
+        replay.coefficients.len(),
+        proof.tables.len(),
+        "the verifier derived a coefficient for a different number of tables"
+    );
+    // Every coefficient distinct: two equal ones would mean two tables absorbed
+    // into the same seed state, which is the fold losing its binding.
+    let mut seen = replay.coefficients.clone();
+    seen.sort_by_key(|c| format!("{c:?}"));
+    seen.dedup_by_key(|c| format!("{c:?}"));
+    assert_eq!(
+        seen.len(),
+        replay.coefficients.len(),
+        "two tables got the same fold coefficient"
+    );
+}
