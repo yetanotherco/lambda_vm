@@ -58,7 +58,7 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
         None,
         None,
     );
-    let mut resident = crate::logup_phase::resident_tables(&elf, &[], &max_rows).expect("resident");
+    let mut resident = crate::logup_phase::walk_only(&elf, &[], &max_rows).expect("resident");
 
     // BITWISE is table 0 and the largest resident one, so it exercises a real
     // domain rather than a one-row corner.

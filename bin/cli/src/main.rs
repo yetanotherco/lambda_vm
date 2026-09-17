@@ -286,6 +286,9 @@ enum Stage {
     /// Instead of one FRI per table, fold them by domain, open at the group's
     /// indices, and assemble the batched proof.
     Batched,
+    /// Only the walk: replay the execution and rebuild every table, proving
+    /// nothing. The floor each pass pays.
+    Walk,
 }
 
 fn main() -> ExitCode {
@@ -1055,6 +1058,12 @@ fn run_approach_1(
     #[cfg(feature = "instruments")]
     stark::instruments::reset_timeline();
     let t0 = std::time::Instant::now();
+    if through == Stage::Walk {
+        let resident = prover::logup_phase::walk_only(elf, private_inputs, max_rows)
+            .map_err(|e| format!("{e:?}"))?;
+        println!("  walk only          {:>8.2}s", t0.elapsed().as_secs_f64());
+        return Ok(resident.pages.len());
+    }
     let committed = prover::commit_phase::run_to_end(elf, private_inputs, max_rows, options)
         .map_err(|e| format!("{e:?}"))?;
     let t_commit = t0.elapsed();

@@ -131,8 +131,10 @@ pub(crate) fn fork_for(
 
 /// Rebuild only the tables a pass cannot retire, for a caller that wants one of
 /// them without proving the run.
-#[cfg(test)]
-pub(crate) fn resident_tables(
+/// The walk with nothing done to any table: what the execution costs to
+/// replay and rebuild, on its own. This is the floor every pass pays, and the
+/// number the pipeline can at best hide behind the proving.
+pub fn walk_only(
     elf: &Elf,
     private_input: &[u8],
     max_rows: &MaxRowsConfig,
