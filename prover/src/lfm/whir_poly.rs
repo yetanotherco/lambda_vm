@@ -9,28 +9,52 @@ use crate::tables::types::FEE;
 
 use super::builder::{Ext, LfmBuilder};
 
-/// INSTRUCTIONS [`emit_eq_eval`] emits over `n` variables.
+/// INSTRUCTIONS [`emit_eq_eval`] emits over `n` variables, as the FIRST leg in
+/// its program.
 ///
 /// Four rows per variable and one product to fold each into the running
 /// accumulator, except the first, which *is* the accumulator. Plus the interned
 /// `1`, counted the way [`super::preprocessed::bitwise_preprocessed_rows`]
 /// counts it — an `LFM_CONST` row, paid once per program rather than once per
-/// leg, so a second leg in the same program pays nothing for it and this number
-/// is an upper bound there.
+/// leg (`LfmBuilder::ext_const` interns by canonical word), so a second leg in
+/// the same program costs [`eq_eval_rows_again`] and this number is an upper
+/// bound there.
+///
+/// ⚠ The three terms sum to exactly `5n`, so a measurement of ONE leg cannot
+/// tell them apart: it forces `per_variable + fold_per_variable = 5` and
+/// `interned_one = fold_per_variable`, and leaves the split free. What pins the
+/// split is a second leg in the same program, which pays `5n − interned_one`.
+/// That is why the cost has two pins rather than one.
 ///
 /// Pinned against the emitter by
-/// `whir_poly_tests::the_eq_leg_emits_its_closed_form`.
+/// `whir_poly_tests::the_eq_leg_emits_its_closed_form` (this form) and
+/// `whir_poly_tests::the_interned_one_is_paid_once_per_program` (the split).
 pub const fn eq_eval_rows(n: usize) -> usize {
     if n == 0 {
         // `eq` over no variables is the empty product. Nothing is emitted but
         // the constant it returns.
         return 1;
     }
-    let interned_one = 1;
+    INTERNED_ONE + eq_eval_rows_again(n)
+}
+
+/// INSTRUCTIONS a FURTHER [`emit_eq_eval`] emits in a program that already has
+/// one: the same rows less the constant, which is already interned.
+///
+/// This is the form the assembled verifier's census adds up — it emits `eq`
+/// once per GKR layer, twice per stacked column and once per sumcheck close,
+/// and only the first of those pays for the `1`.
+pub const fn eq_eval_rows_again(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
     let per_variable = 4 * n; // r·x, 1−r, 1−x, and the MulAdd that joins them
     let fold = n - 1; // one product per variable past the first
-    interned_one + per_variable + fold
+    per_variable + fold
 }
+
+/// The `LFM_CONST` row holding `1`, paid once per program.
+const INTERNED_ONE: usize = 1;
 
 /// ★ `eq(r, x) = Π_i [ r_i·x_i + (1−r_i)(1−x_i) ]`, emitted.
 ///

@@ -8,7 +8,7 @@ use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
-use super::whir_poly::{emit_eq_eval, eq_eval_rows};
+use super::whir_poly::{emit_eq_eval, eq_eval_rows, eq_eval_rows_again};
 use super::word::{ext_word, word_as_ext};
 
 fn sample(seed: u64, n: usize) -> Vec<FEE> {
@@ -66,6 +66,71 @@ fn the_eq_leg_emits_its_closed_form() {
         assert_eq!(
             measured, predicted,
             "eq over {n} variables: the emitted row count must equal the closed form"
+        );
+    }
+}
+
+/// `legs` independent `eq` legs over their own hinted points, and the rows they
+/// emit BETWEEN them — the program's total less the `2n + 1` hints and public
+/// each leg's plumbing contributes, which is countable by construction rather
+/// than by differencing against another program.
+fn legs_rows(n: usize, legs: usize) -> usize {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena((2 * n * legs) as u32);
+    for leg in 0..legs {
+        let base = (2 * n * leg) as u32;
+        let r: Vec<_> = (0..n)
+            .map(|i| b.hint_word(arena, base + i as u32).as_ext())
+            .collect();
+        let x: Vec<_> = (0..n)
+            .map(|i| b.hint_word(arena, base + (n + i) as u32).as_ext())
+            .collect();
+        let v = emit_eq_eval(&mut b, &r, &x);
+        b.public(v.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("a multi-leg eq program must be admissible");
+    program.instrs.len() - legs * (2 * n + 1)
+}
+
+/// ★ The second pin on the cost, and the reason there are two.
+///
+/// `eq_eval_rows(n)` is `5n` at every width, so the single-leg measurement in
+/// [`the_eq_leg_emits_its_closed_form`] forces only the SUM of the form's
+/// terms. A second leg in the same program separates them: it pays no second
+/// constant, so it costs `5n − 1`. Between the two measurements all three terms
+/// are determined, and a form that moved a row from the constant into the
+/// per-variable count would pass the first pin and fail this one.
+///
+/// It also carries a control on the first pin's method — `legs_rows(n, 1)`
+/// counts the leg directly, where `marginal_rows(n)` differences two programs,
+/// and the two agree.
+#[test]
+fn the_interned_one_is_paid_once_per_program() {
+    for n in [1usize, 4, 20, 25] {
+        let one_leg = legs_rows(n, 1);
+        let two_legs = legs_rows(n, 2);
+        let second = two_legs - one_leg;
+        println!(
+            "eq over {n:>2} variables: first leg {one_leg:>4} rows emitted, \
+             {:>4} predicted; second leg {second:>4} rows emitted, {:>4} predicted",
+            eq_eval_rows(n),
+            eq_eval_rows_again(n)
+        );
+        assert_eq!(
+            one_leg,
+            eq_eval_rows(n),
+            "eq over {n} variables: counted directly, the first leg must equal the closed form"
+        );
+        assert_eq!(
+            one_leg,
+            marginal_rows(n),
+            "eq over {n} variables: the direct count and the differenced count must agree"
+        );
+        assert_eq!(
+            second,
+            eq_eval_rows_again(n),
+            "eq over {n} variables: a second leg must pay every row but the interned constant"
         );
     }
 }
