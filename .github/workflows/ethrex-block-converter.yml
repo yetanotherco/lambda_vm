@@ -71,6 +71,12 @@ jobs:
       - name: Run converter tests
         run: make test-ethrex-real-block-converter
 
+      # Shares the converter's target dir (see the target), so this is the encoder's own
+      # tests and not a second build of the ethrex host tree. They pin the guest output
+      # layout the fixture producers read, which nothing else in CI covers.
+      - name: Run the SSZ encoder's tests
+        run: make test-ethrex-ssz-input
+
   block-usable:
     name: Real-block usability screen
     runs-on: ubuntu-latest
@@ -120,3 +126,34 @@ jobs:
         run: |
           cd tooling/ethrex-tests && \
             cargo test --release test_ethrex_real_block_native -- --include-ignored
+
+      # Same key as pr_main.yaml's, so this is normally a restore. The build step below
+      # runs anyway: the ELF rule is FORCE-driven, so cargo decides, and a restore-keys
+      # fallback could otherwise hand this job an ELF from another guest.
+      - name: Cache compiled Rust ELF artifacts and build cache
+        if: steps.fixture.outputs.present == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            executor/program_artifacts/rust
+            executor/shared_target
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          restore-keys: |
+            rust-elf-artifacts-
+
+      - name: Compile the ethrex guest ELF
+        if: steps.fixture.outputs.present == 'true'
+        run: make executor/program_artifacts/rust/ethrex.elf
+
+      # The real block THROUGH THE VM, compared against the native reference. This is the
+      # only job that has both halves -- it builds the fixture above, and the PR gate has
+      # no fixture to run against -- so until this step existed the block every benchmark
+      # proves was never once executed by the VM in CI: `test_ethrex_real_block_vm` is
+      # `#[ignore]`d, `make test-ethrex` skips it by name and the gate's `--skip
+      # test_ethrex_real_block` substring drops it too. It is 37.1M cycles, seconds of
+      # work, so the reason it stayed out was the missing fixture and not its cost.
+      - name: Check the real block through the guest ELF
+        if: steps.fixture.outputs.present == 'true'
+        run: |
+          cd tooling/ethrex-tests && \
+            cargo test --release test_ethrex_real_block_vm -- --ignored

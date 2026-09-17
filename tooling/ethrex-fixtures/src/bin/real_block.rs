@@ -66,7 +66,11 @@ fn collect_leaves(node: &Node, path: Nibbles, out: &mut Vec<(H256, Vec<u8>)>) ->
     };
     match node {
         Node::Branch(branch) => {
-            let mut unusable = 0;
+            // A branch carries a value only when some key ends at it, which cannot happen
+            // in these tries: every key is a 32-byte hash, so no key is a prefix of
+            // another. Counted rather than ignored, because "cannot happen" is exactly
+            // what this function reports instead of asserting.
+            let mut unusable = usize::from(!branch.value.is_empty());
             for (i, child) in branch.choices.iter().enumerate() {
                 unusable += descend(child, path.append_new(i as u8), out);
             }
@@ -179,6 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut installed_accounts = 0usize;
     let mut installed_slots = 0usize;
     let mut installed_codes = 0usize;
+    // Two things the witness can leave out. Neither is an error here -- an account whose
+    // storage or code this block never touches is simply absent from the witness, and
+    // installing it is not this tool's job -- but an account that DECLARES either and
+    // does not get it is installed pointing at nodes the local store does not have. That
+    // surfaces downstream as a missing-node or missing-code failure if the block reaches
+    // it, and as nothing at all if it does not, so the counts are reported.
+    let empty_code_hash = H256(NativeCrypto.keccak256(&[]));
+    let mut declared_storage_missing = 0usize;
+    let mut declared_code_missing = 0usize;
     for (hashed_address, encoded) in &accounts {
         let mut account = AccountState::decode(encoded)
             .map_err(|e| format!("decode account {hashed_address:#x}: {e:?}"))?;
@@ -194,6 +207,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             installed_slots += leaves.len();
             account.storage_root = storage_trie.hash(&NativeCrypto)?;
+        } else if account.storage_root != *ethrex_common::constants::EMPTY_TRIE_HASH {
+            declared_storage_missing += 1;
         }
         if let Some(code) = codes_by_hash.get(&account.code_hash) {
             store
@@ -203,6 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
                 .await?;
             installed_codes += 1;
+        } else if account.code_hash != empty_code_hash {
+            declared_code_missing += 1;
         }
         state_trie.insert(hashed_address.0.to_vec(), account.encode_to_vec())?;
         installed_accounts += 1;
@@ -280,11 +297,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let skeleton = create_payload(&payload_args, &store, Bytes::new())?;
     // Every ancestor the witness carries, not just the parent: a transaction reading
-    // BLOCKHASH at any of the other 255 depths would otherwise see zero where mainnet gave
-    // it a hash, and the fixture would quietly execute something else. The local head
+    // BLOCKHASH at one of those depths would otherwise see zero where mainnet gave it a
+    // hash, and the fixture would quietly execute something else. The local head
     // overwrites the real ancestor at its own height, because that is the block this one
-    // builds on. If the guest disagreed with any of it the generator would fail below, at
-    // the post-state-root check.
+    // builds on.
+    //
+    // The reach is whatever the cache's `headers` field carries, NOT the full 255 depths
+    // EIP-2935 allows: this cache feeds `build_payload_t8n` here, and the witness the
+    // guest gets is regenerated separately below. A read deeper than that sees zero on
+    // both sides, so it cannot make the guest and the native reference disagree -- it
+    // would just be a block whose BLOCKHASH behaviour is not mainnet's. Repointing to a
+    // block whose transactions reach further needs that checked, not assumed.
     let mut block_hash_cache: BTreeMap<u64, H256> = decoded_headers
         .iter()
         .map(|header| (header.number, header.compute_block_hash(&NativeCrypto)))
@@ -332,10 +355,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block = result.payload;
     let included = block.body.transactions.len();
     // The tx mix is the whole reason this fixture exists, so a builder that applied
-    // fewer than all of them has produced a smaller workload than the block it claims
-    // to reproduce -- and every guard below still passes, because a block with fewer
+    // fewer than all of them has produced a smaller block than the one it claims to
+    // reproduce -- and every guard below still passes, because a block with fewer
     // transactions is a perfectly valid block. The screen sets the escape: surveying
     // candidate blocks needs the partial ones reported, not refused.
+    //
+    // This counts INCLUSION, not work. A transaction that runs out of gas is included
+    // with a failed receipt and passes here while executing a fraction of its opcodes,
+    // and its gas is charged in full either way, so neither this count nor gas_used can
+    // stand in for the workload. What bounds that is the cycle floor the benchmark
+    // entry points apply (scripts/assert_workload_cycles.sh).
     if included != total_txs && std::env::var_os("REAL_BLOCK_ALLOW_DROPS").is_none() {
         return Err(format!(
             "the payload builder applied only {included} of {total_txs} transactions; \
@@ -343,6 +372,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              anyway."
         )
         .into());
+    }
+    if included != total_txs {
+        // The bytes carry no record of this: a fixture written with drops is
+        // indistinguishable from one whose block really had that many transactions, and
+        // the Makefile's sha256 would happily pin it. Say so where the operator sees it.
+        eprintln!(
+            "WARNING: REAL_BLOCK_ALLOW_DROPS is set and {} of {total_txs} transactions \
+             were dropped. The output records nothing about that -- use it to screen a \
+             candidate block, do NOT pin it as the benchmark fixture.",
+            total_txs - included
+        );
     }
 
     // --- 4. witness -> SSZ -> native validation ----------------------------
@@ -392,6 +432,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "installed   {installed_accounts} accounts / {installed_slots} storage slots / \
          {installed_codes} codes, state root {installed_root:#x}"
     );
+    if declared_storage_missing > 0 || declared_code_missing > 0 {
+        println!(
+            "note        {declared_storage_missing} account(s) declare storage and \
+             {declared_code_missing} declare code the witness did not carry; they are \
+             installed pointing at nodes this store does not have. Harmless unless the \
+             block reaches them, in which case execution fails below rather than here."
+        );
+    }
     println!(
         "rebuilt     #{} ({included}/{total_txs} txs, {} gas, {reverted} reverted)",
         block.header.number, block.header.gas_used

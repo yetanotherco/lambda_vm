@@ -40,8 +40,15 @@ jobs:
       - name: Check ethrex fixture checksums
         run: make check-ethrex-fixture-checksums
 
-      # Five manifests carry the ethrex rev and they must agree: a skew is not a build
-      # failure, it is a fixture the guest decodes as the all-zero default. `--show`
+      # The cycle floor every benchmark entry point calls. Shell, so no cargo test sees
+      # it, and it is the only thing between a benchmark and a workload the guest
+      # rejected. Two seconds, no dependencies.
+      - name: Test the benchmark guards
+        run: make test-bench-guards
+
+      # Six manifests carry the ethrex rev and they must agree: a skew is not a build
+      # failure, it is a fixture the guest does not recognise, which it reports by
+      # committing `successful_validation = 0` after ~500 cycles. `--show`
       # exits non-zero on MIXED. It reads manifests only; the matching locks are held by
       # `--locked` on each workspace's own test/build step.
       - name: Check the ethrex rev is consistent across manifests

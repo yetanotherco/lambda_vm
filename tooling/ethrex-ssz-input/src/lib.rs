@@ -195,6 +195,63 @@ mod tests {
     use super::*;
     use ethrex_common::types::stateless_ssz::SszStatelessValidationResult;
 
+    /// Every artifact this repo generates carries empty `withdrawals`, `extra_data`,
+    /// `versioned_hashes` and `execution_requests`, so those lists are only ever
+    /// exercised at length zero and an offset written wrong would encode, decode and
+    /// validate exactly as well as a correct one. Two of the four can be filled here and
+    /// read back with the guest's own decoder.
+    ///
+    /// The other two cannot. `execution_requests` is hardcoded empty by the encoder (see
+    /// `empty_execution_requests`, which is what upstream's L2 builder does too), so
+    /// there is nothing to vary. `versioned_hashes` is derived from blob transactions,
+    /// which need a signed transaction with a recoverable key; no fixture or cache
+    /// available to this crate has one, and inventing one belongs with a blob-bearing
+    /// fixture rather than here.
+    #[test]
+    fn non_empty_lists_survive_the_encoding() {
+        use ethrex_common::types::{Block, Withdrawal};
+        use ethrex_common::{Address, Bytes};
+        use libssz::SszDecode;
+
+        let bal = BlockAccessList::new();
+        let mut block = Block::default();
+        block.header.block_access_list_hash = Some(bal.compute_hash(&NativeCrypto));
+        block.header.slot_number = Some(7);
+        block.header.base_fee_per_gas = Some(1);
+        block.header.extra_data = Bytes::from_static(b"lambda");
+        block.body.withdrawals = Some(vec![Withdrawal {
+            index: 11,
+            validator_index: 22,
+            address: Address::from_low_u64_be(33),
+            amount: 44,
+        }]);
+
+        let bytes = build_stateless_input(&block, &RpcExecutionWitness::default(), Some(&bal), 1)
+            .expect("a block carrying withdrawals must encode");
+
+        // Past the two-byte schema id, this is exactly what the guest's
+        // `decode_stateless_input` hands to SSZ.
+        let decoded = SszStatelessInput::from_ssz_bytes(&bytes[2..])
+            .expect("the guest's decoder must accept what the encoder wrote");
+        let payload = &decoded.new_payload_request.execution_payload;
+
+        assert_eq!(payload.withdrawals.to_vec().len(), 1, "the withdrawal was dropped");
+        let withdrawal = &payload.withdrawals.to_vec()[0];
+        assert_eq!(withdrawal.index, 11);
+        assert_eq!(withdrawal.validator_index, 22);
+        assert_eq!(withdrawal.amount, 44);
+        assert_eq!(
+            withdrawal.address.0,
+            Address::from_low_u64_be(33).to_fixed_bytes(),
+            "the withdrawal address did not survive"
+        );
+        assert_eq!(
+            payload.extra_data.to_vec(),
+            b"lambda".to_vec(),
+            "extra_data did not survive"
+        );
+    }
+
     /// [`GUEST_OUTPUT_LEN`] and [`VALIDATION_FLAG`] are offsets into a struct this crate
     /// does not own, and the only thing checking them is `validate_natively`'s length
     /// comparison -- which a reordering that kept 43 bytes would pass while the flag

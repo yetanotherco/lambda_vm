@@ -48,7 +48,8 @@ block touches arrives intact — registers a parent header at the block's real
 height, replays the transactions in the block's own order through the t8n
 entry point, and validates the result through the native guest before writing.
 
-Output for mainnet 25453112 (38 transactions, 4,238,394 gas):
+Output for mainnet 25453112, whose 38 transactions consumed 4,238,394 gas on mainnet
+under Osaka (the `rebuilt` line reports what they consume here, under Amsterdam):
 
 ```
 installed   132 accounts / 261 storage slots / 132 codes

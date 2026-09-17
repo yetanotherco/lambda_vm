@@ -9,7 +9,8 @@ bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
 print-real-block-cache-url \
-test-ethrex-real-block-converter regen-real-block-fixture
+test-ethrex-real-block-converter regen-real-block-fixture \
+test-ethrex-ssz-input test-bench-guards
 
 UNAME := $(shell uname)
 
@@ -305,7 +306,7 @@ test-rust: compile-programs-rust
 # below. It is no longer what regenerates this fixture.
 #
 # ---- Repointing to a different block ----
-# These SIX lines and nothing else. Every path below derives from them, the
+# These FIVE lines and nothing else. Every path below derives from them, the
 # benchmark scripts and CI resolve the fixture through
 # `make -s print-real-block-fixture`, and no workflow, script or env var anywhere
 # names a block. Outside this file the repoint touches only REAL_BLOCK_FIXTURE in
@@ -418,9 +419,19 @@ endef
 # generator, so its digest is re-checked here the same way -- hashing 549 KB costs
 # nothing, and only a MISMATCH pays for a rebuild, which is what keeps a cargo
 # build off every benchmark's critical path.
-ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
+# The generate-if-missing step lives INSIDE the recipe rather than as a file
+# prerequisite, so this can tell a fixture it just built from one that was already on
+# disk. As a prerequisite it could not: a clean checkout with a stale pin generated the
+# fixture, found the digest mismatched, and generated it a second time before erroring --
+# two cold ethrex host builds to report one wrong pin.
+ethrex-real-block-fixture:
 	@set -e; \
 	want="$(ETHREX_REAL_BLOCK_FIXTURE_SHA256)"; \
+	just_built=0; \
+	if [ ! -f "$(ETHREX_REAL_BLOCK_FIXTURE)" ]; then \
+		$(MAKE) regen-real-block-fixture; \
+		just_built=1; \
+	fi; \
 	if [ -z "$$want" ]; then \
 		echo "::warning::ETHREX_REAL_BLOCK_FIXTURE_SHA256 is unset - the fixture is not being verified."; \
 		exit 0; \
@@ -430,8 +441,10 @@ ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 	else echo "fixture: missing sha256sum or shasum for checksum verification" >&2; exit 1; fi; \
 	sha_of() { $$shacmd "$$1" | awk '{print $$1}'; }; \
 	if [ "$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")" = "$$want" ]; then exit 0; fi; \
-	echo "fixture $(ETHREX_REAL_BLOCK_FIXTURE) does not match $$want - regenerating."; \
-	$(MAKE) regen-real-block-fixture; \
+	if [ "$$just_built" = 0 ]; then \
+		echo "fixture $(ETHREX_REAL_BLOCK_FIXTURE) does not match $$want - regenerating."; \
+		$(MAKE) regen-real-block-fixture; \
+	fi; \
 	got="$$(sha_of "$(ETHREX_REAL_BLOCK_FIXTURE)")"; \
 	if [ "$$got" != "$$want" ]; then \
 		echo "ERROR: the freshly generated fixture is $$got, not the pinned $$want." >&2; \
@@ -443,11 +456,11 @@ ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
 		exit 1; \
 	fi
 
-# No prerequisites on purpose. `ethrex-real-block-cache` is phony (so its digest is
-# re-checked on every call), and a phony prerequisite always reads as newer than its
-# target, which would rebuild the fixture on every single benchmark invocation. The
-# cache is fetched from inside `regen-real-block-fixture` instead, so this recipe runs
-# only when the file is genuinely missing.
+# Kept for `make executor/tests/ethrex_<network>_<block>.bin` by hand; the phony target
+# above no longer depends on it (see its comment). No prerequisites on purpose either:
+# `ethrex-real-block-cache` is phony, and a phony prerequisite always reads as newer than
+# its target, which would rebuild the fixture on every single invocation. The cache is
+# fetched from inside `regen-real-block-fixture` instead.
 $(ETHREX_REAL_BLOCK_FIXTURE):
 	$(MAKE) regen-real-block-fixture
 
@@ -527,7 +540,7 @@ test-ethrex-real-block-converter: $(ETHREX_CONVERTER_CACHE)
 # there is no artifact to upload.
 regen-real-block-fixture: ethrex-real-block-cache
 	cd tooling/ethrex-fixtures && \
-		cargo run --release --bin real_block -- \
+		cargo run --locked --release --bin real_block -- \
 			../../$(ETHREX_REAL_BLOCK_CACHE) ../../$(ETHREX_REAL_BLOCK_FIXTURE)
 
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
@@ -608,6 +621,21 @@ check-ethrex-fixture-checksums:
 test-syscalls:
 	cd syscalls && cargo test
 	cd syscalls && cargo test --release
+
+# The SSZ encoder is a path dependency with no workspace of its own in any lockfile, so
+# no `cargo test` in this repo reaches its tests -- and what they pin is the guest's
+# output layout, which belongs to a crate upstream owns. Built into the converter's target
+# dir on purpose: its dependency graph is a subset of that one's, so this reuses the build
+# instead of paying for a second copy of the ethrex host tree.
+test-ethrex-ssz-input:
+	cd tooling/ethrex-ssz-input && \
+		CARGO_TARGET_DIR=$(CURDIR)/tooling/ethrex-block-converter/target cargo test
+
+# The benchmark entry points are shell, and `make lint` is fmt + clippy over Rust, so
+# nothing else in this repo can see a typo in the cycle floor -- a gate that passes
+# everything looks exactly like a gate that works.
+test-bench-guards:
+	scripts/tests/assert_workload_cycles_test.sh
 
 # ethrex-crypto is a detached workspace (excluded from the root members), so a
 # root `cargo test` never runs it. Run it explicitly, like test-syscalls.

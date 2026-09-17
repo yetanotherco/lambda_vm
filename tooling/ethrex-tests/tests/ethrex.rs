@@ -108,7 +108,7 @@ fn no_kzg_backend_linked() {
     );
 }
 
-/// Same screen for EIP-2537 (0x0b-0x11), which the 797df554 bump moved behind the
+/// Same screen for EIP-2537 (0x0b-0x11), which ethrex moved behind the
 /// native-only `blst` feature. Unlike the KZG gap these do NOT revert: levm maps
 /// `CryptoError::Unsupported` to `InternalError`, which aborts the run. Goes red if a
 /// dependency restores a backend, or if upstream rewords the message.
@@ -130,11 +130,14 @@ fn no_bls_backend_linked() {
 /// The same real block through the guest ELF, checking the VM's committed
 /// output matches the native reference. Split from the native gate above
 /// because this one needs the ethrex ELF and is far heavier than the synthetic
-/// fixtures (a ~1 MB witness, real contract execution).
+/// fixtures (a ~550 KB witness, real contract execution).
 ///
-/// Deliberately excluded from the PR CI step, which otherwise runs everything
-/// via `--include-ignored`: the cycle cost of a real block in the VM has not
-/// been measured yet, so it is opt-in until we know what it does to job time.
+/// Deliberately excluded from the PR CI step, which otherwise runs everything via
+/// `--include-ignored`. Not for its runtime -- the block executes in 37.1M cycles,
+/// seconds of work -- but because the PR gate has no fixture: it is generated from a
+/// replay cache by the ethrex host tooling, which that job does not build. The job
+/// that does is the real-block usability screen in
+/// .github/workflows/ethrex-block-converter.yml.
 /// Run it explicitly with:
 ///   cd tooling/ethrex-tests && cargo test --release test_ethrex_real_block_vm -- --ignored
 #[ignore = "real block through the VM; unmeasured runtime, run explicitly on a build server"]
