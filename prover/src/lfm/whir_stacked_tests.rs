@@ -222,3 +222,26 @@ fn the_weight_leg_computes_what_the_host_computes() {
         }
     }
 }
+
+/// ★ `multilinear::challenge_powers` is REACHABLE from this crate, and means
+/// what the batching weights need it to mean.
+///
+/// Without this, item 0's visibility change is a check that cannot fail: a
+/// `pub` item with no consumer draws no warning and no test, so "the emitter
+/// can gate against it" would be a claim nothing stands behind until the
+/// stacked wiring lands. This is the cheapest thing that fails if the
+/// visibility is reverted — it would not compile — and it pins the semantics
+/// the γ-powers leg will be gated against: `[1, γ, γ², …]`, the FIRST weight
+/// one and not γ, which is the end that is easy to get wrong.
+#[test]
+fn challenge_powers_is_reachable_and_starts_at_one() {
+    let gamma = fee(0x51);
+    let powers = multilinear::challenge_powers::<
+        math::field::extensions_goldilocks::Degree3GoldilocksExtensionField,
+    >(&gamma, 4);
+    let want = [FEE::one(), gamma, gamma * gamma, gamma * gamma * gamma];
+    assert_eq!(powers.len(), want.len(), "one weight per source");
+    for (i, (got, expected)) in powers.iter().zip(&want).enumerate() {
+        assert_eq!(got, expected, "gamma^{i}");
+    }
+}

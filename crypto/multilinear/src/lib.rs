@@ -51,10 +51,13 @@ pub(crate) const HOST_CUBE_DIRECT: usize = 1 << 9;
 pub(crate) const HOST_CUBE_COMPILED: usize = 1 << 5;
 
 /// `[1, gamma, gamma^2, ..]` — the weights a batching challenge expands into.
-pub(crate) fn challenge_powers<F: IsField>(
-    gamma: &FieldElement<F>,
-    count: usize,
-) -> Vec<FieldElement<F>> {
+///
+/// `pub` for the recursion emitter, which reproduces these weights inside the
+/// field machine: a leg with no host function on the other side of the equals
+/// sign can only be gated against a copy of itself, which is no evidence about
+/// either. Every caller inside this crate reaches it through the batching
+/// routines below.
+pub fn challenge_powers<F: IsField>(gamma: &FieldElement<F>, count: usize) -> Vec<FieldElement<F>> {
     let mut acc = FieldElement::<F>::one();
     (0..count)
         .map(|_| {

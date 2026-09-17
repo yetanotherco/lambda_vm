@@ -271,6 +271,17 @@ fn a_corrupted_proof_value_cannot_execute() {
     verify(&proved.proof, output, &mut verifying).expect("the control proof must verify");
 
     let layers = proved.proof.layers.len();
+    // The corruption sites below are `[0, 1, layers − 1]`, which is three
+    // DISTINCT layers only while the ladder has at least three. At two they
+    // collapse to `[0, 1, 1]`: the loop still runs six times, still passes, and
+    // silently stops covering the last layer — the coverage would be a property
+    // of the fixture rather than of the test. `tree(3, ..)` gives four layers
+    // today; this is what says so, and what fires if the fixture shrinks.
+    assert!(
+        layers >= 3,
+        "the tamper arm needs at least three layers for [0, 1, layers−1] to be three \
+         distinct sites; this ladder has {layers}"
+    );
     let program = gkr_program(layers);
     let honest = gkr_arena(output, &proved.proof, &verifying.sampled);
     assert!(

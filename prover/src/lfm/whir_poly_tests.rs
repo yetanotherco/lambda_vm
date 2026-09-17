@@ -140,6 +140,46 @@ fn the_interned_one_is_paid_once_per_program() {
     }
 }
 
+/// ★ The zero-variable entry, which the assembled census REACHES rather than
+/// avoids: `gkr_layer_rows(i)` adds `eq_eval_rows_again(i)`, so the ladder's
+/// layer 0 asks for `eq` over no variables. Both cost branches (`= 1` for a
+/// first leg, `= 0` for a further one) and the value are gated here; the loops
+/// above start at one variable and could not have.
+///
+/// The value side is against `eq_eval(&[], &[])` — the host's own empty
+/// product, not the emitter's claim about it.
+#[test]
+fn eq_over_no_variables_is_the_empty_product() {
+    let one_leg = legs_rows(0, 1);
+    let second = legs_rows(0, 2) - one_leg;
+    println!(
+        "eq over  0 variables: first leg {one_leg} rows emitted, {} predicted; \
+         second leg {second} rows emitted, {} predicted",
+        eq_eval_rows(0),
+        eq_eval_rows_again(0)
+    );
+    assert_eq!(
+        one_leg,
+        eq_eval_rows(0),
+        "the empty product costs exactly the constant it returns"
+    );
+    assert_eq!(
+        second,
+        eq_eval_rows_again(0),
+        "a further empty product costs nothing: the constant is already interned"
+    );
+
+    let program = eq_only_program(0);
+    let exec = execute(&program, &[Vec::new()], &crate::hash_pin::BLOCK_HASHER)
+        .expect("the eq leg executes over an empty point");
+    let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
+    let want = eq_eval::<GoldilocksExtension>(&[], &[]).expect("the host agrees on the width");
+    assert_eq!(
+        got, want,
+        "eq over no variables: the emitted leg and the host disagree on the empty product"
+    );
+}
+
 /// ★ The leg computes what `multilinear::eq::eq_eval` computes — the function
 /// the verifier calls, not a restatement of the emitter's own algebra.
 #[test]
@@ -271,6 +311,87 @@ fn a_sumcheck_round_costs_its_closed_form() {
             "degree {degree}: the first round pays for its Newton constants too"
         );
     }
+}
+
+/// ★ The degree-0 entry, which is the caller's degree and not a shape the
+/// emitter can be handed.
+///
+/// `verify_rounds` clamps with `degree.max(1)` (`sumcheck.rs:366`), so a rule
+/// whose degree is zero is verified at degree ONE and its round proof carries
+/// one evaluation. A census adding up `sumcheck_round_rows(degree_of(rules))`
+/// holds the RAW degree, so the cost form has to be callable there — and
+/// `clamp_degree` is only right if it matches the host's clamp. Nothing above
+/// can see that: the loops start at one and the emitter refuses zero
+/// evaluations outright.
+///
+/// Three observations, each able to fail: the host ACCEPTS a one-evaluation
+/// round at degree 0 (the clamp, watched rather than assumed); it REJECTS a
+/// two-evaluation one, which is what says the clamp is a clamp and not an
+/// unchecked pass; and the cost form at the raw 0 predicts the program emitted
+/// at the width the clamp implies.
+#[test]
+fn a_degree_zero_rule_is_verified_at_degree_one() {
+    let rounds = 3;
+    let values = sample(0x0D, 1 + rounds);
+    let claim = values[0];
+    let proof: Vec<RoundProof<GoldilocksExtension>> = (0..rounds)
+        .map(|round| RoundProof {
+            evaluations: vec![values[1 + round]],
+        })
+        .collect();
+
+    let mut transcript = DefaultTranscript::<GoldilocksExtension>::new(b"v1-sumcheck-degree0");
+    let host = verify_rounds(&proof, claim, 0, &mut transcript)
+        .expect("asked for degree 0, the host clamps to 1 and accepts one evaluation a round");
+    assert_eq!(host.point.len(), rounds, "one challenge per round");
+
+    let mut wider = DefaultTranscript::<GoldilocksExtension>::new(b"v1-sumcheck-degree0");
+    let two: Vec<RoundProof<GoldilocksExtension>> = (0..rounds)
+        .map(|round| RoundProof {
+            evaluations: vec![values[1 + round], values[1 + round]],
+        })
+        .collect();
+    assert!(
+        verify_rounds(&two, claim, 0, &mut wider).is_err(),
+        "the clamp is a clamp: at degree 0 a two-evaluation round must be rejected, or \
+         the acceptance above says nothing about the width"
+    );
+
+    // The cost form at the RAW degree, against the program emitted at the width
+    // the clamp implies.
+    let slope = sumcheck_leg_rows(1, rounds + 1) - sumcheck_leg_rows(1, rounds);
+    let first = sumcheck_leg_rows(1, 1);
+    println!(
+        "sumcheck degree 0 (clamped to 1): {slope} rows a round emitted, \
+         {} predicted; first round {first}, {} predicted",
+        sumcheck_round_rows(0),
+        sumcheck_round_rows(0) + sumcheck_round_consts(0)
+    );
+    assert_eq!(
+        slope,
+        sumcheck_round_rows(0),
+        "a degree-0 rule's round must cost what the clamped width emits"
+    );
+    assert_eq!(
+        first,
+        sumcheck_round_rows(0) + sumcheck_round_consts(0),
+        "and its constants must be the clamped width's constants"
+    );
+
+    // The value, against the host's own claim.
+    let mut arena = vec![ext_word(&claim)];
+    for (round, r) in host.point.iter().enumerate() {
+        arena.extend(proof[round].evaluations.iter().map(ext_word));
+        arena.push(ext_word(r));
+    }
+    let program = sumcheck_program(1, rounds);
+    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+        .expect("the sumcheck leg executes at the clamped width");
+    let got = word_as_ext(&exec.public_words[0].1).expect("a published claim");
+    assert_eq!(
+        got, host.expected_evaluation,
+        "degree 0 over {rounds} rounds: the emitted leg and the host disagree"
+    );
 }
 
 /// ★ The leg computes what `sumcheck::verify_rounds` computes, driven by that

@@ -24,10 +24,10 @@ use super::whir_poly::{emit_eq_eval, eq_eval_rows_again};
 /// One column's claim, as wires: the point it is claimed at and the batching
 /// weight it carries (`gamma^column`).
 ///
-/// ⚠ The weights are INPUTS. `challenge_powers` is `pub(crate)` in the
-/// multilinear crate, so there is no host function to gate an emitted copy
-/// against, and an ungated copy is not worth having — whoever assembles the
-/// group emits the `n − 1` multiplies.
+/// ⚠ The weights are INPUTS here: whoever assembles the group emits the `n − 1`
+/// multiplies. `multilinear::challenge_powers` is the host function that leg is
+/// gated against — it was `pub(crate)` when this type was written, which is why
+/// the weights arrive from outside rather than being built in place.
 #[derive(Clone, Copy)]
 pub struct ColumnClaim<'a> {
     pub point: &'a [Ext],
