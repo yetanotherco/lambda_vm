@@ -65,6 +65,7 @@ pub mod transcript_replay;
 pub mod validator;
 pub mod whir_gkr;
 pub mod whir_poly;
+pub mod whir_program;
 pub mod whir_stacked;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
@@ -138,6 +139,8 @@ mod preprocessed_tests;
 mod whir_gkr_tests;
 #[cfg(test)]
 mod whir_poly_tests;
+#[cfg(test)]
+mod whir_program_tests;
 #[cfg(test)]
 mod whir_stacked_tests;
 #[cfg(test)]
