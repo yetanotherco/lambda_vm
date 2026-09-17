@@ -145,6 +145,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
         &owed,
         &config(),
         &mut verifier,
+        None,
     )?;
     Ok(proof.tables[0].bus_output)
 }
@@ -357,6 +358,7 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         &expected,
         &config(),
         &mut verifier,
+        None,
     )
     .expect("the whole table set verifies");
 
@@ -457,6 +459,7 @@ fn a_real_table_proof_survives_serialization() {
             &owed,
             &config(),
             &mut verifier,
+            None,
         )
         .unwrap_or_else(|e| panic!("{label}: {e:?}"));
     }

@@ -173,6 +173,7 @@ fn a_forged_preprocessed_column_is_rejected() {
             &FieldElement::<E>::zero(),
             &config,
             &mut transcript,
+            None,
         )
         .is_ok()
     };

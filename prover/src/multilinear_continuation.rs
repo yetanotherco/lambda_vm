@@ -586,6 +586,7 @@ fn verify_global_bookends(
             &FieldElement::<E>::zero(),
             &config,
             &mut transcript,
+            None,
         )
     });
     if verdict.is_err() {
@@ -1051,6 +1052,7 @@ fn verify_epoch_bookend(
             &owed,
             &config,
             &mut transcript,
+            None,
         )
     });
     if verdict.is_err() {

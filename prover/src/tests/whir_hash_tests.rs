@@ -112,6 +112,7 @@ fn verify<H: WhirHash>(proof: &Proof, columns: &Columns) -> Result<(), multiline
         &owed,
         &config(),
         &mut transcript,
+        None,
     )
 }
 

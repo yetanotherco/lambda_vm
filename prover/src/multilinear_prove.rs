@@ -517,6 +517,7 @@ pub fn verify_with_options(
             &owed,
             &config,
             &mut transcript,
+            None,
         )
         .is_ok()
     }))
