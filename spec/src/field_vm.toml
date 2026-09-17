@@ -5,13 +5,13 @@ code = "FVM"
 name = "pc"
 type = "BaseField"
 desc = "The program counter"
-pad = 0 # TODO? Make this a reserved address containing the self loop
+pad = 0
 
 [[variables.input]]
 name = "argument_registers"
 type = ["BaseField", 4]
 desc = "The register numbers of the arguments `d`, `a`, `b`, `c`, in that order"
-pad = ["arr", 1, 1, 1, 1]
+pad = ["arr", 1, 0, 0, 1]
 
 [[variables.input]]
 name = "argument_scalars"
@@ -35,7 +35,7 @@ pad = 0
 name = "hint_input"
 type = ["Bit", 5] # PARAM: ["Bit", N]
 desc = "Whether each input register is hinted this cycle"
-pad = 0
+pad = ["arr", 1, 1, 1, 1, 1] # PARAM: N long
 
 [[variables.input]]
 name = "hint_output"
@@ -53,7 +53,7 @@ pad = 0
 name = "ZERO"
 type = "Bit"
 desc = "Whether the output of the previous instruction was zero"
-pad = 0
+pad = 1
 
 [[variables.auxiliary]]
 name = "out_inverse"
@@ -65,19 +65,19 @@ pad = 0
 name = "arg_reg_pows_computed"
 type = [["BaseField", 1], 4] # PARAM: [["BaseField", T], 4]
 desc = "Powers of the argument register indices to split the MUX polynomials into lower degree parts"
-pad = ["arr", ["arr", 1], ["arr", 1], ["arr", 1], ["arr", 1]]
+pad = ["arr", 1, 1, 1, 1]
 
 [[variables.auxiliary]]
 name = "args_premem"
 type = ["ExtField", 4]
 desc = "The argument values, before a potential memory lookup"
-pad = ["arr", ["-", 1], 0, 0, ["-", 1]]
+pad = 0
 
 [[variables.auxiliary]]
 name = "args"
 type = ["ExtField", 4]
 desc = "The argument values, after a potential memory lookup"
-pad = ["arr", ["-", 1], 0, 0, ["-", 1]]
+pad = 0
 
 [[variables.virtual]]
 name = "all_regs"
