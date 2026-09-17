@@ -156,7 +156,7 @@ as experience may point out further useful abstractions.
        table.header[*Pseudoinstr.*][*Translation*][*Comment*], table.hline(stroke: 1.5pt))[
   `ADD d, a, b`][`FMA d == (0 * X + 1) * a + b, hint out`][Addition][
   `MUL d, a, b`][`FMA d == a * b + (0 * X), hint out`][Multiplication][
-  `INV d, a`][`fma d == (a + 1) * d - 1, hint <register of d>`][extension field inversion. note: `d` and `a` cannot use the same register here][
+  `INV d, a`][`FMA d == (a + 1) * d - 1, hint <register of d>`][Extension field inversion. Note: `d` and `a` cannot use the same register here, and `d` should not be input-hinted in the next instruction.][
   `J a`][`FMA PC == a, hint out`][Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC][
   `JZA imm`][`FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`][Jump if ZERO, absolute target address][
   `JZR a`][`FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`][Jump if ZERO, PC-relative target address][
@@ -164,7 +164,7 @@ as experience may point out further useful abstractions.
   `JNZR a`][`FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`][Jump if not ZERO, PC-relative target address]
 
 Eventually, usage may inform a set of common pseudoinstructions,
-along with inform potential optimizations that remove unused capabilities
+along with informing potential optimizations that remove unused capabilities
 (e.g. reducing the number of immediates involved).
 
 == Calling convention<field-VM:sec:calling>
@@ -196,7 +196,7 @@ RET:
 ```
 
 As a halting state, we choose to let the VM loop to itself at `PC = 0`, hinting all inputs.
-That means the decoding will always contain `FMA PC = PC, hint out, hint R_1, ..., hint R_N` at that address.
+That means the decoding will always contain `FMA PC == PC, hint out, hint 2, ..., hint (N + 1)` at that address.
 For technical reasons, in @field-VM:sec:boundary, execution of the VM starts at `PC = 1`, with `FMA 0 = 0` and no hinting.
 
 = Arithmetization
