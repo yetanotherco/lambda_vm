@@ -4,7 +4,6 @@
 compile_error!("the `disk-spill` feature requires memmap2, which does not compile on wasm32");
 
 #[cfg(feature = "debug-checks")]
-pub mod batched;
 pub mod bus_debug;
 pub mod commitment;
 pub mod constraint_ir;

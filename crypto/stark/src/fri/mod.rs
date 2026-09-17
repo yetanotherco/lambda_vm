@@ -1,8 +1,6 @@
-pub mod batched;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
-pub mod mmcs;
 pub(crate) mod terminal;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
