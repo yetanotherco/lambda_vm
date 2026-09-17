@@ -66,6 +66,24 @@
 //! backend, an RPX grind and a KECCAK sponge, and this line was the digest of
 //! that mixture. Both lines are now PINNED; see [`RPX_LINE`].
 //!
+//! ⚠ BOTH lines and the length moved again at W1-B step 1, and NOT because of
+//! a hash: `MultiProof` gained `preprocessed: Option<StackedProof>` and rkyv
+//! writes a discriminant even for `None`. Previous values, for anyone bisecting
+//! a byte change to its cause:
+//!
+//! ```text
+//! before step 1   keccak 7b8afea2…6dd3   rpx dcc0e8d5…4985   6880 bytes
+//! after  step 1   keccak 0bc7b999…e25e   rpx fcfbf8fe…4682   6904 bytes
+//! ```
+//!
+//! ⛔ This gate does NOT see W1-B's derived-root absorb, and must not be cited
+//! as evidence that it happened. The fixture is a single EQ air (`:167`, `:190`)
+//! — one table, not DECODE — so it commits no preprocessed group and no derived
+//! root. The lines above moved because the STRUCT changed, which is a different
+//! fact wearing the same clothes. The absorb's position is pinned by
+//! `the_derived_root_is_absorbed_after_the_carried_ones` in
+//! `crypto/crypto/tests/transcript_counters.rs`.
+//!
 //! That is the gate: **the keccak arm's bytes do not move.** A commit that
 //! changes this line has changed the proof PR #988 produces, and owes an
 //! explanation.
@@ -141,7 +159,7 @@ fn canonically_sorted_columns() -> Vec<Vec<FieldElement<Fp>>> {
 }
 
 /// The keccak arm's line. It has never moved and must not.
-const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982336436e6dd3";
+const KECCAK_LINE: &str = "0bc7b9998634986c89d6913f28361af720102a0329a054c192144d91a60ee25e";
 
 /// ★★ The RPX arm's line, PINNED rather than merely required to differ.
 ///
@@ -156,11 +174,21 @@ const KECCAK_LINE: &str = "7b8afea2618350600e99bb67200bb4447d962f753b6e858ee0982
 /// would have passed on that run and said nothing. A pinned constant is the
 /// difference between an instrument that can report a surprise and one that can
 /// only report a category.
-const RPX_LINE: &str = "dcc0e8d52a80a6c9ee4ed9911d54b41e7df132d209fbf91e43018b0ac01c4985";
+const RPX_LINE: &str = "fcfbf8fe7d2e6b008d41462b478141abfb10dacb2888f2ea668c27d16d044682";
 
-/// The serialized length, which neither arm may move: 32-byte digests either
-/// way and no proof struct gains a field.
-const SERIALIZED_LEN: usize = 6880;
+/// The serialized length, which **neither arm may move from the other**.
+///
+/// ⚠ The invariant this carries is CROSS-ARM equality — "a hash swap is not a
+/// proof format change" — not equality with any particular past value. W1-B
+/// step 1 moved it 6880 -> 6904 for a reason that is not a hash swap:
+/// `MultiProof` gained `preprocessed: Option<StackedProof>`, and rkyv writes a
+/// discriminant even when it is `None`.
+///
+/// So the number was re-pinned ONCE, from a measurement, and BOTH arms were run
+/// against the new value — keccak and RPX each printed 6904. Chasing whichever
+/// arm happened to be run first would have left the other arm's agreement
+/// unasserted and turned this back into a print.
+const SERIALIZED_LEN: usize = 6904;
 
 /// Prints the identity line and the serialized length, and ASSERTS what each
 /// arm owes. See the module header.

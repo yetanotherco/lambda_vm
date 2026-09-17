@@ -413,3 +413,47 @@ fn decode_rows_are_in_ascending_pc_order() {
     );
     assert_eq!(pcs[0], 0x1000, "the first row is not the lowest pc");
 }
+
+/// Prints DECODE's row count and the W1-B group shape for a named ELF.
+///
+/// The five preprocessed columns stack into one polynomial, so the group's
+/// `n_stack` is `ceil_log2(5 * rows)` and its codeword is `n_stack + log_blowup`
+/// — which is the residency budget W1-B has to reserve. One power of two either
+/// way doubles it, so it is measured from the ELF rather than quoted.
+///
+/// ```text
+/// cargo test -p lambda-vm-prover --release --lib print_decode_shape_for \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "prints the DECODE group shape for the bench ELFs; run with --ignored --nocapture"]
+fn print_decode_shape_for_the_bench_elfs() {
+    for name in ["ethrex", "sub"] {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("executor/program_artifacts");
+        let bytes = ["rust", "asm"]
+            .iter()
+            .find_map(|d| std::fs::read(root.join(d).join(format!("{name}.elf"))).ok());
+        let Some(bytes) = bytes else {
+            eprintln!("{name}: no ELF, skipped");
+            continue;
+        };
+        let elf = Elf::load(&bytes).expect("ELF load");
+        let instructions =
+            crate::tables::decode::instructions_from_elf(&elf).expect("instructions");
+        // +1 for the CPU padding entry, then the next power of two, min 2.
+        let rows = (instructions.len() + 1).next_power_of_two().max(2);
+        let cells = 5 * rows;
+        let n_stack = cells.next_power_of_two().trailing_zeros();
+        eprintln!(
+            "{name}: {} instructions -> {rows} rows (2^{}), 5 cols = {cells} cells, \
+             n_stack = {n_stack}, codeword at blowup 4 = 2^{} = {} MiB",
+            instructions.len(),
+            rows.trailing_zeros(),
+            n_stack + 2,
+            ((1u64 << (n_stack + 2)) * 8) / (1024 * 1024),
+        );
+    }
+}

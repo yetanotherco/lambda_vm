@@ -599,6 +599,21 @@ pub struct MultiProof<F: IsField, E: IsField> {
     /// Every table's columns, at each one's own point — one opening per
     /// commitment group, in group order.
     pub columns: Vec<StackedProof<F, E>>,
+    /// ★★ The out-of-band preprocessed opening, when the proof carries one.
+    ///
+    /// DECODE's five preprocessed columns are ELF-derived, so their commitment
+    /// is a function of the program alone and is built ONCE per ELF rather than
+    /// per epoch. This opens it at DECODE's own reduced point, and the verifier
+    /// compares the opened values against the ones DECODE's table settled on —
+    /// which replaces re-evaluating five 2^20 MLEs on every epoch.
+    ///
+    /// ⚠ Its ROOT IS NOT IN [`roots`](Self::roots), and that is deliberate. The
+    /// verifier derives the root from the ELF it already holds and absorbs the
+    /// DERIVED value; a root carried here would be a second copy that a reader
+    /// assumes is checked, and a value that has not been checked must never
+    /// reach the transcript. `roots` therefore keeps exactly the group roots it
+    /// always had, and the group indexing that slices it is untouched.
+    pub preprocessed: Option<StackedProof<F, E>>,
 }
 
 /// The table's share of the bus, `p/q`.
@@ -923,6 +938,10 @@ where
         roots: committed.roots().to_vec(),
         tables,
         columns,
+        // Step 2 fills this when a prepared commitment is supplied. Until then
+        // every proof carries `None` and the verifier's preprocessed path is
+        // the MLE evaluation it has always been.
+        preprocessed: None,
     })
 }
 

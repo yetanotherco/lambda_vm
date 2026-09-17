@@ -1239,6 +1239,9 @@ fn phases() {
         roots: committed.roots().to_vec(),
         tables: table_proofs,
         columns: vec![columns],
+        // This bench re-implements `multi_prove`'s body to clock its phases
+        // apart; it commits no preprocessed group, so there is nothing to open.
+        preprocessed: None,
     };
     let total = total.elapsed();
 
