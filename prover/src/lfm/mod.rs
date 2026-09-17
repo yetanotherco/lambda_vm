@@ -63,6 +63,7 @@ pub mod sub_proof;
 pub mod trace;
 pub mod transcript_replay;
 pub mod validator;
+pub mod whir_transcript_kats;
 pub mod word;
 
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
@@ -129,6 +130,8 @@ mod per_table_census_tests;
 mod poseidon_chip_tests;
 #[cfg(test)]
 mod preprocessed_tests;
+#[cfg(test)]
+mod whir_transcript_kat_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]
