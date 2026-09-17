@@ -82,12 +82,14 @@ fn sha256_traces_spill_in_disk_mode() {
     .expect("trace build failed");
 
     for (name, table) in [
-        ("sha256", &traces.sha256),
-        ("sha256_round", &traces.sha256_round),
-        ("sha256_schedule", &traces.sha256_schedule),
-        ("sha256_rotxor", &traces.sha256_rotxor),
-        ("sha256_k", &traces.sha256_k),
-    ] {
+        ("sha256", &traces.sha256s),
+        ("sha256_round", &traces.sha256_rounds),
+        ("sha256_schedule", &traces.sha256_schedules),
+        ("sha256_rotxor", &traces.sha256_rotxors),
+        ("sha256_k", &traces.sha256_ks),
+    ]
+    .map(|(name, v)| (name, v.first().expect("the program makes SHA calls")))
+    {
         assert!(
             table.main_table.is_spilled(),
             "{name} stayed on the heap in disk mode",

@@ -23,6 +23,17 @@ fn sample_counts() -> TableCounts {
         bytewise: 1,
         store: 1,
         cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
+        sha256: 1,
+        sha256_round: 1,
+        sha256_schedule: 1,
+        sha256_rotxor: 1,
+        sha256_k: 1,
     }
 }
 
@@ -61,6 +72,102 @@ fn state_after_absorb(
     t.state()
 }
 
+/// A `&mut` handle to every count, for tests that have to move each one.
+///
+/// The exhaustive destructure makes a new `TableCounts` field a compile error
+/// here, and `deny(unused_variables)` makes *destructuring it and then not
+/// returning it* an error too — which is the hole a plain destructure leaves:
+/// `absorb_statement` has the same exhaustive pattern, but the array it feeds
+/// the transcript is written out separately, so a field can be destructured
+/// there and quietly dropped before it reaches the sponge.
+#[deny(unused_variables)]
+fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
+    let TableCounts {
+        cpu,
+        lt,
+        memw,
+        memw_aligned,
+        load,
+        mul,
+        dvrm,
+        shift,
+        branch,
+        memw_register,
+        eq,
+        bytewise,
+        store,
+        cpu32,
+        keccak,
+        keccak_rnd,
+        ecsm,
+        ecdas,
+        hint,
+        commit,
+        sha256,
+        sha256_round,
+        sha256_schedule,
+        sha256_rotxor,
+        sha256_k,
+    } = counts;
+    vec![
+        ("cpu", cpu),
+        ("lt", lt),
+        ("memw", memw),
+        ("memw_aligned", memw_aligned),
+        ("load", load),
+        ("mul", mul),
+        ("dvrm", dvrm),
+        ("shift", shift),
+        ("branch", branch),
+        ("memw_register", memw_register),
+        ("eq", eq),
+        ("bytewise", bytewise),
+        ("store", store),
+        ("cpu32", cpu32),
+        ("keccak", keccak),
+        ("keccak_rnd", keccak_rnd),
+        ("ecsm", ecsm),
+        ("ecdas", ecdas),
+        ("hint", hint),
+        ("commit", commit),
+        ("sha256", sha256),
+        ("sha256_round", sha256_round),
+        ("sha256_schedule", sha256_schedule),
+        ("sha256_rotxor", sha256_rotxor),
+        ("sha256_k", sha256_k),
+    ]
+}
+
+/// Every count has to reach the transcript, not just the one a test happened
+/// to pick. The V4 encoding added six accelerator counts; a field that is
+/// destructured in `absorb_statement` and then left out of the array it
+/// absorbs compiles clean and changes nothing about the state, which is a
+/// prover-chosen number the verifier would no longer be bound to.
+#[test]
+fn state_depends_on_every_table_count() {
+    let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 7);
+
+    let names: Vec<&str> = each_count_mut(&mut sample_counts())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names.len(), 25, "every count must be probed");
+
+    for name in names {
+        let mut counts = sample_counts();
+        for (candidate, slot) in each_count_mut(&mut counts) {
+            if candidate == name {
+                *slot += 1;
+            }
+        }
+        assert_ne!(
+            baseline,
+            state_after_absorb(b"elf", b"out", &counts, 1, &sample_ranges(), 7),
+            "state must depend on table_counts.{name}",
+        );
+    }
+}
+
 #[test]
 fn state_is_deterministic() {
     let a = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges(), 7);
@@ -97,13 +204,8 @@ fn state_depends_on_every_field() {
         "state must depend on public_output",
     );
 
-    let mut counts2 = sample_counts();
-    counts2.branch += 1;
-    assert_ne!(
-        baseline,
-        state_after_absorb(b"elf", b"out", &counts2, 1, &sample_ranges(), 7),
-        "state must depend on table_counts",
-    );
+    // table_counts gets its own test: one field moving the state says nothing
+    // about the other nineteen. See `state_depends_on_every_table_count`.
 
     assert_ne!(
         baseline,
@@ -140,10 +242,17 @@ fn public_output_length_prefix_prevents_collision() {
 }
 
 fn epoch_state(elf: &[u8], label: u64) -> [u8; 32] {
+    epoch_state_with_role(elf, label, true)
+}
+
+fn epoch_state_with_role(elf: &[u8], label: u64, is_final: bool) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut t,
-        StatementKind::ContinuationEpoch { epoch_label: label },
+        StatementKind::ContinuationEpoch {
+            epoch_label: label,
+            is_final,
+        },
         elf,
         b"out",
         &sample_counts(),
@@ -164,6 +273,20 @@ fn continuation_epoch_state_binds_label_and_program() {
     assert_ne!(baseline, epoch_state(b"elf", 2), "must bind epoch_label");
     // Pinned to the program.
     assert_ne!(baseline, epoch_state(b"other-elf", 1), "must bind the ELF");
+}
+
+/// `is_final` decides whether HALT is in the epoch's AIR set, so a final and a
+/// non-final epoch that declare the same counts describe two different AIR sets.
+/// The verifier derives the flag from the epoch's position in the bundle, so
+/// re-reading an epoch under the other role has to move the transcript — or the
+/// two sets would be told apart by the sub-proof count alone.
+#[test]
+fn continuation_epoch_state_binds_is_final() {
+    assert_ne!(
+        epoch_state_with_role(b"elf", 1, true),
+        epoch_state_with_role(b"elf", 1, false),
+        "must bind is_final",
+    );
 }
 
 #[test]
