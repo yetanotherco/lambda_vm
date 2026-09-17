@@ -214,11 +214,7 @@ The #fieldvm is comprised of #nr_variables variables that are expressed using #n
 
 == Constraints
 
-We first decode the instruction at the current PC.
-
-#render_constraint_table(chip, config, groups: "decode")
-
-Then, we compute all values $#`imm`_0 dot #`reg` + #`imm`_1$,
+First, we compute all values $#`imm`_0 dot #`reg` + #`imm`_1$,
 where we need to multiplex out of `registers`, based on `argument_registers[i]`.
 We do this by constructing the Lagrange basis polynomials $f_(i)(x)$ such that $f_(i)(j) = 1$
 for $i = j in [0, N + 1]$ and $f_(i)(j) = 0$ for $i != j in [0, N + 1]$.#footnote[
@@ -267,8 +263,7 @@ Now everything is in place to check the core operation of the VM: the FMA constr
 
 #render_constraint_table(chip, config, groups: "fma")
 
-Finally, we must ensure the consistency between consecutive rows of the table,
-and allow for hinting.
+We must ensure the consistency between consecutive rows of the table, and allow for hinting.
 We again make use of the multiplexing machinery from before.
 The constraints we want to enforce on a register index $r$ are as follows:
 - $!next("hint_input")_r and !#`hint_output` => next("registers")_r = #`registers`_r$,\ `r` could not have been hinted,
@@ -283,6 +278,34 @@ and $next("ZERO")$ purely depends on $#`args`_0$ and not on `ZERO`.
 
 #render_constraint_table(chip, config, groups: "transition")
 
+Finally, to decode the instruction at the current PC, we would like to compress the information coming from
+the decoding table to reduce its number of columns.
+Doing so would require the elements being combined into one column to be range checked on this side
+of the interaction, ideally without needing any extra interactions or committed columns.
+For `Bit` variables, this is no problem with the `IS_BIT` template from @isbit.
+For `argument_registers` however, which should be in the range $[0, N + 1]$,
+which upon first attempt cannot be checked with a constraint of degree $<= d$.
+The standard way to construct the range-check polynomial $g$ would be to choose
+$ g(x) = (x - 0) dot (x - 1) dot ... dot (x - (N + 1)), $
+which has degree $N + 2$.
+Our polynomial approach to multiplexing already provides a way to evaluate a polynomial of degree $<= N + 1$,
+which falls short of one coefficient to evaluate $g$.
+However, recall that $op("deg") f_(i,t) <= d - 2$, and unlike in multiplexing,
+$g$ needs no further multiplications to be used in an arithmetic constraint.
+So we can simply add one extra coefficient to the last split polynomial to achieve our goal.#footnote[
+  We can in theory choose any of the split polynomials to increase, but we need to ensure
+  that we can still use the same `arg_register_powers` as before to recombine the results,
+  so as to avoid the need for extra columns.
+]
+In the constraints, we write `RANGE` for the coefficients of $g$, in a similar structure to `MUX[r]`.
+We assume $N <= 254$, such that each register index takes up at most 8 bits in the compressed column.
+
+To compress base field columns, we can batch 3 base field columns as coefficients of an extension field element.
+In order to do so, we write the constant column `X` as the extension field element, such that $(1, #`X`, #`X`^2)$
+is the canonical basis of the extension field over the base field.
+
+#render_constraint_table(chip, config, groups: "decode")
+
 == Padding
 
 #rj[...]
@@ -294,5 +317,4 @@ and $next("ZERO")$ purely depends on $#`args`_0$ and not on `ZERO`.
  - We can reduce the places in which immediates are valid
  - We can reduce for which arguments a memory access can be specified
  - Do we need input hinting per register, or can we reduce things to input hinting for (some of) the used registers only
-- The `FIELD_VM_DECODE` table can be further compressed, including potentially fitting multiple base field elements into single extension field elements
 - Since memory accesses can probably be presumed to have `BaseField` indices, we may be able to reduce area/hashing somewhat by working with the overlap of `args_premem` and `args`
