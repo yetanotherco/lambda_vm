@@ -331,7 +331,19 @@ fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
 #[cfg(feature = "hash-metrics")]
 mod transcript_pin {
     /// sha256 of the guest ELF these counts were measured against.
-    pub const ELF_SHA256: &str = "8f826601776d4085a9c1f1b4f30ab4e1de2f8e9e1e2c9bb0bb0e1d39e64e94f7";
+    ///
+    /// MEASURED, and it has to say where: `sha256sum` on the box fixture
+    /// `ethrex_8f826601.elf`. The previous value agreed with this one for
+    /// exactly 16 hex characters and was invented for the other 48 — every
+    /// message that carried the sha carried a 16-char prefix, and the tail was
+    /// written to look like a measurement. The guard then skipped on the pinned
+    /// guest itself, and the skip line printed `[..16]` of both sides, which is
+    /// precisely the width at which a fabricated tail still agrees.
+    ///
+    /// A guard on a value nobody measured to full width is a guard on a guess.
+    /// Anything shortened for a message is a display; the constant is the
+    /// measurement.
+    pub const ELF_SHA256: &str = "8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a";
     pub const ELF_LEN: usize = 3_948_504;
     pub const EPOCH_LOG2: u32 = 21;
 
@@ -344,6 +356,40 @@ mod transcript_pin {
     /// is `Sum roots.len()` over the 15 epoch calls, 30 squeezes is `2 x 15`,
     /// and it reads no state.
     pub const OWED: (u64, u64, u64) = (137, 30, 0);
+}
+
+/// Whether the pinned counts describe THIS run.
+///
+/// Pure, and taking the sha as a string so the refusal can be tested without
+/// forging an ELF: a sha that agrees on a prefix and differs in the tail is one
+/// `format!` away, which is the case that actually occurred.
+#[cfg(feature = "hash-metrics")]
+fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
+    sha == transcript_pin::ELF_SHA256
+        && len == transcript_pin::ELF_LEN
+        && epoch_size_log2 == transcript_pin::EPOCH_LOG2
+}
+
+/// The line a skipped pin prints.
+///
+/// FULL 64 hex on BOTH sides, never a prefix. The truncated version of this
+/// line is why a wrong constant survived a box run: it showed `[..16]` of each,
+/// the two agreed there, and the mismatch it existed to report was invisible in
+/// its own output. A diagnostic that can agree while the values differ is not a
+/// diagnostic.
+#[cfg(feature = "hash-metrics")]
+fn pin_skip_line(sha: &str, len: usize, epoch_size_log2: u32) -> String {
+    format!(
+        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}); \
+         pinned {} ({} bytes, epoch 2^{})",
+        "WHIR",
+        sha,
+        len,
+        epoch_size_log2,
+        transcript_pin::ELF_SHA256,
+        transcript_pin::ELF_LEN,
+        transcript_pin::EPOCH_LOG2,
+    )
 }
 
 /// Asserts the pinned pair, or says out loud why it did not.
@@ -360,24 +406,11 @@ fn check_transcript_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if sha != transcript_pin::ELF_SHA256
-        || elf.len() != transcript_pin::ELF_LEN
-        || epoch_size_log2 != transcript_pin::EPOCH_LOG2
-    {
+    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
         // Never silent. A skipped assert that prints nothing is
         // indistinguishable from one that passed, which is the failure this
         // whole pin exists against.
-        println!(
-            "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}); \
-             pinned {} ({} bytes, epoch 2^{})",
-            "WHIR",
-            &sha[..16],
-            elf.len(),
-            epoch_size_log2,
-            &transcript_pin::ELF_SHA256[..16],
-            transcript_pin::ELF_LEN,
-            transcript_pin::EPOCH_LOG2,
-        );
+        println!("{}", pin_skip_line(&sha, elf.len(), epoch_size_log2));
         return;
     }
 
@@ -513,6 +546,88 @@ fn the_pinned_constants_differ_by_owed() {
     // had `oa % 1 == 0`, which is true of every integer. It is pinned by
     // `VERIFY - PROVE` above and by V1's closed form, which is where it belongs.
     let _ = oa;
+}
+
+/// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
+///
+/// The defect this is written against: the constant's last 48 hex were
+/// fabricated, so the guard skipped on the pinned guest itself — and the skip
+/// line printed 16 characters of each side, the exact width at which the real
+/// sha and the invented one agreed. The failure was invisible in the output of
+/// the thing that existed to report it.
+///
+/// Both halves are needed. The refusal alone would pass with a truncated
+/// diagnostic; the diagnostic alone would pass with a comparison that only
+/// looked at a prefix.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
+    // Same first 16 hex, different tail — one `format!`, no ELF to forge.
+    let near_miss = format!("{}{}", &transcript_pin::ELF_SHA256[..16], "0".repeat(48));
+    assert_eq!(near_miss.len(), 64);
+    assert_eq!(
+        near_miss[..16],
+        transcript_pin::ELF_SHA256[..16],
+        "the near miss must agree on the prefix, or it tests nothing"
+    );
+    assert_ne!(near_miss, transcript_pin::ELF_SHA256);
+
+    assert!(
+        !pin_applies(
+            &near_miss,
+            transcript_pin::ELF_LEN,
+            transcript_pin::EPOCH_LOG2
+        ),
+        "a sha differing only after position 16 was accepted: the comparison is \
+         looking at a prefix"
+    );
+
+    // …and the line it prints must make the difference visible.
+    let line = pin_skip_line(
+        &near_miss,
+        transcript_pin::ELF_LEN,
+        transcript_pin::EPOCH_LOG2,
+    );
+    assert!(
+        line.contains(&near_miss),
+        "the skip line does not carry the found sha in full: {line}"
+    );
+    assert!(
+        line.contains(transcript_pin::ELF_SHA256),
+        "the skip line does not carry the pinned sha in full: {line}"
+    );
+
+    // The property in one assertion: whatever the line shows of each side, the
+    // two shown values must differ. A prefix display fails here.
+    let shown: Vec<&str> = line.split_whitespace().filter(|w| w.len() == 64).collect();
+    assert_eq!(
+        shown.len(),
+        2,
+        "expected two 64-hex values in the skip line, found {}: {line}",
+        shown.len()
+    );
+    assert_ne!(
+        shown[0], shown[1],
+        "the skip line shows the same value twice for a genuine mismatch"
+    );
+}
+
+/// ★ The pinned constant is a full-width sha, not a truncation.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pinned_sha_is_full_width() {
+    assert_eq!(
+        transcript_pin::ELF_SHA256.len(),
+        64,
+        "a sha256 is 64 hex characters; anything shorter is a display that got \
+         pinned"
+    );
+    assert!(
+        transcript_pin::ELF_SHA256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "the pinned sha is not lowercase hex"
+    );
 }
 
 /// ★ The guard skips rather than fires on a guest that is not the pinned one.
