@@ -284,8 +284,10 @@ fn assemble(
 
 /// One FRI per height group, instead of one per table.
 pub struct Batched {
-    /// Per group, in ascending domain size: the domain and its FRI layer roots.
-    pub groups: Vec<(usize, Vec<stark::config::Commitment>)>,
+    /// Per group, in ascending domain size: the domain and its FRI instance —
+    /// layers, final polynomial, the shared query indices and their
+    /// decommitments.
+    pub groups: Vec<(usize, stark::prover::GroupFri<GoldilocksExtension>)>,
     /// How many tables each group folded, so the collapse is visible.
     pub members: Vec<usize>,
     pub resident: Resident,

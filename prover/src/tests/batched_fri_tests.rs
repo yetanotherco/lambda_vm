@@ -75,7 +75,7 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
     .expect("deep");
 
     let one = math::field::element::FieldElement::<GoldilocksExtension>::one();
-    let roots = <P as IsStarkProver<_, _, _>>::batch_fri(
+    let fri = <P as IsStarkProver<_, _, _>>::batch_fri(
         airs.bitwise.as_ref(),
         vec![deep],
         &one,
@@ -83,9 +83,33 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
     )
     .expect("batched fri");
 
+    // Everything round 4 would have produced for this table on its own: the
+    // layers, the final polynomial, the ground nonce, and the queries its
+    // openings answer.
+    let want = &vm_proof.proof.proofs[idx];
     assert_eq!(
-        roots, vm_proof.proof.proofs[idx].fri_layers_merkle_roots,
+        fri.layer_roots, want.fri_layers_merkle_roots,
         "a batch of one folded to a different FRI than the proof carries"
+    );
+    assert_eq!(
+        fri.final_poly_coeffs, want.fri_final_poly_coeffs,
+        "a batch of one folded to a different final polynomial"
+    );
+    // And there the comparison stops. Grinding searches for a nonce in parallel
+    // and finds whichever one it finds first, so two runs over the same
+    // transcript state produce different valid nonces — and the queries are
+    // sampled after the nonce is absorbed, so they differ with it. What is
+    // deterministic is everything up to that point, which is what is checked
+    // above; the queries are checked instead by the count they produce.
+    assert_eq!(
+        fri.query_list.len(),
+        want.query_list.len(),
+        "a batch of one answered a different number of queries"
+    );
+    assert_eq!(
+        fri.iotas.len(),
+        want.query_list.len(),
+        "the group sampled a different number of query indices than it decommitted"
     );
 }
 
@@ -232,13 +256,17 @@ fn the_driver_folds_every_table_grouped_by_domain() {
     // not a group that failed.
     let terminal =
         (1usize << proof_options.fri_final_poly_log_degree) * proof_options.blowup_factor as usize;
-    for ((lde_size, roots), count) in batched.groups.iter().zip(batched.members.iter()) {
+    for ((lde_size, fri), count) in batched.groups.iter().zip(batched.members.iter()) {
         assert!(*count > 0, "a group of {lde_size} folded nothing");
         assert_eq!(
-            !roots.is_empty(),
+            !fri.layer_roots.is_empty(),
             *lde_size > terminal,
             "a group of {lde_size} committed {} layers against a terminal of {terminal}",
-            roots.len()
+            fri.layer_roots.len()
+        );
+        assert!(
+            !fri.iotas.is_empty(),
+            "a group of {lde_size} sampled no queries for its members to open at"
         );
     }
     // Domains are distinct: a repeated one would mean two groups that should

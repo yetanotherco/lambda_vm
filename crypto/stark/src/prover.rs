@@ -668,6 +668,17 @@ pub struct MainRoots {
     pub main: Commitment,
 }
 
+/// One height group's FRI: the instance every member of the group folds into.
+pub struct GroupFri<FieldExtension: IsField> {
+    pub layer_roots: Vec<Commitment>,
+    pub final_poly_coeffs: Vec<FieldElement<FieldExtension>>,
+    /// The query indices the whole group answers, and which each member's
+    /// openings are taken at.
+    pub iotas: Vec<usize>,
+    pub query_list: Vec<crate::fri::fri_decommit::FriDecommitment<FieldExtension>>,
+    pub nonce: Option<u64>,
+}
+
 /// One table's contribution to a batched FRI.
 #[derive(Clone)]
 pub struct TableDeep<FieldExtension: IsField> {
@@ -2180,7 +2191,7 @@ pub trait IsStarkProver<
         members: Vec<TableDeep<FieldExtension>>,
         alpha: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-    ) -> Option<Vec<Commitment>>
+    ) -> Option<GroupFri<FieldExtension>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
@@ -2205,7 +2216,7 @@ pub trait IsStarkProver<
 
         let (domain, _) = domain_and_twiddles(air, trace_rows);
         let coset_offset = FieldElement::<Field>::from(air.context().proof_options.coset_offset);
-        let (_, layers) = fri::commit_phase_from_evaluations(
+        let (final_poly_coeffs, layers) = fri::commit_phase_from_evaluations(
             acc,
             transcript,
             &coset_offset,
@@ -2214,7 +2225,28 @@ pub trait IsStarkProver<
             air.options().fri_final_poly_log_degree as u32,
             domain.fri_inv_twiddles(),
         );
-        Some(layers.iter().map(|l| l.merkle_tree.root).collect())
+
+        // Grinding, then the queries — both from the batch's transcript, so the
+        // whole group answers the same indices. That sharing is the point: the
+        // openings a member owes are at the group's iotas, not at its own.
+        let grinding_factor = air.context().proof_options.grinding_factor;
+        let mut nonce = None;
+        if grinding_factor > 0 {
+            let value = grinding::generate_nonce_maybe_gpu(&transcript.state(), grinding_factor)?;
+            transcript.append_bytes(&value.to_be_bytes());
+            nonce = Some(value);
+        }
+        let iotas =
+            Self::sample_query_indexes(air.options().fri_number_of_queries, &domain, transcript);
+        let query_list = fri::query_phase(&layers, &iotas);
+
+        Some(GroupFri {
+            layer_roots: layers.iter().map(|l| l.merkle_tree.root).collect(),
+            final_poly_coeffs,
+            iotas,
+            query_list,
+            nonce,
+        })
     }
 
     /// The main commitment of an already-expanded LDE, split when the AIR is
