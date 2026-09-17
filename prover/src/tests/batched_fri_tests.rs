@@ -174,3 +174,77 @@ fn alpha_moves_when_any_table_moves() {
         "alpha ignores the table order, which the verifier replays"
     );
 }
+
+/// The driver must fold every table, and fold them by domain.
+///
+/// Two things can silently go wrong at once here. A table can go missing — the
+/// walk produces the chunked ones and the end-of-run step the rest, and a batch
+/// that skips one is not a smaller batch, it is a wrong one. And tables of
+/// different domains can end up in the same group, which the fold cannot
+/// express: it squares the coset offset each layer, so a short codeword never
+/// lines up with a tall fold.
+///
+/// So this checks the count against a real proof's table count, and that every
+/// group is one domain with at least one member, and that the collapse actually
+/// happened.
+#[test]
+fn the_driver_folds_every_table_grouped_by_domain() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let vm_proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &proof_options, &max_rows)
+        .expect("ordinary prove");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let batched = crate::logup_phase::run_batched(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("batched phase");
+
+    let folded: usize = batched.members.iter().sum();
+    assert_eq!(
+        folded,
+        vm_proof.proof.proofs.len(),
+        "the driver folded {folded} tables but the proof has {}",
+        vm_proof.proof.proofs.len()
+    );
+    assert!(
+        batched.groups.len() < folded,
+        "{} groups for {folded} tables is no collapse at all",
+        batched.groups.len()
+    );
+    // A group commits layers exactly when there is something to fold. FRI stops
+    // at the final polynomial, whose CODEWORD is the blowup times its degree
+    // bound — so with blowup 2 and a degree bound of 2^7, a 256-long codeword is
+    // already terminal and folds zero times. The short tables (one row blown up
+    // to two) are terminal for the same reason. An empty group there is correct,
+    // not a group that failed.
+    let terminal =
+        (1usize << proof_options.fri_final_poly_log_degree) * proof_options.blowup_factor as usize;
+    for ((lde_size, roots), count) in batched.groups.iter().zip(batched.members.iter()) {
+        assert!(*count > 0, "a group of {lde_size} folded nothing");
+        assert_eq!(
+            !roots.is_empty(),
+            *lde_size > terminal,
+            "a group of {lde_size} committed {} layers against a terminal of {terminal}",
+            roots.len()
+        );
+    }
+    // Domains are distinct: a repeated one would mean two groups that should
+    // have been one, which is a fold that did not happen.
+    let mut sizes: Vec<usize> = batched.groups.iter().map(|(s, _)| *s).collect();
+    let before = sizes.len();
+    sizes.dedup();
+    assert_eq!(before, sizes.len(), "two groups share a domain");
+}
