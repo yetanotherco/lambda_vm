@@ -669,6 +669,7 @@ pub struct MainRoots {
 }
 
 /// One table's contribution to a batched FRI.
+#[derive(Clone)]
 pub struct TableDeep<FieldExtension: IsField> {
     /// The domain the codeword lives on. Only tables that agree on this can be
     /// folded together: the fold squares the coset offset each layer, so a
@@ -682,10 +683,17 @@ pub struct TableDeep<FieldExtension: IsField> {
     pub trace_rows: usize,
     /// The DEEP composition codeword, `lde_size` long.
     pub deep: Vec<FieldElement<FieldExtension>>,
-    /// The fork's state once this table is done with it. The batch's
-    /// coefficient is drawn from every one of these, in AIR order, which is
-    /// what binds the fold to all the data it folds.
-    pub fork_state: Vec<u8>,
+    /// What the batch's coefficient is drawn from: this table's public round-3
+    /// data, in the order a transcript absorbs it.
+    ///
+    /// Not the fork's state, which was the first design and is unusable — the
+    /// verifier has no forks, only a proof. Everything here is carried in the
+    /// proof, so the verifier rebuilds the same seed from the same bytes.
+    pub bus_contribution: Option<FieldElement<FieldExtension>>,
+    pub composition_poly_root: Commitment,
+    pub trace_ood: Table<FieldExtension>,
+    pub trace_ood_next: Table<FieldExtension>,
+    pub parts_ood: Vec<FieldElement<FieldExtension>>,
 }
 
 /// Source of truth for a table whose *trace* has been retired.
@@ -1962,6 +1970,8 @@ pub trait IsStarkProver<
             Round2<FieldExtension>,
             Round3<FieldExtension>,
             FieldElement<FieldExtension>,
+            Table<FieldExtension>,
+            Table<FieldExtension>,
         ),
         ProvingError,
     >
@@ -2029,7 +2039,7 @@ pub trait IsStarkProver<
             transcript.append_field_element(element);
         }
 
-        Ok((round_2_result, round_3_result, z))
+        Ok((round_2_result, round_3_result, z, ood_block0, ood_block1))
     }
 
     /// One table taken as far as a batched FRI lets it go on its own.
@@ -2058,14 +2068,15 @@ pub trait IsStarkProver<
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let mut round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript)?;
-        let (mut round_2_result, round_3_result, z) = Self::rounds_2_and_3(
-            air,
-            pub_inputs,
-            &mut round_1_result,
-            transcript,
-            &domain,
-            &twiddles,
-        )?;
+        let (mut round_2_result, round_3_result, z, trace_ood, trace_ood_next) =
+            Self::rounds_2_and_3(
+                air,
+                pub_inputs,
+                &mut round_1_result,
+                transcript,
+                &domain,
+                &twiddles,
+            )?;
 
         // Round 4's opening move, up to the point where the batch takes over:
         // gamma is this table's own, sampled from its own fork.
@@ -2102,8 +2113,56 @@ pub trait IsStarkProver<
             lde_size: domain.interpolation_domain_size * domain.blowup_factor,
             trace_rows: domain.interpolation_domain_size,
             deep,
-            fork_state: transcript.state().to_vec(),
+            bus_contribution: round_1_result
+                .bus_public_inputs
+                .as_ref()
+                .map(|b| b.table_contribution.clone()),
+            composition_poly_root: round_2_result.composition_poly_root,
+            trace_ood,
+            trace_ood_next,
+            parts_ood: round_3_result.composition_poly_parts_ood_evaluation.clone(),
         })
+    }
+
+    /// The batch's coefficient, drawn from every table's round-3 data.
+    ///
+    /// `pre_fork` is the shared transcript as it stood before the per-table
+    /// forks — after the LogUp challenges and nothing else. On top of it go, per
+    /// table in AIR order: the bus contribution when there is one, the
+    /// composition root, the two out-of-domain blocks column by column, and the
+    /// composition parts. That byte order is the protocol, and the verifier
+    /// walks it from the same fields the proof carries, which is why this reads
+    /// public data rather than the forks — the verifier has no forks.
+    ///
+    /// Drawing `alpha` from all of it is what makes the fold binding: a table
+    /// cannot be swapped after the fact without moving the coefficient that
+    /// folded it.
+    fn batch_alpha(
+        pre_fork: &(impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        tables: &[TableDeep<FieldExtension>],
+    ) -> FieldElement<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let mut seed = pre_fork.clone();
+        for t in tables {
+            if let Some(ref c) = t.bus_contribution {
+                seed.append_field_element(c);
+            }
+            seed.append_bytes(&t.composition_poly_root);
+            for block in [&t.trace_ood, &t.trace_ood_next] {
+                for col in block.columns().iter() {
+                    for elem in col.iter() {
+                        seed.append_field_element(elem);
+                    }
+                }
+            }
+            for elem in t.parts_ood.iter() {
+                seed.append_field_element(elem);
+            }
+        }
+        seed.sample_field_element()
     }
 
     /// One FRI over a whole group of tables.
