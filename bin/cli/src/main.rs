@@ -283,6 +283,9 @@ enum Stage {
     Challenge,
     /// Also walk again to build and commit the auxiliary columns.
     Logup,
+    /// Instead of one FRI per table, fold them by domain, open at the group's
+    /// indices, and assemble the batched proof.
+    Batched,
 }
 
 fn main() -> ExitCode {
@@ -1070,6 +1073,36 @@ fn run_approach_1(
         println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
         return Ok(challenge.roots.len());
     }
+    // The batched path replaces the per-table prove; running both would measure
+    // neither.
+    if through == Stage::Batched {
+        let t3 = std::time::Instant::now();
+        let batched =
+            prover::logup_phase::run_batched(elf, private_inputs, max_rows, options, &challenge)
+                .map_err(|e| format!("{e:?}"))?;
+        let opened = prover::logup_phase::run_open(
+            elf,
+            private_inputs,
+            max_rows,
+            options,
+            &challenge,
+            &batched,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let tables = batched.tables.len();
+        let groups = batched.groups.len();
+        let proof = prover::logup_phase::assemble_batched_proof(batched, opened)
+            .map_err(|e| format!("{e:?}"))?;
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+        println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
+        println!(
+            "  passes 3-5 (fold+open) {:>6.2}s",
+            t3.elapsed().as_secs_f64()
+        );
+        report_batched_size(&proof, tables, groups);
+        return Ok(tables);
+    }
+
     let t2 = std::time::Instant::now();
     let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
         .map_err(|e| format!("{e:?}"))?;
@@ -1080,6 +1113,48 @@ fn run_approach_1(
     report_span_totals();
     report_fri_shape(&logup.tables);
     Ok(logup.tables.len())
+}
+
+/// What the batched proof weighs, against what the per-table one weighs.
+///
+/// The prize was priced before any of this was built: the per-table FRI data
+/// was 57.9% of the proof. This is the same measurement on the other side —
+/// what a table still carries once the layers, the final polynomial, the
+/// queries and the nonce belong to its group.
+fn report_batched_size(proof: &prover::logup_phase::BatchedProof, tables: usize, groups: usize) {
+    let mut per_table = 0usize;
+    for (t, o) in proof.tables.iter().zip(proof.openings.iter()) {
+        per_table += serde_cbor::to_vec(&t.trace_ood)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&t.trace_ood_next)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&t.parts_ood)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(o).map(|v| v.len()).unwrap_or(0)
+            + 32 * 4;
+    }
+    let mut per_group = 0usize;
+    for (_, fri) in proof.groups.iter() {
+        per_group += serde_cbor::to_vec(&fri.layer_roots)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&fri.final_poly_coeffs)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&fri.query_list)
+                .map(|v| v.len())
+                .unwrap_or(0);
+    }
+    let total = per_table + per_group;
+    println!(
+        "Batched: {tables} tables over {groups} groups; {} MB per table + {} MB per group = {} MB",
+        per_table / (1024 * 1024),
+        per_group / (1024 * 1024),
+        total / (1024 * 1024),
+    );
 }
 
 /// Where the time went, summed per span label.
