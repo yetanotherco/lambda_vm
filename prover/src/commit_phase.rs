@@ -52,9 +52,13 @@ struct CommitMain<'a> {
 }
 
 impl<'a> CommitMain<'a> {
-    fn new(airs: &'a ChunkAirs, roots: &'a std::sync::Mutex<Vec<ChunkCommitment>>) -> Self {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        roots: &'a std::sync::Mutex<Vec<ChunkCommitment>>,
+    ) -> Self {
         Self {
-            batch: pass::Batched::new(move |items| commit_batch(airs, roots, items)),
+            batch: pass::Batched::new(scope, move |items| commit_batch(airs, roots, items)),
         }
     }
 }
@@ -110,10 +114,12 @@ pub fn run(
 ) -> Result<CommitPhase, Error> {
     let airs = ChunkAirs::new(proof_options);
     let roots = std::sync::Mutex::new(Vec::new());
-    let mut visitor = CommitMain::new(&airs, &roots);
-    let walked = pass::walk(elf, private_input, max_rows, &mut visitor)?;
-    visitor.flush()?;
-    drop(visitor);
+    let walked = std::thread::scope(|s| {
+        let mut visitor = CommitMain::new(s, &airs, &roots);
+        let walked = pass::walk(elf, private_input, max_rows, &mut visitor)?;
+        visitor.flush()?;
+        Ok::<_, Error>(walked)
+    })?;
     Ok(CommitPhase {
         closed: roots.into_inner().expect("roots"),
         walked,
@@ -134,9 +140,10 @@ pub fn run_to_end(
 ) -> Result<Committed, Error> {
     let airs = ChunkAirs::new(proof_options);
     let roots = std::sync::Mutex::new(Vec::new());
-    let mut visitor = CommitMain::new(&airs, &roots);
-    let remaining = pass::run(elf, private_input, max_rows, &mut visitor)?;
-    drop(visitor);
+    let remaining = std::thread::scope(|s| {
+        let mut visitor = CommitMain::new(s, &airs, &roots);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
     Ok(Committed {
         chunks: roots.into_inner().expect("roots"),
         remaining,
@@ -155,9 +162,10 @@ pub fn commit_remaining(
 ) -> Result<(Vec<ChunkCommitment>, Resident), Error> {
     let airs = ChunkAirs::new(proof_options);
     let roots = std::sync::Mutex::new(Vec::new());
-    let mut visitor = CommitMain::new(&airs, &roots);
-    let resident = pass::finish(walked, private_input, max_rows, &mut visitor)?;
-    drop(visitor);
+    let resident = std::thread::scope(|s| {
+        let mut visitor = CommitMain::new(s, &airs, &roots);
+        pass::finish(walked, private_input, max_rows, &mut visitor)
+    })?;
     Ok((roots.into_inner().expect("roots"), resident))
 }
 

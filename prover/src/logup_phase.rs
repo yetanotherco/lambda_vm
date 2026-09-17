@@ -54,9 +54,16 @@ struct BuildAux<'a> {
 }
 
 impl<'a> BuildAux<'a> {
-    fn new(airs: &'a ChunkAirs, challenge: &'a Challenge, done: &'a Proofs) -> Self {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        done: &'a Proofs,
+    ) -> Self {
         Self {
-            batch: pass::Batched::new(move |items| rounds_batch(airs, challenge, done, items)),
+            batch: pass::Batched::new(scope, move |items| {
+                rounds_batch(airs, challenge, done, items)
+            }),
         }
     }
 }
@@ -185,9 +192,10 @@ pub fn run(
 ) -> Result<LogUp, Error> {
     let airs = ChunkAirs::new(proof_options);
     let done = std::sync::Mutex::new(Vec::new());
-    let mut visitor = BuildAux::new(&airs, challenge, &done);
-    let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
-    drop(visitor);
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = BuildAux::new(s, &airs, challenge, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
 
     let chunks = done.into_inner().expect("logup results");
     let tables = assemble(chunks, &mut resident, elf, proof_options, challenge)?;
@@ -344,9 +352,14 @@ struct BuildDeep<'a> {
 }
 
 impl<'a> BuildDeep<'a> {
-    fn new(airs: &'a ChunkAirs, challenge: &'a Challenge, done: &'a Deeps) -> Self {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        done: &'a Deeps,
+    ) -> Self {
         Self {
-            batch: pass::Batched::new(move |items| deep_batch(airs, challenge, done, items)),
+            batch: pass::Batched::new(scope, move |items| deep_batch(airs, challenge, done, items)),
         }
     }
 }
@@ -481,9 +494,10 @@ pub fn run_batched(
         order: Vec::new(),
         tables: Vec::new(),
     });
-    let mut visitor = BuildDeep::new(&chunk_airs, challenge, &done);
-    let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
-    drop(visitor);
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = BuildDeep::new(s, &chunk_airs, challenge, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
 
     // The tables the walk could not retire, folded after it in AIR order.
     let order = &challenge.order;
@@ -615,13 +629,14 @@ struct OpenTables<'a> {
 
 impl<'a> OpenTables<'a> {
     fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
         airs: &'a ChunkAirs,
         challenge: &'a Challenge,
         batched: &'a Batched,
         done: &'a Opens,
     ) -> Self {
         Self {
-            batch: pass::Batched::new(move |items| {
+            batch: pass::Batched::new(scope, move |items| {
                 open_batch(airs, challenge, batched, done, items)
             }),
         }
@@ -721,9 +736,10 @@ pub fn run_open(
 ) -> Result<Opened, Error> {
     let chunk_airs = ChunkAirs::new(proof_options);
     let done = std::sync::Mutex::new(Vec::new());
-    let mut visitor = OpenTables::new(&chunk_airs, challenge, batched, &done);
-    let mut resident = pass::run(elf, private_input, max_rows, &mut visitor)?;
-    drop(visitor);
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = OpenTables::new(s, &chunk_airs, challenge, batched, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
     let mut opens = done.into_inner().expect("openings");
 
     let order = &challenge.order;

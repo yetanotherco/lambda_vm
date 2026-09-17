@@ -80,41 +80,121 @@ pub fn table_parallelism() -> usize {
         .unwrap_or(1)
 }
 
-/// Collects tables until there are `k` of them, then hands the batch over.
-///
-/// Sits between the walk and a pass so the pass only says what to do with one
-/// batch; the batching, and the bound on how many tables are alive, live here
-/// once. The action is boxed so a pass names `Batched<'_, Item>` and not a
-/// closure type.
-pub struct Batched<'a, T> {
-    batch: Vec<T>,
-    k: usize,
-    #[allow(clippy::type_complexity)]
-    run: Box<dyn FnMut(Vec<T>) -> Result<(), Error> + 'a>,
+/// How many full batches may wait in the channel between the walk and the
+/// worker, beyond the one being processed. `A1_INFLIGHT`, default 0: the walk
+/// hands a batch over and is free the moment the worker takes it, so at most
+/// `k` tables are being processed while `k` more are being built.
+fn inflight() -> usize {
+    std::env::var("A1_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
-impl<'a, T> Batched<'a, T> {
-    pub fn new(run: impl FnMut(Vec<T>) -> Result<(), Error> + 'a) -> Self {
+/// `A1_PIPELINE=0` processes each batch inline, blocking the walk — the
+/// pre-pipeline behaviour, kept so the two can be measured against each other
+/// in one binary.
+fn pipelined() -> bool {
+    std::env::var("A1_PIPELINE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Collects tables until there are `k` of them, then hands the batch to a
+/// worker thread and keeps walking.
+///
+/// The walk is serial — it re-executes the program — and a batch's proving is
+/// not, so the two should overlap: while the worker proves batch N the walk
+/// builds batch N+1. Measured at k=1 the walk is ~22s of a 246s pass, and with
+/// the old inline processing every one of those seconds was spent with the
+/// worker idle and vice versa. The bound on how many tables are alive moves
+/// from `k` to `k` times the batches in flight, which is the knob a caller has.
+///
+/// The action is boxed so a pass names `Batched<'_, Item>` and not a closure
+/// type, and it is `Send` because it runs on the worker.
+pub struct Batched<'scope, T> {
+    batch: Vec<T>,
+    k: usize,
+    tx: Option<std::sync::mpsc::SyncSender<Vec<T>>>,
+    worker: Option<std::thread::ScopedJoinHandle<'scope, Result<(), Error>>>,
+    #[allow(clippy::type_complexity)]
+    inline: Option<Box<dyn FnMut(Vec<T>) -> Result<(), Error> + Send + 'scope>>,
+}
+
+impl<'scope, T: Send + 'scope> Batched<'scope, T> {
+    pub fn new(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        run: impl FnMut(Vec<T>) -> Result<(), Error> + Send + 'scope,
+    ) -> Self {
+        let k = table_parallelism();
+        if !pipelined() {
+            return Self {
+                batch: Vec::new(),
+                k,
+                tx: None,
+                worker: None,
+                inline: Some(Box::new(run)),
+            };
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<T>>(inflight());
+        let worker = scope.spawn(move || {
+            let mut run = run;
+            for batch in rx {
+                run(batch)?;
+            }
+            Ok(())
+        });
         Self {
             batch: Vec::new(),
-            k: table_parallelism(),
-            run: Box::new(run),
+            k,
+            tx: Some(tx),
+            worker: Some(worker),
+            inline: None,
         }
     }
 
     pub fn push(&mut self, item: T) -> Result<(), Error> {
         self.batch.push(item);
         if self.batch.len() >= self.k {
-            return self.drain();
+            return self.hand_over();
         }
         Ok(())
     }
 
-    pub fn drain(&mut self) -> Result<(), Error> {
+    /// Give the current batch to whoever processes it, without waiting for
+    /// the result.
+    fn hand_over(&mut self) -> Result<(), Error> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        (self.run)(std::mem::take(&mut self.batch))
+        let batch = std::mem::take(&mut self.batch);
+        if let Some(run) = self.inline.as_mut() {
+            return run(batch);
+        }
+        match self.tx.as_ref() {
+            Some(tx) => tx.send(batch).map_err(|_| {
+                // The worker is gone, which means it failed; the real error is
+                // what `join` returns.
+                Error::Prover("batched: the worker stopped early".into())
+            }),
+            None => Err(Error::Prover("batched: pushed after finishing".into())),
+        }
+    }
+
+    /// Hand over what is left and wait for the worker to finish everything.
+    pub fn drain(&mut self) -> Result<(), Error> {
+        let handed = self.hand_over();
+        // Closing the channel is what ends the worker's loop.
+        drop(self.tx.take());
+        let joined = match self.worker.take() {
+            Some(w) => w
+                .join()
+                .unwrap_or_else(|_| Err(Error::Prover("batched: the worker panicked".into()))),
+            None => Ok(()),
+        };
+        // A send failure only ever means the worker had already failed; report
+        // the worker's error, which says why.
+        joined.and(handed)
     }
 }
 
