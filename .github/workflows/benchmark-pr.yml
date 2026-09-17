@@ -490,7 +490,7 @@ jobs:
             echo "real_all_times=$ALL_TIMES"
             echo "real_input=$(basename "$REAL_INPUT")"
             # The basename is derived from network+block, so it is a complete key for
-            # WHICH block but not for which bytes: the archived ProgramInput layout moves
+            # WHICH block but not for which bytes: the archived input's layout moves
             # with the ethrex rev, so one basename can name two byte streams. The digest
             # is what makes the comparison guard below able to see a fixture swap.
             echo "real_input_sha=$(sha256sum "$REAL_INPUT" | cut -c1-12)"

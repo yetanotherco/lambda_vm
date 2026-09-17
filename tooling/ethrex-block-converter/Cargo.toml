@@ -13,24 +13,25 @@ ethrex-ssz-input = { path = "../ethrex-ssz-input" }
 # Pinned to the SAME ethrex rev as the guest so the generated SSZ input matches
 # what the stateless guest deserializes.
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-common", default-features = false, features = ["secp256k1"] }
+# Source of the chain id, through `Network::get_genesis`.
+#
+# CAVEAT: this graph does NOT reproduce the guest's precompile surface, and this dep is
+# why. It pulls `ethrex-p2p`, whose `default = ["c-kzg"]` propagates to
+# `ethrex-crypto/c-kzg` — and `default-features = false` cannot switch it off, because
+# ethrex's own workspace declares `ethrex-p2p` with its defaults on. So this links a
+# working c-kzg that the guest does not have; verify with
+# `cargo tree -e features -i ethrex-crypto`. c-kzg is the whole gap now — malachite
+# modexp and `ark-ff/asm` are on both sides since ethrex-trie's `std` default. Closing
+# it means dropping this dep and sourcing the chain id another way. What covers the gap
+# meanwhile is the real-block usability screen in
+# .github/workflows/ethrex-block-converter.yml, which runs against the guest's own
+# feature set.
 ethrex-config = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-config", default-features = false }
 # Provides `NativeCrypto`, the host `Crypto` implementation used to recover
 # transaction keys, hash the BAL, and validate the generated stateless input.
 # Already in the graph via `ethrex-config` -> `ethrex-p2p`, so this adds no
 # compilation; the line exists because the bin build needs its own.
 ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-crypto", default-features = false, features = ["secp256k1"] }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-rlp" }
-# Matches the guest's own declaration (executor/programs/rust/ethrex/Cargo.toml).
-#
-# CAVEAT: this line alone does NOT reproduce the guest's precompile surface. The
-# `ethrex-config` dep above pulls `ethrex-p2p`, whose `default = ["c-kzg"]`
-# propagates to `ethrex-crypto/c-kzg` — and `default-features = false` cannot
-# switch it off, because ethrex's own workspace declares `ethrex-p2p` with its
-# defaults on. So this graph links a working c-kzg that the guest does not have;
-# verify with `cargo tree -e features -i ethrex-crypto`. c-kzg is the whole gap now —
-# malachite modexp and `ark-ff/asm` are on both sides since ethrex-trie's `std` default.
-# Closing it means dropping `ethrex-config` and sourcing `ChainConfig` another way.
-ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "8effcb0671c5d0b12fe0161ea37c174ec4466b6a", package = "ethrex-guest-program", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

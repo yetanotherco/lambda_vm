@@ -172,6 +172,41 @@ mod tests {
         );
     }
 
+    /// The success path has no cache to run on: every published replay cache is
+    /// pre-Amsterdam, which is exactly what the rejection above asserts. So this one is
+    /// built -- the checked-in cache with the two fields the gate requires, and the
+    /// empty-BAL hash so that branch resolves without a raw list. What it covers is this
+    /// file's own work (read the cache, screen it, hand the block to the encoder), not
+    /// the block's validity: a patched header no longer matches its own hash, so the
+    /// assertions are on the encoding and the summary rather than on `validate_natively`,
+    /// which `main` runs and which only a real Amsterdam cache can satisfy.
+    #[test]
+    fn an_amsterdam_shaped_cache_is_converted() {
+        let mut cache: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(CACHE).expect(CACHE_MISSING)).unwrap();
+        let header = &mut cache["blocks"][0]["header"];
+        header["blockAccessListHash"] =
+            serde_json::json!(format!("{:#x}", *EMPTY_BLOCK_ACCESS_LIST_HASH));
+        header["slotNumber"] = serde_json::json!("0x1");
+
+        let path =
+            std::env::temp_dir().join(format!("ethrex_amsterdam_{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let result = stateless_input_from_cache(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        let (bytes, summary) = result.expect("a cache carrying the Amsterdam fields must convert");
+        assert!(!bytes.is_empty(), "the encoder produced no output");
+        assert_eq!(summary.blocks, 1);
+        assert_eq!(
+            summary.transactions,
+            cache["blocks"][0]["body"]["transactions"]
+                .as_array()
+                .map_or(0, Vec::len),
+            "the summary does not describe the block it converted"
+        );
+    }
+
     #[test]
     fn unmappable_network_is_rejected() {
         let mut cache: serde_json::Value =

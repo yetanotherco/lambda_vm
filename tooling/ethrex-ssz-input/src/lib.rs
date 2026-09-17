@@ -189,3 +189,56 @@ pub fn validate_natively(bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethrex_common::types::stateless_ssz::SszStatelessValidationResult;
+
+    /// [`GUEST_OUTPUT_LEN`] and [`VALIDATION_FLAG`] are offsets into a struct this crate
+    /// does not own, and the only thing checking them is `validate_natively`'s length
+    /// comparison -- which a reordering that kept 43 bytes would pass while the flag
+    /// moved somewhere else. Encoding the upstream struct pins both, and it is the same
+    /// encoding the guest publishes: `run_stateless_guest` ends in
+    /// `SszStatelessValidationResult { .. }.ssz_append(&mut out)`.
+    ///
+    /// No CI job runs this crate's tests -- it is a path dependency with no lockfile of
+    /// its own, and building it standalone would be a second cold build of the ethrex
+    /// host tree. What covers the same property on every PR is `native_output` in
+    /// tooling/ethrex-tests, which asserts both constants against real fixtures
+    /// (`make test-ethrex-offline`). This test is what turns that failure into a
+    /// localized one: there, a reordering shows up as a committed fixture being rejected.
+    #[test]
+    fn output_constants_match_the_upstream_result_layout() {
+        let mut accepted = Vec::new();
+        SszStatelessValidationResult {
+            successful_validation: true,
+            ..Default::default()
+        }
+        .ssz_append(&mut accepted);
+
+        assert_eq!(
+            accepted.len(),
+            GUEST_OUTPUT_LEN,
+            "the stateless result's encoded length moved"
+        );
+        assert_eq!(
+            accepted[VALIDATION_FLAG], 1,
+            "successful_validation is no longer at VALIDATION_FLAG"
+        );
+        // Every other field is zero here, so that byte is the flag rather than merely
+        // agreeing with it -- a field reordered into this offset would fail here too.
+        assert_eq!(
+            accepted.iter().filter(|byte| **byte != 0).count(),
+            1,
+            "another field is non-zero, so the offset no longer identifies the flag"
+        );
+
+        // The rejection path returns the Default, which is what makes an input the guest
+        // cannot decode a clean exit instead of an abort: same length, flag clear.
+        let mut rejected = Vec::new();
+        SszStatelessValidationResult::default().ssz_append(&mut rejected);
+        assert_eq!(rejected.len(), GUEST_OUTPUT_LEN);
+        assert_eq!(rejected[VALIDATION_FLAG], 0);
+    }
+}

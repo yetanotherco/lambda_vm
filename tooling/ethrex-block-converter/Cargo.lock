@@ -841,8 +841,6 @@ dependencies = [
  "ethrex-common",
  "ethrex-config",
  "ethrex-crypto",
- "ethrex-guest-program",
- "ethrex-rlp",
  "ethrex-ssz-input",
  "serde",
  "serde_json",

@@ -55,8 +55,17 @@ artifacts and are incompatible with the pinned ethrex.
 
 ## What the tests cover
 
-Both tests assert a rejection. The pinned Hoodi cache predates Amsterdam and is
-refused rather than rewritten, and an unmappable network is refused too. The
-success path — cache in, valid SSZ out — has no automated coverage: it needs a
-cache from a network that runs Amsterdam, and none is published yet. Until one is,
-the encoder is exercised by hand through the `cargo run` above.
+Two of the three tests assert a rejection: the pinned Hoodi cache predates
+Amsterdam and is refused rather than rewritten, and an unmappable network is
+refused too.
+
+The third covers the success path, with the cache it has: the Hoodi one patched to
+carry the two fields the Amsterdam gate requires — a `blockAccessListHash` set to
+the empty-BAL hash, so the BAL branch resolves without a raw list, and a
+`slotNumber`. That exercises this crate's own work, which is to read a cache,
+screen it and hand the block to the encoder. It does not cover the block's
+validity: a patched header no longer matches its own hash, so the test asserts on
+the encoding and the summary and not on `validate_natively`, which `main` runs and
+which only a cache from a network that runs Amsterdam can satisfy. None is
+published yet, so that last step is still exercised by hand through the `cargo run`
+above.
