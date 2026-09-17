@@ -23,6 +23,23 @@ So this reads each guest's OWN flags out of its config and appends to them. The
 config stays the single source of truth; nothing is duplicated, and a guest that
 gains a flag needs no change here.
 
+⛔ WHAT THIS DOES NOT FIX, measured rather than assumed. After remapping, an ELF
+has zero `/Users/...` strings, but two differently NAMED checkouts of one commit
+still differ (3,948,944 against 3,950,136 bytes on one machine). The residue is
+cargo's `-C metadata` disambiguator: cargo derives it from a package's absolute
+source path and hands it to rustc before any remapping applies. The boundary is
+exact — the guest crate and `lambda-vm-ethrex-crypto`, both PATH packages, get
+different disambiguators, while `ethrex-trie` (a git dependency) and `core`
+(build-std) are identical. Closing that needs a canonical build path, not a
+flag.
+
+What this DOES fix is the larger and more dangerous half: the ELF no longer
+depends on the HOST. The home directory, the cargo registry location, the
+sysroot and the rustup toolchain path — which carries the host triple, and so
+differed between a Linux box and a macOS laptop in every one of the many strings
+that embed it — are gone. That is what made "the same sources" produce 3,948,520
+on one machine and 3,952,608 on another.
+
 `CARGO_ENCODED_RUSTFLAGS` rather than `RUSTFLAGS` because the encoded form is
 separated by `\\x1f` and needs no quoting: `--cfg getrandom_backend="custom"`
 survives verbatim, where the space-separated form depends on the shell.

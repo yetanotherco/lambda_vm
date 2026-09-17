@@ -350,6 +350,30 @@ ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-block-converter/caches/cache_$(ETHREX_
 # guest changed — the ethrex rev, the syscalls crate, `ethrex-crypto`, the
 # toolchain, or a flag — and every ELF-derived constant needs re-deriving with
 # it. `make check-ethrex-guest-elf` prints both digests on a miss.
+#
+# ⛔ **PROVISIONAL, AND THE REASON IS MEASURED.** The remapping removes every
+# path rustc controls — a build now has ZERO `/Users/...` strings — but the ELF
+# is still not byte-identical across differently NAMED checkouts. Two worktrees
+# of this commit on one machine gave 3,948,944 and 3,950,136 bytes.
+#
+# The residue is not a path in the binary, it is cargo's `-C metadata`
+# disambiguator, which cargo derives from a package's absolute source path and
+# passes to rustc before `--remap-path-prefix` can apply to anything. Measured
+# across the two builds, the boundary is exact:
+#
+#   ethrex (the guest crate, a path package)   DIFFERS
+#   lambda-vm-ethrex-crypto (path dependency)  DIFFERS
+#   ethrex-trie (git dependency)               same
+#   core (build-std)                           same
+#
+# So it is path DEPENDENCIES only, and it is a cargo input rather than a rustc
+# one. Closing it needs the build to happen at a canonical path — a container or
+# a fixed mount — which is a bigger decision than a flag.
+#
+# ⇒ Until then this digest is a property of THIS commit built in a directory
+# named `lambda_vm-remap`, not of the commit. Do not wire the check into `test`
+# or `lint`; it is for a builder that controls its own path, which is what the
+# campaign's fixture-by-sha workflow already is.
 ETHREX_GUEST_ELF := $(RUST_ARTIFACTS_DIR)/ethrex.elf
 ETHREX_GUEST_ELF_SHA256 := 3d34a312e15049a74741eec96232f479dedab9020a4851f20661f60bbce8a197
 
