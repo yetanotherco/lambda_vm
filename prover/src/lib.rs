@@ -54,9 +54,9 @@ use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
     create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memmove_air, create_memw_air, create_memw_aligned_air, create_memw_register_air,
+    create_mul_air, create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -81,15 +81,16 @@ pub struct RuntimePageRange {
 }
 
 /// Number of tables that contribute exactly one sub-proof regardless of
-/// `TableCounts`: bitwise, decode, halt, keccak_rc, register. The accelerator
-/// chips are counted instead — a run that never calls one carries no table for
-/// it.
+/// `TableCounts`: bitwise, decode, halt, keccak_rc, register, memmove. The other
+/// accelerator chips are counted instead — a run that never calls one carries no
+/// table for it. MEMMOVE stays fixed because the COMMIT byte loop is deferred to
+/// it, so any run that produces output reaches it.
 ///
 /// HALT is the exception, and the reason this is not simply "always": a
 /// continuation epoch carries it only when it is the final one, so `verify_epoch`
 /// sizes non-final epochs with `FIXED_TABLE_COUNT - 1`. Any caller computing an
 /// expected sub-proof count for a continuation epoch must do the same.
-pub const FIXED_TABLE_COUNT: usize = 5;
+pub const FIXED_TABLE_COUNT: usize = 6;
 
 /// How many sub-proofs each counted table contributes. Chunked chips report
 /// their chunk count; the six accelerators are not chunked and report 0 or 1
@@ -593,6 +594,7 @@ pub(crate) struct VmAirs {
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub memmove: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -666,6 +668,7 @@ impl VmAirs {
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
+            (self.memmove.as_ref(), &mut traces.memmove, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -753,6 +756,7 @@ impl VmAirs {
             self.bitwise.as_ref(),
             self.decode.as_ref(),
             self.keccak_rc.as_ref(),
+            self.memmove.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -971,6 +975,7 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let memmove: VmAir = Box::new(create_memmove_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -1092,6 +1097,7 @@ impl VmAirs {
             ecsms,
             ecdases,
             hints,
+            memmove,
             register,
             pages,
             memw_registers,
@@ -1109,6 +1115,11 @@ impl VmAirs {
 // =============================================================================
 
 /// Compute the bus balance offset for the COMMIT[index, value] bus.
+///
+/// The MEMMOVE chip commits eight bytes per row but sends them as eight
+/// `(index, value)` pairs, one per byte, so this rebuild is independent of the
+/// prover's row schedule — which it has to be: the schedule restarts at every
+/// commit ECALL and the verifier sees only the concatenated `public_output`.
 ///
 /// For each public output byte at index `i` with value `v`:
 ///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`

@@ -14,6 +14,7 @@ ecsm = { path = "../crypto/ecsm" }
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
 
 [dev-dependencies]
+proptest = "1.9"
 # Test-only: the guest-side syscall crate re-declares the `hint` selectors as `usize`
 # and they must stay equal to the `u64` copies here (see `hint_selectors_match_the_guest`).
 # Unlike `crypto/crypto`'s and `ethrex-crypto`'s copies of this dep, it is NOT
