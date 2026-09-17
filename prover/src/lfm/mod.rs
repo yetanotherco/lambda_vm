@@ -65,6 +65,7 @@ pub mod transcript_replay;
 pub mod validator;
 pub mod whir_gkr;
 pub mod whir_poly;
+pub mod whir_stacked;
 pub mod whir_transcript_kats;
 pub mod word;
 
@@ -136,6 +137,8 @@ mod preprocessed_tests;
 mod whir_gkr_tests;
 #[cfg(test)]
 mod whir_poly_tests;
+#[cfg(test)]
+mod whir_stacked_tests;
 #[cfg(test)]
 mod whir_transcript_kat_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
