@@ -11,6 +11,10 @@ on:
       # hashes it; both lists must agree on what rebuilds the guest, or a syscalls-only
       # change (a guest allocator swap, say) never gets benchmarked at all.
       - 'syscalls/**'
+      # Same rule for the guest's cargo config: it carries the rustflags every guest
+      # ELF is built with, so a change confined to it recompiles the programs this job
+      # measures. The cache key below already hashes it.
+      - '.cargo/config.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,7 +44,7 @@ jobs:
         id: cache
         with:
           path: ${{ matrix.branch }}_programs/*.elf
-          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**' ) }}
+          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**', '.cargo/config.toml' ) }}
           restore-keys: benchmarks-${{ matrix.branch }}-
 
       - name: Setup Rust Environment
@@ -56,7 +60,7 @@ jobs:
 
       - name: Export benchmark hashes
         id: export-hashes
-        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**' ) }}" >> "$GITHUB_OUTPUT"
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/**', 'syscalls/**', '.cargo/config.toml' ) }}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     strategy:
