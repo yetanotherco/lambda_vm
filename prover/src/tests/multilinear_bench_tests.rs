@@ -328,6 +328,16 @@ fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
 /// independently reproduced by lane V1's shape-derived closed form, which
 /// predicts the verify triple exactly from the table shapes — two derivations,
 /// one number.
+///
+/// # ...and so is the BRANCH, which is why the absorbs are not one number
+///
+/// The absorb columns carry a term that differs between lineages — one `u64`
+/// per per-table count, per epoch statement — so they are pinned as a base plus
+/// `EPOCHS * NUM_TABLE_KINDS`, with the kind count read from the struct. The
+/// bases were taken on the seam branch (`whir/rpx`, the `c73568f4` measurement
+/// plus this branch's computed statement padding); the merged lineage, which
+/// binds one count more, gets its own totals from the same bases without
+/// editing anything here. See [`transcript_pin::PROVE_BASE_ABSORBS`].
 #[cfg(feature = "hash-metrics")]
 mod transcript_pin {
     /// sha256 of the guest ELF these counts were measured against.
@@ -347,10 +357,49 @@ mod transcript_pin {
     pub const ELF_LEN: usize = 3_948_504;
     pub const EPOCH_LOG2: u32 = 21;
 
+    /// Epoch proofs in the pinned run. Part of the measured shape, like the ELF
+    /// and the epoch size: 2^21 epochs over this guest is fifteen of them, which
+    /// is also where `OWED`'s thirty squeezes come from (two per epoch call).
+    pub const EPOCHS: u64 = 15;
+
+    /// ★★ THE ABSORB COUNTS ARE A BASE PLUS A PER-BRANCH TERM, and the term is
+    /// read from the struct rather than written down.
+    ///
+    /// Every epoch statement binds one `u64` per per-table count
+    /// (`statement::absorb_table_counts`), so the absorb total carries
+    /// `EPOCHS * NUM_TABLE_KINDS`. That count is **not a constant of the
+    /// protocol**: the per-table campaign adds `TableCounts::blake3`, so this
+    /// lineage absorbs fourteen per epoch and the merged one fifteen. The box
+    /// discovered that as a pin FAILURE (+15 on both sides at the merged base),
+    /// and the term was legitimate — the BLAKE3 table is conditional and its
+    /// count is the one entry a verifier cannot derive, which is why per-table
+    /// bumped both domain tags for it.
+    ///
+    /// A pin carrying `583_940` would therefore be a constant describing one
+    /// branch while claiming to describe the protocol. The bases below are
+    /// branch-independent; the branch supplies its own kind count.
+    ///
+    /// ⚠ PROVENANCE, and one half of it is a PREDICTION. The box measured
+    /// `583_924 / 584_061` at `c73568f4` (run a2q, both hashes, against the
+    /// `8f826601` fixture). The computed statement padding adds exactly one
+    /// absorb per statement — fifteen epoch statements and one cross-epoch
+    /// statement, sixteen — giving `583_940 / 584_077`, from which
+    /// `EPOCHS * 14 = 210` is subtracted here. The `+16` has not been measured
+    /// yet; these constants are what will say so if it is wrong.
+    pub const PROVE_BASE_ABSORBS: u64 = 583_730;
+    /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
+    pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
+
+    /// Absorbs the per-table counts contribute to a whole continuation proof.
+    pub const fn table_count_absorbs() -> u64 {
+        EPOCHS * crate::statement::NUM_TABLE_KINDS as u64
+    }
+
     /// (absorbs, squeezes, states) after `prove_continuation`.
-    pub const PROVE: (u64, u64, u64) = (583_924, 183_226, 2_996);
+    pub const PROVE: (u64, u64, u64) = (PROVE_BASE_ABSORBS + table_count_absorbs(), 183_226, 2_996);
     /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
-    pub const VERIFY: (u64, u64, u64) = (584_061, 183_256, 2_996);
+    pub const VERIFY: (u64, u64, u64) =
+        (VERIFY_BASE_ABSORBS + table_count_absorbs(), 183_256, 2_996);
 
     /// `owed`'s own cost, stated rather than left as a subtraction: 137 absorbs
     /// is `Sum roots.len()` over the 15 epoch calls, 30 squeezes is `2 x 15`,
@@ -483,10 +532,20 @@ fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
 /// test would pass on any value. The numbers below are written out so that a
 /// constant which drifts, is mistyped, or has its two lines swapped fails here,
 /// on a laptop, rather than on the box an hour later.
+///
+/// ⚠ The literals are the BASES, and the per-branch term is recomputed from the
+/// struct — because that term is what differs between this lineage and the
+/// merged one. Writing the totals out would make this test the thing that has
+/// to be edited on every branch, which is precisely the property the split
+/// removed from the pin.
 #[cfg(feature = "hash-metrics")]
 #[test]
 fn the_pinned_pair_is_the_measurement() {
-    assert_pinned_pair((583_924, 183_226, 2_996), (584_061, 183_256, 2_996));
+    let counts = 15 * crate::statement::NUM_TABLE_KINDS as u64;
+    assert_pinned_pair(
+        (583_730 + counts, 183_226, 2_996),
+        (583_867 + counts, 183_256, 2_996),
+    );
 }
 
 /// ★ One unit on the prove line fails on the prove assertion.
@@ -494,7 +553,8 @@ fn the_pinned_pair_is_the_measurement() {
 #[test]
 #[should_panic(expected = "the PROVE-side transcript counts moved")]
 fn a_prove_count_off_by_one_is_rejected() {
-    assert_pinned_pair((583_925, 183_226, 2_996), (584_061, 183_256, 2_996));
+    let (a, s, t) = transcript_pin::PROVE;
+    assert_pinned_pair((a + 1, s, t), transcript_pin::VERIFY);
 }
 
 /// ★ One unit on the verify line fails on the verify assertion.
@@ -502,7 +562,60 @@ fn a_prove_count_off_by_one_is_rejected() {
 #[test]
 #[should_panic(expected = "the VERIFY-side transcript counts moved")]
 fn a_verify_count_off_by_one_is_rejected() {
-    assert_pinned_pair((583_924, 183_226, 2_996), (584_062, 183_256, 2_996));
+    let (a, s, t) = transcript_pin::VERIFY;
+    assert_pinned_pair(transcript_pin::PROVE, (a + 1, s, t));
+}
+
+/// ★★ The per-branch term is a TERM, not a re-baseline.
+///
+/// The pin's absorb totals are `base + EPOCHS * NUM_TABLE_KINDS`, and this says
+/// the split is the one the protocol makes: the kind count is the length of the
+/// list `absorb_table_counts` walks, and an epoch statement absorbs exactly that
+/// many counts.
+///
+/// It can fail. `NUM_TABLE_KINDS` is checked against the array
+/// `statement::table_count_values` actually returns — which is the one place the
+/// destructure of `TableCounts` is written — so a field added to `TableCounts`
+/// and pushed into the array without bumping the constant fails to compile, and
+/// a constant bumped without the field fails here.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_per_branch_term_is_the_table_kind_count() {
+    let zero = crate::TableCounts {
+        cpu: 0,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+    };
+    let kinds = crate::statement::table_count_values(&zero).len();
+    assert_eq!(
+        kinds,
+        crate::statement::NUM_TABLE_KINDS,
+        "NUM_TABLE_KINDS is not the number of counts a statement absorbs"
+    );
+    assert_eq!(
+        transcript_pin::table_count_absorbs(),
+        transcript_pin::EPOCHS * kinds as u64,
+        "the pin's per-branch term is not `epochs x kinds`"
+    );
+    assert_eq!(
+        transcript_pin::PROVE.0 - transcript_pin::PROVE_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs(),
+    );
+    assert_eq!(
+        transcript_pin::VERIFY.0 - transcript_pin::VERIFY_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs(),
+    );
 }
 
 /// ★★ THE DERIVED DELTA, checked where it can actually fail: on the constants.
@@ -537,7 +650,11 @@ fn the_pinned_constants_differ_by_owed() {
     // over the 15 epoch calls, 30 squeezes is two per call. Stating the shape
     // means a future epoch count cannot silently keep the old constant.
     let (oa, os, ot) = transcript_pin::OWED;
-    assert_eq!(os, 2 * 15, "`owed` samples twice per epoch call");
+    assert_eq!(
+        os,
+        2 * transcript_pin::EPOCHS,
+        "`owed` samples twice per epoch call"
+    );
     assert_eq!(ot, 0, "`owed` reads no transcript state");
     // ⚠ The absorb count gets no assertion of its own. It is `Sum roots.len()`
     // over the epochs — data from the table shapes, not something derivable
