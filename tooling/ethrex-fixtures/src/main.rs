@@ -20,6 +20,18 @@
 //!
 //! Pinned to the same ethrex rev as the guest, so the SSZ layout matches what
 //! the guest deserializes.
+//!
+//! INVARIANT, and the condition on adding a mode: every mode above emits plain value
+//! transfers and nothing else, so a fixture from here cannot reach a precompile the guest
+//! does not implement. That matters because this crate's own graph is not the guest's --
+//! it links a working c-kzg (see its Cargo.lock) that the guest has no backend for, so
+//! `validate_natively` here would accept a block calling point evaluation (0x0a) that
+//! reverts in the VM. What screens for that is `tooling/ethrex-tests`, which links no KZG
+//! backend (pinned by its `no_kzg_backend_linked` test) and runs the committed fixtures
+//! and the real block through both the native reference and the ELF. The fixtures this
+//! binary generates on demand -- `ethrex_bench_<n>.bin`, `ethrex_<n>_transfers.bin` --
+//! are NOT in that screen, which is only sound while this invariant holds. A mode that
+//! executes contract code has to arrive with one.
 
 use bytes::Bytes;
 use ethrex_blockchain::payload::{BuildPayloadArgs, create_payload};

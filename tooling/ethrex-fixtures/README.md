@@ -15,7 +15,13 @@ cargo run --release -- <n_transfers> <output_path> [same|recipients|distinct]
 ```
 
 `same` uses one funded sender, `recipients` sends to distinct recipients, and
-`distinct` uses deterministic funded senders. The standard fixtures are:
+`distinct` uses deterministic funded senders. All three emit plain value transfers and
+nothing else, which is what keeps the generated fixtures out of reach of a precompile the
+guest does not implement — this crate links a working c-kzg that the guest has no backend
+for, and only `tooling/ethrex-tests` (no KZG linked) screens for that. Adding a mode that
+executes contract code means adding that screen; see the invariant in `src/main.rs`.
+
+The standard fixtures are:
 
 ```bash
 cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin

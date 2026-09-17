@@ -7,6 +7,16 @@
 //! meant they had to move together on every ethrex rev bump with nothing enforcing it.
 //! They differ in where the block comes FROM, not in how it is encoded, so only the
 //! sourcing stays in each.
+//!
+//! Upstream ships an encoder of its own —
+//! `build_ssz_stateless_input` in `crates/l2/sequencer/native_rollup/l1_advancer.rs` —
+//! and this is deliberately not it. That one serves the L2 native-rollup advancer: it
+//! hardcodes `versioned_hashes` and `withdrawals` to empty, which is true of the blocks
+//! it builds and not of an L1 block, and it takes its inputs from the sequencer's state
+//! rather than from a block plus a witness. What IS worth keeping in step is the field
+//! order and the schema prefix, both of which come from the same
+//! `ethrex_common::types::stateless_ssz` types this module encodes into, so a layout
+//! change upstream is a compile error here rather than a wrong fixture.
 
 use ethrex_common::types::Block;
 use ethrex_common::types::block_access_list::BlockAccessList;
@@ -176,6 +186,13 @@ pub const VALIDATION_FLAG: usize = 32;
 /// This is the check every producer owes its output before writing it: a guest that cannot
 /// decode the input does not fail, it commits an all-zero result and exits cleanly, so an
 /// unvalidated fixture benchmarks nothing while looking like a 99% improvement.
+///
+/// It runs the guest's code, NOT the guest's dependency graph. Both callers link a working
+/// c-kzg through their own trees (the guest links none), so a block whose transactions
+/// call point evaluation (0x0a) passes here and reverts in the VM. Accepting a block is
+/// therefore a statement about its ENCODING, not about its precompile surface: what
+/// covers that is `tooling/ethrex-tests`, which links no KZG backend and compares the
+/// native reference against the ELF.
 pub fn validate_natively(bytes: &[u8]) -> Result<(), String> {
     let output = run_stateless_guest(bytes, std::sync::Arc::new(NativeCrypto));
     if output.len() != GUEST_OUTPUT_LEN {
@@ -235,7 +252,11 @@ mod tests {
             .expect("the guest's decoder must accept what the encoder wrote");
         let payload = &decoded.new_payload_request.execution_payload;
 
-        assert_eq!(payload.withdrawals.to_vec().len(), 1, "the withdrawal was dropped");
+        assert_eq!(
+            payload.withdrawals.to_vec().len(),
+            1,
+            "the withdrawal was dropped"
+        );
         let withdrawal = &payload.withdrawals.to_vec()[0];
         assert_eq!(withdrawal.index, 11);
         assert_eq!(withdrawal.validator_index, 22);
