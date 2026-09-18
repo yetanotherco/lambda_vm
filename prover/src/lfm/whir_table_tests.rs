@@ -211,16 +211,14 @@ fn the_selectors_share_one_interned_constant() {
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
-use multilinear::claim_reduce::FactorSource;
-use multilinear::constraint_argument::FactorKind;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
 };
-use stark::multilinear_air::{IrShape, Uniforms};
+use stark::multilinear_air::Uniforms;
 use stark::multilinear_logup::{InteractionShape, interaction_shapes};
-use stark::multilinear_table::{CommittedTable, TableProof, weight_slots};
+use stark::multilinear_table::{CommittedTable, TableProof};
 use stark::traits::AIR;
 
 use super::whir_bus::alpha_powers_read;
@@ -654,6 +652,9 @@ fn the_table_verify_emits_its_closed_form() {
     }
 }
 
+/// One forgery: what it is called, and the single value it moves.
+type TamperSite = (&'static str, Box<dyn Fn(&mut TableProof<E>)>);
+
 /// ★ G3 — the tamper arm, in THREE halves (instance 49).
 ///
 /// Every site runs all three: the untouched proof EXECUTES, the HOST rejects
@@ -707,8 +708,12 @@ fn the_tamper_arm_refuses_what_the_host_rejects() {
     host(&honest).expect("the honest proof must verify on the host");
     run(&honest).expect("the honest proof must EXECUTE on the machine");
 
-    let bump = |value: &mut FEE| *value += FEE::one();
-    let sites: Vec<(&str, Box<dyn Fn(&mut TableProof<E>)>)> = vec![
+    // An item, not a closure: a `TamperSite` outlives the function body, so a
+    // boxed closure in it cannot borrow a local.
+    fn bump(value: &mut FEE) {
+        *value += FEE::one();
+    }
+    let sites: Vec<TamperSite> = vec![
         (
             "a GKR layer's q_lo",
             Box::new(|p: &mut TableProof<E>| bump(&mut p.gkr.layers[0].q_lo)),

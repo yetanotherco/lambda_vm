@@ -159,11 +159,11 @@ mod whir_poly_tests;
 #[cfg(test)]
 mod whir_program_tests;
 #[cfg(test)]
-mod whir_table_tests;
-#[cfg(test)]
 mod whir_reduce_tests;
 #[cfg(test)]
 mod whir_stacked_tests;
+#[cfg(test)]
+mod whir_table_tests;
 #[cfg(test)]
 mod whir_transcript_kat_tests;
 #[cfg(test)]

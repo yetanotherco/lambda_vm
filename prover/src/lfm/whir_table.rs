@@ -9,8 +9,8 @@
 //! This module starts with the one kernel none of the earlier legs has: the row
 //! SELECTOR, which is what a public factor's value is.
 
-use multilinear::constraint_argument::FactorKind;
 use multilinear::claim_reduce::FactorSource;
+use multilinear::constraint_argument::FactorKind;
 use multilinear::logup::input_layer_vars;
 use multilinear::selector::Selector;
 use stark::multilinear_air::IrShape;
@@ -19,12 +19,10 @@ use stark::multilinear_table::weight_slots;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-use super::builder::{Ext, LfmBuilder};
 use super::algebraic_commit::leaf_capacity;
+use super::builder::{Ext, LfmBuilder};
 use super::whir_air::{combine_rows, emit_combine};
-use super::whir_bus::{
-    BusInputs, Cost, claim_statements_cost, emit_claim_statements,
-};
+use super::whir_bus::{BusInputs, Cost, claim_statements_cost, emit_claim_statements};
 use super::whir_gkr::{
     GKR_SUMCHECK_DEGREE, GkrLayerChallenges, GkrLayerWires, emit_gkr_verify, gkr_verify_rows,
 };
@@ -32,9 +30,7 @@ use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, emit_sumcheck_rounds,
     eq_eval_rows_again, sumcheck_round_rows,
 };
-use super::whir_reduce::{
-    REDUCE_DEGREE, ReduceWires, claim_reduce_rows, emit_claim_reduce_verify,
-};
+use super::whir_reduce::{REDUCE_DEGREE, ReduceWires, claim_reduce_rows, emit_claim_reduce_verify};
 use super::whir_transcript::{
     COORDINATES_PER_EXT, SpongeEntry, SpongeSchedule, WhirTranscript, absorb_unpack_rows,
     sample_ext_rows,
