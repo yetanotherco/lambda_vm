@@ -50,6 +50,3 @@ alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
 # The device nonce search behind `generate_nonce_maybe_gpu`.
 cuda = ["dep:math-cuda", "std"]
-# Host-only diagnostic: count keccak finalizes during verify (see `hash_metrics`).
-# Off by default → `PlatformKeccak256 = sha3::Keccak256`, provably unchanged.
-hash-metrics = []

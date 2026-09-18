@@ -25,8 +25,6 @@ disk-spill = ["stark/disk-spill"]
 # Trace-shape profile emission (segment-profile JSONL). Host-only: pulls
 # in serde_json, which the RISC-V recursion guest must not carry.
 shape-profile = ["dep:serde", "dep:serde_json"]
-# Host-only verify-hash counter (see `crypto::hash_metrics`).
-hash-metrics = ["crypto/hash-metrics"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
