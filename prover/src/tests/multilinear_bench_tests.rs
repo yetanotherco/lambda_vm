@@ -293,15 +293,19 @@ fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
     // ★ Its own line, and labelled with the same window, because alignment is a
     // property of the byte stream rather than of a sponge: the same stream under
     // two hashes is misaligned in the same places or in neither, so there is no
-    // keccak/rpx pair to print. A real proof reads ZERO here; the WHIR byte
-    // gate's own fixture does not, and `a_window_that_opens_off_a_boundary_is_counted`
-    // is what stops that zero from being a counter nobody bumps.
+    // keccak/rpx pair to print.
+    //
+    // A real proof reads ZERO here, and that zero is now a property rather than
+    // a wish: the counter starts at the statement's padding, which is where the
+    // padding's promise starts. The earlier definition counted a statement's own
+    // fields too and read 25 on the EQ fixture, which is why the name carries
+    // the boundary. `a_statement_that_ends_off_a_boundary_is_still_counted` is
+    // what stops the zero from being a counter nobody can bump.
     println!(
-        "{:<12} misaligned absorbs: {} (statements' own fields included; a \
-         statement is variable-length by nature and the padding only promises \
-         that what FOLLOWS it is aligned, so a non-zero here is the statement \
-         shapes and not a regression)",
-        window, c.transcript_misaligned_absorbs,
+        "{:<12} misaligned absorbs after a statement: {} (zero is what a correct \
+         pad produces; a non-zero says a statement ended off a field element \
+         boundary and everything the verifier re-slices after it straddles two)",
+        window, c.transcript_misaligned_absorbs_after_statement,
     );
 }
 

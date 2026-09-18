@@ -75,9 +75,9 @@ pub struct Counts {
     pub transcript_states_keccak: u64,
     /// Of those, the ones whose sponge is RPX256.
     pub transcript_states_rpx: u64,
-    /// ★★ Fiat-Shamir absorbs that began at a byte offset which is NOT a
-    /// multiple of 8, measured within the current WINDOW — the bytes absorbed
-    /// since the sponge was last reset by a squeeze.
+    /// ★★ Fiat-Shamir absorbs AFTER A STATEMENT that began at a byte offset
+    /// which is NOT a multiple of 8, measured within the current WINDOW — the
+    /// bytes absorbed since the sponge was last reset by a squeeze.
     ///
     /// An in-guest verifier re-slices a window into field elements every 8
     /// bytes, so a value that starts off a boundary straddles two of them and
@@ -89,25 +89,39 @@ pub struct Counts {
     /// the byte stream, and the same stream under two hashes is misaligned in
     /// the same places or in neither.
     ///
-    /// ⚠ A zero here is only a measurement if something can make it non-zero.
-    /// `a_window_that_opens_off_a_boundary_is_counted` drives a transcript
-    /// seeded with 13 bytes — the WHIR byte gate's own first window, which is
-    /// documented as not aligned — and requires a non-zero count.
+    /// # ⛔ WHY "AFTER A STATEMENT" IS IN THE NAME
     ///
-    /// ⛔ AND A REAL PROOF DOES NOT READ ZERO HERE, so do not pre-register one.
-    /// A STATEMENT is variable-length by nature — a tag, one byte per table
+    /// The first version of this field counted EVERY misaligned absorb, and a
+    /// zero was pre-registered for a real proof. That zero was a wish. A
+    /// STATEMENT is variable-length by nature — a tag, one byte per table
     /// count, a three-byte grind trailer — so absorbs inside it start off
     /// boundaries constantly, and the padding never promised otherwise: what it
-    /// promises is that whatever follows the statement starts aligned. Measured
-    /// on the EQ fixture, one epoch statement plus its proof reads 25 misaligned
-    /// absorbs at `public_output = 0` and 24 at 2 bytes, of which ZERO are after
-    /// the statement — and filtering to felt-sized payloads does not recover a
-    /// zero either (22 and 21 of them are). This counter is a per-run number
-    /// that a regression MOVES; the "nothing after a statement is misaligned"
-    /// property is the recorder's in
+    /// promises is that whatever FOLLOWS a statement starts aligned. Measured on
+    /// the EQ fixture under the old definition, one epoch statement plus its
+    /// proof read 25 misaligned absorbs at `public_output = 0` and 24 at two
+    /// bytes, of which 22 and 21 were felt-sized — and ZERO fell after the
+    /// statement. Filtering by payload size recovered nothing; only the boundary
+    /// did.
+    ///
+    /// So the transcript is TOLD where a statement ends
+    /// ([`IsTranscript::mark_statement_end`], called by the prover's statement
+    /// padding) and counts from there. A transcript that is never told counts
+    /// nothing, which is correct — it has no "after a statement".
+    ///
+    /// ⚠ A zero is only a measurement if something can make it non-zero, and
+    /// two tests hold that. `a_window_that_opens_off_a_boundary_is_counted`
+    /// marks a transcript whose window is already at 13 — the WHIR byte gate's
+    /// own first window, documented as not aligned — and requires exactly two.
+    /// `a_statement_that_ends_off_a_boundary_is_still_counted` is the sharper
+    /// one: the mark does NOT reset the window, so a statement that ended badly
+    /// is reported rather than forgiven. Without that, the mark would be a way
+    /// of switching off the check it was built to sharpen.
+    ///
+    /// The cross-check on a real prove is
     /// `statement_alignment_tests::the_counter_and_the_recorder_agree_on_one_prove`,
-    /// which pins it and cross-checks this counter on the same prove.
-    pub transcript_misaligned_absorbs: u64,
+    /// which measures the same prove with an independent recorder and compares
+    /// this counter against the recorder's own after-the-statement count.
+    pub transcript_misaligned_absorbs_after_statement: u64,
 }
 
 impl Counts {
@@ -264,11 +278,13 @@ mod imp {
         };
     }
 
-    /// ★★ One Fiat-Shamir absorb that began off a field element boundary.
+    /// ★★ One Fiat-Shamir absorb, PAST A STATEMENT, that began off a field
+    /// element boundary.
     ///
     /// Untagged by sponge on purpose — see the field's documentation. The
-    /// caller decides; `DefaultTranscript` is the only one, because it is the
-    /// only place that knows the window.
+    /// caller decides both halves: `DefaultTranscript` is the only one, because
+    /// it is the only place that knows the window AND the only one that has
+    /// been told where the statement ended.
     #[inline(always)]
     pub fn count_transcript_misaligned_absorb() {
         T_MISALIGNED.fetch_add(1, Ordering::Relaxed);
@@ -338,7 +354,7 @@ mod imp {
             transcript_states: T_STATES.load(Ordering::Relaxed),
             transcript_states_keccak: T_STATES_KECCAK.load(Ordering::Relaxed),
             transcript_states_rpx: T_STATES_RPX.load(Ordering::Relaxed),
-            transcript_misaligned_absorbs: T_MISALIGNED.load(Ordering::Relaxed),
+            transcript_misaligned_absorbs_after_statement: T_MISALIGNED.load(Ordering::Relaxed),
         }
     }
 }

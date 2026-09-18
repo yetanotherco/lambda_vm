@@ -184,6 +184,18 @@ pub(crate) fn absorb_statement_padding(
 
     let pad = statement_padding(len);
     t.append_bytes(&PAD_ZEROS[..pad]);
+    // ★ The statement is over, and the transcript is told so.
+    //
+    // `Counts::transcript_misaligned_absorbs_after_statement` reports what
+    // happens from here on, and nothing else can define that boundary: a
+    // transcript sees a byte stream and a statement is not a type. Compiles to
+    // nothing without `hash-metrics`.
+    //
+    // ⚠ It is called AFTER the pad, not before, and the difference is the whole
+    // check: the pad is what makes the next absorb aligned, so a mark placed
+    // before it would count the pad's own absorb and a mark that reset the
+    // window would report zero whether the pad worked or not.
+    t.mark_statement_end();
 
     // A diagnostic, not a gate: it prints every variable length the pad is a
     // function of beside the pad itself, so a run that reports a total number of

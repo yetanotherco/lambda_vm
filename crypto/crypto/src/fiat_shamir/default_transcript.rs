@@ -51,7 +51,9 @@ pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = Keccak
     /// WINDOW an in-guest verifier re-slices into field elements every 8 bytes.
     /// A value absorbed at an offset that is not a multiple of 8 straddles two
     /// of them, which is what the statement padding exists to prevent and what
-    /// `Counts::transcript_misaligned_absorbs` counts.
+    /// `Counts::transcript_misaligned_absorbs_after_statement` counts — from the
+    /// statement's end, because only past that boundary is the padding making a
+    /// promise. See `counting` below.
     ///
     /// The definition is `WindowRecorder`'s, not a second one: opens at 0,
     /// becomes `SQUEEZE_LEN` after a squeeze (which finalize-resets and
@@ -64,6 +66,20 @@ pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = Keccak
     /// `cfg` lines.
     #[cfg(feature = "hash-metrics")]
     window: usize,
+    /// ★ Whether this transcript is PAST a statement, and therefore whether a
+    /// misaligned absorb is a finding.
+    ///
+    /// False until `mark_statement_end`. A statement's own fields are
+    /// misaligned by nature and counting them made the counter a number nobody
+    /// could pre-register — the EQ fixture read 25 at `public_output = 0` and 24
+    /// at two bytes, of which 22 and 21 were felt-sized, and ZERO fell after the
+    /// statement. Counting only past the mark is what makes zero the reading a
+    /// correct pad produces.
+    ///
+    /// ⚠ A transcript that never marks counts nothing, which is right: it has
+    /// no "after a statement". The byte gate's raw fixture is one.
+    #[cfg(feature = "hash-metrics")]
+    counting: bool,
     phantom: PhantomData<(F, T)>,
 }
 
@@ -78,6 +94,10 @@ impl<F: HasDefaultTranscript, T: TranscriptHash> Clone for DefaultTranscript<F, 
             // original's are.
             #[cfg(feature = "hash-metrics")]
             window: self.window,
+            // …and so does the mark. A replay of a stream that is past its
+            // statement is past it too — the `owed` fork is exactly that.
+            #[cfg(feature = "hash-metrics")]
+            counting: self.counting,
             phantom: PhantomData,
         }
     }
@@ -97,6 +117,8 @@ where
             out_pos: SQUEEZE_LEN,
             #[cfg(feature = "hash-metrics")]
             window: 0,
+            #[cfg(feature = "hash-metrics")]
+            counting: false,
             phantom: PhantomData,
         };
         // The seed goes through `append_bytes`, so a non-empty one advances the
@@ -202,7 +224,7 @@ where
         crate::hash_metrics::count_transcript_absorb::<T::Digest>();
         #[cfg(feature = "hash-metrics")]
         {
-            if !self.window.is_multiple_of(FELT_BYTES) {
+            if self.counting && !self.window.is_multiple_of(FELT_BYTES) {
                 crate::hash_metrics::count_transcript_misaligned_absorb();
             }
             self.window += new_bytes.len();
@@ -226,18 +248,30 @@ where
         // absorbs in both instruments or in neither.
         #[cfg(feature = "hash-metrics")]
         let window = &mut self.window;
+        #[cfg(feature = "hash-metrics")]
+        let counting = self.counting;
         let hasher = &mut self.hasher;
         element.stream_bytes(&mut |b| {
             crate::hash_metrics::count_transcript_absorb::<T::Digest>();
             #[cfg(feature = "hash-metrics")]
             {
-                if !window.is_multiple_of(FELT_BYTES) {
+                if counting && !window.is_multiple_of(FELT_BYTES) {
                     crate::hash_metrics::count_transcript_misaligned_absorb();
                 }
                 *window += b.len();
             }
             hasher.update(b);
         });
+    }
+
+    fn mark_statement_end(&mut self) {
+        // The window is DELIBERATELY untouched: see the trait's documentation.
+        // If the statement ended off a boundary the next absorb is counted, and
+        // that is the whole point of the mark existing at all.
+        #[cfg(feature = "hash-metrics")]
+        {
+            self.counting = true;
+        }
     }
 
     fn state(&self) -> [u8; 32] {
