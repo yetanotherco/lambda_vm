@@ -902,7 +902,7 @@ pub fn run_open(
 /// The split is the whole point. A table keeps what only it can answer for —
 /// its roots, its out-of-domain values, its openings — and a group carries the
 /// FRI those tables share. That is the 57.9% of a per-table proof that stops
-/// being paid 227 times.
+/// being paid once per table.
 pub struct BatchedProof {
     /// Per table, in AIR order.
     pub tables: Vec<TablePublic>,

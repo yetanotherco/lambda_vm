@@ -1258,7 +1258,7 @@ fn report_batched_size(proof: &prover::logup_phase::BatchedProof, tables: usize,
 
 /// Where the time went, summed per span label.
 ///
-/// The prover's own spans are per table and there are 227 of them, so the raw
+/// The prover's own spans are per table and there are hundreds of them, so the raw
 /// timeline is unreadable; what answers "where is the time" is the total per
 /// label. Sums exceed wall time, because tables run concurrently — the ratios
 /// between labels are the point, not the absolute figures.

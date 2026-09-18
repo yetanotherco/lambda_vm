@@ -46,7 +46,7 @@ pub struct Challenge {
     /// (DECODE from the ELF, one per ELF data page, ...) are the bulk of this pass.
     pub(crate) airs: crate::VmAirs,
     /// The transcript right after the sampling, which every later pass forks
-    /// per table. Kept rather than rebuilt: re-absorbing 227 roots to get back
+    /// per table. Kept rather than rebuilt: re-absorbing every root to get back
     /// to this state is both slower and a second place for the order to be
     /// wrong.
     pub transcript: DefaultTranscript<GoldilocksExtension>,

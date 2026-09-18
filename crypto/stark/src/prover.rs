@@ -2108,7 +2108,7 @@ pub trait IsStarkProver<
     ///
     /// The codeword is kept rather than the LDEs it came from. That is the
     /// whole reason this split is affordable: on the ethrex block the trace and
-    /// composition LDEs of all 227 tables are tens of gigabytes, while their
+    /// composition LDEs of every table are tens of gigabytes, while their
     /// DEEP codewords together are about 6.5 GB — one extension element per row
     /// instead of every column. Holding them is what saves walking the
     /// execution again just to recompute them once the coefficient is known.
@@ -2268,7 +2268,7 @@ pub trait IsStarkProver<
     /// The accumulator is the batch polynomial the spec describes. A member is
     /// added and dropped, so what is held is one codeword per distinct domain
     /// rather than one per table — which on the ethrex block is 13 instead of
-    /// 227, and about a gigabyte instead of eight and a half.
+    /// one per table, and about a gigabyte instead of eight and a half.
     fn accumulate(
         acc: &mut Vec<FieldElement<FieldExtension>>,
         coefficient: &FieldElement<FieldExtension>,

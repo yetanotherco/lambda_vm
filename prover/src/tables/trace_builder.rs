@@ -5493,8 +5493,12 @@ impl Traces {
     /// This is Approach 1's Commit phase seen from the producer side: the spec
     /// has the prover commit tables "once the memory pressure becomes too
     /// large" and drop them, which it can only do if the tables arrive while
-    /// the execution is still being walked. Buffers here never exceed one
-    /// chunk per table, so what the walk holds does not grow with the run.
+    /// the execution is still being walked. The buffers of the kinds listed in
+    /// [`CHUNKED_KINDS`] never exceed one chunk each; the rest — the four the
+    /// paragraph below names, the `retired_*` rows a closing chunk converts its
+    /// ops into, the accumulators and the walk's own BITWISE lookups — are held
+    /// whole and grow with the run. See `crate::pass`'s header for the size of
+    /// that term.
     ///
     /// The chunks come out exactly as `ops.chunks(max_rows)` would cut them and
     /// each is built by the same generator, so a consumer sees byte-identical
