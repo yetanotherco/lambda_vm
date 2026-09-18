@@ -3667,7 +3667,16 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+        // KECCAK_RC is a provider: its multiplicities must match what KECCAK_RND
+        // actually consumes in THIS proof. A hoisted epoch has no round chip, so
+        // nothing draws round constants here and the count is zero — the global
+        // proof's own KECCAK_RC carries the real total.
+        let rounds_served = if hoist_keccak_rounds {
+            0
+        } else {
+            keccak_ops.len()
+        };
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, rounds_served);
         keccak_rc_trace
     };
     let gen_pages = || match initial_image {
