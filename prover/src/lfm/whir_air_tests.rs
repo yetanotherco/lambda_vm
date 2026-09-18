@@ -55,10 +55,8 @@ fn options() -> stark::proof::options::ProofOptions {
 /// carry `EmptyConstraints` and so have no roots to batch at all.
 fn production_shape(num_vars: usize) -> Shape {
     let opts = options();
-    let air = crate::continuation::l2g_memory_air(
-        &opts,
-        crate::tables::local_to_global::epoch_label(1),
-    );
+    let air =
+        crate::continuation::l2g_memory_air(&opts, crate::tables::local_to_global::epoch_label(1));
     let layout = TableLayout::<F, E>::new(
         air.constraint_program(),
         air.constraints_meta(),
