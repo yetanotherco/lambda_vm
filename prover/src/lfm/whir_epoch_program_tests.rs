@@ -1033,6 +1033,7 @@ enum WalkStage {
     Groups,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_program(
     proof: &stark::multilinear_table::MultiProof<GoldilocksField, FEE3>,
     shapes: &[super::whir_table::TableShape<'_>],
@@ -1531,12 +1532,6 @@ fn the_table_walk_emits_its_closed_form() {
         })
         .collect();
     let slots: Vec<&[usize]> = statements.iter().map(|s| s.slot_of).collect();
-    let plans: Vec<super::whir_epoch::PreprocessedPlan<'_>> = (0..shapes.len())
-        .map(|_| super::whir_epoch::PreprocessedPlan {
-            settled: 0,
-            route: super::whir_epoch::PreprocessedRoute::None,
-        })
-        .collect();
 
     let layouts: Vec<_> = committed
         .groups()
