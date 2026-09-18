@@ -2585,7 +2585,7 @@ fn whir_bus_shapes() {
             pairs.push((&l2g_air, &mut l2g_trace, &()));
 
             println!(
-                "{:<16} {:>5} {:>5} {:>9} {:>6} {:>7} {:>8} {:>5} {:>4} {:>10} {:>8}",
+                "{:<16} {:>5} {:>5} {:>9} {:>6} {:>7} {:>8} {:>5} {:>4} {:>10} {:>8} {:>6}",
                 "table",
                 "vars",
                 "I",
@@ -2596,10 +2596,21 @@ fn whir_bus_shapes() {
                 "gkr",
                 "deg",
                 "table rows",
-                "perms"
+                "perms",
+                "pool"
             );
             let (mut ti, mut te, mut tt, mut tw, mut tr) = (0usize, 0usize, 0usize, 0usize, 0usize);
             let (mut total_rows, mut total_perms) = (0usize, 0usize);
+            // ★ THE COLUMN THE RECOUNT NEEDED AND bs2 DID NOT PRINT. Each
+            // table's `pool` is how many of its rows are `LFM_CONST`, so the
+            // CONST-FREE per-table half is `Σ rows − Σ pool`; and `one pool` is
+            // the UNION of those words, which is what an assembled epoch
+            // actually pays, because one program has one constant pool and the
+            // tables' constants collide in it. Printing both is what closes the
+            // convention gap: the recount's 2,064,462 is neither figure, and
+            // with these two lines it can be stated in either.
+            let mut union: Vec<crate::lfm::word::LfmWord> = Vec::new();
+            let mut pool_sum = 0usize;
             // The sponge is THREADED, as an assembled epoch threads it: a table
             // enters on whatever the one before it left, not on `fresh`.
             let mut entry = SpongeEntry::fresh();
@@ -2654,7 +2665,7 @@ fn whir_bus_shapes() {
                 let whole = table_verify_cost(&shape, entry);
                 entry = whole.entry();
                 println!(
-                    "{:<16} {num_vars:>5} {:>5} {elements:>9} {terms:>6} {widest:>7} {:>8} {:>5} {:>4} {:>10} {:>8}",
+                    "{:<16} {num_vars:>5} {:>5} {elements:>9} {terms:>6} {widest:>7} {:>8} {:>5} {:>4} {:>10} {:>8} {:>6}",
                     air.name(),
                     shapes.len(),
                     cost.rows(),
@@ -2662,6 +2673,7 @@ fn whir_bus_shapes() {
                     shape.sumcheck_degree(),
                     whole.rows(),
                     whole.perms(),
+                    whole.leg.constant_values().len(),
                 );
                 ti += shapes.len();
                 te += elements;
@@ -2670,6 +2682,12 @@ fn whir_bus_shapes() {
                 tr += cost.rows();
                 total_rows += whole.rows();
                 total_perms += whole.perms();
+                pool_sum += whole.leg.constant_values().len();
+                for word in whole.leg.constant_values() {
+                    if !union.contains(word) {
+                        union.push(*word);
+                    }
+                }
             }
             println!(
                 "epoch 0 BUS TOTAL over {} tables: I {ti} | elements {te} | affine terms {tt} \
@@ -2680,6 +2698,14 @@ fn whir_bus_shapes() {
                 "★ epoch 0 PER-TABLE HALF over {} tables: {total_rows} rows | {total_perms} \
                  permutations",
                 pairs.len()
+            );
+            println!(
+                "★ epoch 0 CONSTANTS: {pool_sum} summed over the tables | {} in the ONE pool an \
+                 assembled epoch has | CONST-FREE per-table half {} rows | ONE-POOL per-table \
+                 half {} rows",
+                union.len(),
+                total_rows - pool_sum,
+                total_rows - pool_sum + union.len(),
             );
             println!(
                 "  ⚠ NOT the whole epoch. Missing, and each is named rather than estimated: the \
