@@ -57,11 +57,15 @@ use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::ChainConfig;
 
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
+use super::algebraic_commit::leaf_capacity;
+use super::builder::{Cell, Ext, LfmBuilder};
 use super::whir_chain::ChainShape;
 use super::whir_stacked::{StackedCost, stacked_verify_cost};
-use super::whir_transcript::{SpongeEntry, SpongeSchedule};
+use super::whir_transcript::{
+    SpongeEntry, SpongeSchedule, WhirTranscript, absorb_unpack_rows, sample_ext_rows,
+};
 use super::word::LfmWord;
 
 /// The epoch's AIRs, as the builder takes them.
@@ -269,3 +273,136 @@ pub fn fresh_schedule() -> SpongeSchedule {
 /// through this module so a caller assembling an epoch does not reach into the
 /// prover's own module for one type.
 pub type EpochDomains = Vec<Domain<GoldilocksField>>;
+
+// =============================================================================
+// The roots block
+// =============================================================================
+
+/// ★ `absorb_roots_and_challenge` (`multilinear_table.rs:622`), emitted: every
+/// CARRIED group root, then the DERIVED DECODE root, then `z`, `alpha`, `beta`.
+///
+/// This is the one step of the assembled epoch verify that no other gate can
+/// see. Each leg below it derives its own challenges from the transcript it is
+/// handed, so a leg run against the wrong `z` is internally consistent and
+/// globally wrong; and the roots block is where `z` comes from. Its three
+/// decisions, each of which a mutation moves:
+///
+/// 1. the carried roots first, in `proof.roots` order;
+/// 2. the derived DECODE root AFTER them and BEFORE any draw;
+/// 3. THREE draws, not two — `beta` is sampled here even though the tables read
+///    it later, and a squeeze nobody reads still moves the sponge.
+///
+/// # ⛔ `derived` is PROGRAM TEXT, and the word "derived" would overstate it
+///
+/// The host recomputes DECODE's preprocessed commitment from the ELF it holds.
+/// The machine cannot rebuild a `2^20` Merkle root, so the root is interned as a
+/// program constant — `digest_const`, not `hint_word`, which is the whole
+/// difference: a hinted root is a value the prover chooses and this one is not.
+///
+/// What the constant is bound to: the prepared opening proves the pinned
+/// commitment takes DECODE's own settled column values at DECODE's own reduced
+/// point, so a program carrying a root nothing can be opened against does not
+/// execute. What it is NOT bound to: the `elf_digest` the statement names.
+/// Nothing inside ONE epoch program ties the root to the digest; that pin is
+/// once per ELF and lives outside. Recorded as owed, not described as covered.
+///
+/// Returns `(z, alpha, beta)` in the host's own order.
+pub fn emit_roots_block(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    carried: &[Cell],
+    derived: &[LfmWord],
+) -> (Ext, Ext, Ext) {
+    for root in carried {
+        transcript.absorb_digest(b, *root);
+    }
+    for word in derived {
+        let root = b.digest_const(*word);
+        transcript.absorb_digest(b, root.as_cell());
+    }
+    let z = transcript.sample_ext(b);
+    let alpha = transcript.sample_ext(b);
+    let beta = transcript.sample_ext(b);
+    (z, alpha, beta)
+}
+
+/// What [`emit_roots_block`] costs, by the shape it comes from.
+///
+/// - one `Unpack` per CARRIED root, which is what `absorb_digest` emits beyond
+///   its sponge (`absorb_unpack_rows`);
+/// - the same for each DERIVED root, plus the `LFM_CONST` that holds it —
+///   counted in [`roots_block_constants`] rather than here, because this form is
+///   const-free like every other in this module;
+/// - three `Pack`s, one per draw (`sample_ext_rows`);
+/// - the sponge: `COORDINATES_PER_DIGEST` felts absorbed per root and three
+///   extension draws.
+pub fn roots_block_cost(
+    carried: usize,
+    derived: usize,
+    entry: SpongeEntry,
+) -> (usize, SpongeSchedule) {
+    let mut schedule = SpongeSchedule::new(entry);
+    for _ in 0..carried + derived {
+        schedule.absorb(FELTS_PER_DIGEST);
+    }
+    for _ in 0..DRAWS {
+        schedule.draw_ext();
+    }
+    let ops = (carried + derived) * absorb_unpack_rows() + DRAWS * sample_ext_rows();
+    (ops, schedule)
+}
+
+/// The `LFM_CONST` words [`emit_roots_block`] interns, deduplicated and BY
+/// VALUE — TWO kinds, and the second is invisible to any per-step form.
+///
+/// - one per DERIVED root, which is the whole point of the leg: a carried root
+///   is arena data and interns nothing, an interned one is program text;
+/// - `leaf_capacity(felts)` per hash of the block's own SCHEDULE.
+///   `algebraic_leaf_hash` interns it for the leaf it is about to hash
+///   (`edsl.rs:676-692`), so a program pays one per distinct leaf length —
+///   instance 63's constant, the same one `StackedCost::own_constants` and
+///   `table_verify_cost` take off their finished schedules.
+/// - the ZERO WORD, once, when the schedule hashes at all.
+///   `algebraic_leaf_hash` opens with `felt_const(zero)` and
+///   `digest_const([zero; 4])` UNCONDITIONALLY — the tail padding and the
+///   initial rate — and both are the same pooled word. Item 4 found the same
+///   zero from the statement's side and read it as conditional on the leaf
+///   being partial; it is not, it is every leaf hash.
+///
+/// ⚠ This form came in TWO short at eight carried roots and one derived, twice:
+/// first at 3 against 1, then at 3 against 2. Neither gap was closed by adding a
+/// number — the test PRINTS the words the program interns that the form does not
+/// name, and both times the printout said which term was missing.
+pub fn roots_block_constants(derived: &[LfmWord], schedule: &SpongeSchedule) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = Vec::new();
+    for word in derived {
+        if !words.contains(word) {
+            words.push(*word);
+        }
+    }
+    for hash in schedule.hashes() {
+        let word = leaf_capacity(hash.felts());
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    if !schedule.hashes().is_empty() {
+        let zero = [FE::zero(); 4];
+        if !words.contains(&zero) {
+            words.push(zero);
+        }
+    }
+    words
+}
+
+/// Challenges the roots block draws: `z`, `alpha` and `beta`.
+///
+/// ⚠ THREE, and the third is the one a reader drops. `beta` batches the
+/// constraint roots and is not read until a table's own leg, but it is SAMPLED
+/// here; a block that drew two would leave the sponge in a different state and
+/// every table's first challenge would differ.
+const DRAWS: usize = 3;
+
+/// Felts a 32-byte commitment occupies in the sponge's stream — the transcript's
+/// own constant, not a second spelling of four.
+use super::whir_transcript::DIGEST_FELTS as FELTS_PER_DIGEST;
