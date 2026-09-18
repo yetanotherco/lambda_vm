@@ -832,6 +832,41 @@ fn the_pinned_pair_is_the_measurement() {
     );
 }
 
+/// The shape DERIVER, exercised on a guest a laptop has.
+///
+/// ⚠ `check_transcript_pins` reaches its shape assertion only behind the sha
+/// guard, so on the box and nowhere else — the same blindness the pin's own
+/// split was written to remove. The assertion compares a derived tuple against
+/// a constant, and the way that comparison goes wrong without the guest is the
+/// tuple: two `usize`s, and nothing in the type says which is the width. So the
+/// deriver runs here on `sub`, where the column count is a constant of the
+/// DECODE table and the height is whatever that program implies.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_shape_deriver_reads_columns_then_log2_rows() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let built =
+        crate::tables::decode::preprocessed_columns_from_elf(&elf).expect("DECODE's columns");
+
+    let (columns, num_vars) = decode_prepared_shape(&elf_bytes);
+    assert_eq!(
+        columns,
+        built.len(),
+        "the first element is the column count"
+    );
+    assert_eq!(
+        1usize << num_vars,
+        built[0].len(),
+        "the second element is log2 of the rows"
+    );
+    assert_eq!(
+        columns,
+        crate::tables::decode::NUM_PRECOMPUTED_COLS,
+        "DECODE's column count is the same for every guest; only the height moves"
+    );
+}
+
 /// ★★ WHAT THE PINNED SHAPE IMPLIES, written where a laptop can falsify it.
 ///
 /// Every term the prepared opening adds is a function of four numbers the shape
