@@ -23,6 +23,8 @@
 //! host ever reorders, this says so rather than leaving the machine to fail at
 //! a root and look like a hashing bug.
 
+use core::cell::RefCell;
+
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
@@ -32,6 +34,7 @@ use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GrindBits, RoundOpenings, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
+use math::traits::AsBytes;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -42,11 +45,12 @@ use super::edsl::WrapDigest;
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_chain::{
-    ChainRoundWires, ChainShape, QueryOpening, RoundNonces, chain_opening_perms,
-    emit_verify_weighted,
+    ChainRoundWires, ChainShape, QueryOpening, RoundNonces, SpongeEntry, SpongeHash,
+    chain_grind_perms, chain_hash_schedule, chain_opening_perms, chain_perms, chain_rows,
+    chain_schedule_perms, chain_schedule_rows, chain_shape_rows, emit_verify_weighted,
 };
 use super::whir_open::BlockValues;
-use super::whir_poly::emit_eq_eval;
+use super::whir_poly::{emit_eq_eval, eq_eval_rows_again};
 use super::whir_transcript::WhirTranscript;
 use super::word::{LfmWord, ext_word};
 
@@ -54,14 +58,115 @@ type F = GoldilocksField;
 type E = GoldilocksExtension;
 type HostTranscript = DefaultTranscript<E, RpxTranscriptHash>;
 
+/// Bytes one squeeze hands out (`default_transcript.rs:19`).
+const SQUEEZE_BYTES: usize = 32;
+
+/// Bytes one candidate consumes (`:130-132`).
+const CANDIDATE_BYTES: usize = 8;
+
+/// ★ The host's duplex, reconstructed from the calls the VERIFIER makes.
+///
+/// This is the second derivation the chain's schedule half is gated against,
+/// and it reads nothing of the emitter. Every rule is the host's own:
+///
+/// - an absorb appends its bytes and invalidates the output buffer
+///   (`default_transcript.rs:205-210`);
+/// - a candidate is eight bytes, and refills with ONE `sample()` when fewer
+///   than eight remain (`:125-134`);
+/// - `sample()` hashes everything absorbed since the last one and RE-ABSORBS
+///   its 32-byte digest, so the buffer afterwards is four felts and not none
+///   (`:104-110`);
+/// - `state()` hashes that same buffer and leaves it alone (`:236-239`).
+///
+/// ★ **The reconstruction is not trusted, it is CHECKED.** `shadow` is a second
+/// `DefaultTranscript` fed exactly the same bytes and squeezed at exactly the
+/// points this reconstruction says the host squeezes; every value the real
+/// transcript hands back is compared against the one the shadow's bytes give.
+/// A squeeze in the wrong place leaves different bytes in the buffer, so the
+/// very next draw disagrees — which is what makes this a check and not a
+/// restatement of the same belief twice.
+struct HostDuplex {
+    shadow: HostTranscript,
+    out: [u8; SQUEEZE_BYTES],
+    out_pos: usize,
+    /// Bytes absorbed since the last squeeze.
+    buffered: usize,
+    hashes: Vec<SpongeHash>,
+}
+
+impl HostDuplex {
+    fn new() -> Self {
+        Self {
+            shadow: HostTranscript::new(&[]),
+            out: [0u8; SQUEEZE_BYTES],
+            out_pos: SQUEEZE_BYTES,
+            buffered: 0,
+            hashes: Vec::new(),
+        }
+    }
+
+    /// Felts in the buffer. A hash reads whole 8-byte groups, so a buffer that
+    /// is not a multiple of eight would mean a value straddling two felts —
+    /// the alignment the emitter refuses by construction, asserted here rather
+    /// than rounded away.
+    fn felts(&self) -> usize {
+        assert_eq!(
+            self.buffered % CANDIDATE_BYTES,
+            0,
+            "the chain absorbs whole felts: {} bytes buffered",
+            self.buffered
+        );
+        self.buffered / CANDIDATE_BYTES
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.shadow.append_bytes(bytes);
+        self.buffered += bytes.len();
+        self.out_pos = SQUEEZE_BYTES;
+    }
+
+    /// `append_field_element` absorbs exactly the bytes the element streams
+    /// (`:193-206`), so the shadow is given those same bytes and their count is
+    /// MEASURED rather than assumed to be three felts.
+    fn absorb_element(&mut self, element: &FEE) {
+        let mut bytes = Vec::new();
+        element.stream_bytes(&mut |chunk| bytes.extend_from_slice(chunk));
+        self.absorb(&bytes);
+    }
+
+    fn state(&mut self) {
+        let felts = self.felts();
+        self.hashes.push(SpongeHash::State(felts));
+    }
+
+    fn candidate(&mut self) -> u64 {
+        if self.out_pos + CANDIDATE_BYTES > SQUEEZE_BYTES {
+            let felts = self.felts();
+            self.hashes.push(SpongeHash::Squeeze(felts));
+            self.out = self.shadow.sample();
+            self.buffered = SQUEEZE_BYTES;
+            self.out_pos = 0;
+        }
+        let mut bytes = [0u8; CANDIDATE_BYTES];
+        bytes.copy_from_slice(&self.out[self.out_pos..self.out_pos + CANDIDATE_BYTES]);
+        self.out_pos += CANDIDATE_BYTES;
+        u64::from_be_bytes(bytes)
+    }
+}
+
 /// A transcript that records what it hands out, delegating everything.
 ///
 /// The chain's challenges are drawn interleaved with its sumchecks and never
 /// returned, and re-deriving them would mirror the host rather than read it.
+///
+/// It also carries [`HostDuplex`], which reconstructs the host's hash schedule
+/// from these same calls. `state()` takes `&self`, so the reconstruction lives
+/// behind a `RefCell`.
 struct Recording {
     inner: HostTranscript,
     sampled: Vec<FEE>,
     drawn_u64: Vec<u64>,
+    duplex: RefCell<HostDuplex>,
 }
 
 impl Recording {
@@ -70,27 +175,50 @@ impl Recording {
             inner: HostTranscript::new(&[]),
             sampled: Vec::new(),
             drawn_u64: Vec::new(),
+            duplex: RefCell::new(HostDuplex::new()),
         }
     }
 }
 
 impl IsTranscript<E> for Recording {
     fn append_field_element(&mut self, element: &FEE) {
+        self.duplex.borrow_mut().absorb_element(element);
         self.inner.append_field_element(element);
     }
     fn append_bytes(&mut self, new_bytes: &[u8]) {
+        self.duplex.borrow_mut().absorb(new_bytes);
         self.inner.append_bytes(new_bytes);
     }
     fn state(&self) -> [u8; 32] {
+        self.duplex.borrow_mut().state();
         self.inner.state()
     }
     fn sample_field_element(&mut self) -> FEE {
+        // Three candidates, one a coordinate and in coordinate order
+        // (`extensions_goldilocks.rs:574-581`); each coordinate IS its
+        // candidate, because `candidate_in_range` accepted it.
+        let mine: [FE; 3] = {
+            let mut duplex = self.duplex.borrow_mut();
+            core::array::from_fn(|_| FE::from(duplex.candidate()))
+        };
         let drawn = self.inner.sample_field_element();
+        assert_eq!(
+            *drawn.value(),
+            mine,
+            "the reconstructed duplex must reproduce the host's challenge — a squeeze in the \
+             wrong place is what this catches"
+        );
         self.sampled.push(drawn);
         drawn
     }
     fn sample_u64(&mut self, upper_bound: u64) -> u64 {
+        let mine = self.duplex.borrow_mut().candidate();
         let drawn = self.inner.sample_u64(upper_bound);
+        assert_eq!(
+            mine % upper_bound,
+            drawn,
+            "the reconstructed duplex must reproduce the host's query position"
+        );
         self.drawn_u64.push(drawn);
         drawn
     }
@@ -513,7 +641,10 @@ fn push_openings(words: &mut Vec<LfmWord>, round: &ChainRound<F, E>, current: bo
 /// comparison — see the module doc.
 #[test]
 fn the_chain_executes_on_a_proof_the_host_accepts() {
-    for (num_vars, num_queries) in [(6usize, 3usize), (6, 5), (5, 3)] {
+    // ★ `S = 9` is the three-round shape: the only one here carrying a round
+    // that is neither the first nor the last, and therefore the only one where
+    // a successor block is opened and then re-opened as a current one.
+    for (num_vars, num_queries) in [(6usize, 3usize), (6, 5), (5, 3), (9, 3)] {
         let f = fixture(num_vars, num_queries, 0);
         let program = chain_program(&f.shape);
         let arena = chain_arena(&f, &f.proof);
@@ -796,4 +927,278 @@ fn the_refusals_a_real_proof_cannot_reach() {
         !runs(&tail, [two, zero, FEE::one()]),
         "a zero weight with a nonzero claim must have no execution either"
     );
+}
+
+/// The shapes the cost forms are gated at: `(num_vars, num_queries, grind)`.
+///
+/// Grind 0 is not a smaller version of grind 8. With no query grind the query
+/// phase is entered with a candidate still in hand, which is the `avail > 0`
+/// branch of the schedule — a branch the production shape never takes, and one
+/// a suite run only at a real grind width would never reach. `S = 9` is the
+/// only shape here with three rounds, so it is the only one carrying a round
+/// that is neither the first nor the last.
+const COST_SHAPES: [(usize, usize, u8); 5] =
+    [(6, 3, 0), (6, 5, 0), (5, 3, 0), (6, 3, 8), (9, 3, 8)];
+
+fn count_rows(program: &LfmProgram, want: fn(&super::instr::Instr) -> bool) -> usize {
+    program.instrs.iter().filter(|instr| want(instr)).count()
+}
+
+fn const_rows(program: &LfmProgram) -> usize {
+    count_rows(program, |i| matches!(i, super::instr::Instr::Const { .. }))
+}
+
+/// `LFM_HASH` invocations: one per sponge permutation, whether it is a leaf's
+/// duplex block or a Merkle parent's compress.
+fn perm_rows(program: &LfmProgram) -> usize {
+    count_rows(program, |i| matches!(i, super::instr::Instr::Hash { .. }))
+}
+
+fn hint_rows(program: &LfmProgram) -> usize {
+    count_rows(program, |i| matches!(i, super::instr::Instr::Hint { .. }))
+}
+
+/// Rows the chain PROGRAM carries that are not the chain's own cost.
+///
+/// Derived from the test's own [`Layout`] and not from the program's
+/// histogram, so a form row that turned into a hint could not hide inside the
+/// subtraction: one `Hint` per arena word the layout declares, the caller's
+/// single `Unpack` of the root (shared by every query against it, which is why
+/// the opening form does not charge it), and the weight closure —
+/// `emit_eq_eval(z, alphas)` is the caller's `W`, and `chain_fixed_rows`
+/// deliberately counts only the out-of-domain `eq`s. The closure's interned `1`
+/// is a `Const` row and is subtracted with the other constants, so the
+/// second-leg form is the right one here.
+fn chain_plumbing(shape: &ChainShape) -> usize {
+    Layout::new(shape).total as usize + 1 + eq_eval_rows_again(shape.num_vars)
+}
+
+/// ★ GATE ONE for the schedule: the emitter's hash schedule is the HOST's.
+///
+/// `chain_hash_schedule` is derived from the round structure — the absorbs, the
+/// draws, the `state()` reads, the candidates a squeeze hands out. The host's
+/// is reconstructed by [`HostDuplex`] from the calls a real `whir_chain::verify`
+/// makes on a real proof, and checked against the values that verify received.
+/// Two derivations that share no code, compared event for event and felt count
+/// for felt count.
+///
+/// This is the half the previous instance could not write, and the reason its
+/// row form was not quotable: a sponge's cost is what its BUFFER holds at each
+/// hash, which is a running quantity and not a shape.
+#[test]
+fn the_schedule_is_the_host_transcripts() {
+    for (num_vars, num_queries, grind) in COST_SHAPES {
+        let f = fixture(num_vars, num_queries, grind);
+        let host = f.recorded.duplex.borrow().hashes.clone();
+        let mine = chain_hash_schedule(&f.shape, SpongeEntry::fresh());
+
+        let squeezes = mine
+            .iter()
+            .filter(|h| matches!(h, SpongeHash::Squeeze(_)))
+            .count();
+        let states = mine.len() - squeezes;
+        println!(
+            "schedule S={num_vars} Q={num_queries} grind={grind}: {squeezes} squeezes, \
+             {states} state reads, {} rows, {} permutations",
+            chain_schedule_rows(&f.shape, SpongeEntry::fresh()),
+            chain_schedule_perms(&f.shape, SpongeEntry::fresh()),
+        );
+
+        assert_eq!(
+            mine.len(),
+            host.len(),
+            "S={num_vars} Q={num_queries} grind={grind}: the host performs {} transcript \
+             hashes and the form says {}",
+            host.len(),
+            mine.len()
+        );
+        for (i, (derived, observed)) in mine.iter().zip(&host).enumerate() {
+            assert_eq!(
+                derived, observed,
+                "S={num_vars} Q={num_queries} grind={grind}: hash {i} of {} — the form says \
+                 {derived:?} and the host's own transcript did {observed:?}",
+                host.len()
+            );
+        }
+
+        // A state read happens exactly where a grind is spent, and nowhere
+        // else: `3R − 1` at a real width, none at zero bits.
+        let expected_states = if grind == 0 {
+            0
+        } else {
+            3 * f.shape.rounds() - 1
+        };
+        assert_eq!(
+            states, expected_states,
+            "state reads are one per grind check spent"
+        );
+    }
+}
+
+/// ★ GATE TWO: the chain's rows and permutations against the program it emits.
+///
+/// Pinned separately and on purpose (the opening leg's reason, one level up): a
+/// form that moved work between the sponge and the arithmetic at constant total
+/// fails one of the two rather than neither. The permutation form has THREE
+/// terms — the query phase's openings, two per grind check, and the schedule's
+/// own — and only the first of them was pinned before this test.
+#[test]
+fn the_chain_emits_its_closed_form() {
+    for (num_vars, num_queries, grind) in COST_SHAPES {
+        let f = fixture(num_vars, num_queries, grind);
+        let program = chain_program(&f.shape);
+        let entry = SpongeEntry::fresh();
+
+        let hints = hint_rows(&program);
+        assert_eq!(
+            hints,
+            Layout::new(&f.shape).total as usize,
+            "every arena word is hinted exactly once — the plumbing subtraction below is only \
+             honest while this holds"
+        );
+
+        let consts = const_rows(&program);
+        let measured = program.instrs.len() - consts - chain_plumbing(&f.shape);
+        let predicted = chain_rows(&f.shape, entry);
+        let perms = perm_rows(&program);
+        let predicted_perms = chain_perms(&f.shape, entry);
+
+        println!(
+            "chain S={num_vars} Q={num_queries} grind={grind}: {measured} rows \
+             ({} shape + {} schedule predicted {predicted}); {perms} permutations \
+             ({} openings + {} grind + {} schedule predicted {predicted_perms}); \
+             {consts} constants, {hints} hints, {} instructions",
+            chain_shape_rows(&f.shape),
+            chain_schedule_rows(&f.shape, entry),
+            chain_opening_perms(&f.shape),
+            chain_grind_perms(&f.shape),
+            chain_schedule_perms(&f.shape, entry),
+            program.instrs.len(),
+        );
+
+        assert_eq!(
+            measured, predicted,
+            "S={num_vars} Q={num_queries} grind={grind}: rows"
+        );
+        assert_eq!(
+            perms, predicted_perms,
+            "S={num_vars} Q={num_queries} grind={grind}: permutations"
+        );
+    }
+}
+
+/// ★ What a chain is ENTERED with reaches its first SQUEEZE, and stops there.
+///
+/// The property the census rests on: a chain inside an assembled verifier finds
+/// the sponge holding whatever the statement and the tables before it left, and
+/// that could in principle change every later buffer length. It does not — but
+/// the boundary is not where this test first claimed it was.
+///
+/// ⚠ It was written as "the first HASH carries the entering buffer and nothing
+/// after it does", and it failed: a `state()` hashes the buffer WITHOUT
+/// clearing it (`default_transcript.rs:236-239`), so a grind's state read is a
+/// hash that passes the entering felts straight through to the squeeze behind
+/// it. The boundary is the first SQUEEZE, which is the first event that resets
+/// the buffer to the digest. Recorded rather than quietly corrected, because
+/// the wrong version is the one a reader would assume.
+///
+/// The entering `out_pos` is never read at all: the first draw of the first
+/// round always follows an absorb, and an absorb invalidates the output buffer.
+#[test]
+fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
+    let shape = ChainShape::new(&config(4, 8), 6);
+    let fresh = chain_hash_schedule(&shape, SpongeEntry::fresh());
+    let first_squeeze = fresh
+        .iter()
+        .position(|h| matches!(h, SpongeHash::Squeeze(_)))
+        .expect("a chain squeezes");
+
+    for (buffered, out_pos) in [(0, 0), (3, 2), (7, 4), (12, 1)] {
+        let entry = SpongeEntry {
+            buffered_felts: buffered,
+            out_pos,
+        };
+        let entered = chain_hash_schedule(&shape, entry);
+        assert_eq!(entered.len(), fresh.len(), "the event count cannot move");
+        for i in 0..=first_squeeze {
+            assert_eq!(
+                entered[i].felts(),
+                fresh[i].felts() + buffered,
+                "hash {i} is at or before the first squeeze, so it carries the entering buffer"
+            );
+            assert_eq!(
+                core::mem::discriminant(&entered[i]),
+                core::mem::discriminant(&fresh[i]),
+                "hash {i} is the same KIND either way"
+            );
+        }
+        assert_eq!(
+            &entered[first_squeeze + 1..],
+            &fresh[first_squeeze + 1..],
+            "every hash after the first squeeze is identical — that squeeze reset the buffer \
+             to the digest"
+        );
+    }
+
+    // The entering `out_pos` changes nothing: at one buffer length, every
+    // position gives the same schedule.
+    for out_pos in 0..=4 {
+        assert_eq!(
+            chain_hash_schedule(
+                &shape,
+                SpongeEntry {
+                    buffered_felts: 5,
+                    out_pos
+                }
+            ),
+            chain_hash_schedule(
+                &shape,
+                SpongeEntry {
+                    buffered_felts: 5,
+                    out_pos: 0
+                }
+            ),
+            "a chain never draws before it absorbs, so what is in hand on entry is dropped"
+        );
+    }
+}
+
+/// ★ The production chain's cost, whole: the number the epoch census adds up.
+///
+/// The forms are gated at [`COST_SHAPES`]; this evaluates them at the shape the
+/// campaign runs and pins the answer, so a change to any term has to be
+/// restated here before it can be quoted. Every number was derived by hand in
+/// the design note before this test was written, which is what makes the first
+/// run of it a measurement rather than a transcription.
+///
+/// ⚠ The sizing note's per-chain figures are NOT these. Its 22,830 permutations
+/// predate both the grind term and the schedule term; the 318 it implies for the
+/// transcript is 42 above the 276 the schedule actually costs, and was never
+/// re-derived. Quote these.
+#[test]
+fn the_production_chain_costs_what_the_census_quotes() {
+    // `multilinear_prove.rs:93`: blowup 2, fold 4, 128 bits, uniform 20-bit
+    // grinds — the config the block is proven under.
+    let shape = ChainShape::new(&config(112, 20), 25);
+    let entry = SpongeEntry::fresh();
+    let schedule = chain_hash_schedule(&shape, entry);
+    let squeezes = schedule
+        .iter()
+        .filter(|h| matches!(h, SpongeHash::Squeeze(_)))
+        .count();
+
+    assert_eq!(squeezes, 233, "squeezes a chain");
+    assert_eq!(schedule.len() - squeezes, 20, "state reads = 3R − 1 grinds");
+    assert_eq!(chain_schedule_rows(&shape, entry), 836, "schedule rows");
+    assert_eq!(chain_schedule_perms(&shape, entry), 276, "schedule perms");
+    assert_eq!(chain_grind_perms(&shape), 40, "two permutations a grind");
+    assert_eq!(chain_shape_rows(&shape), 184_673, "shape rows");
+
+    println!(
+        "production chain S=25 k=4 Q=112 grind=20: {} rows, {} permutations",
+        chain_rows(&shape, entry),
+        chain_perms(&shape, entry)
+    );
+    assert_eq!(chain_rows(&shape, entry), 185_509, "rows a chain");
+    assert_eq!(chain_perms(&shape, entry), 22_828, "permutations a chain");
 }

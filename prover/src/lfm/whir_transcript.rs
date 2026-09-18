@@ -275,6 +275,17 @@ pub const fn state_rows(felts: usize) -> usize {
     felts.div_ceil(4) + felts.div_ceil(8)
 }
 
+/// PERMUTATIONS a transcript hash over `felts` buffered felts costs, whether it
+/// is a squeeze or a `state()`: one per rate-8 block, and NONE for an empty
+/// buffer, which returns the zero digest without permuting
+/// (`edsl.rs:694-697`).
+///
+/// The rate is [`super::whir_open::RATE_FELTS`] rather than a literal, because
+/// it is the same sponge the leaves are hashed with.
+pub const fn sponge_perms(felts: usize) -> usize {
+    felts.div_ceil(super::whir_open::RATE_FELTS)
+}
+
 /// INSTRUCTIONS an absorbed extension element or commitment emits: the one
 /// `Unpack` that turns the cell into lanes.
 pub const fn absorb_unpack_rows() -> usize {

@@ -70,7 +70,10 @@ use super::edsl::{self, WrapDigest};
 const FELTS_PER_EXT: usize = 3;
 
 /// The sponge's rate, in felts — the block size `leaf_capacity` is keyed on.
-const RATE_FELTS: usize = 8;
+///
+/// Shared with [`super::whir_transcript`], whose sponge is the same one: a
+/// second spelling of the rate is a second thing to keep in step.
+pub(super) const RATE_FELTS: usize = 8;
 
 /// Felts a `Pack` assembles into one sponge word.
 const FELTS_PER_WORD: usize = 4;

@@ -86,7 +86,10 @@ use super::whir_open::{
 use super::whir_poly::{
     emit_eq_eval, emit_sumcheck_round, eq_eval_rows_again, sumcheck_round_rows,
 };
-use super::whir_transcript::{WhirTranscript, emit_grind_check};
+use super::whir_transcript::{
+    CANDIDATES_PER_SQUEEZE, COORDINATES_PER_EXT, WhirTranscript, emit_grind_check, sponge_perms,
+    squeeze_rows, state_rows,
+};
 
 /// The degree the weight raises the plain `f` term to (`whir_chain.rs:991`).
 const SUMCHECK_DEGREE: usize = 2;
@@ -199,7 +202,8 @@ impl ChainShape {
 /// The transcript's own permutations are NOT in this: they depend on the
 /// sponge's buffer at each squeeze, which is a schedule and not a shape, and
 /// mixing the two would make a form that no longer says where its cost is.
-/// They are counted from the emitted program instead.
+/// They are [`chain_schedule_perms`], and the grinds' two-apiece are
+/// [`chain_grind_perms`]; [`chain_perms`] is the sum of the three.
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
     for r in 0..shape.rounds() {
@@ -249,8 +253,8 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
 ///
 /// ⚠ The grinds' `state_rows` term is NOT here. A `state()` hashes whatever the
 /// sponge is holding at that moment, which is a property of the schedule rather
-/// than of the shape; it is counted from the emitted program beside the
-/// transcript's own permutations.
+/// than of the shape; it is in [`chain_hash_schedule`], as a `State` event,
+/// beside the transcript's own squeezes.
 pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     let (folding, ood, query) = shape.grind;
     let mut rows = 0;
@@ -294,6 +298,240 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
 /// belongs to the schedule.
 const fn grind_fixed(bits: usize) -> usize {
     super::whir_transcript::grind_check_rows(bits)
+}
+
+/// PERMUTATIONS the grinds cost: two a check — one for the inner hash of
+/// `PREFIX ‖ seed ‖ factor` and one for the outer hash of `inner ‖ nonce`
+/// (`epoch.rs:614-640`). A check at zero bits costs none, because it is not
+/// emitted at all.
+///
+/// The count of checks is the round structure's `3R − 1`, written as the three
+/// terms it comes from so a config that grinds in only one place still reads
+/// correctly.
+pub fn chain_grind_perms(shape: &ChainShape) -> usize {
+    let (folding, ood, query) = shape.grind;
+    let rounds = shape.rounds();
+    let checks = rounds * usize::from(folding > 0)
+        + (rounds - 1) * usize::from(ood > 0)
+        + rounds * usize::from(query > 0);
+    PERMS_PER_GRIND * checks
+}
+
+/// Permutations one grind check spends: its two hashes.
+const PERMS_PER_GRIND: usize = 2;
+
+/// Felts a squeeze's digest occupies when it is re-absorbed: 32 bytes.
+const DIGEST_FELTS: usize = 4;
+
+/// The transcript state a chain is ENTERED with.
+///
+/// The schedule below is a function of the round structure and of this, and of
+/// nothing else. A standalone chain enters [`SpongeEntry::fresh`]; a chain
+/// inside an assembled verifier enters whatever the statement and the tables
+/// before it left behind, which is why this is a parameter rather than an
+/// assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpongeEntry {
+    /// Felts the sponge is holding but has not hashed.
+    pub buffered_felts: usize,
+    /// Candidates of the last squeeze already handed out;
+    /// `CANDIDATES_PER_SQUEEZE` means "none in hand, the next draw squeezes".
+    pub out_pos: usize,
+}
+
+impl SpongeEntry {
+    /// `WhirTranscript::new()`, which is `DefaultTranscript::new(&[])`: an empty
+    /// buffer and no squeeze in hand (`default_transcript.rs:67-77`).
+    pub const fn fresh() -> Self {
+        Self {
+            buffered_felts: 0,
+            out_pos: CANDIDATES_PER_SQUEEZE,
+        }
+    }
+}
+
+/// One hash the transcript performs, and how many felts it hashes.
+///
+/// Told apart because they cost differently and because a `state()` does NOT
+/// advance the chain: the buffer it hashed is still there for the next squeeze
+/// to hash again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpongeHash {
+    /// `sample()`: hash the buffer, hand out four candidates, re-absorb the
+    /// digest.
+    Squeeze(usize),
+    /// `state()`: hash the buffer and leave it alone.
+    State(usize),
+}
+
+impl SpongeHash {
+    pub const fn felts(self) -> usize {
+        match self {
+            Self::Squeeze(felts) | Self::State(felts) => felts,
+        }
+    }
+
+    pub const fn rows(self) -> usize {
+        match self {
+            Self::Squeeze(felts) => squeeze_rows(felts),
+            Self::State(felts) => state_rows(felts),
+        }
+    }
+
+    pub const fn perms(self) -> usize {
+        sponge_perms(self.felts())
+    }
+}
+
+/// The sponge as the SCHEDULE sees it: what it holds and what it has in hand.
+///
+/// Emits nothing. Every transition is one of the host's
+/// (`default_transcript.rs`), named after it.
+struct SpongeSchedule {
+    buffered: usize,
+    out_pos: usize,
+    hashes: Vec<SpongeHash>,
+}
+
+impl SpongeSchedule {
+    fn new(entry: SpongeEntry) -> Self {
+        Self {
+            buffered: entry.buffered_felts,
+            out_pos: entry.out_pos,
+            hashes: Vec::new(),
+        }
+    }
+
+    /// `append_bytes` / `append_field_element`: the buffer grows and any
+    /// buffered squeeze output is dropped (`:205-210`).
+    fn absorb(&mut self, felts: usize) {
+        self.buffered += felts;
+        self.out_pos = CANDIDATES_PER_SQUEEZE;
+    }
+
+    /// `sample()`: the buffer is hashed, and the digest is re-absorbed — which
+    /// is why the buffer is FOUR felts afterwards and not none (`:104-110`).
+    fn squeeze(&mut self) {
+        self.hashes.push(SpongeHash::Squeeze(self.buffered));
+        self.buffered = DIGEST_FELTS;
+        self.out_pos = 0;
+    }
+
+    /// `next_sample_u64`: refill only when nothing is in hand.
+    fn candidate(&mut self) {
+        if self.out_pos >= CANDIDATES_PER_SQUEEZE {
+            self.squeeze();
+        }
+        self.out_pos += 1;
+    }
+
+    /// `sample_field_element` on the cubic extension: one candidate a
+    /// coordinate, no rejection (`CANDIDATES_PER_COORDINATE = Some(1)`).
+    fn draw_ext(&mut self) {
+        for _ in 0..COORDINATES_PER_EXT {
+            self.candidate();
+        }
+    }
+
+    /// `check_grind`: at zero bits it returns before reading the state and
+    /// before absorbing the nonce (`whir_chain.rs:131-133`), so it is not in the
+    /// schedule at all. Otherwise `state()` over the buffer, then the nonce's
+    /// eight big-endian bytes.
+    fn grind(&mut self, bits: usize) {
+        if bits == 0 {
+            return;
+        }
+        self.hashes.push(SpongeHash::State(self.buffered));
+        self.absorb(NONCE_FELTS);
+    }
+}
+
+/// Felts the grind's nonce occupies: `nonce.to_be_bytes()` is eight.
+const NONCE_FELTS: usize = 1;
+
+/// ★ The chain's SCHEDULE: every hash its transcript performs, in order, and
+/// how many felts each one hashes.
+///
+/// This is the half of the chain's cost that the shape alone does not give,
+/// because a sponge's cost is what its BUFFER holds at each hash and the buffer
+/// is a running quantity. It is derived here from the round structure — the
+/// absorbs, the draws, the `state()` reads and the candidates a squeeze hands
+/// out — and NOT read off [`WhirTranscript`], which is a different state
+/// machine written for a different purpose. Its gate is the host's own call
+/// stream (`whir_chain_tests::the_schedule_is_the_host_transcripts`).
+///
+/// Every absorb by the shape it comes from: `SUMCHECK_DEGREE ·
+/// COORDINATES_PER_EXT` felts a sumcheck round, `DIGEST_FELTS` for a successor
+/// root, `COORDINATES_PER_EXT` for `y0` or `final_value`, `NONCE_FELTS` a
+/// spent grind. Every draw: one extension challenge a sumcheck round, `z0` and
+/// `gamma` on a round with a successor, and `num_queries` bounded draws in the
+/// query phase — which come FIRST and together, because `sample_queries` draws
+/// them all before any opening is checked (`whir_round.rs:68-76`).
+pub fn chain_hash_schedule(shape: &ChainShape, entry: SpongeEntry) -> Vec<SpongeHash> {
+    let (folding, ood, query) = shape.grind;
+    let mut sponge = SpongeSchedule::new(entry);
+
+    for r in 0..shape.rounds() {
+        sponge.grind(folding);
+        for _ in 0..shape.schedule[r] {
+            sponge.absorb(SUMCHECK_DEGREE * COORDINATES_PER_EXT);
+            sponge.draw_ext();
+        }
+        match shape.next_depth(r) {
+            Some(_) => {
+                sponge.absorb(DIGEST_FELTS);
+                sponge.draw_ext();
+                sponge.absorb(COORDINATES_PER_EXT);
+                sponge.grind(ood);
+                sponge.draw_ext();
+                sponge.grind(query);
+            }
+            None => {
+                sponge.absorb(COORDINATES_PER_EXT);
+                sponge.grind(query);
+            }
+        }
+        for _ in 0..shape.num_queries {
+            sponge.candidate();
+        }
+    }
+
+    sponge.hashes
+}
+
+/// INSTRUCTIONS the schedule costs: the `Pack`s that build each hash's words
+/// and the `Unpack` a squeeze spends reading its digest.
+pub fn chain_schedule_rows(shape: &ChainShape, entry: SpongeEntry) -> usize {
+    chain_hash_schedule(shape, entry)
+        .iter()
+        .map(|hash| hash.rows())
+        .sum()
+}
+
+/// PERMUTATIONS the schedule costs: one per rate-8 block of every hash.
+pub fn chain_schedule_perms(shape: &ChainShape, entry: SpongeEntry) -> usize {
+    chain_hash_schedule(shape, entry)
+        .iter()
+        .map(|hash| hash.perms())
+        .sum()
+}
+
+/// ★ INSTRUCTIONS one chain costs, whole: the shape half and the schedule half.
+///
+/// The two are pinned apart and not only as this sum, because they move
+/// independently — a form that shifted work from the sponge to the arithmetic
+/// at constant total would fail one of them rather than neither.
+pub fn chain_rows(shape: &ChainShape, entry: SpongeEntry) -> usize {
+    chain_shape_rows(shape) + chain_schedule_rows(shape, entry)
+}
+
+/// ★ PERMUTATIONS one chain costs, whole, in the THREE terms it has: the query
+/// phase's openings, the grinds' two hashes each, and the transcript's own.
+///
+/// ⚠ Only the first was pinned before this; the sizing note's per-chain
+/// permutation figure predates the other two and is not reproduced by them.
+pub fn chain_perms(shape: &ChainShape, entry: SpongeEntry) -> usize {
+    chain_opening_perms(shape) + chain_grind_perms(shape) + chain_schedule_perms(shape, entry)
 }
 
 /// ★ `whir_chain::verify_weighted`, emitted.
@@ -570,6 +808,8 @@ fn emit_slot_mux(b: &mut LfmBuilder, values: &[Ext], bits: &[Bit]) -> Ext {
 }
 
 /// The half of a chain's cost that does not depend on the sponge's schedule.
+///
+/// The other half is [`chain_schedule_rows`] and the sum is [`chain_rows`].
 pub fn chain_shape_rows(shape: &ChainShape) -> usize {
     chain_fixed_rows(shape) + chain_query_rows(shape)
 }
