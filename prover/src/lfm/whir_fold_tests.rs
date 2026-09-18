@@ -85,13 +85,7 @@ fn const_rows(program: &LfmProgram) -> usize {
 /// that moves with the index width, so pinning it needs two widths at the SAME
 /// block: `(8, 4, 4)` and `(8, 4, 6)` are that pair, and a form that folded the
 /// index term into the block term would fit one and miss the other.
-const SHAPES: &[(usize, usize, usize)] = &[
-    (5, 1, 4),
-    (6, 2, 4),
-    (8, 4, 4),
-    (10, 4, 6),
-    (8, 4, 6),
-];
+const SHAPES: &[(usize, usize, usize)] = &[(5, 1, 4), (6, 2, 4), (8, 4, 4), (10, 4, 6), (8, 4, 6)];
 
 /// ★ F1 for the fold: every row named, with the interned constants counted
 /// separately and pinned in their own right.
@@ -232,8 +226,7 @@ fn the_point_chain_holds_at_the_widest_indices() {
         if index >= half {
             top_half += 1;
         }
-        let want =
-            fold_coset::<F, E, E>(&values, &domain, index, &alphas).expect("the host folds");
+        let want = fold_coset::<F, E, E>(&values, &domain, index, &alphas).expect("the host folds");
         let exec = execute(
             &program,
             &[fold_arena(&words, &alphas, index)],

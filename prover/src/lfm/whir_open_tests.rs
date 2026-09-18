@@ -77,16 +77,16 @@ const SHAPES: &[Shape] = &[
 
 /// The arena, in the order [`opening_program`] hints it: the block's values,
 /// then one word per sibling, then the root, then the index.
-fn opening_arena(values: &[LfmWord], siblings: &[LfmWord], root: LfmWord, index: usize) -> Vec<LfmWord> {
+fn opening_arena(
+    values: &[LfmWord],
+    siblings: &[LfmWord],
+    root: LfmWord,
+    index: usize,
+) -> Vec<LfmWord> {
     let mut words = values.to_vec();
     words.extend_from_slice(siblings);
     words.push(root);
-    words.push([
-        FE::from(index as u64),
-        FE::zero(),
-        FE::zero(),
-        FE::zero(),
-    ]);
+    words.push([FE::from(index as u64), FE::zero(), FE::zero(), FE::zero()]);
     words
 }
 
@@ -195,16 +195,15 @@ fn perm_rows(program: &LfmProgram) -> usize {
 }
 
 /// Commits a base-field codeword and opens one block.
-fn base_commitment(
-    shape: &Shape,
-    seed: u64,
-) -> (CodewordCommitment<F, RpxWhir>, Vec<FE>) {
+fn base_commitment(shape: &Shape, seed: u64) -> (CodewordCommitment<F, RpxWhir>, Vec<FE>) {
     let codeword: Vec<FE> = (0..1usize << shape.log_domain)
         .map(|i| base(seed + i as u64))
         .collect();
-    let commitment =
-        CodewordCommitment::<F, RpxWhir>::from_codeword_on_host(codeword.clone(), shape.log_folding)
-            .expect("the codeword commits");
+    let commitment = CodewordCommitment::<F, RpxWhir>::from_codeword_on_host(
+        codeword.clone(),
+        shape.log_folding,
+    )
+    .expect("the codeword commits");
     (commitment, codeword)
 }
 
@@ -257,13 +256,15 @@ fn the_opening_emits_its_closed_form() {
             );
             println!("    [{}]", histogram(&program));
             assert_eq!(
-                measured, predicted,
+                measured,
+                predicted,
                 "{} {}: the emitted row count must equal the closed form",
                 shape.name,
                 if is_ext { "ext" } else { "base" }
             );
             assert_eq!(
-                perms, predicted_perms,
+                perms,
+                predicted_perms,
                 "{} {}: the permutation count must equal the closed form",
                 shape.name,
                 if is_ext { "ext" } else { "base" }
@@ -303,7 +304,10 @@ fn the_opening_accepts_what_the_host_accepts() {
                 index,
             );
             execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-                panic!("{} base at {index}: the machine refused a valid opening: {e:?}", shape.name)
+                panic!(
+                    "{} base at {index}: the machine refused a valid opening: {e:?}",
+                    shape.name
+                )
             });
         }
 
@@ -324,7 +328,10 @@ fn the_opening_accepts_what_the_host_accepts() {
                 index,
             );
             execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-                panic!("{} ext at {index}: the machine refused a valid opening: {e:?}", shape.name)
+                panic!(
+                    "{} ext at {index}: the machine refused a valid opening: {e:?}",
+                    shape.name
+                )
             });
         }
     }
@@ -362,7 +369,12 @@ fn a_tampered_opening_cannot_execute() {
     assert!(
         execute(
             &program,
-            &[opening_arena(&honest_values, &honest_siblings, honest_root, index)],
+            &[opening_arena(
+                &honest_values,
+                &honest_siblings,
+                honest_root,
+                index
+            )],
             &crate::hash_pin::BLOCK_HASHER
         )
         .is_ok(),
@@ -397,7 +409,12 @@ fn a_tampered_opening_cannot_execute() {
     assert!(
         execute(
             &program,
-            &[opening_arena(&honest_values, &siblings_of(&forged), honest_root, index)],
+            &[opening_arena(
+                &honest_values,
+                &siblings_of(&forged),
+                honest_root,
+                index
+            )],
             &crate::hash_pin::BLOCK_HASHER
         )
         .is_err(),
@@ -437,7 +454,12 @@ fn a_tampered_opening_cannot_execute() {
     assert!(
         execute(
             &program,
-            &[opening_arena(&honest_values, &honest_siblings, honest_root, elsewhere)],
+            &[opening_arena(
+                &honest_values,
+                &honest_siblings,
+                honest_root,
+                elsewhere
+            )],
             &crate::hash_pin::BLOCK_HASHER
         )
         .is_err(),
