@@ -15,6 +15,7 @@ math = { path = "../math", features = [
     "rkyv",
 ] }
 crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
+multilinear = { path = "../multilinear" }
 thiserror = "1.0.38"
 log = "0.4.17"
 digest = "0.10.7"

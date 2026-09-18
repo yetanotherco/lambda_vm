@@ -23,6 +23,9 @@ pub mod instruments;
 #[cfg(feature = "cuda")]
 pub mod logup_gpu;
 pub mod lookup;
+pub mod multilinear_air;
+pub mod multilinear_logup;
+pub mod multilinear_table;
 pub mod ood;
 pub(crate) mod par;
 pub mod profile_markers;
