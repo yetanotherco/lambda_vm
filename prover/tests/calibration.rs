@@ -21,6 +21,23 @@ use tikv_jemalloc_ctl::{epoch, stats};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// This binary also runs the purge policy the shipped binary runs, so it is the
+// production allocator *configuration* and not just the production allocator.
+// The reason and the numbers are at the two primary sites (`bin/cli/src/main.rs`
+// and `prover/src/lib.rs`): never purging bought 4 s a block on the WHIR prover
+// (lb4) and 5-24 s on the STARK tree (ds7-ds10, ABBA) for +1.4 / +2.9-3.3 GiB
+// of peak RSS.
+//
+// It moves nothing this file asserts — `stats::allocated` is live bytes, which
+// the decay timers do not touch; a resident-memory assertion added here later
+// would read the wrong configuration without it.
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> =
+    Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
 fn allocated_bytes() -> usize {
     epoch::advance().ok();
     stats::allocated::read().unwrap_or(0)

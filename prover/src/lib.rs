@@ -46,6 +46,42 @@ pub mod whir_identity;
 #[global_allocator]
 static TEST_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// It runs it with the shipped binary's purge policy too, for the same reason: a
+// harness on a different allocator *configuration* measures a different process
+// than production. The string matches `bin/cli/src/main.rs`'s export exactly,
+// and `tests/allocator_conf_tests.rs` reads both options back out of jemalloc
+// and fails if this export is not in force.
+//
+// Never purge. jemalloc returns freed pages to the OS on decay timers; the
+// prover allocates and frees multi-hundred-MiB host buffers continuously, so
+// the pages come straight back as faults. Measured on both pipelines on an RTX
+// 5090 box, ABBA in each, every arm at one commit and one set of knobs:
+//   * lb4 (WHIR prover, keccak, ABBA, `whir/lfm` @ 64393da9) — prove
+//     39.69-39.88 s with this setting against 43.94-44.07 s without, the
+//     default costing +13 M minor faults and +15 s of system time per arm;
+//   * ds7-ds10 (STARK tree, 0e4f4610, ABBA) — 187 / 163 / 166 / 171 s, both
+//     never-purge arms under both default arms, 5-24 s a block, with the proof
+//     bytes unmoved (30 IDENTITY lines, 0 differing).
+// The cost is peak RSS: +1.4 GiB on the WHIR arm (10.99-11.00 against
+// 9.54-9.58 GiB) and +2.9-3.3 GiB on the STARK tree (42.20 against 39.27 GiB
+// high-water) — an order below the 13 GiB glibc penalty above, which is why the
+// lever is the decay setting and not the allocator. `background_thread:true`
+// recovers none of it: the cost is the re-touch on the worker threads, not the
+// `madvise` call.
+//
+// jemalloc reads this symbol as a `const char *` before `main` is entered, so
+// the value has to be in the initializer, and the name is the prefixed one
+// `tikv-jemalloc-sys` declares (`#[cfg_attr(prefixed, link_name =
+// "_rjem_malloc_conf")]`, its `src/lib.rs`).
+#[cfg(test)]
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> =
+    Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
 use std::fmt;
 use std::sync::Arc;
 

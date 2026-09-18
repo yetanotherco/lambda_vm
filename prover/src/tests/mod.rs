@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub mod allocator_conf_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
 #[cfg(test)]
