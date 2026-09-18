@@ -236,3 +236,224 @@ fn emit_newton_step(b: &mut LfmBuilder, r: Ext, j: usize) -> Ext {
     ]));
     b.emul_add(r, scale, shift)
 }
+
+/// The three kernels a shift step can read.
+///
+/// `eq_j` accepts the bit unchanged, `carry` accepts `x_j = 1, y_j = 0` (the
+/// only way a `+1` carries out of this bit), and `no_carry` accepts
+/// `x_j = 0, y_j = 1` (the only way it does not). Named rather than indexed
+/// because which of them a step reads is what its cost is made of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShiftKernel {
+    Eq,
+    Carry,
+    NoCarry,
+}
+
+/// One contribution a step makes: which carry state weights it, which kernel it
+/// multiplies, and which carry state it lands on.
+type ShiftStep = (usize, ShiftKernel, usize);
+
+/// The contributions a step makes, given the constant's bit and which carry
+/// states can be nonzero.
+///
+/// This IS the host's `match ((k >> t) & 1) + c` (`eq.rs:163-172`), read as
+/// structure rather than as arithmetic: a zero bit with no carry in keeps the
+/// bit equal and the carry out zero; a one bit with no carry in (or a zero bit
+/// with a carry in) either lands and carries or lands and does not; a one bit
+/// with a carry in must equal and carry.
+fn shift_contributions(bit: usize, live: [bool; 2]) -> Vec<ShiftStep> {
+    let mut out = Vec::new();
+    for (c, &alive) in live.iter().enumerate() {
+        if !alive {
+            continue;
+        }
+        match bit + c {
+            0 => out.push((c, ShiftKernel::Eq, 0)),
+            1 => {
+                out.push((c, ShiftKernel::NoCarry, 0));
+                out.push((c, ShiftKernel::Carry, 1));
+            }
+            _ => out.push((c, ShiftKernel::Eq, 1)),
+        }
+    }
+    out
+}
+
+/// INSTRUCTIONS [`emit_shift_eval`] emits over `n` variables at shift `k`,
+/// once the program has interned its `1`.
+///
+/// Counted from the recursion's structure rather than from the emitter. At each
+/// variable, from the LEAST significant end:
+///
+/// - the kernels that step's contributions read cost `1` for `1 − x_j` if any
+///   of them is `eq` or `no_carry`, `1` for `1 − y_j` if any is `eq` or
+///   `carry`, then `2` for `eq` (one `Mul` and one `MulAdd`), `1` for `carry`
+///   and `1` for `no_carry`;
+/// - each contribution costs one row — a `Mul` for the first one landing on a
+///   state and a `MulAdd` for every later one — except a contribution weighted
+///   by a state that is still the literal `1`, whose first landing is the
+///   kernel wire itself and costs nothing;
+/// - the two states are added at the end, which the shift's wrap is the reason
+///   for, unless only one of them can be nonzero.
+///
+/// ★ **At `k = 0` this must be [`eq_eval_rows_again`], and that is a check and
+/// not a coincidence.** With every bit zero the second carry state is never
+/// reached, every step reads `eq` alone, and the recursion IS `eq`'s: four rows
+/// a variable and one fold per variable past the first, `5n − 1`. The two forms
+/// are derived from different code and pinned against each other.
+///
+/// Bits of `k` at or above `n` are never read (`eq.rs:155`), so this is a
+/// function of `k mod 2^n` — pinned in the tests rather than assumed.
+pub fn shift_eval_rows(n: usize, k: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut live = [true, false];
+    let mut unit = [true, false];
+    let mut rows = 0;
+
+    for t in 0..n {
+        let steps = shift_contributions((k >> t) & 1, live);
+        let reads = |kernel: ShiftKernel| steps.iter().any(|&(_, used, _)| used == kernel);
+        let uses_eq = reads(ShiftKernel::Eq);
+        let uses_carry = reads(ShiftKernel::Carry);
+        let uses_no_carry = reads(ShiftKernel::NoCarry);
+
+        rows += usize::from(uses_eq || uses_no_carry); // 1 − x_j
+        rows += usize::from(uses_eq || uses_carry); // 1 − y_j
+        rows += 2 * usize::from(uses_eq);
+        rows += usize::from(uses_carry);
+        rows += usize::from(uses_no_carry);
+
+        let mut next_live = [false; 2];
+        for &(source, _, target) in &steps {
+            let first = !next_live[target];
+            rows += usize::from(!(first && unit[source]));
+            next_live[target] = true;
+        }
+        live = next_live;
+        // A state that has been through a step is a product of kernels, never
+        // the literal one again.
+        unit = [false, false];
+    }
+
+    rows + usize::from(live[0] && live[1])
+}
+
+/// ★ `shift_k(x, y)`, emitted — `multilinear::eq::shift_eval`
+/// (`eq.rs:141-176`), the kernel `claim_reduce` settles a shifted column with.
+///
+/// `shift_k(x, y) = 1` exactly when `index(y) = index(x) + k mod 2^n`, extended
+/// multilinearly. The host adds the constant `k` bit by bit from the least
+/// significant end, carrying; `state[c]` is the weight of the bits handled so
+/// far having produced carry `c`, and because the shift WRAPS both carries are
+/// accepted at the end.
+///
+/// `k` is emit-time — it is a factor's frame offset, which is program structure
+/// — so the emitter knows each bit and specialises: a step whose carry state
+/// cannot be nonzero emits nothing for it, and the first step's weight is the
+/// literal `1` and costs no multiply. That specialisation is why `k = 0`
+/// collapses to exactly [`emit_eq_eval`]'s shape.
+pub fn emit_shift_eval(b: &mut LfmBuilder, x: &[Ext], y: &[Ext], k: usize) -> Ext {
+    assert_eq!(
+        x.len(),
+        y.len(),
+        "a shift's two points must have the same number of variables"
+    );
+    let one = b.ext_const(&FEE::one());
+    let n = x.len();
+    if n == 0 {
+        // The empty product: every index agrees with itself, at any shift.
+        return one;
+    }
+
+    // `None` is the zero weight; `Some(None)` is the literal one, which costs no
+    // multiply; `Some(Some(w))` is a wire.
+    let mut state: [Option<Option<Ext>>; 2] = [Some(None), None];
+
+    for t in 0..n {
+        // `x.iter().zip(y).rev()`: `t` counts from the LAST variable, which is
+        // the least significant bit of an index.
+        let j = n - 1 - t;
+        let (xj, yj) = (x[j], y[j]);
+        let live = [state[0].is_some(), state[1].is_some()];
+        let steps = shift_contributions((k >> t) & 1, live);
+        let reads = |kernel: ShiftKernel| steps.iter().any(|&(_, used, _)| used == kernel);
+        let uses_eq = reads(ShiftKernel::Eq);
+        let uses_carry = reads(ShiftKernel::Carry);
+        let uses_no_carry = reads(ShiftKernel::NoCarry);
+
+        let not_x = (uses_eq || uses_no_carry).then(|| b.esub(one, xj));
+        let not_y = (uses_eq || uses_carry).then(|| b.esub(one, yj));
+        let eq = uses_eq.then(|| {
+            let xy = b.emul(xj, yj);
+            b.emul_add(
+                not_x.expect("eq reads 1 − x"),
+                not_y.expect("eq reads 1 − y"),
+                xy,
+            )
+        });
+        let carry = uses_carry.then(|| b.emul(xj, not_y.expect("carry reads 1 − y")));
+        let no_carry = uses_no_carry.then(|| b.emul(not_x.expect("no_carry reads 1 − x"), yj));
+        let kernel = |which: ShiftKernel| match which {
+            ShiftKernel::Eq => eq.expect("the step reads eq"),
+            ShiftKernel::Carry => carry.expect("the step reads carry"),
+            ShiftKernel::NoCarry => no_carry.expect("the step reads no_carry"),
+        };
+
+        let mut next: [Option<Ext>; 2] = [None, None];
+        for &(source, which, target) in &steps {
+            let value = kernel(which);
+            let weight = state[source].expect("a dead state makes no contribution");
+            next[target] = Some(match (next[target], weight) {
+                // The first landing, weighted by the literal one: the kernel
+                // itself, with nothing to emit.
+                (None, None) => value,
+                (None, Some(w)) => b.emul(w, value),
+                (Some(acc), None) => b.eadd(acc, value),
+                (Some(acc), Some(w)) => b.emul_add(w, value, acc),
+            });
+        }
+        state = [next[0].map(Some), next[1].map(Some)];
+    }
+
+    match (state[0], state[1]) {
+        (Some(a), Some(c)) => {
+            let a = a.expect("a state past the first step is a wire");
+            let c = c.expect("a state past the first step is a wire");
+            b.eadd(a, c)
+        }
+        (Some(only), None) | (None, Some(only)) => only.expect("a state past the first step is a wire"),
+        (None, None) => unreachable!("some carry state survives every step"),
+    }
+}
+
+/// INSTRUCTIONS [`emit_challenge_powers`] emits, once the program has interned
+/// its `1`: one multiply per power past the first.
+///
+/// ⚠ One FEWER than the host runs. `multilinear::challenge_powers`
+/// (`lib.rs:60-69`) multiplies once per element and throws the last product
+/// away, because it accumulates before returning the current power. The values
+/// are identical; only the dead row is missing.
+pub const fn challenge_powers_rows(count: usize) -> usize {
+    count.saturating_sub(1)
+}
+
+/// ★ `[1, γ, γ², …]` — `multilinear::challenge_powers`, emitted.
+///
+/// The batching weights of every batched statement in the verifier: the three
+/// rules of the main sumcheck, the factor values of `claim_reduce`, and the
+/// stacked evaluation's columns. It starts at ONE and not at γ, which is what
+/// makes the first term of every batch free.
+pub fn emit_challenge_powers(b: &mut LfmBuilder, gamma: Ext, count: usize) -> Vec<Ext> {
+    let mut powers = Vec::with_capacity(count);
+    let mut acc = b.ext_const(&FEE::one());
+    for i in 0..count {
+        if i > 0 {
+            acc = b.emul(acc, gamma);
+        }
+        powers.push(acc);
+    }
+    powers
+}

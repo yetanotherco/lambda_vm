@@ -1,7 +1,7 @@
 //! Gates for the shared polynomial primitives.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use multilinear::eq::eq_eval;
+use multilinear::eq::{eq_eval, rot_eval, shift_eval};
 use multilinear::sumcheck::{RoundProof, verify_rounds};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension};
@@ -11,8 +11,8 @@ use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_poly::{
-    emit_eq_eval, emit_sumcheck_rounds, eq_eval_rows, eq_eval_rows_again, sumcheck_round_consts,
-    sumcheck_round_rows,
+    emit_eq_eval, emit_shift_eval, emit_sumcheck_rounds, eq_eval_rows, eq_eval_rows_again,
+    shift_eval_rows, sumcheck_round_consts, sumcheck_round_rows,
 };
 use super::word::{ext_word, word_as_ext};
 
@@ -439,5 +439,185 @@ fn the_sumcheck_leg_computes_what_the_host_computes() {
                 );
             }
         }
+    }
+}
+
+/// `shift_k` over `n` variables, both points hinted, the result published.
+fn shift_only_program(n: usize, k: usize) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(2 * n as u32);
+    let x: Vec<_> = (0..n)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let y: Vec<_> = (0..n)
+        .map(|i| b.hint_word(arena, (n + i) as u32).as_ext())
+        .collect();
+    let v = emit_shift_eval(&mut b, &x, &y, k);
+    b.public(v.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the shift leg must be admissible");
+    program
+}
+
+/// The shift leg's marginal cost, measured the way the `eq` leg's is: the same
+/// program without it.
+fn shift_marginal_rows(n: usize, k: usize) -> usize {
+    let with = shift_only_program(n, k);
+    let without = {
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let arena = b.declare_arena(2 * n as u32);
+        let first = b.hint_word(arena, 0).as_ext();
+        for i in 1..2 * n {
+            let _ = b.hint_word(arena, i as u32);
+        }
+        b.public(first.as_cell());
+        compile(b.finish())
+    };
+    with.instrs.len() - without.instrs.len()
+}
+
+/// The shifts `claim_reduce` reaches, and the ones that exercise the carry.
+///
+/// A VM table's factors are read at frame offsets — 0 and 1 in the tables this
+/// campaign proves — but the kernel takes any `k`, and a form that only ever
+/// saw 0 and 1 would never see a carry ripple past one bit.
+const SHIFTS: [(usize, usize); 12] = [
+    (1, 0),
+    (1, 1),
+    (4, 0),
+    (4, 1),
+    (4, 2),
+    (4, 5),
+    (4, 15),
+    (7, 0),
+    (7, 1),
+    (7, 3),
+    (7, 64),
+    (7, 127),
+];
+
+/// ★ F1 for the shift kernel, against a form derived from the recursion rather
+/// than from the emitter.
+#[test]
+fn the_shift_leg_emits_its_closed_form() {
+    for (n, k) in SHIFTS {
+        let measured = shift_marginal_rows(n, k);
+        // The leg's own rows, plus the `LFM_CONST` holding `1` — the same
+        // accounting `eq_eval_rows` uses, where the constant is paid once per
+        // program and `shift_eval_rows` is the second-leg form.
+        let predicted = shift_eval_rows(n, k) + 1;
+        println!("shift n={n} k={k}: {measured} rows emitted, {predicted} predicted");
+        assert_eq!(measured, predicted, "shift over {n} variables at k={k}");
+    }
+}
+
+/// ★★ At `k = 0` the shift IS `eq`, in VALUE and in COST, and the two forms
+/// were derived from different code.
+///
+/// The second carry state is never reached with every bit zero, so the
+/// recursion collapses to `eq`'s: this pins `shift_eval_rows(n, 0)` against
+/// `eq_eval_rows_again(n)`, a number this module pinned another way entirely
+/// (against a second leg in one program, to fix the split of `5n`).
+#[test]
+fn the_shift_form_is_eqs_at_a_zero_shift() {
+    for n in 1..=12 {
+        assert_eq!(
+            shift_eval_rows(n, 0),
+            eq_eval_rows_again(n),
+            "a zero shift is eq over {n} variables, and must cost exactly that"
+        );
+    }
+}
+
+/// ★ The shift leg against the host, at every shift in [`SHIFTS`].
+///
+/// `shift_eval` is the function `claim_reduce` settles a shifted column with,
+/// and it is the only kernel in the per-table verify whose answer depends on a
+/// constant the AIR chose rather than on a challenge.
+#[test]
+fn the_shift_leg_computes_what_the_host_computes() {
+    for (n, k) in SHIFTS {
+        let program = shift_only_program(n, k);
+        for seed in [0x11u64, 0x5eed] {
+            let x = sample(seed, n);
+            let y = sample(seed ^ 0xFFFF, n);
+            let arenas = vec![x.iter().chain(y.iter()).map(ext_word).collect::<Vec<_>>()];
+            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                .expect("the shift leg executes");
+            let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
+            let want = shift_eval(&x, &y, k).expect("the host agrees on the width");
+            assert_eq!(got, want, "shift_{k} over {n} variables at seed {seed:#x}");
+            if k == 0 {
+                assert_eq!(want, eq_eval(&x, &y).expect("eq agrees"), "shift_0 is eq");
+            }
+            if k == 1 {
+                assert_eq!(want, rot_eval(&x, &y).expect("rot agrees"), "shift_1 is rot");
+            }
+        }
+    }
+}
+
+/// ★ The shift is an indicator on the cube, and that is what says the kernel
+/// counts in the right DIRECTION.
+///
+/// A leg that added the constant the other way round agrees with the host's own
+/// arithmetic at random points only if it is wrong in the same direction; the
+/// corners say which way it goes. `index(y) = index(x) + k mod 2^n`, with the
+/// index read big-endian — variable 0 is the most significant, which is why the
+/// recursion walks the variables in reverse.
+#[test]
+fn the_shift_is_one_exactly_where_the_index_advances() {
+    let n = 4;
+    let size = 1usize << n;
+    for k in [0usize, 1, 3, 13] {
+        let program = shift_only_program(n, k);
+        let corner = |index: usize| -> Vec<FEE> {
+            (0..n)
+                .map(|bit| {
+                    if index >> (n - 1 - bit) & 1 == 1 {
+                        FEE::one()
+                    } else {
+                        FEE::zero()
+                    }
+                })
+                .collect()
+        };
+        for from in 0..size {
+            for to in 0..size {
+                let x = corner(from);
+                let y = corner(to);
+                let arenas = vec![x.iter().chain(y.iter()).map(ext_word).collect::<Vec<_>>()];
+                let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                    .expect("the shift leg executes");
+                let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
+                let want = if to == (from + k) % size {
+                    FEE::one()
+                } else {
+                    FEE::zero()
+                };
+                assert_eq!(got, want, "shift_{k}: corner {from} to corner {to}");
+            }
+        }
+    }
+}
+
+/// Bits of `k` at or above `n` are never read, so the kernel is a function of
+/// `k mod 2^n` — the host's loop only ever asks for `t < n` (`eq.rs:155`).
+///
+/// `claim_reduce` is handed a factor's raw offset, and `materialize` reduces it
+/// on the prover's side (`claim_reduce.rs:357`); this is what says the two
+/// agree without the verifier reducing anything.
+#[test]
+fn the_shift_reads_only_the_bits_it_has_variables_for() {
+    let n = 4;
+    let size = 1usize << n;
+    for k in [0usize, 3, 9] {
+        assert_eq!(shift_eval_rows(n, k), shift_eval_rows(n, k + size));
+        let x = sample(0xA1, n);
+        let y = sample(0xB2, n);
+        assert_eq!(
+            shift_eval(&x, &y, k).expect("the host agrees"),
+            shift_eval(&x, &y, k + 3 * size).expect("the host agrees"),
+        );
     }
 }

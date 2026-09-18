@@ -69,6 +69,7 @@ pub mod whir_gkr;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
+pub mod whir_reduce;
 pub mod whir_stacked;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
