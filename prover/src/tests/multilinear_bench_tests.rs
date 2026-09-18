@@ -1764,17 +1764,8 @@ fn whir_table_shapes() {
             pairs.push((&l2g_air, &mut l2g_trace, &()));
 
             println!(
-                "{:<16} {:>5} {:>6} {:>4} {:>8} {:>8} {:>7} {:>7} {:>7} {}",
-                "table",
-                "vars",
-                "width",
-                "I",
-                "columns",
-                "factors",
-                "public",
-                "degree",
-                "roots",
-                "offsets"
+                "{:<16} {:>5} {:>6} {:>4} {:>8} {:>8} {:>7} {:>7} {:>7} offsets",
+                "table", "vars", "width", "I", "columns", "factors", "public", "degree", "roots"
             );
             let mut degree_rounds = 0usize;
             for (air, trace, _) in pairs.iter() {
