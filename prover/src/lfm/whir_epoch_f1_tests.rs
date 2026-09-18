@@ -944,6 +944,7 @@ struct BlockEpochShape {
 fn the_block_f1_at_every_epoch_shape() {
     use crate::multilinear_prove::chain_config;
     use crate::tables::trace_builder::DecodeArtifacts;
+    use multilinear::stacking::StackedLayout;
 
     let elf_path = std::env::var("LFM_F1_ELF").expect("LFM_F1_ELF must name the guest ELF");
     let input_path = std::env::var("LFM_F1_INPUT").expect("LFM_F1_INPUT must name the block input");
@@ -1046,6 +1047,36 @@ fn the_block_f1_at_every_epoch_shape() {
             public_output: &published,
         };
         let f1 = epoch_f1(&refs, &table_num_vars, config, &statement_bytes, &text, &[]);
+        // ★ sh1's OWN summary line, verbatim in format, so this run can be
+        // diffed against `sh1-epoch-shapes-2026-09-18.log` line for line. It is
+        // here because sh1's per-epoch layout does NOT predict wt3's per-wrap
+        // instruction counts — sh1 gives epoch 12 six more chain rounds than
+        // epoch 0 while wt3's wrap 12 reads 44,669 FEWER instructions than its
+        // wrap 0 — and only a run that computes the shapes and the form in ONE
+        // walk can say whether the two logs describe the same epochs.
+        let (slayouts, _sd) = stacks(&shapes, &epoch_groups(shapes.len()), &config)
+            .expect("the epoch's groups stack");
+        let epoch_cells: u64 = shapes.iter().map(|&(w, v)| (w as u64) << v).sum();
+        let s_chains: usize = slayouts.iter().map(StackedLayout::num_polys).sum();
+        let s_rounds: usize = slayouts
+            .iter()
+            .map(|l| l.num_polys() * l.n_stack().div_ceil(config.log_folding))
+            .sum();
+        println!(
+            "epoch {:>2}: tables {:>2} cells {:>12} | group0 n_stack {:>2} polys {:>2} | bookend \
+             n_stack {:>2} polys {:>2} | chains {:>2} rounds {:>3} | Q {}",
+            prepared.index,
+            shapes.len(),
+            epoch_cells,
+            slayouts[0].n_stack(),
+            slayouts[0].num_polys(),
+            slayouts[1].n_stack(),
+            slayouts[1].num_polys(),
+            s_chains,
+            s_rounds,
+            config.num_queries,
+        );
+
         census.push(BlockEpochShape {
             index: prepared.index,
             tables: shapes.len(),
@@ -1106,5 +1137,303 @@ fn the_block_f1_at_every_epoch_shape() {
     assert!(
         !census.is_empty(),
         "a block walk must cover at least one epoch"
+    );
+}
+
+/// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(name, width, vars)`
+/// per table in sub-proof order.
+///
+/// ⚠ A FIXTURE READ FROM A BOX RUN, transcribed from
+/// `thoughts/shared/whir-recursion/handoffs/sh1-epoch-shapes-2026-09-18.log`
+/// (`whir_epoch_shapes` at `a3b128db` on FAST, guest ethrex
+/// `8f826601…ec80a`, input `ethrex_mainnet_25368371` `573004e6…`). The widths
+/// are the AIRs' and the heights the proof's.
+///
+/// ⛔ sh1 prints this for EPOCH 0 ONLY — its printer is gated on the epoch index
+/// — which is why [`the_block_f1_at_every_epoch_shape`] exists.
+fn sh1_epoch_zero() -> Vec<(&'static str, usize, usize)> {
+    vec![
+        ("BITWISE", 21, 20),
+        ("DECODE", 6, 20),
+        ("COMMIT", 19, 2),
+        ("KECCAK", 511, 2),
+        ("KECCAK_RND", 1480, 2),
+        ("KECCAK_RC", 10, 5),
+        ("ECSM", 667, 2),
+        ("ECDAS", 521, 2),
+        ("HINT", 41, 2),
+        ("REGISTER", 5, 7),
+        ("CPU[0]", 38, 19),
+        ("CPU[1]", 38, 19),
+        ("CPU[2]", 38, 19),
+        ("CPU[3]", 38, 19),
+        ("LT[0]", 17, 19),
+        ("LT[1]", 17, 19),
+        ("SHIFT[0]", 29, 18),
+        ("MEMW[0]", 49, 17),
+        ("MEMW_A[0]", 29, 19),
+        ("MEMW_A[1]", 29, 16),
+        ("LOAD[0]", 18, 19),
+        ("MUL[0]", 26, 11),
+        ("DVRM[0]", 34, 2),
+        ("BRANCH[0]", 14, 17),
+        ("MEMW_R[0]", 10, 20),
+        ("MEMW_R[1]", 10, 20),
+        ("MEMW_R[2]", 10, 20),
+        ("MEMW_R[3]", 10, 20),
+        ("MEMW_R[4]", 10, 18),
+        ("EQ[0]", 12, 13),
+        ("BYTEWISE[0]", 26, 17),
+        ("STORE[0]", 16, 19),
+        ("CPU32[0]", 38, 10),
+        ("l2g bookend", 9, 21),
+    ]
+}
+
+/// ★★★ THE TERMS OF THE PRODUCTION SHAPE THAT NEED NO AIRs — evaluated at the
+/// block's epoch 0, card-free, in milliseconds.
+///
+/// The commitment groups, their chains and the arena those chains occupy are
+/// functions of `(width, num_vars)`, `epoch_groups`, `chain_config` and
+/// `stacks` alone. No AIR, no proof, no card enters any of them — which means
+/// the DOMINANT term of a WHIR wrap can be put on the record from a shape log
+/// rather than from a box slot.
+///
+/// ⛔ WHAT THIS DOES NOT COVER, so no number from it is read as a total: the
+/// per-table walk's arithmetic and its share of the arena (both need the AIRs'
+/// constraint DAGs and buses), the alpha ladder, and the pool. Those are
+/// [`the_block_f1_at_every_epoch_shape`]'s, at all fifteen shapes.
+///
+/// ★ It ASSERTS sh1's own printed layout before counting anything — two groups,
+/// `n_stack` 25, seven polynomials and one, Q 112, eight chains, 56 rounds — so
+/// a reconstruction that misses the box's layout fails loudly instead of
+/// censusing a different epoch. That is V1g's rule, kept.
+#[test]
+fn the_production_chain_terms_at_epoch_zero() {
+    use crate::multilinear_prove::chain_config;
+    use multilinear::stacking::StackedLayout;
+
+    let census = sh1_epoch_zero();
+    let shapes: Vec<(usize, usize)> = census.iter().map(|&(_, w, v)| (w, v)).collect();
+    assert_eq!(shapes.len(), 34, "epoch 0 is 34 tables (sh1)");
+
+    let sizes = epoch_groups(shapes.len());
+    assert_eq!(sizes, vec![33, 1], "the bookend is committed alone");
+    let config = chain_config(&shapes);
+    assert_eq!(config.num_queries, 112, "sh1: Q 112");
+    let (layouts, _domains) = stacks(&shapes, &sizes, &config).expect("the epoch's stacks build");
+    assert_eq!(layouts.len(), 2, "two commitment groups");
+    assert_eq!(layouts[0].n_stack(), 25, "sh1: group0 n_stack 25");
+    assert_eq!(layouts[0].num_polys(), 7, "sh1: group0 polys 7");
+    assert_eq!(layouts[1].n_stack(), 25, "sh1: bookend n_stack 25");
+    assert_eq!(layouts[1].num_polys(), 1, "sh1: bookend polys 1");
+
+    let shape = ChainShape::new(&config, 25);
+    let rounds = shape.rounds();
+    let chains: usize = layouts.iter().map(StackedLayout::num_polys).sum();
+    assert_eq!(chains, 8, "sh1: chains 8");
+    assert_eq!(chains * rounds, 56, "sh1: rounds 56");
+
+    // The DECODE prepared group: five columns at twenty variables, one stacked
+    // polynomial, at its own config — the one `EpochPlan::build` derives.
+    let decode_config = decode_prepared_config(5, 20);
+    let (decode_layouts, _dd) =
+        stacks(&[(5usize, 20usize)], &[1], &decode_config).expect("DECODE's prepared group stacks");
+    let decode_shape = ChainShape::new(&config, decode_layouts[0].n_stack());
+
+    let per_chain_rows = super::whir_chain::chain_shape_rows(&shape);
+    let per_chain_words = RoundStorage::words(&shape) as usize;
+    let chain_rows = chains * per_chain_rows;
+    let chain_words = chains * (1 + per_chain_words);
+    let prepared_words =
+        decode_layouts[0].num_polys() * (1 + RoundStorage::words(&decode_shape) as usize);
+
+    // The epoch's own carried roots: one word per polynomial of every group.
+    let carried = chains;
+    let closure = closure_rows(shapes.len(), 0);
+
+    println!("== epoch 0 of block 25368371, the terms that need no AIRs ==");
+    println!(
+        "   Q {} · rounds per chain {rounds} · chains {chains}",
+        config.num_queries
+    );
+    println!("   chain shape rows, per chain      {per_chain_rows:>10}");
+    println!("   chain shape rows, all chains     {chain_rows:>10}");
+    println!("   chain arena words, per chain     {per_chain_words:>10}");
+    println!("   chain arena words, all chains    {chain_words:>10}");
+    println!("   prepared arena words             {prepared_words:>10}");
+    println!("   carried root words               {carried:>10}");
+    println!("   closure (silent epoch)           {closure:>10}");
+    println!(
+        "   ⇒ chains' rows + chains' arena   {:>10}",
+        chain_rows + chain_words
+    );
+    // wt3 measured wrap 0 at 2,560,529 instructions, of which LFM_HINT was
+    // 375,421 and LFM_CONST 407. Printed as a RATIO rather than asserted,
+    // because the measurement is a box run's and this test is a laptop's.
+    const WT3_WRAP0_INSTRUCTIONS: usize = 2_560_529;
+    const WT3_WRAP0_HINT: usize = 375_421;
+    println!(
+        "   share of wt3 wrap 0's {WT3_WRAP0_INSTRUCTIONS} instructions: chains' rows {:.1}%, \
+         chains' arena {:.1}% of its {WT3_WRAP0_HINT} LFM_HINT",
+        100.0 * chain_rows as f64 / WT3_WRAP0_INSTRUCTIONS as f64,
+        100.0 * chain_words as f64 / WT3_WRAP0_HINT as f64,
+    );
+
+    // ⛔ A CHECK THAT CAN FAIL, and the reason it is here: the chains' rows are
+    // the largest single term of a WHIR wrap, so a form that silently returned
+    // something small would make every lever sized against it look decisive.
+    assert!(
+        chain_rows > WT3_WRAP0_INSTRUCTIONS / 2,
+        "the eight chains' shape rows are {chain_rows}, under half of wrap 0's \
+         measured {WT3_WRAP0_INSTRUCTIONS} — either the form or the shape is wrong"
+    );
+    assert!(
+        chain_words < WT3_WRAP0_HINT,
+        "the chains' arena words are {chain_words}, at or above the whole \
+         measured LFM_HINT of {WT3_WRAP0_HINT}, which leaves the 34 tables' own \
+         wires no room"
+    );
+}
+
+/// ★★★ THE LEVERS ON THE LARGEST TERM, SIZED — the chains' query openings at the
+/// block's epoch-0 shape, under each knob that moves them.
+///
+/// [`the_production_chain_terms_at_epoch_zero`] establishes that the eight
+/// chains are the dominant term of a WHIR wrap. This evaluates them under the
+/// knobs that set them, so a lever is sized against the term it binds rather
+/// than against the program as a whole.
+///
+/// ⛔ NONE OF THESE IS FREE, and each row's cost side is named in the printout:
+/// a bigger blowup buys fewer queries and costs the BASE prover a larger
+/// codeword; more grinding buys fewer queries and costs host search; a smaller
+/// security target is a POSTURE decision and Mauro's, not an optimisation.
+///
+/// ★ The one that is not a trade is the last: `ChainConfig::with_security`'s own
+/// doc says the count is "the conservative mirror of the parameters the repo
+/// already ships", that WHIR's per-round analysis "gets to use the
+/// out-of-domain point, which this ignores entirely", and — verbatim — "Doing
+/// that analysis is what would let the query count come down." So the largest
+/// term of the WHIR wrap is set by a query count the code itself calls
+/// conservative, and the lever on it is an ANALYSIS, not a parameter.
+#[test]
+fn the_chain_levers_sized_at_epoch_zero() {
+    use crate::multilinear_prove::chain_config;
+    use multilinear::stacking::StackedLayout;
+    use multilinear::whir_chain::GrindBits;
+
+    let census = sh1_epoch_zero();
+    let shapes: Vec<(usize, usize)> = census.iter().map(|&(_, w, v)| (w, v)).collect();
+    let sizes = epoch_groups(shapes.len());
+    let shipped = chain_config(&shapes);
+    assert_eq!(shipped.num_queries, 112, "sh1: Q 112");
+    assert_eq!(shipped.log_blowup, 2, "the shipped posture is blowup 4");
+    assert_eq!(
+        shipped.log_folding, 4,
+        "the shipped posture folds four a round"
+    );
+    let (layouts, _d) = stacks(&shapes, &sizes, &shipped).expect("the epoch's stacks build");
+    let chains: usize = layouts.iter().map(StackedLayout::num_polys).sum();
+    assert_eq!(chains, 8, "sh1: chains 8");
+    let n_stack = layouts[0].n_stack();
+
+    let base_shape = ChainShape::new(&shipped, n_stack);
+    let base_rows = chains * super::whir_chain::chain_shape_rows(&base_shape);
+    let base_words = chains * (1 + RoundStorage::words(&base_shape) as usize);
+    let base = base_rows + base_words;
+
+    // wt3's wrap 0, measured on FAST at bad7caca. Quoted, never asserted: a box
+    // run's number does not belong in a laptop test's assertion.
+    const WT3_WRAP0_INSTRUCTIONS: usize = 2_560_529;
+
+    println!("== the chains at epoch 0, under each knob that sets them ==");
+    println!(
+        "   shipped: blowup 2^{} · fold {} · Q {} · rounds {} ⇒ {base_rows} rows + {base_words} \
+         arena words = {base} of wt3 wrap 0's {WT3_WRAP0_INSTRUCTIONS}",
+        shipped.log_blowup,
+        shipped.log_folding,
+        shipped.num_queries,
+        base_shape.rounds(),
+    );
+    println!(
+        "{:<34} {:>4} {:>4} {:>7} {:>12} {:>12} {:>9}",
+        "knob", "Q", "rnds", "per-ch", "chain rows", "arena words", "vs base"
+    );
+    let row = |label: &str, cfg: &multilinear::whir_chain::ChainConfig| {
+        let shape = ChainShape::new(cfg, n_stack);
+        let rows = chains * super::whir_chain::chain_shape_rows(&shape);
+        let words = chains * (1 + RoundStorage::words(&shape) as usize);
+        println!(
+            "{label:<34} {:>4} {:>4} {:>7} {rows:>12} {words:>12} {:>8.1}%",
+            cfg.num_queries,
+            shape.rounds(),
+            super::whir_chain::chain_shape_rows(&shape),
+            100.0 * ((rows + words) as f64 - base as f64) / base as f64,
+        );
+    };
+    for bits in [128u8, 120, 112, 100] {
+        row(
+            &format!("security {bits} (posture, Mauro's)"),
+            &multilinear::whir_chain::ChainConfig::with_security(
+                2,
+                4,
+                n_stack,
+                bits,
+                GrindBits::uniform(20),
+            ),
+        );
+    }
+    for blowup in [2usize, 3, 4] {
+        row(
+            &format!("blowup 2^{blowup} (costs the BASE)"),
+            &multilinear::whir_chain::ChainConfig::with_security(
+                blowup,
+                4,
+                n_stack,
+                128,
+                GrindBits::uniform(20),
+            ),
+        );
+    }
+    for fold in [4usize, 5, 6] {
+        row(
+            &format!("fold {fold} (bigger blocks per query)"),
+            &multilinear::whir_chain::ChainConfig::with_security(
+                2,
+                fold,
+                n_stack,
+                128,
+                GrindBits::uniform(20),
+            ),
+        );
+    }
+    for grind in [20u8, 24, 28] {
+        row(
+            &format!("grind {grind} (costs HOST search)"),
+            &multilinear::whir_chain::ChainConfig::with_security(
+                2,
+                4,
+                n_stack,
+                128,
+                GrindBits::uniform(grind),
+            ),
+        );
+    }
+
+    // ⛔ A CHECK THAT CAN FAIL: the shipped row must be reproduced by the ladder
+    // at its own knobs, or the ladder is describing a different protocol from
+    // the one the block ran.
+    let reproduced = multilinear::whir_chain::ChainConfig::with_security(
+        shipped.log_blowup,
+        shipped.log_folding,
+        n_stack,
+        128,
+        GrindBits::uniform(20),
+    );
+    assert_eq!(
+        reproduced.num_queries, shipped.num_queries,
+        "the ladder's own 128-bit / blowup-4 / fold-4 row must be the shipped \
+         posture's {} queries",
+        shipped.num_queries
     );
 }
