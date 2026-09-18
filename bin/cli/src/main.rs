@@ -1173,6 +1173,17 @@ fn run_approach_1(
         println!("  pass 5 (open)      {:>8.2}s", t_open.as_secs_f64());
         report_span_totals();
         report_batched_size(&proof, tables, groups);
+        if verify {
+            let started = std::time::Instant::now();
+            match prover::batched_verifier::verify(&proof, elf_bytes, options) {
+                Ok(true) => println!(
+                    "Batched proof verifies: {tables} tables in {groups} groups, {:.3}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Ok(false) => return Err("batched proof REJECTED by the verifier".into()),
+                Err(e) => return Err(format!("batched proof verification error: {e}")),
+            }
+        }
         return Ok((tables, None));
     }
 

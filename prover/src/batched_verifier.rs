@@ -13,11 +13,16 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
+use log::error;
 use math::field::element::FieldElement;
+use stark::batched_verifier::BatchedGroup;
+use stark::proof::options::ProofOptions;
+use stark::proof::stark::StarkProof;
 
 use crate::Error;
 use crate::logup_phase::BatchedProof;
-use crate::tables::types::GoldilocksExtension;
+use crate::tables::trace_builder::Traces;
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 /// Every challenge a batched proof's verification needs, derived from the proof.
 pub struct Replay {
@@ -105,4 +110,183 @@ pub fn replay(
         coefficients,
         iotas: Vec::new(),
     })
+}
+
+/// Verify a batched proof of `elf_bytes`.
+///
+/// The VM half — the statement, the AIRs rebuilt from the layout the proof
+/// declares, the preprocessed roots, the LogUp bus balance — is here; every
+/// table's rounds after round 1 and each group's FRI are
+/// [`stark::batched_verifier::verify_batched`].
+pub fn verify(
+    proof: &BatchedProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
+    let table_counts = &proof.table_counts;
+    table_counts.validate()?;
+    let n = proof.tables.len();
+    if proof.openings.len() != n || proof.group_of.len() != n || proof.fold_order.len() != n {
+        return Err(Error::InvalidTableCounts(format!(
+            "batched proof: {n} tables, {} openings, {} group slots, {} fold entries",
+            proof.openings.len(),
+            proof.group_of.len(),
+            proof.fold_order.len()
+        )));
+    }
+    let elf = executor::elf::Elf::load(elf_bytes)
+        .map_err(|e| Error::Prover(format!("batched verify: ELF: {e}")))?;
+    let num_private_input_pages = proof
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let max_pages = crate::tables::page::max_private_input_pages();
+    if num_private_input_pages > max_pages {
+        return Err(Error::InvalidTableCounts(format!(
+            "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",
+        )));
+    }
+    let runtime_page_ranges =
+        crate::tables::trace_builder::runtime_page_ranges(&proof.page_configs);
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &elf,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        n,
+    )?;
+    let expected = table_counts.total() + crate::FIXED_TABLE_COUNT + page_configs.len();
+    if expected != n {
+        return Err(Error::InvalidTableCounts(format!(
+            "table_counts total ({}) + {} fixed + {} pages = {expected}, but the proof has {n} tables",
+            table_counts.total(),
+            crate::FIXED_TABLE_COUNT,
+            page_configs.len(),
+        )));
+    }
+    let vm_airs = crate::VmAirs::new(
+        &elf,
+        proof_options,
+        false,
+        &page_configs,
+        table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let airs = vm_airs.air_refs();
+    if airs.len() != n {
+        error!("batched verify: {} AIRs for {n} tables", airs.len());
+        return Ok(false);
+    }
+
+    let mut transcript = DefaultTranscript::<GoldilocksExtension>::new(&[]);
+    crate::statement::absorb_statement(
+        &mut transcript,
+        crate::statement::StatementKind::Monolithic,
+        elf_bytes,
+        &proof.public_output,
+        table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+    // Round 1, in AIR order. A preprocessed table's precomputed root is the
+    // AIR's constant, not the prover's word.
+    for (idx, (air, t)) in airs.iter().zip(proof.tables.iter()).enumerate() {
+        if air.is_preprocessed() {
+            let expected = air.precomputed_commitment();
+            match t.precomputed_root {
+                Some(actual) if actual == expected => {}
+                _ => {
+                    error!("batched verify: table {idx}'s precomputed root is not the AIR's");
+                    return Ok(false);
+                }
+            }
+            transcript.append_bytes(&expected);
+        } else if t.precomputed_root.is_some() {
+            error!("batched verify: table {idx} carries a precomputed root it should not");
+            return Ok(false);
+        }
+        transcript.append_bytes(&t.main_root);
+    }
+    let logup: Vec<FieldElement<GoldilocksExtension>> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
+        .map(|_| transcript.sample_field_element())
+        .collect();
+
+    // Every interacting table contributes to the bus, no other does, and the
+    // contributions balance against the public output.
+    for (idx, (air, t)) in airs.iter().zip(proof.tables.iter()).enumerate() {
+        if air.has_trace_interaction() != t.bus_public_inputs.is_some() {
+            error!("batched verify: table {idx}'s bus inputs do not match its AIR");
+            return Ok(false);
+        }
+    }
+    let Some(expected_balance) = crate::compute_commit_bus_offset(
+        &proof.public_output,
+        0,
+        &logup[0],
+        &logup[stark::lookup::LOGUP_CHALLENGE_ALPHA],
+    ) else {
+        error!("batched verify: the public output has no bus balance");
+        return Ok(false);
+    };
+    let mut total = FieldElement::<GoldilocksExtension>::zero();
+    for (air, t) in airs.iter().zip(proof.tables.iter()) {
+        if air.has_trace_interaction()
+            && let Some(ref bpi) = t.bus_public_inputs
+        {
+            total += bpi.table_contribution;
+        }
+    }
+    if total != expected_balance {
+        error!("batched verify: LogUp bus does not balance");
+        return Ok(false);
+    }
+
+    // Each table as the ordinary verifier reads one, with the FRI left empty.
+    let tables: Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>> = proof
+        .tables
+        .iter()
+        .zip(proof.openings.iter())
+        .map(|(t, opening)| StarkProof {
+            trace_length: t.trace_rows,
+            lde_trace_main_merkle_root: t.main_root,
+            lde_trace_aux_merkle_root: t.aux_root,
+            lde_trace_precomputed_merkle_root: t.precomputed_root,
+            trace_ood_evaluations: t.trace_ood.clone(),
+            trace_ood_next_evaluations: t.trace_ood_next.clone(),
+            composition_poly_root: t.composition_poly_root,
+            composition_poly_parts_ood_evaluation: t.parts_ood.clone(),
+            fri_layers_merkle_roots: Vec::new(),
+            fri_final_poly_coeffs: Vec::new(),
+            query_list: Vec::new(),
+            deep_poly_openings: opening.clone(),
+            nonce: None,
+            bus_public_inputs: t.bus_public_inputs.clone(),
+            public_inputs: (),
+        })
+        .collect();
+    let blowup = proof_options.blowup_factor as usize;
+    let groups: Vec<BatchedGroup<'_, GoldilocksExtension>> = proof
+        .groups
+        .iter()
+        .map(|(lde_size, fri)| BatchedGroup {
+            trace_rows: lde_size / blowup,
+            fri,
+        })
+        .collect();
+    let public_inputs = vec![(); n];
+    Ok(stark::batched_verifier::verify_batched(
+        &airs,
+        &public_inputs,
+        &tables,
+        &proof.group_of,
+        &groups,
+        &proof.fold_order,
+        &transcript,
+        &logup,
+    ))
 }

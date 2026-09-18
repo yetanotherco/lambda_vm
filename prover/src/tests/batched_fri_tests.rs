@@ -534,3 +534,111 @@ fn the_verifier_replays_the_provers_challenges() {
         "two tables got the same fold coefficient"
     );
 }
+
+fn batched_proof_of_fib() -> (
+    Vec<u8>,
+    stark::proof::options::ProofOptions,
+    crate::logup_phase::BatchedProof,
+) {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let batched = crate::logup_phase::run_batched(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("batched phase");
+    let opened =
+        crate::logup_phase::run_open(&elf, &[], &max_rows, &proof_options, &challenge, &batched)
+            .expect("open pass");
+    let proof = crate::logup_phase::assemble_batched_proof(batched, opened).expect("assemble");
+    (elf_bytes, proof_options, proof)
+}
+
+/// The whole thing, from nothing but the proof, the program and the options.
+#[test]
+fn the_batched_proof_verifies() {
+    let (elf_bytes, proof_options, proof) = batched_proof_of_fib();
+    assert!(
+        crate::batched_verifier::verify(&proof, &elf_bytes, &proof_options).expect("verify"),
+        "the batched proof does not verify"
+    );
+}
+
+/// Each part the verifier reads, changed on its own, is caught — and the
+/// untouched proof still passes afterwards, so it is the change that was caught.
+#[test]
+fn a_tampered_batched_proof_is_rejected() {
+    let (elf_bytes, proof_options, mut proof) = batched_proof_of_fib();
+    let one = math::field::element::FieldElement::<GoldilocksExtension>::one();
+    let rejected = |proof: &crate::logup_phase::BatchedProof, what: &str| {
+        assert!(
+            !matches!(
+                crate::batched_verifier::verify(proof, &elf_bytes, &proof_options),
+                Ok(true)
+            ),
+            "{what} was not caught"
+        );
+    };
+    let accepted = |proof: &crate::logup_phase::BatchedProof| {
+        assert!(
+            crate::batched_verifier::verify(proof, &elf_bytes, &proof_options).expect("verify"),
+            "the untouched proof no longer verifies"
+        );
+    };
+
+    // A composition part at z.
+    let orig = proof.tables[0].parts_ood[0];
+    proof.tables[0].parts_ood[0] = &orig + &one;
+    rejected(&proof, "a composition part at z");
+    proof.tables[0].parts_ood[0] = orig;
+    accepted(&proof);
+
+    // An opened value.
+    let orig = proof.openings[0][0].composition_poly.evaluations[0];
+    proof.openings[0][0].composition_poly.evaluations[0] = &orig + &one;
+    rejected(&proof, "an opened composition value");
+    proof.openings[0][0].composition_poly.evaluations[0] = orig;
+    accepted(&proof);
+
+    // The fold order.
+    proof.fold_order.swap(0, 1);
+    rejected(&proof, "a swapped fold order");
+    proof.fold_order.swap(0, 1);
+    accepted(&proof);
+
+    // A group's final polynomial.
+    let orig = proof.groups[0].1.final_poly_coeffs[0];
+    proof.groups[0].1.final_poly_coeffs[0] = &orig + &one;
+    rejected(&proof, "a final polynomial coefficient");
+    proof.groups[0].1.final_poly_coeffs[0] = orig;
+    accepted(&proof);
+
+    // A group's query index.
+    proof.groups[0].1.iotas[0] ^= 1;
+    rejected(&proof, "a query index");
+    proof.groups[0].1.iotas[0] ^= 1;
+    accepted(&proof);
+
+    // The public output, which the statement binds.
+    proof.public_output.push(0);
+    rejected(&proof, "a longer public output");
+    proof.public_output.pop();
+    accepted(&proof);
+
+    // The layout.
+    proof.table_counts.cpu += 1;
+    rejected(&proof, "a layout with one more CPU chunk");
+    proof.table_counts.cpu -= 1;
+    accepted(&proof);
+}

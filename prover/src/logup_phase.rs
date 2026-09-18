@@ -351,6 +351,8 @@ pub struct Batched {
     /// table depends on every table folded before it, so the verifier has to
     /// replay this order and the proof carries it.
     pub fold_order: Vec<usize>,
+    /// The chunk layout, which the verifier needs to rebuild the AIRs.
+    pub table_counts: crate::TableCounts,
     /// Per table, by AIR index: its composition parts over the LDE domain when
     /// the fold pass kept them (`A1_KEEP_COMPOSITION`), taken by the Open pass.
     pub composition_ldes: Vec<std::sync::Mutex<Option<CompositionLde>>>,
@@ -660,6 +662,7 @@ pub fn run_batched(
         groups,
         members,
         group_of,
+        table_counts: challenge.order.counts().clone(),
         composition_ldes,
         resident,
     })
@@ -903,6 +906,8 @@ pub fn run_open(
 pub struct BatchedProof {
     /// Per table, in AIR order.
     pub tables: Vec<TablePublic>,
+    /// The chunk layout the tables follow; the verifier rebuilds the AIRs from it.
+    pub table_counts: crate::TableCounts,
     /// Per table, in AIR order: its rows at its group's indices.
     pub openings: Vec<Open>,
     /// Which group each table belongs to.
@@ -931,6 +936,7 @@ pub fn assemble_batched_proof(batched: Batched, opened: Opened) -> Result<Batche
     }
     Ok(BatchedProof {
         tables: batched.tables,
+        table_counts: batched.table_counts,
         fold_order: batched.fold_order,
         openings: opened.openings,
         group_of: batched.group_of,
