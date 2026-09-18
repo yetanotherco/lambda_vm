@@ -73,6 +73,7 @@ pub mod whir_poly;
 pub mod whir_program;
 pub mod whir_reduce;
 pub mod whir_stacked;
+pub mod whir_statement;
 pub mod whir_table;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
@@ -162,6 +163,8 @@ mod whir_program_tests;
 mod whir_reduce_tests;
 #[cfg(test)]
 mod whir_stacked_tests;
+#[cfg(test)]
+mod whir_statement_tests;
 #[cfg(test)]
 mod whir_table_tests;
 #[cfg(test)]
