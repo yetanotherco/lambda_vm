@@ -528,6 +528,273 @@ fn emit_expected(
 }
 
 // =============================================================================
+// The published aggregation set
+// =============================================================================
+
+/// Rows the L2G field costs that are not publishes: ONE `Unpack`.
+///
+/// The schema wants one published WORD per lane of the bookend's root, and the
+/// emitter holds that root as the single four-lane word
+/// [`super::algebraic_commit::commitment_to_digest`] packs it into, so the four
+/// lanes are one unpack away. Named because [`publish_rows`] would otherwise be
+/// the published-word count plus an unexplained one.
+const UNPACK_ROWS: usize = 1;
+
+/// How many polynomials the local-to-global bookend's own commitment group
+/// holds.
+///
+/// One, and `SchemaLayout::wrap`'s `l2g_words = lanes_per_root()` is written for
+/// exactly one root's lanes. A MEASURED property of the block rather than a
+/// structural certainty — W1f read all fifteen of block 25368371's bookends at
+/// `polys 1` — so [`whir_epoch_program`] asserts it instead of assuming it.
+///
+/// ⚠ Deliberately NOT spelled [`DECODE_GROUP_POLYS`]. Both are one today and
+/// they are different facts about different groups; one constant for the two
+/// would make a change to either read as a change to both.
+const L2G_GROUP_POLYS: usize = 1;
+
+/// Everything one epoch's wrap publishes, gathered so the emission ORDER is one
+/// readable run instead of six call sites.
+///
+/// ⚠ THE ORDER IS THE CONTRACT, and it is
+/// [`super::per_table_aggregator::SchemaLayout::wrap`]'s. An aggregation node
+/// reads a child by INDEX — `layout.reg_fini(r)`, `layout.label(i)` — so a field
+/// inserted, dropped or transposed here silently re-binds every field the node
+/// reads below it. Append only, and extend the layout in the same commit.
+///
+/// Position, unlike order, is free: a publish emits `Instr::Public` and moves no
+/// transcript operation, so this whole run is emitted at the end of
+/// [`whir_epoch_program`] where all four wires are in scope. The STARK wrap
+/// interleaves the same words with its Phase A and its closure
+/// (`epoch_tests.rs:1851-2062`); the two agree on what a node reads, which is
+/// the only thing that has to agree.
+///
+/// # ⛔ Five of these fields are PROGRAM TEXT, and that is not a weakening
+///
+/// The STARK wrap publishes arena cells, bound through Phase A and the REGISTER
+/// preprocessed derivation. Here the same values are constants, and each is
+/// already bound by the verification this program IS:
+///
+/// - `register_init` and `reg_fini` are exactly the two vectors `epoch_airs_for`
+///   builds REGISTER's preprocessed columns from, and those columns reach the
+///   program on the constant-MLE route, where `check_preprocessed` compares them
+///   against REGISTER's claimed column values at its own reduced point.
+///   `register_init[X254_INDEX]` is additionally the closure's COMMIT-bus start
+///   index, so the carried commit index is the same value twice over.
+/// - `label` and `public_output` are interned by
+///   [`super::whir_statement::emit_epoch_statement`] and seed the transcript, so
+///   a different value is a different `z` and the honest proof stops executing.
+/// - `program_id` is a fold of the first two plus the ELF digest and the DECODE
+///   root, all of which are already program text.
+///
+/// The four WIRES — `z`, `alpha`, `l2g_root`, `balance` — are the four that
+/// could not be constants: two challenges the machine derives, one root the
+/// prover supplied and the transcript absorbed, and one value the closure
+/// computed.
+pub struct EpochPublishes<'a> {
+    /// The shared LogUp challenge, from the roots block.
+    pub z: Ext,
+    /// Its partner, from the same block.
+    pub alpha: Ext,
+    /// The five fields that are program text — see [`PublishedText`].
+    pub text: PublishedText<'a>,
+    /// The bookend group's single carried root, as the ONE arena word the
+    /// program hinted it from. Published as its four LANES, one per word, which
+    /// is the shape `per_table_aggregator::digest_from_lanes` reads back.
+    pub l2g_root: Cell,
+    /// The closure's bus balance — the tail word, which the STARK wrap
+    /// publishes last too.
+    pub balance: Ext,
+}
+
+/// The published fields that are PROGRAM TEXT, separated from the wires because
+/// the separation is the claim.
+///
+/// Everything here is known before a builder exists, so the pool contribution
+/// ([`publish_constants`]) is a function of this alone and can be named without
+/// emitting anything. Everything NOT here is a wire, and there are exactly four
+/// of them.
+pub struct PublishedText<'a> {
+    /// [`epoch_program_id`] — the attestation fold, evaluated at emit time
+    /// because every one of its inputs is program text.
+    pub program_id: [u8; 32],
+    /// `position.register_init`, this epoch's INIT vector.
+    pub register_init: &'a [u32],
+    /// `proof.reg_fini`, the vector the NEXT epoch takes as its INIT.
+    pub reg_fini: &'a [u32],
+    /// `position.label`.
+    pub label: u64,
+    /// `public_output()` — its length decides `out_halves` and therefore the
+    /// whole published count.
+    pub public_output: &'a [u8],
+}
+
+/// The attestation id an epoch's wrap publishes.
+///
+/// ⛔ THE THIRD INPUT IS [`WhirRealEpoch::decode_prepared_roots`], NOT
+/// `decode_commitment`. The two are different commitments with confusable names
+/// and only one of them this program checks: the multilinear path never compares
+/// `decode_commitment` (`the_supplied_decode_commitment_is_the_one_carried`
+/// passes a deliberately bogus one and the epoch still verifies), while the
+/// prepared roots are what `absorb_roots_and_challenge` absorbs and what the
+/// prepared opening is checked against. An id folded over a value nothing
+/// constrains would attest to nothing.
+///
+/// ⚠ CONSEQUENCE, stated rather than hidden: a WHIR wrap's id therefore differs
+/// from the STARK wrap's id for the same epoch, because the two programs bind
+/// different DECODE commitments. Nothing compares them across families —
+/// `per_table_aggregator::emit_chain_bindings` asserts only that a node's own
+/// children share ONE id — and a tree of WHIR wraps agrees with itself.
+///
+/// The page list is EMPTY BY CONSTRUCTION, not by choice: `prove_epoch` refuses
+/// an epoch carrying any PAGE config and both `build_epoch_airs` call sites pass
+/// `&[]` (`epoch_tests.rs:1175-1183`).
+pub fn epoch_program_id(epoch: &WhirRealEpoch) -> [u8; 32] {
+    assert_eq!(
+        epoch.decode_prepared_roots.len(),
+        DECODE_GROUP_POLYS,
+        "the prepared DECODE group is one polynomial, so the id folds one root; \
+         a group split into {} has no unambiguous input here",
+        epoch.decode_prepared_roots.len()
+    );
+    crate::recursion::program_id_from_digest(
+        &epoch.elf_digest,
+        epoch.pc_start,
+        &epoch.decode_prepared_roots[0],
+        &[],
+    )
+}
+
+/// Bytes as the `u32` halves a published byte string is read in: four
+/// little-endian bytes each, the last zero-padded.
+///
+/// One function for the id, the label and the public output, because they are
+/// one convention — `epoch_tests.rs:2109-2117` packs all three this way and
+/// `epoch_tests.rs:2209` reads a published digest back the same way. Three
+/// spellings of it is how a field ends up read at the wrong stride.
+pub fn byte_halves(bytes: &[u8]) -> Vec<FE> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            FE::from(u64::from(u32::from_le_bytes(w)))
+        })
+        .collect()
+}
+
+/// The published words that are PROGRAM TEXT, in emission order — one
+/// contiguous run from `id[0]` to the last output half.
+///
+/// The emitter interns exactly this list and [`publish_constants`] names exactly
+/// this list, so the F1's pool is named BY CONSTRUCTION rather than by a second
+/// walk that has to be kept in step with the first.
+fn publish_constant_words(p: &PublishedText<'_>) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = Vec::new();
+    // The attestation id, as a node reads it: eight halves, FOUR TO A WORD.
+    let id = byte_halves(&p.program_id);
+    assert_eq!(
+        id.len(),
+        2 * super::word::WORD_LANES,
+        "a digest is 32 bytes"
+    );
+    for chunk in id.chunks(super::word::WORD_LANES) {
+        words.push([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    for value in p.register_init.iter().chain(p.reg_fini) {
+        words.push(super::word::base_word(FE::from(u64::from(*value))));
+    }
+    for half in byte_halves(&p.label.to_le_bytes()) {
+        words.push(super::word::base_word(half));
+    }
+    for half in byte_halves(p.public_output) {
+        words.push(super::word::base_word(half));
+    }
+    words
+}
+
+/// The ONE pool's contribution from the published set, by value and DISTINCT.
+///
+/// `LfmBuilder::word_const` interns on the canonical word, so a register value
+/// that repeats — and zero repeats a great deal in a register boundary vector —
+/// costs one `LFM_CONST` row for the whole set, not one per publish.
+pub fn publish_constants(p: &PublishedText<'_>) -> Vec<LfmWord> {
+    let mut out: Vec<LfmWord> = Vec::new();
+    for word in publish_constant_words(p) {
+        if !out.contains(&word) {
+            out.push(word);
+        }
+    }
+    out
+}
+
+/// F1 for the published set, CONST-FREE: one `Public` per published word, plus
+/// the single `Unpack` the L2G lanes cost.
+///
+/// The published-word count is the layout's own accessor rather than `145 +
+/// out_halves`, because a literal here and a layout there is precisely how a
+/// node comes to read the wrong field.
+pub fn publish_rows(out_halves: usize) -> usize {
+    super::per_table_aggregator::SchemaLayout::wrap(out_halves).total() + UNPACK_ROWS
+}
+
+/// ★★ THE PUBLISHED AGGREGATION SET, emitted — what makes this program a level-0
+/// CHILD rather than a verifier that convinces nobody above it.
+///
+/// ⚠ THE ORDER IS THE CONTRACT AND THE POSITION IS FREE. A node indexes a child
+/// by `layout.reg_fini(r)`, so the sequence below is load-bearing to the word;
+/// but a publish emits `Instr::Public` and moves no transcript operation, so
+/// WHERE this run sits in the program is a readability choice. The STARK wrap
+/// interleaves the same words with its Phase A and its closure
+/// (`epoch_tests.rs:1851-2062`) and this emits them in one run at the end. The
+/// two agree on what a node reads, which is the only thing that has to agree.
+///
+/// Returns the layout it emitted against, so a caller pins the count with
+/// `assert_covers` instead of a second count of its own.
+pub fn emit_epoch_publishes(
+    b: &mut LfmBuilder,
+    p: &EpochPublishes<'_>,
+) -> super::per_table_aggregator::SchemaLayout {
+    let out_halves = p.text.public_output.len().div_ceil(4);
+    let layout = super::per_table_aggregator::SchemaLayout::wrap(out_halves);
+    assert_eq!(
+        p.text.register_init.len(),
+        layout.num_reg,
+        "the INIT vector is one word per register word address"
+    );
+    assert_eq!(
+        p.text.reg_fini.len(),
+        layout.num_reg,
+        "the FINI vector is one word per register word address"
+    );
+    // ⛔ THE LANES-VERSUS-WORDS REFUSAL. `commitment_to_digest` packs a root into
+    // ONE word unconditionally, so on a byte-hash build the layout would want
+    // EIGHT published lanes out of a four-lane word and every field after the
+    // L2G run would shift. The `SchemaLayout` doc records the codebase being
+    // bitten by this twice; here it is a build failure.
+    assert_eq!(
+        layout.l2g_words,
+        super::word::WORD_LANES,
+        "this emitter holds a root as one four-lane word, and the schema wants \
+         {} published lanes for it",
+        layout.l2g_words
+    );
+
+    b.public(p.z.as_cell());
+    b.public(p.alpha.as_cell());
+    for word in publish_constant_words(&p.text) {
+        let cell = b.digest_const(word).as_cell();
+        b.public(cell);
+    }
+    let lanes = b.unpack(p.l2g_root);
+    for lane in lanes {
+        b.public(lane.as_cell());
+    }
+    b.public(p.balance.as_cell());
+    layout
+}
+
+// =============================================================================
 // The per-table walk
 // =============================================================================
 
@@ -1316,9 +1583,11 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         beta,
     );
 
-    // 4. The closure: the bus balance against the epoch's expected value.
+    // 4. The closure: the bus balance against the epoch's expected value. Its
+    //    balance is the published set's TAIL word, which is why the wires come
+    //    back rather than being dropped.
     let start_index = u64::from(epoch.position.register_init[crate::tables::register::X254_INDEX]);
-    emit_epoch_closure(
+    let closure = emit_epoch_closure(
         &mut b,
         &walk.outputs,
         epoch.public_output(),
@@ -1438,8 +1707,48 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
         at, total,
         "the program must hint exactly the words the arena writes"
     );
-    b.public(z.as_cell());
+
+    // 7. The published aggregation set — see [`EpochPublishes`] for the order
+    //    and for which fields are wires.
+    //
+    // ★ THE L2G ROOT IS THE BOOKEND GROUP'S, AND IT IS THE CARRIED WIRE. The
+    // bookend is committed in the LAST group, alone, so its roots are the tail
+    // of `proof.roots` — the rule `EpochProof::l2g_roots` states and the same
+    // rule `root_at` above walked to reach the last group's polynomials.
+    // Publishing the carried CELL rather than a constant is what makes this the
+    // epoch's own root: it is the word the roots block absorbed, so a prover who
+    // published something else would have absorbed something else and derived a
+    // different `z`.
+    let l2g_polys = plan
+        .group_layouts
+        .last()
+        .expect("an epoch has at least the bookend group")
+        .num_polys();
+    assert_eq!(
+        l2g_polys, L2G_GROUP_POLYS,
+        "the L2G bookend fits in ONE stacked polynomial, so the schema's l2g \
+         field covers one root's lanes; a bookend split into {l2g_polys} \
+         publishes a set this layout does not describe"
+    );
+    let layout = emit_epoch_publishes(
+        &mut b,
+        &EpochPublishes {
+            z,
+            alpha,
+            text: PublishedText {
+                program_id: epoch_program_id(epoch),
+                register_init: &epoch.position.register_init,
+                reg_fini: &epoch.proof.reg_fini,
+                label: epoch.position.label,
+                public_output: epoch.public_output(),
+            },
+            l2g_root: carried[carried.len() - l2g_polys],
+            balance: closure.balance,
+        },
+    );
+
     let program = super::compiler::compile(b.finish());
+    layout.assert_covers(program.public_len as usize);
     super::validator::validate(&program).expect("an epoch program must be admissible");
     program
 }

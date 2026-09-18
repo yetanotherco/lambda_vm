@@ -24,8 +24,9 @@ use super::validator::validate;
 use super::whir_chain::{ChainShape, chain_shape_rows};
 use super::whir_chain_tests::const_rows;
 use super::whir_epoch::{
-    closure_rows, emit_epoch_closure, emit_roots_block, epoch_group_costs, expected_rows,
-    group_columns, preprocessed_targets, roots_block_constants, roots_block_cost,
+    EpochPublishes, PublishedText, closure_rows, emit_epoch_closure, emit_epoch_publishes,
+    emit_roots_block, epoch_group_costs, expected_rows, group_columns, preprocessed_targets,
+    publish_constants, publish_rows, roots_block_constants, roots_block_cost,
 };
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, ext_word, word_as_ext};
@@ -1858,5 +1859,405 @@ fn the_epoch_program_executes_on_the_epoch_the_host_accepts() {
         arena[0].len(),
         super::whir_chain_tests::perm_rows(&program),
         exec.public_words.len(),
+    );
+}
+
+// =============================================================================
+// The published aggregation set
+// =============================================================================
+
+/// The host's `z` and `alpha` for a real epoch, drawn the way the VERIFIER draws
+/// them — the statement absorb, then the roots block over the carried roots and
+/// the PREPARED DECODE roots.
+///
+/// ★ A SECOND DERIVATION, not a read-back: this replays
+/// `multilinear_continuation::absorb_epoch` and
+/// `multilinear_table::absorb_roots_and_challenge` on a host transcript of the
+/// configuration's own hash, so the machine's published pair is compared against
+/// the host's function rather than against itself.
+fn host_epoch_challenges(
+    elf_bytes: &[u8],
+    proof: &crate::multilinear_continuation::EpochProof,
+    epoch: &super::whir_real_epoch::WhirRealEpoch,
+) -> (FEE, FEE) {
+    let mut transcript = HostTranscript::new(&[]);
+    crate::multilinear_continuation::absorb_epoch(
+        &mut transcript,
+        &crate::statement::elf_digest(elf_bytes),
+        &proof.public_output,
+        &proof.table_counts,
+        epoch.position.label,
+        &proof.table_num_vars,
+        &epoch.config,
+    );
+    let (z, alpha, _beta) = stark::multilinear_table::absorb_roots_and_challenge::<FEE3, _>(
+        &mut transcript,
+        &proof.proof.roots,
+        &epoch.decode_prepared_roots,
+    );
+    (z, alpha)
+}
+
+/// A published BASE word's value, with the three empty lanes ASSERTED.
+///
+/// A base publish is `(v, 0, 0, 0)` and the aggregator's `assert_word_is_const`
+/// reads it that way (`per_table_aggregator.rs:783`); a word that carried
+/// anything in lanes 1..4 would compare equal here and fail there.
+fn published_base(public: &[(u32, LfmWord)], at: usize, what: &str) -> u64 {
+    use math::field::traits::IsPrimeField;
+    let word = &public[at].1;
+    for (lane, value) in word.iter().enumerate().skip(1) {
+        assert_eq!(
+            GoldilocksField::canonical(value.value()),
+            0,
+            "{what}: lane {lane} of a base publish must be zero"
+        );
+    }
+    GoldilocksField::canonical(word[0].value())
+}
+
+/// A keccak digest published as TWO words starting at `at` — eight `u32`
+/// halves, four per word, each four bytes little-endian.
+///
+/// The same reading `epoch_tests.rs:2209` applies to the STARK wrap's id, and
+/// deliberately so: one convention, or a node reads the id at the wrong stride.
+fn published_id(public: &[(u32, LfmWord)], at: usize) -> [u8; 32] {
+    use math::field::traits::IsPrimeField;
+    let mut out = [0u8; 32];
+    for h in 0..8 {
+        let lane = public[at + h / 4].1[h % 4];
+        let half = GoldilocksField::canonical(lane.value()) as u32;
+        out[4 * h..4 * h + 4].copy_from_slice(&half.to_le_bytes());
+    }
+    out
+}
+
+/// A register boundary vector at production's width, with a value that REPEATS.
+///
+/// Zero repeats a great deal in a real boundary vector, and `word_const`
+/// interns, so a form that charged one constant per published register word
+/// would over-count. The fixture has to contain the repetition or the F1 cannot
+/// see that.
+fn a_register_vector(seed: u32) -> Vec<u32> {
+    (0..crate::tables::register::NUM_REGISTER_ADDRESSES as u32)
+        .map(|r| {
+            if r % 3 == 0 {
+                0
+            } else {
+                seed.wrapping_mul(r).wrapping_add(seed)
+            }
+        })
+        .collect()
+}
+
+/// The published set alone, on a fresh builder: its rows, its `LFM_CONST` rows
+/// and the constant words by value.
+///
+/// Both arms hint the same four wires and publish the same stand-in, so the
+/// hints and that publish cancel out of the subtraction and what is left is the
+/// leg.
+fn machine_publishes(
+    program_id: [u8; 32],
+    register_init: &[u32],
+    reg_fini: &[u32],
+    label: u64,
+    public_output: &[u8],
+    leg: bool,
+) -> (usize, usize, Vec<LfmWord>) {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(4);
+    let z = b.hint_word(arena, 0).as_ext();
+    let alpha = b.hint_word(arena, 1).as_ext();
+    let balance = b.hint_word(arena, 2).as_ext();
+    let l2g_root = b.hint_word(arena, 3);
+    b.public(l2g_root);
+    if leg {
+        emit_epoch_publishes(
+            &mut b,
+            &EpochPublishes {
+                z,
+                alpha,
+                text: PublishedText {
+                    program_id,
+                    register_init,
+                    reg_fini,
+                    label,
+                    public_output,
+                },
+                l2g_root,
+                balance,
+            },
+        );
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("the published set must be admissible");
+    let words: Vec<LfmWord> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            super::instr::Instr::Const { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect();
+    (program.instrs.len(), words.len(), words)
+}
+
+/// The shapes the published set is measured at: a silent epoch, the fixture's
+/// own output length, a length that does not divide four, and a block-scale one.
+fn publish_shapes() -> Vec<Vec<u8>> {
+    vec![
+        Vec::new(),
+        (0..12u8).collect(),
+        (0..13u8).collect(),
+        (0..64u8).map(|i| i.wrapping_mul(37)).collect(),
+    ]
+}
+
+/// ★ F1 for the published set: the emitted count equals the closed form, and
+/// the pool is NAMED.
+#[test]
+fn the_publishes_emit_their_closed_form() {
+    let init = a_register_vector(0x5EED_0001);
+    let fini = a_register_vector(0x5EED_0002);
+    let (program_id, _) = a_root(99);
+    for output in publish_shapes() {
+        let label = 0x0000_0007_0000_0003u64;
+        let (with_rows, with_consts, with_words) =
+            machine_publishes(program_id, &init, &fini, label, &output, true);
+        let (without_rows, without_consts, without_words) =
+            machine_publishes(program_id, &init, &fini, label, &output, false);
+        let measured = (with_rows - without_rows) - (with_consts - without_consts);
+        let out_halves = output.len().div_ceil(4);
+        let predicted = publish_rows(out_halves);
+        println!(
+            "publishes at {} output bytes ({out_halves} halves): {measured} rows emitted, \
+             {predicted} predicted",
+            output.len(),
+        );
+        assert_eq!(
+            measured,
+            predicted,
+            "{} output bytes: the emitted operation count must equal the closed form",
+            output.len()
+        );
+
+        // ★ instance 63: ASK which constants the set interns that the form does
+        // not name, and print them.
+        let named = publish_constants(&PublishedText {
+            program_id,
+            register_init: &init,
+            reg_fini: &fini,
+            label,
+            public_output: &output,
+        });
+        let interned: Vec<LfmWord> = with_words
+            .iter()
+            .filter(|word| !without_words.contains(word))
+            .copied()
+            .collect();
+        let unnamed: Vec<_> = interned
+            .iter()
+            .filter(|word| !named.contains(word))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "{} output bytes: the set interns {unnamed:?} which the form does not name",
+            output.len()
+        );
+        assert_eq!(
+            interned.len(),
+            named.len(),
+            "{} output bytes: the interned pool and the named pool must be the same set",
+            output.len()
+        );
+
+        // ⛔ ANTI-VACUITY ON THE DEDUP: the named pool must be SHORTER than the
+        // published constant run, or a form that charged one constant per
+        // published word would pass this too.
+        let run = 2 + 2 * crate::tables::register::NUM_REGISTER_ADDRESSES + 2 + out_halves;
+        assert!(
+            named.len() < run,
+            "{} output bytes: {} constants for a run of {run} published words means the \
+             fixture has no repeated value and the dedup is untested",
+            output.len(),
+            named.len()
+        );
+    }
+}
+
+/// ★★ THE GATE ON THE PUBLISHED SET: the wrap publishes exactly the words an
+/// aggregation node reads, in the order the node INDEXES them by, and every one
+/// of them equals the host's own value for that field.
+///
+/// The count alone cannot see a transposition and the values alone cannot see a
+/// dropped field, so both are here, and every value is compared against a
+/// derivation that does not come from this program: the host's transcript for
+/// `z` and `alpha`, `recursion::program_id_from_digest` for the id, the harvest's
+/// own vectors for the registers, `EpochProof::l2g_roots` for the bookend root,
+/// and the proof's `bus_output` pairs for the tail.
+#[test]
+fn the_epoch_program_publishes_the_aggregation_set() {
+    let (elf_bytes, opts, bundle) = driver_bundle();
+    let index = bundle.epochs.len() - 1;
+    let epoch = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
+        multilinear::whir_hash::RpxWhir,
+    >(&opts, &elf_bytes, &bundle, index, None, None)
+    .expect("the last epoch harvests, which is the host accepting it");
+
+    // ★ ANTI-VACUITY, on the ANSWERS rather than the inputs (instance 72).
+    assert!(
+        !epoch.public_output().is_empty(),
+        "the gated epoch must PUBLISH, or `out_halves` is zero and the output run is empty"
+    );
+    assert_ne!(
+        epoch.position.register_init, epoch.proof.reg_fini,
+        "the INIT and FINI vectors must DIFFER, or transposing the two published runs is \
+         invisible and the swap mutation cannot fire"
+    );
+
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+    let airs = crate::multilinear_continuation::epoch_airs_for(
+        &elf,
+        &opts,
+        &bundle.epochs[index],
+        &epoch.position.register_init,
+        epoch.position.is_final,
+        epoch.position.label,
+        Some(epoch.decode_commitment),
+    );
+    let refs = airs.refs();
+    let program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
+    let arena = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
+    let exec = execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the machine must execute the epoch the host accepted");
+    let public = &exec.public_words;
+
+    // ---- the COUNT, through the layout's OWN accessor
+    let out_halves = epoch.public_output().len().div_ceil(4);
+    let layout = super::per_table_aggregator::SchemaLayout::wrap(out_halves);
+    layout.assert_covers(public.len());
+    assert_eq!(
+        program.public_len as usize,
+        public.len(),
+        "the program declares the words the execution produced"
+    );
+
+    // ---- z and alpha, against the HOST's own draw
+    let (z, alpha) = host_epoch_challenges(&elf_bytes, &bundle.epochs[index], &epoch);
+    assert_eq!(
+        word_as_ext(&public[0].1).expect("an ext challenge"),
+        z,
+        "word 0 is the shared LogUp challenge z"
+    );
+    assert_eq!(
+        word_as_ext(&public[1].1).expect("an ext challenge"),
+        alpha,
+        "word 1 is alpha"
+    );
+
+    // ---- the attestation id
+    let expected_id = super::whir_epoch::epoch_program_id(&epoch);
+    assert_ne!(
+        expected_id, [0u8; 32],
+        "an all-zero id would compare equal to an unwritten field"
+    );
+    assert_eq!(
+        published_id(public, layout.id(0)),
+        expected_id,
+        "the two id words are `program_id_from_digest` over this epoch's four inputs"
+    );
+
+    // ---- the register chain's two vectors
+    for (r, value) in epoch.position.register_init.iter().enumerate() {
+        assert_eq!(
+            published_base(public, layout.reg_init(r), "reg_init"),
+            u64::from(*value),
+            "register INIT slot {r}"
+        );
+    }
+    for (r, value) in epoch.proof.reg_fini.iter().enumerate() {
+        assert_eq!(
+            published_base(public, layout.reg_fini(r), "reg_fini"),
+            u64::from(*value),
+            "register FINI slot {r}"
+        );
+    }
+
+    // ---- the label, lo then hi, which is what `assert_word_is_const` pins
+    let label = epoch.position.label;
+    assert_eq!(
+        published_base(public, layout.label(0), "label lo"),
+        label & 0xFFFF_FFFF,
+        "the epoch label's low half"
+    );
+    assert_eq!(
+        published_base(public, layout.label(1), "label hi"),
+        label >> 32,
+        "the epoch label's high half"
+    );
+
+    // ---- the public output, in the halves the STARK wrap publishes it in
+    let halves = super::whir_epoch::byte_halves(epoch.public_output());
+    assert_eq!(halves.len(), out_halves, "the half count is the layout's");
+    for (i, half) in halves.iter().enumerate() {
+        use math::field::traits::IsPrimeField;
+        assert_eq!(
+            published_base(public, layout.out_half(i), "output half"),
+            GoldilocksField::canonical(half.value()),
+            "output half {i}"
+        );
+    }
+
+    // ---- the L2G bookend's root, through the HOST's own accessor
+    let shapes: Vec<(usize, usize)> = refs
+        .iter()
+        .zip(&bundle.epochs[index].table_num_vars)
+        .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
+        .collect();
+    let config = chain_config(&shapes);
+    let sizes = epoch_groups(shapes.len());
+    let (group_layouts, _) = stacks(&shapes, &sizes, &config).expect("the epoch's groups stack");
+    let num_polys = group_layouts.last().expect("the bookend group").num_polys();
+    let l2g = epoch
+        .proof
+        .l2g_roots(num_polys)
+        .expect("the bookend's own roots");
+    assert_eq!(l2g.len(), 1, "the bookend is one stacked polynomial");
+    let root = commitment_to_digest(&l2g[0]);
+    for (w, lane) in root.iter().enumerate() {
+        use math::field::traits::IsPrimeField;
+        assert_eq!(
+            published_base(public, layout.l2g_word(w), "l2g lane"),
+            GoldilocksField::canonical(lane.value()),
+            "L2G lane {w} — the bookend group's carried root, as the node reads it back"
+        );
+    }
+
+    // ---- the tail: the bus balance, against the proof's own `p/q` pairs
+    let mut balance = FEE::zero();
+    for table in &bundle.epochs[index].proof.tables {
+        let (p, q) = &table.bus_output;
+        balance += (p / q).expect("a table whose denominator vanished would not have verified");
+    }
+    assert_ne!(
+        balance,
+        FEE::zero(),
+        "a zero balance would compare equal to an unwritten tail word"
+    );
+    assert_eq!(
+        word_as_ext(&public[layout.total() - 1].1).expect("an ext balance"),
+        balance,
+        "the tail word is the closure's bus balance"
+    );
+
+    println!(
+        "epoch {index} of {}: {} published words = {} head + {} schema + {} tail \
+         (out_halves {out_halves}), {} instructions",
+        bundle.epochs.len(),
+        public.len(),
+        layout.head,
+        layout.schema_words(),
+        layout.tail,
+        program.instrs.len(),
     );
 }
