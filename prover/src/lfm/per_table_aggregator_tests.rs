@@ -5110,6 +5110,589 @@ fn prove_global_child(
     Some((g, global_child))
 }
 
+/// Everything [`compose_interior_levels`] reads that its caller already built.
+///
+/// ⛔ A STRUCT RATHER THAN NINE POSITIONAL PARAMETERS, and the reason is the
+/// extraction itself: the interior is driven by TWO harnesses now — the STARK
+/// production tree and its WHIR sibling — and nine positional arguments of
+/// which four are `usize` is precisely the shape two call sites drift in
+/// without a compile error to show for it. Every field is a reference or a
+/// scalar; the struct is a view and owns nothing.
+pub(super) struct InteriorInputs<'a> {
+    /// The tree's per-level arities, as [`tree_shape`] built them.
+    pub(super) shape: &'a [super::per_table_aggregator::Level],
+    /// The highest level this run proves.
+    pub(super) hi: usize,
+    /// The tree's TOP level, which is not always `hi` — a root arm stops the
+    /// loop at the level the root's children come from.
+    pub(super) top: usize,
+    /// Whether the sizing arm needs the top level HELD instead of swapped in.
+    pub(super) size_root: bool,
+    pub(super) fan_in: usize,
+    pub(super) wrap_opts: &'a crate::ProofOptions,
+    pub(super) cache_dir: Option<&'a str>,
+    /// The cgroup ceiling, or why it could not be read — every host-peak line
+    /// prints a percentage of it when it is known and none when it is not.
+    pub(super) ceiling: &'a Result<f64, String>,
+    /// Whether a given level proves or loads. A closure because it reads the
+    /// caller's `lo` and cache directory, which are not this function's.
+    ///
+    /// ⚠ `+ Sync` IS LOAD-BEARING, AND THE EXTRACTION IS WHAT REVEALED IT. A
+    /// node is proved from inside `in_index_order` and
+    /// `prove_in_dependency_order`, both of which want `impl Fn(..) + Sync`,
+    /// and the closure they are handed captures this one. Inline that was
+    /// invisible — a concrete closure over two `Sync` captures is `Sync` and
+    /// nobody had to write it down. Behind `dyn` the bound has to be stated,
+    /// and without it the sibling and pool arms stop COMPILING rather than
+    /// quietly running serial.
+    pub(super) stage_mode: &'a (dyn Fn(usize) -> CacheMode + Sync),
+}
+
+/// What the interior levels produced.
+///
+/// The three vectors are the same `(children, layouts, labels)` the caller
+/// handed in, advanced to level `hi`; `report` is the per-node table the caller
+/// prints; `top_level` is `Some` only under the sizing arm, which needs two
+/// levels live at once.
+pub(super) struct InteriorOutcome {
+    pub(super) children: Vec<RealChild>,
+    pub(super) layouts: Vec<super::per_table_aggregator::SchemaLayout>,
+    pub(super) labels: Vec<Vec<u64>>,
+    pub(super) report: Vec<(usize, usize, u64, usize, f64, f64, f64)>,
+    pub(super) top_level: Option<TreeLevel>,
+}
+
+/// Levels 1..=`hi` of a production tree, over whatever level 0 produced.
+///
+/// ★★★ ONE INTERIOR FOR BOTH PRODUCTION TREES. Level 0 is what the STARK and
+/// WHIR pipelines differ in — a wrap of a univariate epoch proof against a wrap
+/// of a multilinear one — and everything above level 0 consumes a `RealChild`
+/// through its `SchemaLayout`, which is a description of an LFM proof and says
+/// nothing about what that proof verified. So the interior is shared BY
+/// CONSTRUCTION rather than by two drivers that happen to agree, and the WHIR
+/// tree's interior numbers are the STARK tree's own code producing them.
+///
+/// ⚠ THIS FUNCTION IS A PURE EXTRACTION and must stay one. It was lifted out of
+/// [`the_production_tree_composes_to_a_root`] verbatim: of the 475 lines moved,
+/// FIVE changed text, and all five because a captured value became a parameter
+/// that was already a reference (`&wrap_opts` → `wrap_opts`,
+/// `cache_dir.as_deref()` → `cache_dir`, and `match &ceiling` → `match ceiling`
+/// three times). Its control is the byte gate: the tree's IDENTITY lines are
+/// unmoved against the run before the extraction.
+///
+/// ⓘ The device permit is ARMED here and disarmed by the caller, exactly as it
+/// was when this was inline — the interior's sibling count must not reach level
+/// 0 or the stages after it.
+pub(super) fn compose_interior_levels(
+    ctx: InteriorInputs<'_>,
+    mut children: Vec<RealChild>,
+    mut layouts: Vec<super::per_table_aggregator::SchemaLayout>,
+    mut labels: Vec<Vec<u64>>,
+) -> InteriorOutcome {
+    use super::per_table_aggregator::SchemaLayout;
+    use std::time::Instant;
+
+    // ⓘ Destructured into locals with the caller's own names, deliberately: it
+    // is what keeps the 475 lines below byte-identical to the ones that were
+    // inline. `hi` in particular is interpolated as `{hi}` in four format
+    // strings, and a format string cannot capture a field access.
+    let InteriorInputs {
+        shape,
+        hi,
+        top,
+        size_root,
+        fan_in,
+        wrap_opts,
+        cache_dir,
+        ceiling,
+        stage_mode,
+    } = ctx;
+
+    // ---- levels 1..=hi.
+    //
+    // ★★★ ARMED HERE AND DISARMED AFTER, so the change is scoped to the
+    // INTERIOR. The base and the epoch wraps below run exactly as they did: the
+    // permit reads one relaxed `usize` and returns, taking no lock, so a level-0
+    // number from this binary is comparable to one from any earlier tip.
+    //
+    // ⚠ Wraps are a DIFFERENT MACHINE from nodes and want a different value.
+    // Measured at `94540566`: a node is device 3.80 s against host 3.86 s, one
+    // to one, so it is device-bound at two siblings and more buy nothing but
+    // host peak; a wrap is device 2.85 s against host 7.90 s, one to 2.8, so at
+    // two siblings the card would sit idle most of the level and the host would
+    // bind. ⇒ whoever extends this to level 0 must re-derive the count, not
+    // inherit it.
+    let siblings_wanted = tree_siblings();
+    // ★ THE LOG SAYS WHAT THE RUN DID, not what the launcher meant. A knob
+    // that never reached the process is otherwise indistinguishable from a
+    // lever that did not work, and the second reading is the one that gets
+    // written down.
+    println!(
+        "   ★ SIBLING CONCURRENCY: {siblings_wanted} proof(s) at once per interior level \
+         (LFM_TREE_SIBLINGS or LFM_TREE_K; 1 = the serial control)"
+    );
+    super::device_permit::arm(siblings_wanted);
+    let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
+    // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
+    // the loop. `None` on every other arm, where one level's output is all the
+    // run needs.
+    let mut top_level: Option<TreeLevel> = None;
+    type NodeSlot = (
+        RealChild,
+        super::per_table_aggregator::SchemaLayout,
+        Vec<u64>,
+        (usize, usize, u64, usize, f64, f64, f64),
+    );
+    // ★★★ ONE NODE, WITH ITS CHILDREN PASSED IN RATHER THAN SLICED FROM A LEVEL.
+    //
+    // ⛔ The three child slices used to be `&children[g]`, `&layouts[g]` and
+    // `&labels[g]` — captured from the level loop, which is what tied a node to
+    // the level being the unit of scheduling. They are PARAMETERS now, so a
+    // caller that holds one node's children (rather than a whole level's) can
+    // prove it. That is the whole of what `LFM_TREE_LEVEL_POOL` needs, and this
+    // commit is only the naming.
+    //
+    // `siblings` rides along because it decides one PRINT — whether the node's
+    // host-peak line says "process-wide, N proofs in flight" — and a wrong
+    // number there is a reader believing a concurrent reading is a solitary one.
+    #[allow(clippy::too_many_arguments)]
+    let prove_one_node = |level_no: usize,
+                          j: usize,
+                          siblings: usize,
+                          kids: &[RealChild],
+                          kid_layouts: &[super::per_table_aggregator::SchemaLayout],
+                          kid_labels: &[Vec<u64>]|
+     -> NodeSlot {
+        let arity = &kids.len();
+        let label = format!("L{level_no}N{j} (arity {arity})");
+
+        let label_refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
+        let range = (
+            kid_labels[0][0],
+            *kid_labels[arity - 1].last().expect("a label run"),
+        );
+        let out_halves = kid_layouts[arity - 1].out_halves;
+
+        let t_emit = Instant::now();
+        let program = node_program(
+            kids,
+            kid_layouts,
+            &label_refs,
+            range,
+            super::per_table_aggregator::NodePublishSet::Aggregation,
+        );
+        println!(
+            "   {label}: emitted in {:.1}s",
+            t_emit.elapsed().as_secs_f64()
+        );
+        let (cells, instrs) = census_and_panel(&program, &label, fan_in);
+
+        let sampler = HostSampler::start();
+        let t_node = Instant::now();
+        // ⛔ The program the census was taken on, NOT a second emission of
+        // the same thing. See `prove_node_program_as_child`.
+        let (child, layout) = prove_node_program_as_child(
+            &label,
+            &program,
+            kids,
+            out_halves,
+            wrap_opts,
+            stage_mode(level_no),
+            stage_path(cache_dir, &format!("node-{level_no}-{j}")),
+        );
+        let wall = t_node.elapsed().as_secs_f64();
+        let (peak, at) = sampler.stop();
+        println!(
+            "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s{}",
+            match ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                Err(_) => String::new(),
+            },
+            // ⚠ `rss_marks` reads the PROCESS, so with a sibling in flight
+            // this figure is the process peak during this node's window and
+            // not this node's own. Said on the line rather than in a note,
+            // because the per-node peak is what the retention law was fitted
+            // on and a concurrent one must never be fed to it.
+            if siblings > 1 {
+                format!(" ⓘ PROCESS-WIDE, {siblings} proofs in flight")
+            } else {
+                String::new()
+            },
+        );
+        // ★★★ THE WITHIN-ROUND SAMPLE, and it is the only thing that can
+        // attribute the FIRST-ROUND SPIKE.
+        //
+        // Every level from 2 up peaks in its first round and drops 2.7-3.4
+        // GiB for the rest — at an IDENTICAL live count (level 2's rounds 1
+        // and 2 both hold two nodes and read 2.45 GiB apart), so it is not
+        // residency. A BOUNDARY snapshot cannot see it: by the end of the
+        // level the spike is over. Sampled per node, the three candidates
+        // separate in one read:
+        //
+        //   allocated spikes      ⇒ LIVE — the prover really holds it
+        //   only resident spikes  ⇒ jemalloc dirty pages, a decay knob
+        //   NEITHER, but RSS does ⇒ OUTSIDE jemalloc: the pinned staging
+        //                           slabs (✓ `Backend::pinned_staging`
+        //                           "grows lazily to the largest LDE the
+        //                           worker has seen" and never shrinks),
+        //                           the retained device pool, the driver.
+        println!("{}", jemalloc_line(&label));
+        (
+            child,
+            layout,
+            vec![range.0, range.1],
+            (level_no, *arity, cells, instrs, peak, at, wall),
+        )
+    };
+
+    // ★★★ WHERE THE BARRIER STOPS AND THE POOL STARTS.
+    //
+    // Unset, `barrier_levels == hi` and the loop below is the whole interior,
+    // byte for byte as it shipped. With `LFM_TREE_LEVEL_POOL=1` the loop runs
+    // levels 1..`pool_from` and the dependency pool takes the rest — so the
+    // insurance row (`LFM_TREE_LEVEL_POOL_FROM=2`) is the same code with a
+    // different boundary rather than a second implementation.
+    let pool_on = tree_level_pool();
+    let pool_from = tree_level_pool_from();
+    let levels_in_flight = tree_levels_in_flight();
+    // ⛔ REFUSED, NOT SILENTLY DISABLED. The sizing arm holds TWO levels' outputs
+    // at the top and picks them by level index; a pool that frees a level into
+    // its parent has no such index to hand out, and the failure would be a root
+    // built over the wrong children — which `emit_l2g_compare`'s count guard
+    // catches only when the shapes happen to differ.
+    assert!(
+        !(pool_on && size_root),
+        "LFM_TREE_LEVEL_POOL and LFM_TREE_SIZE_ROOT are incompatible: the sizing \
+         arm needs two levels' outputs held by index, and the pool consumes a \
+         level into its parent. Run them as separate arms"
+    );
+    let barrier_levels = if pool_on { (pool_from - 1).min(hi) } else { hi };
+    if pool_on {
+        println!(
+            "   ★ LEVEL POOL: levels {}..={hi} run in dependency order, {levels_in_flight} \
+             level(s) in flight (LFM_TREE_LEVEL_POOL=1; unset = the per-level barrier)",
+            barrier_levels + 1
+        );
+    }
+    for (li, level) in shape.iter().enumerate().take(barrier_levels) {
+        let level_no = li + 1;
+        let t_level = Instant::now();
+        // ★ HOW MANY DISTINCT PROGRAMS THIS LEVEL ACTUALLY HAS. The artifact
+        // cache's premise is that a level's nodes share one — the pre-registration
+        // predicts one or two, and a level that reports as many programs as nodes
+        // is the falsifier, printed either way rather than assumed.
+        super::program_census::begin_level();
+        let (mut next, mut next_layouts, mut next_labels) = (
+            Vec::with_capacity(level.arities.len()),
+            Vec::with_capacity(level.arities.len()),
+            Vec::with_capacity(level.arities.len()),
+        );
+        let groups = level_groups(&level.arities);
+        // ★★★ SIBLING CONCURRENCY. `siblings` proofs of this level run at once,
+        // each holding ONE shared card permit across each of its two device
+        // phases and releasing it between them, so one proof's executor and
+        // trace fill overlap another's time on the card.
+        //
+        // ⛔ `siblings == 1` IS THE CONTROL, and it runs the ORIGINAL path: no
+        // threads, no permit, no sampler change. An A/B whose control arm is
+        // "the parallel code with one worker" measures the scheduler against
+        // itself and would hide a constant cost in both arms.
+        //
+        // The proofs at a level are independent — the driver takes disjoint
+        // child subslices — so the only shared things a worker touches are the
+        // census window (which it enrols in) and the card (which the permit
+        // serialises). Results land in per-index slots and are drained in
+        // order, so `children`, `layouts` and `labels` are built in exactly the
+        // order the serial loop built them: scheduling is invisible to the
+        // bytes because nothing downstream can observe it.
+        let siblings = super::device_permit::workers().min(groups.len().max(1));
+        let level_sampler = HostSampler::start();
+
+        let prove_one = |j: usize| -> NodeSlot {
+            let g = &groups[j];
+            prove_one_node(
+                level_no,
+                j,
+                siblings,
+                &children[g.clone()],
+                &layouts[g.clone()],
+                &labels[g.clone()],
+            )
+        };
+
+        // ★★★ THE BYTE-IDENTITY LINES, PRINTED AT THE JOIN AND THEREFORE IN
+        // INDEX ORDER. Two arms that schedule differently must produce the same
+        // tree, and this is the line that says so: `diff` a serial run's
+        // IDENTITY lines against a concurrent one's and an EMPTY DIFF IS THE
+        // PROOF.
+        //
+        // ⛔ PRINTED HERE, NOT ON THE WORKER. A worker prints when it finishes,
+        // so at two siblings L2N1 lands before L2N0 and a raw `diff` files a
+        // SCHEDULING ORDER as a byte difference. Sorting both sides also works —
+        // each line begins with its own node label, so a permuted tree still
+        // sorts differently — but it is a step a reader has to remember, and the
+        // one who forgets reports a false red. The join already has every child
+        // in index order; printing there costs nothing and needs no procedure.
+        //
+        // `program_id` is the fingerprint that settles it because it is what a
+        // PARENT absorbs: a digest over every group root, the chunk-root tail,
+        // the heights, the chip set and the hasher. Move any committed felt and
+        // it moves. The heights ride along so that when the digest DOES move,
+        // the line says which shape moved; cells and instructions ride along so
+        // the line subsumes the census and one grep is the whole gate.
+        for (j, (child, layout, lbl, row)) in in_index_order(groups.len(), siblings, prove_one)
+            .into_iter()
+            .enumerate()
+        {
+            let (_, arity, cells, instrs, ..) = row;
+            println!(
+                "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights {:?} \
+                 · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                 ({instrs} instructions)",
+                child
+                    .artifacts
+                    .program_id
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                child.artifacts.log_heights,
+                child.artifacts.blake3_chunk_log_heights,
+                child.public_words.len(),
+            );
+            report.push(row);
+            next.push(child);
+            next_layouts.push(layout);
+            next_labels.push(lbl);
+        }
+        assert_eq!(
+            groups.last().map(|g| g.end).unwrap_or(0),
+            children.len(),
+            "every child must be consumed"
+        );
+        // ★ The level below goes, and the trough is the point: a tree-builder at
+        // level k holds level k-1 and nothing under it. Only a live sample can
+        // show a release; a high-water cannot.
+        //
+        // ⛔ EXCEPT AT THE TOP LEVEL UNDER SIZING, WHERE BOTH ARE HELD — and this
+        // is the fix for a real abort, so it is worth being exact about.
+        //
+        // The sizing arm emits BOTH root options, and they take DIFFERENT levels'
+        // OUTPUTS: A takes `RootOption::A.child_level(top)`'s, B takes `top`'s.
+        // A single pass cannot hand both out by capturing one mid-loop, because
+        // `RealChild` is not cloneable and a capture therefore MOVES the very
+        // children the next level is built from.
+        //
+        // ⇒ The previous code captured at `level_no + 1 == top`, evaluated BEFORE
+        // this swap, so it held level `top - 1`'s INPUT rather than its OUTPUT —
+        // one level lower again. At 19 epochs and fan-in 2 it handed the root 3
+        // children where option A's fold shape refolds to 2, and
+        // `emit_l2g_compare`'s count guard aborted a box run thirteen minutes in.
+        // ⚠ The guard catching it was luck of the shape: where the two counts
+        // agree, the root compares a fold of the wrong depth and an HONEST prover
+        // fails instead.
+        //
+        // ⇒ So at the TOP level the new output is kept as B's and the swap is
+        // SKIPPED, leaving `children` = A's children. Nothing is moved, nothing
+        // is cloned, and there is no mid-loop capture to be off by one.
+        let produced = next.len();
+        let both_held = size_root && level_no == top;
+        if both_held {
+            top_level = Some((next, next_layouts, next_labels));
+        } else {
+            children = next;
+            layouts = next_layouts;
+            labels = next_labels;
+        }
+        mark(&format!(
+            "AFTER level {level_no}, {}",
+            if both_held {
+                "its children HELD — the sizing arm needs both levels live"
+            } else {
+                "its children released"
+            }
+        ));
+        let level_wall = t_level.elapsed().as_secs_f64();
+        let (level_peak, level_at) = level_sampler.stop();
+        println!("   level {level_no}: {produced} nodes in {level_wall:.1}s");
+        // ★ THE LEVEL'S OWN PEAK, which is the figure the >52 GiB stop is about.
+        // The per-node peaks are process-wide readings taken inside overlapping
+        // windows once siblings run together, so the level needs a window of its
+        // own or the campaign has no concurrent host-peak number at all.
+        println!(
+            "   level {level_no}: host peak {level_peak:.3} GiB at t={level_at:.1}{}, {siblings} \
+             proof(s) in flight",
+            match ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * level_peak / g),
+                Err(_) => String::new(),
+            },
+        );
+        // ★★ WHICH RESOURCE BOUND THE LEVEL — and the falsifier's own evidence.
+        // `max holders` must read 1: more than one proof inside a device phase
+        // is the two-VramGates condition, and the permit asserts it at the
+        // instant it would happen rather than leaving it to a VRAM abort.
+        // `held` against the wall says whether the card or the host was the
+        // wall, which is what decides whether a HIGHER sibling count would buy
+        // anything at this level.
+        let permit = super::device_permit::take_stats();
+        if permit.acquisitions > 0 {
+            println!("   level {level_no}: {}", permit.describe(level_wall));
+        }
+        // ★ THE DISCRIMINATOR, at the boundary where the peaks rise. Retention
+        // and residency are indistinguishable in `VmRSS` and trivially apart
+        // here: a level whose RETAINED figure grows while its allocated figure
+        // falls is the allocator, not the prover.
+        println!("{}", jemalloc_line(&format!("level {level_no}")));
+        if let Some(stats) = super::program_census::end_level() {
+            println!("   {}", stats.describe(&format!("level {level_no}")));
+        }
+    }
+    // ---- the POOLED span, when the knob asks for it.
+    //
+    // Everything the barrier loop above would have done for levels
+    // `barrier_levels+1..=hi`, in dependency order instead.
+    //
+    // ⚠ WHAT THIS SPAN CANNOT PRINT, and it is a real loss rather than an
+    // oversight: a PER-LEVEL host peak. Two levels running at once share one
+    // process, so "level 3's peak" stops being a quantity — the span reports ONE
+    // window and the per-NODE peaks the nodes print themselves. The stop
+    // condition therefore reads off the node lines and this span line, not off a
+    // per-level maximum that no longer exists.
+    if pool_on && barrier_levels < hi {
+        let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
+            .iter()
+            .take(hi)
+            .skip(barrier_levels)
+            .map(|level| level_groups(&level.arities))
+            .collect();
+        let workers = super::device_permit::workers().max(1);
+        let span_sampler = HostSampler::start();
+        let t_span = Instant::now();
+        super::program_census::begin_level();
+        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
+            .into_iter()
+            .zip(layouts)
+            .zip(labels)
+            .map(|((c, l), b)| (c, l, b))
+            .collect();
+        let first_level = barrier_levels + 1;
+        let (top, summaries) = prove_in_dependency_order(
+            &pool_groups,
+            seed,
+            workers,
+            levels_in_flight,
+            |depth, j, kids| {
+                let level_no = first_level + depth - 1;
+                let (mut ch, mut la, mut lb) = (
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                    Vec::with_capacity(kids.len()),
+                );
+                for (c, l, b) in kids {
+                    ch.push(c);
+                    la.push(l);
+                    lb.push(b);
+                }
+                let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
+                // ★ TAKEN, SO RELEASED HERE — the pool's one structural
+                // difference from the barrier, stated where it happens. These
+                // children were moved out of the level below's slots, so this
+                // node owns them alone and they go the moment it is proved,
+                // rather than at the end of a level that borrows every child.
+                // It is worth a handful of lines only because it is the thing
+                // that lets two levels be in flight without two levels of
+                // children being live.
+                drop(ch);
+                drop(la);
+                drop(lb);
+                // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
+                // The child is about to be eaten by its parent, so the line has
+                // to be taken while it exists; printing it here would put it in
+                // completion order, which is the thing the gate is not allowed to
+                // depend on.
+                let (_, arity, cells, instrs, ..) = row;
+                let line = format!(
+                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
+                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
+                     ({instrs} instructions)",
+                    child
+                        .artifacts
+                        .program_id
+                        .iter()
+                        .take(8)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    child.artifacts.log_heights,
+                    child.artifacts.blake3_chunk_log_heights,
+                    child.public_words.len(),
+                );
+                ((child, layout, lbl), (line, row))
+            },
+            |depth| {
+                // ★ THE FLOOR FALSIFIER'S OWN INSTRUMENT. Lane P5's boundary
+                // snapshots showed the interior's rising floor is LIVE bytes, not
+                // jemalloc retention (resident − allocated is 0.37–0.79 GiB at
+                // every boundary), and that the 19 wraps are still allocated after
+                // level 1 ends. Take-on-consume says they should be gone here.
+                // ⓘ The barrier loop prints this per level; the pooled span has to
+                // print it from inside, because a level's completion is a moment
+                // in the middle of the span rather than the end of a loop body.
+                println!(
+                    "{}",
+                    jemalloc_line(&format!("level {} (pooled)", first_level + depth - 1))
+                );
+            },
+        );
+        // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
+        // ordered IDENTITY diff against a barrier run is empty rather than
+        // merely sortable. Scheduling stays invisible to the bytes AND to the log.
+        for level in &summaries {
+            for (line, row) in level {
+                println!("{line}");
+                report.push(*row);
+            }
+        }
+        let (span_peak, span_at) = span_sampler.stop();
+        println!(
+            "   levels {first_level}..={hi} POOLED: {} nodes in {:.1}s, {levels_in_flight} \
+             level(s) in flight, {workers} worker(s)",
+            summaries.iter().map(Vec::len).sum::<usize>(),
+            t_span.elapsed().as_secs_f64(),
+        );
+        println!(
+            "   levels {first_level}..={hi}: host peak {span_peak:.3} GiB at t={span_at:.1}{} \
+             ⓘ ONE WINDOW — overlapped levels have no separate peaks",
+            match ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * span_peak / g),
+                Err(_) => String::new(),
+            },
+        );
+        if let Some(stats) = super::program_census::end_level() {
+            println!(
+                "   {}",
+                stats.describe(&format!("levels {first_level}..={hi}"))
+            );
+        }
+        let (mut c, mut l, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for (child, layout, lbl) in top {
+            c.push(child);
+            l.push(layout);
+            b.push(lbl);
+        }
+        children = c;
+        layouts = l;
+        labels = b;
+    }
+
+    InteriorOutcome {
+        children,
+        layouts,
+        labels,
+        report,
+        top_level,
+    }
+}
+
 #[test]
 #[ignore = "box tier, production scale: composes the whole interior tree"]
 fn the_production_tree_composes_to_a_root() {
@@ -5770,481 +6353,33 @@ fn the_production_tree_composes_to_a_root() {
         return;
     }
 
-    // ---- levels 1..=hi.
+    // ---- levels 1..=hi, in the one interior both production trees share.
     //
-    // ★★★ ARMED HERE AND DISARMED AFTER, so the change is scoped to the
-    // INTERIOR. The base and the epoch wraps below run exactly as they did: the
-    // permit reads one relaxed `usize` and returns, taking no lock, so a level-0
-    // number from this binary is comparable to one from any earlier tip.
-    //
-    // ⚠ Wraps are a DIFFERENT MACHINE from nodes and want a different value.
-    // Measured at `94540566`: a node is device 3.80 s against host 3.86 s, one
-    // to one, so it is device-bound at two siblings and more buy nothing but
-    // host peak; a wrap is device 2.85 s against host 7.90 s, one to 2.8, so at
-    // two siblings the card would sit idle most of the level and the host would
-    // bind. ⇒ whoever extends this to level 0 must re-derive the count, not
-    // inherit it.
-    let siblings_wanted = tree_siblings();
-    // ★ THE LOG SAYS WHAT THE RUN DID, not what the launcher meant. A knob
-    // that never reached the process is otherwise indistinguishable from a
-    // lever that did not work, and the second reading is the one that gets
-    // written down.
-    println!(
-        "   ★ SIBLING CONCURRENCY: {siblings_wanted} proof(s) at once per interior level \
-         (LFM_TREE_SIBLINGS or LFM_TREE_K; 1 = the serial control)"
+    // ⓘ EXTRACTED, NOT CHANGED. What ran inline here runs in
+    // [`compose_interior_levels`] now, so a WHIR level 0 composes through the
+    // same code rather than through a second driver that agrees with this one
+    // today. The permit is armed inside and disarmed on the line below, as before.
+    let interior = compose_interior_levels(
+        InteriorInputs {
+            shape: &shape,
+            hi,
+            top,
+            size_root,
+            fan_in,
+            wrap_opts: &wrap_opts,
+            cache_dir: cache_dir.as_deref(),
+            ceiling: &ceiling,
+            stage_mode: &stage_mode,
+        },
+        children,
+        layouts,
+        labels,
     );
-    super::device_permit::arm(siblings_wanted);
-    let mut report: Vec<(usize, usize, u64, usize, f64, f64, f64)> = Vec::new();
-    // ★★ OPTION B's CHILD, under the SIZING arm — see the capture at the end of
-    // the loop. `None` on every other arm, where one level's output is all the
-    // run needs.
-    let mut top_level: Option<TreeLevel> = None;
-    type NodeSlot = (
-        RealChild,
-        super::per_table_aggregator::SchemaLayout,
-        Vec<u64>,
-        (usize, usize, u64, usize, f64, f64, f64),
-    );
-    // ★★★ ONE NODE, WITH ITS CHILDREN PASSED IN RATHER THAN SLICED FROM A LEVEL.
-    //
-    // ⛔ The three child slices used to be `&children[g]`, `&layouts[g]` and
-    // `&labels[g]` — captured from the level loop, which is what tied a node to
-    // the level being the unit of scheduling. They are PARAMETERS now, so a
-    // caller that holds one node's children (rather than a whole level's) can
-    // prove it. That is the whole of what `LFM_TREE_LEVEL_POOL` needs, and this
-    // commit is only the naming.
-    //
-    // `siblings` rides along because it decides one PRINT — whether the node's
-    // host-peak line says "process-wide, N proofs in flight" — and a wrong
-    // number there is a reader believing a concurrent reading is a solitary one.
-    #[allow(clippy::too_many_arguments)]
-    let prove_one_node = |level_no: usize,
-                          j: usize,
-                          siblings: usize,
-                          kids: &[RealChild],
-                          kid_layouts: &[super::per_table_aggregator::SchemaLayout],
-                          kid_labels: &[Vec<u64>]|
-     -> NodeSlot {
-        let arity = &kids.len();
-        let label = format!("L{level_no}N{j} (arity {arity})");
-
-        let label_refs: Vec<&[u64]> = kid_labels.iter().map(|l| &l[..]).collect();
-        let range = (
-            kid_labels[0][0],
-            *kid_labels[arity - 1].last().expect("a label run"),
-        );
-        let out_halves = kid_layouts[arity - 1].out_halves;
-
-        let t_emit = Instant::now();
-        let program = node_program(
-            kids,
-            kid_layouts,
-            &label_refs,
-            range,
-            super::per_table_aggregator::NodePublishSet::Aggregation,
-        );
-        println!(
-            "   {label}: emitted in {:.1}s",
-            t_emit.elapsed().as_secs_f64()
-        );
-        let (cells, instrs) = census_and_panel(&program, &label, fan_in);
-
-        let sampler = HostSampler::start();
-        let t_node = Instant::now();
-        // ⛔ The program the census was taken on, NOT a second emission of
-        // the same thing. See `prove_node_program_as_child`.
-        let (child, layout) = prove_node_program_as_child(
-            &label,
-            &program,
-            kids,
-            out_halves,
-            &wrap_opts,
-            stage_mode(level_no),
-            stage_path(cache_dir.as_deref(), &format!("node-{level_no}-{j}")),
-        );
-        let wall = t_node.elapsed().as_secs_f64();
-        let (peak, at) = sampler.stop();
-        println!(
-            "   {label}: host peak {peak:.3} GiB at t={at:.1}{}, wall {wall:.1}s{}",
-            match &ceiling {
-                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
-                Err(_) => String::new(),
-            },
-            // ⚠ `rss_marks` reads the PROCESS, so with a sibling in flight
-            // this figure is the process peak during this node's window and
-            // not this node's own. Said on the line rather than in a note,
-            // because the per-node peak is what the retention law was fitted
-            // on and a concurrent one must never be fed to it.
-            if siblings > 1 {
-                format!(" ⓘ PROCESS-WIDE, {siblings} proofs in flight")
-            } else {
-                String::new()
-            },
-        );
-        // ★★★ THE WITHIN-ROUND SAMPLE, and it is the only thing that can
-        // attribute the FIRST-ROUND SPIKE.
-        //
-        // Every level from 2 up peaks in its first round and drops 2.7-3.4
-        // GiB for the rest — at an IDENTICAL live count (level 2's rounds 1
-        // and 2 both hold two nodes and read 2.45 GiB apart), so it is not
-        // residency. A BOUNDARY snapshot cannot see it: by the end of the
-        // level the spike is over. Sampled per node, the three candidates
-        // separate in one read:
-        //
-        //   allocated spikes      ⇒ LIVE — the prover really holds it
-        //   only resident spikes  ⇒ jemalloc dirty pages, a decay knob
-        //   NEITHER, but RSS does ⇒ OUTSIDE jemalloc: the pinned staging
-        //                           slabs (✓ `Backend::pinned_staging`
-        //                           "grows lazily to the largest LDE the
-        //                           worker has seen" and never shrinks),
-        //                           the retained device pool, the driver.
-        println!("{}", jemalloc_line(&label));
-        (
-            child,
-            layout,
-            vec![range.0, range.1],
-            (level_no, *arity, cells, instrs, peak, at, wall),
-        )
-    };
-
-    // ★★★ WHERE THE BARRIER STOPS AND THE POOL STARTS.
-    //
-    // Unset, `barrier_levels == hi` and the loop below is the whole interior,
-    // byte for byte as it shipped. With `LFM_TREE_LEVEL_POOL=1` the loop runs
-    // levels 1..`pool_from` and the dependency pool takes the rest — so the
-    // insurance row (`LFM_TREE_LEVEL_POOL_FROM=2`) is the same code with a
-    // different boundary rather than a second implementation.
-    let pool_on = tree_level_pool();
-    let pool_from = tree_level_pool_from();
-    let levels_in_flight = tree_levels_in_flight();
-    // ⛔ REFUSED, NOT SILENTLY DISABLED. The sizing arm holds TWO levels' outputs
-    // at the top and picks them by level index; a pool that frees a level into
-    // its parent has no such index to hand out, and the failure would be a root
-    // built over the wrong children — which `emit_l2g_compare`'s count guard
-    // catches only when the shapes happen to differ.
-    assert!(
-        !(pool_on && size_root),
-        "LFM_TREE_LEVEL_POOL and LFM_TREE_SIZE_ROOT are incompatible: the sizing \
-         arm needs two levels' outputs held by index, and the pool consumes a \
-         level into its parent. Run them as separate arms"
-    );
-    let barrier_levels = if pool_on { (pool_from - 1).min(hi) } else { hi };
-    if pool_on {
-        println!(
-            "   ★ LEVEL POOL: levels {}..={hi} run in dependency order, {levels_in_flight} \
-             level(s) in flight (LFM_TREE_LEVEL_POOL=1; unset = the per-level barrier)",
-            barrier_levels + 1
-        );
-    }
-    for (li, level) in shape.iter().enumerate().take(barrier_levels) {
-        let level_no = li + 1;
-        let t_level = Instant::now();
-        // ★ HOW MANY DISTINCT PROGRAMS THIS LEVEL ACTUALLY HAS. The artifact
-        // cache's premise is that a level's nodes share one — the pre-registration
-        // predicts one or two, and a level that reports as many programs as nodes
-        // is the falsifier, printed either way rather than assumed.
-        super::program_census::begin_level();
-        let (mut next, mut next_layouts, mut next_labels) = (
-            Vec::with_capacity(level.arities.len()),
-            Vec::with_capacity(level.arities.len()),
-            Vec::with_capacity(level.arities.len()),
-        );
-        let groups = level_groups(&level.arities);
-        // ★★★ SIBLING CONCURRENCY. `siblings` proofs of this level run at once,
-        // each holding ONE shared card permit across each of its two device
-        // phases and releasing it between them, so one proof's executor and
-        // trace fill overlap another's time on the card.
-        //
-        // ⛔ `siblings == 1` IS THE CONTROL, and it runs the ORIGINAL path: no
-        // threads, no permit, no sampler change. An A/B whose control arm is
-        // "the parallel code with one worker" measures the scheduler against
-        // itself and would hide a constant cost in both arms.
-        //
-        // The proofs at a level are independent — the driver takes disjoint
-        // child subslices — so the only shared things a worker touches are the
-        // census window (which it enrols in) and the card (which the permit
-        // serialises). Results land in per-index slots and are drained in
-        // order, so `children`, `layouts` and `labels` are built in exactly the
-        // order the serial loop built them: scheduling is invisible to the
-        // bytes because nothing downstream can observe it.
-        let siblings = super::device_permit::workers().min(groups.len().max(1));
-        let level_sampler = HostSampler::start();
-
-        let prove_one = |j: usize| -> NodeSlot {
-            let g = &groups[j];
-            prove_one_node(
-                level_no,
-                j,
-                siblings,
-                &children[g.clone()],
-                &layouts[g.clone()],
-                &labels[g.clone()],
-            )
-        };
-
-        // ★★★ THE BYTE-IDENTITY LINES, PRINTED AT THE JOIN AND THEREFORE IN
-        // INDEX ORDER. Two arms that schedule differently must produce the same
-        // tree, and this is the line that says so: `diff` a serial run's
-        // IDENTITY lines against a concurrent one's and an EMPTY DIFF IS THE
-        // PROOF.
-        //
-        // ⛔ PRINTED HERE, NOT ON THE WORKER. A worker prints when it finishes,
-        // so at two siblings L2N1 lands before L2N0 and a raw `diff` files a
-        // SCHEDULING ORDER as a byte difference. Sorting both sides also works —
-        // each line begins with its own node label, so a permuted tree still
-        // sorts differently — but it is a step a reader has to remember, and the
-        // one who forgets reports a false red. The join already has every child
-        // in index order; printing there costs nothing and needs no procedure.
-        //
-        // `program_id` is the fingerprint that settles it because it is what a
-        // PARENT absorbs: a digest over every group root, the chunk-root tail,
-        // the heights, the chip set and the hasher. Move any committed felt and
-        // it moves. The heights ride along so that when the digest DOES move,
-        // the line says which shape moved; cells and instructions ride along so
-        // the line subsumes the census and one grep is the whole gate.
-        for (j, (child, layout, lbl, row)) in in_index_order(groups.len(), siblings, prove_one)
-            .into_iter()
-            .enumerate()
-        {
-            let (_, arity, cells, instrs, ..) = row;
-            println!(
-                "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights {:?} \
-                 · blake3 chunk heights {:?} · published {} words · {cells} cells \
-                 ({instrs} instructions)",
-                child
-                    .artifacts
-                    .program_id
-                    .iter()
-                    .take(8)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-                child.artifacts.log_heights,
-                child.artifacts.blake3_chunk_log_heights,
-                child.public_words.len(),
-            );
-            report.push(row);
-            next.push(child);
-            next_layouts.push(layout);
-            next_labels.push(lbl);
-        }
-        assert_eq!(
-            groups.last().map(|g| g.end).unwrap_or(0),
-            children.len(),
-            "every child must be consumed"
-        );
-        // ★ The level below goes, and the trough is the point: a tree-builder at
-        // level k holds level k-1 and nothing under it. Only a live sample can
-        // show a release; a high-water cannot.
-        //
-        // ⛔ EXCEPT AT THE TOP LEVEL UNDER SIZING, WHERE BOTH ARE HELD — and this
-        // is the fix for a real abort, so it is worth being exact about.
-        //
-        // The sizing arm emits BOTH root options, and they take DIFFERENT levels'
-        // OUTPUTS: A takes `RootOption::A.child_level(top)`'s, B takes `top`'s.
-        // A single pass cannot hand both out by capturing one mid-loop, because
-        // `RealChild` is not cloneable and a capture therefore MOVES the very
-        // children the next level is built from.
-        //
-        // ⇒ The previous code captured at `level_no + 1 == top`, evaluated BEFORE
-        // this swap, so it held level `top - 1`'s INPUT rather than its OUTPUT —
-        // one level lower again. At 19 epochs and fan-in 2 it handed the root 3
-        // children where option A's fold shape refolds to 2, and
-        // `emit_l2g_compare`'s count guard aborted a box run thirteen minutes in.
-        // ⚠ The guard catching it was luck of the shape: where the two counts
-        // agree, the root compares a fold of the wrong depth and an HONEST prover
-        // fails instead.
-        //
-        // ⇒ So at the TOP level the new output is kept as B's and the swap is
-        // SKIPPED, leaving `children` = A's children. Nothing is moved, nothing
-        // is cloned, and there is no mid-loop capture to be off by one.
-        let produced = next.len();
-        let both_held = size_root && level_no == top;
-        if both_held {
-            top_level = Some((next, next_layouts, next_labels));
-        } else {
-            children = next;
-            layouts = next_layouts;
-            labels = next_labels;
-        }
-        mark(&format!(
-            "AFTER level {level_no}, {}",
-            if both_held {
-                "its children HELD — the sizing arm needs both levels live"
-            } else {
-                "its children released"
-            }
-        ));
-        let level_wall = t_level.elapsed().as_secs_f64();
-        let (level_peak, level_at) = level_sampler.stop();
-        println!("   level {level_no}: {produced} nodes in {level_wall:.1}s");
-        // ★ THE LEVEL'S OWN PEAK, which is the figure the >52 GiB stop is about.
-        // The per-node peaks are process-wide readings taken inside overlapping
-        // windows once siblings run together, so the level needs a window of its
-        // own or the campaign has no concurrent host-peak number at all.
-        println!(
-            "   level {level_no}: host peak {level_peak:.3} GiB at t={level_at:.1}{}, {siblings} \
-             proof(s) in flight",
-            match &ceiling {
-                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * level_peak / g),
-                Err(_) => String::new(),
-            },
-        );
-        // ★★ WHICH RESOURCE BOUND THE LEVEL — and the falsifier's own evidence.
-        // `max holders` must read 1: more than one proof inside a device phase
-        // is the two-VramGates condition, and the permit asserts it at the
-        // instant it would happen rather than leaving it to a VRAM abort.
-        // `held` against the wall says whether the card or the host was the
-        // wall, which is what decides whether a HIGHER sibling count would buy
-        // anything at this level.
-        let permit = super::device_permit::take_stats();
-        if permit.acquisitions > 0 {
-            println!("   level {level_no}: {}", permit.describe(level_wall));
-        }
-        // ★ THE DISCRIMINATOR, at the boundary where the peaks rise. Retention
-        // and residency are indistinguishable in `VmRSS` and trivially apart
-        // here: a level whose RETAINED figure grows while its allocated figure
-        // falls is the allocator, not the prover.
-        println!("{}", jemalloc_line(&format!("level {level_no}")));
-        if let Some(stats) = super::program_census::end_level() {
-            println!("   {}", stats.describe(&format!("level {level_no}")));
-        }
-    }
-    // ---- the POOLED span, when the knob asks for it.
-    //
-    // Everything the barrier loop above would have done for levels
-    // `barrier_levels+1..=hi`, in dependency order instead.
-    //
-    // ⚠ WHAT THIS SPAN CANNOT PRINT, and it is a real loss rather than an
-    // oversight: a PER-LEVEL host peak. Two levels running at once share one
-    // process, so "level 3's peak" stops being a quantity — the span reports ONE
-    // window and the per-NODE peaks the nodes print themselves. The stop
-    // condition therefore reads off the node lines and this span line, not off a
-    // per-level maximum that no longer exists.
-    if pool_on && barrier_levels < hi {
-        let pool_groups: Vec<Vec<std::ops::Range<usize>>> = shape
-            .iter()
-            .take(hi)
-            .skip(barrier_levels)
-            .map(|level| level_groups(&level.arities))
-            .collect();
-        let workers = super::device_permit::workers().max(1);
-        let span_sampler = HostSampler::start();
-        let t_span = Instant::now();
-        super::program_census::begin_level();
-        let seed: Vec<(RealChild, SchemaLayout, Vec<u64>)> = children
-            .into_iter()
-            .zip(layouts)
-            .zip(labels)
-            .map(|((c, l), b)| (c, l, b))
-            .collect();
-        let first_level = barrier_levels + 1;
-        let (top, summaries) = prove_in_dependency_order(
-            &pool_groups,
-            seed,
-            workers,
-            levels_in_flight,
-            |depth, j, kids| {
-                let level_no = first_level + depth - 1;
-                let (mut ch, mut la, mut lb) = (
-                    Vec::with_capacity(kids.len()),
-                    Vec::with_capacity(kids.len()),
-                    Vec::with_capacity(kids.len()),
-                );
-                for (c, l, b) in kids {
-                    ch.push(c);
-                    la.push(l);
-                    lb.push(b);
-                }
-                let (child, layout, lbl, row) = prove_one_node(level_no, j, workers, &ch, &la, &lb);
-                // ★ TAKEN, SO RELEASED HERE — the pool's one structural
-                // difference from the barrier, stated where it happens. These
-                // children were moved out of the level below's slots, so this
-                // node owns them alone and they go the moment it is proved,
-                // rather than at the end of a level that borrows every child.
-                // It is worth a handful of lines only because it is the thing
-                // that lets two levels be in flight without two levels of
-                // children being live.
-                drop(ch);
-                drop(la);
-                drop(lb);
-                // ★ THE IDENTITY LINE IS FORMATTED HERE AND PRINTED AT THE JOIN.
-                // The child is about to be eaten by its parent, so the line has
-                // to be taken while it exists; printing it here would put it in
-                // completion order, which is the thing the gate is not allowed to
-                // depend on.
-                let (_, arity, cells, instrs, ..) = row;
-                let line = format!(
-                    "   L{level_no}N{j} (arity {arity}) IDENTITY: program_id {} · heights \
-                     {:?} · blake3 chunk heights {:?} · published {} words · {cells} cells \
-                     ({instrs} instructions)",
-                    child
-                        .artifacts
-                        .program_id
-                        .iter()
-                        .take(8)
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
-                    child.artifacts.log_heights,
-                    child.artifacts.blake3_chunk_log_heights,
-                    child.public_words.len(),
-                );
-                ((child, layout, lbl), (line, row))
-            },
-            |depth| {
-                // ★ THE FLOOR FALSIFIER'S OWN INSTRUMENT. Lane P5's boundary
-                // snapshots showed the interior's rising floor is LIVE bytes, not
-                // jemalloc retention (resident − allocated is 0.37–0.79 GiB at
-                // every boundary), and that the 19 wraps are still allocated after
-                // level 1 ends. Take-on-consume says they should be gone here.
-                // ⓘ The barrier loop prints this per level; the pooled span has to
-                // print it from inside, because a level's completion is a moment
-                // in the middle of the span rather than the end of a loop body.
-                println!(
-                    "{}",
-                    jemalloc_line(&format!("level {} (pooled)", first_level + depth - 1))
-                );
-            },
-        );
-        // ⛔ PRINTED IN LEVEL ORDER AND INDEX ORDER, after the whole span, so the
-        // ordered IDENTITY diff against a barrier run is empty rather than
-        // merely sortable. Scheduling stays invisible to the bytes AND to the log.
-        for level in &summaries {
-            for (line, row) in level {
-                println!("{line}");
-                report.push(*row);
-            }
-        }
-        let (span_peak, span_at) = span_sampler.stop();
-        println!(
-            "   levels {first_level}..={hi} POOLED: {} nodes in {:.1}s, {levels_in_flight} \
-             level(s) in flight, {workers} worker(s)",
-            summaries.iter().map(Vec::len).sum::<usize>(),
-            t_span.elapsed().as_secs_f64(),
-        );
-        println!(
-            "   levels {first_level}..={hi}: host peak {span_peak:.3} GiB at t={span_at:.1}{} \
-             ⓘ ONE WINDOW — overlapped levels have no separate peaks",
-            match &ceiling {
-                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * span_peak / g),
-                Err(_) => String::new(),
-            },
-        );
-        if let Some(stats) = super::program_census::end_level() {
-            println!(
-                "   {}",
-                stats.describe(&format!("levels {first_level}..={hi}"))
-            );
-        }
-        let (mut c, mut l, mut b) = (Vec::new(), Vec::new(), Vec::new());
-        for (child, layout, lbl) in top {
-            c.push(child);
-            l.push(layout);
-            b.push(lbl);
-        }
-        children = c;
-        layouts = l;
-        labels = b;
-    }
+    children = interior.children;
+    layouts = interior.layouts;
+    labels = interior.labels;
+    let report = interior.report;
+    let top_level = interior.top_level;
 
     // The interior is done; level 0 and everything after it run serial.
     super::device_permit::arm(1);
