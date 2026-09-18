@@ -45,7 +45,7 @@ use crate::{Error, TableCounts};
 ///
 /// Distinct from both the univariate epoch tag and the monolithic multilinear
 /// one: no two of the three may ever share a transcript prefix.
-const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
+pub(crate) const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
 
 /// One epoch's proof and everything a standalone verifier re-binds.
 ///
@@ -130,8 +130,14 @@ pub fn l2g_commitment(
 /// The monolithic multilinear statement plus the epoch's position. A
 /// continuation epoch never has private-input pages (the bookend replaces
 /// PAGE), so that count is not stated — it is zero by construction.
-fn absorb_epoch<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
-    t: &mut DefaultTranscript<E, T>,
+///
+/// ★ The length is accumulated beside the absorbs, never written as a constant:
+/// a `FIXED` the caller has to keep in step is the same class of defect as the
+/// pad this function exists to compute. See
+/// [`statement::absorb_statement_padding`] for why the roots that follow have to
+/// start on a field element boundary and why the pad cannot be a literal.
+pub(crate) fn absorb_epoch(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
     elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
@@ -139,17 +145,26 @@ fn absorb_epoch<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    let mut len = 0usize;
+
     t.append_bytes(MULTILINEAR_EPOCH_TAG);
+    len += MULTILINEAR_EPOCH_TAG.len();
     t.append_bytes(elf_digest);
+    len += elf_digest.len();
     t.append_bytes(&epoch_label.to_le_bytes());
+    len += size_of_val(&epoch_label);
 
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(public_output);
+    len += public_output.len();
 
-    statement::absorb_table_counts(t, table_counts);
+    len += statement::absorb_table_counts(t, table_counts);
 
     t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(table_num_vars);
+    len += table_num_vars.len();
 
     let &ChainConfig {
         log_blowup,
@@ -159,8 +174,21 @@ fn absorb_epoch<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
+        len += size_of_val(&value);
     }
-    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+    let trailer = [grind.folding, grind.ood, grind.query];
+    t.append_bytes(&trailer);
+    len += trailer.len();
+
+    statement::absorb_statement_padding(
+        t,
+        "epoch",
+        len,
+        &[
+            ("public_output", public_output.len()),
+            ("table_num_vars", table_num_vars.len()),
+        ],
+    );
 }
 
 /// How an epoch's tables are split across commitments: everything together,
@@ -209,7 +237,7 @@ fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
 }
 
 /// Domain tag for the multilinear cross-epoch proof.
-const MULTILINEAR_GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
+pub(crate) const MULTILINEAR_GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
 
 /// The one cross-epoch proof: every epoch's bookend and the global-memory
 /// tables, in one transcript.
@@ -245,8 +273,14 @@ impl GlobalProof {
 }
 
 /// Binds the cross-epoch statement: what the run was, not what any epoch was.
-fn absorb_global<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
-    t: &mut DefaultTranscript<E, T>,
+///
+/// ⚠ This statement is padded for the same reason the epoch statement is, and
+/// it needs it for the same reason: `table_num_vars` is one byte per table
+/// (every epoch's bookend plus the global-memory tables), so it is a
+/// variable-length field sitting between the fixed prefix and the roots.
+/// `page_bases` is eight bytes an entry and does not move the alignment.
+pub(crate) fn absorb_global(
+    t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
     elf_digest: &[u8; 32],
     num_epochs: usize,
     num_private_input_pages: usize,
@@ -254,16 +288,26 @@ fn absorb_global<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     table_num_vars: &[u8],
     config: &ChainConfig,
 ) {
+    let mut len = 0usize;
+
     t.append_bytes(MULTILINEAR_GLOBAL_TAG);
+    len += MULTILINEAR_GLOBAL_TAG.len();
     t.append_bytes(elf_digest);
+    len += elf_digest.len();
     t.append_bytes(&(num_epochs as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(&(page_bases.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     for base in page_bases {
         t.append_bytes(&base.to_le_bytes());
+        len += size_of_val(base);
     }
     t.append_bytes(&(table_num_vars.len() as u64).to_le_bytes());
+    len += size_of::<u64>();
     t.append_bytes(table_num_vars);
+    len += table_num_vars.len();
     let &ChainConfig {
         log_blowup,
         log_folding,
@@ -272,8 +316,21 @@ fn absorb_global<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
+        len += size_of_val(&value);
     }
-    t.append_bytes(&[grind.folding, grind.ood, grind.query]);
+    let trailer = [grind.folding, grind.ood, grind.query];
+    t.append_bytes(&trailer);
+    len += trailer.len();
+
+    statement::absorb_statement_padding(
+        t,
+        "global",
+        len,
+        &[
+            ("page_bases", page_bases.len()),
+            ("table_num_vars", table_num_vars.len()),
+        ],
+    );
 }
 
 /// How the cross-epoch proof's tables are split: every bookend alone — so its

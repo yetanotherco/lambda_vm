@@ -104,6 +104,8 @@ pub mod transcript_counts;
 
 pub mod shift_tests;
 #[cfg(test)]
+pub mod statement_alignment_tests;
+#[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
 pub mod static_commitments_tests;

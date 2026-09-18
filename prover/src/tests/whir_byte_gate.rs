@@ -87,6 +87,17 @@
 //! ground proof cannot be gated this way at all. One table, one group, one
 //! stacked polynomial: this is a canary for the seam, not a block-level
 //! measurement.
+//!
+//! ⛔ **AND NO STATEMENT.** The fixture builds its own transcript from the seed
+//! `b"whir-identity"` and calls `multi_prove`, which begins at the roots. So
+//! nothing here absorbs an epoch, cross-epoch or monolithic statement, and a
+//! change to one of those — the computed statement padding, for instance —
+//! CANNOT move these lines. When such a change lands, "the gate is unmoved" is
+//! the assertion it owes, not evidence that it did nothing; the instruments that
+//! see it are the transcript pair pin's absorb counts and
+//! `tests::statement_alignment_tests`. It also means this fixture's own first
+//! window (13 seed bytes, then roots) is NOT field element aligned and must
+//! never be quoted as a witness that a real proof's is.
 
 use digest::Digest;
 use math::field::element::FieldElement;
