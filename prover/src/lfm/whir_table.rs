@@ -309,13 +309,21 @@ fn weave(kinds: &[FactorKind], committed: &[Ext], public: &[Ext]) -> Vec<Ext> {
 /// # ⛔ `check_preprocessed` IS NOT EMITTED, and this is the seam
 ///
 /// The host evaluates each preprocessed column's MLE at the reduced point
-/// (`multilinear_table.rs:806-826`), a full pass per column. A verifier that is
-/// itself proven cannot pay it. The caller supplies the replacement and the two
-/// are named here rather than anywhere else: BITWISE by
+/// (`check_preprocessed`), a full pass per column. A verifier that is itself
+/// proven cannot pay it. The caller supplies the replacement and the two are
+/// named here rather than anywhere else: BITWISE by
 /// [`super::preprocessed::emit_bitwise_preprocessed`], DECODE by its own pinned
 /// commitment group. A table with no preprocessed columns owes nothing, and the
 /// gate below is on such a table — said so rather than left to read as
 /// coverage.
+///
+/// ★ The host now names half of that itself: `verify`'s `settled_out_of_band`
+/// is how many LEADING preprocessed columns a prepared opening already settled
+/// at this very point, and those are skipped. So DECODE's replacement is not a
+/// thing this emitter invents — it is the argument the host takes, and the two
+/// sides have to agree on the same count. What stays owed here is the
+/// REMAINDER: every preprocessed column past that prefix is still an MLE pass
+/// the host makes and this leg does not.
 pub fn emit_table_verify(
     b: &mut LfmBuilder,
     transcript: &mut WhirTranscript,
