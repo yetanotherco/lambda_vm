@@ -133,6 +133,16 @@ pub struct EpochF1 {
     pub public: usize,
     /// `LFM_HASH`: the transcript's permutations.
     pub perms: usize,
+    /// Chains threaded — one per polynomial of every commitment group, which is
+    /// also the carried-root count.
+    ///
+    /// ★ Carried so the gate can ask the question the block's two logs disagree
+    /// about: does one more chain cost what the chain form says it costs?
+    /// ⛔ It ANSWERS no — every epoch of the driver's fixture carries exactly two
+    /// chains, so the form being exact there is silent on the chain count. The
+    /// field earns its place by making that limit visible in the run rather than
+    /// leaving it to be assumed the other way.
+    pub chains: usize,
 }
 
 impl EpochF1 {
@@ -530,6 +540,7 @@ pub fn epoch_f1(
     }
 
     f1.arena = arena_words(&plan);
+    f1.chains = plan.carried_roots();
     f1.pool = pool.len();
     f1.perms = perms;
     let _ = plan.decode_at;
@@ -715,6 +726,7 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
     let mut published_epochs = 0usize;
     let mut silent_epochs = 0usize;
     let mut rows: Vec<(usize, usize, usize, i64, i64)> = Vec::new();
+    let mut chain_rows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
 
     for index in 0..bundle.epochs.len() {
         let epoch = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
@@ -838,6 +850,7 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
             measured - measured_const,
         );
         rows.push((index, refs.len(), measured, ops_gap, pool_gap));
+        chain_rows.push((index, f1.chains, f1.groups, f1.arena, measured));
     }
 
     // ★ THE ANTI-VACUITY PAIR, asserted after the walk so the message can say
@@ -857,6 +870,26 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
     );
     for (index, tables, measured, ops_gap, pool_gap) in &rows {
         println!("{index:>6} {tables:>8} {measured:>12} {ops_gap:>12} {pool_gap:>10}");
+    }
+
+    // ⛔ THE CHAIN-SCALING QUESTION, AND THE ANSWER IS THAT THIS FIXTURE CANNOT
+    // ASK IT. At the block, the shape log gives epoch 12 one more chain and six
+    // more rounds than epoch 0 while the run's wrap 12 reads 44,669 FEWER
+    // instructions — either two runs describing different epochs, or a form that
+    // does not scale in the chain count. ★ MEASURED HERE: all three fixture
+    // epochs carry exactly TWO chains, so F1 being exact at all three says
+    // NOTHING about what one more chain costs. The groups term still moves
+    // (325,823 / 299,031 / 314,356) but that is `n_stack`, not the chain count.
+    // ⇒ No shape this laptop can prove discriminates it, and the block
+    // instrument is the only instrument. Printed rather than asserted, because
+    // what it records is a LIMIT of the fixture.
+    println!("\n== the chain term, where F1 is exact ==");
+    println!(
+        "{:>6} {:>7} {:>12} {:>10} {:>13}",
+        "epoch", "chains", "groups term", "arena", "instructions"
+    );
+    for (index, chains, groups, arena, measured) in &chain_rows {
+        println!("{index:>6} {chains:>7} {groups:>12} {arena:>10} {measured:>13}");
     }
 
     let bad: Vec<_> = rows.iter().filter(|r| r.3 != SPINE_RESIDUAL).collect();
