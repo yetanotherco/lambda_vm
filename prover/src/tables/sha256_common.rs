@@ -26,6 +26,7 @@ pub fn lin(v: Vec<(usize, i64)>, k: i64) -> BusValue {
 pub fn bits(c: usize, n: usize) -> BusValue {
     lin((0..n).map(|i| (c + i, 1i64 << i)).collect(), 0)
 }
+
 pub fn be(c: usize) -> BusValue {
     lin((0..4).map(|i| (c + i, 1i64 << (8 * (3 - i)))).collect(), 0)
 }

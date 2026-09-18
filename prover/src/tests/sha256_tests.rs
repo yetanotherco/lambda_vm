@@ -54,7 +54,7 @@ fn sha256_constraints_and_mutations() {
     assert!(!holds(sha256::Constraints, &core));
     let mut rounds = sha256_round::generate(&ops);
     assert!(holds(sha256_round::Constraints, &rounds));
-    rounds.main_table.set(0, sha256_round::OUT, FE::from(2));
+    rounds.main_table.set(0, sha256_round::OUT_A, FE::from(2));
     assert!(!holds(sha256_round::Constraints, &rounds));
     let mut schedule = sha256_schedule::generate(&ops);
     assert!(holds(sha256_schedule::Constraints, &schedule));

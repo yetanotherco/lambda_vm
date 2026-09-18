@@ -267,9 +267,11 @@ pub fn bitwise_ops(ops: &[Operation]) -> Vec<super::bitwise::BitwiseOperation> {
         for i in 0..16 {
             v.push(Op::halfword(Ty::AreBytes, out[2 * i], out[2 * i + 1]));
         }
-        for i in 0..48 {
-            v.push(Op::halfword(Ty::AreBytes, i, 0));
-        }
     }
+    // ROTXOR resolves its shifts and XORs through BITWISE now, so its lookups
+    // have to be counted here too or the bus does not balance.
+    v.extend(super::sha256_rotxor::bitwise_ops(&rot_ops(ops)));
+    v.extend(super::sha256_round::bitwise_ops(ops));
+    v.extend(super::sha256_schedule::bitwise_ops(ops));
     v
 }
