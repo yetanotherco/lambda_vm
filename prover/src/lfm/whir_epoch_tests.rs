@@ -796,5 +796,35 @@ mod tests {
             "inverting is_final left the AIR set identical, so the set does not \
              depend on the epoch's position and this test proves nothing"
         );
+
+        // ★ AND THE SECOND TAMPER IS THE ONE THAT REACHES THE VERIFY. Restating
+        // the epoch's `table_counts` changes how many AIRs the set has, so the
+        // set no longer describes the proof in front of it — and because
+        // `verify_epoch_bookend` builds ITS set through this same function, the
+        // verification refuses rather than arguing against a layout the prover
+        // never used. That is the by-construction claim reaching a verdict, not
+        // just a count.
+        let mut restated = b.clone();
+        restated.epochs[0].table_counts.cpu += 1;
+        let mismatched = crate::multilinear_continuation::epoch_airs_for(
+            &elf,
+            &opts,
+            &restated.epochs[0],
+            &position.register_init,
+            position.is_final,
+            position.label,
+            Some(harvested.decode_commitment),
+        );
+        assert_ne!(
+            mismatched.refs().len(),
+            refs.len(),
+            "a restated table count left the AIR set the same size, so the set is \
+             not a function of the counts and the refusal below would prove nothing"
+        );
+        assert!(
+            real_epoch_from_whir_continuation(&opts, &elf_bytes, &restated, 0, None).is_err(),
+            "an epoch whose restated table counts no longer match its own AIR set \
+             was harvested into a wrap input"
+        );
     }
 }
