@@ -205,6 +205,15 @@ pub(super) fn real_epoch_from_whir_continuation(
 /// commitment ONCE per bundle rather than once per epoch — fifteen derivations
 /// to one on the block, the same saving `decode_commitment` exists for on the
 /// STARK driver. `None` derives it here, exactly as before.
+///
+/// ⚠ AND THE SIZE OF IT, SO NOBODY REACHES FOR IT AS A LEVER. The derivation
+/// costs ≈0.08 s per call on the card — rs4 on FAST at the 8f826601 fixture,
+/// where DECODE is 5 x 2^20: `ONE-COMMIT 0.083 s`, one GPU commit, no host
+/// fallback (rs2 read 0.068 s earlier; both are single untimed reads). Fifteen
+/// harvests therefore spend about 1.2 s deriving, and handing `prepared` in
+/// once saves about 1.1 s of it. On a 220-second block that is a tidy-up, not
+/// a lever. What makes the parameter worth having is that a walk over every
+/// epoch should not repeat a pure function of (ELF, options) fifteen times.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn real_epoch_from_whir_continuation_under<H>(
     opts: &crate::ProofOptions,
