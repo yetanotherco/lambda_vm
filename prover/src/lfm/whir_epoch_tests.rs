@@ -630,6 +630,23 @@ mod tests {
     /// failure to `Ok(None)`, so the refusal carries no reason of its own and a
     /// driver that refused everything would pass the refusing half alone. The
     /// accept arm is what makes the refusal mean something.
+    ///
+    /// # What was mutated, and the ratio stated plainly
+    ///
+    /// ONE PROGRAM MUTATION: the verdict computed and discarded in
+    /// [`real_epoch_from_whir_continuation_under`] — the mutated driver builds a
+    /// `WhirRealEpoch` from a proof that failed verification, which the original
+    /// never does. It turns THIS test red on the `HARVESTED under RPX` arm, and
+    /// `an_epoch_that_does_not_verify_is_refused` and
+    /// `a_restated_register_carry_is_refused_by_the_driver` red on theirs, while
+    /// the six non-refusal tests stay green.
+    ///
+    /// ONE TEST-SIDE CONTROL, which is NOT a program mutation and is not counted
+    /// as one: running the refusal arm at `KeccakWhir` too. That changes the
+    /// TEST, not the driver — it is the accept arm read the other way — so what
+    /// it demonstrates is this test's discriminating power, that the arm is
+    /// measuring `H` and not something incidental about the bundle. It fails on
+    /// the `Ok(_)` arm, as it must.
     #[test]
     fn an_epoch_proven_under_keccak_is_refused_when_harvested_under_rpx() {
         use multilinear::whir_hash::{KeccakWhir, RpxWhir};
@@ -681,6 +698,14 @@ mod tests {
     /// default and red under `LAMBDA_VM_WHIR_HASH=rpx`, for no reason anybody
     /// reading the test would guess. What is true in every process is that the
     /// note fires exactly when the setting is not RPX.
+    ///
+    /// ★ AND IT FAILS IN BOTH DIRECTIONS, which a relation alone would not. The
+    /// setting is read into a local ONCE and the note's text must contain THAT
+    /// name, so a note naming a setting other than the one in force is red — not
+    /// merely a note that fires at the wrong time. Measured: making the note
+    /// report the opposite setting turns this test red on the naming assert
+    /// while the `is_some()` relation still holds, so the two asserts catch
+    /// different defects.
     #[test]
     fn the_process_hash_posture_is_reported_and_never_decides() {
         let setting = crate::whir_hash_knob::selected();
