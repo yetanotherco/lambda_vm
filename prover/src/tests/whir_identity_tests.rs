@@ -142,7 +142,7 @@ fn prove_with(seed: &[u8], columns: &[Vec<FieldElement<Fp>>], config: &ChainConf
         CommittedTables::<_, _, KeccakWhir>::commit(vec![table], config).expect("commit");
 
     let mut transcript = DefaultTranscript::<Ext>::new(seed);
-    multilinear_table::multi_prove(&committed, config, &mut transcript).expect("prove")
+    multilinear_table::multi_prove(&committed, config, &mut transcript, None).expect("prove")
 }
 
 /// The fixture is worth using only if it actually carries what the propositions

@@ -1169,10 +1169,15 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         is_final,
         None,
         None,
-        Some((
-            register::compute_precomputed_commitment_with_fini(&opts, &register_init, &reg_fini),
-            register::NUM_PREPROCESSED_COLS_WITH_FINI,
-        )),
+        Some(crate::RegisterPreprocessed {
+            commitment: register::compute_precomputed_commitment_with_fini(
+                &opts,
+                &register_init,
+                &reg_fini,
+            ),
+            init: &register_init,
+            fini: &reg_fini,
+        }),
     );
     let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);

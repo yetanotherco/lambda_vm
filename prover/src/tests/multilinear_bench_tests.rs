@@ -31,7 +31,10 @@ pub(super) fn options() -> stark::proof::options::ProofOptions {
     GoldilocksCubicProofOptions::with_params(4, 128, 20).expect("valid options")
 }
 
-pub(super) fn elf_bytes(name: &str) -> Vec<u8> {
+/// `pub(crate)` so `decode_residency_tests`' guest knob resolves a name the SAME
+/// way this bench does. Two resolvers would be two answers to "which ELF is
+/// `ethrex`", which is the question that cost this campaign a day.
+pub(crate) fn elf_bytes(name: &str) -> Vec<u8> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -290,6 +293,23 @@ fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
         us,
         ut,
     );
+    // ★ Its own line, and labelled with the same window, because alignment is a
+    // property of the byte stream rather than of a sponge: the same stream under
+    // two hashes is misaligned in the same places or in neither, so there is no
+    // keccak/rpx pair to print.
+    //
+    // A real proof reads ZERO here, and that zero is now a property rather than
+    // a wish: the counter starts at the statement's padding, which is where the
+    // padding's promise starts. The earlier definition counted a statement's own
+    // fields too and read 25 on the EQ fixture, which is why the name carries
+    // the boundary. `a_statement_that_ends_off_a_boundary_is_still_counted` is
+    // what stops the zero from being a counter nobody can bump.
+    println!(
+        "{:<12} misaligned absorbs after a statement: {} (zero is what a correct \
+         pad produces; a non-zero says a statement ended off a field element \
+         boundary and everything the verifier re-slices after it straddles two)",
+        window, c.transcript_misaligned_absorbs_after_statement,
+    );
 }
 
 /// ★★ THE TRANSCRIPT PAIR, PINNED — one configuration, both sides.
@@ -387,6 +407,20 @@ mod transcript_pin {
     /// statement, sixteen — giving `583_940 / 584_077`, from which
     /// `EPOCHS * 14 = 210` is subtracted here. The `+16` has not been measured
     /// yet; these constants are what will say so if it is wrong.
+    ///
+    /// ⚠ A SECOND PREDICTION rides on top, and it is NOT symmetric between the
+    /// two sides. W1-B's out-of-band opening puts DECODE's derived root into
+    /// each epoch's roots block: the prover absorbs it once per epoch, the
+    /// verifier twice (`multi_verify` and the `owed` replay). So at fourteen
+    /// kinds this lineage predicts prove `583_730 + 210 + 15 = 583_955` and
+    /// verify `583_867 + 210 + 30 = 584_107`.
+    ///
+    /// ★ The prove line coincides with the pair `whir/lfm` shows at FIFTEEN
+    /// table kinds (`583_730 + 225`), and for a different reason — one branch's
+    /// extra table count against another's extra root. The verify lines do NOT
+    /// coincide, because the replay absorbs the root a second time and a table
+    /// count is absorbed once. Reading one as evidence for the other would be
+    /// reading a coincidence.
     pub const PROVE_BASE_ABSORBS: u64 = 583_730;
     /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
     pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
@@ -396,16 +430,219 @@ mod transcript_pin {
         EPOCHS * crate::statement::NUM_TABLE_KINDS as u64
     }
 
-    /// (absorbs, squeezes, states) after `prove_continuation`.
-    pub const PROVE: (u64, u64, u64) = (PROVE_BASE_ABSORBS + table_count_absorbs(), 183_226, 2_996);
-    /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
-    pub const VERIFY: (u64, u64, u64) =
-        (VERIFY_BASE_ABSORBS + table_count_absorbs(), 183_256, 2_996);
+    /// The DECODE group's shape at the pinned guest: columns, and log2 of the
+    /// rows its instruction table fills.
+    ///
+    /// ⚠ NOT A CONSTANT OF THE PROTOCOL — it is this guest's instruction table,
+    /// so [`super::check_transcript_pins`] DERIVES it from the ELF and asserts
+    /// it before comparing any count. A guest whose program grew past 2^20
+    /// instructions then fails by name, instead of moving every number below by
+    /// an amount that would read as a protocol change.
+    pub const DECODE_PREPARED_SHAPE: (usize, usize) = (5, 20);
 
-    /// `owed`'s own cost, stated rather than left as a subtraction: 137 absorbs
-    /// is `Sum roots.len()` over the 15 epoch calls, 30 squeezes is `2 x 15`,
-    /// and it reads no state.
-    pub const OWED: (u64, u64, u64) = (137, 30, 0);
+    /// Eight-byte candidates one 32-byte sponge squeeze hands out, which is why
+    /// a round's `num_queries` draws cost `ceil(Q / 4)` squeezes and not `Q`.
+    pub const CANDIDATES_PER_SQUEEZE: u64 = 4;
+
+    /// ★★ WHAT ONE PREPARED OPENING COSTS THE TRANSCRIPT, PER EPOCH — derived
+    /// from the round structure, not from the box.
+    ///
+    /// The landing gate before run a2v priced this at "+1 absorb per epoch": the
+    /// derived root's absorb, and nothing else. But opening a committed
+    /// polynomial in WHIR *is a chain*, and W1-B opens DECODE's out-of-band
+    /// commitment at DECODE's reduced point once per epoch. The box read
+    /// +79 absorbs / +202 squeezes / +17 states an epoch on both hashes. What
+    /// follows is that number reached from the code instead, so the next shape
+    /// change moves it on its own.
+    ///
+    /// `stacked_eval::verify` absorbs one field element per
+    /// `layout.placements()` entry — the group's columns — then draws ONE
+    /// batching challenge, then runs `layout.num_polys()` chains at
+    /// `layout.n_stack()`. For this group the stacker puts all five columns in
+    /// one polynomial, so it is one chain and five absorbs.
+    ///
+    /// Each chain is `whir_chain::verify_weighted` over
+    /// `config.schedule(n_stack)`. Per round, read off that loop:
+    ///
+    /// * `check_grind(folding)` — one state read, one nonce absorbed;
+    /// * `sumcheck::verify_rounds(.., degree 2, ..)` — two evaluations absorbed
+    ///   and one challenge drawn per variable, so `2K` absorbs and `K` squeezes
+    ///   over the chain, `K` being the schedule's sum;
+    /// * a non-final round also absorbs the successor root and the
+    ///   out-of-domain value, draws `z0` and `gamma`, and grinds twice more:
+    ///   four absorbs, two squeezes, two states, `R - 1` times;
+    /// * the final round absorbs the final value and grinds once: two absorbs,
+    ///   one state, and no `z0` or `gamma` because there is no successor;
+    /// * every round draws `num_queries` positions with `sample_u64` and
+    ///   absorbs nothing (`whir_round::verify`, `verify_final`).
+    ///
+    /// ⚠ THE SQUEEZE COLUMN CARRIES AN ASSUMPTION THE ABSORB COLUMN DOES NOT:
+    /// that each field-element sample costs one squeeze and that consecutive
+    /// `u64` draws pack [`CANDIDATES_PER_SQUEEZE`] to a squeeze. That is what
+    /// makes the query term `R * ceil(Q / 4)` rather than `R * Q`. It is the
+    /// reading the box confirmed at this shape; a buffer that straddled
+    /// differently would show up in this column and nowhere else.
+    pub fn prepared_opening_per_epoch(shape: (usize, usize)) -> (u64, u64, u64) {
+        let (layout, config) = prepared_group(shape);
+        let schedule = config.schedule(layout.n_stack());
+
+        let rounds = schedule.len() as u64;
+        let folded: u64 = schedule.iter().sum::<usize>() as u64;
+        let queries = config.num_queries as u64;
+        let per_round_query_squeezes = queries.div_ceil(CANDIDATES_PER_SQUEEZE);
+
+        let grinds = 3 * rounds - 1;
+        let chain_absorbs = grinds + 2 * folded + 2 * (rounds - 1) + 1;
+        let chain_squeezes = folded + 2 * (rounds - 1) + rounds * per_round_query_squeezes;
+
+        let polys = layout.num_polys() as u64;
+        (
+            layout.placements().len() as u64 + polys * chain_absorbs,
+            1 + polys * chain_squeezes,
+            polys * grinds,
+        )
+    }
+
+    /// The layout and chain config the DECODE group is committed and opened
+    /// under — the same two values `decode_prepared_for` builds, from the same
+    /// functions, so nothing here can describe a group the prover does not use.
+    pub fn prepared_group(
+        shape: (usize, usize),
+    ) -> (
+        multilinear::stacking::StackedLayout,
+        multilinear::whir_chain::ChainConfig,
+    ) {
+        let (columns, num_vars) = shape;
+        (
+            stark::multilinear_table::global_layout(&[(columns, num_vars)])
+                .expect("the DECODE group's layout"),
+            crate::multilinear_continuation::decode_prepared_config(columns, num_vars),
+        )
+    }
+
+    /// Device commits one prepared opening costs per epoch: the chain's
+    /// successor codewords, `R - 1` of them per stacked polynomial.
+    pub fn prepared_fold_commits_per_epoch(shape: (usize, usize)) -> u64 {
+        let (layout, config) = prepared_group(shape);
+        let rounds = config.schedule(layout.n_stack()).len() as u64;
+        layout.num_polys() as u64 * (rounds - 1)
+    }
+
+    /// The commitment itself: one commit per stacked polynomial, built once for
+    /// the whole run and held across the epochs — which is the count
+    /// `decode_residency_tests` reads off the production path.
+    pub fn prepared_commitments(shape: (usize, usize)) -> u64 {
+        prepared_group(shape).0.num_polys() as u64
+    }
+
+    /// Roots DECODE's out-of-band commitment contributes to one epoch's roots
+    /// block — one, and it is a property of the derivation rather than of this
+    /// guest.
+    ///
+    /// `decode_prepared_from_columns` commits the five columns under
+    /// `global_layout(&[(5, rows)])`, whose `n_stack` is `ceil_log2(5 * rows)`,
+    /// so all five always fit one stacked polynomial and the commitment always
+    /// has exactly one root. `decode_prepared_tests` pins that shape; this
+    /// constant is what makes the pin move if it ever stops holding.
+    pub const DERIVED_ROOTS_PER_EPOCH: u64 = 1;
+
+    /// Absorbs DECODE's derived root contributes to the PROVE line: one per
+    /// epoch, inside `multi_prove`'s roots block.
+    pub const fn prove_derived_root_absorbs() -> u64 {
+        EPOCHS * DERIVED_ROOTS_PER_EPOCH
+    }
+
+    /// ...and to the VERIFY line, which is TWICE that and not the same number.
+    ///
+    /// The verifier absorbs the derived root in `multi_verify`'s roots block
+    /// AND again in the `owed` replay, which has to see the same block or it
+    /// draws challenges no table is checked at. So the term is doubled here and
+    /// the second half of it is also what [`OWED`] grows by.
+    ///
+    /// ⚠ Writing one term for both sides is the mistake this split exists to
+    /// prevent, and it was made: a single `derived_root_absorbs()` on both lines
+    /// put VERIFY at `584_092`, and `the_pinned_constants_differ_by_owed` caught
+    /// it because the pair then differed by 137 while `OWED` said 152.
+    pub const fn verify_derived_root_absorbs() -> u64 {
+        2 * EPOCHS * DERIVED_ROOTS_PER_EPOCH
+    }
+
+    /// The squeezes and states a continuation cost BEFORE the prepared opening
+    /// was wired: run a2q's measurement at `c73568f4`, carried unchanged.
+    ///
+    /// The two sides differ by `owed`'s thirty squeezes and by nothing else, and
+    /// neither side reads a transcript state outside a grind check, which is why
+    /// the state base is one number for both.
+    pub const PROVE_BASE_SQUEEZES: u64 = 183_226;
+    /// See [`PROVE_BASE_SQUEEZES`].
+    pub const VERIFY_BASE_SQUEEZES: u64 = 183_256;
+    /// See [`PROVE_BASE_SQUEEZES`]. One state read per grind check, both sides.
+    pub const BASE_STATES: u64 = 2_996;
+
+    /// (absorbs, squeezes, states) after `prove_continuation`.
+    ///
+    /// ⚠ A FUNCTION, not a constant, because the opening's terms come out of
+    /// `schedule()` and that allocates. The shape it is evaluated at is asserted
+    /// against the ELF before any comparison is made.
+    pub fn prove(shape: (usize, usize)) -> (u64, u64, u64) {
+        let (a, s, t) = prepared_opening_per_epoch(shape);
+        (
+            PROVE_BASE_ABSORBS + table_count_absorbs() + prove_derived_root_absorbs() + EPOCHS * a,
+            PROVE_BASE_SQUEEZES + EPOCHS * s,
+            BASE_STATES + EPOCHS * t,
+        )
+    }
+
+    /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
+    ///
+    /// ★ The opening's term is the SAME on both sides and is NOT part of `owed`:
+    /// the prover runs the opening too, and `owed` replays only the roots block.
+    /// So the new term moves both lines by the same amount and
+    /// `the_pinned_constants_differ_by_owed` stays a live check rather than one
+    /// the new term could have absorbed.
+    pub fn verify(shape: (usize, usize)) -> (u64, u64, u64) {
+        let (a, s, t) = prepared_opening_per_epoch(shape);
+        (
+            VERIFY_BASE_ABSORBS
+                + table_count_absorbs()
+                + verify_derived_root_absorbs()
+                + EPOCHS * a,
+            VERIFY_BASE_SQUEEZES + EPOCHS * s,
+            BASE_STATES + EPOCHS * t,
+        )
+    }
+
+    /// Device commits a whole continuation makes.
+    ///
+    /// ⚠ THE BASE IS A MEASUREMENT AND THE DELTA IS DERIVED, and the doc says
+    /// which is which. `COMMITS_BASE` is the box's reading before W1-B's opening
+    /// existed; what this adds to it is the opening's own device work — `R - 1`
+    /// successor codewords per epoch plus the one-time commitment — computed
+    /// from the same layout the transcript terms come from.
+    pub const COMMITS_BASE: u64 = 1_050;
+
+    /// See [`COMMITS_BASE`].
+    pub fn commits(shape: (usize, usize)) -> u64 {
+        COMMITS_BASE + EPOCHS * prepared_fold_commits_per_epoch(shape) + prepared_commitments(shape)
+    }
+
+    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: 137, which is
+    /// `Sum roots.len()` over the 15 epoch calls, measured.
+    pub const OWED_CARRIED_ABSORBS: u64 = 137;
+
+    /// `owed`'s own cost, stated rather than left as a subtraction: the carried
+    /// roots plus DECODE's derived one, `2 x 15` squeezes, and no state read.
+    ///
+    /// ⚠ The squeeze count is TWO per call and not three. `owed` shares the
+    /// roots block's absorb half and spells its own draws, because a fork that
+    /// is discarded must not pay a squeeze nobody reads — and `hash_metrics`
+    /// counts squeezes on a clone like any other transcript, so a third draw
+    /// would show up right here as `3 x 15`.
+    pub const OWED: (u64, u64, u64) = (
+        OWED_CARRIED_ABSORBS + prove_derived_root_absorbs(),
+        2 * EPOCHS,
+        0,
+    );
 }
 
 /// Whether the pinned counts describe THIS run.
@@ -464,6 +701,25 @@ fn check_transcript_pins(
         return;
     }
 
+    // ★ THE SHAPE IS DERIVED FROM THIS GUEST, NOT ASSUMED. Every term the
+    // prepared opening contributes is a function of the DECODE group's shape,
+    // so the shape is read off the ELF here and asserted before a single count
+    // is compared. Without it the pin could describe a program whose
+    // instruction table changed size, and the disagreement would arrive as "the
+    // counts moved" — the one message that says nothing about which of the two
+    // is wrong.
+    //
+    // It costs the instruction map and no commitment, and it runs after both
+    // measurement windows are closed.
+    let shape = decode_prepared_shape(elf);
+    assert_eq!(
+        shape,
+        transcript_pin::DECODE_PREPARED_SHAPE,
+        "the pinned guest's DECODE group is {shape:?} columns/log2-rows; the pin \
+         was derived at {:?}",
+        transcript_pin::DECODE_PREPARED_SHAPE
+    );
+
     let triple = |c: &crypto::hash_metrics::Counts| {
         (
             c.transcript_absorbs,
@@ -471,11 +727,31 @@ fn check_transcript_pins(
             c.transcript_states,
         )
     };
-    assert_pinned_pair(triple(prove), triple(verify));
+    assert_pinned_pair(shape, triple(prove), triple(verify));
     println!(
         "{:<12} transcript pin OK (both sides, and the owed delta)",
         "WHIR"
     );
+}
+
+/// The DECODE group's shape — columns, and log2 of the rows — as the ELF
+/// implies it.
+///
+/// The two numbers `decode_prepared_for` derives before it commits anything,
+/// taken the same way: `preprocessed_columns_from_elf` builds the instruction
+/// table's columns, and the group is as wide as that list and as tall as one of
+/// them.
+#[cfg(feature = "hash-metrics")]
+fn decode_prepared_shape(elf_bytes: &[u8]) -> (usize, usize) {
+    let elf = Elf::load(elf_bytes).expect("the pinned guest loads");
+    let columns =
+        crate::tables::decode::preprocessed_columns_from_elf(&elf).expect("DECODE's columns");
+    let rows = columns.first().expect("DECODE has columns").len();
+    assert!(
+        rows.is_power_of_two(),
+        "DECODE's preprocessed columns are {rows} rows, which the hypercube cannot hold"
+    );
+    (columns.len(), rows.trailing_zeros() as usize)
 }
 
 /// The assertions themselves, split from the guard so they can be reached
@@ -488,7 +764,7 @@ fn check_transcript_pins(
 /// every branch reachable from a laptop, which is why the four tests below
 /// exist and why three of them are `should_panic`.
 #[cfg(feature = "hash-metrics")]
-fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
+fn assert_pinned_pair(shape: (usize, usize), prove: (u64, u64, u64), verify: (u64, u64, u64)) {
     // Only the state columns are destructured: the two lines are compared whole
     // against their pins, and the delta between them is a property of the
     // CONSTANTS rather than of a measurement — see
@@ -498,12 +774,12 @@ fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
 
     assert_eq!(
         prove,
-        transcript_pin::PROVE,
+        transcript_pin::prove(shape),
         "the PROVE-side transcript counts moved"
     );
     assert_eq!(
         verify,
-        transcript_pin::VERIFY,
+        transcript_pin::verify(shape),
         "the VERIFY-side transcript counts moved"
     );
 
@@ -528,7 +804,7 @@ fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
 
 /// ★★ The constants are the measurement — asserted against LITERALS.
 ///
-/// Passing `transcript_pin::PROVE` here would be a check that cannot fail: a
+/// Passing `transcript_pin::prove()` here would be a check that cannot fail: a
 /// mutated constant would move the input and the expectation together and the
 /// test would pass on any value. The numbers below are written out so that a
 /// constant which drifts, is mistyped, or has its two lines swapped fails here,
@@ -543,9 +819,138 @@ fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
 #[test]
 fn the_pinned_pair_is_the_measurement() {
     let counts = 15 * crate::statement::NUM_TABLE_KINDS as u64;
+    // The derived-root term, re-spelled from the protocol rather than called
+    // from `transcript_pin` — a re-derivation that calls the thing it checks is
+    // not one. One root per epoch into the prover's roots block; two per epoch
+    // on the verify side, because the `owed` replay absorbs it as well.
+    //
+    // ★ AND THE PREPARED OPENING'S TERM, re-spelled the same way. The pin
+    // derives it by calling `schedule()`; this writes the arithmetic out at the
+    // shape that schedule implies — six rounds over twenty-three variables at
+    // fold width four, 112 queries, four candidates a squeeze — so the two
+    // spellings disagree if either the round structure or the shape moves.
+    // `the_prepared_opening_is_the_schedule_the_shape_implies` is what ties
+    // those four numbers to the shape rather than to this comment.
+    let (rounds, folded, queries) = (6u64, 23u64, 112u64);
+    let grinds = 3 * rounds - 1;
+    let opening = (
+        5 + grinds + 2 * folded + 2 * (rounds - 1) + 1,
+        1 + folded + 2 * (rounds - 1) + rounds * queries.div_ceil(4),
+        grinds,
+    );
     assert_pinned_pair(
-        (583_730 + counts, 183_226, 2_996),
-        (583_867 + counts, 183_256, 2_996),
+        transcript_pin::DECODE_PREPARED_SHAPE,
+        (
+            583_730 + counts + 15 + 15 * opening.0,
+            183_226 + 15 * opening.1,
+            2_996 + 15 * opening.2,
+        ),
+        (
+            583_867 + counts + 30 + 15 * opening.0,
+            183_256 + 15 * opening.1,
+            2_996 + 15 * opening.2,
+        ),
+    );
+}
+
+/// The shape DERIVER, exercised on a guest a laptop has.
+///
+/// ⚠ `check_transcript_pins` reaches its shape assertion only behind the sha
+/// guard, so on the box and nowhere else — the same blindness the pin's own
+/// split was written to remove. The assertion compares a derived tuple against
+/// a constant, and the way that comparison goes wrong without the guest is the
+/// tuple: two `usize`s, and nothing in the type says which is the width. So the
+/// deriver runs here on `sub`, where the column count is a constant of the
+/// DECODE table and the height is whatever that program implies.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_shape_deriver_reads_columns_then_log2_rows() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let built =
+        crate::tables::decode::preprocessed_columns_from_elf(&elf).expect("DECODE's columns");
+
+    let (columns, num_vars) = decode_prepared_shape(&elf_bytes);
+    assert_eq!(
+        columns,
+        built.len(),
+        "the first element is the column count"
+    );
+    assert_eq!(
+        1usize << num_vars,
+        built[0].len(),
+        "the second element is log2 of the rows"
+    );
+    assert_eq!(
+        columns,
+        crate::tables::decode::NUM_PRECOMPUTED_COLS,
+        "DECODE's column count is the same for every guest; only the height moves"
+    );
+}
+
+/// ★★ WHAT THE PINNED SHAPE IMPLIES, written where a laptop can falsify it.
+///
+/// Every term the prepared opening adds is a function of four numbers the shape
+/// determines: the stacked width, the number of polynomials, the fold schedule
+/// and the query count. They are asserted here, so a change to the stacking
+/// rule, to `MAX_STACK_VARS`, to the fold width or to the shipped query count
+/// fails on a laptop with a name attached instead of arriving on the box as a
+/// pin that moved by an unexplained amount.
+///
+/// The query count is not a number invented here: `query_count` pins the
+/// shipped posture's 110 / 112 / 113 in its own tests, and this says which of
+/// them this shape lands on.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_prepared_opening_is_the_schedule_the_shape_implies() {
+    let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let (columns, _) = shape;
+    let (layout, config) = transcript_pin::prepared_group(shape);
+
+    // Five columns of 2^20 is 5,242,880 cells, which the stacker rounds up to
+    // 2^23 — one polynomial, so one chain and one root.
+    assert_eq!(layout.n_stack(), 23, "the DECODE group's stacked width");
+    assert_eq!(layout.num_polys(), 1, "the DECODE group is one polynomial");
+    assert_eq!(
+        layout.placements().len(),
+        columns,
+        "one placement per column, which is what the opening's wrapper absorbs"
+    );
+    assert_eq!(
+        config.schedule(layout.n_stack()),
+        vec![4, 4, 4, 4, 4, 3],
+        "the fold schedule the chain runs"
+    );
+    assert_eq!(
+        config.num_queries, 112,
+        "the shipped query count at this shape"
+    );
+
+    // …and the terms those four numbers produce.
+    assert_eq!(
+        transcript_pin::prepared_opening_per_epoch(shape),
+        (79, 202, 17),
+        "the opening's per-epoch transcript cost"
+    );
+    assert_eq!(
+        transcript_pin::prepared_fold_commits_per_epoch(shape),
+        5,
+        "one successor codeword per non-final round"
+    );
+    assert_eq!(
+        transcript_pin::prepared_commitments(shape),
+        1,
+        "the commitment itself, once for the run"
+    );
+    // The device commit total, re-spelled: the measured base plus the fold
+    // commits of fifteen openings plus the one commitment. Written here rather
+    // than only inside the `cuda` pin so the arithmetic is reachable from a
+    // laptop, which is the same reason `assert_pinned_pair` takes its triples
+    // as arguments.
+    assert_eq!(
+        transcript_pin::commits(shape),
+        transcript_pin::COMMITS_BASE + transcript_pin::EPOCHS * 5 + 1,
+        "the device commit total is its base plus the opening's own commits"
     );
 }
 
@@ -554,8 +959,9 @@ fn the_pinned_pair_is_the_measurement() {
 #[test]
 #[should_panic(expected = "the PROVE-side transcript counts moved")]
 fn a_prove_count_off_by_one_is_rejected() {
-    let (a, s, t) = transcript_pin::PROVE;
-    assert_pinned_pair((a + 1, s, t), transcript_pin::VERIFY);
+    let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let (a, s, t) = transcript_pin::prove(shape);
+    assert_pinned_pair(shape, (a + 1, s, t), transcript_pin::verify(shape));
 }
 
 /// ★ One unit on the verify line fails on the verify assertion.
@@ -563,8 +969,9 @@ fn a_prove_count_off_by_one_is_rejected() {
 #[test]
 #[should_panic(expected = "the VERIFY-side transcript counts moved")]
 fn a_verify_count_off_by_one_is_rejected() {
-    let (a, s, t) = transcript_pin::VERIFY;
-    assert_pinned_pair(transcript_pin::PROVE, (a + 1, s, t));
+    let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let (a, s, t) = transcript_pin::verify(shape);
+    assert_pinned_pair(shape, transcript_pin::prove(shape), (a + 1, s, t));
 }
 
 /// ★★ The per-branch term is a TERM, not a re-baseline.
@@ -610,13 +1017,20 @@ fn the_per_branch_term_is_the_table_kind_count() {
         transcript_pin::EPOCHS * kinds as u64,
         "the pin's per-branch term is not `epochs x kinds`"
     );
+    let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let opening_absorbs =
+        transcript_pin::EPOCHS * transcript_pin::prepared_opening_per_epoch(shape).0;
     assert_eq!(
-        transcript_pin::PROVE.0 - transcript_pin::PROVE_BASE_ABSORBS,
-        transcript_pin::table_count_absorbs(),
+        transcript_pin::prove(shape).0 - transcript_pin::PROVE_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs()
+            + transcript_pin::prove_derived_root_absorbs()
+            + opening_absorbs,
     );
     assert_eq!(
-        transcript_pin::VERIFY.0 - transcript_pin::VERIFY_BASE_ABSORBS,
-        transcript_pin::table_count_absorbs(),
+        transcript_pin::verify(shape).0 - transcript_pin::VERIFY_BASE_ABSORBS,
+        transcript_pin::table_count_absorbs()
+            + transcript_pin::verify_derived_root_absorbs()
+            + opening_absorbs,
     );
 }
 
@@ -639,8 +1053,9 @@ fn the_per_branch_term_is_the_table_kind_count() {
 #[cfg(feature = "hash-metrics")]
 #[test]
 fn the_pinned_constants_differ_by_owed() {
-    let (pa, ps, pt) = transcript_pin::PROVE;
-    let (va, vs, vt) = transcript_pin::VERIFY;
+    let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let (pa, ps, pt) = transcript_pin::prove(shape);
+    let (va, vs, vt) = transcript_pin::verify(shape);
     assert_eq!(
         (va - pa, vs - ps, vt - pt),
         transcript_pin::OWED,
@@ -658,13 +1073,23 @@ fn the_pinned_constants_differ_by_owed() {
         "`owed` samples twice per epoch call"
     );
     assert_eq!(ot, 0, "`owed` reads no transcript state");
-    // ⚠ The absorb count gets no assertion of its own. It is `Sum roots.len()`
-    // over the epochs — data from the table shapes, not something derivable
-    // here — so any predicate this test could write about it would be either
-    // circular (comparing the constant to itself) or vacuous. An earlier draft
-    // had `oa % 1 == 0`, which is true of every integer. It is pinned by
-    // `VERIFY - PROVE` above and by V1's closed form, which is where it belongs.
-    let _ = oa;
+    // ★ The out-of-band opening's own term, which IS derivable here: the replay
+    // absorbs DECODE's derived root once per epoch on top of the carried ones.
+    // Without this the two halves of the wiring — the root reaching
+    // `multi_verify` and the root reaching the replay — could be re-pinned one
+    // at a time, which is exactly the drift that made this branch red.
+    assert_eq!(
+        oa - transcript_pin::OWED_CARRIED_ABSORBS,
+        transcript_pin::prove_derived_root_absorbs(),
+        "`owed` no longer absorbs DECODE's derived root once per epoch"
+    );
+    // ⚠ Only the DERIVED half of the absorb count is asserted, above. The
+    // carried half is `Sum roots.len()` over the epochs — data from the table
+    // shapes, not something derivable here — so any predicate this test could
+    // write about it would be either circular (comparing the constant to
+    // itself) or vacuous. An earlier draft had `oa % 1 == 0`, which is true of
+    // every integer. That half is pinned by `VERIFY - PROVE` above and by V1's
+    // closed form, which is where it belongs.
 }
 
 /// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
@@ -812,6 +1237,20 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     let mib = |n: usize| n as f64 / (1024.0 * 1024.0);
     let mut fri = None;
     let mut whir = None;
+    // ★ THE COUNTS ARE TAKEN IN THE ARM'S OWN WINDOW; ONLY THE COMPARISON IS
+    // DEFERRED, to below the timing table.
+    //
+    // Run a2v's pin went red and the run printed no prove time, no verify time
+    // and no proof size: the assert panicked before the table, so a wrong
+    // prediction cost the measurement that would have helped explain it. A pin
+    // is a gate on a measurement, and a gate that destroys its own subject is
+    // worth one line of plumbing to avoid.
+    #[cfg(feature = "hash-metrics")]
+    let mut pinned: Option<(crypto::hash_metrics::Counts, crypto::hash_metrics::Counts)> = None;
+    // The device commit count, read where the read-0 line below reads it so the
+    // two can never describe different windows.
+    #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
+    let mut device_commits: Option<u64> = None;
 
     if backend != "whir" {
         let start = Instant::now();
@@ -878,6 +1317,10 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
             crypto::grinding::gpu_grind_calls(),
             crypto::grinding::gpu_grind_calls_rpx(),
         );
+        #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
+        {
+            device_commits = Some(multilinear::gpu::commit_calls());
+        }
         // ★★ WHICH SPONGE THE TRANSCRIPT RAN ON, per arm and on BOTH sides.
         //
         // The line above says which KERNELS ran; this one says which sponge the
@@ -916,7 +1359,7 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         {
             let verify_counts = crypto::hash_metrics::snapshot();
             print_transcript_counts("WHIR verify", &verify_counts);
-            check_transcript_pins(&bytes, epoch_size_log2, &prove_counts, &verify_counts);
+            pinned = Some((prove_counts, verify_counts));
         }
         whir = Some((prove, start.elapsed(), size, epochs));
     }
@@ -944,6 +1387,73 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
             w.2 as f64 / f.2 as f64,
         );
     }
+
+    // The pins, after the table. A red one from here costs nothing that was
+    // measured.
+    #[cfg(feature = "hash-metrics")]
+    if let Some((prove_counts, verify_counts)) = pinned {
+        #[cfg(feature = "cuda")]
+        check_device_pins(&bytes, epoch_size_log2, device_commits, &prove_counts);
+        check_transcript_pins(&bytes, epoch_size_log2, &prove_counts, &verify_counts);
+    }
+}
+
+/// The device counters, pinned the way the transcript pair is: a shape-derived
+/// delta on a measured base, behind the same guest guard.
+///
+/// ★ THE GRIND LINE IS AN IDENTITY, NOT A SECOND NUMBER. The only production
+/// readers of `transcript.state()` on this path are `whir_chain`'s `grind` and
+/// `check_grind`, one read each, so the device grind count and the prove side's
+/// state column are two instruments on one quantity and must agree exactly.
+/// Pinning a literal beside the state pin would have been a second copy of the
+/// same measurement; this way a host fallback, or a state read appearing
+/// somewhere new, says which instrument moved.
+///
+/// The commit line cannot be an identity — its base is a measured total over
+/// every table of every epoch — so it is `COMMITS_BASE` plus the opening's own
+/// device work, derived from the layout.
+#[cfg(all(feature = "cuda", feature = "hash-metrics"))]
+fn check_device_pins(
+    elf: &[u8],
+    epoch_size_log2: u32,
+    commits: Option<u64>,
+    prove: &crypto::hash_metrics::Counts,
+) {
+    use sha2::{Digest, Sha256};
+
+    let sha: String = Sha256::digest(elf)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+        println!(
+            "{:<12} device pin SKIPPED - see the transcript pin's line",
+            "WHIR"
+        );
+        return;
+    }
+    let shape = decode_prepared_shape(elf);
+
+    let grinds = crypto::grinding::gpu_grind_calls() + crypto::grinding::gpu_grind_calls_rpx();
+    assert_eq!(
+        grinds, prove.transcript_states,
+        "device grinds and the prove side's transcript state reads disagree; on \
+         this path every grind reads the state exactly once and nothing else \
+         reads it"
+    );
+
+    let Some(commits) = commits else {
+        panic!("the WHIR arm ran but its device commit count was never taken");
+    };
+    assert_eq!(
+        commits,
+        transcript_pin::commits(shape),
+        "the device commit count moved"
+    );
+    println!(
+        "{:<12} device pin OK (commits {commits}, grinds {grinds} = states)",
+        "WHIR"
+    );
 }
 
 /// Where a continuation's time goes: preparing an epoch against proving it.
@@ -983,30 +1493,37 @@ fn continuation_phases() {
     let mut prove = Vec::new();
     let mut epochs = Vec::new();
     let mut last = Instant::now();
-    let boundaries = crate::continuation::for_each_epoch(
-        &elf,
-        &inputs,
-        epoch_size_log2,
-        &artifacts,
-        |prepared, _| {
-            prepare.push(last.elapsed());
-            let start = Instant::now();
-            epochs.push(multilinear_continuation::prove_epoch(
-                &elf,
-                &bytes,
-                &prepared.register_init,
-                prepared.label,
-                prepared.traces,
-                prepared.is_final,
-                &prepared.boundary,
-                &opts,
-                Some(decode_commitment),
-            )?);
-            prove.push(start.elapsed());
-            last = Instant::now();
-            Ok(())
-        },
-    )
+    // The dispatch above the epoch loop, as production does it, so DECODE's
+    // out-of-band commitment is built once and held for the whole run.
+    let boundaries = crate::with_whir_hash!(|H| {
+        let pinned = multilinear_continuation::decode_prepared_for::<H>(&elf, &bytes)
+            .expect("DECODE's out-of-band commitment");
+        crate::continuation::for_each_epoch(
+            &elf,
+            &inputs,
+            epoch_size_log2,
+            &artifacts,
+            |prepared, _| {
+                prepare.push(last.elapsed());
+                let start = Instant::now();
+                epochs.push(multilinear_continuation::prove_epoch::<H>(
+                    &elf,
+                    &bytes,
+                    &prepared.register_init,
+                    prepared.label,
+                    prepared.traces,
+                    prepared.is_final,
+                    &prepared.boundary,
+                    &opts,
+                    Some(decode_commitment),
+                    &pinned,
+                )?);
+                prove.push(start.elapsed());
+                last = Instant::now();
+                Ok(())
+            },
+        )
+    })
     .expect("the epochs prepare");
 
     let start = Instant::now();
@@ -1241,6 +1758,9 @@ fn phases() {
         roots: committed.roots().to_vec(),
         tables: table_proofs,
         columns: vec![columns],
+        // This bench re-implements `multi_prove`'s body to clock its phases
+        // apart; it commits no preprocessed group, so there is nothing to open.
+        preprocessed: None,
     };
     let total = total.elapsed();
 

@@ -340,3 +340,286 @@ fn a_keccak_state_read_is_tagged_as_keccak() {
     assert_eq!(c.transcript_states_rpx, 0);
     assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
+
+// =========================================================================
+// W1-B: where the derived root goes
+// =========================================================================
+
+/// ★★★ THE ABSORB POSITION — the orderings are distinguishable, and the
+/// challenge sees it.
+///
+/// W1-B adds one root the proof does not carry: the verifier derives it from
+/// the ELF and absorbs it AFTER the roots the proof does carry, and BEFORE any
+/// challenge. Two guards were proposed for that ordering and neither reaches
+/// it:
+///
+/// * a transcript-count gate is **blind to position** — an absorb lands at
+///   `out_pos == SQUEEZE_LEN` wherever it goes, so first and last cost an
+///   identical `+1 absorb, +0 squeezes`. Demonstrated at the end of this test
+///   rather than asserted in prose;
+/// * the WHIR byte gate is **blind to the feature** — its fixture is a single
+///   EQ air (`whir_byte_gate.rs:167,190`), so it commits no DECODE table, no
+///   preprocessed group and no derived root at all.
+///
+/// Nothing downstream catches it either: prover and verifier share the
+/// position, so a consistently wrong one still verifies. **A round-trip between
+/// two halves that share code is not evidence about either.**
+///
+/// # WHAT THIS TEST DOES NOT DO
+///
+/// It does **not** call the production roots block, so it cannot tell you the
+/// verifier absorbs anything at all. It pins that the specified order is
+/// *distinguishable* from every wrong one — including from omitting the root
+/// entirely — which is the property the count gate lacks and which has to hold
+/// before a wiring guard can mean anything.
+///
+/// The wiring guard arrives at **step 3**, when `multi_verify`'s roots block
+/// exists to be called; its mutation is deleting the absorb, and that is the
+/// failure this branch has produced twice — the transcript defaulting to keccak
+/// while everything else moved, and the grind dispatching keccak-only with a
+/// correct RPX kernel sitting unused. **Both were the feature not wired, not
+/// the feature wired wrongly.** Until step 3, this file pins the specification
+/// and the design note's ordering section is the normative statement.
+/// What one run of the roots-block script leaves behind: the sponge state, and
+/// the first challenge drawn from it. Named because the two travel together —
+/// a failure in the state and a failure in the challenge mean different things.
+type Draw = ([u8; 32], FieldElement<Ext>);
+
+#[test]
+fn the_derived_root_is_absorbed_after_the_carried_ones() {
+    let _serialised = serialise();
+
+    // Stand-ins: what matters is the ORDER, not the values.
+    let carried: [[u8; 32]; 3] = [[0x11; 32], [0x22; 32], [0x33; 32]];
+    let derived = [0xAB; 32];
+
+    // The script runs past the absorbs to the FIRST CHALLENGE, because that is
+    // where the property has teeth: "every root is in the transcript before the
+    // first challenge". Pinning the state alone would pin the absorbs' order
+    // among themselves and leave "absorbed AFTER z" — the genuinely dangerous
+    // variant — unrepresentable.
+    //
+    // `z` comes back beside the state so a failure localises: "the challenge
+    // moved" reads differently from "the state moved".
+    let script = |order: &[&[u8; 32]], after_z: Option<&[u8; 32]>| -> Draw {
+        let mut t = DefaultTranscript::<Ext, RpxTranscriptHash>::new(b"w1b-roots");
+        for root in order {
+            t.append_bytes(*root);
+        }
+        let z: FieldElement<Ext> = t.sample_field_element();
+        if let Some(late) = after_z {
+            t.append_bytes(late);
+        }
+        (IsTranscript::<Ext>::state(&t), z)
+    };
+
+    let all = [&carried[0], &carried[1], &carried[2], &derived];
+    let (specified, z_specified) = script(&all, None);
+
+    // Every wrong placement, including the two that are not reorderings.
+    let wrong: [(&str, Draw); 4] = [
+        (
+            "first",
+            script(&[&derived, &carried[0], &carried[1], &carried[2]], None),
+        ),
+        (
+            "middle",
+            script(&[&carried[0], &derived, &carried[1], &carried[2]], None),
+        ),
+        // OMITTED — the failure mode that is not a reordering at all.
+        (
+            "omitted",
+            script(&[&carried[0], &carried[1], &carried[2]], None),
+        ),
+        // AFTER the challenge — unrepresentable without the `z` draw above.
+        (
+            "after z",
+            script(&[&carried[0], &carried[1], &carried[2]], Some(&derived)),
+        ),
+    ];
+
+    for (name, (state, z)) in &wrong {
+        assert_ne!(
+            specified, *state,
+            "placing the derived root {name} gives the same sponge state as the \
+             specified order — the transcript cannot distinguish them, so this \
+             test pins nothing"
+        );
+        if *name != "after z" {
+            assert_ne!(
+                z_specified, *z,
+                "placing the derived root {name} draws the SAME challenge — the \
+                 root is not binding z, which is the whole point of absorbing it \
+                 before any challenge"
+            );
+        }
+    }
+
+    // ★★ THE DANGER, STATED AS AN EQUALITY: absorbing after the challenge is
+    // indistinguishable IN THE CHALLENGE from not absorbing at all. Both draw
+    // `z` from a transcript holding only the carried roots, so the derived root
+    // binds nothing — while the counters happily see it and the sponge state
+    // afterwards differs from the omitted case, which is what makes it look
+    // wired when it is not.
+    //
+    // ⚠ An earlier draft asserted this against `z_specified` with the comment
+    // "the same z BY CONSTRUCTION". That was wrong and the test said so: the
+    // specified order absorbs FOUR roots before drawing, the late order absorbs
+    // three, so the two draws differ. The equality that holds — and the one
+    // worth pinning — is against the OMITTED case.
+    assert_eq!(
+        wrong[3].1.1, wrong[2].1.1,
+        "absorbing after the challenge draws a different z from omitting the \
+         root entirely — then a late absorb would be detectable in z, and the \
+         reason this ordering is dangerous is not the one stated here"
+    );
+
+    // The count gate's blindness, demonstrated rather than asserted.
+    hash_metrics::reset();
+    let _ = script(&all, None);
+    let last = hash_metrics::snapshot();
+    hash_metrics::reset();
+    let _ = script(&[&derived, &carried[0], &carried[1], &carried[2]], None);
+    let first = hash_metrics::snapshot();
+    assert_eq!(
+        (last.transcript_absorbs, last.transcript_squeezes),
+        (first.transcript_absorbs, first.transcript_squeezes),
+        "the two orders differ in counters after all — then a count gate DOES see \
+         position and this test's premise is wrong"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Window alignment
+// -------------------------------------------------------------------------
+
+/// ★★ A ZERO IS ONLY A MEASUREMENT IF SOMETHING CAN MAKE IT NON-ZERO.
+///
+/// `transcript_misaligned_absorbs_after_statement` is expected to read 0 over a
+/// real proof, which is exactly the shape of a counter nobody bumps. So this
+/// drives a transcript to a KNOWN misalignment and requires a non-zero count.
+///
+/// The fixture is not invented: 13 seed bytes then a 32-byte root is the WHIR
+/// byte gate's own first window, and its header already records that window as
+/// NOT aligned and warns against quoting it as a witness that a real proof's
+/// is. Here that same stream is the positive control.
+///
+/// The count is an EQUALITY rather than `> 0`, so a counter that fired on every
+/// absorb rather than on the misaligned ones fails too: of the three absorbs
+/// below, the seed opens the window at 0 and is aligned, and the two roots
+/// after it start at 13 and 45 and are not.
+#[test]
+fn a_window_that_opens_off_a_boundary_is_counted() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(b"whir-identity");
+    // The counter reports what happens AFTER a statement, so a fixture with no
+    // statement has to say where one ended. The 13 seed bytes are already
+    // absorbed, and the mark does not move the window, so the two roots are
+    // still the misaligned pair this test is about.
+    t.mark_statement_end();
+    t.append_bytes(&[7u8; 32]);
+    t.append_bytes(&[9u8; 32]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_absorbs, 3,
+        "the seed absorbs once, then two roots"
+    );
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 2,
+        "13 seed bytes leave the window at 13, so both roots start off a field \
+         element boundary; only the seed itself, at offset 0, is aligned"
+    );
+}
+
+/// ★★ THE MARK DOES NOT FORGIVE A BAD PAD, which is the line between a sharper
+/// counter and a switched-off one.
+///
+/// `mark_statement_end` could have reset the window to zero, and then the first
+/// absorb after any statement would be aligned BY CONSTRUCTION — including when
+/// the padding is broken, which is the one case the counter exists for. It sets
+/// a flag and leaves the offset alone, so a statement that ended at 3 mod 8 is
+/// reported.
+#[test]
+fn a_statement_that_ends_off_a_boundary_is_still_counted() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(&[]);
+    // A "statement" that forgot its pad: three bytes, and the window is at 3.
+    t.append_bytes(&[1u8; 3]);
+    t.mark_statement_end();
+    t.append_bytes(&[2u8; 32]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 1,
+        "the statement ended at 3 mod 8 and the absorb after it straddles two \
+         field elements; a mark that zeroed the window would report none"
+    );
+}
+
+/// ★★ ...and a stream that IS aligned reads zero, so the counter is not simply
+/// counting absorbs.
+///
+/// Eight-byte absorbs from an empty seed keep the window at a multiple of 8
+/// throughout. Both halves are needed: the test above alone is satisfied by a
+/// counter that fires on everything, and this one alone by a counter that fires
+/// on nothing.
+#[test]
+fn an_aligned_stream_counts_no_misalignment() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(&[]);
+    // Empty seed, so the window is at 0 and the mark changes nothing about
+    // alignment — it only switches the counting on.
+    t.mark_statement_end();
+    for _ in 0..4 {
+        t.append_bytes(&[1u8; 8]);
+    }
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_absorbs, 5,
+        "the empty seed absorbs once, then four values"
+    );
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 0,
+        "every absorb started on a multiple of 8"
+    );
+}
+
+/// ★★ A SQUEEZE OPENS A NEW WINDOW, and it opens it ALIGNED.
+///
+/// `sample` finalize-resets the sponge and re-absorbs its own 32-byte output,
+/// so the next window starts at 32 — a multiple of 8. A misaligned window is
+/// therefore repaired by the next squeeze, which is why the padding only has to
+/// fix the window the roots land in and not the whole transcript.
+///
+/// Without this, the window field could carry a stale offset across a squeeze
+/// and every post-squeeze absorb of an odd-length stream would be reported
+/// misaligned forever.
+#[test]
+fn a_squeeze_opens_an_aligned_window() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(b"odd");
+    t.mark_statement_end();
+    // Off a boundary: 3 seed bytes, so this one is counted.
+    t.append_bytes(&[5u8; 32]);
+    let _ = t.sample();
+    // The window reopened at 32; these are not.
+    t.append_bytes(&[6u8; 32]);
+    t.append_bytes(&[7u8; 8]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 1,
+        "only the absorb before the squeeze started off a boundary; the squeeze \
+         reopens the window at 32, which is aligned"
+    );
+}
