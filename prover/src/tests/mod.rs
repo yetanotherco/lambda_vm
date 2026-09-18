@@ -37,6 +37,8 @@ pub mod decode_layout_tests;
 #[cfg(test)]
 pub mod decode_prepared_tests;
 #[cfg(test)]
+pub mod decode_residency_tests;
+#[cfg(test)]
 pub mod decode_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod disk_spill_tests;

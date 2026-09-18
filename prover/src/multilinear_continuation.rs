@@ -254,6 +254,42 @@ where
     decode_prepared_from_columns(statement::elf_digest(elf_bytes), columns, config)
 }
 
+thread_local! {
+    /// How many times DECODE's out-of-band commitment has been DERIVED on THIS
+    /// thread, so §4's residency claim — one commitment held across the epochs,
+    /// not one per epoch — is a number a test can read off the production call.
+    ///
+    /// ⚠ THREAD-LOCAL ON PURPOSE. A process-wide counter is an assertion about
+    /// every test in the binary: `cargo test` runs them in parallel and several
+    /// files prove continuations, so a global would read whatever the
+    /// neighbours were doing. The derivation happens on the thread that calls
+    /// `prove_epochs` / `verify_epochs_bookends`, above the epoch loop, so the
+    /// caller's own thread is where the count belongs.
+    ///
+    /// ⚠ And a thread-local has its own failure mode: if the derivation ever
+    /// moved onto a worker thread this would read ZERO, which a `<= 1` bound
+    /// would happily accept. Every assertion on it is therefore an EQUALITY —
+    /// exactly one per run — so both "rebuilt per epoch" and "counted nowhere"
+    /// are failures.
+    static DECODE_DERIVATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Derivations on this thread since the last [`reset_decode_derivations`].
+///
+/// `cfg(test)` because the counter is an instrument and nothing in production
+/// reads it; the BUMP stays unconditional, so what the test counts is the
+/// production path and not a test-only copy of it.
+#[cfg(test)]
+pub(crate) fn decode_derivations() -> u64 {
+    DECODE_DERIVATIONS.with(core::cell::Cell::get)
+}
+
+/// Zeroes this thread's derivation count.
+#[cfg(test)]
+pub(crate) fn reset_decode_derivations() {
+    DECODE_DERIVATIONS.with(|c| c.set(0));
+}
+
 /// [`decode_prepared`]'s core: the commitment over columns already in hand.
 pub(crate) fn decode_prepared_from_columns<H>(
     elf_digest: [u8; 32],
@@ -263,6 +299,10 @@ pub(crate) fn decode_prepared_from_columns<H>(
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    // ★ THE FUNNEL. Both `decode_prepared` and `decode_prepared_for` come
+    // through here, so this is the one place a derivation can be counted and
+    // the one place it can be missed.
+    DECODE_DERIVATIONS.with(|c| c.set(c.get() + 1));
     let columns: Vec<Mle<F>> = columns
         .into_iter()
         .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("DECODE: {e:?}"))))
