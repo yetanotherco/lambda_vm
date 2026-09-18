@@ -335,10 +335,20 @@ pub struct Batched {
     /// table depends on every table folded before it, so the verifier has to
     /// replay this order and the proof carries it.
     pub fold_order: Vec<usize>,
+    /// Per table, by AIR index: its composition parts over the LDE domain when
+    /// the fold pass kept them (`A1_KEEP_COMPOSITION`), taken by the Open pass.
+    pub composition_ldes: Vec<std::sync::Mutex<Option<CompositionLde>>>,
     pub resident: Resident,
 }
 
 type Deep = stark::prover::TableDeep<GoldilocksExtension>;
+type CompositionLde = Vec<Vec<FieldElement<GoldilocksExtension>>>;
+
+/// Whether the fold pass keeps each table's composition parts for the Open
+/// pass: memory for the constraint evaluation the rebuild would repeat.
+fn keep_composition() -> bool {
+    std::env::var("A1_KEEP_COMPOSITION").is_ok_and(|v| v != "0")
+}
 /// What the fold walk carries between batches.
 ///
 /// The seed and the accumulators are advanced sequentially — the coefficient of
@@ -353,6 +363,7 @@ struct FoldState {
     /// so a verifier can replay the same sequence of coefficients.
     order: Vec<usize>,
     tables: Vec<(usize, TablePublic)>,
+    kept: Vec<(usize, CompositionLde)>,
 }
 
 type Deeps = std::sync::Mutex<FoldState>;
@@ -415,8 +426,11 @@ fn deep_batch(
 }
 
 /// Absorb a table, draw its coefficient, add it to its group, drop it.
-fn fold_one(state: &mut FoldState, idx: usize, deep: Deep) {
+fn fold_one(state: &mut FoldState, idx: usize, mut deep: Deep) {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    if let Some(lde) = deep.composition_lde.take() {
+        state.kept.push((idx, lde));
+    }
     let coefficient = <P as IsStarkProver<_, _, _>>::fold_coefficient(&mut state.seed, &deep);
     let entry = state
         .acc
@@ -461,6 +475,7 @@ fn deep_of(
         challenges,
         transcript,
         known_main,
+        keep_composition(),
     )
     .map_err(|e| format!("{e:?}"))
 }
@@ -503,6 +518,7 @@ pub fn run_batched(
         acc: std::collections::BTreeMap::new(),
         order: Vec::new(),
         tables: Vec::new(),
+        kept: Vec::new(),
     });
     let mut resident = std::thread::scope(|s| {
         let mut visitor = BuildDeep::new(s, &chunk_airs, challenge, &done);
@@ -566,6 +582,7 @@ pub fn run_batched(
         acc,
         order: fold_order,
         mut tables,
+        kept,
     } = done.into_inner().expect("fold state");
     if tables.len() != n {
         return Err(Error::Prover(format!(
@@ -601,12 +618,19 @@ pub fn run_batched(
     }
 
     tables.sort_by_key(|(idx, _)| *idx);
+    let composition_ldes: Vec<std::sync::Mutex<Option<CompositionLde>>> = (0..tables.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    for (idx, lde) in kept {
+        *composition_ldes[idx].lock().expect("kept composition") = Some(lde);
+    }
     Ok(Batched {
         tables: tables.into_iter().map(|(_, t)| t).collect(),
         fold_order,
         groups,
         members,
         group_of,
+        composition_ldes,
         resident,
     })
 }
@@ -679,6 +703,7 @@ fn open_batch(
                 &challenge.challenges,
                 &mut transcript,
                 iotas_of(batched, idx)?,
+                take_kept(batched, idx),
             )
             .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
             Ok((idx, opening))
@@ -698,10 +723,30 @@ fn open_of(
     challenges: &[FieldElement<GoldilocksExtension>],
     transcript: &mut DefaultTranscript<GoldilocksExtension>,
     iotas: &[usize],
+    kept: Option<CompositionLde>,
 ) -> Result<Open, String> {
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    <P as IsStarkProver<_, _, _>>::open_for_table(air, &(), trace, challenges, transcript, iotas)
-        .map_err(|e| format!("{e:?}"))
+    match kept {
+        Some(lde) => <P as IsStarkProver<_, _, _>>::open_for_table_kept(
+            air, trace, challenges, transcript, iotas, lde,
+        ),
+        None => <P as IsStarkProver<_, _, _>>::open_for_table(
+            air,
+            &(),
+            trace,
+            challenges,
+            transcript,
+            iotas,
+        ),
+    }
+    .map_err(|e| format!("{e:?}"))
+}
+
+fn take_kept(batched: &Batched, idx: usize) -> Option<CompositionLde> {
+    batched
+        .composition_ldes
+        .get(idx)
+        .and_then(|slot| slot.lock().expect("kept composition").take())
 }
 
 impl Visitor for OpenTables<'_> {
@@ -755,6 +800,7 @@ pub fn run_open(
             &challenge.challenges,
             &mut transcript,
             iotas_of(batched, idx)?,
+            take_kept(batched, idx),
         )
         .map_err(|e| Error::Prover(format!("open pass: table {idx}: {e}")))?;
         Ok((idx, opening))

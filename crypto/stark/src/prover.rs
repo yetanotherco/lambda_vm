@@ -728,6 +728,10 @@ pub struct TableDeep<FieldExtension: IsField> {
     pub trace_ood: Table<FieldExtension>,
     pub trace_ood_next: Table<FieldExtension>,
     pub parts_ood: Vec<FieldElement<FieldExtension>>,
+    /// The composition parts over the LDE domain, kept for the Open pass when
+    /// the caller trades memory for not recomputing them. Round 2 is the
+    /// constraint evaluation, the costliest thing a rebuild does.
+    pub composition_lde: Option<Vec<Vec<FieldElement<FieldExtension>>>>,
 }
 
 /// Source of truth for a table whose *trace* has been retired.
@@ -2109,6 +2113,7 @@ pub trait IsStarkProver<
         challenges: &[FieldElement<FieldExtension>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         known_main: Option<MainRoots>,
+        keep_composition: bool,
     ) -> Result<TableDeep<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
@@ -2190,6 +2195,8 @@ pub trait IsStarkProver<
             trace_ood,
             trace_ood_next,
             parts_ood: round_3_result.composition_poly_parts_ood_evaluation.clone(),
+            composition_lde: keep_composition
+                .then(|| std::mem::take(&mut round_2_result.lde_composition_poly_evaluations)),
         })
     }
 
@@ -2311,6 +2318,55 @@ pub trait IsStarkProver<
         )?;
         #[cfg(feature = "instruments")]
         drop(__o23);
+        #[cfg(feature = "instruments")]
+        let __od = crate::instruments::span("a1_open_deep");
+        let out =
+            Self::open_deep_composition_poly(&domain, &round_1_result, &round_2_result, iotas);
+        #[cfg(feature = "instruments")]
+        drop(__od);
+        Ok(out)
+    }
+
+    /// [`open_for_table`](Self::open_for_table) with the composition parts the
+    /// fold pass kept: round 1 is rebuilt for the trace commitments, the
+    /// composition commitment is rebuilt from the evaluations, and rounds 2 and
+    /// 3 — the constraint evaluation and the out-of-domain values — are skipped.
+    fn open_for_table_kept(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        iotas: &[usize],
+        composition_lde: Vec<Vec<FieldElement<FieldExtension>>>,
+    ) -> Result<DeepPolynomialOpenings<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        PI: Send + Sync + Clone,
+    {
+        let (domain, _twiddles) = domain_and_twiddles(air, trace.num_rows());
+        #[cfg(feature = "instruments")]
+        let __o1 = crate::instruments::span("a1_open_r1");
+        let round_1_result = Self::round_1_from_trace(air, trace, challenges, transcript, None)?;
+        #[cfg(feature = "instruments")]
+        drop(__o1);
+        #[cfg(feature = "instruments")]
+        let __o2 = crate::instruments::span("a1_open_kept_commit");
+        let (composition_poly_merkle_tree, composition_poly_root) =
+            crate::commitment::commit_bit_reversed(
+                &composition_lde,
+                crate::commitment::ROWS_PER_LEAF,
+            )
+            .ok_or(ProvingError::EmptyCommitment)?;
+        let round_2_result = Round2 {
+            lde_composition_poly_evaluations: composition_lde,
+            composition_poly_merkle_tree,
+            composition_poly_root,
+            #[cfg(feature = "cuda")]
+            gpu_composition_tree: None,
+        };
+        #[cfg(feature = "instruments")]
+        drop(__o2);
         #[cfg(feature = "instruments")]
         let __od = crate::instruments::span("a1_open_deep");
         let out =

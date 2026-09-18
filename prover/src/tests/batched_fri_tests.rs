@@ -72,6 +72,7 @@ fn a_batch_of_one_matches_the_unbatched_fri() {
         &challenge.challenges,
         &mut fork,
         None,
+        false,
     )
     .expect("deep");
 
@@ -157,6 +158,7 @@ fn alpha_moves_when_any_table_moves() {
         trace_ood: Table::new(vec![FieldElement::<E>::from(seed + 1)], 1),
         trace_ood_next: Table::new(vec![FieldElement::<E>::from(seed + 2)], 1),
         parts_ood: vec![FieldElement::<E>::from(seed + 3)],
+        composition_lde: None,
     };
 
     let pre_fork = DefaultTranscript::<E>::new(&[7, 7, 7]);
