@@ -319,6 +319,16 @@ enum Commands {
         /// --streaming; each stage includes the ones before it.
         #[arg(long, value_enum, default_value = "logup", requires = "streaming")]
         through: Stage,
+
+        /// Assemble the per-table proof the LogUp stage leaves and run the
+        /// ordinary verifier on it, after the timings are reported.
+        #[arg(long, requires = "streaming")]
+        verify: bool,
+
+        /// Write the assembled per-table proof here (implies the assembly, not
+        /// the verification).
+        #[arg(short, long, requires = "streaming", value_hint = ValueHint::FilePath)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -408,7 +418,9 @@ fn main() -> ExitCode {
             private_input,
             streaming,
             through,
-        } => cmd_trace_build(elf, private_input, streaming, through),
+            verify,
+            output,
+        } => cmd_trace_build(elf, private_input, streaming, through, verify, output),
     }
 }
 
@@ -1103,7 +1115,8 @@ fn run_approach_1(
     max_rows: &prover::tables::MaxRowsConfig,
     options: &stark::proof::options::ProofOptions,
     through: Stage,
-) -> Result<usize, String> {
+    verify: bool,
+) -> Result<(usize, Option<prover::VmProof>), String> {
     #[cfg(feature = "instruments")]
     stark::instruments::reset_timeline();
     let t0 = std::time::Instant::now();
@@ -1111,14 +1124,14 @@ fn run_approach_1(
         let resident = prover::logup_phase::walk_only(elf, private_inputs, max_rows)
             .map_err(|e| format!("{e:?}"))?;
         println!("  walk only          {:>8.2}s", t0.elapsed().as_secs_f64());
-        return Ok(resident.pages.len());
+        return Ok((resident.pages.len(), None));
     }
     let committed = prover::commit_phase::run_to_end(elf, private_inputs, max_rows, options)
         .map_err(|e| format!("{e:?}"))?;
     let t_commit = t0.elapsed();
     if through == Stage::Commit {
         println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
-        return Ok(committed.chunks.len());
+        return Ok((committed.chunks.len(), None));
     }
     let t1 = std::time::Instant::now();
     let challenge = prover::challenge_phase::run(&committed, elf, elf_bytes, options)
@@ -1129,7 +1142,7 @@ fn run_approach_1(
     if through == Stage::Challenge {
         println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
         println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
-        return Ok(challenge.roots.len());
+        return Ok((challenge.roots.len(), None));
     }
     // The batched path replaces the per-table prove; running both would measure
     // neither.
@@ -1160,7 +1173,7 @@ fn run_approach_1(
         println!("  pass 5 (open)      {:>8.2}s", t_open.as_secs_f64());
         report_span_totals();
         report_batched_size(&proof, tables, groups);
-        return Ok(tables);
+        return Ok((tables, None));
     }
 
     let t2 = std::time::Instant::now();
@@ -1172,7 +1185,9 @@ fn run_approach_1(
     println!("  pass 3 (prove)     {:>8.2}s", t_prove.as_secs_f64());
     report_span_totals();
     report_fri_shape(&logup.tables);
-    Ok(logup.tables.len())
+    let tables = logup.tables.len();
+    let proof = verify.then(|| prover::logup_phase::assemble_vm_proof(logup, &challenge));
+    Ok((tables, proof))
 }
 
 /// What the batched proof weighs, against what the per-table one weighs.
@@ -1296,6 +1311,8 @@ fn cmd_trace_build(
     private_input_path: Option<PathBuf>,
     streaming: bool,
     through: Stage,
+    verify: bool,
+    output: Option<PathBuf>,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -1324,14 +1341,14 @@ fn cmd_trace_build(
     let started = std::time::Instant::now();
 
     let max_rows = prover::tables::MaxRowsConfig::default();
+    let options = match stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("bad proof options: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
     let outcome = if streaming {
-        let options = match stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("bad proof options: {e:?}");
-                return ExitCode::FAILURE;
-            }
-        };
         run_approach_1(
             &elf,
             &elf_data,
@@ -1339,25 +1356,29 @@ fn cmd_trace_build(
             &max_rows,
             &options,
             through,
+            verify || output.is_some(),
         )
     } else {
         prover::commit_phase::build_resident(&elf, &private_inputs, &max_rows)
-            .map(|t| t.cpus.len())
+            .map(|t| (t.cpus.len(), None))
             .map_err(|e| format!("{e:?}"))
     };
 
     let elapsed = started.elapsed();
-    match outcome {
-        Ok(n) => println!(
-            "Trace build ({}): {n} tables, {:.3}s",
-            if streaming { "streaming" } else { "resident" },
-            elapsed.as_secs_f64()
-        ),
+    let proof = match outcome {
+        Ok((n, proof)) => {
+            println!(
+                "Trace build ({}): {n} tables, {:.3}s",
+                if streaming { "streaming" } else { "resident" },
+                elapsed.as_secs_f64()
+            );
+            proof
+        }
         Err(e) => {
             eprintln!("trace build failed: {e}");
             return ExitCode::FAILURE;
         }
-    }
+    };
 
     #[cfg(feature = "jemalloc-stats")]
     {
@@ -1367,6 +1388,46 @@ fn cmd_trace_build(
             peak_bytes / (1024 * 1024),
             peak_at_ms as f64 / 1000.0
         );
+    }
+
+    let Some(proof) = proof else {
+        return ExitCode::SUCCESS;
+    };
+    if let Some(path) = output {
+        let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed to serialize the A1 proof: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            eprintln!("Failed to write {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "A1 proof written: {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    }
+    if verify {
+        let started = std::time::Instant::now();
+        match prover::verify_with_options(&proof, &elf_data, &options, None, None) {
+            Ok(true) => println!(
+                "A1 proof verifies: {} tables, {:.3}s",
+                proof.proof.proofs.len(),
+                started.elapsed().as_secs_f64()
+            ),
+            Ok(false) => {
+                eprintln!("A1 proof REJECTED by the verifier");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("A1 proof verification error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     ExitCode::SUCCESS
 }

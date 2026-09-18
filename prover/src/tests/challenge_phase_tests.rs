@@ -129,9 +129,13 @@ fn challenge_matches_the_ordinary_prover() {
 fn logup_matches_the_ordinary_prover() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
     let elf = Elf::load(&elf_bytes).expect("ELF load");
+    // Small enough that MEMW and MEMW_A chunks close mid-walk: their timestamp
+    // checks are LT rows, and a walk that retires a chunk must still hand LT
+    // the rows the chunk owes it.
     let max_rows = MaxRowsConfig {
         cpu: 1 << 15,
         memw: 1 << 10,
+        memw_aligned: 1 << 10,
         load: 1 << 10,
         branch: 1 << 12,
         ..Default::default()
@@ -150,6 +154,11 @@ fn logup_matches_the_ordinary_prover() {
     let logup = crate::logup_phase::run(&elf, &[], &max_rows, &proof_options, &challenge)
         .expect("logup phase");
 
+    assert_eq!(
+        format!("{:?}", challenge.order.counts()),
+        format!("{:?}", vm_proof.table_counts),
+        "the pass laid the tables out differently from the ordinary prover"
+    );
     assert_eq!(
         logup.tables.len(),
         vm_proof.proof.proofs.len(),
@@ -182,24 +191,151 @@ fn logup_matches_the_ordinary_prover() {
     // The decisive one: the pass's own proof, verified. Everything above says
     // it matches the ordinary prover piece by piece; this says the assembled
     // whole is a proof.
-    let rebuilt = crate::VmProof {
-        proof: stark::proof::stark::MultiProof {
-            proofs: logup.tables,
-        },
-        runtime_page_ranges: crate::tables::trace_builder::runtime_page_ranges(
-            &logup.resident.page_configs,
-        ),
-        table_counts: vm_proof.table_counts.clone(),
-        public_output: logup.resident.public_output.clone(),
-        num_private_input_pages: logup
-            .resident
-            .page_configs
-            .iter()
-            .filter(|c| c.is_private_input)
-            .count(),
-    };
+    let rebuilt = crate::logup_phase::assemble_vm_proof(logup, &challenge);
     assert!(
         crate::verify(&rebuilt, &elf_bytes).expect("verify"),
         "the proof the pass assembled does not verify"
+    );
+}
+
+/// Many chunks of every kind, on a program that works memory. The
+/// small program above has one chunk per kind, so it cannot tell per-chunk
+/// accounting from whole-table accounting; ethrex could, and did not verify.
+#[test]
+fn a1_verifies_with_many_chunks() {
+    let elf_bytes = {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.parent().expect("workspace root").join(format!(
+            "executor/program_artifacts/rust/{}.elf",
+            std::env::var("A1_DIAG_ELF").unwrap_or_else(|_| "vector".into())
+        ));
+        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()))
+    };
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = MaxRowsConfig {
+        cpu: 1 << 11,
+        memw: 1 << 9,
+        memw_aligned: 1 << 9,
+        dvrm: 1 << 9,
+        mul: 1 << 9,
+        lt: 1 << 9,
+        shift: 1 << 9,
+        load: 1 << 9,
+        branch: 1 << 9,
+        memw_register: 1 << 9,
+        eq: 1 << 9,
+        bytewise: 1 << 9,
+        store: 1 << 9,
+        cpu32: 1 << 9,
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let vm_proof = crate::prove_with_options_and_inputs(&elf_bytes, &[], &proof_options, &max_rows)
+        .expect("ordinary prove");
+
+    let committed = crate::commit_phase::run_to_end(&elf, &[], &max_rows, &proof_options)
+        .expect("commit phase");
+    let challenge = crate::challenge_phase::run(&committed, &elf, &elf_bytes, &proof_options)
+        .expect("challenge phase");
+    drop(committed);
+    let logup = crate::logup_phase::run(&elf, &[], &max_rows, &proof_options, &challenge)
+        .expect("logup phase");
+    let rebuilt = crate::logup_phase::assemble_vm_proof(logup, &challenge);
+
+    eprintln!(
+        "tables: pass {} vs ordinary {}; counts pass {:?} vs ordinary {:?}",
+        rebuilt.proof.proofs.len(),
+        vm_proof.proof.proofs.len(),
+        rebuilt.table_counts,
+        vm_proof.table_counts
+    );
+    let differing: Vec<usize> = rebuilt
+        .proof
+        .proofs
+        .iter()
+        .zip(vm_proof.proof.proofs.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a.lde_trace_main_merkle_root != b.lde_trace_main_merkle_root)
+        .map(|(i, _)| i)
+        .collect();
+    eprintln!("tables whose main root differs from the ordinary prover's: {differing:?}");
+    assert!(
+        crate::verify(&rebuilt, &elf_bytes).expect("verify"),
+        "the proof the pass assembled does not verify"
+    );
+}
+
+/// Diagnostic: where A1's BITWISE multiplicities depart from the ordinary build's.
+#[test]
+#[allow(clippy::needless_range_loop)]
+fn bitwise_multiplicities_match_the_ordinary_build() {
+    let elf_bytes = {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let name = std::env::var("A1_DIAG_ELF").unwrap_or_else(|_| "vector".into());
+        std::fs::read(
+            root.parent()
+                .unwrap()
+                .join(format!("executor/program_artifacts/rust/{name}.elf")),
+        )
+        .expect("ELF")
+    };
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = if std::env::var("A1_DIAG_DEFAULT_ROWS").is_ok() {
+        MaxRowsConfig::default()
+    } else {
+        MaxRowsConfig {
+            cpu: 1 << 11,
+            memw: 1 << 9,
+            memw_aligned: 1 << 9,
+            dvrm: 1 << 9,
+            mul: 1 << 9,
+            lt: 1 << 9,
+            shift: 1 << 9,
+            load: 1 << 9,
+            branch: 1 << 9,
+            memw_register: 1 << 9,
+            eq: 1 << 9,
+            bytewise: 1 << 9,
+            store: 1 << 9,
+            cpu32: 1 << 9,
+        }
+    };
+    let input = std::env::var("A1_DIAG_INPUT")
+        .ok()
+        .map(|path| std::fs::read(path).expect("private input"))
+        .unwrap_or_default();
+    let ordinary = crate::commit_phase::build_resident(&elf, &input, &max_rows).expect("ordinary");
+    let walked = crate::logup_phase::walk_only(&elf, &input, &max_rows).expect("walk");
+    eprintln!(
+        "cpu rows: {}",
+        ordinary.cpus.iter().map(|t| t.num_rows()).sum::<usize>()
+    );
+    let (a, b) = (&walked.bitwise, &ordinary.bitwise);
+    assert_eq!(a.num_rows(), b.num_rows());
+    assert_eq!(a.num_cols(), b.num_cols());
+    let mut shown = 0;
+    let mut per_col = vec![0usize; a.num_cols()];
+    for row in 0..a.num_rows() {
+        for col in 0..a.num_cols() {
+            if a.get_main(row, col) != b.get_main(row, col) {
+                per_col[col] += 1;
+                if shown < 25 {
+                    eprintln!(
+                        "row {row} (x={:?} y={:?}) col {col}: walk {:?} vs ordinary {:?}",
+                        a.get_main(row, 0).value(),
+                        a.get_main(row, 1).value(),
+                        a.get_main(row, col).value(),
+                        b.get_main(row, col).value()
+                    );
+                    shown += 1;
+                }
+            }
+        }
+    }
+    eprintln!("differing cells per column: {per_col:?}");
+    assert!(
+        per_col.iter().all(|&n| n == 0),
+        "BITWISE multiplicities differ"
     );
 }

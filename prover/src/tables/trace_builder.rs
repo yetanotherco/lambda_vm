@@ -1319,12 +1319,59 @@ impl WalkLeftover {
         self.tail.memw_aligned_ops.extend(buckets.aligned);
         self.tail.memw_ops.extend(buckets.general);
 
+        // What the ordinary build derives after the CPU pass, in its order. CPU32
+        // rows dispatch to SHIFT, MUL and DVRM: the retired chunks' first, then the
+        // tail's, after everything the CPU itself sent.
+        let tail_cpu32 = self.tail.cpu32_ops.len();
+        for c in &self.tail.cpu32_ops[..tail_cpu32] {
+            cpu32_chip_op(
+                c,
+                &mut self.tail.retired_cpu32_shift,
+                &mut self.tail.retired_cpu32_mul,
+                &mut self.tail.retired_cpu32_dvrm,
+            );
+        }
+        let shift = std::mem::take(&mut self.tail.retired_cpu32_shift);
+        self.tail.shift_ops.extend(shift);
+        let mul = std::mem::take(&mut self.tail.retired_cpu32_mul);
+        self.tail.mul_ops.extend(mul);
+        let dvrm = std::mem::take(&mut self.tail.retired_cpu32_dvrm);
+        self.tail.dvrm_ops.extend(dvrm);
+        // Every DVRM op owes LT |r| < |d| and MUL d * q, lo and hi.
+        for (op, _wants_remainder) in &self.tail.dvrm_ops {
+            self.tail
+                .lt_ops
+                .push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+        for (op, _wants_remainder) in &self.tail.dvrm_ops {
+            let mul_op = MulOperation::new(op.d, op.signed, op.compute_quotient(), op.sign_q());
+            self.tail.mul_ops.push((mul_op.clone(), false));
+            self.tail.mul_ops.push((mul_op, true));
+        }
+
+        // MEMW's timestamp checks are LT rows. The chunks retired during the
+        // walk left theirs behind; the tail's are derived now. Same order as the
+        // ordinary build: every general MEMW op, then every aligned one.
+        let retired = std::mem::take(&mut self.tail.retired_memw_lt);
+        self.tail.lt_ops.extend(retired);
         self.tail
             .lt_ops
             .extend(collect_lt_from_memw(&self.tail.memw_ops));
+        let retired = std::mem::take(&mut self.tail.retired_memw_aligned_lt);
+        self.tail.lt_ops.extend(retired);
         self.tail
             .lt_ops
             .extend(collect_lt_from_memw_aligned(&self.tail.memw_aligned_ops));
+        // HINT's range checks, last of all: selector and both address low limbs.
+        self.tail
+            .lt_ops
+            .extend(self.tail.hint_ops.iter().flat_map(|op| {
+                [
+                    LtOperation::new(op.hint_id, hint::HINT_SELECTOR_BOUND, false),
+                    LtOperation::new(op.in_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+                    LtOperation::new(op.out_addr & 0xFFFF_FFFF, hint::HINT_ADDR_LIMB_BOUND, false),
+                ]
+            }));
 
         // Fold the tail's own BITWISE lookups in now, while the tail is whole.
         // The retired chunks contributed theirs as they closed; from here the
@@ -1338,6 +1385,7 @@ impl WalkLeftover {
             TableKind::Bytewise,
             TableKind::Eq,
             TableKind::Store,
+            TableKind::Cpu32,
         ] {
             let n = self.tail.buffered(kind);
             self.tail.fold_bitwise_from_front(kind, n, &mut hist);
@@ -3541,6 +3589,11 @@ impl CollectedOps {
                     hist.add_ops(&op.collect_bitwise_ops());
                 }
             }
+            TableKind::Cpu32 => {
+                for c in &self.cpu32_ops[..n] {
+                    hist.add_ops(&collect_cpu32_bitwise(c));
+                }
+            }
             _ => {}
         }
     }
@@ -3644,6 +3697,14 @@ impl CollectedOps {
 #[derive(Default)]
 pub(crate) struct CollectedOps {
     pub(crate) cpu_ops: Vec<CpuOperation>,
+    /// LT rows owed by the MEMW chunks already retired, kept apart so LT gets
+    /// them in the ordinary build's order once the tail's are known.
+    pub(crate) retired_memw_lt: Vec<LtOperation>,
+    pub(crate) retired_memw_aligned_lt: Vec<LtOperation>,
+    /// SHIFT, MUL and DVRM rows the retired CPU32 chunks dispatched, likewise.
+    pub(crate) retired_cpu32_shift: Vec<ShiftOperation>,
+    pub(crate) retired_cpu32_mul: Vec<(MulOperation, bool)>,
+    pub(crate) retired_cpu32_dvrm: Vec<(DvrmOperation, bool)>,
     pub(crate) memw_ops: Vec<MemwOperation>,
     pub(crate) memw_aligned_ops: Vec<MemwOperation>,
     /// Direct-fill MEMW_R rows (register fast path).
@@ -3942,6 +4003,11 @@ fn collect_all_ops(
     }
 
     CollectedOps {
+        retired_memw_lt: Vec::new(),
+        retired_memw_aligned_lt: Vec::new(),
+        retired_cpu32_shift: Vec::new(),
+        retired_cpu32_mul: Vec::new(),
+        retired_cpu32_dvrm: Vec::new(),
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
@@ -3989,6 +4055,11 @@ fn build_traces<I: ImageSource + Sync>(
     retire_chunked: bool,
 ) -> Result<(Traces, CollectedOps), Error> {
     let CollectedOps {
+        retired_memw_lt: _,
+        retired_memw_aligned_lt: _,
+        retired_cpu32_shift: _,
+        retired_cpu32_mul: _,
+        retired_cpu32_dvrm: _,
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
@@ -5500,6 +5571,8 @@ impl Traces {
             buf.eq_ops.extend(derived.eq_ops);
             buf.bytewise_ops.extend(derived.bytewise_ops);
             buf.store_ops.extend(derived.store_ops);
+            buf.mul_ops.extend(derived.mul_ops);
+            buf.dvrm_ops.extend(derived.dvrm_ops);
             buf.cpu_ops.extend(cpu);
             buf.memw_register_rows.extend(memw.register_rows);
             buf.memw_aligned_ops.extend(memw.aligned);
@@ -5525,6 +5598,31 @@ impl Traces {
                     // Before the ops go: BITWISE counts them across the whole
                     // run, and this chunk is about to stop existing.
                     buf.fold_bitwise_from_front(*kind, limit, &mut bitwise_hist);
+                    // So does LT, which owes a row to every MEMW timestamp check
+                    // and is never closed mid-walk itself.
+                    match kind {
+                        TableKind::Memw => {
+                            let derived = collect_lt_from_memw(&buf.memw_ops[..limit]);
+                            buf.retired_memw_lt.extend(derived);
+                        }
+                        TableKind::MemwAligned => {
+                            let derived =
+                                collect_lt_from_memw_aligned(&buf.memw_aligned_ops[..limit]);
+                            buf.retired_memw_aligned_lt.extend(derived);
+                        }
+                        // CPU32 rows dispatch to SHIFT, MUL and DVRM.
+                        TableKind::Cpu32 => {
+                            for c in &buf.cpu32_ops[..limit] {
+                                cpu32_chip_op(
+                                    c,
+                                    &mut buf.retired_cpu32_shift,
+                                    &mut buf.retired_cpu32_mul,
+                                    &mut buf.retired_cpu32_dvrm,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                     if *kind == TableKind::Cpu {
                         // Each CPU chunk pads to a power of two, and every
                         // padding row looks DECODE up at the padding pc.

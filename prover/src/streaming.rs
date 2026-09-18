@@ -101,8 +101,7 @@ impl AirOrder {
         None
     }
 
-    #[cfg(test)]
-    pub(crate) fn counts(&self) -> &crate::TableCounts {
+    pub fn counts(&self) -> &crate::TableCounts {
         &self.counts
     }
 

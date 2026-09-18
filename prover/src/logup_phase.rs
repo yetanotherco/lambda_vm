@@ -37,6 +37,27 @@ pub struct LogUp {
     pub resident: Resident,
 }
 
+/// The pass's output as the proof the ordinary verifier takes: the same
+/// `MultiProof` the monolithic prover emits, with the layout the walk resolved.
+pub fn assemble_vm_proof(logup: LogUp, challenge: &Challenge) -> crate::VmProof {
+    let resident = &logup.resident;
+    crate::VmProof {
+        proof: stark::proof::stark::MultiProof {
+            proofs: logup.tables,
+        },
+        runtime_page_ranges: crate::tables::trace_builder::runtime_page_ranges(
+            &resident.page_configs,
+        ),
+        table_counts: challenge.order.counts().clone(),
+        public_output: resident.public_output.clone(),
+        num_private_input_pages: resident
+            .page_configs
+            .iter()
+            .filter(|c| c.is_private_input)
+            .count(),
+    }
+}
+
 type Item = (
     TableKind,
     usize,
