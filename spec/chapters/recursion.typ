@@ -86,7 +86,7 @@ The technique is mostly useful in settings where the extra time spent by the pro
 is outweighed by the time saved by the verifier(s), 
 e.g., a computationally constrained verifier, or multiple verifiers.
 
-== Resolving growing instance complexity
+== Resolving growing instance complexity <growing-instance-complexity>
 While recursive proving leads to a decrease in proof size, this is naively traded off
 against an increase in instance complexity.
 Looking at a depth-two recursive proof,
@@ -110,9 +110,9 @@ $
   verify'([comm(instance), comm(verify')],  proof) 
   = verify(comm(instance), proof) or verify(comm(verify'([comm(instance), comm(verify')], dot)), proof).
 $
-In words, $verify'([comm(instance), comm(verify')], dot)$ only accepts $proof$ if it is either
+In words, $verify'([comm(instance), comm(verify')], dot)$ accepts only if $proof$ is either
 a) proof of $instance in language$, or
-b) proof of the existence of a (different) proof that satisfies $verify'([comm(instance), comm(verify')], dot)$.
+b) proof of _the existence of a (different) proof_ that satisfies $verify'([comm(instance), comm(verify')], dot)$.
 We can now recursively expand the expression, yielding
 $
   verify'(commit(instance), commit(verify'), proof)
@@ -131,9 +131,10 @@ In fact, the size of the verification instance is typically fully determined by
 $comm(instance)$, since $comm(verify')$ can often be precomputed.
 
 It is important to note that we have not proven soundness of this construction.
-Specifically, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
+For example, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
 Such a proof would be accepted by $verify'$ even if $instance in.not language$.
 In practice, one might be able to prevent this problem by including a recursion-level counter in the proof.
+The existence of other soundness gaps are not ruled out by the authors.
 
 #aside([$comm(verify')$ absorption])[
   Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
@@ -154,19 +155,32 @@ Emulating field arithmetic on a binary arithmetic-oriented VM typically
 incurs significant computational overhead.
 With the aim of avoiding a performance penalty on this front, we show how one 
 might split the verification process in two halves,
-such that either half can be executed on a VM with an instruction set tailored to its needs.
+such that either half can be executed on a VM with an instruction set tailored to its needs,
+while maintaining completeness and soundness of the verification.
 
 == Communication
-As a result of executing the two verification-algorithm halves on distinct VMs,
-no direct communication between both algorithms is possible.
+When executing the two verification-algorithm halves on distinct VMs,
+no direct communication between both algorithms is possible,
+even if both VMs are proven using the same proof system.
 Yet, practice shows that effective algorithm splits requires some form of communication
 between both halves: typically one half performs a verification step to a certain
 point, after which the other half continues verification starting from this
 intermediate state.
+Hence, support for communication is desirable.
+
+Briefly zooming out, we observe that for two algorithm halves to jointly
+verify a proof, it is paramount that both subprograms are provided identical
+input.
+Moreover, we note that split verification is used in _recursion_ only:
+the verifier verifies the ultimate proof _outside_ the VM, where the monolithic 
+verification algorithm can be executed efficiently.
+Furthermore, all input provided during recursion is hinted by the prover, which
+has access to the full execution trace before proving, including any information
+that would ideally be sent between the two verification halves.
 
 To achieve communication between two programs running on different VMs, 
-we introduce the concept of a prover-hinted _communication record_ $record$ 
-provided as _input_ to both processes.
+we thus introduce the concept of a prover-hinted _communication record_ $record$ 
+provided as input to both subprocesses.
 All values that are to be communicated from one part to another, are stated on this record.
 For each value on the record, the "sending" half _verifies_ that it is as expected, 
 whilst the "receiving" half _assumes_ its correctness and resumes verification under this assumption.
@@ -189,7 +203,8 @@ when both algorithm-halves produce the same record for this input.
 ]
 
 More formally, we define
-$v_0, v_1: instanceSpace times proofSpace to recordSpace$ as a valid _split_ of verifier $v in verifierSpace$ if
+$v_0, v_1: instanceSpace times proofSpace to recordSpace$ as a valid _split_ of 
+verifier $v in verifierSpace$ if
 $
   forall (instance, proof) in instanceSpace times proofSpace: v(comm(instance), proof) = 1 iff v_0(comm(instance), proof) = v_1(comm(instance), proof),
 $
@@ -209,8 +224,7 @@ $
 	= tilde(v)_0(comm(instance), [proof, d(comm(instance), proof)]) 
 		dot tilde(v)_1(comm(instance), [proof, d(comm(instance), proof)]).
 $
-where $d(comm(instance), proof) := v_0(comm(instance), proof)$ denotes the
-record deriviation function.
+where $d(comm(instance), proof)$ denotes the record deriviation function.
 We introduce the function product $(f || g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
 This then allows us to express
 $
@@ -273,7 +287,7 @@ $
 	&= (tilde(verify)^*_0 || tilde(verify)^*_1)([comm(x), comm(y)], [[proof, b], r]),\
 $
 when
-$r = g([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
+$r = d([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
 By selecting $(comm(x), comm(y)) = (comm(instance), comm(tilde(v)^*_0 || tilde(v)^*_1))$, 
 we now obtain
 $
@@ -282,7 +296,7 @@ $
 	&= verify^*([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [proof, b])\
 	&= verify(Delta_commitmentSpace (comm(instance), comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), b), proof)\
 	&= Delta_BB (verify(comm(instance), proof), verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof), b)\
-	&= verify(comm(instance), proof) dot (1-b) + verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof) dot b.
+	&= verify(comm(instance), proof) dot (1-b) + verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof) dot b,
 $
 i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does when $b=1$.
 Importantly, this can be achieved recursively, as
@@ -296,126 +310,95 @@ $
 $
 with
 $
-	r_i :&= g(comm((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot)), [proof_i, 1-delta_(i,0)]).
+	r_i :&= d(comm((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot)), [proof_i, 1-delta_(i,0)]).
 $
 
-= Applied to lambda VM
+= The theory applied
+We now discuss how the split-recursion system is integrated in practice.
 
+== The split
+Let $v$ denote the verification algorithm performing all steps outlined in @verification.
+We split $v$ into halves $tilde(v)_f$ and $tilde(v)_b$ such that an efficient
+arithmetization is achieved when the former is executed in the _field-VM_ (@field-VM)
+and the latter on the _RiscV-VM_ (@decode through @ecall).
+Practically speaking, $tilde(v)_f$ is put in charge of all verification steps
+involving _field_ arithmetic --- e.g., verifying `FRI` folding, 
+while $tilde(v)_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
+by means of the Fiat-Shamir transformation.
 
-When both VMs are proven using the same proof system, the inner product argument is excessive.
-Here, the same commitment to $comm((proof, record))$ can be interpreted by both VMs.
-It therefore suffices for the verifier to verify both partial proofs against
-the same public proof-record commitment.
+The communication record primarily exists of the various Fiat-Shamir-derived
+challenges required by $tilde(v)_f$ to complete verification.
+During execution, $tilde(v)_b$ is in charge of validating these record values,
+while $tilde(v)_f$ assumes them to be correct.
 
-base level:
-- input: instance, verifier
-- witness: proof, record
-- output: proof
+#et([update the communication record overview once @verification is complete.])
 
-$
-  verify': commitmentSpace^2 times proofSpace: (comm(x), comm(y), proof) mapsto
-  verify(comm(x), proof) or verify(comm(y(comm(x), comm(y); dot)), proof)
-$
+== Recursive instance verification
+In @growing-instance-complexity, it is assumed that one can efficiently construct
+the commitment $comm(y([comm(x), comm(y)], dot))$ from $(comm(x), comm(y))$.
+We show that this assumption holds in practice.
 
-how to split $verify'$ into $verify'_0$ and $verify'_1$
+First, note that for an instance $program(input, dot)$, the program 
+$program$ and input $input$ are committed to separately.
+Recall that a (split) program is encoded as one or more 
+`DECODE` (@decode) and/or `FIELD-DECODE` (@field-decode) tables, while the 
+input $input$ --- and private input $witness$ and record $record$ for that matter 
+--- are made available to the VMs by means of `PAGE` tables (@streaming:chip:page).
+In this proof system, the prover commits to each of these tables individually
+by means of sharing _the root of their merkle-tree_.
+#footnote([
+  To clarify the process: 
+  + every table column is _interpolated_, creating a polynomial that 
+    evaluates to the column entries on specific inputs,
+  + the polynomial is _encoded_, creating a codeword of polynomial evaluations 
+    over a different, larger domain,
+  + the codewords are _batched_, turning a list of codewords into a codeword of lists, and
+  + the batched codeword is _merkle-committed_, yielding the tree root.
+])
 
-$
-  verify': commitmentSpace^2 times proofSpace: (comm(x), comm(y), proof) mapsto
-  verify(comm(x), proof) or verify(comm(y(comm(x), comm(y); dot)), proof)
-$
+Aside from this proof-system level commitment contraption, we can additionally leverage
+the `COMMIT` chip to commit to individual bytes in the input.
+Any values sent by the guest program to `std::out` are recorded in this chip's
+table, with the table set up such that it causes an imbalance in the interaction logic
+of the proof system during proving.
+During verification, it can be verified that this imbalance is caused by the 
+`COMMIT`ments of this public information.
 
-$
-  &verify'_0: (comm(x), comm(y), proof) mapsto
-  verify_0(comm(x), proof) or verify_0(comm(y(comm(x), comm(y); dot)), proof)\
-  &verify'_1: (comm(x), comm(y), proof) mapsto
-  verify_1(comm(x), proof) or verify_1(comm(y(comm(x), comm(y); dot)), proof)\
-$
+Leveraging the `COMMIT` chip is mostly useful in situations where revealing full `PAGE`
+tables is unnecessarily expensive or cumbersome, e.g., when committing to small 
+amounts of data or to data scattered across several `PAGE` tables.
+One potential limitation is that `COMMIT`ting in this way is at the discretion of the VM's
+guest program.
+Since the guest program is publically known during recursive verification, 
+this limitation does not apply here
 
-$
-  &verify_0(comm(x), proof)\
-  &verify_1(comm(x), proof)
-$
+Hence, by having $tilde(v)_b ([comm(x), comm(y)], [[proof, b], record])$ `COMMIT` 
+to the commitments $comm(x)$ and $comm(y)$ it is provided, and using the same commitments
+to balance the proof's interaction logic when $b=1$, the ultimate verifier of the
+final proof can be confident that the same verification algorithm was used
+at every recursion step when verifying 
+$(comm(x), comm(y)) = (comm(instance), comm(tilde(v)_b || tilde(v)_f))$.
 
-recursion level:
+== Summary
 
-$
-  &verify'_0\
-  &verify'_1\
-$
+*Communication record $record$:*\
+The communication record contains all challenges derived from the proof by
+means of the Fiat-Shamir transformation.
 
+*`RiscV-VM` subalgorithm*
+$tilde(v)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
+- `COMMIT`s to $comm(instance), comm(instance2)$ by sending both halves to `std::out`.
+- derives challenges from $proof$ by means of Fiat-Shamir, and assert that they 
+  match those located in $record$ at the expected location.
+- Performs the binary arithmetic steps required to verify that $proof$ attests
+  to $instance$ (when $b=0$) or $instance2$ (when $b != 0$#footnote[The RiscV-VM's `PAGE` tables only supports byte data. All non-zero data is treated as $b=1$.]),
+  given the derived challenges.
 
-$
-  verify
-$
-
-TODO: 
-We assume that these VMs are proven using the same proof system, 
-yielding a unified proof of the combined execution as a result.
-
-
-= Combining recursive proving and split processing
-
-= Applied to LambdaVM
-We lastly provide some notes on applying the recursive proving and split processing to
-the verification of a proof in the context of this VM.
-
-First, we note that in any scenario, the prover has to commit to the program $program$
-being exeucted and the public input $input$ that is provided.
-In a non-recursive proof, this is trivially done by committing to the `DECODE` table
-representing $program$, and the `PAGE` tables storing the public $input$.
-Since these commitments are deterministic, the verifier can locally reconstruct
-the commitments and verify any opening proofs against its own version of the commitment.
-Note that in this case, the prover may exclude the opened value from any proof strings
-pertaining to the `DECODE` and `PAGE` tables, as these are already known to the verifier.
-
-When recursing on this process, the prover provides the verifier with this commitment.
-We thus have to demonstrate the commitments the prover provides are as expected.
-This is achieved by having the verification  algorithm `COMMIT` (see @commit)
-to the public input it is provided.
-This act produces an imbalance in the LogUp-component of the proof-of-verification, 
-which must be balanced during verification in the _next_ recursion layer.
-In later recursions, the verifier must consistently `COMMIT` to its public input
-and use the _same_ public input to balance out the LogUp-component of the proof
-it is provided.
-This solution effectively kicks the can down the road; the final verifier has to
-provide the initial input to the program as input to verify the recursive proof.
-
-Denoted as pseudo-algorithms, we find:
-
-= Applied to LambdaVM
-
-
-In theory, any division of tasks between the two VMs would work.
-Moreover, it is unclear what division will lead to optimal performance.
-Yet, it is expected that divisions adhering to these high-level guidelines will 
-be a good first step towards a performant verifier:
-+ have the field-VM perform all verification steps involving field arithmetic,
-+ include all verifier-issued challenges required by these verification steps 
-  in the communication record $record$ as field-elements, so that the field-VM does not have to derive them,
-+ use the binary-VM to verify the challenges hinted by the communication record are indeed correct.
-
-*Communication record overview:*
-- the data required according to the chosen verification split,
-- if $b=1$, reconstructed commitment $comm(verify'(comm(instance), comm(verify'); dot))$
-
-*$verify'_b\(comm(instance), (comm(verify'_b), comm(verify'_f)), proof, record)$:*
-- `COMMIT` to $comm(instance)$, $comm(verify'_b),$ and $comm(verify'_f)$ 
-- verify proof:
-  - if $b=0$: execute $verify_b (comm(instance), proof)$
-  - if $b=1$:
-    + construct $comm(verify'(comm(instance), comm(verify'); dot))$ from $(comm(instance), (comm(verify'_b), comm(verify'_f)))$
-    + execute $verify_b (comm(verify'(comm(instance), comm(verify'); dot)), proof)$
-
-*$verify'_f\(comm(instance), (comm(verify'_b), comm(verify'_f)), b, proof, record)$:*
-- verify proof: $verify_b (comm(verify'(comm(instance), comm(verify'); dot)), proof)$
-  - if $b=1$, use $comm(instance), comm(verify'_b), comm(verify'_f)$ to complete the `COMMIT` LogUp-balance.
-
-*Prover:*
-$
-  proof &arrow.l prove(instance, witness)\
-  proof' &arrow.l prove(verify'_b || verify'_f, (commit(instance), (commit(verify'_b), commit(verify'_f)), 0, proof, record))\
-  proof^((i)) &arrow.l prove(verify'_b || verify'_f, (commit(instance), (commit(verify'_b), commit(verify'_f)), 1, proof^((i-1)), record))
-$
-
-*Final verification.*
-$verify'(commit(instance), (commit(verify'_b), commit(verify'_f)), 1, proof^((n))) =^? one$
+*`Field-VM` subalgorithm*
+$tilde(v)_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
+- Performs the field arithmetic steps required to verify that $proof$ attests
+  to $instance$ (when $b=0$) or $instance2$ (when $b != 0$),
+  given the challenges stated on the $record$.
+  - Importantly, when $b != 0$, assert that the proofs interaction-logic is 
+    balanced out by including $comm(instance), comm(instance2)$ and the 
+    appropriate challenge under `COMMIT`'s domain separator.
