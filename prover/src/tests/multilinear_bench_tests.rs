@@ -612,18 +612,63 @@ mod transcript_pin {
         )
     }
 
-    /// Device commits a whole continuation makes.
+    /// Device commits a whole continuation makes, READ OFF THE BUNDLE.
     ///
-    /// ⚠ THE BASE IS A MEASUREMENT AND THE DELTA IS DERIVED, and the doc says
-    /// which is which. `COMMITS_BASE` is the box's reading before W1-B's opening
-    /// existed; what this adds to it is the opening's own device work — `R - 1`
-    /// successor codewords per epoch plus the one-time commitment — computed
-    /// from the same layout the transcript terms come from.
-    pub const COMMITS_BASE: u64 = 1_050;
-
-    /// See [`COMMITS_BASE`].
-    pub fn commits(shape: (usize, usize)) -> u64 {
-        COMMITS_BASE + EPOCHS * prepared_fold_commits_per_epoch(shape) + prepared_commitments(shape)
+    /// ★ NO MEASURED BASE. An earlier draft carried the box's 1,050 as a
+    /// literal; it is not a constant, it is a sum the proof states. A group's
+    /// opening is a `StackedProof`, each of its polynomials a `ChainProof`, and
+    /// `rounds.len()` is one initial commitment plus `R - 1` successor
+    /// codewords — one commit per round. Summed over every epoch's groups and
+    /// the cross-epoch proof's, that IS 1,050 on the pinned fixture, which is
+    /// what `whir_epoch_shapes` prints as "chains 154 rounds 1050".
+    ///
+    /// DECODE's prepared opening is the one term that is not per-chain: its
+    /// polynomial is committed ONCE for the run and held, so it contributes
+    /// `rounds.len() - 1` folds per epoch plus a single commitment — the
+    /// residency claim, arriving here as arithmetic.
+    ///
+    /// ⚠ AND THE ASSUMPTION THIS CARRIES, because it is shape-dependent and
+    /// silent. The counter counts DEVICE commits, and a polynomial too small for
+    /// the device is committed on the host, where a FOLD commit is counted
+    /// nowhere at all. `decode_residency_tests` measured exactly that: at a
+    /// 5 x 16 DECODE group the model reads 11 and the device counter reads 9.
+    /// This model therefore assumes every chain reached the device, which holds
+    /// here only because the pinned guest's polynomials are far above that
+    /// boundary — and the ELF sha guard above is what makes "the pinned guest"
+    /// something this function may assume.
+    ///
+    /// ⚠ `cuda`-only, because it models a counter that exists nowhere else. The
+    /// SHAPE half of the arithmetic is still laptop-checked —
+    /// `the_prepared_opening_is_the_schedule_the_shape_implies` pins the
+    /// prepared group's folds per epoch and its single held commitment — and
+    /// what runs only on the box is the summation over the bundle's chains.
+    #[cfg(feature = "cuda")]
+    pub fn commits(
+        proofs: &[&stark::multilinear_table::MultiProof<
+            crate::test_utils::F,
+            crate::test_utils::E,
+        >],
+    ) -> u64 {
+        let rounds: u64 = proofs
+            .iter()
+            .flat_map(|p| &p.columns)
+            .flat_map(|group| &group.polys)
+            .map(|poly| poly.rounds.len() as u64)
+            .sum();
+        let prepared_folds: u64 = proofs
+            .iter()
+            .flat_map(|p| p.preprocessed.iter())
+            .flat_map(|opening| &opening.polys)
+            .map(|poly| poly.rounds.len() as u64 - 1)
+            .sum();
+        // The held commitment: one per stacked polynomial of the prepared
+        // group, counted ONCE for the run however many epochs open it.
+        let held: u64 = proofs
+            .iter()
+            .find_map(|p| p.preprocessed.as_ref())
+            .map(|opening| opening.polys.len() as u64)
+            .unwrap_or(0);
+        rounds + prepared_folds + held
     }
 
     /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: 137, which is
@@ -942,16 +987,6 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
         1,
         "the commitment itself, once for the run"
     );
-    // The device commit total, re-spelled: the measured base plus the fold
-    // commits of fifteen openings plus the one commitment. Written here rather
-    // than only inside the `cuda` pin so the arithmetic is reachable from a
-    // laptop, which is the same reason `assert_pinned_pair` takes its triples
-    // as arguments.
-    assert_eq!(
-        transcript_pin::commits(shape),
-        transcript_pin::COMMITS_BASE + transcript_pin::EPOCHS * 5 + 1,
-        "the device commit total is its base plus the opening's own commits"
-    );
 }
 
 /// ★ One unit on the prove line fails on the prove assertion.
@@ -1250,7 +1285,7 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     // The device commit count, read where the read-0 line below reads it so the
     // two can never describe different windows.
     #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
-    let mut device_commits: Option<u64> = None;
+    let mut device_commits: Option<(u64, u64)> = None;
 
     if backend != "whir" {
         let start = Instant::now();
@@ -1319,7 +1354,15 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         );
         #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
         {
-            device_commits = Some(multilinear::gpu::commit_calls());
+            // The model beside the reading, taken from the bundle that produced
+            // it so the two cannot describe different runs.
+            let mut proofs: Vec<&stark::multilinear_table::MultiProof<_, _>> =
+                bundle.epochs.iter().map(|e| &e.proof).collect();
+            proofs.push(&bundle.global.proof);
+            device_commits = Some((
+                multilinear::gpu::commit_calls(),
+                transcript_pin::commits(&proofs),
+            ));
         }
         // ★★ WHICH SPONGE THE TRANSCRIPT RAN ON, per arm and on BOTH sides.
         //
@@ -1409,14 +1452,15 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
 /// same measurement; this way a host fallback, or a state read appearing
 /// somewhere new, says which instrument moved.
 ///
-/// The commit line cannot be an identity — its base is a measured total over
-/// every table of every epoch — so it is `COMMITS_BASE` plus the opening's own
-/// device work, derived from the layout.
+/// The commit line is not an identity either, but it is not a literal: the
+/// bundle's own chains sum to it, one commit per chain round, with DECODE's
+/// prepared polynomial held once and its folds paid per epoch. See
+/// [`transcript_pin::commits`], including the admission assumption it carries.
 #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
 fn check_device_pins(
     elf: &[u8],
     epoch_size_log2: u32,
-    commits: Option<u64>,
+    commits: Option<(u64, u64)>,
     prove: &crypto::hash_metrics::Counts,
 ) {
     use sha2::{Digest, Sha256};
@@ -1432,8 +1476,6 @@ fn check_device_pins(
         );
         return;
     }
-    let shape = decode_prepared_shape(elf);
-
     let grinds = crypto::grinding::gpu_grind_calls() + crypto::grinding::gpu_grind_calls_rpx();
     assert_eq!(
         grinds, prove.transcript_states,
@@ -1442,13 +1484,14 @@ fn check_device_pins(
          reads it"
     );
 
-    let Some(commits) = commits else {
+    let Some((commits, model)) = commits else {
         panic!("the WHIR arm ran but its device commit count was never taken");
     };
     assert_eq!(
-        commits,
-        transcript_pin::commits(shape),
-        "the device commit count moved"
+        commits, model,
+        "the device commit count moved: the bundle's own chains sum to {model} \
+         commits — one per chain round, with DECODE's prepared polynomial held \
+         and its folds paid per epoch — and the counter read {commits}"
     );
     println!(
         "{:<12} device pin OK (commits {commits}, grinds {grinds} = states)",
