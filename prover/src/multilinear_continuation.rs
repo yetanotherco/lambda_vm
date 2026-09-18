@@ -772,6 +772,112 @@ pub fn verify_global(
     .is_some())
 }
 
+/// The cross-epoch proof's AIR set, OWNED — because everything downstream
+/// borrows from it.
+///
+/// ★ TWO FAMILIES, KEPT APART, and that is the whole reason this is a struct
+/// with two fields rather than one flat `Vec`. Both constructors return the
+/// same concrete type, so one vector would compile — and the bookend/page SPLIT
+/// would then be unrecoverable from the set. That split is what
+/// [`global_groups`] takes, and unlike an epoch's it does NOT follow from the
+/// table count: fifteen bookends with thirty-five pages and fourteen with
+/// thirty-six are fifty tables either way. Here it is the struct's shape, so
+/// [`refs`](Self::refs) and [`groups`](Self::groups) are written from the same
+/// two vectors and cannot describe different layouts.
+///
+/// The AIRs are boxed only so their concrete type does not have to be spelled
+/// here — [`WhirEpochAirs`] boxes its bookend for the same reason, and a `&dyn
+/// AIR` is a `&dyn AIR` either way.
+pub(crate) struct WhirGlobalAirs {
+    /// One local-to-global bookend per epoch, in epoch-label order.
+    bookends: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
+    /// One GLOBAL_MEMORY table per touched page, in the canonical page-base
+    /// order [`crate::continuation::global_memory_configs`] hands back.
+    pages: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
+}
+
+impl WhirGlobalAirs {
+    /// The AIRs in PROOF ORDER: every bookend, then every page.
+    ///
+    /// ⚠ The order IS the proof's layout — `multi_verify` matches AIRs to
+    /// sub-proofs positionally — and it is written once, here, because it used
+    /// to be written at the call site.
+    pub(crate) fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+            Vec::with_capacity(self.bookends.len() + self.pages.len());
+        for air in self.bookends.iter().chain(&self.pages) {
+            refs.push(air.as_ref());
+        }
+        refs
+    }
+
+    /// How that set is committed: every bookend alone, then the pages together.
+    ///
+    /// [`global_groups`] over this set's OWN two families, so a caller cannot
+    /// restate the split from a table count it arrived at some other way.
+    pub(crate) fn groups(&self) -> Vec<usize> {
+        global_groups(self.bookends.len(), self.pages.len())
+    }
+}
+
+/// The AIR set the cross-epoch proof's tables are argued against.
+///
+/// ★ ONE DERIVATION, AND EVERY CONSUMER GOES THROUGH IT.
+/// [`verify_global_bookends`] builds its statements from this, and so must any
+/// later emitter of the cross-epoch program, so "the AIRs a program is emitted
+/// against are the AIRs the verifier accepted" is true by construction. Two
+/// call sites that agree today is exactly the shape that let REGISTER's
+/// preprocessed columns and its root describe different tables.
+/// ⚠ REACHABILITY IS NOT AN ARGUMENT FOR A SECOND COPY: `l2g_global_air`,
+/// `global_memory_air` and `global_memory_configs` are all `pub(crate)`, so one
+/// can be written anywhere in the crate — and it would be a second derivation
+/// of the layout `multi_verify` matches positionally.
+///
+/// ⚠ THE PAGE CONFIGS ARE REBUILT FROM THE ELF, never taken from the bundle:
+/// that is the genesis binding, and it is why this takes an [`Elf`] rather than
+/// a config list. [`prove_global`] builds its own set from the run's init page
+/// data with private genesis included — a different source on purpose, which is
+/// why the prover is not a caller of this.
+///
+/// ⚠ `global_memory_air`'s preprocessed commitment is `None` here and there is
+/// deliberately no parameter for it, which is the opposite of
+/// [`epoch_airs_for`]'s `decode_commitment`. That argument supplies a page's
+/// UNIVARIATE preprocessed commitment, and this path never reads one:
+/// `AIR::precomputed_columns` runs the columns closure, while the commitment
+/// sits behind `LazyCommitment::get`, whose callers are the univariate prover
+/// and verifier and `crate::lfm`. A parameter would therefore be a knob with no
+/// observable effect and no cost either way — the deferred per-page commitment
+/// is never forced on this path. A cross-epoch program's own genesis opening is
+/// a MULTILINEAR commitment over the same columns, a different object that this
+/// argument cannot carry.
+pub(crate) fn global_airs_for(
+    elf: &Elf,
+    opts: &ProofOptions,
+    num_epochs: usize,
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+) -> WhirGlobalAirs {
+    let bookends = (0..num_epochs)
+        .map(|i| {
+            Box::new(crate::continuation::l2g_global_air(
+                opts,
+                local_to_global::epoch_label(i as u64),
+            )) as Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>
+        })
+        .collect();
+    // Rebuilt from the ELF, never from the bundle: this is the genesis binding.
+    let gm_configs =
+        crate::continuation::global_memory_configs(page_bases, elf, num_private_input_pages);
+    let pages = gm_configs
+        .iter()
+        .map(|config| {
+            Box::new(crate::continuation::global_memory_air(opts, config, None))
+                as Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>
+        })
+        .collect();
+    WhirGlobalAirs { bookends, pages }
+}
+
 /// [`verify_global`], handing back the roots each epoch's bookend was
 /// committed under — which is what the binding compares. `None` is a proof
 /// that does not verify.
@@ -785,22 +891,10 @@ fn verify_global_bookends(
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<Vec<Commitment>>>, Error> {
-    let l2g_airs: Vec<_> = (0..num_epochs)
-        .map(|i| crate::continuation::l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
-        .collect();
-    // Rebuilt from the ELF, never from the bundle: this is the genesis binding.
-    let gm_configs =
-        crate::continuation::global_memory_configs(page_bases, elf, num_private_input_pages);
-    let gm_airs: Vec<_> = gm_configs
-        .iter()
-        .map(|config| crate::continuation::global_memory_air(opts, config, None))
-        .collect();
-
-    let mut air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        l2g_airs.iter().map(|a| a as _).collect();
-    for air in &gm_airs {
-        air_refs.push(air);
-    }
+    // ★ THE ONE DERIVATION. An emitter of the cross-epoch program builds its
+    // set through this same function.
+    let air_set = global_airs_for(elf, opts, num_epochs, page_bases, num_private_input_pages);
+    let air_refs = air_set.refs();
     if air_refs.len() != global.proof.tables.len() || global.table_num_vars.len() != air_refs.len()
     {
         return Err(Error::InvalidTableCounts(format!(
@@ -840,7 +934,7 @@ fn verify_global_bookends(
         .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
         .collect();
 
-    let sizes = global_groups(num_epochs, gm_configs.len());
+    let sizes = air_set.groups();
     let (stacks, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
     // Each bookend is a group of its own, so its roots are the group's — as
     // many as the stack split it into.

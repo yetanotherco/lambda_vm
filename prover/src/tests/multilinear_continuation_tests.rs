@@ -725,3 +725,132 @@ fn a_restated_touched_page_set_is_rejected() {
         "a restated touched page set was accepted"
     );
 }
+
+/// The cross-epoch AIR set is built ONCE, by `global_airs_for`, and this is
+/// what that one set has to say about the proof it was asked for.
+///
+/// ★ WIDTH IS THE HALF A PROOF DOES NOT STATE. `GlobalProof` carries a height
+/// per table and nothing else, so a set built in the wrong ORDER — the pages
+/// before the bookends, or one family built twice — is invisible to every count
+/// the proof itself can check. The two families' widths differ (9 against 4),
+/// which is what makes the order observable at all.
+///
+/// The preprocessed route is the other half: a GLOBAL_MEMORY table preprocesses
+/// OFFSET alone on a private-input page and OFFSET+INIT everywhere else. ⚠ What
+/// that half can catch is a page routed against the wrong config — the configs
+/// ordered differently from the page bases, or the branch taken the wrong way.
+/// It does NOT independently check `is_private_input_page`, which both sides
+/// reach.
+///
+/// ⛔ WHAT THIS FIXTURE DOES NOT COVER, measured and printed rather than
+/// assumed. The run's cross-epoch shape is **4 tables = 3 bookends + 1 page,
+/// and that page is the PRIVATE-INPUT one**, so:
+///   * the OFFSET+INIT route — the one every ELF-backed and zero-init page on a
+///     real block takes — has NO table here and therefore no gate here. Closing
+///     it needs a fixture whose run leaves cross-epoch cells on a non-private
+///     page, not another assertion on this one.
+///   * the group split is pinned only as a COUNT: with a single page the page
+///     group has one member and is shape-identical to a bookend singleton. At
+///     block scale (fifteen singletons then one group of thirty-five) the same
+///     assertion pins the split as well.
+///
+/// `touched_page_bases` lists the pages carrying cells that CROSS an epoch
+/// boundary, which is why a run that reads its input from another page still
+/// reaches only one of them.
+#[test]
+fn the_global_airs_describe_the_cross_epoch_proof_they_were_asked_for() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    let elf = Elf::load(&elf_bytes).expect("load");
+
+    let epochs = bundle.num_epochs();
+    // The AIRs come back in the canonical page order the config build imposes,
+    // not in the bundle's wire order.
+    let mut bases = bundle.touched_page_bases.clone();
+    bases.sort_unstable();
+    bases.dedup();
+    assert!(!bases.is_empty(), "the run touched no memory");
+
+    let airs = multilinear_continuation::global_airs_for(
+        &elf,
+        &opts,
+        epochs,
+        &bundle.touched_page_bases,
+        bundle.num_private_input_pages,
+    );
+    let refs = airs.refs();
+
+    // The proof states one height per table and no width at all, so the AIR set
+    // and the proof reach this count by different routes.
+    assert_eq!(
+        refs.len(),
+        bundle.global.table_num_vars.len(),
+        "the cross-epoch AIR set and the proof describe a different number of tables"
+    );
+    assert_eq!(
+        refs.len(),
+        epochs + bases.len(),
+        "the set is not one bookend per epoch and one table per touched page"
+    );
+
+    for (index, air) in refs.iter().enumerate() {
+        let expected = if index < epochs {
+            local_to_global::cols::NUM_COLUMNS
+        } else {
+            crate::tables::global_memory::cols::NUM_COLUMNS
+        };
+        assert_eq!(
+            air.trace_layout().0,
+            expected,
+            "table {index} is not the family the layout puts there (bookends 0..{epochs}, pages {epochs}..{})",
+            refs.len()
+        );
+    }
+
+    // Every bookend committed alone — which is what lets its root be compared
+    // against the epoch that committed it — and then the pages together.
+    let mut expected_groups = vec![1usize; epochs];
+    expected_groups.push(bases.len());
+    assert_eq!(
+        airs.groups(),
+        expected_groups,
+        "the cross-epoch commitment groups are not fifteen-style singletons plus the pages"
+    );
+
+    let mut private = 0usize;
+    let mut genesis = 0usize;
+    for (page, base) in bases.iter().enumerate() {
+        let air = refs[epochs + page];
+        let is_private =
+            crate::tables::page::is_private_input_page(*base, bundle.num_private_input_pages);
+        let expected = if is_private {
+            private += 1;
+            crate::tables::page::NUM_PREPROCESSED_COLS_PRIVATE
+        } else {
+            genesis += 1;
+            crate::tables::global_memory::NUM_PREPROCESSED_COLS
+        };
+        assert_eq!(
+            air.num_precomputed_columns(),
+            expected,
+            "page {page} at base {base:#x} declares the wrong preprocessed route"
+        );
+        // The declared count and the columns the closure builds are two
+        // different members of the AIR, and the statement is built from both.
+        assert_eq!(
+            air.precomputed_columns().len(),
+            expected,
+            "page {page} at base {base:#x} builds a different number of preprocessed columns than it declares"
+        );
+    }
+    // Both arms bump, so the sum is a prediction and not a restatement of the
+    // loop's own trip count.
+    assert_eq!(private + genesis, bases.len());
+    println!(
+        "GLOBAL AIRS: {} tables = {epochs} bookends + {} pages ({private} private-input OFFSET-only, {genesis} OFFSET+INIT)",
+        refs.len(),
+        bases.len(),
+    );
+}
