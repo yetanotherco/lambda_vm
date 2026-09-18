@@ -77,6 +77,11 @@ type Shape = InteractionShape<GoldilocksExtension>;
 /// per sub-form and adding would charge a shared value twice. This carries the
 /// values and deduplicates once, the way `whir_program::steps_rows` counts a
 /// DAG's `Fixed` steps.
+///
+/// It lives here because the bus statements were the first leg that needed it,
+/// and it is the accumulator every later per-table form uses — the whole table
+/// shares one constant pool, so the terms have to be added into one of these
+/// rather than summed as numbers.
 #[derive(Default, Debug, Clone)]
 pub struct Cost {
     operations: usize,
@@ -85,17 +90,17 @@ pub struct Cost {
 
 impl Cost {
     /// One `LFM_XALU` row.
-    fn op(&mut self) {
+    pub fn op(&mut self) {
         self.operations += 1;
     }
 
     /// `count` of them.
-    fn ops(&mut self, count: usize) {
+    pub fn ops(&mut self, count: usize) {
         self.operations += count;
     }
 
     /// One `LFM_CONST` row, unless this value is already interned.
-    fn constant(&mut self, value: FEE) {
+    pub fn constant(&mut self, value: FEE) {
         if !self.constants.contains(&value) {
             self.constants.push(value);
         }
