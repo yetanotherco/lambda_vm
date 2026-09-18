@@ -32,22 +32,29 @@
 //! that verification because the transcript hash is part of the configuration
 //! and every challenge diverges. A label can be wrong; this cannot.
 //!
-//! ⚠ AND THE REFUSAL IS NOT YET TESTABLE ON THIS BASE, which is stated rather
-//! than papered over. On `whir/lfm` both `prove_epoch` and `verify_epoch`
-//! dispatch on the cached process knob internally, so one process is one hash
-//! and a test cannot hold a keccak bundle and an RPX verification at the same
-//! time. The `whir/decode-group` lineage makes both generic over `H`, which is
-//! exactly what the test needs: prove at `KeccakWhir`, harvest at `RpxWhir`,
-//! and require the refusal — with the same bundle harvested at `KeccakWhir` as
-//! the control that must be ACCEPTED, since a refusal test with only its
-//! refusing half passes on a driver that refuses everything. The test is
-//! written the moment that merge lands; see `the_hash_agreement_is_owed`.
+//! ★ AND IT IS MEASURED, not argued. [`real_epoch_from_whir_continuation_under`]
+//! takes `H` and verifies under it;
+//! `tests::an_epoch_proven_under_keccak_is_refused_when_harvested_under_rpx`
+//! proves a real bundle's epochs with a literal `prove_epoch::<KeccakWhir>`,
+//! harvests that bundle at `RpxWhir` and requires the refusal — beside the
+//! same bundle harvested at `KeccakWhir`, which must be ACCEPTED. The control
+//! is not decoration: `verify_epoch_bookend` collapses every failure to
+//! `Ok(None)`, so without it a driver that refused everything would pass.
+//!
+//! # The process knob is REPORTED, never obeyed
+//!
+//! Level 0's wrap proofs commit under the RPX block hasher, so a process left
+//! at keccak is usually an operator's mistake — but it is not this driver's to
+//! decide, because a keccak bundle harvested under keccak is perfectly valid
+//! and merely not the production posture. [`whir_process_posture_note`] names
+//! it and refuses nothing.
 
 use crate::multilinear_continuation::{ContinuationProof, EpochProof};
 use crate::tables::local_to_global::epoch_label;
 use crate::tables::register;
 use executor::elf::Elf;
 use multilinear::whir_chain::ChainConfig;
+use multilinear::whir_hash::WhirHash;
 use stark::config::Commitment;
 
 /// Where an epoch sits in its run, as the VERIFIER derives it.
@@ -153,6 +160,41 @@ pub(super) fn real_epoch_from_whir_continuation(
     epoch_index: usize,
     decode_commitment: Option<Commitment>,
 ) -> Result<WhirRealEpoch, String> {
+    crate::with_whir_hash!(|H| {
+        real_epoch_from_whir_continuation_under::<H>(
+            opts,
+            elf_bytes,
+            bundle,
+            epoch_index,
+            decode_commitment,
+        )
+    })
+}
+
+/// [`real_epoch_from_whir_continuation`], told which hash to verify under.
+///
+/// ★ THIS IS WHERE THE HASH AGREEMENT LIVES, and it is why the function is
+/// generic rather than reading the knob. `whir_hash_knob::selected()` is a
+/// cached process setting: it says what THIS PROCESS proves under, never what
+/// the bundle in front of it was proven under. The agreement is the
+/// verification — a bundle proven under another hash fails here because the
+/// transcript's sponge is part of the configuration and every challenge
+/// diverges from the first squeeze.
+///
+/// The split mirrors [`crate::multilinear_continuation::verify_epoch`] and
+/// `verify_epoch_bookend::<H>` in the module this drives: one entry point that
+/// dispatches on the knob for production, one that takes `H` so the agreement
+/// can be argued about — and tested — at all.
+pub(super) fn real_epoch_from_whir_continuation_under<H>(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+    epoch_index: usize,
+    decode_commitment: Option<Commitment>,
+) -> Result<WhirRealEpoch, String>
+where
+    H: WhirHash,
+{
     let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
     let decode_commitment = match decode_commitment {
         Some(c) => c,
@@ -168,8 +210,17 @@ pub(super) fn real_epoch_from_whir_continuation(
     })?;
     let proof = bundle.epochs[epoch_index].clone();
 
-    // ★ The acceptance check, and the hash agreement with it.
-    let verified = crate::multilinear_continuation::verify_epoch(
+    // ★ The acceptance check, and the hash agreement with it. Both are the
+    // same call: `H` configures the transcript's sponge, so verifying here IS
+    // asking whether this bundle was proven under `H`.
+    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(&elf, elf_bytes)
+        .map_err(|e| {
+            format!(
+                "DECODE's prepared commitment under {}: {e:?}",
+                <H as WhirHash>::NAME
+            )
+        })?;
+    let verified = crate::multilinear_continuation::verify_epoch_bookend::<H>(
         &elf,
         elf_bytes,
         &proof,
@@ -177,15 +228,23 @@ pub(super) fn real_epoch_from_whir_continuation(
         position.is_final,
         position.label,
         opts,
+        &prepared,
     )
     .map_err(|e| format!("epoch {epoch_index} could not be verified: {e:?}"))?;
-    if !verified {
+    if verified.is_none() {
+        // ⚠ THE NAME IS `H`'s, NOT THE KNOB'S. This message used to fill that
+        // slot from `whir_hash_knob::selected()`, which is wrong in exactly the
+        // case worth diagnosing: a keccak process harvesting under RPX would
+        // have reported "keccak256" while the verifier ran RPX, pointing the
+        // reader away from the defect. The refusal itself is a bare `None` —
+        // `verify_epoch_bookend` collapses every failure — so this string is
+        // the only reason anyone gets.
         return Err(format!(
             "epoch {epoch_index} of this bundle does not verify under {}. Either the \
              bundle is not the one this ELF and these options describe, or it was \
              proven under a different hash — see this module's header on why that \
              is checked cryptographically and not by a tag",
-            crate::whir_hash_knob::selected().name(),
+            <H as WhirHash>::NAME,
         ));
     }
 
@@ -235,6 +294,42 @@ pub(super) fn real_epoch_from_whir_continuation(
         shapes,
         proof,
     })
+}
+
+/// REPORTS, and decides nothing: this process's WHIR hash is not the one level
+/// 0's wraps are pinned to.
+///
+/// `None` when the process is set to RPX. Otherwise a line naming the setting.
+///
+/// ⚠ WHY THIS REFUSES NOTHING. The compile-time pin `hash_pin::BlockStarkHash`
+/// is RPX, so a production tree built in a keccak process is almost certainly
+/// an operator's mistake — but "almost certainly" is not a soundness property.
+/// A keccak bundle harvested under keccak is a correctly verified epoch; it is
+/// simply not the production posture, and a driver that refused it would break
+/// every keccak test and every keccak A/B arm the campaign runs. The refusal
+/// this driver DOES make is the cryptographic one in
+/// [`real_epoch_from_whir_continuation_under`], which needs no knob at all.
+///
+/// So this exists to make a cheap mistake cheap to find: an operator who meant
+/// to run the RPX arm learns it before a tree is built, not from a number that
+/// looks like the RPX arm and is not — the same failure `whir_hash_knob`'s own
+/// header refuses to allow for an unrecognised value.
+pub(super) fn whir_process_posture_note() -> Option<String> {
+    let setting = crate::whir_hash_knob::selected();
+    if setting == crate::whir_hash_knob::Setting::Rpx {
+        return None;
+    }
+    Some(format!(
+        "⚠ {}={} — level 0's wrap proofs commit under the RPX block hasher, so a \
+         production tree wants the RPX arm. Nothing is refused on this: a bundle \
+         proven under {} harvests fine under {}. Set {}=rpx if this run was meant \
+         to be the production posture.",
+        crate::whir_hash_knob::ENV,
+        setting.name(),
+        setting.name(),
+        setting.name(),
+        crate::whir_hash_knob::ENV,
+    ))
 }
 
 #[cfg(test)]
@@ -452,28 +547,205 @@ mod tests {
         );
     }
 
-    /// ⛔ THE HASH AGREEMENT IS OWED, AND THIS IS WHERE IT GOES.
+    /// A bundle whose epochs are proven under a hash NAMED HERE, not inherited
+    /// from the process.
     ///
-    /// The test is: prove a bundle at `KeccakWhir`, harvest it at `RpxWhir`,
-    /// require the refusal, and harvest the SAME bundle at `KeccakWhir` as the
-    /// control that must be accepted. It cannot be written on this base,
-    /// because `prove_epoch` and `verify_epoch` both dispatch on the cached
-    /// process knob, so one process is one hash. The `whir/decode-group`
-    /// lineage makes both generic over `H`, which is exactly what this needs.
+    /// ★★ AND THAT DISTINCTION IS THE WHOLE POINT OF THE HELPER. The cheap
+    /// version of the refusal test proves with `prove_continuation` and harvests
+    /// at `RpxWhir`; `prove_continuation` dispatches on the cached knob, which is
+    /// keccak only because `LAMBDA_VM_WHIR_HASH` is usually unset. Run the suite
+    /// with `LAMBDA_VM_WHIR_HASH=rpx` and that bundle is RPX, the two arms SILENTLY
+    /// INVERT, and the failure reads as a broken hash agreement when it is a
+    /// configuration mismatch. Re-proving the epochs under a literal `KeccakWhir`
+    /// costs one more prove of the same run and makes the test mean the same thing
+    /// in every process.
     ///
-    /// It is a failing-by-construction reminder rather than a comment: an
-    /// `#[ignore]`d test with a name a grep finds, so the obligation is visible
-    /// in a test listing and not only in prose. It is NOT a passing test, which
-    /// would report the work as done.
+    /// The shell is a real bundle — a real cross-epoch proof, a real touched page
+    /// set — because only the epochs are replaced. The driver reads `bundle.epochs`
+    /// and nothing else, so the shell's own hash cannot reach this measurement.
+    fn a_keccak_bundle() -> (
+        Vec<u8>,
+        ProofOptions,
+        multilinear_continuation::ContinuationProof,
+    ) {
+        use multilinear::whir_hash::KeccakWhir;
+
+        let (elf_bytes, input) = a_run();
+        let opts = ProofOptions::default_test_options();
+        let mut b = multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts)
+            .expect("prove the continuation");
+
+        let elf = Elf::load(&elf_bytes).expect("load");
+        let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)
+            .expect("decode artifacts");
+        let prepared =
+            multilinear_continuation::decode_prepared_for::<KeccakWhir>(&elf, &elf_bytes)
+                .expect("DECODE's prepared commitment under keccak");
+
+        let mut epochs = Vec::new();
+        crate::continuation::for_each_epoch(&elf, &input, 2, &artifacts, |prepared_epoch, _| {
+            let crate::continuation::PreparedEpoch {
+                register_init,
+                label,
+                traces,
+                boundary,
+                is_final,
+                ..
+            } = prepared_epoch;
+            epochs.push(multilinear_continuation::prove_epoch::<KeccakWhir>(
+                &elf,
+                &elf_bytes,
+                &register_init,
+                label,
+                traces,
+                is_final,
+                &boundary,
+                &opts,
+                None,
+                &prepared,
+            )?);
+            Ok(())
+        })
+        .expect("prove every epoch under a literal keccak");
+
+        assert_eq!(
+            epochs.len(),
+            b.epochs.len(),
+            "the explicit pass split the run differently from prove_continuation's"
+        );
+        assert!(epochs.len() >= 2, "a one-epoch run chains nothing");
+        b.epochs = epochs;
+        (elf_bytes, opts, b)
+    }
+
+    /// ★★ SEAM 1: THE HASH AGREEMENT, AT THE DRIVER'S OWN ENTRY POINT.
+    ///
+    /// The bundle carries no hash tag and cannot — a WHIR proof's bytes are
+    /// hash-agnostic by design, which is the byte gate's own invariant — and the
+    /// process knob describes the process, not the bundle. So the refusal is the
+    /// verification: hand the driver an `H`, and a bundle proven under another
+    /// hash fails because the transcript's sponge is part of the configuration.
+    ///
+    /// ⚠ BOTH ARMS, ON THE SAME BUNDLE. `verify_epoch_bookend` collapses every
+    /// failure to `Ok(None)`, so the refusal carries no reason of its own and a
+    /// driver that refused everything would pass the refusing half alone. The
+    /// accept arm is what makes the refusal mean something.
     #[test]
-    #[ignore = "blocked: needs the H-generic prove/verify entry points from whir/decode-group"]
-    fn the_hash_agreement_is_owed() {
-        panic!(
-            "the cryptographic hash-agreement test is owed and cannot be written \
-             on this base: `prove_epoch` and `verify_epoch` dispatch on the cached \
-             process knob, so a keccak bundle and an RPX harvest cannot coexist in \
-             one process. Merge the H-generic entry points from `whir/decode-group` \
-             and write it here"
+    fn an_epoch_proven_under_keccak_is_refused_when_harvested_under_rpx() {
+        use multilinear::whir_hash::{KeccakWhir, RpxWhir};
+
+        let (elf_bytes, opts, b) = a_keccak_bundle();
+
+        // THE CONTROL FIRST, and on epoch 1 so the register carry is exercised
+        // with it: the hash it was proven under must ACCEPT.
+        let accepted =
+            real_epoch_from_whir_continuation_under::<KeccakWhir>(&opts, &elf_bytes, &b, 1, None)
+                .expect("a keccak bundle must harvest under keccak");
+        assert_eq!(
+            accepted.position.label,
+            epoch_label(1),
+            "the control harvested some other epoch"
+        );
+
+        // A `match` rather than `expect_err`, which would want `WhirRealEpoch:
+        // Debug` — a derive on a production type added for a test's
+        // convenience, on a struct holding a whole proof.
+        let refused = match real_epoch_from_whir_continuation_under::<RpxWhir>(
+            &opts, &elf_bytes, &b, 1, None,
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!(
+                "an epoch proven under keccak was HARVESTED under RPX; level 0's \
+                 whole hash agreement rests on that being impossible"
+            ),
+        };
+
+        // The reason is NAMED, and it names the hash the harvest RAN UNDER
+        // rather than the process knob — which in this very test is whatever
+        // the suite was started with, and is not RPX.
+        assert!(
+            refused.contains(<RpxWhir as WhirHash>::NAME),
+            "the refusal must name the hash it verified under; it said: {refused}"
+        );
+        assert!(
+            !refused.contains(<KeccakWhir as WhirHash>::NAME),
+            "the refusal named the bundle's hash instead of the verifier's: {refused}"
+        );
+    }
+
+    /// ★ THE POSTURE IS REPORTED AND DECIDES NOTHING.
+    ///
+    /// ⚠ THE ASSERTION IS A RELATION, NOT A VALUE. `whir_hash_knob::selected()`
+    /// is a cached process-global, so `assert!(note.is_some())` would be an
+    /// assertion about how the whole test binary was invoked — green under the
+    /// default and red under `LAMBDA_VM_WHIR_HASH=rpx`, for no reason anybody
+    /// reading the test would guess. What is true in every process is that the
+    /// note fires exactly when the setting is not RPX.
+    #[test]
+    fn the_process_hash_posture_is_reported_and_never_decides() {
+        let setting = crate::whir_hash_knob::selected();
+        let note = whir_process_posture_note();
+
+        assert_eq!(
+            note.is_some(),
+            setting != crate::whir_hash_knob::Setting::Rpx,
+            "the posture note disagreed with the process setting {setting:?}"
+        );
+        if let Some(text) = &note {
+            assert!(
+                text.contains(setting.name()),
+                "the note must name the setting it reports: {text}"
+            );
+            assert!(
+                text.contains(crate::whir_hash_knob::ENV),
+                "the note must name the knob an operator would change: {text}"
+            );
+        }
+
+        // AND IT DECIDES NOTHING. A bundle proven under this process's own hash
+        // harvests whether the note fired or not — which is the half that would
+        // break if anyone ever turned this report into a refusal.
+        let (elf_bytes, opts, b) = bundle();
+        real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 0, None)
+            .expect("the posture note must not refuse anything");
+    }
+
+    /// ★ THE RESTATED REGISTER CARRY IS REFUSED — at the driver, on the base
+    /// that fixed it.
+    ///
+    /// This file used to carry an `#[ignore]`d red flag recording the opposite:
+    /// flipping one bit of `epochs[0].reg_fini` — the vector that IS epoch 1's
+    /// `register_init` — and harvesting epoch 1 was ACCEPTED, because
+    /// `VmAirs::new` gave REGISTER a preprocessed commitment and no columns
+    /// closure and the multilinear verifier checks columns. 5e3df0c0 binds both
+    /// ends as columns. The red flag is deleted; this is what replaces it, at
+    /// the entry point level 0 actually calls.
+    ///
+    /// Both indices W1d established are flipped: index 1, and `X254_INDEX`, the
+    /// synthetic commit index that rides in the same vector. The untouched
+    /// bundle is harvested first, or a driver that refused everything would pass.
+    #[test]
+    fn a_restated_register_carry_is_refused_by_the_driver() {
+        let (elf_bytes, opts, mut b) = bundle();
+        assert!(b.epochs.len() >= 2, "a one-epoch run chains nothing");
+
+        real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 1, None)
+            .expect("the control: the untouched bundle must harvest epoch 1");
+
+        let mut carry = b.epochs.clone();
+        carry[0].reg_fini[1] ^= 1;
+        let restated = std::mem::replace(&mut b.epochs, carry);
+        assert!(
+            real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 1, None).is_err(),
+            "epoch 1 was harvested against a register file the chain never handed it"
+        );
+
+        let mut commit_index = restated;
+        commit_index[0].reg_fini[crate::tables::register::X254_INDEX] ^= 1;
+        b.epochs = commit_index;
+        assert!(
+            real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 1, None).is_err(),
+            "epoch 1 was harvested against a restated commit index"
         );
     }
 }
