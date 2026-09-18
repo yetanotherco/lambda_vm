@@ -724,3 +724,76 @@ fn the_production_shape_reproduces_the_campaigns_permutation_count() {
     );
     assert_eq!(shape.current_felts(1), 48, "every later round is three");
 }
+
+/// A one-refusal program: hints its inputs, runs the refusal, publishes a
+/// witness so the program has an output.
+fn refusal_program(which: &str) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(3);
+    let one = b.ext_const(&FEE::one());
+    let a = b.hint_word(arena, 0).as_ext();
+    let c = b.hint_word(arena, 1).as_ext();
+    let d = b.hint_word(arena, 2).as_ext();
+    match which {
+        "ood" => super::whir_chain::emit_require_out_of_domain(&mut b, a, one),
+        _ => super::whir_chain::emit_final_check(&mut b, a, c, d, one),
+    }
+    b.public(a.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("a refusal leg must be admissible");
+    program
+}
+
+fn runs(program: &LfmProgram, words: [FEE; 3]) -> bool {
+    let arena: Vec<LfmWord> = words.iter().map(ext_word).collect();
+    execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_ok()
+}
+
+/// ★ The two refusals a chain-level gate CANNOT exercise, driven directly.
+///
+/// Mutations CC and CD deleted each of these from the assembled chain and all
+/// four chain tests stayed green — measured, not feared. The reason is the same
+/// for both: the input that would trip them is one a Fiat-Shamir transcript does
+/// not produce. An in-domain `z0` has negligible probability, and a weight and
+/// claim that are BOTH zero is a point no honest or tampered fixture reaches.
+///
+/// So they are called with the inputs the protocol never will, each beside a
+/// control that must execute — otherwise the refusal would be a refusal of
+/// everything, which is the sibling failure.
+#[test]
+fn the_refusals_a_real_proof_cannot_reach() {
+    let ood = refusal_program("ood");
+    let zero = FEE::zero();
+    let two = FEE::one() + FEE::one();
+    // `z0` raised to the domain's size: one means in-domain.
+    assert!(
+        runs(&ood, [two, zero, zero]),
+        "an out-of-domain point must execute, or the refusal below refuses everything"
+    );
+    assert!(
+        !runs(&ood, [FEE::one(), zero, zero]),
+        "an IN-domain point must have no execution: this is `OodPointInDomain`, and a \
+         transcript never draws one, so nothing else in this suite can see it"
+    );
+
+    let tail = refusal_program("tail");
+    // (claim, weight, final_value): the honest relation is final = claim/weight.
+    assert!(
+        runs(&tail, [two + two, two, two]),
+        "4 / 2 == 2 must execute, or the refusal below refuses everything"
+    );
+    assert!(
+        !runs(&tail, [two + two, two, FEE::one()]),
+        "a final value that is not claim/weight must have no execution"
+    );
+    assert!(
+        !runs(&tail, [zero, zero, FEE::one()]),
+        "★ the DOUBLE ZERO: the host returns DegenerateEvaluationPoint here, and the \
+         cross-multiplied form `final·weight == claim` would accept any final value. \
+         This is the whole reason the tail inverts."
+    );
+    assert!(
+        !runs(&tail, [two, zero, FEE::one()]),
+        "a zero weight with a nonzero claim must have no execution either"
+    );
+}

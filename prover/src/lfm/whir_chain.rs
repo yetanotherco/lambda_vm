@@ -380,11 +380,7 @@ pub fn emit_verify_weighted(
                     let squared = b.emul(powers[j], powers[j]);
                     powers.push(squared);
                 }
-                // `require_out_of_domain`: `z0^(2^log_size) != 1`. A difference
-                // of zero leaves `1/0` with no satisfying assignment, which is
-                // the host's `OodPointInDomain`.
-                let gap = b.esub(powers[depth], one);
-                let _ = b.ediv(one, gap);
+                emit_require_out_of_domain(b, powers[depth], one);
                 let ood_point: Vec<Ext> = powers[..shape.num_vars - bound].to_vec();
 
                 transcript.absorb_ext(b, y0);
@@ -435,8 +431,39 @@ pub fn emit_verify_weighted(
         weight = b.emul_add(*gamma, eq, weight);
     }
 
-    // `required = claim / weight`, with the host's degenerate-weight rejection
-    // carried by the division itself.
+    emit_final_check(b, claim, weight, final_value, one);
+}
+
+/// ★ `require_out_of_domain` (`whir_chain.rs:88-101`), emitted as a REFUSAL.
+///
+/// The host rejects `z0` whose `2^log_size`-th power is one, because such a
+/// point lies inside the domain and constrains nothing beyond the in-domain
+/// queries. Here `raised − 1` is inverted: `1/0` has no satisfying assignment,
+/// so an in-domain `z0` has no execution.
+///
+/// ⚠ **Its own function because no honest fixture reaches it.** A transcript
+/// draws an in-domain `z0` with negligible probability, so a chain-level
+/// mutation that deletes this check passes every gate — measured, not assumed:
+/// mutation CC removed it and all four chain tests stayed green. A refusal that
+/// nothing can exercise is a check that cannot fail, and the cure is to make it
+/// callable so a test can hand it the input the protocol never will.
+pub fn emit_require_out_of_domain(b: &mut LfmBuilder, raised: Ext, one: Ext) {
+    let gap = b.esub(raised, one);
+    let _ = b.ediv(one, gap);
+}
+
+/// ★ The chain's last check: `final_value == claim · weight⁻¹`.
+///
+/// Inverting rather than cross-multiplying, and the difference is soundness
+/// rather than taste. `final_value · weight == claim` is one row cheaper and
+/// accepts EVERY `final_value` when `weight` and `claim` are both zero, where
+/// the host returns `DegenerateEvaluationPoint` (`whir_chain.rs:1095-1102`).
+///
+/// ⚠ **Its own function for the same reason as above.** Weight and claim are
+/// both zero only at a point a transcript does not produce, so mutation CD
+/// replaced this with the cross-multiplied form and all four chain tests stayed
+/// green. The gap is closed by calling this directly with the degenerate input.
+pub fn emit_final_check(b: &mut LfmBuilder, claim: Ext, weight: Ext, final_value: Ext, one: Ext) {
     let inv = b.ediv(one, weight);
     let required = b.emul(claim, inv);
     b.assert_eq_ext(final_value, required);
