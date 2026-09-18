@@ -184,20 +184,49 @@ fn the_decode_commitment_is_derived_once_per_run() {
 /// the test asserts that at least one arm had two or more epochs, and says so
 /// when it did not.
 ///
-/// Under `cuda` this also reads `free_vram_bytes()` either side of the run, with
-/// the pool drained first, and prints what the run took. Its only assertion is
-/// against RETENTION: after `prove_epochs` returns, nothing the run built may
-/// still be on the card. That is a real regression — the commitment outliving
-/// the call — and it is NOT the residency discriminator, for the reason in this
-/// module's header. It is deliberately not sampled on a thread during the run:
-/// an in-flight peak cannot separate held from rebuilt either, so the extra
-/// machinery would buy a number that decides nothing.
+/// # The counts print and assert FIRST, and the VRAM line is a measurement
+///
+/// ⛔ Run rs1 died in 0.93 s on the VRAM assertion and the two RESIDENCY count
+/// lines — the discriminator, the whole point of the test — never printed. A
+/// secondary check that runs before the primary one can spend a box slot
+/// answering nothing. The VRAM READING still happens where it must, straight
+/// after `prove_epochs` and a drain, because anything allocated afterwards
+/// would spoil it; only the printing and the verdict move.
+///
+/// The reading is now PRINTED, not asserted, and here is what it means.
+/// `drain_and_trim` synchronises the context and trims the device's DEFAULT
+/// memory pool to zero, so what it cannot give back is (i) memory a live
+/// `CudaSlice` still owns, (ii) allocations outside that pool, and (iii) the
+/// driver's own per-process reservations. `Backend` holds device buffers for
+/// the life of the process — the forward and inverse twiddle caches are
+/// `Arc<CudaSlice<u64>>` per `log_n`, filled lazily and never dropped — and the
+/// cubin modules with their per-SM local-memory backing store are the driver's,
+/// paid at the first launch. rs1 read 544 MiB retained; none of those can be
+/// sized from the source at this fixture's shapes.
+///
+/// ★ WHAT SEPARATES THEM IS ALREADY IN THIS TEST: it runs TWO arms in ONE
+/// process, and every candidate above is paid ONCE. So the SECOND arm's
+/// retention is the number that decides it, and rs1 never reached it.
+///
+/// * arm 2 far below arm 1 — the retention is one-time process cost, and there
+///   is nothing to chase.
+/// * arm 2 level with arm 1 — the run's own device buffers are outliving the
+///   call that built them, which is a real regression and worth a bug.
+///
+/// No assertion rides on that yet, deliberately: the threshold would be a
+/// number nobody has measured, and a second box slot spent on a guessed bound
+/// is what this reordering exists to prevent.
+///
+/// It is also deliberately not sampled on a thread during the run: an in-flight
+/// peak cannot separate held from rebuilt either, so the machinery would buy a
+/// number that decides nothing.
 #[test]
 #[ignore = "runs two full continuations; the box runs it with a card"]
 fn the_decode_commitment_is_held_across_the_epochs() {
     let _exclusive = exclusive();
     let mut most_epochs = 0usize;
-    for epoch_size_log2 in [4u32, 2u32] {
+    for (arm, epoch_size_log2) in [4u32, 2u32].into_iter().enumerate() {
+        let arm = arm + 1;
         let elf_bytes = asm_elf_bytes(PROGRAM);
         let elf = Elf::load(&elf_bytes).expect("load");
         let opts = ProofOptions::default_test_options();
@@ -220,23 +249,15 @@ fn the_decode_commitment_is_held_across_the_epochs() {
             multilinear_continuation::prove_epochs(&elf_bytes, &input(), epoch_size_log2, &opts)
                 .expect("prove the epochs");
 
+        // ⚠ TAKEN HERE, PRINTED BELOW. The reading has to happen before
+        // anything else allocates; the verdict it feeds does not have to come
+        // first, and rs1 is what that cost.
         #[cfg(feature = "cuda")]
-        {
+        let retained = {
             math_cuda::device::drain_and_trim().expect("drain");
             let free_after = backend.free_vram_bytes().expect("cuMemGetInfo");
-            let retained = free_before.saturating_sub(free_after);
-            // One DECODE codeword at this shape, for scale. `log_blowup` is 2,
-            // so the codeword is `4 * cells` field elements of 8 bytes.
-            let cells = 5u64 * 16;
-            let codeword_bytes = (cells << 2) * 8;
-            println!(
-                "RESIDENCY-VRAM  epoch 2^{epoch_size_log2}  retained {retained} B                   one DECODE codeword {codeword_bytes} B"
-            );
-            assert!(
-                retained < codeword_bytes.max(1 << 20),
-                "after `prove_epochs` returned and the pool was drained, {retained} B are                  still held on the card — more than one DECODE codeword ({codeword_bytes} B).                  Something the run built outlived the call."
-            );
-        }
+            free_before.saturating_sub(free_after)
+        };
 
         let derivations = multilinear_continuation::decode_derivations();
         let commits = multilinear::gpu::commit_calls() + multilinear::gpu::host_fallbacks();
@@ -249,8 +270,8 @@ fn the_decode_commitment_is_held_across_the_epochs() {
             + 1;
 
         println!(
-            "RESIDENCY  epoch 2^{epoch_size_log2}  epochs {}  derivations {derivations}  \
-             commits {commits}  predicted {predicted}",
+            "RESIDENCY  arm {arm}  epoch 2^{epoch_size_log2}  epochs {}  \
+             derivations {derivations}  commits {commits}  predicted {predicted}",
             proofs.len(),
         );
         assert_eq!(
@@ -268,6 +289,21 @@ fn the_decode_commitment_is_held_across_the_epochs() {
              out-of-band commitment missing entirely.",
             proofs.len(),
         );
+        // The measurement, after the verdict it must never pre-empt. One
+        // DECODE codeword at this shape is printed beside it for scale:
+        // `log_blowup` is 2, so the codeword is `4 * cells` field elements of
+        // eight bytes.
+        #[cfg(feature = "cuda")]
+        {
+            let cells = 5u64 * 16;
+            let codeword_bytes = (cells << 2) * 8;
+            println!(
+                "RESIDENCY-VRAM  epoch 2^{epoch_size_log2}  arm {arm}  retained {retained} B  \
+                 one DECODE codeword {codeword_bytes} B  (arm 2 far below arm 1 = one-time \
+                 process cost; arm 2 level with arm 1 = the run's buffers outlived the call)"
+            );
+        }
+
         most_epochs = most_epochs.max(proofs.len());
         let _ = &elf;
     }
@@ -288,13 +324,44 @@ fn the_decode_commitment_is_held_across_the_epochs() {
 ///
 /// It prints the shape beside the time, because a commit time without the
 /// polynomial's size is a number that cannot be compared with anything.
+///
+/// # ⛔ THE GUEST IS A KNOB WITH NO DEFAULT
+///
+/// This ran on [`PROGRAM`], whose DECODE table is 5 x 16. That measures the
+/// SHAPE working; it is not the 2^23 commit the seam band needs a figure for,
+/// and the two differ by five orders of magnitude in cells while printing the
+/// same sentence. `LAMBDA_VM_ONE_COMMIT_ELF` therefore has NO fallback: an
+/// unset knob panics naming why, so nobody can run the small one and read the
+/// number as the big one.
+///
+/// ⚠ AND THE LINE CARRIES THE GUEST'S FULL SHA256, not its name. "ethrex" names
+/// whatever a build directory produced, and this campaign has already spent a
+/// day on a 0.23% difference that turned out to be two builds of "the same"
+/// guest. A name in the output is a display; the sha is the measurement.
+///
+/// ```text
+/// LAMBDA_VM_ONE_COMMIT_ELF=ethrex_8f826601 cargo test --release \
+///     -p lambda-vm-prover --lib --features cuda \
+///     tests::decode_residency_tests::the_one_commit_cost -- --exact --ignored --nocapture
+/// ```
 #[test]
 #[ignore = "a printing measurement; the box runs it with a card"]
 fn the_one_commit_cost() {
     let _exclusive = exclusive();
+    use sha2::{Digest, Sha256};
     use std::time::Instant;
 
-    let elf_bytes = asm_elf_bytes(PROGRAM);
+    let name = std::env::var("LAMBDA_VM_ONE_COMMIT_ELF").expect(
+        "LAMBDA_VM_ONE_COMMIT_ELF must name the guest. This measurement is what the \
+         WHIR prove's delta is attributed to, and the file's own fixture would answer \
+         with a 5 x 16 DECODE table while printing the same line as a 5 x 2^20 one. \
+         There is no default on purpose.",
+    );
+    let elf_bytes = crate::tests::multilinear_bench_tests::elf_bytes(&name);
+    let sha: String = Sha256::digest(&elf_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let elf = Elf::load(&elf_bytes).expect("load");
 
     let columns = crate::tables::decode::preprocessed_columns_from_elf(&elf).expect("columns");
@@ -314,9 +381,10 @@ fn the_one_commit_cost() {
         let elapsed = start.elapsed();
 
         println!(
-            "ONE-COMMIT  {:.3} s  columns {}  rows {rows}  cells {}  roots {}  \
-             gpu commits {}  host fallbacks {}",
+            "ONE-COMMIT  {:.3} s  guest {name} sha {sha} ({} bytes)  columns {}  \
+             rows {rows}  cells {}  roots {}  gpu commits {}  host fallbacks {}",
             elapsed.as_secs_f64(),
+            elf_bytes.len(),
             columns.len(),
             columns.len() * rows,
             prepared.roots.len(),

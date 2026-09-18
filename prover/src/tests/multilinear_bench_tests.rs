@@ -31,7 +31,10 @@ fn options() -> stark::proof::options::ProofOptions {
     GoldilocksCubicProofOptions::with_params(4, 128, 20).expect("valid options")
 }
 
-fn elf_bytes(name: &str) -> Vec<u8> {
+/// `pub(crate)` so `decode_residency_tests`' guest knob resolves a name the SAME
+/// way this bench does. Two resolvers would be two answers to "which ELF is
+/// `ethrex`", which is the question that cost this campaign a day.
+pub(crate) fn elf_bytes(name: &str) -> Vec<u8> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
