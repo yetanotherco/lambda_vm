@@ -1688,3 +1688,135 @@ fn whir_epoch_shapes() {
         3 * (er + grounds) - (ec + gchains)
     );
 }
+
+/// ★ The per-table AIR properties V1's census needs, which `whir_epoch_shapes`
+/// does not print: the interaction count, the factor layout, the frame offsets
+/// and the constraint degree.
+///
+/// All four are EXECUTION-INDEPENDENT — they are properties of the AIR and of
+/// the table's width, not of what the guest did — but building the AIR set
+/// needs the guest ELF, so this is a box run and not a laptop one. It is a
+/// sibling of `whir_epoch_shapes` rather than an edit of it, so that
+/// instrument's log stays the one sh1 filed.
+///
+/// What each column is for:
+///
+/// - `I` sets the GKR ladder's height: `input_layer_vars(I, num_vars)` rounds,
+///   and the bus weights are `eq_evals` over `ceil(log2 I)` variables, which is
+///   the one term of a table's cost that is exponential in anything;
+/// - `factors` is what `claim_reduce` batches and `offsets` is how many `shift`
+///   kernels it spends — one per DISTINCT offset, however many factors read it;
+/// - `degree` is the zerocheck rule's, so the main batched sumcheck runs at
+///   `max(degree + 1, 2)` (`multilinear_table.rs:765`, `batch.rs:264`);
+/// - `roots` is the length `beta_powers` must have.
+#[test]
+#[ignore = "needs the guest ELF and builds every epoch's AIRs"]
+fn whir_table_shapes() {
+    use crate::tables::trace_builder::DecodeArtifacts;
+    use executor::elf::Elf;
+    use multilinear::constraint_argument::FactorKind;
+    use stark::multilinear_air::Uniforms;
+    use stark::multilinear_table::TableLayout;
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21);
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let opts = options();
+    let elf = Elf::load(&bytes).expect("load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    println!("\n== V1 table shapes: {input} epoch_size_log2={epoch_size_log2} ==");
+
+    crate::continuation::for_each_epoch(
+        &elf,
+        &inputs,
+        epoch_size_log2,
+        &artifacts,
+        |prepared, _| {
+            if prepared.index != 0 {
+                return Ok(());
+            }
+            let mut traces = prepared.traces;
+            crate::tables::bitwise::update_multiplicities(
+                &mut traces.bitwise,
+                &crate::tables::local_to_global::collect_bitwise_from_l2g(&prepared.boundary),
+            );
+            let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
+            let table_counts = traces.table_counts();
+            let airs = crate::continuation::build_epoch_airs(
+                &elf,
+                &opts,
+                &[],
+                &table_counts,
+                &prepared.register_init,
+                &reg_fini,
+                prepared.is_final,
+                None,
+            );
+            let l2g_air = crate::continuation::l2g_memory_air(&opts, prepared.label);
+            let mut l2g_trace =
+                crate::tables::local_to_global::generate_local_to_global_trace(&prepared.boundary);
+            let mut pairs = airs.air_trace_pairs(&mut traces);
+            pairs.push((&l2g_air, &mut l2g_trace, &()));
+
+            println!(
+                "{:<16} {:>5} {:>6} {:>4} {:>8} {:>8} {:>7} {:>7} {:>7} {}",
+                "table",
+                "vars",
+                "width",
+                "I",
+                "columns",
+                "factors",
+                "public",
+                "degree",
+                "roots",
+                "offsets"
+            );
+            let mut degree_rounds = 0usize;
+            for (air, trace, _) in pairs.iter() {
+                let width = trace.main_table.width;
+                let num_vars = trace.main_table.height.trailing_zeros() as usize;
+                let layout = TableLayout::<
+                    crate::tables::types::GoldilocksField,
+                    crate::tables::types::GoldilocksExtension,
+                >::new(
+                    air.constraint_program(),
+                    air.constraints_meta(),
+                    air.bus_interactions(),
+                    width,
+                    num_vars,
+                    Uniforms::default(),
+                )
+                .expect("the table lays out");
+                let kinds = layout.kinds();
+                let public = kinds
+                    .iter()
+                    .filter(|k| matches!(k, FactorKind::Public))
+                    .count();
+                let mut offsets: Vec<usize> = kinds
+                    .iter()
+                    .filter_map(|k| k.source().map(|s| s.offset))
+                    .collect();
+                offsets.sort_unstable();
+                offsets.dedup();
+                let degree = layout.shape().degree();
+                degree_rounds += num_vars;
+                println!(
+                    "{:<16} {num_vars:>5} {width:>6} {:>4} {:>8} {:>8} {public:>7} {degree:>7} {:>7} {offsets:?}",
+                    air.name(),
+                    air.bus_interactions().len(),
+                    layout.num_columns(),
+                    kinds.len(),
+                    layout.shape().num_roots(),
+                );
+            }
+            println!("epoch 0: {} tables, {degree_rounds} main-sumcheck rounds over all of them", pairs.len());
+            Ok(())
+        },
+    )
+    .expect("epochs prepare");
+}

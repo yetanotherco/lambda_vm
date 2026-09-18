@@ -302,6 +302,162 @@ pub const fn sample_u64_rows() -> usize {
     1
 }
 
+/// Felts a squeeze's digest occupies when it is re-absorbed: 32 bytes.
+pub const DIGEST_FELTS: usize = 4;
+
+/// The transcript state a chain is ENTERED with.
+///
+/// The schedule below is a function of the round structure and of this, and of
+/// nothing else. A standalone chain enters [`SpongeEntry::fresh`]; a chain
+/// inside an assembled verifier enters whatever the statement and the tables
+/// before it left behind, which is why this is a parameter rather than an
+/// assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpongeEntry {
+    /// Felts the sponge is holding but has not hashed.
+    pub buffered_felts: usize,
+    /// Candidates of the last squeeze already handed out;
+    /// `CANDIDATES_PER_SQUEEZE` means "none in hand, the next draw squeezes".
+    pub out_pos: usize,
+}
+
+impl SpongeEntry {
+    /// `WhirTranscript::new()`, which is `DefaultTranscript::new(&[])`: an empty
+    /// buffer and no squeeze in hand (`default_transcript.rs:67-77`).
+    pub const fn fresh() -> Self {
+        Self {
+            buffered_felts: 0,
+            out_pos: CANDIDATES_PER_SQUEEZE,
+        }
+    }
+}
+
+/// One hash the transcript performs, and how many felts it hashes.
+///
+/// Told apart because they cost differently and because a `state()` does NOT
+/// advance the chain: the buffer it hashed is still there for the next squeeze
+/// to hash again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpongeHash {
+    /// `sample()`: hash the buffer, hand out four candidates, re-absorb the
+    /// digest.
+    Squeeze(usize),
+    /// `state()`: hash the buffer and leave it alone.
+    State(usize),
+}
+
+impl SpongeHash {
+    pub const fn felts(self) -> usize {
+        match self {
+            Self::Squeeze(felts) | Self::State(felts) => felts,
+        }
+    }
+
+    pub const fn rows(self) -> usize {
+        match self {
+            Self::Squeeze(felts) => squeeze_rows(felts),
+            Self::State(felts) => state_rows(felts),
+        }
+    }
+
+    pub const fn perms(self) -> usize {
+        sponge_perms(self.felts())
+    }
+}
+
+/// The sponge as the SCHEDULE sees it: what it holds and what it has in hand.
+///
+/// Emits nothing. Every transition is one of the host's
+/// (`default_transcript.rs`), named after it.
+pub struct SpongeSchedule {
+    buffered: usize,
+    out_pos: usize,
+    hashes: Vec<SpongeHash>,
+}
+
+impl SpongeSchedule {
+    pub fn new(entry: SpongeEntry) -> Self {
+        Self {
+            buffered: entry.buffered_felts,
+            out_pos: entry.out_pos,
+            hashes: Vec::new(),
+        }
+    }
+
+    /// `append_bytes` / `append_field_element`: the buffer grows and any
+    /// buffered squeeze output is dropped (`:205-210`).
+    pub fn absorb(&mut self, felts: usize) {
+        self.buffered += felts;
+        self.out_pos = CANDIDATES_PER_SQUEEZE;
+    }
+
+    /// `sample()`: the buffer is hashed, and the digest is re-absorbed — which
+    /// is why the buffer is FOUR felts afterwards and not none (`:104-110`).
+    pub fn squeeze(&mut self) {
+        self.hashes.push(SpongeHash::Squeeze(self.buffered));
+        self.buffered = DIGEST_FELTS;
+        self.out_pos = 0;
+    }
+
+    /// `next_sample_u64`: refill only when nothing is in hand.
+    pub fn candidate(&mut self) {
+        if self.out_pos >= CANDIDATES_PER_SQUEEZE {
+            self.squeeze();
+        }
+        self.out_pos += 1;
+    }
+
+    /// `sample_field_element` on the cubic extension: one candidate a
+    /// coordinate, no rejection (`CANDIDATES_PER_COORDINATE = Some(1)`).
+    pub fn draw_ext(&mut self) {
+        for _ in 0..COORDINATES_PER_EXT {
+            self.candidate();
+        }
+    }
+
+    /// `check_grind`: at zero bits it returns before reading the state and
+    /// before absorbing the nonce (`whir_chain.rs:131-133`), so it is not in the
+    /// schedule at all. Otherwise `state()` over the buffer, then the nonce's
+    /// eight big-endian bytes.
+    pub fn grind(&mut self, bits: usize) {
+        if bits == 0 {
+            return;
+        }
+        self.hashes.push(SpongeHash::State(self.buffered));
+        self.absorb(NONCE_FELTS);
+    }
+}
+
+/// Felts the grind's nonce occupies: `nonce.to_be_bytes()` is eight.
+const NONCE_FELTS: usize = 1;
+
+impl SpongeSchedule {
+    /// The hashes performed, in order — what a leg's schedule half is summed
+    /// from.
+    pub fn hashes(&self) -> &[SpongeHash] {
+        &self.hashes
+    }
+
+    /// Where the sponge is left, so one leg's schedule can be continued by the
+    /// next in the same program.
+    pub fn entry(&self) -> SpongeEntry {
+        SpongeEntry {
+            buffered_felts: self.buffered,
+            out_pos: self.out_pos,
+        }
+    }
+
+    /// INSTRUCTIONS the hashes cost.
+    pub fn rows(&self) -> usize {
+        self.hashes.iter().map(|hash| hash.rows()).sum()
+    }
+
+    /// PERMUTATIONS the hashes cost.
+    pub fn perms(&self) -> usize {
+        self.hashes.iter().map(|hash| hash.perms()).sum()
+    }
+}
+
 /// The cubic extension element a squeeze's lanes would produce, for tests that
 /// need the host's value beside the machine's.
 pub fn ext_from_lanes(a0: FE, a1: FE, a2: FE) -> FEE {

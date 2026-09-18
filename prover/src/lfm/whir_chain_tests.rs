@@ -45,13 +45,13 @@ use super::edsl::WrapDigest;
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_chain::{
-    ChainRoundWires, ChainShape, QueryOpening, RoundNonces, SpongeEntry, SpongeHash,
-    chain_grind_perms, chain_hash_schedule, chain_opening_perms, chain_perms, chain_rows,
-    chain_schedule_perms, chain_schedule_rows, chain_shape_rows, emit_verify_weighted,
+    ChainRoundWires, ChainShape, QueryOpening, RoundNonces, chain_grind_perms, chain_hash_schedule,
+    chain_opening_perms, chain_perms, chain_rows, chain_schedule_perms, chain_schedule_rows,
+    chain_shape_rows, emit_verify_weighted,
 };
 use super::whir_open::BlockValues;
 use super::whir_poly::{emit_eq_eval, eq_eval_rows_again};
-use super::whir_transcript::WhirTranscript;
+use super::whir_transcript::{SpongeEntry, SpongeHash, WhirTranscript};
 use super::word::{LfmWord, ext_word};
 
 type F = GoldilocksField;
