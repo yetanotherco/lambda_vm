@@ -177,10 +177,7 @@ where
             .zip(&constants)
             .map(|(value, constant)| value - constant)
             .collect();
-        if coefficients
-            .iter()
-            .all(|c| *c == FieldElement::<E>::zero())
-        {
+        if coefficients.iter().all(|c| *c == FieldElement::<E>::zero()) {
             continue;
         }
         let slot = slot_of(column)?;
@@ -611,7 +608,10 @@ mod tests {
             for (index, (z, alpha)) in [
                 (ExtE::from(7u64), ExtE::from(11u64)),
                 (ExtE::from(0x9E37_79B9u64), ExtE::from(31u64)),
-                (ExtE::new([FE::from(3u64), FE::from(5u64), FE::from(9u64)]), ExtE::new([FE::from(2u64), FE::from(0u64), FE::from(4u64)])),
+                (
+                    ExtE::new([FE::from(3u64), FE::from(5u64), FE::from(9u64)]),
+                    ExtE::new([FE::from(2u64), FE::from(0u64), FE::from(4u64)]),
+                ),
             ]
             .into_iter()
             .enumerate()
@@ -629,10 +629,10 @@ mod tests {
 
                     // `fingerprint_at`'s own loop: the bus id at alpha^0, then
                     // each element at the next power.
-                    let mut power = alpha.clone();
-                    let mut fingerprint = shape.bus_id.clone();
+                    let mut power = alpha;
+                    let mut fingerprint = shape.bus_id;
                     for element in &shape.elements {
-                        fingerprint = fingerprint + &power * element.evaluate(&values);
+                        fingerprint += &power * element.evaluate(&values);
                         power = &power * &alpha;
                     }
                     assert_eq!(
@@ -648,8 +648,12 @@ mod tests {
                     // coefficient is a polynomial in alpha and could vanish at
                     // a particular one — so this is a check on these
                     // challenges, not a theorem.
-                    let mut fused_slots: Vec<usize> =
-                        fused_i.denominator.terms().iter().map(|(s, _)| *s).collect();
+                    let mut fused_slots: Vec<usize> = fused_i
+                        .denominator
+                        .terms()
+                        .iter()
+                        .map(|(s, _)| *s)
+                        .collect();
                     fused_slots.sort_unstable();
                     let mut element_slots: Vec<usize> = shape
                         .elements

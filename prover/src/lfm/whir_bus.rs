@@ -303,6 +303,31 @@ pub fn eq_evals_cost(n: usize, cost: &mut Cost) {
     cost.ops(2 * ((1usize << n) - 1));
 }
 
+/// Everything the bus statements read besides the bus itself.
+///
+/// Grouped because they travel together: item 2e's per-table assembly builds
+/// this once from what the transcript has handed it, and a wide positional
+/// argument list is exactly where a caller swaps two factor slots without the
+/// compiler noticing.
+#[derive(Clone, Copy)]
+pub struct BusInputs<'a> {
+    /// The GKR claim's point, interaction half first.
+    pub claim_point: &'a [Ext],
+    /// The table's row variables — the tail of `claim_point`.
+    pub num_row_vars: usize,
+    /// The LogUp challenge `z`.
+    pub z: Ext,
+    /// `alpha_powers[p]` must be `alpha^p`, and there must be at least
+    /// [`alpha_powers_read`] of them.
+    pub alpha_powers: &'a [Ext],
+    /// The woven factor values the rules index
+    /// (`constraint_argument.rs:103-136`).
+    pub values: &'a [Ext],
+    /// The factor slot holding `eq(row_point, ·)`, which the caller registers
+    /// as a public factor.
+    pub weight: usize,
+}
+
 /// The two rule values a table's bus leaves for the main sumcheck.
 #[derive(Debug, Clone, Copy)]
 pub struct BusValues {
@@ -338,13 +363,16 @@ pub fn claim_point_vars(interactions: usize, num_row_vars: usize) -> usize {
 pub fn emit_claim_statements(
     b: &mut LfmBuilder,
     shapes: &[Shape],
-    claim_point: &[Ext],
-    num_row_vars: usize,
-    z: Ext,
-    alpha_powers: &[Ext],
-    values: &[Ext],
-    weight: usize,
+    inputs: &BusInputs<'_>,
 ) -> BusValues {
+    let &BusInputs {
+        claim_point,
+        num_row_vars,
+        z,
+        alpha_powers,
+        values,
+        weight,
+    } = inputs;
     assert!(
         !shapes.is_empty(),
         "a table with no bus interactions does not lay out"

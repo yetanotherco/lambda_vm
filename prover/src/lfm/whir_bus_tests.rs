@@ -32,8 +32,8 @@ use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_bus::{
-    Cost, alpha_powers_read, claim_statements_cost, emit_claim_statements, emit_eq_evals,
-    emit_interaction, eq_evals_cost, interaction_cost,
+    BusInputs, Cost, alpha_powers_read, claim_statements_cost, emit_claim_statements,
+    emit_eq_evals, emit_interaction, eq_evals_cost, interaction_cost,
 };
 use super::word::{ext_word, word_as_ext};
 
@@ -209,19 +209,27 @@ fn inputs(case: &BusCase, shapes: &[Shape], z: FEE, alpha: FEE, seed: u64) -> In
     let mut power = FEE::one();
     for _ in 0..count {
         alpha_powers.push(power);
-        power = power * alpha;
+        power *= alpha;
     }
     Inputs {
         z,
         alpha_powers,
         claim_point: pseudo(seed, input_layer_vars(shapes.len(), case.num_row_vars)),
         values: pseudo(seed ^ 0x5A5A, case.num_values()),
-        }
+    }
 }
 
 /// The same hinted arena for every program under gate, so "with the leg" and
 /// "without it" differ by the leg alone.
-fn hint_inputs(b: &mut LfmBuilder, shape: &Inputs) -> (super::builder::Ext, Vec<super::builder::Ext>, Vec<super::builder::Ext>, Vec<super::builder::Ext>) {
+fn hint_inputs(
+    b: &mut LfmBuilder,
+    shape: &Inputs,
+) -> (
+    super::builder::Ext,
+    Vec<super::builder::Ext>,
+    Vec<super::builder::Ext>,
+    Vec<super::builder::Ext>,
+) {
     let arena = b.declare_arena(shape.len() as u32);
     let mut index = 0u32;
     let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<super::builder::Ext> {
@@ -247,12 +255,14 @@ fn statements_program(case: &BusCase, shapes: &[Shape], shape: &Inputs) -> LfmPr
     let out = emit_claim_statements(
         &mut b,
         shapes,
-        &claim_point,
-        case.num_row_vars,
-        z,
-        &alpha_powers,
-        &values,
-        case.weight(),
+        &BusInputs {
+            claim_point: &claim_point,
+            num_row_vars: case.num_row_vars,
+            z,
+            alpha_powers: &alpha_powers,
+            values: &values,
+            weight: case.weight(),
+        },
     );
     b.public(out.numerator.as_cell());
     b.public(out.denominator.as_cell());
@@ -379,7 +389,8 @@ fn every_interaction_is_what_the_host_probes() {
             let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
             let (z_wire, alpha_wires, _point, values) = hint_inputs(&mut b, &shape);
             for interaction in &shapes {
-                let (num, den) = emit_interaction(&mut b, interaction, z_wire, &alpha_wires, &values);
+                let (num, den) =
+                    emit_interaction(&mut b, interaction, z_wire, &alpha_wires, &values);
                 b.public(num.as_cell());
                 b.public(den.as_cell());
             }
@@ -461,8 +472,8 @@ fn the_bus_statements_emit_their_closed_form() {
     for case in cases() {
         let shapes = case.shapes();
         let shape = inputs(&case, &shapes, FEE::from(13u64), FEE::from(17u64), 0xF00D);
-        let measured =
-            statements_program(&case, &shapes, &shape).instrs.len() - empty_program(&shape).instrs.len();
+        let measured = statements_program(&case, &shapes, &shape).instrs.len()
+            - empty_program(&shape).instrs.len();
         let cost = claim_statements_cost(&shapes, case.num_row_vars);
         let n = input_layer_vars(shapes.len(), case.num_row_vars) - case.num_row_vars;
         println!(
@@ -541,7 +552,11 @@ fn the_affine_getter_is_the_hosts_constant() {
 fn the_stress_bus_carries_what_the_production_one_does_not() {
     let stress = stress_case();
     let shapes = stress.shapes();
-    assert_eq!(shapes.len(), 3, "not a power of two, so padding slots exist");
+    assert_eq!(
+        shapes.len(),
+        3,
+        "not a power of two, so padding slots exist"
+    );
     assert_eq!(shapes[0].elements.len(), 4, "QuadHL is four bus elements");
     assert!(
         shapes[0].numerator.terms().is_empty(),
@@ -584,10 +599,7 @@ fn the_bus_leg_prints_its_shape() {
             .iter()
             .map(|s| {
                 s.numerator.terms().len()
-                    + s.elements
-                        .iter()
-                        .map(|e| e.terms().len())
-                        .sum::<usize>()
+                    + s.elements.iter().map(|e| e.terms().len()).sum::<usize>()
             })
             .sum();
         let cost = claim_statements_cost(&shapes, case.num_row_vars);
@@ -627,7 +639,11 @@ fn the_row_form_recounts_from_the_shapes() {
         for shape in &shapes {
             for affine in affines(shape) {
                 recount += affine.terms().len();
-                if affine.terms().first().is_some_and(|(_, c)| *c == FEE::one()) {
+                if affine
+                    .terms()
+                    .first()
+                    .is_some_and(|(_, c)| *c == FEE::one())
+                {
                     leading_units += 1;
                     recount -= 1;
                 }
@@ -711,7 +727,7 @@ fn the_statements_read_the_factor_values() {
             .map(|(slot, _)| *slot)
             .next()
             .expect("the bus reads at least one factor");
-        moved.values[slot] = moved.values[slot] + FEE::one();
+        moved.values[slot] += FEE::one();
         let second = run(&program, &moved, case.name);
         assert_ne!(
             first[1], second[1],
@@ -728,6 +744,10 @@ fn the_two_rules_are_different_values() {
     let shapes = case.shapes();
     let (z, alpha) = challenges()[0];
     let shape = inputs(&case, &shapes, z, alpha, 0x2468);
-    let out = run(&statements_program(&case, &shapes, &shape), &shape, case.name);
+    let out = run(
+        &statements_program(&case, &shapes, &shape),
+        &shape,
+        case.name,
+    );
     assert_ne!(out[0], out[1], "the numerator and denominator must differ");
 }
