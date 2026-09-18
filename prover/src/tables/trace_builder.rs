@@ -4226,7 +4226,10 @@ fn build_traces<I: ImageSource + Sync>(
     {
         base.add_ops(&bitwise_ops);
         memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
-        for f in &collectors {
+        // By value, like the parallel arm's `units.extend(collectors)`: these
+        // closures borrow the op lists, and the lists are moved into
+        // `CollectedOps` below, so the collectors have to be dropped here.
+        for f in collectors {
             f(&mut base);
         }
     }

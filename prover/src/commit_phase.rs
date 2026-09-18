@@ -100,18 +100,20 @@ fn commit_batch(
     roots: &std::sync::Mutex<Vec<ChunkCommitment>>,
     items: Vec<Item>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
     type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
-    let done: Result<Vec<ChunkCommitment>, Error> = items
-        .into_par_iter()
-        .map(|(kind, chunk, trace)| {
-            <P as IsStarkProver<_, _, _>>::commit_table_root(airs.get(kind).as_ref(), &trace)
-                .map(|root| (kind, chunk, root))
-                .ok_or_else(|| {
-                    Error::Prover(format!("commit phase: no commitment for a {kind:?} chunk"))
-                })
-        })
-        .collect();
+    let commit = |(kind, chunk, trace): Item| -> Result<ChunkCommitment, Error> {
+        <P as IsStarkProver<_, _, _>>::commit_table_root(airs.get(kind).as_ref(), &trace)
+            .map(|root| (kind, chunk, root))
+            .ok_or_else(|| {
+                Error::Prover(format!("commit phase: no commitment for a {kind:?} chunk"))
+            })
+    };
+    #[cfg(feature = "parallel")]
+    let done: Result<Vec<ChunkCommitment>, Error> = items.into_par_iter().map(commit).collect();
+    #[cfg(not(feature = "parallel"))]
+    let done: Result<Vec<ChunkCommitment>, Error> = items.into_iter().map(commit).collect();
     roots.lock().expect("roots").extend(done?);
     Ok(())
 }
