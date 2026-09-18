@@ -352,6 +352,21 @@ pub fn preprocessed_columns(init: &[u32]) -> Vec<Vec<FE>> {
 /// column order (OFFSET, INIT, FINI), and FINI on padding rows is 0, as the
 /// trace builds it — the prover rejects a trace that disagrees before it
 /// commits anything (`multilinear_continuation`'s preprocessed guard).
+///
+/// # ★ Why the epoch statement does not absorb `init` or `fini`, and must not
+///
+/// The chain of custody is already closed without an absorb. The commitment
+/// ROOTS go into the transcript before any challenge is drawn, so the FINI
+/// column is fixed before the prover learns the reduced point; `check_preprocessed`
+/// then binds the verifier's own `(init, fini)` — the ELF's entry file for epoch
+/// 0, the previous epoch's proved `reg_fini` after that — to that committed
+/// column AT that point. A prover therefore cannot choose the claim after the
+/// fact: the column is committed first and the value it is compared against is
+/// the verifier's, not the proof's.
+///
+/// Adding these vectors to `absorb_epoch` would bind nothing further and would
+/// move every pinned transcript constant. Said here so nobody adds the
+/// redundant absorb later.
 pub fn preprocessed_columns_with_fini(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();

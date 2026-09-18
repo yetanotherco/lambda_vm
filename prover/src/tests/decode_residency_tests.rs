@@ -258,14 +258,11 @@ fn the_decode_commitment_is_derived_once_per_run() {
 /// process, and every candidate above is paid ONCE. So the SECOND arm's
 /// retention is the number that decides it, and rs1 never reached it.
 ///
-/// * arm 2 far below arm 1 — the retention is one-time process cost, and there
-///   is nothing to chase.
-/// * arm 2 level with arm 1 — the run's own device buffers are outliving the
-///   call that built them, which is a real regression and worth a bug.
-///
-/// No assertion rides on that yet, deliberately: the threshold would be a
-/// number nobody has measured, and a second box slot spent on a guessed bound
-/// is what this reordering exists to prevent.
+/// ★ AND rs3 ANSWERED IT: arm 1 retained 570,425,344 B and arm 2 retained ZERO.
+/// The 544 MiB is one-time process cost — the first arm's twiddle caches and
+/// module load, neither of which a pool trim can return — and not a leak. So
+/// arm 1 stays a printed measurement and arm 2 now carries the bound, where the
+/// run's OWN buffers are the only thing left that could show.
 ///
 /// It is also deliberately not sampled on a thread during the run: an in-flight
 /// peak cannot separate held from rebuilt either, so the machinery would buy a
@@ -389,32 +386,44 @@ fn the_decode_commitment_is_held_across_the_epochs() {
                  the out-of-band commitment missing entirely."
             );
         } else {
-            // ⛔ PRINTED, NOT ASSERTED, and the reason is a measurement rather
-            // than caution. The model below reads 11 for the one-epoch arm and
-            // the box read 9 — computed card-free from these same proofs before
-            // any card run, so the disagreement is established, not suspected.
+            // ⛔ WHAT rs3 MEASURED, and what it did and did not settle.
             //
-            // The mechanism is shape-dependence. `commit_calls` counts DEVICE
-            // commits, and a polynomial too small for the device is committed on
-            // the host, where a FOLD commit is counted nowhere at all
-            // (`note_host_fallback` has one call site, the initial commitment).
-            // This fixture's DECODE group is 5 x 16, right at that boundary; the
-            // pinned guest's is 5 x 2^20, far above it, which is why the pinned
-            // run's commit total does contain DECODE's folds and its held
-            // commitment. One arithmetic cannot describe both without the
-            // admission rule, and asserting the wrong one is how a box slot was
-            // already spent.
+            // ```text
+            // arm 1  device  7  host 2  model 11 = groups  9 + prepared folds 1 + 1 held
+            // arm 2  device 21  host 4  model 30 = groups 26 + prepared folds 3 + 1 held
+            // ```
             //
-            // So the decomposition is printed and two arms of it identify which
-            // terms the counter saw: `device == groups` means the prepared chain
-            // went to the host entirely, `device == groups + prepared` means only
-            // the held commitment did, and `device == model` means all three
-            // counted.
+            // The counters see 9 of arm 1's 11 predicted commits and 25 of arm
+            // 2's 30. The shortfall is 2 and 5. On arm 1 that is exactly the
+            // prepared group's own contribution — its held commitment and its
+            // one fold, both invisible because a polynomial too small for the
+            // device is committed on the host, where a FOLD commit is counted
+            // nowhere at all (`note_host_fallback` has one call site, and it is
+            // the initial commitment). On arm 2 the same reasoning accounts for
+            // 4 of the 5. ONE COMMIT IS STILL UNEXPLAINED, so the exact model
+            // is not settled and this test does not pretend otherwise.
+            //
+            // What IS established is the direction that matters here: every
+            // commit the counters see is one the chains predict. DECODE being
+            // rebuilt per epoch would add commits BEYOND the model and push the
+            // sum above it, which is the residency regression this file exists
+            // to catch, so the bound is asserted and the shortfall is printed
+            // beside the term that should explain it.
+            let seen = device_commits + host_commits;
             println!(
                 "RESIDENCY-COMMITS  arm {arm}  epoch 2^{epoch_size_log2}  device \
-                 {device_commits}  host {host_commits}  model {device_model} = groups \
-                 {groups_rounds} + prepared folds {prepared_folds} + 1 held  (NOT \
-                 asserted: this model reads 11 where the box read 9 at these shapes)"
+                 {device_commits}  host {host_commits}  seen {seen}  model {device_model} \
+                 = groups {groups_rounds} + prepared folds {prepared_folds} + 1 held  \
+                 shortfall {} (the prepared group's own commits are {})",
+                device_model - seen,
+                prepared_folds + 1,
+            );
+            assert!(
+                seen <= device_model,
+                "arm {arm} made {seen} commits where its chains predict at most \
+                 {device_model}; a count above the model is work no chain in this \
+                 proof accounts for, and DECODE rebuilt per epoch is what that \
+                 looks like"
             );
         }
     }
@@ -429,10 +438,28 @@ fn the_decode_commitment_is_held_across_the_epochs() {
         let codeword_bytes = (cells << 2) * 8;
         println!(
             "RESIDENCY-VRAM  arm {}  epoch 2^{}  retained {} B  one DECODE codeword \
-             {codeword_bytes} B  (arm 2 far below arm 1 = one-time process cost; arm 2 \
-             level with arm 1 = the run's buffers outlived the call)",
+             {codeword_bytes} B",
             a.arm, a.epoch_size_log2, a.retained,
         );
+        // ★ ASSERTED ON THE SECOND ARM ONLY, and now on a measurement rather
+        // than a guess. rs3 read 570,425,344 B retained after arm 1 and ZERO
+        // after arm 2 — so the 544 MiB is one-time process cost (the first
+        // arm's twiddle caches and module load, neither of which the pool trim
+        // can return) and not a leak. Arm 1 is therefore still only printed;
+        // arm 2 is where the run's OWN buffers would show, and there the bound
+        // is a real check: anything the run built and did not give back lands
+        // above one DECODE codeword.
+        if a.arm >= 2 {
+            assert!(
+                a.retained < codeword_bytes.max(1 << 20),
+                "after arm {}'s `prove_epochs` returned and the pool was drained, {} B \
+                 are still held on the card — more than one DECODE codeword \
+                 ({codeword_bytes} B). The process's one-time costs were already paid \
+                 by arm 1, so this is the run's own memory outliving the call.",
+                a.arm,
+                a.retained,
+            );
+        }
     }
 }
 
