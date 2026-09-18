@@ -288,6 +288,29 @@ where
     None
 }
 
+pub(crate) fn fold_codeword_k<F, C, N>(
+    _codeword: &[math::field::element::FieldElement<C>],
+    _generator: &math::field::element::FieldElement<F>,
+    _alphas: &[math::field::element::FieldElement<N>],
+) -> Option<Vec<math::field::element::FieldElement<N>>>
+where
+    F: math::field::traits::IsField + 'static,
+    C: math::field::traits::IsField + 'static,
+    N: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+pub(crate) fn commit_tree_ext3<F>(
+    _codeword: &[math::field::element::FieldElement<F>],
+    _log_folding: usize,
+) -> Option<Vec<[u8; 32]>>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 pub(crate) fn evaluate_many_base<F, E>(
     _columns: &[crate::mle::Mle<F>],
     _point: &[math::field::element::FieldElement<E>],
@@ -546,4 +569,155 @@ where
     E: math::field::traits::IsField + 'static,
 {
     None
+}
+
+/// Factors a build declined to upload. Never constructed.
+pub struct OpeningFactors(std::convert::Infallible);
+
+pub(crate) fn open_on_device<F, E>(
+    _message: &crate::mle::Mle<F>,
+    _weight: &crate::mle::Mle<E>,
+    _program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+impl OpeningFactors {
+    pub(crate) fn num_vars(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn rounds<E>(
+        &mut self,
+        _group: usize,
+        _degree: usize,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Result<SumcheckRounds<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn evaluate_message<E>(
+        &self,
+        _point: &[math::field::element::FieldElement<E>],
+    ) -> Result<math::field::element::FieldElement<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn add_scaled_eq<E>(
+        &mut self,
+        _point: &[math::field::element::FieldElement<E>],
+        _gamma: &math::field::element::FieldElement<E>,
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+pub(crate) fn open_shared<F, E>(
+    _message: &crate::whir_chain::Stacked<'_, F>,
+    _shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    _n_stack: usize,
+    _program: &crate::program::Program<E>,
+) -> Option<OpeningFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// A codeword a commit declined to keep. Never constructed.
+pub struct DeviceCodeword(std::convert::Infallible);
+
+impl std::fmt::Debug for DeviceCodeword {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {}
+    }
+}
+
+pub(crate) fn commit_resident(
+    _store: &ResidentColumns,
+    _parts: &[(usize, usize)],
+    _log_evals: usize,
+    _log_blowup: usize,
+    _log_folding: usize,
+    _transient: bool,
+) -> Option<(DeviceCodeword, [u8; 32])> {
+    None
+}
+
+pub(crate) fn commit_parts<F>(
+    _parts: &[(&crate::mle::Mle<F>, usize)],
+    _log_evals: usize,
+    _log_blowup: usize,
+    _log_folding: usize,
+    _transient: bool,
+) -> Option<(DeviceCodeword, [u8; 32])>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+impl DeviceCodeword {
+    pub(crate) fn elements(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn fold<F, N>(
+        &self,
+        _generator: &math::field::element::FieldElement<F>,
+        _alphas: &[math::field::element::FieldElement<N>],
+    ) -> Option<Self>
+    where
+        F: math::field::traits::IsField + 'static,
+        N: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn commit(&self, _log_folding: usize) -> Option<[u8; 32]> {
+        match self.0 {}
+    }
+
+    pub(crate) fn paths(
+        &self,
+        _log_folding: usize,
+        _indices: &[usize],
+    ) -> Option<Vec<Vec<[u8; 32]>>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn cosets<F>(
+        &self,
+        _indices: &[usize],
+        _num_leaves: usize,
+        _block: usize,
+    ) -> Option<Vec<Vec<math::field::element::FieldElement<F>>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn first<F>(&self) -> Option<math::field::element::FieldElement<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
 }

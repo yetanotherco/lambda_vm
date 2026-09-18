@@ -1,12 +1,19 @@
 //! Multilinear machinery for a sumcheck-based proof system: extensions over the
-//! Boolean hypercube, batched sumcheck, zerocheck and LogUp-GKR.
+//! Boolean hypercube, batched sumcheck, zerocheck, LogUp-GKR and a polynomial
+//! commitment over the same cube.
 //!
 //! One brick and two uses. [`sumcheck`] reduces a sum over `2^n` points to one
 //! evaluation; on top of it [`zerocheck`] says a polynomial vanishes on the
 //! whole cube and [`logup`] says a bus balances. [`claim_reduce`] ties the
 //! shifted views a table reads back to the columns they read.
 //!
-//! Nothing here is wired into a prover yet.
+//! What discharges the evaluation those leave behind is [`whir_chain`]: a
+//! round folds the message with a sumcheck and the codeword alongside it, and
+//! queries check that the two folds agree. [`stacking`] is what puts many
+//! columns into few polynomials, so a table opens once instead of per column.
+//!
+//! The codeword domain is a two-adic subgroup of the base field; codeword
+//! values live in the extension. Nothing here is wired into a prover yet.
 
 pub mod batch;
 pub mod claim_reduce;
@@ -18,7 +25,13 @@ pub mod mle;
 pub mod poly;
 pub mod program;
 pub mod selector;
+pub mod stacked_eval;
+pub mod stacking;
 pub mod sumcheck;
+pub mod whir;
+pub mod whir_chain;
+pub mod whir_commit;
+pub mod whir_round;
 pub mod zerocheck;
 
 use math::field::{element::FieldElement, traits::IsField};
