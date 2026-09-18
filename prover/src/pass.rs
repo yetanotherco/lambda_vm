@@ -9,7 +9,21 @@
 //!
 //! Trading re-execution for memory is the whole bargain: a pass never keeps a
 //! chunk it has dealt with, so what it holds is one table plus the tables that
-//! cannot be retired, no matter how long the run is.
+//! cannot be retired.
+//!
+//! That bound is not O(1) in the length of the run, and the difference is worth
+//! being precise about. Four chunked tables — LT, MUL, DVRM and SHIFT — are
+//! deliberately absent from [`crate::tables::trace_builder::CHUNKED_KINDS`]
+//! because later derivations keep appending to them (MEMW and HINT feed LT,
+//! DVRM feeds LT and MUL, CPU32 feeds all three), so their chunk boundaries are
+//! not knowable until the run ends. Their op lists, and the `retired_*` buffers
+//! a closing MEMW/MEMW_A/CPU32 chunk converts its rows into, are held whole and
+//! chunked only in [`finish`]. So is the walk's BITWISE lookup list. Those are
+//! compact routed intermediates — tens of bytes per op against the hundreds a
+//! trace row costs — and on the measured mainnet block they are a low single
+//! digit percentage of the peak, but they grow with the execution, and a
+//! workload that sends many wide memory accesses down the general MEMW path
+//! (which emits up to eight LT ops each) grows them faster than this one does.
 
 use stark::proof::options::ProofOptions;
 
@@ -61,8 +75,10 @@ pub trait Visitor {
 ///
 /// Up to 16 the peak does not move at all, because it is set at the end of the
 /// run by the tables that cannot be retired — BITWISE, DECODE, the pages — and
-/// a batch of chunks is small beside them. At 32 the batch itself becomes the
-/// peak (it moves to halfway through the run) and buys 1% of time for 5 GB.
+/// by the op lists the walk holds whole (LT, MUL, DVRM, SHIFT and the walk's
+/// BITWISE lookups; see this module's header), against which a batch of chunks
+/// is small. At 32 the batch itself becomes the peak (it moves to halfway
+/// through the run) and buys 1% of time for 5 GB.
 ///
 /// So the knee is 16 on that machine, and the bound is memory rather than
 /// cores: a smaller run has a smaller resident set for a batch to hide behind.

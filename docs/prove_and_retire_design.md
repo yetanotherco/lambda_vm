@@ -31,11 +31,27 @@ challenges, an accumulated codeword.
 ## 2. The passes
 
 "Walk" means re-executing the program and rebuilding the tables chunk by chunk
-(`prover/src/pass.rs`, `trace_builder::walk_and_emit_chunks`). Chunked tables
-(CPU, MEMW, LOAD, LT, …) are handed to the pass's visitor as soon as a chunk
-fills; the tables that cannot be chunked — the preprocessed ones, the
-accumulators (KECCAK, ECSM, …), REGISTER, HALT, one PAGE per page — are the
-*residents*, handed over when the walk ends.
+(`prover/src/pass.rs`, `trace_builder::walk_and_emit_chunks`). Tables fall into three
+groups, not two. Most chunked tables (CPU, MEMW, MEMW_A, MEMW_R, LOAD, CPU32,
+BRANCH, EQ, BYTEWISE, STORE — the list is `CHUNKED_KINDS`) are handed to the
+pass's visitor as soon as a chunk fills. Four more — **LT, MUL, DVRM and
+SHIFT** — are chunked tables in the finished proof but are *not* handed over
+during the walk: later derivations keep appending to them (MEMW and HINT feed
+LT, DVRM feeds LT and MUL, CPU32 feeds SHIFT, MUL and DVRM), and the finished
+run concatenates each source whole, so closing them early would cut their
+chunks somewhere the monolithic build does not — which would move their roots
+and cost the byte-identical property of §3. Their op lists are held to the end
+and chunked in `pass::finish`. The tables that cannot be chunked at all — the
+preprocessed ones, the accumulators (KECCAK, ECSM, …), REGISTER, HALT, one PAGE
+per page — are the *residents*, handed over when the walk ends.
+
+So what the walk holds is one chunk per table of the first group, plus the
+residents, plus the op lists of the second group and of BITWISE. The last term
+grows with the execution rather than with `k`: on the ethrex block it is a low
+single-digit percentage of the peak, but a workload that sends many wide memory
+accesses down the general MEMW path (up to eight LT ops each, against one for
+the aligned path) grows it considerably faster. §10 lists it as the known
+asymptotic gap.
 
 | pass | what it does | keeps | drops |
 |---|---|---|---|
@@ -103,14 +119,18 @@ Each run prints the pass timings, `Trace build (prove-and-retire): N tables, T s
 
 | knob | default | what it does |
 |---|---|---|
-| `A1_TABLE_PARALLELISM` | cores / 6, at most 16 | tables in flight per batch. Measured flat between 12 and 24; 24 costs 6 GB more |
+| `A1_TABLE_PARALLELISM` | cores / 6, at most 16 | tables in flight per batch. The sweep recorded on `pass::table_parallelism` is flat from 1 to 16 (21550 MB) and steps at 32 (26640 MB, +5.0 GB) for 1% of time |
 | `A1_PIPELINE=0` | pipelined | run each batch inline instead of on the consumer thread (diagnostic) |
 | `A1_KEEP_COMPOSITION=1` | off | keep the composition parts for the Open pass (§3) |
+| `A1_INFLIGHT` | 0 | full batches allowed to wait in the channel beyond the one being processed |
+| `LAMBDA_STREAM_LDE` | off | `1`/`true` retires each table's main LDE after the Round 1 commit and rebuilds it on demand, and frees the leaf half of every committed Merkle tree; `auto` decides from the peak-RAM estimate (needs `disk-spill`). Off by default, and it changes this approach's memory profile too — §6's numbers were taken with it off |
 | `_RJEM_MALLOC_CONF` | — | jemalloc options for experiments; the CLI's own setting is §6 |
 
 Verification on its own: `cli verify <proof> <elf>` for a per-table proof
-written with `--output`. With `--features hash-metrics` (#987) every verify
-path prints the keccak hashes it did.
+written with `--output`. The `hash-metrics` feature that prints a verify's
+keccak count comes from #987, which is **not on this branch** — the verify-hash
+column in §6 was measured on a tree that has it, and cannot be reproduced here
+until this branch is rebased onto it.
 
 ## 5. What verifies, and with what
 
@@ -137,7 +157,11 @@ Still to be reviewed by someone who did not write it: the soundness of the
 fold coefficient (sampled per table from the shared seed after absorbing that
 table's round-3 data) and of the absorption order.
 
-## 6. Numbers (ethrex block 25368371, 30.5 M cycles, 96 cores)
+## 6. Numbers (ethrex block 25368371, 30.5 M cycles, 96 cores, blowup 2)
+
+Taken with `LAMBDA_STREAM_LDE` off and `A1_KEEP_COMPOSITION` off except where
+the row names it. `trace-build` hard-codes blowup 2 and has no `--blowup`
+flag, so the batched path cannot yet be measured at the blowup-4 posture.
 
 | | peak heap | prove | vs monolithic | proof | verify | verify hashes |
 |---|---|---|---|---|---|---|
@@ -175,9 +199,12 @@ processed one at a time after each walk (−10% once batched).
 - One batch polynomial **per height**, not one in total: the fold squares the
   coset offset each layer, so codewords of different lengths do not line up
   without a mixed-height commitment (#951's direction).
-- The spec's Open optimization (keep the Merkle internal nodes, drop the leaves)
+- Holding each table's whole Merkle tree from the fold pass to the Open pass
   measured +9 GB for −4 s and was not kept; keeping the composition parts
-  (`A1_KEEP_COMPOSITION`) is the trade that pays.
+  (`A1_KEEP_COMPOSITION`) is the trade that pays. The spec's Open optimization
+  proper — keep the internal nodes, drop the leaves — *is* implemented
+  (`MerkleTree::drop_leaves`, `get_proof_by_pos_with_leaf_sibling`,
+  `TableCommit::retire_leaves`) and ships behind `LAMBDA_STREAM_LDE`.
 - The per-table variant is not in the spec; it is what makes the approach a
   drop-in. Distribution across workers is not attempted; the pipelined batch
   worker is the seam for it.
@@ -225,3 +252,9 @@ of it in the monolithic build and check the walk has each.
 - Serializing `BatchedProof` to disk (`--output` covers the per-table proof).
 - Distributing retirement batches across workers.
 - An independent soundness review of the batched fold (§5).
+- Bounding the op lists the walk holds whole (§2): LT, MUL, DVRM and SHIFT
+  are excluded from `CHUNKED_KINDS` because their chunk boundaries are not
+  knowable until the run ends, so residency is O(cycles) rather than O(chunk)
+  for that term. BITWISE's lookup list is the cheaper half of the same problem
+  and has no ordering constraint — a histogram is commutative, so it could be
+  folded per segment without moving any root.

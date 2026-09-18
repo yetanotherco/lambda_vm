@@ -330,7 +330,7 @@ where
         leaves_len: usize,
         sibling_leaf: B::Node,
     ) -> Option<Proof<B::Node>> {
-        if leaves_len <= 1 || pos >= leaves_len {
+        if leaves_len <= 1 || pos >= leaves_len || self.is_root_only() {
             return None;
         }
         let mut merkle_path = Vec::with_capacity(leaves_len.trailing_zeros() as usize);
@@ -338,7 +338,12 @@ where
 
         let mut node = parent_index(pos + leaves_len - 1);
         while node != ROOT {
-            merkle_path.push(self.nodes.get(sibling_index(node))?.clone());
+            // `node_get`, not `self.nodes` directly: every other read in this
+            // file goes through it for the disk-spill mmap indirection. The two
+            // are mutually exclusive today — `drop_leaves` refuses an mmap-backed
+            // tree — but a direct read would silently yield `None` here if that
+            // ever stopped holding, and the prover's opening path unwraps this.
+            merkle_path.push(self.node_get(sibling_index(node))?.clone());
             node = parent_index(node);
         }
         self.create_proof(merkle_path)

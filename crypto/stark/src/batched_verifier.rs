@@ -36,6 +36,10 @@ struct GroupReplay<F: IsFFTField, E: IsField> {
     iotas: Vec<usize>,
     acc: Vec<FieldElement<E>>,
     acc_sym: Vec<FieldElement<E>>,
+    /// The first table of the group, whose AIR supplied the domain. Kept from
+    /// the scan that already found it rather than looked up again: the second
+    /// scan is what forced an `expect` into verifier code.
+    member: usize,
 }
 
 /// Verify the rounds after round 1 of every table and each group's FRI.
@@ -90,10 +94,31 @@ where
     let num_queries = first_air.options().fri_number_of_queries;
     let grinding_factor = first_air.context().proof_options.grinding_factor;
 
-    // Every table's domain is its group's.
-    for (idx, (table, &g)) in tables.iter().zip(group_of).enumerate() {
+    // Every table's domain is its group's, and every block and opening has the
+    // shape its AIR declares.
+    //
+    // Both run before the fold seed below reads a single out-of-domain value.
+    // That seed indexes the blocks at the dimensions the *proof* advertises, so
+    // a proof whose advertised dimensions disagree with its data length has to
+    // be rejected here rather than panic there — the rule `ood_blocks_well_formed`
+    // documents, and the one the ordinary verifier keeps by running it in round 1.
+    for (idx, ((air, table), &g)) in airs.iter().zip(tables).zip(group_of).enumerate() {
         if table.trace_length == 0 || table.trace_length != groups[g].trace_rows {
             error!("batched: table {idx} does not live on its group's domain");
+            return false;
+        }
+        let view = StarkProofView::Owned(table);
+        // `trace_length` is non-zero by the check above, so the division is safe.
+        if table.composition_poly_parts_ood_evaluation.len()
+            != air.composition_poly_degree_bound(table.trace_length) / table.trace_length
+            || !V::<Field, FieldExtension, PI>::ood_blocks_well_formed(*air, view)
+            || !V::<Field, FieldExtension, PI>::trace_opening_widths_well_formed(
+                *air,
+                view,
+                num_queries,
+            )
+        {
+            error!("batched: table {idx}'s blocks or openings are malformed");
             return false;
         }
     }
@@ -182,6 +207,7 @@ where
             iotas,
             acc: vec![FieldElement::zero(); num_queries],
             acc_sym: vec![FieldElement::zero(); num_queries],
+            member,
         });
     }
 
@@ -199,19 +225,9 @@ where
         if let Some(ref bpi) = table.bus_public_inputs {
             fork.append_field_element(&bpi.table_contribution);
         }
+        // Shapes were pinned to the AIR in the pre-pass above, before the fold
+        // seed read any of this table's blocks.
         let domain = new_verifier_domain(*air, table.trace_length);
-        if table.composition_poly_parts_ood_evaluation.len()
-            != air.composition_poly_degree_bound(table.trace_length) / table.trace_length
-            || !V::<Field, FieldExtension, PI>::ood_blocks_well_formed(*air, view)
-            || !V::<Field, FieldExtension, PI>::trace_opening_widths_well_formed(
-                *air,
-                view,
-                num_queries,
-            )
-        {
-            error!("batched: table {idx}'s blocks or openings are malformed");
-            return false;
-        }
         let layout = V::<Field, FieldExtension, PI>::ood_layout(*air);
         let RoundsChallenges {
             z,
@@ -219,7 +235,7 @@ where
             transition_coeffs,
             trace_term_coeffs,
             gammas,
-        } = V::<Field, FieldExtension, PI>::replay_rounds_2_and_3(
+        } = V::<Field, FieldExtension, PI>::replay_rounds_2_to_4(
             *air,
             view,
             &public_inputs[idx],
@@ -291,10 +307,7 @@ where
 
     // Each group's FRI, from the folded first layer down to the final polynomial.
     for (g, (group, replay)) in groups.iter().zip(replays.iter()).enumerate() {
-        let member = group_of
-            .iter()
-            .position(|&h| h == g)
-            .expect("checked above");
+        let member = replay.member;
         let fri = group.fri;
         let synthetic = StarkProof::<Field, FieldExtension, PI> {
             trace_length: group.trace_rows,

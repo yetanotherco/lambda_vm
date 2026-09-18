@@ -18,8 +18,18 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Disable the arena's decay and purge it on our own clock instead: hot buffers are
 /// reused across threads, cold ones still go back to the OS.
 ///
+/// The index is `opt.narenas`: jemalloc 5 reserves the slot immediately after the
+/// automatic arenas for the oversize arena (`arena_init_huge`, `huge_arena_ind =
+/// narenas_total_get()`), and `opt.oversize_threshold` defaults to the same 8 MiB.
+///
 /// Linux only: elsewhere jemalloc is built without background threads and the decay
 /// mallctl traps.
+///
+/// Called only from the paths that allocate trace-sized buffers, not from `main`:
+/// it disables an arena's decay for the life of the process and leaves a purge
+/// thread behind, which is not something `cli verify` or `--help` should pay, and
+/// it would otherwise change the allocator under every baseline measured with
+/// this binary.
 fn keep_large_buffers_warm() {
     #[cfg(target_os = "linux")]
     {
@@ -35,13 +45,28 @@ fn keep_large_buffers_warm() {
         // SAFETY: `opt.narenas` is `unsigned`, the decay knob is `ssize_t`, and `purge`
         // takes no value.
         unsafe {
-            let Ok(huge_arena) = raw::read::<u32>(b"opt.narenas\0") else {
-                return;
+            let huge_arena = match raw::read::<u32>(b"opt.narenas\0") {
+                Ok(n) => n,
+                Err(e) => {
+                    // Not fatal, but the run is then indistinguishable from one
+                    // where the knob worked — which is exactly what makes a
+                    // memory measurement unreadable. Say so.
+                    log::warn!(
+                        "keep_large_buffers_warm: cannot read opt.narenas ({e}); \
+                                the oversize arena keeps jemalloc's default decay"
+                    );
+                    return;
+                }
             };
             let decay = format!("arena.{huge_arena}.dirty_decay_ms\0");
-            if raw::write(decay.as_bytes(), -1i64).is_err() {
+            if let Err(e) = raw::write(decay.as_bytes(), -1i64) {
+                log::warn!(
+                    "keep_large_buffers_warm: cannot disable decay on arena \
+                            {huge_arena} ({e}); the oversize arena keeps jemalloc's default"
+                );
                 return;
             }
+            log::debug!("keep_large_buffers_warm: decay disabled on arena {huge_arena}");
             let purge = CString::new(format!("arena.{huge_arena}.purge")).unwrap();
             std::thread::spawn(move || {
                 loop {
@@ -356,7 +381,6 @@ enum Stage {
 }
 
 fn main() -> ExitCode {
-    keep_large_buffers_warm();
     env_logger::init();
     let cli = Cli::parse();
 
@@ -1258,7 +1282,7 @@ fn report_batched_size(proof: &prover::logup_phase::BatchedProof, tables: usize,
 
 /// Where the time went, summed per span label.
 ///
-/// The prover's own spans are per table and there are 227 of them, so the raw
+/// The prover's own spans are per table and there are hundreds of them, so the raw
 /// timeline is unreadable; what answers "where is the time" is the total per
 /// label. Sums exceed wall time, because tables run concurrently — the ratios
 /// between labels are the point, not the absolute figures.
@@ -1338,6 +1362,23 @@ fn cmd_trace_build(
     verify: bool,
     output: Option<PathBuf>,
 ) -> ExitCode {
+    // Only the per-table proof is serializable today, so `--output` with any
+    // other stage would walk the whole execution and then write nothing. Say so
+    // before spending the walk rather than exiting 0 in silence.
+    if output.is_some() && prove_and_retire && through != Stage::Logup {
+        eprintln!(
+            "--output writes the per-table proof, which only `--through logup` assembles; \
+             `--through {}` has no serializable proof yet (see docs/prove_and_retire_design.md \u{00A7}10).",
+            match through {
+                Stage::Walk => "walk",
+                Stage::Commit => "commit",
+                Stage::Challenge => "challenge",
+                Stage::Batched => "batched",
+                Stage::Logup => unreachable!(),
+            }
+        );
+        return ExitCode::FAILURE;
+    }
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -1373,6 +1414,9 @@ fn cmd_trace_build(
         }
     };
     let outcome = if prove_and_retire {
+        // The walk allocates and drops one trace-sized buffer after another,
+        // which is the pattern this works around.
+        keep_large_buffers_warm();
         run_approach_1(
             &elf,
             &elf_data,

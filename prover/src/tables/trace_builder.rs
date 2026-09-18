@@ -1249,8 +1249,6 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
     ops
 }
 
-/// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
-/// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
 /// What a Commit-phase walk still holds when the execution ends.
 ///
 /// The chunks it closed are gone — committed and dropped as they filled. This
@@ -1439,9 +1437,6 @@ impl WalkLeftover {
     /// whose rows are the lookup space — only its multiplicity columns depend
     /// on the run — so it is built once, at the end, and never chunked.
     ///
-    /// Only the three sources a walk can retire are folded so far. The rest —
-    /// LT, MUL, DVRM, SHIFT, the accelerators, PAGE — feed BITWISE too and are
-    /// not here yet.
     /// Every BITWISE lookup the run owes, from the retired chunks and from the
     /// tail — `finalize` folded both in, so this is complete whatever has been
     /// drained since. PAGE's own lookups are added by `build_pages`.
@@ -1636,6 +1631,8 @@ pub struct AccumulatedTables {
 pub const CPU32_APPENDS_TO: [TableKind; 3] = [TableKind::Shift, TableKind::Mul, TableKind::Dvrm];
 
 #[allow(clippy::type_complexity)]
+/// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
+/// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
 fn cpu32_chip_op(
     c: &cpu32::Cpu32Operation,
     shift_ops: &mut Vec<ShiftOperation>,
@@ -2499,9 +2496,6 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Build the initial-memory image (byte address -> value) from the ELF segments
-/// and the private-input region. Single source of "what memory starts as", read
-/// by both `MemoryState` seeding and PAGE/bitwise init.
 /// Run-length encode the runtime (non-ELF) page bases into `(base, count)`.
 ///
 /// Zero-init pages are the runtime ones, so `init_values == None` identifies
@@ -2541,6 +2535,9 @@ pub(crate) fn runtime_page_ranges(
     ranges
 }
 
+/// Build the initial-memory image (byte address -> value) from the ELF segments
+/// and the private-input region. Single source of "what memory starts as", read
+/// by both `MemoryState` seeding and PAGE/bitwise init.
 pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
     let mut image: HashMap<u64, u8> = HashMap::new();
     for segment in &elf.data {
@@ -3221,16 +3218,16 @@ pub struct CollectedEpoch {
 }
 
 impl CollectedEpoch {
-    /// The epoch's touched memory cells (sorted by address): the exact values
-    /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
-    /// [`touched_cells_from_memory_state`] over the same immutable
-    /// `memory_state`), available before any table is built.
     /// Ops collected for `kind`. Mirrors [`CollectedOps::buffered`] so a walk's
     /// output and a finished run's can be compared on the same footing.
     pub fn op_count(&self, kind: TableKind) -> usize {
         self.ops.buffered(kind)
     }
 
+    /// The epoch's touched memory cells (sorted by address): the exact values
+    /// `build_traces` later stores in `Traces::touched_memory_cells` (both are
+    /// [`touched_cells_from_memory_state`] over the same immutable
+    /// `memory_state`), available before any table is built.
     pub fn touched_memory_cells(&self) -> local_to_global::EpochTouches {
         touched_cells_from_memory_state(&self.memory_state)
     }
@@ -4229,7 +4226,10 @@ fn build_traces<I: ImageSource + Sync>(
     {
         base.add_ops(&bitwise_ops);
         memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
-        for f in &collectors {
+        // By value, like the parallel arm's `units.extend(collectors)`: these
+        // closures borrow the op lists, and the lists are moved into
+        // `CollectedOps` below, so the collectors have to be dropped here.
+        for f in collectors {
             f(&mut base);
         }
     }
@@ -5490,20 +5490,18 @@ impl Traces {
         )
     }
 
-    /// The sequential-critical half of an epoch's trace build: log collection
-    /// and op routing (Phases 1-2), which read the pre-epoch memory image and
-    /// produce the epoch's memory/register end state. This must run in epoch
-    /// order (the image advances between epochs); the table generation that
-    /// consumes the result ([`Self::build_from_collected`]) is epoch-local and
-    /// can run on another thread.
     /// Walk the execution and hand each chunked table's chunk to `on_chunk` as
     /// soon as it is full, dropping its ops right after.
     ///
     /// This is Approach 1's Commit phase seen from the producer side: the spec
     /// has the prover commit tables "once the memory pressure becomes too
     /// large" and drop them, which it can only do if the tables arrive while
-    /// the execution is still being walked. Buffers here never exceed one
-    /// chunk per table, so what the walk holds does not grow with the run.
+    /// the execution is still being walked. The buffers of the kinds listed in
+    /// [`CHUNKED_KINDS`] never exceed one chunk each; the rest — the four the
+    /// paragraph below names, the `retired_*` rows a closing chunk converts its
+    /// ops into, the accumulators and the walk's own BITWISE lookups — are held
+    /// whole and grow with the run. See `crate::pass`'s header for the size of
+    /// that term.
     ///
     /// The chunks come out exactly as `ops.chunks(max_rows)` would cut them and
     /// each is built by the same generator, so a consumer sees byte-identical
@@ -5739,6 +5737,12 @@ impl Traces {
         })
     }
 
+    /// The sequential-critical half of an epoch's trace build: log collection
+    /// and op routing (Phases 1-2), which read the pre-epoch memory image and
+    /// produce the epoch's memory/register end state. This must run in epoch
+    /// order (the image advances between epochs); the table generation that
+    /// consumes the result ([`Self::build_from_collected`]) is epoch-local and
+    /// can run on another thread.
     pub fn collect_epoch<I: ImageSource + Sync>(
         artifacts: &DecodeArtifacts,
         initial_image: &I,
