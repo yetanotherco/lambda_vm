@@ -28,6 +28,9 @@ rkyv = { version = "0.8.10", default-features = false, features = [
     "pointer_width_64",
 ], optional = true }
 
+# GPU dispatch for the proof-of-work grind — only linked when `cuda` is enabled.
+math-cuda = { path = "../math-cuda", optional = true }
+
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 lambda-vm-syscalls = { path = "../../syscalls" }
 
@@ -45,3 +48,5 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# The device nonce search behind `generate_nonce_maybe_gpu`.
+cuda = ["dep:math-cuda", "std"]
