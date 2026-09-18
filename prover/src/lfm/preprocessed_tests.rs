@@ -17,7 +17,10 @@ use crate::tables::types::{FE, FEE, GoldilocksExtension};
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
-use super::preprocessed::{bitwise_preprocessed_rows, emit_bitwise_preprocessed};
+use super::preprocessed::{
+    MAX_CONST_MLE_VARS, bitwise_preprocessed_rows, const_mle_constants, const_mle_rows,
+    emit_bitwise_preprocessed, emit_const_mle_at, eq_table_rows,
+};
 use super::validator::validate;
 use super::word::{ext_word, word_as_ext};
 
@@ -141,4 +144,227 @@ fn the_bitwise_leg_computes_what_the_host_fold_computes() {
             );
         }
     }
+}
+
+// =============================================================================
+// The columns no closed form covers: KECCAK_RC and REGISTER
+// =============================================================================
+
+/// A fixed-seed point of `n` coordinates, so a failure names one reproducible
+/// point.
+fn sample_point_n(seed: u64, n: usize) -> Vec<FEE> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        FE::from(state >> 2)
+    };
+    (0..n).map(|_| FEE::new([next(), next(), next()])).collect()
+}
+
+/// The two real continuation-epoch tables this route serves, with their columns
+/// as the AIR hands them over.
+///
+/// REGISTER's `init` and `fini` are a register file, so they are chosen here
+/// rather than zeroed: an all-zero column is the one shape whose fold cannot
+/// distinguish a right answer from a wrong one.
+fn const_mle_fixtures() -> Vec<(&'static str, Vec<Vec<FE>>)> {
+    let init: Vec<u32> = (0..crate::tables::register::NUM_REGISTER_ADDRESSES)
+        .map(|i| (i as u32).wrapping_mul(7).wrapping_add(3) % 251)
+        .collect();
+    let fini: Vec<u32> = (0..crate::tables::register::NUM_REGISTER_ADDRESSES)
+        .map(|i| (i as u32).wrapping_mul(11).wrapping_add(5) % 241)
+        .collect();
+    vec![
+        (
+            "KECCAK_RC",
+            crate::tables::keccak_rc::preprocessed_columns(),
+        ),
+        (
+            "REGISTER",
+            crate::tables::register::preprocessed_columns_with_fini(&init, &fini),
+        ),
+    ]
+}
+
+/// The leg alone: the point arrives by hint, the columns' values are published.
+fn const_mle_program(columns: &[Vec<FE>], num_vars: usize, leg: bool) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(num_vars as u32);
+    let point: Vec<_> = (0..num_vars)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    if !leg {
+        // The hints and the publishes cancel out of the subtraction, so what
+        // survives it is the leg and nothing else.
+        //
+        // ⚠ ONE publish per COLUMN, not per coordinate. A table can have more
+        // columns than variables (KECCAK_RC has nine of each five), and a
+        // `take(columns.len())` over a shorter point silently publishes fewer
+        // cells here than the leg does — which the subtraction then charges to
+        // the leg. That is exactly how this came in four rows long.
+        for index in 0..columns.len() {
+            b.public(point[index % num_vars].as_cell());
+        }
+        return compile(b.finish());
+    }
+    let borrowed: Vec<&[FE]> = columns.iter().map(Vec::as_slice).collect();
+    for value in emit_const_mle_at(&mut b, &borrowed, &point) {
+        b.public(value.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("the constant-MLE leg must be admissible");
+    program
+}
+
+/// The `LFM_CONST` words a program interns, in no particular order.
+fn const_words_of(program: &LfmProgram) -> Vec<super::word::LfmWord> {
+    program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            super::instr::Instr::Const { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ★ THE VALUE GATE: the leg computes what `check_preprocessed`'s own fold
+/// computes, over the real columns of the two real tables.
+///
+/// The right-hand side is `Mle::evaluate_in`, which is the exact call
+/// `check_preprocessed` (`multilinear_table.rs:1001`) makes — the host
+/// function this leg replaces, not a model of it.
+#[test]
+fn the_constant_mle_leg_is_the_hosts_fold() {
+    for (name, columns) in const_mle_fixtures() {
+        let num_vars = columns[0].len().trailing_zeros() as usize;
+        let program = const_mle_program(&columns, num_vars, true);
+        for seed in [1u64, 0x5eed, 0xDEAD_BEEF] {
+            let point = sample_point_n(seed, num_vars);
+            let arena: Vec<_> = point.iter().map(ext_word).collect();
+            let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+                .unwrap_or_else(|e| panic!("{name}: the leg must execute: {e:?}"));
+            assert_eq!(
+                exec.public_words.len(),
+                columns.len(),
+                "{name}: one published value per preprocessed column"
+            );
+            for (index, column) in columns.iter().enumerate() {
+                let emitted = word_as_ext(&exec.public_words[index].1).expect("a published value");
+                let host = Mle::new(column.clone())
+                    .expect("a preprocessed column is a power of two long")
+                    .evaluate_in::<GoldilocksExtension>(&point)
+                    .expect("the point has the column's variables");
+                assert_eq!(
+                    emitted, host,
+                    "{name} column {index} at seed {seed}: the machine must \
+                     compute the fold `check_preprocessed` computes"
+                );
+            }
+        }
+    }
+}
+
+/// ★ F1. The emitted count equals the closed form, and the pool is NAMED.
+///
+/// The second half is the assertion instance 63 earned: the test ASKS which
+/// constants the program interns that the form does not name, so the next
+/// unnamed constant fails here instead of being absorbed into a fudge factor.
+#[test]
+fn the_constant_mle_leg_emits_its_closed_form() {
+    for (name, columns) in const_mle_fixtures() {
+        let num_vars = columns[0].len().trailing_zeros() as usize;
+        let with = const_mle_program(&columns, num_vars, true);
+        let without = const_mle_program(&columns, num_vars, false);
+        let consts_with = const_words_of(&with);
+        let consts_without = const_words_of(&without);
+        let measured =
+            (with.instrs.len() - without.instrs.len()) - (consts_with.len() - consts_without.len());
+        let borrowed: Vec<&[FE]> = columns.iter().map(Vec::as_slice).collect();
+        let predicted = const_mle_rows(&borrowed, num_vars);
+        println!(
+            "{name} constant-MLE leg at {num_vars} vars, {} columns: \
+             {measured} rows emitted, {predicted} predicted \
+             (eq table {}, folds {}); the host fold it replaces is {} steps",
+            columns.len(),
+            eq_table_rows(num_vars),
+            predicted - eq_table_rows(num_vars),
+            columns.len() << num_vars,
+        );
+        assert_eq!(
+            measured, predicted,
+            "{name}: the emitted operation count must equal the closed form"
+        );
+
+        // `LfmWord` is four field elements and field elements are not ordered,
+        // so the two sets are compared by containment both ways rather than by
+        // sorting — which also reports WHICH word is unnamed.
+        let named = const_mle_constants(&borrowed);
+        let mut interned: Vec<super::word::LfmWord> = Vec::new();
+        for word in consts_with {
+            if !consts_without.contains(&word) && !interned.contains(&word) {
+                interned.push(word);
+            }
+        }
+        for word in &interned {
+            assert!(
+                named.contains(word),
+                "{name}: the program interns a constant the form does not name \
+                 ({word:?}) — that is a term, not a fudge factor"
+            );
+        }
+        for word in &named {
+            assert!(
+                interned.contains(word),
+                "{name}: the form names a constant the program does not intern \
+                 ({word:?})"
+            );
+        }
+        assert_eq!(
+            interned.len(),
+            named.len(),
+            "{name}: the interned pool and the named pool must be the same set"
+        );
+    }
+}
+
+/// ⛔ The cap refuses rather than emitting a program nobody can prove.
+///
+/// The failure this asserts is the one that would otherwise arrive as a prove
+/// that does not finish: a preprocessed table at twenty variables costs `2^20`
+/// rows a column on this route, and BITWISE and DECODE are precisely the tables
+/// that must not take it.
+#[test]
+#[should_panic(expected = "needs a closed form or a prepared opening")]
+fn a_table_above_the_cap_is_refused() {
+    let num_vars = MAX_CONST_MLE_VARS + 1;
+    let column: Vec<FE> = vec![FE::from(1u64); 1usize << num_vars];
+    const_mle_program(std::slice::from_ref(&column), num_vars, true);
+}
+
+/// The cap's CONTROL: one variable below it emits and executes, so the refusal
+/// above is the cap and not a leg that cannot serve any table.
+#[test]
+fn a_table_at_the_cap_still_emits() {
+    let num_vars = MAX_CONST_MLE_VARS;
+    let column: Vec<FE> = (0..1usize << num_vars)
+        .map(|i| FE::from(i as u64))
+        .collect();
+    let columns = vec![column.clone()];
+    let program = const_mle_program(&columns, num_vars, true);
+    let point = sample_point_n(7, num_vars);
+    let arena: Vec<_> = point.iter().map(ext_word).collect();
+    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+        .expect("a table at the cap must still execute");
+    let emitted = word_as_ext(&exec.public_words[0].1).expect("a published value");
+    let host = Mle::new(column)
+        .expect("a power of two")
+        .evaluate_in::<GoldilocksExtension>(&point)
+        .expect("the point has the column's variables");
+    assert_eq!(
+        emitted, host,
+        "the value at the cap is still the host's fold"
+    );
 }

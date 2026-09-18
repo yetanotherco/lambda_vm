@@ -23,9 +23,10 @@
 //! This leg covers the columns whose values follow from where they sit.
 
 use crate::tables::bitwise::{NUM_PRECOMPUTED_COLS, NUM_VARS};
-use crate::tables::types::FEE;
+use crate::tables::types::{FE, FEE, GoldilocksExtension};
 
 use super::builder::{Ext, LfmBuilder};
+use super::word::{LfmWord, ext_word};
 
 /// INSTRUCTIONS this leg emits, by construction rather than by measurement.
 ///
@@ -202,4 +203,183 @@ pub fn emit_bitwise_preprocessed(b: &mut LfmBuilder, point: &[Ext]) -> [Ext; NUM
     }
 
     [x, y, z, and, or, xor, msb8, msb16, is_zero, sll, sllc]
+}
+
+// =============================================================================
+// The preprocessed columns NO closed form covers
+// =============================================================================
+
+/// ⛔ The largest `num_vars` [`emit_const_mle_at`] will serve — A CAP, NOT A
+/// TUNING KNOB.
+///
+/// That emitter is the host's own fold with the leaves interned, so it is
+/// `O(2^n)`: a table whose unsettled preprocessed columns sat at twenty
+/// variables would emit a million rows a column and nothing in the program would
+/// say so. The two tables that DO sit at twenty variables are exactly the two
+/// that never arrive here — BITWISE has [`emit_bitwise_preprocessed`], and
+/// DECODE's five are settled out of band by the prepared opening, which is what
+/// `settled_out_of_band` counts. What is left in a real continuation epoch is
+/// KECCAK_RC at five variables and REGISTER at seven, so this sits above both
+/// and far below twenty.
+///
+/// A new preprocessed table above the cap is an EMIT-TIME REFUSAL. That refusal
+/// is the whole point: the alternative is a program that silently becomes
+/// unprovable, which is a failure nobody reads until a prove does not finish.
+pub const MAX_CONST_MLE_VARS: usize = 12;
+
+/// INSTRUCTIONS the shared `eq(point, ·)` table costs over `num_vars`
+/// variables.
+///
+/// Level 0 is ONE `Sub`: its two entries are `1 − p_0` and the wire `p_0`
+/// itself, because the parent is the interned one and multiplying by it emits
+/// nothing. Every later level turns each of its `2^i` entries into two — one
+/// `Mul` by `p_i` for the set bit and one `Sub` taking the complement from the
+/// parent — so level `i` costs `2^{i + 1}` and the tail sums to `2^n⁺¹ − 4`.
+///
+/// The interned `1` is not counted here: it is an `LFM_CONST` shared with every
+/// other leg of the program, and this form counts operation rows.
+pub const fn eq_table_rows(num_vars: usize) -> usize {
+    if num_vars == 0 {
+        // `eq` over no variables is the interned one, and nothing is emitted.
+        return 0;
+    }
+    1 + (1usize << (num_vars + 1)) - 4
+}
+
+/// INSTRUCTIONS one constant column's fold against a built `eq` table costs.
+///
+/// One row per NONZERO entry — a `Mul` for the first and a `MulAdd` for each
+/// one after, which are the same row — and a zero entry emits nothing at all,
+/// which is why a sparse column is cheap. An ALL-zero column emits no operation
+/// and is the interned zero.
+///
+/// ⚠ A coefficient of ONE is NOT special-cased, and the form says so rather
+/// than the emitter hiding it: skipping the multiply for a unit coefficient
+/// would save a row per such entry and cost a second shape the form has to
+/// know about. The saving is a handful of rows on the two tables this serves.
+pub fn const_column_rows(column: &[FE]) -> usize {
+    column.iter().filter(|value| **value != FE::zero()).count()
+}
+
+/// INSTRUCTIONS [`emit_const_mle_at`] emits for one table's columns at one
+/// point: the shared `eq` table, then each column's fold.
+///
+/// The `eq` table is built ONCE per call and every column of the table folds
+/// against it, which is the structure — a table's preprocessed columns are all
+/// claimed at that table's own reduced point.
+pub fn const_mle_rows(columns: &[&[FE]], num_vars: usize) -> usize {
+    eq_table_rows(num_vars)
+        + columns
+            .iter()
+            .map(|column| const_column_rows(column))
+            .sum::<usize>()
+}
+
+/// The `LFM_CONST` words [`emit_const_mle_at`] interns, deduplicated and BY
+/// VALUE, so a caller can union them into the one pool its program has.
+///
+/// Three kinds: `FEE::one()`, which level 0 subtracts from and which every
+/// other leg shares; each DISTINCT nonzero coefficient, embedded into the
+/// extension the accumulator lives in; and `FEE::zero()` when some column is
+/// entirely zero, because that column IS the interned zero.
+pub fn const_mle_constants(columns: &[&[FE]]) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = vec![ext_word(&FEE::one())];
+    for column in columns {
+        if column.iter().all(|value| *value == FE::zero()) {
+            let zero = ext_word(&FEE::zero());
+            if !words.contains(&zero) {
+                words.push(zero);
+            }
+        }
+        for value in column.iter() {
+            if *value == FE::zero() {
+                continue;
+            }
+            let word = ext_word(&value.to_extension::<GoldilocksExtension>());
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+    }
+    words
+}
+
+/// ★ `Mle::evaluate_in` over EMIT-TIME CONSTANT columns at a WIRE point —
+/// `check_preprocessed`'s remaining obligation, emitted.
+///
+/// `check_preprocessed` (`multilinear_table.rs:959`) evaluates every
+/// preprocessed column past `settled_out_of_band` at the reduced point and
+/// compares it against the value that table's own argument settled on. The
+/// columns are a property of the program the epoch is OF, so they are program
+/// text here and only the point is a wire — which is what makes the fold a
+/// straight line of interned coefficients rather than a pass over hinted data.
+///
+/// `point` is in [`multilinear::mle::Mle::evaluate_in`]'s order: `point[0]`
+/// binds the HIGH index bit, so the `eq` table is doubled with `point[0]` most
+/// significant and entry `j` is the row whose index is `j`. Getting this
+/// backwards is silent on a symmetric column and wrong on every other, which is
+/// why it is a named mutation rather than a comment.
+///
+/// Returns one value per column, in the order given.
+///
+/// # Panics
+///
+/// Above [`MAX_CONST_MLE_VARS`], and on a column whose length is not `2^n`.
+/// Both are emit-time shape refusals, the `epoch_verify.rs:171-179` idiom: a
+/// table of another shape has no way to be supplied to a program that emits a
+/// fixed straight line.
+pub fn emit_const_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) -> Vec<Ext> {
+    let num_vars = point.len();
+    assert!(
+        num_vars <= MAX_CONST_MLE_VARS,
+        "a preprocessed column at {num_vars} variables costs 2^{num_vars} rows a column; \
+         it needs a closed form or a prepared opening, not this route"
+    );
+    let height = 1usize << num_vars;
+    for column in columns {
+        assert_eq!(
+            column.len(),
+            height,
+            "a preprocessed column must have one entry per row of its table"
+        );
+    }
+
+    let one = b.ext_const(&FEE::one());
+    // `eq[j] = Π_i (p_i if bit i of j else 1 − p_i)`, doubled with `point[0]`
+    // most significant. Level 0's parent is the interned one, so its set half is
+    // the wire itself and only its clear half is emitted.
+    let mut eq: Vec<Ext> = vec![one];
+    for (level, &p) in point.iter().enumerate() {
+        let mut next: Vec<Ext> = Vec::with_capacity(eq.len() * 2);
+        for &parent in &eq {
+            let set = if level == 0 { p } else { b.emul(parent, p) };
+            let clear = if level == 0 {
+                b.esub(one, p)
+            } else {
+                b.esub(parent, set)
+            };
+            next.push(clear);
+            next.push(set);
+        }
+        eq = next;
+    }
+    debug_assert_eq!(eq.len(), height);
+
+    columns
+        .iter()
+        .map(|column| {
+            let mut acc: Option<Ext> = None;
+            for (row, value) in column.iter().enumerate() {
+                if *value == FE::zero() {
+                    continue;
+                }
+                let coefficient = b.ext_const(&value.to_extension::<GoldilocksExtension>());
+                acc = Some(match acc {
+                    None => b.emul(coefficient, eq[row]),
+                    Some(running) => b.emul_add(coefficient, eq[row], running),
+                });
+            }
+            acc.unwrap_or_else(|| b.ext_const(&FEE::zero()))
+        })
+        .collect()
 }
