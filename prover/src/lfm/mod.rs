@@ -78,6 +78,11 @@ pub mod whir_program;
 /// program builder, and a production builder cannot take its input from a test
 /// module.
 pub(crate) mod whir_real_epoch;
+/// The WHIR cross-epoch driver, beside the level-0 one above.
+///
+/// ⚠ NOT `whir_global`: that name belongs to the emitter, exactly as
+/// `whir_real_epoch` is not `whir_epoch`.
+pub(crate) mod whir_real_global;
 pub mod whir_reduce;
 pub mod whir_stacked;
 pub mod whir_statement;
@@ -171,6 +176,9 @@ mod whir_open_tests;
 mod whir_poly_tests;
 #[cfg(test)]
 mod whir_program_tests;
+/// The cross-epoch driver's tests, beside the level-0 driver's.
+#[cfg(test)]
+mod whir_real_global_tests;
 #[cfg(test)]
 mod whir_reduce_tests;
 #[cfg(test)]
