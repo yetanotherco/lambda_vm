@@ -2,12 +2,15 @@
 //! the single-source constraint count, and isolated negative checks for the
 //! padding closure, the scalar-bit padding guard and the `xG < p` overflow.
 
-use crate::tables::ecsm::{EcsmConstraints, EcsmOperation, cols, generate_ecsm_trace};
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::ecsm::{
+    EcsmConstraints, EcsmOperation, bus_interactions, cols, generate_ecsm_trace,
+};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use ecsm::{N_BYTES, P_BYTES, compute_witness};
 use math::field::element::FieldElement;
 use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
 use stark::frame::Frame;
+use stark::lookup::{BusValue, LinearTerm};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
@@ -19,6 +22,8 @@ const IDX_YG_CONV0: usize = 323; // ConvCarry(Yg, 0)
 const IDX_Q1_BIT32: usize = 388; // IS_BIT(q1[32])
 const IDX_XG_CARRY0: usize = 389; // CarryBit(XgLtP, 0)
 const IDX_XG_OVERFLOW: usize = 396; // OverflowRequired(XgLtP)
+const IDX_YR_OVERFLOW: usize = 420; // OverflowRequired(YrLtP)
+const IDX_YG_OVERFLOW: usize = 428; // OverflowRequired(YgLtP)
 
 fn gx_le() -> [u8; 32] {
     // secp256k1 Gx, little-endian.
@@ -94,7 +99,7 @@ fn constraints_hold_on_generated_trace() {
 
 #[test]
 fn constraint_set_count() {
-    assert_eq!(EcsmConstraints.meta().len(), 413);
+    assert_eq!(EcsmConstraints.meta().len(), 429);
 }
 
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
@@ -205,6 +210,33 @@ fn xg_ge_p_overflow_required_fires() {
     );
 }
 
+/// `yR` and `yG` are published to guest memory, and the caller resolves the root by comparing
+/// the echoed `yG` against its own `y`. A non-canonical representative would break that: `p`
+/// is odd, so `y` and `p − y` differ in parity, but `y + p` — a second 256-bit representative
+/// whenever `y < 2^256 − p ≈ 2^32`, and reachable, since `3 | p−1` leaves a third of the small
+/// `y` with a curve `x` — carries the opposite parity. `OverflowRequired` is what forbids it;
+/// `y = p` is the boundary where the addition stops overflowing.
+#[test]
+fn yr_and_yg_ge_p_overflow_required_fires() {
+    for (coord, idx, name) in [
+        (cols::YR, IDX_YR_OVERFLOW, "yR"),
+        (cols::YG, IDX_YG_OVERFLOW, "yG"),
+    ] {
+        let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
+        main[cols::MU] = FE::one();
+        // y = p, y_sub_p = 0 (invalid subtraction witness — fine for this isolation test).
+        for (i, &b) in P_BYTES.iter().enumerate() {
+            main[coord + i] = FE::from(b as u64);
+        }
+        let row = eval_main_row(main);
+        assert_ne!(
+            row[idx],
+            FE::zero(),
+            "OverflowRequired must fire when {name} = p"
+        );
+    }
+}
+
 fn five_g_x_le() -> [u8; 32] {
     // x-coordinate of 5·G (secp256k1), little-endian.
     // 0x2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4
@@ -266,4 +298,126 @@ fn constraints_hold_for_k_eq_n_minus_one() {
             assert_eq!(*v, FE::zero(), "constraint {i} must hold at row {row}");
         }
     }
+}
+
+// =========================================================================
+// Structural: the 96-byte output buffer and its ECDAS backing
+// =========================================================================
+
+/// The single column of a `Packed` bus value.
+fn packed_col(v: &BusValue) -> Option<usize> {
+    match v {
+        BusValue::Packed { start_column, .. } => Some(*start_column),
+        _ => None,
+    }
+}
+
+/// `(column, constant)` of a `Linear` bus value shaped `1·col + k`.
+fn linear_col_plus(v: &BusValue) -> Option<(usize, i64)> {
+    let BusValue::Linear(terms) = v else {
+        return None;
+    };
+    let mut col = None;
+    let mut constant = 0i64;
+    for t in terms {
+        match t {
+            LinearTerm::Column {
+                coefficient: 1,
+                column,
+            } => col = Some(*column),
+            LinearTerm::Constant(k) => constant += k,
+            _ => return None,
+        }
+    }
+    col.map(|c| (c, constant))
+}
+
+/// The chip publishes `[xR ‖ yR ‖ yG]` as twelve doubleword MEMW writes, and the aliasing
+/// argument rests on WHEN they happen: the operands are read at `T` and `T + 1`, so every
+/// write must land strictly later, or an output buffer overlapping `xG`/`k` would touch one
+/// address twice at the same timestamp. `yR` and `yG` share `T + 3`, which is legal only
+/// because their address ranges are disjoint — and `T + 3` is the last sub-timestamp of the
+/// instruction's stride-4 window, so there is no room for a fourth group.
+///
+/// Pin the layout: nothing else fails loudly if a write moves back onto a read's timestamp
+/// or one of the two new coordinates stops being published.
+#[test]
+fn output_buffer_memw_writes_are_twelve_at_the_expected_offsets() {
+    let want: Vec<(usize, i64, i64)> =
+        [(cols::XR, 0i64, 2i64), (cols::YR, 32, 3), (cols::YG, 64, 3)]
+            .iter()
+            .flat_map(|&(col, off, ts)| (0..4).map(move |i| (col + 8 * i, off + 8 * i as i64, ts)))
+            .collect();
+
+    // MEMW write tuple: [is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8].
+    let got: Vec<(usize, i64, i64)> = bus_interactions()
+        .iter()
+        .filter(|b| b.is_sender && b.bus_id == BusId::Memw as u64 && b.values.len() == 16)
+        .filter_map(|b| {
+            // Every other MEMW access this chip makes is a read, and the length filter
+            // already dropped those (24-element tuple), so these twelve are the buffer.
+            let (addr_col, addr_off) = linear_col_plus(&b.values[1])?;
+            assert_eq!(addr_col, cols::ADDR_XR_0);
+            assert_eq!(packed_col(&b.values[2]), Some(cols::ADDR_XR_1));
+            let (ts_col, ts_off) = linear_col_plus(&b.values[11])?;
+            assert_eq!(ts_col, cols::TIMESTAMP_0);
+            Some((packed_col(&b.values[3])?, addr_off, ts_off))
+        })
+        .collect();
+
+    assert_eq!(
+        got, want,
+        "the [xR ‖ yR ‖ yG] write group changed shape (column, address offset, ts offset)"
+    );
+}
+
+/// `yR` is not a free column, and neither is `yG`.
+///
+/// The ECDAS final receiver carries `[id, ts, xR, yR, xG, yG, −1, 0]`, so the published `yR`
+/// has to match the constrained double-and-add output; the start sender carries the same
+/// `(xG, yG)` the `Relation::Yg` convolution binds to the curve. The caller-side sign fix-up
+/// (`ŷ = ±y` ⇒ negate or not) is sound only while both hold, so pin the tuple offsets.
+#[test]
+fn ecdas_tuples_carry_the_published_coordinates() {
+    // ECDAS tuple: [id, ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32), round, op].
+    const ACC_X: usize = 3;
+    const ACC_Y: usize = ACC_X + 32;
+    const GEN_X: usize = ACC_Y + 32;
+    const GEN_Y: usize = GEN_X + 32;
+
+    let coord_is = |values: &[BusValue], at: usize, base: usize| {
+        (0..32).all(|b| packed_col(&values[at + b]) == Some(base + b))
+    };
+
+    let ecdas: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|b| b.bus_id == BusId::Ecdas as u64)
+        .collect();
+    assert_eq!(
+        ecdas.len(),
+        2,
+        "ECSM sends the start tuple and receives the result"
+    );
+
+    let start = ecdas
+        .iter()
+        .find(|b| b.is_sender)
+        .expect("ECDAS start sender");
+    assert!(coord_is(&start.values, ACC_X, cols::XG));
+    assert!(coord_is(&start.values, ACC_Y, cols::YG));
+
+    let result = ecdas
+        .iter()
+        .find(|b| !b.is_sender)
+        .expect("ECDAS final receiver");
+    assert!(
+        coord_is(&result.values, ACC_X, cols::XR),
+        "xR must come from the ECDAS accumulator"
+    );
+    assert!(
+        coord_is(&result.values, ACC_Y, cols::YR),
+        "yR must come from the ECDAS accumulator, not be a free witness"
+    );
+    assert!(coord_is(&result.values, GEN_X, cols::XG));
+    assert!(coord_is(&result.values, GEN_Y, cols::YG));
 }
