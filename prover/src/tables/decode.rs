@@ -273,6 +273,16 @@ pub fn preprocessed_columns(instructions: &U64HashMap<Instruction>) -> Vec<Vec<F
         .collect()
 }
 
+/// [`preprocessed_columns`] for a program, straight from its ELF.
+///
+/// ★ The ONE place both sides of the multilinear argument take DECODE's
+/// preprocessed columns from, so a prover and a verifier cannot end up looking
+/// at two different instruction tables — see the out-of-band commitment in
+/// `multilinear_continuation`.
+pub fn preprocessed_columns_from_elf(elf: &Elf) -> Result<Vec<Vec<FE>>, InstructionError> {
+    Ok(preprocessed_columns(&instructions_from_elf(elf)?))
+}
+
 /// Computes the LDE commitment for DECODE precomputed columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed

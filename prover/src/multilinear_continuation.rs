@@ -125,6 +125,167 @@ pub fn l2g_commitment(
     Ok(roots)
 }
 
+/// DECODE's preprocessed columns, committed ONCE per ELF, outside every epoch's
+/// proof.
+///
+/// # Why this exists
+///
+/// The five columns (`PC_0`, `PC_1`, `PACKED_DECODE`, `IMM_0`, `IMM_1`) are
+/// ELF-derived: the same bytes in every epoch of every run of that program.
+/// Today each epoch commits them with the rest of DECODE and the verifier then
+/// evaluates each column's MLE at that epoch's reduced point — five 2^20 folds,
+/// fifteen times, for a value that depended on nothing the epoch chose. Here
+/// they are committed once and OPENED per epoch at DECODE's reduced point, and
+/// the opening replaces the folds.
+///
+/// # ★ One derivation, both sides
+///
+/// The prover and the host verifier call this same function on the same ELF.
+/// The verifier therefore absorbs a root it RECOMPUTED, never one the proof
+/// handed it — a value that has not been checked must not reach the transcript,
+/// or a forged root steers the challenges before the comparison that would have
+/// rejected it. Nothing about the commitment is read from the proof: not the
+/// root, not the layout, not the domain.
+///
+/// The digest travels with the roots for the same reason they are computed
+/// together: the field machine cannot recompute either in-guest and pins the
+/// PAIR as program text, so a pair that could be assembled from two different
+/// ELFs is the defect to prevent.
+///
+/// # Cost, stated
+///
+/// The host verifier pays one commit over a 2^23 polynomial for the whole
+/// proof, in place of `epochs x 5 x 2^20` MLE evaluations. The in-guest verifier
+/// pays neither — it pins `(digest, roots)` as emit-time constants.
+pub(crate) struct DecodePrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// The program these columns came from, as the transcript's own digest.
+    pub elf_digest: [u8; 32],
+    /// The five columns, in DECODE's column order.
+    pub columns: Vec<Mle<F>>,
+    /// Derived, never read from a proof.
+    pub roots: Vec<Commitment>,
+    pub commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+}
+
+impl<H> DecodePrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// What the verifier settles the opening against.
+    pub(crate) fn check(&self, table: usize) -> multilinear_table::PreparedCheck<'_, F> {
+        multilinear_table::PreparedCheck {
+            roots: &self.roots,
+            layout: self.commitment.layout(),
+            domain: self.commitment.domain(),
+            table,
+            columns: self.columns.len(),
+        }
+    }
+}
+
+/// Derives [`DecodePrepared`] from an ELF. See its documentation.
+///
+/// ★ This is the entry point BOTH SIDES call. It is two lines over
+/// [`decode_prepared_from_columns`] because the split is what lets the
+/// commitment's own properties — that it is a function of the instruction table
+/// and of nothing else, and that its shape is the one the ELF implies — be
+/// tested without an ELF artifact on disk. A test that silently skips when a
+/// build product is missing is a test that passed for the wrong reason.
+///
+/// ⚠ NOT CALLED YET. The `allow` below is the marker for that, and it is meant
+/// to be deleted by the commit that wires this into `prove_epoch` and
+/// `verify_epoch` — an unreachable function is exactly the state this branch has
+/// twice mistaken for a working feature, so it says so in the lint rather than
+/// in a comment nobody greps for.
+#[allow(dead_code)]
+pub(crate) fn decode_prepared<H>(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    config: &ChainConfig,
+) -> Result<DecodePrepared<H>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    let columns = crate::tables::decode::preprocessed_columns_from_elf(elf)
+        .map_err(|e| Error::Prover(format!("DECODE: {e:?}")))?;
+    decode_prepared_from_columns(statement::elf_digest(elf_bytes), columns, config)
+}
+
+/// [`decode_prepared`]'s core: the commitment over columns already in hand.
+pub(crate) fn decode_prepared_from_columns<H>(
+    elf_digest: [u8; 32],
+    columns: Vec<Vec<FieldElement<F>>>,
+    config: &ChainConfig,
+) -> Result<DecodePrepared<H>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    let columns: Vec<Mle<F>> = columns
+        .into_iter()
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("DECODE: {e:?}"))))
+        .collect::<Result<_, _>>()?;
+    let rows = columns
+        .first()
+        .ok_or_else(|| Error::Prover("DECODE has no preprocessed columns".to_string()))?
+        .len();
+    if !rows.is_power_of_two() {
+        return Err(Error::Prover(format!(
+            "DECODE's preprocessed columns are {rows} rows, which the hypercube cannot hold",
+        )));
+    }
+    let shape = [(columns.len(), rows.trailing_zeros() as usize)];
+    let layout =
+        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+        layout,
+        &multilinear::stacking::borrow(&columns),
+        None,
+        config,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let roots = commitment.roots();
+    if roots.is_empty() {
+        return Err(Error::Prover(
+            "the DECODE preprocessed group commits to nothing".to_string(),
+        ));
+    }
+    Ok(DecodePrepared {
+        elf_digest,
+        columns,
+        roots,
+        commitment,
+    })
+}
+
+/// Where DECODE sits among an epoch's tables, found by NAME.
+///
+/// ⚠ Not a constant and not a position. The opening binds the pinned columns to
+/// ONE table's reduced point, and a prover able to aim them at a different
+/// table's point would be settling them against challenges they were never
+/// bound to. So the index is asserted against the AIR that carries the columns,
+/// and "exactly one" is part of the assertion: a table set with two DECODEs, or
+/// none, is a layout nobody meant to build.
+pub(crate) fn decode_table_index(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+) -> Result<usize, Error> {
+    let found: Vec<usize> = airs
+        .iter()
+        .enumerate()
+        .filter(|(_, air)| air.name() == "DECODE")
+        .map(|(i, _)| i)
+        .collect();
+    match found.as_slice() {
+        [only] => Ok(*only),
+        _ => Err(Error::Prover(format!(
+            "an epoch's table set must carry exactly one DECODE, it carries {} (at {found:?})",
+            found.len(),
+        ))),
+    }
+}
+
 /// Binds an epoch's statement into the transcript before any challenge.
 ///
 /// The monolithic multilinear statement plus the epoch's position. A
