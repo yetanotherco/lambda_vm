@@ -2584,3 +2584,77 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
         "  the three sites moved arena words {moved:?}; the honest arena executes after all of them"
     );
 }
+
+// =============================================================================
+// Item 6: the two shapes a prepared INIT opening can take
+// =============================================================================
+
+/// ★ THE SIZING THE GLOBAL PROGRAM'S INIT ROUTE TURNS ON, evaluated rather than
+/// estimated.
+///
+/// The cross-epoch proof's page tables carry INIT — the page's genesis bytes,
+/// `2^18` per page — as a preprocessed column. No fold is possible in the
+/// machine, so it takes DECODE's route: a commitment built once out of band and
+/// OPENED at each page's reduced point. Two shapes are available and they differ
+/// only in cost, because (see the handback) both introduce the same new object:
+///
+/// - **A, one family polynomial.** The pages' INIT columns stacked into ONE
+///   polynomial, opened in ONE chain, its claims shared per point.
+/// - **B, one opening per page.** Thirty-five polynomials, thirty-five chains.
+///
+/// This evaluates `ChainShape` and `chain_shape_rows` — the SAME forms V1d's
+/// 16 groups / 17 chains / 105 rounds come from — at both shapes, at the
+/// epoch's own posture, and prints rounds and rows so the choice is made on
+/// numbers. It asserts only the ORDERING it exists to establish, because the
+/// absolute figures move with the posture and a pin on them would be a pin on
+/// the posture.
+#[test]
+fn the_prepared_init_shapes_are_sized_before_one_is_chosen() {
+    // The posture the WHIR bench and the harness both run at.
+    let config = multilinear::whir_chain::ChainConfig::with_security(
+        2,
+        4,
+        25,
+        128,
+        multilinear::whir_chain::GrindBits::uniform(20),
+    );
+    const PAGE_VARS: usize = 18;
+    const PAGES: usize = 35;
+
+    // A: the family stacked into one polynomial.
+    let family_vars = PAGE_VARS + PAGES.next_power_of_two().trailing_zeros() as usize;
+    let a = ChainShape::new(&config, family_vars);
+    let a_rows = chain_shape_rows(&a);
+
+    // B: one polynomial per page, each opened in its own chain.
+    let b = ChainShape::new(&config, PAGE_VARS);
+    let b_rows = chain_shape_rows(&b) * PAGES;
+
+    println!(
+        "INIT shape A (one family polynomial at {family_vars} vars): {} rounds, {a_rows} chain rows, 1 chain",
+        a.rounds()
+    );
+    println!(
+        "INIT shape B ({PAGES} polynomials at {PAGE_VARS} vars): {} rounds each = {} total, \
+         {b_rows} chain rows, {PAGES} chains",
+        b.rounds(),
+        b.rounds() * PAGES,
+    );
+    println!(
+        "  ⇒ B/A = {:.1}x the chain rows and {:.1}x the rounds",
+        b_rows as f64 / a_rows as f64,
+        (b.rounds() * PAGES) as f64 / a.rounds() as f64,
+    );
+
+    // ⛔ THE ONE PROPERTY THIS EXISTS TO ESTABLISH, and the only thing asserted:
+    // stacking the family is cheaper than opening each page, by a margin no
+    // posture change closes. A chain's cost grows with its variable count but
+    // its ROUNDS grow logarithmically, so thirty-five short chains cost more
+    // than one chain six variables longer.
+    assert!(
+        a_rows * 4 < b_rows,
+        "one family polynomial costs {a_rows} chain rows against {b_rows} for \
+         {PAGES} openings; if that margin is not large the choice is not obvious \
+         and this test should not pretend it is"
+    );
+}
