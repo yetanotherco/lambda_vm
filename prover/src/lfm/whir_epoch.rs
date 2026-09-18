@@ -53,16 +53,28 @@
 //! the host's own accepted proof through this program is therefore the check on
 //! this paragraph.
 
+use multilinear::constraint_argument::FactorKind;
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::ChainConfig;
 
+use crate::tables::bitwise::NUM_PRECOMPUTED_COLS;
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::algebraic_commit::leaf_capacity;
 use super::builder::{Cell, Ext, LfmBuilder};
+use super::preprocessed::{
+    bitwise_preprocessed_rows, const_mle_constants, const_mle_rows, emit_bitwise_preprocessed,
+    emit_const_mle_at,
+};
+use super::whir_bus::Cost;
 use super::whir_chain::ChainShape;
-use super::whir_stacked::{StackedCost, stacked_verify_cost};
+use super::whir_stacked::{
+    StackedCost, StackedPolyWires, emit_stacked_verify, stacked_verify_cost,
+};
+use super::whir_table::{
+    TableProofWires, TableShape, TableVerdictWires, emit_table_verify, table_verify_cost,
+};
 use super::whir_transcript::{
     SpongeEntry, SpongeSchedule, WhirTranscript, absorb_unpack_rows, sample_ext_rows,
 };
@@ -509,4 +521,405 @@ fn emit_expected(
         });
     }
     sum.expect("a non-empty public output")
+}
+
+// =============================================================================
+// The per-table walk
+// =============================================================================
+
+/// How one table's preprocessed columns are discharged.
+///
+/// The host has ONE route — rebuild each column's multilinear extension and
+/// evaluate it at the reduced point (`multilinear_table.rs:959`) — and the
+/// machine cannot take it: BITWISE alone is eleven columns of `2^20`. So the
+/// machine has four, and which one a table takes is a property of the TABLE and
+/// never of its position: they are selected by `air.name()`, the same rule
+/// `decode_table_index` applies (`multilinear_continuation.rs:368`).
+pub enum PreprocessedRoute<'a> {
+    /// Nothing left to check — either the table has no preprocessed columns, or
+    /// a prepared opening settled all of them.
+    None,
+    /// BITWISE: the closed form, `O(NUM_VARS)` where the fold is `O(2^NUM_VARS)`.
+    Bitwise,
+    /// KECCAK_RC and REGISTER: one shared `eq(point, ·)` per table with each
+    /// column folded against it, one row per NONZERO entry.
+    ConstMle(&'a [&'a [FE]]),
+}
+
+/// One table's preprocessed plan: what a prepared opening settled, and how
+/// whatever is left is checked.
+///
+/// ⚠ `settled` must be the SAME value that drives the opening, never a knob a
+/// caller sets on its own — the host's own warning at
+/// `multilinear_table.rs:943`. A second, independent knob would be a way to
+/// switch off a check with nothing put in its place.
+pub struct PreprocessedPlan<'a> {
+    /// Leading columns the prepared opening covers: `settled_out_of_band`.
+    pub settled: usize,
+    /// How the columns past those are checked.
+    pub route: PreprocessedRoute<'a>,
+}
+
+/// Where each preprocessed column's claimed value sits among a table's reduced
+/// column values.
+///
+/// ★ THIS IS THE HOST'S OWN INDIRECTION, AND IT IS NOT THE IDENTITY.
+/// `check_preprocessed` does not compare preprocessed column `c` against
+/// `column_values[c]`. It reads `slot(slot_of, c)` to get a factor, takes that
+/// factor's SOURCE, requires the source unshifted, and indexes
+/// `column_values[source.column]` (`multilinear_table.rs:1060-1080`). A leg that
+/// indexed by `c` would agree with the host on every table whose layout happens
+/// to be the identity and disagree silently on the rest, which is why the
+/// mapping is derived here from the same two slices the host reads rather than
+/// assumed.
+///
+/// Both of the host's refusals are EMIT-TIME assertions, the
+/// `epoch_verify.rs:171-179` idiom: a column with no factor slot, or a factor
+/// read at an offset, describes a layout nobody meant to build, and a program
+/// emitted for it could not be supplied a proof of the right shape anyway.
+pub fn preprocessed_targets(slot_of: &[usize], kinds: &[FactorKind], columns: usize) -> Vec<usize> {
+    (0..columns)
+        .map(|column| {
+            let factor = *slot_of.get(column).unwrap_or_else(|| {
+                panic!(
+                    "preprocessed column {column} has no factor slot in a layout of {} columns",
+                    slot_of.len()
+                )
+            });
+            let source = kinds
+                .get(factor)
+                .and_then(FactorKind::source)
+                .filter(|source| source.offset == 0)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "preprocessed column {column} rides factor {factor}, which is not an \
+                         unshifted committed source"
+                    )
+                });
+            source.column
+        })
+        .collect()
+}
+
+/// What the per-table walk leaves for the two legs below it.
+///
+/// The collections are the host's own under the host's names: `outputs` is what
+/// the closure sums, `points` and `values` are what each commitment group
+/// settles. ⚠ `points` is kept ONE PER TABLE and expanded to one per COLUMN by
+/// [`Self::column_points`], because one per column is the shape
+/// `emit_stacked_verify` takes and the expansion is where the host's
+/// `for _ in 0..statement.slot_of.len()` (`multilinear_table.rs:1226`) lives.
+pub struct TableWalk {
+    /// `(p, q)` per table, in table order.
+    pub outputs: Vec<(Ext, Ext)>,
+    /// The reduced point, one per TABLE.
+    pub points: Vec<Vec<Ext>>,
+    /// Committed columns per table — what the group walk advances by.
+    pub widths: Vec<usize>,
+    /// Every table's reduced column values, concatenated in table order.
+    pub values: Vec<Ext>,
+}
+
+impl TableWalk {
+    /// The host's `points`: one entry per COLUMN, a table's columns sharing that
+    /// table's point.
+    pub fn column_points(&self) -> Vec<&[Ext]> {
+        let mut out = Vec::with_capacity(self.values.len());
+        for (point, &width) in self.points.iter().zip(&self.widths) {
+            for _ in 0..width {
+                out.push(point.as_slice());
+            }
+        }
+        out
+    }
+
+    /// Where table `index`'s columns start in the global column order — the
+    /// host's `prepared_at` when `index` is the prepared table.
+    pub fn column_at(&self, index: usize) -> usize {
+        self.widths[..index].iter().sum()
+    }
+}
+
+/// ★ The per-table walk, emitted: `multi_verify`'s first loop
+/// (`multilinear_table.rs:1218`).
+///
+/// Per table in index order, [`emit_table_verify`] with the sponge entry
+/// threaded table to table, then that table's preprocessed leg IMMEDIATELY
+/// after. The leg sits inside the same step rather than in a pass of its own
+/// because `check_preprocessed` is the LAST statement of the host's `verify`
+/// (`multilinear_table.rs:936`) and moves no transcript operation — a pass of
+/// its own would compute the same values and say something different about
+/// where they belong.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_table_walk(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    tables: &[TableProofWires<'_>],
+    shapes: &[TableShape<'_>],
+    plans: &[PreprocessedPlan<'_>],
+    slots: &[&[usize]],
+    z: Ext,
+    alpha_powers: &[Ext],
+    beta: Ext,
+) -> TableWalk {
+    assert_eq!(tables.len(), shapes.len(), "one shape per table proof");
+    assert_eq!(tables.len(), plans.len(), "one preprocessed plan per table");
+    assert_eq!(tables.len(), slots.len(), "one slot map per table");
+
+    let mut walk = TableWalk {
+        outputs: Vec::with_capacity(tables.len()),
+        points: Vec::with_capacity(tables.len()),
+        widths: Vec::with_capacity(tables.len()),
+        values: Vec::new(),
+    };
+
+    for (index, ((proof, shape), plan)) in tables.iter().zip(shapes).zip(plans).enumerate() {
+        let verdict = emit_table_verify(b, transcript, proof, shape, z, alpha_powers, beta);
+        emit_preprocessed_leg(b, plan, slots[index], shape, &verdict);
+        walk.outputs.push(verdict.bus_output);
+        walk.widths.push(verdict.column_values.len());
+        walk.values.extend(verdict.column_values.iter().copied());
+        walk.points.push(verdict.point);
+    }
+    walk
+}
+
+/// One table's preprocessed columns, checked against the values its own
+/// argument settled on.
+fn emit_preprocessed_leg(
+    b: &mut LfmBuilder,
+    plan: &PreprocessedPlan<'_>,
+    slot_of: &[usize],
+    shape: &TableShape<'_>,
+    verdict: &TableVerdictWires,
+) {
+    let columns: &[&[FE]] = match &plan.route {
+        PreprocessedRoute::None => return,
+        PreprocessedRoute::Bitwise => {
+            // The closed form covers all eleven at once, so a settled prefix
+            // over them would be two checks on one column rather than none.
+            assert_eq!(
+                plan.settled, 0,
+                "BITWISE's columns are covered by the closed form, not by an opening"
+            );
+            let targets = preprocessed_targets(slot_of, shape.kinds, NUM_PRECOMPUTED_COLS);
+            let values = emit_bitwise_preprocessed(b, &verdict.point);
+            for (value, &target) in values.iter().zip(&targets) {
+                b.assert_eq_ext(*value, verdict.column_values[target]);
+            }
+            return;
+        }
+        PreprocessedRoute::ConstMle(columns) => columns,
+    };
+
+    // The host's own assert, at emit time: an opening may not cover more
+    // columns than the table has (`multilinear_table.rs:1069`).
+    assert!(
+        plan.settled <= columns.len(),
+        "a prepared opening settled {} of {} preprocessed columns",
+        plan.settled,
+        columns.len()
+    );
+    let remaining = &columns[plan.settled..];
+    if remaining.is_empty() {
+        return;
+    }
+    let targets = preprocessed_targets(slot_of, shape.kinds, columns.len());
+    let values = emit_const_mle_at(b, remaining, &verdict.point);
+    for (value, &target) in values.iter().zip(&targets[plan.settled..]) {
+        b.assert_eq_ext(*value, verdict.column_values[target]);
+    }
+}
+
+/// What the per-table walk costs, threaded, under ONE constant pool.
+///
+/// ⚠ THE CONVENTION, stated because two meet in this file. `table_verify_cost`
+/// reports a PER-TABLE program's own pool, and in an epoch program those pools
+/// COLLIDE — the `one` every `eq` seeds, each leaf capacity, each bus id. So
+/// this unions the tables' constant WORDS through [`Cost::merge`] instead of
+/// adding their `rows()`, and the pool is charged once by the caller. Adding
+/// `table_verify_cost(..).rows()` over the tables is the other convention and
+/// over-counts; the recount's per-table term is quoted in that one deliberately,
+/// which is why the two totals differ by the collisions.
+pub struct TableWalkCost {
+    /// Operations and the union of every table's interned words.
+    pub leg: Cost,
+    /// The sponge's own rows, summed over the tables.
+    pub sponge_rows: usize,
+    /// Permutations, summed over the tables.
+    pub perms: usize,
+    /// Where the sponge is left for the group walk.
+    pub entry: SpongeEntry,
+}
+
+impl TableWalkCost {
+    /// INSTRUCTIONS excluding the pool, so it composes with the other
+    /// const-free forms in this module.
+    pub fn operations(&self) -> usize {
+        self.leg.operations() + self.sponge_rows
+    }
+}
+
+/// [`emit_table_walk`]'s cost, table by table, threading the sponge.
+pub fn table_walk_cost(
+    shapes: &[TableShape<'_>],
+    plans: &[PreprocessedPlan<'_>],
+    entry: SpongeEntry,
+) -> TableWalkCost {
+    assert_eq!(shapes.len(), plans.len(), "one preprocessed plan per table");
+    let mut leg = Cost::default();
+    let mut sponge_rows = 0usize;
+    let mut perms = 0usize;
+    let mut entry = entry;
+    for (shape, plan) in shapes.iter().zip(plans) {
+        let table = table_verify_cost(shape, entry);
+        // The per-table form's constants come back as VALUES so the pools
+        // union rather than sum; its operations are the leg's.
+        leg.ops(table.leg.operations());
+        for word in table.leg.constant_values() {
+            leg.constant_word(*word);
+        }
+        sponge_rows += table.schedule.rows();
+        perms += table.schedule.perms();
+        entry = table.entry();
+        preprocessed_leg_cost(plan, &mut leg);
+    }
+    TableWalkCost {
+        leg,
+        sponge_rows,
+        perms,
+        entry,
+    }
+}
+
+/// One preprocessed plan's rows and constants, added into the walk's pool.
+///
+/// The three routes' forms are the landed ones: `bitwise_preprocessed_rows`
+/// counts INSTRUCTIONS including its interned `one`, so its constant is already
+/// inside the number and is added as an operation here to keep this function's
+/// pool the union of the ones the emitters actually intern.
+fn preprocessed_leg_cost(plan: &PreprocessedPlan<'_>, leg: &mut Cost) {
+    match &plan.route {
+        PreprocessedRoute::None => {}
+        PreprocessedRoute::Bitwise => {
+            leg.ops(bitwise_preprocessed_rows());
+            leg.ops(NUM_PRECOMPUTED_COLS * ASSERT_EQ_ROWS);
+        }
+        PreprocessedRoute::ConstMle(columns) => {
+            let remaining = &columns[plan.settled..];
+            if remaining.is_empty() {
+                return;
+            }
+            let num_vars = remaining[0].len().trailing_zeros() as usize;
+            leg.ops(const_mle_rows(remaining, num_vars));
+            for word in const_mle_constants(remaining) {
+                leg.constant_word(word);
+            }
+            leg.ops(remaining.len() * ASSERT_EQ_ROWS);
+        }
+    }
+}
+
+/// Rows an `assert_eq_ext` lowers to: the difference and the division by zero
+/// (`builder.rs:289-292`). The same constant `whir_table` names; spelled here
+/// rather than imported because the two forms are counted independently and a
+/// shared name would hide a disagreement.
+const ASSERT_EQ_ROWS: usize = 2;
+
+// =============================================================================
+// The commitment-group walk
+// =============================================================================
+
+/// One commitment group's wires: its layout, its chains, and the domain they
+/// run over.
+pub struct GroupWires<'a> {
+    pub layout: &'a StackedLayout,
+    pub polys: &'a [StackedPolyWires<'a>],
+    pub shape: &'a ChainShape,
+    pub domain: &'a Domain<GoldilocksField>,
+}
+
+/// ★ The commitment-group walk, emitted: `multi_verify`'s second loop
+/// (`multilinear_table.rs:1254`).
+///
+/// The three counters ARE this function, and they are the host's own:
+/// `statement_at` advances by the group's table count, `column_at` by the sum of
+/// those tables' COLUMN counts, and the roots by `layout.num_polys()`. A group
+/// handed the wrong column slice settles one table's values against another
+/// table's commitment, which is precisely what a counter that advanced by
+/// tables rather than columns would do.
+///
+/// Returns each group's batching challenge, so a gate can compare them against
+/// the elements the HOST verifier sampled rather than only observing that the
+/// program executed.
+pub fn emit_group_walk(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    groups: &[GroupWires<'_>],
+    sizes: &[usize],
+    walk: &TableWalk,
+) -> Vec<Ext> {
+    assert_eq!(groups.len(), sizes.len(), "one size per commitment group");
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        walk.widths.len(),
+        "the groups' sizes must cover every table exactly once"
+    );
+    let points = walk.column_points();
+    let mut statement_at = 0usize;
+    let mut column_at = 0usize;
+    let mut gammas = Vec::with_capacity(groups.len());
+    for (group, &size) in groups.iter().zip(sizes) {
+        let width: usize = walk.widths[statement_at..statement_at + size].iter().sum();
+        gammas.push(emit_stacked_verify(
+            b,
+            transcript,
+            group.layout,
+            group.polys,
+            &points[column_at..column_at + width],
+            &walk.values[column_at..column_at + width],
+            group.shape,
+            group.domain,
+        ));
+        statement_at += size;
+        column_at += width;
+    }
+    gammas
+}
+
+/// ★ The PREPARED opening, emitted: `multi_verify`'s last step
+/// (`multilinear_table.rs:1295`) — the same wrapper on the DECODE group.
+///
+/// Three things differ from a group above, and all three come from the host:
+///
+/// 1. the claim is `Claimed::Shared`. DECODE's five columns are settled at ONE
+///    point, the prepared table's own reduced point, so the wrapper pays one
+///    `eq` for the five and not five;
+/// 2. the LAYOUT and the DOMAIN are DECODE's, from `stacks` over its own shape,
+///    while the CHAIN CONFIG is the EPOCH's — `multi_verify` passes its own
+///    `config` to this call and only the first two belong to the group;
+/// 3. there is no separate check that the opened values are the table's. The
+///    values handed here ARE the ones DECODE's own argument settled on, so the
+///    opening proves the pinned commitment takes exactly those at exactly that
+///    point. An equality someone has to remember to write is replaced by a slice
+///    nobody can omit.
+///
+/// ⚠ The root is the INTERNED CONSTANT the roots block absorbed, re-interned by
+/// the caller. `LfmBuilder::word_const` (`builder.rs:169`) keys on the canonical
+/// word and hands back the same address, so the second mention costs nothing and
+/// the program still holds exactly one `Const` for that root — which is what the
+/// arena schema asserts.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_prepared_group(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    layout: &StackedLayout,
+    polys: &[StackedPolyWires<'_>],
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+    point: &[Ext],
+    values: &[Ext],
+) -> Ext {
+    let points: Vec<&[Ext]> = (0..values.len()).map(|_| point).collect();
+    emit_stacked_verify(b, transcript, layout, polys, &points, values, shape, domain)
 }

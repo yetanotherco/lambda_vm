@@ -9,24 +9,26 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
+use multilinear::constraint_argument::FactorKind;
+use stark::traits::AIR;
 
 use crate::multilinear_continuation::epoch_groups;
 use crate::multilinear_prove::{chain_config, stacks};
-use crate::tables::types::{FEE, GoldilocksExtension as FEE3};
+use crate::tables::types::{FE, FEE, GoldilocksExtension as FEE3, GoldilocksField};
 
 use super::algebraic_commit::commitment_to_digest;
-use super::builder::LfmBuilder;
-use super::compiler::compile;
+use super::builder::{Ext, LfmBuilder};
+use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_chain::{ChainShape, chain_shape_rows};
 use super::whir_chain_tests::const_rows;
 use super::whir_epoch::{
     closure_rows, emit_epoch_closure, emit_roots_block, epoch_group_costs, expected_rows,
-    group_columns, roots_block_constants, roots_block_cost,
+    group_columns, preprocessed_targets, roots_block_constants, roots_block_cost,
 };
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
-use super::word::{ext_word, word_as_ext};
+use super::word::{LfmWord, ext_word, word_as_ext};
 
 /// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(width, num_vars)` per
 /// table in sub-proof order.
@@ -712,5 +714,1001 @@ fn the_closure_emits_its_closed_form() {
             measured, predicted,
             "{name}: the emitted operation count must equal the closed form"
         );
+    }
+}
+
+// =============================================================================
+// The per-table walk: the preprocessed claim's address
+// =============================================================================
+
+/// ★ THE GATE ON THE INDIRECTION: a preprocessed column's claimed value is
+/// addressed through the LAYOUT, never by the column's own index.
+///
+/// The host reads `slot(slot_of, column)` to a factor, takes that factor's
+/// unshifted source, and indexes `column_values[source.column]`
+/// (`multilinear_table.rs:1060-1080`). The two agree whenever the layout happens
+/// to be the identity, which is exactly why this fixture is built NOT to be: its
+/// slot map and its factor list both permute, so a leg that indexed by the
+/// column would return `[0, 1, 2]` where the host returns `[2, 0, 1]`.
+///
+/// ⚠ THE FIXTURE IS THE TEST. A permutation drawn from a real table would make
+/// this pass or fail for reasons outside the function; built here, the expected
+/// answer is a property of the two slices and nothing else.
+#[test]
+fn the_preprocessed_targets_follow_the_layout_not_the_column_index() {
+    // Column 0 rides factor 2, column 1 factor 0, column 2 factor 1; and the
+    // factors read columns 2, 0, 1 in turn. Composing the two is the answer.
+    let slot_of = [2usize, 0, 1];
+    let kinds = [
+        FactorKind::direct(2),
+        FactorKind::direct(0),
+        FactorKind::direct(1),
+    ];
+    let identity: Vec<usize> = (0..3).collect();
+    let targets = preprocessed_targets(&slot_of, &kinds, 3);
+    assert_eq!(
+        targets,
+        vec![1usize, 2, 0],
+        "column c rides slot_of[c], whose factor reads kinds[slot].source().column"
+    );
+    // ⛔ ANTI-VACUITY, AND IT IS THE COMPOSITION THAT HAS TO MOVE. The first
+    // version of this fixture permuted both slices and they composed back to
+    // the identity, so `preprocessed_targets` returning the column index passed
+    // it — a check that could not fail, caught by running the mutation that
+    // drops the indirection and watching this test stay green. Asserting the
+    // two inputs are not the identity is not enough; the ANSWER must differ
+    // from the column index.
+    assert_ne!(
+        targets, identity,
+        "a fixture whose slot map and factor list compose to the identity gates nothing: a leg \
+         that ignored both slices would return exactly this"
+    );
+    assert_ne!(
+        slot_of.to_vec(),
+        identity,
+        "a fixture whose slot map is the identity gates nothing"
+    );
+    let direct: Vec<usize> = kinds
+        .iter()
+        .filter_map(FactorKind::source)
+        .map(|s| s.column)
+        .collect();
+    assert_ne!(
+        direct, identity,
+        "a fixture whose factor list is the identity gates nothing"
+    );
+}
+
+/// ★ THE TWO REFUSALS the host makes, at emit time — each with the control that
+/// says the fixture is otherwise good.
+#[test]
+fn a_preprocessed_column_with_no_slot_is_refused() {
+    let kinds = [FactorKind::direct(0)];
+    // The control: one column, one slot, and it resolves.
+    assert_eq!(preprocessed_targets(&[0usize], &kinds, 1), vec![0usize]);
+    // Two columns over a one-entry slot map: the second has no factor at all.
+    let panicked = std::panic::catch_unwind(|| preprocessed_targets(&[0usize], &kinds, 2));
+    assert!(
+        panicked.is_err(),
+        "a preprocessed column with no factor slot must be refused at emit time"
+    );
+}
+
+#[test]
+fn a_preprocessed_column_read_at_an_offset_is_refused() {
+    // The control: the same layout with the factor unshifted resolves.
+    assert_eq!(
+        preprocessed_targets(&[0usize], &[FactorKind::direct(3)], 1),
+        vec![3usize]
+    );
+    let shifted = [FactorKind::shifted(3, 1)];
+    let panicked = std::panic::catch_unwind(|| preprocessed_targets(&[0usize], &shifted, 1));
+    assert!(
+        panicked.is_err(),
+        "a preprocessed column whose factor is read at an offset must be refused"
+    );
+    // And a PUBLIC factor is refused for the same reason: it has no column.
+    let public = [FactorKind::Public];
+    let panicked = std::panic::catch_unwind(|| preprocessed_targets(&[0usize], &public, 1));
+    assert!(
+        panicked.is_err(),
+        "a preprocessed column riding a public factor has no claimed value"
+    );
+}
+
+// =============================================================================
+// The two walks, on a real multi-table proof
+// =============================================================================
+
+/// The AIR type the three example tables share.
+type WalkAir = stark::lookup::AirWithBuses<
+    GoldilocksField,
+    FEE3,
+    stark::lookup::NullBoundaryConstraintBuilder,
+    (),
+    stark::constraints::builder::EmptyConstraints,
+>;
+
+/// The repo's own three-table example — CPU sends, ADD and MUL receive — proved
+/// through `multi_prove` and committed the way an EPOCH commits: everything
+/// together, the last table alone, which is `epoch_groups`' `[n − 1, 1]`.
+///
+/// ⚠ WHAT THIS FIXTURE IS AND IS NOT, so nobody later takes it for more. It is a
+/// real two-group, three-table argument over a bus that BALANCES ACROSS THE
+/// TABLES, which is exactly what the walks are about: the order, the sponge
+/// threaded table to table, and the group walk's three counters. It carries NO
+/// preprocessed columns and no prepared opening — the three preprocessed routes
+/// are gated in `preprocessed_tests`, the claim's address is gated above on the
+/// slices alone, and the real AIRs meet the walks on the driver's fixture in
+/// item 5c.
+fn walk_airs(options: &stark::proof::options::ProofOptions) -> (WalkAir, WalkAir, WalkAir) {
+    (
+        stark::examples::multi_table_lookup::new_cpu_air_with_lookup(options),
+        stark::examples::multi_table_lookup::new_add_air_with_lookup(options),
+        stark::examples::multi_table_lookup::new_mul_air_with_lookup(options),
+    )
+}
+
+fn base_column(values: &[u64]) -> Vec<FE> {
+    values.iter().map(|v| FE::from(*v)).collect()
+}
+
+/// The example's own balancing trace: the CPU table sends each row to ADD or
+/// MUL, and the two receive exactly what was sent.
+fn walk_columns() -> [Vec<Vec<FE>>; 3] {
+    [
+        vec![
+            base_column(&[1, 0, 1, 0, 1, 1, 0, 0]),
+            base_column(&[0, 1, 0, 1, 0, 0, 1, 1]),
+            base_column(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            base_column(&[10, 20, 30, 40, 50, 60, 70, 80]),
+            base_column(&[11, 40, 33, 160, 55, 66, 490, 640]),
+        ],
+        vec![
+            base_column(&[1, 3, 5, 6]),
+            base_column(&[10, 30, 50, 60]),
+            base_column(&[11, 33, 55, 66]),
+            base_column(&[1, 1, 1, 1]),
+        ],
+        vec![
+            base_column(&[2, 4, 7, 8]),
+            base_column(&[20, 40, 70, 80]),
+            base_column(&[40, 160, 490, 640]),
+            base_column(&[1, 1, 1, 1]),
+        ],
+    ]
+}
+
+/// The chain parameters the fixture argues at — small, because the walks'
+/// claims are about order and slicing and not about the chains.
+fn walk_config() -> multilinear::whir_chain::ChainConfig {
+    multilinear::whir_chain::ChainConfig {
+        log_blowup: 2,
+        log_folding: 2,
+        num_queries: 3,
+        grind: multilinear::whir_chain::GrindBits::default(),
+    }
+}
+
+/// How the fixture's tables are grouped: the epoch's own split.
+const WALK_SIZES: [usize; 2] = [2, 1];
+
+/// One of the fixture's tables, committed at the height its trace implies.
+fn walk_table<'a>(
+    air: &'a WalkAir,
+    columns: &[Vec<FE>],
+) -> stark::multilinear_table::CommittedTable<'a, GoldilocksField, FEE3> {
+    let num_vars = columns[0].len().trailing_zeros() as usize;
+    let owned = columns.to_vec();
+    stark::multilinear_table::CommittedTable::new(
+        air.constraint_program(),
+        air.constraints_meta(),
+        air.bus_interactions(),
+        columns.len(),
+        num_vars,
+        stark::multilinear_air::Uniforms::default(),
+        |col| owned[col as usize].clone(),
+    )
+    .expect("the example table commits")
+}
+
+/// The host's own per-table pieces of `multi_verify`, taken by calling the host's
+/// own functions in the host's own order.
+struct HostWalk {
+    z: FEE,
+    alpha: FEE,
+    beta: FEE,
+    outputs: Vec<(FEE, FEE)>,
+    points: Vec<Vec<FEE>>,
+    values: Vec<FEE>,
+}
+
+/// ★ The reference the walk is gated against, and it is the HOST's.
+///
+/// This is not a second implementation of `multi_verify`: it CALLS
+/// `absorb_roots_and_challenge` and `multilinear_table::verify`, in the order
+/// and on the transcript `multi_verify` uses, and keeps what they return.
+/// Comparing the machine against a copy of the machine would be no evidence
+/// about either (instance 68), and comparing it against a re-derivation of the
+/// host's arithmetic would only say the two derivations agree.
+fn host_walk(
+    proof: &stark::multilinear_table::MultiProof<GoldilocksField, FEE3>,
+    statements: &[stark::multilinear_table::TableStatement<'_, GoldilocksField, FEE3>],
+) -> HostWalk {
+    let mut transcript = DefaultTranscript::<FEE3, RpxTranscriptHash>::new(&[]);
+    let (z, alpha, beta) =
+        stark::multilinear_table::absorb_roots_and_challenge(&mut transcript, &proof.roots, &[]);
+    let mut walk = HostWalk {
+        z,
+        alpha,
+        beta,
+        outputs: Vec::new(),
+        points: Vec::new(),
+        values: Vec::new(),
+    };
+    for (table, statement) in proof.tables.iter().zip(statements) {
+        let (output, reduced) = stark::multilinear_table::verify(
+            table,
+            *statement,
+            &z,
+            &alpha,
+            &beta,
+            &mut transcript,
+            0,
+        )
+        .expect("the host verifies its own table");
+        walk.outputs.push(output);
+        walk.points.push(reduced.point.clone());
+        walk.values.extend(reduced.column_values.iter().cloned());
+    }
+    walk
+}
+
+/// Every word the walk program hints, in the order it hints them: the carried
+/// roots first, then each table's proof, table by table.
+///
+/// ⚠ ONE ORDER, WRITTEN ONCE. The program below and this function are the two
+/// halves that have to agree, and nothing but execution catches a disagreement:
+/// a misaligned arena hands the machine somebody else's field element and the
+/// argument stops satisfying its own refusals.
+fn walk_arena(
+    proof: &stark::multilinear_table::MultiProof<GoldilocksField, FEE3>,
+    layouts: &[multilinear::stacking::StackedLayout],
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = proof.roots.iter().map(commitment_to_digest).collect();
+    for table in &proof.tables {
+        words.push(ext_word(&table.bus_output.0));
+        words.push(ext_word(&table.bus_output.1));
+        for layer in &table.gkr.layers {
+            for round in &layer.sumcheck.rounds {
+                words.extend(round.evaluations.iter().map(ext_word));
+            }
+            for value in [&layer.p_lo, &layer.p_hi, &layer.q_lo, &layer.q_hi] {
+                words.push(ext_word(value));
+            }
+        }
+        for round in &table.constraint.sumcheck.rounds {
+            words.extend(round.evaluations.iter().map(ext_word));
+        }
+        words.extend(table.constraint.factor_values.iter().map(ext_word));
+        for round in &table.constraint.reduce.sumcheck.rounds {
+            words.extend(round.evaluations.iter().map(ext_word));
+        }
+        words.extend(table.constraint.reduce.column_values.iter().map(ext_word));
+    }
+    for (group, opening) in proof.columns.iter().enumerate() {
+        let shape = ChainShape::new(config, layouts[group].n_stack());
+        for chain in &opening.polys {
+            words.push(ext_word(&chain.final_value));
+            super::whir_chain::push_round_words(&mut words, &shape, chain);
+        }
+    }
+    words
+}
+
+/// The walk program: the roots block, the shared alpha ladder, and the
+/// per-table walk, publishing every verdict the host's own pieces can be
+/// compared against.
+///
+/// ★ THE ALPHA LADDER IS EPOCH-LEVEL AND SHARED. `emit_interaction` reads
+/// `alpha_powers[i + 1]` (`whir_bus.rs:247`) and panics if the ladder is short,
+/// so ONE ladder of the longest table's length serves every table — and
+/// `table_verify_cost` does not charge it, which is why the assembled form has
+/// to name it separately.
+/// How much of the assembly a program carries, so the F1 can MEASURE each term
+/// as a controlled delta instead of subtracting one total from another.
+///
+/// ★ A subtraction attributes a gap to whatever the arithmetic is written
+/// against; a delta between two programs that differ by ONE stage attributes it
+/// to that stage. The 3-row gap this instrument was built to chase is exactly
+/// the case where the two answers differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkStage {
+    /// The roots block and the shared alpha ladder, and nothing else.
+    Spine,
+    /// Those, then the per-table walk.
+    Tables,
+    /// Those, then the commitment groups.
+    Groups,
+}
+
+fn walk_program(
+    proof: &stark::multilinear_table::MultiProof<GoldilocksField, FEE3>,
+    shapes: &[super::whir_table::TableShape<'_>],
+    slots: &[&[usize]],
+    layouts: &[multilinear::stacking::StackedLayout],
+    domains: &[multilinear::whir::Domain<GoldilocksField>],
+    config: &multilinear::whir_chain::ChainConfig,
+    sizes: &[usize],
+    stage: WalkStage,
+) -> LfmProgram {
+    let words = walk_arena(proof, layouts, config);
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(words.len() as u32);
+    let mut at = 0u32;
+    let carried: Vec<_> = proof
+        .roots
+        .iter()
+        .map(|_| {
+            let cell = b.hint_word(arena, at);
+            at += 1;
+            cell
+        })
+        .collect();
+
+    let mut transcript = WhirTranscript::new();
+    let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &[]);
+    let ladder = super::whir_poly::emit_challenge_powers(&mut b, alpha, walk_alpha_powers(shapes));
+    if stage == WalkStage::Spine {
+        b.public(z.as_cell());
+        b.public(alpha.as_cell());
+        b.public(beta.as_cell());
+        for wire in &ladder {
+            b.public(wire.as_cell());
+        }
+        let program = compile(b.finish());
+        validate(&program).expect("the spine must be admissible");
+        return program;
+    }
+
+    // Each table's proof wires, in `walk_arena`'s order.
+    let mut gkr_store: Vec<Vec<super::whir_gkr::GkrLayerWires>> = Vec::new();
+    let mut sumcheck_store: Vec<Vec<Vec<Ext>>> = Vec::new();
+    let mut factor_store: Vec<Vec<Ext>> = Vec::new();
+    let mut reduce_store: Vec<Vec<Vec<Ext>>> = Vec::new();
+    let mut column_store: Vec<Vec<Ext>> = Vec::new();
+    let mut outputs: Vec<(Ext, Ext)> = Vec::new();
+    for table in &proof.tables {
+        let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
+            (0..count)
+                .map(|_| {
+                    let wire = b.hint_word(arena, at).as_ext();
+                    at += 1;
+                    wire
+                })
+                .collect()
+        };
+        let output = take(&mut b, 2);
+        outputs.push((output[0], output[1]));
+        let mut layers = Vec::with_capacity(table.gkr.layers.len());
+        for layer in &table.gkr.layers {
+            let sumcheck: Vec<Vec<Ext>> = layer
+                .sumcheck
+                .rounds
+                .iter()
+                .map(|round| take(&mut b, round.evaluations.len()))
+                .collect();
+            let halves = take(&mut b, 4);
+            layers.push(super::whir_gkr::GkrLayerWires {
+                sumcheck,
+                p_lo: halves[0],
+                p_hi: halves[1],
+                q_lo: halves[2],
+                q_hi: halves[3],
+            });
+        }
+        gkr_store.push(layers);
+        sumcheck_store.push(
+            table
+                .constraint
+                .sumcheck
+                .rounds
+                .iter()
+                .map(|round| take(&mut b, round.evaluations.len()))
+                .collect(),
+        );
+        factor_store.push(take(&mut b, table.constraint.factor_values.len()));
+        reduce_store.push(
+            table
+                .constraint
+                .reduce
+                .sumcheck
+                .rounds
+                .iter()
+                .map(|round| take(&mut b, round.evaluations.len()))
+                .collect(),
+        );
+        column_store.push(take(&mut b, table.constraint.reduce.column_values.len()));
+    }
+
+    let wires: Vec<super::whir_table::TableProofWires<'_>> = (0..proof.tables.len())
+        .map(|i| super::whir_table::TableProofWires {
+            bus_output: outputs[i],
+            gkr: &gkr_store[i],
+            sumcheck: &sumcheck_store[i],
+            factor_values: &factor_store[i],
+            reduce: super::whir_reduce::ReduceWires {
+                sumcheck: &reduce_store[i],
+                column_values: &column_store[i],
+            },
+        })
+        .collect();
+    let plans: Vec<super::whir_epoch::PreprocessedPlan<'_>> = (0..proof.tables.len())
+        .map(|_| super::whir_epoch::PreprocessedPlan {
+            settled: 0,
+            route: super::whir_epoch::PreprocessedRoute::None,
+        })
+        .collect();
+
+    let walk = super::whir_epoch::emit_table_walk(
+        &mut b,
+        &mut transcript,
+        &wires,
+        shapes,
+        &plans,
+        slots,
+        z,
+        &ladder,
+        beta,
+    );
+
+    // ★ THE GROUPS. Each polynomial's ROOT is the cell the roots block already
+    // hinted — the same wire, not a second copy. A program that hinted it twice
+    // would let a prover absorb one root into the transcript and open the chain
+    // against another, and the honest arena would look identical; the schema
+    // assertion below is what makes that unspellable.
+    let mut storages: Vec<Vec<super::whir_chain::RoundStorage>> = Vec::new();
+    let mut finals: Vec<Vec<Ext>> = Vec::new();
+    let mut chain_shapes: Vec<ChainShape> = Vec::new();
+    for (group, opening) in proof.columns.iter().enumerate() {
+        let shape = ChainShape::new(config, layouts[group].n_stack());
+        let mut group_storage = Vec::new();
+        let mut group_finals = Vec::new();
+        for _ in &opening.polys {
+            group_finals.push(b.hint_word(arena, at).as_ext());
+            at += 1;
+            group_storage.push(super::whir_chain::RoundStorage::hint(
+                &mut b, arena, at, &shape,
+            ));
+            at += super::whir_chain::RoundStorage::words(&shape);
+        }
+        storages.push(group_storage);
+        finals.push(group_finals);
+        chain_shapes.push(shape);
+    }
+    let openings: Vec<Vec<_>> = storages
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(super::whir_chain::RoundStorage::openings)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let chain_wires: Vec<Vec<Vec<super::whir_chain::ChainRoundWires<'_>>>> = storages
+        .iter()
+        .zip(&openings)
+        .map(|(group, group_openings)| {
+            group
+                .iter()
+                .zip(group_openings)
+                .map(|(chain, (current, next))| chain.wires(current, next))
+                .collect()
+        })
+        .collect();
+    let mut root_at = 0usize;
+    let mut polys: Vec<Vec<super::whir_stacked::StackedPolyWires<'_>>> = Vec::new();
+    for (group, opening) in proof.columns.iter().enumerate() {
+        polys.push(
+            (0..opening.polys.len())
+                .map(|poly| super::whir_stacked::StackedPolyWires {
+                    rounds: &chain_wires[group][poly],
+                    root: carried[root_at + poly],
+                    final_value: finals[group][poly],
+                })
+                .collect(),
+        );
+        root_at += layouts[group].num_polys();
+    }
+    let groups: Vec<super::whir_epoch::GroupWires<'_>> = (0..proof.columns.len())
+        .map(|group| super::whir_epoch::GroupWires {
+            layout: &layouts[group],
+            polys: &polys[group],
+            shape: &chain_shapes[group],
+            domain: &domains[group],
+        })
+        .collect();
+    let gammas = if stage == WalkStage::Groups {
+        super::whir_epoch::emit_group_walk(&mut b, &mut transcript, &groups, sizes, &walk)
+    } else {
+        Vec::new()
+    };
+
+    b.public(z.as_cell());
+    b.public(alpha.as_cell());
+    b.public(beta.as_cell());
+    for gamma in &gammas {
+        b.public(gamma.as_cell());
+    }
+    for (p, q) in &walk.outputs {
+        b.public(p.as_cell());
+        b.public(q.as_cell());
+    }
+    for point in &walk.points {
+        for wire in point {
+            b.public(wire.as_cell());
+        }
+    }
+    for value in &walk.values {
+        b.public(value.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("the walk must be admissible");
+    program
+}
+
+/// The shared ladder's length: the longest bus in the walk.
+fn walk_alpha_powers(shapes: &[super::whir_table::TableShape<'_>]) -> usize {
+    shapes
+        .iter()
+        .map(|shape| super::whir_bus::alpha_powers_read(shape.bus))
+        .max()
+        .unwrap_or(1)
+}
+
+/// ★★ THE VALUE GATE ON THE PER-TABLE WALK: three tables, one transcript, and
+/// the machine's verdict is the host's verdict table by table.
+///
+/// The machine derives every challenge itself, so executing an honest proof at
+/// all is already the challenge-stream comparison — a wrong challenge anywhere
+/// leaves a refusal with no satisfying assignment. What the published values add
+/// is that the walk THREADED the sponge: table 1's challenges are a function of
+/// where table 0 left it, so a walk that entered each table fresh would still
+/// execute table 0 and diverge from table 1 onward.
+#[test]
+fn the_table_walk_computes_what_the_host_computes() {
+    let options = stark::proof::options::ProofOptions::default_test_options();
+    let (cpu, add, mul) = walk_airs(&options);
+    let columns = walk_columns();
+    let config = walk_config();
+
+    let committed = stark::multilinear_table::CommittedTables::<
+        _,
+        _,
+        multilinear::whir_hash::RpxWhir,
+    >::commit_grouped(
+        vec![
+            walk_table(&cpu, &columns[0]),
+            walk_table(&add, &columns[1]),
+            walk_table(&mul, &columns[2]),
+        ],
+        &WALK_SIZES,
+        &config,
+    )
+    .expect("the three tables commit in two groups");
+
+    let mut prover = DefaultTranscript::<FEE3, RpxTranscriptHash>::new(&[]);
+    let proof = stark::multilinear_table::multi_prove(&committed, &config, &mut prover, None)
+        .expect("the fixture proves");
+    let statements: Vec<_> = committed.tables().iter().map(|t| t.statement()).collect();
+
+    // ⚠ THE FIXTURE MUST BE A PROOF THE HOST ACCEPTS, or every reference below
+    // refers to nothing. Two groups and three tables, checked by name.
+    assert_eq!(
+        proof.columns.len(),
+        WALK_SIZES.len(),
+        "two commitment groups"
+    );
+    assert_eq!(proof.tables.len(), 3, "three tables");
+    let layouts: Vec<_> = committed
+        .groups()
+        .iter()
+        .map(|g| g.layout().clone())
+        .collect();
+    let domains: Vec<_> = committed
+        .groups()
+        .iter()
+        .map(|g| g.domain().clone())
+        .collect();
+    let mut verifier = DefaultTranscript::<FEE3, RpxTranscriptHash>::new(&[]);
+    stark::multilinear_table::multi_verify::<_, _, _, multilinear::whir_hash::RpxWhir>(
+        &proof,
+        &statements,
+        &layouts,
+        &domains,
+        committed.sizes(),
+        &FEE::zero(),
+        &config,
+        &mut verifier,
+        None,
+    )
+    .expect("the fixture must be a proof the host accepts");
+
+    let host = host_walk(&proof, &statements);
+
+    // The shapes, rebuilt from the statements the host itself verified against.
+    let buses: Vec<Vec<stark::multilinear_logup::InteractionShape<FEE3>>> = statements
+        .iter()
+        .map(|statement| {
+            let slots = statement.slot_of.to_vec();
+            stark::multilinear_logup::interaction_shapes(
+                statement.interactions,
+                statement.slot_of.len(),
+                |column| {
+                    slots
+                        .get(column)
+                        .copied()
+                        .ok_or(multilinear::Error::UnknownPolynomial {
+                            index: column,
+                            len: slots.len(),
+                        })
+                },
+            )
+            .expect("the bus probes")
+        })
+        .collect();
+    let shapes: Vec<super::whir_table::TableShape<'_>> = statements
+        .iter()
+        .zip(&buses)
+        .map(|(statement, bus)| super::whir_table::TableShape {
+            ir: statement.shape,
+            bus,
+            kinds: statement.kinds,
+            num_columns: statement.slot_of.len(),
+            num_vars: statement.num_vars,
+        })
+        .collect();
+    let slots: Vec<&[usize]> = statements.iter().map(|s| s.slot_of).collect();
+
+    let program = walk_program(
+        &proof,
+        &shapes,
+        &slots,
+        &layouts,
+        &domains,
+        &config,
+        &WALK_SIZES,
+        WalkStage::Groups,
+    );
+    let arena = walk_arena(&proof, &layouts, &config);
+    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+        .expect("the machine must execute the host's own proof");
+
+    let published: Vec<FEE> = exec
+        .public_words
+        .iter()
+        .map(|(_, word)| word_as_ext(word).expect("a published extension element"))
+        .collect();
+    let mut at = 0usize;
+    let mut next = |count: usize| -> Vec<FEE> {
+        let slice = published[at..at + count].to_vec();
+        at += count;
+        slice
+    };
+
+    let challenges = next(3);
+    assert_eq!(challenges[0], host.z, "z must be the host's");
+    assert_eq!(challenges[1], host.alpha, "alpha must be the host's");
+    assert_eq!(challenges[2], host.beta, "beta must be the host's");
+
+    // ★ THE GROUP WALK'S OWN GATE: each group's batching challenge is the one
+    // the HOST verifier sampled at that point in the stream. The offsets are
+    // derived from the structure — three challenges, then every table's draws,
+    // then per group its gamma and its chains' — and the derivation is checked
+    // against the recorder's total, so an offset that drifts fails here rather
+    // than silently comparing the wrong pair.
+    let gammas = next(proof.columns.len());
+    let recorded = recorded_draws(
+        &proof,
+        &statements,
+        &layouts,
+        &domains,
+        committed.sizes(),
+        &config,
+    );
+    let mut draw_at = 3 + recorded.table_draws;
+    for (group, gamma) in gammas.iter().enumerate() {
+        assert_eq!(
+            *gamma, recorded.sampled[draw_at],
+            "group {group}: the batching challenge must be the one the host sampled"
+        );
+        draw_at += 1 + recorded.chain_draws[group];
+    }
+    assert_eq!(
+        draw_at,
+        recorded.sampled.len(),
+        "the derived offsets must account for every extension element the host drew"
+    );
+
+    for (index, (p, q)) in host.outputs.iter().enumerate() {
+        let got = next(2);
+        assert_eq!(
+            &got[0], p,
+            "table {index}: the bus numerator must be the host's"
+        );
+        assert_eq!(
+            &got[1], q,
+            "table {index}: the bus denominator must be the host's"
+        );
+    }
+    for (index, point) in host.points.iter().enumerate() {
+        let got = next(point.len());
+        assert_eq!(
+            &got, point,
+            "table {index}: the reduced point must be the host's — this is the half that fails \
+             when the sponge is not threaded from the previous table"
+        );
+    }
+    let got = next(host.values.len());
+    assert_eq!(
+        got, host.values,
+        "every table's claimed column values must be the host's"
+    );
+    assert_eq!(at, published.len(), "every published word accounted for");
+}
+
+/// ★ F1 FOR THE PER-TABLE WALK: the emitted count is the closed form's, and the
+/// convention is named.
+///
+/// ⚠ THE CONVENTION. `table_walk_cost` is CONST-FREE in exactly the sense every
+/// other form in `whir_epoch` is: it reports operations and carries its interned
+/// words as a SET, because one epoch program has one pool and the tables'
+/// constants collide in it. So the measurement subtracts the program's constants
+/// and compares against `operations()`, and the pool is asserted separately as a
+/// count of distinct words.
+///
+/// ⚠ AND THE TWO TERMS THE WALK'S FORM DOES NOT OWN, both subtracted here with
+/// their own reasons: the ROOTS BLOCK, whose form is `roots_block_cost`, and the
+/// shared ALPHA LADDER, which `table_verify_cost` does not charge because the
+/// ladder is EPOCH-level — one ladder serves every table, so a per-table form
+/// that charged it would charge it once per table.
+#[test]
+fn the_table_walk_emits_its_closed_form() {
+    let options = stark::proof::options::ProofOptions::default_test_options();
+    let (cpu, add, mul) = walk_airs(&options);
+    let columns = walk_columns();
+    let config = walk_config();
+
+    let committed = stark::multilinear_table::CommittedTables::<
+        _,
+        _,
+        multilinear::whir_hash::RpxWhir,
+    >::commit_grouped(
+        vec![
+            walk_table(&cpu, &columns[0]),
+            walk_table(&add, &columns[1]),
+            walk_table(&mul, &columns[2]),
+        ],
+        &WALK_SIZES,
+        &config,
+    )
+    .expect("the three tables commit in two groups");
+    let mut prover = DefaultTranscript::<FEE3, RpxTranscriptHash>::new(&[]);
+    let proof = stark::multilinear_table::multi_prove(&committed, &config, &mut prover, None)
+        .expect("the fixture proves");
+    let statements: Vec<_> = committed.tables().iter().map(|t| t.statement()).collect();
+
+    let buses: Vec<Vec<stark::multilinear_logup::InteractionShape<FEE3>>> = statements
+        .iter()
+        .map(|statement| {
+            let slots = statement.slot_of.to_vec();
+            stark::multilinear_logup::interaction_shapes(
+                statement.interactions,
+                statement.slot_of.len(),
+                |column| {
+                    slots
+                        .get(column)
+                        .copied()
+                        .ok_or(multilinear::Error::UnknownPolynomial {
+                            index: column,
+                            len: slots.len(),
+                        })
+                },
+            )
+            .expect("the bus probes")
+        })
+        .collect();
+    let shapes: Vec<super::whir_table::TableShape<'_>> = statements
+        .iter()
+        .zip(&buses)
+        .map(|(statement, bus)| super::whir_table::TableShape {
+            ir: statement.shape,
+            bus,
+            kinds: statement.kinds,
+            num_columns: statement.slot_of.len(),
+            num_vars: statement.num_vars,
+        })
+        .collect();
+    let slots: Vec<&[usize]> = statements.iter().map(|s| s.slot_of).collect();
+    let plans: Vec<super::whir_epoch::PreprocessedPlan<'_>> = (0..shapes.len())
+        .map(|_| super::whir_epoch::PreprocessedPlan {
+            settled: 0,
+            route: super::whir_epoch::PreprocessedRoute::None,
+        })
+        .collect();
+
+    let layouts: Vec<_> = committed
+        .groups()
+        .iter()
+        .map(|g| g.layout().clone())
+        .collect();
+    let domains: Vec<_> = committed
+        .groups()
+        .iter()
+        .map(|g| g.domain().clone())
+        .collect();
+    let words = walk_arena(&proof, &layouts, &config);
+
+    // The predictions, each from its own landed form.
+    let (roots_leg, roots_schedule) = roots_block_cost(proof.roots.len(), 0, SpongeEntry::fresh());
+    let roots_ops = roots_leg + roots_schedule.rows();
+    let ladder = super::whir_poly::challenge_powers_rows(walk_alpha_powers(&shapes));
+    let plans: Vec<super::whir_epoch::PreprocessedPlan<'_>> = (0..shapes.len())
+        .map(|_| super::whir_epoch::PreprocessedPlan {
+            settled: 0,
+            route: super::whir_epoch::PreprocessedRoute::None,
+        })
+        .collect();
+    let walk = super::whir_epoch::table_walk_cost(&shapes, &plans, roots_schedule.entry());
+    let table_shapes: Vec<(usize, usize)> = shapes
+        .iter()
+        .map(|shape| (shape.num_columns, shape.num_vars))
+        .collect();
+    let group_costs = epoch_group_costs(&table_shapes, &WALK_SIZES, &layouts, &config, walk.entry);
+    let group_ops: usize = group_costs.iter().map(|cost| cost.operations()).sum();
+    let group_perms: usize = group_costs.iter().map(|cost| cost.perms()).sum();
+    let predicted_perms = roots_schedule.perms() + walk.perms + group_perms;
+
+    let stages = [WalkStage::Spine, WalkStage::Tables, WalkStage::Groups];
+    let mut measured = Vec::new();
+    let mut perms = Vec::new();
+    for stage in stages {
+        let program = walk_program(
+            &proof,
+            &shapes,
+            &slots,
+            &layouts,
+            &domains,
+            &config,
+            &WALK_SIZES,
+            stage,
+        );
+        let hints = super::whir_chain_tests::hint_rows(&program);
+        // ⚠ The spine stops before the tables, so it hints the ROOTS alone; the
+        // two full stages hint every word the filler writes. Each stage's own
+        // hints are subtracted from its own count, so the deltas below stay
+        // honest either way — what this asserts is that no stage hints a word
+        // TWICE, which is what refuses a second copy of a commitment root: the
+        // chains open against the very cells the roots block absorbed, and a
+        // program that hinted them again would hint more words than the filler
+        // writes while looking identical to every value gate.
+        let expected_hints = if stage == WalkStage::Spine {
+            proof.roots.len()
+        } else {
+            words.len()
+        };
+        assert_eq!(
+            hints, expected_hints,
+            "every word this stage reads is hinted exactly once"
+        );
+        assert_eq!(
+            program.arena_schema.lens,
+            vec![words.len() as u32],
+            "one arena, of exactly the words the filler writes"
+        );
+        let consts = const_rows(&program);
+        measured.push(program.instrs.len() - consts - hints - program.public_len as usize);
+        perms.push(super::whir_chain_tests::perm_rows(&program));
+    }
+
+    let spine = measured[0];
+    let table_walk = measured[1] - measured[0];
+    let group_walk = measured[2] - measured[1];
+    println!(
+        "the two walks, by stage: spine {spine} emitted / {} predicted ({roots_ops} roots block \
+         + {ladder} alpha ladder); table walk {table_walk} / {}; groups {group_walk} / \
+         {group_ops}; permutations {} / {predicted_perms}",
+        roots_ops + ladder,
+        walk.operations(),
+        perms[2],
+    );
+
+    // ★ EACH TERM AGAINST ITS OWN STAGE, so a gap names the leg it belongs to
+    // rather than landing on whichever term the arithmetic was written against.
+    assert_eq!(
+        spine,
+        roots_ops + ladder,
+        "the spine: the roots block and the shared alpha ladder"
+    );
+    assert_eq!(
+        table_walk,
+        walk.operations(),
+        "the per-table walk, as the delta between the two programs that differ by it"
+    );
+    assert_eq!(
+        group_walk, group_ops,
+        "the commitment groups, as the delta between the two programs that differ by them"
+    );
+    assert_eq!(
+        perms[2], predicted_perms,
+        "permutations: the roots block's sponge, every table's, and every chain's"
+    );
+}
+
+/// What the HOST drew over a whole `multi_verify`, and how those draws split.
+struct RecordedDraws {
+    /// Every extension element the host sampled, in order.
+    sampled: Vec<FEE>,
+    /// Draws the TABLE phase made, after the roots block's three.
+    table_draws: usize,
+    /// Draws each group's chains made, after that group's batching challenge.
+    chain_draws: Vec<usize>,
+}
+
+/// ★ The host's draw stream, recorded — and split by a derivation the total
+/// then checks.
+///
+/// `table_draws` is MEASURED, by recording a second run that stops where the
+/// table phase does; `chain_draws` is DERIVED from the chain structure, the same
+/// expression `whir_stacked_tests` asserts against its own recorder. Neither is
+/// read off the full stream by eye, and the caller asserts that the two together
+/// account for every element — so an offset that drifts fails instead of
+/// comparing the wrong pair (instance 68's shape, applied to an index).
+fn recorded_draws(
+    proof: &stark::multilinear_table::MultiProof<GoldilocksField, FEE3>,
+    statements: &[stark::multilinear_table::TableStatement<'_, GoldilocksField, FEE3>],
+    layouts: &[multilinear::stacking::StackedLayout],
+    domains: &[multilinear::whir::Domain<GoldilocksField>],
+    sizes: &[usize],
+    config: &multilinear::whir_chain::ChainConfig,
+) -> RecordedDraws {
+    // The table phase alone, on its own recorder.
+    let mut tables_only = super::whir_chain_tests::Recording::new();
+    let (z, alpha, beta) =
+        stark::multilinear_table::absorb_roots_and_challenge(&mut tables_only, &proof.roots, &[]);
+    for (table, statement) in proof.tables.iter().zip(statements) {
+        stark::multilinear_table::verify(table, *statement, &z, &alpha, &beta, &mut tables_only, 0)
+            .expect("the host verifies its own table");
+    }
+    let table_draws = tables_only.sampled.len() - 3;
+
+    // The whole verify, so the groups' own draws are in the same stream.
+    let mut whole = super::whir_chain_tests::Recording::new();
+    stark::multilinear_table::multi_verify::<_, _, _, multilinear::whir_hash::RpxWhir>(
+        proof,
+        statements,
+        layouts,
+        domains,
+        sizes,
+        &FEE::zero(),
+        config,
+        &mut whole,
+        None,
+    )
+    .expect("the host accepts its own proof");
+
+    let chain_draws = layouts
+        .iter()
+        .map(|layout| {
+            let shape = ChainShape::new(config, layout.n_stack());
+            layout.num_polys() * (shape.num_vars + 2 * (shape.rounds() - 1))
+        })
+        .collect();
+
+    RecordedDraws {
+        sampled: whole.sampled,
+        table_draws,
+        chain_draws,
     }
 }
