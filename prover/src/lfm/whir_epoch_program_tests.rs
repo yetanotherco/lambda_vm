@@ -642,7 +642,7 @@ fn the_closure_is_the_hosts_commit_bus_offset() {
     for (name, published, start_index) in closure_fixtures() {
         let host = crate::compute_commit_bus_offset(&published, start_index, &z, &alpha)
             .expect("the host's offset exists at these challenges");
-        let outputs = balancing_outputs(34, host, 0xC10_5u64);
+        let outputs = balancing_outputs(34, host, 0xC105_u64);
         let (drawn, _, _) = machine_closure(&outputs, &published, start_index, z, alpha, true);
         let drawn = drawn
             .unwrap_or_else(|| panic!("{name}: the machine must execute a balance that closes"));
@@ -668,7 +668,7 @@ fn a_balance_that_does_not_close_is_refused() {
     let alpha = FEE::from(0xbeef_5678u64);
     let published = vec![1u8, 2, 3, 250, 0, 9, 9, 7];
     let host = crate::compute_commit_bus_offset(&published, 0, &z, &alpha).expect("an offset");
-    let mut outputs = balancing_outputs(34, host, 0xC10_5u64);
+    let mut outputs = balancing_outputs(34, host, 0xC105_u64);
     // The control first: the honest arm executes, so a refusal below is the
     // tamper and not a leg that refuses everything.
     assert!(
@@ -694,7 +694,7 @@ fn the_closure_emits_its_closed_form() {
     for (name, published, start_index) in closure_fixtures() {
         let host = crate::compute_commit_bus_offset(&published, start_index, &z, &alpha)
             .expect("an offset");
-        let outputs = balancing_outputs(34, host, 0xC10_5u64);
+        let outputs = balancing_outputs(34, host, 0xC105_u64);
         let (_, with_rows, with_consts) =
             machine_closure(&outputs, &published, start_index, z, alpha, true);
         let (_, without_rows, without_consts) =
