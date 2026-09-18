@@ -248,6 +248,99 @@ fn a_restated_register_fini_is_refused_by_the_epoch_that_states_it() {
     );
 }
 
+/// ★★ THE HASH AGREEMENT IS CRYPTOGRAPHIC, AND HERE IS THE MEASUREMENT.
+///
+/// Level 0's driver cannot refuse a bundle by reading a label: a WHIR proof's
+/// bytes are hash-agnostic by design — both arms serialise to the same 6904
+/// bytes, which is the byte gate's own invariant — and `whir_hash_knob` is a
+/// cached process setting that says what THIS process proves under, not what a
+/// bundle was proven under. So the refusal the design settles on is the
+/// verification itself: hand the epoch to a verifier configured with a hash,
+/// and a bundle proven under another one fails because the transcript's sponge
+/// is part of the configuration and every challenge diverges.
+///
+/// ⚠ THAT WAS A DESIGN CLAIM UNTIL SOMETHING RAN IT, and the driver that will
+/// depend on it lives on another branch. The claim itself does not: `prove_epoch`
+/// and `verify_epoch_bookend` both take `H` here, so it is measurable today,
+/// and measuring it now means the seam arrives with its premise already checked
+/// rather than assumed.
+///
+/// ⚠ BOTH HALVES, because a verifier that refused everything would pass the
+/// refusing one alone. The same epoch is verified under the hash it was proven
+/// with and must be ACCEPTED — and the refusal is a bare `None`, so the control
+/// is what makes it mean anything (`verify_epoch_bookend` collapses every
+/// failure to `Ok(None)`).
+#[test]
+fn an_epoch_proven_under_one_hash_is_refused_under_the_other() {
+    use multilinear::whir_hash::{KeccakWhir, RpxWhir};
+
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let opts = ProofOptions::default_test_options();
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let entry = register::register_init_from_entry_point(elf.entry_point);
+
+    let keccak = multilinear_continuation::decode_prepared_for::<KeccakWhir>(&elf, &elf_bytes)
+        .expect("DECODE's commitment under keccak");
+    let rpx = multilinear_continuation::decode_prepared_for::<RpxWhir>(&elf, &elf_bytes)
+        .expect("DECODE's commitment under rpx");
+
+    // Epoch 0 only: the carry is not what this is about, and one epoch is one
+    // prove. `is_final` and `label` travel with it, because a verifier that
+    // disagreed about either would refuse for a reason that is not the hash.
+    let mut first: Option<(multilinear_continuation::EpochProof, bool, u64)> = None;
+    continuation::for_each_epoch(&elf, &[], 2, &artifacts, |prepared, _| {
+        if first.is_none() {
+            let PreparedEpoch {
+                register_init,
+                label,
+                traces,
+                boundary,
+                is_final,
+                ..
+            } = prepared;
+            let proof = multilinear_continuation::prove_epoch::<KeccakWhir>(
+                &elf,
+                &elf_bytes,
+                &register_init,
+                label,
+                traces,
+                is_final,
+                &boundary,
+                &opts,
+                None,
+                &keccak,
+            )?;
+            first = Some((proof, is_final, label));
+        }
+        Ok(())
+    })
+    .expect("prove epoch 0 under keccak");
+
+    let (epoch, is_final, label) = first.expect("the program has at least one epoch");
+
+    assert!(
+        multilinear_continuation::verify_epoch_bookend::<KeccakWhir>(
+            &elf, &elf_bytes, &epoch, &entry, is_final, label, &opts, &keccak,
+        )
+        .expect("verify")
+        .is_some(),
+        "the control: an epoch proven under keccak must verify under keccak, or \
+         the refusal below says nothing"
+    );
+
+    assert!(
+        multilinear_continuation::verify_epoch_bookend::<RpxWhir>(
+            &elf, &elf_bytes, &epoch, &entry, is_final, label, &opts, &rpx,
+        )
+        .expect("verify")
+        .is_none(),
+        "an epoch proven under keccak was ACCEPTED by a verifier configured with \
+         RPX; the level-0 driver's whole hash agreement rests on that being \
+         impossible"
+    );
+}
+
 /// **The binding.** An epoch commits its local-to-global bookend on its own and
 /// the cross-epoch proof commits the same table: the two roots have to match,
 /// or nothing says they are the same table.

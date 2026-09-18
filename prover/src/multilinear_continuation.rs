@@ -1274,8 +1274,16 @@ pub fn verify_epoch(
 /// [`verify_epoch`], handing back the roots the epoch's bookend was committed
 /// under — which is what the binding compares. `None` is a proof that does not
 /// verify.
+///
+/// ★ `pub(crate)` because this is the ONLY verify entry point that takes its
+/// hash as a parameter. [`verify_epoch`] chooses `H` from the cached process
+/// knob, so from outside this module one process can verify under exactly one
+/// hash — and the level-0 driver's refusal is precisely the claim that a bundle
+/// proven under keccak fails under RPX, which cannot be tested through a
+/// function that will not be told which to use. See
+/// `multilinear_continuation_tests::an_epoch_proven_under_one_hash_is_refused_under_the_other`.
 #[allow(clippy::too_many_arguments)]
-fn verify_epoch_bookend<H>(
+pub(crate) fn verify_epoch_bookend<H>(
     elf: &Elf,
     elf_bytes: &[u8],
     epoch: &EpochProof,
