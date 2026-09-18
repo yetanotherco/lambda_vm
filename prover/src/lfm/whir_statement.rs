@@ -198,6 +198,14 @@ impl StatementCost {
 /// (`whir_transcript::pack_const_bytes`), keyed the way the builder's pool keys
 /// them — so a group that repeats, and the zero group that most statements are
 /// full of, costs one row between them all.
+///
+/// ⚠ **A NON-MUTATION, recorded rather than deleted (instance 52).** Dropping
+/// the `resize` below — counting the groups of the UNPADDED stream — passes
+/// every gate, and it is a rewrite and not a fudge: the pad is zeros and the
+/// packer zero-extends a trailing partial group on the low side, so the last
+/// group is the same word either way. The pad changes the FELT COUNT, which
+/// `felts` carries and a mutation of it does fail, and it changes no constant at
+/// all. Kept explicit so the next reader does not spend a run discovering it.
 pub fn statement_cost(bytes: &[u8]) -> StatementCost {
     let len = bytes.len();
     let pad = statement_padding(len);
