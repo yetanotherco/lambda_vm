@@ -613,7 +613,12 @@ pub fn contribution<E: IsField>(
 
 /// The factor slots: the trace's factors, then `eq(r, ·)` for the zerocheck and
 /// `eq(row, ·)` for the bus's two claims.
-fn weights(num_trace_factors: usize) -> (usize, usize) {
+///
+/// Public because a verifier written OUTSIDE this crate — the WHIR recursion's
+/// in-guest one — has to index the same two slots, and a second spelling of a
+/// convention both sides must agree on is exactly the kind of drift nothing
+/// would catch.
+pub fn weight_slots(num_trace_factors: usize) -> (usize, usize) {
     (num_trace_factors, num_trace_factors + 1)
 }
 
@@ -676,7 +681,7 @@ where
         .map(|_| transcript.sample_field_element())
         .collect();
 
-    let (weight_r, weight_z) = weights(table.kinds().len());
+    let (weight_r, weight_z) = weight_slots(table.kinds().len());
     let bus = logup::claim_statements(&interactions, &gkr_out.claim.point, num_vars, weight_z)?;
 
     let shape = table.shape();
@@ -752,7 +757,7 @@ where
         .map(|_| transcript.sample_field_element())
         .collect();
 
-    let (weight_r, weight_z) = weights(statement.kinds.len());
+    let (weight_r, weight_z) = weight_slots(statement.kinds.len());
     let bus = logup::claim_statements(&interactions, &gkr_claim.point, num_vars, weight_z)?;
     let row_point = bus.row_point.clone();
 

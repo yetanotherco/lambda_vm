@@ -204,3 +204,452 @@ fn the_selectors_share_one_interned_constant() {
         - selectors.len() * PUBLISH_ROW;
     assert_eq!(measured, pool.rows(), "the pooled form is the emitted set");
 }
+
+// ---------------------------------------------------------------------------
+// The assembly, against a REAL per-table proof.
+// ---------------------------------------------------------------------------
+
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
+use multilinear::claim_reduce::FactorSource;
+use multilinear::constraint_argument::FactorKind;
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+    NullBoundaryConstraintBuilder, Packing,
+};
+use stark::multilinear_air::{IrShape, Uniforms};
+use stark::multilinear_logup::{InteractionShape, interaction_shapes};
+use stark::multilinear_table::{CommittedTable, TableProof, weight_slots};
+use stark::traits::AIR;
+
+use super::whir_bus::alpha_powers_read;
+use super::whir_gkr::GkrLayerWires;
+use super::whir_reduce::ReduceWires;
+use super::whir_table::{
+    TableCost, TableProofWires, TableShape, emit_table_verify, table_verify_cost,
+};
+use super::whir_transcript::{SpongeEntry, WhirTranscript};
+
+type F = crate::tables::types::GoldilocksField;
+type E = crate::tables::types::GoldilocksExtension;
+type HostTranscript = DefaultTranscript<E, RpxTranscriptHash>;
+
+/// The table under gate: three constraint roots, one of them carrying a
+/// selector, over a trace that SATISFIES them.
+///
+/// ⚠ A test constraint set, said so. What makes it worth gating against is that
+/// it goes through the same `AirWithBuses` + `TableLayout` pipeline a VM table
+/// does, so its `IrShape`, its factor kinds and its public selector are built
+/// by the production compiler — and unlike 2c's shape this one is SATISFIABLE,
+/// which is what lets a real `multilinear_table::prove` run over it.
+///
+/// - `c = a·b` and `d = a + b` apply on every row;
+/// - `next(a) = a + 1` cannot apply on the last, so it carries
+///   `except_last(1)` — and that selector is what puts a PUBLIC FACTOR in the
+///   woven factor vector, which is how the assembly's gate reaches the selector
+///   leg as well as its own.
+struct ThreeRootsOneSelector;
+
+const COLUMNS: usize = 4;
+
+impl ConstraintSet<F, E> for ThreeRootsOneSelector {
+    fn max_degree(&self) -> usize {
+        2
+    }
+
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let a = b.main(0, 0);
+        let y = b.main(0, 1);
+        let c = b.main(0, 2);
+        b.emit_base(0, a * y - c);
+
+        let a = b.main(0, 0);
+        let y = b.main(0, 1);
+        let d = b.main(0, 3);
+        b.emit_base(1, a + y - d);
+
+        let one = b.one();
+        let next = b.main(1, 0);
+        let here = b.main(0, 0);
+        b.emit_base_rows(2, RowDomain::except_last(1), next - here - one);
+    }
+}
+
+/// Two interactions over the same four columns: a real bus, and one the layout
+/// will not refuse.
+fn buses() -> Vec<BusInteraction> {
+    vec![
+        BusInteraction::sender(
+            0u64,
+            Multiplicity::Column(1),
+            Packing::Direct.columns(&[0, 2]),
+        ),
+        BusInteraction::receiver(
+            0u64,
+            Multiplicity::Column(1),
+            Packing::Direct.columns(&[0, 3]),
+        ),
+    ]
+}
+
+/// The trace the constraints hold on: `a` counts, `b` is fixed, `c = a·b`,
+/// `d = a + b`.
+fn columns(num_vars: usize) -> Vec<Vec<FE>> {
+    let rows = 1usize << num_vars;
+    let b = 7u64;
+    vec![
+        (0..rows).map(|i| FE::from(i as u64)).collect(),
+        (0..rows).map(|_| FE::from(b)).collect(),
+        (0..rows).map(|i| FE::from(i as u64 * b)).collect(),
+        (0..rows).map(|i| FE::from(i as u64 + b)).collect(),
+    ]
+}
+
+fn air() -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), ThreeRootsOneSelector> {
+    AirWithBuses::new(
+        COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: buses(),
+        },
+        &table_options(),
+        1,
+        ThreeRootsOneSelector,
+    )
+}
+
+fn table_options() -> stark::proof::options::ProofOptions {
+    stark::proof::options::GoldilocksCubicProofOptions::with_params(4, 128, 20)
+        .expect("valid options")
+}
+
+/// The LogUp challenges and the zerocheck's batching challenge, as the epoch
+/// would have drawn them.
+fn table_challenges() -> (FEE, FEE, FEE) {
+    let drawn = pseudo(0x7AB1E, 3);
+    (drawn[0], drawn[1], drawn[2])
+}
+
+/// A real per-table proof. `multilinear_table::prove` reads no commitment root
+/// (`multilinear_table.rs:630-700`), so this needs no WHIR commitment and no
+/// guest ELF.
+fn real_proof(
+    air: &AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), ThreeRootsOneSelector>,
+    num_vars: usize,
+) -> (TableProof<E>, Vec<FE>, Vec<Vec<FE>>) {
+    let cols = columns(num_vars);
+    let lifted = cols.clone();
+    let table = CommittedTable::<F, E>::new(
+        air.constraint_program(),
+        air.constraints_meta(),
+        air.bus_interactions(),
+        COLUMNS,
+        num_vars,
+        Uniforms::default(),
+        move |col| lifted[col as usize].clone(),
+    )
+    .expect("the table lays out");
+
+    let (z, alpha, beta) = table_challenges();
+    let mut prover = HostTranscript::new(&[]);
+    let (proof, _point) = stark::multilinear_table::prove(&table, &z, &alpha, &beta, &mut prover)
+        .expect("the table proves");
+    (proof, Vec::new(), cols)
+}
+
+/// The bus, with the challenges factored out, and the layout it came from.
+fn shape_of(
+    air: &AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), ThreeRootsOneSelector>,
+    num_vars: usize,
+) -> (
+    stark::multilinear_table::TableLayout<'_, F, E>,
+    Vec<InteractionShape<E>>,
+) {
+    let layout = stark::multilinear_table::TableLayout::<F, E>::new(
+        air.constraint_program(),
+        air.constraints_meta(),
+        air.bus_interactions(),
+        COLUMNS,
+        num_vars,
+        Uniforms::default(),
+    )
+    .expect("the table lays out");
+    let slots = layout.slot_of().to_vec();
+    let bus = interaction_shapes(air.bus_interactions(), COLUMNS, |column| {
+        slots
+            .get(column)
+            .copied()
+            .ok_or(multilinear::Error::UnknownPolynomial {
+                index: column,
+                len: slots.len(),
+            })
+    })
+    .expect("the bus probes");
+    (layout, bus)
+}
+
+/// The alpha ladder the emitter reads.
+fn alpha_ladder(bus: &[InteractionShape<E>], alpha: FEE) -> Vec<FEE> {
+    let mut powers = Vec::with_capacity(alpha_powers_read(bus));
+    let mut power = FEE::one();
+    for _ in 0..alpha_powers_read(bus) {
+        powers.push(power);
+        power *= alpha;
+    }
+    powers
+}
+
+/// Every value the program hints, in arena order.
+fn flatten(proof: &TableProof<E>, z: FEE, alpha_powers: &[FEE], beta: FEE) -> Vec<FEE> {
+    let mut values = vec![z];
+    values.extend_from_slice(alpha_powers);
+    values.push(beta);
+    values.push(proof.bus_output.0);
+    values.push(proof.bus_output.1);
+    for layer in &proof.gkr.layers {
+        for round in &layer.sumcheck.rounds {
+            values.extend(round.evaluations.iter().copied());
+        }
+        values.extend([layer.p_lo, layer.p_hi, layer.q_lo, layer.q_hi]);
+    }
+    for round in &proof.constraint.sumcheck.rounds {
+        values.extend(round.evaluations.iter().copied());
+    }
+    values.extend(proof.constraint.factor_values.iter().copied());
+    for round in &proof.constraint.reduce.sumcheck.rounds {
+        values.extend(round.evaluations.iter().copied());
+    }
+    values.extend(proof.constraint.reduce.column_values.iter().copied());
+    values
+}
+
+/// The assembled program, or — with `leg` false — the same hinted arena with no
+/// leg at all, so the difference is the leg.
+fn table_program(
+    proof: &TableProof<E>,
+    shape: &TableShape<'_>,
+    alpha_count: usize,
+    total: usize,
+    leg: bool,
+) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(total as u32);
+    let mut index = 0u32;
+    let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<super::builder::Ext> {
+        (0..count)
+            .map(|_| {
+                let wire = b.hint_word(arena, index).as_ext();
+                index += 1;
+                wire
+            })
+            .collect()
+    };
+
+    let z = take(&mut b, 1)[0];
+    let alpha_powers = take(&mut b, alpha_count);
+    let beta = take(&mut b, 1)[0];
+    let output = take(&mut b, 2);
+    let mut gkr = Vec::with_capacity(proof.gkr.layers.len());
+    for layer in &proof.gkr.layers {
+        let sumcheck: Vec<Vec<_>> = layer
+            .sumcheck
+            .rounds
+            .iter()
+            .map(|round| take(&mut b, round.evaluations.len()))
+            .collect();
+        let halves = take(&mut b, 4);
+        gkr.push(GkrLayerWires {
+            sumcheck,
+            p_lo: halves[0],
+            p_hi: halves[1],
+            q_lo: halves[2],
+            q_hi: halves[3],
+        });
+    }
+    let sumcheck: Vec<Vec<_>> = proof
+        .constraint
+        .sumcheck
+        .rounds
+        .iter()
+        .map(|round| take(&mut b, round.evaluations.len()))
+        .collect();
+    let factor_values = take(&mut b, proof.constraint.factor_values.len());
+    let reduce_sumcheck: Vec<Vec<_>> = proof
+        .constraint
+        .reduce
+        .sumcheck
+        .rounds
+        .iter()
+        .map(|round| take(&mut b, round.evaluations.len()))
+        .collect();
+    let column_values = take(&mut b, proof.constraint.reduce.column_values.len());
+
+    if !leg {
+        b.public(z.as_cell());
+        b.public(beta.as_cell());
+        return compile(b.finish());
+    }
+
+    let mut transcript = WhirTranscript::new();
+    let verdict = emit_table_verify(
+        &mut b,
+        &mut transcript,
+        &TableProofWires {
+            bus_output: (output[0], output[1]),
+            gkr: &gkr,
+            sumcheck: &sumcheck,
+            factor_values: &factor_values,
+            reduce: ReduceWires {
+                sumcheck: &reduce_sumcheck,
+                column_values: &column_values,
+            },
+        },
+        shape,
+        z,
+        &alpha_powers,
+        beta,
+    );
+    b.public(verdict.bus_output.0.as_cell());
+    b.public(verdict.bus_output.1.as_cell());
+    for wire in &verdict.point {
+        b.public(wire.as_cell());
+    }
+    for wire in &verdict.column_values {
+        b.public(wire.as_cell());
+    }
+    compile(b.finish())
+}
+
+/// ★ G1 — the assembled per-table verify computes what the host computes.
+///
+/// The machine derives every challenge itself, so executing an honest proof IS
+/// the challenge-stream comparison: a wrong challenge anywhere leaves one of
+/// three refusals the machine cannot satisfy. The verdict compared against the
+/// host's is the value gate on top of that.
+#[test]
+fn the_table_verify_computes_what_the_host_computes() {
+    for num_vars in [3usize, 4] {
+        let built = air();
+        let (proof, _, _) = real_proof(&built, num_vars);
+        let (layout, bus) = shape_of(&built, num_vars);
+        let (z, alpha, beta) = table_challenges();
+
+        let mut verifier = HostTranscript::new(&[]);
+        let (bus_output, reduced) = stark::multilinear_table::verify(
+            &proof,
+            layout.statement(),
+            &z,
+            &alpha,
+            &beta,
+            &mut verifier,
+        )
+        .expect("the host must verify its own proof — the fixture is the precondition");
+
+        let shape = TableShape {
+            ir: layout.shape(),
+            bus: &bus,
+            kinds: layout.kinds(),
+            num_columns: layout.num_columns(),
+            num_vars,
+        };
+        let alpha_powers = alpha_ladder(&bus, alpha);
+        let values = flatten(&proof, z, &alpha_powers, beta);
+        let program = table_program(&proof, &shape, alpha_powers.len(), values.len(), true);
+        validate(&program).expect("the table leg must be admissible");
+
+        let exec = execute(&program, &words(&values), &crate::hash_pin::BLOCK_HASHER)
+            .unwrap_or_else(|e| panic!("num_vars {num_vars}: the table leg must execute: {e:?}"));
+        let got: Vec<FEE> = exec
+            .public_words
+            .iter()
+            .map(|(_, word)| word_as_ext(word).expect("a published extension value"))
+            .collect();
+
+        assert_eq!(got[0], bus_output.0, "num_vars {num_vars}: bus output p");
+        assert_eq!(got[1], bus_output.1, "num_vars {num_vars}: bus output q");
+        assert_eq!(
+            &got[2..2 + num_vars],
+            reduced.point.as_slice(),
+            "num_vars {num_vars}: the reduced point"
+        );
+        assert_eq!(
+            &got[2 + num_vars..],
+            reduced.column_values.as_slice(),
+            "num_vars {num_vars}: the column values"
+        );
+        println!(
+            "table verify num_vars={num_vars}: {} GKR layers, degree {}, {} factors, \
+             {} columns, {} public selectors",
+            proof.gkr.layers.len(),
+            shape.sumcheck_degree(),
+            layout.kinds().len(),
+            layout.num_columns(),
+            layout.shape().public_selectors().len()
+        );
+    }
+}
+
+/// ★ G2 — F1 for the whole table: its marginal rows and its permutations.
+#[test]
+fn the_table_verify_emits_its_closed_form() {
+    for num_vars in [3usize, 4] {
+        let built = air();
+        let (proof, _, _) = real_proof(&built, num_vars);
+        let (layout, bus) = shape_of(&built, num_vars);
+        let (z, alpha, beta) = table_challenges();
+        let shape = TableShape {
+            ir: layout.shape(),
+            bus: &bus,
+            kinds: layout.kinds(),
+            num_columns: layout.num_columns(),
+            num_vars,
+        };
+        let alpha_powers = alpha_ladder(&bus, alpha);
+        let values = flatten(&proof, z, &alpha_powers, beta);
+        let with = table_program(&proof, &shape, alpha_powers.len(), values.len(), true);
+        let without = table_program(&proof, &shape, alpha_powers.len(), values.len(), false);
+        // The leg publishes the whole verdict; the bare program publishes two.
+        let published = 2 + num_vars + layout.num_columns();
+        let measured = with.instrs.len() - without.instrs.len() - (published - 2) * PUBLISH_ROW;
+
+        let cost: TableCost = table_verify_cost(&shape, SpongeEntry::fresh());
+        let consts = |p: &LfmProgram| {
+            p.instrs
+                .iter()
+                .filter(|i| matches!(i, super::instr::Instr::Const { .. }))
+                .count()
+        };
+        let measured_consts = consts(&with) - consts(&without);
+        {
+            // Diagnostic: which VALUES the program interns that the form does
+            // not name. A residual here is a leg whose own constants are not in
+            // the pool, and naming it is the point.
+            let predicted = cost.leg.constant_values();
+            let mut unnamed: Vec<LfmWord> = Vec::new();
+            for instr in &with.instrs {
+                if let super::instr::Instr::Const { value, .. } = instr
+                    && !predicted.contains(value)
+                    && !unnamed.contains(value)
+                {
+                    unnamed.push(*value);
+                }
+            }
+            assert!(
+                unnamed.is_empty(),
+                "the form must NAME every constant the program interns, and it does not name {:?}",
+                unnamed
+            );
+        }
+        println!(
+            "table num_vars={num_vars}: {measured} rows emitted ({} of them LFM_CONST), \
+             {} predicted ({} leg ops + {} constants + {} sponge rows, {} permutations)",
+            measured_consts,
+            cost.rows(),
+            cost.leg.operations(),
+            cost.leg.constants(),
+            cost.schedule.rows(),
+            cost.perms()
+        );
+        assert_eq!(measured, cost.rows(), "num_vars {num_vars}");
+    }
+}

@@ -67,6 +67,7 @@ use stark::multilinear_logup::InteractionShape;
 use crate::tables::types::{FEE, GoldilocksExtension};
 
 use super::builder::{Ext, LfmBuilder};
+use super::word::{LfmWord, ext_word};
 
 type Aff = Affine<GoldilocksExtension>;
 type Shape = InteractionShape<GoldilocksExtension>;
@@ -85,7 +86,11 @@ type Shape = InteractionShape<GoldilocksExtension>;
 #[derive(Default, Debug, Clone)]
 pub struct Cost {
     operations: usize,
-    constants: Vec<FEE>,
+    /// The interned values as WORDS, not field elements: the pool is keyed on
+    /// the canonical word (`builder.rs:180-190`), and not every constant a leg
+    /// interns is an extension element — the sponge's leaf capacity is a
+    /// four-lane digest and shares the same pool.
+    constants: Vec<LfmWord>,
 }
 
 impl Cost {
@@ -101,9 +106,30 @@ impl Cost {
 
     /// One `LFM_CONST` row, unless this value is already interned.
     pub fn constant(&mut self, value: FEE) {
-        if !self.constants.contains(&value) {
-            self.constants.push(value);
+        self.constant_word(ext_word(&value));
+    }
+
+    /// The same for a constant that is a whole word — a digest, or the sponge's
+    /// leaf capacity.
+    pub fn constant_word(&mut self, word: LfmWord) {
+        if !self.constants.contains(&word) {
+            self.constants.push(word);
         }
+    }
+
+    /// Another leg's cost folded in, with the constant pools UNIONED rather
+    /// than added — which is the whole reason this is a type and not a number.
+    pub fn merge(&mut self, other: &Cost) {
+        self.operations += other.operations;
+        for value in &other.constants {
+            self.constant_word(*value);
+        }
+    }
+
+    /// The distinct words interned, for a caller that has to union them with
+    /// its own.
+    pub fn constant_values(&self) -> &[LfmWord] {
+        &self.constants
     }
 
     /// The instructions the leg emits.
