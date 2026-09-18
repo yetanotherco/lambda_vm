@@ -488,3 +488,138 @@ fn the_derived_root_is_absorbed_after_the_carried_ones() {
          position and this test's premise is wrong"
     );
 }
+
+// -------------------------------------------------------------------------
+// Window alignment
+// -------------------------------------------------------------------------
+
+/// ★★ A ZERO IS ONLY A MEASUREMENT IF SOMETHING CAN MAKE IT NON-ZERO.
+///
+/// `transcript_misaligned_absorbs_after_statement` is expected to read 0 over a
+/// real proof, which is exactly the shape of a counter nobody bumps. So this
+/// drives a transcript to a KNOWN misalignment and requires a non-zero count.
+///
+/// The fixture is not invented: 13 seed bytes then a 32-byte root is the WHIR
+/// byte gate's own first window, and its header already records that window as
+/// NOT aligned and warns against quoting it as a witness that a real proof's
+/// is. Here that same stream is the positive control.
+///
+/// The count is an EQUALITY rather than `> 0`, so a counter that fired on every
+/// absorb rather than on the misaligned ones fails too: of the three absorbs
+/// below, the seed opens the window at 0 and is aligned, and the two roots
+/// after it start at 13 and 45 and are not.
+#[test]
+fn a_window_that_opens_off_a_boundary_is_counted() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(b"whir-identity");
+    // The counter reports what happens AFTER a statement, so a fixture with no
+    // statement has to say where one ended. The 13 seed bytes are already
+    // absorbed, and the mark does not move the window, so the two roots are
+    // still the misaligned pair this test is about.
+    t.mark_statement_end();
+    t.append_bytes(&[7u8; 32]);
+    t.append_bytes(&[9u8; 32]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_absorbs, 3,
+        "the seed absorbs once, then two roots"
+    );
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 2,
+        "13 seed bytes leave the window at 13, so both roots start off a field \
+         element boundary; only the seed itself, at offset 0, is aligned"
+    );
+}
+
+/// ★★ THE MARK DOES NOT FORGIVE A BAD PAD, which is the line between a sharper
+/// counter and a switched-off one.
+///
+/// `mark_statement_end` could have reset the window to zero, and then the first
+/// absorb after any statement would be aligned BY CONSTRUCTION — including when
+/// the padding is broken, which is the one case the counter exists for. It sets
+/// a flag and leaves the offset alone, so a statement that ended at 3 mod 8 is
+/// reported.
+#[test]
+fn a_statement_that_ends_off_a_boundary_is_still_counted() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(&[]);
+    // A "statement" that forgot its pad: three bytes, and the window is at 3.
+    t.append_bytes(&[1u8; 3]);
+    t.mark_statement_end();
+    t.append_bytes(&[2u8; 32]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 1,
+        "the statement ended at 3 mod 8 and the absorb after it straddles two \
+         field elements; a mark that zeroed the window would report none"
+    );
+}
+
+/// ★★ ...and a stream that IS aligned reads zero, so the counter is not simply
+/// counting absorbs.
+///
+/// Eight-byte absorbs from an empty seed keep the window at a multiple of 8
+/// throughout. Both halves are needed: the test above alone is satisfied by a
+/// counter that fires on everything, and this one alone by a counter that fires
+/// on nothing.
+#[test]
+fn an_aligned_stream_counts_no_misalignment() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(&[]);
+    // Empty seed, so the window is at 0 and the mark changes nothing about
+    // alignment — it only switches the counting on.
+    t.mark_statement_end();
+    for _ in 0..4 {
+        t.append_bytes(&[1u8; 8]);
+    }
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_absorbs, 5,
+        "the empty seed absorbs once, then four values"
+    );
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 0,
+        "every absorb started on a multiple of 8"
+    );
+}
+
+/// ★★ A SQUEEZE OPENS A NEW WINDOW, and it opens it ALIGNED.
+///
+/// `sample` finalize-resets the sponge and re-absorbs its own 32-byte output,
+/// so the next window starts at 32 — a multiple of 8. A misaligned window is
+/// therefore repaired by the next squeeze, which is why the padding only has to
+/// fix the window the roots land in and not the whole transcript.
+///
+/// Without this, the window field could carry a stale offset across a squeeze
+/// and every post-squeeze absorb of an odd-length stream would be reported
+/// misaligned forever.
+#[test]
+fn a_squeeze_opens_an_aligned_window() {
+    let _serialised = serialise();
+    hash_metrics::reset();
+
+    let mut t = DefaultTranscript::<Ext, KeccakTranscriptHash>::new(b"odd");
+    t.mark_statement_end();
+    // Off a boundary: 3 seed bytes, so this one is counted.
+    t.append_bytes(&[5u8; 32]);
+    let _ = t.sample();
+    // The window reopened at 32; these are not.
+    t.append_bytes(&[6u8; 32]);
+    t.append_bytes(&[7u8; 8]);
+    let c = hash_metrics::snapshot();
+
+    assert_eq!(
+        c.transcript_misaligned_absorbs_after_statement, 1,
+        "only the absorb before the squeeze started off a boundary; the squeeze \
+         reopens the window at 32, which is aligned"
+    );
+}

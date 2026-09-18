@@ -85,6 +85,18 @@ const SQUEEZE_LEN: usize = 32;
 /// buffer is mirrored, because that is the only part that tells the recorder
 /// when a window ends.
 struct WindowRecorder<T: TranscriptHash> {
+    /// Whether `mark_statement_end` has reached this transcript.
+    ///
+    /// ⛔ THE ONE THING NO OTHER CHECK HERE CAN SEE. Every comparison in this
+    /// file reads zero when the mark is MISSING just as it does when the mark
+    /// is present and the pad is correct: a correct pad misaligns nothing after
+    /// a statement, so "counter 0" and "recorder 0" agree either way. Deleting
+    /// the call from `absorb_statement_padding` would pass the whole file. This
+    /// flag is what
+    /// [`the_statement_padding_tells_the_transcript_the_statement_ended`]
+    /// asserts, and it is not gated on `hash-metrics`, because the wiring must
+    /// be checkable in an ordinary build.
+    marked: bool,
     inner: DefaultTranscript<E, T>,
     out_buf: [u8; SQUEEZE_LEN],
     out_pos: usize,
@@ -108,6 +120,7 @@ fn misaligned(absorbs: &[(usize, usize)], from: usize) -> Vec<(usize, usize)> {
 impl<T: TranscriptHash> WindowRecorder<T> {
     fn new() -> Self {
         Self {
+            marked: false,
             inner: DefaultTranscript::<E, T>::new(&[]),
             out_buf: [0u8; SQUEEZE_LEN],
             out_pos: SQUEEZE_LEN,
@@ -162,6 +175,17 @@ impl<T: TranscriptHash> IsTranscript<E> for WindowRecorder<T> {
             self.record(len);
         }
         self.inner.append_field_element(element);
+    }
+
+    fn mark_statement_end(&mut self) {
+        // Delegated, like absorption: the inner transcript is the production
+        // one and its counter is the instrument being cross-checked. The
+        // recorder's own TAPE needs no flag — `misaligned(&rec, from)` takes
+        // the boundary as an argument, which is what makes it an INDEPENDENT
+        // second answer to the same question rather than a copy of the first.
+        // The flag records only that the call ARRIVED.
+        self.marked = true;
+        self.inner.mark_statement_end();
     }
 
     fn state(&self) -> [u8; 32] {
@@ -577,6 +601,35 @@ fn seed_with_statement(t: &mut impl IsTranscript<E>, table_num_vars: &[u8], po: 
     epoch_expected(po.len(), table_num_vars.len()).calls
 }
 
+/// ★★ THE MARK IS WIRED, checked where its absence is otherwise SILENT.
+///
+/// Delete `mark_statement_end` from `absorb_statement_padding` and every other
+/// test in this file still passes: the counter reads zero because it never
+/// started counting, the recorder reads zero because the pad is correct, and
+/// the two agree on a number that means nothing. The counting flag's own tests
+/// in `crypto` drive transcripts by hand and never touch the prover's statement
+/// path at all.
+///
+/// So this asserts the CALL, not a count: the production `absorb_epoch` runs
+/// against a recorder that notes whether the mark arrived. It needs no
+/// `hash-metrics` and no process-global counter, so it runs in the ordinary
+/// suite alongside everything else.
+#[test]
+fn the_statement_padding_tells_the_transcript_the_statement_ended() {
+    let mut rec = WindowRecorder::<KeccakTranscriptHash>::new();
+    assert!(
+        !rec.marked,
+        "a fresh transcript has not been told anything yet"
+    );
+    let _ = seed_with_statement(&mut rec, &[1u8], &[]);
+    assert!(
+        rec.marked,
+        "`absorb_epoch` finished without telling the transcript its statement \
+         ended, so the alignment counter would count nothing for the rest of the \
+         proof and read a zero that means only that it never started"
+    );
+}
+
 /// ⚠ The trace is generated ONCE and handed to both proves.
 ///
 /// `generate_eq_trace` emits its rows in `HashMap` iteration order, so two
@@ -697,6 +750,141 @@ fn every_absorb_of_a_real_prove_is_field_element_aligned() {
                 "ALIGNED {arm} po={} {} absorbs after the statement, 0 misaligned",
                 po.len(),
                 rec.len() - statement_absorbs,
+            );
+        }
+    }
+}
+
+/// ★★ TWO INSTRUMENTS ON ONE QUANTITY: the recorder above, and the counter
+/// inside `DefaultTranscript`.
+///
+/// `Counts::transcript_misaligned_absorbs_after_statement` was written to
+/// reproduce THIS file's definition of a window — opens at 0, becomes 32 after
+/// a squeeze, unmoved by `state()` — and of a statement's END. Both are claims,
+/// and this is what checks them: one production prove, measured both ways,
+/// required to agree. The counter learns the boundary from
+/// `absorb_statement_padding`'s mark; the recorder is handed it here from
+/// `epoch_expected`'s independent field-by-field derivation, so the two roads to
+/// it are separate. Without this the box's `misaligned absorbs after a
+/// statement: 0` line would be a number taken on trust.
+///
+/// ⛔ MUST RUN ALONE, and that is why it is `#[ignore]`d rather than part of
+/// the suite. The counters are PROCESS-GLOBAL and the prover's lib-test binary
+/// runs 650 tests in parallel, many of which absorb; a snapshot taken there is
+/// a measurement of whatever the neighbours were doing. `--exact` gives one
+/// test per process, where the subject is trivially the only writer.
+///
+/// ```text
+/// cargo test --release -p lambda-vm-prover --lib --features hash-metrics \
+///     tests::statement_alignment_tests::the_counter_and_the_recorder_agree_on_one_prove \
+///     -- --exact --ignored --nocapture
+/// ```
+#[cfg(feature = "hash-metrics")]
+#[test]
+#[ignore = "reads process-global counters; must be the only test in its process"]
+fn the_counter_and_the_recorder_agree_on_one_prove() {
+    let (air, columns) = eq_table();
+
+    for po in [vec![], vec![0u8, 0u8]] {
+        for arm in ["keccak", "rpx"] {
+            let rec = match arm {
+                "keccak" => {
+                    prove_through_recorder::<KeccakWhir>(air, &columns, &po)
+                        .1
+                        .absorbs
+                }
+                _ => {
+                    prove_through_recorder::<RpxWhir>(air, &columns, &po)
+                        .1
+                        .absorbs
+                }
+            };
+
+            crypto::hash_metrics::reset();
+            match arm {
+                "keccak" => {
+                    let _ = prove_through_production::<KeccakWhir>(air, &columns, &po);
+                }
+                _ => {
+                    let _ = prove_through_production::<RpxWhir>(air, &columns, &po);
+                }
+            }
+            let counted = crypto::hash_metrics::snapshot();
+
+            // ★ TWO INSTRUMENTS ON THE PROPERTY THE PADDING OWES, and they
+            // reach it by different roads. The counter is told where the
+            // statement ended — `absorb_statement_padding` calls
+            // `mark_statement_end` — and counts from there. The recorder is
+            // told nothing: it tapes every absorb and `misaligned(&rec, from)`
+            // is given the boundary here, computed from `epoch_expected`'s
+            // independent field-by-field derivation of the statement's call
+            // count. So a wrong mark in the production path and a wrong
+            // expectation in this file cannot agree by construction.
+            let statement_absorbs = epoch_expected(po.len(), 1).calls;
+            assert_eq!(
+                counted.transcript_misaligned_absorbs_after_statement,
+                misaligned(&rec, statement_absorbs).len() as u64,
+                "the counter inside `DefaultTranscript` and this file's recorder \
+                 disagree about how many absorbs of the {arm} arm started off a \
+                 field element boundary AFTER its statement (po {} bytes)",
+                po.len(),
+            );
+
+            // ★ ONE MORE ABSORB, named rather than absorbed into a tolerance.
+            // `DefaultTranscript::new` absorbs its seed through `append_bytes`,
+            // so it is counted even when the seed is EMPTY — and
+            // `WindowRecorder::new` builds its inner transcript directly, so
+            // that absorb never reaches the tape. The difference is exactly one,
+            // every time. It sits at window 0 and is therefore aligned, which is
+            // why the misaligned comparison above needs no such term.
+            //
+            // Found by this assertion failing at 146 against 145 on its first
+            // run, which is the whole reason for having two instruments.
+            const SEED_ABSORB: u64 = 1;
+            assert_eq!(
+                counted.transcript_absorbs,
+                rec.len() as u64 + SEED_ABSORB,
+                "the counter saw {} absorbs where the recorder taped {} plus the \
+                 transcript's own seed",
+                counted.transcript_absorbs,
+                rec.len(),
+            );
+
+            // ★★ WHAT THE MISALIGNED COUNT IS MADE OF. A statement's own
+            // fields are odd-length by nature — a tag, one byte per table
+            // count, a three-byte grind trailer — so absorbs INSIDE a statement
+            // start off boundaries constantly, and the padding never promised
+            // otherwise: it promises that what follows the statement starts
+            // aligned. Split the same tape both ways so a box line that is not
+            // zero is read as the statements' own shape and not as a
+            // regression.
+            let all_misaligned = misaligned(&rec, 0);
+            let after_statement = misaligned(&rec, statement_absorbs).len();
+            let felt_sized = all_misaligned
+                .iter()
+                .filter(|(_, len)| len.is_multiple_of(FELT_BYTES))
+                .count();
+            // ⚠ THE TOTAL IS PRINTED FROM THE RECORDER, NOT THE COUNTER. The
+            // counter no longer reports it — it starts at the statement's end —
+            // and W1c's measured totals (25 and 24, of which 22 and 21 are
+            // felt-sized) are the reason the boundary is in the field's name.
+            // Keeping them in the line means a reader can still see that a
+            // statement's own fields are misaligned by the dozen while the
+            // number that matters is zero.
+            println!(
+                "AGREE {arm} po={} absorbs {} (taped {} + seed), misaligned total \
+                 {} of which felt-sized {felt_sized}; after the statement \
+                 {after_statement} (counter {})",
+                po.len(),
+                counted.transcript_absorbs,
+                rec.len(),
+                all_misaligned.len(),
+                counted.transcript_misaligned_absorbs_after_statement,
+            );
+            assert_eq!(
+                after_statement, 0,
+                "the {arm} arm misaligned {after_statement} absorbs after its \
+                 statement, which is the property the padding owes"
             );
         }
     }
