@@ -560,6 +560,19 @@ where
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
 
+pub fn upload_factors_from_columns<F, E>(
+    _columns: &[crate::mle::Mle<F>],
+    _kinds: &[crate::constraint_argument::FactorKind],
+    _public: &[crate::mle::Mle<E>],
+    _resident: Option<(&ResidentColumns, usize)>,
+) -> Option<DeviceFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 pub fn input_layer_tree<E>(
     _factors: std::sync::Arc<DeviceFactors>,
     _numerators: Vec<crate::program::Program<E>>,

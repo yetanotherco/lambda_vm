@@ -17,6 +17,7 @@
 
 pub mod batch;
 pub mod claim_reduce;
+pub mod constraint_argument;
 pub mod eq;
 pub mod gkr;
 pub mod gpu;
