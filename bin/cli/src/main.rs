@@ -310,24 +310,30 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
 
-        /// Walk the execution, committing and retiring each table as it fills
-        /// (Approach 1's Commit phase), instead of building every trace first.
+        /// Prove-and-retire (the spec's Approach 1): walk the execution,
+        /// committing and retiring each table as it fills, instead of building
+        /// every trace first.
         #[arg(long)]
-        streaming: bool,
+        prove_and_retire: bool,
 
         /// How far down Approach 1's pipeline to run. Only meaningful with
-        /// --streaming; each stage includes the ones before it.
-        #[arg(long, value_enum, default_value = "logup", requires = "streaming")]
+        /// --prove-and-retire; each stage includes the ones before it.
+        #[arg(
+            long,
+            value_enum,
+            default_value = "logup",
+            requires = "prove_and_retire"
+        )]
         through: Stage,
 
         /// Assemble the per-table proof the LogUp stage leaves and run the
         /// ordinary verifier on it, after the timings are reported.
-        #[arg(long, requires = "streaming")]
+        #[arg(long, requires = "prove_and_retire")]
         verify: bool,
 
         /// Write the assembled per-table proof here (implies the assembly, not
         /// the verification).
-        #[arg(short, long, requires = "streaming", value_hint = ValueHint::FilePath)]
+        #[arg(short, long, requires = "prove_and_retire", value_hint = ValueHint::FilePath)]
         output: Option<PathBuf>,
     },
 }
@@ -416,11 +422,18 @@ fn main() -> ExitCode {
         Commands::TraceBuild {
             elf,
             private_input,
-            streaming,
+            prove_and_retire,
             through,
             verify,
             output,
-        } => cmd_trace_build(elf, private_input, streaming, through, verify, output),
+        } => cmd_trace_build(
+            elf,
+            private_input,
+            prove_and_retire,
+            through,
+            verify,
+            output,
+        ),
     }
 }
 
@@ -1320,7 +1333,7 @@ fn report_fri_shape(
 fn cmd_trace_build(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
-    streaming: bool,
+    prove_and_retire: bool,
     through: Stage,
     verify: bool,
     output: Option<PathBuf>,
@@ -1359,7 +1372,7 @@ fn cmd_trace_build(
             return ExitCode::FAILURE;
         }
     };
-    let outcome = if streaming {
+    let outcome = if prove_and_retire {
         run_approach_1(
             &elf,
             &elf_data,
@@ -1380,7 +1393,11 @@ fn cmd_trace_build(
         Ok((n, proof)) => {
             println!(
                 "Trace build ({}): {n} tables, {:.3}s",
-                if streaming { "streaming" } else { "resident" },
+                if prove_and_retire {
+                    "prove-and-retire"
+                } else {
+                    "resident"
+                },
                 elapsed.as_secs_f64()
             );
             proof
