@@ -9,9 +9,9 @@
 //! openings have a different value type from every later one, and the type says
 //! so rather than leaving it to a reader.
 //!
-//! [`whir_eval`](crate::whir_eval) is the one-round case, and there a block
-//! *is* the message — which is what dominates its proof size and its verifier's
-//! work. Here the sumcheck runs in groups of `k`: after each group the codeword
+//! Opening in one round — no folding at all — makes a block *be* the message,
+//! which is what would dominate the proof size and the verifier's work. Here
+//! the sumcheck runs in groups of `k`: after each group the codeword
 //! folds by `2^k`, the successor is committed **before** the queries are drawn,
 //! and each query checks that folding a current block really lands on the
 //! successor's value there. The last group has no successor — the message is a
@@ -1105,7 +1105,7 @@ mod tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::{eq::eq_evals, whir_eval};
+    use crate::eq::eq_evals;
 
     type FE = FieldElement<F>;
 
@@ -1260,8 +1260,9 @@ mod tests {
         }
     }
 
-    /// And what that buys, against the one-round argument on the same
-    /// polynomial.
+    /// And what that buys, against opening in one round. Without folding a
+    /// query has nothing to check the fold against, so it sends the whole
+    /// message: `num_queries` times `2^num_vars`.
     #[test]
     fn chaining_opens_far_less_than_one_round_does() {
         let num_vars = 8;
@@ -1273,25 +1274,9 @@ mod tests {
         let chained =
             prove::<F, F, _>(&f, &z, &commitment, &domain, &cfg, &mut transcript()).unwrap();
 
-        let one_round_cfg = whir_eval::EvalConfig {
-            log_blowup: cfg.log_blowup,
-            num_queries: cfg.num_queries,
-        };
-        let (one_commitment, one_domain) = whir_eval::commit::<F, F>(&f, &one_round_cfg).unwrap();
-        let one_round = whir_eval::prove::<F, F, _>(
-            &f,
-            &z,
-            &one_commitment,
-            &one_domain,
-            &one_round_cfg,
-            &mut transcript(),
-        )
-        .unwrap();
-
-        let one_round_elements: usize = one_round.openings.iter().map(|o| o.values.len()).sum();
         // One round sends `num_queries` blocks of the whole message; chaining
         // sends small blocks, two per query per round.
-        assert_eq!(one_round_elements, 3 * (1 << num_vars));
+        let one_round_elements = cfg.num_queries * (1 << num_vars);
         assert!(
             chained.opened_elements() * 4 < one_round_elements,
             "chained {} vs one round {one_round_elements}",

@@ -411,10 +411,7 @@ mod tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::{
-        mle::Mle,
-        virtual_poly::{Term, VirtualPolynomial},
-    };
+    use crate::{mle::Mle, poly::Composed};
 
     type FE = FieldElement<F>;
 
@@ -434,6 +431,12 @@ mod tests {
         mle(&vals)
     }
 
+    /// `f` itself, as a one-factor composition. Rebuilt rather than cloned:
+    /// the rule is a closure, and a closure is not `Clone`.
+    fn single(m: Mle<F>) -> Composed<F, impl Fn(&[FE]) -> FE> {
+        Composed::new(vec![m], |v: &[FE]| v[0], 1).unwrap()
+    }
+
     #[test]
     fn interpolation_reproduces_the_nodes() {
         let values: Vec<FE> = [3u64, 1, 4, 1].iter().map(|v| FE::from(*v)).collect();
@@ -451,12 +454,12 @@ mod tests {
 
     #[test]
     fn linear_polynomial_round_trips() {
-        let f = VirtualPolynomial::new(vec![pseudo_mle(4, 1)], vec![Term::single(0)]).unwrap();
+        let f = single(pseudo_mle(4, 1));
         let claimed = f.sum_over_hypercube();
         let num_vars = f.num_vars();
         let degree = f.degree();
 
-        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, _) = prove(single(pseudo_mle(4, 1)), &mut transcript()).unwrap();
         let claim = verify(&proof, claimed, num_vars, degree, &mut transcript()).unwrap();
 
         assert_eq!(f.evaluate(&claim.point).unwrap(), claim.expected_evaluation);
@@ -464,16 +467,20 @@ mod tests {
 
     #[test]
     fn product_of_three_polynomials_round_trips() {
-        let f = VirtualPolynomial::new(
-            vec![pseudo_mle(5, 1), pseudo_mle(5, 2), pseudo_mle(5, 3)],
-            vec![Term::new(FE::from(7), vec![0, 1, 2])],
-        )
-        .unwrap();
+        let product = || {
+            Composed::new(
+                vec![pseudo_mle(5, 1), pseudo_mle(5, 2), pseudo_mle(5, 3)],
+                |v: &[FE]| FE::from(7) * v[0] * v[1] * v[2],
+                3,
+            )
+            .unwrap()
+        };
+        let f = product();
         let claimed = f.sum_over_hypercube();
         let (num_vars, degree) = (f.num_vars(), f.degree());
         assert_eq!(degree, 3);
 
-        let (proof, challenges) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, challenges) = prove(product(), &mut transcript()).unwrap();
         let claim = verify(&proof, claimed, num_vars, degree, &mut transcript()).unwrap();
 
         // Prover and verifier must derive the same challenges from the transcript.
@@ -483,19 +490,19 @@ mod tests {
 
     #[test]
     fn sum_of_terms_of_mixed_degree_round_trips() {
-        let f = VirtualPolynomial::new(
-            vec![pseudo_mle(4, 10), pseudo_mle(4, 20), pseudo_mle(4, 30)],
-            vec![
-                Term::new(FE::from(2), vec![0, 1]),
-                Term::new(FE::from(3), vec![2]),
-                Term::new(FE::from(5), vec![]),
-            ],
-        )
-        .unwrap();
+        let mixed = || {
+            Composed::new(
+                vec![pseudo_mle(4, 10), pseudo_mle(4, 20), pseudo_mle(4, 30)],
+                |v: &[FE]| FE::from(2) * v[0] * v[1] + FE::from(3) * v[2] + FE::from(5),
+                2,
+            )
+            .unwrap()
+        };
+        let f = mixed();
         let claimed = f.sum_over_hypercube();
         let (num_vars, degree) = (f.num_vars(), f.degree());
 
-        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, _) = prove(mixed(), &mut transcript()).unwrap();
         let claim = verify(&proof, claimed, num_vars, degree, &mut transcript()).unwrap();
 
         assert_eq!(f.evaluate(&claim.point).unwrap(), claim.expected_evaluation);
@@ -503,11 +510,11 @@ mod tests {
 
     #[test]
     fn single_variable_round_trips() {
-        let f = VirtualPolynomial::new(vec![mle(&[3, 11])], vec![Term::single(0)]).unwrap();
+        let f = single(mle(&[3, 11]));
         let claimed = f.sum_over_hypercube();
         assert_eq!(claimed, FE::from(14));
 
-        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, _) = prove(single(mle(&[3, 11])), &mut transcript()).unwrap();
         let claim = verify(&proof, claimed, 1, 1, &mut transcript()).unwrap();
         assert_eq!(f.evaluate(&claim.point).unwrap(), claim.expected_evaluation);
     }
@@ -518,9 +525,9 @@ mod tests {
     /// they rely on.
     #[test]
     fn a_wrong_claimed_sum_corrupts_the_residual() {
-        let f = VirtualPolynomial::new(vec![pseudo_mle(3, 1)], vec![Term::single(0)]).unwrap();
+        let f = single(pseudo_mle(3, 1));
         let claimed = f.sum_over_hypercube();
-        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, _) = prove(single(pseudo_mle(3, 1)), &mut transcript()).unwrap();
 
         let honest = verify(&proof, claimed, 3, 1, &mut transcript()).unwrap();
         assert_eq!(
@@ -534,13 +541,17 @@ mod tests {
 
     #[test]
     fn a_tampered_round_polynomial_corrupts_the_residual() {
-        let f = VirtualPolynomial::new(
-            vec![pseudo_mle(4, 1), pseudo_mle(4, 2)],
-            vec![Term::new(FE::one(), vec![0, 1])],
-        )
-        .unwrap();
+        let pair = || {
+            Composed::new(
+                vec![pseudo_mle(4, 1), pseudo_mle(4, 2)],
+                |v: &[FE]| v[0] * v[1],
+                2,
+            )
+            .unwrap()
+        };
+        let f = pair();
         let claimed = f.sum_over_hypercube();
-        let (mut proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (mut proof, _) = prove(pair(), &mut transcript()).unwrap();
 
         proof.rounds[2].evaluations[0] += FE::one();
         let claim = verify(&proof, claimed, 4, 2, &mut transcript()).unwrap();
@@ -549,7 +560,7 @@ mod tests {
 
     #[test]
     fn a_proof_with_the_wrong_round_count_is_rejected() {
-        let f = VirtualPolynomial::new(vec![pseudo_mle(3, 1)], vec![Term::single(0)]).unwrap();
+        let f = single(pseudo_mle(3, 1));
         let claimed = f.sum_over_hypercube();
         let (mut proof, _) = prove(f, &mut transcript()).unwrap();
         proof.rounds.pop();
@@ -566,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_round_polynomial_of_the_wrong_degree_is_rejected() {
-        let f = VirtualPolynomial::new(vec![pseudo_mle(3, 1)], vec![Term::single(0)]).unwrap();
+        let f = single(pseudo_mle(3, 1));
         let claimed = f.sum_over_hypercube();
         let (mut proof, _) = prove(f, &mut transcript()).unwrap();
         proof.rounds[0].evaluations.push(FE::from(1));
@@ -580,11 +591,9 @@ mod tests {
         // The challenge point is bound to the statement, not just to the
         // polynomial: proving the same claim under a different seed must land
         // somewhere else.
-        let f = VirtualPolynomial::new(vec![pseudo_mle(4, 1)], vec![Term::single(0)]).unwrap();
-
-        let (_, a) = prove(f.clone(), &mut transcript()).unwrap();
+        let (_, a) = prove(single(pseudo_mle(4, 1)), &mut transcript()).unwrap();
         let mut other = DefaultTranscript::<F>::new(b"a-different-statement");
-        let (_, b) = prove(f, &mut other).unwrap();
+        let (_, b) = prove(single(pseudo_mle(4, 1)), &mut other).unwrap();
 
         assert_ne!(a, b);
     }
@@ -593,9 +602,9 @@ mod tests {
     fn a_proof_replayed_under_another_transcript_is_rejected() {
         // Fiat-Shamir binding: the verifier redraws challenges, so a proof
         // lifted onto a different statement stops matching.
-        let f = VirtualPolynomial::new(vec![pseudo_mle(4, 1)], vec![Term::single(0)]).unwrap();
+        let f = single(pseudo_mle(4, 1));
         let claimed = f.sum_over_hypercube();
-        let (proof, _) = prove(f.clone(), &mut transcript()).unwrap();
+        let (proof, _) = prove(single(pseudo_mle(4, 1)), &mut transcript()).unwrap();
 
         let honest = verify(&proof, claimed, 4, 1, &mut transcript()).unwrap();
         assert_eq!(

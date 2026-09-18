@@ -134,10 +134,7 @@ mod tests {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::{
-        mle::Mle,
-        virtual_poly::{Term, VirtualPolynomial},
-    };
+    use crate::{mle::Mle, poly::Composed};
 
     type FE = FieldElement<F>;
 
@@ -151,17 +148,18 @@ mod tests {
 
     /// `C = a·b − c`, with `c` set to the product so it vanishes everywhere.
     /// This is the shape of a real AIR constraint: a relation among columns.
-    fn satisfied_constraint(n: usize) -> VirtualPolynomial<F> {
+    ///
+    /// Rebuilt on each call rather than cloned: the rule is a closure, and a
+    /// closure is not `Clone`.
+    fn satisfied_constraint(n: usize) -> Composed<F, impl Fn(&[FE]) -> FE> {
         let size = 1usize << n;
         let a: Vec<u64> = (0..size as u64).map(|i| i * 3 + 1).collect();
         let b: Vec<u64> = (0..size as u64).map(|i| i * 5 + 2).collect();
         let c: Vec<u64> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
-        VirtualPolynomial::new(
+        Composed::new(
             vec![mle(&a), mle(&b), mle(&c)],
-            vec![
-                Term::new(FE::one(), vec![0, 1]),
-                Term::new(-FE::one(), vec![2]),
-            ],
+            |v: &[FE]| v[0] * v[1] - v[2],
+            2,
         )
         .unwrap()
     }
@@ -171,7 +169,7 @@ mod tests {
         let c = satisfied_constraint(4);
         assert_eq!(c.sum_over_hypercube(), FE::zero());
 
-        let out = prove(c.clone(), &mut transcript()).unwrap();
+        let out = prove(satisfied_constraint(4), &mut transcript()).unwrap();
         let (proof, r_prover) = (out.proof, out.r);
         let claim = verify(&proof, 4, c.degree(), &mut transcript()).unwrap();
 
@@ -186,7 +184,9 @@ mod tests {
     #[test]
     fn the_residual_claim_factors_as_eq_times_c() {
         let c = satisfied_constraint(3);
-        let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
+        let proof = prove(satisfied_constraint(3), &mut transcript())
+            .unwrap()
+            .proof;
         let claim = verify(&proof, 3, c.degree(), &mut transcript()).unwrap();
 
         let c_at_point = c.evaluate(&claim.point).unwrap();
@@ -201,20 +201,21 @@ mod tests {
         let mut c: Vec<u64> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
         c[5] += 1; // one bad row
 
-        let broken = VirtualPolynomial::new(
-            vec![mle(&a), mle(&b), mle(&c)],
-            vec![
-                Term::new(FE::one(), vec![0, 1]),
-                Term::new(-FE::one(), vec![2]),
-            ],
-        )
-        .unwrap();
+        let build = || {
+            Composed::new(
+                vec![mle(&a), mle(&b), mle(&c)],
+                |v: &[FE]| v[0] * v[1] - v[2],
+                2,
+            )
+            .unwrap()
+        };
+        let broken = build();
         assert_ne!(broken.sum_over_hypercube(), FE::zero());
 
         // The prover runs the protocol honestly on a false statement. `g(0)` is
         // derived from the claim, so nothing is rejected in the round — the lie
         // surfaces in the residual, which stops describing the constraint.
-        let proof = prove(broken.clone(), &mut transcript()).unwrap().proof;
+        let proof = prove(build(), &mut transcript()).unwrap().proof;
         let claim = verify(&proof, 3, broken.degree(), &mut transcript()).unwrap();
         assert_ne!(
             claim.constraint_evaluation(),
@@ -227,14 +228,18 @@ mod tests {
     fn a_nonzero_polynomial_that_happens_to_sum_to_zero_is_still_rejected() {
         // Σ C = 0 but C is not identically zero: exactly the case a plain
         // sumcheck-for-zero would miss and eq(r, ·) is there to catch.
-        let c = VirtualPolynomial::new(
-            vec![Mle::new(vec![FE::from(7), -FE::from(7)]).unwrap()],
-            vec![Term::single(0)],
-        )
-        .unwrap();
+        let build = || {
+            Composed::new(
+                vec![Mle::new(vec![FE::from(7), -FE::from(7)]).unwrap()],
+                |v: &[FE]| v[0],
+                1,
+            )
+            .unwrap()
+        };
+        let c = build();
         assert_eq!(c.sum_over_hypercube(), FE::zero());
 
-        let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
+        let proof = prove(build(), &mut transcript()).unwrap().proof;
         let result = verify(&proof, 1, c.degree(), &mut transcript());
 
         // The residual claim must be inconsistent with the real polynomial:
@@ -250,7 +255,9 @@ mod tests {
     #[test]
     fn degree_accounts_for_the_eq_factor() {
         let c = satisfied_constraint(3);
-        let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
+        let proof = prove(satisfied_constraint(3), &mut transcript())
+            .unwrap()
+            .proof;
         // C has degree 2; with eq the round polynomials are degree 3, so each
         // carries three evaluations — `g(1), g(2), g(3)`, with `g(0)` derived.
         assert_eq!(c.degree(), 2);
@@ -260,7 +267,9 @@ mod tests {
     #[test]
     fn verifying_with_the_wrong_degree_is_rejected() {
         let c = satisfied_constraint(3);
-        let proof = prove(c.clone(), &mut transcript()).unwrap().proof;
+        let proof = prove(satisfied_constraint(3), &mut transcript())
+            .unwrap()
+            .proof;
         let err = verify(&proof, 3, c.degree() + 1, &mut transcript()).unwrap_err();
         assert!(matches!(err, Error::RoundDegreeMismatch { round: 0, .. }));
     }

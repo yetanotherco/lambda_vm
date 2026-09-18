@@ -19,13 +19,9 @@ pub mod selector;
 pub mod stacked_eval;
 pub mod stacking;
 pub mod sumcheck;
-pub mod uneven;
-pub mod uni_skip;
-pub mod virtual_poly;
 pub mod whir;
 pub mod whir_chain;
 pub mod whir_commit;
-pub mod whir_eval;
 pub mod whir_round;
 pub mod zerocheck;
 

@@ -266,10 +266,7 @@ mod tests {
     use super::*;
     use math::field::goldilocks::GoldilocksField as F;
 
-    use crate::{
-        eq::eq_mle,
-        virtual_poly::{Term, VirtualPolynomial},
-    };
+    use crate::eq::eq_mle;
 
     type FE = FieldElement<F>;
 
@@ -277,10 +274,13 @@ mod tests {
         Mle::new(vals.iter().map(|v| FE::from(*v)).collect()).unwrap()
     }
 
-    fn inner() -> VirtualPolynomial<F> {
-        VirtualPolynomial::new(
+    /// `2·a·b`. Rebuilt on each call rather than cloned: the rule is a
+    /// closure, and a closure is not `Clone`.
+    fn inner() -> Composed<F, impl Fn(&[FE]) -> FE> {
+        Composed::new(
             vec![mle(&[1, 2, 3, 4]), mle(&[5, 6, 7, 8])],
-            vec![Term::new(FE::from(2), vec![0, 1])],
+            |v: &[FE]| FE::from(2) * v[0] * v[1],
+            2,
         )
         .unwrap()
     }
@@ -312,15 +312,12 @@ mod tests {
     fn eq_scaled_sum_of_a_multilinear_polynomial_is_its_extension_at_r() {
         // Σ_x eq(r,x)·f(x) = f̃(r) — the defining property of eq, and it holds
         // only when f is itself multilinear.
-        let linear = VirtualPolynomial::new(
-            vec![mle(&[1, 2, 3, 4])],
-            vec![Term::new(FE::from(2), vec![0])],
-        )
-        .unwrap();
+        let linear =
+            || Composed::new(vec![mle(&[1, 2, 3, 4])], |v: &[FE]| FE::from(2) * v[0], 1).unwrap();
         let r = vec![FE::from(11), FE::from(13)];
-        let scaled = EqScaled::new(linear.clone(), eq_mle(&r).unwrap()).unwrap();
+        let scaled = EqScaled::new(linear(), eq_mle(&r).unwrap()).unwrap();
 
-        assert_eq!(scaled.sum_over_hypercube(), linear.evaluate(&r).unwrap());
+        assert_eq!(scaled.sum_over_hypercube(), linear().evaluate(&r).unwrap());
     }
 
     #[test]
@@ -352,7 +349,8 @@ mod tests {
     #[test]
     fn rejects_an_eq_table_of_the_wrong_arity() {
         let r = vec![FE::from(3)];
-        let err = EqScaled::new(inner(), eq_mle(&r).unwrap()).unwrap_err();
+        // `.err()` rather than `unwrap_err()`: a closure has no `Debug`.
+        let err = EqScaled::new(inner(), eq_mle(&r).unwrap()).err().unwrap();
         assert_eq!(
             err,
             Error::VariableCountMismatch {
@@ -392,22 +390,28 @@ mod tests {
     }
 
     #[test]
-    fn a_composed_polynomial_matches_the_equivalent_terms() {
-        let polys = vec![mle(&[1, 2, 3, 4]), mle(&[5, 6, 7, 8])];
-        let by_terms =
-            VirtualPolynomial::new(polys.clone(), vec![Term::new(FE::from(2), vec![0, 1])])
-                .unwrap();
-        let by_closure = Composed::new(polys, |v: &[FE]| FE::from(2) * v[0] * v[1], 2).unwrap();
+    fn a_composed_polynomial_is_its_rule_over_the_factors_extensions() {
+        let (a, b) = (mle(&[1, 2, 3, 4]), mle(&[5, 6, 7, 8]));
+        let composed = Composed::new(
+            vec![a.clone(), b.clone()],
+            |v: &[FE]| FE::from(2) * v[0] * v[1],
+            2,
+        )
+        .unwrap();
 
+        // Off the cube, the rule is applied to each factor's own extension —
+        // not to the extension of the product, which is a different polynomial.
         let point = [FE::from(19), FE::from(23)];
         assert_eq!(
-            by_terms.evaluate(&point).unwrap(),
-            by_closure.evaluate(&point).unwrap()
+            composed.evaluate(&point).unwrap(),
+            FE::from(2) * a.evaluate(&point).unwrap() * b.evaluate(&point).unwrap()
         );
-        assert_eq!(
-            by_terms.sum_over_hypercube(),
-            by_closure.sum_over_hypercube()
-        );
+
+        // On the cube, the sum is the rule applied row by row.
+        let row_by_row = (0..4).fold(FE::zero(), |acc, i| {
+            acc + FE::from(2) * a.evals()[i] * b.evals()[i]
+        });
+        assert_eq!(composed.sum_over_hypercube(), row_by_row);
     }
 
     #[test]
