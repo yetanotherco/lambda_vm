@@ -8,6 +8,7 @@
 //! table die. What it produces is a root per chunk and, at the end, the tables
 //! that cannot be retired — which the Challenge phase commits and samples from.
 
+use stark::config::Commitment;
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, MainRoots};
 
@@ -28,6 +29,34 @@ pub struct Committed {
     pub chunks: Vec<ChunkCommitment>,
     /// The tables the walk could not commit, still as traces.
     pub remaining: Resident,
+    /// The preprocessed commitments the ELF alone determines, computed beside the walk.
+    pub precomputed: Precomputed,
+}
+
+/// The preprocessed commitments that depend on the ELF and nothing else — DECODE and
+/// one per ELF data page. They are most of what building the AIRs costs, and they
+/// need nothing from the execution, so they run on a thread beside the walk.
+pub struct Precomputed {
+    pub decode: Commitment,
+    pub pages: Vec<(u64, Commitment)>,
+}
+
+impl Precomputed {
+    pub fn new(elf: &Elf, proof_options: &ProofOptions) -> Result<Self, Error> {
+        let decode = crate::tables::decode::commitment_from_elf(elf, proof_options)
+            .map_err(|e| Error::Prover(format!("decode commitment: {e}")))?;
+        let pages = Traces::page_configs_from_elf(elf)
+            .iter()
+            .filter(|config| config.init_values.is_some())
+            .map(|config| {
+                (
+                    config.page_base,
+                    crate::tables::page::compute_precomputed_commitment(config, proof_options),
+                )
+            })
+            .collect();
+        Ok(Self { decode, pages })
+    }
 }
 
 /// What the walk alone produced.
@@ -140,13 +169,16 @@ pub fn run_to_end(
 ) -> Result<Committed, Error> {
     let airs = ChunkAirs::new(proof_options);
     let roots = std::sync::Mutex::new(Vec::new());
-    let remaining = std::thread::scope(|s| {
+    let (remaining, precomputed) = std::thread::scope(|s| {
+        let precomputed = s.spawn(|| Precomputed::new(elf, proof_options));
         let mut visitor = CommitMain::new(s, &airs, &roots);
-        pass::run(elf, private_input, max_rows, &mut visitor)
-    })?;
+        let remaining = pass::run(elf, private_input, max_rows, &mut visitor);
+        (remaining, precomputed.join().expect("precompute thread"))
+    });
     Ok(Committed {
         chunks: roots.into_inner().expect("roots"),
-        remaining,
+        remaining: remaining?,
+        precomputed: precomputed?,
     })
 }
 

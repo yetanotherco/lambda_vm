@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::proof::options::ProofOptions;
@@ -77,10 +79,10 @@ pub fn run(
         false,
         &remaining.page_configs,
         &table_counts,
-        None,
+        Some(committed.precomputed.decode),
         true,
         None,
-        None,
+        Some(&committed.precomputed.pages),
         None,
     );
 
@@ -156,9 +158,13 @@ fn assemble_roots(
         (&airs.hint, &accumulated.hint, "HINT"),
         (&airs.register, &remaining.register, "REGISTER"),
     ];
-    for (air, trace, name) in fixed {
-        roots.push(commit_resident(air, trace, name)?);
-    }
+    // Small tables, many of them: one commit at a time leaves most cores idle.
+    roots.extend(
+        fixed
+            .par_iter()
+            .map(|(air, trace, name)| commit_resident(air, trace, name))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     if airs.include_halt {
         roots.push(commit_resident(&airs.halt, &remaining.halt, "HALT")?);
     }
@@ -177,9 +183,13 @@ fn assemble_roots(
         let Some(kind) = group else {
             // PAGE is built from the ELF image rather than from an op list, so
             // it is never retired and is committed here with the rest.
-            for (air, trace) in page_airs.by_ref() {
-                roots.push(commit_resident(air, trace, "PAGE")?);
-            }
+            let pages: Vec<_> = page_airs.by_ref().collect();
+            roots.extend(
+                pages
+                    .par_iter()
+                    .map(|(air, trace)| commit_resident(air, trace, "PAGE"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             continue;
         };
         for chunk in 0..count_for(table_counts, kind) {
