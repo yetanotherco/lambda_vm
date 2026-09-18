@@ -981,30 +981,37 @@ fn continuation_phases() {
     let mut prove = Vec::new();
     let mut epochs = Vec::new();
     let mut last = Instant::now();
-    let boundaries = crate::continuation::for_each_epoch(
-        &elf,
-        &inputs,
-        epoch_size_log2,
-        &artifacts,
-        |prepared, _| {
-            prepare.push(last.elapsed());
-            let start = Instant::now();
-            epochs.push(multilinear_continuation::prove_epoch(
-                &elf,
-                &bytes,
-                &prepared.register_init,
-                prepared.label,
-                prepared.traces,
-                prepared.is_final,
-                &prepared.boundary,
-                &opts,
-                Some(decode_commitment),
-            )?);
-            prove.push(start.elapsed());
-            last = Instant::now();
-            Ok(())
-        },
-    )
+    // The dispatch above the epoch loop, as production does it, so DECODE's
+    // out-of-band commitment is built once and held for the whole run.
+    let boundaries = crate::with_whir_hash!(|H| {
+        let pinned = multilinear_continuation::decode_prepared_for::<H>(&elf, &bytes)
+            .expect("DECODE's out-of-band commitment");
+        crate::continuation::for_each_epoch(
+            &elf,
+            &inputs,
+            epoch_size_log2,
+            &artifacts,
+            |prepared, _| {
+                prepare.push(last.elapsed());
+                let start = Instant::now();
+                epochs.push(multilinear_continuation::prove_epoch::<H>(
+                    &elf,
+                    &bytes,
+                    &prepared.register_init,
+                    prepared.label,
+                    prepared.traces,
+                    prepared.is_final,
+                    &prepared.boundary,
+                    &opts,
+                    Some(decode_commitment),
+                    &pinned,
+                )?);
+                prove.push(start.elapsed());
+                last = Instant::now();
+                Ok(())
+            },
+        )
+    })
     .expect("the epochs prepare");
 
     let start = Instant::now();

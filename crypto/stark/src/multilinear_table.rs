@@ -835,6 +835,7 @@ pub fn verify<E, T>(
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
     transcript: &mut T,
+    settled_out_of_band: usize,
 ) -> Result<TableVerdict<E>, MlError>
 where
     E: IsField + Send + Sync + 'static,
@@ -887,7 +888,7 @@ where
         transcript,
     )?;
 
-    check_preprocessed(statement, &reduced)?;
+    check_preprocessed(statement, &reduced, settled_out_of_band)?;
 
     Ok((proof.bus_output.clone(), reduced))
 }
@@ -901,15 +902,37 @@ where
 /// the proof settled on and demands the same value. Costs one pass over each
 /// such column, which is what recomputing a preprocessed commitment costs on
 /// the univariate side.
+/// ★★ `settled_out_of_band` is how many of this table's leading preprocessed
+/// columns a PREPARED OPENING already settled, and it is the whole saving: those
+/// columns are tied to an ELF-derived commitment by an opening at this very
+/// point, so evaluating their MLEs here would prove the same thing a second time
+/// at `5 * 2^20` folds an epoch.
+///
+/// ⚠ It must be driven by the same `PreparedCheck` value that drives the
+/// opening, never by a flag a caller sets on its own — otherwise it is a switch
+/// that turns off a check with nothing put in its place. The caller asserts it
+/// covers no more columns than the opening does; see `multi_verify`.
 fn check_preprocessed<F, E>(
     statement: TableStatement<'_, F, E>,
     reduced: &claim_reduce::ReducedClaim<E>,
+    settled_out_of_band: usize,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
-    for (col, column) in statement.preprocessed.iter().enumerate() {
+    if settled_out_of_band > statement.preprocessed.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: statement.preprocessed.len(),
+            got: settled_out_of_band,
+        });
+    }
+    for (col, column) in statement
+        .preprocessed
+        .iter()
+        .enumerate()
+        .skip(settled_out_of_band)
+    {
         let factor = slot(statement.slot_of, col)?;
         // A preprocessed column is read unshifted by construction: `TableLayout`
         // registers every main column that way. Anything else means the two
@@ -1149,10 +1172,26 @@ where
     // claimed values.
     let mut prepared_at: Option<usize> = None;
     for (index, (table, statement)) in proof.tables.iter().zip(statements).enumerate() {
-        if prepared.as_ref().is_some_and(|p| p.table == index) {
-            prepared_at = Some(points.len());
+        // ★ ONE VALUE drives both halves: the columns the opening settles are
+        // the columns `check_preprocessed` may skip. A second, independent knob
+        // would be a way to switch off a check with nothing in its place.
+        let settled = match prepared.as_ref() {
+            Some(p) if p.table == index => {
+                prepared_at = Some(points.len());
+                p.columns
+            }
+            _ => 0,
+        };
+        // ⚠ THE ASSERT THAT MATTERS. The opening covers `p.columns` of this
+        // table; skipping more than that would drop a preprocessed check
+        // nothing replaced.
+        if settled > statement.preprocessed.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: statement.preprocessed.len(),
+                got: settled,
+            });
         }
-        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript)?;
+        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript, settled)?;
         balance += contribution(&output).ok_or(MlError::BusImbalance)?;
         for _ in 0..statement.slot_of.len() {
             points.push(reduced.point.clone());

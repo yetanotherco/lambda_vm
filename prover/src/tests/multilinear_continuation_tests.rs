@@ -32,7 +32,9 @@ fn epochs_prove_and_verify(name: &str, epoch_size_log2: u32) -> usize {
     let mut carried = register::register_init_from_entry_point(elf.entry_point);
     let mut count = 0usize;
 
-    let boundaries =
+    let boundaries = crate::with_whir_hash!(|H| {
+        let pinned = multilinear_continuation::decode_prepared_for::<H>(&elf, &elf_bytes)
+            .expect("DECODE's out-of-band commitment");
         continuation::for_each_epoch(&elf, &[], epoch_size_log2, &artifacts, |prepared, _| {
             let PreparedEpoch {
                 register_init,
@@ -47,7 +49,7 @@ fn epochs_prove_and_verify(name: &str, epoch_size_log2: u32) -> usize {
                 "epoch {label} starts from registers the chain did not hand it"
             );
 
-            let proof = multilinear_continuation::prove_epoch(
+            let proof = multilinear_continuation::prove_epoch::<H>(
                 &elf,
                 &elf_bytes,
                 &register_init,
@@ -57,6 +59,7 @@ fn epochs_prove_and_verify(name: &str, epoch_size_log2: u32) -> usize {
                 &boundary,
                 &opts,
                 None,
+                &pinned,
             )?;
             assert!(
                 multilinear_continuation::verify_epoch(
@@ -68,7 +71,8 @@ fn epochs_prove_and_verify(name: &str, epoch_size_log2: u32) -> usize {
             count += 1;
             Ok(())
         })
-        .expect("the epochs prepare");
+    })
+    .expect("the epochs prepare");
 
     assert!(count > 0, "the program ran no epochs");
     // What the cross-epoch proof will be made of: one boundary per epoch.
@@ -143,12 +147,15 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
         Vec<stark::config::Commitment>,
         Vec<stark::config::Commitment>,
     )> = Vec::new();
+    crate::with_whir_hash!(|H| {
+    let pinned = multilinear_continuation::decode_prepared_for::<H>(&elf, &elf_bytes)
+        .expect("DECODE's out-of-band commitment");
     continuation::for_each_epoch(&elf, &[], 4, &artifacts, |prepared, _| {
         let boundary = std::sync::Arc::clone(&prepared.boundary);
         let register_init = prepared.register_init.clone();
         let label = prepared.label;
         let is_final = prepared.is_final;
-        let proof = multilinear_continuation::prove_epoch(
+        let proof = multilinear_continuation::prove_epoch::<H>(
             &elf,
             &elf_bytes,
             &register_init,
@@ -158,6 +165,7 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
             &boundary,
             &opts,
             None,
+            &pinned,
         )?;
         // The config the standalone commitment runs at is the epoch's: the root
         // depends on the blowup and the fold width, and those are fixed —
@@ -190,6 +198,7 @@ fn the_bookend_commits_to_a_root_the_cross_epoch_proof_can_reproduce() {
             standalone,
         ));
         Ok(())
+    })
     })
     .expect("the epochs prepare");
 
