@@ -107,6 +107,58 @@ fn a_run_of_epochs_proves_and_verifies_from_the_elf() {
     );
 }
 
+/// The same for one epoch proved twice from the same traces — which says
+/// whether the drift is in building the trace or in committing it.
+#[test]
+fn proving_one_epoch_twice_commits_the_same() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let opts = ProofOptions::default_test_options();
+    let elf = executor::elf::Elf::load(&elf_bytes).unwrap();
+    let decode = crate::tables::decode::commitment_from_elf(&elf, &opts).unwrap();
+    let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf).unwrap();
+
+    let mut roots: Vec<Vec<Vec<u8>>> = Vec::new();
+    for _ in 0..2 {
+        let mut first = None;
+        crate::continuation::for_each_epoch_overlapped(&elf, &[], 4, &artifacts, |prepared| {
+            if first.is_none() {
+                let proof = multilinear_continuation::prove_epoch(
+                    &elf,
+                    &elf_bytes,
+                    &prepared.register_init,
+                    prepared.label,
+                    prepared.traces,
+                    prepared.is_final,
+                    &prepared.boundary,
+                    &opts,
+                    Some(decode),
+                )?;
+                first = Some(proof.proof.roots.iter().map(|r| r.to_vec()).collect());
+            }
+            Ok(())
+        })
+        .unwrap();
+        roots.push(first.unwrap());
+    }
+    assert_eq!(roots[0], roots[1], "one epoch committed differently twice");
+}
+/// Proving the same run twice has to commit to the same trace: the commitment
+/// is a function of the ELF, the input and the epoch size, and nothing else.
+/// A two-pass protocol cannot exist without this.
+#[test]
+fn proving_a_run_twice_commits_to_the_same_traces() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let opts = ProofOptions::default_test_options();
+    let once = multilinear_continuation::prove_epochs(&elf_bytes, &[], 4, &opts).expect("once");
+    let twice = multilinear_continuation::prove_epochs(&elf_bytes, &[], 4, &opts).expect("twice");
+    assert_eq!(once.len(), twice.len());
+    for (i, (a, b)) in once.iter().zip(&twice).enumerate() {
+        assert_eq!(
+            a.proof.roots, b.proof.roots,
+            "epoch {i} committed differently"
+        );
+    }
+}
 /// The registers are the chain: handing an epoch the wrong ones has to be
 /// caught, or nothing links one epoch to the next.
 #[test]
