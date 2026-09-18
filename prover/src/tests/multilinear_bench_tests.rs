@@ -1931,14 +1931,22 @@ fn whir_table_shapes() {
     .expect("epochs prepare");
 }
 
-/// ★ The per-table BUS census V1's item-5 recount needs, which neither
-/// `whir_epoch_shapes` nor `whir_table_shapes` prints.
+/// ★ THE PER-TABLE HALF of item 5's recount, in one card-free run.
 ///
 /// `whir_table_shapes` gives the interaction COUNT; what the bus statements
-/// actually cost is set by what is inside those interactions — how many bus
+/// actually cost is set by what is INSIDE those interactions — how many bus
 /// elements each carries and how many columns each element reads — and neither
-/// is derivable from `I`. This prints those, and the row count
-/// `whir_bus::claim_statements_cost` makes of them, per epoch-0 table.
+/// is derivable from `I`. This prints those, and then the whole thing:
+/// `whir_table::table_verify_cost` for every epoch-0 table, rows and
+/// permutations, with the SPONGE THREADED across the tables the way an
+/// assembled epoch threads it rather than restarted fresh at each one.
+///
+/// ⚠ What the total is NOT: it is the per-table half alone. The chain half, the
+/// DECODE group's own chain, `stacked_eval`'s wrapper, the epoch statement and
+/// the preprocessed seam are each named in the output rather than estimated
+/// into it. ⚠ And these rows INCLUDE their constants, where `chain_rows` does
+/// not — the two conventions are set out in V1e's handoff and must not be added
+/// without saying which one the sum is in.
 ///
 /// Execution-independent (the AIRs' own structure), card-free, and it returns
 /// after epoch 0 — but building the AIR set needs the guest ELF, so it is a box
@@ -1953,7 +1961,9 @@ fn whir_table_shapes() {
 #[test]
 #[ignore = "needs the guest ELF and builds every epoch's AIRs"]
 fn whir_bus_shapes() {
-    use crate::lfm::whir_bus::{alpha_powers_read, claim_statements_cost};
+    use crate::lfm::whir_bus::claim_statements_cost;
+    use crate::lfm::whir_table::{TableShape, table_verify_cost};
+    use crate::lfm::whir_transcript::SpongeEntry;
     use crate::tables::trace_builder::DecodeArtifacts;
     use executor::elf::Elf;
     use multilinear::Error as MlError;
@@ -2007,19 +2017,24 @@ fn whir_bus_shapes() {
             pairs.push((&l2g_air, &mut l2g_trace, &()));
 
             println!(
-                "{:<16} {:>5} {:>5} {:>6} {:>9} {:>6} {:>7} {:>7} {:>7} {:>8}",
+                "{:<16} {:>5} {:>5} {:>9} {:>6} {:>7} {:>8} {:>5} {:>4} {:>10} {:>8}",
                 "table",
                 "vars",
                 "I",
-                "slots",
                 "elements",
                 "terms",
                 "widest",
-                "ladder",
-                "consts",
-                "rows"
+                "bus rows",
+                "gkr",
+                "deg",
+                "table rows",
+                "perms"
             );
             let (mut ti, mut te, mut tt, mut tw, mut tr) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut total_rows, mut total_perms) = (0usize, 0usize);
+            // The sponge is THREADED, as an assembled epoch threads it: a table
+            // enters on whatever the one before it left, not on `fresh`.
+            let mut entry = SpongeEntry::fresh();
             for (air, trace, _) in pairs.iter() {
                 let width = trace.main_table.width;
                 let num_vars = trace.main_table.height.trailing_zeros() as usize;
@@ -2061,25 +2076,50 @@ fn whir_bus_shapes() {
                     .sum();
                 let widest = shapes.iter().map(|s| s.elements.len()).max().unwrap_or(0);
                 let cost = claim_statements_cost(&shapes, num_vars);
+                let shape = TableShape {
+                    ir: layout.shape(),
+                    bus: &shapes,
+                    kinds: layout.kinds(),
+                    num_columns: layout.num_columns(),
+                    num_vars,
+                };
+                let whole = table_verify_cost(&shape, entry);
+                entry = whole.entry();
                 println!(
-                    "{:<16} {num_vars:>5} {:>5} {:>6} {elements:>9} {terms:>6} {widest:>7} {:>7} {:>7} {:>8}",
+                    "{:<16} {num_vars:>5} {:>5} {elements:>9} {terms:>6} {widest:>7} {:>8} {:>5} {:>4} {:>10} {:>8}",
                     air.name(),
                     shapes.len(),
-                    slots.len(),
-                    alpha_powers_read(&shapes),
-                    cost.constants(),
                     cost.rows(),
+                    shape.gkr_layers(),
+                    shape.sumcheck_degree(),
+                    whole.rows(),
+                    whole.perms(),
                 );
                 ti += shapes.len();
                 te += elements;
                 tt += terms;
                 tw = tw.max(widest);
                 tr += cost.rows();
+                total_rows += whole.rows();
+                total_perms += whole.perms();
             }
             println!(
                 "epoch 0 BUS TOTAL over {} tables: I {ti} | elements {te} | affine terms {tt} \
                  | widest interaction {tw} | claim_statements rows {tr}",
                 pairs.len()
+            );
+            println!(
+                "★ epoch 0 PER-TABLE HALF over {} tables: {total_rows} rows | {total_perms} \
+                 permutations",
+                pairs.len()
+            );
+            println!(
+                "  ⚠ NOT the whole epoch. Missing, and each is named rather than estimated: the \
+                 CHAIN half (V1d: 1,484,072 rows over eight chains at n_stack 25, a CONST-FREE \
+                 figure — see V1e's handoff on the two conventions), the DECODE group's own chain \
+                 per epoch, `stacked_eval`'s wrapper (item 3), the epoch STATEMENT (item 4), and \
+                 the preprocessed seam (BITWISE's landed 295-instruction closed form, DECODE's \
+                 pinned group). The rows above INCLUDE their constants."
             );
             Ok(())
         },
