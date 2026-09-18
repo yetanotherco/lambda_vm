@@ -2275,10 +2275,16 @@ enum TamperKind {
     ColumnValue(usize),
 }
 
-/// One tamper site: a table, a value in it, and what it is supposed to reach.
+/// One tamper site: a table, a value in it, and what binds it.
+///
+/// ⚠ `bound_by` NAMES A LEG THAT BINDS THE VALUE, NOT THE LEG THAT REFUSES.
+/// Two mutations measured the difference and the field is worded from what they
+/// showed — see this test's own doc for the numbers. A refusal here is
+/// over-determined: these values are settled by more than one leg, so which one
+/// fires first is an emission-order fact, not a soundness one.
 struct TamperSite {
     what: &'static str,
-    leg: &'static str,
+    bound_by: &'static str,
     table: usize,
     kind: TamperKind,
 }
@@ -2358,6 +2364,32 @@ fn the_one_differing_word(honest: &[LfmWord], other: &[LfmWord]) -> usize {
 /// The closing control is the honest execution AFTER every restore: it is what
 /// says the three refusals came from the tampers rather than from a fixture
 /// this test corrupted on its way through.
+///
+/// # ⛔ WHAT TWO MUTATIONS MEASURED, AND WHAT THIS TEST THEREFORE DOES NOT SHOW
+///
+/// Each site was pre-registered against ONE leg. Both attempts to attribute a
+/// site to its leg FAILED, and the failures are recorded here because they are
+/// the more useful result:
+///
+/// 1. BITWISE's preprocessed route switched to [`PreprocessedRoute::None`] —
+///    the whole leg gone — left this module **17 of 17 green**, with site c
+///    refusing at the IDENTICAL executor address. Site c never exercised
+///    `check_preprocessed` at all.
+/// 2. The closure's `assert_eq_ext(balance, expected)` removed left the tamper
+///    arm green too (two OTHER tests went red), with site a still refusing but
+///    at a different address. Site a is bound above the closure as well.
+///
+/// So a refusal here says the value is BOUND; it does not say by which leg, and
+/// this test must not be read as covering one.
+///
+/// ⚠ AND THE CONSEQUENCE WORTH ACTING ON: BITWISE's preprocessed leg has NO
+/// gate in this module. That is not an oversight in this test — it is not
+/// reachable by the tamper this test performs. BITWISE's preprocessed columns
+/// are COMMITTED columns, so one moved arena word is refused by the group's
+/// opening before the closed form is consulted; defeating the closed form needs
+/// a prover who COMMITS a different preprocessed polynomial and opens to it
+/// consistently, which is a re-prove-level fixture and not an arena tamper. The
+/// leg's own gate is owed and is recorded as owed.
 #[test]
 fn a_tampered_epoch_is_refused_at_three_sites() {
     let (elf_bytes, opts, mut bundle) = driver_bundle();
@@ -2446,20 +2478,21 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
     let sites = [
         TamperSite {
             what: "a table's bus output (p)",
-            leg: "the epoch closure: the balance stops equalling `owed`",
+            bound_by: "the epoch closure's balance, and the GKR output claim above it",
             table: plain,
             kind: TamperKind::BusOutput,
         },
         TamperSite {
             what: "a claimed MAIN column value",
-            leg: "the commitment group's opening: the stacked evaluation stops \
-                  answering the claim",
+            bound_by: "the commitment group's opening, and the claim reduce above it",
             table: plain,
             kind: TamperKind::ColumnValue(0),
         },
         TamperSite {
             what: "a BITWISE PREPROCESSED column's claimed value",
-            leg: "check_preprocessed: BITWISE's closed form stops equalling the claim",
+            bound_by: "the commitment group's opening — BITWISE's preprocessed columns \
+                       are COMMITTED columns, so the closed form is a second binding \
+                       on the same word and not the only one",
             table: bitwise,
             kind: TamperKind::ColumnValue(targets[0]),
         },
@@ -2473,7 +2506,7 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
         assert!(
             verdict.is_err(),
             "{}: the host must refuse a bundle whose {} was moved",
-            site.leg,
+            site.bound_by,
             site.what
         );
         println!(
@@ -2514,7 +2547,7 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
         assert!(
             refusal.is_err(),
             "{}: the machine must refuse an arena whose {} was moved",
-            site.leg,
+            site.bound_by,
             site.what
         );
         println!(
