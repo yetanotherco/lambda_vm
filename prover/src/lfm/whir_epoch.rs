@@ -57,18 +57,22 @@ use multilinear::constraint_argument::FactorKind;
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::ChainConfig;
+use stark::multilinear_logup::InteractionShape;
+use stark::multilinear_table::TableLayout;
 
 use crate::tables::bitwise::NUM_PRECOMPUTED_COLS;
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::algebraic_commit::leaf_capacity;
 use super::builder::{Cell, Ext, LfmBuilder};
+use super::compiler::LfmProgram;
 use super::preprocessed::{
     bitwise_preprocessed_rows, const_mle_constants, const_mle_rows, emit_bitwise_preprocessed,
     emit_const_mle_at,
 };
 use super::whir_bus::Cost;
 use super::whir_chain::ChainShape;
+use super::whir_real_epoch::WhirRealEpoch;
 use super::whir_stacked::{
     StackedCost, StackedPolyWires, emit_stacked_verify, stacked_verify_cost,
 };
@@ -922,4 +926,636 @@ pub fn emit_prepared_group(
 ) -> Ext {
     let points: Vec<&[Ext]> = (0..values.len()).map(|_| point).collect();
     emit_stacked_verify(b, transcript, layout, polys, &points, values, shape, domain)
+}
+
+// =============================================================================
+// The assembled epoch program
+// =============================================================================
+
+/// Everything one epoch's program is emitted against, derived ONCE.
+///
+/// ★ ONE DERIVATION, TWO FUNCTIONS. [`whir_epoch_program`] and
+/// [`whir_epoch_arena`] are only correct relative to each other: the arena is a
+/// list of words in the order the program hints them, and two derivations of
+/// that order is precisely the drift this campaign keeps finding. So both build
+/// this and walk it.
+///
+/// ⚠ The `TableLayout`s are rebuilt here rather than borrowed from the
+/// verifier, because `layout_of` is private to `multilinear_continuation`. What
+/// catches a drift is not this comment: every challenge downstream of a layout
+/// is derived from it, so a layout that differed from the host's would give the
+/// machine a different `z` and the honest proof would stop executing.
+struct EpochPlan<'a> {
+    config: ChainConfig,
+    /// `epoch_groups(n)`.
+    sizes: Vec<usize>,
+    layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>>,
+    buses: Vec<Vec<InteractionShape<GoldilocksExtension>>>,
+    /// Each table's preprocessed columns, owned, empty for a table with none.
+    preprocessed: Vec<Vec<Vec<FE>>>,
+    /// Each table's name, which is what selects its preprocessed route.
+    names: Vec<String>,
+    group_layouts: Vec<StackedLayout>,
+    group_domains: Vec<Domain<GoldilocksField>>,
+    /// Where DECODE sits, found by name.
+    decode_at: usize,
+    decode_layout: StackedLayout,
+    decode_domain: Domain<GoldilocksField>,
+}
+
+/// The four tables whose preprocessed columns an epoch carries, and the route
+/// each one takes.
+///
+/// ⛔ A TABLE WITH PREPROCESSED COLUMNS AND NONE OF THESE NAMES IS A REFUSAL,
+/// not a skip. Skipping it would drop a `check_preprocessed` with nothing put in
+/// its place, which is exactly what `settled_out_of_band` is documented never to
+/// become (`multilinear_table.rs:943`). A fifth preprocessed table added
+/// upstream must fail this build rather than go quietly unchecked.
+const BITWISE_NAME: &str = "BITWISE";
+const DECODE_NAME: &str = "DECODE";
+const KECCAK_RC_NAME: &str = "KECCAK_RC";
+const REGISTER_NAME: &str = "REGISTER";
+
+impl<'a> EpochPlan<'a> {
+    fn build(epoch: &WhirRealEpoch, airs: EpochAirs<'a>) -> Self {
+        assert_eq!(
+            airs.len(),
+            epoch.proof.table_num_vars.len(),
+            "one AIR per table the proof states a height for"
+        );
+        assert_eq!(
+            airs.len(),
+            epoch.proof.proof.tables.len(),
+            "one AIR per table the proof argues"
+        );
+
+        let shapes: Vec<(usize, usize)> = airs
+            .iter()
+            .zip(&epoch.proof.table_num_vars)
+            .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
+            .collect();
+        let config = epoch.config;
+        let sizes = crate::multilinear_continuation::epoch_groups(shapes.len());
+
+        let layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>> = airs
+            .iter()
+            .zip(&shapes)
+            .map(|(air, &(width, num_vars))| {
+                TableLayout::new(
+                    air.constraint_program(),
+                    air.constraints_meta(),
+                    air.bus_interactions(),
+                    width,
+                    num_vars,
+                    stark::multilinear_air::Uniforms::default(),
+                )
+                .expect("a table the verifier accepted must lay out")
+            })
+            .collect();
+        let buses: Vec<Vec<InteractionShape<GoldilocksExtension>>> =
+            airs.iter()
+                .zip(&layouts)
+                .map(|(air, layout)| {
+                    let slots = layout.slot_of().to_vec();
+                    stark::multilinear_logup::interaction_shapes(
+                        air.bus_interactions(),
+                        slots.len(),
+                        |column| {
+                            slots.get(column).copied().ok_or(
+                                multilinear::Error::UnknownPolynomial {
+                                    index: column,
+                                    len: slots.len(),
+                                },
+                            )
+                        },
+                    )
+                    .expect("the bus probes")
+                })
+                .collect();
+        let preprocessed: Vec<Vec<Vec<FE>>> =
+            airs.iter().map(|air| air.precomputed_columns()).collect();
+        let names: Vec<String> = airs.iter().map(|air| air.name().to_string()).collect();
+
+        // ⛔ The refusal, before anything is emitted.
+        for (index, (name, columns)) in names.iter().zip(&preprocessed).enumerate() {
+            assert!(
+                columns.is_empty()
+                    || matches!(
+                        name.as_str(),
+                        BITWISE_NAME | DECODE_NAME | KECCAK_RC_NAME | REGISTER_NAME
+                    ),
+                "table {index} is named {name} and carries {} preprocessed columns, which no \
+                 route covers; a table whose columns nothing checks must fail the build, not be \
+                 skipped",
+                columns.len()
+            );
+        }
+
+        let (group_layouts, group_domains) =
+            crate::multilinear_prove::stacks(&shapes, &sizes, &config)
+                .expect("the epoch's groups stack");
+
+        let decode_at = crate::multilinear_continuation::decode_table_index(airs)
+            .expect("an epoch's table set carries exactly one DECODE");
+        let decode_columns = &preprocessed[decode_at];
+        let decode_rows = decode_columns
+            .first()
+            .map(Vec::len)
+            .expect("DECODE carries preprocessed columns");
+        let decode_vars = decode_rows.trailing_zeros() as usize;
+        let decode_config = crate::multilinear_continuation::decode_prepared_config(
+            decode_columns.len(),
+            decode_vars,
+        );
+        let (mut decode_layouts, mut decode_domains) = crate::multilinear_prove::stacks(
+            &[(decode_columns.len(), decode_vars)],
+            &[DECODE_GROUP_POLYS],
+            &decode_config,
+        )
+        .expect("DECODE's prepared group stacks");
+        assert_eq!(
+            decode_layouts.len(),
+            1,
+            "the prepared group is ONE stacked polynomial"
+        );
+
+        Self {
+            config,
+            sizes,
+            layouts,
+            buses,
+            preprocessed,
+            names,
+            group_layouts,
+            group_domains,
+            decode_at,
+            decode_layout: decode_layouts.remove(0),
+            decode_domain: decode_domains.remove(0),
+        }
+    }
+
+    /// The emit-time shapes, borrowed from the layouts and the buses.
+    fn table_shapes(&self) -> Vec<TableShape<'_>> {
+        self.layouts
+            .iter()
+            .zip(&self.buses)
+            .map(|(layout, bus)| TableShape {
+                ir: layout.shape(),
+                bus,
+                kinds: layout.kinds(),
+                num_columns: layout.num_columns(),
+                num_vars: layout.num_vars(),
+            })
+            .collect()
+    }
+
+    /// Each table's slot map, which the preprocessed leg addresses through.
+    fn slots(&self) -> Vec<&[usize]> {
+        self.layouts.iter().map(|layout| layout.slot_of()).collect()
+    }
+
+    /// The preprocessed plan per table, over views the caller owns.
+    fn routes<'v>(&self, views: &'v [Vec<&'v [FE]>]) -> Vec<PreprocessedPlan<'v>> {
+        self.names
+            .iter()
+            .zip(views)
+            .zip(&self.preprocessed)
+            .map(|((name, view), columns)| {
+                if columns.is_empty() {
+                    return PreprocessedPlan {
+                        settled: 0,
+                        route: PreprocessedRoute::None,
+                    };
+                }
+                match name.as_str() {
+                    BITWISE_NAME => PreprocessedPlan {
+                        settled: 0,
+                        route: PreprocessedRoute::Bitwise,
+                    },
+                    // ★ Every one of DECODE's columns is settled by the prepared
+                    // opening, so nothing is emitted for it here — and `settled`
+                    // is the SAME number the opening covers, never a second knob.
+                    DECODE_NAME => PreprocessedPlan {
+                        settled: columns.len(),
+                        route: PreprocessedRoute::None,
+                    },
+                    KECCAK_RC_NAME | REGISTER_NAME => PreprocessedPlan {
+                        settled: 0,
+                        route: PreprocessedRoute::ConstMle(view),
+                    },
+                    other => unreachable!("the build refused {other} already"),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Every word one epoch's program hints, in the order it hints them.
+///
+/// ⚠ THE ORDER IS THE CONTRACT between this and [`whir_epoch_program`], and
+/// nothing but EXECUTION catches a disagreement: a misaligned arena hands the
+/// machine somebody else's field element, and the argument stops satisfying its
+/// own refusals. Both walk the same [`EpochPlan`], and the gate on the pair is
+/// that the program hints exactly as many words as this writes.
+pub fn whir_epoch_arena(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> Vec<Vec<LfmWord>> {
+    let plan = EpochPlan::build(epoch, airs);
+    let proof = &epoch.proof.proof;
+    let mut words: Vec<LfmWord> = proof
+        .roots
+        .iter()
+        .map(super::algebraic_commit::commitment_to_digest)
+        .collect();
+    for table in &proof.tables {
+        push_table_words(&mut words, table);
+    }
+    for (group, opening) in proof.columns.iter().enumerate() {
+        let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
+        for chain in &opening.polys {
+            words.push(super::word::ext_word(&chain.final_value));
+            super::whir_chain::push_round_words(&mut words, &shape, chain);
+        }
+    }
+    // The prepared opening's chain runs at the EPOCH's config, and only its
+    // layout and domain are DECODE's (`multilinear_table.rs:1310`).
+    let prepared = proof
+        .preprocessed
+        .as_ref()
+        .expect("an epoch carries DECODE's prepared opening");
+    let shape = ChainShape::new(&plan.config, plan.decode_layout.n_stack());
+    for chain in &prepared.polys {
+        words.push(super::word::ext_word(&chain.final_value));
+        super::whir_chain::push_round_words(&mut words, &shape, chain);
+    }
+    vec![words]
+}
+
+/// One table's proof words, in the order [`whir_epoch_program`] hints them.
+fn push_table_words(
+    words: &mut Vec<LfmWord>,
+    table: &stark::multilinear_table::TableProof<GoldilocksExtension>,
+) {
+    let ext = super::word::ext_word;
+    words.push(ext(&table.bus_output.0));
+    words.push(ext(&table.bus_output.1));
+    for layer in &table.gkr.layers {
+        for round in &layer.sumcheck.rounds {
+            words.extend(round.evaluations.iter().map(ext));
+        }
+        for value in [&layer.p_lo, &layer.p_hi, &layer.q_lo, &layer.q_hi] {
+            words.push(ext(value));
+        }
+    }
+    for round in &table.constraint.sumcheck.rounds {
+        words.extend(round.evaluations.iter().map(ext));
+    }
+    words.extend(table.constraint.factor_values.iter().map(ext));
+    for round in &table.constraint.reduce.sumcheck.rounds {
+        words.extend(round.evaluations.iter().map(ext));
+    }
+    words.extend(table.constraint.reduce.column_values.iter().map(ext));
+}
+
+/// ★★ ONE EPOCH'S VERIFY, ASSEMBLED — `verify_epoch_bookend`'s body as one
+/// machine program.
+///
+/// The order is the host's, and the order is the only part of a Fiat-Shamir
+/// verifier that no per-leg gate can see. Read from `multi_verify`, by line:
+/// the STATEMENT (`absorb_epoch`), the ROOTS BLOCK (`:1205`), the per-table
+/// walk (`:1218`), the CLOSURE (`:1245`), the group walk (`:1254`) and the
+/// PREPARED opening last (`:1295`).
+///
+/// ⚠ ONE QUALIFICATION, so nobody reads a gate as covering more than it does:
+/// the closure emits NO transcript operation — it is divisions, adds and one
+/// `assert_eq_ext` over wires the roots block already produced — so its position
+/// between the two walks is a readability choice and not a soundness one. Every
+/// other step's position IS load-bearing.
+pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProgram {
+    let plan = EpochPlan::build(epoch, airs);
+    let proof = &epoch.proof.proof;
+    let words = whir_epoch_arena(epoch, airs);
+    let total = words[0].len() as u32;
+
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(total);
+    let mut at = 0u32;
+
+    let carried: Vec<Cell> = proof
+        .roots
+        .iter()
+        .map(|_| {
+            let cell = b.hint_word(arena, at);
+            at += 1;
+            cell
+        })
+        .collect();
+
+    // 1. The statement, which is entirely program text.
+    let mut transcript = WhirTranscript::new();
+    super::whir_statement::emit_epoch_statement(
+        &mut transcript,
+        &super::whir_statement::EpochStatement {
+            elf_digest: &epoch.elf_digest,
+            epoch_label: epoch.position.label,
+            public_output: epoch.public_output(),
+            table_counts: &epoch.proof.table_counts,
+            table_num_vars: &epoch.proof.table_num_vars,
+            config: &plan.config,
+        },
+    );
+
+    // 2. The roots block. The DECODE root is INTERNED, not hinted — see this
+    //    module's header for what that constant is and is not bound to.
+    // ⛔ THE PREPARED ROOTS, NOT `decode_commitment`. The two are different
+    // commitments with confusable names: `decode_commitment` is the UNIVARIATE
+    // one that reaches `build_epoch_airs` and that the multilinear path never
+    // compares, while what `absorb_roots_and_challenge` absorbs after the
+    // carried roots is the prepared multilinear stack's. Absorbing the wrong
+    // one derives a different `z` and every leg below it, with nothing naming
+    // the cause — which is exactly how this was found.
+    let derived: Vec<LfmWord> = epoch
+        .decode_prepared_roots
+        .iter()
+        .map(super::algebraic_commit::commitment_to_digest)
+        .collect();
+    let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &derived);
+
+    // The shared alpha ladder. ⚠ EPOCH-LEVEL: `emit_interaction` reads
+    // `alpha_powers[i + 1]` and one ladder of the longest table's length serves
+    // every table, so `table_verify_cost` does not charge it and the assembled
+    // form names it here.
+    let shapes = plan.table_shapes();
+    let ladder_len = shapes
+        .iter()
+        .map(|shape| super::whir_bus::alpha_powers_read(shape.bus))
+        .max()
+        .unwrap_or(1);
+    let ladder = super::whir_poly::emit_challenge_powers(&mut b, alpha, ladder_len);
+
+    // 3. The per-table walk, with each table's proof wires hinted first.
+    let mut store = Vec::with_capacity(proof.tables.len());
+    for table in &proof.tables {
+        store.push(hint_table_wires(&mut b, arena, &mut at, table));
+    }
+    let wires: Vec<TableProofWires<'_>> = store.iter().map(TableWires::borrow).collect();
+    let views: Vec<Vec<&[FE]>> = plan
+        .preprocessed
+        .iter()
+        .map(|columns| columns.iter().map(Vec::as_slice).collect())
+        .collect();
+    let routes = plan.routes(&views);
+    let slots = plan.slots();
+    let walk = emit_table_walk(
+        &mut b,
+        &mut transcript,
+        &wires,
+        &shapes,
+        &routes,
+        &slots,
+        z,
+        &ladder,
+        beta,
+    );
+
+    // 4. The closure: the bus balance against the epoch's expected value.
+    let start_index = u64::from(epoch.position.register_init[crate::tables::register::X254_INDEX]);
+    emit_epoch_closure(
+        &mut b,
+        &walk.outputs,
+        epoch.public_output(),
+        start_index,
+        z,
+        alpha,
+    );
+
+    // 5. The commitment groups.
+    let mut chains = Vec::with_capacity(proof.columns.len());
+    for (group, opening) in proof.columns.iter().enumerate() {
+        let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
+        chains.push(hint_group_chains(&mut b, arena, &mut at, opening, &shape));
+    }
+    let group_shapes: Vec<ChainShape> = plan
+        .group_layouts
+        .iter()
+        .map(|layout| ChainShape::new(&plan.config, layout.n_stack()))
+        .collect();
+    // ⚠ The openings and the round wires are LOCALS, because a chain's wires
+    // borrow its openings and its openings borrow its storage. Returning them
+    // from a helper would mean leaking them; keeping the whole ladder in one
+    // scope is what the chain suite does and costs nothing.
+    let group_openings: Vec<Vec<_>> = chains
+        .iter()
+        .map(|held| {
+            held.storage
+                .iter()
+                .map(super::whir_chain::RoundStorage::openings)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let group_rounds: Vec<Vec<Vec<super::whir_chain::ChainRoundWires<'_>>>> = chains
+        .iter()
+        .zip(&group_openings)
+        .map(|(held, openings)| {
+            held.storage
+                .iter()
+                .zip(openings)
+                .map(|(chain, (current, next))| chain.wires(current, next))
+                .collect()
+        })
+        .collect();
+    let group_wires: Vec<Vec<StackedPolyWires<'_>>> = {
+        let mut root_at = 0usize;
+        let mut out = Vec::with_capacity(chains.len());
+        for (group, held) in chains.iter().enumerate() {
+            out.push(
+                (0..held.finals.len())
+                    .map(|poly| StackedPolyWires {
+                        rounds: &group_rounds[group][poly],
+                        root: carried[root_at + poly],
+                        final_value: held.finals[poly],
+                    })
+                    .collect(),
+            );
+            root_at += plan.group_layouts[group].num_polys();
+        }
+        out
+    };
+    let groups: Vec<GroupWires<'_>> = (0..chains.len())
+        .map(|group| GroupWires {
+            layout: &plan.group_layouts[group],
+            polys: &group_wires[group],
+            shape: &group_shapes[group],
+            domain: &plan.group_domains[group],
+        })
+        .collect();
+    emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);
+
+    // 6. The prepared opening, last, on DECODE's own layout and domain at the
+    //    EPOCH's config. Its root is the SAME interned constant the roots block
+    //    absorbed: `word_const` keys on the canonical word, so this re-mention
+    //    costs no row and the program still holds exactly one `Const` for it.
+    let prepared = proof
+        .preprocessed
+        .as_ref()
+        .expect("an epoch carries DECODE's prepared opening");
+    let prepared_shape = ChainShape::new(&plan.config, plan.decode_layout.n_stack());
+    let held = hint_group_chains(&mut b, arena, &mut at, prepared, &prepared_shape);
+    let decode_roots: Vec<Cell> = derived
+        .iter()
+        .map(|word| b.digest_const(*word).as_cell())
+        .collect();
+    let prepared_openings: Vec<_> = held
+        .storage
+        .iter()
+        .map(super::whir_chain::RoundStorage::openings)
+        .collect();
+    let prepared_rounds: Vec<Vec<super::whir_chain::ChainRoundWires<'_>>> = held
+        .storage
+        .iter()
+        .zip(&prepared_openings)
+        .map(|(chain, (current, next))| chain.wires(current, next))
+        .collect();
+    let prepared_polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
+        .map(|poly| StackedPolyWires {
+            rounds: &prepared_rounds[poly],
+            root: decode_roots[poly],
+            final_value: held.finals[poly],
+        })
+        .collect();
+    let column_at = walk.column_at(plan.decode_at);
+    let settled = plan.preprocessed[plan.decode_at].len();
+    emit_prepared_group(
+        &mut b,
+        &mut transcript,
+        &plan.decode_layout,
+        &prepared_polys,
+        &prepared_shape,
+        &plan.decode_domain,
+        &walk.points[plan.decode_at],
+        &walk.values[column_at..column_at + settled],
+    );
+
+    assert_eq!(
+        at, total,
+        "the program must hint exactly the words the arena writes"
+    );
+    b.public(z.as_cell());
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("an epoch program must be admissible");
+    program
+}
+
+/// One table's hinted wires, OWNED, because `TableProofWires` borrows them.
+struct TableWires {
+    bus_output: (Ext, Ext),
+    gkr: Vec<super::whir_gkr::GkrLayerWires>,
+    sumcheck: Vec<Vec<Ext>>,
+    factor_values: Vec<Ext>,
+    reduce_sumcheck: Vec<Vec<Ext>>,
+    column_values: Vec<Ext>,
+}
+
+impl TableWires {
+    fn borrow(&self) -> TableProofWires<'_> {
+        TableProofWires {
+            bus_output: self.bus_output,
+            gkr: &self.gkr,
+            sumcheck: &self.sumcheck,
+            factor_values: &self.factor_values,
+            reduce: super::whir_reduce::ReduceWires {
+                sumcheck: &self.reduce_sumcheck,
+                column_values: &self.column_values,
+            },
+        }
+    }
+}
+
+/// Hints one table's proof, in [`push_table_words`]' order.
+fn hint_table_wires(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    table: &stark::multilinear_table::TableProof<GoldilocksExtension>,
+) -> TableWires {
+    let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
+        (0..count)
+            .map(|_| {
+                let wire = b.hint_word(arena, *at).as_ext();
+                *at += 1;
+                wire
+            })
+            .collect()
+    };
+    let output = take(b, 2);
+    let mut gkr = Vec::with_capacity(table.gkr.layers.len());
+    for layer in &table.gkr.layers {
+        let sumcheck: Vec<Vec<Ext>> = layer
+            .sumcheck
+            .rounds
+            .iter()
+            .map(|round| take(b, round.evaluations.len()))
+            .collect();
+        let halves = take(b, 4);
+        gkr.push(super::whir_gkr::GkrLayerWires {
+            sumcheck,
+            p_lo: halves[0],
+            p_hi: halves[1],
+            q_lo: halves[2],
+            q_hi: halves[3],
+        });
+    }
+    let sumcheck: Vec<Vec<Ext>> = table
+        .constraint
+        .sumcheck
+        .rounds
+        .iter()
+        .map(|round| take(b, round.evaluations.len()))
+        .collect();
+    let factor_values = take(b, table.constraint.factor_values.len());
+    let reduce_sumcheck: Vec<Vec<Ext>> = table
+        .constraint
+        .reduce
+        .sumcheck
+        .rounds
+        .iter()
+        .map(|round| take(b, round.evaluations.len()))
+        .collect();
+    let column_values = take(b, table.constraint.reduce.column_values.len());
+    TableWires {
+        bus_output: (output[0], output[1]),
+        gkr,
+        sumcheck,
+        factor_values,
+        reduce_sumcheck,
+        column_values,
+    }
+}
+
+/// One commitment group's hinted chains, OWNED for the same reason.
+///
+/// ⛔ The ROOTS ARE NOT HERE. A group's roots are the cells the roots block
+/// already hinted, and [`Self::polys`] takes them by reference: a second copy
+/// would let a prover absorb one root into the transcript and open the chain
+/// against another, with an honest arena looking identical to every value gate.
+struct GroupChains {
+    finals: Vec<Ext>,
+    storage: Vec<super::whir_chain::RoundStorage>,
+}
+
+/// Hints one group's chains, in [`whir_epoch_arena`]'s order.
+fn hint_group_chains(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+    opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    shape: &ChainShape,
+) -> GroupChains {
+    let mut finals = Vec::with_capacity(opening.polys.len());
+    let mut storage = Vec::with_capacity(opening.polys.len());
+    for _ in &opening.polys {
+        finals.push(b.hint_word(arena, *at).as_ext());
+        *at += 1;
+        storage.push(super::whir_chain::RoundStorage::hint(b, arena, *at, shape));
+        *at += super::whir_chain::RoundStorage::words(shape);
+    }
+    GroupChains { finals, storage }
 }

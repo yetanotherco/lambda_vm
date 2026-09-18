@@ -1707,3 +1707,156 @@ fn recorded_draws(
         chain_draws,
     }
 }
+
+// =============================================================================
+// The assembled epoch program, on the level-0 driver's own fixture
+// =============================================================================
+
+/// The driver's run: `test_private_input_xpage` at `epoch_size_log2 = 2`.
+///
+/// ★ THE LAST EPOCH IS THE ONE THIS GATES, and that is not arbitrary. It both
+/// PUBLISHES and CONTINUES a prior epoch, which is one notch stronger than "a
+/// publishing epoch": V1g's two complementary closure mutations showed that at
+/// index 0 the dropped-commit-index mutation computes the same thing, so a
+/// fixture that published at index 0 would leave that defect invisible.
+fn driver_bundle() -> (
+    Vec<u8>,
+    crate::ProofOptions,
+    crate::multilinear_continuation::ContinuationProof,
+) {
+    let mut input: Vec<u8> = Vec::with_capacity(16);
+    input.extend_from_slice(&16u32.to_le_bytes());
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    input.extend_from_slice(&[0u8; 4]);
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let opts = crate::ProofOptions::default_test_options();
+    let mut bundle =
+        crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts)
+            .expect("the fixture bundle proves");
+
+    // ⛔ THE EPOCHS ARE RE-PROVEN UNDER A LITERAL `RpxWhir`, and that is not
+    // belt-and-braces. `prove_continuation` dispatches on the cached process
+    // knob, which is keccak whenever `LAMBDA_VM_WHIR_HASH` is unset — and the
+    // emitter's `WhirTranscript` is the ALGEBRAIC sponge, so a keccak bundle
+    // gives the machine a different challenge stream and the honest proof stops
+    // executing. With the knob set this test would pass and without it fail,
+    // and the failure would read as a broken assembly when it is a
+    // configuration mismatch. The driver's suite makes exactly this argument
+    // for its keccak arm; this is the other one. One more prove of the same
+    // run, and the test means the same thing in every process.
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+    let artifacts =
+        crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let prepared = crate::multilinear_continuation::decode_prepared_for::<
+        multilinear::whir_hash::RpxWhir,
+    >(&elf, &elf_bytes)
+    .expect("DECODE's prepared commitment under rpx");
+    let mut epochs = Vec::new();
+    crate::continuation::for_each_epoch(&elf, &input, 2, &artifacts, |prepared_epoch, _| {
+        let crate::continuation::PreparedEpoch {
+            register_init,
+            label,
+            traces,
+            boundary,
+            is_final,
+            ..
+        } = prepared_epoch;
+        epochs.push(crate::multilinear_continuation::prove_epoch::<
+            multilinear::whir_hash::RpxWhir,
+        >(
+            &elf,
+            &elf_bytes,
+            &register_init,
+            label,
+            traces,
+            is_final,
+            &boundary,
+            &opts,
+            None,
+            &prepared,
+        )?);
+        Ok(())
+    })
+    .expect("prove every epoch under a literal rpx");
+    assert_eq!(
+        epochs.len(),
+        bundle.epochs.len(),
+        "the explicit pass split the run differently from prove_continuation's"
+    );
+    bundle.epochs = epochs;
+    (elf_bytes, opts, bundle)
+}
+
+/// ★★ THE GATE ON THE ASSEMBLED EPOCH: the machine executes the very epoch the
+/// HOST accepted, built from the AIR set the host's own verifier derives.
+///
+/// `epoch_airs_for` is the one derivation both sides use, so "the AIRs this
+/// program was emitted against are the AIRs the verifier accepted" is true by
+/// construction rather than by two call sites agreeing.
+///
+/// Every challenge in the program is derived by the machine from a transcript
+/// it builds itself, so EXECUTING AT ALL is the challenge-stream comparison: the
+/// statement, the roots block, every table's three refusals, the closure's
+/// balance and every chain's openings are each a division with no satisfying
+/// assignment when the stream diverges.
+#[test]
+fn the_epoch_program_executes_on_the_epoch_the_host_accepts() {
+    let (elf_bytes, opts, bundle) = driver_bundle();
+    assert!(
+        bundle.epochs.len() >= 2,
+        "a one-epoch run chains nothing, so its last epoch continues no prior one"
+    );
+    let index = bundle.epochs.len() - 1;
+    let epoch = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
+        multilinear::whir_hash::RpxWhir,
+    >(&opts, &elf_bytes, &bundle, index, None, None)
+    .expect("the last epoch harvests, which is the host accepting it");
+
+    // ★ ANTI-VACUITY, both halves of what makes this fixture the right one.
+    assert!(
+        !epoch.public_output().is_empty(),
+        "the gated epoch must PUBLISH, or the closure's expected value is the host's early \
+         return and reads neither challenge"
+    );
+    assert!(
+        index > 0,
+        "the gated epoch must CONTINUE a prior one, or a dropped commit index computes the same \
+         thing"
+    );
+
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+    let airs = crate::multilinear_continuation::epoch_airs_for(
+        &elf,
+        &opts,
+        &bundle.epochs[index],
+        &epoch.position.register_init,
+        epoch.position.is_final,
+        epoch.position.label,
+        Some(epoch.decode_commitment),
+    );
+    let refs = airs.refs();
+
+    let program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
+    let arena = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
+    assert_eq!(
+        program.arena_schema.lens,
+        vec![arena[0].len() as u32],
+        "one arena, of exactly the words the filler writes"
+    );
+    assert_eq!(
+        super::whir_chain_tests::hint_rows(&program),
+        arena[0].len(),
+        "every arena word is hinted exactly once"
+    );
+
+    let exec = execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the machine must execute the epoch the host accepted");
+    println!(
+        "epoch {index} of {}: {} instructions, {} arena words, {} permutations, z published {}",
+        bundle.epochs.len(),
+        program.instrs.len(),
+        arena[0].len(),
+        super::whir_chain_tests::perm_rows(&program),
+        exec.public_words.len(),
+    );
+}
