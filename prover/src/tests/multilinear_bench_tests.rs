@@ -1930,3 +1930,159 @@ fn whir_table_shapes() {
     )
     .expect("epochs prepare");
 }
+
+/// ★ The per-table BUS census V1's item-5 recount needs, which neither
+/// `whir_epoch_shapes` nor `whir_table_shapes` prints.
+///
+/// `whir_table_shapes` gives the interaction COUNT; what the bus statements
+/// actually cost is set by what is inside those interactions — how many bus
+/// elements each carries and how many columns each element reads — and neither
+/// is derivable from `I`. This prints those, and the row count
+/// `whir_bus::claim_statements_cost` makes of them, per epoch-0 table.
+///
+/// Execution-independent (the AIRs' own structure), card-free, and it returns
+/// after epoch 0 — but building the AIR set needs the guest ELF, so it is a box
+/// run. A SIBLING of `whir_table_shapes` rather than an edit of it, so that
+/// instrument's filed log stays the one ts1 produced.
+///
+/// ```text
+/// LAMBDA_VM_BENCH_ELF=ethrex LAMBDA_VM_BENCH_INPUT=ethrex_mainnet_25368371 \
+/// LAMBDA_VM_BENCH_EPOCH_LOG2=21 \
+/// cargo test --release -p lambda-vm-prover --lib whir_bus_shapes -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs the guest ELF and builds every epoch's AIRs"]
+fn whir_bus_shapes() {
+    use crate::lfm::whir_bus::{alpha_powers_read, claim_statements_cost};
+    use crate::tables::trace_builder::DecodeArtifacts;
+    use executor::elf::Elf;
+    use multilinear::Error as MlError;
+    use stark::multilinear_air::Uniforms;
+    use stark::multilinear_logup::interaction_shapes;
+    use stark::multilinear_table::TableLayout;
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21);
+    let bytes = elf_bytes(&name);
+    let inputs = input_bytes(&input);
+    let opts = options();
+    let elf = Elf::load(&bytes).expect("load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    println!("\n== V1 bus shapes: {input} epoch_size_log2={epoch_size_log2} ==");
+
+    crate::continuation::for_each_epoch(
+        &elf,
+        &inputs,
+        epoch_size_log2,
+        &artifacts,
+        |prepared, _| {
+            if prepared.index != 0 {
+                return Ok(());
+            }
+            let mut traces = prepared.traces;
+            crate::tables::bitwise::update_multiplicities(
+                &mut traces.bitwise,
+                &crate::tables::local_to_global::collect_bitwise_from_l2g(&prepared.boundary),
+            );
+            let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
+            let table_counts = traces.table_counts();
+            let airs = crate::continuation::build_epoch_airs(
+                &elf,
+                &opts,
+                &[],
+                &table_counts,
+                &prepared.register_init,
+                &reg_fini,
+                prepared.is_final,
+                None,
+            );
+            let l2g_air = crate::continuation::l2g_memory_air(&opts, prepared.label);
+            let mut l2g_trace =
+                crate::tables::local_to_global::generate_local_to_global_trace(&prepared.boundary);
+            let mut pairs = airs.air_trace_pairs(&mut traces);
+            pairs.push((&l2g_air, &mut l2g_trace, &()));
+
+            println!(
+                "{:<16} {:>5} {:>5} {:>6} {:>9} {:>6} {:>7} {:>7} {:>7} {:>8}",
+                "table",
+                "vars",
+                "I",
+                "slots",
+                "elements",
+                "terms",
+                "widest",
+                "ladder",
+                "consts",
+                "rows"
+            );
+            let (mut ti, mut te, mut tt, mut tw, mut tr) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for (air, trace, _) in pairs.iter() {
+                let width = trace.main_table.width;
+                let num_vars = trace.main_table.height.trailing_zeros() as usize;
+                let layout = TableLayout::<
+                    crate::tables::types::GoldilocksField,
+                    crate::tables::types::GoldilocksExtension,
+                >::new(
+                    air.constraint_program(),
+                    air.constraints_meta(),
+                    air.bus_interactions(),
+                    width,
+                    num_vars,
+                    Uniforms::default(),
+                )
+                .expect("the table lays out");
+                let slots = layout.slot_of().to_vec();
+                let shapes = interaction_shapes::<crate::tables::types::GoldilocksExtension, _>(
+                    air.bus_interactions(),
+                    width,
+                    |column| {
+                        slots
+                            .get(column)
+                            .copied()
+                            .ok_or(MlError::UnknownPolynomial {
+                                index: column,
+                                len: slots.len(),
+                            })
+                    },
+                )
+                .expect("the bus probes");
+
+                let elements: usize = shapes.iter().map(|s| s.elements.len()).sum();
+                let terms: usize = shapes
+                    .iter()
+                    .map(|s| {
+                        s.numerator.terms().len()
+                            + s.elements.iter().map(|e| e.terms().len()).sum::<usize>()
+                    })
+                    .sum();
+                let widest = shapes.iter().map(|s| s.elements.len()).max().unwrap_or(0);
+                let cost = claim_statements_cost(&shapes, num_vars);
+                println!(
+                    "{:<16} {num_vars:>5} {:>5} {:>6} {elements:>9} {terms:>6} {widest:>7} {:>7} {:>7} {:>8}",
+                    air.name(),
+                    shapes.len(),
+                    slots.len(),
+                    alpha_powers_read(&shapes),
+                    cost.constants(),
+                    cost.rows(),
+                );
+                ti += shapes.len();
+                te += elements;
+                tt += terms;
+                tw = tw.max(widest);
+                tr += cost.rows();
+            }
+            println!(
+                "epoch 0 BUS TOTAL over {} tables: I {ti} | elements {te} | affine terms {tt} \
+                 | widest interaction {tw} | claim_statements rows {tr}",
+                pairs.len()
+            );
+            Ok(())
+        },
+    )
+    .expect("epochs prepare");
+}

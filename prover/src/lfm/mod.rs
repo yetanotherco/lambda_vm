@@ -64,6 +64,7 @@ pub mod trace;
 pub mod transcript_replay;
 pub mod validator;
 pub mod whir_air;
+pub mod whir_bus;
 pub mod whir_chain;
 pub mod whir_fold;
 pub mod whir_gkr;
@@ -142,6 +143,8 @@ mod poseidon_chip_tests;
 mod preprocessed_tests;
 #[cfg(test)]
 mod whir_air_tests;
+#[cfg(test)]
+mod whir_bus_tests;
 #[cfg(test)]
 mod whir_chain_tests;
 #[cfg(test)]
