@@ -131,10 +131,12 @@ impl<F: IsField> TableCommit<F>
 where
     FieldElement<F>: AsBytes,
 {
-    /// Build a `TableCommit` for a plain (non-preprocessed) table.
     /// Roots without a tree, for a pass that will not open against it. The
     /// tree is the expensive half; a caller that already knows the roots and
     /// only needs them to travel should not pay for one.
+    ///
+    /// Serves preprocessed and plain tables alike — `precomputed` is `Some`
+    /// exactly when the AIR is preprocessed.
     fn known_roots(root: Commitment, precomputed: Option<Commitment>) -> Self {
         Self {
             tree: Arc::new(BatchedMerkleTree::from_root(root)),
@@ -146,6 +148,7 @@ where
         }
     }
 
+    /// Build a `TableCommit` for a plain (non-preprocessed) table.
     fn plain(#[allow(unused_mut)] mut tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
         let leaves_dropped = Self::retire_leaves(&mut tree);
         Self {
@@ -646,26 +649,6 @@ fn host_cores() -> usize {
         .unwrap_or(4)
 }
 
-/// Number of tables `multi_prove` proves concurrently, out of `num_airs` of
-/// them.
-///
-/// Defaults: **every table** under `cuda`, `num_cores / 3` on CPU builds
-/// (benchmarked optimal on both M3 Pro and EPYC 9454P — every table there is
-/// pure host work, so `k` genuinely competes for cores). Both arms are
-/// overridden by the `TABLE_PARALLELISM` env var, and the result is clamped to
-/// `1..=num_airs`. Without the `parallel` feature this is 1 and the env var is
-/// ignored.
-///
-/// # Why the `cuda` arm has no core term
-///
-/// Measured over 881 runs on two RTX 5090 boxes (sweep record linked from
-/// PR #911): the work `k` divides is device- and workload-bound — invariant to
-/// host core count over an 8× range — so `available_parallelism()` is the
-/// wrong quantity to scale `k` by. `k` is not a thread count; it counts
-/// concurrent drivers whose per-table work all runs on the one global rayon
-/// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
-/// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
-/// admission's job (`VramGate`), not this count's.
 /// A table's Round 1 roots, in the order Fiat-Shamir absorbs them.
 ///
 /// A plain table contributes one root. A preprocessed one contributes two: its
@@ -826,6 +809,29 @@ const RETIRE_OVERRIDE_OFF: u8 = 1;
 const RETIRE_OVERRIDE_ON: u8 = 2;
 static RETIRE_LDE_OVERRIDE: AtomicU8 = AtomicU8::new(RETIRE_OVERRIDE_UNSET);
 
+/// Number of tables `multi_prove` proves concurrently, out of `num_airs` of
+/// them.
+///
+/// Defaults: **every table** under `cuda`, `num_cores / 3` on CPU builds
+/// (benchmarked optimal on both M3 Pro and EPYC 9454P — every table there is
+/// pure host work, so `k` genuinely competes for cores). Both arms are
+/// overridden by the `TABLE_PARALLELISM` env var, and the result is clamped to
+/// `1..=num_airs`. Without the `parallel` feature this is 1 and the env var is
+/// ignored.
+///
+/// Not to be confused with `prover::pass::table_parallelism`, which sizes the
+/// prove-and-retire walk's batches and reads `A1_TABLE_PARALLELISM`.
+///
+/// # Why the `cuda` arm has no core term
+///
+/// Measured over 881 runs on two RTX 5090 boxes (sweep record linked from
+/// PR #911): the work `k` divides is device- and workload-bound — invariant to
+/// host core count over an 8× range — so `available_parallelism()` is the
+/// wrong quantity to scale `k` by. `k` is not a thread count; it counts
+/// concurrent drivers whose per-table work all runs on the one global rayon
+/// pool. Worst case against the best measured `k`: `num_airs` +1.6 % (inside
+/// noise), the old `cores*2/3` +13.0 %. Bounding concurrency is memory
+/// admission's job (`VramGate`), not this count's.
 pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(feature = "parallel")]
     {

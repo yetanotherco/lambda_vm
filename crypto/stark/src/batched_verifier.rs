@@ -235,7 +235,7 @@ where
             transition_coeffs,
             trace_term_coeffs,
             gammas,
-        } = V::<Field, FieldExtension, PI>::replay_rounds_2_and_3(
+        } = V::<Field, FieldExtension, PI>::replay_rounds_2_to_4(
             *air,
             view,
             &public_inputs[idx],
