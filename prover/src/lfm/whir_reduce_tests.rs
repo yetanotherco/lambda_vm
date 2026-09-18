@@ -26,9 +26,7 @@ use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
-use super::whir_reduce::{
-    REDUCE_DEGREE, ReduceWires, claim_reduce_rows, emit_claim_reduce_verify,
-};
+use super::whir_reduce::{REDUCE_DEGREE, ReduceWires, claim_reduce_rows, emit_claim_reduce_verify};
 use super::whir_transcript::{
     COORDINATES_PER_EXT, SpongeEntry, SpongeSchedule, WhirTranscript, absorb_unpack_rows,
 };
@@ -66,11 +64,7 @@ fn ext_point(seed: u64, n: usize) -> Vec<FEE> {
 /// case where the `γ^0 = 1` saving does NOT apply.
 fn layouts() -> Vec<(usize, usize, Vec<FactorSource>)> {
     vec![
-        (
-            3,
-            2,
-            vec![FactorSource::direct(0), FactorSource::direct(1)],
-        ),
+        (3, 2, vec![FactorSource::direct(0), FactorSource::direct(1)]),
         (
             4,
             3,
@@ -107,7 +101,9 @@ struct Fixture {
 /// Proves and verifies one reduction on the host, keeping what both sides saw.
 fn fixture(num_vars: usize, num_columns: usize, sources: &[FactorSource]) -> Fixture {
     let columns: Vec<Mle<F>> = (0..num_columns)
-        .map(|c| Mle::new(pseudo(0x51ced + c as u64, 1 << num_vars)).expect("a power-of-two column"))
+        .map(|c| {
+            Mle::new(pseudo(0x51ced + c as u64, 1 << num_vars)).expect("a power-of-two column")
+        })
         .collect();
     let alpha = ext_point(0x5EED_u64, num_vars);
     // The claims being reduced must be the ones the columns hold, or the
@@ -189,7 +185,10 @@ fn reduce_program(num_vars: usize, num_columns: usize, sources: &[FactorSource])
     let sumcheck: Vec<Vec<_>> = (0..num_vars)
         .map(|round| {
             (0..REDUCE_DEGREE)
-                .map(|which| b.hint_word(arena, layout.sumcheck_at(round, which)).as_ext())
+                .map(|which| {
+                    b.hint_word(arena, layout.sumcheck_at(round, which))
+                        .as_ext()
+                })
                 .collect()
         })
         .collect();
@@ -278,9 +277,13 @@ fn the_reduce_leg_executes_and_lands_where_the_host_does() {
         let f = fixture(num_vars, num_columns, &sources);
         let program = reduce_program(num_vars, num_columns, &sources);
         let arena = reduce_arena(&f, &f.proof, num_columns);
-        let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-            panic!("{num_vars} vars, {} factors: the machine refused an accepted proof: {e:?}", sources.len())
-        });
+        let exec =
+            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+                panic!(
+                    "{num_vars} vars, {} factors: the machine refused an accepted proof: {e:?}",
+                    sources.len()
+                )
+            });
         let point: Vec<FEE> = exec
             .public_words
             .iter()
@@ -390,7 +393,10 @@ fn the_reduce_leg_emits_its_closed_form() {
             schedule.rows(),
             schedule.perms(),
         );
-        assert_eq!(measured, predicted, "{num_vars} vars, {num_columns} columns");
+        assert_eq!(
+            measured, predicted,
+            "{num_vars} vars, {num_columns} columns"
+        );
     }
 }
 

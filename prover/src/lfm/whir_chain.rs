@@ -319,7 +319,6 @@ pub fn chain_grind_perms(shape: &ChainShape) -> usize {
 /// Permutations one grind check spends: its two hashes.
 const PERMS_PER_GRIND: usize = 2;
 
-
 /// ★ The chain's SCHEDULE: every hash its transcript performs, in order, and
 /// how many felts each one hashes.
 ///

@@ -551,7 +551,11 @@ fn the_shift_leg_computes_what_the_host_computes() {
                 assert_eq!(want, eq_eval(&x, &y).expect("eq agrees"), "shift_0 is eq");
             }
             if k == 1 {
-                assert_eq!(want, rot_eval(&x, &y).expect("rot agrees"), "shift_1 is rot");
+                assert_eq!(
+                    want,
+                    rot_eval(&x, &y).expect("rot agrees"),
+                    "shift_1 is rot"
+                );
             }
         }
     }

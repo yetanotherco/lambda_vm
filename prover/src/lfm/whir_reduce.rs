@@ -30,6 +30,20 @@
 //! `rebuilt != claim.expected_evaluation` is `Error::ShiftedReadMismatch` on
 //! the host (`:310-312`) and an `assert_eq_ext` here — a division with no
 //! satisfying assignment, so a proof the host rejects has no execution.
+//!
+//! # ⛔ A non-mutation, recorded rather than dropped (instance 52)
+//!
+//! Moving the column-value absorbs from AFTER the refusal to before it was run
+//! as a mutation and passed every gate — because it is a rewrite. The refusal
+//! emits no transcript operation, so carrying the absorbs across it leaves the
+//! absorb sequence, every drawn challenge and every row exactly as they were;
+//! a straight-line program is a DAG and the order two independent groups are
+//! emitted in is not a property of it. The claim written down before running it
+//! — "it moves every challenge a later leg draws" — was simply false.
+//!
+//! The mutation that IS one moves the absorbs above the SUMCHECK, where a draw
+//! sits between: every round challenge then comes from a transcript that
+//! already holds the column values, and three of the four gates fail.
 
 use multilinear::claim_reduce::FactorSource;
 
@@ -103,7 +117,9 @@ pub fn claim_reduce_rows(sources: &[FactorSource], num_columns: usize, num_vars:
 
     for offset in distinct_offsets(sources) {
         rows += shift_eval_rows(num_vars, offset);
-        let members: Vec<usize> = (0..factors).filter(|&i| sources[i].offset == offset).collect();
+        let members: Vec<usize> = (0..factors)
+            .filter(|&i| sources[i].offset == offset)
+            .collect();
         // The first member costs nothing when its weight is `γ^0 = 1`, which
         // only the very first factor can be.
         rows += members.len() - usize::from(members[0] == 0);
@@ -199,10 +215,7 @@ pub fn emit_claim_reduce_verify(
             Some(acc) => b.emul_add(kernel, batched, acc),
         });
     }
-    b.assert_eq_ext(
-        rebuilt.expect("a table has at least one offset"),
-        residual,
-    );
+    b.assert_eq_ext(rebuilt.expect("a table has at least one offset"), residual);
 
     for &value in proof.column_values {
         transcript.absorb_ext(b, value);

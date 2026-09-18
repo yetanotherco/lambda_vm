@@ -424,7 +424,9 @@ pub fn emit_shift_eval(b: &mut LfmBuilder, x: &[Ext], y: &[Ext], k: usize) -> Ex
             let c = c.expect("a state past the first step is a wire");
             b.eadd(a, c)
         }
-        (Some(only), None) | (None, Some(only)) => only.expect("a state past the first step is a wire"),
+        (Some(only), None) | (None, Some(only)) => {
+            only.expect("a state past the first step is a wire")
+        }
         (None, None) => unreachable!("some carry state survives every step"),
     }
 }
