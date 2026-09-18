@@ -386,6 +386,20 @@ mod transcript_pin {
     /// statement, sixteen — giving `583_940 / 584_077`, from which
     /// `EPOCHS * 14 = 210` is subtracted here. The `+16` has not been measured
     /// yet; these constants are what will say so if it is wrong.
+    ///
+    /// ⚠ A SECOND PREDICTION rides on top, and it is NOT symmetric between the
+    /// two sides. W1-B's out-of-band opening puts DECODE's derived root into
+    /// each epoch's roots block: the prover absorbs it once per epoch, the
+    /// verifier twice (`multi_verify` and the `owed` replay). So at fourteen
+    /// kinds this lineage predicts prove `583_730 + 210 + 15 = 583_955` and
+    /// verify `583_867 + 210 + 30 = 584_107`.
+    ///
+    /// ★ The prove line coincides with the pair `whir/lfm` shows at FIFTEEN
+    /// table kinds (`583_730 + 225`), and for a different reason — one branch's
+    /// extra table count against another's extra root. The verify lines do NOT
+    /// coincide, because the replay absorbs the root a second time and a table
+    /// count is absorbed once. Reading one as evidence for the other would be
+    /// reading a coincidence.
     pub const PROVE_BASE_ABSORBS: u64 = 583_730;
     /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
     pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
@@ -395,16 +409,68 @@ mod transcript_pin {
         EPOCHS * crate::statement::NUM_TABLE_KINDS as u64
     }
 
-    /// (absorbs, squeezes, states) after `prove_continuation`.
-    pub const PROVE: (u64, u64, u64) = (PROVE_BASE_ABSORBS + table_count_absorbs(), 183_226, 2_996);
-    /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
-    pub const VERIFY: (u64, u64, u64) =
-        (VERIFY_BASE_ABSORBS + table_count_absorbs(), 183_256, 2_996);
+    /// Roots DECODE's out-of-band commitment contributes to one epoch's roots
+    /// block — one, and it is a property of the derivation rather than of this
+    /// guest.
+    ///
+    /// `decode_prepared_from_columns` commits the five columns under
+    /// `global_layout(&[(5, rows)])`, whose `n_stack` is `ceil_log2(5 * rows)`,
+    /// so all five always fit one stacked polynomial and the commitment always
+    /// has exactly one root. `decode_prepared_tests` pins that shape; this
+    /// constant is what makes the pin move if it ever stops holding.
+    pub const DERIVED_ROOTS_PER_EPOCH: u64 = 1;
 
-    /// `owed`'s own cost, stated rather than left as a subtraction: 137 absorbs
-    /// is `Sum roots.len()` over the 15 epoch calls, 30 squeezes is `2 x 15`,
-    /// and it reads no state.
-    pub const OWED: (u64, u64, u64) = (137, 30, 0);
+    /// Absorbs DECODE's derived root contributes to the PROVE line: one per
+    /// epoch, inside `multi_prove`'s roots block.
+    pub const fn prove_derived_root_absorbs() -> u64 {
+        EPOCHS * DERIVED_ROOTS_PER_EPOCH
+    }
+
+    /// ...and to the VERIFY line, which is TWICE that and not the same number.
+    ///
+    /// The verifier absorbs the derived root in `multi_verify`'s roots block
+    /// AND again in the `owed` replay, which has to see the same block or it
+    /// draws challenges no table is checked at. So the term is doubled here and
+    /// the second half of it is also what [`OWED`] grows by.
+    ///
+    /// ⚠ Writing one term for both sides is the mistake this split exists to
+    /// prevent, and it was made: a single `derived_root_absorbs()` on both lines
+    /// put VERIFY at `584_092`, and `the_pinned_constants_differ_by_owed` caught
+    /// it because the pair then differed by 137 while `OWED` said 152.
+    pub const fn verify_derived_root_absorbs() -> u64 {
+        2 * EPOCHS * DERIVED_ROOTS_PER_EPOCH
+    }
+
+    /// (absorbs, squeezes, states) after `prove_continuation`.
+    pub const PROVE: (u64, u64, u64) = (
+        PROVE_BASE_ABSORBS + table_count_absorbs() + prove_derived_root_absorbs(),
+        183_226,
+        2_996,
+    );
+    /// ...and after `verify_continuation`. The difference is `owed`, nothing else.
+    pub const VERIFY: (u64, u64, u64) = (
+        VERIFY_BASE_ABSORBS + table_count_absorbs() + verify_derived_root_absorbs(),
+        183_256,
+        2_996,
+    );
+
+    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: 137, which is
+    /// `Sum roots.len()` over the 15 epoch calls, measured.
+    pub const OWED_CARRIED_ABSORBS: u64 = 137;
+
+    /// `owed`'s own cost, stated rather than left as a subtraction: the carried
+    /// roots plus DECODE's derived one, `2 x 15` squeezes, and no state read.
+    ///
+    /// ⚠ The squeeze count is TWO per call and not three. `owed` shares the
+    /// roots block's absorb half and spells its own draws, because a fork that
+    /// is discarded must not pay a squeeze nobody reads — and `hash_metrics`
+    /// counts squeezes on a clone like any other transcript, so a third draw
+    /// would show up right here as `3 x 15`.
+    pub const OWED: (u64, u64, u64) = (
+        OWED_CARRIED_ABSORBS + prove_derived_root_absorbs(),
+        2 * EPOCHS,
+        0,
+    );
 }
 
 /// Whether the pinned counts describe THIS run.
@@ -542,9 +608,13 @@ fn assert_pinned_pair(prove: (u64, u64, u64), verify: (u64, u64, u64)) {
 #[test]
 fn the_pinned_pair_is_the_measurement() {
     let counts = 15 * crate::statement::NUM_TABLE_KINDS as u64;
+    // The derived-root term, re-spelled from the protocol rather than called
+    // from `transcript_pin` — a re-derivation that calls the thing it checks is
+    // not one. One root per epoch into the prover's roots block; two per epoch
+    // on the verify side, because the `owed` replay absorbs it as well.
     assert_pinned_pair(
-        (583_730 + counts, 183_226, 2_996),
-        (583_867 + counts, 183_256, 2_996),
+        (583_730 + counts + 15, 183_226, 2_996),
+        (583_867 + counts + 30, 183_256, 2_996),
     );
 }
 
@@ -610,11 +680,11 @@ fn the_per_branch_term_is_the_table_kind_count() {
     );
     assert_eq!(
         transcript_pin::PROVE.0 - transcript_pin::PROVE_BASE_ABSORBS,
-        transcript_pin::table_count_absorbs(),
+        transcript_pin::table_count_absorbs() + transcript_pin::prove_derived_root_absorbs(),
     );
     assert_eq!(
         transcript_pin::VERIFY.0 - transcript_pin::VERIFY_BASE_ABSORBS,
-        transcript_pin::table_count_absorbs(),
+        transcript_pin::table_count_absorbs() + transcript_pin::verify_derived_root_absorbs(),
     );
 }
 
@@ -656,13 +726,23 @@ fn the_pinned_constants_differ_by_owed() {
         "`owed` samples twice per epoch call"
     );
     assert_eq!(ot, 0, "`owed` reads no transcript state");
-    // ⚠ The absorb count gets no assertion of its own. It is `Sum roots.len()`
-    // over the epochs — data from the table shapes, not something derivable
-    // here — so any predicate this test could write about it would be either
-    // circular (comparing the constant to itself) or vacuous. An earlier draft
-    // had `oa % 1 == 0`, which is true of every integer. It is pinned by
-    // `VERIFY - PROVE` above and by V1's closed form, which is where it belongs.
-    let _ = oa;
+    // ★ The out-of-band opening's own term, which IS derivable here: the replay
+    // absorbs DECODE's derived root once per epoch on top of the carried ones.
+    // Without this the two halves of the wiring — the root reaching
+    // `multi_verify` and the root reaching the replay — could be re-pinned one
+    // at a time, which is exactly the drift that made this branch red.
+    assert_eq!(
+        oa - transcript_pin::OWED_CARRIED_ABSORBS,
+        transcript_pin::prove_derived_root_absorbs(),
+        "`owed` no longer absorbs DECODE's derived root once per epoch"
+    );
+    // ⚠ Only the DERIVED half of the absorb count is asserted, above. The
+    // carried half is `Sum roots.len()` over the epochs — data from the table
+    // shapes, not something derivable here — so any predicate this test could
+    // write about it would be either circular (comparing the constant to
+    // itself) or vacuous. An earlier draft had `oa % 1 == 0`, which is true of
+    // every integer. That half is pinned by `VERIFY - PROVE` above and by V1's
+    // closed form, which is where it belongs.
 }
 
 /// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
