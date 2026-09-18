@@ -6706,3 +6706,857 @@ fn the_production_tree_composes_to_a_root() {
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
 }
+
+// ========================= the WHIR production tree ========================
+//
+// Level 0 is the only thing the STARK and WHIR pipelines differ in. A wrap of a
+// univariate epoch proof and a wrap of a multilinear one are two LFM programs;
+// everything above them consumes a `RealChild` through its `SchemaLayout`, which
+// describes an LFM proof and says nothing about what that proof verified. So the
+// interior is `compose_interior_levels` in both trees, and what follows is one
+// level and the driver that stops when it has no global wrap to hand a root.
+
+// ⓘ THE REAL BUILDER. Until V1's 5c landed, these two names came from a shim
+// in this file carrying only their signature, so that everything AROUND the
+// two calls could be type-checked before the builder existed. The shim's two
+// bodies panicked on purpose — a stub returning an empty program would have
+// let this harness pass while proving nothing. Deleting it and repointing this
+// line was the whole of the merge step.
+use super::whir_epoch::{whir_epoch_arena, whir_epoch_program};
+
+/// One WHIR epoch's level-0 wrap, and the whole level of them.
+///
+/// ★★★ WHY THIS IS A GENERIC FUNCTION AND NOT A BLOCK INSIDE `with_whir_hash!`.
+/// That macro is a `match` on the cached process setting that DUPLICATES its
+/// body into two arms, each with a local `type H = …`. So a value whose type
+/// names `H` cannot leave it — which is exactly what
+/// `DecodePrepared<H>` is, and why the driver's own knob wrapper "has no `H` to
+/// name" and passes `None`. Putting the level inline would therefore either
+/// monomorphise the whole harness twice or give up hoisting the prepared
+/// opening. As a function whose RETURN TYPE names no `H`, the macro's arms are
+/// one line each, the interior tree never enters the macro at all, and the
+/// hoist is free.
+///
+/// ⛔ TWO DERIVATIONS ARE HOISTED HERE, AND THEY ARE DIFFERENT OBJECTS. The
+/// level-0 driver's own block walk passes `decode_commitment: None` — right for
+/// a walk whose subject is the derivation counter, wasteful for a driver —
+/// which makes `real_epoch_from_whir_continuation_under` call
+/// `commitment_from_elf` on EVERY harvest. That univariate root feeds
+/// `build_epoch_airs`; the MULTILINEAR `prepared` opening feeds
+/// `verify_epoch_bookend`. Handing one in does nothing for the other, so both
+/// are taken once per bundle here. The STARK harness hoists the same pair for
+/// the same reason and says so where it does it.
+#[allow(clippy::too_many_arguments)]
+fn whir_level_zero<H>(
+    bundle: &crate::multilinear_continuation::ContinuationProof,
+    elf_bytes: &[u8],
+    elf: &executor::elf::Elf,
+    inner: &crate::ProofOptions,
+    wrap_opts: &crate::ProofOptions,
+    ceiling: &Result<f64, String>,
+    siblings: usize,
+) -> (
+    Vec<RealChild>,
+    Vec<super::per_table_aggregator::SchemaLayout>,
+    Vec<Vec<u64>>,
+)
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    use super::per_table_aggregator::SchemaLayout;
+    use super::program_census::build_artifacts_counted;
+    use super::proof::lfm_prove;
+    use std::time::Instant;
+
+    // ⛔ THE PROCESS HASH IS REFUSED HERE, NOT REPORTED — and this is the one
+    // place in the harness that is stricter than the driver it calls.
+    //
+    // A wrap program's sponge is `WrapHash::production()`, the compile-time RPX
+    // pin, while the epochs it verifies were proven under whatever
+    // `LAMBDA_VM_WHIR_HASH` said. Mismatch the two and the program replays the
+    // epoch's transcript under a different hash: every challenge diverges and
+    // the first equality assert fails. ★ MEASURED, not argued — the first
+    // fixture run of this harness left the knob unset, and the failure surfaced
+    // as `Exec(DivByZero { addr: 19890 })` from inside `lfm_prove`, an address
+    // with no hash anywhere in it, one statement before the check that would
+    // have said something useful. A configuration error deserves a better place
+    // to be learned than that.
+    //
+    // ⚠ THE DRIVER REFUSES NOTHING, DELIBERATELY, and its note says so in as
+    // many words: a keccak bundle harvested under keccak is perfectly valid,
+    // merely not the production posture. That is a fact about HARVESTING. This
+    // is level 0, where the wrap also has to PROVE under the pin, so the same
+    // configuration stops being merely non-production and becomes unprovable.
+    // The note is quoted for the setting it names, not for its last sentence.
+    if let Some(note) = crate::lfm::whir_real_epoch::whir_process_posture_note() {
+        panic!(
+            "level 0 REFUSES a non-RPX process hash: its wrap proofs commit under \
+             the RPX block hasher by compile-time pin, so an epoch proven under \
+             another hash cannot be verified by the program that wraps it, and \
+             the failure is unreadable where it lands.\n  the driver's own note, \
+             which reports and refuses nothing: {note}"
+        );
+    }
+
+    // ⚠ AFTER the prove, not before: `prove_continuation` derives its own, and
+    // counting it would make the line below describe the base rather than this
+    // level. The driver's block walk makes the same ordering choice.
+    crate::multilinear_continuation::reset_decode_derivations();
+    let t = Instant::now();
+    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
+        .expect("DECODE's prepared opening, once per bundle");
+    let decode_root = crate::tables::decode::commitment_from_elf(elf, inner)
+        .expect("DECODE's univariate commitment, once per bundle");
+    println!(
+        "   ★ WHIR LEVEL 0: both DECODE derivations hoisted in {:.2}s \
+         (the prepared opening and the univariate root — different objects, \
+         one each per bundle rather than one each per epoch)",
+        t.elapsed().as_secs_f64()
+    );
+    // ⛔⛔ THE COUNTER IS A THREAD-LOCAL `Cell`, AND THAT DECIDES WHERE THESE
+    // ASSERTS GO. `multilinear_continuation`'s own comment names the hazard:
+    // "if the derivation ever moved onto a worker thread this would read ZERO".
+    // It is worse than that HERE, because this level runs its harvests on a
+    // worker pool: the hoist below bumps the MAIN thread to 1, every per-epoch
+    // derivation would bump a WORKER's own counter, and a `decode_derivations()
+    // == 1` read at the end of the level would pass whether the hoist reached
+    // the harvests or not. That is a check that cannot fail, so it is not the
+    // check made.
+    //
+    // ⇒ TWO ASSERTS INSTEAD, each on the thread that can observe its own claim:
+    // here, that the hoist derived EXACTLY ONCE; and inside each wrap, that
+    // preparing that wrap derived NOTHING. The second is the one that catches a
+    // regression, and it fires on whichever worker regressed.
+    let hoisted = crate::multilinear_continuation::decode_derivations();
+    assert_eq!(
+        hoisted, 1,
+        "the hoist must derive the prepared opening exactly once on this thread, \
+         and it derived {hoisted} times"
+    );
+
+    type WhirWrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
+
+    let prove_one_wrap = |k: usize| -> WhirWrapSlot {
+        let t_wrap = Instant::now();
+        // ⓘ ON THIS WORKER'S OWN COUNTER. Zeroed here rather than once per level
+        // because a pool reuses its threads, so a second wrap on the same worker
+        // would otherwise inherit the first one's count and the assert below
+        // would stop meaning "this wrap derived nothing".
+        crate::multilinear_continuation::reset_decode_derivations();
+
+        // THE HARVEST, and it is a full host WHIR verify of the epoch under `H`
+        // — the hash agreement is this call and not a label.
+        //
+        // ⓘ It REPLACES the STARK wrap's `assert_samplable`, which is a guard on
+        // the inner proof's query sampler (`log2_trace_length + log2_blowup >= 1`)
+        // and has no per-table counterpart in a multilinear epoch. The harvest is
+        // strictly stronger — the verifier's own verdict rather than a shape
+        // precondition — so the guard is dropped rather than transliterated.
+        let t = Instant::now();
+        let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
+            inner,
+            elf_bytes,
+            bundle,
+            k,
+            Some(decode_root),
+            Some(&prepared),
+        )
+        .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+        let t_harvest_epoch = t.elapsed().as_secs_f64();
+
+        // THE AIR SET, held as an OWNED value for as long as the program build.
+        // It is two owned things — a `VmAirs` whose `air_refs()` borrows it, and
+        // the local-to-global AIR, which is a separate by-value return — so a
+        // `statements` field on the epoch would be self-referential and a
+        // lifetime on it would infect every caller.
+        //
+        // ⚠ `Some(decode_root)` is the one argument this caller and the verifier
+        // disagree about, deliberately: `verify_epoch_bookend` builds its own set
+        // through the SAME function with `None`. The difference reaches only
+        // DECODE's preprocessed commitment, which the multilinear path never
+        // compares — a real equivalence, and not an obvious one.
+        let air_set = crate::multilinear_continuation::epoch_airs_for(
+            elf,
+            inner,
+            &bundle.epochs[k],
+            &e.position.register_init,
+            e.position.is_final,
+            e.position.label,
+            Some(decode_root),
+        );
+        let refs = air_set.refs();
+
+        // ★ THE ASSERT THAT CAN ACTUALLY FAIL, and it covers BOTH hoists: the
+        // harvest above took `Some(&prepared)` and the AIR set took
+        // `Some(decode_root)`, so preparing this wrap must have derived NOTHING
+        // on this thread. Hand either one in as `None` — which is what the
+        // driver's own block walk does, correctly for a walk and wastefully for
+        // a driver — and this reads 1 on the worker that did it.
+        let derived_here = crate::multilinear_continuation::decode_derivations();
+        assert_eq!(
+            derived_here, 0,
+            "wrap {k} derived DECODE {derived_here} time(s) while preparing; both \
+             the prepared opening and the univariate root are handed in, so a \
+             non-zero count means a hoist is not reaching the harvest"
+        );
+
+        let out_halves = e.public_output().len().div_ceil(4);
+
+        let t = Instant::now();
+        let program = whir_epoch_program(&e, &refs[..]);
+        let arenas = whir_epoch_arena(&e, &refs[..]);
+        let t_emit = t.elapsed().as_secs_f64();
+
+        let (cells, instrs) = census_and_panel(&program, &format!("whir wrap {k}"), 1);
+        let wrap_sampler = HostSampler::start();
+
+        let t = Instant::now();
+        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let t_artifacts = t.elapsed().as_secs_f64();
+
+        let t = Instant::now();
+        // ⛔ AND WHEN IT DOES NOT PROVE, SAY WHICH ASSERT FAILED. `lfm_prove`'s
+        // `Exec(DivByZero { addr })` is not an inversion gone wrong: `assert_eq`
+        // lowers to `diff = a - b; _ = diff / ZERO` and the executor reports the
+        // NUMERATOR's address, so a `DivByZero` is ALWAYS a failing equality and
+        // the address always names the `diff` cell (`executor.rs:1389-1398`).
+        // Bare, that reads as a machine fault at an address nobody can place;
+        // `locate_addr` turns it into the instruction that wrote the cell and its
+        // neighbours, which identifies the assert without bisecting the emitter.
+        // Costs nothing on the success path and is the difference between "the
+        // WHIR wrap did not prove" and a report V1 can act on.
+        let proved = match lfm_prove(&program, &artifacts, &arenas, wrap_opts) {
+            Ok(p) => p,
+            Err(super::proof::LfmProveError::Exec(super::executor::LfmExecError::DivByZero {
+                addr,
+            })) => {
+                panic!(
+                    "wrap {k}: the emitted WHIR verifier REFUSED this epoch — a \
+                     failing equality assert, not a machine fault.\n{}",
+                    super::executor::locate_addr(&program, addr)
+                );
+            }
+            Err(why) => panic!("wrap {k}: the WHIR wrap must prove: {why:?}"),
+        };
+        let t_prove = t.elapsed().as_secs_f64();
+
+        // ★★ THE SEAM'S OWN CHECK, and the cheapest assertion in this file.
+        //
+        // The interior reads a level-0 child through `SchemaLayout::wrap`, which
+        // is `head 4 + 2 * 67 registers + 2 label + out_halves + 4 L2G lanes + 1
+        // tail` = 145 + out_halves words, in that order. A production STARK wrap
+        // publishes exactly 145 on the block. If the WHIR builder's publish set
+        // and this layout disagree, every binding above level 0 is describing
+        // the wrong words and NOTHING else in the run would say so.
+        //
+        // ⓘ `l2g_words` is one root's lanes. That fits because every bookend of
+        // this block is ONE polynomial — measured across all fifteen epochs, not
+        // assumed structural — and this assert is what catches a block where it
+        // stops being true.
+        let layout = SchemaLayout::wrap(out_halves);
+        layout.assert_covers(proved.public_words.len());
+
+        // ⛔⛔ AND THE COUNT ALONE STOPPED BEING A CHECK THAT CAN FAIL.
+        //
+        // `whir_epoch_program` now ends with `layout.assert_covers(program
+        // .public_len)` over a `SchemaLayout::wrap` built from the SAME
+        // `epoch.public_output()` this driver reads. So the line above compares
+        // two numbers derived the same way from one field: it says the two sides
+        // agree, and it would catch V1 deriving `out_halves` differently later,
+        // but on this tip it cannot fail. Kept for that future, not counted as a
+        // gate.
+        //
+        // ⇒ THIS is the check that can fail. A node reads NOTHING about a child
+        // but its `program_id` and these words, and it indexes them by
+        // `SchemaLayout` — so a wrap publishing the right NUMBER of words from
+        // the wrong epoch would compose a tree over the wrong block with every
+        // count above it still adding up.
+        let word_at = |i: usize| -> LfmWord {
+            proved
+                .public_words
+                .iter()
+                .find(|(at, _)| *at as usize == i)
+                .unwrap_or_else(|| panic!("wrap {k} published no word at schema index {i}"))
+                .1
+        };
+        for (r, value) in e.position.register_init.iter().enumerate() {
+            assert_eq!(
+                word_at(layout.reg_init(r)),
+                base_word(FE::from(u64::from(*value))),
+                "wrap {k}: published reg_init[{r}] is not this epoch's own"
+            );
+        }
+        for (r, value) in e.proof.reg_fini.iter().enumerate() {
+            assert_eq!(
+                word_at(layout.reg_fini(r)),
+                base_word(FE::from(u64::from(*value))),
+                "wrap {k}: published reg_fini[{r}] is not this epoch's own — it is \
+                 the word the NEXT epoch's wrap has to carry as its reg_init"
+            );
+        }
+        // ★ The label is the field a register comparison cannot stand in for:
+        // two epochs of one run share most of their register file and never
+        // their label, so this is what separates "some epoch" from "epoch k".
+        for (i, half) in super::whir_epoch::byte_halves(&e.position.label.to_le_bytes())
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                word_at(layout.label(i)),
+                base_word(half),
+                "wrap {k}: published label half {i} is not epoch {k}'s"
+            );
+        }
+
+        let t = Instant::now();
+        let (child, t_verify) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+        let t_child = t.elapsed().as_secs_f64();
+        let (peak, at) = wrap_sampler.stop();
+
+        println!(
+            "   whir wrap {k} TIMING: harvest-epoch {t_harvest_epoch:.2}s · emit+arenas \
+             {t_emit:.2}s · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · harvest \
+             {t_child:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s",
+            t_child - t_verify,
+            t_wrap.elapsed().as_secs_f64()
+        );
+        println!(
+            "   whir wrap {k}: host peak {peak:.3} GiB at t={at:.1}{}{}",
+            match ceiling {
+                Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * peak / g),
+                Err(_) => String::new(),
+            },
+            if siblings > 1 {
+                format!(" ⓘ PROCESS-WIDE, {siblings} wraps in flight")
+            } else {
+                String::new()
+            },
+        );
+
+        (
+            child,
+            layout,
+            vec![crate::tables::local_to_global::epoch_label(k as u64)],
+            cells,
+            instrs,
+        )
+    };
+
+    let mut children = Vec::with_capacity(bundle.num_epochs());
+    let mut layouts = Vec::with_capacity(bundle.num_epochs());
+    let mut labels = Vec::with_capacity(bundle.num_epochs());
+
+    // ★★★ THE IDENTITY LINES ARE PRINTED AT THE JOIN, SO IN INDEX ORDER, for the
+    // reason the STARK level has them there: a worker prints when it finishes, so
+    // at several siblings the lines land in completion order and a raw diff files
+    // a SCHEDULING ORDER as a byte difference.
+    //
+    // ⛔ AND THEY ARE A SELF-CONSISTENCY GATE ACROSS WHIR RUNS ONLY. A WHIR wrap
+    // is a different program from a STARK wrap, and an interior node's program is
+    // a function of its children's shapes, so every line of a WHIR tree differs
+    // from the STARK tree's BY CONSTRUCTION. Diffing the two families reports a
+    // difference that was designed in. The comparison this gate makes is one WHIR
+    // run against another.
+    for (k, (child, layout, lbl, cells, instrs)) in
+        in_index_order(bundle.num_epochs(), siblings, prove_one_wrap)
+            .into_iter()
+            .enumerate()
+    {
+        println!(
+            "   whir wrap {k} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights \
+             {:?} · published {} words · {cells} cells ({instrs} instructions)",
+            child
+                .artifacts
+                .program_id
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            child.artifacts.log_heights,
+            child.artifacts.blake3_chunk_log_heights,
+            child.public_words.len(),
+        );
+        children.push(child);
+        layouts.push(layout);
+        labels.push(lbl);
+    }
+
+    // ⓘ NO LEVEL-WIDE DERIVATION ASSERT HERE, deliberately: at this point the
+    // main thread's counter still reads the hoist's 1 no matter what the workers
+    // did, so an equality on it would pass in exactly the case worth catching.
+    // The two asserts above are the ones that can fail.
+
+    (children, layouts, labels)
+}
+
+/// ★★★ THE WHIR PRODUCTION TREE — the WHIR base, one LFM wrap per epoch, and
+/// the same interior above them.
+///
+/// The sibling of [`the_production_tree_composes_to_a_root`], and deliberately
+/// beside it: the two differ in their base and their level 0 and share
+/// [`compose_interior_levels`] verbatim, so the interior numbers of a WHIR run
+/// are this file's own code producing them rather than a second driver's.
+///
+/// ⛔ IT COMPOSES THE INTERIOR AND STOPS. There is no cross-epoch WHIR program
+/// yet, so there is no global child and no block-artifact root, and the run says
+/// so in its own output rather than ending green over a stage nobody ran. Every
+/// root and global knob is REFUSED rather than ignored.
+///
+/// ⛔ AND IT REFUSES A CACHE DIRECTORY, which the STARK tree requires for some
+/// arms. `stage_path` names a stage `<dir>/<stage>.rkyv`, so a WHIR run sharing
+/// a cache directory with a STARK run would read and write the SAME
+/// `wrap-0.rkyv` — loading a STARK wrap into a WHIR tree, or overwriting one.
+/// There is nothing to load yet either: no WHIR tree has ever been proved. A
+/// prefix would fix the collision; a refusal also stops a first run from
+/// quietly filling someone else's cache, which is the failure that is hard to
+/// notice later.
+#[test]
+#[ignore = "box tier, production scale: the WHIR base, its level 0 and the interior"]
+fn the_whir_production_tree_composes_to_a_root() {
+    use super::epoch_tests::EpochInputs;
+    use super::per_table_aggregator::{FAN_IN, tree_node_count, tree_shape};
+    use std::time::Instant;
+
+    // ⛔ THE DEVICE, ASSERTED IN-PROCESS, for the STARK harness's own reason: a
+    // CPU run completes, reads legibly and biases every host figure the wrong
+    // way, so a red would be an artefact of the build rather than a fact.
+    if !cfg!(feature = "cuda") {
+        panic!(
+            "the WHIR production tree requires `--features cuda`. Without it this \
+             proves on the CPU and answers a different question"
+        );
+    }
+    for var in ["LFM_CENSUS_ELF", "LFM_CENSUS_INPUT"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "{var} must name a file: this composes the PRODUCTION WHIR tree, and a \
+             silent fixture fallback would report a fixture number under a \
+             production name"
+        );
+    }
+    assert!(
+        std::env::var("A_BUNDLE_MODE").is_err(),
+        "A_BUNDLE_MODE is set and this driver does NOT consult it — the level range \
+         names the experiment. Unset it and use LFM_TREE_LEVELS"
+    );
+    for var in [
+        "LFM_TREE_PROVE_ROOT",
+        "LFM_TREE_SIZE_ROOT",
+        "LFM_TREE_ROOT_OPTION",
+        "LFM_TREE_ROOT_MODE",
+        "LFM_TREE_STOP_AFTER_GLOBAL",
+        "LFM_TREE_SIZE_GLOBAL",
+        "LFM_TREE_GLOBAL_K",
+        "LFM_TREE_GLOBAL_MODE",
+        "LFM_TREE_PARENT_MODE",
+        "LFM_TREE_TOP_OVERLAP",
+    ] {
+        assert!(
+            std::env::var(var).is_err(),
+            "{var} is set. This driver has NO global wrap and NO root stage — the \
+             cross-epoch WHIR program is not written — so the knob would be set and \
+             silently ignored, which is the failure A_BUNDLE_MODE's refusal exists \
+             for. Unset it"
+        );
+    }
+    assert!(
+        std::env::var("A_CACHE_DIR").is_err(),
+        "A_CACHE_DIR is set. This driver caches NOTHING: `stage_path` names a stage \
+         `<dir>/<stage>.rkyv`, so a WHIR run sharing a directory with a STARK run \
+         would read and write the same `wrap-0.rkyv`. There is also nothing to load \
+         — no WHIR tree has been proved. Unset it"
+    );
+
+    let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
+        Err(_) => FAN_IN,
+    };
+    assert!(
+        (2..=4).contains(&fan_in),
+        "LFM_CENSUS_FAN_IN must be in 2..=4, got {fan_in}"
+    );
+    let spec = std::env::var("LFM_TREE_LEVELS").unwrap_or_else(|_| "all".to_string());
+    let (lo, hi_req): (usize, Option<usize>) = match spec.as_str() {
+        "all" => (0, None),
+        s => match s.split_once('-') {
+            Some((a, b)) => (
+                a.parse().expect("LFM_TREE_LEVELS lo must be an integer"),
+                Some(b.parse().expect("LFM_TREE_LEVELS hi must be an integer")),
+            ),
+            None => {
+                let n = s
+                    .parse()
+                    .expect("LFM_TREE_LEVELS must be `all`, `N` or `lo-hi`");
+                (n, Some(n))
+            }
+        },
+    };
+    assert_eq!(
+        lo, 0,
+        "LFM_TREE_LEVELS starts at {lo}, so the levels below it would have to be \
+         LOADED — and this driver has no cache. Every run proves from level 0"
+    );
+
+    let inputs = EpochInputs::from_env();
+    let inner = crate::recursion::Preset::Blowup4.options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let ceiling = cgroup_limit_gib();
+    println!(
+        "★★★ WHIR PRODUCTION TREE (INTERIOR ONLY — no global wrap, no block-artifact root)\n   \
+         guest {}, {} input bytes, 2^{} cycles/epoch, fan-in {fan_in}\n   \
+         inner blowup {} / {} q · wrap blowup {} / {} q\n   \
+         levels: prove 0..={} · cache: NONE\n   cgroup ceiling: {}",
+        inputs.label,
+        inputs.private_input.len(),
+        inputs.epoch_log2,
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+        wrap_opts.blowup_factor,
+        wrap_opts.fri_number_of_queries,
+        match hi_req {
+            Some(h) => h.to_string(),
+            None => "top".to_string(),
+        },
+        match &ceiling {
+            Ok(g) => format!("{g:.2} GiB"),
+            Err(why) => format!("UNKNOWN — {why}"),
+        },
+    );
+
+    let whole_run = HostSampler::start();
+    let t_all = Instant::now();
+
+    // ---- the base, under WHIR.
+    //
+    // ⓘ `multilinear_continuation::prove_continuation`, and it is NOT generic:
+    // the hash dispatch happens inside it, above its epoch loop, so the bundle
+    // that comes back names no `H` and the level below can take it as a plain
+    // value. Its `ContinuationProof` is also a DISTINCT rkyv type from the STARK
+    // bundle's, which is a second reason `cached_bundle` does not apply here.
+    let base_sampler = HostSampler::start();
+    let t = Instant::now();
+    let bundle = crate::multilinear_continuation::prove_continuation(
+        &inputs.elf_bytes,
+        &inputs.private_input,
+        inputs.epoch_log2,
+        &inner,
+    )
+    .expect("the WHIR block must prove");
+    let base_secs = t.elapsed().as_secs_f64();
+    let (base_peak, base_at) = base_sampler.stop();
+    println!(
+        "   base (WHIR): {} epochs in {base_secs:.1}s",
+        bundle.num_epochs()
+    );
+    println!(
+        "   base (WHIR): host peak {base_peak:.3} GiB at t={base_at:.1}{} (proved)",
+        match &ceiling {
+            Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * base_peak / g),
+            Err(_) => String::new(),
+        },
+    );
+    mark("AFTER the WHIR base (this live figure is L_bundle)");
+    println!("{}", jemalloc_line("AFTER the WHIR base"));
+
+    let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
+    let shape = tree_shape(bundle.num_epochs(), fan_in);
+    let top = shape.len();
+    let hi = hi_req.unwrap_or(top).min(top);
+    println!(
+        "   ★ SHAPE from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
+        bundle.num_epochs(),
+        tree_node_count(&shape),
+    );
+    for (i, level) in shape.iter().enumerate() {
+        let short = level.arities.iter().filter(|a| **a < fan_in).count();
+        println!(
+            "     level {}: {} nodes ({short} short)",
+            i + 1,
+            level.arities.len()
+        );
+    }
+
+    // ---- level 0: one WHIR wrap per epoch.
+    let t_level = Instant::now();
+    super::program_census::begin_level();
+    let l0_siblings = tree_siblings_l0().min(bundle.num_epochs().max(1));
+    println!(
+        "   ★ LEVEL-0 CONCURRENCY: {l0_siblings} wrap(s) at once \
+         (LFM_TREE_SIBLINGS_L0 or LFM_TREE_K_L0; 1 = the serial control)"
+    );
+    super::device_permit::arm(l0_siblings);
+    let level0_sampler = HostSampler::start();
+
+    // ⓘ ONE LINE PER ARM, which is the whole reason level 0 is a function: the
+    // macro duplicates whatever is written here.
+    let (mut children, mut layouts, mut labels) = crate::with_whir_hash!(|H| {
+        whir_level_zero::<H>(
+            &bundle,
+            &inputs.elf_bytes,
+            &elf,
+            &inner,
+            &wrap_opts,
+            &ceiling,
+            l0_siblings,
+        )
+    });
+
+    super::device_permit::arm(1);
+    let level0_wall = t_level.elapsed().as_secs_f64();
+    let (l0_peak, l0_at) = level0_sampler.stop();
+    println!(
+        "   level 0: {} WHIR wraps in {level0_wall:.1}s",
+        children.len()
+    );
+    println!("{}", jemalloc_line("level 0"));
+    println!(
+        "   level 0: host peak {l0_peak:.3} GiB at t={l0_at:.1}{}, {l0_siblings} wrap(s) in flight",
+        match &ceiling {
+            Ok(g) => format!(" ({:.1}% of {g:.2})", 100.0 * l0_peak / g),
+            Err(_) => String::new(),
+        },
+    );
+    let l0_permit = super::device_permit::take_stats();
+    if l0_permit.acquisitions > 0 {
+        println!("   level 0: {}", l0_permit.describe(level0_wall));
+    }
+    if let Some(stats) = super::program_census::end_level() {
+        println!("   {}", stats.describe("level 0"));
+    }
+
+    // ---- ⛔ AND NOT THE GLOBAL WRAP. Stated here, where the STARK tree proves
+    // one, so the absence is legible in the log at the point it happens rather
+    // than only in a summary at the end.
+    println!(
+        "\n   ⛔ NO GLOBAL WRAP AND NO BLOCK-ARTIFACT ROOT. The cross-epoch WHIR \
+         program does not exist yet, so this run composes the interior over {} \
+         level-0 wraps and stops. It is NOT the block artifact, and the tree it \
+         closes to is NOT a proof of the block.\n",
+        children.len()
+    );
+
+    // ---- levels 1..=hi, in the one interior both production trees share.
+    let interior = compose_interior_levels(
+        InteriorInputs {
+            shape: &shape,
+            hi,
+            top,
+            // ⓘ No sizing arm here: it needs two levels held at once for two root
+            // options, and this driver emits no root.
+            size_root: false,
+            fan_in,
+            wrap_opts: &wrap_opts,
+            // ⓘ Both `None`/`Off` because this driver refuses a cache directory —
+            // see the test's own doc for the `wrap-0.rkyv` collision.
+            cache_dir: None,
+            ceiling: &ceiling,
+            stage_mode: &|_| CacheMode::Off,
+        },
+        children,
+        layouts,
+        labels,
+    );
+    children = interior.children;
+    layouts = interior.layouts;
+    labels = interior.labels;
+    let report = interior.report;
+    assert!(
+        interior.top_level.is_none(),
+        "the sizing arm is off, so no level may be held back"
+    );
+    // The interior is done, and the reset is the CALLER's — the same line the
+    // STARK harness carries immediately after its own call to
+    // `compose_interior_levels`. It stays outside the function on purpose: the
+    // two drivers' stage sequences diverge from here (that one goes on to prove
+    // a root, this one has none to prove), so a function that disarmed on its
+    // caller's behalf would be resetting a process-global for stages it does
+    // not run.
+    super::device_permit::arm(1);
+
+    let closed = children.len();
+    println!("\n★★★ WHIR INTERIOR COMPOSED — {closed} proof(s) at level {hi}");
+    if hi == top {
+        assert_eq!(closed, 1, "the interior must close to exactly one proof");
+    }
+    assert_eq!(layouts.len(), closed, "one layout per surviving proof");
+    assert_eq!(labels.len(), closed, "one label run per surviving proof");
+
+    println!("\nlevel arity        cells  instructions  host GiB   argmax t    wall s");
+    for (l, a, cells, instrs, peak, at, wall) in &report {
+        println!("{l:>5} {a:>5} {cells:>12} {instrs:>13} {peak:>9.3} {at:>10.1} {wall:>9.1}");
+    }
+
+    let (run_peak, run_at) = whole_run.stop();
+    println!(
+        "\n★★★ WHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
+        t_all.elapsed().as_secs_f64(),
+    );
+    match &ceiling {
+        Ok(c) => println!(
+            "           = {:.1}% of the {c:.2} GiB cgroup ceiling",
+            100.0 * run_peak / c
+        ),
+        Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
+    }
+}
+
+/// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small
+/// enough for a laptop.
+///
+/// ★ WHY IT EXISTS SEPARATELY. [`the_whir_production_tree_composes_to_a_root`]
+/// PANICS without `cuda` on purpose: a CPU run of it completes, reads legibly,
+/// and biases every host figure the wrong way. So the production driver can
+/// never be exercised off the box, and a path that only ever runs on the box is
+/// a path nobody can debug. This runs the identical sequence — WHIR base, the
+/// generic level 0 with both derivations hoisted, the schema check per wrap,
+/// `compose_interior_levels` above it — on three tiny epochs.
+///
+/// ⛔ NOT A MEASUREMENT, AND NOTHING FROM IT IS A D4 TERM. What it does NOT have,
+/// listed so no number taken from it is quoted as a production one:
+///
+/// - NO CARD. Every prove here is the CPU path, so every time is a different
+///   quantity from the box's and none of them belongs on the ledger.
+/// - THREE EPOCHS, not fifteen: the tree is one level deep, so it exercises
+///   level 0 -> level 1 and never the level-1..4 chain, and the pooled span
+///   (`LFM_TREE_LEVEL_POOL`) does not run at all.
+/// - FIXTURE SHAPES. The block's epochs carry 34 tables against this guest's
+///   handful, a 25-variable stack against a tiny one, and 3,837 columns in
+///   group 0 against two orders fewer — which are exactly the terms the
+///   per-epoch cost is dominated by.
+/// - ONE PUBLISHING EPOCH. Only the last epoch of this run publishes, so
+///   `out_halves` is zero on two of the three children and a wrong `out_halves`
+///   in the layout would be invisible on those two. The publishing epoch is the
+///   one that can catch it, which is why the fixture is this guest and not a
+///   simpler one.
+/// - `default_test_options`, NOT `Preset::Blowup4`: blowup 2 and 3 queries
+///   against the production 4 and its query count. The SHAPE of the tree is the
+///   same; its cost is not.
+/// - ITS BASE IS PROVED UNDER THE PROCESS KNOB, like every other WHIR run here:
+///   `prove_continuation` reads `LAMBDA_VM_WHIR_HASH`, so this arm needs
+///   `LAMBDA_VM_WHIR_HASH=rpx` in its environment. Level 0 refuses anything else
+///   rather than letting the mismatch surface as a `DivByZero` inside the prove;
+///   the refusal is in `whir_level_zero` and its comment says why.
+///
+/// What it DOES establish is the half a byte gate cannot: that the sequence runs
+/// end to end, that the publish set and `SchemaLayout::wrap` agree, that both
+/// hoists reach every harvest, and that the interior accepts a WHIR child.
+#[test]
+#[ignore = "fixture scale, card-free, but minutes long: run it with --ignored"]
+fn the_whir_fixture_tree_composes_through_the_same_interior() {
+    use super::per_table_aggregator::{tree_node_count, tree_shape};
+    use std::time::Instant;
+
+    // ⓘ NO `cuda` ASSERT HERE, and that is the whole point of this arm — see the
+    // doc above. It is also why nothing it prints may be quoted as a cost.
+    let mut input: Vec<u8> = Vec::with_capacity(16);
+    input.extend_from_slice(&16u32.to_le_bytes());
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    input.extend_from_slice(&[0u8; 4]);
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+    let inner = crate::ProofOptions::default_test_options();
+    let wrap_opts = super::proof::aggregation_wrap_options();
+    let ceiling = cgroup_limit_gib();
+    let fan_in = 2;
+
+    let t_all = Instant::now();
+    let bundle = crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
+        .expect("the fixture continuation must prove under WHIR");
+    assert!(
+        bundle.num_epochs() >= 2,
+        "a one-epoch run chains nothing and would make the interior vacuous"
+    );
+    println!(
+        "   FIXTURE base (WHIR): {} epochs in {:.1}s",
+        bundle.num_epochs(),
+        t_all.elapsed().as_secs_f64()
+    );
+
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture ELF must load");
+    let shape = tree_shape(bundle.num_epochs(), fan_in);
+    let top = shape.len();
+    println!(
+        "   FIXTURE shape from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
+        bundle.num_epochs(),
+        tree_node_count(&shape),
+    );
+
+    // ⓘ ONE WRAP AT A TIME. The serial arm is the control everywhere else in
+    // this file, and a fixture run has nothing to learn from concurrency.
+    super::device_permit::arm(1);
+    let (children, layouts, labels) = crate::with_whir_hash!(|H| {
+        whir_level_zero::<H>(&bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1)
+    });
+    assert_eq!(
+        children.len(),
+        bundle.num_epochs(),
+        "one level-0 wrap per epoch"
+    );
+
+    let interior = compose_interior_levels(
+        InteriorInputs {
+            shape: &shape,
+            hi: top,
+            top,
+            size_root: false,
+            fan_in,
+            wrap_opts: &wrap_opts,
+            cache_dir: None,
+            ceiling: &ceiling,
+            stage_mode: &|_| CacheMode::Off,
+        },
+        children,
+        layouts,
+        labels,
+    );
+    assert!(
+        interior.top_level.is_none(),
+        "the sizing arm is off, so no level may be held back"
+    );
+    // ⓘ Owed here as well, and not because this arm runs anything after it:
+    // `compose_interior_levels` ARMS the interior's own sibling count inside,
+    // so a caller that armed 1 before level 0 no longer has 1 when it returns.
+    // The reset belongs to whoever called it, in both drivers.
+    super::device_permit::arm(1);
+    assert_eq!(
+        interior.children.len(),
+        1,
+        "the fixture interior must close to exactly one proof"
+    );
+    assert_eq!(
+        interior.layouts.len(),
+        1,
+        "one layout for the closing proof"
+    );
+    assert_eq!(
+        interior.labels.len(),
+        1,
+        "one label run for the closing proof"
+    );
+    // ★ THE LABEL RUN IS THE WHOLE BLOCK, and it is the one assert here that a
+    // tree built over the wrong children would fail: the root's range must run
+    // from the first epoch's label to the last's, which is a fact about WHICH
+    // wraps the interior consumed rather than about how many.
+    assert_eq!(
+        interior.labels[0],
+        vec![
+            crate::tables::local_to_global::epoch_label(0),
+            crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+        ],
+        "the closing proof must span every epoch of the run"
+    );
+    assert_eq!(
+        interior.report.len(),
+        tree_node_count(&shape),
+        "one report row per interior node"
+    );
+    println!(
+        "   ★ FIXTURE WHIR TREE CLOSED to 1 proof over {} epochs in {:.1}s — \
+         NOT a measurement (CPU, blowup {}, {} queries)",
+        bundle.num_epochs(),
+        t_all.elapsed().as_secs_f64(),
+        inner.blowup_factor,
+        inner.fri_number_of_queries,
+    );
+}
