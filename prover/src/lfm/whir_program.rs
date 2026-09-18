@@ -41,10 +41,20 @@ use super::builder::{Ext, LfmBuilder};
 /// Countable straight off `steps()` without simulating the walk, which is what
 /// makes the pin independent of the emitter rather than a restatement of it.
 pub fn program_rows(program: &Program<GoldilocksExtension>) -> usize {
+    steps_rows(program.steps())
+}
+
+/// The same count over a DAG's steps alone.
+///
+/// Split out because a caller that reads SEVERAL roots out of one DAG — the
+/// zerocheck rule batches one per constraint root — has no single `Program` to
+/// hand over, and counting it a second way would be a second form to keep in
+/// step.
+pub fn steps_rows(steps: &[Op<GoldilocksExtension>]) -> usize {
     let mut operations = 0;
     let mut negates = false;
     let mut constants: Vec<FEE> = Vec::new();
-    for step in program.steps() {
+    for step in steps {
         match step {
             Op::Fixed(value) => {
                 if !constants.contains(value) {
@@ -96,9 +106,23 @@ pub fn emit_program(
     program: &Program<GoldilocksExtension>,
     values: &[Ext],
 ) -> Ext {
-    let mut wires: Vec<Ext> = Vec::with_capacity(program.steps().len());
+    let wires = emit_steps(b, program.steps(), values);
+    wires[program.root() as usize]
+}
+
+/// Every step's value as a wire, in step order.
+///
+/// [`emit_program`] is this and then one index. The zerocheck rule needs the
+/// whole vector, because it reads one node per constraint root out of a single
+/// DAG and batches them.
+pub fn emit_steps(
+    b: &mut LfmBuilder,
+    steps: &[Op<GoldilocksExtension>],
+    values: &[Ext],
+) -> Vec<Ext> {
+    let mut wires: Vec<Ext> = Vec::with_capacity(steps.len());
     let mut zero: Option<Ext> = None;
-    for (index, step) in program.steps().iter().enumerate() {
+    for (index, step) in steps.iter().enumerate() {
         let wire = match *step {
             Op::Fixed(value) => b.ext_const(&value),
             Op::Var(slot) => *values.get(slot as usize).unwrap_or_else(|| {
@@ -117,5 +141,5 @@ pub fn emit_program(
         };
         wires.push(wire);
     }
-    wires[program.root() as usize]
+    wires
 }

@@ -63,6 +63,7 @@ pub mod sub_proof;
 pub mod trace;
 pub mod transcript_replay;
 pub mod validator;
+pub mod whir_air;
 pub mod whir_chain;
 pub mod whir_fold;
 pub mod whir_gkr;
@@ -139,6 +140,8 @@ mod per_table_census_tests;
 mod poseidon_chip_tests;
 #[cfg(test)]
 mod preprocessed_tests;
+#[cfg(test)]
+mod whir_air_tests;
 #[cfg(test)]
 mod whir_chain_tests;
 #[cfg(test)]
