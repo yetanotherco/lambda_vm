@@ -336,9 +336,21 @@ mod tests {
     /// driver would hand the guest a wrap input built from it, and the failure
     /// would surface a whole wrap prove later, reading as an emitter bug.
     ///
-    /// ⚠ The obvious tamper — the register carry — does NOT work here, and the
-    /// reason is a finding rather than a quirk of this test. See
-    /// `the_register_carry_is_not_bound_on_the_multilinear_path`.
+    /// ⚠ THE OBVIOUS TAMPER — THE REGISTER CARRY — WAS NOT USABLE HERE WHEN
+    /// THIS TEST WAS WRITTEN, AND THE REASON WAS A DEFECT.
+    /// `VmAirs::new` gave REGISTER a preprocessed COMMITMENT and no columns
+    /// closure, so the multilinear verifier's `check_preprocessed` walked an
+    /// empty list in zero iterations and a restated `reg_fini` verified. That
+    /// is fixed on this base: 5e3df0c0 binds INIT and FINI as columns, and the
+    /// carry is refused by `verify_epoch` itself under
+    /// `a_restated_register_carry_is_refused_by_the_epoch_it_lands_in` and
+    /// `a_restated_register_fini_is_refused_by_the_epoch_that_states_it`
+    /// (`multilinear_continuation_tests`), each beside its accept control.
+    ///
+    /// The PUBLIC OUTPUT remains this test's tamper by choice rather than by
+    /// necessity: it is the field `absorb_epoch` binds before any challenge, so
+    /// it exercises the driver's acceptance check through the statement the
+    /// guest's replay will read, which is what this driver is for.
     #[test]
     fn an_epoch_that_does_not_verify_is_refused() {
         let (elf_bytes, opts, mut b) = bundle();
@@ -354,60 +366,6 @@ mod tests {
         assert!(
             refused.is_err(),
             "a restated public output was harvested into a wrap input"
-        );
-    }
-
-    /// ⛔⛔ A FINDING, NOT A TEST OF THIS DRIVER: on the multilinear
-    /// continuation path an epoch's INIT register file appears not to be bound,
-    /// so a restated cross-epoch carry verifies.
-    ///
-    /// # What was measured
-    ///
-    /// Flipping one bit of `epochs[0].reg_fini` and harvesting epoch 1 — whose
-    /// `register_init` is exactly that vector — was ACCEPTED: `verify_epoch`
-    /// returned true for an epoch checked against a register file the chain
-    /// never handed it. That was this test's first form, and it failed by not
-    /// failing.
-    ///
-    /// # What reading says the mechanism is (✓ VERIFIED, not inferred)
-    ///
-    /// `continuation::build_epoch_airs` always passes
-    /// `register_preprocessed = Some((commitment, NUM_PREPROCESSED_COLS_WITH_FINI))`,
-    /// and in `VmAirs::new` that argument selects
-    /// `.with_preprocessed(commitment, n)` — a COMMITMENT and NO columns
-    /// closure. The other branch, taken only when the argument is `None`, uses
-    /// `.with_preprocessed_columns(commitment, n, || register::preprocessed_columns(..))`
-    /// and supplies both. The multilinear verifier checks preprocessed COLUMNS
-    /// (`air.precomputed_columns()` feeding `check_preprocessed`), not the
-    /// univariate root — so for a continuation epoch REGISTER hands it nothing
-    /// to compare, and `register_init` and `reg_fini` are unconstrained on this
-    /// path.
-    ///
-    /// # Why it is `#[ignore]`d and panics rather than asserting the behaviour
-    ///
-    /// Writing `assert!(verify_epoch(wrong_init))` and calling it green would
-    /// record a suspected defect as intended behaviour. This is a visible
-    /// obligation instead: it appears in a test listing, it names the mechanism,
-    /// and it cannot be mistaken for a passing check. It is NOT within this
-    /// lane's scope to fix — `continuation.rs` is a STARK-pipeline file this
-    /// brief forbids touching, and the remedy (give the continuation REGISTER
-    /// AIR its columns closure as well as its root, or make the multilinear
-    /// path check the root) is a soundness change that needs its own review.
-    ///
-    /// ⚠ And note what this does NOT say: `a_broken_register_carry_is_rejected`
-    /// in `multilinear_continuation_tests` passes, and it flips the same bit.
-    /// It calls `verify_epochs`, which checks EVERY epoch, so its rejection may
-    /// come from epoch 0 rather than from the carry into epoch 1 — which is a
-    /// second thing to establish before anyone concludes how wide this is.
-    #[test]
-    #[ignore = "a reported finding, not a check: the multilinear path appears not to bind register_init"]
-    fn the_register_carry_is_not_bound_on_the_multilinear_path() {
-        panic!(
-            "measured: flipping one bit of epochs[0].reg_fini and verifying epoch 1 \
-             — whose register_init IS that vector — was ACCEPTED. Read: \
-             `build_epoch_airs` gives REGISTER a preprocessed COMMITMENT and no \
-             columns closure, and the multilinear verifier checks columns. Needs \
-             its own review; do not close this by weakening a test"
         );
     }
 
