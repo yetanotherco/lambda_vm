@@ -837,10 +837,16 @@ pub(crate) fn build_epoch_airs(
     // final register file is a verifier-known public value bound by the REG-C2
     // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
     // init(epoch i+1) == fini(epoch i).
-    let register_preprocessed = Some((
-        register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
-        register::NUM_PREPROCESSED_COLS_WITH_FINI,
-    ));
+    let register_preprocessed = {
+        let init = register_init.to_vec();
+        let fini = reg_fini.to_vec();
+        Some((
+            register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
+            register::NUM_PREPROCESSED_COLS_WITH_FINI,
+            Arc::new(move || register::preprocessed_columns_with_fini(&init, &fini))
+                as Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+        ))
+    };
     VmAirs::new(
         elf,
         opts,

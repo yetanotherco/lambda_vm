@@ -509,6 +509,20 @@ pub type AirTracePair<'a> = (
 );
 
 /// All VM AIR instances, grouped by table.
+/// A continuation epoch's REGISTER preprocessing: the commitment, how many
+/// columns it covers, and the columns themselves.
+///
+/// The columns are not an optimization. The univariate verifier compares the
+/// commitment against the proof's precomputed root; the multilinear one has no
+/// such root and checks the claimed openings against these instead, so without
+/// them `R_i` and `R_{i+1}` are values that verifier derives and then never
+/// holds the proof to.
+pub(crate) type RegisterPreprocessed = Option<(
+    Commitment,
+    usize,
+    std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+)>;
+
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
     pub bitwise: VmAir,
@@ -710,7 +724,7 @@ impl VmAirs {
         include_halt: bool,
         register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
-        register_preprocessed: Option<(Commitment, usize)>,
+        register_preprocessed: RegisterPreprocessed,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
@@ -826,10 +840,13 @@ impl VmAirs {
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let hint: VmAir = Box::new(create_hint_air(proof_options));
         let register: VmAir =
-            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
+            if let Some((commitment, num_preprocessed_cols, columns)) = register_preprocessed {
                 Box::new(
-                    create_register_air(proof_options)
-                        .with_preprocessed(commitment, num_preprocessed_cols),
+                    create_register_air(proof_options).with_preprocessed_columns(
+                        commitment,
+                        num_preprocessed_cols,
+                        columns,
+                    ),
                 )
             } else {
                 let register_init = register_init

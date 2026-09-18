@@ -161,21 +161,37 @@ fn proving_a_run_twice_commits_to_the_same_traces() {
 }
 /// The registers are the chain: handing an epoch the wrong ones has to be
 /// caught, or nothing links one epoch to the next.
+///
+/// The epoch size is what makes this a test. At the default this program fits
+/// in one epoch, and a run with nothing to chain cannot say whether chaining
+/// works — which is what the version of this test that returned early on a
+/// single epoch was doing.
 #[test]
 fn a_broken_register_carry_is_rejected() {
     let elf_bytes = asm_elf_bytes("sub");
     let opts = ProofOptions::default_test_options();
-    let mut epochs =
-        multilinear_continuation::prove_epochs(&elf_bytes, &[], 4, &opts).expect("prove");
-    if epochs.len() < 2 {
-        return; // nothing to chain
-    }
-    // Claim the first epoch ended somewhere it did not.
-    epochs[0].reg_fini[1] ^= 1;
+    let epochs = multilinear_continuation::prove_epochs(&elf_bytes, &[], 2, &opts).expect("prove");
     assert!(
-        !multilinear_continuation::verify_epochs(&elf_bytes, &epochs, &opts).expect("verify"),
-        "a restated register carry was accepted"
+        epochs.len() >= 2,
+        "the run has to span epochs for there to be a chain"
     );
+    assert!(
+        multilinear_continuation::verify_epochs(&elf_bytes, &epochs, &opts).expect("verify"),
+        "the honest run has to verify first"
+    );
+
+    // Every register the first epoch says it ended on is where the second one
+    // starts, so restating any of them has to be caught — not only the commit
+    // index, which is the one that rides in the bus offset and so is the one a
+    // test can catch without the chain being enforced at all.
+    for i in [1usize, 5, register::X254_INDEX] {
+        let mut tampered = epochs.clone();
+        tampered[0].reg_fini[i] ^= 1;
+        assert!(
+            !multilinear_continuation::verify_epochs(&elf_bytes, &tampered, &opts).expect("verify"),
+            "a restated register {i} was accepted"
+        );
+    }
 }
 
 /// **The binding.** An epoch commits its local-to-global bookend on its own and

@@ -336,6 +336,15 @@ pub fn compute_precomputed_commitment_with_fini(
     init: &[u32],
     fini: &[u32],
 ) -> Commitment {
+    commit_register_columns(options, preprocessed_columns_with_fini(init, fini))
+}
+
+/// The continuation variant's columns themselves: OFFSET, INIT and FINI.
+///
+/// The multilinear path has no preprocessed root to compare, so it checks a
+/// proof's claimed openings against these. Without them `R_i` and `R_{i+1}` are
+/// values the verifier derives and then never holds the proof to.
+pub fn preprocessed_columns_with_fini(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
@@ -350,7 +359,7 @@ pub fn compute_precomputed_commitment_with_fini(
         fini_col[i] = FE::from(fini[i] as u64);
     }
 
-    commit_register_columns(options, vec![offset_col, init_col, fini_col])
+    vec![offset_col, init_col, fini_col]
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
