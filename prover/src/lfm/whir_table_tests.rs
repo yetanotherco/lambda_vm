@@ -653,3 +653,99 @@ fn the_table_verify_emits_its_closed_form() {
         assert_eq!(measured, cost.rows(), "num_vars {num_vars}");
     }
 }
+
+/// ★ G3 — the tamper arm, in THREE halves (instance 49).
+///
+/// Every site runs all three: the untouched proof EXECUTES, the HOST rejects
+/// the forgery, and the machine REFUSES it. The middle half is not decoration —
+/// without it a machine that refused something the host accepts would score as
+/// a soundness success when it is a completeness bug.
+///
+/// The three sites are chosen to land on three different refusals: a GKR half
+/// breaks the layer relation, a main-sumcheck evaluation breaks the batch's
+/// residual, and a column value breaks `claim_reduce`'s shifted read. Each is
+/// reached only if the machine drew the same challenges the host did, which is
+/// the other thing this arm witnesses.
+#[test]
+fn the_tamper_arm_refuses_what_the_host_rejects() {
+    let num_vars = 3usize;
+    let built = air();
+    let (honest, _, _) = real_proof(&built, num_vars);
+    let (layout, bus) = shape_of(&built, num_vars);
+    let (z, alpha, beta) = table_challenges();
+    let shape = TableShape {
+        ir: layout.shape(),
+        bus: &bus,
+        kinds: layout.kinds(),
+        num_columns: layout.num_columns(),
+        num_vars,
+    };
+    let alpha_powers = alpha_ladder(&bus, alpha);
+
+    let run = |proof: &TableProof<E>| -> Result<(), String> {
+        let values = flatten(proof, z, &alpha_powers, beta);
+        let program = table_program(proof, &shape, alpha_powers.len(), values.len(), true);
+        execute(&program, &words(&values), &crate::hash_pin::BLOCK_HASHER)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    };
+    let host = |proof: &TableProof<E>| -> Result<(), String> {
+        let mut verifier = HostTranscript::new(&[]);
+        stark::multilinear_table::verify(
+            proof,
+            layout.statement(),
+            &z,
+            &alpha,
+            &beta,
+            &mut verifier,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+    };
+
+    // HALF ONE: the untouched proof executes, on both sides.
+    host(&honest).expect("the honest proof must verify on the host");
+    run(&honest).expect("the honest proof must EXECUTE on the machine");
+
+    let bump = |value: &mut FEE| *value += FEE::one();
+    let sites: Vec<(&str, Box<dyn Fn(&mut TableProof<E>)>)> = vec![
+        (
+            "a GKR layer's q_lo",
+            Box::new(|p: &mut TableProof<E>| bump(&mut p.gkr.layers[0].q_lo)),
+        ),
+        (
+            "the main sumcheck's first evaluation",
+            Box::new(|p: &mut TableProof<E>| {
+                bump(&mut p.constraint.sumcheck.rounds[0].evaluations[0])
+            }),
+        ),
+        (
+            "a claimed column value",
+            Box::new(|p: &mut TableProof<E>| bump(&mut p.constraint.reduce.column_values[0])),
+        ),
+    ];
+
+    for (name, tamper) in sites {
+        let mut forged = honest.clone();
+        tamper(&mut forged);
+        // HALF TWO: the host must reject it, or it is not a forgery and the
+        // machine's refusal would say nothing.
+        let rejected = host(&forged);
+        assert!(
+            rejected.is_err(),
+            "{name}: the HOST accepted the tampered proof, so this site is not a forgery"
+        );
+        // HALF THREE: the machine refuses it.
+        let refused = run(&forged);
+        assert!(
+            refused.is_err(),
+            "{name}: the machine EXECUTED a proof the host rejected with {:?}",
+            rejected.unwrap_err()
+        );
+        println!(
+            "tamper {name}: host {} / machine {}",
+            rejected.unwrap_err(),
+            refused.unwrap_err()
+        );
+    }
+}
