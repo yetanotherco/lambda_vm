@@ -30,14 +30,21 @@ pub struct Replay {
     pub logup: Vec<FieldElement<GoldilocksExtension>>,
     /// Per table, in AIR order: its fold coefficient.
     pub coefficients: Vec<FieldElement<GoldilocksExtension>>,
-    /// Per group, in the order the prover ran them: the query indices.
-    pub iotas: Vec<Vec<usize>>,
 }
 
 /// Replay the transcript the prover walked, from the proof.
 ///
 /// `elf_bytes` and the statement come from outside the proof on purpose: a
 /// proof that could choose its own statement would prove nothing.
+///
+/// # This is a test oracle, not a verifier
+///
+/// It derives the challenges and stops. [`verify`] does not call it — it walks
+/// the same prefix itself and is the stricter of the two: it checks each
+/// preprocessed root against the AIR's own constant where this takes the
+/// prover's word, and it rejects a `fold_order` that is not a permutation.
+/// Promoting this function to a verification path without closing both gaps
+/// would be a soundness hole; it exists so a test can compare challenges.
 pub fn replay(
     proof: &BatchedProof,
     elf_bytes: &[u8],
@@ -73,6 +80,25 @@ pub fn replay(
 
     // The fold coefficients, in the order the prover folded — which the proof
     // carries because a table's coefficient depends on every table before it.
+    if proof.fold_order.len() != proof.tables.len() {
+        return Err(Error::Prover(format!(
+            "batched verify: {} tables folded of {}",
+            proof.fold_order.len(),
+            proof.tables.len()
+        )));
+    }
+    // Shapes before the seed reads a value, for the same reason
+    // `verify_batched` pins them before its own fold loop: `Table::columns`
+    // indexes at the advertised dimensions.
+    for (idx, t) in proof.tables.iter().enumerate() {
+        for block in [&t.trace_ood, &t.trace_ood_next] {
+            if !block.dimensions_consistent() {
+                return Err(Error::Prover(format!(
+                    "batched verify: table {idx}'s out-of-domain block is malformed"
+                )));
+            }
+        }
+    }
     let mut seed = transcript.clone();
     let mut coefficients = vec![FieldElement::<GoldilocksExtension>::zero(); proof.tables.len()];
     for &idx in proof.fold_order.iter() {
@@ -97,19 +123,8 @@ pub fn replay(
         }
         coefficients[idx] = seed.sample_field_element();
     }
-    if proof.fold_order.len() != proof.tables.len() {
-        return Err(Error::Prover(format!(
-            "batched verify: {} tables folded of {}",
-            proof.fold_order.len(),
-            proof.tables.len()
-        )));
-    }
 
-    Ok(Replay {
-        logup,
-        coefficients,
-        iotas: Vec::new(),
-    })
+    Ok(Replay { logup, coefficients })
 }
 
 /// Verify a batched proof of `elf_bytes`.
