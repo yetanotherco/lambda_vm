@@ -32,24 +32,22 @@ use math::traits::AsBytes;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    ChainConfig, ChainProof, ChainRound, GrindBits, RoundOpenings, commit, prove, verify,
+    ChainConfig, ChainProof, GrindBits, RoundOpenings, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::algebraic_commit::commitment_to_digest;
-use super::builder::{Ext, Felt, LfmBuilder};
+use super::builder::{Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
-use super::edsl::WrapDigest;
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_chain::{
-    ChainRoundWires, ChainShape, QueryOpening, RoundNonces, chain_grind_perms, chain_hash_schedule,
-    chain_opening_perms, chain_perms, chain_rows, chain_schedule_perms, chain_schedule_rows,
-    chain_shape_rows, emit_verify_weighted,
+    ChainShape, RoundStorage, chain_grind_perms, chain_hash_schedule, chain_opening_perms,
+    chain_perms, chain_rows, chain_schedule_perms, chain_schedule_rows, chain_shape_rows,
+    emit_verify_weighted, push_round_words, round_words,
 };
-use super::whir_open::BlockValues;
 use super::whir_poly::{emit_eq_eval, eq_eval_rows_again};
 use super::whir_transcript::{SpongeEntry, SpongeHash, WhirTranscript};
 use super::word::{LfmWord, ext_word};
@@ -224,211 +222,6 @@ impl IsTranscript<E> for Recording {
     }
 }
 
-/// A current block's wires, in the field its round holds them in.
-pub(super) enum CurrentBlock {
-    Base(Vec<Felt>),
-    Ext(Vec<Ext>),
-}
-
-impl CurrentBlock {
-    fn as_block(&self) -> BlockValues<'_> {
-        match self {
-            CurrentBlock::Base(v) => BlockValues::Base(v),
-            CurrentBlock::Ext(v) => BlockValues::Ext(v),
-        }
-    }
-}
-
-/// ★ One chain's round wires, hinted and OWNED — because `ChainRoundWires`
-/// borrows them.
-///
-/// Extracted from [`chain_program`] so a caller that emits SEVERAL chains in one
-/// program — `stacked_eval`'s wrapper, one chain per stacked polynomial — builds
-/// them from this walk rather than from a second copy of it. The chain suite is
-/// the control that the extraction moved nothing.
-pub(super) struct RoundStorage {
-    shape: ChainShape,
-    sumchecks: Vec<Vec<Vec<Ext>>>,
-    currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>>,
-    nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>>,
-    roots: Vec<Option<super::builder::Cell>>,
-    oods: Vec<Option<Ext>>,
-    nonces: Vec<RoundNonces>,
-}
-
-impl RoundStorage {
-    /// Words one chain's rounds occupy, which is what a caller placing several
-    /// chains in one arena advances by.
-    pub(super) fn words(shape: &ChainShape) -> u32 {
-        (0..shape.rounds())
-            .map(|r| Layout::round_words(shape, r))
-            .sum()
-    }
-
-    /// Hints every round's wires out of `arena`, starting at `base`, in the
-    /// order [`push_round_words`] writes them.
-    pub(super) fn hint(
-        b: &mut LfmBuilder,
-        arena: super::instr::ArenaId,
-        base: u32,
-        shape: &ChainShape,
-    ) -> Self {
-        let mut sumchecks: Vec<Vec<Vec<Ext>>> = Vec::new();
-        let mut currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>> = Vec::new();
-        let mut nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>> = Vec::new();
-        let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
-        let mut oods: Vec<Option<Ext>> = Vec::new();
-        let mut nonces: Vec<RoundNonces> = Vec::new();
-
-        let mut at = base;
-        for r in 0..shape.rounds() {
-            let next_word = |b: &mut LfmBuilder, at: &mut u32| {
-                let cell = b.hint_word(arena, *at);
-                *at += 1;
-                cell
-            };
-            let k = shape.schedule[r];
-            let sumcheck: Vec<Vec<Ext>> = (0..k)
-                .map(|_| (0..2).map(|_| next_word(b, &mut at).as_ext()).collect())
-                .collect();
-            // The nonces are FELTS: `append_bytes(&nonce.to_be_bytes())` is one
-            // big-endian felt, which is how the grind absorbs them.
-            let folding = b.hint_felt(arena, at);
-            let ood_nonce = b.hint_felt(arena, at + 1);
-            let query = b.hint_felt(arena, at + 2);
-            at += 3;
-
-            let depth = shape.current_depth(r);
-            let block = 1usize << k;
-            // ★ ROUND 0's current codeword is BASE on the host
-            // (`whir_chain.rs:983`), so its block hashes ONE felt a value and
-            // not three. Hinting it as extension wires would hash forty-eight
-            // felts where the committer hashed sixteen and the root would never
-            // match — which is exactly how this test first failed.
-            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries)
-                .map(|_| {
-                    let values = if r == 0 {
-                        let felts: Vec<Felt> = (0..block)
-                            .map(|_| {
-                                let f = b.hint_felt(arena, at);
-                                at += 1;
-                                f
-                            })
-                            .collect();
-                        CurrentBlock::Base(felts)
-                    } else {
-                        CurrentBlock::Ext(
-                            (0..block).map(|_| next_word(b, &mut at).as_ext()).collect(),
-                        )
-                    };
-                    let path: Vec<WrapDigest> = (0..depth)
-                        .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
-                        .collect();
-                    (values, path)
-                })
-                .collect();
-
-            let (next_root, ood_value, next) = match shape.next_depth(r) {
-                Some(next_depth) => {
-                    let nr = next_word(b, &mut at);
-                    let ov = next_word(b, &mut at).as_ext();
-                    let next_block = 1usize << shape.schedule[r + 1];
-                    let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
-                        .map(|_| {
-                            let values: Vec<Ext> = (0..next_block)
-                                .map(|_| next_word(b, &mut at).as_ext())
-                                .collect();
-                            let path: Vec<WrapDigest> = (0..next_depth)
-                                .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
-                                .collect();
-                            (values, path)
-                        })
-                        .collect();
-                    (Some(nr), Some(ov), next)
-                }
-                None => (None, None, Vec::new()),
-            };
-
-            sumchecks.push(sumcheck);
-            currents.push(current);
-            nexts.push(next);
-            roots.push(next_root);
-            oods.push(ood_value);
-            nonces.push(RoundNonces {
-                folding,
-                ood: ood_nonce,
-                query,
-            });
-        }
-        assert_eq!(
-            at - base,
-            Self::words(shape),
-            "the round walk and the word count are one derivation"
-        );
-
-        Self {
-            shape: shape.clone(),
-            sumchecks,
-            currents,
-            nexts,
-            roots,
-            oods,
-            nonces,
-        }
-    }
-
-    /// The query openings, current and successor, borrowing this storage.
-    #[allow(clippy::type_complexity)]
-    pub(super) fn openings(&self) -> (Vec<Vec<QueryOpening<'_>>>, Vec<Vec<QueryOpening<'_>>>) {
-        let current: Vec<Vec<QueryOpening<'_>>> = self
-            .currents
-            .iter()
-            .map(|round| {
-                round
-                    .iter()
-                    .map(|(values, path)| QueryOpening {
-                        values: values.as_block(),
-                        siblings: path,
-                    })
-                    .collect()
-            })
-            .collect();
-        let next: Vec<Vec<QueryOpening<'_>>> = self
-            .nexts
-            .iter()
-            .map(|round| {
-                round
-                    .iter()
-                    .map(|(values, path)| QueryOpening {
-                        values: BlockValues::Ext(values),
-                        siblings: path,
-                    })
-                    .collect()
-            })
-            .collect();
-        (current, next)
-    }
-
-    /// The wires `emit_verify_weighted` takes, borrowing this storage and the
-    /// openings built from it.
-    pub(super) fn wires<'a>(
-        &'a self,
-        current: &'a [Vec<QueryOpening<'a>>],
-        next: &'a [Vec<QueryOpening<'a>>],
-    ) -> Vec<ChainRoundWires<'a>> {
-        (0..self.shape.rounds())
-            .map(|r| ChainRoundWires {
-                sumcheck: &self.sumchecks[r],
-                next_root: self.roots[r],
-                ood_value: self.oods[r],
-                nonces: self.nonces[r],
-                current: &current[r],
-                next: &next[r],
-            })
-            .collect()
-    }
-}
-
 fn pseudo_mle(num_vars: usize, seed: u64) -> Mle<F> {
     let vals = (0..1usize << num_vars)
         .map(|i| {
@@ -557,31 +350,13 @@ impl Layout {
         let mut at = (shape.num_vars + 3) as u32;
         for r in 0..shape.rounds() {
             round_at.push(at);
-            at += Self::round_words(shape, r);
+            at += round_words(shape, r);
         }
         Self {
             shape: shape.clone(),
             round_at,
             total: at,
         }
-    }
-
-    fn round_words(shape: &ChainShape, r: usize) -> u32 {
-        let k = shape.schedule[r];
-        // The sumcheck's two evaluations a round, three nonces, and per query
-        // the current block plus its path.
-        let mut n = (2 * k + 3) as u32;
-        let depth = shape.current_depth(r);
-        let block = 1usize << k;
-        n += (shape.num_queries * (block + depth)) as u32;
-        if let Some(next_depth) = shape.next_depth(r) {
-            // The successor root, its out-of-domain value, and per query its
-            // block and path.
-            n += 2;
-            let next_block = 1usize << shape.schedule[r + 1];
-            n += (shape.num_queries * (next_block + next_depth)) as u32;
-        }
-        n
     }
 }
 
@@ -639,78 +414,6 @@ fn chain_arena(fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
 
     push_round_words(&mut words, shape, proof);
     words
-}
-
-/// One chain's round wires, in the order [`RoundStorage::hint`] reads them.
-///
-/// Split out of [`chain_arena`] for the same reason [`RoundStorage`] was split
-/// out of [`chain_program`]: a program holding several chains fills one arena
-/// with several of these, and a second copy of the order would be a second thing
-/// to keep in step with the walk that reads it.
-pub(super) fn push_round_words(
-    words: &mut Vec<LfmWord>,
-    shape: &ChainShape,
-    proof: &ChainProof<F, E>,
-) {
-    for (r, round) in proof.rounds.iter().enumerate() {
-        for sc in &round.sumcheck {
-            for e in &sc.evaluations {
-                words.push(ext_word(e));
-            }
-        }
-        for nonce in [round.nonces.folding, round.nonces.ood, round.nonces.query] {
-            words.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
-        }
-        push_openings(words, round, true);
-        if shape.next_depth(r).is_some() {
-            words.push(commitment_to_digest(
-                round.next_root.as_ref().expect("a successor root"),
-            ));
-            words.push(ext_word(
-                round.ood_value.as_ref().expect("an out-of-domain value"),
-            ));
-            push_openings(words, round, false);
-        }
-    }
-}
-
-/// One round's query openings, current or successor, block then path.
-fn push_openings(words: &mut Vec<LfmWord>, round: &ChainRound<F, E>, current: bool) {
-    match &round.openings {
-        RoundOpenings::Base(p) => {
-            if current {
-                for opening in &p.current {
-                    // A base value arrives as `(v, 0, 0, 0)`.
-                    for v in &opening.values {
-                        words.push([*v, FE::zero(), FE::zero(), FE::zero()]);
-                    }
-                    for node in &opening.proof.merkle_path {
-                        words.push(commitment_to_digest(node));
-                    }
-                }
-            } else {
-                for opening in &p.next {
-                    for v in &opening.values {
-                        words.push(ext_word(v));
-                    }
-                    for node in &opening.proof.merkle_path {
-                        words.push(commitment_to_digest(node));
-                    }
-                }
-            }
-        }
-        RoundOpenings::Extension(p) => {
-            let side = if current { &p.current } else { &p.next };
-            for opening in side {
-                for v in &opening.values {
-                    words.push(ext_word(v));
-                }
-                for node in &opening.proof.merkle_path {
-                    words.push(commitment_to_digest(node));
-                }
-            }
-        }
-    }
 }
 
 /// ★ The assembled chain executes on a proof the host accepts.

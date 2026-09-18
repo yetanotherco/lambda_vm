@@ -27,10 +27,10 @@ use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
-use super::whir_chain::{ChainRoundWires, ChainShape, chain_hash_schedule};
-use super::whir_chain_tests::{
-    Recording, RoundStorage, chain_program, const_rows, hint_rows, perm_rows, push_round_words,
+use super::whir_chain::{
+    ChainRoundWires, ChainShape, RoundStorage, chain_hash_schedule, push_round_words,
 };
+use super::whir_chain_tests::{Recording, chain_program, const_rows, hint_rows, perm_rows};
 use super::whir_stacked::{
     ColumnClaim, StackedPolyWires, emit_stacked_verify, emit_weight_at, stacked_verify_cost,
     weight_at_consts, weight_at_rows,
