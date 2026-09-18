@@ -1203,3 +1203,60 @@ fn the_production_chain_costs_what_the_census_quotes() {
     assert_eq!(chain_rows(&shape, entry), 185_509, "rows a chain");
     assert_eq!(chain_perms(&shape, entry), 22_828, "permutations a chain");
 }
+
+/// ★ The chain's F1 AT THE PRODUCTION SHAPE, and the constants the campaign's
+/// figure does not carry.
+///
+/// `the_chain_emits_its_closed_form` runs at five to nine variables; the number
+/// the campaign quotes — 185,509 rows a chain — was derived by EVALUATING the
+/// form at `S = 25, k = 4, Q = 112`, not by emitting the program. This emits it.
+/// A program costs nothing to build but its own construction: `chain_program`
+/// takes the SHAPE alone, so no proof, no commitment and no ELF are involved.
+///
+/// ⚠ It also measures what `chain_rows` does NOT carry. The F1 above subtracts
+/// `const_rows` before comparing, so `chain_rows` is a form over rows that are
+/// neither `LFM_CONST` nor plumbing — and V1e's per-table form INCLUDES its
+/// constants. Adding a chain figure to a table figure without saying which
+/// convention the sum is in is the mistake this number exists to prevent.
+///
+/// `#[ignore]`d because it builds a program of a few hundred thousand
+/// instructions, which is a second or two and a few hundred megabytes — fine on
+/// a laptop, and not something every `cargo test` should pay.
+#[test]
+#[ignore = "builds a production-shape chain program; run it when the census needs the number"]
+fn the_production_chain_emits_its_closed_form() {
+    let shape = ChainShape::new(&config(112, 20), 25);
+    assert_eq!(shape.schedule, vec![4, 4, 4, 4, 4, 4, 1], "the production schedule");
+
+    let program = chain_program(&shape);
+    let entry = SpongeEntry::fresh();
+    let consts = const_rows(&program);
+    let hints = hint_rows(&program);
+    let plumbing = chain_plumbing(&shape);
+    let measured = program.instrs.len() - consts - plumbing;
+    let predicted = chain_rows(&shape, entry);
+    let perms = perm_rows(&program);
+    let predicted_perms = chain_perms(&shape, entry);
+
+    println!(
+        "PRODUCTION chain S=25 k=4 Q=112 grind=20: {measured} rows against {predicted} predicted \
+         ({} shape + {} schedule); {perms} permutations against {predicted_perms} \
+         ({} openings + {} grind + {} schedule); {consts} CONSTANTS, {hints} hints, \
+         {} instructions whole",
+        chain_shape_rows(&shape),
+        chain_schedule_rows(&shape, entry),
+        chain_opening_perms(&shape),
+        chain_grind_perms(&shape),
+        chain_schedule_perms(&shape, entry),
+        program.instrs.len(),
+    );
+    println!(
+        "  ⇒ the const-free figure the campaign quotes is {measured}; the same chain's whole \
+         instruction count LESS its hinted arena is {}",
+        measured + consts
+    );
+
+    assert_eq!(hints, Layout::new(&shape).total as usize, "every arena word hinted once");
+    assert_eq!(measured, predicted, "the production shape's rows");
+    assert_eq!(perms, predicted_perms, "the production shape's permutations");
+}
