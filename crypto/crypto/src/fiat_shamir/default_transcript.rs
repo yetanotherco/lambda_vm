@@ -16,6 +16,10 @@ use math::{
 /// per squeeze).
 const SQUEEZE_LEN: usize = 32;
 
+/// Bytes in a field element, for the window alignment the counter reports.
+#[cfg(feature = "hash-metrics")]
+const FELT_BYTES: usize = 8;
+
 /// Sponge Fiat-Shamir transcript with a Plonky3-style duplex output buffer,
 /// over the hash `T` names.
 ///
@@ -43,6 +47,23 @@ pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = Keccak
     /// squeeze can never reflect input appended after it was produced.
     out_buf: [u8; SQUEEZE_LEN],
     out_pos: usize,
+    /// ★ Bytes absorbed since the sponge was last reset by a squeeze — the
+    /// WINDOW an in-guest verifier re-slices into field elements every 8 bytes.
+    /// A value absorbed at an offset that is not a multiple of 8 straddles two
+    /// of them, which is what the statement padding exists to prevent and what
+    /// `Counts::transcript_misaligned_absorbs` counts.
+    ///
+    /// The definition is `WindowRecorder`'s, not a second one: opens at 0,
+    /// becomes `SQUEEZE_LEN` after a squeeze (which finalize-resets and
+    /// re-absorbs its own 32-byte output, so a window never opens empty), and
+    /// does not move on `state()`, which finalizes a clone.
+    ///
+    /// ⚠ Gated, because this module promises a normal build compiles every
+    /// counter call to nothing and is provably unchanged. An unconditional
+    /// field and an add per absorb would make that sentence false to save a few
+    /// `cfg` lines.
+    #[cfg(feature = "hash-metrics")]
+    window: usize,
     phantom: PhantomData<(F, T)>,
 }
 
@@ -52,6 +73,11 @@ impl<F: HasDefaultTranscript, T: TranscriptHash> Clone for DefaultTranscript<F, 
             hasher: self.hasher.clone(),
             out_buf: self.out_buf,
             out_pos: self.out_pos,
+            // The window travels with the clone: a fork replays the same stream
+            // from the same offset, so its absorbs are aligned exactly when the
+            // original's are.
+            #[cfg(feature = "hash-metrics")]
+            window: self.window,
             phantom: PhantomData,
         }
     }
@@ -69,8 +95,13 @@ where
             out_buf: [0u8; SQUEEZE_LEN],
             // Empty: the first sample forces a squeeze.
             out_pos: SQUEEZE_LEN,
+            #[cfg(feature = "hash-metrics")]
+            window: 0,
             phantom: PhantomData,
         };
+        // The seed goes through `append_bytes`, so a non-empty one advances the
+        // window like any other absorb — which is why the WHIR byte gate's own
+        // first window, 13 seed bytes then a root, is NOT aligned.
         res.append_bytes(data);
         res
     }
@@ -106,6 +137,11 @@ where
         }
         self.hasher.update(result_hash);
         self.out_pos = SQUEEZE_LEN;
+        // A new window, holding the 32 bytes just re-absorbed.
+        #[cfg(feature = "hash-metrics")]
+        {
+            self.window = SQUEEZE_LEN;
+        }
         result_hash
     }
 
@@ -164,6 +200,13 @@ where
         // squeezed before it.
         self.out_pos = SQUEEZE_LEN;
         crate::hash_metrics::count_transcript_absorb::<T::Digest>();
+        #[cfg(feature = "hash-metrics")]
+        {
+            if !self.window.is_multiple_of(FELT_BYTES) {
+                crate::hash_metrics::count_transcript_misaligned_absorb();
+            }
+            self.window += new_bytes.len();
+        }
         self.hasher.update(new_bytes);
     }
 
@@ -178,9 +221,21 @@ where
         // a field or a serialisation that streams in pieces would not, and the
         // counter should follow the sponge rather than the argument list.
         self.out_pos = SQUEEZE_LEN;
+        // ⚠ Per `update`, the unit the absorb counter already uses and the one
+        // `WindowRecorder` mirrors: an element streamed in pieces is several
+        // absorbs in both instruments or in neither.
+        #[cfg(feature = "hash-metrics")]
+        let window = &mut self.window;
         let hasher = &mut self.hasher;
         element.stream_bytes(&mut |b| {
             crate::hash_metrics::count_transcript_absorb::<T::Digest>();
+            #[cfg(feature = "hash-metrics")]
+            {
+                if !window.is_multiple_of(FELT_BYTES) {
+                    crate::hash_metrics::count_transcript_misaligned_absorb();
+                }
+                *window += b.len();
+            }
             hasher.update(b);
         });
     }

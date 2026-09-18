@@ -75,6 +75,39 @@ pub struct Counts {
     pub transcript_states_keccak: u64,
     /// Of those, the ones whose sponge is RPX256.
     pub transcript_states_rpx: u64,
+    /// ★★ Fiat-Shamir absorbs that began at a byte offset which is NOT a
+    /// multiple of 8, measured within the current WINDOW — the bytes absorbed
+    /// since the sponge was last reset by a squeeze.
+    ///
+    /// An in-guest verifier re-slices a window into field elements every 8
+    /// bytes, so a value that starts off a boundary straddles two of them and
+    /// costs the machine the arithmetic of putting it back together. The
+    /// statement padding exists to keep this at zero on a real proof, and this
+    /// is what says whether it did.
+    ///
+    /// NOT split by sponge, unlike the three above: alignment is a property of
+    /// the byte stream, and the same stream under two hashes is misaligned in
+    /// the same places or in neither.
+    ///
+    /// ⚠ A zero here is only a measurement if something can make it non-zero.
+    /// `a_window_that_opens_off_a_boundary_is_counted` drives a transcript
+    /// seeded with 13 bytes — the WHIR byte gate's own first window, which is
+    /// documented as not aligned — and requires a non-zero count.
+    ///
+    /// ⛔ AND A REAL PROOF DOES NOT READ ZERO HERE, so do not pre-register one.
+    /// A STATEMENT is variable-length by nature — a tag, one byte per table
+    /// count, a three-byte grind trailer — so absorbs inside it start off
+    /// boundaries constantly, and the padding never promised otherwise: what it
+    /// promises is that whatever follows the statement starts aligned. Measured
+    /// on the EQ fixture, one epoch statement plus its proof reads 25 misaligned
+    /// absorbs at `public_output = 0` and 24 at 2 bytes, of which ZERO are after
+    /// the statement — and filtering to felt-sized payloads does not recover a
+    /// zero either (22 and 21 of them are). This counter is a per-run number
+    /// that a regression MOVES; the "nothing after a statement is misaligned"
+    /// property is the recorder's in
+    /// `statement_alignment_tests::the_counter_and_the_recorder_agree_on_one_prove`,
+    /// which pins it and cross-checks this counter on the same prove.
+    pub transcript_misaligned_absorbs: u64,
 }
 
 impl Counts {
@@ -116,6 +149,7 @@ mod imp {
     static T_STATES: AtomicU64 = AtomicU64::new(0);
     static T_STATES_KECCAK: AtomicU64 = AtomicU64::new(0);
     static T_STATES_RPX: AtomicU64 = AtomicU64::new(0);
+    static T_MISALIGNED: AtomicU64 = AtomicU64::new(0);
 
     /// Which known sponge `D` is, if any: `Some(true)` keccak, `Some(false)`
     /// RPX256, `None` a configuration nobody has instrumented.
@@ -230,6 +264,16 @@ mod imp {
         };
     }
 
+    /// ★★ One Fiat-Shamir absorb that began off a field element boundary.
+    ///
+    /// Untagged by sponge on purpose — see the field's documentation. The
+    /// caller decides; `DefaultTranscript` is the only one, because it is the
+    /// only place that knows the window.
+    #[inline(always)]
+    pub fn count_transcript_misaligned_absorb() {
+        T_MISALIGNED.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// ★★ One Fiat-Shamir SQUEEZE, tagged the same way.
     #[inline(always)]
     pub fn count_transcript_squeeze<D: 'static>() {
@@ -274,6 +318,7 @@ mod imp {
         T_STATES.store(0, Ordering::Relaxed);
         T_STATES_KECCAK.store(0, Ordering::Relaxed);
         T_STATES_RPX.store(0, Ordering::Relaxed);
+        T_MISALIGNED.store(0, Ordering::Relaxed);
     }
 
     pub fn snapshot() -> Counts {
@@ -293,6 +338,7 @@ mod imp {
             transcript_states: T_STATES.load(Ordering::Relaxed),
             transcript_states_keccak: T_STATES_KECCAK.load(Ordering::Relaxed),
             transcript_states_rpx: T_STATES_RPX.load(Ordering::Relaxed),
+            transcript_misaligned_absorbs: T_MISALIGNED.load(Ordering::Relaxed),
         }
     }
 }
@@ -321,6 +367,8 @@ mod imp {
     #[inline(always)]
     pub fn count_transcript_squeeze<D: 'static>() {}
     #[inline(always)]
+    pub fn count_transcript_misaligned_absorb() {}
+    #[inline(always)]
     pub fn count_transcript_state<D: 'static>() {}
     pub fn reset() {}
     pub fn snapshot() -> Counts {
@@ -330,6 +378,7 @@ mod imp {
 
 pub use imp::{
     count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
-    count_merkle_node_direct, count_total, count_transcript_absorb, count_transcript_squeeze,
-    count_transcript_state, reset, snapshot,
+    count_merkle_node_direct, count_total, count_transcript_absorb,
+    count_transcript_misaligned_absorb, count_transcript_squeeze, count_transcript_state, reset,
+    snapshot,
 };

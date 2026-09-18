@@ -290,6 +290,19 @@ fn print_transcript_counts(window: &str, c: &crypto::hash_metrics::Counts) {
         us,
         ut,
     );
+    // ★ Its own line, and labelled with the same window, because alignment is a
+    // property of the byte stream rather than of a sponge: the same stream under
+    // two hashes is misaligned in the same places or in neither, so there is no
+    // keccak/rpx pair to print. A real proof reads ZERO here; the WHIR byte
+    // gate's own fixture does not, and `a_window_that_opens_off_a_boundary_is_counted`
+    // is what stops that zero from being a counter nobody bumps.
+    println!(
+        "{:<12} misaligned absorbs: {} (statements' own fields included; a \
+         statement is variable-length by nature and the padding only promises \
+         that what FOLLOWS it is aligned, so a non-zero here is the statement \
+         shapes and not a regression)",
+        window, c.transcript_misaligned_absorbs,
+    );
 }
 
 /// ★★ THE TRANSCRIPT PAIR, PINNED — one configuration, both sides.

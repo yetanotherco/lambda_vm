@@ -687,6 +687,122 @@ fn every_absorb_of_a_real_prove_is_field_element_aligned() {
     }
 }
 
+/// ★★ TWO INSTRUMENTS ON ONE QUANTITY: the recorder above, and the counter
+/// inside `DefaultTranscript`.
+///
+/// `Counts::transcript_misaligned_absorbs` was written to reproduce THIS file's
+/// definition of a window — opens at 0, becomes 32 after a squeeze, unmoved by
+/// `state()`. That is a claim, and this is what checks it: one production
+/// prove, measured both ways, required to agree. Without it the box's
+/// `misaligned absorbs: 0` line would be a number taken on trust.
+///
+/// ⛔ MUST RUN ALONE, and that is why it is `#[ignore]`d rather than part of
+/// the suite. The counters are PROCESS-GLOBAL and the prover's lib-test binary
+/// runs 650 tests in parallel, many of which absorb; a snapshot taken there is
+/// a measurement of whatever the neighbours were doing. `--exact` gives one
+/// test per process, where the subject is trivially the only writer.
+///
+/// ```text
+/// cargo test --release -p lambda-vm-prover --lib --features hash-metrics \
+///     tests::statement_alignment_tests::the_counter_and_the_recorder_agree_on_one_prove \
+///     -- --exact --ignored --nocapture
+/// ```
+#[cfg(feature = "hash-metrics")]
+#[test]
+#[ignore = "reads process-global counters; must be the only test in its process"]
+fn the_counter_and_the_recorder_agree_on_one_prove() {
+    let (air, columns) = eq_table();
+
+    for po in [vec![], vec![0u8, 0u8]] {
+        for arm in ["keccak", "rpx"] {
+            let rec = match arm {
+                "keccak" => {
+                    prove_through_recorder::<KeccakWhir>(air, &columns, &po)
+                        .1
+                        .absorbs
+                }
+                _ => {
+                    prove_through_recorder::<RpxWhir>(air, &columns, &po)
+                        .1
+                        .absorbs
+                }
+            };
+
+            crypto::hash_metrics::reset();
+            match arm {
+                "keccak" => {
+                    let _ = prove_through_production::<KeccakWhir>(air, &columns, &po);
+                }
+                _ => {
+                    let _ = prove_through_production::<RpxWhir>(air, &columns, &po);
+                }
+            }
+            let counted = crypto::hash_metrics::snapshot();
+
+            // The counter sees the whole transcript, statement included, so the
+            // comparison is against every taped absorb rather than the ones
+            // after the statement.
+            assert_eq!(
+                counted.transcript_misaligned_absorbs,
+                misaligned(&rec, 0).len() as u64,
+                "the counter inside `DefaultTranscript` and this file's recorder \
+                 disagree about how many absorbs of the {arm} arm started off a \
+                 field element boundary (po {} bytes)",
+                po.len(),
+            );
+
+            // ★ ONE MORE ABSORB, named rather than absorbed into a tolerance.
+            // `DefaultTranscript::new` absorbs its seed through `append_bytes`,
+            // so it is counted even when the seed is EMPTY — and
+            // `WindowRecorder::new` builds its inner transcript directly, so
+            // that absorb never reaches the tape. The difference is exactly one,
+            // every time. It sits at window 0 and is therefore aligned, which is
+            // why the misaligned comparison above needs no such term.
+            //
+            // Found by this assertion failing at 146 against 145 on its first
+            // run, which is the whole reason for having two instruments.
+            const SEED_ABSORB: u64 = 1;
+            assert_eq!(
+                counted.transcript_absorbs,
+                rec.len() as u64 + SEED_ABSORB,
+                "the counter saw {} absorbs where the recorder taped {} plus the \
+                 transcript's own seed",
+                counted.transcript_absorbs,
+                rec.len(),
+            );
+
+            // ★★ WHAT THE MISALIGNED COUNT IS MADE OF. A statement's own
+            // fields are odd-length by nature — a tag, one byte per table
+            // count, a three-byte grind trailer — so absorbs INSIDE a statement
+            // start off boundaries constantly, and the padding never promised
+            // otherwise: it promises that what follows the statement starts
+            // aligned. Split the same tape both ways so a box line that is not
+            // zero is read as the statements' own shape and not as a
+            // regression.
+            let all_misaligned = misaligned(&rec, 0);
+            let statement_absorbs = epoch_expected(po.len(), 1).calls;
+            let after_statement = misaligned(&rec, statement_absorbs).len();
+            let felt_sized = all_misaligned
+                .iter()
+                .filter(|(_, len)| len.is_multiple_of(FELT_BYTES))
+                .count();
+            println!(
+                "AGREE {arm} po={} absorbs {} (taped {} + seed), misaligned {} \
+                 (after the statement {after_statement}, felt-sized {felt_sized})",
+                po.len(),
+                counted.transcript_absorbs,
+                rec.len(),
+                counted.transcript_misaligned_absorbs,
+            );
+            assert_eq!(
+                after_statement, 0,
+                "the {arm} arm misaligned {after_statement} absorbs after its \
+                 statement, which is the property the padding owes"
+            );
+        }
+    }
+}
+
 fn keccak_line(bytes: &[u8]) -> String {
     crypto::hash::platform_keccak::PlatformKeccak256::digest(bytes)
         .iter()
