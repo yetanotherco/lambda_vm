@@ -28,13 +28,13 @@ use core::cell::RefCell;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
+use math::traits::AsBytes;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GrindBits, RoundOpenings, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
-use math::traits::AsBytes;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -1014,7 +1014,8 @@ fn the_schedule_is_the_host_transcripts() {
         );
         for (i, (derived, observed)) in mine.iter().zip(&host).enumerate() {
             assert_eq!(
-                derived, observed,
+                derived,
+                observed,
                 "S={num_vars} Q={num_queries} grind={grind}: hash {i} of {} — the form says \
                  {derived:?} and the host's own transcript did {observed:?}",
                 host.len()
