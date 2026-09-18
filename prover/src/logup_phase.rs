@@ -200,7 +200,7 @@ pub fn run(
     })?;
 
     let chunks = done.into_inner().expect("logup results");
-    let tables = assemble(chunks, &mut resident, elf, proof_options, challenge)?;
+    let tables = assemble(chunks, &mut resident, challenge)?;
     Ok(LogUp { tables, resident })
 }
 
@@ -212,23 +212,10 @@ pub fn run(
 fn assemble(
     chunks: Vec<Proved>,
     resident: &mut Resident,
-    elf: &Elf,
-    proof_options: &ProofOptions,
     challenge: &Challenge,
 ) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
     let order = &challenge.order;
-    let airs = crate::VmAirs::new(
-        elf,
-        proof_options,
-        false,
-        &resident.page_configs,
-        order.counts(),
-        None,
-        true,
-        None,
-        None,
-        None,
-    );
+    let airs = &challenge.airs;
 
     let mut slots: Vec<Option<StarkProof<GoldilocksField, GoldilocksExtension, ()>>> =
         (0..order.len()).map(|_| None).collect();
@@ -503,18 +490,7 @@ pub fn run_batched(
 
     // The tables the walk could not retire, folded after it in AIR order.
     let order = &challenge.order;
-    let airs = crate::VmAirs::new(
-        elf,
-        proof_options,
-        false,
-        &resident.page_configs,
-        order.counts(),
-        None,
-        true,
-        None,
-        None,
-        None,
-    );
+    let airs = &challenge.airs;
     let n = order.len();
     {
         let mut state = done.lock().expect("fold state");
@@ -745,18 +721,7 @@ pub fn run_open(
     let mut opens = done.into_inner().expect("openings");
 
     let order = &challenge.order;
-    let airs = crate::VmAirs::new(
-        elf,
-        proof_options,
-        false,
-        &resident.page_configs,
-        order.counts(),
-        None,
-        true,
-        None,
-        None,
-        None,
-    );
+    let airs = &challenge.airs;
     let n = order.len();
     let build = |idx: usize,
                  air: &crate::VmAir,

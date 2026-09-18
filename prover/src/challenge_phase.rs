@@ -40,6 +40,9 @@ pub struct Challenge {
     pub challenges: Vec<FieldElement<GoldilocksExtension>>,
     /// Every root absorbed, in AIR order.
     pub roots: Vec<MainRoots>,
+    /// The AIRs of this proof, built once here: their preprocessed commitments
+    /// (DECODE from the ELF, one per ELF data page, ...) are the bulk of this pass.
+    pub(crate) airs: crate::VmAirs,
     /// The transcript right after the sampling, which every later pass forks
     /// per table. Kept rather than rebuilt: re-absorbing 227 roots to get back
     /// to this state is both slower and a second place for the order to be
@@ -109,15 +112,17 @@ pub fn run(
         .map(|_| transcript.sample_field_element())
         .collect();
 
+    let order = crate::streaming::AirOrder::new(
+        table_counts,
+        airs.include_halt,
+        remaining.page_configs.len(),
+    );
     Ok(Challenge {
         challenges,
         roots,
+        airs,
         transcript,
-        order: crate::streaming::AirOrder::new(
-            table_counts,
-            airs.include_halt,
-            remaining.page_configs.len(),
-        ),
+        order,
     })
 }
 
