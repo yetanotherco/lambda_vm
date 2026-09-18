@@ -10,6 +10,54 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc serves allocations of 8 MiB and up from one shared arena and purges each of
+/// them the moment it is freed, whatever the decay says, unless decay is disabled for that
+/// arena (`extent_may_force_decay`). A prover that allocates and drops one trace-sized
+/// buffer after another then refaults and re-zeroes the same pages for every chunk.
+/// Disable the arena's decay and purge it on our own clock instead: hot buffers are
+/// reused across threads, cold ones still go back to the OS.
+///
+/// Linux only: elsewhere jemalloc is built without background threads and the decay
+/// mallctl traps.
+fn keep_large_buffers_warm() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::ptr::null_mut;
+        use std::time::Duration;
+        use tikv_jemalloc_ctl::raw;
+
+        const PURGE_EVERY: Duration = Duration::from_secs(10);
+
+        // The arena only exists after the first large allocation.
+        std::hint::black_box(vec![0u8; 16 << 20]);
+        // SAFETY: `opt.narenas` is `unsigned`, the decay knob is `ssize_t`, and `purge`
+        // takes no value.
+        unsafe {
+            let Ok(huge_arena) = raw::read::<u32>(b"opt.narenas\0") else {
+                return;
+            };
+            let decay = format!("arena.{huge_arena}.dirty_decay_ms\0");
+            if raw::write(decay.as_bytes(), -1i64).is_err() {
+                return;
+            }
+            let purge = CString::new(format!("arena.{huge_arena}.purge")).unwrap();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(PURGE_EVERY);
+                    tikv_jemalloc_sys::mallctl(
+                        purge.as_ptr(),
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        0,
+                    );
+                }
+            });
+        }
+    }
+}
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
@@ -292,6 +340,7 @@ enum Stage {
 }
 
 fn main() -> ExitCode {
+    keep_large_buffers_warm();
     env_logger::init();
     let cli = Cli::parse();
 
