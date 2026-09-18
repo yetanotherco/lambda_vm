@@ -719,4 +719,82 @@ mod tests {
             );
         })
     }
+    /// ★ THE AIR SET THE BUILDER WILL GET IS THE ONE THE VERIFIER ACCEPTED.
+    ///
+    /// V1's `whir_epoch_program` takes `EpochAirs<'_>` alongside the
+    /// `WhirRealEpoch`, because `multi_verify`'s `TableStatement`s are built
+    /// from the AIRs and a proof states heights, never widths.
+    /// `epoch_airs_for` is what hands them over.
+    ///
+    /// ⚠ THIS IS NOT A COMPARISON OF TWO DERIVATIONS, AND THAT IS THE DESIGN.
+    /// `verify_epoch_bookend` calls `epoch_airs_for` itself, so "the builder's
+    /// AIRs are the verifier's AIRs" is true by construction and this test only
+    /// has to check that what comes out describes the epoch it was asked for. A
+    /// test that rebuilt the set independently and compared could pass with
+    /// both halves wrong — the shape that let REGISTER's columns and its root
+    /// describe different tables.
+    ///
+    /// The tamper is `is_final`, which decides whether HALT is in the set, so
+    /// an inverted position yields a DIFFERENT NUMBER of AIRs. That is the
+    /// check that the set is a function of the epoch's position rather than a
+    /// constant the caller could have got anywhere.
+    #[test]
+    fn the_epoch_airs_describe_the_epoch_they_were_asked_for() {
+        let (elf_bytes, opts, b) = bundle();
+        let elf = Elf::load(&elf_bytes).expect("load");
+        assert!(
+            b.epochs.len() >= 2,
+            "a one-epoch run has no non-final epoch"
+        );
+
+        let harvested = real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 0, None)
+            .expect("epoch 0 harvests");
+        let position = whir_epoch_chain_position(&b, &elf, 0).expect("epoch 0 has a position");
+
+        let set = crate::multilinear_continuation::epoch_airs_for(
+            &elf,
+            &opts,
+            &b.epochs[0],
+            &position.register_init,
+            position.is_final,
+            position.label,
+            Some(harvested.decode_commitment),
+        );
+        let refs = set.refs();
+
+        // It reproduces the harvested shapes: the same count, and the same
+        // WIDTH per table, which is the half a proof does not state and the
+        // half a builder cannot guess.
+        assert_eq!(
+            refs.len(),
+            harvested.shapes.len(),
+            "the exposed AIR set and the harvested shapes disagree on the table count"
+        );
+        for (index, (air, &(width, _))) in refs.iter().zip(&harvested.shapes).enumerate() {
+            assert_eq!(
+                air.trace_layout().0,
+                width,
+                "table {index}'s width from the AIR set is not the harvested one"
+            );
+        }
+
+        // THE TAMPER: the same epoch at the wrong position. `is_final` decides
+        // whether HALT is in the set, so the count must move — if it does not,
+        // this test cannot see a driver that ignored the position.
+        let wrong = crate::multilinear_continuation::epoch_airs_for(
+            &elf,
+            &opts,
+            &b.epochs[0],
+            &position.register_init,
+            !position.is_final,
+            position.label,
+            Some(harvested.decode_commitment),
+        );
+        assert_ne!(
+            wrong.refs().len(),
+            refs.len(),
+            "inverting is_final left the AIR set identical, so the set does not \
+             depend on the epoch's position and this test proves nothing"
+        );
+    }
 }

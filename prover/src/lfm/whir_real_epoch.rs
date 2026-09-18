@@ -329,19 +329,19 @@ where
     // argued at. The AIR set is where widths live, and rebuilding it here is
     // the same rebuild `verify_epoch_bookend` performs, with the same
     // arguments, so the two cannot disagree.
-    let airs = crate::continuation::build_epoch_airs(
+    // ★ THE VERIFIER'S OWN DERIVATION, not a second one that agrees. `Some` is
+    // this side's answer for DECODE's preprocessed commitment — see
+    // `epoch_airs_for` on why that is the only thing the two callers differ on.
+    let air_set = crate::multilinear_continuation::epoch_airs_for(
         &elf,
         opts,
-        &[],
-        &proof.table_counts,
+        &proof,
         &position.register_init,
-        &proof.reg_fini,
         position.is_final,
+        position.label,
         Some(decode_commitment),
     );
-    let l2g_air = crate::continuation::l2g_memory_air(opts, position.label);
-    let mut air_refs = airs.air_refs();
-    air_refs.push(&l2g_air);
+    let air_refs = air_set.refs();
     if air_refs.len() != proof.table_num_vars.len() {
         return Err(format!(
             "epoch {epoch_index}'s layout has {} tables and the proof states {} heights",
