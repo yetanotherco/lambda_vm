@@ -579,6 +579,136 @@ pub struct TableProof<E: IsField> {
     pub constraint: ConstraintCore<E>,
 }
 
+/// ★★★ THE ROOTS BLOCK: every root into the transcript, then the three shared
+/// challenges — used by `multi_prove`, by `multi_verify`, AND by every caller
+/// that REPLAYS the block on a fork of the transcript.
+///
+/// # Why it is one function
+///
+/// The two sides must absorb the same roots in the same order and draw the same
+/// challenges after them. Written twice, they can drift — and a drift here is
+/// silent in the worst way, because a consistently wrong order still verifies:
+/// prover and verifier agree with each other and disagree with the
+/// specification. Sharing the code makes that particular disagreement
+/// unspellable rather than merely tested for.
+///
+/// # ⛔ The replays are callers too, and forgetting one is how this broke
+///
+/// A verifier that needs `z` and `alpha` BEFORE `multi_verify` runs — to compute
+/// the COMMIT bus's counterparty, which is a function of them — replays this
+/// block on a clone of the transcript. Such a replay is a third side of the same
+/// agreement, and it is public for exactly that reason: when the block grew the
+/// derived root, the two call sites inside this module grew with it and a
+/// hand-rolled replay in the prover crate did not, so the counterparty was
+/// computed at challenges no table had been checked at and every epoch that
+/// published output failed on `BusImbalance`. The epochs that published nothing
+/// could not see it, because the counterparty is zero there without reading
+/// either challenge.
+///
+/// So: never spell this loop out again. Call [`absorb_roots`], pass the same
+/// `derived` list the verification will be handed, and draw what you consume.
+///
+/// # The order, and why `derived` is last
+///
+/// The carried roots — the ones the proof actually contains — go in first, then
+/// any derived root the verifier computed for itself. "Last" means last among
+/// the roots, NOT after the challenges: a root absorbed after `z` is
+/// indistinguishable IN `z` from a root never absorbed at all, so it would bind
+/// nothing while looking wired from every counter and every byte gate.
+///
+/// That is the one placement no round-trip can catch, which is why
+/// `the_roots_block_binds_the_derived_root_to_the_first_challenge` compares this
+/// against an independently built transcript rather than against the other side.
+pub fn absorb_roots_and_challenge<E, T>(
+    transcript: &mut T,
+    carried: &[Commitment],
+    derived: &[Commitment],
+) -> (FieldElement<E>, FieldElement<E>, FieldElement<E>)
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots::<E, T>(transcript, carried, derived);
+    (
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+    )
+}
+
+/// The half of the roots block that can DRIFT: which roots, in which order.
+///
+/// Split out because a replay needs this half and not the other. The order is a
+/// shared fact and is shared here; how many challenges are drawn afterwards is
+/// the caller's own business, because a replay works on a fork it throws away
+/// and only the first two challenges ever leave it.
+///
+/// ⚠ A challenge nobody reads is neither free nor invisible. Each is a sponge
+/// squeeze; `hash_metrics` counts squeezes on every transcript instance, a
+/// clone included; and the output buffer hands out four candidates per squeeze,
+/// so an unread draw moves a pinned squeeze count by an amount that depends on
+/// where the buffer happened to be. A replay draws exactly what it consumes,
+/// and the order it draws in is checked against
+/// [`absorb_roots_and_challenge`] by a test rather than by a comment.
+pub fn absorb_roots<E, T>(transcript: &mut T, carried: &[Commitment], derived: &[Commitment])
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    for root in carried {
+        transcript.append_bytes(root);
+    }
+    for root in derived {
+        transcript.append_bytes(root);
+    }
+}
+
+/// What the verifier needs to settle a prepared commitment it derived itself.
+///
+/// ⚠ `roots` are DERIVED — recomputed from the ELF by the verifier — never read
+/// from the proof. A root taken from the proof would be a value absorbed before
+/// it was checked.
+pub struct PreparedCheck<'a, F>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+{
+    /// Recomputed from the ELF, not carried in the proof.
+    pub roots: &'a [Commitment],
+    pub layout: &'a StackedLayout,
+    pub domain: &'a Domain<F>,
+    /// Whose reduced point the opening is settled at.
+    pub table: usize,
+    /// How many of that table's columns the commitment covers.
+    pub columns: usize,
+}
+
+/// A commitment built OUTSIDE this proof, to be opened at one table's point.
+///
+/// DECODE's five preprocessed columns are ELF-derived: the same bytes in every
+/// epoch of every run of that program. Committing them per epoch and then
+/// re-evaluating their MLEs per epoch is work that depends on nothing the epoch
+/// chose. This carries a commitment built once per ELF, so the epoch pays an
+/// opening instead of five 2^20 folds.
+///
+/// ⚠ The `table` index is part of the statement, not a hint. The opening binds
+/// these columns to ONE table's reduced point, and which table that is must be
+/// asserted rather than inferred from position — a prover who could aim the
+/// pinned columns at a different table's point would be settling them against
+/// challenges they were never bound to.
+pub struct Prepared<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// Built once per ELF, outside this proof.
+    pub commitment: &'a StackedCommitment<F, H>,
+    /// The columns it was committed over, in that order.
+    pub columns: &'a [&'a Mle<F>],
+    /// Whose reduced point the opening is at.
+    pub table: usize,
+}
+
 /// Every table's argument, and the **one** opening that settles all of them.
 #[derive(
     Clone,
@@ -599,6 +729,21 @@ pub struct MultiProof<F: IsField, E: IsField> {
     /// Every table's columns, at each one's own point — one opening per
     /// commitment group, in group order.
     pub columns: Vec<StackedProof<F, E>>,
+    /// ★★ The out-of-band preprocessed opening, when the proof carries one.
+    ///
+    /// DECODE's five preprocessed columns are ELF-derived, so their commitment
+    /// is a function of the program alone and is built ONCE per ELF rather than
+    /// per epoch. This opens it at DECODE's own reduced point, and the verifier
+    /// compares the opened values against the ones DECODE's table settled on —
+    /// which replaces re-evaluating five 2^20 MLEs on every epoch.
+    ///
+    /// ⚠ Its ROOT IS NOT IN [`roots`](Self::roots), and that is deliberate. The
+    /// verifier derives the root from the ELF it already holds and absorbs the
+    /// DERIVED value; a root carried here would be a second copy that a reader
+    /// assumes is checked, and a value that has not been checked must never
+    /// reach the transcript. `roots` therefore keeps exactly the group roots it
+    /// always had, and the group indexing that slices it is untouched.
+    pub preprocessed: Option<StackedProof<F, E>>,
 }
 
 /// The table's share of the bus, `p/q`.
@@ -734,6 +879,7 @@ pub fn verify<E, T>(
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
     transcript: &mut T,
+    settled_out_of_band: usize,
 ) -> Result<TableVerdict<E>, MlError>
 where
     E: IsField + Send + Sync + 'static,
@@ -786,7 +932,7 @@ where
         transcript,
     )?;
 
-    check_preprocessed(statement, &reduced)?;
+    check_preprocessed(statement, &reduced, settled_out_of_band)?;
 
     Ok((proof.bus_output.clone(), reduced))
 }
@@ -800,15 +946,37 @@ where
 /// the proof settled on and demands the same value. Costs one pass over each
 /// such column, which is what recomputing a preprocessed commitment costs on
 /// the univariate side.
+/// ★★ `settled_out_of_band` is how many of this table's leading preprocessed
+/// columns a PREPARED OPENING already settled, and it is the whole saving: those
+/// columns are tied to an ELF-derived commitment by an opening at this very
+/// point, so evaluating their MLEs here would prove the same thing a second time
+/// at `5 * 2^20` folds an epoch.
+///
+/// ⚠ It must be driven by the same `PreparedCheck` value that drives the
+/// opening, never by a flag a caller sets on its own — otherwise it is a switch
+/// that turns off a check with nothing put in its place. The caller asserts it
+/// covers no more columns than the opening does; see `multi_verify`.
 fn check_preprocessed<F, E>(
     statement: TableStatement<'_, F, E>,
     reduced: &claim_reduce::ReducedClaim<E>,
+    settled_out_of_band: usize,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
-    for (col, column) in statement.preprocessed.iter().enumerate() {
+    if settled_out_of_band > statement.preprocessed.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: statement.preprocessed.len(),
+            got: settled_out_of_band,
+        });
+    }
+    for (col, column) in statement
+        .preprocessed
+        .iter()
+        .enumerate()
+        .skip(settled_out_of_band)
+    {
         let factor = slot(statement.slot_of, col)?;
         // A preprocessed column is read unshifted by construction: `TableLayout`
         // registers every main column that way. Anything else means the two
@@ -850,6 +1018,7 @@ pub fn multi_prove<F, E, T, H>(
     committed: &CommittedTables<'_, F, E, H>,
     config: &ChainConfig,
     transcript: &mut T,
+    prepared: Option<Prepared<'_, F, H>>,
 ) -> Result<MultiProof<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -874,19 +1043,31 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
-    for root in committed.roots() {
-        transcript.append_bytes(root);
-    }
-    let z: FieldElement<E> = transcript.sample_field_element();
-    let alpha: FieldElement<E> = transcript.sample_field_element();
-    let beta: FieldElement<E> = transcript.sample_field_element();
+    // ⚠ The prepared root is NOT added to `MultiProof::roots`. The verifier
+    // derives it from the ELF and absorbs the derived value; a copy carried in
+    // the proof would be a field a reader assumes is checked.
+    // `StackedCommitment::roots` builds a fresh `Vec`, so it is bound here
+    // rather than borrowed from a temporary.
+    let prepared_roots: Vec<Commitment> = prepared
+        .as_ref()
+        .map(|p| p.commitment.roots())
+        .unwrap_or_default();
+    let (z, alpha, beta) =
+        absorb_roots_and_challenge::<E, T>(transcript, committed.roots(), &prepared_roots);
 
     let mut tables = Vec::with_capacity(committed.tables().len());
     // One point and one claimed value per **column**, in the global column
     // order the stack was built in.
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
-    for table in committed.tables() {
+    // Where the prepared columns' table starts in the global column order. Its
+    // columns all share one reduced point, so the offset is all the opening
+    // needs to find both the point and the claimed values.
+    let mut prepared_at: Option<usize> = None;
+    for (index, table) in committed.tables().iter().enumerate() {
+        if prepared.as_ref().is_some_and(|p| p.table == index) {
+            prepared_at = Some(points.len());
+        }
         let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
         for _ in 0..table.num_committed_columns() {
             points.push(point.clone());
@@ -924,10 +1105,41 @@ where
         column_at += width;
     }
 
+    // The out-of-band opening, at the target table's reduced point. `Shared`
+    // rather than `PerColumn` because every one of these columns is settled at
+    // the SAME point — the one that table's argument reduced to — which is what
+    // makes the opened values comparable to that table's own claimed values.
+    let preprocessed = match prepared {
+        Some(prepared) => {
+            let at = prepared_at.ok_or(MlError::UnknownPolynomial {
+                index: prepared.table,
+                len: committed.tables().len(),
+            })?;
+            let width = prepared.columns.len();
+            if at + width > values.len() {
+                return Err(MlError::QueryCountMismatch {
+                    expected: at + width,
+                    got: values.len(),
+                });
+            }
+            Some(stacked_eval::prove::<F, E, T, H>(
+                prepared.commitment,
+                prepared.columns,
+                None,
+                &Claimed::Shared(&points[at]),
+                &values[at..at + width],
+                config,
+                transcript,
+            )?)
+        }
+        None => None,
+    };
+
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
         tables,
         columns,
+        preprocessed,
     })
 }
 
@@ -949,6 +1161,7 @@ pub fn multi_verify<F, E, T, H>(
     expected: &FieldElement<E>,
     config: &ChainConfig,
     transcript: &mut T,
+    prepared: Option<PreparedCheck<'_, F>>,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -989,18 +1202,40 @@ where
             got: proof.columns.len(),
         });
     }
-    for root in &proof.roots {
-        transcript.append_bytes(root);
-    }
-    let z: FieldElement<E> = transcript.sample_field_element();
-    let alpha: FieldElement<E> = transcript.sample_field_element();
-    let beta: FieldElement<E> = transcript.sample_field_element();
+    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(
+        transcript,
+        &proof.roots,
+        prepared.as_ref().map(|p| p.roots).unwrap_or(&[]),
+    );
 
     let mut balance = FieldElement::<E>::zero();
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
-    for (table, statement) in proof.tables.iter().zip(statements) {
-        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript)?;
+    // Where the prepared columns' table starts in the global column order, so
+    // the opening can be settled at that table's point against that table's own
+    // claimed values.
+    let mut prepared_at: Option<usize> = None;
+    for (index, (table, statement)) in proof.tables.iter().zip(statements).enumerate() {
+        // ★ ONE VALUE drives both halves: the columns the opening settles are
+        // the columns `check_preprocessed` may skip. A second, independent knob
+        // would be a way to switch off a check with nothing in its place.
+        let settled = match prepared.as_ref() {
+            Some(p) if p.table == index => {
+                prepared_at = Some(points.len());
+                p.columns
+            }
+            _ => 0,
+        };
+        // ⚠ THE ASSERT THAT MATTERS. The opening covers `p.columns` of this
+        // table; skipping more than that would drop a preprocessed check
+        // nothing replaced.
+        if settled > statement.preprocessed.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: statement.preprocessed.len(),
+                got: settled,
+            });
+        }
+        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript, settled)?;
         balance += contribution(&output).ok_or(MlError::BusImbalance)?;
         for _ in 0..statement.slot_of.len() {
             points.push(reduced.point.clone());
@@ -1043,6 +1278,48 @@ where
         statement_at += size;
         column_at += width;
         root_at += layout.num_polys();
+    }
+
+    // ★★★ THE PREPARED OPENING, and check (d) with it.
+    //
+    // (d) is NOT a separate assertion here, and that is deliberate. The values
+    // handed to `stacked_eval::verify` are the ones THIS TABLE's own argument
+    // settled on — `values[at .. at + n]` — so the opening has to prove the
+    // pinned commitment takes exactly those values at exactly that point. Two
+    // copies of the same columns are tied by the check that already exists
+    // rather than by an equality someone has to remember to write.
+    //
+    // The alternative shape — verify the opening against its own claimed
+    // values, then assert those equal the table's — is one line longer and one
+    // line forgettable. This one cannot be omitted without deleting the call.
+    if let Some(prepared) = prepared {
+        let at = prepared_at.ok_or(MlError::UnknownPolynomial {
+            index: prepared.table,
+            len: proof.tables.len(),
+        })?;
+        let opening = proof
+            .preprocessed
+            .as_ref()
+            .ok_or(MlError::QueryCountMismatch {
+                expected: 1,
+                got: 0,
+            })?;
+        if at + prepared.columns > values.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: at + prepared.columns,
+                got: values.len(),
+            });
+        }
+        stacked_eval::verify::<F, E, T, H>(
+            opening,
+            prepared.layout,
+            prepared.roots,
+            &Claimed::Shared(&points[at]),
+            &values[at..at + prepared.columns],
+            prepared.domain,
+            config,
+            transcript,
+        )?;
     }
     Ok(())
 }
@@ -1223,7 +1500,7 @@ mod tests {
         )?;
 
         let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        let proof = multi_prove(&committed, &config(), &mut prover)?;
+        let proof = multi_prove(&committed, &config(), &mut prover, None)?;
 
         // Three tables of different heights, and **one** commitment with one
         // opening for all of them.
@@ -1252,6 +1529,7 @@ mod tests {
             &ExtE::zero(),
             &config(),
             &mut verifier,
+            None,
         )
     }
 
@@ -1260,6 +1538,70 @@ mod tests {
     /// own constraints *and* its buses, every one argued in a single sumcheck
     /// against one commitment per trace — and the buses balance, checked by the
     /// verifier rather than by the caller.
+    /// ★★★ THE ROOTS BLOCK BINDS THE DERIVED ROOT TO THE FIRST CHALLENGE.
+    ///
+    /// This is the guard for the one placement nothing else catches. Step 2's
+    /// prover test sees a root that is never absorbed, and its sibling sees one
+    /// aimed at the wrong table — but a root absorbed AFTER `z` left both green,
+    /// because `alpha` and `beta` still move and the proof still differs.
+    ///
+    /// A round-trip cannot close it either: prover and verifier call the same
+    /// block, so a consistently late absorb verifies on both sides. The two
+    /// halves agree with each other and disagree with the specification.
+    ///
+    /// So this compares against an INDEPENDENTLY BUILT transcript rather than
+    /// against the other side — the shape every check on this branch that held
+    /// has in common. The reference absorbs carried-then-derived and draws three
+    /// challenges; the production block must produce the same three.
+    ///
+    /// ⚠ The first challenge is the one that matters. Moving the absorb after
+    /// `z` leaves `alpha` and `beta` correct, so a test comparing only the later
+    /// two would pass on exactly the mutation this exists to catch.
+    #[test]
+    fn the_roots_block_binds_the_derived_root_to_the_first_challenge() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let carried: Vec<Commitment> = vec![[0x11; 32], [0x22; 32]];
+        let derived: Vec<Commitment> = vec![[0xAB; 32]];
+
+        // The specification, built by hand: carried roots, then the derived one,
+        // then the three challenges.
+        let mut reference = DefaultTranscript::<Ext>::new(b"roots-block");
+        for root in carried.iter().chain(derived.iter()) {
+            reference.append_bytes(root);
+        }
+        let want = (
+            reference.sample_field_element(),
+            reference.sample_field_element(),
+            reference.sample_field_element(),
+        );
+
+        let mut got_transcript = DefaultTranscript::<Ext>::new(b"roots-block");
+        let got = absorb_roots_and_challenge::<Ext, _>(&mut got_transcript, &carried, &derived);
+
+        assert_eq!(
+            got.0, want.0,
+            "the FIRST challenge does not match a transcript that absorbed the \
+             derived root before drawing it — the root is absorbed late, or not \
+             at all, and binds nothing"
+        );
+        assert_eq!(got.1, want.1, "alpha diverged");
+        assert_eq!(got.2, want.2, "beta diverged");
+
+        // …and the reference really is sensitive to the placement, or the
+        // assertions above hold for a reason that is not the ordering.
+        let mut late = DefaultTranscript::<Ext>::new(b"roots-block");
+        for root in &carried {
+            late.append_bytes(root);
+        }
+        let late_z: ExtE = late.sample_field_element();
+        assert_ne!(
+            late_z, want.0,
+            "drawing before the derived root gives the same first challenge as \
+             drawing after it — this test cannot see the placement"
+        );
+    }
+
     #[test]
     fn three_tables_argue_and_their_buses_balance() {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();

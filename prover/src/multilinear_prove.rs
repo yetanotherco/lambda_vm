@@ -300,7 +300,7 @@ pub fn prove_with_options_and_inputs(
         );
         let committed = CommittedTables::<_, _, H>::commit(committed, &config)
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
     });
 
@@ -497,10 +497,14 @@ pub fn verify_with_options(
         // are a function of the configuration's sponge, so computing them
         // against a transcript of a different hash is the same defect one level
         // down, and just as quiet.
+        //
+        // ★ The block is CALLED, not re-spelled: a replay is a third side of the
+        // roots-block agreement, and the epoch path's `owed` broke precisely by
+        // being a second spelling that did not grow a list the block had grown.
+        // This path opens nothing out of band, so `derived` is empty and not one
+        // byte of any transcript moves; what changes is that it cannot drift.
         let mut probe = transcript.clone();
-        for root in &proof.proof.roots {
-            probe.append_bytes(root);
-        }
+        multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &[]);
         let z: FieldElement<E> = probe.sample_field_element();
         let alpha: FieldElement<E> = probe.sample_field_element();
         // `start_index` is the carried x254: zero for a monolithic proof.
@@ -517,6 +521,7 @@ pub fn verify_with_options(
             &owed,
             &config,
             &mut transcript,
+            None,
         )
         .is_ok()
     }))

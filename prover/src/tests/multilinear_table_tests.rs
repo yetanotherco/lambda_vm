@@ -117,7 +117,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
     let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config())?;
 
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-table");
-    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)?;
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover, None)?;
 
     // One commitment for the whole trace, one opening, one pass over the rows.
     assert_eq!(proof.roots.len(), 1);
@@ -145,6 +145,7 @@ fn argue<CS: ConstraintSet<Fp, Ext>>(
         &owed,
         &config(),
         &mut verifier,
+        None,
     )?;
     Ok(proof.tables[0].bus_output)
 }
@@ -313,7 +314,7 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         CommittedTables::<_, _, KeccakWhir>::commit(tables, &config()).expect("commit every table");
 
     let mut prover = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover)
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover, None)
         .expect("prove every table");
 
     // Verifier side: the layouts are rebuilt from the AIRs and the shapes, with
@@ -337,10 +338,10 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     // The verifier redraws the shared LogUp challenges, so the offset has to be
     // computed against the same ones — which means replaying the transcript up
     // to that point exactly as `multi_verify` will.
+    // The block is CALLED rather than re-spelled, so this promise stays true
+    // when the block changes — which is how the epoch path's replay broke.
     let mut probe = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    for root in &proof.roots {
-        probe.append_bytes(root);
-    }
+    multilinear_table::absorb_roots::<Ext, _>(&mut probe, &proof.roots, &[]);
     let z: ExtE = probe.sample_field_element();
     let alpha: ExtE = probe.sample_field_element();
     // `start_index` is the carried x254: zero for a monolithic proof.
@@ -357,6 +358,7 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         &expected,
         &config(),
         &mut verifier,
+        None,
     )
     .expect("the whole table set verifies");
 
@@ -429,7 +431,7 @@ fn a_real_table_proof_survives_serialization() {
     let table = CommittedTable::from_layout(layout(), |col| columns[col as usize].clone()).unwrap();
     let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config()).unwrap();
     let mut prover = DefaultTranscript::<Ext>::new(b"serialized");
-    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover).unwrap();
+    let proof = multilinear_table::multi_prove(&committed, &config(), &mut prover, None).unwrap();
 
     let json = serde_json::to_vec(&proof).expect("serde round trip");
     let from_json: multilinear_table::MultiProof<Fp, Ext> =
@@ -457,6 +459,7 @@ fn a_real_table_proof_survives_serialization() {
             &owed,
             &config(),
             &mut verifier,
+            None,
         )
         .unwrap_or_else(|e| panic!("{label}: {e:?}"));
     }
@@ -528,4 +531,161 @@ fn a_real_table_is_one_commitment_for_its_main_columns() {
     // And they all ride in one stacked polynomial, alone or alongside others.
     let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config()).unwrap();
     assert_eq!(committed.roots().len(), 1);
+}
+
+// =========================================================================
+// W1-B step 2: the out-of-band preprocessed opening, prover side
+// =========================================================================
+
+/// Builds a table from the EQ trace plus a commitment over two of its columns,
+/// standing in for DECODE's five ELF-derived ones at a scale a test can run.
+fn eq_table_and_prepared_columns() -> (Vec<Vec<FieldElement<Fp>>>, Vec<multilinear::mle::Mle<Fp>>) {
+    let trace = eq::generate_eq_trace(&eq_operations());
+    let columns = trace.columns_main();
+    let prepared: Vec<multilinear::mle::Mle<Fp>> = columns[..2]
+        .iter()
+        .map(|c| multilinear::mle::Mle::new(c.clone()).expect("mle"))
+        .collect();
+    (columns, prepared)
+}
+
+/// Proves the EQ table, optionally against a prepared commitment over its first
+/// two columns, and hands back the proof.
+///
+/// ⚠ The TRACE IS AN ARGUMENT, not regenerated here, and that is load-bearing:
+/// `generate_eq_trace` orders its rows by `HashMap` iteration, so two calls
+/// produce two different row orders, two different commitments and two
+/// different roots. Comparing proofs from two independently generated traces
+/// would compare that instead of the thing under test — which is exactly what
+/// the first draft of this helper did, and what `a850dd29` fixed for DECODE.
+fn prove_eq_with_prepared(
+    columns: &[Vec<FieldElement<Fp>>],
+    prepared_columns: &[multilinear::mle::Mle<Fp>],
+    prepared: bool,
+    table_index: usize,
+) -> Result<multilinear_table::MultiProof<Fp, Ext>, multilinear::Error> {
+    let options = ProofOptions::default_test_options();
+    let air = create_eq_air(&options);
+    let num_vars = columns[0].len().trailing_zeros() as usize;
+
+    let layout = TableLayout::<Fp, Ext>::new(
+        air.constraint_program(),
+        air.constraints_meta(),
+        air.bus_interactions(),
+        eq::cols::NUM_COLUMNS,
+        num_vars,
+        Uniforms::default(),
+    )?;
+    let table = CommittedTable::from_layout(layout, |col| columns[col as usize].clone())?;
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(vec![table], &config())?;
+
+    let refs: Vec<&multilinear::mle::Mle<Fp>> = prepared_columns.iter().collect();
+    let out_of_band = multilinear::stacked_eval::StackedCommitment::<Fp, KeccakWhir>::commit(
+        multilinear_table::global_layout(&[(refs.len(), num_vars)])?,
+        &refs,
+        None,
+        &config(),
+    )?;
+
+    let mut prover = DefaultTranscript::<Ext>::new(b"w1b-step2");
+    multilinear_table::multi_prove(
+        &committed,
+        &config(),
+        &mut prover,
+        prepared.then(|| multilinear_table::Prepared {
+            commitment: &out_of_band,
+            columns: &refs,
+            table: table_index,
+        }),
+    )
+}
+
+/// ★★★ THE PROVER-SIDE WIRING GUARD: the prepared root reaches the sponge.
+///
+/// Nothing verifies the opening until step 3, so the question this answers is
+/// the one that has gone wrong twice on this branch — **is the feature wired at
+/// all?** The transcript defaulting to keccak while everything else moved, and
+/// the grind dispatching keccak-only with a correct RPX kernel sitting unused,
+/// were both "not wired", not "wired wrongly".
+///
+/// The absorb lands before `z`, so supplying a prepared commitment must move
+/// the whole challenge stream and therefore the proof. If the proofs are equal,
+/// the root did not reach the sponge — whatever else the opening contains.
+///
+/// ⚠ This is why a `preprocessed.is_some()` assertion would not do: the field
+/// can be populated by an opening the transcript never saw.
+///
+/// # ⛔ WHAT IT STILL DOES NOT CATCH, measured not assumed
+///
+/// Moving the absorb to AFTER the first challenge leaves this test green. Run
+/// as a mutation: the proof still differs from the no-prepared case, because
+/// `alpha` and `beta` are drawn after the absorb wherever it sits, so the
+/// inequality below is satisfied by a root that binds `z` to nothing.
+///
+/// So the three placements split cleanly by who catches them:
+///
+/// * **not absorbed at all** — this test;
+/// * **aimed at the wrong table** — its sibling below;
+/// * **absorbed after the first challenge** — NEITHER, today.
+///
+/// The last one is the dangerous one and it is currently guarded only by the
+/// specification: `the_derived_root_is_absorbed_after_the_carried_ones` proves
+/// the orderings are distinguishable, but nothing yet asserts which one the
+/// production code uses. A round-trip will not close it either — prover and
+/// verifier share the position, so a consistently late absorb verifies.
+///
+/// Step 3 closes it by comparing the verifier's roots block against an
+/// independently built transcript, which is the same shape as every other check
+/// on this branch that held: compare against a CONSTRUCTION, not against the
+/// other side.
+#[test]
+fn a_prepared_commitment_moves_the_challenge_stream() {
+    // One trace, two proves. See `prove_eq_with_prepared`'s note.
+    let (columns, prepared_columns) = eq_table_and_prepared_columns();
+    let without =
+        prove_eq_with_prepared(&columns, &prepared_columns, false, 0).expect("prove without");
+    let with = prove_eq_with_prepared(&columns, &prepared_columns, true, 0).expect("prove with");
+
+    assert!(
+        without.preprocessed.is_none(),
+        "no prepared commitment was supplied, so nothing should be opened"
+    );
+    assert!(
+        with.preprocessed.is_some(),
+        "a prepared commitment was supplied and produced no opening"
+    );
+
+    // The roots the proof CARRIES are the same: the derived root is not one of
+    // them, which is the other half of the design.
+    assert_eq!(
+        without.roots, with.roots,
+        "the prepared root leaked into `MultiProof::roots`; it is derived by the \
+         verifier and must never be carried"
+    );
+
+    // …and the challenges moved, which is the absorb having happened.
+    let a = rkyv::to_bytes::<rkyv::rancor::Error>(&without.tables).expect("serialize");
+    let b = rkyv::to_bytes::<rkyv::rancor::Error>(&with.tables).expect("serialize");
+    assert_ne!(
+        a.as_ref(),
+        b.as_ref(),
+        "the table arguments are byte-identical with and without the prepared \
+         commitment — its root never reached the transcript, so it binds nothing"
+    );
+}
+
+/// ★ The table index is checked, not trusted.
+///
+/// The opening binds the pinned columns to ONE table's reduced point. An index
+/// that names no table must be an error rather than silently opening at
+/// whatever point happens to be first.
+#[test]
+fn a_prepared_commitment_aimed_at_no_table_is_rejected() {
+    let (columns, prepared_columns) = eq_table_and_prepared_columns();
+    let err = prove_eq_with_prepared(&columns, &prepared_columns, true, 7)
+        .expect_err("an out-of-range table index must fail");
+    assert!(
+        matches!(err, multilinear::Error::UnknownPolynomial { .. }),
+        "expected the index to be reported as unknown, got {err:?}"
+    );
 }
