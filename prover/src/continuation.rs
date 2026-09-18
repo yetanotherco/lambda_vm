@@ -83,7 +83,7 @@ use crate::test_utils::{
     create_keccak_rounds_request_air,
 };
 use crate::{
-    Error, FIXED_TABLE_COUNT, HOISTED_KECCAK_TABLE_DELTA, RuntimePageRange, TableCounts, VmAirs,
+    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
     compute_expected_commit_bus_balance_view, verify_epoch_block_binding_view,
     verify_l2g_commitment_binding_view,
 };
@@ -93,21 +93,26 @@ type E = GoldilocksExtension;
 type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 
 /// Fresh transcript seeded with the epoch's statement (ELF, public output, table
-/// layout) and `epoch_label` (its position). The epoch's prove, verify, and
-/// bus-balance replay all seed via this so their challenges match; the seeding
-/// pins each epoch proof to its program and position (replay protection).
+/// layout), `epoch_label` (its position) and `is_final` (whether it carries
+/// HALT). The epoch's prove, verify, and bus-balance replay all seed via this so
+/// their challenges match; the seeding pins each epoch proof to its program,
+/// position and role (replay protection).
 fn epoch_transcript(
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     epoch_label: u64,
+    is_final: bool,
     fri_final_poly_log_degree: u8,
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
-        StatementKind::ContinuationEpoch { epoch_label },
+        StatementKind::ContinuationEpoch {
+            epoch_label,
+            is_final,
+        },
         elf_bytes,
         public_output,
         table_counts,
@@ -468,7 +473,7 @@ struct EpochProof {
     /// requests rather than a set of the prover's choosing. Without it the
     /// permutations would simply go unproven: the epoch omits the bus pair, so
     /// nothing there relates `input_state` to `output_state`.
-    keccak_core_root: Commitment,
+    keccak_core_root: Option<Commitment>,
 }
 
 /// A self-contained continuation proof: the per-epoch proofs in execution order, the one
@@ -505,6 +510,13 @@ impl ContinuationProof {
     /// Number of epochs the execution was split into.
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
+    }
+
+    /// What each epoch declared it carries, for tests that have to show the
+    /// epochs disagree. `epochs` itself stays private.
+    #[cfg(test)]
+    pub(crate) fn epoch_table_counts(&self) -> Vec<&TableCounts> {
+        self.epochs.iter().map(|e| &e.table_counts).collect()
     }
 }
 
@@ -589,10 +601,10 @@ impl<'a> EpochProofView<'a> {
         }
     }
 
-    fn keccak_core_root(&self) -> Commitment {
+    fn keccak_core_root(&self) -> Option<Commitment> {
         match self {
             Self::Owned(e) => e.keccak_core_root,
-            Self::Archived(e) => e.keccak_core_root,
+            Self::Archived(e) => e.keccak_core_root.as_ref().copied(),
         }
     }
 }
@@ -694,7 +706,7 @@ fn build_epoch_airs(
     // Every epoch commits only KECCAK_BRIDGE; one run-wide round chip in the
     // global proof serves all their requests. Set here, in the single source of
     // truth for the epoch AIR set, so prove and verify can never disagree.
-    .with_hoisted_keccak_rounds()
+    .with_hoisted_keccak_rounds(opts)
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -757,6 +769,7 @@ fn prove_epoch(
             &table_counts,
             &runtime_page_ranges,
             label,
+            is_final,
             opts.fri_final_poly_log_degree,
         )
     };
@@ -785,18 +798,22 @@ fn prove_epoch(
         })?
         .lde_trace_main_merkle_root;
 
-    let keccak_core_index = airs.keccak_core_index().ok_or_else(|| {
-        Error::ContinuationInvariant(
-            "continuation epochs must hoist the keccak round chip".to_string(),
-        )
-    })?;
-    let keccak_core_root = proof
-        .proofs
-        .get(keccak_core_index)
-        .ok_or_else(|| {
-            Error::ContinuationInvariant("epoch proof is missing the KECCAK sub-table".to_string())
-        })?
-        .lde_trace_main_merkle_root;
+    // `None` when this epoch never hashes: with KECCAK a counted table, such an
+    // epoch commits no core at all and so has nothing to bind.
+    let keccak_core_root = match airs.keccak_core_index() {
+        None => None,
+        Some(idx) => Some(
+            proof
+                .proofs
+                .get(idx)
+                .ok_or_else(|| {
+                    Error::ContinuationInvariant(
+                        "epoch proof is missing the KECCAK sub-table".to_string(),
+                    )
+                })?
+                .lde_trace_main_merkle_root,
+        ),
+    };
 
     Ok(EpochProof {
         proof,
@@ -840,16 +857,25 @@ fn verify_epoch(
 
     // Cross-check table_counts before building AIRs from bundle data. Continuation
     // epochs have no PAGE proofs, and append one epoch-local L2G proof after the VM
-    // tables. HALT is present only on the final epoch, and the keccak round chip is
-    // always hoisted into the global proof (see `build_epoch_airs`), which costs one
-    // fixed table.
+    // tables. HALT is present only on the final epoch. The hoisted keccak round
+    // chip needs no adjustment here: KECCAK_RND is a counted table, so an epoch
+    // that hoists it simply reports `keccak_rnd: 0` and `table_counts.total()`
+    // already reflects that.
     let fixed_tables = if is_final {
         FIXED_TABLE_COUNT
     } else {
         FIXED_TABLE_COUNT - 1
-    } - HOISTED_KECCAK_TABLE_DELTA;
+    };
     let proof = epoch.proof();
-    let expected_proof_count = table_counts.total() + fixed_tables + 1;
+    // Checked: the counts are prover-supplied and a wrapped sum would let one
+    // field stay huge and still match `proof.len()`.
+    let Some(expected_proof_count) = table_counts
+        .total()
+        .and_then(|t| t.checked_add(fixed_tables))
+        .and_then(|t| t.checked_add(1))
+    else {
+        return Ok(false);
+    };
     if expected_proof_count != proof.len() {
         return Ok(false);
     }
@@ -879,6 +905,7 @@ fn verify_epoch(
             &table_counts,
             &runtime_page_ranges,
             label,
+            is_final,
             opts.fri_final_poly_log_degree,
         )
     };
@@ -1030,11 +1057,16 @@ fn prove_global(
     // the `Keccak` bus pair here. Plus the single run-wide KECCAK_RND/KECCAK_RC
     // that actually serves the requests, and the BITWISE provider for the round
     // chip's lookups.
+    //
+    // An epoch that never hashes commits NO core table (KECCAK is a counted
+    // table since #977), so the block holds one entry per epoch that actually
+    // hashes, in epoch order — not one per epoch.
     let mut request_traces: Vec<TraceTable<F, E>> = keccak_ops_per_epoch
         .iter()
+        .filter(|ops| !ops.is_empty())
         .map(|ops| keccak::generate_keccak_trace(ops))
         .collect();
-    let request_airs: Vec<_> = (0..keccak_ops_per_epoch.len())
+    let request_airs: Vec<_> = (0..request_traces.len())
         .map(|_| create_keccak_rounds_request_air(opts))
         .collect();
     let (keccak_rnd_air, keccak_rc_air, bitwise_air) = global_keccak_airs(opts);
@@ -1047,7 +1079,7 @@ fn prove_global(
         .map(|(air, t)| (air as AirRef, t, &()))
         .collect();
     // The core copies sit immediately after the L2G block so both cross-proof
-    // root bindings live at fixed offsets: L2G at `0..E`, keccak cores at `E..2E`.
+    // root bindings live at fixed offsets: L2G at `0..E`, keccak cores from `E`.
     for (air, trace) in request_airs.iter().zip(request_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
@@ -1076,6 +1108,7 @@ fn prove_global(
 #[allow(clippy::too_many_arguments)]
 fn verify_global(
     num_epochs: usize,
+    num_keccak_cores: usize,
     page_bases: &[u64],
     proof: MultiProofView<'_, F, E, ()>,
     elf: &Elf,
@@ -1142,7 +1175,7 @@ fn verify_global(
 
     // Mirrors `prove_global`'s order exactly: L2G block, keccak-core block, GM
     // block, then the run-wide keccak chip and its BITWISE provider.
-    let request_airs: Vec<_> = (0..num_epochs)
+    let request_airs: Vec<_> = (0..num_keccak_cores)
         .map(|_| create_keccak_rounds_request_air(opts))
         .collect();
     let (keccak_rnd_air, keccak_rc_air, bitwise_air) = global_keccak_airs(opts);
@@ -1808,7 +1841,9 @@ fn verify_continuation_view(
         }
 
         epoch_roots.push(l2g_root);
-        keccak_core_roots.push(keccak_core_root);
+        if let Some(root) = keccak_core_root {
+            keccak_core_roots.push(root);
+        }
         public_output.extend_from_slice(epoch_public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
@@ -1858,6 +1893,7 @@ fn verify_continuation_view(
     let global_proof = bundle.global();
     if !verify_global(
         n,
+        keccak_core_roots.len(),
         &page_bases,
         global_proof,
         &elf,
@@ -2149,6 +2185,146 @@ mod tests {
             )
             .unwrap()
             .is_some()
+        );
+    }
+
+    /// Each epoch drops the chips it never reaches, and it decides that on its
+    /// own: a table missing from one epoch still shows up in another that does
+    /// use it. The skip is not a property of the run, it is a property of the
+    /// epoch — computing it over the whole run instead would drag every table
+    /// used anywhere into every epoch.
+    #[test]
+    fn table_presence_is_decided_per_epoch() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let epoch_size_log2 = 3;
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation(&elf_bytes, &[], epoch_size_log2, &opts).unwrap();
+        // Guard against silent degradation: one epoch cannot disagree with another.
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need at least two epochs, got {}",
+            bundle.epochs.len()
+        );
+
+        // `(name, count)` per epoch, in a fixed order so the rows line up.
+        let per_epoch: Vec<Vec<(&str, usize)>> = bundle
+            .epochs
+            .iter()
+            .map(|e| {
+                let c = &e.table_counts;
+                vec![
+                    ("lt", c.lt),
+                    ("memw", c.memw),
+                    ("memw_aligned", c.memw_aligned),
+                    ("load", c.load),
+                    ("mul", c.mul),
+                    ("dvrm", c.dvrm),
+                    ("shift", c.shift),
+                    ("branch", c.branch),
+                    ("eq", c.eq),
+                    ("bytewise", c.bytewise),
+                    ("store", c.store),
+                    ("cpu32", c.cpu32),
+                    ("keccak", c.keccak),
+                    ("keccak_rnd", c.keccak_rnd),
+                    ("ecsm", c.ecsm),
+                    ("ecdas", c.ecdas),
+                    ("hint", c.hint),
+                    ("commit", c.commit),
+                ]
+            })
+            .collect();
+        let layout = || {
+            per_epoch
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let present: Vec<&str> = row
+                        .iter()
+                        .filter(|(_, n)| *n > 0)
+                        .map(|(t, _)| *t)
+                        .collect();
+                    format!("epoch {i}: {present:?}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        };
+
+        // Something is actually being skipped, or the rest proves nothing.
+        assert!(
+            per_epoch.iter().any(|row| row.iter().any(|(_, n)| *n == 0)),
+            "no epoch skipped any table:\n  {}",
+            layout()
+        );
+
+        // And the epochs disagree: some table is in one and out of another.
+        //
+        // Among the *non-final* epochs only. The final epoch is the one that
+        // carries HALT and the one where a program's output is committed, so a
+        // difference that involves it can be structural — a whole-run table set
+        // would still produce it, and this assertion would pass while measuring
+        // nothing about per-epoch granularity.
+        assert!(
+            per_epoch.len() >= 3,
+            "need at least two non-final epochs to compare, got {} epochs",
+            per_epoch.len()
+        );
+        let non_final = &per_epoch[..per_epoch.len() - 1];
+        let disagreeing: Vec<&str> = non_final[0]
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, first))| {
+                non_final
+                    .iter()
+                    .any(|row| (row[*i].1 == 0) != (*first == 0))
+            })
+            .map(|(_, (name, _))| *name)
+            .collect();
+        assert!(
+            !disagreeing.is_empty(),
+            "the non-final epochs all carry the same tables, so per-epoch \
+             granularity is untested here — pick a program or epoch size that \
+             varies:\n  {}",
+            layout()
+        );
+
+        // Sharper: a table that is present, goes away, and comes back cannot be
+        // produced by any scheme that computes one set over the run or over a
+        // prefix of it. Counting the blocks of consecutive epochs a table
+        // appears in, more than one block is exactly that shape.
+        let blocks = |i: usize| {
+            let present: Vec<bool> = per_epoch.iter().map(|row| row[i].1 > 0).collect();
+            present
+                .iter()
+                .enumerate()
+                .filter(|(k, p)| **p && (*k == 0 || !present[k - 1]))
+                .count()
+        };
+        let reappearing: Vec<&str> = per_epoch[0]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| blocks(*i) > 1)
+            .map(|(_, (name, _))| *name)
+            .collect();
+        assert!(
+            !reappearing.is_empty(),
+            "no table leaves and comes back, so a union or prefix scheme would \
+             produce this same layout — the test cannot tell them apart:\n  {}",
+            layout()
+        );
+
+        println!("tables present in some non-final epochs but not others: {disagreeing:?}");
+        println!("tables that leave and come back: {reappearing:?}");
+        println!("  {}", layout());
+
+        // The mixed-shape bundle has to verify end to end.
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "a bundle whose epochs carry different table sets must still verify"
         );
     }
 
@@ -2447,6 +2623,89 @@ mod tests {
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// The epoch counterpart of the overflow branch: `verify_epoch` swallows a
+    /// total that wraps as `Ok(false)` where the monolithic verifier returns
+    /// `Err`, so a regression there is silent. Nothing reached that arm before.
+    #[test]
+    fn test_split_verify_rejects_an_epoch_whose_counts_overflow() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(!bundle.epochs.is_empty());
+
+        bundle.epochs[0].table_counts.lt = usize::MAX;
+        assert!(
+            bundle.epochs[0].table_counts.total().is_none(),
+            "the tampered counts must actually wrap, or this tests the wrong branch"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_none(),
+            "an epoch whose declared counts have no total must be rejected"
+        );
+    }
+
+    /// The continuation counterpart of the monolithic
+    /// `test_verify_rejects_undercounted_table_count`: an epoch that declares
+    /// away a table it actually carries. Both branches of the cross-check are
+    /// exercised, because the fixed-table term differs between a non-final
+    /// epoch (`FIXED_TABLE_COUNT - 1`, no HALT) and the final one — and
+    /// `verify_epoch` swallows the mismatch as `Ok(false)` rather than an
+    /// error, so a regression in that arithmetic would be silent.
+    #[test]
+    fn test_split_verify_rejects_undercounted_epoch_table_count() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 3, &opts).unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need a non-final and a final epoch, got {}",
+            bundle.epochs.len()
+        );
+        let last = bundle.epochs.len() - 1;
+        for epoch in [0, last] {
+            // Whatever this epoch does carry: the point is declaring one of its
+            // own tables away, not which one.
+            let counts = &mut bundle.epochs[epoch].table_counts;
+            let (name, restore) = if counts.load > 0 {
+                ("load", std::mem::replace(&mut counts.load, 0))
+            } else if counts.store > 0 {
+                ("store", std::mem::replace(&mut counts.store, 0))
+            } else {
+                ("lt", std::mem::replace(&mut counts.lt, 0))
+            };
+            assert!(
+                restore > 0,
+                "epoch {epoch} carries no optional table to declare away"
+            );
+            assert!(
+                verify_continuation(&elf_bytes, &bundle, &opts)
+                    .unwrap()
+                    .is_none(),
+                "epoch {epoch} declaring away its {name} table must be rejected"
+            );
+            let counts = &mut bundle.epochs[epoch].table_counts;
+            match name {
+                "load" => counts.load = restore,
+                "store" => counts.store = restore,
+                _ => counts.lt = restore,
+            }
+        }
+
+        // The control, and the reason the rejections above mean something: put
+        // the counts back and the same bundle verifies. One verify, at the end,
+        // rather than one before and one after — each costs a full pass.
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some(),
+            "restoring the counts must bring the bundle back"
         );
     }
 
@@ -2962,7 +3221,14 @@ mod tests {
             "the honest bundle must verify before tampering"
         );
 
-        bundle.epochs[0].keccak_core_root[0] ^= 1;
+        // The program must actually hash, or there is no core root to tamper with.
+        let tampered = bundle
+            .epochs
+            .iter_mut()
+            .find_map(|e| e.keccak_core_root.as_mut())
+            .map(|root| root[0] ^= 1)
+            .is_some();
+        assert!(tampered, "the fixture must hash in at least one epoch");
 
         assert!(
             verify_continuation(&elf_bytes, &bundle, &opts)
