@@ -127,6 +127,152 @@ where
         .collect()
 }
 
+/// The same recovery for a VECTOR of linear functions probed together.
+///
+/// One pass per candidate recovers every component's coefficient at once. That
+/// is what [`interaction_shapes`] needs: a fingerprint's bus elements all come
+/// out of ONE `combine_from` walk, so probing them one at a time would repeat
+/// that walk once per element and turn a pass per candidate into `elements`
+/// passes per candidate.
+///
+/// `slot_of` is asked about a column that is nonzero in ANY component, once —
+/// [`probe`]'s laziness widened to the vector.
+///
+/// ⚠ This duplicates [`probe`]'s dozen lines rather than replacing it.
+/// Expressing `probe` as a one-component call here would allocate a `Vec` per
+/// eval, and eval is the thing [`interactions`] is written to run as few times
+/// as possible. The two are held together by a test instead:
+/// `the_vector_probe_is_the_scalar_one_component_by_component`.
+fn probe_many<E, S>(
+    candidates: &[usize],
+    slot_of: &mut S,
+    eval: impl Fn(&dyn Fn(usize) -> FieldElement<E>) -> Vec<FieldElement<E>>,
+) -> Result<Vec<Affine<E>>, MlError>
+where
+    E: IsField + 'static,
+    S: FnMut(usize) -> Result<usize, MlError>,
+{
+    let constants = eval(&|_| FieldElement::<E>::zero());
+    let mut terms: Vec<Vec<(usize, FieldElement<E>)>> = vec![Vec::new(); constants.len()];
+    for &column in candidates {
+        let at_basis = eval(&|i| {
+            if i == column {
+                FieldElement::<E>::one()
+            } else {
+                FieldElement::<E>::zero()
+            }
+        });
+        // A contract on `eval`, not a runtime condition: the one producer is a
+        // fingerprint's bus elements, whose count is a property of the
+        // interaction and not of the columns it is asked about. Stated as an
+        // assert rather than an error so a future producer that breaks it says
+        // so here instead of silently dropping a component.
+        assert_eq!(
+            at_basis.len(),
+            constants.len(),
+            "a probed vector must have the same length at every point"
+        );
+        let coefficients: Vec<FieldElement<E>> = at_basis
+            .iter()
+            .zip(&constants)
+            .map(|(value, constant)| value - constant)
+            .collect();
+        if coefficients
+            .iter()
+            .all(|c| *c == FieldElement::<E>::zero())
+        {
+            continue;
+        }
+        let slot = slot_of(column)?;
+        for (component, coefficient) in coefficients.into_iter().enumerate() {
+            if coefficient == FieldElement::zero() {
+                continue;
+            }
+            terms[component].push((slot, coefficient));
+        }
+    }
+
+    Ok(terms
+        .into_iter()
+        .zip(constants)
+        .map(|(terms, constant)| Affine::new(terms, constant))
+        .collect())
+}
+
+/// One interaction's affine structure with the LogUp challenges factored OUT.
+///
+/// [`interactions`] fuses `z` and the powers of `alpha` into the denominator's
+/// coefficients, which is right for a verifier that has drawn them and wrong
+/// for one that is EMITTING code to be run later: the recursion's in-guest
+/// verifier knows the bus at emit time and the challenges only at run time.
+/// This is the same bus, cut the other way.
+///
+/// ```text
+///     numerator_i   = the multiplicity, signed          (no challenge at all)
+///     denominator_i = z − bus_id − Σ_p alpha^{p+1}·elements[p]
+/// ```
+///
+/// ★ The numerator is not challenge-dependent in any part: `interactions`
+/// builds it from `multiplicity.evaluate_with` alone, so it is repeated here
+/// verbatim and a caller may intern its coefficients as constants.
+pub struct InteractionShape<E: IsField> {
+    /// Exactly what [`interactions`] builds, at any `z` and `alpha`.
+    pub numerator: Affine<E>,
+    /// The fingerprint's `alpha^0` term.
+    pub bus_id: FieldElement<E>,
+    /// The bus elements in fingerprint order: `elements[p]` rides
+    /// `alpha^{p+1}`, matching `fingerprint_at`'s `power` counter.
+    pub elements: Vec<Affine<E>>,
+}
+
+/// Every interaction's affine structure, challenge-free.
+///
+/// The same `probe`-the-real-evaluators discipline [`interactions`] uses, and
+/// the same `num_main_columns` filter: a column past the main width is PINNED
+/// TO ZERO in the recovered affine rather than carried, because it is never a
+/// probe candidate.
+///
+/// ⚠ `slot_of` is asked about a column whose coefficient is structurally
+/// nonzero. [`interactions`] asks about a column whose coefficient is nonzero
+/// AT ITS ALPHA, which is the same set except on a measure-zero choice of
+/// alpha where the powers cancel; the two therefore agree in value always and
+/// in term list with overwhelming probability. The test below asserts both.
+pub fn interaction_shapes<E, S>(
+    buses: &[BusInteraction],
+    num_main_columns: usize,
+    mut slot_of: S,
+) -> Result<Vec<InteractionShape<E>>, MlError>
+where
+    E: IsField + 'static,
+    S: FnMut(usize) -> Result<usize, MlError>,
+{
+    buses
+        .iter()
+        .map(|bus| {
+            let candidates: Vec<usize> = bus
+                .columns_read()
+                .into_iter()
+                .filter(|&column| column < num_main_columns)
+                .collect();
+            let numerator = probe(&candidates, &mut slot_of, |column| {
+                let value = bus.multiplicity.evaluate_with(column);
+                if bus.is_sender { value } else { -value }
+            })?;
+            let elements = probe_many(&candidates, &mut slot_of, |column| {
+                bus.values
+                    .iter()
+                    .flat_map(|value| value.combine_from(column))
+                    .collect()
+            })?;
+            Ok(InteractionShape {
+                numerator,
+                bus_id: FieldElement::<E>::from(bus.bus_id),
+                elements,
+            })
+        })
+        .collect()
+}
+
 /// The identity map: factor `i` reads main column `i`.
 ///
 /// What a table with no constraints of its own uses, where the factor list is
@@ -360,6 +506,204 @@ mod tests {
         };
         assert_eq!(sum(&statements.numerator), out.claim.p);
         assert_eq!(sum(&statements.denominator), out.claim.q);
+    }
+
+    /// Deterministic extension values, one per main column.
+    fn column_values(seed: u64, count: usize) -> Vec<ExtE> {
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            FE::from(state >> 2)
+        };
+        (0..count)
+            .map(|_| {
+                let (a, b, c) = (next(), next(), next());
+                ExtE::new([a, b, c])
+            })
+            .collect()
+    }
+
+    /// The affine recovery over a VECTOR agrees, component by component, with
+    /// the scalar one it is written beside.
+    ///
+    /// The two are separate code because `probe` sits on a path whose cost is
+    /// the number of eval calls, and expressing it as a one-component
+    /// `probe_many` would allocate a `Vec` per call. This test is what holds
+    /// them together: a drift in either fires here.
+    #[test]
+    fn the_vector_probe_is_the_scalar_one_component_by_component() {
+        let options = ProofOptions::default_test_options();
+        let air = new_cpu_air_with_lookup(&options);
+        let mut components = 0;
+        for bus in air.bus_interactions() {
+            let candidates: Vec<usize> = bus
+                .columns_read()
+                .into_iter()
+                .filter(|&column| column < 5)
+                .collect();
+            let mut slot_of = columns_as_factors;
+            let together: Vec<Affine<Ext>> = probe_many(&candidates, &mut slot_of, |column| {
+                bus.values
+                    .iter()
+                    .flat_map(|value| value.combine_from(column))
+                    .collect()
+            })
+            .unwrap();
+            assert!(
+                !together.is_empty(),
+                "the interaction must have bus elements for this to compare anything"
+            );
+            for (index, component) in together.iter().enumerate() {
+                let mut slot_of = columns_as_factors;
+                let alone: Affine<Ext> = probe(&candidates, &mut slot_of, |column| {
+                    bus.values
+                        .iter()
+                        .flat_map(|value| value.combine_from(column))
+                        .nth(index)
+                        .expect("the element index is inside the interaction")
+                })
+                .unwrap();
+                assert_eq!(component.terms(), alone.terms(), "element {index}'s terms");
+                assert_eq!(
+                    component.constant_term(),
+                    alone.constant_term(),
+                    "element {index}'s constant"
+                );
+                components += 1;
+            }
+        }
+        assert_eq!(components, 6, "two interactions of three bus elements each");
+    }
+
+    /// ★ The challenge-free shapes rebuild what `interactions` fuses.
+    ///
+    /// This is the whole contract: a caller holding the bus at emit time and
+    /// the challenges only at run time can put them back together and land on
+    /// what the verifier would have computed. A wrong alpha offset, a reversed
+    /// element order, a dropped bus id, a lost receiver sign or a dropped
+    /// out-of-range filter each break it — and the challenges are varied
+    /// because an identity that only holds at one `alpha` is not one.
+    #[test]
+    fn the_shapes_recombine_into_the_fused_interactions() {
+        let options = ProofOptions::default_test_options();
+        let cpu = new_cpu_air_with_lookup(&options);
+        let add = new_add_air_with_lookup(&options);
+        let mul = new_mul_air_with_lookup(&options);
+        let cases: Vec<(&str, &[BusInteraction], usize)> = vec![
+            ("cpu", cpu.bus_interactions(), 5),
+            ("add", add.bus_interactions(), 4),
+            ("mul", mul.bus_interactions(), 4),
+            // ⚠ The CPU bus reads columns 0..=4; declaring only three main
+            // columns is what exercises the `column < num_main_columns`
+            // filter, which pins columns 3 and 4 to ZERO on BOTH sides rather
+            // than carrying them. Without this case the filter is a line no
+            // gate reaches.
+            ("cpu narrowed to 3 main columns", cpu.bus_interactions(), 3),
+        ];
+        for (name, buses, width) in cases {
+            let mut slot_of = columns_as_factors;
+            let shapes: Vec<InteractionShape<Ext>> =
+                interaction_shapes(buses, width, &mut slot_of).unwrap();
+            assert_eq!(shapes.len(), buses.len(), "{name}");
+
+            for (index, (z, alpha)) in [
+                (ExtE::from(7u64), ExtE::from(11u64)),
+                (ExtE::from(0x9E37_79B9u64), ExtE::from(31u64)),
+                (ExtE::new([FE::from(3u64), FE::from(5u64), FE::from(9u64)]), ExtE::new([FE::from(2u64), FE::from(0u64), FE::from(4u64)])),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let fused: Vec<Interaction<Ext>> =
+                    interactions(buses, width, &z, &alpha, columns_as_factors).unwrap();
+                let values = column_values(0xB0_5A11 + index as u64, width);
+
+                for (i, (fused_i, shape)) in fused.iter().zip(&shapes).enumerate() {
+                    assert_eq!(
+                        fused_i.numerator.evaluate(&values),
+                        shape.numerator.evaluate(&values),
+                        "{name} interaction {i}: the numerator reads no challenge and must be identical"
+                    );
+
+                    // `fingerprint_at`'s own loop: the bus id at alpha^0, then
+                    // each element at the next power.
+                    let mut power = alpha.clone();
+                    let mut fingerprint = shape.bus_id.clone();
+                    for element in &shape.elements {
+                        fingerprint = fingerprint + &power * element.evaluate(&values);
+                        power = &power * &alpha;
+                    }
+                    assert_eq!(
+                        fused_i.denominator.evaluate(&values),
+                        &z - &fingerprint,
+                        "{name} interaction {i} at challenge set {index}"
+                    );
+
+                    // The same statement about the TERM LIST, which the value
+                    // comparison cannot make: the slots the fused affine keeps
+                    // are exactly the slots some element reads. ⚠ True with
+                    // overwhelming probability rather than always — a fused
+                    // coefficient is a polynomial in alpha and could vanish at
+                    // a particular one — so this is a check on these
+                    // challenges, not a theorem.
+                    let mut fused_slots: Vec<usize> =
+                        fused_i.denominator.terms().iter().map(|(s, _)| *s).collect();
+                    fused_slots.sort_unstable();
+                    let mut element_slots: Vec<usize> = shape
+                        .elements
+                        .iter()
+                        .flat_map(|e| e.terms().iter().map(|(s, _)| *s))
+                        .collect();
+                    element_slots.sort_unstable();
+                    element_slots.dedup();
+                    assert_eq!(fused_slots, element_slots, "{name} interaction {i}'s slots");
+                }
+            }
+        }
+    }
+
+    /// The element ORDER and the sign, worked out by hand for this bus.
+    ///
+    /// `Packing::Direct.columns(&[2, 3, 4])` gives each column its own bus
+    /// element, so the CPU sender's fingerprint is
+    /// `bus_id + alpha·c2 + alpha²·c3 + alpha³·c4` — the same hand derivation
+    /// the fused test above this one makes, stated against the pieces rather
+    /// than against the sum, which is where an off-by-one in the power would
+    /// otherwise hide behind a matching total.
+    #[test]
+    fn the_elements_are_the_columns_in_fingerprint_order() {
+        let options = ProofOptions::default_test_options();
+        let cpu = new_cpu_air_with_lookup(&options);
+        let mut slot_of = columns_as_factors;
+        let shapes: Vec<InteractionShape<Ext>> =
+            interaction_shapes(cpu.bus_interactions(), 5, &mut slot_of).unwrap();
+        assert_eq!(shapes.len(), 2);
+        for (i, shape) in shapes.iter().enumerate() {
+            // A sender's numerator is its multiplicity, unnegated: column `i`
+            // with coefficient one and no constant.
+            assert_eq!(shape.numerator.terms(), &[(i, ExtE::one())]);
+            assert_eq!(shape.numerator.constant_term(), &ExtE::zero());
+            assert_eq!(shape.elements.len(), 3);
+            for (p, element) in shape.elements.iter().enumerate() {
+                assert_eq!(
+                    element.terms(),
+                    &[(p + 2, ExtE::one())],
+                    "element {p} of interaction {i} reads column {}",
+                    p + 2
+                );
+                assert_eq!(element.constant_term(), &ExtE::zero());
+            }
+        }
+
+        // A RECEIVER's numerator carries the sign, which the senders above
+        // cannot show.
+        let add = new_add_air_with_lookup(&options);
+        let mut slot_of = columns_as_factors;
+        let received: Vec<InteractionShape<Ext>> =
+            interaction_shapes(add.bus_interactions(), 4, &mut slot_of).unwrap();
+        assert_eq!(received[0].numerator.terms(), &[(3, -ExtE::one())]);
     }
 
     /// Columns no interaction reads never need a factor: the probe only asks

@@ -55,6 +55,17 @@ impl<E: IsField + 'static> Affine<E> {
         &self.terms
     }
 
+    /// The `k` of `Σ c_j·f_{s_j} + k`.
+    ///
+    /// Read-only, and named `constant_term` rather than `constant` because that
+    /// name is already the CONSTRUCTOR above. A caller that emits this
+    /// expression as code — the WHIR recursion's in-guest verifier — needs the
+    /// coefficients and this, where [`Affine::evaluate`] gives it only the
+    /// answer.
+    pub fn constant_term(&self) -> &FieldElement<E> {
+        &self.constant
+    }
+
     /// The expression's value, given every factor's value at a point.
     pub fn evaluate(&self, values: &[FieldElement<E>]) -> FieldElement<E> {
         self.terms
