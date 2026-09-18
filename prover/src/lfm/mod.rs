@@ -126,6 +126,9 @@ mod per_table_aggregator_tests;
 mod per_table_census_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
+/// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
+#[cfg(test)]
+mod whir_epoch_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]
