@@ -691,10 +691,6 @@ pub struct TableDeep<FieldExtension: IsField> {
     pub trace_rows: usize,
     /// The DEEP composition codeword, `lde_size` long.
     pub deep: Vec<FieldElement<FieldExtension>>,
-    /// Where the table sits in the AIR order, carried so the batch can say
-    /// which group each table ended up in once the codewords are sorted by
-    /// domain rather than by position.
-    pub air_index: usize,
     /// What the batch's coefficient is drawn from: this table's public round-3
     /// data, in the order a transcript absorbs it.
     ///
@@ -2186,7 +2182,6 @@ pub trait IsStarkProver<
             lde_size: domain.interpolation_domain_size * domain.blowup_factor,
             trace_rows: domain.interpolation_domain_size,
             deep,
-            air_index: usize::MAX,
             bus_contribution: round_1_result
                 .bus_public_inputs
                 .as_ref()

@@ -626,13 +626,9 @@ pub fn run_batched(
     // One FRI per accumulator, and the mapping from table to group.
     let mut group_of = vec![usize::MAX; n];
     let sizes: Vec<usize> = acc.keys().copied().collect();
-    for (&idx, _) in tables.iter().map(|(i, t)| (i, t)) {
-        let rows = tables
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, t)| t.trace_rows)
-            .expect("table just listed");
-        let lde = rows * proof_options.blowup_factor as usize;
+    for (idx, table) in tables.iter() {
+        let lde = table.trace_rows * proof_options.blowup_factor as usize;
+        let idx = *idx;
         group_of[idx] = sizes.iter().position(|s| *s == lde).ok_or_else(|| {
             Error::Prover(format!(
                 "batched phase: table {idx} has no group of size {lde}"

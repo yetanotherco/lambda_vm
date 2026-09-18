@@ -124,7 +124,10 @@ pub fn replay(
         coefficients[idx] = seed.sample_field_element();
     }
 
-    Ok(Replay { logup, coefficients })
+    Ok(Replay {
+        logup,
+        coefficients,
+    })
 }
 
 /// Verify a batched proof of `elf_bytes`.

@@ -146,7 +146,6 @@ fn alpha_moves_when_any_table_moves() {
         lde_size: 8,
         trace_rows: 4,
         deep: Vec::new(),
-        air_index: seed as usize,
         bus_contribution: Some(FieldElement::<E>::from(seed)),
         main_roots: stark::prover::MainRoots {
             precomputed: None,
@@ -673,7 +672,7 @@ fn a_tampered_batched_proof_is_rejected() {
     accepted(&proof);
 
     // An out-of-domain value, the other thing the fold seed binds.
-    let orig = proof.tables[0].trace_ood.get(0, 0).clone();
+    let orig = *proof.tables[0].trace_ood.get(0, 0);
     proof.tables[0].trace_ood.set(0, 0, &orig + &one);
     rejected(&proof, "an out-of-domain trace value");
     proof.tables[0].trace_ood.set(0, 0, orig);

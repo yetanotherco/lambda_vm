@@ -51,15 +51,19 @@ fn keep_large_buffers_warm() {
                     // Not fatal, but the run is then indistinguishable from one
                     // where the knob worked — which is exactly what makes a
                     // memory measurement unreadable. Say so.
-                    log::warn!("keep_large_buffers_warm: cannot read opt.narenas ({e}); \
-                                the oversize arena keeps jemalloc's default decay");
+                    log::warn!(
+                        "keep_large_buffers_warm: cannot read opt.narenas ({e}); \
+                                the oversize arena keeps jemalloc's default decay"
+                    );
                     return;
                 }
             };
             let decay = format!("arena.{huge_arena}.dirty_decay_ms\0");
             if let Err(e) = raw::write(decay.as_bytes(), -1i64) {
-                log::warn!("keep_large_buffers_warm: cannot disable decay on arena \
-                            {huge_arena} ({e}); the oversize arena keeps jemalloc's default");
+                log::warn!(
+                    "keep_large_buffers_warm: cannot disable decay on arena \
+                            {huge_arena} ({e}); the oversize arena keeps jemalloc's default"
+                );
                 return;
             }
             log::debug!("keep_large_buffers_warm: decay disabled on arena {huge_arena}");
