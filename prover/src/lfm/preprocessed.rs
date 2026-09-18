@@ -383,3 +383,77 @@ pub fn emit_const_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) -
         })
         .collect()
 }
+
+// =============================================================================
+// The OFFSET ramp — the cross-epoch proof's page tables
+// =============================================================================
+
+/// ★ THE IDENTITY RAMP'S MULTILINEAR EXTENSION, IN CLOSED FORM.
+///
+/// `page::offset_column()` is `(0..DEFAULT_PAGE_SIZE).map(FE::from)` — the row
+/// index itself — and it is the preprocessed column every GLOBAL_MEMORY table
+/// carries (`continuation.rs:241-251`: OFFSET alone on a private-input page,
+/// OFFSET and INIT on any other). Its extension is the one multilinear
+/// polynomial with a one-line answer:
+///
+/// ```text
+///   MLE(r) = Σ_i i · eq(r, i) = Σ_k 2^k · r_k
+/// ```
+///
+/// because `Σ_i bit_k(i) · eq(r, i)` marginalises to `r_k`. So a `2^18` fold per
+/// page becomes `num_vars − 1` rows, and the cross-epoch proof's thirty-five
+/// page tables cost about six hundred rows between them instead of nine million.
+///
+/// ⚠ THE BIT ORDER IS THE WHOLE CORRECTNESS OF THIS, and it is taken from
+/// [`emit_bitwise_preprocessed`] rather than assumed: index bit `k` is carried
+/// by `point[num_vars − 1 − k]`, so `point[0]` is the HIGH bit. Horner from
+/// `point[0]` therefore accumulates the right weights, and the gate against
+/// `Mle::evaluate_in` over the real column is what says so — a reversed
+/// convention is a different number at every point but the symmetric ones.
+pub fn emit_offset_ramp(b: &mut LfmBuilder, point: &[Ext]) -> Ext {
+    assert!(
+        !point.is_empty(),
+        "a ramp over 2^0 rows is the constant zero, and no page is that shape"
+    );
+    let two = b.ext_const(&FEE::from(2u64));
+    // `point[0]` carries 2^(n-1); each step doubles what is held and adds the
+    // next coordinate, so the last one lands at 2^0.
+    let mut acc = point[0];
+    for coordinate in &point[1..] {
+        acc = b.emul_add(two, acc, *coordinate);
+    }
+    acc
+}
+
+/// INSTRUCTIONS [`emit_offset_ramp`] emits, CONST-FREE.
+///
+/// One `MulAdd` per coordinate after the first; the leading coordinate is a
+/// wire the caller already holds, so it costs nothing.
+pub const fn offset_ramp_rows(num_vars: usize) -> usize {
+    num_vars.saturating_sub(1)
+}
+
+/// The ONE constant [`emit_offset_ramp`] interns.
+///
+/// By value, like [`const_mle_constants`], because an epoch's or a global's
+/// program has ONE pool and thirty-five ramps share this word between them —
+/// a form that charged a constant per page would over-count by thirty-four.
+pub fn offset_ramp_constants() -> Vec<LfmWord> {
+    vec![ext_word(&FEE::from(2u64))]
+}
+
+/// The host's own closed form, for the differential.
+///
+/// ⚠ A THIRD DERIVATION, deliberately: the test compares the EMITTED value
+/// against `Mle::evaluate_in` over the real column (the fold being replaced) and
+/// against this (the arithmetic being claimed). Comparing the emitter against
+/// only this one would be two halves that share an author.
+pub fn offset_ramp_at(point: &[FEE]) -> FEE {
+    assert!(!point.is_empty(), "a ramp needs at least one variable");
+    let two = FEE::from(2u64);
+    let mut acc = point[0];
+    for coordinate in &point[1..] {
+        acc = &acc * &two + coordinate;
+    }
+    acc
+}
