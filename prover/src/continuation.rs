@@ -66,17 +66,24 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
+use crate::tables::ecdas::{self, EcdasOperation};
+use crate::tables::ecsm::{self, EcsmOperation};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
+use crate::tables::trace_builder::collect_bitwise_from_ecdas;
 use crate::tables::trace_builder::{
     DecodeArtifacts, Traces, build_init_page_data, build_initial_image_paged,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-use crate::tables::{MaxRowsConfig, global_memory};
+use crate::tables::{MaxRowsConfig, bitwise, global_memory};
+use crate::test_utils::{
+    ConcreteVmAir, create_bitwise_air, create_ecdas_air, create_ecsm_ecdas_request_air,
+};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding_view,
+    compute_expected_commit_bus_balance_view, verify_epoch_block_binding_view,
+    verify_l2g_commitment_binding_view,
 };
 
 type F = GoldilocksField;
@@ -458,6 +465,15 @@ struct EpochProof {
     /// The committed L2G table root, tied to the global proof by
     /// [`verify_l2g_commitment_binding_view`].
     l2g_root: Commitment,
+    /// The committed ECSM root, or `None` when this epoch does no scalar
+    /// multiplication (ECSM is a counted table, so such an epoch commits none).
+    /// The global proof commits the identical trace carrying only the ECDAS
+    /// delegation, so comparing the two roots is what forces the run-wide ECDAS
+    /// to serve *this* epoch's actual requests rather than a set of the prover's
+    /// choosing. Without it the point arithmetic would simply go unproven: the
+    /// epoch omits the delegation, so nothing there relates the scalar and base
+    /// point to the result.
+    ecsm_root: Option<Commitment>,
 }
 
 /// A self-contained continuation proof: the per-epoch proofs in execution order, the one
@@ -584,6 +600,13 @@ impl<'a> EpochProofView<'a> {
             Self::Archived(e) => e.l2g_root,
         }
     }
+
+    fn ecsm_root(&self) -> Option<Commitment> {
+        match self {
+            Self::Owned(e) => e.ecsm_root,
+            Self::Archived(e) => e.ecsm_root.as_ref().copied(),
+        }
+    }
 }
 
 /// Borrowed view over a [`ContinuationProof`] (owned or archived-in-place),
@@ -677,6 +700,12 @@ fn build_epoch_airs(
         None,
         register_preprocessed,
     )
+    // ECDAS is a pure function, so it does not need re-proving each epoch. Every
+    // epoch commits only its ECSM (minus the delegation buses); one run-wide
+    // ECDAS in the global proof answers all their requests. Set here, in the
+    // single source of truth for the epoch AIR set, so prove and verify can
+    // never disagree.
+    .with_hoisted_ecdas(opts)
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -768,6 +797,23 @@ fn prove_epoch(
         })?
         .lde_trace_main_merkle_root;
 
+    // `None` when this epoch does no scalar multiplication: with ECSM a counted
+    // table, such an epoch commits none and so has nothing to bind.
+    let ecsm_root = match airs.ecsm_index() {
+        None => None,
+        Some(idx) => Some(
+            proof
+                .proofs
+                .get(idx)
+                .ok_or_else(|| {
+                    Error::ContinuationInvariant(
+                        "epoch proof is missing the ECSM sub-table".to_string(),
+                    )
+                })?
+                .lde_trace_main_merkle_root,
+        ),
+    };
+
     Ok(EpochProof {
         proof,
         public_output,
@@ -775,6 +821,7 @@ fn prove_epoch(
         runtime_page_ranges,
         reg_fini,
         l2g_root,
+        ecsm_root,
     })
 }
 
@@ -896,8 +943,46 @@ fn verify_epoch(
 /// non-preprocessed (committed, bus-enforced genesis — see `global_memory_air` / §3.6).
 /// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
 /// matches its source (the ELF for ELF/runtime pages).
+/// The run-wide ECDAS chip the global proof carries, plus the BITWISE provider
+/// its range checks need. ECDAS is a pure function, so one instance serves every
+/// epoch; each epoch commits only its ECSM, whose root is tied to the copy here.
+/// Built identically on the prove and verify sides.
+pub(crate) fn global_ecdas_airs(
+    opts: &ProofOptions,
+) -> (
+    ConcreteVmAir<crate::tables::ecdas::EcdasConstraints>,
+    ConcreteVmAir<EmptyConstraints>,
+) {
+    let ecdas = create_ecdas_air(opts);
+    let bw = create_bitwise_air(opts).with_preprocessed(
+        bitwise::preprocessed_commitment(opts),
+        bitwise::NUM_PRECOMPUTED_COLS,
+    );
+    (ecdas, bw)
+}
+
+/// Traces for [`global_ecdas_airs`]: the double-and-add chain over EVERY epoch's
+/// steps, and the BITWISE lookups it emits (which left the epochs' BITWISE
+/// tables when ECDAS was hoisted — see `trace_builder`'s `hoist_ecdas`).
+pub(crate) fn global_ecdas_traces(
+    ecdas_ops_per_epoch: &[Vec<EcdasOperation>],
+) -> (TraceTable<F, E>, TraceTable<F, E>) {
+    let all_ops: Vec<EcdasOperation> = ecdas_ops_per_epoch.iter().flatten().cloned().collect();
+    let ecdas = ecdas::generate_ecdas_trace(&all_ops);
+
+    let mut bw = bitwise::generate_bitwise_trace();
+    let mut histogram = bitwise::BitwiseHistogram::new();
+    histogram.add_ops(&collect_bitwise_from_ecdas(&all_ops));
+    histogram.fill_multiplicities(&mut bw);
+
+    (ecdas, bw)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prove_global(
     boundaries: &[Arc<Vec<CellBoundary>>],
+    ecsm_ops_per_epoch: &[Vec<EcsmOperation>],
+    ecdas_ops_per_epoch: &[Vec<EcdasOperation>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
@@ -943,14 +1028,41 @@ fn prove_global(
         .map(|config| global_memory_air(opts, config, None))
         .collect();
 
+    // The hoisted ECDAS chip: each epoch's ECSM table, rebuilt from that epoch's
+    // ops so it is byte-identical to the one the epoch proof committed (the
+    // binding compares their main-trace roots), carrying only the delegation
+    // buses here. Plus the single run-wide ECDAS that actually serves the
+    // requests, and the BITWISE provider for its range checks.
+    //
+    // An epoch that never does a scalar multiplication commits NO ECSM table
+    // (ECSM is a counted table since #977), so the block holds one entry per
+    // epoch that actually uses ECSM, in epoch order — not one per epoch.
+    let mut request_traces: Vec<TraceTable<F, E>> = ecsm_ops_per_epoch
+        .iter()
+        .filter(|ops| !ops.is_empty())
+        .map(|ops| ecsm::generate_ecsm_trace(ops))
+        .collect();
+    let request_airs: Vec<_> = (0..request_traces.len())
+        .map(|_| create_ecsm_ecdas_request_air(opts))
+        .collect();
+    let (ecdas_air, bitwise_air) = global_ecdas_airs(opts);
+    let (mut ecdas_trace, mut bitwise_trace) = global_ecdas_traces(ecdas_ops_per_epoch);
+
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
         .iter()
         .zip(l2g_traces.iter_mut())
         .map(|(air, t)| (air as AirRef, t, &()))
         .collect();
+    // The ECSM copies sit immediately after the L2G block so both cross-proof
+    // root bindings live at fixed offsets: L2G at `0..E`, ECSMs from `E`.
+    for (air, trace) in request_airs.iter().zip(request_traces.iter_mut()) {
+        pairs.push((air as AirRef, trace, &()));
+    }
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
+    pairs.push((&ecdas_air as AirRef, &mut ecdas_trace, &()));
+    pairs.push((&bitwise_air as AirRef, &mut bitwise_trace, &()));
 
     Prover::multi_prove(
         pairs,
@@ -970,6 +1082,7 @@ fn prove_global(
 #[allow(clippy::too_many_arguments)]
 fn verify_global(
     num_epochs: usize,
+    num_ecsms: usize,
     page_bases: &[u64],
     proof: MultiProofView<'_, F, E, ()>,
     elf: &Elf,
@@ -1034,10 +1147,22 @@ fn verify_global(
         })
         .collect();
 
+    // Mirrors `prove_global`'s order exactly: L2G block, ECSM block, GM block,
+    // then the run-wide ECDAS and its BITWISE provider.
+    let request_airs: Vec<_> = (0..num_ecsms)
+        .map(|_| create_ecsm_ecdas_request_air(opts))
+        .collect();
+    let (ecdas_air, bitwise_air) = global_ecdas_airs(opts);
+
     let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
+    for air in &request_airs {
+        refs.push(air as AirRef);
+    }
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
+    refs.push(&ecdas_air as AirRef);
+    refs.push(&bitwise_air as AirRef);
 
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
@@ -1125,7 +1250,15 @@ pub fn prove_continuation(
     // prepared) — the global proof depends only on these execution artifacts,
     // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
     // of serializing after them. Proof bytes are unchanged — only the schedule.
-    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
+    // Carries each epoch's boundary AND its EC ops: the global proof needs both
+    // (the boundary for the memory argument, the ops for the hoisted ECDAS chip
+    // and this epoch's ECSM copy).
+    type GlobalInputs = (
+        Arc<Vec<CellBoundary>>,
+        Vec<EcsmOperation>,
+        Vec<EcdasOperation>,
+    );
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<GlobalInputs>();
 
     // Three-stage epoch pipeline: a producer thread runs the
     // sequential-critical work (execute + op collection over the advancing
@@ -1389,7 +1522,11 @@ pub fn prove_continuation(
                     ));
                     // Publish this epoch's boundary for the global prove (in
                     // epoch order; the channel closes when the producer ends).
-                    let _ = boundary_tx.send(Arc::clone(&boundary));
+                    let _ = boundary_tx.send((
+                        Arc::clone(&boundary),
+                        collected.ecsm_ops(),
+                        collected.ecdas_ops(),
+                    ));
 
                     // R_{i+1} from the collected register end state — the exact
                     // value the generated REGISTER trace binds (`fini_from_trace`
@@ -1451,8 +1588,12 @@ pub fn prove_continuation(
         let init_page_data_ref = &init_page_data;
         scope.spawn(move || {
             let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
-            while let Ok(b) = boundary_rx.recv() {
-                all.push(b);
+            let mut all_ecsm: Vec<Vec<EcsmOperation>> = Vec::new();
+            let mut all_ecdas: Vec<Vec<EcdasOperation>> = Vec::new();
+            while let Ok((boundary, ecsm_ops, ecdas_ops)) = boundary_rx.recv() {
+                all.push(boundary);
+                all_ecsm.push(ecsm_ops);
+                all_ecdas.push(ecdas_ops);
             }
             // An epoch already failed: its error wins and the bundle is never
             // assembled — skip the (whole-prove-sized) global prove.
@@ -1469,6 +1610,8 @@ pub fn prove_continuation(
                 let touched = touched_page_bases(&all);
                 let global = prove_global(
                     &all,
+                    &all_ecsm,
+                    &all_ecdas,
                     elf_bytes,
                     init_page_data_ref,
                     &touched,
@@ -1657,6 +1800,7 @@ fn verify_continuation_view(
     // Derived from the ELF for epoch 0, then from each epoch's bound fini.
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
+    let mut ecsm_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
     for (index, epoch) in bundle.epochs().enumerate() {
@@ -1679,6 +1823,9 @@ fn verify_continuation_view(
         }
 
         epoch_roots.push(l2g_root);
+        if let Some(root) = epoch.ecsm_root() {
+            ecsm_roots.push(root);
+        }
         public_output.extend_from_slice(epoch_public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
@@ -1728,6 +1875,7 @@ fn verify_continuation_view(
     let global_proof = bundle.global();
     if !verify_global(
         n,
+        ecsm_roots.len(),
         &page_bases,
         global_proof,
         &elf,
@@ -1741,6 +1889,15 @@ fn verify_continuation_view(
 
     // Each epoch's committed L2G table is the same one the global proof used.
     if !verify_l2g_commitment_binding_view(&epoch_roots, global_proof) {
+        return Ok(None);
+    }
+
+    // Same for each epoch's ECSM table. This is the ONLY thing relating that
+    // epoch's scalar and base point to its result: the epoch omits the ECDAS
+    // delegation entirely, and the global proof answers requests over whatever
+    // trace it commits. Equal roots force those to be the same trace. The ECSM
+    // block sits immediately after the L2G block in `prove_global`.
+    if !verify_epoch_block_binding_view(&ecsm_roots, global_proof, n) {
         return Ok(None);
     }
 

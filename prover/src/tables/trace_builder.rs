@@ -2792,6 +2792,20 @@ impl CollectedEpoch {
         touched_cells_from_memory_state(&self.memory_state)
     }
 
+    /// The epoch's ECSM calls and the double-and-add steps they drove, for the
+    /// global proof: it rebuilds this epoch's ECSM table (whose committed root
+    /// must equal the one the epoch proof publishes) and folds the steps into
+    /// the run-wide ECDAS chain. The epoch's own trace build derives its ECSM
+    /// from the very same ops, so the two copies are identical by construction.
+    pub fn ecsm_ops(&self) -> Vec<ecsm::EcsmOperation> {
+        self.ops.ecsm_ops.clone()
+    }
+
+    /// The epoch's ECDAS steps. See [`Self::ecsm_ops`].
+    pub fn ecdas_ops(&self) -> Vec<ecdas::EcdasOperation> {
+        self.ops.ecdas_ops.clone()
+    }
+
     /// The epoch's final register file (`R_{i+1}`) in
     /// `register_word_address_list` order: the exact values
     /// [`register::fini_from_trace`] reads off the generated REGISTER trace
@@ -3241,6 +3255,14 @@ fn build_traces<I: ImageSource + Sync>(
         hint_ops,
     } = ops;
 
+    // Continuation epochs hoist the ECDAS chip out: the epoch commits its ECSM
+    // without the delegation buses, and one run-wide ECDAS in the global proof
+    // answers every epoch's requests. ECDAS is a pure function — it takes an
+    // accumulator on a bus and returns the next one, touching no memory and
+    // carrying no state between calls — so one instance suffices. This is
+    // exactly "is a continuation epoch", the same condition as the L2G bookend.
+    let hoist_ecdas = l2g_memory_bookend;
+
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
@@ -3324,7 +3346,13 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        // ECDAS's lookups follow ECDAS: when it is hoisted they go to the
+        // GLOBAL proof's BITWISE table instead of this one.
+        Box::new(|h| {
+            if !hoist_ecdas {
+                h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops));
+            }
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
@@ -3638,6 +3666,12 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_ecdases = || {
+        // Hoisted: ECDAS is proved once in the global proof, so this epoch emits
+        // no ECDAS table at all. `table_counts` is derived from these vectors,
+        // so the count follows automatically.
+        if hoist_ecdas {
+            return Ok(Vec::new());
+        }
         generate_optional(
             &ecdas_ops,
             ecdas::generate_ecdas_trace,

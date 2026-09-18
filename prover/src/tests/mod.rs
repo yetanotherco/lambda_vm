@@ -41,6 +41,7 @@ pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod ecdas_hoist_tests;
 pub mod ecdas_tests;
 #[cfg(test)]
 pub mod ecsm_tests;

@@ -1012,6 +1012,38 @@ pub fn create_ecsm_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcsmConstr
 }
 
 /// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).
+/// ECSM for a continuation epoch: everything except the ECDAS delegation, which
+/// is hoisted into the global proof along with the double-and-add chip.
+pub fn create_ecsm_air_without_ecdas(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<EcsmConstraints> {
+    build_air(
+        ecsm_cols::NUM_COLUMNS,
+        crate::tables::ecsm::bus_interactions_without_ecdas(),
+        proof_options,
+        1,
+        EcsmConstraints,
+        "ECSM_ND",
+    )
+}
+
+/// The global proof's view of one epoch's ECSM table: the SAME committed
+/// columns, carrying only the ECDAS delegation, so the single run-wide ECDAS
+/// chain answers that epoch's requests. No constraints — the epoch proof owns
+/// those, and the two are tied by comparing main-trace Merkle roots.
+pub fn create_ecsm_ecdas_request_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        ecsm_cols::NUM_COLUMNS,
+        crate::tables::ecsm::ecdas_delegation_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "ECSM_REQ",
+    )
+}
+
 pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasConstraints> {
     build_air(
         ecdas_cols::NUM_COLUMNS,

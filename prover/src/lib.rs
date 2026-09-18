@@ -53,10 +53,11 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_ecsm_air, create_ecsm_air_without_ecdas, create_eq_air, create_halt_air,
+    create_hint_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
+    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
+    create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -590,7 +591,11 @@ pub(crate) struct VmAirs {
     pub keccaks: Vec<VmAir>,
     pub keccak_rnds: Vec<VmAir>,
     pub keccak_rc: VmAir,
+    /// ECSM tables. When [`Self::hoist_ecdas`] is set these are built WITHOUT
+    /// the ECDAS delegation — nothing in this proof would answer it, because the
+    /// double-and-add chip lives in the global proof.
     pub ecsms: Vec<VmAir>,
+    /// Empty when [`Self::hoist_ecdas`] is set.
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
     pub register: VmAir,
@@ -599,6 +604,16 @@ pub(crate) struct VmAirs {
     /// Whether the HALT table participates in this proof. False for intermediate
     /// continuation epochs, which do not terminate the program.
     pub include_halt: bool,
+    /// Whether the ECDAS double-and-add chip is hoisted out of this proof. True
+    /// for continuation epochs: ECDAS is proved ONCE for the whole run in the
+    /// global proof, and each epoch's ECSM simply omits its delegation buses.
+    /// ECDAS is a pure function — it takes an accumulator on a bus and returns
+    /// the next one, touching no memory and carrying no state between calls — so
+    /// one run-wide instance can serve every epoch. The epoch's ECSM trace is
+    /// the carrier: the global proof re-emits the delegation over that same
+    /// committed trace, and the two are tied by comparing its main-trace Merkle
+    /// root (see `continuation::verify_continuation_view`).
+    pub hoist_ecdas: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
@@ -1096,11 +1111,51 @@ impl VmAirs {
             pages,
             memw_registers,
             include_halt,
+            hoist_ecdas: false,
             eqs,
             bytewises,
             stores,
             cpu32s,
         }
+    }
+
+    /// Hoist the ECDAS chip out of this proof: ECDAS drops to zero tables and
+    /// each ECSM stops emitting its delegation buses, since nothing here would
+    /// answer them. The global proof re-emits that delegation over the same
+    /// committed ECSM traces, against one run-wide ECDAS chain.
+    ///
+    /// Only valid for a continuation epoch. Prover and verifier must set this
+    /// identically — it changes both the AIR set and what each ECSM emits.
+    pub fn with_hoisted_ecdas(mut self, proof_options: &ProofOptions) -> Self {
+        self.hoist_ecdas = true;
+        self.ecsms = (0..self.ecsms.len())
+            .map(|i| {
+                Box::new(
+                    create_ecsm_air_without_ecdas(proof_options).with_name(&format!("ECSM[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        self.ecdases.clear();
+        self
+    }
+
+    /// Index of the first ECSM table in this proof's table list, when ECDAS is
+    /// hoisted and there is an ECSM to point at. Used to pull ECSM's committed
+    /// root out of an epoch proof so it can be tied to the global proof's copy.
+    ///
+    /// Mirrors the order `air_trace_pairs` builds: the four fixed tables
+    /// (BITWISE, DECODE, KECCAK_RC, REGISTER), then HALT when present, then the
+    /// COMMIT, KECCAK and KECCAK_RND chunks, then the ECSMs.
+    pub fn ecsm_index(&self) -> Option<usize> {
+        if !self.hoist_ecdas || self.ecsms.is_empty() {
+            return None;
+        }
+        Some(
+            4 + usize::from(self.include_halt)
+                + self.commits.len()
+                + self.keccaks.len()
+                + self.keccak_rnds.len(),
+        )
     }
 }
 
@@ -1206,11 +1261,30 @@ pub(crate) fn verify_l2g_commitment_binding_view(
     epoch_l2g_roots: &[Commitment],
     final_proof: MultiProofView<'_, F, E, ()>,
 ) -> bool {
-    final_proof.len() >= epoch_l2g_roots.len()
-        && epoch_l2g_roots
-            .iter()
-            .enumerate()
-            .all(|(i, root)| *final_proof.get(i).lde_trace_main_merkle_root() == *root)
+    // The L2G block is the global proof's first `E` sub-tables.
+    verify_epoch_block_binding_view(epoch_l2g_roots, final_proof, 0)
+}
+
+/// Tie one per-epoch table to the global proof's copy of it: the global proof
+/// commits the identical main trace (a different AIR over the same columns), so
+/// equal main-trace roots means equal data. Only main roots are compared; the
+/// aux traces legitimately differ, since each proof derives its own from its own
+/// LogUp challenges.
+///
+/// `block_offset` is where that per-epoch block starts in the global proof's
+/// table list: 0 for L2G, `E` for the ECSM copies (see `prove_global`).
+pub(crate) fn verify_epoch_block_binding_view(
+    epoch_roots: &[Commitment],
+    final_proof: MultiProofView<'_, F, E, ()>,
+    block_offset: usize,
+) -> bool {
+    final_proof.len() >= block_offset + epoch_roots.len()
+        && epoch_roots.iter().enumerate().all(|(i, root)| {
+            *final_proof
+                .get(block_offset + i)
+                .lde_trace_main_merkle_root()
+                == *root
+        })
 }
 
 // =============================================================================

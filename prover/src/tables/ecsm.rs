@@ -297,7 +297,100 @@ fn k_dword_busvalues(dword_idx: usize) -> [BusValue; 8] {
 // Bus interactions
 // =========================================================================
 
+/// The ECDAS delegation: the `Bit` bus (one receiver per scalar bit, plus the
+/// MSB sender) and the `Ecdas` bus (seed and drain of the double-and-add
+/// chain). Together, everything ECSM says to the chip that does the actual
+/// point arithmetic.
+///
+/// ECDAS is a pure function — it takes an accumulator on a bus and returns the
+/// next one, touching no memory and carrying no state between calls — so a
+/// continuation proves ONE run-wide instance instead of one per epoch. The
+/// epoch omits this whole block ([`bus_interactions_without_ecdas`]); the
+/// global proof re-emits it over the SAME committed ECSM trace
+/// ([`ecdas_delegation_bus_interactions`]), where the single ECDAS chain
+/// answers it. Polarity is identical in both — ECSM is always the one
+/// delegating — so this takes no flag. The two proofs are tied by comparing
+/// the ECSM table's main-trace Merkle root.
+fn ecdas_delegation_interactions() -> Vec<BusInteraction> {
+    let mu = || Multiplicity::Column(cols::MU);
+    let ts_lo = || packed(cols::TIMESTAMP_0);
+    let ts_hi = || packed(cols::TIMESTAMP_1);
+    let mut out = Vec::new();
+
+    // Delegation buses.
+    // BIT receivers: receive Bit[ts, i] from ECDAS for each scalar bit i=0..255.
+    for i in 0..256 {
+        out.push(BusInteraction::receiver(
+            BusId::Bit,
+            Multiplicity::Column(cols::k_bit(i)),
+            vec![ts_lo(), ts_hi(), BusValue::constant(i as u64)],
+        ));
+    }
+    // BIT sender: the MSB at position len_k (always 1).
+    out.push(BusInteraction::sender(
+        BusId::Bit,
+        mu(),
+        vec![ts_lo(), ts_hi(), packed(cols::LEN_K)],
+    ));
+    // ECDAS start: [ts, xG, yG, xG, yG, len_k - 1, 0].
+    out.push(BusInteraction::sender(
+        BusId::Ecdas,
+        mu(),
+        ecdas_tuple(
+            cols::XG,
+            cols::YG,
+            cols::XG,
+            cols::YG,
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::LEN_K,
+                },
+                LinearTerm::Constant(-1),
+            ]),
+            BusValue::constant(0),
+            ts_lo(),
+            ts_hi(),
+        ),
+    ));
+    // ECDAS final receiver: [ts, xR, yR, xG, yG, -1, 0].
+    out.push(BusInteraction::receiver(
+        BusId::Ecdas,
+        mu(),
+        ecdas_tuple(
+            cols::XR,
+            cols::YR,
+            cols::XG,
+            cols::YG,
+            BusValue::linear(vec![LinearTerm::Constant(-1)]),
+            BusValue::constant(0),
+            ts_lo(),
+            ts_hi(),
+        ),
+    ));
+
+    out
+}
+
+/// Only the ECDAS delegation: the global proof's view of an epoch's ECSM table.
+/// Same committed columns, nothing else — the memory, dispatch and range-check
+/// interactions stay in the epoch.
+pub fn ecdas_delegation_bus_interactions() -> Vec<BusInteraction> {
+    ecdas_delegation_interactions()
+}
+
+/// Everything except the ECDAS delegation — a continuation epoch's ECSM, whose
+/// double-and-add chip lives in the global proof.
+pub fn bus_interactions_without_ecdas() -> Vec<BusInteraction> {
+    build_bus_interactions(false)
+}
+
+/// The full set: the monolithic path, where ECDAS shares this proof.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    build_bus_interactions(true)
+}
+
+fn build_bus_interactions(with_ecdas: bool) -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
     let ts_lo = || packed(cols::TIMESTAMP_0);
     let ts_hi = || packed(cols::TIMESTAMP_1);
@@ -523,57 +616,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Delegation buses.
-    // BIT receivers: receive Bit[ts, i] from ECDAS for each scalar bit i=0..255.
-    for i in 0..256 {
-        out.push(BusInteraction::receiver(
-            BusId::Bit,
-            Multiplicity::Column(cols::k_bit(i)),
-            vec![ts_lo(), ts_hi(), BusValue::constant(i as u64)],
-        ));
+    if with_ecdas {
+        out.extend(ecdas_delegation_interactions());
     }
-    // BIT sender: the MSB at position len_k (always 1).
-    out.push(BusInteraction::sender(
-        BusId::Bit,
-        mu(),
-        vec![ts_lo(), ts_hi(), packed(cols::LEN_K)],
-    ));
-    // ECDAS start: [ts, xG, yG, xG, yG, len_k - 1, 0].
-    out.push(BusInteraction::sender(
-        BusId::Ecdas,
-        mu(),
-        ecdas_tuple(
-            cols::XG,
-            cols::YG,
-            cols::XG,
-            cols::YG,
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::LEN_K,
-                },
-                LinearTerm::Constant(-1),
-            ]),
-            BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
-        ),
-    ));
-    // ECDAS final receiver: [ts, xR, yR, xG, yG, -1, 0].
-    out.push(BusInteraction::receiver(
-        BusId::Ecdas,
-        mu(),
-        ecdas_tuple(
-            cols::XR,
-            cols::YR,
-            cols::XG,
-            cols::YG,
-            BusValue::linear(vec![LinearTerm::Constant(-1)]),
-            BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
-        ),
-    ));
 
     out
 }
