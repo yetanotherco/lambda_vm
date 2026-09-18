@@ -21,7 +21,6 @@
 //! `LeafLayout::build_live_over`'s job, not this module's.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
@@ -317,7 +316,10 @@ pub(crate) fn decode_prepared_config(columns: usize, num_vars: usize) -> ChainCo
 ///
 /// The one call BOTH SIDES make, so the prover and the verifier cannot build the
 /// commitment from two different ELFs or under two different parameter sets.
-pub(crate) fn decode_prepared_for<H>(elf: &Elf, elf_bytes: &[u8]) -> Result<DecodePrepared<H>, Error>
+pub(crate) fn decode_prepared_for<H>(
+    elf: &Elf,
+    elf_bytes: &[u8],
+) -> Result<DecodePrepared<H>, Error>
 where
     H: multilinear::whir_hash::WhirHash,
 {
@@ -457,19 +459,35 @@ fn layout_of<'a>(
 
 /// What the epoch's tables owe the statement: the COMMIT bus's counterparty,
 /// counted from the commit index this epoch carried in.
-fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
+///
+/// # ⛔ This is a REPLAY of the roots block, not a second spelling of it
+///
+/// The counterparty is a function of `z` and `alpha`, which `multi_verify` has
+/// not drawn yet when this is called, so the transcript is forked and the block
+/// is replayed on the fork. `carried` and `derived` are therefore the SAME two
+/// lists that verification will be handed — the derived one included. A replay
+/// that absorbed only the carried roots would compute the counterparty at
+/// challenges no table was ever checked against, and every epoch with a
+/// non-empty `public_output` would fail on `BusImbalance` while every epoch
+/// without one passed: [`crate::compute_commit_bus_offset`] returns zero for an
+/// empty output without reading either challenge, so those epochs accept any
+/// replay at all. That is the failure this signature exists to prevent, and
+/// [`multilinear_table::absorb_roots_and_challenge`] is called rather than
+/// re-spelled so the two can no longer disagree.
+///
+/// `beta` is drawn and dropped: the fork is discarded, and drawing it keeps this
+/// a call to the block rather than a prefix of it.
+pub(crate) fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     public_output: &[u8],
     register_init: &[u32],
-    roots: &[Commitment],
+    carried: &[Commitment],
+    derived: &[Commitment],
     transcript: &DefaultTranscript<E, T>,
 ) -> Option<FieldElement<E>> {
     let start_index = *register_init.get(register::X254_INDEX)? as u64;
     let mut probe = transcript.clone();
-    for root in roots {
-        probe.append_bytes(root);
-    }
-    let z: FieldElement<E> = probe.sample_field_element();
-    let alpha: FieldElement<E> = probe.sample_field_element();
+    let (z, alpha, _beta) =
+        multilinear_table::absorb_roots_and_challenge::<E, _>(&mut probe, carried, derived);
     crate::compute_commit_bus_offset(public_output, start_index, &z, &alpha)
 }
 
@@ -1323,6 +1341,15 @@ where
         &epoch.table_num_vars,
         &config,
     );
+    // ★ ONE VALUE, TWO USES. The replay below and the verification below it are
+    // handed the same `PreparedCheck`, so they cannot be given two different
+    // derived-root lists: the challenges `owed` computes the COMMIT bus's
+    // counterparty at are the challenges every table is then checked at. Built
+    // once here rather than twice at the two call sites, because "twice" is
+    // precisely how the replay came to absorb a shorter roots block than the
+    // verification did.
+    let check = prepared.check(decode_at);
+    let derived = check.roots;
     // ★ `owed` replays this transcript to draw `z` and `alpha`, which are a
     // function of the configuration's sponge. Computing them against a
     // transcript of a different hash is the same defect one level down, and
@@ -1331,6 +1358,7 @@ where
         &epoch.public_output,
         register_init,
         &epoch.proof.roots,
+        derived,
         &transcript,
     ) else {
         return Ok(None);
@@ -1344,7 +1372,7 @@ where
         &owed,
         &config,
         &mut transcript,
-        Some(prepared.check(decode_at)),
+        Some(check),
     );
     if verdict.is_err() {
         return Ok(None);

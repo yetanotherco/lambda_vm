@@ -580,7 +580,8 @@ pub struct TableProof<E: IsField> {
 }
 
 /// ★★★ THE ROOTS BLOCK: every root into the transcript, then the three shared
-/// challenges — used by BOTH `multi_prove` and `multi_verify`.
+/// challenges — used by `multi_prove`, by `multi_verify`, AND by every caller
+/// that REPLAYS the block on a fork of the transcript.
 ///
 /// # Why it is one function
 ///
@@ -590,6 +591,22 @@ pub struct TableProof<E: IsField> {
 /// prover and verifier agree with each other and disagree with the
 /// specification. Sharing the code makes that particular disagreement
 /// unspellable rather than merely tested for.
+///
+/// # ⛔ The replays are callers too, and forgetting one is how this broke
+///
+/// A verifier that needs `z` and `alpha` BEFORE `multi_verify` runs — to compute
+/// the COMMIT bus's counterparty, which is a function of them — replays this
+/// block on a clone of the transcript. Such a replay is a third side of the same
+/// agreement, and it is public for exactly that reason: when the block grew the
+/// derived root, the two call sites inside this module grew with it and a
+/// hand-rolled replay in the prover crate did not, so the counterparty was
+/// computed at challenges no table had been checked at and every epoch that
+/// published output failed on `BusImbalance`. The epochs that published nothing
+/// could not see it, because the counterparty is zero there without reading
+/// either challenge.
+///
+/// So: never spell this loop out again. Call it, and pass the same `derived`
+/// list the verification will be handed.
 ///
 /// # The order, and why `derived` is last
 ///
@@ -602,7 +619,7 @@ pub struct TableProof<E: IsField> {
 /// That is the one placement no round-trip can catch, which is why
 /// `the_roots_block_binds_the_derived_root_to_the_first_challenge` compares this
 /// against an independently built transcript rather than against the other side.
-fn absorb_roots_and_challenge<E, T>(
+pub fn absorb_roots_and_challenge<E, T>(
     transcript: &mut T,
     carried: &[Commitment],
     derived: &[Commitment],

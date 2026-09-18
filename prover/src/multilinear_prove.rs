@@ -38,10 +38,8 @@
 //! transcript up to that point.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ChainConfig, GrindBits};
 use stark::multilinear_air::Uniforms;
@@ -497,12 +495,18 @@ pub fn verify_with_options(
         // are a function of the configuration's sponge, so computing them
         // against a transcript of a different hash is the same defect one level
         // down, and just as quiet.
+        //
+        // ★ The block is CALLED, not re-spelled: a replay is a third side of the
+        // roots-block agreement, and the epoch path's `owed` broke precisely by
+        // being a second spelling that did not grow a list the block had grown.
+        // This path opens nothing out of band, so `derived` is empty and not one
+        // byte of any transcript moves; what changes is that it cannot drift.
         let mut probe = transcript.clone();
-        for root in &proof.proof.roots {
-            probe.append_bytes(root);
-        }
-        let z: FieldElement<E> = probe.sample_field_element();
-        let alpha: FieldElement<E> = probe.sample_field_element();
+        let (z, alpha, _beta) = multilinear_table::absorb_roots_and_challenge::<E, _>(
+            &mut probe,
+            &proof.proof.roots,
+            &[],
+        );
         // `start_index` is the carried x254: zero for a monolithic proof.
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
         else {
