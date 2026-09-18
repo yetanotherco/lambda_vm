@@ -389,6 +389,13 @@ pub(crate) fn decode_table_index(
 /// continuation epoch never has private-input pages (the bookend replaces
 /// PAGE), so that count is not stated — it is zero by construction.
 ///
+/// ⚠ AND NEITHER ARE THE REGISTER VECTORS, deliberately. `register_init` and
+/// `reg_fini` are bound by REGISTER's preprocessed COLUMNS, not by anything
+/// here: the roots commit those columns before a challenge exists, and
+/// `check_preprocessed` ties the verifier's own pair to them at the reduced
+/// point. See `register::preprocessed_columns_with_fini`. Absorbing them would
+/// add no binding and move every pinned constant.
+///
 /// ★ The length is accumulated beside the absorbs, never written as a constant:
 /// a `FIXED` the caller has to keep in step is the same class of defect as the
 /// pad this function exists to compute. See
