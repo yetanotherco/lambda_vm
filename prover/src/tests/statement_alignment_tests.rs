@@ -600,7 +600,7 @@ where
     let statement_absorbs = seed_with_statement(&mut rec, &[num_vars], po);
     assert_eq!(rec.absorbs.len(), statement_absorbs);
 
-    let proof = multilinear_table::multi_prove(&committed, &cfg, &mut rec).expect("prove");
+    let proof = multilinear_table::multi_prove(&committed, &cfg, &mut rec, None).expect("prove");
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
         .expect("serialize")
         .to_vec();
@@ -619,7 +619,7 @@ fn prove_through_production<H: WhirHash>(
     let mut t = DefaultTranscript::<E, H::Transcript>::new(&[]);
     seed_with_statement(&mut t, &[num_vars], po);
 
-    let proof = multilinear_table::multi_prove(&committed, &cfg, &mut t).expect("prove");
+    let proof = multilinear_table::multi_prove(&committed, &cfg, &mut t, None).expect("prove");
     rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
         .expect("serialize")
         .to_vec()

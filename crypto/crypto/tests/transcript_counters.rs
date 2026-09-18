@@ -340,3 +340,151 @@ fn a_keccak_state_read_is_tagged_as_keccak() {
     assert_eq!(c.transcript_states_rpx, 0);
     assert_eq!(c.transcript_unattributed(), (0, 0, 0));
 }
+
+// =========================================================================
+// W1-B: where the derived root goes
+// =========================================================================
+
+/// ★★★ THE ABSORB POSITION — the orderings are distinguishable, and the
+/// challenge sees it.
+///
+/// W1-B adds one root the proof does not carry: the verifier derives it from
+/// the ELF and absorbs it AFTER the roots the proof does carry, and BEFORE any
+/// challenge. Two guards were proposed for that ordering and neither reaches
+/// it:
+///
+/// * a transcript-count gate is **blind to position** — an absorb lands at
+///   `out_pos == SQUEEZE_LEN` wherever it goes, so first and last cost an
+///   identical `+1 absorb, +0 squeezes`. Demonstrated at the end of this test
+///   rather than asserted in prose;
+/// * the WHIR byte gate is **blind to the feature** — its fixture is a single
+///   EQ air (`whir_byte_gate.rs:167,190`), so it commits no DECODE table, no
+///   preprocessed group and no derived root at all.
+///
+/// Nothing downstream catches it either: prover and verifier share the
+/// position, so a consistently wrong one still verifies. **A round-trip between
+/// two halves that share code is not evidence about either.**
+///
+/// # WHAT THIS TEST DOES NOT DO
+///
+/// It does **not** call the production roots block, so it cannot tell you the
+/// verifier absorbs anything at all. It pins that the specified order is
+/// *distinguishable* from every wrong one — including from omitting the root
+/// entirely — which is the property the count gate lacks and which has to hold
+/// before a wiring guard can mean anything.
+///
+/// The wiring guard arrives at **step 3**, when `multi_verify`'s roots block
+/// exists to be called; its mutation is deleting the absorb, and that is the
+/// failure this branch has produced twice — the transcript defaulting to keccak
+/// while everything else moved, and the grind dispatching keccak-only with a
+/// correct RPX kernel sitting unused. **Both were the feature not wired, not
+/// the feature wired wrongly.** Until step 3, this file pins the specification
+/// and the design note's ordering section is the normative statement.
+/// What one run of the roots-block script leaves behind: the sponge state, and
+/// the first challenge drawn from it. Named because the two travel together —
+/// a failure in the state and a failure in the challenge mean different things.
+type Draw = ([u8; 32], FieldElement<Ext>);
+
+#[test]
+fn the_derived_root_is_absorbed_after_the_carried_ones() {
+    let _serialised = serialise();
+
+    // Stand-ins: what matters is the ORDER, not the values.
+    let carried: [[u8; 32]; 3] = [[0x11; 32], [0x22; 32], [0x33; 32]];
+    let derived = [0xAB; 32];
+
+    // The script runs past the absorbs to the FIRST CHALLENGE, because that is
+    // where the property has teeth: "every root is in the transcript before the
+    // first challenge". Pinning the state alone would pin the absorbs' order
+    // among themselves and leave "absorbed AFTER z" — the genuinely dangerous
+    // variant — unrepresentable.
+    //
+    // `z` comes back beside the state so a failure localises: "the challenge
+    // moved" reads differently from "the state moved".
+    let script = |order: &[&[u8; 32]], after_z: Option<&[u8; 32]>| -> Draw {
+        let mut t = DefaultTranscript::<Ext, RpxTranscriptHash>::new(b"w1b-roots");
+        for root in order {
+            t.append_bytes(*root);
+        }
+        let z: FieldElement<Ext> = t.sample_field_element();
+        if let Some(late) = after_z {
+            t.append_bytes(late);
+        }
+        (IsTranscript::<Ext>::state(&t), z)
+    };
+
+    let all = [&carried[0], &carried[1], &carried[2], &derived];
+    let (specified, z_specified) = script(&all, None);
+
+    // Every wrong placement, including the two that are not reorderings.
+    let wrong: [(&str, Draw); 4] = [
+        (
+            "first",
+            script(&[&derived, &carried[0], &carried[1], &carried[2]], None),
+        ),
+        (
+            "middle",
+            script(&[&carried[0], &derived, &carried[1], &carried[2]], None),
+        ),
+        // OMITTED — the failure mode that is not a reordering at all.
+        (
+            "omitted",
+            script(&[&carried[0], &carried[1], &carried[2]], None),
+        ),
+        // AFTER the challenge — unrepresentable without the `z` draw above.
+        (
+            "after z",
+            script(&[&carried[0], &carried[1], &carried[2]], Some(&derived)),
+        ),
+    ];
+
+    for (name, (state, z)) in &wrong {
+        assert_ne!(
+            specified, *state,
+            "placing the derived root {name} gives the same sponge state as the \
+             specified order — the transcript cannot distinguish them, so this \
+             test pins nothing"
+        );
+        if *name != "after z" {
+            assert_ne!(
+                z_specified, *z,
+                "placing the derived root {name} draws the SAME challenge — the \
+                 root is not binding z, which is the whole point of absorbing it \
+                 before any challenge"
+            );
+        }
+    }
+
+    // ★★ THE DANGER, STATED AS AN EQUALITY: absorbing after the challenge is
+    // indistinguishable IN THE CHALLENGE from not absorbing at all. Both draw
+    // `z` from a transcript holding only the carried roots, so the derived root
+    // binds nothing — while the counters happily see it and the sponge state
+    // afterwards differs from the omitted case, which is what makes it look
+    // wired when it is not.
+    //
+    // ⚠ An earlier draft asserted this against `z_specified` with the comment
+    // "the same z BY CONSTRUCTION". That was wrong and the test said so: the
+    // specified order absorbs FOUR roots before drawing, the late order absorbs
+    // three, so the two draws differ. The equality that holds — and the one
+    // worth pinning — is against the OMITTED case.
+    assert_eq!(
+        wrong[3].1.1, wrong[2].1.1,
+        "absorbing after the challenge draws a different z from omitting the \
+         root entirely — then a late absorb would be detectable in z, and the \
+         reason this ordering is dangerous is not the one stated here"
+    );
+
+    // The count gate's blindness, demonstrated rather than asserted.
+    hash_metrics::reset();
+    let _ = script(&all, None);
+    let last = hash_metrics::snapshot();
+    hash_metrics::reset();
+    let _ = script(&[&derived, &carried[0], &carried[1], &carried[2]], None);
+    let first = hash_metrics::snapshot();
+    assert_eq!(
+        (last.transcript_absorbs, last.transcript_squeezes),
+        (first.transcript_absorbs, first.transcript_squeezes),
+        "the two orders differ in counters after all — then a count gate DOES see \
+         position and this test's premise is wrong"
+    );
+}

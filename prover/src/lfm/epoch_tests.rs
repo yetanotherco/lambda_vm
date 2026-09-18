@@ -869,14 +869,15 @@ impl EpochFront {
             is_final,
             None,
             None,
-            Some((
-                register::compute_precomputed_commitment_with_fini(
+            Some(crate::RegisterPreprocessed {
+                commitment: register::compute_precomputed_commitment_with_fini(
                     &opts,
                     &register_init,
                     &reg_fini,
                 ),
-                register::NUM_PREPROCESSED_COLS_WITH_FINI,
-            )),
+                init: &register_init,
+                fini: &reg_fini,
+            }),
         );
         let decode_root = crate::tables::decode::commitment_from_elf(&elf, &opts)
             .expect("the DECODE commitment must compute");

@@ -125,6 +125,264 @@ pub fn l2g_commitment(
     Ok(roots)
 }
 
+/// DECODE's preprocessed columns, committed ONCE per ELF, outside every epoch's
+/// proof.
+///
+/// # Why this exists
+///
+/// The five columns (`PC_0`, `PC_1`, `PACKED_DECODE`, `IMM_0`, `IMM_1`) are
+/// ELF-derived: the same bytes in every epoch of every run of that program.
+/// Today each epoch commits them with the rest of DECODE and the verifier then
+/// evaluates each column's MLE at that epoch's reduced point — five 2^20 folds,
+/// fifteen times, for a value that depended on nothing the epoch chose. Here
+/// they are committed once and OPENED per epoch at DECODE's reduced point, and
+/// the opening replaces the folds.
+///
+/// # ★ One derivation, both sides
+///
+/// The prover and the host verifier call this same function on the same ELF.
+/// The verifier therefore absorbs a root it RECOMPUTED, never one the proof
+/// handed it — a value that has not been checked must not reach the transcript,
+/// or a forged root steers the challenges before the comparison that would have
+/// rejected it. Nothing about the commitment is read from the proof: not the
+/// root, not the layout, not the domain.
+///
+/// The digest travels with the roots for the same reason they are computed
+/// together: the field machine cannot recompute either in-guest and pins the
+/// PAIR as program text, so a pair that could be assembled from two different
+/// ELFs is the defect to prevent.
+///
+/// # Cost, stated
+///
+/// The host verifier pays one commit over a 2^23 polynomial for the whole
+/// proof, in place of `epochs x 5 x 2^20` MLE evaluations. The in-guest verifier
+/// pays neither — it pins `(digest, roots)` as emit-time constants.
+pub struct DecodePrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// The program these columns came from, as the transcript's own digest.
+    pub elf_digest: [u8; 32],
+    /// The five columns, in DECODE's column order.
+    pub columns: Vec<Mle<F>>,
+    /// Derived, never read from a proof.
+    pub roots: Vec<Commitment>,
+    pub commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+    /// The parameters it was committed under — see [`Self::agrees_with`].
+    log_blowup: usize,
+    log_folding: usize,
+}
+
+impl<H> DecodePrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// What the prover opens at `table`'s reduced point.
+    ///
+    /// `borrowed` is the caller's because [`multilinear_table::Prepared`] holds
+    /// a slice of references and a self-referential struct cannot hand one out.
+    pub(crate) fn opening<'a>(
+        &'a self,
+        borrowed: &'a [&'a Mle<F>],
+        table: usize,
+    ) -> multilinear_table::Prepared<'a, F, H> {
+        multilinear_table::Prepared {
+            commitment: &self.commitment,
+            columns: borrowed,
+            table,
+        }
+    }
+
+    /// ★ ONE COMMITMENT SERVES EVERY EPOCH, and this is why it may.
+    ///
+    /// `StackedCommitment::commit` reads `log_blowup` — the codeword's rate and
+    /// the room it reserves — and `log_folding`, and never `num_queries`. Each
+    /// epoch derives its own `ChainConfig` from its own table shapes, and the
+    /// query count legitimately differs between them; blowup and fold width do
+    /// not. So a commitment built once is valid under every epoch's config
+    /// exactly as long as that holds, and it is ASSERTED per epoch rather than
+    /// assumed, because the day a blowup becomes shape-dependent this is the
+    /// line that says so instead of a proof nobody can verify.
+    pub(crate) fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
+        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
+            return Err(Error::Prover(format!(
+                "the pinned DECODE commitment was built at blowup {} / folding {}, \
+                 and this epoch argues at blowup {} / folding {}",
+                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
+            )));
+        }
+        Ok(())
+    }
+
+    /// What the verifier settles the opening against.
+    pub(crate) fn check(&self, table: usize) -> multilinear_table::PreparedCheck<'_, F> {
+        multilinear_table::PreparedCheck {
+            roots: &self.roots,
+            layout: self.commitment.layout(),
+            domain: self.commitment.domain(),
+            table,
+            columns: self.columns.len(),
+        }
+    }
+}
+
+thread_local! {
+    /// How many times DECODE's out-of-band commitment has been DERIVED on THIS
+    /// thread, so §4's residency claim — one commitment held across the epochs,
+    /// not one per epoch — is a number a test can read off the production call.
+    ///
+    /// ⚠ THREAD-LOCAL ON PURPOSE. A process-wide counter is an assertion about
+    /// every test in the binary: `cargo test` runs them in parallel and several
+    /// files prove continuations, so a global would read whatever the
+    /// neighbours were doing. The derivation happens on the thread that calls
+    /// `prove_epochs` / `verify_epochs_bookends`, above the epoch loop, so the
+    /// caller's own thread is where the count belongs.
+    ///
+    /// ⚠ And a thread-local has its own failure mode: if the derivation ever
+    /// moved onto a worker thread this would read ZERO, which a `<= 1` bound
+    /// would happily accept. Every assertion on it is therefore an EQUALITY —
+    /// exactly one per run — so both "rebuilt per epoch" and "counted nowhere"
+    /// are failures.
+    static DECODE_DERIVATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Derivations on this thread since the last [`reset_decode_derivations`].
+///
+/// `cfg(test)` because the counter is an instrument and nothing in production
+/// reads it; the BUMP stays unconditional, so what the test counts is the
+/// production path and not a test-only copy of it.
+#[cfg(test)]
+pub(crate) fn decode_derivations() -> u64 {
+    DECODE_DERIVATIONS.with(core::cell::Cell::get)
+}
+
+/// Zeroes this thread's derivation count.
+#[cfg(test)]
+pub(crate) fn reset_decode_derivations() {
+    DECODE_DERIVATIONS.with(|c| c.set(0));
+}
+
+/// [`decode_prepared_for`]'s core: the commitment over columns already in hand.
+///
+/// The split is what lets the commitment's own properties — that it is a
+/// function of the instruction table and of nothing else, and that its shape is
+/// the one the ELF implies — be tested without an ELF artifact on disk. A test
+/// that silently skips when a build product is missing is a test that passed
+/// for the wrong reason.
+pub(crate) fn decode_prepared_from_columns<H>(
+    elf_digest: [u8; 32],
+    columns: Vec<Vec<FieldElement<F>>>,
+    config: &ChainConfig,
+) -> Result<DecodePrepared<H>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    // ★ THE FUNNEL. Both `decode_prepared` and `decode_prepared_for` come
+    // through here, so this is the one place a derivation can be counted and
+    // the one place it can be missed.
+    DECODE_DERIVATIONS.with(|c| c.set(c.get() + 1));
+    let columns: Vec<Mle<F>> = columns
+        .into_iter()
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("DECODE: {e:?}"))))
+        .collect::<Result<_, _>>()?;
+    let rows = columns
+        .first()
+        .ok_or_else(|| Error::Prover("DECODE has no preprocessed columns".to_string()))?
+        .len();
+    if !rows.is_power_of_two() {
+        return Err(Error::Prover(format!(
+            "DECODE's preprocessed columns are {rows} rows, which the hypercube cannot hold",
+        )));
+    }
+    let shape = [(columns.len(), rows.trailing_zeros() as usize)];
+    let layout =
+        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+        layout,
+        &multilinear::stacking::borrow(&columns),
+        None,
+        config,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let roots = commitment.roots();
+    if roots.is_empty() {
+        return Err(Error::Prover(
+            "the DECODE preprocessed group commits to nothing".to_string(),
+        ));
+    }
+    Ok(DecodePrepared {
+        elf_digest,
+        columns,
+        roots,
+        commitment,
+        log_blowup: config.log_blowup,
+        log_folding: config.log_folding,
+    })
+}
+
+/// The `ChainConfig` DECODE's out-of-band commitment is built under.
+///
+/// Derived from the group's OWN shape, because it has to exist before any epoch
+/// does. Only `log_blowup` and `log_folding` matter to a commitment — see
+/// [`DecodePrepared::agrees_with`] — and those are constants of
+/// [`chain_config`], so this agrees with every epoch's by construction and is
+/// asserted to anyway.
+pub(crate) fn decode_prepared_config(columns: usize, num_vars: usize) -> ChainConfig {
+    chain_config(&[(columns, num_vars)])
+}
+
+/// Derives [`DecodePrepared`] from an ELF, at the config its own shape implies.
+///
+/// The one call BOTH SIDES make, so the prover and the verifier cannot build the
+/// commitment from two different ELFs or under two different parameter sets.
+pub(crate) fn decode_prepared_for<H>(
+    elf: &Elf,
+    elf_bytes: &[u8],
+) -> Result<DecodePrepared<H>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    let columns = crate::tables::decode::preprocessed_columns_from_elf(elf)
+        .map_err(|e| Error::Prover(format!("DECODE: {e:?}")))?;
+    let rows = columns
+        .first()
+        .ok_or_else(|| Error::Prover("DECODE has no preprocessed columns".to_string()))?
+        .len();
+    if !rows.is_power_of_two() {
+        return Err(Error::Prover(format!(
+            "DECODE's preprocessed columns are {rows} rows, which the hypercube cannot hold",
+        )));
+    }
+    let config = decode_prepared_config(columns.len(), rows.trailing_zeros() as usize);
+    decode_prepared_from_columns(statement::elf_digest(elf_bytes), columns, &config)
+}
+
+/// Where DECODE sits among an epoch's tables, found by NAME.
+///
+/// ⚠ Not a constant and not a position. The opening binds the pinned columns to
+/// ONE table's reduced point, and a prover able to aim them at a different
+/// table's point would be settling them against challenges they were never
+/// bound to. So the index is asserted against the AIR that carries the columns,
+/// and "exactly one" is part of the assertion: a table set with two DECODEs, or
+/// none, is a layout nobody meant to build.
+pub(crate) fn decode_table_index(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+) -> Result<usize, Error> {
+    let found: Vec<usize> = airs
+        .iter()
+        .enumerate()
+        .filter(|(_, air)| air.name() == "DECODE")
+        .map(|(i, _)| i)
+        .collect();
+    match found.as_slice() {
+        [only] => Ok(*only),
+        _ => Err(Error::Prover(format!(
+            "an epoch's table set must carry exactly one DECODE, it carries {} (at {found:?})",
+            found.len(),
+        ))),
+    }
+}
+
 /// Binds an epoch's statement into the transcript before any challenge.
 ///
 /// The monolithic multilinear statement plus the epoch's position. A
@@ -220,17 +478,37 @@ fn layout_of<'a>(
 
 /// What the epoch's tables owe the statement: the COMMIT bus's counterparty,
 /// counted from the commit index this epoch carried in.
-fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
+///
+/// # ⛔ This is a REPLAY of the roots block, not a second spelling of it
+///
+/// The counterparty is a function of `z` and `alpha`, which `multi_verify` has
+/// not drawn yet when this is called, so the transcript is forked and the block
+/// is replayed on the fork. `carried` and `derived` are therefore the SAME two
+/// lists that verification will be handed — the derived one included. A replay
+/// that absorbed only the carried roots would compute the counterparty at
+/// challenges no table was ever checked against, and every epoch with a
+/// non-empty `public_output` would fail on `BusImbalance` while every epoch
+/// without one passed: [`crate::compute_commit_bus_offset`] returns zero for an
+/// empty output without reading either challenge, so those epochs accept any
+/// replay at all. That is the failure this signature exists to prevent, and
+/// [`multilinear_table::absorb_roots_and_challenge`] is called rather than
+/// re-spelled so the two can no longer disagree.
+///
+/// Only the absorb half is shared. Two challenges are drawn, not three: the fork
+/// is discarded, `beta` would never be read, and an unread draw is a real sponge
+/// squeeze that `hash_metrics` counts on this clone like any other transcript.
+/// The order the two are drawn in is checked against the block itself by
+/// [`crate::tests::multilinear_continuation_tests`] rather than asserted here.
+pub(crate) fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     public_output: &[u8],
     register_init: &[u32],
-    roots: &[Commitment],
+    carried: &[Commitment],
+    derived: &[Commitment],
     transcript: &DefaultTranscript<E, T>,
 ) -> Option<FieldElement<E>> {
     let start_index = *register_init.get(register::X254_INDEX)? as u64;
     let mut probe = transcript.clone();
-    for root in roots {
-        probe.append_bytes(root);
-    }
+    multilinear_table::absorb_roots::<E, _>(&mut probe, carried, derived);
     let z: FieldElement<E> = probe.sample_field_element();
     let alpha: FieldElement<E> = probe.sample_field_element();
     crate::compute_commit_bus_offset(public_output, start_index, &z, &alpha)
@@ -451,7 +729,7 @@ pub fn prove_global(
         );
         let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
+        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
     });
 
@@ -586,6 +864,7 @@ fn verify_global_bookends(
             &FieldElement::<E>::zero(),
             &config,
             &mut transcript,
+            None,
         )
     });
     if verdict.is_err() {
@@ -598,8 +877,14 @@ fn verify_global_bookends(
 
 /// Proves one epoch: its tables plus the local-to-global bookend, against one
 /// commitment.
+///
+/// ★ GENERIC OVER THE HASH, and the dispatch belongs to its CALLER. That is what
+/// lets `prepared` — DECODE's out-of-band commitment, whose type names the hash
+/// — be built once and HELD across every epoch of a run, instead of rebuilt
+/// fifteen times for a value that depends on nothing an epoch chose. A dispatch
+/// inside this function would make that commitment unable to outlive one call.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_epoch(
+pub fn prove_epoch<H>(
     elf: &Elf,
     elf_bytes: &[u8],
     register_init: &[u32],
@@ -609,7 +894,11 @@ pub fn prove_epoch(
     boundary: &[CellBoundary],
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
-) -> Result<EpochProof, Error> {
+    prepared: &DecodePrepared<H>,
+) -> Result<EpochProof, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     // The bookend's range checks are lookups into BITWISE, so its
     // multiplicities have to carry them.
     crate::tables::bitwise::update_multiplicities(
@@ -641,6 +930,10 @@ pub fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
+
+    // Taken here, while the AIRs are still in hand, and by NAME — the opening
+    // binds the pinned columns to ONE table's reduced point.
+    let decode_at = decode_table_index(&pairs.iter().map(|(air, _, _)| *air).collect::<Vec<_>>())?;
 
     let shapes: Vec<(usize, usize)> = pairs
         .iter()
@@ -675,26 +968,32 @@ pub fn prove_epoch(
         );
     }
     let sizes = epoch_groups(committed.len());
-    let proof = crate::with_whir_hash!(|H| {
-        // ★ Inside the dispatch, because the transcript's hash is part of
-        // the configuration and `H` does not exist outside this block. The
-        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_epoch(
-            &mut transcript,
-            &statement::elf_digest(elf_bytes),
-            &public_output,
-            &table_counts,
-            label,
-            &table_num_vars,
-            &config,
-        );
-        let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?
-    });
+    prepared.agrees_with(&config)?;
+
+    // ★ The transcript's hash is part of the configuration, and `H` is the
+    // caller's dispatch. The bound on `multi_prove`/`multi_verify` rejects any
+    // other spelling.
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_epoch(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        &public_output,
+        &table_counts,
+        label,
+        &table_num_vars,
+        &config,
+    );
+    let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let borrowed = multilinear::stacking::borrow(&prepared.columns);
+    let proof = multilinear_table::multi_prove(
+        &committed,
+        &config,
+        &mut transcript,
+        Some(prepared.opening(&borrowed, decode_at)),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     Ok(EpochProof {
         proof,
@@ -752,26 +1051,33 @@ pub fn prove_continuation(
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
 
     let mut epochs = Vec::new();
-    let boundaries = crate::continuation::for_each_epoch_overlapped(
-        &elf,
-        private_inputs,
-        epoch_size_log2,
-        &artifacts,
-        |prepared| {
-            epochs.push(prove_epoch(
-                &elf,
-                elf_bytes,
-                &prepared.register_init,
-                prepared.label,
-                prepared.traces,
-                prepared.is_final,
-                &prepared.boundary,
-                opts,
-                Some(decode_commitment),
-            )?);
-            Ok(())
-        },
-    )?;
+    // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
+    // commitment — whose type names the hash — is built ONCE and held across
+    // every epoch. Inside `prove_epoch` it could not outlive one call.
+    let boundaries = crate::with_whir_hash!(|H| {
+        let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
+        crate::continuation::for_each_epoch_overlapped(
+            &elf,
+            private_inputs,
+            epoch_size_log2,
+            &artifacts,
+            |p| {
+                epochs.push(prove_epoch::<H>(
+                    &elf,
+                    elf_bytes,
+                    &p.register_init,
+                    p.label,
+                    p.traces,
+                    p.is_final,
+                    &p.boundary,
+                    opts,
+                    Some(decode_commitment),
+                    &prepared,
+                )?);
+                Ok(())
+            },
+        )?
+    });
 
     // The genesis image, which is the one the run started from — rebuilt here
     // rather than carried, because `for_each_epoch` advances its copy.
@@ -856,26 +1162,31 @@ pub fn prove_epochs(
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
 
     let mut proofs = Vec::new();
-    crate::continuation::for_each_epoch_overlapped(
-        &elf,
-        private_inputs,
-        epoch_size_log2,
-        &artifacts,
-        |prepared| {
-            proofs.push(prove_epoch(
-                &elf,
-                elf_bytes,
-                &prepared.register_init,
-                prepared.label,
-                prepared.traces,
-                prepared.is_final,
-                &prepared.boundary,
-                opts,
-                Some(decode_commitment),
-            )?);
-            Ok(())
-        },
-    )?;
+    // The dispatch above the loop, for the reason in `prove_continuation`.
+    crate::with_whir_hash!(|H| {
+        let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
+        crate::continuation::for_each_epoch_overlapped(
+            &elf,
+            private_inputs,
+            epoch_size_log2,
+            &artifacts,
+            |p| {
+                proofs.push(prove_epoch::<H>(
+                    &elf,
+                    elf_bytes,
+                    &p.register_init,
+                    p.label,
+                    p.traces,
+                    p.is_final,
+                    &p.boundary,
+                    opts,
+                    Some(decode_commitment),
+                    &prepared,
+                )?);
+                Ok(())
+            },
+        )?
+    });
     Ok(proofs)
 }
 
@@ -906,20 +1217,27 @@ fn verify_epochs_bookends(
         return Ok(None);
     }
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let mut carried = register::register_init_from_entry_point(elf.entry_point);
-    let mut bookends = Vec::with_capacity(epochs.len());
-    for (index, epoch) in epochs.iter().enumerate() {
-        let label = local_to_global::epoch_label(index as u64);
-        let is_final = index + 1 == epochs.len();
-        let Some(roots) =
-            verify_epoch_bookend(&elf, elf_bytes, epoch, &carried, is_final, label, opts)?
-        else {
-            return Ok(None);
-        };
-        bookends.push(roots);
-        carried.clone_from(&epoch.reg_fini);
-    }
-    Ok(Some(bookends))
+    // The dispatch above the loop, so the verifier derives DECODE's commitment
+    // ONCE for the whole run rather than once per epoch — the same reason the
+    // prover holds it, and the same saving.
+    crate::with_whir_hash!(|H| {
+        let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
+        let mut carried = register::register_init_from_entry_point(elf.entry_point);
+        let mut bookends = Vec::with_capacity(epochs.len());
+        for (index, epoch) in epochs.iter().enumerate() {
+            let label = local_to_global::epoch_label(index as u64);
+            let is_final = index + 1 == epochs.len();
+            let Some(roots) = verify_epoch_bookend::<H>(
+                &elf, elf_bytes, epoch, &carried, is_final, label, opts, &prepared,
+            )?
+            else {
+                return Ok(None);
+            };
+            bookends.push(roots);
+            carried.clone_from(&epoch.reg_fini);
+        }
+        Ok(Some(bookends))
+    })
 }
 
 /// Verifies one epoch from the bundle and the ELF alone.
@@ -937,17 +1255,35 @@ pub fn verify_epoch(
     label: u64,
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
-    Ok(
-        verify_epoch_bookend(elf, elf_bytes, epoch, register_init, is_final, label, opts)?
-            .is_some(),
-    )
+    crate::with_whir_hash!(|H| {
+        let prepared = decode_prepared_for::<H>(elf, elf_bytes)?;
+        Ok(verify_epoch_bookend::<H>(
+            elf,
+            elf_bytes,
+            epoch,
+            register_init,
+            is_final,
+            label,
+            opts,
+            &prepared,
+        )?
+        .is_some())
+    })
 }
 
 /// [`verify_epoch`], handing back the roots the epoch's bookend was committed
 /// under — which is what the binding compares. `None` is a proof that does not
 /// verify.
+///
+/// ★ `pub(crate)` because this is the ONLY verify entry point that takes its
+/// hash as a parameter. [`verify_epoch`] chooses `H` from the cached process
+/// knob, so from outside this module one process can verify under exactly one
+/// hash — and the level-0 driver's refusal is precisely the claim that a bundle
+/// proven under keccak fails under RPX, which cannot be tested through a
+/// function that will not be told which to use. See
+/// `multilinear_continuation_tests::an_epoch_proven_under_one_hash_is_refused_under_the_other`.
 #[allow(clippy::too_many_arguments)]
-fn verify_epoch_bookend(
+pub(crate) fn verify_epoch_bookend<H>(
     elf: &Elf,
     elf_bytes: &[u8],
     epoch: &EpochProof,
@@ -955,7 +1291,11 @@ fn verify_epoch_bookend(
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
-) -> Result<Option<Vec<Commitment>>, Error> {
+    prepared: &DecodePrepared<H>,
+) -> Result<Option<Vec<Commitment>>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     let airs = crate::continuation::build_epoch_airs(
         elf,
         opts,
@@ -969,6 +1309,8 @@ fn verify_epoch_bookend(
     let l2g_air = crate::continuation::l2g_memory_air(opts, label);
     let mut air_refs = airs.air_refs();
     air_refs.push(&l2g_air);
+    // By NAME, and exactly one — the same rule the prover applied.
+    let decode_at = decode_table_index(&air_refs)?;
 
     if air_refs.len() != epoch.proof.tables.len() || epoch.table_num_vars.len() != air_refs.len() {
         return Err(Error::InvalidTableCounts(format!(
@@ -1015,44 +1357,54 @@ fn verify_epoch_bookend(
     // group's — as many as the stack split it into.
     let num_polys = layouts.last().map(|l| l.num_polys()).unwrap_or(0);
 
-    let verdict = crate::with_whir_hash!(|H| {
-        // ★ Inside the dispatch, because the transcript's hash is part of
-        // the configuration and `H` does not exist outside this block. The
-        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_epoch(
-            &mut transcript,
-            &statement::elf_digest(elf_bytes),
-            &epoch.public_output,
-            &epoch.table_counts,
-            label,
-            &epoch.table_num_vars,
-            &config,
-        );
-        // ★ Inside the dispatch with the transcript it forks: `owed` replays
-        // this transcript to draw `z` and `alpha`, which are a function of the
-        // configuration's sponge. Computing them against a transcript of a
-        // different hash is the same defect one level down, and just as quiet.
-        let Some(owed) = owed(
-            &epoch.public_output,
-            register_init,
-            &epoch.proof.roots,
-            &transcript,
-        ) else {
-            return Ok(None);
-        };
-        multilinear_table::multi_verify::<_, _, _, H>(
-            &epoch.proof,
-            &statements,
-            &layouts,
-            &domains,
-            &sizes,
-            &owed,
-            &config,
-            &mut transcript,
-        )
-    });
+    prepared.agrees_with(&config)?;
+    // ★ The transcript's hash is part of the configuration, and `H` is the
+    // caller's dispatch. The bound on `multi_prove`/`multi_verify` rejects any
+    // other spelling.
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_epoch(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        &epoch.public_output,
+        &epoch.table_counts,
+        label,
+        &epoch.table_num_vars,
+        &config,
+    );
+    // ★ ONE VALUE, TWO USES. The replay below and the verification below it are
+    // handed the same `PreparedCheck`, so they cannot be given two different
+    // derived-root lists: the challenges `owed` computes the COMMIT bus's
+    // counterparty at are the challenges every table is then checked at. Built
+    // once here rather than twice at the two call sites, because "twice" is
+    // precisely how the replay came to absorb a shorter roots block than the
+    // verification did.
+    let check = prepared.check(decode_at);
+    let derived = check.roots;
+    // ★ `owed` replays this transcript to draw `z` and `alpha`, which are a
+    // function of the configuration's sponge. Computing them against a
+    // transcript of a different hash is the same defect one level down, and
+    // just as quiet.
+    let Some(owed) = owed(
+        &epoch.public_output,
+        register_init,
+        &epoch.proof.roots,
+        derived,
+        &transcript,
+    ) else {
+        return Ok(None);
+    };
+    let verdict = multilinear_table::multi_verify::<_, _, _, H>(
+        &epoch.proof,
+        &statements,
+        &layouts,
+        &domains,
+        &sizes,
+        &owed,
+        &config,
+        &mut transcript,
+        Some(check),
+    );
     if verdict.is_err() {
         return Ok(None);
     }

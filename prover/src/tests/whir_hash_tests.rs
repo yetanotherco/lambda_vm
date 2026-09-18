@@ -88,7 +88,7 @@ fn prove<H: WhirHash>(columns: &Columns) -> Proof {
         .expect("committed table");
     let committed = CommittedTables::<_, _, H>::commit(vec![table], &config()).expect("commit");
     let mut transcript = DefaultTranscript::<Ext, H::Transcript>::new(b"whir-hash-seam");
-    multilinear_table::multi_prove(&committed, &config(), &mut transcript).expect("prove")
+    multilinear_table::multi_prove(&committed, &config(), &mut transcript, None).expect("prove")
 }
 
 /// Verify `proof` under `H`. Returns the verifier's verdict rather than
@@ -112,6 +112,7 @@ fn verify<H: WhirHash>(proof: &Proof, columns: &Columns) -> Result<(), multiline
         &owed,
         &config(),
         &mut transcript,
+        None,
     )
 }
 
