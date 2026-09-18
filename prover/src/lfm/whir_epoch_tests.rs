@@ -884,4 +884,199 @@ mod tests {
         };
         println!("PREPARED-REFUSAL  {refused}");
     }
+    /// The ELF the bench knobs name, resolved WITHOUT panicking when it is
+    /// absent.
+    ///
+    /// `multilinear_bench_tests::elf_bytes` panics on a missing program, which
+    /// is right for a bench that must not silently measure the wrong thing and
+    /// wrong for a test whose contract is to SKIP. Same two directories, same
+    /// order, so the two cannot disagree about where a program lives.
+    fn bench_elf_if_present(name: &str) -> Option<Vec<u8>> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("executor/program_artifacts");
+        for dir in ["rust", "asm"] {
+            if let Ok(bytes) = std::fs::read(root.join(dir).join(format!("{name}.elf"))) {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// ★★ THE DRIVER AGAINST A REAL BLOCK BUNDLE: every epoch harvested, from
+    /// ONE derivation of DECODE's prepared commitment.
+    ///
+    /// Everything the driver's other tests check runs on a three-epoch toy at
+    /// 2^2. This runs the same walk a level-0 tree will run — fifteen epochs at
+    /// 2^21 on the box — and is the only place the driver meets a card.
+    ///
+    /// # What it asserts, and what each assert would catch
+    ///
+    /// - EVERY epoch harvests. A driver that worked on epoch 0 and not on epoch
+    ///   14 would be found here and nowhere else.
+    /// - THE DERIVATION COUNT IS 1 AFTER THE WALK. The counter is the
+    ///   production one `decode_residency_tests` uses, not a copy. The reset
+    ///   sits AFTER the prove on purpose: `prove_continuation` derives its own,
+    ///   and counting it would make this line describe the prove instead of the
+    ///   walk.
+    /// - THE CHAIN. Labels are `epoch_label(0..n)` in order, `is_final` is true
+    ///   on the last epoch and only there, and epoch i+1's `register_init` IS
+    ///   epoch i's proved `reg_fini`. That is the property
+    ///   `the_starting_registers_come_from_the_previous_epoch` checks on three
+    ///   epochs, over fifteen real ones.
+    /// - THE POSTURE NOTE fires iff the knob is not RPX, so a keccak arm and an
+    ///   RPX arm read differently and both are checked rather than one being
+    ///   assumed.
+    ///
+    /// ⚠ NOT AN ASSERT, DELIBERATELY: comparing the harvested epochs' table
+    /// counts to the bundle's. `WhirRealEpoch::num_tables()` returns
+    /// `self.proof.table_num_vars.len()` and `proof` is a clone of the bundle's
+    /// epoch, so that comparison is a value against itself and cannot fail on
+    /// any input. What is checked instead is each epoch's AIR-derived
+    /// `shapes.len()` against its stated height count — still only a
+    /// restatement of the driver's own per-epoch guard, but one that runs
+    /// fifteen times on real shapes rather than never.
+    ///
+    /// ⚠ AND THERE IS NO SHA GUARD THAT REFUSES. The transcript pin refuses a
+    /// non-pinned ELF because it asserts exact COUNTS, which are a function of
+    /// one program. Every assert here is structural and holds for any program,
+    /// so refusing would reject valid runs and would also put this test out of
+    /// reach of anyone without the block fixture. It prints the ELF's FULL
+    /// 64-hex sha256 instead — full, never a prefix, for the reason
+    /// `pin_skip_line` records: a diagnostic that can agree while the values
+    /// differ is not a diagnostic.
+    #[test]
+    #[ignore = "the box runs it: a real block bundle under the process hash"]
+    fn the_block_bundle_harvests_every_epoch_under_the_process_hash() {
+        let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+        let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+        let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
+        let Some(elf_bytes) = bench_elf_if_present(&name) else {
+            println!(
+                "L0-HARVEST SKIPPED - no ELF named {name} in executor/program_artifacts/\
+                 {{rust,asm}}; set LAMBDA_VM_BENCH_ELF to a program that exists"
+            );
+            return;
+        };
+        let input = crate::tests::multilinear_bench_tests::input_bytes(&input_name);
+        let opts = ProofOptions::default_test_options();
+
+        println!(
+            "L0-HARVEST fixture {name} sha {} ({} bytes)  input {} ({} bytes)  epoch 2^{}",
+            sha256_hex(&elf_bytes),
+            elf_bytes.len(),
+            if input_name.is_empty() {
+                "<none>"
+            } else {
+                &input_name
+            },
+            input.len(),
+            epoch_size_log2,
+        );
+
+        crate::with_whir_hash!(|H| {
+            let b = multilinear_continuation::prove_continuation(
+                &elf_bytes,
+                &input,
+                epoch_size_log2,
+                &opts,
+            )
+            .expect("prove the continuation under the process hash");
+
+            let elf = Elf::load(&elf_bytes).expect("load");
+
+            // ⚠ AFTER the prove. `prove_continuation` derives its own; counting
+            // it would make the line below describe the prove, not the walk.
+            multilinear_continuation::reset_decode_derivations();
+            let prepared = multilinear_continuation::decode_prepared_for::<H>(&elf, &elf_bytes)
+                .expect("DECODE's prepared commitment for the process hash");
+
+            let started = std::time::Instant::now();
+            let mut harvested = Vec::with_capacity(b.epochs.len());
+            for index in 0..b.epochs.len() {
+                let at = std::time::Instant::now();
+                let e = real_epoch_from_whir_continuation_under::<H>(
+                    &opts,
+                    &elf_bytes,
+                    &b,
+                    index,
+                    None,
+                    Some(&prepared),
+                )
+                .unwrap_or_else(|e| panic!("epoch {index} of the block bundle: {e}"));
+                let max_vars = e.shapes.iter().map(|&(_, v)| v).max().unwrap_or(0);
+                println!(
+                    "L0-HARVEST epoch {index}  tables {}  max_vars {max_vars}  harvest {:.3} s",
+                    e.num_tables(),
+                    at.elapsed().as_secs_f64(),
+                );
+                assert_eq!(
+                    e.shapes.len(),
+                    b.epochs[index].table_num_vars.len(),
+                    "epoch {index}'s layout width and its stated height count disagree"
+                );
+                harvested.push(e);
+            }
+
+            let derivations = multilinear_continuation::decode_derivations();
+            println!(
+                "L0-HARVEST epochs {}  derivations {derivations}  total {:.3} s",
+                harvested.len(),
+                started.elapsed().as_secs_f64(),
+            );
+
+            assert!(
+                !harvested.is_empty(),
+                "the bundle carried no epochs, so nothing above was exercised"
+            );
+            assert_eq!(
+                derivations,
+                1,
+                "DECODE's prepared commitment was derived {derivations} times over {} \
+                 harvests; `prepared` is handed in once and must be reused",
+                harvested.len()
+            );
+
+            // THE CHAIN, across every epoch of a real run.
+            for (index, e) in harvested.iter().enumerate() {
+                assert_eq!(
+                    e.position.label,
+                    epoch_label(index as u64),
+                    "epoch {index} was labelled as some other epoch"
+                );
+                assert_eq!(
+                    e.position.is_final,
+                    index + 1 == harvested.len(),
+                    "epoch {index}'s is_final is not its position"
+                );
+                if index > 0 {
+                    assert_eq!(
+                        e.position.register_init,
+                        b.epochs[index - 1].reg_fini,
+                        "epoch {index} did not start from epoch {}'s proved reg_fini",
+                        index - 1
+                    );
+                }
+            }
+
+            assert_eq!(
+                whir_process_posture_note().is_some(),
+                crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx,
+                "the posture note disagreed with the process setting this bundle was \
+                 proven and harvested under"
+            );
+        })
+    }
 }
