@@ -57,7 +57,7 @@ use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::ChainConfig;
 
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::algebraic_commit::leaf_capacity;
 use super::builder::{Cell, Ext, LfmBuilder};
@@ -249,12 +249,32 @@ pub fn prepared_cost(
 pub fn closure_rows(num_tables: usize, published: usize) -> usize {
     let contributions = num_tables; // one Div each
     let balance = num_tables.saturating_sub(1); // the running Add
-    let expected = if published == 0 {
-        0
-    } else {
-        1 + published * 4 - 1
-    };
-    contributions + balance + expected + ASSERT_ROWS
+    contributions + balance + expected_rows(published) + ASSERT_ROWS
+}
+
+/// INSTRUCTIONS the epoch's EXPECTED value costs — `compute_commit_bus_offset`
+/// (`lib.rs:1156`), emitted.
+///
+/// ⛔ ZERO when the epoch publishes nothing, and that is instance 51's seam
+/// rather than an optimisation: the host returns the literal zero for an empty
+/// public output WITHOUT reading `z` or `alpha`, so an epoch that publishes
+/// nothing discharges this term without ever touching the challenges. A defect
+/// in it is invisible on every silent epoch, which is why the fixture must
+/// include one that publishes.
+///
+/// Otherwise, by the shape it comes from:
+/// - `alpha^2`, once;
+/// - `z - bus_id`, once, because the bus id is the same constant for every byte;
+/// - per published byte, two `MulAdd`s for `- index*alpha` and `- value*alpha^2`
+///   (both coefficients are program text: the bytes are the statement's and
+///   `start_index` is the carried `x254` of the register file this program is
+///   compiled for), one `Div` for the inverse, and one `Add` into the running
+///   sum which the first byte does not need.
+pub const fn expected_rows(published: usize) -> usize {
+    if published == 0 {
+        return 0;
+    }
+    2 + published * 4 - 1
 }
 
 /// Rows an `assert_eq_ext` lowers to: the difference and the division by zero
@@ -406,3 +426,87 @@ const DRAWS: usize = 3;
 /// Felts a 32-byte commitment occupies in the sponge's stream — the transcript's
 /// own constant, not a second spelling of four.
 use super::whir_transcript::DIGEST_FELTS as FELTS_PER_DIGEST;
+
+/// What the epoch's closure leaves for a caller to look at.
+///
+/// Both halves come back because a gate that could only see the refusal would
+/// be checking "it did not execute", and a leg that refuses everything passes
+/// that. The values let the expected half be compared against the host's own
+/// `compute_commit_bus_offset` by value.
+pub struct ClosureWires {
+    /// `Σ contribution(table)`, the bus balance.
+    pub balance: Ext,
+    /// `owed`, the COMMIT bus's counterparty.
+    pub expected: Ext,
+}
+
+/// ★ The epoch's closure, emitted: `balance != expected` is `BusImbalance`.
+///
+/// `contribution` (`multilinear_table.rs:753`) is `p/q` per table and is `None`
+/// when the denominator vanished; here it is a `Div`, and a division by zero has
+/// no satisfying assignment, so the host's `None` and the machine's refusal are
+/// the same event rather than two behaviours that have to agree.
+///
+/// `published` and `start_index` are PROGRAM TEXT. The statement already interns
+/// the public output (item 4: the whole statement is a run of program-constant
+/// bytes), and `start_index` is `register_init[X254_INDEX]` of the register file
+/// this program is compiled for. So every per-byte coefficient is emit-time and
+/// only `z` and `alpha` are wires.
+pub fn emit_epoch_closure(
+    b: &mut LfmBuilder,
+    outputs: &[(Ext, Ext)],
+    published: &[u8],
+    start_index: u64,
+    z: Ext,
+    alpha: Ext,
+) -> ClosureWires {
+    assert!(
+        !outputs.is_empty(),
+        "an epoch's balance is over at least one table"
+    );
+    let mut balance: Option<Ext> = None;
+    for (p, q) in outputs {
+        let share = b.ediv(*p, *q);
+        balance = Some(match balance {
+            None => share,
+            Some(running) => b.eadd(running, share),
+        });
+    }
+    let balance = balance.expect("at least one table");
+    let expected = emit_expected(b, published, start_index, z, alpha);
+    b.assert_eq_ext(balance, expected);
+    ClosureWires { balance, expected }
+}
+
+/// `compute_commit_bus_offset`, emitted — see [`expected_rows`] for the terms.
+fn emit_expected(
+    b: &mut LfmBuilder,
+    published: &[u8],
+    start_index: u64,
+    z: Ext,
+    alpha: Ext,
+) -> Ext {
+    if published.is_empty() {
+        // ⛔ The host's own early return, and it reads NEITHER challenge.
+        return b.ext_const(&FEE::zero());
+    }
+    let alpha_sq = b.emul(alpha, alpha);
+    let bus_id = b.ext_const(&FEE::from(crate::tables::types::BusId::Commit as u64));
+    let base = b.esub(z, bus_id);
+    let one = b.ext_const(&FEE::one());
+    let mut sum: Option<Ext> = None;
+    for (offset, value) in published.iter().enumerate() {
+        // The two coefficients are NEGATED at emit time, so the fingerprint is
+        // two `MulAdd`s rather than two multiplies and two subtractions.
+        let index = b.ext_const(&-FEE::from(start_index + offset as u64));
+        let byte = b.ext_const(&-FEE::from(u64::from(*value)));
+        let term = b.emul_add(index, alpha, base);
+        let term = b.emul_add(byte, alpha_sq, term);
+        let inverse = b.ediv(one, term);
+        sum = Some(match sum {
+            None => inverse,
+            Some(running) => b.eadd(running, inverse),
+        });
+    }
+    sum.expect("a non-empty public output")
+}

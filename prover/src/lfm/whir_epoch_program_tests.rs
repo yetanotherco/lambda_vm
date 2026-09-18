@@ -22,11 +22,11 @@ use super::validator::validate;
 use super::whir_chain::{ChainShape, chain_shape_rows};
 use super::whir_chain_tests::const_rows;
 use super::whir_epoch::{
-    closure_rows, emit_roots_block, epoch_group_costs, group_columns, roots_block_constants,
-    roots_block_cost,
+    closure_rows, emit_epoch_closure, emit_roots_block, epoch_group_costs, expected_rows,
+    group_columns, roots_block_constants, roots_block_cost,
 };
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
-use super::word::word_as_ext;
+use super::word::{ext_word, word_as_ext};
 
 /// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(width, num_vars)` per
 /// table in sub-proof order.
@@ -274,9 +274,9 @@ fn the_closure_costs_what_publishing_adds() {
     );
     assert_eq!(
         publishing - silent,
-        1 + 8 * 4 - 1,
+        2 + 8 * 4 - 1,
         "a published byte costs two MulAdds, an inverse and an Add, with the \
-         alpha square once and the first sum needing no Add"
+         alpha square and `z - bus_id` once each and the first sum needing no Add"
     );
     // ⛔ The half instance 51 is about: an epoch that publishes nothing
     // discharges the commit bus WITHOUT reading z or alpha, so a verifier bug
@@ -530,4 +530,187 @@ fn the_derived_root_is_program_text_and_not_an_arena_word() {
         consts.contains(&derived_words[0]),
         "the derived DECODE root must be interned as a program constant"
     );
+}
+
+// =============================================================================
+// The closure
+// =============================================================================
+
+/// Bus outputs that BALANCE to a given total: `n - 1` arbitrary shares and a
+/// last one that closes the sum, all as `(p, q)` with `q` non-zero.
+fn balancing_outputs(n: usize, total: FEE, seed: u64) -> Vec<(FEE, FEE)> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        FEE::from(state >> 3)
+    };
+    let mut out: Vec<(FEE, FEE)> = Vec::with_capacity(n);
+    let mut running = FEE::zero();
+    for _ in 0..n - 1 {
+        let q = next() + FEE::one();
+        let p = next();
+        running += (&p / &q).expect("a non-zero denominator");
+        out.push((p, q));
+    }
+    // The last share closes the sum exactly, which is what makes the honest arm
+    // honest rather than approximately so.
+    let q = FEE::from(7u64);
+    let p = (total - running) * &q;
+    out.push((p, q));
+    out
+}
+
+/// The machine's closure over one epoch's outputs: the two values it published
+/// and what the program cost.
+fn machine_closure(
+    outputs: &[(FEE, FEE)],
+    published: &[u8],
+    start_index: u64,
+    z: FEE,
+    alpha: FEE,
+    leg: bool,
+) -> (Option<Vec<FEE>>, usize, usize) {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let words = 2 * outputs.len() + 2;
+    let arena = b.declare_arena(words as u32);
+    let wires: Vec<_> = (0..words)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let pairs: Vec<(_, _)> = (0..outputs.len())
+        .map(|i| (wires[2 * i], wires[2 * i + 1]))
+        .collect();
+    let z_wire = wires[words - 2];
+    let alpha_wire = wires[words - 1];
+    if !leg {
+        for wire in wires.iter().take(2) {
+            b.public(wire.as_cell());
+        }
+        let program = compile(b.finish());
+        return (None, program.instrs.len(), const_rows(&program));
+    }
+    let verdict = emit_epoch_closure(&mut b, &pairs, published, start_index, z_wire, alpha_wire);
+    b.public(verdict.balance.as_cell());
+    b.public(verdict.expected.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the closure must be admissible");
+    let rows = program.instrs.len();
+    let consts = const_rows(&program);
+    let mut arena_words: Vec<_> = Vec::with_capacity(words);
+    for (p, q) in outputs {
+        arena_words.push(ext_word(p));
+        arena_words.push(ext_word(q));
+    }
+    arena_words.push(ext_word(&z));
+    arena_words.push(ext_word(&alpha));
+    let drawn = execute(&program, &[arena_words], &crate::hash_pin::BLOCK_HASHER)
+        .ok()
+        .map(|exec| {
+            exec.public_words
+                .iter()
+                .map(|(_, word)| word_as_ext(word).expect("a published value"))
+                .collect()
+        });
+    (drawn, rows, consts)
+}
+
+/// A silent epoch and a publishing one, with the carried commit index the
+/// publishing one continues from.
+fn closure_fixtures() -> Vec<(&'static str, Vec<u8>, u64)> {
+    vec![
+        ("silent", Vec::new(), 0),
+        (
+            "publishing 8 bytes at index 0",
+            vec![1, 2, 3, 250, 0, 9, 9, 7],
+            0,
+        ),
+        (
+            "publishing 8 bytes continuing a prior epoch",
+            vec![1, 2, 3, 250, 0, 9, 9, 7],
+            4_096,
+        ),
+    ]
+}
+
+/// ★ THE GATE: the machine's expected value is the host's own
+/// `compute_commit_bus_offset`, and the honest balance executes against it.
+#[test]
+fn the_closure_is_the_hosts_commit_bus_offset() {
+    let z = FEE::from(0x5eed_1234u64);
+    let alpha = FEE::from(0xbeef_5678u64);
+    for (name, published, start_index) in closure_fixtures() {
+        let host = crate::compute_commit_bus_offset(&published, start_index, &z, &alpha)
+            .expect("the host's offset exists at these challenges");
+        let outputs = balancing_outputs(34, host, 0xC10_5u64);
+        let (drawn, _, _) = machine_closure(&outputs, &published, start_index, z, alpha, true);
+        let drawn = drawn
+            .unwrap_or_else(|| panic!("{name}: the machine must execute a balance that closes"));
+        assert_eq!(
+            drawn[1], host,
+            "{name}: the expected value must be the host's commit bus offset"
+        );
+        assert_eq!(
+            drawn[0], drawn[1],
+            "{name}: the honest balance equals the expected value"
+        );
+    }
+}
+
+/// ★ THE REFUSAL: a balance that does not close has no satisfying assignment.
+///
+/// The host answers `BusImbalance`; the machine's `assert_eq_ext` is a
+/// difference and a division by zero, so the two are the same event rather than
+/// two behaviours that have to agree.
+#[test]
+fn a_balance_that_does_not_close_is_refused() {
+    let z = FEE::from(0x5eed_1234u64);
+    let alpha = FEE::from(0xbeef_5678u64);
+    let published = vec![1u8, 2, 3, 250, 0, 9, 9, 7];
+    let host = crate::compute_commit_bus_offset(&published, 0, &z, &alpha).expect("an offset");
+    let mut outputs = balancing_outputs(34, host, 0xC10_5u64);
+    // The control first: the honest arm executes, so a refusal below is the
+    // tamper and not a leg that refuses everything.
+    assert!(
+        machine_closure(&outputs, &published, 0, z, alpha, true)
+            .0
+            .is_some(),
+        "the honest balance must execute"
+    );
+    outputs[7].0 += FEE::one();
+    assert!(
+        machine_closure(&outputs, &published, 0, z, alpha, true)
+            .0
+            .is_none(),
+        "a tampered bus output must leave the machine with no satisfying assignment"
+    );
+}
+
+/// ★ F1 for the closure, at both a silent and a publishing epoch.
+#[test]
+fn the_closure_emits_its_closed_form() {
+    let z = FEE::from(0x5eed_1234u64);
+    let alpha = FEE::from(0xbeef_5678u64);
+    for (name, published, start_index) in closure_fixtures() {
+        let host = crate::compute_commit_bus_offset(&published, start_index, &z, &alpha)
+            .expect("an offset");
+        let outputs = balancing_outputs(34, host, 0xC10_5u64);
+        let (_, with_rows, with_consts) =
+            machine_closure(&outputs, &published, start_index, z, alpha, true);
+        let (_, without_rows, without_consts) =
+            machine_closure(&outputs, &published, start_index, z, alpha, false);
+        let measured = (with_rows - without_rows) - (with_consts - without_consts);
+        let predicted = closure_rows(outputs.len(), published.len());
+        println!(
+            "closure, {name}: {measured} rows emitted, {predicted} predicted \
+             ({} tables, {} published; expected half {})",
+            outputs.len(),
+            published.len(),
+            expected_rows(published.len()),
+        );
+        assert_eq!(
+            measured, predicted,
+            "{name}: the emitted operation count must equal the closed form"
+        );
+    }
 }
