@@ -178,6 +178,19 @@ impl Recording {
     }
 }
 
+/// ★ The recorder's hash, NAMED — because `multi_verify` will not take a
+/// transcript that does not name one.
+///
+/// This is not a convenience: the bound exists so that a keccak transcript
+/// cannot be passed under an RPX `H`, which is the half-configured arm that ran
+/// undetected for a day. It is TRUE here rather than asserted: `Recording`'s
+/// inner transcript is `DefaultTranscript<E, RpxTranscriptHash>` (the alias at
+/// the top of this file), so a recorder handed to an RPX verify runs the same
+/// sponge the verify does. Changing that alias must change this line with it.
+impl crypto::fiat_shamir::transcript_hash::HasTranscriptHash for Recording {
+    type Hash = RpxTranscriptHash;
+}
+
 impl IsTranscript<E> for Recording {
     fn append_field_element(&mut self, element: &FEE) {
         self.duplex.borrow_mut().absorb_element(element);

@@ -8,24 +8,31 @@
 //!
 //! ⚠ NOT `whir_epoch.rs` — that name is V1's, for the emitter.
 //!
-//! # ⛔ THE `dead_code` ALLOW, AND WHEN IT COMES OUT
+//! # ⛔ THE `dead_code` ALLOW, AND WHY ITS STATED CONDITION DID NOT DISCHARGE IT
 //!
 //! Moving out of `#[cfg(test)]` put this module in the LIBRARY target, where
-//! every item is currently unreachable: the only callers are the tests, and
-//! V1's level-0 program builder — the production caller this move exists for —
-//! does not exist yet. `make lint`'s first arm builds `--all-targets`, so the
-//! lib target is compiled on its own and `-D warnings` turns that into seven
-//! hard errors.
+//! every item is unreachable until something PUBLICLY reachable uses it.
+//! `make lint`'s first arm compiles the lib target on its own, so `-D warnings`
+//! turns that into hard errors, and the allow was added with its removal
+//! condition written here: "it comes out the moment `whir_epoch_program` takes
+//! a `WhirRealEpoch`".
 //!
-//! The allow is therefore SCOPED TO THIS MODULE and temporary. It comes out
-//! the moment `whir_epoch_program` calls `epoch_airs_for` and takes a
-//! `WhirRealEpoch`, which is the whole point of the move; if it is still here
-//! after that lands, something did not get wired.
+//! ⚠ THAT HAPPENED, AND IT WAS NOT ENOUGH. `lfm::whir_epoch::whir_epoch_program`
+//! and `whir_epoch_arena` take one, and [`WhirRealEpoch`] is `pub` so their
+//! signatures hold — but `dead_code` asks what is REACHABLE, not what is
+//! called. The struct and its two accessors are reachable now; the rest of this
+//! module is not, because the only callers of
+//! [`real_epoch_from_whir_continuation`], [`whir_epoch_chain_position`] and
+//! [`whir_process_posture_note`] are tests, and their types are `pub(crate)`.
+//! Removing the allow put seven errors back.
 //!
-//! ⚠ What it costs while it stands: a genuinely unused item added here would
-//! not be reported. That is why it is a module attribute with this note rather
-//! than an `#[allow]` sprinkled per item, where it would quietly outlive its
-//! reason.
+//! So the condition is the OTHER one: the allow comes out when this module has
+//! a production caller — seam 2's harness — or when the driver's surface is
+//! made `pub` deliberately, which is a decision for the lane that owns it and
+//! not a side effect of wiring the builder.
+//!
+//! ⚠ What it costs while it stands is unchanged: a genuinely unused item added
+//! here is not reported.
 #![allow(dead_code)]
 
 //! The WHIR level-0 driver: one wrap input per epoch of a WHIR continuation.
@@ -105,7 +112,7 @@ pub(crate) struct WhirChainPosition {
 /// [`crate::multilinear_continuation::absorb_epoch`]'s argument list, because
 /// the in-guest verifier's first job is to replay that absorb and any field it
 /// cannot see is a challenge it cannot reproduce.
-pub(crate) struct WhirRealEpoch {
+pub struct WhirRealEpoch {
     /// The epoch proof itself, cloned out of the bundle.
     pub(crate) proof: EpochProof,
     /// `statement::elf_digest(elf_bytes)` — the program this run was of.
@@ -116,8 +123,16 @@ pub(crate) struct WhirRealEpoch {
     /// proof states rather than carried: `chain_config` over
     /// `(width, num_vars)` per table.
     pub(crate) config: ChainConfig,
-    /// DECODE's univariate preprocessed commitment for this (ELF, options)
+    /// ⚠ DECODE's UNIVARIATE preprocessed commitment for this (ELF, options)
     /// pair, taken once per bundle rather than once per epoch.
+    ///
+    /// ⛔ NOT the root the multilinear transcript absorbs. This one reaches
+    /// `build_epoch_airs` and the multilinear path never compares it — a
+    /// deliberately bogus value still verifies, which
+    /// `the_supplied_decode_commitment_is_the_one_carried` asserts. The root
+    /// `absorb_roots_and_challenge` takes is [`Self::decode_prepared_roots`].
+    /// The two are different objects with confusable names, and an emitter that
+    /// absorbed this one derives a different `z` and every leg below it.
     pub(crate) decode_commitment: Commitment,
     /// The inner ELF's entry point — `program_id`'s `pc_start`.
     pub(crate) pc_start: u64,
@@ -125,6 +140,17 @@ pub(crate) struct WhirRealEpoch {
     /// AIRs' and the heights are the proof's. Kept because the config is a
     /// function of them and a caller that wants to check one needs the other.
     pub(crate) shapes: Vec<(usize, usize)>,
+    /// ★ The roots of DECODE's PREPARED multilinear commitment — what
+    /// `absorb_roots_and_challenge` absorbs after the carried roots
+    /// (`multilinear_table.rs:1205`), and what the prepared opening is checked
+    /// against.
+    ///
+    /// Carried rather than re-derived, because deriving them is
+    /// `decode_prepared_for`, which commits a `2^23` stack: once-per-bundle
+    /// work this driver already does, and which a per-epoch program builder
+    /// must not repeat. See [`Self::decode_commitment`] for the other
+    /// commitment, which is not this one.
+    pub(crate) decode_prepared_roots: Vec<Commitment>,
 }
 
 impl WhirRealEpoch {
@@ -361,6 +387,11 @@ where
         position,
         config,
         decode_commitment,
+        // ★ From the very `DecodePrepared` this epoch was VERIFIED against, so
+        // the roots a wrap program absorbs are the roots the verifier absorbed
+        // — the same argument `epoch_airs_for` makes for the AIR set, applied
+        // to the one value that reaches the transcript before any challenge.
+        decode_prepared_roots: prepared.roots.clone(),
         pc_start: elf.entry_point,
         shapes,
         proof,

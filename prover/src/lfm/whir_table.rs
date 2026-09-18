@@ -666,7 +666,24 @@ fn newton_constants(degree: usize) -> Vec<FEE> {
 ///
 /// Counted the same way it counts them, so that subtracting it from
 /// `combine_rows` leaves exactly the operations.
+///
+/// ⚠ AND THE EMPTY DAG'S ZERO, which is the one case where `combine_rows`'
+/// single row is not an operation at all. A shape with NO ROOTS takes
+/// `combine_rows`' early return of 1 (`whir_air.rs:74`), and what
+/// `emit_combine` emits for it is `b.ext_const(&FEE::zero())`
+/// (`whir_air.rs:125`) — an `LFM_CONST`, not an `LFM_XALU`. `combine_rows` is
+/// in a rows-INCLUSIVE convention and is right; this function is the conversion
+/// to the const-free one, so the zero has to be named HERE or the conversion
+/// charges an operation nobody emits. The zero itself is already in
+/// [`table_constants`], so naming it costs the pool nothing.
+///
+/// Found by the assembled walk's F1 over three tables whose AIRs carry
+/// `EmptyConstraints`: it read exactly three rows under its prediction, one per
+/// table. No fixture with an empty DAG existed before it.
 fn dag_constant_rows(ir: &IrShape<GoldilocksField, GoldilocksExtension>) -> usize {
+    if ir.root_steps().is_empty() {
+        return 1;
+    }
     let mut values: Vec<FEE> = Vec::new();
     let mut negates = false;
     for step in ir.steps_as_ops() {
