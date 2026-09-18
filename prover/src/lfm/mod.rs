@@ -66,6 +66,7 @@ pub mod validator;
 pub mod whir_air;
 pub mod whir_bus;
 pub mod whir_chain;
+pub mod whir_epoch;
 pub mod whir_fold;
 pub mod whir_gkr;
 pub mod whir_open;
@@ -149,6 +150,8 @@ mod whir_air_tests;
 mod whir_bus_tests;
 #[cfg(test)]
 mod whir_chain_tests;
+#[cfg(test)]
+mod whir_epoch_program_tests;
 #[cfg(test)]
 mod whir_fold_tests;
 #[cfg(test)]
