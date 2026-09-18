@@ -235,6 +235,7 @@ fn assemble(
     resident: &mut Resident,
     challenge: &Challenge,
 ) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
+    use rayon::prelude::*;
     let order = &challenge.order;
     let airs = &challenge.airs;
 
@@ -278,17 +279,32 @@ fn assemble(
         (&airs.hint, &mut resident.accumulated.hint),
         (&airs.register, &mut resident.register),
     ];
-    for (idx, (air, trace)) in fixed.into_iter().enumerate() {
-        slots[idx] = Some(build(idx, air, trace)?);
-    }
+    // Independent tables, most of them small: one at a time would leave the
+    // machine idle after the walk.
+    let mut jobs: Vec<(
+        usize,
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    )> = fixed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (air, trace))| (idx, air, trace))
+        .collect();
     if airs.include_halt {
-        slots[NUM_FIXED_AIRS] = Some(build(NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?);
+        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
     }
     for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
         let idx = order
             .page_index(i)
             .ok_or_else(|| Error::Prover(format!("logup phase: page {i} is not in the layout")))?;
-        slots[idx] = Some(build(idx, air, trace)?);
+        jobs.push((idx, air, trace));
+    }
+    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
+        .into_par_iter()
+        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
+        .collect::<Result<_, _>>()?;
+    for (idx, proof) in built {
+        slots[idx] = Some(proof);
     }
 
     slots
@@ -530,12 +546,12 @@ pub fn run_batched(
     let airs = &challenge.airs;
     let n = order.len();
     {
+        use rayon::prelude::*;
         let mut state = done.lock().expect("fold state");
-        let build = |state: &mut FoldState,
-                     idx: usize,
+        let build = |idx: usize,
                      air: &crate::VmAir,
                      trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
-         -> Result<(), Error> {
+         -> Result<(usize, Deep), Error> {
             let mut transcript = fork(&challenge.transcript, idx, n);
             let deep = deep_of(
                 air.as_ref(),
@@ -545,8 +561,7 @@ pub fn run_batched(
                 challenge.roots.get(idx).cloned(),
             )
             .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
-            fold_one(state, idx, deep);
-            Ok(())
+            Ok((idx, deep))
         };
         let fixed: [(
             &crate::VmAir,
@@ -563,17 +578,32 @@ pub fn run_batched(
             (&airs.hint, &mut resident.accumulated.hint),
             (&airs.register, &mut resident.register),
         ];
-        for (idx, (air, trace)) in fixed.into_iter().enumerate() {
-            build(&mut state, idx, air, trace)?;
-        }
+        // The codewords are independent and computed in parallel; the fold
+        // itself is sequential and keeps this order, which the proof records.
+        let mut jobs: Vec<(
+            usize,
+            &crate::VmAir,
+            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        )> = fixed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (air, trace))| (idx, air, trace))
+            .collect();
         if airs.include_halt {
-            build(&mut state, NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?;
+            jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
         }
         for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
             let idx = order.page_index(i).ok_or_else(|| {
                 Error::Prover(format!("batched phase: page {i} is not in the layout"))
             })?;
-            build(&mut state, idx, air, trace)?;
+            jobs.push((idx, air, trace));
+        }
+        let deeps: Vec<(usize, Deep)> = jobs
+            .into_par_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<_, _>>()?;
+        for (idx, deep) in deeps {
+            fold_one(&mut state, idx, deep);
         }
     }
 
@@ -820,17 +850,31 @@ pub fn run_open(
         (&airs.hint, &mut resident.accumulated.hint),
         (&airs.register, &mut resident.register),
     ];
-    for (idx, (air, trace)) in fixed.into_iter().enumerate() {
-        opens.push(build(idx, air, trace)?);
-    }
+    let mut jobs: Vec<(
+        usize,
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    )> = fixed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (air, trace))| (idx, air, trace))
+        .collect();
     if airs.include_halt {
-        opens.push(build(NUM_FIXED_AIRS, &airs.halt, &mut resident.halt)?);
+        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
     }
     for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
         let idx = order
             .page_index(i)
             .ok_or_else(|| Error::Prover(format!("open pass: page {i} is not in the layout")))?;
-        opens.push(build(idx, air, trace)?);
+        jobs.push((idx, air, trace));
+    }
+    {
+        use rayon::prelude::*;
+        opens.extend(
+            jobs.into_par_iter()
+                .map(|(idx, air, trace)| build(idx, air, trace))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
     }
 
     opens.sort_by_key(|(idx, _)| *idx);
