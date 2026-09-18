@@ -167,6 +167,12 @@ pub(super) fn real_epoch_from_whir_continuation(
             bundle,
             epoch_index,
             decode_commitment,
+            // ⚠ NOT AN OVERSIGHT. This form has no `H` to name, so
+            // `&DecodePrepared<H>` cannot appear in its signature at all. The
+            // reuse is available at the generic entry point, which is what a
+            // level-0 walk calls once it knows its hash, and nowhere it would
+            // be a lie.
+            None,
         )
     })
 }
@@ -185,12 +191,28 @@ pub(super) fn real_epoch_from_whir_continuation(
 /// `verify_epoch_bookend::<H>` in the module this drives: one entry point that
 /// dispatches on the knob for production, one that takes `H` so the agreement
 /// can be argued about — and tested — at all.
+///
+/// # `decode_commitment` and `prepared` are DIFFERENT OBJECTS, and both stay
+///
+/// They reach different places and collapsing them would read as a
+/// simplification while quietly changing which root the AIR carries.
+/// `decode_commitment` is the UNIVARIATE preprocessed root from
+/// `commitment_from_elf`, and it feeds `build_epoch_airs`. `prepared` is the
+/// MULTILINEAR prepared columns, their derived roots and the stacked
+/// commitment, and it feeds `verify_epoch_bookend`.
+///
+/// `prepared` is `Some` so a walk over every epoch derives DECODE's prepared
+/// commitment ONCE per bundle rather than once per epoch — fifteen derivations
+/// to one on the block, the same saving `decode_commitment` exists for on the
+/// STARK driver. `None` derives it here, exactly as before.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn real_epoch_from_whir_continuation_under<H>(
     opts: &crate::ProofOptions,
     elf_bytes: &[u8],
     bundle: &ContinuationProof,
     epoch_index: usize,
     decode_commitment: Option<Commitment>,
+    prepared: Option<&crate::multilinear_continuation::DecodePrepared<H>>,
 ) -> Result<WhirRealEpoch, String>
 where
     H: WhirHash,
@@ -213,13 +235,23 @@ where
     // ★ The acceptance check, and the hash agreement with it. Both are the
     // same call: `H` configures the transcript's sponge, so verifying here IS
     // asking whether this bundle was proven under `H`.
-    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(&elf, elf_bytes)
-        .map_err(|e| {
-            format!(
-                "DECODE's prepared commitment under {}: {e:?}",
-                <H as WhirHash>::NAME
-            )
-        })?;
+    // ★ HANDED IN, OR DERIVED HERE. A caller walking every epoch derives once
+    // and hands the same value to all of them; `None` keeps the old behaviour.
+    // The binding below outlives the borrow, which is why it is declared first.
+    let derived;
+    let prepared = match prepared {
+        Some(p) => p,
+        None => {
+            derived = crate::multilinear_continuation::decode_prepared_for::<H>(&elf, elf_bytes)
+                .map_err(|e| {
+                    format!(
+                        "DECODE's prepared commitment under {}: {e:?}",
+                        <H as WhirHash>::NAME
+                    )
+                })?;
+            &derived
+        }
+    };
     let verified = crate::multilinear_continuation::verify_epoch_bookend::<H>(
         &elf,
         elf_bytes,
@@ -228,7 +260,7 @@ where
         position.is_final,
         position.label,
         opts,
-        &prepared,
+        prepared,
     )
     .map_err(|e| format!("epoch {epoch_index} could not be verified: {e:?}"))?;
     if verified.is_none() {
@@ -655,9 +687,10 @@ mod tests {
 
         // THE CONTROL FIRST, and on epoch 1 so the register carry is exercised
         // with it: the hash it was proven under must ACCEPT.
-        let accepted =
-            real_epoch_from_whir_continuation_under::<KeccakWhir>(&opts, &elf_bytes, &b, 1, None)
-                .expect("a keccak bundle must harvest under keccak");
+        let accepted = real_epoch_from_whir_continuation_under::<KeccakWhir>(
+            &opts, &elf_bytes, &b, 1, None, None,
+        )
+        .expect("a keccak bundle must harvest under keccak");
         assert_eq!(
             accepted.position.label,
             epoch_label(1),
@@ -668,7 +701,7 @@ mod tests {
         // Debug` — a derive on a production type added for a test's
         // convenience, on a struct holding a whole proof.
         let refused = match real_epoch_from_whir_continuation_under::<RpxWhir>(
-            &opts, &elf_bytes, &b, 1, None,
+            &opts, &elf_bytes, &b, 1, None, None,
         ) {
             Err(reason) => reason,
             Ok(_) => panic!(
@@ -772,5 +805,74 @@ mod tests {
             real_epoch_from_whir_continuation(&opts, &elf_bytes, &b, 1, None).is_err(),
             "epoch 1 was harvested against a restated commit index"
         );
+    }
+    /// ★ THE HANDED-IN PREPARED COMMITMENT IS THE ONE USED, not a rebuilt equal.
+    ///
+    /// `prepared` exists so a walk over every epoch derives DECODE's prepared
+    /// commitment ONCE per bundle instead of once per epoch — fifteen
+    /// derivations to one on the block. A driver that took the argument and
+    /// derived its own anyway would be INDISTINGUISHABLE on the accept path, so
+    /// the check is a prepared built from a DIFFERENT program: used, it must
+    /// refuse; ignored, the epoch verifies exactly as it does today and this
+    /// test fails. That asymmetry is the whole design — the refusal arm is what
+    /// proves USE, and the accept arm is what stops a driver that refuses
+    /// everything from passing it.
+    ///
+    /// ⚠ AND THE OTHER HALF IS UNREACHABLE RATHER THAN UNTESTED. A prepared
+    /// built for the wrong HASH cannot be handed to this function at all:
+    /// `DecodePrepared<H>` carries the hash in its type and the driver is
+    /// `::<H>`, so the mismatch is a compile error. That is strictly better than
+    /// a runtime refusal, and it is why no test for it exists — a test for a
+    /// state the type system forbids is a check that cannot fail.
+    ///
+    /// ⚠ The refusal is NOT a shape guard. `DecodePrepared::agrees_with`
+    /// compares only `log_blowup` and `log_folding`, which two programs at the
+    /// same options share, so a wrong-program prepared sails past it and is
+    /// caught by the derived roots block the transcript absorbs — the same
+    /// cryptographic mechanism as the hash agreement. The reason is printed so
+    /// a reader can see which path actually fired.
+    #[test]
+    fn the_prepared_commitment_handed_in_is_the_one_used() {
+        use multilinear::whir_hash::KeccakWhir;
+
+        let (elf_bytes, opts, b) = a_keccak_bundle();
+        let elf = Elf::load(&elf_bytes).expect("load");
+
+        // THE ACCEPT CONTROL: the bundle's own prepared commitment, handed in
+        // rather than derived, must harvest.
+        let own = multilinear_continuation::decode_prepared_for::<KeccakWhir>(&elf, &elf_bytes)
+            .expect("the bundle's own prepared commitment");
+        real_epoch_from_whir_continuation_under::<KeccakWhir>(
+            &opts,
+            &elf_bytes,
+            &b,
+            1,
+            None,
+            Some(&own),
+        )
+        .expect("the bundle's own prepared commitment must harvest");
+
+        // A prepared built from a DIFFERENT program, at the same options.
+        let other_bytes = asm_elf_bytes("sub");
+        let other = Elf::load(&other_bytes).expect("load sub");
+        let wrong =
+            multilinear_continuation::decode_prepared_for::<KeccakWhir>(&other, &other_bytes)
+                .expect("sub's prepared commitment");
+        let refused = match real_epoch_from_whir_continuation_under::<KeccakWhir>(
+            &opts,
+            &elf_bytes,
+            &b,
+            1,
+            None,
+            Some(&wrong),
+        ) {
+            Err(reason) => reason,
+            Ok(_) => panic!(
+                "the driver harvested an epoch against a DECODE commitment prepared \
+                 from a DIFFERENT program, so the `prepared` argument is accepted \
+                 and ignored — a parameter that changes nothing is a display"
+            ),
+        };
+        println!("PREPARED-REFUSAL  {refused}");
     }
 }
