@@ -19,7 +19,7 @@ use multilinear::{
     constraint_argument::FactorKind,
     mle::Mle,
     poly::SumcheckPolynomial,
-    program::{Builder, Program},
+    program::{Builder, Op as ProgramOp, Program},
     selector::Selector,
 };
 use std::collections::BTreeMap;
@@ -834,6 +834,45 @@ where
     /// How many roots are batched — the length `beta_powers` must have.
     pub fn num_roots(&self) -> usize {
         self.roots.len()
+    }
+
+    /// The compiled DAG, in `multilinear::program`'s vocabulary.
+    ///
+    /// `Step` and `program::Op` are the same six variants over the same dense
+    /// operand numbering, so this is that conversion — stated once, and in the
+    /// crate that owns `Step`, rather than a second spelling of the DAG in
+    /// every consumer that has to walk it. `Step` itself stays private.
+    ///
+    /// Read together with [`root_steps`](Self::root_steps) and
+    /// [`selector_of_root`](Self::selector_of_root) by the recursion emitter,
+    /// which rebuilds [`combine`](Self::combine) with the batching coefficients
+    /// as RUNTIME wires: `program` interns them as `Fixed` steps
+    /// (`Builder::weighted_sum`), which is correct for a host that already has
+    /// `beta` and wrong for a verifier that draws it from a transcript.
+    pub fn steps_as_ops(&self) -> Vec<ProgramOp<E>> {
+        self.steps
+            .iter()
+            .map(|step| match *step {
+                Step::Fixed(ref c) => ProgramOp::Fixed(c.clone()),
+                Step::Var(i) => ProgramOp::Var(i),
+                Step::Add(a, b) => ProgramOp::Add(a, b),
+                Step::Sub(a, b) => ProgramOp::Sub(a, b),
+                Step::Mul(a, b) => ProgramOp::Mul(a, b),
+                Step::Neg(a) => ProgramOp::Neg(a),
+            })
+            .collect()
+    }
+
+    /// Each batched root's step index, in `roots` order — the steps
+    /// [`combine`](Self::combine) reads out of the DAG.
+    pub fn root_steps(&self) -> &[u32] {
+        &self.root_steps
+    }
+
+    /// Each batched root's selector factor, or `None` where the root applies on
+    /// every step and the multiplication is skipped.
+    pub fn selector_of_root(&self) -> &[Option<usize>] {
+        &self.selector_of_root
     }
 
     /// The batched constraint, given each factor's value at a point.
