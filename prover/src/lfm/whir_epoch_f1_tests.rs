@@ -830,7 +830,13 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
         let measured_const = chip("LFM_CONST");
         let pool_gap = f1.pool as i64 - measured_const as i64;
         let ops_gap = f1.operations() as i64 - (measured - measured_const) as i64;
-        println!("   residual: const-free {ops_gap} · pool {pool_gap}");
+        println!(
+            "   F1 {} of {measured} measured (const-free {} of {}); residual: \
+             const-free {ops_gap} · pool {pool_gap}",
+            f1.instructions(),
+            f1.operations(),
+            measured - measured_const,
+        );
         rows.push((index, refs.len(), measured, ops_gap, pool_gap));
     }
 
@@ -876,6 +882,23 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
 // =============================================================================
 // THE PRODUCTION SHAPES — item 5g's fifteen, and the instrument that prints them
 // =============================================================================
+
+/// One epoch's shape and its F1, as [`the_block_f1_at_every_epoch_shape`]
+/// collects them.
+///
+/// Named rather than a five-deep tuple because the three `usize`s next to each
+/// other — the table count, the published byte count and, inside `names`, each
+/// table's width and vars — are exactly the kind that swap silently.
+struct BlockEpochShape {
+    index: u64,
+    tables: usize,
+    /// PUBLISHED BYTES, not words and not `out_halves`.
+    published: usize,
+    f1: EpochF1,
+    /// `(name, width, num_vars)` per table, in sub-proof order — the census sh1
+    /// prints for epoch 0 and this prints for all fifteen.
+    names: Vec<(String, usize, usize)>,
+}
 
 /// ★★ F1 AT EVERY EPOCH OF A REAL BLOCK, card-free and proof-free.
 ///
@@ -948,7 +971,7 @@ fn the_block_f1_at_every_epoch_shape() {
 
     // How many epochs the run has, so the LAST one can be told apart before it
     // is reached — the published output is the one term that depends on it.
-    let mut census: Vec<(u64, usize, usize, EpochF1, Vec<(String, usize, usize)>)> = Vec::new();
+    let mut census: Vec<BlockEpochShape> = Vec::new();
     crate::continuation::for_each_epoch(&elf, &inputs, epoch_log2, &artifacts, |prepared, _| {
         let mut traces = prepared.traces;
         crate::tables::bitwise::update_multiplicities(
@@ -1023,12 +1046,25 @@ fn the_block_f1_at_every_epoch_shape() {
             public_output: &published,
         };
         let f1 = epoch_f1(&refs, &table_num_vars, config, &statement_bytes, &text, &[]);
-        census.push((prepared.index, shapes.len(), published.len(), f1, names));
+        census.push(BlockEpochShape {
+            index: prepared.index,
+            tables: shapes.len(),
+            published: published.len(),
+            f1,
+            names,
+        });
         Ok(())
     })
     .expect("every epoch prepares");
 
-    for (index, tables, published, f1, names) in &census {
+    for row in &census {
+        let BlockEpochShape {
+            index,
+            tables,
+            published,
+            f1,
+            names,
+        } = row;
         println!(
             "\n-- epoch {index} per-table census: {tables} tables, {published} published bytes --"
         );
@@ -1051,13 +1087,15 @@ fn the_block_f1_at_every_epoch_shape() {
         "{:>6} {:>7} {:>13} {:>10} {:>10} {:>8}",
         "epoch", "tables", "F1 const-free", "arena", "perms", "words"
     );
-    for (index, tables, _p, f1, _n) in &census {
+    for row in &census {
         println!(
-            "{index:>6} {tables:>7} {:>13} {:>10} {:>10} {:>8}",
-            f1.operations(),
-            f1.arena,
-            f1.perms,
-            f1.public,
+            "{:>6} {:>7} {:>13} {:>10} {:>10} {:>8}",
+            row.index,
+            row.tables,
+            row.f1.operations(),
+            row.f1.arena,
+            row.f1.perms,
+            row.f1.public,
         );
     }
     println!(
