@@ -338,8 +338,26 @@ const PERMS_PER_GRIND: usize = 2;
 /// query phase — which come FIRST and together, because `sample_queries` draws
 /// them all before any opening is checked (`whir_round.rs:68-76`).
 pub fn chain_hash_schedule(shape: &ChainShape, entry: SpongeEntry) -> Vec<SpongeHash> {
-    let (folding, ood, query) = shape.grind;
     let mut sponge = SpongeSchedule::new(entry);
+    chain_sponge(shape, &mut sponge);
+    sponge.hashes().to_vec()
+}
+
+/// ★ The same round structure, driven into a schedule the CALLER owns — so the
+/// sponge a chain leaves behind is reachable, and the next leg of the same
+/// program continues from it.
+///
+/// ⚠ **This is the one place the chain's round structure is written**, and
+/// [`chain_hash_schedule`] is a thin wrapper over it rather than a second copy.
+/// A caller that needs the successor entry — `stacked_eval`'s wrapper threading
+/// one sponge through every polynomial's chain — could instead replay the
+/// structure beside this one, and that replay would be a second thing to keep
+/// in step: the schedule's gate
+/// (`whir_chain_tests::the_schedule_is_the_host_transcripts`) compares THIS
+/// walk against a real verifier's calls, and would say nothing about a copy.
+/// Sharing the walk puts the caller inside that gate.
+pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
+    let (folding, ood, query) = shape.grind;
 
     for r in 0..shape.rounds() {
         sponge.grind(folding);
@@ -365,8 +383,6 @@ pub fn chain_hash_schedule(shape: &ChainShape, entry: SpongeEntry) -> Vec<Sponge
             sponge.candidate();
         }
     }
-
-    sponge.hashes().to_vec()
 }
 
 /// INSTRUCTIONS the schedule costs: the `Pack`s that build each hash's words

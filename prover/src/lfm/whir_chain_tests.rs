@@ -85,13 +85,13 @@ const CANDIDATE_BYTES: usize = 8;
 /// A squeeze in the wrong place leaves different bytes in the buffer, so the
 /// very next draw disagrees — which is what makes this a check and not a
 /// restatement of the same belief twice.
-struct HostDuplex {
+pub(super) struct HostDuplex {
     shadow: HostTranscript,
     out: [u8; SQUEEZE_BYTES],
     out_pos: usize,
     /// Bytes absorbed since the last squeeze.
     buffered: usize,
-    hashes: Vec<SpongeHash>,
+    pub(super) hashes: Vec<SpongeHash>,
 }
 
 impl HostDuplex {
@@ -162,15 +162,15 @@ impl HostDuplex {
 /// It also carries [`HostDuplex`], which reconstructs the host's hash schedule
 /// from these same calls. `state()` takes `&self`, so the reconstruction lives
 /// behind a `RefCell`.
-struct Recording {
+pub(super) struct Recording {
     inner: HostTranscript,
-    sampled: Vec<FEE>,
-    drawn_u64: Vec<u64>,
-    duplex: RefCell<HostDuplex>,
+    pub(super) sampled: Vec<FEE>,
+    pub(super) drawn_u64: Vec<u64>,
+    pub(super) duplex: RefCell<HostDuplex>,
 }
 
 impl Recording {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: HostTranscript::new(&[]),
             sampled: Vec::new(),
@@ -225,7 +225,7 @@ impl IsTranscript<E> for Recording {
 }
 
 /// A current block's wires, in the field its round holds them in.
-enum CurrentBlock {
+pub(super) enum CurrentBlock {
     Base(Vec<Felt>),
     Ext(Vec<Ext>),
 }
@@ -236,6 +236,196 @@ impl CurrentBlock {
             CurrentBlock::Base(v) => BlockValues::Base(v),
             CurrentBlock::Ext(v) => BlockValues::Ext(v),
         }
+    }
+}
+
+/// ★ One chain's round wires, hinted and OWNED — because `ChainRoundWires`
+/// borrows them.
+///
+/// Extracted from [`chain_program`] so a caller that emits SEVERAL chains in one
+/// program — `stacked_eval`'s wrapper, one chain per stacked polynomial — builds
+/// them from this walk rather than from a second copy of it. The chain suite is
+/// the control that the extraction moved nothing.
+pub(super) struct RoundStorage {
+    shape: ChainShape,
+    sumchecks: Vec<Vec<Vec<Ext>>>,
+    currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>>,
+    nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>>,
+    roots: Vec<Option<super::builder::Cell>>,
+    oods: Vec<Option<Ext>>,
+    nonces: Vec<RoundNonces>,
+}
+
+impl RoundStorage {
+    /// Words one chain's rounds occupy, which is what a caller placing several
+    /// chains in one arena advances by.
+    pub(super) fn words(shape: &ChainShape) -> u32 {
+        (0..shape.rounds())
+            .map(|r| Layout::round_words(shape, r))
+            .sum()
+    }
+
+    /// Hints every round's wires out of `arena`, starting at `base`, in the
+    /// order [`push_round_words`] writes them.
+    pub(super) fn hint(
+        b: &mut LfmBuilder,
+        arena: super::instr::ArenaId,
+        base: u32,
+        shape: &ChainShape,
+    ) -> Self {
+        let mut sumchecks: Vec<Vec<Vec<Ext>>> = Vec::new();
+        let mut currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>> = Vec::new();
+        let mut nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>> = Vec::new();
+        let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
+        let mut oods: Vec<Option<Ext>> = Vec::new();
+        let mut nonces: Vec<RoundNonces> = Vec::new();
+
+        let mut at = base;
+        for r in 0..shape.rounds() {
+            let next_word = |b: &mut LfmBuilder, at: &mut u32| {
+                let cell = b.hint_word(arena, *at);
+                *at += 1;
+                cell
+            };
+            let k = shape.schedule[r];
+            let sumcheck: Vec<Vec<Ext>> = (0..k)
+                .map(|_| (0..2).map(|_| next_word(b, &mut at).as_ext()).collect())
+                .collect();
+            // The nonces are FELTS: `append_bytes(&nonce.to_be_bytes())` is one
+            // big-endian felt, which is how the grind absorbs them.
+            let folding = b.hint_felt(arena, at);
+            let ood_nonce = b.hint_felt(arena, at + 1);
+            let query = b.hint_felt(arena, at + 2);
+            at += 3;
+
+            let depth = shape.current_depth(r);
+            let block = 1usize << k;
+            // ★ ROUND 0's current codeword is BASE on the host
+            // (`whir_chain.rs:983`), so its block hashes ONE felt a value and
+            // not three. Hinting it as extension wires would hash forty-eight
+            // felts where the committer hashed sixteen and the root would never
+            // match — which is exactly how this test first failed.
+            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries)
+                .map(|_| {
+                    let values = if r == 0 {
+                        let felts: Vec<Felt> = (0..block)
+                            .map(|_| {
+                                let f = b.hint_felt(arena, at);
+                                at += 1;
+                                f
+                            })
+                            .collect();
+                        CurrentBlock::Base(felts)
+                    } else {
+                        CurrentBlock::Ext(
+                            (0..block).map(|_| next_word(b, &mut at).as_ext()).collect(),
+                        )
+                    };
+                    let path: Vec<WrapDigest> = (0..depth)
+                        .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                        .collect();
+                    (values, path)
+                })
+                .collect();
+
+            let (next_root, ood_value, next) = match shape.next_depth(r) {
+                Some(next_depth) => {
+                    let nr = next_word(b, &mut at);
+                    let ov = next_word(b, &mut at).as_ext();
+                    let next_block = 1usize << shape.schedule[r + 1];
+                    let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
+                        .map(|_| {
+                            let values: Vec<Ext> = (0..next_block)
+                                .map(|_| next_word(b, &mut at).as_ext())
+                                .collect();
+                            let path: Vec<WrapDigest> = (0..next_depth)
+                                .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                                .collect();
+                            (values, path)
+                        })
+                        .collect();
+                    (Some(nr), Some(ov), next)
+                }
+                None => (None, None, Vec::new()),
+            };
+
+            sumchecks.push(sumcheck);
+            currents.push(current);
+            nexts.push(next);
+            roots.push(next_root);
+            oods.push(ood_value);
+            nonces.push(RoundNonces {
+                folding,
+                ood: ood_nonce,
+                query,
+            });
+        }
+        assert_eq!(
+            at - base,
+            Self::words(shape),
+            "the round walk and the word count are one derivation"
+        );
+
+        Self {
+            shape: shape.clone(),
+            sumchecks,
+            currents,
+            nexts,
+            roots,
+            oods,
+            nonces,
+        }
+    }
+
+    /// The query openings, current and successor, borrowing this storage.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn openings(&self) -> (Vec<Vec<QueryOpening<'_>>>, Vec<Vec<QueryOpening<'_>>>) {
+        let current: Vec<Vec<QueryOpening<'_>>> = self
+            .currents
+            .iter()
+            .map(|round| {
+                round
+                    .iter()
+                    .map(|(values, path)| QueryOpening {
+                        values: values.as_block(),
+                        siblings: path,
+                    })
+                    .collect()
+            })
+            .collect();
+        let next: Vec<Vec<QueryOpening<'_>>> = self
+            .nexts
+            .iter()
+            .map(|round| {
+                round
+                    .iter()
+                    .map(|(values, path)| QueryOpening {
+                        values: BlockValues::Ext(values),
+                        siblings: path,
+                    })
+                    .collect()
+            })
+            .collect();
+        (current, next)
+    }
+
+    /// The wires `emit_verify_weighted` takes, borrowing this storage and the
+    /// openings built from it.
+    pub(super) fn wires<'a>(
+        &'a self,
+        current: &'a [Vec<QueryOpening<'a>>],
+        next: &'a [Vec<QueryOpening<'a>>],
+    ) -> Vec<ChainRoundWires<'a>> {
+        (0..self.shape.rounds())
+            .map(|r| ChainRoundWires {
+                sumcheck: &self.sumchecks[r],
+                next_root: self.roots[r],
+                ood_value: self.oods[r],
+                nonces: self.nonces[r],
+                current: &current[r],
+                next: &next[r],
+            })
+            .collect()
     }
 }
 
@@ -397,7 +587,7 @@ impl Layout {
 
 /// Builds the program for one shape, publishing every extension challenge the
 /// machine draws in the order it draws them.
-fn chain_program(shape: &ChainShape) -> LfmProgram {
+pub(super) fn chain_program(shape: &ChainShape) -> LfmProgram {
     let layout = Layout::new(shape);
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(layout.total);
@@ -412,135 +602,9 @@ fn chain_program(shape: &ChainShape) -> LfmProgram {
     let final_value = b.hint_word(arena, shape.num_vars as u32 + 2).as_ext();
 
     // Owned storage, because the wires borrow from it.
-    let mut sumchecks: Vec<Vec<Vec<Ext>>> = Vec::new();
-    let mut currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>> = Vec::new();
-    let mut nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>> = Vec::new();
-    let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
-    let mut oods: Vec<Option<Ext>> = Vec::new();
-    let mut nonces: Vec<RoundNonces> = Vec::new();
-
-    for r in 0..shape.rounds() {
-        let mut at = layout.round_at[r];
-        let next_word = |b: &mut LfmBuilder, at: &mut u32| {
-            let cell = b.hint_word(arena, *at);
-            *at += 1;
-            cell
-        };
-        let k = shape.schedule[r];
-        let sumcheck: Vec<Vec<Ext>> = (0..k)
-            .map(|_| {
-                (0..2)
-                    .map(|_| next_word(&mut b, &mut at).as_ext())
-                    .collect()
-            })
-            .collect();
-        // The nonces are FELTS: `append_bytes(&nonce.to_be_bytes())` is one
-        // big-endian felt, which is how the grind absorbs them.
-        let folding = b.hint_felt(arena, at);
-        let ood_nonce = b.hint_felt(arena, at + 1);
-        let query = b.hint_felt(arena, at + 2);
-        at += 3;
-
-        let depth = shape.current_depth(r);
-        let block = 1usize << k;
-        // ★ ROUND 0's current codeword is BASE on the host
-        // (`whir_chain.rs:983`), so its block hashes ONE felt a value and not
-        // three. Hinting it as extension wires would hash forty-eight felts
-        // where the committer hashed sixteen and the root would never match —
-        // which is exactly how this test first failed.
-        let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries)
-            .map(|_| {
-                let values = if r == 0 {
-                    let felts: Vec<Felt> = (0..block)
-                        .map(|_| {
-                            let f = b.hint_felt(arena, at);
-                            at += 1;
-                            f
-                        })
-                        .collect();
-                    CurrentBlock::Base(felts)
-                } else {
-                    CurrentBlock::Ext(
-                        (0..block)
-                            .map(|_| next_word(&mut b, &mut at).as_ext())
-                            .collect(),
-                    )
-                };
-                let path: Vec<WrapDigest> = (0..depth)
-                    .map(|_| WrapDigest::from_cell(next_word(&mut b, &mut at)))
-                    .collect();
-                (values, path)
-            })
-            .collect();
-
-        let (next_root, ood_value, next) = match shape.next_depth(r) {
-            Some(next_depth) => {
-                let nr = next_word(&mut b, &mut at);
-                let ov = next_word(&mut b, &mut at).as_ext();
-                let next_block = 1usize << shape.schedule[r + 1];
-                let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
-                    .map(|_| {
-                        let values: Vec<Ext> = (0..next_block)
-                            .map(|_| next_word(&mut b, &mut at).as_ext())
-                            .collect();
-                        let path: Vec<WrapDigest> = (0..next_depth)
-                            .map(|_| WrapDigest::from_cell(next_word(&mut b, &mut at)))
-                            .collect();
-                        (values, path)
-                    })
-                    .collect();
-                (Some(nr), Some(ov), next)
-            }
-            None => (None, None, Vec::new()),
-        };
-
-        sumchecks.push(sumcheck);
-        currents.push(current);
-        nexts.push(next);
-        roots.push(next_root);
-        oods.push(ood_value);
-        nonces.push(RoundNonces {
-            folding,
-            ood: ood_nonce,
-            query,
-        });
-    }
-
-    let current_openings: Vec<Vec<QueryOpening<'_>>> = currents
-        .iter()
-        .map(|round| {
-            round
-                .iter()
-                .map(|(values, path)| QueryOpening {
-                    values: values.as_block(),
-                    siblings: path,
-                })
-                .collect()
-        })
-        .collect();
-    let next_openings: Vec<Vec<QueryOpening<'_>>> = nexts
-        .iter()
-        .map(|round| {
-            round
-                .iter()
-                .map(|(values, path)| QueryOpening {
-                    values: BlockValues::Ext(values),
-                    siblings: path,
-                })
-                .collect()
-        })
-        .collect();
-
-    let wires: Vec<ChainRoundWires<'_>> = (0..shape.rounds())
-        .map(|r| ChainRoundWires {
-            sumcheck: &sumchecks[r],
-            next_root: roots[r],
-            ood_value: oods[r],
-            nonces: nonces[r],
-            current: &current_openings[r],
-            next: &next_openings[r],
-        })
-        .collect();
+    let storage = RoundStorage::hint(&mut b, arena, layout.round_at[0], shape);
+    let (current_openings, next_openings) = storage.openings();
+    let wires = storage.wires(&current_openings, &next_openings);
 
     emit_verify_weighted(
         &mut b,
@@ -573,6 +637,21 @@ fn chain_arena(fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
     words.push(fixture.root);
     words.push(ext_word(&proof.final_value));
 
+    push_round_words(&mut words, shape, proof);
+    words
+}
+
+/// One chain's round wires, in the order [`RoundStorage::hint`] reads them.
+///
+/// Split out of [`chain_arena`] for the same reason [`RoundStorage`] was split
+/// out of [`chain_program`]: a program holding several chains fills one arena
+/// with several of these, and a second copy of the order would be a second thing
+/// to keep in step with the walk that reads it.
+pub(super) fn push_round_words(
+    words: &mut Vec<LfmWord>,
+    shape: &ChainShape,
+    proof: &ChainProof<F, E>,
+) {
     for (r, round) in proof.rounds.iter().enumerate() {
         for sc in &round.sumcheck {
             for e in &sc.evaluations {
@@ -582,7 +661,7 @@ fn chain_arena(fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
         for nonce in [round.nonces.folding, round.nonces.ood, round.nonces.query] {
             words.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
         }
-        push_openings(&mut words, round, true);
+        push_openings(words, round, true);
         if shape.next_depth(r).is_some() {
             words.push(commitment_to_digest(
                 round.next_root.as_ref().expect("a successor root"),
@@ -590,10 +669,9 @@ fn chain_arena(fixture: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
             words.push(ext_word(
                 round.ood_value.as_ref().expect("an out-of-domain value"),
             ));
-            push_openings(&mut words, round, false);
+            push_openings(words, round, false);
         }
     }
-    words
 }
 
 /// One round's query openings, current or successor, block then path.
@@ -940,21 +1018,21 @@ fn the_refusals_a_real_proof_cannot_reach() {
 const COST_SHAPES: [(usize, usize, u8); 5] =
     [(6, 3, 0), (6, 5, 0), (5, 3, 0), (6, 3, 8), (9, 3, 8)];
 
-fn count_rows(program: &LfmProgram, want: fn(&super::instr::Instr) -> bool) -> usize {
+pub(super) fn count_rows(program: &LfmProgram, want: fn(&super::instr::Instr) -> bool) -> usize {
     program.instrs.iter().filter(|instr| want(instr)).count()
 }
 
-fn const_rows(program: &LfmProgram) -> usize {
+pub(super) fn const_rows(program: &LfmProgram) -> usize {
     count_rows(program, |i| matches!(i, super::instr::Instr::Const { .. }))
 }
 
 /// `LFM_HASH` invocations: one per sponge permutation, whether it is a leaf's
 /// duplex block or a Merkle parent's compress.
-fn perm_rows(program: &LfmProgram) -> usize {
+pub(super) fn perm_rows(program: &LfmProgram) -> usize {
     count_rows(program, |i| matches!(i, super::instr::Instr::Hash { .. }))
 }
 
-fn hint_rows(program: &LfmProgram) -> usize {
+pub(super) fn hint_rows(program: &LfmProgram) -> usize {
     count_rows(program, |i| matches!(i, super::instr::Instr::Hint { .. }))
 }
 
