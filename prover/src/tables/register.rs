@@ -58,12 +58,20 @@ pub const NUM_PREPROCESSED_COLS: usize = 2;
 
 /// Number of preprocessed columns (OFFSET, INIT, FINI) for continuation epochs.
 /// A continuation epoch additionally preprocesses FINI so the epoch's final
-/// register file becomes a verifier-known public value (`R_{i+1}`): the verifier
-/// recomputes the commitment from it, the REG-C2 Memory-bus token forces it to
-/// equal the true final registers, and the next epoch reuses the same `R_{i+1}`
-/// as its preprocessed INIT — binding `init(epoch i+1) == fini(epoch i)` with no
-/// extra bus. The monolithic prover keeps FINI as a main-trace column (it has no
-/// verifier-known final state), using `NUM_PREPROCESSED_COLS` instead.
+/// register file becomes a verifier-known public value (`R_{i+1}`): the REG-C2
+/// Memory-bus token forces it to equal the true final registers, and the next
+/// epoch reuses the same `R_{i+1}` as its preprocessed INIT — binding
+/// `init(epoch i+1) == fini(epoch i)` with no extra bus. The monolithic prover
+/// keeps FINI as a main-trace column (it has no verifier-known final state),
+/// using `NUM_PREPROCESSED_COLS` instead.
+///
+/// ⚠ "Preprocessed" is only as binding as what the verifier compares, and the
+/// two verifiers compare different things: a root
+/// ([`compute_precomputed_commitment_with_fini`]) on the univariate path and the
+/// columns ([`preprocessed_columns_with_fini`]) on the multilinear one. Both are
+/// supplied to the AIR, because supplying one without the other leaves the
+/// other path checking nothing. `register_tests` pins this count against the
+/// columns function so the two cannot drift.
 pub const NUM_PREPROCESSED_COLS_WITH_FINI: usize = 3;
 
 // =========================================================================
@@ -324,18 +332,27 @@ pub fn preprocessed_columns(init: &[u32]) -> Vec<Vec<FE>> {
     vec![offset_col, init_col]
 }
 
-/// Continuation variant: commits OFFSET + INIT + FINI, so the verifier recomputes
-/// the commitment from the public `init` (`R_i`) and `fini` (`R_{i+1}`) and the
-/// proof's FINI column is locked to `R_{i+1}`. `fini` is the vector produced by
-/// `fini_from_trace` (entry `i` = the register at `register_word_address_list()[i]`).
-/// Used by continuation epochs with `NUM_PREPROCESSED_COLS_WITH_FINI`; must match
-/// the column order of the REGISTER trace (OFFSET, INIT, FINI), and FINI on padding
-/// rows is 0 (as the trace builds it).
-pub fn compute_precomputed_commitment_with_fini(
-    options: &ProofOptions,
-    init: &[u32],
-    fini: &[u32],
-) -> Commitment {
+/// The continuation variant's columns themselves: OFFSET, INIT and FINI, padded
+/// to a power of two.
+///
+/// ★ THE COLUMNS, NOT ONLY THEIR ROOT, because the two verifiers bind different
+/// things. The univariate verifier compares
+/// [`compute_precomputed_commitment_with_fini`]'s root against the proof's
+/// precomputed tree (`stark::verifier`, the `is_preprocessed()` branch). The
+/// multilinear verifier has no such tree: it checks the claimed openings of
+/// columns `0..num_precomputed_columns()` against the values the program
+/// implies (`stark::multilinear_table::check_preprocessed`), and it reads them
+/// through [`stark::traits::AIR::precomputed_columns`]. An AIR built with a
+/// commitment and no columns closure hands that check an EMPTY list, which it
+/// walks in zero iterations — so this function is what makes `R_i` and
+/// `R_{i+1}` binding on the multilinear path at all.
+///
+/// `fini` is the vector produced by `fini_from_trace` (entry `i` = the register
+/// at `register_word_address_list()[i]`). The order is the REGISTER trace's
+/// column order (OFFSET, INIT, FINI), and FINI on padding rows is 0, as the
+/// trace builds it — the prover rejects a trace that disagrees before it
+/// commits anything (`multilinear_continuation`'s preprocessed guard).
+pub fn preprocessed_columns_with_fini(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
@@ -347,10 +364,30 @@ pub fn compute_precomputed_commitment_with_fini(
     for i in 0..NUM_REGISTER_ADDRESSES {
         offset_col[i] = FE::from(addr_list[i]);
         init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
-        fini_col[i] = FE::from(fini[i] as u64);
+        fini_col[i] = FE::from(fini.get(i).copied().unwrap_or(0) as u64);
     }
 
-    commit_register_columns(options, vec![offset_col, init_col, fini_col])
+    vec![offset_col, init_col, fini_col]
+}
+
+/// Continuation variant: commits OFFSET + INIT + FINI over
+/// [`preprocessed_columns_with_fini`], so the root and the columns are one
+/// derivation and cannot drift apart.
+///
+/// ⚠ WHAT THE ROOT BINDS AND WHERE. On the univariate path the verifier
+/// recomputes this root from the public `init` (`R_i`) and `fini` (`R_{i+1}`)
+/// and compares it, which is what locks the proof's FINI column to `R_{i+1}`;
+/// the REG-C2 Memory-bus token then forces `R_{i+1}` to be the true final
+/// registers and the next epoch's preprocessed INIT reuses it, binding
+/// `init(epoch i+1) == fini(epoch i)`. The multilinear path never reads this
+/// root — see [`preprocessed_columns_with_fini`], which is what it reads
+/// instead. Used by continuation epochs with `NUM_PREPROCESSED_COLS_WITH_FINI`.
+pub fn compute_precomputed_commitment_with_fini(
+    options: &ProofOptions,
+    init: &[u32],
+    fini: &[u32],
+) -> Commitment {
+    commit_register_columns(options, preprocessed_columns_with_fini(init, fini))
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column

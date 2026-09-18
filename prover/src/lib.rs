@@ -544,6 +544,29 @@ pub(crate) struct VmAirs {
     pub cpu32s: Vec<VmAir>,
 }
 
+/// What a continuation epoch preprocesses REGISTER against: the commitment
+/// **and** the two public vectors it commits, INIT = `R_i` and FINI = `R_{i+1}`.
+///
+/// ★ THE VECTORS TRAVEL WITH THE COMMITMENT BECAUSE THE TWO VERIFIERS BIND
+/// DIFFERENT THINGS. The univariate verifier recomputes the root and compares
+/// it; the multilinear one has no precomputed tree and instead checks the
+/// proof's claimed openings of columns `0..n` against the values the program
+/// implies, which it obtains from
+/// [`stark::traits::AIR::precomputed_columns`]. Handing an AIR a commitment
+/// with no columns closure therefore binds the first path and nothing at all on
+/// the second. Carrying both here makes "preprocessed" mean the same thing on
+/// both, and makes the omission a missing field rather than a silent `None`.
+pub struct RegisterPreprocessed<'a> {
+    /// The root, for the univariate verifier.
+    pub commitment: Commitment,
+    /// `R_i`, the epoch's starting register file — the verifier's own value:
+    /// the ELF's entry point for epoch 0, the previous epoch's proved `reg_fini`
+    /// after that.
+    pub init: &'a [u32],
+    /// `R_{i+1}`, the epoch's final register file as the proof states it.
+    pub fini: &'a [u32],
+}
+
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
@@ -712,7 +735,7 @@ impl VmAirs {
         include_halt: bool,
         register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
-        register_preprocessed: Option<(Commitment, usize)>,
+        register_preprocessed: Option<RegisterPreprocessed<'_>>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
@@ -827,25 +850,44 @@ impl VmAirs {
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let hint: VmAir = Box::new(create_hint_air(proof_options));
-        let register: VmAir =
-            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
-                Box::new(
-                    create_register_air(proof_options)
-                        .with_preprocessed(commitment, num_preprocessed_cols),
-                )
-            } else {
-                let register_init = register_init
-                    .map(<[u32]>::to_vec)
-                    .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-                let commitment = register::preprocessed_commitment(proof_options, &register_init);
-                Box::new(
-                    create_register_air(proof_options).with_preprocessed_columns(
-                        commitment,
-                        register::NUM_PREPROCESSED_COLS,
-                        Arc::new(move || register::preprocessed_columns(&register_init)),
-                    ),
-                )
-            };
+        let register: VmAir = if let Some(RegisterPreprocessed {
+            commitment,
+            init,
+            fini,
+        }) = register_preprocessed
+        {
+            // ⚠ THE COLUMNS, NOT ONLY THE COMMITMENT. `with_preprocessed`
+            // alone leaves `precomputed_columns()` empty, and the
+            // multilinear verifier checks exactly that list — an empty one
+            // in zero iterations. REGISTER was the only preprocessed AIR
+            // here built that way, so on the multilinear continuation path
+            // INIT and FINI were prover-chosen main trace: a bundle whose
+            // epoch 0 `reg_fini` had one bit flipped verified, on every
+            // epoch and through `verify_epochs`. The univariate path is
+            // unaffected either way — it compares the root and never calls
+            // `precomputed_columns()`.
+            let init = init.to_vec();
+            let fini = fini.to_vec();
+            Box::new(
+                create_register_air(proof_options).with_preprocessed_columns(
+                    commitment,
+                    register::NUM_PREPROCESSED_COLS_WITH_FINI,
+                    Arc::new(move || register::preprocessed_columns_with_fini(&init, &fini)),
+                ),
+            )
+        } else {
+            let register_init = register_init
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+            let commitment = register::preprocessed_commitment(proof_options, &register_init);
+            Box::new(
+                create_register_air(proof_options).with_preprocessed_columns(
+                    commitment,
+                    register::NUM_PREPROCESSED_COLS,
+                    Arc::new(move || register::preprocessed_columns(&register_init)),
+                ),
+            )
+        };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const

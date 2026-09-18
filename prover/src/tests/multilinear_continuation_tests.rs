@@ -14,6 +14,7 @@ use stark::proof::options::ProofOptions;
 
 use crate::continuation::{self, PreparedEpoch};
 use crate::multilinear_continuation;
+use crate::tables::local_to_global;
 use crate::tables::register;
 use crate::tables::trace_builder::DecodeArtifacts;
 use crate::test_utils::asm_elf_bytes;
@@ -87,13 +88,19 @@ fn every_epoch_of_a_program_proves_and_verifies() {
 
 /// A smaller epoch means more of them, which is what exercises the carry: each
 /// one starts where the last proof said it ended.
+///
+/// ⚠ THE SIZES ARE THE CHECK. At 2^6 and 2^4 `sub` is ONE epoch either way, so
+/// `many >= few` read `1 >= 1` — a comparison whose two sides the fixture could
+/// not separate. `sub` splits at 2^2, so the inequality is now strict and the
+/// count that must exceed the other is the one the carry runs through.
 #[test]
 fn the_epochs_chain_through_their_registers() {
-    let few = epochs_prove_and_verify("sub", 6);
-    let many = epochs_prove_and_verify("sub", 4);
+    let few = epochs_prove_and_verify("sub", 4);
+    let many = epochs_prove_and_verify("sub", 2);
     assert!(
-        many >= few,
-        "a smaller epoch should not produce fewer of them: {many} against {few}"
+        many > few,
+        "a smaller epoch must produce more of them, or nothing here chains: \
+         {many} at 2^2 against {few} at 2^4"
     );
 }
 
@@ -118,15 +125,126 @@ fn a_broken_register_carry_is_rejected() {
     let elf_bytes = asm_elf_bytes("sub");
     let opts = ProofOptions::default_test_options();
     let mut epochs =
-        multilinear_continuation::prove_epochs(&elf_bytes, &[], 4, &opts).expect("prove");
-    if epochs.len() < 2 {
-        return; // nothing to chain
-    }
+        multilinear_continuation::prove_epochs(&elf_bytes, &[], 2, &opts).expect("prove");
+    // ⚠ NOT `if epochs.len() < 2 { return; }`, which is how this test spent its
+    // life: at 2^4 `sub` is a single epoch, so the early return fired and the
+    // assertion below never ran. A run with nothing to chain is a fixture
+    // failure, not a pass.
+    assert!(
+        epochs.len() >= 2,
+        "the carry needs two epochs to cross; this fixture produced {}",
+        epochs.len()
+    );
     // Claim the first epoch ended somewhere it did not.
     epochs[0].reg_fini[1] ^= 1;
     assert!(
         !multilinear_continuation::verify_epochs(&elf_bytes, &epochs, &opts).expect("verify"),
         "a restated register carry was accepted"
+    );
+}
+
+/// ★★ THE CARRY, CHECKED ONE EPOCH AT A TIME AND FROM BOTH ENDS.
+///
+/// `verify_epochs` checks every epoch of a run, so a `false` from it says the
+/// RUN is bad and not which epoch objected, nor to what. This hands ONE epoch
+/// its starting register file directly, which is the value the chain is made
+/// of, and asserts the refusal beside the control that the same epoch under the
+/// honest vector is ACCEPTED — without that half, a verifier that refused
+/// everything would pass.
+///
+/// ⛔ WHAT THIS CAUGHT. Both arms were ACCEPTED before the fix in this commit,
+/// on `verify_epoch` and through `verify_epochs`, measured on three epochs of
+/// `test_private_input_xpage`: `continuation::build_epoch_airs` gave REGISTER a
+/// preprocessed COMMITMENT and no columns closure, the multilinear verifier
+/// checks preprocessed COLUMNS and never a root, and an empty column list is
+/// walked in zero iterations. INIT and FINI were prover-chosen main trace, so
+/// the epoch boundary bound nothing on this path. Two indices are flipped
+/// because they are read by different consumers: a general-purpose word, and
+/// [`register::X254_INDEX`], the synthetic commit index the public output rides
+/// on.
+#[test]
+fn a_restated_register_carry_is_refused_by_the_epoch_it_lands_in() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let opts = ProofOptions::default_test_options();
+    let epochs = multilinear_continuation::prove_epochs(&elf_bytes, &[], 2, &opts).expect("prove");
+    assert!(
+        epochs.len() >= 2,
+        "a carry needs an epoch to land in; this fixture produced {}",
+        epochs.len()
+    );
+
+    let verify_one = |index: usize, carried: &[u32]| {
+        multilinear_continuation::verify_epoch(
+            &elf,
+            &elf_bytes,
+            &epochs[index],
+            carried,
+            index + 1 == epochs.len(),
+            local_to_global::epoch_label(index as u64),
+            &opts,
+        )
+        .expect("verify_epoch")
+    };
+
+    let honest = epochs[0].reg_fini.clone();
+    assert!(
+        verify_one(1, &honest),
+        "the control: epoch 1 under the registers epoch 0 proved it ended with"
+    );
+
+    for at in [1usize, register::X254_INDEX] {
+        let mut restated = honest.clone();
+        restated[at] ^= 1;
+        assert!(
+            !verify_one(1, &restated),
+            "epoch 1 accepted a starting register file differing at index {at} from \
+             the one the previous epoch proved"
+        );
+    }
+}
+
+/// The other end of the same binding: what an epoch CLAIMS it ended with.
+///
+/// The carry test restates the vector the next epoch starts from; this restates
+/// the vector the epoch itself publishes, and verifies that epoch alone. The two
+/// are the same column pair read by the two neighbours, and a fix that bound
+/// only one of them would pass one of these tests.
+#[test]
+fn a_restated_register_fini_is_refused_by_the_epoch_that_states_it() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let opts = ProofOptions::default_test_options();
+    let mut epochs =
+        multilinear_continuation::prove_epochs(&elf_bytes, &[], 2, &opts).expect("prove");
+    assert!(
+        epochs.len() >= 2,
+        "this fixture produced {} epochs",
+        epochs.len()
+    );
+    let entry = register::register_init_from_entry_point(elf.entry_point);
+
+    let verify_first = |epochs: &[multilinear_continuation::EpochProof]| {
+        multilinear_continuation::verify_epoch(
+            &elf,
+            &elf_bytes,
+            &epochs[0],
+            &entry,
+            epochs.len() == 1,
+            local_to_global::epoch_label(0),
+            &opts,
+        )
+        .expect("verify_epoch")
+    };
+
+    assert!(
+        verify_first(&epochs),
+        "the control: epoch 0 as it was proved"
+    );
+    epochs[0].reg_fini[register::X254_INDEX] ^= 1;
+    assert!(
+        !verify_first(&epochs),
+        "epoch 0 was accepted while claiming a final register file it did not reach"
     );
 }
 
