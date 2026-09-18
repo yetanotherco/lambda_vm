@@ -990,13 +990,45 @@ fn the_block_f1_at_every_epoch_shape() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    // ⛔⛔ THE TABLE-CHUNKING POSTURE IS PART OF THE MEASUREMENT, and it is
+    // REFUSED rather than defaulted.
+    //
+    // ✓ `for_each_epoch` (`continuation.rs:634`, inside 554..669) builds every
+    // epoch's traces with `MaxRowsConfig::default()`, and that default reads
+    // `LAMBDA_VM_MAX_ROWS_LOG2` (`tables/mod.rs:126-146`): set, it is ONE
+    // UNIFORM cap for every table; unset, the production per-table values
+    // (CPU 2^19, MEMW_R 2^20, …). The two produce DIFFERENT CHUNK COUNTS for the
+    // same work — four CPU chunks at 2^19 against one at 2^21 — and the config's
+    // own doc says why it matters here: "every extra sub-proof is a leg the
+    // recursion wrap pays for".
+    //
+    // The first run of this instrument was scored against a block run that had
+    // exported `LAMBDA_VM_MAX_ROWS_LOG2=21` (its launcher's own line) while this
+    // walk had not, so the two described different epochs and every residual was
+    // downstream of that. A knob that changes the subject silently is a knob
+    // this has to refuse.
+    let caps = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2");
+    assert!(
+        caps.is_ok() || std::env::var("LFM_F1_ALLOW_DEFAULT_CAPS").is_ok_and(|v| !v.is_empty()),
+        "REFUSING TO MEASURE: LAMBDA_VM_MAX_ROWS_LOG2 is unset, so this walk \
+         would chunk every epoch at the PRODUCTION per-table caps. A run scored \
+         against a prover that set it is comparing two different epoch shapes. \
+         Set it to the prover's value, or set LFM_F1_ALLOW_DEFAULT_CAPS=1 to say \
+         in writing that the production caps are what you meant."
+    );
+
     let bytes = std::fs::read(&elf_path).expect("the guest ELF reads");
     let inputs = std::fs::read(&input_path).expect("the block input reads");
     println!(
         "★ F1 BLOCK SHAPES: guest {elf_path} ({} B), input {input_path} ({} B), \
-         epoch 2^{epoch_log2}, final published bytes {final_out_bytes}",
+         epoch 2^{epoch_log2}, final published bytes {final_out_bytes}, \
+         LAMBDA_VM_MAX_ROWS_LOG2={}",
         bytes.len(),
         inputs.len(),
+        match &caps {
+            Ok(v) => v.clone(),
+            Err(_) => "<unset: PRODUCTION per-table caps>".to_string(),
+        },
     );
 
     let opts = crate::recursion::Preset::Blowup4.options();
