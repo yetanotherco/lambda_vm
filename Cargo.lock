@@ -422,6 +422,7 @@ dependencies = [
  "lambda-vm-syscalls",
  "libc",
  "math",
+ "math-cuda",
  "memmap2",
  "rayon",
  "rkyv",

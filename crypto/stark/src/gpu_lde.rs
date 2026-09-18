@@ -171,16 +171,17 @@ pub fn reset_all_gpu_call_counters() {
     GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_COMPOSITION_PARTS_DOWNLOADS.store(0, Ordering::Relaxed);
-    GPU_GRIND_CALLS.store(0, Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    crypto::grinding::reset_gpu_grind_calls();
 }
 
-/// Successful GPU proof-of-work grind dispatches — one per table whose round-4
-/// nonce search ran on device and produced a nonce that passed the host
-/// validity check (a device miss or an invalid kernel result falls back to the
-/// CPU search and is not counted).
-pub(crate) static GPU_GRIND_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Successful GPU proof-of-work grind dispatches. Counted by
+/// [`crypto::grinding`], which owns the dispatch both provers share.
 pub fn gpu_grind_calls() -> u64 {
-    GPU_GRIND_CALLS.load(Ordering::Relaxed)
+    #[cfg(feature = "cuda")]
+    return crypto::grinding::gpu_grind_calls();
+    #[cfg(not(feature = "cuda"))]
+    return 0;
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
