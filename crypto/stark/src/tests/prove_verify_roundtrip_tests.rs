@@ -253,13 +253,20 @@ fn create_mul_air(
 /// row-major coset LDE inside the table's fused chain — never its contents.
 /// A mismatch means the rebuild diverged from what was committed.
 ///
-/// The env var is process-global, so the two proving runs are serialized under
-/// a mutex and the prior value is restored.
+/// Skipped under `cuda`: there `retire_leaves` returns `None` unconditionally
+/// and `retire_main_lde` is compiled out, so both arms would take the resident
+/// path and the assertion would compare a proof against itself.
+///
+/// The env var is process-global. `cargo nextest`, which is what CI runs, gives
+/// each test its own process; a plain `cargo test` does not, so under `make
+/// test` the other proving tests in this binary may observe the flag while this
+/// one holds it. That costs those tests the mode they meant to exercise, not
+/// memory safety: `std::env`'s own `RwLock` serialises every Rust-side reader
+/// against the write. The proper fix is this test's own integration binary, the
+/// way `prover/tests/gpu_force_downgrade.rs` does it.
 #[test]
+#[cfg(not(feature = "cuda"))]
 fn retire_lde_proof_is_byte_identical() {
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn prove_once() -> Vec<u8> {
         let add_column = vec![
             FE::one(),
@@ -333,14 +340,23 @@ fn retire_lde_proof_is_byte_identical() {
         serde_cbor::to_vec(&proofs).expect("serialize proofs")
     }
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let prev = std::env::var("LAMBDA_STREAM_LDE").ok();
 
-    // SAFETY: single-threaded section guarded by ENV_LOCK; restored below.
+    // SAFETY: the only writer in this binary, and every reader of it goes
+    // through `std::env`, which serialises reads against writes on its own
+    // lock. Restored below.
     unsafe { std::env::set_var("LAMBDA_STREAM_LDE", "0") };
+    assert!(
+        !crate::prover::streaming_retire_lde(),
+        "the flag did not take: this test would compare a proof against itself"
+    );
     let resident = prove_once();
 
     unsafe { std::env::set_var("LAMBDA_STREAM_LDE", "1") };
+    assert!(
+        crate::prover::streaming_retire_lde(),
+        "the flag did not take: this test would compare a proof against itself"
+    );
     let retired = prove_once();
 
     match prev {
