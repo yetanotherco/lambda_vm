@@ -361,6 +361,35 @@ impl<'a> ShapePlan<'a> {
             .collect()
     }
 
+    /// ★★ THE WIDTH `stacks` WAS GIVEN, AGAINST THE WIDTH ACTUALLY COMMITTED.
+    ///
+    /// `EpochPlan::build` calls `stacks` with `air.trace_layout().0`, while the
+    /// columns a group's commitment actually holds are
+    /// `TableLayout::num_columns()` — `leaves.num_columns()`, documented as "the
+    /// columns to commit, in the order they must be materialized". Nothing makes
+    /// the two equal; they are simply both called "width" at different points.
+    ///
+    /// ⛔ WHY THIS IS INSTRUMENTED RATHER THAN ASSUMED. A difference here is
+    /// INVISIBLE at fixture scale — the fixture's group 0 fits in ONE stacked
+    /// polynomial whatever the width is, so the poly count cannot move — and
+    /// decisive at block scale, where group 0 packs into seven to eleven and a
+    /// constant error of a few million cells tips exactly the epochs whose last
+    /// polynomial is nearly full. That is the shape of the residual the block
+    /// run shows: the shape walk is short by a CONSTANT between 10,084,636 and
+    /// 17,254,080 cells, and BITWISE's eleven preprocessed columns at `2^20` are
+    /// 11,534,336 of them.
+    fn width_audit(&self) -> Vec<(String, usize, usize, usize)> {
+        self.names
+            .iter()
+            .zip(&self.raw_shapes)
+            .zip(&self.layouts)
+            .zip(&self.preprocessed)
+            .map(|(((name, (width, _)), layout), prep)| {
+                (name.clone(), *width, layout.num_columns(), prep.len())
+            })
+            .collect()
+    }
+
     /// Carried roots: one per polynomial of every commitment group, in
     /// `proof.roots` order.
     fn carried_roots(&self) -> usize {
@@ -425,6 +454,15 @@ fn arena_words(plan: &ShapePlan<'_>) -> usize {
 /// its LENGTH, because the sponge every later leg squeezes against is entered
 /// where the statement leaves it. `public_output` is the epoch's, whose length
 /// decides `out_halves` and the closure's expected value.
+/// The width audit at a shape, for a caller that has no plan of its own.
+pub fn width_audit_at(
+    airs: EpochAirs<'_>,
+    table_num_vars: &[usize],
+    config: ChainConfig,
+) -> Vec<(String, usize, usize, usize)> {
+    ShapePlan::build(airs, table_num_vars, config).width_audit()
+}
+
 pub fn epoch_f1(
     airs: EpochAirs<'_>,
     table_num_vars: &[usize],
@@ -811,6 +849,36 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
         }
         println!("   {:<14} {:>10}", "TOTAL", measured);
         println!("{f1:#?}");
+
+        // ★★ THE WIDTH AUDIT: the width `stacks` was handed against the width
+        // the commitment holds. A difference cannot move the poly count here —
+        // the fixture's group 0 is one polynomial — which is exactly why it is
+        // printed at every epoch rather than asserted at one.
+        let audit = width_audit_at(&refs, &table_num_vars, epoch.config);
+        let differing: Vec<_> = audit
+            .iter()
+            .filter(|(_, w, c, _)| w != c)
+            .cloned()
+            .collect();
+        println!(
+            "   width audit: {} of {} tables have trace_layout().0 != num_columns(){}",
+            differing.len(),
+            audit.len(),
+            if differing.is_empty() {
+                String::new()
+            } else {
+                format!("  {differing:?}")
+            },
+        );
+        let (sum_w, sum_c): (usize, usize) = audit
+            .iter()
+            .fold((0, 0), |(a, b), (_, w, c, _)| (a + w, b + c));
+        println!("   width audit: Σ trace_layout().0 = {sum_w} · Σ num_columns() = {sum_c}");
+        for (name, w, c, prep) in &audit {
+            if w != c || *prep > 0 {
+                println!("     {name:<14} width {w:>5} committed {c:>5} preprocessed {prep:>3}");
+            }
+        }
 
         let workload: usize = chips
             .iter()
