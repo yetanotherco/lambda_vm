@@ -357,6 +357,46 @@ fn the_owed_replay_is_sensitive_to_the_derived_roots() {
     );
 }
 
+/// ⛔ THE REPLAY DRAWS WHAT THE BLOCK DRAWS, IN THE ORDER THE BLOCK DRAWS IT.
+///
+/// The replay shares the roots block's ABSORB half and spells its own two draws,
+/// because a fork that is thrown away must not pay for a third squeeze nobody
+/// reads. What that split leaves open is the draw ORDER, so it is checked here
+/// against the block itself rather than trusted: the counterparty computed from
+/// the block's first two challenges must equal the one `owed` returns.
+///
+/// Two implementations, not one — which is what makes this able to fail. Swap
+/// `z` and `alpha` in either and it goes red.
+#[test]
+fn the_owed_replay_draws_what_the_roots_block_draws() {
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+
+    let public_output = [0x11u8, 0x22, 0x33, 0x44];
+    let register_init = register::register_init_from_entry_point(0x2000);
+    let carried: Vec<stark::config::Commitment> = vec![[3u8; 32], [5u8; 32]];
+    let derived: Vec<stark::config::Commitment> = vec![[17u8; 32]];
+    let seed = DefaultTranscript::<crate::test_utils::E>::new(b"w1c-owed-agrees");
+
+    let from_the_replay =
+        multilinear_continuation::owed(&public_output, &register_init, &carried, &derived, &seed)
+            .expect("the commit fingerprints are invertible");
+
+    let mut block = seed.clone();
+    let (z, alpha, _beta) = stark::multilinear_table::absorb_roots_and_challenge::<
+        crate::test_utils::E,
+        _,
+    >(&mut block, &carried, &derived);
+    let start_index = register_init[crate::tables::register::X254_INDEX] as u64;
+    let from_the_block = crate::compute_commit_bus_offset(&public_output, start_index, &z, &alpha)
+        .expect("the commit fingerprints are invertible");
+
+    assert_eq!(
+        from_the_replay, from_the_block,
+        "the replay and the roots block disagree on the challenges, so the \
+         counterparty is computed at challenges no table is checked at"
+    );
+}
+
 /// ★ WHY THE REST OF THIS FILE COULD NOT SEE THE DRIFT, written where it can be
 /// falsified instead of in a comment.
 ///

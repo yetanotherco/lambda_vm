@@ -605,8 +605,8 @@ pub struct TableProof<E: IsField> {
 /// could not see it, because the counterparty is zero there without reading
 /// either challenge.
 ///
-/// So: never spell this loop out again. Call it, and pass the same `derived`
-/// list the verification will be handed.
+/// So: never spell this loop out again. Call [`absorb_roots`], pass the same
+/// `derived` list the verification will be handed, and draw what you consume.
 ///
 /// # The order, and why `derived` is last
 ///
@@ -628,17 +628,39 @@ where
     E: IsField + 'static,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    absorb_roots::<E, T>(transcript, carried, derived);
+    (
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+    )
+}
+
+/// The half of the roots block that can DRIFT: which roots, in which order.
+///
+/// Split out because a replay needs this half and not the other. The order is a
+/// shared fact and is shared here; how many challenges are drawn afterwards is
+/// the caller's own business, because a replay works on a fork it throws away
+/// and only the first two challenges ever leave it.
+///
+/// ⚠ A challenge nobody reads is neither free nor invisible. Each is a sponge
+/// squeeze; `hash_metrics` counts squeezes on every transcript instance, a
+/// clone included; and the output buffer hands out four candidates per squeeze,
+/// so an unread draw moves a pinned squeeze count by an amount that depends on
+/// where the buffer happened to be. A replay draws exactly what it consumes,
+/// and the order it draws in is checked against
+/// [`absorb_roots_and_challenge`] by a test rather than by a comment.
+pub fn absorb_roots<E, T>(transcript: &mut T, carried: &[Commitment], derived: &[Commitment])
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
     for root in carried {
         transcript.append_bytes(root);
     }
     for root in derived {
         transcript.append_bytes(root);
     }
-    (
-        transcript.sample_field_element(),
-        transcript.sample_field_element(),
-        transcript.sample_field_element(),
-    )
 }
 
 /// What the verifier needs to settle a prepared commitment it derived itself.

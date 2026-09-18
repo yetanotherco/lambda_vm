@@ -21,6 +21,7 @@
 //! `LeafLayout::build_live_over`'s job, not this module's.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
@@ -475,8 +476,11 @@ fn layout_of<'a>(
 /// [`multilinear_table::absorb_roots_and_challenge`] is called rather than
 /// re-spelled so the two can no longer disagree.
 ///
-/// `beta` is drawn and dropped: the fork is discarded, and drawing it keeps this
-/// a call to the block rather than a prefix of it.
+/// Only the absorb half is shared. Two challenges are drawn, not three: the fork
+/// is discarded, `beta` would never be read, and an unread draw is a real sponge
+/// squeeze that `hash_metrics` counts on this clone like any other transcript.
+/// The order the two are drawn in is checked against the block itself by
+/// [`crate::tests::multilinear_continuation_tests`] rather than asserted here.
 pub(crate) fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
     public_output: &[u8],
     register_init: &[u32],
@@ -486,8 +490,9 @@ pub(crate) fn owed<T: crypto::fiat_shamir::transcript_hash::TranscriptHash>(
 ) -> Option<FieldElement<E>> {
     let start_index = *register_init.get(register::X254_INDEX)? as u64;
     let mut probe = transcript.clone();
-    let (z, alpha, _beta) =
-        multilinear_table::absorb_roots_and_challenge::<E, _>(&mut probe, carried, derived);
+    multilinear_table::absorb_roots::<E, _>(&mut probe, carried, derived);
+    let z: FieldElement<E> = probe.sample_field_element();
+    let alpha: FieldElement<E> = probe.sample_field_element();
     crate::compute_commit_bus_offset(public_output, start_index, &z, &alpha)
 }
 

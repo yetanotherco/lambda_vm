@@ -14,7 +14,7 @@
 //! from the ALU, whose counterparties are other tables — so what is checked is
 //! each table's own argument, with the output fraction left to the caller.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::{default_transcript::DefaultTranscript, is_transcript::IsTranscript};
 use math::field::element::FieldElement;
 use math::field::{
     extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
@@ -341,8 +341,9 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     // The block is CALLED rather than re-spelled, so this promise stays true
     // when the block changes — which is how the epoch path's replay broke.
     let mut probe = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    let (z, alpha, _beta) =
-        multilinear_table::absorb_roots_and_challenge::<Ext, _>(&mut probe, &proof.roots, &[]);
+    multilinear_table::absorb_roots::<Ext, _>(&mut probe, &proof.roots, &[]);
+    let z: ExtE = probe.sample_field_element();
+    let alpha: ExtE = probe.sample_field_element();
     // `start_index` is the carried x254: zero for a monolithic proof.
     let expected = crate::compute_commit_bus_offset(&public_output, 0, &z, &alpha)
         .expect("the commit fingerprints are invertible");

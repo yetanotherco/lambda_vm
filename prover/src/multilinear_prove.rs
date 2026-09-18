@@ -38,8 +38,10 @@
 //! transcript up to that point.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ChainConfig, GrindBits};
 use stark::multilinear_air::Uniforms;
@@ -502,11 +504,9 @@ pub fn verify_with_options(
         // This path opens nothing out of band, so `derived` is empty and not one
         // byte of any transcript moves; what changes is that it cannot drift.
         let mut probe = transcript.clone();
-        let (z, alpha, _beta) = multilinear_table::absorb_roots_and_challenge::<E, _>(
-            &mut probe,
-            &proof.proof.roots,
-            &[],
-        );
+        multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &[]);
+        let z: FieldElement<E> = probe.sample_field_element();
+        let alpha: FieldElement<E> = probe.sample_field_element();
         // `start_index` is the carried x254: zero for a monolithic proof.
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
         else {
