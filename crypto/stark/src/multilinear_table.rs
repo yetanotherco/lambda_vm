@@ -580,7 +580,8 @@ pub struct TableProof<E: IsField> {
 }
 
 /// ★★★ THE ROOTS BLOCK: every root into the transcript, then the three shared
-/// challenges — used by BOTH `multi_prove` and `multi_verify`.
+/// challenges — used by `multi_prove`, by `multi_verify`, AND by every caller
+/// that REPLAYS the block on a fork of the transcript.
 ///
 /// # Why it is one function
 ///
@@ -590,6 +591,22 @@ pub struct TableProof<E: IsField> {
 /// prover and verifier agree with each other and disagree with the
 /// specification. Sharing the code makes that particular disagreement
 /// unspellable rather than merely tested for.
+///
+/// # ⛔ The replays are callers too, and forgetting one is how this broke
+///
+/// A verifier that needs `z` and `alpha` BEFORE `multi_verify` runs — to compute
+/// the COMMIT bus's counterparty, which is a function of them — replays this
+/// block on a clone of the transcript. Such a replay is a third side of the same
+/// agreement, and it is public for exactly that reason: when the block grew the
+/// derived root, the two call sites inside this module grew with it and a
+/// hand-rolled replay in the prover crate did not, so the counterparty was
+/// computed at challenges no table had been checked at and every epoch that
+/// published output failed on `BusImbalance`. The epochs that published nothing
+/// could not see it, because the counterparty is zero there without reading
+/// either challenge.
+///
+/// So: never spell this loop out again. Call [`absorb_roots`], pass the same
+/// `derived` list the verification will be handed, and draw what you consume.
 ///
 /// # The order, and why `derived` is last
 ///
@@ -602,11 +619,38 @@ pub struct TableProof<E: IsField> {
 /// That is the one placement no round-trip can catch, which is why
 /// `the_roots_block_binds_the_derived_root_to_the_first_challenge` compares this
 /// against an independently built transcript rather than against the other side.
-fn absorb_roots_and_challenge<E, T>(
+pub fn absorb_roots_and_challenge<E, T>(
     transcript: &mut T,
     carried: &[Commitment],
     derived: &[Commitment],
 ) -> (FieldElement<E>, FieldElement<E>, FieldElement<E>)
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots::<E, T>(transcript, carried, derived);
+    (
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+    )
+}
+
+/// The half of the roots block that can DRIFT: which roots, in which order.
+///
+/// Split out because a replay needs this half and not the other. The order is a
+/// shared fact and is shared here; how many challenges are drawn afterwards is
+/// the caller's own business, because a replay works on a fork it throws away
+/// and only the first two challenges ever leave it.
+///
+/// ⚠ A challenge nobody reads is neither free nor invisible. Each is a sponge
+/// squeeze; `hash_metrics` counts squeezes on every transcript instance, a
+/// clone included; and the output buffer hands out four candidates per squeeze,
+/// so an unread draw moves a pinned squeeze count by an amount that depends on
+/// where the buffer happened to be. A replay draws exactly what it consumes,
+/// and the order it draws in is checked against
+/// [`absorb_roots_and_challenge`] by a test rather than by a comment.
+pub fn absorb_roots<E, T>(transcript: &mut T, carried: &[Commitment], derived: &[Commitment])
 where
     E: IsField + 'static,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
@@ -617,11 +661,6 @@ where
     for root in derived {
         transcript.append_bytes(root);
     }
-    (
-        transcript.sample_field_element(),
-        transcript.sample_field_element(),
-        transcript.sample_field_element(),
-    )
 }
 
 /// What the verifier needs to settle a prepared commitment it derived itself.
@@ -835,6 +874,7 @@ pub fn verify<E, T>(
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
     transcript: &mut T,
+    settled_out_of_band: usize,
 ) -> Result<TableVerdict<E>, MlError>
 where
     E: IsField + Send + Sync + 'static,
@@ -887,7 +927,7 @@ where
         transcript,
     )?;
 
-    check_preprocessed(statement, &reduced)?;
+    check_preprocessed(statement, &reduced, settled_out_of_band)?;
 
     Ok((proof.bus_output.clone(), reduced))
 }
@@ -901,15 +941,37 @@ where
 /// the proof settled on and demands the same value. Costs one pass over each
 /// such column, which is what recomputing a preprocessed commitment costs on
 /// the univariate side.
+/// ★★ `settled_out_of_band` is how many of this table's leading preprocessed
+/// columns a PREPARED OPENING already settled, and it is the whole saving: those
+/// columns are tied to an ELF-derived commitment by an opening at this very
+/// point, so evaluating their MLEs here would prove the same thing a second time
+/// at `5 * 2^20` folds an epoch.
+///
+/// ⚠ It must be driven by the same `PreparedCheck` value that drives the
+/// opening, never by a flag a caller sets on its own — otherwise it is a switch
+/// that turns off a check with nothing put in its place. The caller asserts it
+/// covers no more columns than the opening does; see `multi_verify`.
 fn check_preprocessed<F, E>(
     statement: TableStatement<'_, F, E>,
     reduced: &claim_reduce::ReducedClaim<E>,
+    settled_out_of_band: usize,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
-    for (col, column) in statement.preprocessed.iter().enumerate() {
+    if settled_out_of_band > statement.preprocessed.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: statement.preprocessed.len(),
+            got: settled_out_of_band,
+        });
+    }
+    for (col, column) in statement
+        .preprocessed
+        .iter()
+        .enumerate()
+        .skip(settled_out_of_band)
+    {
         let factor = slot(statement.slot_of, col)?;
         // A preprocessed column is read unshifted by construction: `TableLayout`
         // registers every main column that way. Anything else means the two
@@ -1149,10 +1211,26 @@ where
     // claimed values.
     let mut prepared_at: Option<usize> = None;
     for (index, (table, statement)) in proof.tables.iter().zip(statements).enumerate() {
-        if prepared.as_ref().is_some_and(|p| p.table == index) {
-            prepared_at = Some(points.len());
+        // ★ ONE VALUE drives both halves: the columns the opening settles are
+        // the columns `check_preprocessed` may skip. A second, independent knob
+        // would be a way to switch off a check with nothing in its place.
+        let settled = match prepared.as_ref() {
+            Some(p) if p.table == index => {
+                prepared_at = Some(points.len());
+                p.columns
+            }
+            _ => 0,
+        };
+        // ⚠ THE ASSERT THAT MATTERS. The opening covers `p.columns` of this
+        // table; skipping more than that would drop a preprocessed check
+        // nothing replaced.
+        if settled > statement.preprocessed.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: statement.preprocessed.len(),
+                got: settled,
+            });
         }
-        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript)?;
+        let (output, reduced) = verify(table, *statement, &z, &alpha, &beta, transcript, settled)?;
         balance += contribution(&output).ok_or(MlError::BusImbalance)?;
         for _ in 0..statement.slot_of.len() {
             points.push(reduced.point.clone());

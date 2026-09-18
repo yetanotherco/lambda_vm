@@ -338,10 +338,10 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     // The verifier redraws the shared LogUp challenges, so the offset has to be
     // computed against the same ones — which means replaying the transcript up
     // to that point exactly as `multi_verify` will.
+    // The block is CALLED rather than re-spelled, so this promise stays true
+    // when the block changes — which is how the epoch path's replay broke.
     let mut probe = DefaultTranscript::<Ext>::new(b"vm-sweep");
-    for root in &proof.roots {
-        probe.append_bytes(root);
-    }
+    multilinear_table::absorb_roots::<Ext, _>(&mut probe, &proof.roots, &[]);
     let z: ExtE = probe.sample_field_element();
     let alpha: ExtE = probe.sample_field_element();
     // `start_index` is the carried x254: zero for a monolithic proof.
