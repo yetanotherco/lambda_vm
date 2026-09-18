@@ -5,15 +5,17 @@
 //! cargo test -p lambda-vm-prover --lib decode_prepared
 //! ```
 //!
-//! # ⚠ NOT YET WIRED, and this file says so rather than implying otherwise
+//! # WHERE IT IS WIRED, kept current rather than left as a plan
 //!
-//! Nothing in production calls [`decode_prepared`] yet: every `multi_prove` and
-//! `multi_verify` call site still passes `None`, so no proof carries a prepared
-//! opening and the per-epoch MLE evaluation of the five columns is still paid.
-//! What is landed is the derivation and the index rule, with the properties the
-//! wiring will depend on pinned first. The branch has twice been bitten by a
-//! feature that was not wired at all rather than wired wrongly, so the state is
-//! written down instead of inferred from the presence of a function.
+//! ⛔ This section said "NOT YET WIRED — every `multi_prove` and `multi_verify`
+//! call site still passes `None`" for one commit longer than it was true. It is
+//! wired: `prove_epoch` and `verify_epoch_bookend` both build the commitment
+//! through `decode_prepared_for` and pass it down, so a proof carries the
+//! prepared opening and the per-epoch MLE evaluation of the five columns is no
+//! longer paid. What this file pins is the derivation and the index rule, which
+//! the wiring depends on; a statement about what calls it belongs beside the
+//! callers, and is written here only because the branch has twice been bitten by
+//! a feature that was not wired at all rather than wired wrongly.
 //!
 //! # No ELF on disk
 //!
@@ -116,8 +118,8 @@ fn a_different_program_commits_to_a_different_root() {
 /// The pair is what the field machine pins as program text, so a pair that could
 /// be assembled from two different ELFs is the defect to prevent. This says the
 /// two halves are carried together; that they describe one ELF is
-/// [`crate::multilinear_continuation::decode_prepared`]'s one-call structure,
-/// not something a test can observe from the outside.
+/// [`crate::multilinear_continuation::decode_prepared_for`]'s one-call
+/// structure, not something a test can observe from the outside.
 #[test]
 fn the_digest_is_carried_beside_the_roots() {
     let instrs = program(64, 3);

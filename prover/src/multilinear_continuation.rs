@@ -226,34 +226,6 @@ where
     }
 }
 
-/// Derives [`DecodePrepared`] from an ELF. See its documentation.
-///
-/// ★ This is the entry point BOTH SIDES call. It is two lines over
-/// [`decode_prepared_from_columns`] because the split is what lets the
-/// commitment's own properties — that it is a function of the instruction table
-/// and of nothing else, and that its shape is the one the ELF implies — be
-/// tested without an ELF artifact on disk. A test that silently skips when a
-/// build product is missing is a test that passed for the wrong reason.
-///
-/// ⚠ NOT CALLED YET. The `allow` below is the marker for that, and it is meant
-/// to be deleted by the commit that wires this into `prove_epoch` and
-/// `verify_epoch` — an unreachable function is exactly the state this branch has
-/// twice mistaken for a working feature, so it says so in the lint rather than
-/// in a comment nobody greps for.
-#[allow(dead_code)]
-pub(crate) fn decode_prepared<H>(
-    elf: &Elf,
-    elf_bytes: &[u8],
-    config: &ChainConfig,
-) -> Result<DecodePrepared<H>, Error>
-where
-    H: multilinear::whir_hash::WhirHash,
-{
-    let columns = crate::tables::decode::preprocessed_columns_from_elf(elf)
-        .map_err(|e| Error::Prover(format!("DECODE: {e:?}")))?;
-    decode_prepared_from_columns(statement::elf_digest(elf_bytes), columns, config)
-}
-
 thread_local! {
     /// How many times DECODE's out-of-band commitment has been DERIVED on THIS
     /// thread, so §4's residency claim — one commitment held across the epochs,
@@ -290,7 +262,13 @@ pub(crate) fn reset_decode_derivations() {
     DECODE_DERIVATIONS.with(|c| c.set(0));
 }
 
-/// [`decode_prepared`]'s core: the commitment over columns already in hand.
+/// [`decode_prepared_for`]'s core: the commitment over columns already in hand.
+///
+/// The split is what lets the commitment's own properties — that it is a
+/// function of the instruction table and of nothing else, and that its shape is
+/// the one the ELF implies — be tested without an ELF artifact on disk. A test
+/// that silently skips when a build product is missing is a test that passed
+/// for the wrong reason.
 pub(crate) fn decode_prepared_from_columns<H>(
     elf_digest: [u8; 32],
     columns: Vec<Vec<FieldElement<F>>>,
@@ -353,7 +331,7 @@ pub(crate) fn decode_prepared_config(columns: usize, num_vars: usize) -> ChainCo
     chain_config(&[(columns, num_vars)])
 }
 
-/// [`decode_prepared`] at the config its own shape implies.
+/// Derives [`DecodePrepared`] from an ELF, at the config its own shape implies.
 ///
 /// The one call BOTH SIDES make, so the prover and the verifier cannot build the
 /// commitment from two different ELFs or under two different parameter sets.
