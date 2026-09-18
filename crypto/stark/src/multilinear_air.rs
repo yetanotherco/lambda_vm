@@ -805,6 +805,17 @@ where
         ))
     }
 
+    /// The public factors' selectors, in the order they appear in the kinds.
+    ///
+    /// [`public_values`](Self::public_values) evaluates these and hands back
+    /// the answers; a caller that is EMITTING that evaluation as code needs the
+    /// selectors themselves, and [`public_tables`](Self::public_tables) is not
+    /// a substitute — it builds a `2^num_vars` table per selector, which is the
+    /// pass the closed form exists to avoid.
+    pub fn public_selectors(&self) -> &[Selector] {
+        &self.public_selectors
+    }
+
     /// The public factors' tables, in the order they appear in the kinds.
     ///
     /// Only the prover needs them: the verifier evaluates the same selectors in
