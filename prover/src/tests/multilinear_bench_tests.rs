@@ -65,7 +65,12 @@ const PROGRAMS: &[(&str, &str)] = &[
 
 /// A private-input fixture from `executor/tests`, empty for a program that
 /// takes none.
-pub(super) fn input_bytes(name: &str) -> Vec<u8> {
+///
+/// ★ `pub(crate)` for the same reason [`elf_bytes`] is: there must be ONE
+/// answer to "which bytes are `ethrex_10_transfers`". The level-0 driver's box
+/// test (`lfm::whir_epoch_tests`) loads its fixture through these two rather
+/// than re-implementing the path, so the two cannot drift.
+pub(crate) fn input_bytes(name: &str) -> Vec<u8> {
     if name.is_empty() {
         return Vec::new();
     }

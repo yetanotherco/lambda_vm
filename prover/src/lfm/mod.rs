@@ -72,6 +72,12 @@ pub mod whir_gkr;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
+/// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
+///
+/// ⚠ NOT `#[cfg(test)]`: `WhirRealEpoch` is the input type of V1's level-0
+/// program builder, and a production builder cannot take its input from a test
+/// module.
+pub(crate) mod whir_real_epoch;
 pub mod whir_reduce;
 pub mod whir_stacked;
 pub mod whir_statement;
@@ -152,6 +158,9 @@ mod whir_bus_tests;
 mod whir_chain_tests;
 #[cfg(test)]
 mod whir_epoch_program_tests;
+/// Its tests, which stayed behind when the driver moved out.
+#[cfg(test)]
+mod whir_epoch_tests;
 #[cfg(test)]
 mod whir_fold_tests;
 #[cfg(test)]

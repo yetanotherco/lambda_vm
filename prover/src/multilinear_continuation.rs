@@ -1278,6 +1278,80 @@ pub fn verify_epoch(
     })
 }
 
+/// One epoch's AIR set, OWNED — because everything downstream borrows from it.
+///
+/// ★ THE SET IS TWO OWNED THINGS, NOT ONE, and that is why this struct exists
+/// rather than a function returning `Vec<&dyn AIR>`. [`VmAirs::air_refs`] hands
+/// out borrows of a `VmAirs`, and the local-to-global AIR is a SEPARATE value
+/// that [`crate::continuation::l2g_memory_air`] returns by value; both have to
+/// outlive the refs, the layouts built from them and the `TableStatement`s
+/// built from those. A caller holds one of these and borrows from it.
+///
+/// The l2g AIR is boxed only so its concrete type does not have to be spelled
+/// here; `VmAirs` boxes its own the same way, and a `&dyn AIR` is a `&dyn AIR`
+/// either way.
+pub(crate) struct WhirEpochAirs {
+    airs: crate::VmAirs,
+    l2g: Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>,
+}
+
+impl WhirEpochAirs {
+    /// The AIRs in PROOF ORDER, local-to-global last.
+    ///
+    /// ⚠ The order IS the proof's layout. It is written once, here, because it
+    /// used to be written at both call sites and getting it wrong at one of
+    /// them would be a silent layout mismatch rather than a compile error.
+    pub(crate) fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        let mut refs = self.airs.air_refs();
+        refs.push(self.l2g.as_ref());
+        refs
+    }
+}
+
+/// The AIR set an epoch's tables are argued against.
+///
+/// ★ ONE DERIVATION, TWO CALLERS. [`verify_epoch_bookend`] builds its
+/// statements from this, and the level-0 driver
+/// (`crate::lfm::whir_real_epoch`) derives the harvested epoch's shapes from
+/// it, so the AIRs a wrap program is emitted against cannot drift from the AIRs
+/// the verifier accepted. Two call sites that agree today is exactly the shape
+/// that let REGISTER's preprocessed columns and its root describe different
+/// tables.
+///
+/// ⚠ `decode_commitment` IS THE ONE THING THE TWO CALLERS DISAGREE ABOUT, so it
+/// is a parameter rather than a constant. The verifier passes `None`; the
+/// driver passes the root it was handed, because that is what its own
+/// `decode_commitment` argument exists to carry. The difference reaches only
+/// DECODE's preprocessed commitment, which the multilinear path never compares
+/// — `lfm::whir_epoch_tests::the_supplied_decode_commitment_is_the_one_carried`
+/// passes a deliberately bogus root and the epoch still verifies. That is a
+/// real equivalence and not an obvious one, which is why the caller states
+/// which it wants instead of relying on it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn epoch_airs_for(
+    elf: &Elf,
+    opts: &ProofOptions,
+    epoch: &EpochProof,
+    register_init: &[u32],
+    is_final: bool,
+    label: u64,
+    decode_commitment: Option<Commitment>,
+) -> WhirEpochAirs {
+    WhirEpochAirs {
+        airs: crate::continuation::build_epoch_airs(
+            elf,
+            opts,
+            &[],
+            &epoch.table_counts,
+            register_init,
+            &epoch.reg_fini,
+            is_final,
+            decode_commitment,
+        ),
+        l2g: Box::new(crate::continuation::l2g_memory_air(opts, label)),
+    }
+}
+
 /// [`verify_epoch`], handing back the roots the epoch's bookend was committed
 /// under — which is what the binding compares. `None` is a proof that does not
 /// verify.
@@ -1303,19 +1377,10 @@ pub(crate) fn verify_epoch_bookend<H>(
 where
     H: multilinear::whir_hash::WhirHash,
 {
-    let airs = crate::continuation::build_epoch_airs(
-        elf,
-        opts,
-        &[],
-        &epoch.table_counts,
-        register_init,
-        &epoch.reg_fini,
-        is_final,
-        None,
-    );
-    let l2g_air = crate::continuation::l2g_memory_air(opts, label);
-    let mut air_refs = airs.air_refs();
-    air_refs.push(&l2g_air);
+    // ★ THE SAME DERIVATION THE LEVEL-0 DRIVER USES. `None` is this side's
+    // answer for DECODE's preprocessed commitment, unchanged.
+    let air_set = epoch_airs_for(elf, opts, epoch, register_init, is_final, label, None);
+    let air_refs = air_set.refs();
     // By NAME, and exactly one — the same rule the prover applied.
     let decode_at = decode_table_index(&air_refs)?;
 
