@@ -1226,7 +1226,11 @@ fn the_production_chain_costs_what_the_census_quotes() {
 #[ignore = "builds a production-shape chain program; run it when the census needs the number"]
 fn the_production_chain_emits_its_closed_form() {
     let shape = ChainShape::new(&config(112, 20), 25);
-    assert_eq!(shape.schedule, vec![4, 4, 4, 4, 4, 4, 1], "the production schedule");
+    assert_eq!(
+        shape.schedule,
+        vec![4, 4, 4, 4, 4, 4, 1],
+        "the production schedule"
+    );
 
     let program = chain_program(&shape);
     let entry = SpongeEntry::fresh();
@@ -1256,7 +1260,14 @@ fn the_production_chain_emits_its_closed_form() {
         measured + consts
     );
 
-    assert_eq!(hints, Layout::new(&shape).total as usize, "every arena word hinted once");
+    assert_eq!(
+        hints,
+        Layout::new(&shape).total as usize,
+        "every arena word hinted once"
+    );
     assert_eq!(measured, predicted, "the production shape's rows");
-    assert_eq!(perms, predicted_perms, "the production shape's permutations");
+    assert_eq!(
+        perms, predicted_perms,
+        "the production shape's permutations"
+    );
 }
