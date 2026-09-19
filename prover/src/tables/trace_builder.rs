@@ -5417,21 +5417,52 @@ impl Traces {
     /// init data populated. Used by the verifier to reconstruct the ELF
     /// portion of the PAGE table layout.
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
-        use std::collections::BTreeSet;
+        use std::collections::BTreeMap;
 
-        let init_page_data = build_init_page_data(&build_initial_image(elf, &[]));
-
-        let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
-
-        page_bases
-            .into_iter()
-            .map(|base| {
-                if let Some(init_data) = init_page_data.get(&base) {
-                    PageConfig::with_data(base, init_data.clone())
-                } else {
-                    PageConfig::zero_init(base)
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        // Written straight into the pages rather than through a per-byte
+        // `HashMap` (`build_initial_image` + `build_init_page_data`): the
+        // verifier runs this, the recursion guest runs the verifier, and one
+        // SipHash insert per ELF byte is most of that guest's startup. Order
+        // and values are what the map produced — ascending bases, last write
+        // wins within a segment run.
+        let mut pages: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for segment in &elf.data {
+            if !segment.base_addr.is_multiple_of(4) {
+                // A word can straddle a page boundary; take the byte path.
+                for (i, &word) in segment.values.iter().enumerate() {
+                    let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
+                    for byte_offset in 0..4u64 {
+                        let addr = word_addr.wrapping_add(byte_offset);
+                        let page = pages
+                            .entry(page::page_base_for_address(addr))
+                            .or_insert_with(|| vec![0u8; page_size]);
+                        page[page::offset_in_page(addr)] =
+                            ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                    }
                 }
-            })
+                continue;
+            }
+            let mut i = 0usize;
+            while i < segment.values.len() {
+                let addr = segment.base_addr.wrapping_add(i as u64 * 4);
+                let offset = page::offset_in_page(addr);
+                let words_in_page = (page_size - offset) / 4;
+                let take = words_in_page.min(segment.values.len() - i);
+                let page = pages
+                    .entry(page::page_base_for_address(addr))
+                    .or_insert_with(|| vec![0u8; page_size]);
+                for (j, &word) in segment.values[i..i + take].iter().enumerate() {
+                    let at = offset + j * 4;
+                    page[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                i += take;
+            }
+        }
+
+        pages
+            .into_iter()
+            .map(|(base, data)| PageConfig::with_data(base, data))
             .collect()
     }
 
