@@ -1,5 +1,17 @@
-//! ★★ H4's result of record — a commitment does NOT keep its tree, and the
-//! bytes it holds are only its codeword.
+//! ★★ H4's result of record, and what replaced it — a commitment does NOT keep
+//! its TREE; it keeps its LEAF LAYER, and the bytes it holds are its codeword
+//! and that layer.
+//!
+//! ⛔ H4's finding stands and is not edited away below: keeping the whole node
+//! array LOST, measured on the card at about +15 s, because the retention is
+//! one object per commitment IN THE GROUP and ten of those put the device at
+//! 96%. What changed is WHICH object. A tree is `2·num_leaves − 1` nodes; its
+//! leaf layer is `num_leaves` of them — half the bytes — and the leaf pass it
+//! saves is two thirds of a base tree's permutations and six sevenths of an
+//! extension one, because a leaf absorbs a whole `2^k` coset while an inner
+//! node absorbs two digests. Half the memory for most of the saving is a
+//! different trade from the one H4 measured, and these tests now pin BOTH
+//! sides of it: the layer must be held, and a whole tree must still never be.
 //!
 //! Needs a GPU:
 //!
@@ -140,11 +152,26 @@ fn a_commitment_hashes_its_leaves_once_per_tree_it_builds() {
             "{name}: the commit itself must hash the leaves exactly once"
         );
 
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: the commit hashes the leaves once"
+        );
+
         let _ = codeword.paths(4, &[0, 1, 7], hash).expect("paths");
         assert_eq!(
             codeword.tree_builds(),
             2,
             "{name}: an opening builds its own tree — a 1 here means one is kept"
+        );
+        // ★ THE OTHER DIRECTION, and it is the whole point of the change: the
+        // tree was rebuilt, but its LEAF LAYER was not re-hashed. A 2 here is
+        // the retention not working.
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: the opening must serve the retained leaf layer — a 2 here \
+             means the layer was not kept, or not matched"
         );
 
         // …and again, because a cache that served once and then evicted would
@@ -154,6 +181,17 @@ fn a_commitment_hashes_its_leaves_once_per_tree_it_builds() {
             codeword.tree_builds(),
             3,
             "{name}: and a second opening builds a third"
+        );
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: and still one leaf pass — a layer that served once and was \
+             then evicted would read 2 here"
+        );
+        assert!(
+            codeword.retained_leaf_bytes() > 0,
+            "{name}: the codeword reports no retained layer, so the counts above \
+             are agreeing about the wrong thing"
         );
     }
 }
@@ -365,19 +403,41 @@ fn a_group_holds_only_its_codewords_before_any_open() {
 
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
     let leaves = ((1u64 << num_vars) << 2) >> log_folding;
+    let leaf_bytes = leaves * 32;
     let tree_bytes = (2 * leaves - 1) * 32;
-    let bound = 8 * codeword_bytes;
+    // ⛔ TWO-SIDED, AND AGAINST THE FORM RATHER THAN A MULTIPLE. The layers must
+    // be HELD (so more than the codewords alone) and a whole TREE must still
+    // never be (so less than four of those). At this shape — `log_folding = 2`,
+    // chosen by the comment above because it makes a tree two codewords — a
+    // leaf layer is exactly ONE codeword, so the three cases are 128, 256 and
+    // 384 MiB and the bound sits between the last two with one codeword of
+    // slack. A one-sided bound passed either way and is what let the old
+    // arithmetic sit on its own edge.
+    let expect = 4 * (codeword_bytes + leaf_bytes);
+    let bound = expect + codeword_bytes;
+    let floor = 4 * codeword_bytes;
     let mib = |b: u64| b / (1 << 20);
     assert!(
         taken < bound,
         "four unopened commitments took {} MiB from the device. Four codewords \
-         are {} MiB and the bound is {} MiB; a tree is {} MiB, so four of those \
-         kept would read {} MiB. Something is held per commitment.",
+         and their leaf layers are {} MiB and the bound is {} MiB; a TREE is {} \
+         MiB, so four of those kept would read {} MiB. Something bigger than a \
+         leaf layer is held per commitment.",
         mib(taken),
-        mib(4 * codeword_bytes),
+        mib(expect),
         mib(bound),
         mib(tree_bytes),
         mib(4 * (codeword_bytes + tree_bytes)),
+    );
+    assert!(
+        taken > floor,
+        "four unopened commitments took only {} MiB, which is at or under the {} \
+         MiB their codewords alone need. The leaf layers ({} MiB for four) are \
+         NOT being held — either the capture never ran or the budget refused it, \
+         and in both cases every opening will re-hash its leaves.",
+        mib(taken),
+        mib(floor),
+        mib(4 * leaf_bytes),
     );
 
     // The commitments are alive up to here, which is the whole point: a `drop`
@@ -406,11 +466,29 @@ fn a_tree_is_built_for_the_blocking_that_is_asked_for() {
         2,
         "the opening must build a tree for the blocking it was given"
     );
+    // ★ THE KEY, ASSERTED WHERE IT CAN FAIL. The retained layer was built at
+    // k=4; this opening is at k=2 and describes a DIFFERENT tree, so the layer
+    // must not be served and the leaves must be hashed again. A 1 here is a
+    // cache ignoring its key, which is the one way this change could hand back
+    // paths that are internally consistent and wrong.
+    assert_eq!(
+        codeword.leaf_passes(),
+        2,
+        "a k=2 opening must NOT be served the k=4 leaf layer"
+    );
 
     // And the rebuild answered the question that was asked: at k=2 the tree has
     // four times the leaves, so each path is two levels deeper.
     let at_four = codeword.paths(4, &[0, 1], hash).expect("paths at k=4");
     assert_eq!(codeword.tree_builds(), 3, "and a third for the k=4 opening");
+    // …and the k=4 layer IS still there and IS served, so the key rejects a
+    // mismatch without throwing away a match. Without this line the test above
+    // would also pass on a cache that had simply stopped working.
+    assert_eq!(
+        codeword.leaf_passes(),
+        2,
+        "the k=4 opening matches the retained layer's key and must not re-hash"
+    );
     assert_eq!(
         at_two.len(),
         at_four.len() + 2 * 2 * 32,

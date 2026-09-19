@@ -7456,6 +7456,36 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
         epochs.iter().map(|r| r.round_count).sum::<u64>(),
         epochs.iter().map(|r| r.chain_count).sum::<u64>()
     );
+    // ⛔ THE RETENTION LINE IS REQUIRED, and it prints on every run including
+    // the ones that retain nothing.
+    //
+    // The leaf-layer retention has a REFUSAL PATH — `DeviceReservation::grow`
+    // declines without changing anything when the budget will not take the
+    // bytes, and the commitment then pays its leaf pass again. That path is
+    // what makes the scheme safe to run at full size, and it is also what makes
+    // a silent zero indistinguishable from a lever that never fired. So the
+    // counts are printed rather than inferred, and a run with nothing to report
+    // says so in words: the launcher refuses to report a block number without
+    // this line, exactly as it refuses one without the grind-knobs banner.
+    let (admitted, refused, asked, got, headroom, saved) = math_cuda::whir::retention_report();
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {}{}",
+        mib(asked),
+        mib(got),
+        math_cuda::whir::leaf_hash_calls(),
+        math_cuda::whir::tree_builds(),
+        if refused > 0 {
+            format!(
+                " · FIRST REFUSAL at {:.0} MiB of budget headroom",
+                mib(headroom)
+            )
+        } else if admitted == 0 {
+            " · NOT TAKEN: no leaf layer was retained in this run".to_string()
+        } else {
+            String::new()
+        },
+    );
     println!(
         "   global (in base) wall {g_wall:.1}s ({:.1}%)",
         pct(g_wall)
