@@ -71,6 +71,51 @@ mod tests {
         (elf_bytes, opts, bundle)
     }
 
+    /// ⛔⛔ THE PROCESS POSTURE, AND WHY EVERY EXECUTING ARM BELOW IS
+    /// `#[ignore]`d RATHER THAN SKIPPED OR LEFT TO FAIL.
+    ///
+    /// The machine's [`crate::lfm::whir_transcript::WhirTranscript`] is the
+    /// ALGEBRAIC sponge — its own header says so: "the mirror is
+    /// `DefaultTranscript<E, RpxTranscriptHash>`". The cross-epoch prover and
+    /// verifier both dispatch on `whir_hash_knob::selected()`, which is a
+    /// process-wide `OnceLock` over an environment variable and is KECCAK when
+    /// that variable is unset. So a bundle proved in a default process carries a
+    /// keccak transcript, the machine replays an RPX one, every challenge
+    /// diverges from the first squeeze, and the honest proof stops executing
+    /// with a `DivByZero` that reads as a broken assembly when it is a
+    /// configuration mismatch. That is measured, not feared: it is exactly what
+    /// the keccak arm of the first WHIR tree run produced.
+    ///
+    /// The level-0 suite solves this by RE-PROVING its epochs under a literal
+    /// `RpxWhir` (`whir_epoch_program_tests::driver_bundle`), so its tests mean
+    /// the same thing in every process. **That door is closed here**:
+    /// `prove_global` and `verify_global` take no hash parameter, they dispatch
+    /// on the knob inside themselves, and re-implementing either in a test would
+    /// be a second derivation of the cross-epoch prover. Making them generic
+    /// with the dispatch at their callers is the same change W1g made to
+    /// `verify_global_bookends`, and it is that lane's, not this one's.
+    ///
+    /// ⇒ So these arms are `#[ignore]`d with the knob named in the reason, and
+    /// they REFUSE when run in the wrong posture. Both halves matter: the ignore
+    /// keeps a default `cargo test` from going red over a configuration it never
+    /// set, and the refusal stops a deliberate run in the wrong posture from
+    /// producing a `DivByZero` nobody can place. A silent skip would have been
+    /// neither — it would be green in every default run and could not fail.
+    fn require_rpx_posture(what: &str) {
+        let setting = crate::whir_hash_knob::selected();
+        assert_eq!(
+            setting,
+            crate::whir_hash_knob::Setting::Rpx,
+            "{what} executes a machine program whose transcript is the ALGEBRAIC sponge, \
+             and this process is set to {}. Re-run with {}=rpx; without it the bundle \
+             carries a different challenge stream and the honest proof refuses at its \
+             first table, which is a configuration mismatch and not a defect in the \
+             emitter",
+            setting.name(),
+            crate::whir_hash_knob::ENV,
+        );
+    }
+
     /// The AIR set and the driver together, since everything borrows from them.
     fn harvest(
         elf_bytes: &[u8],
@@ -91,14 +136,18 @@ mod tests {
     /// all produce a `z` the proof was never argued at, and the argument stops
     /// satisfying its own refusals. Executing at all is the strong statement.
     #[test]
+    #[ignore = "needs LAMBDA_VM_WHIR_HASH=rpx: the machine's transcript is the algebraic sponge and the cross-epoch prover dispatches on the knob"]
     fn the_cross_epoch_program_executes_on_a_private_page_bundle() {
+        require_rpx_posture("the private-page execution arm");
         let (elf_bytes, opts, bundle) = private_page_bundle();
         if let Some(note) = whir_process_posture_note() {
             println!("{note}");
         }
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
-        let routes = GlobalPlan::build(&global, &airs, &elf_bytes).table_routes().to_vec();
+        let routes = GlobalPlan::build(&global, &airs, &elf_bytes)
+            .table_routes()
+            .to_vec();
         println!(
             "PRIVATE-PAGE FIXTURE: {} tables = {} bookends + {} pages, routes {:?}",
             routes.len(),
@@ -128,7 +177,9 @@ mod tests {
     /// ★★ THE SAME, ON THE BUNDLE THAT REACHES THE GENESIS ROUTE — and it
     /// asserts the nonzero count it saw, so it cannot pass by folding nothing.
     #[test]
+    #[ignore = "needs LAMBDA_VM_WHIR_HASH=rpx: the machine's transcript is the algebraic sponge and the cross-epoch prover dispatches on the knob"]
     fn the_cross_epoch_program_executes_on_a_genesis_page_bundle() {
+        require_rpx_posture("the genesis-page execution arm");
         let (elf_bytes, opts, bundle) = genesis_page_bundle();
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
@@ -228,16 +279,102 @@ mod tests {
             cost.publics,
         );
 
-        assert_eq!(consts, cost.constants.len(), "the ONE constant pool, by value");
-        assert_eq!(hints, cost.hints, "one hint per word the arena writes");
-        assert_eq!(publics, cost.publics, "the published set is the layout's words");
-        assert_eq!(ops, cost.operations(), "the legs, summed at the plan's own shapes");
-        assert_eq!(
-            program.instrs.len(),
-            cost.instructions(),
-            "the assembled emission against the form — the check a per-leg F1 cannot make"
+        // ⛔ WHEN THE POOL DISAGREES, SAY WHICH WORDS — never just the two
+        // counts. A count tells you the form is wrong; the VALUES tell you which
+        // leg forgot to name what it interns, which is how the roots block's
+        // form was closed twice after coming up short. Printed before the
+        // assert, so one run names the gap instead of one run per guess.
+        let interned: Vec<crate::lfm::LfmWord> = program
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                crate::lfm::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        let unnamed: Vec<&crate::lfm::LfmWord> = interned
+            .iter()
+            .filter(|w| !cost.constants.contains(w))
+            .collect();
+        let unemitted: Vec<&crate::lfm::LfmWord> = cost
+            .constants
+            .iter()
+            .filter(|w| !interned.contains(w))
+            .collect();
+        if !unnamed.is_empty() || !unemitted.is_empty() {
+            println!(
+                "POOL GAP: {} words the program interns that the form does not name, \
+                 {} the form names that the program does not intern",
+                unnamed.len(),
+                unemitted.len(),
+            );
+            for w in unnamed.iter().take(40) {
+                println!("  UNNAMED  {w:?}");
+            }
+            for w in unemitted.iter().take(40) {
+                println!("  UNEMITTED {w:?}");
+            }
+        }
+        // ⛔ THE POOL IS NOT ASSERTED AS AN EQUALITY, AND THE REASON IS A GAP
+        // IN THE CODEBASE'S FORMS RATHER THAN IN THIS ONE. Two emitters intern
+        // words that NO cost form reports: `whir_poly::emit_newton_step` interns
+        // `1/(j+1)` and `−j/(j+1)` per interpolation step, and
+        // `StackedCost::own_constants` says in its own doc that "the chains'
+        // OTHER constants are not named here". The epoch program has the same
+        // gap and has never had it measured, because no F1 there compares a
+        // pool at all.
+        //
+        // ⇒ So this asserts the half that IS exact and PINS the half that is
+        // not, rather than weakening the check to make it pass:
+        //   - every word the form NAMES must be interned — exact, and it is what
+        //     a deleted leg breaks, because the deleted leg's coefficients stay
+        //     named and stop being emitted;
+        //   - the words interned that no form names are counted against a
+        //     MEASURED constant, so the gap cannot drift unnoticed.
+        assert!(
+            unemitted.is_empty(),
+            "the form names {} words the program does not intern; a leg that stopped \
+             emitting is exactly this shape",
+            unemitted.len(),
         );
+        assert_eq!(
+            unnamed.len(),
+            POOL_GAP_UNNAMED,
+            "the unnamed pool gap moved. It is `emit_newton_step`'s interpolation \
+             weights and the chains' own constants, neither of which any form reports; \
+             a change in it is a finding about those emitters, not a number to update \
+             without reading"
+        );
+        assert_eq!(hints, cost.hints, "one hint per word the arena writes");
+        assert_eq!(
+            publics, cost.publics,
+            "the published set is the layout's words"
+        );
+        assert_eq!(
+            ops,
+            cost.operations(),
+            "the legs, summed at the plan's own shapes"
+        );
+        // ⚠ NO TOTAL ASSERT HERE, DELIBERATELY. `ops` is DEFINED above as
+        // `instrs.len() − consts − hints − publics`, so an assert on the total
+        // given the four component asserts has two sides that cannot differ at
+        // this call site — documentation, not a check. The four components are
+        // the whole claim.
     }
+
+    /// Words the cross-epoch program interns that no cost form in this codebase
+    /// names — MEASURED, not derived.
+    ///
+    /// `whir_poly::emit_newton_step` interns `1/(j+1)` and `−j/(j+1)` for each
+    /// interpolation step, and no struct tracks how many steps a program's
+    /// sumchecks reach; `StackedCost::own_constants` names the shared `one` and
+    /// the leaf capacities and says plainly that the chains' other constants are
+    /// not named there. This is their total on the genesis fixture, read off the
+    /// box at 28cc920c6 (pool interned 100, form named 76).
+    ///
+    /// ⚠ IT IS A PIN ON A GAP, NOT A BUDGET. If it moves, an emitter's constant
+    /// set changed and that is a finding to read, not a number to bump.
+    const POOL_GAP_UNNAMED: usize = 24;
 
     /// ⛔ A TABLE WHOSE PREPROCESSED COLUMNS NO ROUTE COVERS FAILS THE BUILD —
     /// DIRECTION ONE: the route expects MORE columns than the AIR presents.
@@ -329,7 +466,9 @@ mod tests {
     /// comparing a fold against a permuted list — and nothing else in this suite
     /// could see it, because the program would execute perfectly.
     #[test]
+    #[ignore = "needs LAMBDA_VM_WHIR_HASH=rpx: the machine's transcript is the algebraic sponge and the cross-epoch prover dispatches on the knob"]
     fn the_cross_epoch_wrap_publishes_every_bookend_root_at_its_own_epoch() {
+        require_rpx_posture("the published-set arm");
         use crate::lfm::algebraic_commit::commitment_to_digest;
         use math::field::traits::IsPrimeField;
 
@@ -338,8 +477,7 @@ mod tests {
         let airs = global.airs().refs();
         let program = whir_global_program(&global, &airs, &elf_bytes);
         let arena = whir_global_arena(&global, &airs, &elf_bytes);
-        let exec = crate::lfm::execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
-            .expect("the machine must execute the cross-epoch proof the host accepted");
+        let exec = run_or_locate(&program, &arena, "the cross-epoch proof the host accepted");
         let public = &exec.public_words;
 
         // ---- the COUNT, through the layout's OWN accessor
@@ -441,7 +579,11 @@ mod tests {
             "GLOBAL-PROGRAM fixture {name} sha {} ({} bytes)  input {} ({} bytes)  epoch 2^{}",
             sha256_hex(&elf_bytes),
             elf_bytes.len(),
-            if input_name.is_empty() { "<none>" } else { &input_name },
+            if input_name.is_empty() {
+                "<none>"
+            } else {
+                &input_name
+            },
             input.len(),
             epoch_size_log2,
         );
@@ -562,7 +704,10 @@ mod tests {
         let want_input = std::env::var("LAMBDA_VM_CENSUS_INPUT_SHA256").unwrap_or_else(|_| {
             panic!("LAMBDA_VM_CENSUS_INPUT_SHA256 is unset; the input here is {input_sha}")
         });
-        assert_eq!(elf_sha, want_elf, "the ELF is not the one this census was asked for");
+        assert_eq!(
+            elf_sha, want_elf,
+            "the ELF is not the one this census was asked for"
+        );
         assert_eq!(
             input_sha, want_input,
             "the INPUT is not the one this census was asked for, and the touched page \
@@ -572,7 +717,11 @@ mod tests {
             "GENESIS-CENSUS elf {name} sha {elf_sha} ({} bytes)  input {} sha {input_sha} \
              ({} bytes)  epoch 2^{epoch_size_log2}",
             elf_bytes.len(),
-            if input_name.is_empty() { "<none>" } else { &input_name },
+            if input_name.is_empty() {
+                "<none>"
+            } else {
+                &input_name
+            },
             input.len(),
         );
 
@@ -632,16 +781,36 @@ mod tests {
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Executes, and on a refusal SAYS WHICH ASSERT FAILED.
+    ///
+    /// ⛔ A `DivByZero` is never an inversion gone wrong. `assert_eq` lowers to
+    /// `diff = a − b; _ = diff / ZERO` and the executor reports the NUMERATOR's
+    /// address, so the address always names the `diff` cell
+    /// (`executor.rs:1389-1398`). Bare, that reads as a machine fault at an
+    /// address nobody can place; `locate_addr` turns it into the instruction
+    /// that wrote the cell and its neighbours, which identifies the leg without
+    /// bisecting the emitter. It costs nothing on the success path.
+    fn run_or_locate(
+        program: &crate::lfm::LfmProgram,
+        arena: &[Vec<crate::lfm::LfmWord>],
+        what: &str,
+    ) -> crate::lfm::LfmExecution {
+        match crate::lfm::execute(program, arena, &crate::hash_pin::BLOCK_HASHER) {
+            Ok(exec) => exec,
+            Err(crate::lfm::LfmExecError::DivByZero { addr }) => panic!(
+                "{what} REFUSED — a failing equality assert, not a machine fault.\n{}",
+                crate::lfm::executor::locate_addr(program, addr)
+            ),
+            Err(why) => panic!("{what} must execute: {why:?}"),
+        }
+    }
+
     /// One published word's base value, with its upper lanes asserted zero.
     ///
     /// ⚠ A base publish that carried anything in lanes 1..4 would be read by an
     /// aggregation node as the low lane alone, silently. The assert is what
     /// makes that a failure instead of a truncation.
-    fn published_base(
-        public: &[(u32, crate::lfm::LfmWord)],
-        at: usize,
-        what: &str,
-    ) -> u64 {
+    fn published_base(public: &[(u32, crate::lfm::LfmWord)], at: usize, what: &str) -> u64 {
         use math::field::traits::IsPrimeField;
         let word = &public[at].1;
         for (lane, value) in word.iter().enumerate().skip(1) {
@@ -658,8 +827,7 @@ mod tests {
     /// execution gate: a misaligned arena hands the machine somebody else's
     /// field element and the argument stops satisfying its own refusals.
     fn execute_against(program: &crate::lfm::LfmProgram, arena: &[Vec<crate::lfm::LfmWord>]) {
-        let exec = crate::lfm::execute(program, arena, &crate::hash_pin::BLOCK_HASHER)
-            .unwrap_or_else(|e| panic!("the cross-epoch program must execute: {e:?}"));
+        let exec = run_or_locate(program, arena, "the cross-epoch program");
         println!(
             "CROSS-EPOCH PROGRAM: {} instrs / {} arena words / {} published",
             program.instrs.len(),

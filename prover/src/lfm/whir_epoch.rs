@@ -1020,8 +1020,7 @@ fn emit_preprocessed_leg(
             let ramp = super::preprocessed::emit_offset_ramp(b, &verdict.point);
             b.assert_eq_ext(ramp, verdict.column_values[targets[0]]);
             if let Some(init) = init {
-                let values =
-                    super::preprocessed::emit_sparse_mle_at(b, &[*init], &verdict.point);
+                let values = super::preprocessed::emit_sparse_mle_at(b, &[*init], &verdict.point);
                 b.assert_eq_ext(values[0], verdict.column_values[targets[1]]);
             }
             return;

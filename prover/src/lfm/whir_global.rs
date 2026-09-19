@@ -290,27 +290,26 @@ impl<'a> GlobalPlan<'a> {
                 .expect("a table the verifier accepted must lay out")
             })
             .collect();
-        let buses: Vec<Vec<InteractionShape<GoldilocksExtension>>> = airs
-            .iter()
-            .zip(&layouts)
-            .map(|(air, layout)| {
-                let slots = layout.slot_of().to_vec();
-                stark::multilinear_logup::interaction_shapes(
-                    air.bus_interactions(),
-                    slots.len(),
-                    |column| {
-                        slots
-                            .get(column)
-                            .copied()
-                            .ok_or(multilinear::Error::UnknownPolynomial {
-                                index: column,
-                                len: slots.len(),
-                            })
-                    },
-                )
-                .expect("the bus probes")
-            })
-            .collect();
+        let buses: Vec<Vec<InteractionShape<GoldilocksExtension>>> =
+            airs.iter()
+                .zip(&layouts)
+                .map(|(air, layout)| {
+                    let slots = layout.slot_of().to_vec();
+                    stark::multilinear_logup::interaction_shapes(
+                        air.bus_interactions(),
+                        slots.len(),
+                        |column| {
+                            slots.get(column).copied().ok_or(
+                                multilinear::Error::UnknownPolynomial {
+                                    index: column,
+                                    len: slots.len(),
+                                },
+                            )
+                        },
+                    )
+                    .expect("the bus probes")
+                })
+                .collect();
         let preprocessed: Vec<Vec<Vec<FE>>> =
             airs.iter().map(|air| air.precomputed_columns()).collect();
 
@@ -953,8 +952,7 @@ pub fn global_cost(
 
     // The roots block: every carried root, and ZERO derived.
     let carried = global.proof.proof.roots.len();
-    let (roots_ops, schedule) =
-        super::whir_epoch::roots_block_cost(carried, 0, statement.entry());
+    let (roots_ops, schedule) = super::whir_epoch::roots_block_cost(carried, 0, statement.entry());
     cost.spine += roots_ops + schedule.rows();
     cost.perms += schedule.perms();
     for word in super::whir_epoch::roots_block_constants(&[], &schedule) {
@@ -1054,7 +1052,8 @@ pub fn genesis_census(
     num_private_input_pages: usize,
 ) -> Result<Vec<GenesisEntry>, String> {
     let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("the ELF must load: {e}"))?;
-    let configs = crate::continuation::global_memory_configs(page_bases, &elf, num_private_input_pages);
+    let configs =
+        crate::continuation::global_memory_configs(page_bases, &elf, num_private_input_pages);
     Ok(configs
         .iter()
         .map(|config| {
@@ -1113,7 +1112,11 @@ pub fn genesis_census_line(census: &[GenesisEntry]) -> String {
 pub fn genesis_entry_line(entry: &GenesisEntry) -> String {
     format!(
         "  page {:#018x}: private={} init_values={} rows={} nonzero={} leg_rows={}",
-        entry.page_base, entry.is_private, entry.init_len, entry.rows, entry.entries,
+        entry.page_base,
+        entry.is_private,
+        entry.init_len,
+        entry.rows,
+        entry.entries,
         entry.leg_rows,
     )
 }

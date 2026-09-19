@@ -585,7 +585,11 @@ fn sparse_only_program(column: &[FE], num_vars: usize, leg: bool) -> LfmProgram 
 fn real_genesis_column(bytes: &[u8]) -> Vec<FE> {
     let config = crate::tables::page::PageConfig::with_data(0, bytes.to_vec());
     let mut columns = crate::tables::page::preprocessed_columns(&config);
-    assert_eq!(columns.len(), 2, "a non-private page carries OFFSET and INIT");
+    assert_eq!(
+        columns.len(),
+        2,
+        "a non-private page carries OFFSET and INIT"
+    );
     columns.remove(1)
 }
 
@@ -603,7 +607,11 @@ fn the_sparse_leg_computes_what_the_hosts_genesis_fold_computes() {
     let bytes = [0xF0u8, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12];
     let column = real_genesis_column(&bytes);
     let num_vars = column.len().trailing_zeros() as usize;
-    assert_eq!(1usize << num_vars, column.len(), "a page is a power of two tall");
+    assert_eq!(
+        1usize << num_vars,
+        column.len(),
+        "a page is a power of two tall"
+    );
     let entries = super::preprocessed::sparse_entries(&[column.as_slice()]);
     assert_eq!(
         entries,
@@ -709,8 +717,8 @@ fn the_sparse_leg_emits_its_row_form() {
         let leg = sparse_only_program(&column, num_vars, true);
         let control = sparse_only_program(&column, num_vars, false);
 
-        let emitted = (leg.instrs.len() - const_rows(&leg))
-            - (control.instrs.len() - const_rows(&control));
+        let emitted =
+            (leg.instrs.len() - const_rows(&leg)) - (control.instrs.len() - const_rows(&control));
         let predicted = super::preprocessed::sparse_mle_rows(&[column.as_slice()], num_vars);
         let constants = super::preprocessed::sparse_mle_constants(&[column.as_slice()]);
         println!(
@@ -721,7 +729,8 @@ fn the_sparse_leg_emits_its_row_form() {
             const_rows(&leg),
         );
         assert_eq!(
-            emitted, predicted,
+            emitted,
+            predicted,
             "the sparse leg's row form missed the emitter over {} genesis bytes",
             bytes.len()
         );

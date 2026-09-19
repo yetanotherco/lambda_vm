@@ -344,8 +344,7 @@ fn the_global_pad_identity_holds_at_every_residue() {
             // only the table count appears in it.
             let recorded = (2 + 64 - epochs - pages) % 8;
             assert_eq!(
-                recorded,
-                cost.pad,
+                recorded, cost.pad,
                 "the recorded `(2 - epochs - pages) mod 8` missed the stream's pad at \
                  {epochs} epochs and {pages} pages: form {recorded}, stream {}",
                 cost.pad,

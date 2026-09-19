@@ -704,10 +704,10 @@ pub fn sparse_mle_at(column: &[FE], point: &[FEE]) -> FEE {
         if *value == FE::zero() {
             continue;
         }
-        let mut eq = one.clone();
+        let mut eq = one;
         for (level, p) in point.iter().enumerate() {
             let factor = if (row >> (num_vars - 1 - level)) & 1 == 1 {
-                p.clone()
+                *p
             } else {
                 &one - p
             };
