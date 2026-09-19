@@ -177,19 +177,35 @@ impl<H> DecodePrepared<H>
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    /// Where DECODE's prepared columns are settled: its own table, its own
+    /// leading preprocessed columns.
+    ///
+    /// ★ DECODE IS THE SINGLE-TABLE CASE OF A GENERAL SHAPE. A prepared
+    /// commitment now names a `(table, preprocessed column)` per stacked column,
+    /// because the cross-epoch genesis stack spans one table per dense page and
+    /// settles column 1 — INIT — of each. DECODE spans one table and settles its
+    /// prefix, so this is [`multilinear_table::leading_columns`] and nothing
+    /// about what DECODE means has changed. The epoch byte gate says so by not
+    /// moving: the single-table case produces the same weight shares under
+    /// `Claimed::PerColumn` as under the `Shared` it replaces.
+    pub(crate) fn settled_at(&self, table: usize) -> Vec<multilinear_table::PreparedColumn> {
+        multilinear_table::leading_columns(table, self.columns.len())
+    }
+
     /// What the prover opens at `table`'s reduced point.
     ///
-    /// `borrowed` is the caller's because [`multilinear_table::Prepared`] holds
-    /// a slice of references and a self-referential struct cannot hand one out.
+    /// `borrowed` and `at` are the caller's because
+    /// [`multilinear_table::Prepared`] holds slices and a self-referential
+    /// struct cannot hand one out.
     pub(crate) fn opening<'a>(
         &'a self,
         borrowed: &'a [&'a Mle<F>],
-        table: usize,
+        at: &'a [multilinear_table::PreparedColumn],
     ) -> multilinear_table::Prepared<'a, F, H> {
         multilinear_table::Prepared {
             commitment: &self.commitment,
             columns: borrowed,
-            table,
+            at,
         }
     }
 
@@ -215,13 +231,20 @@ where
     }
 
     /// What the verifier settles the opening against.
-    pub(crate) fn check(&self, table: usize) -> multilinear_table::PreparedCheck<'_, F> {
+    ///
+    /// `at` is the caller's, and must be the SAME slice the opening was built
+    /// from — it drives both the columns the opening settles and the checks
+    /// `check_preprocessed` skips. [`Self::settled_at`] is how both sides get
+    /// one.
+    pub(crate) fn check<'a>(
+        &'a self,
+        at: &'a [multilinear_table::PreparedColumn],
+    ) -> multilinear_table::PreparedCheck<'a, F> {
         multilinear_table::PreparedCheck {
             roots: &self.roots,
             layout: self.commitment.layout(),
             domain: self.commitment.domain(),
-            table,
-            columns: self.columns.len(),
+            at,
         }
     }
 }
@@ -1120,11 +1143,12 @@ where
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
+    let decode_columns = prepared.settled_at(decode_at);
     let proof = multilinear_table::multi_prove(
         &committed,
         &config,
         &mut transcript,
-        Some(prepared.opening(&borrowed, decode_at)),
+        Some(prepared.opening(&borrowed, &decode_columns)),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -1582,7 +1606,8 @@ where
     // once here rather than twice at the two call sites, because "twice" is
     // precisely how the replay came to absorb a shorter roots block than the
     // verification did.
-    let check = prepared.check(decode_at);
+    let decode_columns = prepared.settled_at(decode_at);
+    let check = prepared.check(&decode_columns);
     let derived = check.roots;
     // ★ `owed` replays this transcript to draw `z` and `alpha`, which are a
     // function of the configuration's sponge. Computing them against a

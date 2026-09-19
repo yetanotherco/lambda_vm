@@ -955,7 +955,7 @@ fn host_walk(
             &alpha,
             &beta,
             &mut transcript,
-            0,
+            &[],
         )
         .expect("the host verifies its own table");
         walk.outputs.push(output);
@@ -1674,8 +1674,16 @@ fn recorded_draws(
     let (z, alpha, beta) =
         stark::multilinear_table::absorb_roots_and_challenge(&mut tables_only, &proof.roots, &[]);
     for (table, statement) in proof.tables.iter().zip(statements) {
-        stark::multilinear_table::verify(table, *statement, &z, &alpha, &beta, &mut tables_only, 0)
-            .expect("the host verifies its own table");
+        stark::multilinear_table::verify(
+            table,
+            *statement,
+            &z,
+            &alpha,
+            &beta,
+            &mut tables_only,
+            &[],
+        )
+        .expect("the host verifies its own table");
     }
     let table_draws = tables_only.sampled.len() - 3;
 
