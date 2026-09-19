@@ -1061,6 +1061,18 @@ pub fn global_cost(
         for word in super::whir_chain::chain_fold_constants(shape, domain) {
             pool.constant_word(word);
         }
+        // ⛔ THE GRIND'S OWN WORDS — the fourth emitter whose form was a COUNT.
+        // A chain grinds at three widths (folding, ood, query); the prefix and
+        // the two capacities are shared across every grind in the program, and
+        // the FACTOR felt is keyed on the bit count, so the pool is the union
+        // over the DISTINCT widths and never a multiple of the grind count.
+        // Nineteen grinds at one width pay for four words between them.
+        let (folding, ood, query) = shape.grind;
+        for bits in [folding, ood, query] {
+            for word in super::epoch::grinding_check_constants(bits as u8) {
+                pool.constant_word(word);
+            }
+        }
     }
 
     // The published set: its publishes and its unpacks, apart.

@@ -531,6 +531,17 @@ pub const fn grind_check_rows(bits: usize) -> usize {
 /// hashes (which are `leaf_capacity(6)` for the 41-byte inner preimage and
 /// `leaf_capacity(5)` for the 40-byte outer one, and are shared with any other
 /// hash of those widths): the PREFIX felt and the factor felt.
+///
+/// ⛔⛔ **NEVER SUM THIS ACROSS GRINDS, AND NEVER USE IT FOR A POOL.** It is a
+/// COUNT, and counts ADD where values MERGE: nineteen grinds at one width share
+/// all four words and pay for them once. Worse, the factor felt is keyed on the
+/// BIT COUNT, so two widths intern five words and not eight — an arithmetic no
+/// scalar can express.
+///
+/// ⇒ [`crate::lfm::epoch::grinding_check_constants`] is the values form, and
+/// the program-level answer is its union over the distinct bit counts. This
+/// function stays correct for exactly one thing: what ONE grind of a width no
+/// other leg shares would intern.
 pub const fn grind_check_const_felts() -> usize {
     2
 }
