@@ -111,7 +111,7 @@ pub struct FinalByteState {
 pub type FinalStateMap = HashMap<u64, FinalByteState>;
 
 /// Configuration for a single PAGE table instance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct PageConfig {
     /// Base address of this page (must be page-aligned).
     pub page_base: u64,
