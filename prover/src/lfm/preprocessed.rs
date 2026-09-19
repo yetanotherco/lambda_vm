@@ -538,10 +538,20 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
         entries <= MAX_SPARSE_INIT_ENTRIES,
         "these preprocessed columns carry {entries} nonzero entries, which this leg \
          emits {} rows for; the cap is {MAX_SPARSE_INIT_ENTRIES} entries. A column this \
-         dense has no closed form and no opening on the cross-epoch path — see this \
-         module's note on why `Prepared` cannot carry one — so it needs the protocol \
-         change, not a bigger cap",
+         dense has no closed form here, and the prepared genesis opening is the route \
+         it belongs on. ⛔ THE ROUTING RULE SHOULD ALREADY HAVE TAKEN IT: \
+         `continuation::genesis_stack_plan` leaves a genesis page sparse only up to \
+         about {} entries at this height — its tightest case, a lone genesis page, the \
+         bound rising slowly with the page count — so a column arriving here this dense \
+         is not a page that needs a bigger cap. It is that rule and this one having \
+         drifted apart, and neither can be fixed without the other; \
+         `whir_chain_tests::every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit` \
+         is the assertion that they overlap",
         entries * num_vars,
+        crate::continuation::densest_sparse_entries(
+            num_vars,
+            crate::continuation::fixed_stack_vars(num_vars, 1),
+        ),
     );
 
     let one = b.ext_const(&FEE::one());

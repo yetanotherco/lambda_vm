@@ -552,6 +552,33 @@ pub(crate) fn global_memory_configs_from_init_page_data(
 // `num_private_input_pages` — two values the cross-epoch statement already
 // binds — and the reason is not "private pages are not worth stacking" but that
 // a private page presents no INIT column to settle at all.
+//
+// # The rule, in two parts
+//
+// 1. **Is this page a CANDIDATE?** Its sparse leg [`sparse_leg_rows`] against
+//    what carrying it would ADD to the prepared leg, [`marginal_stacked_rows`],
+//    evaluated at the fixed height [`fixed_stack_vars`]. On the block that is
+//    `18 + 18*S > 103`, so `S >= 5`: a page with five nonzero genesis bytes is
+//    already worth more carried than kept, and the 27 all-zero pages are not.
+// 2. **Is the CHAIN worth paying for?** The candidates' total savings against
+//    [`PREPARED_LEG_ROWS`], evaluated ONCE on the whole set. If it refuses,
+//    every candidate stays sparse — there is no partial answer, because a
+//    subset still pays the whole chain.
+//
+// ⛔ WHY IT TAKES TWO PARTS AND NOT ONE. The leg's cost is a fixed chain plus a
+// per-page marginal, and no per-page rule can charge a fixed cost correctly:
+// charge each page the whole chain (the rule this replaces) and two pages that
+// would gladly share one are both refused; charge none of them and a lone page
+// worth five rows drags in a chain costing 175,066. Splitting the question is
+// what lets each term be charged to the thing that actually causes it.
+//
+// ⛔⛔ AND ALL THREE INPUTS ARE DATA ALL THREE PARTIES HOLD. Every `S` is a
+// nonzero count over a genesis page's `init_values`, and `P_touched` is the
+// genesis page count — both read off the very page configs the prover and the
+// verifier each build from the ELF and the touched page list, and the emitter
+// reads through the plan. Nothing in the rule reads a proof, a private byte, or
+// the order the pages were considered in. `the_prover_and_verifier_views_of_a_
+// private_page_plan_alike` is the assertion of it.
 // ===========================================================================
 
 /// A page table's height in variables.
@@ -584,7 +611,8 @@ pub(crate) fn sparse_leg_rows(num_vars: usize, nonzero: usize) -> usize {
     num_vars + num_vars * nonzero
 }
 
-/// The row budget a page must beat before the opening carries it.
+/// PART 2's term: the rows the prepared leg costs ONCE, however many pages it
+/// carries — the stacked chain itself.
 ///
 /// ⛔⛔ THIS IS AN UPPER BOUND, NOT THE STACK'S COST, and calling it the cost
 /// would be a number answering a retired question. It is V1i's card-free sizing
@@ -593,8 +621,13 @@ pub(crate) fn sparse_leg_rows(num_vars: usize, nonzero: usize) -> usize {
 /// `PAGE_NUM_VARS + ceil(log2(2 * n_dense))` variables — six columns at 21 on
 /// the block. Fewer variables means fewer rounds means fewer rows, so the real
 /// chain is CHEAPER than this and the rule is conservative in the direction that
-/// matters: a page must be worth more than the stack could possibly cost before
-/// it joins.
+/// matters: the carried set must be worth more than the chain could possibly
+/// cost before anything joins it.
+///
+/// ⚠ IT PAYS FOR THE CHAIN AND FOR NOTHING ELSE. What a page adds to the leg by
+/// being carried is [`marginal_stacked_rows`], and that is charged to the page
+/// in part 1. Charging this constant per page — the rule this replaces — asked
+/// each page to pay for a chain all of them share.
 ///
 /// ⚠ CONFIGURATION IS PART OF THE NUMBER. Chain rows move with blowup, folding
 /// and the query count. It is a constant here rather than a call because of the
@@ -603,17 +636,164 @@ pub(crate) fn sparse_leg_rows(num_vars: usize, nonzero: usize) -> usize {
 /// the word "bound" honest.
 pub(crate) const PREPARED_LEG_ROWS: usize = 175_066;
 
-/// Whether a page's genesis is dense enough to be worth a prepared opening:
-/// its sparse leg alone costs more than the whole stack could.
+/// The stack height the rule CHARGES AT, which is deliberately not the height
+/// the stack will have: `num_vars + ceil(log2(2 * genesis_pages))`.
 ///
-/// ★ SET-INDEPENDENT BY CONSTRUCTION — a pure function of one page's own
-/// nonzero count. A rule that charged each page the stack's MARGINAL cost would
-/// be cheaper and would make the answer depend on which other pages joined, and
-/// therefore on the order they were considered in. Since prover, verifier and
-/// emitter must reach the same set or the roots block diverges, set-independence
-/// is worth more than the rows it gives up.
-pub(crate) fn is_dense(num_vars: usize, nonzero: usize) -> bool {
-    sparse_leg_rows(num_vars, nonzero) > PREPARED_LEG_ROWS
+/// ⛔⛔ THIS IS WHAT KEEPS THE RULE COMPUTABLE BY ALL THREE PARTIES. The real
+/// stack stands at `num_vars + ceil(log2(2 * n_dense))`, and `n_dense` is the
+/// answer — a marginal evaluated there would be defined in terms of its own
+/// output, and prover, verifier and emitter would each have to guess where the
+/// recursion settled. Evaluating at every touched genesis page instead is a
+/// FIXED quantity all three read off the same page configs, before any routing
+/// decision is made.
+///
+/// ★ AND THE SUBSTITUTION IS CONSERVATIVE. `n_dense <= genesis_pages`, so this
+/// is at or above the real height, so [`marginal_stacked_rows`] is at or above
+/// the real marginal, so a page is charged MORE than it will cost. The rule
+/// therefore errs towards leaving a page sparse, never towards carrying one
+/// whose keep it cannot pay.
+pub(crate) fn fixed_stack_vars(num_vars: usize, genesis_pages: usize) -> usize {
+    num_vars + (2 * genesis_pages).next_power_of_two().trailing_zeros() as usize
+}
+
+/// PART 1's term: the rows ONE MORE page adds to the prepared leg's weight
+/// closure, at a stack standing `n_fixed` variables tall.
+///
+/// The three terms, each traced to `lfm::whir_stacked::weight_at_rows`, which
+/// owns the emitter's side of this and is where the number is PINNED:
+///
+/// 1. **One `eq`, plus the `MulAdd` that joins its group.** A page's two
+///    preprocessed columns are settled at ONE point — its own table's reduced
+///    point — so they form a single group and pay one `eq` between them, over
+///    the page's own `num_vars` variables. That is `4n + (n - 1)` rows, 89 at
+///    `n = 18`, and the join makes 90.
+/// 2. **One prefix indicator per stacked column**, `max(n_fixed - num_vars, 1)`
+///    rows apiece, [`PAGE_PREPROCESSED_COLUMNS`] columns to a page: 12 on the
+///    block. A column filling the whole stack has no indicator and pays only
+///    its fold, which is the `max(_, 1)`.
+/// 3. **One shared `Sub`.** ⚠ THIS TERM IS AMORTISED AND NOT DERIVED, and
+///    saying so is the difference between a form and a number wearing one.
+///    `weight_at_rows` emits one `Sub` per prefix POSITION that any column of
+///    the polynomial reads as a zero bit; it is shared across the whole stack,
+///    bounded above by `n_fixed`, and has no per-page marginal at all. One per
+///    page is the charge, not a reading.
+///
+/// ⚠ AND TWO TERMS OF `stacked_verify_cost` ARE DELIBERATELY ABSENT: its
+/// `columns * absorb_unpack_rows()` and `challenge_powers_rows(columns)` each
+/// grow by one per stacked column, so the true marginal is four rows higher
+/// than this. `whir_chain_tests` asserts that closing the gap moves NO routing
+/// decision this rule is quoted for — the threshold, the lone-page boundary,
+/// the block's set — which is what makes the omission safe rather than merely
+/// small. That assertion reddens the day a stacked column's per-column cost
+/// grows, and then this form is where the fix goes.
+pub(crate) fn marginal_stacked_rows(num_vars: usize, n_fixed: usize) -> usize {
+    let eq = if num_vars == 0 {
+        0
+    } else {
+        4 * num_vars + (num_vars - 1)
+    };
+    let group_join = 1;
+    let indicators = PAGE_PREPROCESSED_COLUMNS * n_fixed.saturating_sub(num_vars).max(1);
+    let shared_sub = 1;
+    eq + group_join + indicators + shared_sub
+}
+
+/// PART 1: whether a page is even a CANDIDATE — whether keeping it sparse costs
+/// more than carrying it would add to the leg.
+///
+/// ★ SET-INDEPENDENT, WHICH IS THE PROPERTY THE THREE PARTIES NEED. Both sides
+/// of the comparison are functions of this page's own nonzero count and of
+/// `n_fixed`, and `n_fixed` is fixed before any page is looked at. Nothing here
+/// depends on which other pages qualified, or on the order they were considered
+/// in, so prover, verifier and emitter cannot reach different candidate sets.
+pub(crate) fn is_candidate(num_vars: usize, n_fixed: usize, nonzero: usize) -> bool {
+    nonzero >= candidate_threshold_entries(num_vars, n_fixed)
+}
+
+/// The fewest nonzero entries that make a page a candidate — `τ`, the number
+/// part 1 is quoted by, and the form [`is_candidate`] is decided on.
+///
+/// The least `S` with `num_vars + num_vars * S > marginal`, which is floor plus
+/// one and NOT `div_ceil`: were the division exact, `div_ceil` would hand back
+/// an `S` whose leg EQUALS the marginal rather than exceeding it. On the block
+/// it is 5.
+///
+/// ⚠ ONE FORM, NOT TWO. Part 1 could as easily be written as the comparison
+/// `sparse_leg_rows(..) > marginal_stacked_rows(..)`, and the two agree for
+/// every `S` — `the_threshold_and_its_entry_count_are_one_rule` is the reading
+/// of that rather than the algebra taken on trust. Deciding through `τ` keeps
+/// the number a reader is quoted and the number the code branches on the same
+/// object.
+///
+/// ⚠ THE FORM ASSUMES `marginal > num_vars`, which holds by construction: the
+/// `eq` term alone is `5 * num_vars`. The `saturating_sub` is there so a
+/// degenerate call cannot panic, not because the case is expected.
+pub(crate) fn candidate_threshold_entries(num_vars: usize, n_fixed: usize) -> usize {
+    if num_vars == 0 {
+        // A page of no rows has no sparse leg to save, so nothing qualifies.
+        return usize::MAX;
+    }
+    let marginal = marginal_stacked_rows(num_vars, n_fixed);
+    debug_assert!(marginal > num_vars, "the eq term alone is 5 * num_vars");
+    marginal.saturating_sub(num_vars) / num_vars + 1
+}
+
+/// What carrying one candidate SAVES: its sparse leg, less what it adds to the
+/// prepared one. Zero for a page that is not a candidate.
+pub(crate) fn page_savings(num_vars: usize, n_fixed: usize, nonzero: usize) -> usize {
+    sparse_leg_rows(num_vars, nonzero).saturating_sub(marginal_stacked_rows(num_vars, n_fixed))
+}
+
+/// PART 2: whether the candidate set is worth paying the chain for at all.
+///
+/// ⛔ EVALUATED ONCE, ON THE WHOLE SET, AND THAT IS WHY IT IS A SEPARATE PART.
+/// The chain is paid once however many pages ride it, so no per-page rule can
+/// see it: a per-page test with a fixed-cost term in it charges every page for
+/// the same chain and refuses two pages that would gladly share one. That is
+/// the case the single-page rule got wrong — two pages of 5,000 entries apiece
+/// were each worth less than the chain and jointly worth more, and both stayed
+/// sparse at 180,036 rows.
+///
+/// If this refuses, EVERY candidate stays sparse. There is no partial answer:
+/// carrying a subset still pays the whole chain.
+pub(crate) fn chain_is_paid(total_savings: usize) -> bool {
+    total_savings > PREPARED_LEG_ROWS
+}
+
+/// The most nonzero entries a page this rule leaves SPARSE can carry.
+///
+/// ⛔⛔ THE QUANTITY THE SPARSE-LEG CAP MUST CLEAR, and it is a property of the
+/// two-part rule rather than of one page. A page is left sparse only when part
+/// 2 refused, so the whole candidate set saved at most [`PREPARED_LEG_ROWS`];
+/// the total is at least this page's own savings, so this page saved at most
+/// that too. Invert [`page_savings`]:
+///
+/// ```text
+/// num_vars + num_vars * S - marginal <= PREPARED_LEG_ROWS
+/// S <= (PREPARED_LEG_ROWS + marginal - num_vars) / num_vars
+/// ```
+///
+/// ⚠ IT BOUNDS A NON-CANDIDATE TOO, and by much more room: a page failing part
+/// 1 has a sparse leg no larger than the marginal, which is three orders under
+/// this. So the one number covers both ways a page can end up sparse.
+pub(crate) fn densest_sparse_entries(num_vars: usize, n_fixed: usize) -> usize {
+    if num_vars == 0 {
+        return 0;
+    }
+    (PREPARED_LEG_ROWS + marginal_stacked_rows(num_vars, n_fixed)).saturating_sub(num_vars)
+        / num_vars
+}
+
+/// How many of the pages are GENESIS pages — the count `n_fixed` is taken at.
+///
+/// ⚠ THE PRIVATE FILTER IS APPLIED HERE TOO, and for the same reason it is
+/// applied in the plan: the prover's and the verifier's views of a private page
+/// differ in their bytes, and a count that included them would still agree, but
+/// a rule that read their bytes would not. Counting only what presents an INIT
+/// column keeps every input to the routing decision one both sides derive from
+/// the ELF.
+pub(crate) fn genesis_page_count(configs: &[PageConfig]) -> usize {
+    configs.iter().filter(|c| !c.is_private_input).count()
 }
 
 /// How many of a page's genesis bytes are nonzero — the only quantity the
@@ -639,6 +819,16 @@ pub(crate) struct PageRoute {
     pub nonzero: usize,
     /// `false` for a private-input page, which presents no INIT column at all.
     pub has_init: bool,
+    /// PART 1's answer: keeping this page sparse costs more than carrying it
+    /// would add to the leg.
+    ///
+    /// ⚠ RECORDED SEPARATELY FROM `dense` ON PURPOSE. A candidate that is not
+    /// dense is a page the chain could not be paid for, and that is a different
+    /// state from a page nobody wanted — the one the fixtures are actually in.
+    /// Without this field a reader meets an absence and has to infer which rule
+    /// produced it.
+    pub candidate: bool,
+    /// Both parts' answer: the opening carries this page.
     pub dense: bool,
 }
 
@@ -659,6 +849,13 @@ pub(crate) struct GenesisStackPlan {
     pub at: Vec<PreparedColumn>,
     /// The rows the pages NOT carried still cost by the sparse form.
     pub sparse_rows: usize,
+    /// The height part 1's marginal was charged at, [`fixed_stack_vars`] of the
+    /// genesis page count — NOT the height the stack will stand at.
+    pub n_fixed: usize,
+    /// What the candidate set saves, the quantity part 2 weighs against
+    /// [`PREPARED_LEG_ROWS`]. Nonzero even when nothing was carried: that is
+    /// the reading that says the chain was refused rather than unwanted.
+    pub savings: usize,
 }
 
 impl GenesisStackPlan {
@@ -688,45 +885,67 @@ impl GenesisStackPlan {
 /// is the one place that order is written. The `PreparedColumn::table` indices
 /// this produces are indices into THAT order, because that is the order
 /// `multi_prove` and `multi_verify` match positionally.
+///
+/// ⛔ TWO PASSES, BECAUSE PART 2 IS A PROPERTY OF THE SET. The first decides
+/// candidacy and totals the savings; only then can the second know whether the
+/// chain is paid for, and therefore whether any candidate is carried. Doing it
+/// in one pass would mean deciding a page's fate before the quantity that
+/// decides it has been computed — which is the set-dependence this rule is
+/// built to avoid, wearing the other hat.
 pub(crate) fn genesis_stack_plan(
     configs: &[PageConfig],
     num_bookends: usize,
     num_vars: usize,
 ) -> GenesisStackPlan {
-    let mut routes = Vec::with_capacity(configs.len());
-    let mut at = Vec::new();
-    let mut sparse_rows = 0usize;
+    // The fixed height, taken before any page is looked at.
+    let n_fixed = fixed_stack_vars(num_vars, genesis_page_count(configs));
 
+    // PASS 1 — candidacy, and what the candidates would save between them.
+    let mut routes: Vec<PageRoute> = Vec::with_capacity(configs.len());
+    let mut savings = 0usize;
     for (page, config) in configs.iter().enumerate() {
-        let table = num_bookends + page;
         // ⛔ The private filter comes FIRST and is not the threshold's business;
         // see the section header for what a threshold reading those bytes does.
         let has_init = !config.is_private_input;
         let nonzero = if has_init { nonzero_entries(config) } else { 0 };
-        let dense = has_init && is_dense(num_vars, nonzero);
-        if dense {
-            // BOTH preprocessed columns, in index order: the prefix
-            // `check_preprocessed` skips. See `PAGE_PREPROCESSED_COLUMNS`.
-            at.extend(stark::multilinear_table::leading_columns(
-                table,
-                PAGE_PREPROCESSED_COLUMNS,
-            ));
-        } else if has_init {
-            sparse_rows += sparse_leg_rows(num_vars, nonzero);
+        let candidate = has_init && is_candidate(num_vars, n_fixed, nonzero);
+        if candidate {
+            savings += page_savings(num_vars, n_fixed, nonzero);
         }
         routes.push(PageRoute {
-            table,
+            table: num_bookends + page,
             page_base: config.page_base,
             nonzero,
             has_init,
-            dense,
+            candidate,
+            dense: false,
         });
+    }
+
+    // PASS 2 — the chain, paid for the whole set or for none of it.
+    let paid = chain_is_paid(savings);
+    let mut at = Vec::new();
+    let mut sparse_rows = 0usize;
+    for route in &mut routes {
+        route.dense = route.candidate && paid;
+        if route.dense {
+            // BOTH preprocessed columns, in index order: the prefix
+            // `check_preprocessed` skips. See `PAGE_PREPROCESSED_COLUMNS`.
+            at.extend(stark::multilinear_table::leading_columns(
+                route.table,
+                PAGE_PREPROCESSED_COLUMNS,
+            ));
+        } else if route.has_init {
+            sparse_rows += sparse_leg_rows(num_vars, route.nonzero);
+        }
     }
 
     GenesisStackPlan {
         routes,
         at,
         sparse_rows,
+        n_fixed,
+        savings,
     }
 }
 
@@ -3720,6 +3939,11 @@ mod tests {
     const BLOCK_ZERO_PAGES: usize = 27;
     const BLOCK_PAGE_VARS: usize = 18;
     const BLOCK_CENSUS_LEG_ROWS: usize = 10_249_056;
+    /// The census's genesis pages: 35 touched less the 5 private.
+    const BLOCK_GENESIS_PAGES: usize = 30;
+    /// The height part 1 charges at on the block, and the marginal there.
+    const BLOCK_N_FIXED: usize = 24;
+    const BLOCK_MARGINAL: usize = 103;
 
     /// The census was read at one page size; every number below is evaluated at
     /// that height only while this holds.
@@ -3755,48 +3979,309 @@ mod tests {
         );
     }
 
-    /// ★ THE PRE-REGISTRATION: exactly the three pages, and nothing near the
-    /// line.
-    #[test]
-    fn the_threshold_selects_exactly_the_blocks_three_dense_pages() {
-        for (base, nonzero, _) in BLOCK_DENSE {
-            assert!(
-                is_dense(BLOCK_PAGE_VARS, nonzero),
-                "page {base:#x} carries {nonzero} nonzero entries and must be stacked"
-            );
+    /// A page set of [`BLOCK_GENESIS_PAGES`] genesis pages whose first ones
+    /// carry the given nonzero counts and whose rest are all-zero.
+    ///
+    /// ⚠ THE PAGE COUNT IS PART OF THE RULE, which is why these tests build a
+    /// set rather than calling the forms. `n_fixed` is taken at the genesis
+    /// page count, so a two-page set answers a different question from a
+    /// thirty-page one, and a number quoted without its `P` is a number nobody
+    /// can reproduce.
+    fn genesis_pages_with(counts: &[usize]) -> Vec<PageConfig> {
+        let page = 1u64 << BLOCK_PAGE_VARS;
+        let mut configs = Vec::with_capacity(BLOCK_GENESIS_PAGES);
+        let mut base = 0u64;
+        for &nonzero in counts {
+            configs.push(data_page(base, vec![1u8; nonzero]));
+            base += page;
         }
-        assert!(
-            !is_dense(BLOCK_PAGE_VARS, 0),
-            "an all-zero page must never be stacked: the sparse form is free for it"
+        while configs.len() < BLOCK_GENESIS_PAGES {
+            configs.push(PageConfig::zero_init(base));
+            base += page;
+        }
+        configs
+    }
+
+    /// The block's own thirty genesis pages: the three dense ones at their
+    /// census bases and counts, and twenty-seven all-zero.
+    fn block_genesis_configs() -> Vec<PageConfig> {
+        assert_eq!(
+            BLOCK_DENSE.len() + BLOCK_ZERO_PAGES,
+            BLOCK_GENESIS_PAGES,
+            "the census's page counts must add up, or this set is not the block's"
+        );
+        let page = 1u64 << BLOCK_PAGE_VARS;
+        let mut configs: Vec<PageConfig> = BLOCK_DENSE
+            .iter()
+            .map(|&(base, nonzero, _)| data_page(base, vec![1u8; nonzero]))
+            .collect();
+        let mut base = 0x1000000u64;
+        for _ in 0..BLOCK_ZERO_PAGES {
+            configs.push(PageConfig::zero_init(base));
+            base += page;
+        }
+        configs.sort_by_key(|config| config.page_base);
+        configs
+    }
+
+    /// The height and the marginal the ruling is quoted at, from the forms.
+    #[test]
+    fn the_blocks_fixed_height_and_marginal_are_what_the_ruling_names() {
+        assert_eq!(
+            fixed_stack_vars(BLOCK_PAGE_VARS, BLOCK_GENESIS_PAGES),
+            BLOCK_N_FIXED,
+            "18 + ceil(log2(60))"
+        );
+        // 90 for the eq and its join, 12 for two indicators of six, 1 shared Sub.
+        assert_eq!(
+            marginal_stacked_rows(BLOCK_PAGE_VARS, BLOCK_N_FIXED),
+            BLOCK_MARGINAL
+        );
+        // ★ τ = 5: `18 + 18*S > 103`. A page with five nonzero genesis bytes is
+        // already worth carrying; four is not.
+        assert_eq!(
+            candidate_threshold_entries(BLOCK_PAGE_VARS, BLOCK_N_FIXED),
+            5
+        );
+        assert!(!is_candidate(BLOCK_PAGE_VARS, BLOCK_N_FIXED, 4));
+        assert!(is_candidate(BLOCK_PAGE_VARS, BLOCK_N_FIXED, 5));
+        // τ rides the eq term, so the bound costing six more prefix rows than
+        // the stack's real height does not move it.
+        assert_eq!(candidate_threshold_entries(BLOCK_PAGE_VARS, 21), 5);
+        // ⚠ FLOOR PLUS ONE AND NOT `div_ceil`, which would hand back an S whose
+        // leg EQUALS the marginal. The two differ exactly when the division is
+        // exact, so a posture where they agree hides the wrong one.
+        assert_eq!(
+            sparse_leg_rows(BLOCK_PAGE_VARS, 5),
+            108,
+            "τ's leg must EXCEED the marginal, not meet it"
         );
     }
 
-    /// The decision does not sit near the constant, which is what makes it a
+    /// ⚠ PART 1's TWO SPELLINGS ARE ONE RULE — read, not taken on trust.
+    ///
+    /// [`is_candidate`] branches on `nonzero >= τ`; the rule is stated as
+    /// `sparse_leg_rows > marginal_stacked_rows`. The equality of the two is a
+    /// floor-versus-strict-inequality argument, which is exactly the kind that
+    /// is right until the division comes out exact. So it is executed, over
+    /// every `S` around the boundary and at several heights — including the
+    /// heights where `(marginal - num_vars)` divides evenly by `num_vars`.
+    #[test]
+    fn the_threshold_and_its_entry_count_are_one_rule() {
+        let mut exact_divisions = 0usize;
+        let mut div_ceil_would_differ = 0usize;
+        // ⚠ THE PAGE HEIGHT IS SWEPT, NOT ONLY THE STACK'S. At `num_vars = 18`
+        // the remainder `(marginal - num_vars) % num_vars` is always ODD and 18
+        // is even, so the exact-division case NEVER ARISES at the production
+        // height — a sweep held at 18 could not tell floor-plus-one from
+        // `div_ceil` at all, and would have been the check that cannot fail.
+        for num_vars in 1..=20usize {
+            for n_fixed in num_vars..num_vars + 12 {
+                let marginal = marginal_stacked_rows(num_vars, n_fixed);
+                if (marginal - num_vars) % num_vars == 0 {
+                    exact_divisions += 1;
+                    if (marginal - num_vars).div_ceil(num_vars)
+                        != candidate_threshold_entries(num_vars, n_fixed)
+                    {
+                        div_ceil_would_differ += 1;
+                    }
+                }
+                for nonzero in 0..40 {
+                    assert_eq!(
+                        is_candidate(num_vars, n_fixed, nonzero),
+                        sparse_leg_rows(num_vars, nonzero) > marginal,
+                        "num_vars {num_vars}, n_fixed {n_fixed}, {nonzero} entries: the \
+                         entry count and the row comparison disagree"
+                    );
+                }
+            }
+        }
+        // The arms that make this a check rather than a restatement.
+        assert!(
+            exact_divisions > 0,
+            "no height in this sweep divided evenly, so it cannot distinguish \
+             floor-plus-one from div_ceil and proves nothing about the form"
+        );
+        assert_eq!(
+            div_ceil_would_differ, exact_divisions,
+            "at every exact division `div_ceil` must give a DIFFERENT answer, or the \
+             two forms were never actually separated"
+        );
+    }
+
+    /// ★ CONSEQUENCE (a) — THE PRE-REGISTRATION, on a real plan over the
+    /// block's thirty pages: exactly those three bases, in that order.
+    #[test]
+    fn the_threshold_selects_exactly_the_blocks_three_dense_pages() {
+        let configs = block_genesis_configs();
+        let plan = genesis_stack_plan(&configs, 15, BLOCK_PAGE_VARS);
+        assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
+
+        // Part 1: the three, and only the three. The 27 zero pages cost 18 rows
+        // sparse against a 103-row marginal, so carrying one would COST rows.
+        assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 0), 18);
+        assert!(!is_candidate(BLOCK_PAGE_VARS, BLOCK_N_FIXED, 0));
+        assert_eq!(
+            plan.routes.iter().filter(|route| route.candidate).count(),
+            BLOCK_DENSE.len()
+        );
+
+        // Part 2: paid, by nearly two orders of magnitude.
+        let expected: usize = BLOCK_DENSE
+            .iter()
+            .map(|&(_, _, rows)| rows - BLOCK_MARGINAL)
+            .sum();
+        assert_eq!(plan.savings, expected);
+        assert_eq!(plan.savings, 10_248_261);
+        assert!(chain_is_paid(plan.savings));
+
+        // ⚠ THE SET AND ITS ORDER, not a count: the stack's column order IS
+        // page-base order, so three of the wrong three would pass a count.
+        let carried: Vec<u64> = plan
+            .routes
+            .iter()
+            .filter(|route| route.dense)
+            .map(|route| route.page_base)
+            .collect();
+        assert_eq!(carried, vec![0x0, 0x40000, 0x280000]);
+        assert_eq!(plan.sparse_rows, BLOCK_ZERO_PAGES * 18);
+    }
+
+    /// The decision does not sit near either constant, which is what makes it a
     /// routing rule rather than a tuning knob.
     #[test]
     fn nothing_on_the_block_sits_near_the_threshold() {
         let least_dense = BLOCK_DENSE.iter().map(|&(_, _, r)| r).min().expect("three");
+        // Part 1: the cheapest carried page clears the marginal 20,000-fold,
+        // and the dearest sparse one misses it by 5.7x.
+        assert!(least_dense > 10_000 * marginal_stacked_rows(BLOCK_PAGE_VARS, BLOCK_N_FIXED));
+        assert!(
+            sparse_leg_rows(BLOCK_PAGE_VARS, 0) * 5
+                < marginal_stacked_rows(BLOCK_PAGE_VARS, BLOCK_N_FIXED)
+        );
+        // Part 2: the CHEAPEST carried page is worth twelve chains on its own,
+        // and the three together fifty-eight, so no plausible re-sizing of the
+        // budget changes the block's answer.
         assert!(
             least_dense > 10 * PREPARED_LEG_ROWS,
             "the cheapest stacked page is {least_dense} rows against a \
              {PREPARED_LEG_ROWS} budget"
         );
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 0) * 1000 < PREPARED_LEG_ROWS);
     }
 
-    /// The break-even in nonzero entries, stated so a fixture can be sized to
-    /// cross it.
+    /// ★ CONSEQUENCE (c) — A LONE PAGE, AT THE BOUNDARY BOTH WAYS.
+    ///
+    /// At one genesis page the two parts collapse to a single condition on that
+    /// page: it is the only candidate, so the set's savings ARE its savings.
+    /// That is the SHAPE of the rule this replaces — and not its value.
+    ///
+    /// ⛔ THE RETIRED BREAK-EVEN WAS 9,725 AND THIS ONE IS 9,731, and the six
+    /// entries between them are why every bound derived from the old rule has
+    /// to be re-derived rather than re-read. A test left at 9,724 stays green
+    /// under both and means something under neither.
     #[test]
-    fn the_break_even_is_where_the_forms_say_it_is() {
-        // The least S with `num_vars + num_vars*S > PREPARED_LEG_ROWS`, which is
-        // floor PLUS ONE and not `div_ceil`: were the division exact, `div_ceil`
-        // would hand back an S whose leg EQUALS the budget and does not exceed
-        // it. The two agree at 18 variables, which is exactly why the wrong one
-        // would have gone unnoticed.
-        let break_even = (PREPARED_LEG_ROWS - BLOCK_PAGE_VARS) / BLOCK_PAGE_VARS + 1;
-        assert_eq!(break_even, 9_725);
-        assert!(!is_dense(BLOCK_PAGE_VARS, break_even - 1));
-        assert!(is_dense(BLOCK_PAGE_VARS, break_even));
+    fn a_lone_page_is_carried_at_9731_and_left_sparse_at_9730() {
+        let n_fixed = fixed_stack_vars(BLOCK_PAGE_VARS, 1);
+        assert_eq!(n_fixed, 19, "18 + ceil(log2(2))");
+        assert_eq!(marginal_stacked_rows(BLOCK_PAGE_VARS, n_fixed), 93);
+
+        for (nonzero, carried, savings) in
+            [(9_730usize, false, 175_065usize), (9_731, true, 175_083)]
+        {
+            let configs = vec![data_page(0x40000, vec![1u8; nonzero])];
+            let plan = genesis_stack_plan(&configs, 3, BLOCK_PAGE_VARS);
+            assert_eq!(plan.n_fixed, n_fixed);
+            assert!(
+                plan.routes[0].candidate,
+                "a page of {nonzero} entries clears part 1 either way; only part 2 \
+                 separates these two"
+            );
+            assert_eq!(plan.savings, savings, "a lone page at {nonzero} entries");
+            assert_eq!(
+                !plan.is_empty(),
+                carried,
+                "a lone page of {nonzero} nonzero entries saves {savings} against a \
+                 {PREPARED_LEG_ROWS}-row chain"
+            );
+        }
+
+        // The retired rule's break-even, kept here as the contrast and nowhere
+        // else: `18 + 18*S > PREPARED_LEG_ROWS`, floor plus one.
+        let retired = (PREPARED_LEG_ROWS - BLOCK_PAGE_VARS) / BLOCK_PAGE_VARS + 1;
+        assert_eq!(retired, 9_725);
+        assert!(
+            retired < 9_731,
+            "the two-part rule charges a lone page its own marginal on top of the \
+             chain, so its boundary must sit ABOVE the retired one ({retired} vs 9,731)"
+        );
+    }
+
+    /// ★ CONSEQUENCE (b) — A CANDIDATE THE CHAIN REFUSES TO PAY FOR, which is
+    /// where every fixture in the tree sits.
+    ///
+    /// `data_page_touch`'s one data page carries 112 nonzero genesis bytes. It
+    /// passes part 1 comfortably — 2,034 rows against a 103-row marginal — and
+    /// part 2 refuses it, because 1,931 saved rows do not buy a 175,066-row
+    /// chain. ⚠ THAT IS THE INTERESTING BRANCH AND IT IS WHY THE FIELD
+    /// `candidate` EXISTS: under the retired rule this page failed the only
+    /// test there was, and "no opening" meant "nobody wanted it".
+    #[test]
+    fn a_candidate_the_chain_cannot_be_paid_for_stays_sparse() {
+        let configs = genesis_pages_with(&[112]);
+        let plan = genesis_stack_plan(&configs, 3, BLOCK_PAGE_VARS);
+        assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
+        assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 112), 2_034);
+        assert!(plan.routes[0].candidate, "2,034 rows against 103");
+        assert_eq!(plan.savings, 2_034 - BLOCK_MARGINAL);
+        assert_eq!(plan.savings, 1_931);
+        assert!(!chain_is_paid(plan.savings));
+        assert!(
+            plan.is_empty(),
+            "the chain is not paid, so nothing is carried"
+        );
+        assert!(!plan.routes[0].dense);
+        assert_eq!(
+            plan.sparse_rows,
+            2_034 + (BLOCK_GENESIS_PAGES - 1) * 18,
+            "a refused candidate still pays its sparse leg, and so do the zero pages"
+        );
+
+        // And the dense guest written for this route clears part 2 outright:
+        // `dense_data_page_touch` surrounds its cell with 32 KiB either side.
+        let dense = genesis_stack_plan(&genesis_pages_with(&[65_652]), 3, BLOCK_PAGE_VARS);
+        assert_eq!(dense.savings, 18 + 18 * 65_652 - BLOCK_MARGINAL);
+        assert!(chain_is_paid(dense.savings));
+        assert_eq!(dense.dense_pages(), vec![0]);
+    }
+
+    /// ★ CONSEQUENCE (d) — TWO PAGES THAT SHARE ONE CHAIN, the case the retired
+    /// rule got wrong.
+    ///
+    /// Neither page is worth a chain of its own; between them they are worth
+    /// two. A rule that charges the chain per page refuses both and spends
+    /// 180,036 rows keeping them sparse — more than the chain it declined to
+    /// buy. That is not a tuning miss, it is a fixed cost charged to the wrong
+    /// thing, and part 2 is where it moves.
+    #[test]
+    fn two_pages_worth_less_than_the_chain_apiece_share_one() {
+        let configs = genesis_pages_with(&[5_000, 5_000]);
+        let plan = genesis_stack_plan(&configs, 3, BLOCK_PAGE_VARS);
+        assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
+        assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 5_000), 90_018);
+
+        // Neither one pays for the chain alone.
+        let alone = page_savings(BLOCK_PAGE_VARS, BLOCK_N_FIXED, 5_000);
+        assert_eq!(alone, 89_915);
+        assert!(!chain_is_paid(alone));
+        // Together they do, and BOTH are carried — the set is paid for or none
+        // of it is.
+        assert_eq!(plan.savings, 2 * alone);
+        assert_eq!(plan.savings, 179_830);
+        assert!(chain_is_paid(plan.savings));
+        assert_eq!(plan.dense_pages(), vec![0, 1]);
+
+        // What the retired rule spent instead.
+        assert_eq!(2 * sparse_leg_rows(BLOCK_PAGE_VARS, 5_000), 180_036);
     }
 
     fn data_page(base: u64, bytes: Vec<u8>) -> PageConfig {
@@ -3812,10 +4297,16 @@ mod tests {
     #[test]
     fn a_private_page_dense_enough_to_qualify_is_still_not_stacked() {
         let dense_bytes = vec![0xABu8; 20_000];
-        assert!(
-            is_dense(BLOCK_PAGE_VARS, dense_bytes.len()),
-            "the fixture bytes must qualify, or this test cannot fail"
-        );
+        // ⚠ THE PRECONDITION: these bytes must be carried when they are PUBLIC,
+        // or the test passes on a page nobody would have stacked anyway. One
+        // genesis page survives the filter, so the rule is evaluated at P = 1.
+        let lone = fixed_stack_vars(BLOCK_PAGE_VARS, 1);
+        assert!(is_candidate(BLOCK_PAGE_VARS, lone, dense_bytes.len()));
+        assert!(chain_is_paid(page_savings(
+            BLOCK_PAGE_VARS,
+            lone,
+            dense_bytes.len()
+        )));
         let mut private = data_page(0xff000000, dense_bytes.clone());
         private.is_private_input = true;
         let public = data_page(0x40000, dense_bytes);
@@ -3851,6 +4342,21 @@ mod tests {
             "prover and verifier must commit the same stack or the roots block diverges"
         );
         assert_eq!(from_prover.sparse_rows, from_verifier.sparse_rows);
+        // ⛔ EVERY INPUT TO THE RULE, NOT JUST ITS ANSWER. The two-part rule
+        // reads a page count and a savings total as well as each page's bytes,
+        // and two sides that agreed on the set while disagreeing on either
+        // would be agreeing by luck. `n_fixed` is the page count's fingerprint
+        // and `savings` the candidate set's.
+        assert_eq!(
+            from_prover.n_fixed, from_verifier.n_fixed,
+            "the fixed height is taken at the genesis page count, which the private \
+             filter must make identical on both sides"
+        );
+        assert_eq!(from_prover.savings, from_verifier.savings);
+        assert_eq!(
+            from_prover.routes, from_verifier.routes,
+            "including each page's candidacy, which is part 1's answer"
+        );
     }
 
     /// The table index a stacked column names is the AIR set's, bookends
@@ -3903,6 +4409,10 @@ mod tests {
 
     /// A run whose genesis is entirely sparse carries no opening at all, and its
     /// cross-epoch proof is the one it was before this route existed.
+    ///
+    /// ⚠ AND IT SAYS WHICH PART REFUSED. The data page IS a candidate here —
+    /// part 2 is what leaves the set empty — so a green would otherwise be
+    /// consistent with a part 1 that had stopped working.
     #[test]
     fn an_all_sparse_page_set_stacks_nothing() {
         let configs = vec![
@@ -3913,5 +4423,60 @@ mod tests {
         assert!(plan.is_empty());
         assert!(plan.dense_pages().is_empty());
         assert!(genesis_stack_columns(&configs, &plan).is_empty());
+        assert!(!plan.routes[0].candidate, "an all-zero page fails part 1");
+        assert!(plan.routes[1].candidate, "112 entries clear part 1");
+        assert!(
+            !chain_is_paid(plan.savings),
+            "part 2 is what empties this set, and its savings are {}",
+            plan.savings
+        );
+    }
+
+    /// ⛔⛔ THE TERMS THE MARGINAL LEAVES OUT CHANGE NO ANSWER THIS RULE IS
+    /// QUOTED FOR — asserted, because "small" is not a reason.
+    ///
+    /// `stacked_verify_cost` also pays `columns * absorb_unpack_rows()` and
+    /// `challenge_powers_rows(columns)`; both grow by one per stacked column
+    /// and a page brings two, so the true marginal is FOUR rows above
+    /// [`marginal_stacked_rows`]. Understating a marginal makes part 1 too
+    /// eager and part 2 too generous, so the omission needs a reading and not
+    /// an assurance.
+    ///
+    /// ★ It moves neither τ, nor the lone-page boundary, nor the block's set.
+    /// The day a stacked column's per-column cost grows, this reddens and
+    /// [`marginal_stacked_rows`] is where the fix goes.
+    #[test]
+    fn the_marginals_omitted_absorb_term_moves_no_ruled_boundary() {
+        // Two absorbs and two challenge powers, one of each per stacked column.
+        const OMITTED: usize = 2 * PAGE_PREPROCESSED_COLUMNS;
+
+        let with_it =
+            |num_vars: usize, n_fixed: usize| marginal_stacked_rows(num_vars, n_fixed) + OMITTED;
+
+        // τ = 5 either way: `18 + 18*S > 103` and `> 107` both break at 5.
+        let block = with_it(BLOCK_PAGE_VARS, BLOCK_N_FIXED);
+        assert_eq!(block, 107);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 4) <= block);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 5) > block);
+
+        // The lone-page boundary stays at 9,730 / 9,731.
+        let lone = with_it(BLOCK_PAGE_VARS, fixed_stack_vars(BLOCK_PAGE_VARS, 1));
+        assert_eq!(lone, 97);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 9_730) - lone <= PREPARED_LEG_ROWS);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 9_731) - lone > PREPARED_LEG_ROWS);
+
+        // The block still selects three pages and still pays for them.
+        let savings: usize = BLOCK_DENSE.iter().map(|&(_, _, rows)| rows - block).sum();
+        assert_eq!(savings, 10_248_249);
+        assert!(chain_is_paid(savings));
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 0) <= block);
+
+        // And the two cases the rule was rewritten for keep their answers.
+        assert!(!chain_is_paid(
+            sparse_leg_rows(BLOCK_PAGE_VARS, 112) - block
+        ));
+        assert!(chain_is_paid(
+            2 * (sparse_leg_rows(BLOCK_PAGE_VARS, 5_000) - block)
+        ));
     }
 }

@@ -1249,8 +1249,8 @@ fn a_dense_genesis_page_is_carried_by_a_prepared_opening() {
     );
     for route in &plan.routes {
         println!(
-            "DENSE FIXTURE PAGE {:#x}: nonzero {} has_init {} dense {}",
-            route.page_base, route.nonzero, route.has_init, route.dense
+            "DENSE FIXTURE PAGE {:#x}: nonzero {} has_init {} candidate {} dense {}",
+            route.page_base, route.nonzero, route.has_init, route.candidate, route.dense
         );
     }
     // ⚠ THE PRECONDITION, ASSERTED. Without a dense page this test would take
@@ -1332,10 +1332,22 @@ fn a_sparse_genesis_page_set_carries_no_prepared_opening() {
         crate::continuation::PAGE_NUM_VARS,
     );
     let worst = plan.routes.iter().map(|r| r.nonzero).max().unwrap_or(0);
+    // ⚠ THE SAVINGS ARE PART OF THE READING. Under the two-part rule an empty
+    // plan has two causes — no page cleared part 1, or the candidates could not
+    // pay for the chain — and "no opening" alone does not say which. The line
+    // prints the candidate count and the savings so the log does.
     println!(
-        "SPARSE FIXTURE: {} pages, worst nonzero {worst}, sparse rows {}",
+        "SPARSE FIXTURE: {} pages, worst nonzero {worst}, sparse rows {}, candidates {}, \
+         savings {} against a {}-row chain",
         plan.routes.len(),
-        plan.sparse_rows
+        plan.sparse_rows,
+        plan.routes.iter().filter(|route| route.candidate).count(),
+        plan.savings,
+        crate::continuation::PREPARED_LEG_ROWS,
+    );
+    assert!(
+        !crate::continuation::chain_is_paid(plan.savings),
+        "part 2 must be what refuses here"
     );
     assert!(
         plan.is_empty(),
@@ -1423,6 +1435,16 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
         !plan.is_empty(),
         "the fixture must carry a stack, or there is no root to have provenance"
     );
+    // ⚠ AND WHY it carries one: part 1 made it a candidate and part 2 paid for
+    // the chain. An absence here would otherwise be consistent with either.
+    println!(
+        "PROVENANCE PLAN: n_fixed {} savings {} chain {} candidates {}",
+        plan.n_fixed,
+        plan.savings,
+        crate::continuation::PREPARED_LEG_ROWS,
+        plan.routes.iter().filter(|route| route.candidate).count(),
+    );
+    assert!(crate::continuation::chain_is_paid(plan.savings));
 
     // Both halves commit under ONE config, so a difference in the roots is a
     // difference in the BYTES and not in the parameters.
@@ -1491,14 +1513,19 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
     // ⚠ ANTI-VACUITY, PER COLUMN KIND — two all-zero stacks match and say
     // nothing. Each kind is asserted against the count only IT can have:
     //
-    // - INIT must clear the density floor that put its page in the stack. An
-    //   INIT column below it means the two halves are reading different pages.
+    // - INIT must clear the fill this guest was BUILT with: `dense_data_page_
+    //   touch` surrounds its touched cell with 32 KiB of non-zero bytes on each
+    //   side, so the counter's own page holds at least one side's worth
+    //   whatever offset the linker chose. ⛔ THE FLOOR IS THE GUEST'S, NOT THE
+    //   ROUTING RULE'S: a page can be carried while holding far fewer entries
+    //   than that (two pages of 5,000 share a chain), so a floor taken from the
+    //   threshold would be true here only by accident of this fixture.
     // - OFFSET is the ramp `0..page_size`, so exactly one entry of it is zero
     //   and its count is `page_size - 1`: pinned EXACTLY, not by a floor.
     //   ⛔ This is the reading that names the old defect outright. An OFFSET
     //   entry rebuilt from the ELF's bytes prints the INIT count instead of
     //   262,143 — which is what the failing log showed, twice.
-    let floor = crate::continuation::PREPARED_LEG_ROWS / crate::continuation::PAGE_NUM_VARS;
+    let floor = 32_768usize;
     let ramp_nonzero = page_size as usize - 1;
     for (column, entry) in rebuilt.iter().zip(&plan.at) {
         let zero = Fe::from(0u64);
@@ -1726,8 +1753,8 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
             sparse_total += rows;
         }
         println!(
-            "ROUTE {:#x}: nonzero {} has_init {} dense {} sparse_rows {rows}",
-            route.page_base, route.nonzero, route.has_init, route.dense
+            "ROUTE {:#x}: nonzero {} has_init {} candidate {} dense {} sparse_rows {rows}",
+            route.page_base, route.nonzero, route.has_init, route.candidate, route.dense
         );
     }
 
@@ -1737,18 +1764,30 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         .filter(|r| r.dense)
         .map(|r| r.page_base)
         .collect();
+    // ⚠ BOTH PARTS, AND BOTH OF THEIR INPUTS. A line quoting only the answer
+    // would not say which rule produced it, and the two are separately wrong in
+    // different ways.
+    let num_vars = crate::continuation::PAGE_NUM_VARS;
+    let marginal = crate::continuation::marginal_stacked_rows(num_vars, plan.n_fixed);
     println!(
         "GENESIS ROUTING: {} of {} pages stacked {dense_bases:02x?}; the sparse form \
-         would have cost {} rows for them and costs {} for the rest; \
-         threshold {} rows ({} nonzero entries)",
+         would have cost {dense_total} rows for them and costs {sparse_total} for the \
+         rest. PART 1 at n_fixed {} ({} genesis pages): marginal {marginal} rows, so a \
+         candidate needs {} nonzero entries; {} candidates. PART 2: savings {} against a \
+         {}-row chain, {}",
         dense_bases.len(),
         plan.routes.len(),
-        dense_total,
-        sparse_total,
+        plan.n_fixed,
+        plan.routes.iter().filter(|r| r.has_init).count(),
+        crate::continuation::candidate_threshold_entries(num_vars, plan.n_fixed),
+        plan.routes.iter().filter(|r| r.candidate).count(),
+        plan.savings,
         crate::continuation::PREPARED_LEG_ROWS,
-        (crate::continuation::PREPARED_LEG_ROWS - crate::continuation::PAGE_NUM_VARS)
-            / crate::continuation::PAGE_NUM_VARS
-            + 1,
+        if crate::continuation::chain_is_paid(plan.savings) {
+            "PAID"
+        } else {
+            "REFUSED — every candidate stays sparse"
+        },
     );
 
     // ⚠ THE ASSERTION IS THE SET AND ITS ORDER, not a count. Three pages of the
@@ -1759,6 +1798,23 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         PRE_REGISTERED.to_vec(),
         "the threshold selected a different set of pages than the ruling names"
     );
+    // The two parts' own pre-registrations, so a green here cannot come from
+    // the right set reached by the wrong arithmetic.
+    assert_eq!(
+        plan.n_fixed, 24,
+        "thirty genesis pages: 18 + ceil(log2(60))"
+    );
+    assert_eq!(
+        marginal, 103,
+        "one eq and its join, two indicators, one Sub"
+    );
+    assert_eq!(
+        plan.routes.iter().filter(|r| r.candidate).count(),
+        PRE_REGISTERED.len(),
+        "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
+    );
+    assert_eq!(plan.savings, 10_248_261);
+    assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.
     assert!(
@@ -1766,4 +1822,25 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         "the sparse remainder is {sparse_total} rows against {dense_total} stacked: \
          the split is not the concentration the census read"
     );
+
+    // ⛔⛔ THE FOURTH OWED PIN, AT THE BLOCK. The in-guest verifier interns this
+    // root as program text and nothing inside the program checks it; the
+    // statement owed out of band is this line. `a_dense_genesis_page_is_carried
+    // _by_a_prepared_opening`'s sibling states the same thing at fixture scale,
+    // and `the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages`
+    // is where the derivation is checked against the ELF's own bytes.
+    let config = crate::multilinear_prove::chain_config(&[(plan.at.len(), num_vars)]);
+    crate::with_whir_hash!(|H| {
+        let prepared =
+            multilinear_continuation::genesis_prepared_for::<H>(&configs, plan.clone(), &config)
+                .expect("the block's genesis stack")
+                .expect("three dense pages must produce a stack");
+        println!(
+            "GENESIS STACK ROOT {:02x?} elf {elf_sha} input {input_sha} columns {} at \
+             {num_vars} variables hash {}",
+            prepared.roots,
+            plan.at.len(),
+            <H as multilinear::whir_hash::WhirHash>::NAME,
+        );
+    });
 }
