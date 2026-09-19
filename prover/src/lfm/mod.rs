@@ -82,7 +82,16 @@ pub(crate) mod whir_real_epoch;
 ///
 /// ⚠ NOT `whir_global`: that name belongs to the emitter, exactly as
 /// `whir_real_epoch` is not `whir_epoch`.
-pub(crate) mod whir_real_global;
+///
+/// ★ `pub`, AND THAT IS THE REMEDY FOR A `dead_code` CLASS, NOT AN OVERSIGHT.
+/// The module above is `pub(crate)` and gets away with it because
+/// `whir_epoch::whir_epoch_program` names `WhirRealEpoch` in a public
+/// signature; nothing public names the cross-epoch driver's type yet, so under
+/// `pub(crate)` the lib target reports every item in it unreachable and
+/// `make lint`'s first arm turns that into hard errors. A module-scoped
+/// `#![allow(dead_code)]` would silence the class AND everything added to it
+/// later, so the surface is published instead of the reports suppressed.
+pub mod whir_real_global;
 pub mod whir_reduce;
 pub mod whir_stacked;
 pub mod whir_statement;
