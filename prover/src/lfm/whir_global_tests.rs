@@ -337,6 +337,24 @@ mod tests {
                 println!("  UNNAMED  {w:?}");
                 if let Some((addr, _)) = interned_at.iter().find(|(_, word)| word == *w) {
                     println!("{}", crate::lfm::executor::locate_addr(&program, *addr));
+                    // ⛔ `locate_addr`'s window is ±4, which shows the SHAPE of
+                    // the leg but not its CALLER. Round one of this narrowed the
+                    // three survivors to one `algebraic_leaf_hash` over six
+                    // felts — `[A, a full four-lane digest, B]`, capacity
+                    // `leaf_capacity(6)` — and then stalled, because the loop
+                    // that builds that felt vector is outside ±4. A wider window
+                    // is the difference between "which leg" and "which call".
+                    if let Some(index) = program.instrs.iter().position(|i| {
+                        matches!(i, crate::lfm::instr::Instr::Const { out, .. } if out.0 == *addr)
+                    }) {
+                        let lo = index.saturating_sub(24);
+                        let hi = (index + 25).min(program.instrs.len());
+                        println!("    ---- wider window {lo}..{hi} ----");
+                        for (k, instr) in program.instrs[lo..hi].iter().enumerate() {
+                            let mark = if lo + k == index { "→" } else { " " };
+                            println!("    {mark} [{}] {instr:?}", lo + k);
+                        }
+                    }
                 }
             }
             for w in unemitted.iter().take(40) {
