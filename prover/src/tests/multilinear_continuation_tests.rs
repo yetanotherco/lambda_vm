@@ -1813,7 +1813,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     assert_eq!(
         marginal, 103,
         "the retired three-term reading, UNPINNED — the threaded sponge makes the \
-         true marginal depend on WHICH page is added, spreading {109, 110, 111} at \
+         true marginal depend on WHICH page is added, spreading {{109, 110, 111}} at \
          this height"
     );
     assert_eq!(
