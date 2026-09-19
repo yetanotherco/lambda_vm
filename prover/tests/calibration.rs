@@ -23,8 +23,9 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // ...with the shipped binary's purge policy, so this binary is the production
 // allocator *configuration* and not just the production allocator. The reason
-// and the numbers are at `bin/cli/src/main.rs`; `prover/tests/jemalloc_conf.rs`
-// is what asserts the export is actually read.
+// and the numbers are at `bin/cli/src/main.rs`. `prover/tests/jemalloc_conf.rs`
+// asserts that this export pattern is read, but it does so against its own copy
+// in its own process — nothing checks the copy below.
 //
 // It moves nothing this file asserts — `stats::allocated` is live bytes, which
 // the decay timers do not touch; a resident-memory assertion added here later

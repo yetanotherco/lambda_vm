@@ -24,28 +24,34 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // each, every arm at one commit and one set of knobs:
 //   * the WHIR prover (keccak, `whir/lfm` @ 64393da9) — 39.69-39.88 s a block
 //     with this setting against 43.94-44.07 s without, the default costing
-//     +13 M minor faults and +15 s of system time per arm;
+//     +13 M minor faults and +15 s of system time per run on this arm;
 //   * the per-table STARK tree (0e4f4610) — 187 / 163 / 166 / 171 s, both
 //     never-purge arms under both default arms, 5-24 s a block, with the proof
 //     bytes unmoved (30 identical lines, 0 differing).
-// The cost is peak RSS: +1.4 GiB and +2.9-3.3 GiB respectively, an order below
-// the 13 GiB the allocator choice itself is worth — which is why the lever is
-// the decay setting and not the allocator. `background_thread:true` recovers
+// The cost is peak RSS: +1.4 GiB and +2.9-3.3 GiB respectively, a ninth to a
+// quarter of the 13 GiB the allocator choice itself is worth — which is why the
+// lever is the decay setting and not the allocator. `background_thread:true` recovers
 // none of it: the cost is the re-touch, not the `madvise` call.
 //
 // This binary's own pipeline has not been measured under the setting; the
 // numbers above are from the campaign's branches, where the prover's
 // allocation pattern is the same.
 //
-// `MALLOC_CONF` / `_RJEM_MALLOC_CONF` in the environment still override this,
-// which is how a measurement arm puts the default policy back.
+// `_RJEM_MALLOC_CONF` in the environment still overrides this, which is how a
+// measurement arm puts the default policy back. It has to be that spelling:
+// `tikv-jemalloc-sys` builds with `--with-jemalloc-prefix=_rjem_` under default
+// features, and jemalloc then reads one env name chosen at configure time
+// (`jemalloc.c`, `obtain_malloc_conf` source 3) — so plain `MALLOC_CONF` is read
+// by nothing here and sets an arm to the default policy without saying it did
+// not. The file source is prefixed too: `/etc/_rjem_malloc.conf`.
 //
 // jemalloc reads this symbol as a `const char *` before `main` is entered, so
 // the value has to be in the initializer, and the name is the prefixed one
 // `tikv-jemalloc-sys` declares (`#[cfg_attr(prefixed, link_name =
-// "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked —
-// `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc and
-// is what fails if the export stops being read.
+// "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked.
+// `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc, but
+// it carries its own copy of this block and reads its own process — it pins the
+// pattern, not this export. Deleting the lines below turns nothing red.
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]

@@ -13,9 +13,12 @@
 //! its own: the prover's lib tests run under the platform allocator, where a
 //! `mallctl` read would say nothing, and `calibration.rs` is behind
 //! `disk-spill` and pays for a full proof. What it pins is the export pattern —
-//! symbol, type, initializer, edition spelling — shared verbatim with the two
-//! production sites. That the shipped `cli` binary carries the symbol is a
-//! link-time property, read with `nm` rather than asserted here.
+//! symbol, type, initializer, edition spelling — in the copy below, which is
+//! byte-identical to the two production sites but not mechanically tied to
+//! them: delete either of those and this still passes. It is a self-test of the
+//! pattern, not a regression guard on the two sites that ship it. That the
+//! shipped `cli` binary carries the symbol is a link-time property, read with
+//! `nm` rather than asserted here.
 
 use tikv_jemalloc_ctl::raw;
 
@@ -36,15 +39,19 @@ const DEFAULT_DIRTY_DECAY_MS: isize = 10_000;
 
 #[test]
 fn jemalloc_never_purge_is_compiled_in() {
-    // The same options can be set from the environment (`MALLOC_CONF` /
-    // `_RJEM_MALLOC_CONF`), and benchmark runs do set them. With either set,
-    // reading `-1` back would say nothing about the compiled-in export, so
-    // refuse to run rather than pass for the wrong reason.
-    for var in ["MALLOC_CONF", "_RJEM_MALLOC_CONF"] {
+    // `_RJEM_MALLOC_CONF` sets these same options from the environment, and
+    // benchmark runs do set it; with it set, reading `-1` back would say nothing
+    // about the compiled-in export, so refuse to run rather than pass for the
+    // wrong reason. Plain `MALLOC_CONF` is inert in this prefixed build — guarded
+    // anyway, so that a future unprefixed build does not silently pass here.
+    // Not covered: `/etc/_rjem_malloc.conf`, the one remaining source that could
+    // set `opt.*` from outside this binary.
+    for var in ["_RJEM_MALLOC_CONF", "MALLOC_CONF"] {
         assert!(
             std::env::var_os(var).is_none(),
-            "{var} is set in this process's environment. It sets `opt.*` on its \
-             own, so this test could not tell the compiled-in export from the \
+            "{var} is set in this process's environment. jemalloc reads \
+             `_RJEM_MALLOC_CONF` (this build is prefixed), which sets `opt.*` on \
+             its own, so this test could not tell the compiled-in export from the \
              environment; unset it and re-run."
         );
     }
