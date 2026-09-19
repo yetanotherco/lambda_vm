@@ -27,6 +27,11 @@ log = "0.4"
 
 [features]
 jemalloc-stats = ["tikv-jemalloc-ctl/stats"]
+# The device counters this enables are how a prove-and-retire run is shown
+# to have reached the card at all: without it `stark::gpu_lde` does not
+# exist, so the CPU arm of a device A/B prints nothing and that absence is
+# itself the control.
+cuda = ["prover/cuda"]
 disk-spill = ["prover/disk-spill"]
 instruments = ["prover/instruments", "stark/instruments"]
 # GPU profiling build (Nsight): CUDA prover + instruments spans + NVTX ranges.

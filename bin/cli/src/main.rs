@@ -1413,6 +1413,11 @@ fn cmd_trace_build(
             return ExitCode::FAILURE;
         }
     };
+    // Zeroed here rather than trusted to start at zero: these are process-wide
+    // counters and anything before this point that touched the card would be
+    // charged to the run below.
+    #[cfg(feature = "cuda")]
+    stark::gpu_lde::reset_all_gpu_call_counters();
     let outcome = if prove_and_retire {
         // The walk allocates and drops one trace-sized buffer after another,
         // which is the pattern this works around.
@@ -1433,6 +1438,24 @@ fn cmd_trace_build(
     };
 
     let elapsed = started.elapsed();
+    // Whether this run reached the card, and how far. A device A/B needs a
+    // reading that separates "the path fired" from "the gate said yes", and
+    // these are incremented before each dispatch, so a zero is a decline and
+    // not a failure. Printed on one line per counter so a harness can read
+    // them without parsing prose. The build without `cuda` prints nothing
+    // here, which is the control arm saying so in its own words.
+    #[cfg(feature = "cuda")]
+    {
+        println!("GPU_LDE_CALLS: {}", stark::gpu_lde::gpu_lde_calls());
+        println!(
+            "GPU_LEAF_HASH_CALLS: {}",
+            stark::gpu_lde::gpu_leaf_hash_calls()
+        );
+        println!(
+            "GPU_DEVICE_ONLY_CALLS: {}",
+            stark::gpu_lde::gpu_device_only_calls()
+        );
+    }
     let proof = match outcome {
         Ok((n, proof)) => {
             println!(
