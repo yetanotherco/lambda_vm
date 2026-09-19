@@ -12,7 +12,7 @@ use super::executor::execute;
 use super::validator::validate;
 use super::whir_poly::{
     emit_eq_eval, emit_shift_eval, emit_sumcheck_rounds, eq_eval_rows, eq_eval_rows_again,
-    shift_eval_rows, sumcheck_round_consts, sumcheck_round_rows,
+    shift_eval_rows, sumcheck_round_constants, sumcheck_round_consts, sumcheck_round_rows,
 };
 use super::word::{ext_word, word_as_ext};
 
@@ -624,4 +624,159 @@ fn the_shift_reads_only_the_bits_it_has_variables_for() {
             shift_eval(&x, &y, k + 3 * size).expect("the host agrees"),
         );
     }
+}
+
+// =============================================================================
+// The Newton pool — the constants a program's sumchecks intern
+// =============================================================================
+
+/// The Newton pairs for degree `d`, computed a SECOND WAY.
+///
+/// ⛔ NOT `newton_step_constants`, and not its spelling either. That helper and
+/// the emitter now share one derivation on purpose, so a test comparing them
+/// would be agreeing with itself — the oracle-shares-the-function trap. This
+/// works in the EXTENSION field throughout (`1/(j+1)` and `−j·(1/(j+1))` as
+/// extension elements) where the production form embeds a BASE-field inverse,
+/// so the two routes meet only if the arithmetic is right.
+fn newton_pairs_second_source(degree: usize) -> Vec<FEE> {
+    let d = degree.max(1);
+    let mut out = Vec::new();
+    for j in 1..d {
+        let scale = FEE::from((j + 1) as u64)
+            .inv()
+            .expect("j + 1 is nonzero in the extension too");
+        let shift = FEE::zero() - FEE::from(j as u64) * scale;
+        out.push(scale);
+        out.push(shift);
+    }
+    out
+}
+
+/// Every `LFM_CONST` value a program holds, in order.
+fn const_values(program: &LfmProgram) -> Vec<[FE; 4]> {
+    program
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            super::instr::Instr::Const { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ★★ THE VALUES FORM NAMES EXACTLY WHAT THE ROUND INTERNS — as a DELTA against
+/// degree one, which runs no Newton step at all and so isolates them.
+///
+/// This is the gate the pool needed and did not have: `sumcheck_round_consts`
+/// counted these words and a count cannot be compared against a value, so the
+/// program-level pool carried them as an unnamed remainder.
+#[test]
+fn the_values_form_names_what_a_sumcheck_round_interns() {
+    for degree in [2usize, 3, 5, 7, 13] {
+        let leg = const_values(&sumcheck_program(degree, 1));
+        let base = const_values(&sumcheck_program(1, 1));
+        let added: Vec<[FE; 4]> = leg.iter().filter(|w| !base.contains(w)).copied().collect();
+
+        let named = sumcheck_round_constants(degree);
+        let expected: Vec<[FE; 4]> = newton_pairs_second_source(degree)
+            .iter()
+            .map(ext_word)
+            .collect();
+
+        println!(
+            "degree {degree}: {} words interned beyond degree 1, {} named by the form,              {} from the second source",
+            added.len(),
+            named.len(),
+            expected.len(),
+        );
+        // ⛔ ANTI-VACUITY: degree 1 runs no step, so a degree that added nothing
+        // would make every comparison below trivially true.
+        assert!(
+            !added.is_empty(),
+            "degree {degree} interned no constant beyond degree 1, so this arm              compares three empty sets"
+        );
+        for word in &expected {
+            assert!(
+                added.contains(word),
+                "degree {degree}: a Newton word the definition requires is not interned"
+            );
+            assert!(
+                named.contains(word),
+                "degree {degree}: a Newton word the definition requires is not named"
+            );
+        }
+        assert_eq!(
+            added.len(),
+            named.len(),
+            "degree {degree}: the form names a different number of words than the              round interns beyond degree one"
+        );
+    }
+}
+
+/// ★★ THE NESTING LAW, which is what lets ONE call at the maximum degree be a
+/// whole program's pool: the set for `d` is a subset of the set for any larger
+/// degree, so a union over a mixed set of degrees IS the maximum's set.
+///
+/// ⛔ This is the property the cross-epoch F1 rests on. Without it a pool would
+/// have to be accumulated round by round, and `sumcheck_round_consts` — a count
+/// — would still be useless for it.
+#[test]
+fn the_newton_pool_of_a_mixed_program_is_its_maximum_degrees_set() {
+    let degrees = [1usize, 2, 3, 2, 7, 5, 13, 3];
+    let max = *degrees.iter().max().expect("a non-empty set");
+
+    let mut union: Vec<[FE; 4]> = Vec::new();
+    for d in degrees {
+        for word in sumcheck_round_constants(d) {
+            if !union.contains(&word) {
+                union.push(word);
+            }
+        }
+    }
+    let at_max = sumcheck_round_constants(max);
+    println!(
+        "degrees {degrees:?}: union {} words, max {max} alone {} words",
+        union.len(),
+        at_max.len()
+    );
+
+    // ⛔ ANTI-VACUITY on the SHAPE of the test: a set of equal degrees would make
+    // the union trivially the max's, and the law would go untested.
+    assert!(
+        degrees.iter().any(|d| *d < max),
+        "every degree equals the maximum, so this arm tests nothing"
+    );
+    assert_eq!(
+        union.len(),
+        at_max.len(),
+        "the union over a mixed degree set is not the maximum's set, so the nesting          law the pool rests on does not hold"
+    );
+    for word in &at_max {
+        assert!(
+            union.contains(word),
+            "a word of the maximum's set is not in the union"
+        );
+    }
+}
+
+/// ★ THE TWO FORMS AGREE — the values form's LENGTH against the count form.
+///
+/// ⚠ It can genuinely fail, which is why it is worth running over a range. The
+/// values are field elements and nothing forbids `1/(a+1) == −b/(b+1)` for some
+/// pair in Goldilocks; the values form deduplicates and would come back SHORT,
+/// and that collision is a fact worth discovering here rather than as an
+/// unexplained two-word gap in a program's pool.
+#[test]
+fn the_newton_values_form_agrees_with_the_count_form() {
+    for degree in 1usize..=20 {
+        let named = sumcheck_round_constants(degree);
+        assert_eq!(
+            named.len(),
+            sumcheck_round_consts(degree),
+            "degree {degree}: the values form deduplicated to {} words where the count              form says {} — two Newton constants collide in Goldilocks at this degree,              which is a finding and not a rounding",
+            named.len(),
+            sumcheck_round_consts(degree),
+        );
+    }
+    println!("the Newton pairs are distinct for every degree through 20");
 }

@@ -574,6 +574,56 @@ pub(super) fn emit_grinding_check(
 /// `felts_from_bytes`, the rate/capacity split and the padding flag from
 /// `single_block_leaf_cells`. The asserts pin the LANE PLACEMENT those rules
 /// imply, so the packs below are the rule rather than a second copy of it.
+/// ★★ THE WORDS THE ALGEBRAIC GRIND INTERNS, BY VALUE — the form a
+/// program-level pool can consume.
+///
+/// [`super::whir_transcript::grind_check_const_felts`] counts these and returns
+/// **2**, and a count is exactly what a pool cannot take. This is the FOURTH
+/// emitter in this codebase found to name its constants as a number
+/// (`sumcheck_round_consts`, `fold_coset_consts`, `whir_program::steps_rows`
+/// and now this), and it is the one that survived three rounds of attribution
+/// in the cross-epoch F1's pool because a count told nobody WHICH words.
+///
+/// The four, each read off [`emit_algebraic_grinding_check`]'s own derivation
+/// rather than restated:
+/// - the PREFIX felt, `felts_from_bytes(GRINDING_PREFIX ‖ …)[0]` — the first
+///   eight big-endian bytes of [`GRINDING_PREFIX`], the same for every grind;
+/// - the FACTOR felt, `[5]` of the same run, which carries `factor` in its TOP
+///   big-endian byte. ⚠ **It is keyed on the BIT COUNT**, so a program grinding
+///   at two different widths interns two of these — which is the whole reason a
+///   single count could never stand in for the values.
+/// - `leaf_capacity(6)` for the 41-byte inner preimage and `leaf_capacity(5)`
+///   for the 40-byte outer one, shared with any other hash of those widths.
+///
+/// `factor == 0` interns nothing, because [`super::whir_transcript::emit_grind_check`]
+/// returns before emitting anything at all.
+pub(crate) fn grinding_check_constants(factor: u8) -> Vec<super::word::LfmWord> {
+    use super::algebraic_commit::{felts_from_bytes, single_block_leaf_cells};
+
+    if factor == 0 {
+        return Vec::new();
+    }
+    let mut inner_bytes = [0u8; 41];
+    inner_bytes[..GRINDING_PREFIX.len()].copy_from_slice(&GRINDING_PREFIX);
+    inner_bytes[40] = factor;
+    let inner_felts = felts_from_bytes(&inner_bytes);
+    let inner_cells = single_block_leaf_cells(&inner_felts);
+    let outer_cells = single_block_leaf_cells(&felts_from_bytes(&[0u8; 40]));
+
+    let mut words: Vec<super::word::LfmWord> = Vec::new();
+    for word in [
+        super::word::base_word(inner_felts[0]),
+        super::word::base_word(inner_felts[5]),
+        inner_cells[2],
+        outer_cells[2],
+    ] {
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    words
+}
+
 fn emit_algebraic_grinding_check(
     b: &mut LfmBuilder,
     seed: super::edsl::WrapDigest,

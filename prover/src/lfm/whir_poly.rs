@@ -8,6 +8,7 @@
 use crate::tables::types::{FE, FEE};
 
 use super::builder::{Ext, LfmBuilder};
+use super::word::{LfmWord, ext_word};
 
 /// INSTRUCTIONS [`emit_eq_eval`] emits over `n` variables, as the FIRST leg in
 /// its program.
@@ -112,8 +113,107 @@ pub const fn sumcheck_round_rows(degree: usize) -> usize {
 /// `LFM_CONST` rows a degree-`d` round interns, paid once per program however
 /// many rounds share the degree: the pair `(1/(j+1), −j/(j+1))` for each Newton
 /// step `u_1 .. u_{d−1}`.
+///
+/// ⛔⛔ **NEVER SUM THIS ACROSS ROUNDS OR LEGS**, and that is not a style note —
+/// it is the reason a program-level pool could not be formed from it for as long
+/// as this function was the only one here. Counts ADD where values MERGE: the
+/// builder interns on the canonical word, so a degree-13 round and a degree-3
+/// round in one program SHARE the steps `u_1, u_2`, and adding their counts
+/// charges those four words twice. There is no scalar that composes.
+///
+/// ⇒ The program-level answer is [`sumcheck_round_constants`] at the program's
+/// MAXIMUM degree — see that function for why the max alone is the whole pool.
+/// This form remains correct for exactly one thing: what ONE round of this
+/// degree would intern in a program containing nothing else.
 pub const fn sumcheck_round_consts(degree: usize) -> usize {
     2 * (clamp_degree(degree) - 1)
+}
+
+/// ★★ THE NEWTON PAIRS A DEGREE-`d` ROUND INTERNS, BY VALUE — and, at a
+/// program's maximum degree, THE WHOLE PROGRAM'S NEWTON POOL.
+///
+/// ★ **THE NESTING LAW, which is what makes one call enough.** Step `j` interns
+/// `(1/(j+1), −j/(j+1))` and a degree-`d` round runs steps `u_1 .. u_{d−1}`, so
+/// the set for `d` is a SUBSET of the set for any larger degree. The union over
+/// every round of every leg is therefore exactly the set for the largest degree
+/// among them, and no summation is involved anywhere:
+///
+/// ```text
+///     pool(program) = sumcheck_round_constants(max over rounds of d)
+/// ```
+///
+/// ⚠ **`≤ 2(d − 1)`, NOT `=`, AND THIS RETURNS A SET.** These are field
+/// elements: nothing forbids `1/(a+1) == −b/(b+1)` for some pair in Goldilocks,
+/// and a collision would make the true pool smaller than the count form says.
+/// So the words are deduplicated here and a caller compares SETS. The identity
+/// against [`sumcheck_round_consts`] is worth asserting precisely because it is
+/// a claim that can fail rather than a restatement.
+///
+/// ⚠ `u_0` is the challenge itself and interns nothing, which is why the range
+/// starts at 1 — a form that started at 0 would name `1/1` and `−0/1`, the
+/// already-interned `one` and `zero`, and over-count every program by two.
+pub fn sumcheck_round_constants(degree: usize) -> Vec<LfmWord> {
+    let d = clamp_degree(degree);
+    let mut words: Vec<LfmWord> = Vec::new();
+    for j in 1..d {
+        for value in newton_step_constants(j) {
+            let word = ext_word(&value);
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+    }
+    words
+}
+
+/// ★ The largest degree whose Newton set a pool has FULLY interned — the same
+/// quantity as a program's maximum sumcheck degree, read off the PROGRAM
+/// instead of off its shapes.
+///
+/// ⛔ TWO SOURCES FOR ONE NUMBER, WHICH IS THE POINT. A caller derives the
+/// maximum degree from the shapes (`GKR_SUMCHECK_DEGREE`, `REDUCE_DEGREE`, the
+/// chain's, and each table's `sumcheck_degree()`); this derives it from the
+/// words the compiled program actually holds. They must agree, and a
+/// disagreement is a real finding: either a leg runs at a degree no shape
+/// predicts, or a form names a degree no leg reaches.
+///
+/// ⚠ `1` when nothing is interned, because degree 1 runs no Newton step — the
+/// same clamp the emitter and the forms use, so "no steps" and "one step's
+/// worth of nothing" are the same answer here as everywhere else.
+pub fn interned_newton_degree(pool: &[LfmWord]) -> usize {
+    let mut degree = 1usize;
+    loop {
+        let next = degree + 1;
+        if sumcheck_round_constants(next)
+            .iter()
+            .all(|word| pool.contains(word))
+        {
+            degree = next;
+        } else {
+            return degree;
+        }
+    }
+}
+
+/// The two constants Newton step `j` interns: `(1/(j+1), −j/(j+1))`.
+///
+/// ★ **ONE DERIVATION, TWO CALLERS.** [`emit_newton_step`] interns exactly these
+/// and [`sumcheck_round_constants`] names exactly these, so the pool a program
+/// PAYS and the pool a form PREDICTS are the same expression rather than two
+/// that have to be kept in step. The gap this closes existed because the only
+/// form here returned a count, and a count cannot be compared against a value.
+fn newton_step_constants(j: usize) -> [FEE; 2] {
+    let inv = FE::from((j + 1) as u64)
+        .inv()
+        .expect("j + 1 is a small nonzero Goldilocks element");
+    [
+        FEE::new([inv, FE::zero(), FE::zero()]),
+        FEE::new([
+            FE::zero() - FE::from(j as u64) * inv,
+            FE::zero(),
+            FE::zero(),
+        ]),
+    ]
 }
 
 /// `verify_rounds` clamps the degree to at least one (`sumcheck.rs:366`), so a
@@ -225,15 +325,9 @@ pub fn emit_sumcheck_rounds(
 
 /// `u_j = (r − j)/(j + 1)`, one `MulAdd` against two interned constants.
 fn emit_newton_step(b: &mut LfmBuilder, r: Ext, j: usize) -> Ext {
-    let inv = FE::from((j + 1) as u64)
-        .inv()
-        .expect("j + 1 is a small nonzero Goldilocks element");
-    let scale = b.ext_const(&FEE::new([inv, FE::zero(), FE::zero()]));
-    let shift = b.ext_const(&FEE::new([
-        FE::zero() - FE::from(j as u64) * inv,
-        FE::zero(),
-        FE::zero(),
-    ]));
+    let [scale, shift] = newton_step_constants(j);
+    let scale = b.ext_const(&scale);
+    let shift = b.ext_const(&shift);
     b.emul_add(r, scale, shift)
 }
 

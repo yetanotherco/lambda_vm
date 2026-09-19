@@ -93,7 +93,7 @@ use super::whir_transcript::{
 use super::word::{LfmWord, ext_word};
 
 /// The degree the weight raises the plain `f` term to (`whir_chain.rs:991`).
-const SUMCHECK_DEGREE: usize = 2;
+pub(crate) const SUMCHECK_DEGREE: usize = 2;
 
 /// One query's opening against one tree: the block, and its authentication
 /// path.
@@ -420,6 +420,42 @@ pub fn chain_rows(shape: &ChainShape, entry: SpongeEntry) -> usize {
 /// permutation figure predates the other two and is not reproduced by them.
 pub fn chain_perms(shape: &ChainShape, entry: SpongeEntry) -> usize {
     chain_opening_perms(shape) + chain_grind_perms(shape) + chain_schedule_perms(shape, entry)
+}
+
+/// ★★ THE FOLD CONSTANTS ONE WHOLE CHAIN INTERNS, by value — every round's,
+/// unioned, over that round's own domain.
+///
+/// ⛔ A UNION AND NOT A MAXIMUM. Round `r` folds over the base domain squared
+/// `Σ_{j<r} schedule[j]` times, so each round's generator differs and the same
+/// exponent set yields different field elements. Nothing nests here the way the
+/// sumcheck round's Newton pairs do, and a form that took a max of anything
+/// would be quietly wrong.
+///
+/// The domain advance mirrors the emitter's own (`:484-489`): `k` squarings per
+/// round, where `k` is that round's schedule entry.
+pub fn chain_fold_constants(
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+) -> Vec<super::word::LfmWord> {
+    let mut words: Vec<super::word::LfmWord> = Vec::new();
+    let mut current = domain.clone();
+    for r in 0..shape.rounds() {
+        for word in super::whir_fold::fold_coset_constants(
+            &current,
+            shape.schedule[r],
+            shape.current_depth(r),
+        ) {
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        for _ in 0..shape.schedule[r] {
+            current = current
+                .squared()
+                .expect("the schedule never folds past the domain");
+        }
+    }
+    words
 }
 
 /// ★ `whir_chain::verify_weighted`, emitted.

@@ -74,6 +74,7 @@ use crate::tables::types::{FE, GoldilocksField};
 
 use super::builder::{Bit, Ext, LfmBuilder};
 use super::edsl::pow_bits;
+use super::word::{LfmWord, base_word};
 
 /// INSTRUCTIONS [`emit_fold_coset`] emits for a block of `block` values over
 /// `log2(block)` levels, with a query index of `index_bits` bits.
@@ -151,6 +152,35 @@ pub fn fold_coset_consts(log_domain: usize, levels: usize, index_bits: usize) ->
     if levels == 0 {
         return 0;
     }
+    fold_coset_exponents(log_domain, levels, index_bits).len() + 1
+}
+
+/// ⛔⛔ **NEVER UNION THIS ACROSS DOMAINS**, which is the warning the Newton
+/// count needed in the other direction and this one needs in its own.
+///
+/// `sumcheck_round_consts`' pairs NEST in the degree, so one call at a
+/// program's maximum is its whole pool. These do NOT nest: the exponent set is
+/// the same integers under a DIFFERENT generator, so two chains over different
+/// domains intern DIFFERENT field elements for the same exponents. A program's
+/// fold pool is a genuine UNION over its distinct domains — a maximum of
+/// anything is wrong here — and a count cannot express a union any more than it
+/// could express the other.
+///
+/// ⇒ [`fold_coset_constants`] is the program-level form; this one is correct
+/// for exactly one thing, which is what ONE fold over ONE domain interns.
+///
+/// The exponents `g` is raised to, deduplicated — the shape half of what
+/// [`emit_fold_coset`] interns, over integer exponents modulo `N`.
+///
+/// - `0`, the base [`pow_bits`] starts its accumulator at;
+/// - `2^i` for each index bit, the factors `pow_bits` multiplies in;
+/// - `(N / block) << l` at each level that has two slots to step between —
+///   level `l`'s stride, which is `g^{2^{l + log_domain − levels}}` once the
+///   squared domain's generator is unfolded.
+fn fold_coset_exponents(log_domain: usize, levels: usize, index_bits: usize) -> Vec<u128> {
+    if levels == 0 {
+        return Vec::new();
+    }
     let n = 1u128 << log_domain;
     let block = 1u128 << levels;
     let mut exponents = vec![0u128];
@@ -162,7 +192,48 @@ pub fn fold_coset_consts(log_domain: usize, levels: usize, index_bits: usize) ->
     }
     exponents.sort_unstable();
     exponents.dedup();
-    exponents.len() + 1
+    exponents
+}
+
+/// ★★ THE VALUES ONE FOLD INTERNS — the form a program-level pool can consume.
+///
+/// [`fold_coset_consts`] counts these and a count is exactly what a pool cannot
+/// take: the builder interns on the canonical word, so two folds sharing a
+/// value pay for it once and adding their counts charges it twice. Same defect
+/// as the sumcheck round's, found the same way — as an unnamed remainder in an
+/// assembled program's pool.
+///
+/// ★ AND IT RETIRES AN ASSUMPTION. The count's own doc says its last term —
+/// `two_inv` — is "counted as one more and assumed distinct from every `g^e`",
+/// and calls that "an assumption about a discrete log, not a proof". This form
+/// does not need it: the words are deduplicated BY VALUE, so a collision makes
+/// the pool one word smaller and the count identity is where it shows.
+pub fn fold_coset_constants(
+    domain: &Domain<GoldilocksField>,
+    levels: usize,
+    index_bits: usize,
+) -> Vec<LfmWord> {
+    if levels == 0 {
+        return Vec::new();
+    }
+    let log_domain = domain.size().trailing_zeros() as usize;
+    let generator = domain.generator();
+    let two_inv = (FE::one() + FE::one())
+        .inv()
+        .expect("2 is invertible in Goldilocks");
+
+    let mut words: Vec<LfmWord> = Vec::new();
+    for exponent in fold_coset_exponents(log_domain, levels, index_bits) {
+        let word = base_word(generator.pow(exponent as u64));
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    let half = base_word(two_inv);
+    if !words.contains(&half) {
+        words.push(half);
+    }
+    words
 }
 
 /// ★ `whir_commit::fold_coset`, emitted.

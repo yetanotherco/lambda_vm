@@ -278,20 +278,34 @@ mod tests {
             cost.hints,
             cost.publics,
         );
+        println!(
+            "CROSS-EPOCH NEWTON: D = {} (from {}), pool {} words, count form says {}",
+            cost.newton_degree,
+            match cost.newton_degree_from {
+                Some(table) => format!("table {table}"),
+                None => "a fixed leg (GKR 3 / reduce 2 / chain 2)".to_string(),
+            },
+            crate::lfm::whir_poly::sumcheck_round_constants(cost.newton_degree).len(),
+            crate::lfm::whir_poly::sumcheck_round_consts(cost.newton_degree),
+        );
 
         // ⛔ WHEN THE POOL DISAGREES, SAY WHICH WORDS — never just the two
         // counts. A count tells you the form is wrong; the VALUES tell you which
         // leg forgot to name what it interns, which is how the roots block's
         // form was closed twice after coming up short. Printed before the
         // assert, so one run names the gap instead of one run per guess.
-        let interned: Vec<crate::lfm::LfmWord> = program
+        // ⚠ THE ADDRESS IS CARRIED WITH THE VALUE, and that is what turns an
+        // unnamed word from a number nobody can place into a leg with a name.
+        let interned_at: Vec<(u64, crate::lfm::LfmWord)> = program
             .instrs
             .iter()
             .filter_map(|i| match i {
-                crate::lfm::instr::Instr::Const { value, .. } => Some(*value),
+                crate::lfm::instr::Instr::Const { out, value, .. } => Some((out.0, *value)),
                 _ => None,
             })
             .collect();
+        let interned: Vec<crate::lfm::LfmWord> =
+            interned_at.iter().map(|(_, word)| *word).collect();
         let unnamed: Vec<&crate::lfm::LfmWord> = interned
             .iter()
             .filter(|w| !cost.constants.contains(w))
@@ -308,42 +322,86 @@ mod tests {
                 unnamed.len(),
                 unemitted.len(),
             );
+            // ⛔⛔ AN UNNAMED WORD IS NAMED BY ITS NEIGHBOURS, NOT BY ITS VALUE.
+            // Three rounds of this gap were closed by reading emitters and
+            // matching value SHAPES — the Newton pairs, the coset fold's
+            // generator powers — and each round cost a box run because a value
+            // alone says nothing about who interned it. `locate_addr` is the
+            // tool this codebase already has for exactly that question: it
+            // reports the instruction that wrote a cell and its neighbours, so
+            // the leg that interned a constant is READ rather than guessed.
+            //
+            // ⚠ It costs nothing on the success path: this block runs only when
+            // a word is already unaccounted for.
             for w in unnamed.iter().take(40) {
                 println!("  UNNAMED  {w:?}");
+                if let Some((addr, _)) = interned_at.iter().find(|(_, word)| word == *w) {
+                    println!("{}", crate::lfm::executor::locate_addr(&program, *addr));
+                    // ⛔ `locate_addr`'s window is ±4, which shows the SHAPE of
+                    // the leg but not its CALLER. Round one of this narrowed the
+                    // three survivors to one `algebraic_leaf_hash` over six
+                    // felts — `[A, a full four-lane digest, B]`, capacity
+                    // `leaf_capacity(6)` — and then stalled, because the loop
+                    // that builds that felt vector is outside ±4. A wider window
+                    // is the difference between "which leg" and "which call".
+                    if let Some(index) = program.instrs.iter().position(|i| {
+                        matches!(i, crate::lfm::instr::Instr::Const { out, .. } if out.0 == *addr)
+                    }) {
+                        let lo = index.saturating_sub(24);
+                        let hi = (index + 25).min(program.instrs.len());
+                        println!("    ---- wider window {lo}..{hi} ----");
+                        for (k, instr) in program.instrs[lo..hi].iter().enumerate() {
+                            let mark = if lo + k == index { "→" } else { " " };
+                            println!("    {mark} [{}] {instr:?}", lo + k);
+                        }
+                    }
+                }
             }
             for w in unemitted.iter().take(40) {
                 println!("  UNEMITTED {w:?}");
             }
         }
-        // ⛔ THE POOL IS NOT ASSERTED AS AN EQUALITY, AND THE REASON IS A GAP
-        // IN THE CODEBASE'S FORMS RATHER THAN IN THIS ONE. Two emitters intern
-        // words that NO cost form reports: `whir_poly::emit_newton_step` interns
-        // `1/(j+1)` and `−j/(j+1)` per interpolation step, and
-        // `StackedCost::own_constants` says in its own doc that "the chains'
-        // OTHER constants are not named here". The epoch program has the same
-        // gap and has never had it measured, because no F1 there compares a
-        // pool at all.
+        // ⛔ THE POOL IS ASSERTED BOTH WAYS, and it was not always so. Two
+        // emitters intern words no cost form reported: `emit_newton_step`'s
+        // interpolation weights, and the chains' own constants, which
+        // `StackedCost::own_constants` disclaims in its own doc. The first is
+        // now named by `sumcheck_round_constants` at this program's maximum
+        // degree — the pairs NEST, so one call at the max is the whole pool —
+        // and the second turns out to BE the first, reached through the chains'
+        // sumcheck rounds.
         //
-        // ⇒ So this asserts the half that IS exact and PINS the half that is
-        // not, rather than weakening the check to make it pass:
-        //   - every word the form NAMES must be interned — exact, and it is what
-        //     a deleted leg breaks, because the deleted leg's coefficients stay
-        //     named and stop being emitted;
-        //   - the words interned that no form names are counted against a
-        //     MEASURED constant, so the gap cannot drift unnoticed.
+        // ⇒ BOTH DIRECTIONS ARE NOW EXACT, and the second one only became
+        // assertable when the Newton pairs got a VALUES form. Until then the
+        // pool's remainder was pinned at a measured 24 because nothing named it.
         assert!(
             unemitted.is_empty(),
             "the form names {} words the program does not intern; a leg that stopped \
              emitting is exactly this shape",
             unemitted.len(),
         );
-        assert_eq!(
+        assert!(
+            unnamed.is_empty(),
+            "{} words are interned that no form names. The Newton pairs are accounted \
+             at D = {}, so a survivor belongs to a DIFFERENT emitter and is a finding \
+             to read off the UNNAMED lines above — not a remainder to pin",
             unnamed.len(),
-            POOL_GAP_UNNAMED,
-            "the unnamed pool gap moved. It is `emit_newton_step`'s interpolation \
-             weights and the chains' own constants, neither of which any form reports; \
-             a change in it is a finding about those emitters, not a number to update \
-             without reading"
+            cost.newton_degree,
+        );
+        // ★ THE DEGREE, FROM TWO SOURCES. `cost.newton_degree` is derived from
+        // the SHAPES; this reads it back out of the words the compiled program
+        // actually holds. A disagreement means a leg runs at a degree no shape
+        // predicts, or a form names one no leg reaches.
+        let read_back = crate::lfm::whir_poly::interned_newton_degree(&interned);
+        assert_eq!(
+            read_back, cost.newton_degree,
+            "the program has interned the Newton set through degree {read_back}, and the \
+             shapes predict {}",
+            cost.newton_degree,
+        );
+        assert_eq!(
+            consts,
+            cost.constants.len(),
+            "the ONE constant pool, by value"
         );
         assert_eq!(hints, cost.hints, "one hint per word the arena writes");
         assert_eq!(
@@ -361,20 +419,6 @@ mod tests {
         // this call site — documentation, not a check. The four components are
         // the whole claim.
     }
-
-    /// Words the cross-epoch program interns that no cost form in this codebase
-    /// names — MEASURED, not derived.
-    ///
-    /// `whir_poly::emit_newton_step` interns `1/(j+1)` and `−j/(j+1)` for each
-    /// interpolation step, and no struct tracks how many steps a program's
-    /// sumchecks reach; `StackedCost::own_constants` names the shared `one` and
-    /// the leaf capacities and says plainly that the chains' other constants are
-    /// not named there. This is their total on the genesis fixture, read off the
-    /// box at 28cc920c6 (pool interned 100, form named 76).
-    ///
-    /// ⚠ IT IS A PIN ON A GAP, NOT A BUDGET. If it moves, an emitter's constant
-    /// set changed and that is a finding to read, not a number to bump.
-    const POOL_GAP_UNNAMED: usize = 24;
 
     /// ⛔ A TABLE WHOSE PREPROCESSED COLUMNS NO ROUTE COVERS FAILS THE BUILD —
     /// DIRECTION ONE: the route expects MORE columns than the AIR presents.
