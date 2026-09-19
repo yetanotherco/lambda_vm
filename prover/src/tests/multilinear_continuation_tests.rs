@@ -1488,3 +1488,175 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
          page bases — the pin this root owes could not be stated"
     );
 }
+
+/// The bench ELF by name, or `None` when it is simply not built here.
+fn bench_elf_if_present(name: &str) -> Option<Vec<u8>> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("executor/program_artifacts");
+    for dir in ["rust", "asm"] {
+        if let Ok(bytes) = std::fs::read(root.join(dir).join(format!("{name}.elf"))) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// ⛔⛔ THE PRE-REGISTRATION, READ OFF THE REAL ELF INSTEAD OF COPIED.
+///
+/// `genesis_stack`'s unit tests encode the block's census — 116,692 nonzero
+/// entries at `0x0`, 229,290 at `0x40000`, 223,380 at `0x280000`, zero at the
+/// other 27 — as numbers I typed from a box log. That is enough to check the
+/// closed form's ARITHMETIC and not enough to check that the form, run against
+/// the actual program, selects those three pages. A routing rule whose
+/// pre-registration rests on a transcription is a rule nobody has tested.
+///
+/// This runs the block guest once — no proving, no card, the same shape as
+/// `whir_global_tests::the_block_genesis_census` — rebuilds the page configs
+/// from the ELF, evaluates [`crate::genesis_stack::plan`] on them, and asserts
+/// the dense set is EXACTLY those three bases.
+///
+/// ⛔ IT REFUSES RATHER THAN SKIPS when the shas are unstated, and SKIPS with
+/// its own line when the ELF is simply absent. Two outcomes, two meanings: a
+/// census quoted as a fact about one program and one input must not be
+/// producible from an unnamed pair, and a missing build product is not a
+/// failure of this check.
+#[test]
+#[ignore = "the box runs it: one execution of the block guest, no proving"]
+fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
+    // What the ruling names, and what this arm exists to confirm against the ELF.
+    const PRE_REGISTERED: [u64; 3] = [0x0, 0x40000, 0x280000];
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21);
+
+    let Some(elf_bytes) = bench_elf_if_present(&name) else {
+        println!(
+            "GENESIS-ROUTING SKIPPED - no ELF named {name} in \
+             executor/program_artifacts/{{rust,asm}}; set LAMBDA_VM_BENCH_ELF"
+        );
+        return;
+    };
+    let input = crate::tests::multilinear_bench_tests::input_bytes(&input_name);
+
+    let elf_sha = sha256_hex(&elf_bytes);
+    let input_sha = sha256_hex(&input);
+    let want_elf = std::env::var("LAMBDA_VM_CENSUS_ELF_SHA256").unwrap_or_else(|_| {
+        panic!(
+            "this routing is quoted as a fact about ONE program and ONE input, so it \
+             refuses to run unnamed. Set LAMBDA_VM_CENSUS_ELF_SHA256={elf_sha} and \
+             LAMBDA_VM_CENSUS_INPUT_SHA256={input_sha}"
+        )
+    });
+    let want_input = std::env::var("LAMBDA_VM_CENSUS_INPUT_SHA256").unwrap_or_else(|_| {
+        panic!("LAMBDA_VM_CENSUS_INPUT_SHA256 is unset; the input here is {input_sha}")
+    });
+    assert_eq!(
+        elf_sha, want_elf,
+        "the ELF is not the one this routing was asked for"
+    );
+    assert_eq!(
+        input_sha, want_input,
+        "the INPUT is not the one this routing was asked for, and the touched page \
+         list is a function of it"
+    );
+    println!(
+        "GENESIS-ROUTING elf {name} sha {elf_sha} ({} bytes)  input {} sha {input_sha} \
+         ({} bytes)  epoch 2^{epoch_size_log2}",
+        elf_bytes.len(),
+        if input_name.is_empty() {
+            "<none>"
+        } else {
+            &input_name
+        },
+        input.len(),
+    );
+
+    let started = std::time::Instant::now();
+    let pages = continuation::block_page_census(&elf_bytes, &input, epoch_size_log2)
+        .expect("the guest runs to completion");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let configs = continuation::global_memory_configs(
+        &pages.touched_page_bases,
+        &elf,
+        pages.num_private_input_pages,
+    );
+    let plan = crate::genesis_stack::plan(
+        &configs,
+        pages.num_epochs,
+        crate::genesis_stack::PAGE_NUM_VARS,
+    );
+    println!(
+        "EXECUTION: {} epochs, {} touched pages, {} private, in {:.1}s",
+        pages.num_epochs,
+        pages.touched_page_bases.len(),
+        pages.num_private_input_pages,
+        started.elapsed().as_secs_f64(),
+    );
+
+    let mut sparse_total = 0usize;
+    let mut dense_total = 0usize;
+    for route in &plan.routes {
+        let rows = crate::genesis_stack::sparse_leg_rows(
+            crate::genesis_stack::PAGE_NUM_VARS,
+            route.nonzero,
+        );
+        if route.dense {
+            dense_total += rows;
+        } else if route.has_init {
+            sparse_total += rows;
+        }
+        println!(
+            "ROUTE {:#x}: nonzero {} has_init {} dense {} sparse_rows {rows}",
+            route.page_base, route.nonzero, route.has_init, route.dense
+        );
+    }
+
+    let dense_bases: Vec<u64> = plan
+        .routes
+        .iter()
+        .filter(|r| r.dense)
+        .map(|r| r.page_base)
+        .collect();
+    println!(
+        "GENESIS ROUTING: {} of {} pages stacked {dense_bases:02x?}; the sparse form \
+         would have cost {} rows for them and costs {} for the rest; \
+         threshold {} rows ({} nonzero entries)",
+        dense_bases.len(),
+        plan.routes.len(),
+        dense_total,
+        sparse_total,
+        crate::genesis_stack::PREPARED_LEG_ROWS,
+        (crate::genesis_stack::PREPARED_LEG_ROWS - crate::genesis_stack::PAGE_NUM_VARS)
+            / crate::genesis_stack::PAGE_NUM_VARS
+            + 1,
+    );
+
+    // ⚠ THE ASSERTION IS THE SET AND ITS ORDER, not a count. Three pages of the
+    // wrong three would pass a count, and the stack's column order IS page-base
+    // order, so the order is part of what the opening means.
+    assert_eq!(
+        dense_bases,
+        PRE_REGISTERED.to_vec(),
+        "the threshold selected a different set of pages than the ruling names"
+    );
+    // And the pages left behind must be genuinely cheap, or the hybrid is not
+    // the win the ruling claimed.
+    assert!(
+        sparse_total < dense_total / 100,
+        "the sparse remainder is {sparse_total} rows against {dense_total} stacked: \
+         the split is not the concentration the census read"
+    );
+}
