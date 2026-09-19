@@ -1238,7 +1238,7 @@ struct EpochPlan<'a> {
 /// its place, which is exactly what `settled_out_of_band` is documented never to
 /// become (`multilinear_table.rs:943`). A fifth preprocessed table added
 /// upstream must fail this build rather than go quietly unchecked.
-const BITWISE_NAME: &str = "BITWISE";
+pub const BITWISE_NAME: &str = "BITWISE";
 const DECODE_NAME: &str = "DECODE";
 const KECCAK_RC_NAME: &str = "KECCAK_RC";
 const REGISTER_NAME: &str = "REGISTER";

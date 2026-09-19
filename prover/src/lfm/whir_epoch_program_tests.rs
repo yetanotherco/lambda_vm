@@ -24,9 +24,9 @@ use super::validator::validate;
 use super::whir_chain::{ChainShape, chain_shape_rows};
 use super::whir_chain_tests::const_rows;
 use super::whir_epoch::{
-    EpochPublishes, PublishedText, closure_rows, emit_epoch_closure, emit_epoch_publishes,
-    emit_roots_block, epoch_group_costs, expected_rows, group_columns, preprocessed_targets,
-    publish_constants, publish_rows, roots_block_constants, roots_block_cost,
+    BITWISE_NAME, EpochPublishes, PublishedText, closure_rows, emit_epoch_closure,
+    emit_epoch_publishes, emit_roots_block, epoch_group_costs, expected_rows, group_columns,
+    preprocessed_targets, publish_constants, publish_rows, roots_block_constants, roots_block_cost,
 };
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, ext_word, word_as_ext};
@@ -2259,5 +2259,402 @@ fn the_epoch_program_publishes_the_aggregation_set() {
         layout.schema_words(),
         layout.tail,
         program.instrs.len(),
+    );
+}
+
+// =============================================================================
+// The tamper arm
+// =============================================================================
+
+/// Which value of a table's proof a site moves.
+#[derive(Clone, Copy, Debug)]
+enum TamperKind {
+    /// `bus_output.0` — the numerator of the table's `p/q` contribution.
+    BusOutput,
+    /// One entry of `constraint.reduce.column_values`, by index.
+    ColumnValue(usize),
+}
+
+/// One tamper site: a table, a value in it, and what binds it.
+///
+/// ⚠ `bound_by` NAMES A LEG THAT BINDS THE VALUE, NOT THE LEG THAT REFUSES.
+/// Two mutations measured the difference and the field is worded from what they
+/// showed — see this test's own doc for the numbers. A refusal here is
+/// over-determined: these values are settled by more than one leg, so which one
+/// fires first is an emission-order fact, not a soundness one.
+struct TamperSite {
+    what: &'static str,
+    bound_by: &'static str,
+    table: usize,
+    kind: TamperKind,
+}
+
+/// Move the site's value by one and hand back what was there.
+///
+/// `+ one` rather than a random value because the property under test is that
+/// the value is BOUND, not that it is far from the truth; the smallest possible
+/// move is the strongest form of that claim.
+fn tamper(proof: &mut crate::multilinear_continuation::EpochProof, site: &TamperSite) -> FEE {
+    let table = &mut proof.proof.tables[site.table];
+    match site.kind {
+        TamperKind::BusOutput => {
+            let was = table.bus_output.0;
+            table.bus_output.0 = was + FEE::one();
+            was
+        }
+        TamperKind::ColumnValue(c) => {
+            let values = &mut table.constraint.reduce.column_values;
+            let was = values[c];
+            values[c] = was + FEE::one();
+            was
+        }
+    }
+}
+
+/// Put the site's value back.
+fn restore(proof: &mut crate::multilinear_continuation::EpochProof, site: &TamperSite, was: FEE) {
+    let table = &mut proof.proof.tables[site.table];
+    match site.kind {
+        TamperKind::BusOutput => table.bus_output.0 = was,
+        TamperKind::ColumnValue(c) => table.constraint.reduce.column_values[c] = was,
+    }
+}
+
+/// The one arena index at which two arenas differ, refusing anything else.
+///
+/// ⛔ THE ANTI-VACUITY GUARD OF THIS WHOLE TEST, and it is on the INPUT half of
+/// each site: a tamper that reached no arena word would make the machine's
+/// refusal impossible and the site would be reporting nothing. Exactly one is
+/// asserted rather than at least one, because these three values occupy one
+/// arena word each and a tamper that moved two would mean the arena writer is
+/// reading one of them twice.
+fn the_one_differing_word(honest: &[LfmWord], other: &[LfmWord]) -> usize {
+    assert_eq!(
+        honest.len(),
+        other.len(),
+        "a tamper must not resize the arena"
+    );
+    let differing: Vec<usize> = (0..honest.len())
+        .filter(|&i| honest[i] != other[i])
+        .collect();
+    assert_eq!(
+        differing.len(),
+        1,
+        "a site must move exactly one arena word, moved {}",
+        differing.len()
+    );
+    differing[0]
+}
+
+/// ★★ THE TAMPER ARM: three values the PROVER supplies, at three different
+/// legs, each moved by one — the host refuses the bundle and the machine refuses
+/// the arena.
+///
+/// The adversary model is a prover who hands the SAME program different words,
+/// so the machine half runs the honest program against a regenerated arena
+/// rather than poking a word at an offset this test computed: the offset is
+/// then `whir_epoch_arena`'s by construction and cannot drift from it.
+///
+/// ⚠ WHAT THE HOST'S REFUSAL IS: one collapsed verdict. `verify_epoch_bookend`
+/// reduces every failure to `Ok(None)` (the driver's module header says so and
+/// says why), so the harvest's `Err` string is the same for all three sites.
+/// What names a site here is WHICH VALUE was moved, which is this test's own
+/// construction — not the host's diagnosis.
+///
+/// The closing control is the honest execution AFTER every restore: it is what
+/// says the three refusals came from the tampers rather than from a fixture
+/// this test corrupted on its way through.
+///
+/// # ⛔ WHAT TWO MUTATIONS MEASURED, AND WHAT THIS TEST THEREFORE DOES NOT SHOW
+///
+/// Each site was pre-registered against ONE leg. Both attempts to attribute a
+/// site to its leg FAILED, and the failures are recorded here because they are
+/// the more useful result:
+///
+/// 1. BITWISE's preprocessed route switched to [`PreprocessedRoute::None`] —
+///    the whole leg gone — left this module **17 of 17 green**, with site c
+///    refusing at the IDENTICAL executor address. Site c never exercised
+///    `check_preprocessed` at all.
+/// 2. The closure's `assert_eq_ext(balance, expected)` removed left the tamper
+///    arm green too (two OTHER tests went red), with site a still refusing but
+///    at a different address. Site a is bound above the closure as well.
+///
+/// So a refusal here says the value is BOUND; it does not say by which leg, and
+/// this test must not be read as covering one.
+///
+/// ⚠ AND THE CONSEQUENCE WORTH ACTING ON: BITWISE's preprocessed leg has NO
+/// gate in this module. That is not an oversight in this test — it is not
+/// reachable by the tamper this test performs. BITWISE's preprocessed columns
+/// are COMMITTED columns, so one moved arena word is refused by the group's
+/// opening before the closed form is consulted; defeating the closed form needs
+/// a prover who COMMITS a different preprocessed polynomial and opens to it
+/// consistently, which is a re-prove-level fixture and not an arena tamper. The
+/// leg's own gate is owed and is recorded as owed.
+#[test]
+fn a_tampered_epoch_is_refused_at_three_sites() {
+    let (elf_bytes, opts, mut bundle) = driver_bundle();
+    let index = bundle.epochs.len() - 1;
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+
+    // ★ ONE prepared commitment for every harvest below. Deriving it is the
+    // `2^23` commit the driver does once per bundle; four harvests at `None`
+    // would pay for the fixture four times over and report it as the tamper
+    // arm's cost.
+    let prepared = crate::multilinear_continuation::decode_prepared_for::<
+        multilinear::whir_hash::RpxWhir,
+    >(&elf, &elf_bytes)
+    .expect("DECODE's prepared commitment under rpx");
+
+    let harvest = |bundle: &crate::multilinear_continuation::ContinuationProof| {
+        crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
+            multilinear::whir_hash::RpxWhir,
+        >(&opts, &elf_bytes, bundle, index, None, Some(&prepared))
+    };
+
+    let mut epoch = harvest(&bundle).expect("the honest last epoch harvests");
+    let airs = crate::multilinear_continuation::epoch_airs_for(
+        &elf,
+        &opts,
+        &bundle.epochs[index],
+        &epoch.position.register_init,
+        epoch.position.is_final,
+        epoch.position.label,
+        Some(epoch.decode_commitment),
+    );
+    let refs = airs.refs();
+    let program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
+    let honest = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
+
+    // ---- the three sites, LOCATED rather than counted out by hand
+    //
+    // BITWISE by name, and its preprocessed target through the slot-to-source
+    // indirection the layout defines — the one `check_preprocessed` reads and
+    // the one V1h's mutation showed is load-bearing. A literal index here would
+    // tamper whichever column happened to sit there.
+    let bitwise = refs
+        .iter()
+        .position(|air| air.name() == BITWISE_NAME)
+        .expect("an epoch's table set carries BITWISE");
+    let columns = refs[bitwise].num_precomputed_columns();
+    assert!(columns > 0, "BITWISE carries preprocessed columns");
+    let (width, _) = refs[bitwise].trace_layout();
+    let num_vars = bundle.epochs[index].table_num_vars[bitwise] as usize;
+    let bitwise_layout = stark::multilinear_table::TableLayout::new(
+        refs[bitwise].constraint_program(),
+        refs[bitwise].constraints_meta(),
+        refs[bitwise].bus_interactions(),
+        width,
+        num_vars,
+        stark::multilinear_air::Uniforms::default(),
+    )
+    .expect("BITWISE lays out");
+    let targets = preprocessed_targets(bitwise_layout.slot_of(), bitwise_layout.kinds(), columns);
+    assert_eq!(
+        targets.len(),
+        columns,
+        "one claimed-value target per preprocessed column"
+    );
+
+    // A table with NO preprocessed columns, so every entry of its
+    // `column_values` is a MAIN column BY CONSTRUCTION rather than by counting
+    // past the preprocessed ones.
+    let plain = refs
+        .iter()
+        .position(|air| air.num_precomputed_columns() == 0)
+        .expect("an epoch has a table with no preprocessed columns");
+    assert!(
+        refs[plain].precomputed_columns().is_empty(),
+        "the count and the columns must agree for the table this site uses"
+    );
+    assert!(
+        !bundle.epochs[index].proof.tables[plain]
+            .constraint
+            .reduce
+            .column_values
+            .is_empty(),
+        "the plain table claims at least one column value"
+    );
+
+    let sites = [
+        TamperSite {
+            what: "a table's bus output (p)",
+            bound_by: "the epoch closure's balance, and the GKR output claim above it",
+            table: plain,
+            kind: TamperKind::BusOutput,
+        },
+        TamperSite {
+            what: "a claimed MAIN column value",
+            bound_by: "the commitment group's opening, and the claim reduce above it",
+            table: plain,
+            kind: TamperKind::ColumnValue(0),
+        },
+        TamperSite {
+            what: "a BITWISE PREPROCESSED column's claimed value",
+            bound_by: "the commitment group's opening — BITWISE's preprocessed columns \
+                       are COMMITTED columns, so the closed form is a second binding \
+                       on the same word and not the only one",
+            table: bitwise,
+            kind: TamperKind::ColumnValue(targets[0]),
+        },
+    ];
+
+    let mut moved: Vec<usize> = Vec::new();
+    for site in &sites {
+        // ---- the HOST half: the same value moved in the BUNDLE
+        let was = tamper(&mut bundle.epochs[index], site);
+        let verdict = harvest(&bundle);
+        assert!(
+            verdict.is_err(),
+            "{}: the host must refuse a bundle whose {} was moved",
+            site.bound_by,
+            site.what
+        );
+        println!(
+            "  site `{}` — HOST REFUSED: {}",
+            site.what,
+            verdict.err().unwrap_or_default()
+        );
+        restore(&mut bundle.epochs[index], site, was);
+
+        // ---- the MACHINE half: the same value moved in the harvested epoch,
+        //      the arena regenerated, the HONEST program run against it
+        let was = tamper(&mut epoch.proof, site);
+        let tampered_arena = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
+        let at = the_one_differing_word(&honest[0], &tampered_arena[0]);
+        assert_ne!(
+            honest[0][at], tampered_arena[0][at],
+            "{}: the moved value must differ from the honest one",
+            site.what
+        );
+
+        // ⛔ THE VALUE IS THE PROVER'S, NOT THE VERIFIER'S, and this is what
+        // says so: a value that had reached PROGRAM TEXT would move the program
+        // instead of the arena, and the refusal would be a different claim.
+        let tampered_program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
+        assert_eq!(
+            tampered_program.instrs.len(),
+            program.instrs.len(),
+            "{}: a moved proof value must not move the program",
+            site.what
+        );
+        assert_eq!(
+            tampered_program.arena_schema.lens, program.arena_schema.lens,
+            "{}: a moved proof value must not move the arena schema",
+            site.what
+        );
+
+        let refusal = execute(&program, &tampered_arena, &crate::hash_pin::BLOCK_HASHER);
+        assert!(
+            refusal.is_err(),
+            "{}: the machine must refuse an arena whose {} was moved",
+            site.bound_by,
+            site.what
+        );
+        println!(
+            "  site `{}` at arena word {at} — MACHINE REFUSED: {:?}",
+            site.what,
+            refusal.err()
+        );
+        restore(&mut epoch.proof, site, was);
+        moved.push(at);
+    }
+
+    // ---- the three sites are THREE sites
+    assert_eq!(moved.len(), sites.len(), "one arena word per site");
+    for i in 0..moved.len() {
+        for j in (i + 1)..moved.len() {
+            assert_ne!(
+                moved[i], moved[j],
+                "sites {i} and {j} moved the same arena word, so they are one site twice"
+            );
+        }
+    }
+
+    // ---- THE CLOSING CONTROL: every restore complete, and the honest bundle
+    //      still executes. Without it, a test that corrupted the fixture on its
+    //      first site would report three refusals and mean nothing.
+    let restored = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
+    assert_eq!(
+        restored, honest,
+        "every restore must put the arena back word for word"
+    );
+    execute(&program, &restored, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the honest bundle must still execute after every tamper is undone");
+    println!(
+        "  the three sites moved arena words {moved:?}; the honest arena executes after all of them"
+    );
+}
+
+// =============================================================================
+// Item 6: the two shapes a prepared INIT opening can take
+// =============================================================================
+
+/// ★ THE SIZING THE GLOBAL PROGRAM'S INIT ROUTE TURNS ON, evaluated rather than
+/// estimated.
+///
+/// The cross-epoch proof's page tables carry INIT — the page's genesis bytes,
+/// `2^18` per page — as a preprocessed column. No fold is possible in the
+/// machine, so it takes DECODE's route: a commitment built once out of band and
+/// OPENED at each page's reduced point. Two shapes are available and they differ
+/// only in cost, because (see the handback) both introduce the same new object:
+///
+/// - **A, one family polynomial.** The pages' INIT columns stacked into ONE
+///   polynomial, opened in ONE chain, its claims shared per point.
+/// - **B, one opening per page.** Thirty-five polynomials, thirty-five chains.
+///
+/// This evaluates `ChainShape` and `chain_shape_rows` — the SAME forms V1d's
+/// 16 groups / 17 chains / 105 rounds come from — at both shapes, at the
+/// epoch's own posture, and prints rounds and rows so the choice is made on
+/// numbers. It asserts only the ORDERING it exists to establish, because the
+/// absolute figures move with the posture and a pin on them would be a pin on
+/// the posture.
+#[test]
+fn the_prepared_init_shapes_are_sized_before_one_is_chosen() {
+    // The posture the WHIR bench and the harness both run at.
+    let config = multilinear::whir_chain::ChainConfig::with_security(
+        2,
+        4,
+        25,
+        128,
+        multilinear::whir_chain::GrindBits::uniform(20),
+    );
+    const PAGE_VARS: usize = 18;
+    const PAGES: usize = 35;
+
+    // A: the family stacked into one polynomial.
+    let family_vars = PAGE_VARS + PAGES.next_power_of_two().trailing_zeros() as usize;
+    let a = ChainShape::new(&config, family_vars);
+    let a_rows = chain_shape_rows(&a);
+
+    // B: one polynomial per page, each opened in its own chain.
+    let b = ChainShape::new(&config, PAGE_VARS);
+    let b_rows = chain_shape_rows(&b) * PAGES;
+
+    println!(
+        "INIT shape A (one family polynomial at {family_vars} vars): {} rounds, {a_rows} chain rows, 1 chain",
+        a.rounds()
+    );
+    println!(
+        "INIT shape B ({PAGES} polynomials at {PAGE_VARS} vars): {} rounds each = {} total, \
+         {b_rows} chain rows, {PAGES} chains",
+        b.rounds(),
+        b.rounds() * PAGES,
+    );
+    println!(
+        "  ⇒ B/A = {:.1}x the chain rows and {:.1}x the rounds",
+        b_rows as f64 / a_rows as f64,
+        (b.rounds() * PAGES) as f64 / a.rounds() as f64,
+    );
+
+    // ⛔ THE ONE PROPERTY THIS EXISTS TO ESTABLISH, and the only thing asserted:
+    // stacking the family is cheaper than opening each page, by a margin no
+    // posture change closes. A chain's cost grows with its variable count but
+    // its ROUNDS grow logarithmically, so thirty-five short chains cost more
+    // than one chain six variables longer.
+    assert!(
+        a_rows * 4 < b_rows,
+        "one family polynomial costs {a_rows} chain rows against {b_rows} for \
+         {PAGES} openings; if that margin is not large the choice is not obvious \
+         and this test should not pretend it is"
     );
 }

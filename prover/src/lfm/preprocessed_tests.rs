@@ -22,6 +22,7 @@ use super::preprocessed::{
     emit_bitwise_preprocessed, emit_const_mle_at, eq_table_rows,
 };
 use super::validator::validate;
+use super::whir_chain_tests::const_rows;
 use super::word::{ext_word, word_as_ext};
 
 /// A fixed-seed xorshift, so a failure names one reproducible point.
@@ -366,5 +367,181 @@ fn a_table_at_the_cap_still_emits() {
     assert_eq!(
         emitted, host,
         "the value at the cap is still the host's fold"
+    );
+}
+
+// =============================================================================
+// The OFFSET ramp — the cross-epoch proof's page tables
+// =============================================================================
+
+/// The ramp leg alone: the point arrives by hint, the one value is published.
+fn ramp_only_program(num_vars: usize, leg: bool) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(num_vars as u32);
+    let point: Vec<_> = (0..num_vars)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    // Both arms publish ONE word, so the publish cancels out of the delta and
+    // what is left is the ramp.
+    let out = if leg {
+        super::preprocessed::emit_offset_ramp(&mut b, &point)
+    } else {
+        point[0]
+    };
+    b.public(out.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the ramp leg must be admissible");
+    program
+}
+
+/// ★★ THE GATE: the emitted ramp equals the host's `2^18` FOLD over
+/// `page::offset_column()` — the very work this closed form exists to avoid.
+///
+/// Three derivations meet here and no two of them share an author: the EMITTED
+/// leg, `Mle::evaluate_in` over the real column, and
+/// `preprocessed::offset_ramp_at`. The fold is the one that matters; the third
+/// is there so a disagreement says WHICH of the two claims broke.
+#[test]
+fn the_offset_ramp_computes_what_the_hosts_page_fold_computes() {
+    let column = crate::tables::page::offset_column();
+    let num_vars = column.len().trailing_zeros() as usize;
+    assert_eq!(
+        1usize << num_vars,
+        column.len(),
+        "the page size must be a power of two for the column to be an MLE"
+    );
+    let mle = Mle::new(column).expect("a power-of-two column");
+    let program = ramp_only_program(num_vars, true);
+
+    for seed in [0x0ff5_e701u64, 0x0ff5_e702, 0x0ff5_e703] {
+        let point = sample_point_n(seed, num_vars);
+        let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the ramp leg executes");
+        assert_eq!(exec.public_words.len(), 1, "the leg publishes one value");
+        let got = word_as_ext(&exec.public_words[0].1).expect("an extension value");
+
+        let folded = mle
+            .evaluate_in::<GoldilocksExtension>(&point)
+            .expect("the column has num_vars variables");
+        let closed = super::preprocessed::offset_ramp_at(&point);
+
+        // ⛔ ANTI-VACUITY ON THE ANSWER, not on the inputs (instance 72). The
+        // trivial leg — the one a dropped Horner loop leaves behind — returns
+        // `point[0]`, and at a random point the true value is not that.
+        assert_ne!(
+            got, point[0],
+            "seed {seed:#x}: the ramp returned its leading coordinate, which is \
+             what a leg that emitted nothing would return"
+        );
+        assert_eq!(
+            got, folded,
+            "seed {seed:#x}: the EMITTED ramp disagrees with the host's 2^{num_vars} fold"
+        );
+        assert_eq!(
+            got, closed,
+            "seed {seed:#x}: the emitted ramp disagrees with the host closed form it mirrors"
+        );
+    }
+}
+
+/// ⛔ THE BIT ORDER IS LOAD-BEARING, AND THIS IS WHAT SAYS SO.
+///
+/// The convention — index bit `k` carried by `point[num_vars − 1 − k]` — is
+/// taken from `emit_bitwise_preprocessed`, not derived here. A test that only
+/// compared the emitter against `offset_ramp_at` would agree with itself under
+/// EITHER convention, because both are written by the same hand. So the
+/// reversed point is evaluated against the REAL fold and must differ: that is
+/// the observation which would fail if the convention were the other one.
+#[test]
+fn the_offset_ramp_is_wrong_under_the_reversed_bit_order() {
+    let column = crate::tables::page::offset_column();
+    let num_vars = column.len().trailing_zeros() as usize;
+    let mle = Mle::new(column).expect("a power-of-two column");
+    let point = sample_point_n(0x0ff5_e7a0, num_vars);
+    let reversed: Vec<FEE> = point.iter().rev().cloned().collect();
+
+    let folded = mle
+        .evaluate_in::<GoldilocksExtension>(&point)
+        .expect("the column has num_vars variables");
+    assert_eq!(
+        super::preprocessed::offset_ramp_at(&point),
+        folded,
+        "the convention this crate uses must reproduce the host's fold"
+    );
+    assert_ne!(
+        super::preprocessed::offset_ramp_at(&reversed),
+        folded,
+        "a reversed point must give a DIFFERENT value, or this test cannot see \
+         the convention at all"
+    );
+}
+
+/// ★ F1: `num_vars − 1` rows and ONE interned constant, whatever the page size.
+#[test]
+fn the_offset_ramp_emits_its_closed_form() {
+    for num_vars in [2usize, 5, 18] {
+        let with = ramp_only_program(num_vars, true);
+        let without = ramp_only_program(num_vars, false);
+        let with_consts = const_rows(&with);
+        let without_consts = const_rows(&without);
+        let measured = (with.instrs.len() - without.instrs.len()) - (with_consts - without_consts);
+        let predicted = super::preprocessed::offset_ramp_rows(num_vars);
+        println!(
+            "offset ramp at {num_vars} vars: {measured} rows emitted, {predicted} predicted, \
+             {} constants interned",
+            with_consts - without_consts
+        );
+        assert_eq!(
+            measured, predicted,
+            "{num_vars} vars: the emitted operation count must equal the closed form"
+        );
+
+        // The pool, by value and both ways.
+        let named = super::preprocessed::offset_ramp_constants();
+        let interned: Vec<super::word::LfmWord> = with
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                super::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .filter(|word| {
+                !without.instrs.iter().any(|instr| {
+                    matches!(instr, super::instr::Instr::Const { value, .. } if value == word)
+                })
+            })
+            .collect();
+        for word in &interned {
+            assert!(
+                named.contains(word),
+                "{num_vars} vars: the ramp interns {word:?}, which the form does not name"
+            );
+        }
+        assert_eq!(
+            interned.len(),
+            named.len(),
+            "{num_vars} vars: the interned pool and the named pool must be the same set"
+        );
+    }
+}
+
+/// ★ THE SIZE OF THE PRIZE, asserted rather than asserted-in-a-comment: the
+/// closed form is smaller than the fold it replaces by more than four orders of
+/// magnitude at the real page size.
+#[test]
+fn the_offset_ramp_is_cheaper_than_the_fold_it_replaces() {
+    let rows = crate::tables::page::DEFAULT_PAGE_SIZE;
+    let num_vars = rows.trailing_zeros() as usize;
+    let closed = super::preprocessed::offset_ramp_rows(num_vars);
+    println!(
+        "OFFSET at {rows} rows: {closed} rows closed-form vs {rows} for a fold \
+         ({}x), and the cross-epoch proof carries one per page",
+        rows / closed.max(1)
+    );
+    assert!(
+        closed * 10_000 < rows,
+        "the ramp costs {closed} rows against a {rows}-row fold, which is not the \
+         saving this leg exists for"
     );
 }
