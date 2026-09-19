@@ -541,15 +541,20 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
          dense has no closed form here, and the prepared genesis opening is the route \
          it belongs on. ⛔ THE ROUTING RULE SHOULD ALREADY HAVE TAKEN IT: \
          `continuation::genesis_stack_plan` leaves a genesis page sparse only up to \
-         {} entries at this height (its marginal measured at {} stacked variables), \
-         so a column arriving here this dense is not a page that needs a bigger cap. \
+         {} entries at this height when the run stands at the block's bracket ({} \
+         stacked variables; a run with fewer genesis pages is charged less and leaves \
+         a slightly sparser page), so a column arriving here this dense is not a page \
+         that needs a bigger cap. \
          It is that rule and this one having drifted apart, and neither can be fixed \
          without the other; \
          `whir_chain_tests::every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit` \
          is the assertion that they overlap",
         entries * num_vars,
-        crate::continuation::densest_sparse_entries(num_vars),
-        crate::continuation::MARGINAL_MEASURED_AT_VARS,
+        crate::continuation::densest_sparse_entries(
+            num_vars,
+            crate::continuation::BLOCK_STACK_VARS
+        ),
+        crate::continuation::BLOCK_STACK_VARS,
     );
 
     let one = b.ext_const(&FEE::one());

@@ -24,8 +24,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::lfm::compiler::LfmProgram;
     use crate::lfm::whir_global::{
-        GlobalPlan, GlobalRoute, global_cost, whir_global_arena, whir_global_program,
+        GlobalCost, GlobalPlan, GlobalRoute, global_cost, whir_global_arena, whir_global_program,
     };
     use crate::lfm::whir_real_epoch::whir_process_posture_note;
     use crate::lfm::whir_real_global::{WhirRealGlobal, real_global_from_whir_continuation};
@@ -233,6 +234,150 @@ mod tests {
         execute_against(&program, &arena);
     }
 
+    /// ★★ THE ARM THAT REACHES THE PREPARED OPENING — and the one no sparse
+    /// fixture in this suite can be.
+    ///
+    /// [`the_cross_epoch_program_executes_on_a_genesis_page_bundle`] runs on
+    /// `data_page_touch`, whose `.data` page carries 112 nonzero INIT entries
+    /// of 262,144 — far under the threshold at which a prepared opening is
+    /// worth taking — so its run takes the SPARSE genesis route and
+    /// `prove_global` builds no opening at all. Every executing arm here
+    /// therefore drives a program whose `proof.preprocessed` is `None`, which
+    /// is precisely the state `whir_global_arena` used to open by asserting.
+    ///
+    /// ⛔ **THAT ASSERT HAD NO FIXTURE THAT REACHED IT, AND THE BLOCK DOES.**
+    /// Thirty of the block's thirty-five pages take OFFSET+INIT, so the block's
+    /// cross-epoch proof carries a prepared opening while every laptop fixture
+    /// says it cannot. Without this arm the disagreement surfaces at the global
+    /// stage, hours into a tree run, on the one path a laptop cannot execute —
+    /// green at fixture scale and dead on the box, which is the failure the
+    /// fixture arms exist to prevent.
+    ///
+    /// `dense_data_page_touch` is `data_page_touch` with 32 KiB of non-zero
+    /// fill on either side of the counter, so the counter's page is dense
+    /// whatever offset the linker chose — a floor of 32,768 surviving entries,
+    /// which is not a fixture sized to just barely qualify.
+    ///
+    /// ⚠ The guest's comment used to size that floor against "the threshold …
+    /// `prover/src/genesis_stack.rs`: 9,725 at 18 variables"; that file never
+    /// existed and the number was the retired per-page budget's. The rule is
+    /// now the two-part one in `continuation::genesis_stack_plan`, weighing
+    /// each page against `continuation::marginal_stacked_rows` at the run's own
+    /// bracket and the whole candidate set against `PREPARED_LEG_ROWS`. The
+    /// fill's floor is comfortably clear of both, and this arm restates
+    /// neither — see the closing comment for why.
+    #[test]
+    #[ignore = "needs LAMBDA_VM_WHIR_HASH=rpx: the machine's transcript is the algebraic sponge and the cross-epoch prover dispatches on the knob"]
+    fn the_cross_epoch_program_executes_on_a_dense_genesis_bundle() {
+        require_rpx_posture("the dense-genesis execution arm");
+        let elf_bytes = asm_elf_bytes("dense_data_page_touch");
+        let opts = ProofOptions::default_test_options();
+        let bundle = multilinear_continuation::prove_continuation(&elf_bytes, &[], 3, &opts)
+            .expect("prove the continuation");
+
+        // ⛔⛔ THE ANTI-VACUITY CHECK, AND IT IS THE WHOLE POINT OF THE ARM.
+        //
+        // A "dense" guest whose page did not in fact clear the threshold yields
+        // a bundle with NO prepared opening, and every line below would then
+        // execute the SPARSE path a sibling arm already covers — green, and
+        // about nothing. Two things this arm may not assume make that a live
+        // possibility rather than a formality: the threshold is a MEASURED
+        // LITERAL that moves when somebody re-measures it, and where `.data`
+        // starts inside its page is the LINKER's business.
+        //
+        // ⚠ It asserts on `proof.preprocessed`, not on `global.prepared`,
+        // because `preprocessed` is the field the arena reads and the assert
+        // refused. The two travel together today; asserting the one that is
+        // actually consumed is what keeps this a check on the state this arm
+        // exists to reach rather than on its twin.
+        assert!(
+            bundle.global.proof.preprocessed.is_some(),
+            "this fixture exists to produce a cross-epoch proof WITH a prepared \
+             opening and produced one without, so every assertion below would \
+             run the sparse path and pass for the wrong reason. Either \
+             `dense_data_page_touch`'s page is no longer dense enough for the \
+             rule, or the rule moved — read the census printed below against \
+             `continuation::genesis_stack_plan` and its \
+             `marginal_stacked_rows` before reading anything else here"
+        );
+
+        let global = harvest(&elf_bytes, &opts, &bundle);
+        let airs = global.airs().refs();
+        let plan = GlobalPlan::build(&global, &airs, &elf_bytes);
+
+        // ★ DENSITY DECIDES THE OPENING, NOT THE ROUTE — so both are checked.
+        // A dense page is still an OFFSET+INIT page; what its density changes
+        // is whether the prover takes a prepared opening over the family
+        // instead of folding the columns. An arm that checked only the route
+        // would be satisfied by the sparse fixture, and one that checked only
+        // the opening would not notice a page that stopped being genesis at
+        // all.
+        let genesis: Vec<usize> = plan
+            .table_routes()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| **r == GlobalRoute::GenesisPage)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !genesis.is_empty(),
+            "the dense fixture reached no OFFSET+INIT table, so it is not \
+             exercising the route its opening belongs to"
+        );
+
+        // The census, PRINTED with its three numbers as the sibling arm prints
+        // them, so the log carries the entry count that the threshold decision
+        // was made on rather than leaving a reader to trust the guest's comment.
+        let census = crate::lfm::whir_global::genesis_census(
+            &elf_bytes,
+            &global.page_bases,
+            global.num_private_input_pages,
+        )
+        .expect("the census reads off the same ELF the harvest verified");
+        println!("{}", crate::lfm::whir_global::genesis_census_line(&census));
+        for entry in &census {
+            println!("{}", crate::lfm::whir_global::genesis_entry_line(entry));
+        }
+        let entries: usize = census.iter().map(|e| e.entries).sum();
+        println!("   dense-genesis arm: {entries} surviving INIT entries");
+
+        // ⛔ AND IT DELIBERATELY DOES NOT ASSERT A THRESHOLD, which is worth a
+        // sentence because the obvious arm would.
+        //
+        // The anti-vacuity check above already establishes the exact state this
+        // arm exists to reach — a proof that CARRIES an opening — and it does
+        // so without knowing anything about how the prover decided to build
+        // one. An `entries > SOME_THRESHOLD` assert beside it would add no
+        // power over that and would hard-code a number this test has no
+        // business owning: the rule weighs each page against
+        // `continuation::marginal_stacked_rows` AT THE RUN'S OWN BRACKET, and
+        // that form's last term is a bound rather than a reading — so a test
+        // that pinned the number here would turn an honest re-derivation into a
+        // red arm somewhere else. The pin that owns that comparison is
+        // `whir_stacked_tests::the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills`.
+        //
+        // ⚠ The count is PRINTED instead, which is what a reader needs when the
+        // anti-vacuity assert fires: the two numbers to compare are then in the
+        // log rather than in somebody's memory.
+
+        let arena = whir_global_arena(&global, &airs, &elf_bytes);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
+        execute_against(&program, &arena);
+
+        // ★★ AND THE F1 OVER THIS BUNDLE, which is the only place the prepared
+        // path's own terms meet a compiled program: the stack's roots in the
+        // roots block, the opening's wrapper and chain, and that chain's
+        // constants. The sparse arms cannot reach one of them, so without this
+        // the three forms would be written and never read.
+        let cost = global_cost(&global, &airs, &elf_bytes);
+        assert!(
+            cost.prepared > 0,
+            "the dense bundle's F1 charges nothing for a prepared opening the proof \
+             carries, so the leg that predicts it is not being evaluated"
+        );
+        the_forms_predict("DENSE GENESIS", &program, &cost);
+    }
+
     /// ★★ THE F1 OVER THE ASSEMBLED EMISSION — the check the epoch program does
     /// not have, and the reason a deleted leg was invisible to seventeen tests.
     ///
@@ -246,7 +391,24 @@ mod tests {
         let airs = global.airs().refs();
         let program = whir_global_program(&global, &airs, &elf_bytes);
         let cost = global_cost(&global, &airs, &elf_bytes);
+        the_forms_predict("SPARSE GENESIS", &program, &cost);
+    }
 
+    /// The F1 itself, over whichever bundle a caller built.
+    ///
+    /// ⛔⛔ A HELPER BECAUSE THE DENSE PATH HAS ITS OWN TERMS AND WOULD
+    /// OTHERWISE HAVE NO F1 AT ALL. A bundle carrying a prepared genesis
+    /// opening pays three things a sparse one does not — the stack's roots in
+    /// the roots block, the opening's own wrapper and chain, and that chain's
+    /// constants — and every one of them is a form somebody wrote. A form
+    /// nothing compares against a compiled program is the exact shape of defect
+    /// this F1 exists for: seventeen tests stayed green over a DELETED
+    /// preprocessed leg because each measured a quantity that could not move
+    /// under the failure it was meant to catch.
+    ///
+    /// `label` names the bundle in the printed line, so a gap in a log is
+    /// attributable to the path that produced it.
+    fn the_forms_predict(label: &str, program: &LfmProgram, cost: &GlobalCost) {
         let consts = program
             .instrs
             .iter()
@@ -264,14 +426,16 @@ mod tests {
             .count();
         let ops = program.instrs.len() - consts - hints - publics;
         println!(
-            "CROSS-EPOCH F1: instrs {} = ops {ops} + consts {consts} + hints {hints} + \
-             publics {publics}; predicted ops {} (spine {} + tables {} + groups {} + \
-             closure {} + publish {}), consts {}, hints {}, publics {}",
+            "CROSS-EPOCH F1 [{label}]: instrs {} = ops {ops} + consts {consts} + hints \
+             {hints} + publics {publics}; predicted ops {} (spine {} + tables {} + \
+             groups {} + prepared {} + closure {} + publish {}), consts {}, hints {}, \
+             publics {}",
             program.instrs.len(),
             cost.operations(),
             cost.spine,
             cost.tables,
             cost.groups,
+            cost.prepared,
             cost.closure,
             cost.publish_ops,
             cost.constants.len(),
@@ -336,7 +500,7 @@ mod tests {
             for w in unnamed.iter().take(40) {
                 println!("  UNNAMED  {w:?}");
                 if let Some((addr, _)) = interned_at.iter().find(|(_, word)| word == *w) {
-                    println!("{}", crate::lfm::executor::locate_addr(&program, *addr));
+                    println!("{}", crate::lfm::executor::locate_addr(program, *addr));
                     // ⛔ `locate_addr`'s window is ±4, which shows the SHAPE of
                     // the leg but not its CALLER. Round one of this narrowed the
                     // three survivors to one `algebraic_leaf_hash` over six

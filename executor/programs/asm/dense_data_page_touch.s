@@ -3,13 +3,26 @@
 # `data_page_touch`, but on a page whose genesis is DENSE.
 #
 # That fixture's .data page holds one .dword, so its INIT column has 112 nonzero
-# entries of 262,144 — far below the threshold at which a prepared opening is
-# worth taking (`prover/src/genesis_stack.rs`: 9,725 at 18 variables). It
-# therefore exercises the SPARSE genesis route and leaves the prepared route
-# with no table at fixture scale.
+# entries of 262,144. It passes the first half of the routing rule and the
+# second half refuses it, so it exercises the SPARSE genesis route and leaves
+# the prepared route with no table at fixture scale.
+#
+# THE RULE IT IS SIZED AGAINST, in `prover/src/continuation.rs`
+# (`genesis_stack_plan`), read at 84a02b8c4. It has two parts and this fixture has
+# to clear BOTH:
+#
+#   1. per page: `18 + 18*S` against `marginal_stacked_rows(18, n_fixed)`, the
+#      rows one more carried page adds to the prepared leg. That marginal is a
+#      FORM evaluated at the run's own bracket — 101 at one genesis page, 111 at
+#      the block's thirty, 125 at four thousand — so the entry threshold is five
+#      or six nonzero bytes and NOT a fixed number to quote here.
+#   2. per candidate SET: its total savings against `PREPARED_LEG_ROWS`, the
+#      175,066 rows the stacked chain costs once, however many pages ride it.
+#      This is the part the 112-entry fixture fails: 1,923 saved rows do not buy
+#      a 175,066-row chain.
 #
 # This one surrounds the touched cell with non-zero bytes so the page it lives
-# on crosses the threshold whatever offset the linker puts it at.
+# on clears part 2 outright, whatever offset the linker puts it at.
 #
 # ⚠ WHY THE FILL IS ON BOTH SIDES. The counter has to be on a DENSE page, and
 # where .data starts inside its page is the linker's business. With `n` bytes
@@ -19,8 +32,12 @@
 # single trailing fill would leave a counter near the end of a page with almost
 # none of it.
 #
-# 32 KiB a side puts the floor at 32,768 nonzero entries, 3.4x the threshold, so
-# the fixture is not sized to just barely qualify.
+# 32 KiB a side puts the floor at 32,768 nonzero entries. That is four orders
+# past part 1 at any bracket, and its savings are `18 + 18*32,768 - marginal`,
+# about 589,700 rows: 3.4x the chain part 2 weighs them against. The fixture is
+# not sized to just barely qualify, which matters because the marginal is a form
+# that moves with the run's page count and the chain's cost moves with the
+# proof's posture.
 	.fill 32768, 1, 0xA5
 counter:
 	.dword 0x123456789ABCDEF0

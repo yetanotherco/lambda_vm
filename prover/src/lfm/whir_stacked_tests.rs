@@ -890,3 +890,204 @@ fn the_decode_groups_threaded_schedule_reproduces_the_box() {
     );
     assert_eq!(states, 17, "3R - 1 grinds, each reading the sponge once");
 }
+
+/// ★★ THE PIN: what the routing rule CHARGES a carried page, against what the
+/// stack BILLS for one — read off [`stacked_verify_cost`], never asserted
+/// against the form's own arithmetic.
+///
+/// `continuation::marginal_stacked_rows` is part 1's whole term, and until this
+/// ran it was four terms READ off this file's cost form by hand. Two earlier
+/// readings of it disagreed, each missing a term the other had, so the form is
+/// pinned here by DIFFERENCING the cost of one more carried page — the only
+/// definition of "marginal" that cannot miss a term.
+///
+/// ⛔⛔ WHY IT IS A MAXIMUM AND NOT AN EQUALITY AT EVERY PAGE. The wrapper
+/// absorbs `COORDINATES_PER_EXT` per column into ONE threaded sponge and
+/// squeezes once, at `f.div_ceil(4) + f.div_ceil(8) + 1`. A page is two
+/// columns, six felts, which divides neither 4 nor 8 — so the cost STEPS
+/// irregularly as pages are added and the per-page marginal is a SPREAD, not a
+/// number. The form charges the dearest position, which is what
+/// `continuation::MAX_SPONGE_MARGINAL` bounds; this walks every position in a
+/// bracket and reads the spread out loud.
+///
+/// ⛔ AND A MARGINAL IS ONLY DEFINED INSIDE A BRACKET. The prefix-indicator term
+/// grows two rows per prefix bit, so the difference across a power-of-two
+/// boundary carries a stack-height change that is not a page's cost at all.
+/// Every difference here is taken between two page counts whose stack stands at
+/// the SAME height and in ONE polynomial, both asserted per page count rather
+/// than assumed from the range.
+///
+/// The two brackets a block-shaped run can stand in are walked: 24 variables
+/// (17..=32 genesis pages, where the block's thirty sit) and 25 (33..=64, the
+/// last bracket that fits one polynomial at
+/// `stark::multilinear_table::MAX_STACK_VARS`).
+#[test]
+fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
+    use crate::continuation::{
+        BLOCK_STACK_VARS, MAX_SPONGE_MARGINAL, PAGE_NUM_VARS, PAGE_PREPROCESSED_COLUMNS,
+        STACKED_ROWS_PER_COLUMN, candidate_threshold_entries, fixed_stack_vars,
+        marginal_stacked_rows,
+    };
+
+    // The posture the whole VM proof runs at (`multilinear_prove.rs:93`), and a
+    // deliberately different one: the marginal must not move with either, since
+    // every chain term is per-POLYNOMIAL and there is one polynomial throughout.
+    let shipped = ChainConfig::with_security(2, 4, 25, 128, GrindBits::uniform(20));
+    let other = ChainConfig::with_security(1, 3, 25, 100, GrindBits::uniform(16));
+
+    let cost_at = |pages: usize, config: &ChainConfig| -> (usize, usize) {
+        let columns = pages * PAGE_PREPROCESSED_COLUMNS;
+        let layout = stark::multilinear_table::global_layout(&[(columns, PAGE_NUM_VARS)])
+            .expect("a stack of whole pages");
+        // ⛔ THE BRACKET GUARD, PER PAGE COUNT. A difference taken across a
+        // height change or a polynomial split is not a page's marginal.
+        assert_eq!(
+            layout.num_polys(),
+            1,
+            "{pages} pages spill into {} polynomials, so this difference would span \
+             two chains",
+            layout.num_polys()
+        );
+        // A page's two preprocessed columns settle at ONE point — its own
+        // table's — so the groups are the pages.
+        let group_of: Vec<usize> = (0..columns)
+            .map(|column| column / PAGE_PREPROCESSED_COLUMNS)
+            .collect();
+        let shape = ChainShape::new(config, layout.n_stack());
+        let cost = stacked_verify_cost(&layout, &group_of, &shape, SpongeEntry::fresh());
+        (layout.n_stack(), cost.operations())
+    };
+
+    for bracket in [BLOCK_STACK_VARS, BLOCK_STACK_VARS + 1] {
+        let counts: Vec<usize> = (1..=64)
+            .filter(|&pages| fixed_stack_vars(PAGE_NUM_VARS, pages) == bracket)
+            .collect();
+        assert!(
+            counts.len() > MAX_SPONGE_MARGINAL + 1,
+            "a bracket of {} page counts cannot show a spread of {MAX_SPONGE_MARGINAL} \
+             values",
+            counts.len()
+        );
+
+        // The deterministic part, which is every term but the sponge's.
+        let deterministic = 5 * PAGE_NUM_VARS
+            + PAGE_PREPROCESSED_COLUMNS * (bracket - PAGE_NUM_VARS)
+            + PAGE_PREPROCESSED_COLUMNS * STACKED_ROWS_PER_COLUMN;
+
+        let mut marginals: Vec<usize> = Vec::with_capacity(counts.len() - 1);
+        let mut sponge: Vec<usize> = Vec::with_capacity(counts.len() - 1);
+        let mut previous: Option<usize> = None;
+        for &pages in &counts {
+            let (n_stack, cost) = cost_at(pages, &shipped);
+            assert_eq!(
+                n_stack, bracket,
+                "{pages} pages stand at {n_stack}, not the \
+                 bracket being walked"
+            );
+            // ⚠ THE POSTURE MUST NOT MOVE THE DIFFERENCE, executed rather than
+            // argued: the same page count under a different blowup, folding,
+            // security level and grind.
+            let (_, elsewhere) = cost_at(pages, &other);
+            if let Some(before) = previous {
+                marginals.push(cost - before);
+                sponge.push(cost - before - deterministic);
+            }
+            previous = Some(cost);
+            let _ = elsewhere;
+        }
+
+        // The same walk under the other posture, differenced on its own.
+        let mut elsewhere_marginals: Vec<usize> = Vec::with_capacity(counts.len() - 1);
+        let mut previous: Option<usize> = None;
+        for &pages in &counts {
+            let (_, cost) = cost_at(pages, &other);
+            if let Some(before) = previous {
+                elsewhere_marginals.push(cost - before);
+            }
+            previous = Some(cost);
+        }
+        assert_eq!(
+            marginals, elsewhere_marginals,
+            "the per-page marginal moved with the chain posture, so a term that is \
+             supposed to be per-polynomial is being charged per page"
+        );
+
+        let charged = marginal_stacked_rows(PAGE_NUM_VARS, bracket);
+        let measured_max = *marginals.iter().max().expect("a walked bracket");
+        let measured_min = *marginals.iter().min().expect("a walked bracket");
+        println!(
+            "MARGINAL PIN at bracket {bracket} ({} pages, {} differences): charged \
+             {charged}, measured {measured_min}..={measured_max}, deterministic \
+             {deterministic}, sponge term s = {sponge:?}",
+            counts.len(),
+            marginals.len(),
+        );
+
+        // (i) THE FORM IS THE MAXIMUM THE STACK BILLS — the assertion the whole
+        // rule rests on, and it is EXACT rather than a bound on a bound: the
+        // charge is reached at some position in the bracket, not merely never
+        // exceeded.
+        assert_eq!(
+            measured_max, charged,
+            "at bracket {bracket} the form charges {charged} and the dearest page the \
+             stack bills is {measured_max}. If this is LARGER, part 1 undercharges \
+             and the form must move; if SMALLER, the bound is loose and the entry \
+             threshold is one too eager"
+        );
+
+        // (ii) THE SPONGE TERM IS INSIDE ITS BOUND AT EVERY POSITION, and the
+        // bound is reached: a bound never reached would be a charge no page can
+        // justify.
+        for (index, &s) in sponge.iter().enumerate() {
+            assert!(
+                (1..=MAX_SPONGE_MARGINAL).contains(&s),
+                "the {}th page of the bracket adds {s} sponge rows, outside \
+                 1..={MAX_SPONGE_MARGINAL}",
+                counts[index + 1]
+            );
+        }
+        assert_eq!(
+            *sponge.iter().max().expect("a walked bracket"),
+            MAX_SPONGE_MARGINAL
+        );
+
+        // (iii) τ IS INVARIANT ACROSS THE SPREAD, which is what makes charging
+        // the maximum cost nothing the rule can see: every position in the
+        // bracket yields the same entry threshold as the charged marginal does.
+        let tau_of = |m: usize| m.saturating_sub(PAGE_NUM_VARS) / PAGE_NUM_VARS + 1;
+        let tau = candidate_threshold_entries(PAGE_NUM_VARS, bracket);
+        assert_eq!(
+            tau_of(charged),
+            tau,
+            "the closure and the live function disagree"
+        );
+        for &m in &marginals {
+            assert_eq!(
+                tau_of(m),
+                tau,
+                "at bracket {bracket} a page billed {m} rows implies τ = {}, against \
+                 the charged {charged}'s τ = {tau}: the choice of the maximum is no \
+                 longer free",
+                tau_of(m)
+            );
+        }
+    }
+
+    // ⛔ WHERE THIS PIN'S COVERAGE STOPS, READ RATHER THAN ASSUMED. At 65
+    // genesis pages the stack wants 26 variables, `global_layout` caps it at
+    // `MAX_STACK_VARS` and the columns spill into a second polynomial — which
+    // is a second chain, so part 2's single-chain price stops being the cost.
+    // `whir_chain_tests::the_chain_term_prices_one_polynomial` is where that
+    // limit is stated; here it is only the end of the range a marginal is
+    // defined on.
+    let spilled =
+        stark::multilinear_table::global_layout(&[(65 * PAGE_PREPROCESSED_COLUMNS, PAGE_NUM_VARS)])
+            .expect("a stack of whole pages");
+    assert_eq!(
+        spilled.num_polys(),
+        2,
+        "65 genesis pages must spill, or the bracket walk above stopped one short of \
+         its own boundary"
+    );
+    assert_eq!(spilled.n_stack(), stark::multilinear_table::MAX_STACK_VARS);
+}

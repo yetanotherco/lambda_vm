@@ -258,6 +258,21 @@ pub struct GlobalPlan<'a> {
     pages: Vec<GlobalPage>,
     group_layouts: Vec<StackedLayout>,
     group_domains: Vec<Domain<GoldilocksField>>,
+    /// Per table: how many of its preprocessed columns the prepared genesis
+    /// opening settles — `check_preprocessed`'s `settled_out_of_band`.
+    ///
+    /// ⛔⛔ READ OFF THE OPENING THE PROOF CARRIES, NEVER RE-DECIDED. The
+    /// routing rule (`continuation::genesis_stack_plan`) chose this set when
+    /// the proof was built; evaluating it a second time here would let a
+    /// program skip a check the opening does not actually cover — the one way
+    /// this leg can be silently unsound. So it is derived from
+    /// `WhirRealGlobal::prepared`'s `at` list, which IS what
+    /// `verify_global_bookends` settled, and any shape this emitter cannot
+    /// mirror is refused at [`Self::build`].
+    settled_of: Vec<usize>,
+    /// The opening's runs, `(table, columns)` in stack order — the host's
+    /// `prepared_runs` for the same list.
+    prepared_runs: Vec<(usize, usize)>,
 }
 
 impl<'a> GlobalPlan<'a> {
@@ -401,6 +416,54 @@ impl<'a> GlobalPlan<'a> {
             crate::multilinear_prove::stacks(&shapes, &sizes, &config)
                 .expect("the cross-epoch groups stack");
 
+        // ⛔⛔ WHAT THE PREPARED OPENING SETTLES, TAKEN FROM THE OPENING. Every
+        // run must be a genesis page's WHOLE preprocessed prefix, the tables
+        // must be visited once each in stack order, and nothing else is
+        // emittable: a partial prefix would leave `check_preprocessed` skipping
+        // columns the opening never covered, and an out-of-order list would
+        // settle one page's values against another page's commitment with every
+        // value gate still green. `leading_columns` is the same constructor
+        // `genesis_stack_plan` built the list with, so this compares the list
+        // against the shape that produced it rather than against a restatement.
+        let mut settled_of = vec![0usize; routes.len()];
+        let mut prepared_runs: Vec<(usize, usize)> = Vec::new();
+        if let Some(prepared) = &global.prepared {
+            let per_page = GlobalRoute::GenesisPage.columns();
+            assert!(
+                !prepared.at.is_empty(),
+                "a prepared genesis opening that settles nothing is an opening nobody \
+                 built; `genesis_prepared_for` hands back `None` for that run"
+            );
+            assert_eq!(
+                prepared.at.len() % per_page,
+                0,
+                "the genesis stack settles {} columns, which is not whole pages of \
+                 {per_page}",
+                prepared.at.len(),
+            );
+            for run in prepared.at.chunks(per_page) {
+                let table = run[0].table;
+                assert_eq!(
+                    run,
+                    stark::multilinear_table::leading_columns(table, per_page),
+                    "the genesis stack's run at table {table} is not that table's whole \
+                     preprocessed prefix, in order"
+                );
+                assert!(
+                    matches!(routes[table], GlobalRoute::GenesisPage),
+                    "the genesis stack settles table {table}, which this emitter routes \
+                     as {:?}: only a genesis page presents an INIT column to settle",
+                    routes[table],
+                );
+                assert!(
+                    prepared_runs.last().is_none_or(|&(last, _)| last < table),
+                    "the genesis stack visits table {table} out of stack order, or twice"
+                );
+                settled_of[table] = per_page;
+                prepared_runs.push((table, per_page));
+            }
+        }
+
         Self {
             config,
             sizes,
@@ -411,6 +474,8 @@ impl<'a> GlobalPlan<'a> {
             pages,
             group_layouts,
             group_domains,
+            settled_of,
+            prepared_runs,
         }
     }
 
@@ -436,32 +501,97 @@ impl<'a> GlobalPlan<'a> {
 
     /// The preprocessed plan per table, over views the caller owns.
     ///
-    /// ⚠ `settled` is ZERO on every route: the cross-epoch proof carries no
-    /// prepared opening, so there is nothing out of band to settle anything and
-    /// a nonzero here would be switching a check off with nothing put in its
-    /// place.
+    /// ★ ONE VALUE DRIVES BOTH HALVES, which is the host's own rule
+    /// (`multilinear_table.rs:1419`): the count the opening settles is the
+    /// count `check_preprocessed` skips, and both come off
+    /// [`Self::settled_of`], which was read off the opening itself. A second,
+    /// independent knob would be a way to switch off a check with nothing put
+    /// in its place.
+    ///
+    /// ⚠ A SETTLED PAGE TAKES NO SPARSE LEG AT ALL, not a shorter one. Its
+    /// OFFSET is settled by the same opening as its INIT — see
+    /// `continuation::PAGE_PREPROCESSED_COLUMNS` for why the identity ramp
+    /// rides along — so there is nothing left for the closed forms to check and
+    /// the route is `None`.
     pub fn routes<'v>(&self, views: &'v [Vec<&'v [FE]>]) -> Vec<PreprocessedPlan<'v>> {
-        self.route_of
+        let plans: Vec<PreprocessedPlan<'v>> = self
+            .route_of
             .iter()
             .zip(views)
-            .map(|(route, view)| {
-                let plan = match route {
-                    GlobalRoute::Bookend => PreprocessedRoute::None,
-                    GlobalRoute::PrivatePage => PreprocessedRoute::Page {
-                        offset: view[0],
-                        init: None,
-                    },
-                    GlobalRoute::GenesisPage => PreprocessedRoute::Page {
-                        offset: view[0],
-                        init: Some(view[1]),
-                    },
+            .zip(&self.settled_of)
+            .map(|((route, view), &settled)| {
+                let plan = if settled == route.columns() {
+                    PreprocessedRoute::None
+                } else {
+                    match route {
+                        GlobalRoute::Bookend => PreprocessedRoute::None,
+                        GlobalRoute::PrivatePage => PreprocessedRoute::Page {
+                            offset: view[0],
+                            init: None,
+                        },
+                        GlobalRoute::GenesisPage => PreprocessedRoute::Page {
+                            offset: view[0],
+                            init: Some(view[1]),
+                        },
+                    }
                 };
                 PreprocessedPlan {
-                    settled: 0,
+                    settled,
                     route: plan,
                 }
             })
-            .collect()
+            .collect();
+
+        // ⛔⛔ EVERY PREPROCESSED COLUMN IS COVERED EXACTLY ONCE — SETTLED BY
+        // THE STACK **XOR** CHECKED BY A CLOSED FORM — and this is executed
+        // rather than argued. The two routes are decided in two places (the
+        // opening decides `settled`, the family decides the closed form), and
+        // the failure that matters is a page that falls between them: its
+        // genesis is then checked by NOTHING, the program is shorter, and every
+        // value gate stays green because no value is wrong — there is simply no
+        // check. A page covered TWICE is only wasteful, and is refused here too
+        // because a rule that tolerates one direction invites the other.
+        //
+        // ⚠ IT IS A SEPARATE PASS OVER THE BUILT PLANS, not a branch inside the
+        // match above, and that is the whole point: written inside the match it
+        // would restate the expression that produced it and could not fail. Here
+        // a mutation of that expression trips it BY NAME
+        // (`mut-v1j-box-2.sh genesis-page-uncovered`).
+        for (index, ((route, plan), &settled)) in self
+            .route_of
+            .iter()
+            .zip(&plans)
+            .zip(&self.settled_of)
+            .enumerate()
+        {
+            if route.columns() == 0 {
+                continue;
+            }
+            let by_the_stack = settled == route.columns();
+            let by_a_closed_form = matches!(plan.route, PreprocessedRoute::Page { .. });
+            assert!(
+                by_the_stack != by_a_closed_form,
+                "cross-epoch table {index} is routed as {route:?} with {} preprocessed                  columns; the prepared opening settles {settled} of them and its                  closed-form leg is {}, so the page is covered by {} — every                  preprocessed column must be covered EXACTLY ONCE",
+                route.columns(),
+                if by_a_closed_form {
+                    "present"
+                } else {
+                    "absent"
+                },
+                if by_the_stack { "both" } else { "neither" },
+            );
+        }
+        plans
+    }
+
+    /// What the prepared opening settles, per table.
+    pub fn settled_of(&self) -> &[usize] {
+        &self.settled_of
+    }
+
+    /// The opening's runs, `(table, columns)` in stack order.
+    pub fn prepared_runs(&self) -> &[(usize, usize)] {
+        &self.prepared_runs
     }
 
     /// The routes, for a census or a gate to read without rebuilding them.
@@ -639,10 +769,18 @@ pub fn global_publish_rows(layout: &super::block_root::GlobalLayout) -> usize {
 /// own refusals. Both walk the same [`GlobalPlan`], and the gate on the pair is
 /// that the program hints exactly as many words as this writes.
 ///
-/// ★ It ends where an epoch's has one more step: there is no prepared opening,
-/// so the last group's chains are the last words. The cross-epoch proof's
-/// `preprocessed` field is `None` on every proof that exists, and a program that
-/// hinted one would hint past the end of the arena.
+/// ★ IT ENDS WHERE THE PROOF ENDS, and on a bundle whose genesis is dense that
+/// is one step further than a group walk: the prepared genesis opening's chains
+/// are the last words, exactly as DECODE's are on an epoch's. A run whose
+/// genesis is entirely sparse carries no opening and ends at the last group,
+/// which is every fixture in this suite.
+///
+/// ⛔ AND THE TWO FACTS ARE TIED, BOTH WAYS. The proof's `preprocessed` field
+/// and the driver's `prepared` record are two readings of one decision; a
+/// program that hinted an opening the proof does not carry would hint past the
+/// end of the arena, and one that skipped an opening the proof does carry would
+/// leave the words nobody reads in the middle of it. The refusal below is an
+/// equality between them, not a `let else`.
 pub fn whir_global_arena(
     global: &WhirRealGlobal,
     airs: &[&dyn stark::traits::AIR<
@@ -654,10 +792,17 @@ pub fn whir_global_arena(
 ) -> Vec<Vec<LfmWord>> {
     let plan = GlobalPlan::build(global, airs, elf_bytes);
     let proof = &global.proof.proof;
-    assert!(
-        proof.preprocessed.is_none(),
-        "the cross-epoch proof carries no prepared opening; one here would be an \
-         object `prove_global` never built and `verify_global_bookends` never checks"
+    assert_eq!(
+        proof.preprocessed.is_some(),
+        !plan.prepared_runs().is_empty(),
+        "the cross-epoch proof {} a prepared opening and the driver's record settles \
+         {} tables: the emitter cannot tell which of the two is the run",
+        if proof.preprocessed.is_some() {
+            "carries"
+        } else {
+            "carries no"
+        },
+        plan.prepared_runs().len(),
     );
     let mut words: Vec<LfmWord> = proof
         .roots
@@ -669,6 +814,21 @@ pub fn whir_global_arena(
     }
     for (group, opening) in proof.columns.iter().enumerate() {
         let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
+        for chain in &opening.polys {
+            words.push(super::word::ext_word(&chain.final_value));
+            super::whir_chain::push_round_words(&mut words, &shape, chain);
+        }
+    }
+    // The prepared genesis opening, last — `multi_verify`'s own last step.
+    //
+    // ⚠ THE LAYOUT AND THE DOMAIN ARE THE STACK'S, FROM THE HOST. The chain
+    // config is the cross-epoch argument's, because `multi_verify` passes its
+    // own to this call; only the first two belong to the opening. Reading them
+    // off `GlobalPrepared` rather than rebuilding them is what keeps the round
+    // count the program walks equal to the round count the prover wrote.
+    if let (Some(opening), Some(prepared)) = (&proof.preprocessed, &global.prepared) {
+        let (layout, _) = prepared.stacked();
+        let shape = ChainShape::new(&plan.config, layout.n_stack());
         for chain in &opening.polys {
             words.push(super::word::ext_word(&chain.final_value));
             super::whir_chain::push_round_words(&mut words, &shape, chain);
@@ -745,11 +905,34 @@ pub fn whir_global_program(
         },
     );
 
-    // 2. The roots block — the carried group roots, then NO derived root, then
-    //    `z`, `alpha`, `beta`. The empty slice is the whole difference from an
-    //    epoch's, and it is the reason this program interns no commitment and
-    //    owes no pin.
-    let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &[]);
+    // 2. The roots block — the carried group roots, then the prepared genesis
+    //    stack's roots, then `z`, `alpha`, `beta`.
+    //
+    // ⛔⛔ THE STACK'S ROOTS ARE PROGRAM TEXT AND ARE THE FOURTH OWED PER-ELF
+    // PIN. They are derived by the verifier from the ELF's genesis bytes, never
+    // read from the proof, so the machine interns them exactly as an epoch
+    // interns DECODE's — and the statement owed out of band is "these roots are
+    // the commitment to this ELF's genesis at the dense page bases, under this
+    // blowup and folding". ⚠ They are NOT the 35 univariate per-page roots
+    // `recursion::precomputed_commitments` builds; nothing on this path ever
+    // compares one of those.
+    //
+    // ⚠ AND THEIR POSITION IS THE HOST'S: `absorb_roots_and_challenge`
+    // (`multilinear_table.rs:1406`) takes the carried roots and then the
+    // prepared ones, before `z`. A program that absorbed them anywhere else
+    // would derive a different `z` and stop executing on an honest proof.
+    let derived: Vec<LfmWord> = global
+        .prepared
+        .as_ref()
+        .map(|prepared| {
+            prepared
+                .roots
+                .iter()
+                .map(super::algebraic_commit::commitment_to_digest)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (z, alpha, beta) = emit_roots_block(&mut b, &mut transcript, &carried, &derived);
 
     // The shared alpha ladder, epoch-level here too: `emit_interaction` reads
     // `alpha_powers[i + 1]` and one ladder of the longest table's length serves
@@ -797,6 +980,21 @@ pub fn whir_global_program(
         let shape = ChainShape::new(&plan.config, plan.group_layouts[group].n_stack());
         chains.push(hint_group_chains(&mut b, arena, &mut at, opening, &shape));
     }
+    // The prepared opening's chains are hinted HERE, after every group's, which
+    // is the order the arena writes them in. The step that consumes them is
+    // emitted after the group walk, because that is where `multi_verify` runs
+    // it — the hint order and the emit order are different orders and both are
+    // contracts.
+    let prepared_shape = global.prepared.as_ref().map(|prepared| {
+        let (layout, _) = prepared.stacked();
+        ChainShape::new(&plan.config, layout.n_stack())
+    });
+    let prepared_chains = proof.preprocessed.as_ref().map(|opening| {
+        let shape = prepared_shape
+            .as_ref()
+            .expect("the arena's refusal ties the opening to the driver's record");
+        hint_group_chains(&mut b, arena, &mut at, opening, shape)
+    });
     let group_shapes = plan.group_shapes();
     // ⚠ The openings and the round wires are LOCALS, because a chain's wires
     // borrow its openings and its openings borrow its storage. Keeping the whole
@@ -853,6 +1051,83 @@ pub fn whir_global_program(
         })
         .collect();
     emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);
+
+    // 5b. ★★ THE PREPARED GENESIS OPENING — `multi_verify`'s last step
+    //     (`multilinear_table.rs:1489`), and check (d) with it.
+    //
+    // ⛔⛔ THE VALUES ARE THE PAGES' OWN, GATHERED AT THE PAGES' OWN POINTS, and
+    // that is what makes this a check on the settled columns rather than on a
+    // second copy of them. Run `k` of the stack is table `t`'s whole
+    // preprocessed prefix, so its points and values are `walk`'s own columns
+    // `column_at(t) .. + n` — the same gather `prepared_claims` performs. No
+    // separate equality ties the two copies together, and none is wanted: an
+    // equality someone has to remember to write is one nobody notices missing.
+    if let (Some(held), Some(shape), Some(prepared)) =
+        (&prepared_chains, &prepared_shape, &global.prepared)
+    {
+        prepared
+            .agrees_with(&plan.config)
+            .expect("the genesis stack must have been committed at this program's shape");
+        let (layout, domain) = prepared.stacked();
+        let openings: Vec<_> = held
+            .storage
+            .iter()
+            .map(super::whir_chain::RoundStorage::openings)
+            .collect();
+        let rounds: Vec<Vec<super::whir_chain::ChainRoundWires<'_>>> = held
+            .storage
+            .iter()
+            .zip(&openings)
+            .map(|(chain, (current, next))| chain.wires(current, next))
+            .collect();
+        // ⚠ THE ROOTS ARE THE INTERNED CONSTANTS THE ROOTS BLOCK ABSORBED,
+        // re-interned here. `LfmBuilder::word_const` keys on the canonical word
+        // and hands back the same address, so the program still holds exactly
+        // one `Const` per root and the pool does not double.
+        let roots: Vec<Cell> = derived
+            .iter()
+            .map(|word| b.digest_const(*word).as_cell())
+            .collect();
+        assert_eq!(
+            roots.len(),
+            layout.num_polys(),
+            "the genesis stack committed {} polynomials and the driver carries {} roots",
+            layout.num_polys(),
+            roots.len(),
+        );
+        let wires: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
+            .map(|poly| StackedPolyWires {
+                rounds: &rounds[poly],
+                root: roots[poly],
+                final_value: held.finals[poly],
+            })
+            .collect();
+        let column_points = walk.column_points();
+        let mut points: Vec<&[Ext]> = Vec::with_capacity(layout.placements().len());
+        let mut values: Vec<Ext> = Vec::with_capacity(layout.placements().len());
+        for &(table, columns) in plan.prepared_runs() {
+            let start = walk.column_at(table);
+            points.extend_from_slice(&column_points[start..start + columns]);
+            values.extend_from_slice(&walk.values[start..start + columns]);
+        }
+        assert_eq!(
+            points.len(),
+            layout.placements().len(),
+            "the stack has {} columns and the runs gather {} claims",
+            layout.placements().len(),
+            points.len(),
+        );
+        super::whir_stacked::emit_stacked_verify(
+            &mut b,
+            &mut transcript,
+            layout,
+            &wires,
+            &points,
+            &values,
+            shape,
+            domain,
+        );
+    }
 
     assert_eq!(
         at, total,
@@ -915,6 +1190,9 @@ pub struct GlobalCost {
     pub tables: usize,
     /// The commitment groups' wrappers and their chains, CONST-FREE.
     pub groups: usize,
+    /// The prepared genesis opening's wrapper and chain, CONST-FREE. Zero on a
+    /// run whose genesis is entirely sparse, which is every fixture here.
+    pub prepared: usize,
     /// The bus balance against the literal zero.
     pub closure: usize,
     /// The published set's `Unpack`s — one per epoch, and NOT its publishes.
@@ -942,7 +1220,7 @@ impl GlobalCost {
     /// INSTRUCTIONS excluding every `LFM_CONST`, every hint and every publish —
     /// the convention the per-leg forms are in.
     pub fn operations(&self) -> usize {
-        self.spine + self.tables + self.groups + self.closure + self.publish_ops
+        self.spine + self.tables + self.groups + self.prepared + self.closure + self.publish_ops
     }
 
     /// Every instruction the compiled program should hold.
@@ -997,12 +1275,25 @@ pub fn global_cost(
         pool.constant_word(*word);
     }
 
-    // The roots block: every carried root, and ZERO derived.
+    // The roots block: every carried root, then the genesis stack's derived
+    // ones — none on a run whose genesis is entirely sparse.
     let carried = global.proof.proof.roots.len();
-    let (roots_ops, schedule) = super::whir_epoch::roots_block_cost(carried, 0, statement.entry());
+    let derived: Vec<LfmWord> = global
+        .prepared
+        .as_ref()
+        .map(|prepared| {
+            prepared
+                .roots
+                .iter()
+                .map(super::algebraic_commit::commitment_to_digest)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (roots_ops, schedule) =
+        super::whir_epoch::roots_block_cost(carried, derived.len(), statement.entry());
     cost.spine += roots_ops + schedule.rows();
     cost.perms += schedule.perms();
-    for word in super::whir_epoch::roots_block_constants(&[], &schedule) {
+    for word in super::whir_epoch::roots_block_constants(&derived, &schedule) {
         pool.constant_word(word);
     }
 
@@ -1080,6 +1371,43 @@ pub fn global_cost(
         // the FACTOR felt is keyed on the bit count, so the pool is the union
         // over the DISTINCT widths and never a multiple of the grind count.
         // Nineteen grinds at one width pay for four words between them.
+        let (folding, ood, query) = shape.grind;
+        for bits in [folding, ood, query] {
+            for word in super::epoch::grinding_check_constants(bits as u8) {
+                pool.constant_word(word);
+            }
+        }
+    }
+
+    // ★★ THE PREPARED GENESIS OPENING, threaded from where the LAST GROUP left
+    // the sponge — the position it is emitted at, which is the only position
+    // its row count is correct for.
+    //
+    // ⚠ ITS GROUPS ARE THE PAGES, not one shared point. DECODE's five columns
+    // settle at ONE point and `whir_epoch::prepared_cost` charges one `eq` for
+    // the five; this stack settles each page's two columns at that page's own
+    // reduced point, so it pays one `eq` per PAGE — which is the term
+    // `continuation::marginal_stacked_rows` charges a carried page, and the
+    // pin in `whir_stacked_tests` is where the two are compared.
+    if let Some(prepared) = &global.prepared {
+        let (layout, domain) = prepared.stacked();
+        let per_page = GlobalRoute::GenesisPage.columns();
+        let group_of: Vec<usize> = (0..layout.placements().len())
+            .map(|column| column / per_page)
+            .collect();
+        let shape = ChainShape::new(plan.config(), layout.n_stack());
+        let entry = groups
+            .last()
+            .map_or(walk.entry, super::whir_stacked::StackedCost::entry);
+        let leg = super::whir_stacked::stacked_verify_cost(layout, &group_of, &shape, entry);
+        cost.prepared += leg.operations();
+        cost.perms += leg.perms();
+        for word in leg.own_constants() {
+            pool.constant_word(word);
+        }
+        for word in super::whir_chain::chain_fold_constants(&shape, domain) {
+            pool.constant_word(word);
+        }
         let (folding, ood, query) = shape.grind;
         for bits in [folding, ood, query] {
             for word in super::epoch::grinding_check_constants(bits as u8) {

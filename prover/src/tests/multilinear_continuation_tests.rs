@@ -1769,7 +1769,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     // would not say which rule produced it, and the two are separately wrong in
     // different ways.
     let num_vars = crate::continuation::PAGE_NUM_VARS;
-    let marginal = crate::continuation::GENESIS_PAGE_MARGINAL_ROWS;
+    let marginal = crate::continuation::marginal_stacked_rows(num_vars, plan.n_fixed);
     println!(
         "GENESIS ROUTING: {} of {} pages stacked {dense_bases:02x?}; the sparse form \
          would have cost {dense_total} rows for them and costs {sparse_total} for the \
@@ -1780,7 +1780,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         plan.routes.len(),
         plan.n_fixed,
         plan.routes.iter().filter(|r| r.has_init).count(),
-        crate::continuation::candidate_threshold_entries(num_vars),
+        crate::continuation::candidate_threshold_entries(num_vars, plan.n_fixed),
         plan.routes.iter().filter(|r| r.candidate).count(),
         plan.savings,
         crate::continuation::PREPARED_LEG_ROWS,
@@ -1801,27 +1801,29 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     );
     // The two parts' own pre-registrations, so a green here cannot come from
     // the right set reached by the wrong arithmetic.
-    // ⚠ `n_fixed` DECIDES NOTHING — the rule reads one literal. It is asserted
-    // because THIS run standing at the height the literal was MEASURED at is
-    // what makes that literal the right charge for it; a taller run would be
-    // charged too little, and this is where that is read.
+    // ★ `n_fixed` DECIDES THE MARGINAL, so it is asserted before anything
+    // derived from it: this run stands at the block's bracket, which is what
+    // makes 111 the charge for it. A run with fewer genesis pages stands lower
+    // and is charged less — the form follows the run rather than the run being
+    // assumed into the form.
     assert_eq!(
         plan.n_fixed, 24,
         "thirty genesis pages: 18 + ceil(log2(60))"
     );
-    assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
+    assert_eq!(plan.n_fixed, crate::continuation::BLOCK_STACK_VARS);
     assert_eq!(
-        marginal, 103,
-        "the retired three-term reading, UNPINNED — the threaded sponge makes the \
-         true marginal depend on WHICH page is added, spreading {{109, 110, 111}} at \
-         this height"
+        marginal, 111,
+        "the form at this bracket: eq 90 + indicators 12 + per-column 6 + the sponge \
+         bound 3. The sponge term is a BOUND — the true marginal is predicted to be \
+         109, 110 or 111 depending on WHICH page is added, and the form charges the \
+         dearest; `lfm::whir_stacked_tests` is where that prediction is measured"
     );
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
         "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_261);
+    assert_eq!(plan.savings, 10_248_237);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.

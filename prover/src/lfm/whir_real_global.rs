@@ -12,10 +12,15 @@
 //! 1. **Sixteen groups, not two.** Every bookend is committed ALONE so its root
 //!    can be compared against the epoch that committed it — that comparison IS
 //!    the cross-epoch binding — and the global-memory tables share one group.
-//! 2. **No DECODE table and no prepared opening**, so the roots block carries
-//!    no derived root and this driver has no `decode_commitment` and no
-//!    `prepared` parameter. The once-per-bundle derivations the epoch driver
-//!    carries have nothing to carry here.
+//! 2. **No DECODE table, and a prepared opening only when the genesis is
+//!    dense.** There is no `decode_commitment` here and never will be: DECODE
+//!    is an epoch table. ⚠ THE SECOND HALF OF THIS SENTENCE USED TO SAY THERE
+//!    WAS NO PREPARED OPENING EITHER, and that stopped being true when the
+//!    genesis stack landed — the [`WhirRealGlobal::prepared`] field carries it,
+//!    the roots block absorbs its roots after the carried ones, and the machine
+//!    interns them as program text. It is `None` on a run whose genesis is
+//!    entirely sparse, which is every fixture but `dense_data_page_touch`, and
+//!    that is why the stale sentence read true for as long as it did.
 //! 3. **The bus target is a literal zero** — the cross-epoch bus has no
 //!    counterparty in the statement, so there is no published-bytes term and no
 //!    commit index.
