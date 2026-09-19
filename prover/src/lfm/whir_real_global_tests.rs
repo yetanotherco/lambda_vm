@@ -151,7 +151,53 @@ mod tests {
         );
     }
 
-    /// ★ THE ACCEPTANCE CHECK IS REAL, and this is the arm that says so.
+    /// ★ THE ARM THAT REACHES THE VERDICT ITSELF, and it exists because a
+    /// mutation could not fire without it.
+    ///
+    /// `a_restated_page_set_does_not_harvest` below refuses through the
+    /// verifier's `Err` — a restated page set changes the TABLE COUNT, and the
+    /// count check inside `verify_global_bookends` errors before any challenge
+    /// is drawn. So that arm never reaches the `Ok(false)` branch, and blunting
+    /// that branch left the whole module green: 3 of 3, with the refusal coming
+    /// from the propagated error instead. Moving a root keeps the count and
+    /// makes `multi_verify` return a VERDICT, which is the only way this arm's
+    /// branch is exercised at all.
+    ///
+    /// The lesson is the campaign's: a refusal that is over-determined shows a
+    /// value is BOUND, not by which check — and the way to find out which is to
+    /// remove one and watch what stays green.
+    #[test]
+    fn a_tampered_cross_epoch_root_does_not_harvest() {
+        let (elf_bytes, opts, mut b) = bundle();
+        assert!(
+            !b.global.proof.roots.is_empty(),
+            "the cross-epoch proof commits nothing, so there is no root to move"
+        );
+        let before = b.global.proof.roots[0];
+        b.global.proof.roots[0][0] ^= 1;
+        assert_ne!(
+            b.global.proof.roots[0], before,
+            "the tamper did not change the root it was meant to move"
+        );
+        // The count is untouched, so the AIR set still matches and the refusal
+        // has to come from the argument rather than from an arity check.
+        assert_eq!(
+            b.global.table_num_vars.len(),
+            b.global.proof.tables.len(),
+            "this tamper must not change the table count"
+        );
+        let message = match real_global_from_whir_continuation(&opts, &elf_bytes, &b) {
+            Ok(_) => panic!("a bundle whose cross-epoch root was moved was harvested"),
+            Err(message) => message,
+        };
+        assert!(
+            message.contains("does not verify"),
+            "the refusal is not the verdict this arm exists to reach: {message}"
+        );
+    }
+
+    /// ★ THE ACCEPTANCE CHECK IS REAL, and this is the arm that says so — by
+    /// the verifier's ERROR, not by its verdict (see the arm above).
     ///
     /// The touched page set drives which cross-epoch tables exist, so a
     /// restated one must not harvest — and a driver that skipped its
