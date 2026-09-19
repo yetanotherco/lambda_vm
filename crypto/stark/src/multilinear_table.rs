@@ -1136,6 +1136,15 @@ fn prepared_runs(at: &[PreparedColumn]) -> Result<Vec<(usize, usize)>, MlError> 
     Ok(runs)
 }
 
+/// What [`prepared_claims`] hands back: the point each settled column is claimed
+/// at, and the value it is claimed to take there, both in stack order.
+///
+/// ⚠ NAMED ONLY TO KEEP THAT SIGNATURE READABLE, and it carries no bound — a
+/// bound on a type alias is not enforced, and `FieldElement`'s own is checked
+/// at every use. That is the form `sumcheck::RoundGroup` and
+/// `batch::ResidentProof` already take in this workspace.
+type PreparedClaims<E> = (Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>);
+
 /// The points and claimed values a prepared opening is settled against, gathered
 /// in stack order.
 ///
@@ -1156,7 +1165,7 @@ fn prepared_claims<E: IsField>(
     runs: &[(usize, usize)],
     points: &[Vec<FieldElement<E>>],
     values: &[FieldElement<E>],
-) -> Result<(Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>), MlError> {
+) -> Result<PreparedClaims<E>, MlError> {
     let mut at_points = Vec::new();
     let mut at_values = Vec::new();
     for &(start, n) in runs {
