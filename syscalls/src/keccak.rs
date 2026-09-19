@@ -182,19 +182,45 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
 /// over owned arrays — never an aligned doubleword load, which the VM would trap
 /// on at a misaligned address.
 pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut state = [0u64; 25];
-    // Bytes 0..64 span rate lanes 0..8: lanes 0..4 from `left`, 4..8 from `right`.
-    for i in 0..4 {
-        let l: &[u8; 8] = left[i * 8..i * 8 + 8].try_into().unwrap();
-        state[i] = u64::from_le_bytes(*l);
-        let r: &[u8; 8] = right[i * 8..i * 8 + 8].try_into().unwrap();
-        state[4 + i] = u64::from_le_bytes(*r);
-    }
-    // pad10*1 for a 64-byte message at rate 136: delimiter at byte 64 (lane 8,
-    // low byte) and the final bit at the last rate byte (byte 135, lane 16 high
-    // byte). Both target lanes are still zero, so XOR == assignment.
-    state[8] ^= u64::from(DELIMITER);
-    state[RATE_LANES - 1] ^= FINAL_PAD_LANE_BIT;
+    let lane = |b: &[u8; 32], i: usize| -> u64 {
+        let w: &[u8; 8] = b[i * 8..i * 8 + 8].try_into().unwrap();
+        u64::from_le_bytes(*w)
+    };
+    // Every lane written once, in one literal: zeroing all 25 and then
+    // overwriting 10 of them costs a memset per call, and this is the guest's
+    // hottest call. Bytes 0..64 span rate lanes 0..8 (0..4 from `left`, 4..8
+    // from `right`); pad10*1 for a 64-byte message at rate 136 puts the
+    // delimiter at byte 64 (lane 8, low byte) and the final bit at the last
+    // rate byte (byte 135, lane 16 high byte). Those lanes start zero, so the
+    // XORs the sponge would do are plain assignments.
+    let mut state: [u64; 25] = [
+        lane(left, 0),
+        lane(left, 1),
+        lane(left, 2),
+        lane(left, 3),
+        lane(right, 0),
+        lane(right, 1),
+        lane(right, 2),
+        lane(right, 3),
+        u64::from(DELIMITER),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        FINAL_PAD_LANE_BIT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    const _: () = assert!(RATE_LANES - 1 == 16);
     keccak_permute(&mut state);
 
     let mut out = [0u8; 32];
