@@ -66,6 +66,14 @@ use super::word::LfmWord;
 /// rather than imported because `whir_epoch`'s copies are private, and a
 /// disagreement between the two lists must fail this file's own refusal below
 /// rather than silently route a table differently from the emitter.
+/// `LFM_HASH`'s column count, read from the census panel's own cliff: wt3's
+/// wrap 0 prints `LFM_HASH 240929/262144 … cliff +85196800 cells`, and a cliff
+/// is the padded height times the width, so `85_196_800 / 262_144 = 325`.
+///
+/// ★ It is the RPX permutation's cell cost, which the campaign measured
+/// independently at 325 cells per permutation — two routes to one number.
+const LFM_HASH_WIDTH: usize = 325;
+
 const BITWISE_NAME: &str = "BITWISE";
 const DECODE_NAME: &str = "DECODE";
 const KECCAK_RC_NAME: &str = "KECCAK_RC";
@@ -1274,17 +1282,37 @@ fn the_block_f1_at_every_epoch_shape() {
 }
 
 /// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(name, width, vars)`
-/// per table in sub-proof order.
+/// per table in sub-proof order — AT THE TABLE-CHUNKING POSTURE THE RECORD
+/// PROVES.
 ///
-/// ⚠ A FIXTURE READ FROM A BOX RUN, transcribed from
-/// `thoughts/shared/whir-recursion/handoffs/sh1-epoch-shapes-2026-09-18.log`
-/// (`whir_epoch_shapes` at `a3b128db` on FAST, guest ethrex
-/// `8f826601…ec80a`, input `ethrex_mainnet_25368371` `573004e6…`). The widths
-/// are the AIRs' and the heights the proof's.
+/// ⚠ A FIXTURE READ FROM A BOX RUN, transcribed from the sh4 log
+/// (`the_block_f1_at_every_epoch_shape` at `90797d63` on FAST, 14.64 s, guest
+/// ethrex
+/// `8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a`, input
+/// `ethrex_mainnet_25368371` `573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f`).
+/// The widths are the AIRs' and the heights the proof's.
 ///
-/// ⛔ sh1 prints this for EPOCH 0 ONLY — its printer is gated on the epoch index
-/// — which is why [`the_block_f1_at_every_epoch_shape`] exists.
-fn sh1_epoch_zero() -> Vec<(&'static str, usize, usize)> {
+/// ⛔⛔ THE POSTURE IS PART OF THIS FIXTURE, and it is why the previous
+/// transcription here was wrong. The run that set the record exports
+/// **`LAMBDA_VM_MAX_ROWS_LOG2=21`** among its required variables, so
+/// `MaxRowsConfig::default()` (`tables/mod.rs:126-146`) returns
+/// `Self::uniform(1 << 21)` and every VM table is ONE chunk per epoch — **27
+/// tables**. The earlier shape walks (sh1, sh2, sh3) exported no cap and got
+/// the PRODUCTION per-table caps, which chunk CPU into four, MEMW_R into five
+/// and LT into two — **34 tables**, a different epoch of the same block. Every
+/// number derived from the 34-table layout is at the wrong posture; the
+/// campaign's correction is the STATE entry of 2026-09-18 22:53Z.
+///
+/// ⓘ 27 rather than 26 because MEMW_R still needs THREE chunks under a uniform
+/// `2^21` cap — two full ones and a `2^18` tail — so the cap does not collapse
+/// every table to one. The last row is the level-to-global bookend, which the
+/// instrument's namer prints as `unknown`; it is committed alone
+/// (`epoch_groups` is `[n - 1, 1]`).
+///
+/// ⛔ sh4 prints the per-table census for every epoch, but this transcription is
+/// EPOCH 0's — the other fourteen live in the log, and the shapes that matter
+/// for a lever are the summary line's.
+fn sh4_epoch_zero() -> Vec<(&'static str, usize, usize)> {
     vec![
         ("BITWISE", 21, 20),
         ("DECODE", 6, 20),
@@ -1296,25 +1324,18 @@ fn sh1_epoch_zero() -> Vec<(&'static str, usize, usize)> {
         ("ECDAS", 521, 2),
         ("HINT", 41, 2),
         ("REGISTER", 5, 7),
-        ("CPU[0]", 38, 19),
-        ("CPU[1]", 38, 19),
-        ("CPU[2]", 38, 19),
-        ("CPU[3]", 38, 19),
-        ("LT[0]", 17, 19),
-        ("LT[1]", 17, 19),
+        ("CPU[0]", 38, 21),
+        ("LT[0]", 17, 20),
         ("SHIFT[0]", 29, 18),
         ("MEMW[0]", 49, 17),
-        ("MEMW_A[0]", 29, 19),
-        ("MEMW_A[1]", 29, 16),
+        ("MEMW_A[0]", 29, 20),
         ("LOAD[0]", 18, 19),
         ("MUL[0]", 26, 11),
         ("DVRM[0]", 34, 2),
         ("BRANCH[0]", 14, 17),
-        ("MEMW_R[0]", 10, 20),
-        ("MEMW_R[1]", 10, 20),
-        ("MEMW_R[2]", 10, 20),
-        ("MEMW_R[3]", 10, 20),
-        ("MEMW_R[4]", 10, 18),
+        ("MEMW_R[0]", 10, 21),
+        ("MEMW_R[1]", 10, 21),
+        ("MEMW_R[2]", 10, 18),
         ("EQ[0]", 12, 13),
         ("BYTEWISE[0]", 26, 17),
         ("STORE[0]", 16, 19),
@@ -1337,35 +1358,54 @@ fn sh1_epoch_zero() -> Vec<(&'static str, usize, usize)> {
 /// constraint DAGs and buses), the alpha ladder, and the pool. Those are
 /// [`the_block_f1_at_every_epoch_shape`]'s, at all fifteen shapes.
 ///
-/// ★ It ASSERTS sh1's own printed layout before counting anything — two groups,
-/// `n_stack` 25, seven polynomials and one, Q 112, eight chains, 56 rounds — so
-/// a reconstruction that misses the box's layout fails loudly instead of
-/// censusing a different epoch. That is V1g's rule, kept.
+/// ★ It ASSERTS sh4's own printed layout before counting anything — 27 tables,
+/// two groups, `n_stack` 25 and 25, eight polynomials and one, Q 112, nine
+/// chains, 63 rounds — so a reconstruction that misses the box's layout fails
+/// loudly instead of censusing a different epoch. That is V1g's rule, kept.
+///
+/// ⛔⛔ RE-PINNED FROM sh1 TO sh4, and that is not a refresh. sh1 ran without
+/// `LAMBDA_VM_MAX_ROWS_LOG2` and censused a 34-table epoch; the record proves a
+/// 27-table one. Every number this test printed at the sh1 layout — the
+/// per-chain rows, the chain share, and the whole lever ladder below it — was
+/// evaluated at a posture nothing in the campaign proves.
 #[test]
 fn the_production_chain_terms_at_epoch_zero() {
     use crate::multilinear_prove::chain_config;
     use multilinear::stacking::StackedLayout;
 
-    let census = sh1_epoch_zero();
+    let census = sh4_epoch_zero();
     let shapes: Vec<(usize, usize)> = census.iter().map(|&(_, w, v)| (w, v)).collect();
-    assert_eq!(shapes.len(), 34, "epoch 0 is 34 tables (sh1)");
+    assert_eq!(
+        shapes.len(),
+        27,
+        "epoch 0 is 27 tables at the record posture (sh4)"
+    );
 
     let sizes = epoch_groups(shapes.len());
-    assert_eq!(sizes, vec![33, 1], "the bookend is committed alone");
+    assert_eq!(sizes, vec![26, 1], "the bookend is committed alone");
     let config = chain_config(&shapes);
-    assert_eq!(config.num_queries, 112, "sh1: Q 112");
+    assert_eq!(config.num_queries, 112, "sh4: Q 112");
     let (layouts, _domains) = stacks(&shapes, &sizes, &config).expect("the epoch's stacks build");
     assert_eq!(layouts.len(), 2, "two commitment groups");
-    assert_eq!(layouts[0].n_stack(), 25, "sh1: group0 n_stack 25");
-    assert_eq!(layouts[0].num_polys(), 7, "sh1: group0 polys 7");
-    assert_eq!(layouts[1].n_stack(), 25, "sh1: bookend n_stack 25");
-    assert_eq!(layouts[1].num_polys(), 1, "sh1: bookend polys 1");
+    assert_eq!(layouts[0].n_stack(), 25, "sh4: group0 n_stack 25");
+    assert_eq!(layouts[0].num_polys(), 8, "sh4: group0 polys 8");
+    assert_eq!(layouts[1].n_stack(), 25, "sh4: bookend n_stack 25");
+    assert_eq!(layouts[1].num_polys(), 1, "sh4: bookend polys 1");
 
-    let shape = ChainShape::new(&config, 25);
-    let rounds = shape.rounds();
+    // ⚠ PER GROUP, not `chains × one shape`. At epoch 0 both groups stack to 25
+    // so a single shape would give the same total, and at every OTHER epoch of
+    // the block it would not: sh4's bookend reads `n_stack` 22, 23 and 24 while
+    // group 0 holds 25, and `ChainShape::rounds()` is
+    // `ceil(n_stack / log_folding)`. Summing per group is what makes this form
+    // transferable to the other fourteen shapes instead of right once.
+    let rounds: usize = layouts
+        .iter()
+        .map(|l| l.num_polys() * l.n_stack().div_ceil(config.log_folding))
+        .sum();
     let chains: usize = layouts.iter().map(StackedLayout::num_polys).sum();
-    assert_eq!(chains, 8, "sh1: chains 8");
-    assert_eq!(chains * rounds, 56, "sh1: rounds 56");
+    assert_eq!(chains, 9, "sh4: chains 9");
+    assert_eq!(rounds, 63, "sh4: rounds 63");
+    let shape = ChainShape::new(&config, 25);
 
     // The DECODE prepared group: five columns at twenty variables, one stacked
     // polynomial, at its own config — the one `EpochPlan::build` derives.
@@ -1381,19 +1421,46 @@ fn the_production_chain_terms_at_epoch_zero() {
     let prepared_words =
         decode_layouts[0].num_polys() * (1 + RoundStorage::words(&decode_shape) as usize);
 
+    // ★ THE CHAINS' PERMUTATIONS, and they are the term this note's ladder was
+    // missing. `LFM_HASH` is one row per sponge permutation at width 325, and
+    // width 325 times a padded `2^18` is 51.8% of wrap 0's whole trace — so the
+    // chains' share of the PERMUTATION count decides the chains' share of the
+    // CELLS, which is the quantity the device is billed for.
+    //
+    // Card-free by the same argument as the rows: `chain_perms` takes a
+    // `ChainShape` and a `SpongeEntry`, and neither is an AIR. ⚠ The entry is
+    // `fresh()` rather than the walk's, so this is the chains' own schedule as
+    // if they ran first; the ASSEMBLED count is F1's `perms` and it threads the
+    // entry leg to leg. The same form is used by
+    // [`the_chain_levers_sized_at_epoch_zero`], so the two tests' permutation
+    // numbers are comparable rather than two conventions side by side.
+    let chain_perms: usize = layouts
+        .iter()
+        .map(|l| {
+            let sh = ChainShape::new(&config, l.n_stack());
+            l.num_polys()
+                * super::whir_chain::chain_perms(&sh, super::whir_transcript::SpongeEntry::fresh())
+        })
+        .sum();
+
     // The epoch's own carried roots: one word per polynomial of every group.
     let carried = chains;
     let closure = closure_rows(shapes.len(), 0);
 
-    println!("== epoch 0 of block 25368371, the terms that need no AIRs ==");
     println!(
-        "   Q {} · rounds per chain {rounds} · chains {chains}",
-        config.num_queries
+        "== epoch 0 of block 25368371 at LAMBDA_VM_MAX_ROWS_LOG2=21, the terms \
+         that need no AIRs =="
+    );
+    println!(
+        "   Q {} · chains {chains} · rounds {rounds} total ({} per chain at n_stack 25)",
+        config.num_queries,
+        shape.rounds(),
     );
     println!("   chain shape rows, per chain      {per_chain_rows:>10}");
     println!("   chain shape rows, all chains     {chain_rows:>10}");
     println!("   chain arena words, per chain     {per_chain_words:>10}");
     println!("   chain arena words, all chains    {chain_words:>10}");
+    println!("   chain permutations, all chains   {chain_perms:>10}");
     println!("   prepared arena words             {prepared_words:>10}");
     println!("   carried root words               {carried:>10}");
     println!("   closure (silent epoch)           {closure:>10}");
@@ -1401,16 +1468,27 @@ fn the_production_chain_terms_at_epoch_zero() {
         "   ⇒ chains' rows + chains' arena   {:>10}",
         chain_rows + chain_words
     );
-    // wt3 measured wrap 0 at 2,560,529 instructions, of which LFM_HINT was
-    // 375,421 and LFM_CONST 407. Printed as a RATIO rather than asserted,
-    // because the measurement is a box run's and this test is a laptop's.
+    // ⚠ EVERY ONE OF THESE IS A BOX MEASUREMENT AT THE RECORD POSTURE — wt3,
+    // `bad7caca` on FAST, `LAMBDA_VM_MAX_ROWS_LOG2=21`, guest `8f826601…`,
+    // input `573004e6…`. Printed as RATIOS rather than asserted, because a box
+    // run's number does not belong in a laptop test's assertion.
     const WT3_WRAP0_INSTRUCTIONS: usize = 2_560_529;
     const WT3_WRAP0_HINT: usize = 375_421;
+    const WT3_WRAP0_HASH: usize = 240_929;
+    const WT3_WRAP0_CELLS: usize = 164_433_664;
     println!(
         "   share of wt3 wrap 0's {WT3_WRAP0_INSTRUCTIONS} instructions: chains' rows {:.1}%, \
-         chains' arena {:.1}% of its {WT3_WRAP0_HINT} LFM_HINT",
+         chains' arena {:.1}% of its {WT3_WRAP0_HINT} LFM_HINT, chains' perms {:.1}% of its \
+         {WT3_WRAP0_HASH} LFM_HASH",
         100.0 * chain_rows as f64 / WT3_WRAP0_INSTRUCTIONS as f64,
         100.0 * chain_words as f64 / WT3_WRAP0_HINT as f64,
+        100.0 * chain_perms as f64 / WT3_WRAP0_HASH as f64,
+    );
+    println!(
+        "   ⇒ LFM_HASH is {} cells of wrap 0's {WT3_WRAP0_CELLS} ({:.1}%) — width {LFM_HASH_WIDTH} \
+         at a padded 2^18, and the single largest chip of a WHIR wrap",
+        LFM_HASH_WIDTH * 262_144,
+        100.0 * (LFM_HASH_WIDTH * 262_144) as f64 / WT3_WRAP0_CELLS as f64,
     );
 
     // ⛔ A CHECK THAT CAN FAIL, and the reason it is here: the chains' rows are
@@ -1418,48 +1496,158 @@ fn the_production_chain_terms_at_epoch_zero() {
     // something small would make every lever sized against it look decisive.
     assert!(
         chain_rows > WT3_WRAP0_INSTRUCTIONS / 2,
-        "the eight chains' shape rows are {chain_rows}, under half of wrap 0's \
+        "the nine chains' shape rows are {chain_rows}, under half of wrap 0's \
          measured {WT3_WRAP0_INSTRUCTIONS} — either the form or the shape is wrong"
     );
     assert!(
         chain_words < WT3_WRAP0_HINT,
         "the chains' arena words are {chain_words}, at or above the whole \
-         measured LFM_HINT of {WT3_WRAP0_HINT}, which leaves the 34 tables' own \
+         measured LFM_HINT of {WT3_WRAP0_HINT}, which leaves the 27 tables' own \
          wires no room"
+    );
+    // ⛔ AND ONE ON THE PERMUTATIONS, which is the term that decides the cells:
+    // the chains cannot account for more permutations than the program emitted.
+    // A form that over-counted them would put the cell lever in the wrong place
+    // — which is exactly the mistake the instruction ladder made.
+    assert!(
+        chain_perms > 0 && chain_perms < WT3_WRAP0_HASH,
+        "the chains' permutations are {chain_perms} against wrap 0's measured \
+         {WT3_WRAP0_HASH} LFM_HASH rows — a chain half at or above the whole \
+         measured count leaves the 27 tables' own sponge no room"
     );
 }
 
-/// ★★★ THE LEVERS ON THE LARGEST TERM, SIZED — the chains' query openings at the
-/// block's epoch-0 shape, under each knob that moves them.
+/// The block's fifteen epoch shapes at the record posture, one row per wrap:
+/// `(tables, group-0 n_stack, group-0 polys, bookend n_stack, bookend polys)`.
 ///
-/// [`the_production_chain_terms_at_epoch_zero`] establishes that the eight
-/// chains are the dominant term of a WHIR wrap. This evaluates them under the
-/// knobs that set them, so a lever is sized against the term it binds rather
-/// than against the program as a whole.
+/// ⚠ TRANSCRIBED FROM THE sh4 LOG's summary lines
+/// (`the_block_f1_at_every_epoch_shape` at `90797d63` on FAST, 14.64 s,
+/// `LAMBDA_VM_MAX_ROWS_LOG2=21`, guest `8f826601…ec80a`, input `573004e6…f17f`).
+/// Q is 112 on all fifteen, which is why the ladder can carry one config.
 ///
-/// ⛔ NONE OF THESE IS FREE, and each row's cost side is named in the printout:
-/// a bigger blowup buys fewer queries and costs the BASE prover a larger
-/// codeword; more grinding buys fewer queries and costs host search; a smaller
-/// security target is a POSTURE decision and Mauro's, not an optimisation.
+/// ★ THIS IS EVERYTHING A CHAIN COST NEEDS. `chain_shape_rows`,
+/// `RoundStorage::words` and `chain_perms` take a `ChainShape`, and a
+/// `ChainShape` is `(config, n_stack)` — no AIR, no per-table census, no card.
+/// So the chain half of all fifteen wraps is a laptop computation from these
+/// five numbers per epoch.
+fn sh4_epoch_shapes() -> Vec<(usize, usize, usize, usize, usize)> {
+    vec![
+        (27, 25, 8, 25, 1),
+        (27, 25, 8, 24, 1),
+        (27, 25, 8, 24, 1),
+        (27, 25, 11, 23, 1),
+        (27, 25, 11, 24, 1),
+        (27, 25, 10, 24, 1),
+        (27, 25, 9, 24, 1),
+        (27, 25, 8, 23, 1),
+        (27, 25, 8, 22, 1),
+        (27, 25, 8, 22, 1),
+        (27, 25, 8, 22, 1),
+        (27, 25, 8, 22, 1),
+        (27, 25, 8, 23, 1),
+        (26, 25, 9, 23, 1),
+        (27, 25, 8, 23, 1),
+    ]
+}
+
+/// wt3's measured census panel, per wrap: `(cells, instructions, LFM_HASH,
+/// LFM_HINT)`.
 ///
-/// ★ The one that is not a trade is the last: `ChainConfig::with_security`'s own
-/// doc says the count is "the conservative mirror of the parameters the repo
-/// already ships", that WHIR's per-round analysis "gets to use the
-/// out-of-domain point, which this ignores entirely", and — verbatim — "Doing
-/// that analysis is what would let the query count come down." So the largest
-/// term of the WHIR wrap is set by a query count the code itself calls
-/// conservative, and the lever on it is an ANALYSIS, not a parameter.
+/// ⚠ A BOX MEASUREMENT AT THE RECORD POSTURE — the WHIR tree at `bad7caca` on
+/// FAST, `LAMBDA_VM_MAX_ROWS_LOG2=21`, RPX, `SIBLINGS_L0 = 6`, guest
+/// `8f826601…ec80a`, input `573004e6…f17f`. These are the numbers a lever has
+/// to move, and they are quoted here rather than asserted because a box run's
+/// count does not belong in a laptop test's assertion.
+fn wt3_wrap_census() -> Vec<(usize, usize, usize, usize)> {
+    vec![
+        (164_433_664, 2_560_529, 240_929, 375_421),
+        (164_433_664, 2_547_399, 238_898, 373_163),
+        (164_433_664, 2_540_032, 239_596, 374_181),
+        (251_006_720, 3_177_986, 306_311, 478_049),
+        (256_249_600, 3_196_212, 308_099, 480_979),
+        (251_006_720, 2_979_794, 285_579, 445_825),
+        (251_006_720, 2_769_396, 263_842, 411_822),
+        (164_433_664, 2_523_302, 237_910, 371_370),
+        (164_433_664, 2_512_281, 236_504, 369_213),
+        (164_433_664, 2_512_389, 236_510, 369_222),
+        (164_433_664, 2_511_700, 236_464, 369_156),
+        (164_433_664, 2_510_068, 236_482, 369_184),
+        (164_433_664, 2_515_860, 237_664, 371_024),
+        (165_809_920, 2_731_381, 260_276, 406_317),
+        (164_435_712, 2_504_309, 236_928, 369_971),
+    ]
+}
+
+/// wt3's wrap-0 census panel in full: `(chip, real rows, padded rows, width)`.
+///
+/// The width is READ OFF THE PANEL'S OWN CLIFF rather than assumed: the panel
+/// prints `cliff +N cells` for the next doubling, and a doubling adds `padded ×
+/// width` cells, so `width = cliff / padded`. Every one of the eleven is
+/// derived that way, and [`the_chain_levers_sized_at_epoch_zero`] asserts that
+/// `Σ width × padded` reproduces the census's own cell total — which is what
+/// makes the derivation a check rather than a guess.
+fn wt3_wrap0_chips() -> Vec<(&'static str, usize, usize, usize)> {
+    vec![
+        ("LFM_HASH", 240_929, 262_144, 325),
+        ("BITWISE", 1_048_576, 1_048_576, 25),
+        ("LFM_XALU", 790_474, 1_048_576, 18),
+        ("LFM_SELECT", 323_008, 524_288, 26),
+        ("LFM_LANES", 417_412, 524_288, 19),
+        ("LFM_BALU", 404_808, 524_288, 10),
+        ("LFM_HINT", 375_421, 524_288, 7),
+        ("LFM_BITDEC", 7_925, 8_192, 168),
+        ("LFM_RANGE", 65_536, 65_536, 4),
+        ("LFM_CONST", 407, 512, 4),
+        ("LFM_PUBLIC", 145, 256, 7),
+    ]
+}
+
+/// ★★★ THE LEVERS, SIZED AGAINST THE CAP THAT ACTUALLY BINDS — the chains at
+/// the block's fifteen record-posture shapes, in ROWS, in PERMUTATIONS, in
+/// CELLS and in DEVICE SECONDS.
+///
+/// ⛔⛔ THE LADDER THIS REPLACES RANKED LEVERS BY INSTRUCTION SHARE, AND
+/// INSTRUCTIONS ARE NOT WHAT LEVEL 0 IS BILLED FOR. Three measurements, all at
+/// the record posture, say so:
+///
+/// 1. **The level-0 wall is card-bound.** wt3/wt5/wt6/wt7 — the four arms of
+///    round 1 — all read `level 0: 15 WHIR wraps in 24.3–24.6s` with
+///    `card permit: 30 acquisitions · max holders 1 · held 19.2–19.3s of 24.3s
+///    (79%)`. Six wraps in flight and the card serialised behind one permit.
+/// 2. **The card half is CELLS.** wt4 is the same tree at `SIBLINGS_L0 = 1`,
+///    the serial control, and its per-wrap `CARD HOLD #n multi_prove` fits
+///    `0.481 s + 3.213 ns/cell` with R² 0.977 and a worst residual of 0.041 s
+///    over fourteen wraps. Fitting the same points on INSTRUCTIONS instead
+///    gives R² 0.842 and a 0.138 s residual, and adding instructions to the
+///    cells fit moves R² by 0.002 while collapsing their coefficient.
+/// 3. **The instruction half is the HOST half, and it overlaps.** `prove` minus
+///    the `multi_prove` card hold fits `0.012 s + 0.171 µs/instruction` with
+///    R² 0.966 — a near-zero intercept, which is the check that the form is the
+///    executor's. It is 7.0 s over the fifteen at concurrency 1, and at
+///    concurrency 6 it runs behind the serialised card.
+///
+/// ⇒ A lever that removes instructions buys host seconds that are off the
+/// critical path. A lever that removes CELLS buys card seconds one for one. And
+/// cells are a STEP function of each chip's padded height, so a row lever pays
+/// only where it carries a chip across a power of two.
+///
+/// ★ `LFM_HASH` — one row per sponge permutation, width 325 — is **51.8% of
+/// wrap 0's cells on its own**, and the entire 86,573,056-cell gap between the
+/// block's two cell clusters is `LFM_HASH` crossing `2^18` (85,196,800 of it)
+/// plus `LFM_BITDEC` crossing `2^13` (1,376,256). So the permutation count is
+/// the cell lever, and this test prices every knob in permutations first.
 #[test]
 fn the_chain_levers_sized_at_epoch_zero() {
+    use super::whir_transcript::SpongeEntry;
     use crate::multilinear_prove::chain_config;
     use multilinear::stacking::StackedLayout;
     use multilinear::whir_chain::GrindBits;
 
-    let census = sh1_epoch_zero();
+    let census = sh4_epoch_zero();
     let shapes: Vec<(usize, usize)> = census.iter().map(|&(_, w, v)| (w, v)).collect();
     let sizes = epoch_groups(shapes.len());
     let shipped = chain_config(&shapes);
-    assert_eq!(shipped.num_queries, 112, "sh1: Q 112");
+    assert_eq!(shipped.num_queries, 112, "sh4: Q 112");
     assert_eq!(shipped.log_blowup, 2, "the shipped posture is blowup 4");
     assert_eq!(
         shipped.log_folding, 4,
@@ -1467,96 +1655,232 @@ fn the_chain_levers_sized_at_epoch_zero() {
     );
     let (layouts, _d) = stacks(&shapes, &sizes, &shipped).expect("the epoch's stacks build");
     let chains: usize = layouts.iter().map(StackedLayout::num_polys).sum();
-    assert_eq!(chains, 8, "sh1: chains 8");
-    let n_stack = layouts[0].n_stack();
+    assert_eq!(chains, 9, "sh4: chains 9");
 
-    let base_shape = ChainShape::new(&shipped, n_stack);
-    let base_rows = chains * super::whir_chain::chain_shape_rows(&base_shape);
-    let base_words = chains * (1 + RoundStorage::words(&base_shape) as usize);
-    let base = base_rows + base_words;
+    // ⛔ READ 0, AND IT CAN FAIL: the transcribed fifteen-shape table must agree
+    // with the layout this walk computes for epoch 0. A transcription that
+    // drifted from the log — or a `stacks` that changed under it — would
+    // otherwise size every lever below at a shape no run proved, which is the
+    // exact failure the posture correction was.
+    let epoch_shapes = sh4_epoch_shapes();
+    assert_eq!(epoch_shapes.len(), 15, "the block is fifteen epochs");
+    assert_eq!(
+        (
+            shapes.len(),
+            layouts[0].n_stack(),
+            layouts[0].num_polys(),
+            layouts[1].n_stack(),
+            layouts[1].num_polys()
+        ),
+        epoch_shapes[0],
+        "epoch 0's transcribed sh4 row must be the layout this walk builds"
+    );
 
-    // wt3's wrap 0, measured on FAST at bad7caca. Quoted, never asserted: a box
-    // run's number does not belong in a laptop test's assertion.
-    const WT3_WRAP0_INSTRUCTIONS: usize = 2_560_529;
+    // ⛔ READ 1, AND IT CAN FAIL: the eleven chip widths derived from the
+    // census's own cliffs must reproduce the census's own cell total. `cells =
+    // Σ width × padded height` is the identity every cell number below rests
+    // on, and a width read wrongly off a cliff would move a lever's price
+    // without moving anything else.
+    let chips = wt3_wrap0_chips();
+    let wraps = wt3_wrap_census();
+    let rebuilt: usize = chips.iter().map(|&(_, _, pad, w)| pad * w).sum();
+    assert_eq!(
+        rebuilt, wraps[0].0,
+        "the eleven chips' width × padded height must rebuild wrap 0's measured \
+         cell count; if it does not, a width is misread off its cliff and every \
+         cell price below is wrong"
+    );
+    assert_eq!(
+        chips[0].3, LFM_HASH_WIDTH,
+        "LFM_HASH's width is the RPX permutation's cell cost"
+    );
 
-    println!("== the chains at epoch 0, under each knob that sets them ==");
+    // The wt4 fit, at the record posture. ⚠ Its slope is anchored on TWO cell
+    // levels — the block's wraps cluster at 164.4 M and 251–256 M cells and
+    // vary by under 1% inside each cluster — so it is a MARGINAL between two
+    // clusters 87.7 M cells apart, not a law resolved continuously. Wrap 0 is
+    // excluded from the fit: at 1.256 s of card hold against 0.982–1.041 s for
+    // nine wraps of identical cells it is the run's warm-up, and including it
+    // takes R² from 0.977 to 0.765.
+    const DEVICE_FIXED_S: f64 = 0.4814;
+    const DEVICE_NS_PER_CELL: f64 = 3.213;
+    const HOST_NS_PER_INSTR: f64 = 0.1706 * 1000.0;
+    // The caps, all from the record-posture tree logs and each named with its
+    // stopwatch:
+    //   level-0 wall           24.3 s  (wt5, `level 0: 15 WHIR wraps in 24.3s`)
+    //   of which card held     19.2 s  (wt5, 30 acquisitions, max holders 1)
+    //   card = multi_prove     16.5 s  (wt4 serial control, Σ of 15 holds)
+    //        + build_artifacts  1.9 s  (wt4 serial control, Σ of 15 holds)
+    //   pipeline               143.1 s (round 1's closing arm)
+    const LEVEL0_WALL_S: f64 = 24.3;
+    const LEVEL0_CARD_S: f64 = 19.2;
+    const PIPELINE_S: f64 = 143.1;
+
+    // One epoch's chain half, at a config: rows, arena words and permutations,
+    // summed over both groups at each group's own `n_stack`.
+    let chain_half = |cfg: &ChainConfig, e: &(usize, usize, usize, usize, usize)| {
+        let (_, g0_ns, g0_polys, bk_ns, bk_polys) = *e;
+        let mut rows = 0usize;
+        let mut words = 0usize;
+        let mut perms = 0usize;
+        for (ns, polys) in [(g0_ns, g0_polys), (bk_ns, bk_polys)] {
+            let sh = ChainShape::new(cfg, ns);
+            rows += polys * super::whir_chain::chain_shape_rows(&sh);
+            words += polys * (1 + RoundStorage::words(&sh) as usize);
+            perms += polys * super::whir_chain::chain_perms(&sh, SpongeEntry::fresh());
+        }
+        (rows, words, perms)
+    };
+
+    // A wrap's cells after a chain lever: `LFM_HASH` moves by the permutation
+    // delta and `LFM_HINT` by the arena-word delta, each re-padded to the next
+    // power of two, and every other chip is held at its measured padding.
+    //
+    // ⚠ HELD, NOT ASSUMED ZERO. The chains' remaining rows — `chain_shape_rows`
+    // less the permutations — land in `LFM_BALU`, `LFM_XALU`, `LFM_SELECT`,
+    // `LFM_LANES` and `LFM_BITDEC` in a proportion NOTHING in this tree
+    // measures. Those five are 48,710,208 of wrap 0's cells (29.6%) and their
+    // down-steps need 142,664 / 266,186 / 60,864 / 155_268 / 3,829 rows
+    // respectively. So every cell figure below is a LOWER BOUND on the saving,
+    // and the missing term is named rather than fitted.
+    let cells_after = |w: &(usize, usize, usize, usize), d_perms: usize, d_words: usize| -> usize {
+        let (cells, _, hash, hint) = *w;
+        let pad = |n: usize| n.next_power_of_two();
+        let base_hash = pad(hash) * LFM_HASH_WIDTH;
+        let base_hint = pad(hint) * 7;
+        let new_hash = pad(hash.saturating_sub(d_perms)) * LFM_HASH_WIDTH;
+        let new_hint = pad(hint.saturating_sub(d_words)) * 7;
+        cells - base_hash - base_hint + new_hash + new_hint
+    };
+
+    let shipped_half: Vec<_> = epoch_shapes
+        .iter()
+        .map(|e| chain_half(&shipped, e))
+        .collect();
+    let base_cells: usize = wraps.iter().map(|w| w.0).sum();
+    let base_instrs: usize = wraps.iter().map(|w| w.1).sum();
+    let base_card = 15.0 * DEVICE_FIXED_S + DEVICE_NS_PER_CELL * base_cells as f64 / 1e9;
+
     println!(
-        "   shipped: blowup 2^{} · fold {} · Q {} · rounds {} ⇒ {base_rows} rows + {base_words} \
-         arena words = {base} of wt3 wrap 0's {WT3_WRAP0_INSTRUCTIONS}",
-        shipped.log_blowup,
-        shipped.log_folding,
-        shipped.num_queries,
-        base_shape.rounds(),
+        "== the chains at the block's 15 record-posture shapes (sh4 @ 90797d63, \
+         LAMBDA_VM_MAX_ROWS_LOG2=21), priced against wt3's census and wt4's fit =="
     );
     println!(
-        "{:<34} {:>4} {:>4} {:>7} {:>12} {:>12} {:>9}",
-        "knob", "Q", "rnds", "per-ch", "chain rows", "arena words", "vs base"
+        "   shipped: blowup 2^{} · fold {} · Q {} · chains at epoch 0 {chains}",
+        shipped.log_blowup, shipped.log_folding, shipped.num_queries,
     );
-    let row = |label: &str, cfg: &multilinear::whir_chain::ChainConfig| {
-        let shape = ChainShape::new(cfg, n_stack);
-        let rows = chains * super::whir_chain::chain_shape_rows(&shape);
-        let words = chains * (1 + RoundStorage::words(&shape) as usize);
+    println!(
+        "   epoch 0 chain half: {} rows · {} arena words · {} permutations \
+         ({:.1}% of wt3 wrap 0's {} LFM_HASH)",
+        shipped_half[0].0,
+        shipped_half[0].1,
+        shipped_half[0].2,
+        100.0 * shipped_half[0].2 as f64 / wraps[0].2 as f64,
+        wraps[0].2,
+    );
+    println!(
+        "   the block's 15 wraps: {base_cells} cells · {base_instrs} instructions \
+         ⇒ predicted card {base_card:.2}s of the {LEVEL0_CARD_S}s held, level-0 wall \
+         {LEVEL0_WALL_S}s, pipeline {PIPELINE_S}s"
+    );
+    println!(
+        "   ⇒ the irreducible half: 15 × {DEVICE_FIXED_S:.3}s of fixed per-prove card = \
+         {:.2}s, which NO wrap-program lever touches",
+        15.0 * DEVICE_FIXED_S
+    );
+    println!(
+        "{:<38} {:>4} {:>12} {:>11} {:>8} {:>12} {:>8} {:>8} {:>8}",
+        "knob", "Q", "chain rows", "Δperms/ep", "Δrows%", "cells", "Δcells%", "card s", "Δwall%"
+    );
+    let row = |label: &str, cfg: &ChainConfig| {
+        let half: Vec<_> = epoch_shapes.iter().map(|e| chain_half(cfg, e)).collect();
+        let rows: usize = half.iter().map(|h| h.0).sum();
+        let base_rows: usize = shipped_half.iter().map(|h| h.0).sum();
+        let cells: usize = wraps
+            .iter()
+            .zip(&half)
+            .zip(&shipped_half)
+            .map(|((w, h), b)| cells_after(w, b.2.saturating_sub(h.2), b.1.saturating_sub(h.1)))
+            .sum();
+        let card = 15.0 * DEVICE_FIXED_S + DEVICE_NS_PER_CELL * cells as f64 / 1e9;
         println!(
-            "{label:<34} {:>4} {:>4} {:>7} {rows:>12} {words:>12} {:>8.1}%",
+            "{label:<38} {:>4} {rows:>12} {:>11} {:>7.1}% {cells:>12} {:>7.1}% \
+             {card:>7.2} {:>7.2}%",
             cfg.num_queries,
-            shape.rounds(),
-            super::whir_chain::chain_shape_rows(&shape),
-            100.0 * ((rows + words) as f64 - base as f64) / base as f64,
+            shipped_half[0].2 as i64 - half[0].2 as i64,
+            100.0 * (rows as f64 - base_rows as f64) / base_rows as f64,
+            100.0 * (cells as f64 - base_cells as f64) / base_cells as f64,
+            100.0 * (card - base_card) / LEVEL0_WALL_S,
         );
     };
-    for bits in [128u8, 120, 112, 100] {
+    let n_stack = layouts[0].n_stack();
+    row("shipped (128 bits, blowup 4, fold 4)", &shipped);
+    for bits in [120u8, 112, 100] {
         row(
-            &format!("security {bits} (posture, Mauro's)"),
-            &multilinear::whir_chain::ChainConfig::with_security(
-                2,
-                4,
-                n_stack,
-                bits,
-                GrindBits::uniform(20),
-            ),
+            &format!("security {bits} (POSTURE — Mauro's)"),
+            &ChainConfig::with_security(2, 4, n_stack, bits, GrindBits::uniform(20)),
         );
     }
-    for blowup in [2usize, 3, 4] {
+    for blowup in [3usize, 4] {
         row(
-            &format!("blowup 2^{blowup} (costs the BASE)"),
-            &multilinear::whir_chain::ChainConfig::with_security(
-                blowup,
-                4,
-                n_stack,
-                128,
-                GrindBits::uniform(20),
-            ),
+            &format!("blowup 2^{blowup} (costs the BASE, 84.7s)"),
+            &ChainConfig::with_security(blowup, 4, n_stack, 128, GrindBits::uniform(20)),
         );
     }
-    for fold in [4usize, 5, 6] {
+    for fold in [5usize, 6] {
         row(
             &format!("fold {fold} (bigger blocks per query)"),
-            &multilinear::whir_chain::ChainConfig::with_security(
-                2,
-                fold,
-                n_stack,
-                128,
-                GrindBits::uniform(20),
-            ),
+            &ChainConfig::with_security(2, fold, n_stack, 128, GrindBits::uniform(20)),
         );
     }
-    for grind in [20u8, 24, 28] {
+    for grind in [24u8, 28, 32] {
         row(
             &format!("grind {grind} (costs HOST search)"),
-            &multilinear::whir_chain::ChainConfig::with_security(
-                2,
-                4,
-                n_stack,
-                128,
-                GrindBits::uniform(grind),
-            ),
+            &ChainConfig::with_security(2, 4, n_stack, 128, GrindBits::uniform(grind)),
         );
     }
 
-    // ⛔ A CHECK THAT CAN FAIL: the shipped row must be reproduced by the ladder
-    // at its own knobs, or the ladder is describing a different protocol from
-    // the one the block ran.
-    let reproduced = multilinear::whir_chain::ChainConfig::with_security(
+    // ★★★ THE STEP TABLE, which is what makes the ladder above readable: how far
+    // each wrap's `LFM_HASH` sits above the padding step below it, and what
+    // crossing it is worth. Four of the fifteen are over `2^18`, and one of
+    // them — wrap 6 — is over it by 1,698 permutations out of 263,842 while
+    // paying 85,196,800 cells for the overshoot.
+    println!("\n== the LFM_HASH step, per wrap: the cheapest cells on the block ==");
+    println!(
+        "{:>3} {:>12} {:>10} {:>10} {:>12} {:>13} {:>9}",
+        "k", "cells", "LFM_HASH", "padded", "perms to cut", "cells saved", "card ms"
+    );
+    let mut cheapest = (usize::MAX, 0usize);
+    for (k, w) in wraps.iter().enumerate() {
+        let pad = w.2.next_power_of_two();
+        let need = w.2 - pad / 2;
+        let saved = (pad / 2) * LFM_HASH_WIDTH;
+        if need < cheapest.0 {
+            cheapest = (need, k);
+        }
+        println!(
+            "{k:>3} {:>12} {:>10} {:>10} {need:>12} {saved:>13} {:>8.1}",
+            w.0,
+            w.2,
+            pad,
+            DEVICE_NS_PER_CELL * saved as f64 / 1e6
+        );
+    }
+    println!(
+        "   ⇒ the cheapest step on the block is wrap {}'s, at {} permutations",
+        cheapest.1, cheapest.0
+    );
+    println!(
+        "   ⇒ and the instruction side, for contrast: the block's {base_instrs} \
+         instructions at {HOST_NS_PER_INSTR:.1} ns each are {:.2}s of HOST time \
+         over the fifteen, which at SIBLINGS_L0 = 6 runs behind the card",
+        HOST_NS_PER_INSTR * base_instrs as f64 / 1e9
+    );
+
+    // ⛔ A CHECK THAT CAN FAIL: the ladder's own 128-bit / blowup-4 / fold-4 row
+    // must be the shipped posture's query count, or the ladder is describing a
+    // different protocol from the one the block ran.
+    let reproduced = ChainConfig::with_security(
         shipped.log_blowup,
         shipped.log_folding,
         n_stack,
@@ -1568,5 +1892,17 @@ fn the_chain_levers_sized_at_epoch_zero() {
         "the ladder's own 128-bit / blowup-4 / fold-4 row must be the shipped \
          posture's {} queries",
         shipped.num_queries
+    );
+    // ⛔ AND ONE ON THE DIRECTION, because a ladder that got the sign wrong
+    // would recommend the lever that costs: folding MORE per round must cost
+    // MORE rows, which is the one result on this ladder that surprises.
+    let fold6 = ChainConfig::with_security(2, 6, n_stack, 128, GrindBits::uniform(20));
+    let fold6_rows: usize = epoch_shapes.iter().map(|e| chain_half(&fold6, e).0).sum();
+    let shipped_rows: usize = shipped_half.iter().map(|h| h.0).sum();
+    assert!(
+        fold6_rows > shipped_rows,
+        "folding six a round costs {fold6_rows} chain rows against the shipped \
+         {shipped_rows} — if this ever reverses, the ladder's central negative \
+         result has changed and the note above is stale"
     );
 }
