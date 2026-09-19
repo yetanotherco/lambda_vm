@@ -94,6 +94,15 @@ pub enum ProvingError {
     /// `WrongParameter` because the cause is internal prover machinery, not a
     /// caller-supplied parameter. Carries the underlying `FFTError`'s message.
     Fft(String),
+    /// A table whose AIR declares auxiliary columns reached an auxiliary
+    /// commit with none of them in its host trace, so there is nothing to
+    /// expand and commit. Under `cuda` the cause is the resident LogUp aux
+    /// build having kept the columns on device for a caller that reads the
+    /// host trace — see `IsStarkProver::build_aux_trace_on_host`, which is
+    /// what declines it. Reported here rather than as `EmptyCommitment`
+    /// because that name says a commitment came back empty and not why.
+    /// Carries the table's name.
+    AuxTraceNotOnHost(String),
 }
 
 impl From<FFTError> for ProvingError {
@@ -1798,6 +1807,39 @@ pub trait IsStarkProver<
         })
     }
 
+    /// Build a table's auxiliary columns *into its host trace*, and declare
+    /// that this is where the caller will read them.
+    ///
+    /// `build_auxiliary_trace` has two ways to leave its result. The ordinary
+    /// one writes the columns into the trace. Under `cuda` it may instead build
+    /// them on device and keep them there (`crate::lookup`'s resident LogUp aux
+    /// build, taken whenever [`TraceTable::resident_aux_ok`] holds — and it
+    /// holds by default), returning the bus contribution and nothing else; the
+    /// host aux table is then left exactly as it was, which for a trace built by
+    /// [`TraceTable::new_main`] is empty.
+    ///
+    /// Every prove-and-retire round 1 reads the columns back out of the host
+    /// trace through `aux_data_row_major`, so it needs the first behaviour.
+    /// Saying so here is what keeps the two in agreement: without it the aux
+    /// LDE of any table above the resident build's threshold expands an empty
+    /// buffer and the commit fails with `EmptyCommitment`.
+    ///
+    /// This does not move the aux build off the device. The non-resident GPU
+    /// arm still computes every term column on device, byte identical, and
+    /// downloads them; what is turned off is only *keeping* them there, which
+    /// this path has no consumer for. A caller that gains one should stop going
+    /// through here and read [`TraceTable::aux_resident`] instead, the way
+    /// `multi_prove`'s round-1 aux commit does.
+    fn build_aux_trace_on_host(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        challenges: &[FieldElement<FieldExtension>],
+    ) -> Option<BusPublicInputs<FieldExtension>> {
+        #[cfg(feature = "cuda")]
+        trace.set_resident_aux_ok(false);
+        air.build_auxiliary_trace(trace, challenges)
+    }
+
     /// A table's auxiliary commitment, built against the shared challenges and
     /// dropped with the call.
     ///
@@ -1822,7 +1864,7 @@ pub trait IsStarkProver<
     {
         let (domain, twiddles) = domain_and_twiddles(air, trace.num_rows());
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-        let bus_public_inputs = air.build_auxiliary_trace(trace, challenges);
+        let bus_public_inputs = Self::build_aux_trace_on_host(air, trace, challenges);
 
         let (trace_data, total_cols) = trace.aux_data_row_major();
         if total_cols == 0 || trace_data.is_empty() {
@@ -1913,7 +1955,7 @@ pub trait IsStarkProver<
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
         let bus_public_inputs = if air.has_aux_trace() {
-            air.build_auxiliary_trace(trace, challenges)
+            Self::build_aux_trace_on_host(air, trace, challenges)
         } else {
             None
         };
@@ -1953,6 +1995,13 @@ pub trait IsStarkProver<
         let __a = crate::instruments::span("a1_r1_aux");
         let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
             let (aux_src, cols) = trace.aux_data_row_major();
+            // The AIR declares auxiliary columns and the build above was asked
+            // to leave them here; an empty buffer means it did not, and
+            // expanding it would commit to nothing. Name the cause rather than
+            // letting the commit come back empty two statements later.
+            if cols == 0 || aux_src.is_empty() {
+                return Err(ProvingError::AuxTraceNotOnHost(air.name().to_string()));
+            }
             let mut out: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(lde_size * cols);
             out.extend_from_slice(aux_src);
             Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
