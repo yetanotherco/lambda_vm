@@ -4791,8 +4791,23 @@ mod tests {
         assert!(!chain_is_paid(alone));
         // Together they do, and BOTH are carried — the set is paid for or none
         // of it is.
-        assert_eq!(plan.savings, 2 * alone);
-        assert_eq!(plan.savings, 179_830);
+        //
+        // ⛔ ONE DERIVATION, AND THE SUM IS THE SECOND PLACE THIS BIT. A bare
+        // `assert_eq!(plan.savings, 179_830)` stood here — `2 × 89,915`, the
+        // retired constant's `alone` DOUBLED. The by-value sweep that caught
+        // the same shape at the refused candidate looked for the BASE
+        // quantities and not their MULTIPLES, so re-pointing `alone` from
+        // 89,915 to 89,907 left its double untouched one line below. ⇒ a sweep
+        // over a moved form must cover SUMS AND PRODUCTS of what moved, not
+        // only the terms themselves.
+        assert_eq!(
+            plan.savings,
+            2 * alone,
+            "two candidates of {} rows each between them save {} against a \
+             {PREPARED_LEG_ROWS}-row chain",
+            alone,
+            plan.savings
+        );
         assert!(chain_is_paid(plan.savings));
         assert_eq!(plan.dense_pages(), vec![0, 1]);
 
