@@ -546,7 +546,7 @@ fn the_table_verify_computes_what_the_host_computes() {
             // DECODE's prepared opening settle its leading preprocessed columns
             // and skip their MLE evaluations here — the very seam
             // `emit_table_verify` says it does not reproduce.
-            &[],
+            0,
         )
         .expect("the host must verify its own proof — the fixture is the precondition");
 
@@ -712,7 +712,7 @@ fn the_tamper_arm_refuses_what_the_host_rejects() {
             // DECODE's prepared opening settle its leading preprocessed columns
             // and skip their MLE evaluations here — the very seam
             // `emit_table_verify` says it does not reproduce.
-            &[],
+            0,
         )
         .map(|_| ())
         .map_err(|e| format!("{e:?}"))
