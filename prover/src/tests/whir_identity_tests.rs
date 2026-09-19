@@ -202,9 +202,28 @@ fn the_identity_line_is_stable_across_runs() {
 /// It compares the two proofs' NON-nonce content directly rather than asserting
 /// two digests differ: the digests differing is the consequence, the roots
 /// differing is the cause, and a test that asserted only the consequence would
-/// pass for the wrong reason if the instrument broke. If the search ever became
-/// deterministic by default, this assertion would fail LOUDLY and name the
-/// reason — which is the correct outcome, not a flake.
+/// pass for the wrong reason if the instrument broke.
+///
+/// # ⛔ THE GUARD IS NARROWER THAN THE NONCE LIST, AND THAT IS THE FIX
+///
+/// This test was intermittently RED — three green of four full-suite runs, and
+/// eight of eight in isolation. Its early return guarded on ALL the nonces
+/// while the assertion below sees only what `after_the_grind` captures:
+/// `final_value` per chain, and `(next_root, ood_value)` per round. **A chain's
+/// LAST round has both of those `None`**, so a run whose only differing nonce
+/// is there passes the guard and then compares two equal lists. ? INFERRED from
+/// the failing output, whose per-round tuples were identical and whose third
+/// entry was `(None, None)` — not from instrumenting the search.
+///
+/// So the guard now reads the nonces of the rounds the assertion CAN see, and
+/// the probe below is what makes that narrowing observable rather than
+/// asserted: a pair differing only in an invisible round must read as agreeing.
+///
+/// ⚠ AND THE SENTENCE THAT USED TO BE HERE IS WITHDRAWN. It said a failure
+/// "would fail LOUDLY and name the reason — which is the correct outcome, not a
+/// flake". The observed failure named nothing and was a flake; a guard that
+/// admits a state its assertion cannot satisfy is a check that cannot pass, not
+/// a report about the prover.
 #[test]
 fn zeroing_the_nonces_does_not_make_a_ground_proof_reproducible() {
     let columns = fixture_columns();
@@ -212,7 +231,7 @@ fn zeroing_the_nonces_does_not_make_a_ground_proof_reproducible() {
     assert_fixture_is_not_degenerate(&a);
     let b = prove_once(b"whir-identity", &columns);
 
-    let nonces_of = |p: &Proof| {
+    let all_nonces = |p: &Proof| {
         p.columns
             .iter()
             .flat_map(|s| &s.polys)
@@ -220,21 +239,18 @@ fn zeroing_the_nonces_does_not_make_a_ground_proof_reproducible() {
             .map(|r| r.nonces)
             .collect::<Vec<_>>()
     };
-    if nonces_of(&a) == nonces_of(&b) {
-        // The two searches happened to agree — at four bits that is common.
-        // Nothing is being claimed about this run.
-        return;
-    }
-
-    // The COMMITTED trace's root is drawn before any grind, so it does not
-    // move — naming that explicitly, because it is the thing that makes this
-    // failure mode easy to miss. What moves is everything the transcript
-    // produced after the first grind.
-    assert_eq!(
-        a.roots, b.roots,
-        "the trace commitment precedes the first grind and cannot depend on it"
-    );
-
+    // The nonces the assertion below can SEE: a round with no successor
+    // contributes nothing to `after_the_grind`, so a nonce differing only there
+    // moves nothing this test compares.
+    let visible_nonces = |p: &Proof| {
+        p.columns
+            .iter()
+            .flat_map(|s| &s.polys)
+            .flat_map(|c| &c.rounds)
+            .filter(|r| r.next_root.is_some() || r.ood_value.is_some())
+            .map(|r| r.nonces)
+            .collect::<Vec<_>>()
+    };
     let after_the_grind = |p: &Proof| {
         p.columns
             .iter()
@@ -250,6 +266,61 @@ fn zeroing_the_nonces_does_not_make_a_ground_proof_reproducible() {
             })
             .collect::<Vec<_>>()
     };
+
+    // ★ THE PROBE: a pair differing ONLY in rounds the assertion cannot see.
+    // Without it, narrowing the guard would be a claim; with it, a guard that
+    // still read every nonce fails here rather than once in four suite runs.
+    {
+        let mut probe = a.clone();
+        let mut moved = 0usize;
+        for chain in probe.columns.iter_mut().flat_map(|s| s.polys.iter_mut()) {
+            for round in chain.rounds.iter_mut() {
+                if round.next_root.is_none() && round.ood_value.is_none() {
+                    round.nonces.query ^= 1;
+                    moved += 1;
+                }
+            }
+        }
+        assert!(
+            moved > 0,
+            "no round in this fixture is invisible to `after_the_grind`, so the state \
+             that made this test intermittent cannot be exhibited here — say so rather \
+             than leave the guard narrowed against nothing"
+        );
+        assert_ne!(
+            all_nonces(&a),
+            all_nonces(&probe),
+            "the probe moved no nonce at all, so it proves nothing about the guard"
+        );
+        assert_eq!(
+            visible_nonces(&a),
+            visible_nonces(&probe),
+            "the guard still reads a nonce the assertion cannot see — which is the \
+             defect it was narrowed to remove"
+        );
+        assert_eq!(
+            after_the_grind(&a),
+            after_the_grind(&probe),
+            "a nonce in a successorless round moved something the assertion compares, \
+             so the narrowing rests on a false premise"
+        );
+    }
+
+    if visible_nonces(&a) == visible_nonces(&b) {
+        // The two searches agreed wherever this test can look — at four bits
+        // that is common. Nothing is being claimed about this run.
+        return;
+    }
+
+    // The COMMITTED trace's root is drawn before any grind, so it does not
+    // move — naming that explicitly, because it is the thing that makes this
+    // failure mode easy to miss. What moves is everything the transcript
+    // produced after the first grind.
+    assert_eq!(
+        a.roots, b.roots,
+        "the trace commitment precedes the first grind and cannot depend on it"
+    );
+
     assert_ne!(
         after_the_grind(&a),
         after_the_grind(&b),
