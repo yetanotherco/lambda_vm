@@ -752,11 +752,15 @@ pub(super) fn epoch_seed(
     table_counts: &crate::TableCounts,
     runtime_page_ranges: &[crate::RuntimePageRange],
     fri_final_poly_log_degree: u8,
+    is_final: bool,
 ) -> crate::hash_pin::BlockTranscript {
     let mut t = crate::hash_pin::block_transcript(&[]);
     crate::statement::absorb_statement(
         &mut t,
-        crate::statement::StatementKind::ContinuationEpoch { epoch_label },
+        crate::statement::StatementKind::ContinuationEpoch {
+            epoch_label,
+            is_final,
+        },
         elf_bytes,
         public_output,
         table_counts,
@@ -914,6 +918,9 @@ impl EpochFront {
             &self.table_counts,
             &self.runtime_page_ranges,
             self.opts.fri_final_poly_log_degree,
+            // HALT's presence IS the role: one source, so the seed cannot state
+            // a role the AIR set contradicts.
+            self.airs.include_halt,
         )
     }
 
@@ -1033,6 +1040,7 @@ fn harvest_real_epoch(
             &table_counts,
             &runtime_page_ranges,
             opts.fri_final_poly_log_degree,
+            airs.include_halt,
         )
     };
     let refs = {
@@ -1142,29 +1150,21 @@ fn harvest_real_epoch(
     Ok(RealEpoch {
         statement: super::statement_replay::EpochStatementShape {
             public_output_len: public_output.len(),
-            table_counts: [
-                table_counts.cpu as u64,
-                table_counts.lt as u64,
-                table_counts.memw as u64,
-                table_counts.memw_aligned as u64,
-                table_counts.load as u64,
-                table_counts.mul as u64,
-                table_counts.dvrm as u64,
-                table_counts.shift as u64,
-                table_counts.branch as u64,
-                table_counts.memw_register as u64,
-                table_counts.eq as u64,
-                table_counts.bytewise as u64,
-                table_counts.store as u64,
-                table_counts.cpu32 as u64,
-                table_counts.blake3 as u64,
-            ],
+            // ★ The single source, not a hand-copied order. This array WAS a
+            // third transcription of `TableCounts`' declaration order, and the
+            // main-sync port is what showed the cost: the host list grew by six
+            // and a copy like this would have gone on absorbing fourteen with
+            // nothing to say so but a diverged challenge.
+            table_counts: crate::statement::table_count_values(&table_counts),
             num_private_input_pages: 0,
             fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
             page_ranges: runtime_page_ranges
                 .iter()
                 .map(|r| (r.base, r.count))
                 .collect(),
+            // From the AIR set rather than a parameter: `is_final` and HALT's
+            // presence are the same fact, and taking both would let them differ.
+            is_final: airs.include_halt,
         },
         elf_digest: crate::statement::elf_digest(&elf_bytes),
         public_output,

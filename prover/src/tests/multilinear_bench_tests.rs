@@ -1044,6 +1044,12 @@ fn the_per_branch_term_is_the_table_kind_count() {
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
         blake3: 0,
     };
     let kinds = crate::statement::table_count_values(&zero).len();

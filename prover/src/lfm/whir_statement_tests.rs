@@ -64,6 +64,12 @@ fn counts() -> TableCounts {
         bytewise: 41,
         store: 43,
         cpu32: 47,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
         blake3: 1,
     }
 }
@@ -219,11 +225,19 @@ fn the_epoch_pad_is_the_one_the_block_measured() {
              {measured})",
             cost.len, cost.pad
         );
+        // ★ DERIVED, not a literal. The fixed part is tag 42 + digest 32 +
+        // label 8 + |po| prefix 8 + counts 8·NUM_TABLE_KINDS + |tnv| prefix 8 +
+        // config 24 + trailer 3. That was 245 at fifteen kinds and is 293 at
+        // twenty-one, and the main-sync port is what showed the cost of writing
+        // it out: a literal turns an encoding change into a red test HERE
+        // instead of naming the encoding that moved.
+        let fixed = 42 + 32 + 8 + 8 + 8 * crate::statement::NUM_TABLE_KINDS + 8 + 24 + 3;
         assert_eq!(
             cost.len,
-            245 + output_len + num_vars_len,
-            "the fixed part is 245 bytes: tag 42 + digest 32 + label 8 + 8 + counts 120 + 8 + \
-             config 24 + trailer 3"
+            fixed + output_len + num_vars_len,
+            "the fixed part is {fixed} bytes at {} table kinds: tag 42 + digest 32 + label 8 \
+             + 8 + counts 8·kinds + 8 + config 24 + trailer 3",
+            crate::statement::NUM_TABLE_KINDS
         );
         assert_eq!(
             cost.pad,

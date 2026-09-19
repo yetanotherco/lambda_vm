@@ -467,7 +467,8 @@ fn test_dvrm_air_wires_in_chip_constraints() {
 
 /// Regression test for the `Msb16` LogUp over-send bug.
 ///
-/// DVRM is split into chip instances of `max_rows.dvrm` raw ops (`chunk_and_generate`)
+/// DVRM is split into chip instances of `max_rows.dvrm` raw ops
+/// (`chunk_and_generate_optional`)
 /// and each instance deduplicates only its own chunk, sending its three MSB16 sign
 /// lookups once per unique signed op *per instance* (multiplicity = the `SIGNED` bit).
 /// So `collect_bitwise_from_dvrm`, which feeds the BITWISE MSB16 multiplicity, must use
