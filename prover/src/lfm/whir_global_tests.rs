@@ -764,13 +764,44 @@ mod tests {
         // ⛔ NOT AN ASSERT ON THE TOTAL. That number is what this arm exists to
         // READ, and asserting it here would pin the posture and make the cap a
         // thing the test agrees with rather than a thing the reading decides.
-        // What is asserted is that the census covered the pages the execution
-        // found — a count that can disagree.
-        assert_eq!(
-            census.len(),
-            pages.touched_page_bases.len(),
-            "the census must cover every page the execution touched"
-        );
+        //
+        // ⚠ AND NOT ON THE PAGE COUNT EITHER, THOUGH IT LOOKS LIKE THE OBVIOUS
+        // ONE. `genesis_census` maps one entry per config and
+        // `global_memory_configs` maps one config per base, so
+        // `census.len() == touched_page_bases.len()` holds by construction and
+        // no input reaches this arm that could make it false. It is ARGUED, not
+        // checked — an earlier draft of this comment claimed it was "a count
+        // that can disagree", which was wrong in exactly the way this campaign
+        // keeps cataloguing.
+        //
+        // What IS asserted is a relation between two fields the census reads
+        // SEPARATELY, which is where a wrong column would show:
+        for entry in &census {
+            if entry.init_len == 0 {
+                assert_eq!(
+                    entry.entries, 0,
+                    "page {:#018x} loads no genesis bytes yet the census found {} nonzero \
+                     entries in its INIT column — the census is reading a column that is \
+                     not this page's genesis",
+                    entry.page_base, entry.entries,
+                );
+            }
+            assert!(
+                entry.entries <= entry.init_len,
+                "page {:#018x} loads {} genesis bytes and the census found {} nonzero — a \
+                 page cannot hold more nonzero genesis than it loads",
+                entry.page_base,
+                entry.init_len,
+                entry.entries,
+            );
+            assert!(
+                !entry.is_private || entry.entries == 0,
+                "page {:#018x} is a private-input page, whose genesis the verifier never \
+                 recomputes, yet the census charged it {} entries",
+                entry.page_base,
+                entry.entries,
+            );
+        }
     }
 
     /// The block ELF, if the artifacts hold one — SKIP, never panic, because
