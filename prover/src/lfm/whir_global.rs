@@ -914,6 +914,15 @@ pub struct GlobalCost {
     pub perms: usize,
     /// The ONE pool, by value.
     pub constants: Vec<LfmWord>,
+    /// ★ The program's MAXIMUM sumcheck degree, which alone decides its Newton
+    /// pool — see [`super::whir_poly::sumcheck_round_constants`]' nesting law.
+    pub newton_degree: usize,
+    /// Which table set that degree, or `None` when a fixed leg did.
+    ///
+    /// ⚠ Carried so a handback can print WHERE the degree came from. A maximum
+    /// with no provenance is a number nobody can check against the AIR that
+    /// produced it.
+    pub newton_degree_from: Option<usize>,
 }
 
 impl GlobalCost {
@@ -1002,6 +1011,31 @@ pub fn global_cost(
     // The closure, against the literal zero.
     cost.closure += global_closure_rows(shapes.len());
     pool.constant(FEE::zero());
+
+    // ★★ THE NEWTON POOL, and it is ONE call because the pairs NEST in the
+    // degree: the union over every round of every leg is exactly the set for
+    // the largest degree among them. Four contributors, three of them fixed
+    // constants of their own legs and the fourth the tables' own.
+    //
+    // ⛔ NOT a sum over rounds. `sumcheck_round_consts` is a count and counts
+    // ADD where values MERGE; that is the whole reason this pool went unnamed
+    // until now. See `whir_poly::sumcheck_round_consts`' warning.
+    let mut newton_degree = super::whir_gkr::GKR_SUMCHECK_DEGREE
+        .max(super::whir_reduce::REDUCE_DEGREE)
+        .max(super::whir_chain::SUMCHECK_DEGREE);
+    let mut newton_degree_from: Option<usize> = None;
+    for (table, shape) in shapes.iter().enumerate() {
+        let degree = shape.sumcheck_degree();
+        if degree > newton_degree {
+            newton_degree = degree;
+            newton_degree_from = Some(table);
+        }
+    }
+    cost.newton_degree = newton_degree;
+    cost.newton_degree_from = newton_degree_from;
+    for word in super::whir_poly::sumcheck_round_constants(newton_degree) {
+        pool.constant_word(word);
+    }
 
     // The commitment groups, threaded from where the tables left the sponge.
     let pairs = global.shapes.clone();

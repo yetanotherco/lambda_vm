@@ -93,7 +93,7 @@ use super::whir_transcript::{
 use super::word::{LfmWord, ext_word};
 
 /// The degree the weight raises the plain `f` term to (`whir_chain.rs:991`).
-const SUMCHECK_DEGREE: usize = 2;
+pub(crate) const SUMCHECK_DEGREE: usize = 2;
 
 /// One query's opening against one tree: the block, and its authentication
 /// path.

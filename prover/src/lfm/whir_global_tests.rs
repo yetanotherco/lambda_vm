@@ -278,6 +278,16 @@ mod tests {
             cost.hints,
             cost.publics,
         );
+        println!(
+            "CROSS-EPOCH NEWTON: D = {} (from {}), pool {} words, count form says {}",
+            cost.newton_degree,
+            match cost.newton_degree_from {
+                Some(table) => format!("table {table}"),
+                None => "a fixed leg (GKR 3 / reduce 2 / chain 2)".to_string(),
+            },
+            crate::lfm::whir_poly::sumcheck_round_constants(cost.newton_degree).len(),
+            crate::lfm::whir_poly::sumcheck_round_consts(cost.newton_degree),
+        );
 
         // ⛔ WHEN THE POOL DISAGREES, SAY WHICH WORDS — never just the two
         // counts. A count tells you the form is wrong; the VALUES tell you which
@@ -315,35 +325,36 @@ mod tests {
                 println!("  UNEMITTED {w:?}");
             }
         }
-        // ⛔ THE POOL IS NOT ASSERTED AS AN EQUALITY, AND THE REASON IS A GAP
-        // IN THE CODEBASE'S FORMS RATHER THAN IN THIS ONE. Two emitters intern
-        // words that NO cost form reports: `whir_poly::emit_newton_step` interns
-        // `1/(j+1)` and `−j/(j+1)` per interpolation step, and
-        // `StackedCost::own_constants` says in its own doc that "the chains'
-        // OTHER constants are not named here". The epoch program has the same
-        // gap and has never had it measured, because no F1 there compares a
-        // pool at all.
+        // ⛔ THE POOL IS ASSERTED BOTH WAYS, and it was not always so. Two
+        // emitters intern words no cost form reported: `emit_newton_step`'s
+        // interpolation weights, and the chains' own constants, which
+        // `StackedCost::own_constants` disclaims in its own doc. The first is
+        // now named by `sumcheck_round_constants` at this program's maximum
+        // degree — the pairs NEST, so one call at the max is the whole pool —
+        // and the second turns out to BE the first, reached through the chains'
+        // sumcheck rounds.
         //
-        // ⇒ So this asserts the half that IS exact and PINS the half that is
-        // not, rather than weakening the check to make it pass:
-        //   - every word the form NAMES must be interned — exact, and it is what
-        //     a deleted leg breaks, because the deleted leg's coefficients stay
-        //     named and stop being emitted;
-        //   - the words interned that no form names are counted against a
-        //     MEASURED constant, so the gap cannot drift unnoticed.
+        // ⇒ BOTH DIRECTIONS ARE NOW EXACT, and the second one only became
+        // assertable when the Newton pairs got a VALUES form. Until then the
+        // pool's remainder was pinned at a measured 24 because nothing named it.
         assert!(
             unemitted.is_empty(),
             "the form names {} words the program does not intern; a leg that stopped \
              emitting is exactly this shape",
             unemitted.len(),
         );
-        assert_eq!(
+        assert!(
+            unnamed.is_empty(),
+            "{} words are interned that no form names. The Newton pairs are accounted \
+             at D = {}, so a survivor belongs to a DIFFERENT emitter and is a finding \
+             to read off the UNNAMED lines above — not a remainder to pin",
             unnamed.len(),
-            POOL_GAP_UNNAMED,
-            "the unnamed pool gap moved. It is `emit_newton_step`'s interpolation \
-             weights and the chains' own constants, neither of which any form reports; \
-             a change in it is a finding about those emitters, not a number to update \
-             without reading"
+            cost.newton_degree,
+        );
+        assert_eq!(
+            consts,
+            cost.constants.len(),
+            "the ONE constant pool, by value"
         );
         assert_eq!(hints, cost.hints, "one hint per word the arena writes");
         assert_eq!(
@@ -361,20 +372,6 @@ mod tests {
         // this call site — documentation, not a check. The four components are
         // the whole claim.
     }
-
-    /// Words the cross-epoch program interns that no cost form in this codebase
-    /// names — MEASURED, not derived.
-    ///
-    /// `whir_poly::emit_newton_step` interns `1/(j+1)` and `−j/(j+1)` for each
-    /// interpolation step, and no struct tracks how many steps a program's
-    /// sumchecks reach; `StackedCost::own_constants` names the shared `one` and
-    /// the leaf capacities and says plainly that the chains' other constants are
-    /// not named there. This is their total on the genesis fixture, read off the
-    /// box at 28cc920c6 (pool interned 100, form named 76).
-    ///
-    /// ⚠ IT IS A PIN ON A GAP, NOT A BUDGET. If it moves, an emitter's constant
-    /// set changed and that is a finding to read, not a number to bump.
-    const POOL_GAP_UNNAMED: usize = 24;
 
     /// ⛔ A TABLE WHOSE PREPROCESSED COLUMNS NO ROUTE COVERS FAILS THE BUILD —
     /// DIRECTION ONE: the route expects MORE columns than the AIR presents.
