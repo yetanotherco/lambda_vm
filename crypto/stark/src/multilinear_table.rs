@@ -1284,6 +1284,15 @@ where
     // span.
     let mut columns = Vec::with_capacity(committed.groups().len());
     multilinear::whir_split::note_groups(committed.groups().len());
+    // ⛔ CLEARED AT THE OPENING OF THE WINDOW, not merely read at its close.
+    // The six are process-global accumulators, so whatever ran the chain
+    // earlier in this process is still sitting in them; reading at the end
+    // alone attributes that to this group loop. The first fixture run showed
+    // it as a NEGATIVE remainder — the six summed to 16.40s inside an
+    // `open_groups` of 12.77s, which is the one arithmetic a sum of parts
+    // cannot produce honestly. Clearing here makes "group openings only" a
+    // property of the window rather than an assumption about callers.
+    let _ = multilinear::whir_split::take_chain();
     let __sp_groups = multilinear::whir_split::mark();
     let mut table_at = 0usize;
     let mut column_at = 0usize;
@@ -1322,6 +1331,12 @@ where
     // `Claimed::point` hands back that one point for every column under either
     // variant, and `Claimed` reaches nothing but the weight.
     multilinear::whir_split::add(&multilinear::whir_split::OPEN_GROUPS, __sp_groups);
+    // ⛔ THE SIX ARE TAKEN HERE AND NOWHERE LATER. The prepared opening below
+    // runs the same chain and writes the same slots, so a take placed after it
+    // would fold DECODE's chain into `open_groups` — and arm E would close, on
+    // a number that is not what its name says. This is the only point at which
+    // the slots hold the GROUP openings and nothing else.
+    multilinear::whir_split::note_chain(multilinear::whir_split::take_chain());
 
     let __sp_prepared = multilinear::whir_split::mark();
     let preprocessed = match prepared {

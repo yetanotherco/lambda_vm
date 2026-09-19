@@ -159,6 +159,58 @@ pub static OPEN_GROUPS: Slot = Slot::new();
 /// The out-of-band DECODE opening, one more chain on top of the two.
 pub static OPEN_PREPARED: Slot = Slot::new();
 
+// ── inside an opening: the WHIR chain's round loop ──────────────────────────
+//
+// `open_groups` is 43.8% of the base and 24.9% of the block's whole wall, and
+// it was one number. These six PARTITION the round (`whir_chain.rs:715-795`),
+// so `open_groups - Σ(six)` is loop overhead and nothing else.
+//
+// ⛔ They are taken at the END OF THE GROUP LOOP, before the prepared opening
+// runs. The prepared chain writes the same slots, so a take placed after it
+// would fold DECODE's chain into `open_groups` and arm E would close on a
+// number that is not what it claims.
+
+/// All THREE 20-bit grinds a round pays: folding, out-of-domain, query.
+pub static GRIND: Slot = Slot::new();
+/// `factors.rounds` — the opening sumcheck.
+pub static SUMCHECK: Slot = Slot::new();
+/// `fold_held` — the codeword folded in place where it lies.
+pub static FOLD: Slot = Slot::new();
+/// The FRESH Merkle commit of the successor, once per round, plus its root
+/// absorb; or the final-value path on the last round.
+pub static COMMIT_FOLDED: Slot = Slot::new();
+/// Out-of-domain: the sampled point, `evaluate_message`, `add_scaled_eq`.
+/// Its grind is in [`GRIND`], not here.
+pub static OOD: Slot = Slot::new();
+/// The query openings — `whir_round::prove` / `final_openings`, which REBUILD
+/// the Merkle tree on device per query batch.
+pub static QUERIES: Slot = Slot::new();
+
+/// The six, as taken at the group-loop boundary, awaiting the record.
+static CHAIN_AT_GROUPS: Mutex<[f64; 6]> = Mutex::new([0.0; 6]);
+
+/// Park the six for the record being built one layer up.
+pub fn note_chain(chain: [f64; 6]) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = CHAIN_AT_GROUPS.lock() {
+        *held = chain;
+    }
+}
+
+/// Read and clear the six chain slots, in record order.
+pub fn take_chain() -> [f64; 6] {
+    [
+        GRIND.take(),
+        SUMCHECK.take(),
+        FOLD.take(),
+        COMMIT_FOLDED.take(),
+        OOD.take(),
+        QUERIES.take(),
+    ]
+}
+
 /// Close a region opened by [`mark`] into `slot`, returning its seconds.
 ///
 /// It returns the value rather than making the caller read the clock again:
@@ -306,7 +358,23 @@ pub struct ProverSplit {
     pub max_table: Option<(String, f64)>,
     pub airs: usize,
     pub overlapped: bool,
+    /// The chain's six, for the GROUP openings only, in the order
+    /// [`take_chain`] returns them: grind, sumcheck, fold, commit_folded, ood,
+    /// queries. The prepared opening keeps its wall and no breakdown — it is
+    /// 2.5% of the base, and six more fields would not move a ranking.
+    pub chain: [f64; 6],
 }
+
+/// The six chain slots' names, in record order — so a message can name the one
+/// that went missing instead of printing an index.
+pub const CHAIN_NAMES: [&str; 6] = [
+    "grind",
+    "sumcheck",
+    "fold",
+    "commit_folded",
+    "ood",
+    "queries",
+];
 
 /// The index the cross-epoch global stage records under. It is the last thing
 /// the base does and it is INSIDE the base's wall, so it belongs in the table —
@@ -321,6 +389,11 @@ impl ProverSplit {
     /// What the four inner slots leave over inside `prove`.
     pub fn prove_other(&self) -> f64 {
         self.prove - self.challenge - self.argue - self.open_groups - self.open_prepared
+    }
+    /// What the six chain slots leave over inside `open_groups` — the round
+    /// loop's own overhead, and nothing else.
+    pub fn chain_other(&self) -> f64 {
+        self.open_groups - self.chain.iter().sum::<f64>()
     }
     pub fn is_global(&self) -> bool {
         self.index == GLOBAL_INDEX
@@ -354,6 +427,16 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.open_groups = OPEN_GROUPS.take();
     rec.open_prepared = OPEN_PREPARED.take();
     rec.groups = GROUPS.swap(0, Ordering::Relaxed);
+    // ⓘ NOT taken here. The six are read at the end of the GROUP loop, where
+    // the prepared opening has not run yet; by this point they would carry
+    // DECODE's chain too. `rec.chain` is already filled by the caller.
+    // Anything still in them is the prepared opening's, and clearing it keeps
+    // it out of the next epoch.
+    let _ = take_chain();
+    rec.chain = CHAIN_AT_GROUPS
+        .lock()
+        .map(|mut h| std::mem::replace(&mut *h, [0.0; 6]))
+        .unwrap_or([0.0; 6]);
     let names = TABLE_NAMES
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
@@ -386,7 +469,9 @@ pub fn push_prover(mut rec: ProverSplit) {
          prove {prove:.2} · other {other:.2} || inside[Σ] challenge {challenge:.3} · \
          argue {argue:.2} (max {max_name} {max_secs:.2}) · \
          open_groups {open_groups:.2} ({groups} groups) · \
-         open_prepared {open_prepared:.2} · other {prove_other:.2}",
+         open_prepared {open_prepared:.2} · other {prove_other:.2} || \
+         chain[Σ groups] grind {c0:.2} · sumcheck {c1:.2} · fold {c2:.2} · \
+         commit_folded {c3:.2} · ood {c4:.2} · queries {c5:.2} · other {c6:.2}",
         tainted = if rec.overlapped { " ⛔OVERLAPPED" } else { "" },
         airs = rec.airs,
         wall = rec.wall,
@@ -401,6 +486,13 @@ pub fn push_prover(mut rec: ProverSplit) {
         groups = rec.groups,
         open_prepared = rec.open_prepared,
         prove_other = rec.prove_other(),
+        c0 = rec.chain[0],
+        c1 = rec.chain[1],
+        c2 = rec.chain[2],
+        c3 = rec.chain[3],
+        c4 = rec.chain[4],
+        c5 = rec.chain[5],
+        c6 = rec.chain_other(),
     );
 
     if let Ok(mut held) = PROVER.lock() {
@@ -473,6 +565,36 @@ pub fn check_closure(
                 r.prove - r.prove_other(),
                 r.prove_other(),
                 100.0 * r.prove_other() / r.prove.max(1e-9),
+            ));
+        }
+        // Arm E: the six chain slots partition `open_groups`, one level below
+        // arm B. `open_groups` is the largest single term in the base, and
+        // until 2b it was one number.
+        if r.chain_other().abs() > tol * r.open_groups.max(1e-9) {
+            let named: Vec<String> = CHAIN_NAMES
+                .iter()
+                .zip(r.chain.iter())
+                .map(|(n, v)| format!("{n} {v:.3}"))
+                .collect();
+            return Err(format!(
+                "arm E: {who}'s chain does not close — open_groups {:.3}s but \
+                 the six sum to {:.3}s, leaving {:.3}s ({:.1}%) unattributed \
+                 inside the round loop{}. Slots: {}.",
+                r.open_groups,
+                r.open_groups - r.chain_other(),
+                r.chain_other(),
+                100.0 * r.chain_other() / r.open_groups.max(1e-9),
+                // ⛔ A NEGATIVE remainder is not "a bit of drift": it means the
+                // slots hold time from outside the window, so the sum is of
+                // parts that are not parts. It gets its own words, because
+                // reading it as a small overshoot is how it survives.
+                if r.chain_other() < 0.0 {
+                    " — NEGATIVE, so the slots carry time from OUTSIDE the \
+                     group loop and the window is not what it claims"
+                } else {
+                    ""
+                },
+                named.join(" · "),
             ));
         }
     }
@@ -663,6 +785,9 @@ mod tests {
                 argue: 1.9,
                 open_groups: 0.8,
                 open_prepared: 0.2,
+                // The six partition `open_groups`: 0.3 + 0.2 + 0.1 + 0.1 +
+                // 0.05 + 0.05 = 0.8.
+                chain: [0.3, 0.2, 0.1, 0.1, 0.05, 0.05],
                 ..Default::default()
             })
             .collect();
@@ -722,6 +847,19 @@ mod tests {
         let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
         assert!(err.starts_with("arm C:"), "expected arm C, got: {err}");
         assert!(err.contains("epoch 0"), "arm C must name the epoch: {err}");
+
+        // Arm E: one of the SIX chain slots omitted. Arms A and B still close
+        // — `open_groups` is unchanged and so is `prove` — so arm E is the
+        // only arm that can see it, which is the whole reason it exists.
+        let (producer, mut prover, base) = honest();
+        prover[1].chain[5] = 0.0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 1"), "arm E must name the epoch: {err}");
+        assert!(
+            err.contains("queries 0.000"),
+            "arm E must print the six by NAME so the missing one is visible: {err}",
+        );
 
         // Arm D, first inequality: a thread claiming more than the pipeline.
         let (producer, prover, _) = honest();

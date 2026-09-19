@@ -714,25 +714,36 @@ where
     let mut final_value = FieldElement::<E>::zero();
 
     for (r, &k) in schedule.iter().enumerate() {
+        // ── the round's six slots, under `LAMBDA_VM_BASE_SPLIT=1` ──
+        // They partition the round, so `open_groups - Σ(six)` is loop overhead
+        // and nothing else. All three grinds share one slot: they are the same
+        // 20-bit search and a lever on one is a lever on all three.
+        let __wc_g = crate::whir_split::mark();
         let mut nonces = RoundNonces {
             folding: grind::<E, T, H>(transcript, config.grind.folding)?,
             ..RoundNonces::default()
         };
+        crate::whir_split::add(&crate::whir_split::GRIND, __wc_g);
 
+        let __wc_sc = crate::whir_split::mark();
         let (sumcheck_rounds, alphas) = factors.rounds(k, transcript)?;
+        crate::whir_split::add(&crate::whir_split::SUMCHECK, __wc_sc);
 
         // The fold lands in the extension whichever field it started in, so
         // the field is the only thing the two cases differ in — and a codeword
         // the device holds is folded where it is.
+        let __wc_fold = crate::whir_split::mark();
         let (folded, folded_domain) = match &current {
             Current::Base(held) => fold_held::<F, F, E>(held.codeword(), &current_domain, &alphas)?,
             Current::Extension(held) => {
                 fold_held::<F, E, E>(held.codeword(), &current_domain, &alphas)?
             }
         };
+        crate::whir_split::add(&crate::whir_split::FOLD, __wc_fold);
 
         // The successor is committed before the queries are drawn, so it cannot
         // be chosen to match them.
+        let __wc_cf = crate::whir_split::mark();
         let next = match schedule.get(r + 1) {
             Some(&next_k) => {
                 let next = commit_folded::<E, H>(folded, next_k)?;
@@ -745,30 +756,48 @@ where
                 None
             }
         };
+        crate::whir_split::add(&crate::whir_split::COMMIT_FOLDED, __wc_cf);
         let next_root = next.as_ref().map(|c| c.root());
 
         // Out of domain: a value the queries cannot vouch for, so answering it
         // pins the successor to one codeword.
+        // ⛔ TWO OOD WINDOWS, NOT ONE SPANNING WINDOW. The out-of-domain block
+        // contains a grind, and the grind belongs to GRIND — so a single
+        // window opened before it and closed after would count that time
+        // TWICE, once in each slot, and the six would sum to more than the
+        // `open_groups` wall that contains them. Arm E read exactly that on the
+        // first two real runs: a NEGATIVE remainder of -3.6s and then -4.0s.
+        // Slots that partition must not nest; these two abut the grind instead.
         let ood_value = if next.is_some() {
+            let __wc_ood_a = crate::whir_split::mark();
             let z0: FieldElement<E> = transcript.sample_field_element();
             require_out_of_domain::<F, E>(&z0, &folded_domain)?;
             let point = ood_point(&z0, factors.num_vars());
             let y0 = factors.evaluate_message(&point)?;
             transcript.append_field_element(&y0);
+            crate::whir_split::add(&crate::whir_split::OOD, __wc_ood_a);
 
+            let __wc_g2 = crate::whir_split::mark();
             nonces.ood = grind::<E, T, H>(transcript, config.grind.ood)?;
+            crate::whir_split::add(&crate::whir_split::GRIND, __wc_g2);
+
+            let __wc_ood_b = crate::whir_split::mark();
             let gamma: FieldElement<E> = transcript.sample_field_element();
             factors.add_scaled_eq(&point, &gamma)?;
+            crate::whir_split::add(&crate::whir_split::OOD, __wc_ood_b);
             Some(y0)
         } else {
             None
         };
 
+        let __wc_g3 = crate::whir_split::mark();
         nonces.query = grind::<E, T, H>(transcript, config.grind.query)?;
+        crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
         let round_config = RoundConfig {
             num_queries: config.num_queries,
             log_folding: k,
         };
+        let __wc_q = crate::whir_split::mark();
         let openings = match (&current, &next) {
             (Current::Base(held), Some(next)) => {
                 RoundOpenings::Base(whir_round::prove(*held, next, &round_config, transcript)?)
@@ -789,6 +818,7 @@ where
                 )?)
             }
         };
+        crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
 
         rounds.push(ChainRound {
             sumcheck: sumcheck_rounds,

@@ -7447,7 +7447,7 @@ open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
         panic!("WHIR BASE SPLIT does not close: {why}");
     }
     println!(
-        "   WHIR BASE SPLIT: closure GREEN (arms A-D at {:.0}% tolerance)",
+        "   WHIR BASE SPLIT: closure GREEN (arms A-E at {:.0}% tolerance)",
         100.0 * TOL
     );
 
