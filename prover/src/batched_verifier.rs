@@ -173,10 +173,24 @@ pub fn verify(
         num_private_input_pages,
         n,
     )?;
-    let expected = table_counts.total() + crate::FIXED_TABLE_COUNT + page_configs.len();
+    // The counts come off the proof, so the sum is fallible: a release build
+    // wraps on overflow, and a wrapped total would satisfy the equality below
+    // and reach `VmAirs::new`, which sizes a `Vec` straight from those fields.
+    // Handled exactly as `verify_proof_parts` handles it, so the two verifiers
+    // agree rather than each deciding for itself. Never `unwrap` here — a
+    // malformed proof is a rejection, not a panic in a verifier.
+    let Some(expected) = table_counts
+        .total()
+        .and_then(|t| t.checked_add(crate::FIXED_TABLE_COUNT))
+        .and_then(|t| t.checked_add(page_configs.len()))
+    else {
+        return Err(Error::InvalidTableCounts(
+            "declared table counts overflow usize".to_string(),
+        ));
+    };
     if expected != n {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + {} fixed + {} pages = {expected}, but the proof has {n} tables",
+            "table_counts total ({:?}) + {} fixed + {} pages = {expected}, but the proof has {n} tables",
             table_counts.total(),
             crate::FIXED_TABLE_COUNT,
             page_configs.len(),

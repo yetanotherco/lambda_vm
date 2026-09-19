@@ -1509,17 +1509,18 @@ impl WalkLeftover {
             }
         }
 
+        // Built in `ACCEL_ORDER`, which is where that order is defined:
+        // Commit, Keccak, KeccakRnd, Ecsm, Ecdas, Hint. The slots are read back
+        // by `AccelGroup::slot()`, so this list is the one place the two have to
+        // agree — a const block in `streaming` refuses to compile if they do not.
         AccumulatedTables {
-            // In `ACCEL_ORDER`, which is where that order is defined. Named
-            // here only so the reader can check them against it.
             accel: [
-                /* Commit    */ accel_of(&self.tail.commit_ops, commit::generate_commit_trace),
-                /* Keccak    */ accel_of(&self.tail.keccak_ops, keccak::generate_keccak_trace),
-                /* KeccakRnd */
+                accel_of(&self.tail.commit_ops, commit::generate_commit_trace),
+                accel_of(&self.tail.keccak_ops, keccak::generate_keccak_trace),
                 accel_of(&keccak_rnd_ops, keccak_rnd::generate_keccak_rnd_trace),
-                /* Ecsm      */ accel_of(&self.tail.ecsm_ops, ecsm::generate_ecsm_trace),
-                /* Ecdas     */ accel_of(&self.tail.ecdas_ops, ecdas::generate_ecdas_trace),
-                /* Hint      */ accel_of(&self.tail.hint_ops, hint::generate_hint_trace),
+                accel_of(&self.tail.ecsm_ops, ecsm::generate_ecsm_trace),
+                accel_of(&self.tail.ecdas_ops, ecdas::generate_ecdas_trace),
+                accel_of(&self.tail.hint_ops, hint::generate_hint_trace),
             ],
             keccak_rc,
         }
