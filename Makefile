@@ -870,6 +870,14 @@ lint:
 	# line and the system test that reads it; without this line neither compiles
 	# in any pass, which is how an instrument rots.
 	cargo clippy -p lambda-vm-prover --all-targets --features hash-metrics -- -D warnings -A clippy::op_ref
+	# ⛔ BOTH AT ONCE, because neither pass above is both. The device pin —
+	# `check_device_pins` and `transcript_pin::commits`, which model the GPU
+	# commit counter against the bundle's own chains — is `cfg(all(cuda,
+	# hash-metrics))`: the cuda pass has no `hash-metrics` and the two
+	# `hash-metrics` passes have no cuda, so until this line the whole model was
+	# compiled by nothing and a box run was its first compiler. No GPU needed;
+	# cuda clippy builds against the cubin stubs like the pass above.
+	cargo clippy -p lambda-vm-prover --all-targets --features cuda,hash-metrics -- -D warnings
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
