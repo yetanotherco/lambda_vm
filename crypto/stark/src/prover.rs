@@ -103,11 +103,23 @@ pub enum ProvingError {
     /// because that name says a commitment came back empty and not why.
     /// Carries the table's name.
     AuxTraceNotOnHost(String),
+    /// Two device admission regimes were asked for in one process: the
+    /// monolithic prover's byte budget and the prove-and-retire passes' serial
+    /// window. They cannot see each other's accounting, so a process running
+    /// both would spend the same card twice. Carries the refusal from
+    /// [`crate::device_window`], which names which regime was already live.
+    DeviceRegime(String),
 }
 
 impl From<FFTError> for ProvingError {
     fn from(e: FFTError) -> Self {
         ProvingError::Fft(format!("{e}"))
+    }
+}
+
+impl From<crate::device_window::DeviceRegimeError> for ProvingError {
+    fn from(e: crate::device_window::DeviceRegimeError) -> Self {
+        ProvingError::DeviceRegime(e.message().to_string())
     }
 }
 
@@ -920,10 +932,21 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// Only OS driver threads block here (see `run_admitted`) — never rayon
 /// workers, whose pool the admitted tables use internally and which a
 /// blocked worker would starve.
+///
+/// Holding one of these makes this process's device admission regime the byte
+/// budget, and the prove-and-retire passes' serial window is refused for as
+/// long as it lives. The budget, the admission rule and the concurrency below
+/// are unchanged by that: the regime token is a separate field, claimed on
+/// construction and released by its own `Drop`.
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
     budget: u64,
+    /// Claimed for the gate's whole life. Private and only obtainable from
+    /// `ByteBudgetRegime::claim`, so a `VramGate` cannot exist without the
+    /// regime being claimed — the rule is enforced by construction rather
+    /// than by a check someone could move or delete.
+    _regime: crate::device_window::ByteBudgetRegime,
 }
 
 struct VramPermit<'a> {
@@ -932,12 +955,15 @@ struct VramPermit<'a> {
 }
 
 impl VramGate {
-    fn new(budget: u64) -> Self {
-        Self {
+    /// Fails only when a prove-and-retire serial device window is open in this
+    /// process; see [`crate::device_window`].
+    fn new(budget: u64) -> Result<Self, crate::device_window::DeviceRegimeError> {
+        Ok(Self {
             used: std::sync::Mutex::new(0),
             freed: std::sync::Condvar::new(),
             budget,
-        }
+            _regime: crate::device_window::ByteBudgetRegime::claim()?,
+        })
     }
 
     fn acquire(&self, bytes: u64) -> VramPermit<'_> {
@@ -4482,7 +4508,7 @@ pub trait IsStarkProver<
         // don't re-add pre-sizing without a shared-slab design that bounds the
         // number of allocations.
 
-        let vram_gate = VramGate::new(vram_budget);
+        let vram_gate = VramGate::new(vram_budget)?;
 
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.

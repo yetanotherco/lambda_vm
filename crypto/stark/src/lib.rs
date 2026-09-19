@@ -11,6 +11,7 @@ pub mod constraint_ir;
 pub mod constraints;
 pub mod context;
 pub mod debug;
+pub mod device_window;
 pub mod domain;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod examples;
