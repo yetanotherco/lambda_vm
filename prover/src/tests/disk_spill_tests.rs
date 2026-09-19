@@ -61,7 +61,7 @@ fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
 
 /// The five SHA-256 tables are fixed-size, so `chunk_and_generate` never sees
 /// them and the fixed-table spill block covers only bitwise/decode/commit/
-/// register/halt/pages. ROTXOR is 224 rows of 197 columns per compression call,
+/// register/halt/pages. SHA256ROUND is 64 rows of 114 columns per compression call,
 /// which makes it the largest thing a SHA-heavy run holds — left on the heap it
 /// defeats the point of selecting disk mode. Builds traces directly rather than
 /// through `prove`, so it needs no `FORCE_DISK_SPILL`.
@@ -85,7 +85,6 @@ fn sha256_traces_spill_in_disk_mode() {
         ("sha256", &traces.sha256s),
         ("sha256_round", &traces.sha256_rounds),
         ("sha256_schedule", &traces.sha256_schedules),
-        ("sha256_rotxor", &traces.sha256_rotxors),
         ("sha256_k", &traces.sha256_ks),
     ]
     .map(|(name, v)| (name, v.first().expect("the program makes SHA calls")))

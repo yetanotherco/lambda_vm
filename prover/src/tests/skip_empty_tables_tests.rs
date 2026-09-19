@@ -103,7 +103,6 @@ fn every_table_participates_in_the_bus() {
         sha256: 1,
         sha256_round: 1,
         sha256_schedule: 1,
-        sha256_rotxor: 1,
         sha256_k: 1,
     };
     let airs = VmAirs::new(
@@ -166,7 +165,6 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         sha256,
         sha256_round,
         sha256_schedule,
-        sha256_rotxor,
         sha256_k,
     } = counts;
     [
@@ -193,7 +191,6 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("SHA256", sha256),
         ("SHA256ROUND", sha256_round),
         ("SHA256MSGSCHED", sha256_schedule),
-        ("ROTXOR", sha256_rotxor),
         ("SHA256_K", sha256_k),
     ]
     .into_iter()

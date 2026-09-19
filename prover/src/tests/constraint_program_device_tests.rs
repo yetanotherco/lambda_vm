@@ -189,10 +189,6 @@ fn all_table_programs_lower_and_match_folders() {
         &crate::test_utils::create_sha256_schedule_air(&opts),
         "sha256_schedule",
     );
-    check_air_device(
-        &crate::test_utils::create_sha256_rotxor_air(&opts),
-        "sha256_rotxor",
-    );
     check_air_device(&crate::test_utils::create_sha256_k_air(&opts), "sha256_k");
 
     check_air_device(&create_ecdas_air(&opts), "ECDAS");

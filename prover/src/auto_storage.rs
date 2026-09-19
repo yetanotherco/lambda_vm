@@ -209,7 +209,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     ];
     // SHA256 is a fixed set of tables, expanded per compression call. Include
     // their real widths and lookup columns in the spill decision.
-    use crate::tables::{sha256, sha256_k, sha256_rotxor, sha256_round, sha256_schedule};
+    use crate::tables::{sha256, sha256_k, sha256_round, sha256_schedule};
     for (factor, width, buses) in [
         (1, sha256::WIDTH, sha256::bus_interactions().len()),
         (
@@ -221,11 +221,6 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             48,
             sha256_schedule::WIDTH,
             sha256_schedule::bus_interactions().len(),
-        ),
-        (
-            224,
-            sha256_rotxor::WIDTH,
-            sha256_rotxor::bus_interactions().len(),
         ),
     ] {
         let rows = (lengths.sha256_calls * factor).next_power_of_two().max(4);

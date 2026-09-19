@@ -1,6 +1,6 @@
 //! Algebraic and trace mutation tests for the SHA compression chips.
 use crate::tables::types::{FE, GoldilocksExtension as E, GoldilocksField as F};
-use crate::tables::{sha256, sha256_rotxor, sha256_round, sha256_schedule};
+use crate::tables::{sha256, sha256_round, sha256_schedule};
 use stark::{
     constraints::builder::{ConstraintSet, ProverEvalFolder},
     frame::Frame,
@@ -58,10 +58,13 @@ fn sha256_constraints_and_mutations() {
     assert!(!holds(sha256_round::Constraints, &rounds));
     let mut schedule = sha256_schedule::generate(&ops);
     assert!(holds(sha256_schedule::Constraints, &schedule));
-    schedule.main_table.set(0, 9, FE::from(2));
+    // A bit of w[i-15] holding 2: σ0 is an expression over these, so the bit
+    // check is what stands between a forged rotation and a valid trace.
+    schedule.main_table.set(0, sha256_schedule::B15, FE::from(2));
     assert!(!holds(sha256_schedule::Constraints, &schedule));
-    let mut rot = sha256_rotxor::generate(&sha256::rot_ops(&ops));
-    assert!(holds(sha256_rotxor::Constraints, &rot));
-    rot.main_table.set(0, 32, FE::from(2));
-    assert!(!holds(sha256_rotxor::Constraints, &rot));
+    let mut round_bits = sha256_round::generate(&ops);
+    round_bits
+        .main_table
+        .set(0, sha256_round::A, FE::from(2));
+    assert!(!holds(sha256_round::Constraints, &round_bits));
 }

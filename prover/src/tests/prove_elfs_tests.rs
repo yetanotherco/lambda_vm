@@ -2848,7 +2848,6 @@ fn test_verify_rejects_zero_table_counts() {
             sha256: 0,
             sha256_round: 0,
             sha256_schedule: 0,
-            sha256_rotxor: 0,
             sha256_k: 0,
         },
         ..vm_proof
@@ -2944,7 +2943,6 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         sha256: 0,
         sha256_round: 0,
         sha256_schedule: 0,
-        sha256_rotxor: 0,
         sha256_k: 0,
     };
     let airs = VmAirs::new(
@@ -4014,7 +4012,12 @@ fn test_prove_elfs_sha256_overlap_and_tampering() {
             1 => (&mut traces.sha256s[0], crate::tables::sha256::PTR),
             2 => (&mut traces.sha256_rounds[0], crate::tables::sha256_round::K),
             3 => (&mut traces.sha256_schedules[0], 3),
-            _ => (&mut traces.sha256_rotxors[0], 32),
+            // Σ0 and σ0 are now expressions over these bits rather than a
+            // ROTXOR lookup, so this is where a forged rotation would land.
+            _ => (
+                &mut traces.sha256_schedules[0],
+                crate::tables::sha256_schedule::B15,
+            ),
         };
         let old = *table.main_table.get(0, col);
         table.main_table.set(0, col, old + FieldElement::<F>::one());

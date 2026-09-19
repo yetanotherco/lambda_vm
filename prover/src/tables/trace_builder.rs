@@ -67,7 +67,7 @@ use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
-use super::{sha256, sha256_k, sha256_rotxor, sha256_round, sha256_schedule};
+use super::{sha256, sha256_k, sha256_round, sha256_schedule};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
@@ -2882,7 +2882,6 @@ pub struct Traces {
     pub sha256s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub sha256_rounds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub sha256_schedules: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub sha256_rotxors: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub sha256_ks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// KECCAK_RND round table (24 rows per keccak call). Empty alongside KECCAK.
@@ -3677,9 +3676,8 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     // SHA-256 accelerator traces. Absent entirely for programs that make no SHA
-    // ecall — which matters more here than for the other accelerators: ROTXOR is
-    // 224 rows of 197 columns per compression call, so it is the heaviest table
-    // the accelerator adds and the one a non-hashing run most wants to skip.
+    // ecall. SHA256ROUND is the heaviest of them at 64 rows of 114 columns per
+    // compression call, and the one a non-hashing run most wants to skip.
     // `generate_optional` also spills in disk mode, so these need no separate
     // spill of their own.
     let gen_sha256s = || {
@@ -3702,15 +3700,6 @@ fn build_traces<I: ImageSource + Sync>(
         generate_optional(
             &sha256_ops,
             sha256_schedule::generate,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
-    let gen_sha256_rotxors = || {
-        let rot_ops = sha256::rot_ops(&sha256_ops);
-        generate_optional(
-            &rot_ops,
-            sha256_rotxor::generate,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3739,7 +3728,7 @@ fn build_traces<I: ImageSource + Sync>(
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
     let (mut sha256s_slot, mut sha256_rounds_slot, mut sha256_schedules_slot) = (None, None, None);
-    let (mut sha256_rotxors_slot, mut sha256_ks_slot) = (None, None);
+    let mut sha256_ks_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3782,7 +3771,6 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
-            spawn_into!(sha256_rotxors_slot, gen_sha256_rotxors);
             spawn_into!(sha256_rounds_slot, gen_sha256_rounds);
             spawn_into!(sha256_schedules_slot, gen_sha256_schedules);
             spawn_into!(sha256s_slot, gen_sha256s);
@@ -3818,7 +3806,6 @@ fn build_traces<I: ImageSource + Sync>(
         sha256s_slot = Some(gen_sha256s());
         sha256_rounds_slot = Some(gen_sha256_rounds());
         sha256_schedules_slot = Some(gen_sha256_schedules());
-        sha256_rotxors_slot = Some(gen_sha256_rotxors());
         sha256_ks_slot = Some(gen_sha256_ks());
     }
 
@@ -3857,7 +3844,6 @@ fn build_traces<I: ImageSource + Sync>(
     let sha256s = sha256s_slot.expect(PHASE5_RAN)?;
     let sha256_rounds = sha256_rounds_slot.expect(PHASE5_RAN)?;
     let sha256_schedules = sha256_schedules_slot.expect(PHASE5_RAN)?;
-    let sha256_rotxors = sha256_rotxors_slot.expect(PHASE5_RAN)?;
     let sha256_ks = sha256_ks_slot.expect(PHASE5_RAN)?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3922,7 +3908,6 @@ fn build_traces<I: ImageSource + Sync>(
         sha256s,
         sha256_rounds,
         sha256_schedules,
-        sha256_rotxors,
         sha256_ks,
         keccak_rc: keccak_rc_trace,
         ecsms,
@@ -4353,7 +4338,6 @@ impl Traces {
             sha256s,
             sha256_rounds,
             sha256_schedules,
-            sha256_rotxors,
             sha256_ks,
             keccak_rc,
             ecsms,
@@ -4425,9 +4409,6 @@ impl Traces {
         }
         for t in sha256_schedules {
             total += (t.num_rows() * sha256_schedule::WIDTH) as u64;
-        }
-        for t in sha256_rotxors {
-            total += (t.num_rows() * sha256_rotxor::WIDTH) as u64;
         }
         for t in sha256_ks {
             total += (t.num_rows() * (sha256_k::WIDTH - sha256_k::NUM_PRECOMPUTED_COLS)) as u64;
@@ -4518,7 +4499,6 @@ impl Traces {
             sha256s,
             sha256_rounds,
             sha256_schedules,
-            sha256_rotxors,
             sha256_ks,
             keccak_rc,
             ecsms,
@@ -4591,9 +4571,6 @@ impl Traces {
         for t in sha256_schedules {
             total += (t.num_rows() * aux_cols(sha256_schedule::bus_interactions().len())) as u64;
         }
-        for t in sha256_rotxors {
-            total += (t.num_rows() * aux_cols(sha256_rotxor::bus_interactions().len())) as u64;
-        }
         for t in sha256_ks {
             total += (t.num_rows() * aux_cols(sha256_k::bus_interactions().len())) as u64;
         }
@@ -4648,7 +4625,6 @@ impl Traces {
             sha256: self.sha256s.len(),
             sha256_round: self.sha256_rounds.len(),
             sha256_schedule: self.sha256_schedules.len(),
-            sha256_rotxor: self.sha256_rotxors.len(),
             sha256_k: self.sha256_ks.len(),
         }
     }

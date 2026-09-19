@@ -123,7 +123,6 @@ pub struct TableCounts {
     pub sha256: usize,
     pub sha256_round: usize,
     pub sha256_schedule: usize,
-    pub sha256_rotxor: usize,
     pub sha256_k: usize,
 }
 
@@ -156,7 +155,6 @@ impl TableCounts {
             self.sha256,
             self.sha256_round,
             self.sha256_schedule,
-            self.sha256_rotxor,
             self.sha256_k,
             self.ecsm,
             self.ecdas,
@@ -225,7 +223,6 @@ impl TableCounts {
             ("sha256", self.sha256),
             ("sha256_round", self.sha256_round),
             ("sha256_schedule", self.sha256_schedule),
-            ("sha256_rotxor", self.sha256_rotxor),
             ("sha256_k", self.sha256_k),
         ];
         for (name, count) in at_most_one {
@@ -607,7 +604,6 @@ pub(crate) struct VmAirs {
     pub sha256s: Vec<VmAir>,
     pub sha256_rounds: Vec<VmAir>,
     pub sha256_schedules: Vec<VmAir>,
-    pub sha256_rotxors: Vec<VmAir>,
     pub sha256_ks: Vec<VmAir>,
     pub keccak_rc: VmAir,
     pub ecsms: Vec<VmAir>,
@@ -650,7 +646,6 @@ impl VmAirs {
                 self.sha256s.len(),
                 self.sha256_rounds.len(),
                 self.sha256_schedules.len(),
-                self.sha256_rotxors.len(),
                 self.sha256_ks.len(),
                 self.ecsms.len(),
                 self.ecdases.len(),
@@ -678,7 +673,6 @@ impl VmAirs {
                 traces.sha256s.len(),
                 traces.sha256_rounds.len(),
                 traces.sha256_schedules.len(),
-                traces.sha256_rotxors.len(),
                 traces.sha256_ks.len(),
                 traces.ecsms.len(),
                 traces.ecdases.len(),
@@ -733,13 +727,6 @@ impl VmAirs {
             .sha256_schedules
             .iter()
             .zip(traces.sha256_schedules.iter_mut())
-        {
-            pairs.push((air.as_ref(), trace, &()));
-        }
-        for (air, trace) in self
-            .sha256_rotxors
-            .iter()
-            .zip(traces.sha256_rotxors.iter_mut())
         {
             pairs.push((air.as_ref(), trace, &()));
         }
@@ -840,9 +827,6 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.sha256_schedules {
-            refs.push(air.as_ref());
-        }
-        for air in &self.sha256_rotxors {
             refs.push(air.as_ref());
         }
         for air in &self.sha256_ks {
@@ -1047,14 +1031,6 @@ impl VmAirs {
                 ) as VmAir
             })
             .collect();
-        let sha256_rotxors: Vec<_> = (0..table_counts.sha256_rotxor)
-            .map(|i| {
-                Box::new(
-                    test_utils::create_sha256_rotxor_air(proof_options)
-                        .with_name(&format!("ROTXOR[{i}]")),
-                ) as VmAir
-            })
-            .collect();
         let sha256_ks: Vec<_> = (0..table_counts.sha256_k)
             .map(|i| {
                 Box::new(
@@ -1202,7 +1178,6 @@ impl VmAirs {
             sha256s,
             sha256_rounds,
             sha256_schedules,
-            sha256_rotxors,
             sha256_ks,
             keccak_rc,
             ecsms,

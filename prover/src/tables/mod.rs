@@ -167,6 +167,5 @@ impl MaxRowsConfig {
 pub mod sha256;
 pub mod sha256_common;
 pub mod sha256_k;
-pub mod sha256_rotxor;
 pub mod sha256_round;
 pub mod sha256_schedule;

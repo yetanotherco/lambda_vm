@@ -32,7 +32,6 @@ fn sample_counts() -> TableCounts {
         sha256: 1,
         sha256_round: 1,
         sha256_schedule: 1,
-        sha256_rotxor: 1,
         sha256_k: 1,
     }
 }
@@ -106,7 +105,6 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         sha256,
         sha256_round,
         sha256_schedule,
-        sha256_rotxor,
         sha256_k,
     } = counts;
     vec![
@@ -133,16 +131,16 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ("sha256", sha256),
         ("sha256_round", sha256_round),
         ("sha256_schedule", sha256_schedule),
-        ("sha256_rotxor", sha256_rotxor),
         ("sha256_k", sha256_k),
     ]
 }
 
 /// Every count has to reach the transcript, not just the one a test happened
-/// to pick. The V4 encoding added six accelerator counts; a field that is
-/// destructured in `absorb_statement` and then left out of the array it
-/// absorbs compiles clean and changes nothing about the state, which is a
-/// prover-chosen number the verifier would no longer be bound to.
+/// to pick. The V4 encoding added six accelerator counts and V6 dropped
+/// ROTXOR's; a field that is destructured in `absorb_statement` and then left
+/// out of the array it absorbs compiles clean and changes nothing about the
+/// state, which is a prover-chosen number the verifier would no longer be
+/// bound to.
 #[test]
 fn state_depends_on_every_table_count() {
     let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 7);
@@ -151,7 +149,7 @@ fn state_depends_on_every_table_count() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(names.len(), 25, "every count must be probed");
+    assert_eq!(names.len(), 24, "every count must be probed");
 
     for name in names {
         let mut counts = sample_counts();

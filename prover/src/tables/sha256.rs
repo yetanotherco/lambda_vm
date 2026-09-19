@@ -235,23 +235,6 @@ impl ConstraintSet<F, E> for Constraints {
     }
 }
 
-pub fn rot_ops(ops: &[Operation]) -> Vec<(u32, usize)> {
-    let mut v = vec![];
-    for op in ops {
-        let w = executor::sha256::schedule(&op.message);
-        for i in 16..64 {
-            v.push((w[i - 15], 0));
-            v.push((w[i - 2], 1));
-        }
-        let mut s = op.state_words();
-        for (&word, &constant) in w.iter().zip(&executor::sha256::K) {
-            v.push((s[0], 2));
-            v.push((s[4], 3));
-            s = executor::sha256::round(s, word, constant);
-        }
-    }
-    v
-}
 pub fn bitwise_ops(ops: &[Operation]) -> Vec<super::bitwise::BitwiseOperation> {
     use super::bitwise::{BitwiseOperation as Op, BitwiseOperationType as Ty};
     let mut v = vec![];
@@ -268,9 +251,9 @@ pub fn bitwise_ops(ops: &[Operation]) -> Vec<super::bitwise::BitwiseOperation> {
             v.push(Op::halfword(Ty::AreBytes, out[2 * i], out[2 * i + 1]));
         }
     }
-    // ROTXOR resolves its shifts and XORs through BITWISE now, so its lookups
-    // have to be counted here too or the bus does not balance.
-    v.extend(super::sha256_rotxor::bitwise_ops(&rot_ops(ops)));
+    // The round and schedule chips resolve Ch, Maj and their range checks
+    // through BITWISE, so their lookups have to be counted here too or the bus
+    // does not balance.
     v.extend(super::sha256_round::bitwise_ops(ops));
     v.extend(super::sha256_schedule::bitwise_ops(ops));
     v

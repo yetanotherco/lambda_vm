@@ -361,7 +361,6 @@ pub enum BusId {
     GlobalMemory = 31,
     ShaRound = 32,
     ShaM = 33,
-    ShaRot = 34,
     ShaK = 35,
 }
 
@@ -394,7 +393,6 @@ impl BusId {
             BusId::GlobalMemory => "GlobalMemory",
             BusId::ShaRound => "ShaRound",
             BusId::ShaM => "ShaM",
-            BusId::ShaRot => "ShaRot",
             BusId::ShaK => "ShaK",
         }
     }
@@ -430,7 +428,6 @@ impl TryFrom<u64> for BusId {
             31 => Ok(BusId::GlobalMemory),
             32 => Ok(BusId::ShaRound),
             33 => Ok(BusId::ShaM),
-            34 => Ok(BusId::ShaRot),
             35 => Ok(BusId::ShaK),
             other => Err(other),
         }

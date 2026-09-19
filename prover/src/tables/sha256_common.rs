@@ -41,8 +41,8 @@ pub fn recv(bus: BusId, mu: usize, v: Vec<BusValue>) -> BusInteraction {
 }
 /// Row-at-a-time writer over a table allocated once at its padded size.
 ///
-/// The chips here are wide (ROTXOR is 197 columns) and produce hundreds of rows
-/// per compression call, so collecting the rows into a `Vec<Vec<u64>>` first
+/// The chips here are wide (SHA256ROUND is 114 columns) and produce a hundred
+/// rows per compression call, so collecting them into a `Vec<Vec<u64>>` first
 /// would allocate once per row and keep a second copy of the whole table alive
 /// while this one is filled.
 pub struct TraceRows {
@@ -84,6 +84,47 @@ impl TraceRows {
         self.table
     }
 }
+/// `(rotate, rotate, rotate-or-shift, is_shift)` for σ0, σ1, Σ0, Σ1.
+const SIGMA: [[usize; 4]; 4] = [[7, 18, 3, 1], [17, 19, 10, 1], [2, 13, 22, 0], [6, 11, 25, 0]];
+
+/// σ_kind or Σ_kind of the 32 bits at `c`, as an expression.
+///
+/// Bit `i` of a right rotation by `n` is bit `(i+n) mod 32` of the input, and of
+/// a right shift it is bit `i+n` or zero — both are free re-indexings. The
+/// three-way XOR is `x+y+z − 2(xy+xz+yz) + 4xyz`; where a shift contributes a
+/// zero bit it collapses to `x+y−2xy` and to degree 2. This is what lets the
+/// round and schedule chips drop their ROTXOR requests — see
+/// SHA256_OPT_ZKVM_SURVEY.md for how OpenVM, ZisK and RISC0 do the same.
+pub fn sigma<B: ConstraintBuilder<F, E>>(b: &B, c: usize, kind: usize) -> B::Expr {
+    let [ra, rb, rc, is_shift] = SIGMA[kind];
+    let mut acc = b.const_base(0);
+    for i in 0..32 {
+        let x = b.main(0, c + (i + ra) % 32);
+        let y = b.main(0, c + (i + rb) % 32);
+        let bit = if is_shift == 1 && i + rc >= 32 {
+            x.clone() + y.clone() - b.const_base(2) * (x * y)
+        } else {
+            let z = b.main(0, c + if is_shift == 1 { i + rc } else { (i + rc) % 32 });
+            x.clone() + y.clone() + z.clone()
+                - b.const_base(2)
+                    * (x.clone() * y.clone() + x.clone() * z.clone() + y.clone() * z.clone())
+                + b.const_base(4) * (x * y * z)
+        };
+        acc = acc + b.const_base(1u64 << i) * bit;
+    }
+    acc
+}
+
+/// Byte `j` of the 32 bit columns at `c`, or its complement — the form a
+/// `BYTE_ALU` operand takes when the word is held as bits.
+pub fn byte_bits(c: usize, j: usize, complement: bool) -> BusValue {
+    let s = if complement { -1i64 } else { 1 };
+    lin(
+        (0..8).map(|i| (c + 8 * j + i, s << i)).collect(),
+        if complement { 255 } else { 0 },
+    )
+}
+
 pub fn put_bits(row: &mut [u64], c: usize, x: u64, n: usize) {
     for i in 0..n {
         row[c + i] = (x >> i) & 1;

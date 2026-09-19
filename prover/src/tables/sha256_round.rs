@@ -1,14 +1,22 @@
 //! SHA256ROUND, following `spec/src/sha256round.toml`: Ch and Maj come from
 //! `BYTE_ALU` lookups over byte-split state words, not from per-bit gates.
 //!
-//! The state splits asymmetrically on purpose, as the spec has it: `a`, `b`,
-//! `c`, `e`, `f`, `g` are WordBL because they feed byte lookups, while `d` and
-//! `h` stay single field elements because they only ever appear in an addition.
-//! `ch`, `maj`, `temp1` and `temp2` are the spec's *virtual* variables — they
-//! are expressions over those columns, never stored.
+//! The state splits asymmetrically on purpose, as the spec has it: `b`, `c`,
+//! `f`, `g` are WordBL because they feed byte lookups, while `d` and `h` stay
+//! single field elements because they only ever appear in an addition. `ch`,
+//! `maj`, `temp1` and `temp2` are the spec's *virtual* variables — they are
+//! expressions over those columns, never stored.
+//!
+//! `a` and `e` are held as 32 bits instead, so Σ0 and Σ1 are expressions rather
+//! than ROTXOR requests: a rotation is an index permutation of the bits, and a
+//! three-way XOR of bits is degree 3 with no columns and no lookups. Their
+//! bytes are still available to `BYTE_ALU` as linear combinations of eight bits,
+//! so no byte column is needed for them either. With the schedule chip doing the
+//! same for σ0/σ1, the ROTXOR chip has no callers left and has been removed —
+//! which is how OpenVM, ZisK and RISC0 arithmetize SHA-256. See
+//! SHA256_OPT_ZKVM_SURVEY.md.
 use super::{
     sha256_common::*,
-    sha256_rotxor as rot,
     types::{BusId, GoldilocksExtension as E, GoldilocksField as F, alu_op},
 };
 use stark::{
@@ -19,33 +27,32 @@ use stark::{
 
 pub const TS: usize = 0;
 pub const INDEX: usize = 2;
+/// `a` and `e`, bit by bit, least-significant first.
 pub const A: usize = 3;
-pub const B: usize = 7;
-pub const C: usize = 11;
-pub const D: usize = 15;
-pub const E_: usize = 16;
-pub const FF: usize = 20;
-pub const G: usize = 24;
-pub const H: usize = 28;
-pub const OUT_A: usize = 29;
-pub const OUT_E: usize = 31;
-pub const A_AND_B: usize = 33;
-pub const A_XOR_B: usize = 37;
-pub const C_AND_A_XOR_B: usize = 41;
-pub const E_AND_F: usize = 45;
-pub const NOT_E_AND_G: usize = 49;
-pub const K: usize = 53;
-pub const S0: usize = 54;
-pub const S1: usize = 55;
-pub const W: usize = 56;
+pub const B: usize = 35;
+pub const C: usize = 39;
+pub const D: usize = 43;
+pub const E_: usize = 44;
+pub const FF: usize = 76;
+pub const G: usize = 80;
+pub const H: usize = 84;
+pub const OUT_A: usize = 85;
+pub const OUT_E: usize = 87;
+pub const A_AND_B: usize = 89;
+pub const A_XOR_B: usize = 93;
+pub const C_AND_A_XOR_B: usize = 97;
+pub const E_AND_F: usize = 101;
+pub const NOT_E_AND_G: usize = 105;
+pub const K: usize = 109;
+pub const W: usize = 110;
 /// The spec keeps the two carries virtual. They are columns here because
 /// recovering them as expressions needs a multiply by 2^-32, and a bus value's
 /// coefficients are i64 — which that constant does not fit. Two columns out of
 /// sixty, and the constraint is the same either way.
-pub const CARRY_A: usize = 57;
-pub const CARRY_E: usize = 58;
-pub const MU: usize = 59;
-pub const WIDTH: usize = 60;
+pub const CARRY_A: usize = 111;
+pub const CARRY_E: usize = 112;
+pub const MU: usize = 113;
+pub const WIDTH: usize = 114;
 
 /// The 32-bit value of the WordBL at `c`.
 fn word_bl(c: usize) -> BusValue {
@@ -75,11 +82,11 @@ pub fn generate(ops: &[super::sha256::Operation]) -> TraceTable<F, E> {
                 r[TS] = op.timestamp & 0xffffffff;
                 r[TS + 1] = op.timestamp >> 32;
                 r[INDEX] = i as u64;
-                put_bytes(r, A, a);
+                put_bits(r, A, a as u64, 32);
                 put_bytes(r, B, b);
                 put_bytes(r, C, c);
                 r[D] = d as u64;
-                put_bytes(r, E_, e);
+                put_bits(r, E_, e as u64, 32);
                 put_bytes(r, FF, f);
                 put_bytes(r, G, g);
                 r[H] = h as u64;
@@ -91,8 +98,6 @@ pub fn generate(ops: &[super::sha256::Operation]) -> TraceTable<F, E> {
                 put_bytes(r, NOT_E_AND_G, !e & g);
 
                 r[K] = executor::sha256::K[i] as u64;
-                r[S0] = executor::sha256::sigma(a, 2) as u64;
-                r[S1] = executor::sha256::sigma(e, 3) as u64;
                 r[W] = word as u64;
 
                 // out_a and out_e are WordHL, so the halves go in separately.
@@ -103,8 +108,9 @@ pub fn generate(ops: &[super::sha256::Operation]) -> TraceTable<F, E> {
 
                 let ch = (e & f) as u64 + (!e & g) as u64;
                 let maj = (a & b) as u64 + (c & (a ^ b)) as u64;
-                let temp1 = h as u64 + r[S1] + ch + r[K] + r[W];
-                let temp2 = r[S0] + maj;
+                let temp1 =
+                    h as u64 + executor::sha256::sigma(e, 3) as u64 + ch + r[K] + r[W];
+                let temp2 = executor::sha256::sigma(a, 2) as u64 + maj;
                 r[CARRY_A] = (temp1 + temp2) >> 32;
                 r[CARRY_E] = (d as u64 + temp1) >> 32;
                 r[MU] = 1;
@@ -119,15 +125,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut v = Vec::with_capacity(30);
     // Ch and Maj, byte by byte. `255 - e[j]` is the byte complement the spec
     // uses so `not_e_and_g` needs no extra opsel.
-    for (op, x, complement_x, y, out) in [
-        (alu_op::AND, A, false, B, A_AND_B),
-        (alu_op::XOR, A, false, B, A_XOR_B),
-        (alu_op::AND, C, false, A_XOR_B, C_AND_A_XOR_B),
-        (alu_op::AND, E_, false, FF, E_AND_F),
-        (alu_op::AND, E_, true, G, NOT_E_AND_G),
+    for (op, x, x_is_bits, complement_x, y, out) in [
+        (alu_op::AND, A, true, false, B, A_AND_B),
+        (alu_op::XOR, A, true, false, B, A_XOR_B),
+        (alu_op::AND, C, false, false, A_XOR_B, C_AND_A_XOR_B),
+        (alu_op::AND, E_, true, false, FF, E_AND_F),
+        (alu_op::AND, E_, true, true, G, NOT_E_AND_G),
     ] {
         for j in 0..4 {
-            let left = if complement_x {
+            let left = if x_is_bits {
+                byte_bits(x, j, complement_x)
+            } else if complement_x {
                 lin(vec![(x + j, -1)], 255)
             } else {
                 col(x + j)
@@ -150,8 +158,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         MU,
         vec![col(TS), col(TS + 1), col(INDEX), col(W)],
     ));
-    v.push(rot::request(MU, word_bl(A), 2, col(S0)));
-    v.push(rot::request(MU, word_bl(E_), 3, col(S1)));
     // The two outputs are range-checked as half-words by lookup; the carries as
     // bytes, which one paired ARE_BYTES send covers.
     for c in [OUT_A, OUT_E] {
@@ -163,11 +169,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     let mut input = vec![col(TS), col(TS + 1), col(INDEX)];
     input.extend([
-        word_bl(A),
+        bits(A, 32),
         word_bl(B),
         word_bl(C),
         col(D),
-        word_bl(E_),
+        bits(E_, 32),
         word_bl(FF),
         word_bl(G),
         col(H),
@@ -175,11 +181,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut output = vec![col(TS), col(TS + 1), lin(vec![(INDEX, 1)], 1)];
     output.extend([
         word_hl(OUT_A),
-        word_bl(A),
+        bits(A, 32),
         word_bl(B),
         word_bl(C),
         word_hl(OUT_E),
-        word_bl(E_),
+        bits(E_, 32),
         word_bl(FF),
         word_bl(G),
     ]);
@@ -191,6 +197,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 #[derive(Clone, Copy)]
 pub struct Constraints;
 impl ConstraintSet<F, E> for Constraints {
+    /// The three-way XOR inside σ/Σ is degree 3. LogUp already raises the
+    /// composition bound to 3, so declaring it here costs nothing and keeps the
+    /// declaration honest.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         let word = |b: &B, c: usize| {
             (0..4).fold(b.const_base(0), |acc, j| {
@@ -201,13 +214,15 @@ impl ConstraintSet<F, E> for Constraints {
 
         let mut id = 0;
         check_bits(b, &mut id, MU, 1);
+        check_bits(b, &mut id, A, 32);
+        check_bits(b, &mut id, E_, 32);
 
         // temp1 = h + S1 + ch + k + w, temp2 = S0 + maj — the spec's virtuals,
         // with ch and maj summed straight out of the BYTE_ALU results.
         let ch = word(b, E_AND_F) + word(b, NOT_E_AND_G);
         let maj = word(b, A_AND_B) + word(b, C_AND_A_XOR_B);
-        let temp1 = b.main(0, H) + b.main(0, S1) + ch + b.main(0, K) + b.main(0, W);
-        let temp2 = b.main(0, S0) + maj;
+        let temp1 = b.main(0, H) + sigma(b, E_, 3) + ch + b.main(0, K) + b.main(0, W);
+        let temp2 = sigma(b, A, 2) + maj;
 
         b.emit_base(
             id,

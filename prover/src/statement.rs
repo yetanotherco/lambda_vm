@@ -17,7 +17,7 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V5";
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V6";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -121,7 +121,6 @@ pub(crate) fn absorb_statement_with_digest(
         sha256,
         sha256_round,
         sha256_schedule,
-        sha256_rotxor,
         sha256_k,
     } = table_counts;
     for count in [
@@ -148,7 +147,6 @@ pub(crate) fn absorb_statement_with_digest(
         sha256,
         sha256_round,
         sha256_schedule,
-        sha256_rotxor,
         sha256_k,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());
@@ -199,7 +197,7 @@ pub(crate) fn absorb_statement_with_digest(
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V5";
+const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V6";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

@@ -1065,20 +1065,6 @@ pub fn create_sha256_schedule_air(
     )
 }
 
-pub fn create_sha256_rotxor_air(
-    options: &ProofOptions,
-) -> ConcreteVmAir<crate::tables::sha256_rotxor::Constraints> {
-    use crate::tables::sha256_rotxor as chip;
-    build_air(
-        chip::WIDTH,
-        chip::bus_interactions(),
-        options,
-        1,
-        chip::Constraints,
-        "ROTXOR",
-    )
-}
-
 pub fn create_sha256_k_air(options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
     use crate::tables::sha256_k as chip;
     build_air(
