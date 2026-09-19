@@ -1079,17 +1079,18 @@ fn the_global_airs_describe_the_cross_epoch_proof_they_were_asked_for() {
 /// chained, at the cost of the execution alone. That matters: re-deriving the
 /// boundaries in a test would be a second spelling of the epoch split, which is
 /// the thing the cross-epoch proof is about.
-fn cross_epoch_inputs(
-    elf_bytes: &[u8],
-    input: &[u8],
-    epoch_size_log2: u32,
-) -> (
+/// What [`cross_epoch_inputs`] hands back: the loaded ELF, every epoch's
+/// boundary, the init page data, the touched page bases, and how many of those
+/// are private-input pages.
+type CrossEpochInputs = (
     Elf,
     Vec<std::sync::Arc<Vec<local_to_global::CellBoundary>>>,
     std::collections::HashMap<u64, Vec<u8>>,
     Vec<u64>,
     usize,
-) {
+);
+
+fn cross_epoch_inputs(elf_bytes: &[u8], input: &[u8], epoch_size_log2: u32) -> CrossEpochInputs {
     let elf = Elf::load(elf_bytes).expect("load");
     let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
     let boundaries = continuation::for_each_epoch(
@@ -1810,16 +1811,16 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     );
     assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
     assert_eq!(
-        marginal, 103,
-        "the literal: what the rule charges today, UNPINNED — the pin is expected to \
-         measure 108 plus the threaded-sponge term"
+        marginal, 111,
+        "the MAXIMUM of the per-page spread {109, 110, 111}, UNPINNED — the threaded \
+         sponge makes the marginal depend on WHICH page is added"
     );
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
         "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_261);
+    assert_eq!(plan.savings, 10_248_237);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.

@@ -1231,7 +1231,16 @@ impl WhirGlobalAirs {
     /// [`refs`](Self::refs) — bookends included — because that is the order the
     /// proof is matched in. Deriving it here from `self.bookends.len()` is why a
     /// caller cannot arrive at the offset some other way.
-    pub fn genesis_stack(&self) -> crate::continuation::GenesisStackPlan {
+    ///
+    /// ⚠ `pub(crate)` AND NOT `pub`, THOUGH `WhirGlobalAirs` IS PUBLIC. The
+    /// plan it hands back is a crate-private type, so a `pub` method here is a
+    /// `private_interfaces` error. Widening the TYPE instead would CASCADE —
+    /// `GenesisStackPlan::routes` is a `Vec<PageRoute>` and `PageRoute` is
+    /// crate-private too — so two types' fields would become public API. The
+    /// only caller is in this crate and the emitter that will consume it is as
+    /// well, so the narrow fix is also the honest one: widening later is
+    /// trivial and reversible, publishing two types' fields is not.
+    pub(crate) fn genesis_stack(&self) -> crate::continuation::GenesisStackPlan {
         crate::continuation::genesis_stack_plan(
             &self.configs,
             self.bookends.len(),

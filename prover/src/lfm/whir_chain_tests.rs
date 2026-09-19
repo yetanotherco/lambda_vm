@@ -1199,15 +1199,18 @@ fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
         "ROUTE OVERLAP: at marginal {GENESIS_PAGE_MARGINAL_ROWS} the densest page the \
          rule can leave sparse carries {densest_sparse} entries and the least it \
          carries is {}, against a sparse-leg cap of {cap}. The retired single-page \
-         rule's pair was {} and {retired_break_even}.",
+         rule's pair was {} and {retired_break_even}; the retired 103 literal gave \
+         9,730.",
         densest_sparse + 1,
         retired_break_even - 1,
     );
     assert_eq!(retired_break_even, 9_725);
     assert_eq!(
-        densest_sparse, 9_730,
-        "the bound the cap must clear is the two-part rule's, and it is neither the \
-         retired rule's 9,724 nor its 9,725"
+        densest_sparse, 9_731,
+        "the bound the cap must clear is the two-part rule's AT THIS LITERAL; the \
+         retired single-page rule's pair was 9,724 / 9,725 and the retired 103 gave \
+         9,730 — all four clear the cap, which is exactly why this must be re-derived \
+         rather than re-read"
     );
 
     // ⚠ EXACT, BOTH WAYS — a bound asserted only from above could be any number
@@ -1324,7 +1327,7 @@ fn the_marginal_is_at_least_what_the_weight_term_bills() {
     // charges anyway; everything above that is the per-column and sponge terms
     // this form cannot see.
     assert!(
-        GENESIS_PAGE_MARGINAL_ROWS >= billed + 1,
+        GENESIS_PAGE_MARGINAL_ROWS > billed,
         "the literal charges {GENESIS_PAGE_MARGINAL_ROWS} rows for a page the weight \
          closure alone bills {billed} for: it is below a term it must contain"
     );
