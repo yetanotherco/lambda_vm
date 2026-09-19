@@ -40,6 +40,7 @@ pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
 /// DECODE, COMMIT, KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS, HINT, REGISTER.
 pub(crate) const NUM_FIXED_AIRS: usize = 10;
 
+#[cfg(feature = "parallel")]
 /// Where each table sits in `VmAirs::air_trace_pairs`.
 ///
 /// The order is the protocol — the transcript absorbs roots in it, and each
@@ -55,6 +56,7 @@ pub(crate) struct AirOrder {
     num_pages: usize,
 }
 
+#[cfg(feature = "parallel")]
 impl AirOrder {
     pub(crate) fn new(counts: crate::TableCounts, include_halt: bool, num_pages: usize) -> Self {
         Self {

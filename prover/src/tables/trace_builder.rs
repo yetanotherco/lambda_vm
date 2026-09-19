@@ -4232,6 +4232,8 @@ fn build_traces<I: ImageSource + Sync>(
         for f in &collectors {
             f(&mut base);
         }
+        // The collectors borrow the op lists that are moved below.
+        drop(collectors);
     }
     let bitwise_histogram = base;
     // The in-walk lookup Vec has been counted into the histogram; free it now.

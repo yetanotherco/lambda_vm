@@ -12,8 +12,11 @@
 
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
+#[cfg(feature = "parallel")]
 pub mod batched_verifier;
+#[cfg(feature = "parallel")]
 pub mod challenge_phase;
+#[cfg(feature = "parallel")]
 pub mod commit_phase;
 pub mod constraints;
 pub mod continuation;
@@ -21,8 +24,10 @@ pub mod continuation;
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+#[cfg(feature = "parallel")]
 pub mod logup_phase;
 mod paged_mem;
+#[cfg(feature = "parallel")]
 pub mod pass;
 pub(crate) mod streaming;
 pub use stark::profile_markers;
