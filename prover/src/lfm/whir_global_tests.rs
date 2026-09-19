@@ -843,10 +843,29 @@ mod tests {
         let built = started.elapsed();
         let arena = whir_global_arena(&global, &airs, &elf_bytes);
         let cost = global_cost(&global, &airs, &elf_bytes);
+
+        // ★ THE ROUTING, PRINTED — the reading the hybrid's ruling is quoted by,
+        // which this arm could not show before: `prepared` nonzero means the
+        // stack was TAKEN and the dense pages' genesis is settled by an opening
+        // rather than folded row by row.
+        //
+        // ⚠ READ OFF THE DRIVER'S OWN RECORD, never re-derived. `global.prepared`
+        // is what the VERIFICATION consumed, so the page count comes from the
+        // opening itself; evaluating the threshold a second time here would be a
+        // second opinion about a decision that was already made, and the two
+        // could disagree with nothing to say which was the run's.
+        let (dense_pages, stack_vars) = match &global.prepared {
+            Some(prepared) => (
+                prepared.at.len() / crate::continuation::PAGE_PREPROCESSED_COLUMNS,
+                prepared.stacked().0.n_stack(),
+            ),
+            None => (0, 0),
+        };
         println!(
             "GLOBAL PROGRAM: {} tables = {} bookends + {} pages; {} instrs \
-             (ops {} + consts {} + hints {} + publics {}); {} arena words; \
-             {} published; built in {:.2}s",
+             (ops {} + consts {} + hints {} + publics {}); prepared {} rows over \
+             {} dense pages at n_stack {}; {} arena words; {} published; built in \
+             {:.2}s",
             global.num_tables(),
             global.num_epochs,
             global.num_tables() - global.num_epochs,
@@ -855,6 +874,9 @@ mod tests {
             cost.constants.len(),
             cost.hints,
             cost.publics,
+            cost.prepared,
+            dense_pages,
+            stack_vars,
             arena[0].len(),
             program.public_len,
             built.as_secs_f64(),
