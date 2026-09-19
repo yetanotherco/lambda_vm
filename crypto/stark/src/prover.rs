@@ -2027,22 +2027,78 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __m = crate::instruments::span("a1_r1_main");
         let (main_src, num_main_cols) = trace.main_data_row_major();
-        let main_data =
-            expand_main(main_src, num_main_cols).map_err(|_| ProvingError::EmptyCommitment)?;
+
+        // Device round 1, main: one row-major NTT and one Merkle build on the
+        // card, with the HOST LDE KEPT (`retain_host_lde = true`) so a declined
+        // dispatch downstream degrades to the host arm instead of aborting. The
+        // handle is threaded onto the LDE trace at the end of this function,
+        // which is the thing that stops round 2 declining at `gpu_main()?`.
+        //
+        // ⚠ The host TREE that comes back is root-only, and that is NOT
+        // governed by `retain_host_lde` — from the commit threshold upward the
+        // tree stays resident whatever the flag says. So this also moves the
+        // R4 openings onto `gather_proofs_dev`, which needs no code here
+        // (`open_deep_composition_poly` already branches on the handle's tree)
+        // but does mean a declined gather has nothing to fall back to.
+        //
+        // Two deliberate exclusions, both of them seams for a later slice:
+        // `known_main` callers, because they asked NOT to have a tree built and
+        // that saving is the whole reason that path exists; and preprocessed
+        // tables, whose split commits two trees through their own helper.
+        #[cfg(feature = "cuda")]
+        let mut gpu_main_handle: Option<math_cuda::lde::GpuLdeBase> = None;
+        #[cfg(feature = "cuda")]
+        let mut device_main: Option<(Vec<FieldElement<Field>>, TableCommit<Field>)> = None;
+        #[cfg(not(feature = "cuda"))]
+        let device_main: Option<(Vec<FieldElement<Field>>, TableCommit<Field>)> = None;
+        #[cfg(feature = "cuda")]
+        if known_main.is_none() && !air.is_preprocessed() && num_main_cols > 0 {
+            let n = main_src.len() / num_main_cols;
+            if let Some((tree, handle, host_lde)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(
+                    main_src,
+                    trace.main_rowmajor_dev(),
+                    n,
+                    num_main_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    true,
+                )
+            {
+                let root = tree.root;
+                gpu_main_handle = Some(handle);
+                device_main = Some((host_lde, TableCommit::plain(tree, root)));
+            }
+        }
+
         // A caller that already has this table's main roots — the Commit phase
         // computed every one of them — and that will not open against the tree
         // can hand them over instead. Building the tree is the hottest thing in
         // a prove (keccak is 17.6% of the profile), so not building one that
         // nothing will ask a question of is the cheapest saving there is.
-        let main = match known_main {
-            Some(roots) => TableCommit::known_roots(roots.main, roots.precomputed),
-            None => Self::table_commit_for(air, &main_data, num_main_cols)?,
+        let (main_data, main) = match device_main {
+            Some(pair) => pair,
+            None => {
+                let main_data = expand_main(main_src, num_main_cols)
+                    .map_err(|_| ProvingError::EmptyCommitment)?;
+                let main = match known_main {
+                    Some(roots) => TableCommit::known_roots(roots.main, roots.precomputed),
+                    None => Self::table_commit_for(air, &main_data, num_main_cols)?,
+                };
+                (main_data, main)
+            }
         };
 
         #[cfg(feature = "instruments")]
         drop(__m);
         #[cfg(feature = "instruments")]
         let __a = crate::instruments::span("a1_r1_aux");
+        #[cfg(feature = "cuda")]
+        let mut gpu_aux_handle: Option<math_cuda::lde::GpuLdeExt3> = None;
         let (aux_data, num_aux_cols, aux) = if air.has_aux_trace() {
             let (aux_src, cols) = trace.aux_data_row_major();
             // The AIR declares auxiliary columns and the build above was asked
@@ -2052,24 +2108,71 @@ pub trait IsStarkProver<
             if cols == 0 || aux_src.is_empty() {
                 return Err(ProvingError::AuxTraceNotOnHost(air.name().to_string()));
             }
-            let mut out: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(lde_size * cols);
-            out.extend_from_slice(aux_src);
-            Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
-                &mut out,
-                cols,
-                domain.blowup_factor,
-                &twiddles.coset_weights,
-                &twiddles.two_half_inv,
-                &twiddles.two_half_fwd,
-            )
-            .map_err(|_| ProvingError::EmptyCommitment)?;
-            #[cfg(feature = "instruments")]
-            let __am = crate::instruments::span("a1_aux_merkle");
-            let (tree, root) =
-                Self::commit_rows_bit_reversed(&out, cols).ok_or(ProvingError::EmptyCommitment)?;
-            #[cfg(feature = "instruments")]
-            drop(__am);
-            (out, cols, Some(TableCommit::plain(tree, root)))
+
+            // The aux LDE is ext3, and the base-field helper above refuses a
+            // non-Goldilocks `E`, so this is its own entry point. Round 2 opens
+            // with `gpu_main()?` THEN `gpu_aux()?`: threading one without the
+            // other leaves it declining exactly as it did before, so these two
+            // arms are a pair rather than two independent savings.
+            #[cfg(feature = "cuda")]
+            let mut device_aux: Option<(
+                Vec<FieldElement<FieldExtension>>,
+                TableCommit<FieldExtension>,
+            )> = None;
+            #[cfg(not(feature = "cuda"))]
+            let device_aux: Option<(
+                Vec<FieldElement<FieldExtension>>,
+                TableCommit<FieldExtension>,
+            )> = None;
+            #[cfg(feature = "cuda")]
+            {
+                let n = aux_src.len() / cols;
+                if let Some((tree, handle, host_lde)) =
+                    crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep::<
+                        Field,
+                        FieldExtension,
+                        BatchedMerkleTreeBackend<FieldExtension>,
+                    >(
+                        aux_src,
+                        n,
+                        cols,
+                        domain.blowup_factor,
+                        &twiddles.coset_weights,
+                        true,
+                    )
+                {
+                    let root = tree.root;
+                    gpu_aux_handle = Some(handle);
+                    device_aux = Some((host_lde, TableCommit::plain(tree, root)));
+                }
+            }
+
+            match device_aux {
+                Some((out, commit)) => (out, cols, Some(commit)),
+                None => {
+                    let mut out: Vec<FieldElement<FieldExtension>> =
+                        Vec::with_capacity(lde_size * cols);
+                    out.extend_from_slice(aux_src);
+                    Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<
+                        Field,
+                    >(
+                        &mut out,
+                        cols,
+                        domain.blowup_factor,
+                        &twiddles.coset_weights,
+                        &twiddles.two_half_inv,
+                        &twiddles.two_half_fwd,
+                    )
+                    .map_err(|_| ProvingError::EmptyCommitment)?;
+                    #[cfg(feature = "instruments")]
+                    let __am = crate::instruments::span("a1_aux_merkle");
+                    let (tree, root) = Self::commit_rows_bit_reversed(&out, cols)
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                    #[cfg(feature = "instruments")]
+                    drop(__am);
+                    (out, cols, Some(TableCommit::plain(tree, root)))
+                }
+            }
         } else {
             (Vec::new(), 0, None)
         };
@@ -2087,15 +2190,32 @@ pub trait IsStarkProver<
             transcript.append_field_element(&bpi.table_contribution);
         }
 
+        #[allow(unused_mut)]
+        let mut lde_trace = LDETraceTable::from_row_major(
+            main_data,
+            num_main_cols,
+            aux_data,
+            num_aux_cols,
+            air.step_size(),
+            domain.blowup_factor,
+        );
+        // The handles the device round 1 produced, threaded onto the trace that
+        // rounds 2 to 4 read. `from_row_major` opens an empty `GpuTableSession`,
+        // which is why every device path downstream has been declining on this
+        // route: `try_evaluate_composition_gpu` returns None on `gpu_main()?`
+        // before it looks at anything else.
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(handle) = gpu_main_handle {
+                lde_trace.set_gpu_main(handle);
+            }
+            if let Some(handle) = gpu_aux_handle {
+                lde_trace.set_gpu_aux(handle);
+            }
+        }
+
         let round_1_result = Round1 {
-            lde_trace: LDETraceTable::from_row_major(
-                main_data,
-                num_main_cols,
-                aux_data,
-                num_aux_cols,
-                air.step_size(),
-                domain.blowup_factor,
-            ),
+            lde_trace,
             main,
             aux,
             rap_challenges: challenges.to_vec(),
