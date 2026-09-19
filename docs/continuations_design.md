@@ -502,7 +502,10 @@ weaken soundness — and it pins every proof to its program and position, so a p
 can't be replayed elsewhere:
 
 - Each **epoch** absorbs: a domain tag, the ELF digest, the public output, the
-  table layout, and the **epoch label** (its position).
+  table layout, the **epoch label** (its position), and **`is_final`** (whether it
+  carries HALT). The table layout is every `TableCounts` field individually, so a
+  layout that moves a count from one chip to another diverges here even when the
+  total is unchanged.
 - The **global** proof absorbs: a (distinct) domain tag, the ELF digest, the
   **epoch count**, the **private-input page count** (§3.6), and the **touched page-base
   set** — so the whole genesis AIR layout (which GLOBAL_MEMORY tables exist and which are
@@ -544,9 +547,16 @@ becomes an **explicit verifier action**:
 
 - **Enumerate, don't trust.** The verifier assigns each epoch's `label` and the
   `is_final` flag **by position** (`0..N-1`; the last is final), so the prover can't
-  relabel, reorder, truncate, or append epochs — a wrong label diverges that epoch's
-  Fiat-Shamir challenges, and a wrong `is_final` builds the HALT table in/out and
-  mismatches the committed proof.
+  relabel, reorder, truncate, or append epochs. Both are absorbed into the epoch
+  statement, so either one wrong diverges that epoch's Fiat-Shamir challenges.
+  `is_final` is additionally load-bearing three more times: it moves the expected
+  sub-proof count by one (`FIXED_TABLE_COUNT - 1` for non-final epochs); deleting
+  HALT's sub-proof to compensate drops its main Merkle root from the Phase A
+  absorption and re-randomizes every downstream challenge; and HALT's bus
+  interactions are hardcoded `Multiplicity::One`, so its contribution cannot be
+  missing from a balanced sum. That last one is what makes "the last epoch really
+  halted" a constraint rather than a convention — a truncated run's non-halting
+  last epoch is built *with* HALT and fails the balance.
 - **Derive the register / x254 chain.** Epoch 0's register INIT is derived from the
   ELF entry point; epoch *i+1*'s INIT is derived from epoch *i*'s bundle `reg_fini`
   (incl. x254 @ 508). So `init(i+1) == fini(i)` is now *enforced by the verifier
@@ -565,9 +575,11 @@ becomes an **explicit verifier action**:
   while any different set is rejected.
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
-- The verifier also `validate()`s `table_counts` and never trusts a prover-supplied
-  page config (continuation epochs have none — PAGE is skipped under the L2G
-  bookend, so `page_configs` is always empty).
+- The verifier also `validate()`s `table_counts` — which since per-epoch table skipping
+  means *only* that CPU and MEMW_R are present and that no unchunked chip claims more
+  than one table (the six accelerators and BLAKE3), not that every table is there — and
+  never trusts a prover-supplied page config (continuation epochs have none — PAGE is
+  skipped under the L2G bookend, so `page_configs` is always empty).
 
 A single `build_epoch_airs` helper builds the AIR set identically on both sides, so
 prove and verify cannot diverge.

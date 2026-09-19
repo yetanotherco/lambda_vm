@@ -469,7 +469,8 @@ pub fn splice_program(prefix_len: usize, num_halves: u32) -> LfmProgram {
 }
 
 /// Tag length of the alternating splice program — the real
-/// `LAMBDAVM_CONTINUATION_EPOCH_V2` is exactly this long.
+/// `LAMBDAVM_CONTINUATION_EPOCH_V5` is exactly this long. (Every suffix this
+/// tag has carried is 30 bytes, so the bump does not move this constant.)
 pub const SPLICE_ALT_TAG: usize = 30;
 pub const SPLICE_ALT_DIGEST_HALVES: u32 = 8;
 pub const SPLICE_ALT_FIELD_HALVES: u32 = 2;
@@ -538,10 +539,14 @@ pub fn stmt_arena_halves() -> u32 {
 pub fn epoch_statement_shape() -> super::statement_replay::EpochStatementShape {
     super::statement_replay::EpochStatementShape {
         public_output_len: STMT_PUBLIC_OUTPUT_LEN,
-        table_counts: [3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        // Twenty-one: fourteen split families, six accelerators, BLAKE3.
+        table_counts: [
+            3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        ],
         num_private_input_pages: 2,
         fri_final_poly_log_degree: 7,
         page_ranges: vec![(0x1000, 4), (0x8000, 1)],
+        is_final: true,
     }
 }
 

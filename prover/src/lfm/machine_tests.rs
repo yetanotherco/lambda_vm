@@ -2254,7 +2254,13 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         bytewise: c[11],
         store: c[12],
         cpu32: c[13],
-        blake3: c[14],
+        keccak: c[14],
+        keccak_rnd: c[15],
+        ecsm: c[16],
+        ecdas: c[17],
+        hint: c[18],
+        commit: c[19],
+        blake3: c[20],
     };
     let ranges: Vec<RuntimePageRange> = shape
         .page_ranges
@@ -2267,6 +2273,7 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         &mut t,
         StatementKind::ContinuationEpoch {
             epoch_label: f.epoch_label,
+            is_final: shape.is_final,
         },
         &f.elf_digest,
         &f.public_output,

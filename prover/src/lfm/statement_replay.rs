@@ -19,11 +19,19 @@
 //! The tag is 30 bytes, `≡ 2 (mod 4)`, so the ELF digest immediately after it
 //! straddles half boundaries; the one-byte `fri_final_poly_log_degree` later
 //! moves the cursor again. The whole statement is
-//! `215 + public_output_len + 16·page_ranges` bytes, which is `≡ 3 (mod 4)`
-//! whenever `public_output_len ≡ 0 (mod 4)` — so **every Phase-A root absorb is
-//! spliced at shift 3 too**, at about one `BitDec` and 34 `BALU` rows per half.
-//! A single pad byte at the end of the statement encoding would make all of
-//! Phase A free; that is a production-encoding change and is not taken here.
+//! `264 + public_output_len + 16·page_ranges` bytes.
+//!
+//! ★★ THE TRAILING MISALIGNMENT IS GONE, and not because anyone aimed at it.
+//! At fifteen table counts the total was `215 + …`, which is `≡ 3 (mod 4)`
+//! whenever `public_output_len ≡ 0 (mod 4)` — so every Phase-A root absorb was
+//! spliced at shift 3, at about one `BitDec` and 34 `BALU` rows per half, and
+//! this note said "a single pad byte at the end of the statement encoding would
+//! make all of Phase A free". The main-sync port supplies that byte: the counts
+//! grew by six (`+48 ≡ 0 mod 4`, which moves nothing) and the statement gained
+//! a trailing `is_final` byte, so `264 ≡ 0 (mod 4)` and the roots that follow
+//! start on a half boundary. `Counts::transcript_misaligned_absorbs_after_statement`
+//! is what reads it; the internal straddles (the digest after the 30-byte tag,
+//! the FRI byte) are untouched, since only the statement's END moved.
 //!
 //! ## Which fields are program constants
 //!
@@ -41,12 +49,18 @@ use super::builder::{Ext, Felt, LfmBuilder};
 use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
 
-/// Counts `TableCounts` absorbs: fourteen split-table families plus the
-/// 0-or-1 BLAKE3 presence count. The guest must absorb exactly what the host's
-/// `statement::absorb_statement_with_digest` does — one count too few and every
-/// challenge downstream diverges, so this tracks that encoding, not a
-/// structural property of the machine.
-pub const NUM_TABLE_COUNTS: usize = 15;
+/// Counts `TableCounts` absorbs: fourteen split-table families, the six
+/// accelerator chips, and the 0-or-1 BLAKE3 presence count. The guest must
+/// absorb exactly what the host's `statement::absorb_statement_with_digest`
+/// does — one count too few and every challenge downstream diverges, so this
+/// tracks that encoding, not a structural property of the machine.
+///
+/// ⚠ A SECOND COPY OF `statement::NUM_TABLE_KINDS`, and nothing in the type
+/// system ties them together. What catches a drift is the host-vs-machine
+/// challenge equality in `algebraic_transcript`'s replay test, plus the
+/// hand-written `[u64; NUM_TABLE_COUNTS]` literal it builds — which fails to
+/// compile when this number moves and the literal does not.
+pub const NUM_TABLE_COUNTS: usize = 21;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]
@@ -61,6 +75,11 @@ pub struct EpochStatementShape {
     pub fri_final_poly_log_degree: u8,
     /// `(base, count)` per runtime page range.
     pub page_ranges: Vec<(u64, u64)>,
+    /// Whether this is the run's final epoch. Shape-static for the same reason
+    /// the counts are: it decides whether HALT is in the epoch's AIR set, so it
+    /// fixes how many sub-proofs Phase A absorbs. The host appends it as the
+    /// statement's LAST byte.
+    pub is_final: bool,
 }
 
 impl EpochStatementShape {
@@ -77,6 +96,7 @@ impl EpochStatementShape {
             + 8
             + 16 * self.page_ranges.len()
             + 8
+            + 1
     }
 }
 
@@ -147,8 +167,10 @@ pub fn absorb_epoch_statement(
         t.append_const_bytes(&count.to_le_bytes());
     }
 
-    // Continuation epochs bind their position last (replay protection).
+    // Continuation epochs bind their position, then their role (replay
+    // protection). One call each, matching the host's two `append_bytes`.
     t.append_halves_misaligned(vars.epoch_label);
+    t.append_const_bytes(&[u8::from(shape.is_final)]);
 }
 
 /// A preprocessed commitment as Phase A absorbs it — and the distinction is

@@ -925,11 +925,17 @@ fn the_contributing_table_count_is_shape() {
 /// and KECCAK_RND's fourteen are all `Multiplicity::Column(cols::MU)`, KECCAK_RC's
 /// single one likewise, and ECDAS's three are `MU` twice plus `NEXT_OP` once.
 /// ECSM's include `cols::k_bit(i)` as well, which is why the blank witness — the
-/// stronger of the two — is the one used for it.
+/// stronger of the two — WAS the one used for it.
+///
+/// ⚠ THAT WITNESS IS GONE, because the state it named stopped being reachable.
+/// `Blank` meant "the generator wrote nothing, so this table has no rows at
+/// all". Since the accelerators became counted chips, a table with no rows is
+/// not in the proof — there is nothing left to classify. The two tables it used
+/// to describe here, ECSM and KECCAK_RND, are no longer on this list, and none
+/// of the four that remain can be blank. Kept as a comment rather than a
+/// variant nobody constructs: re-add it the moment an always-on table can
+/// legitimately be empty again.
 enum RowWitness {
-    /// Every main cell is zero: the generator wrote nothing, so there is no row
-    /// to participate in anything.
-    Blank,
     /// Padding carries canonical values, so the trace is not blank. The witness
     /// is that every column any interaction uses as MULTIPLICITY is zero on
     /// every row, which gates every LogUp term off.
@@ -1084,36 +1090,29 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // own length against the constant it is a census OF goes stale exactly that
     // way again, so the length is now asserted below.
     //
-    // BLAKE3 has since left this list in the other direction: it is no longer
-    // always-on but counted in `TableCounts::blake3`, and this epoch does not
-    // use it, so it contributes no sub-proof to census.
+    // BLAKE3 left this list in the other direction: it is no longer always-on
+    // but counted in `TableCounts::blake3`, and this epoch does not use it, so
+    // it contributes no sub-proof to census.
+    //
+    // ★ SEVEN MORE LEFT THE SAME WAY, and the list is now four. COMMIT, KECCAK,
+    // KECCAK_RND, ECSM, ECDAS and HINT became counted chips (`FIXED_TABLE_COUNT`
+    // 11 → 5), so a chip this epoch does not reach carries no sub-proof at all
+    // rather than a padded one. What that costs this census is the per-chip
+    // witness classification above — an ECSM the epoch never called used to be
+    // asserted all-zero HERE. It is not replaced with a length check against
+    // `table_counts`, because `table_counts` is built FROM these vectors and
+    // such a check could not fail. What still binds all seven is the sub-proof
+    // identity below: `view.len()` must equal this census plus `total()` plus
+    // one L2G, and `total()` is where every counted chip now appears.
     let census: Vec<(&str, usize, bool)> = {
-        use crate::tables::{ecdas, hint, keccak, keccak_rc};
+        use crate::tables::keccak_rc;
         let fixed: [(&str, &TraceTable<Gl, Ext3>, RowWitness); crate::FIXED_TABLE_COUNT - 1] = [
             ("BITWISE", &traces.bitwise, RowWitness::Populated),
             ("DECODE", &traces.decode, RowWitness::Populated),
-            ("COMMIT", &traces.commit, RowWitness::Populated),
-            (
-                "KECCAK",
-                &traces.keccak,
-                RowWitness::GatedOff(&[keccak::cols::MU]),
-            ),
-            ("KECCAK_RND", &traces.keccak_rnd, RowWitness::Blank),
             (
                 "KECCAK_RC",
                 &traces.keccak_rc,
                 RowWitness::GatedOff(&[keccak_rc::cols::MU]),
-            ),
-            ("ECSM", &traces.ecsm, RowWitness::Blank),
-            (
-                "ECDAS",
-                &traces.ecdas,
-                RowWitness::GatedOff(&[ecdas::cols::MU, ecdas::cols::NEXT_OP]),
-            ),
-            (
-                "HINT",
-                &traces.hint,
-                RowWitness::GatedOff(&[hint::cols::MU]),
             ),
             ("REGISTER", &traces.register, RowWitness::Populated),
         ];
@@ -1121,15 +1120,6 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
             .into_iter()
             .map(|(name, t, witness)| {
                 let no_bus_rows = match witness {
-                    RowWitness::Blank => {
-                        assert!(
-                            all_main_zero(t),
-                            "{name} was expected to have NO rows in this epoch \
-                             (its generator writes nothing when there is no \
-                             work), but its main trace is not all zero"
-                        );
-                        true
-                    }
                     RowWitness::GatedOff(cols) => {
                         assert!(
                             columns_zero(t, cols),
@@ -1188,7 +1178,12 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         let mut t = crate::hash_pin::block_transcript(&[]);
         crate::statement::absorb_statement(
             &mut t,
-            crate::statement::StatementKind::ContinuationEpoch { epoch_label: label },
+            crate::statement::StatementKind::ContinuationEpoch {
+                epoch_label: label,
+                // HALT's presence IS the role; taking it from the AIR set keeps
+                // the seed and the proof from stating different ones.
+                is_final: airs.include_halt,
+            },
             &elf_bytes,
             &public_output,
             &table_counts,
@@ -1220,7 +1215,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     );
     assert_eq!(
         view.len(),
-        census.len() + table_counts.total() + 1,
+        census.len() + table_counts.total().expect("the fixture's counts sum") + 1,
         "an intermediate epoch is {} fixed tables, the chunked families, and \
          one L2G_MEMORY",
         crate::FIXED_TABLE_COUNT - 1

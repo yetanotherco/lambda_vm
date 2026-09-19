@@ -17,12 +17,19 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-/// V4 appends `TableCounts::blake3`, which made the BLAKE3 table conditional.
-/// [`CONTINUATION_EPOCH_TAG`] moved to V3 in the same change and for the same
-/// reason: the count loop below is SHARED, so a continuation epoch absorbs the
-/// new u64 too. Bumping only the monolithic tag would have left continuation
-/// proofs from two encodings sharing a transcript prefix.
-pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V4";
+/// V4 appended `TableCounts::blake3`, which made the BLAKE3 table conditional.
+/// [`CONTINUATION_EPOCH_TAG`] moved with it and for the same reason: the count
+/// list below is SHARED, so a continuation epoch absorbs the new u64 too.
+/// Bumping only the monolithic tag would have left continuation proofs from two
+/// encodings sharing a transcript prefix.
+///
+/// ⚠ V5 is a MERGE OF TWO INDEPENDENT V4s, and that is why it exists. The
+/// per-table lineage reached V4 by appending `blake3`; main reached its own V4
+/// by appending the six accelerator counts. Two different encodings were both
+/// called V4, so keeping either suffix would have let proofs from the two
+/// branches share a transcript prefix — the exact thing this tag prevents. The
+/// merged encoding appends all seven counts and is V5.
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V5";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -41,8 +48,9 @@ pub(crate) fn elf_digest(elf: &[u8]) -> [u8; 32] {
 pub(crate) enum StatementKind {
     /// Whole-program (monolithic) proof.
     Monolithic,
-    /// One continuation epoch proof, pinned to its position by `epoch_label`.
-    ContinuationEpoch { epoch_label: u64 },
+    /// One continuation epoch proof, pinned to its position by `epoch_label` and
+    /// to its role by `is_final`.
+    ContinuationEpoch { epoch_label: u64, is_final: bool },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -106,6 +114,11 @@ pub(crate) fn absorb_statement_with_digest(
     t.append_bytes(public_output);
 
     // The width is for callers that pad from it; this one does not.
+    //
+    // ⚠ The exhaustive destructure that turns a new `TableCounts` field into a
+    // compile error lives in [`table_count_values`], not here. It is the same
+    // tripwire one level down, and it is what the WHIR statements inherit by
+    // calling the same helper.
     let _ = absorb_table_counts(t, table_counts);
 
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
@@ -123,10 +136,31 @@ pub(crate) fn absorb_statement_with_digest(
         t.append_bytes(&count.to_le_bytes());
     }
 
-    // Continuation epochs additionally bind their position (replay protection).
-    // Monolithic proofs append nothing here, so their encoding is unchanged.
-    if let StatementKind::ContinuationEpoch { epoch_label } = kind {
+    // Continuation epochs additionally bind their position (replay protection)
+    // and whether they are the final one. `is_final` decides whether HALT is in
+    // the epoch's AIR set, so without it the transcripts of a final and a
+    // non-final epoch carrying the same counts are identical. The verifier
+    // derives `is_final` from the epoch's position in the bundle, so a spliced
+    // bundle re-reads an epoch under the other role and diverges here.
+    //
+    // Defense in depth, not a plugged hole: a role flip is already rejected
+    // without this byte, and by more than one check. Re-reading an epoch under
+    // the other role moves the expected sub-proof count by one (`verify_epoch`'s
+    // `FIXED_TABLE_COUNT - 1` arm); deleting HALT's sub-proof to compensate
+    // drops its main Merkle root from the Phase A absorption and re-randomizes
+    // every downstream challenge; and HALT's own bus interactions are hardcoded
+    // `Multiplicity::One`, so its contribution cannot be absent from a balanced
+    // sum. Binding the role here makes it an explicit statement field instead of
+    // an emergent consequence of those three — do not weaken any of them on the
+    // strength of this byte. Monolithic proofs append nothing, so their encoding
+    // is unchanged.
+    if let StatementKind::ContinuationEpoch {
+        epoch_label,
+        is_final,
+    } = kind
+    {
         t.append_bytes(&epoch_label.to_le_bytes());
+        t.append_bytes(&[is_final as u8]);
     }
 }
 
@@ -233,7 +267,7 @@ pub(crate) fn absorb_statement_padding(
 /// exhaustive destructure in [`table_count_values`] fails when a field is added
 /// to [`TableCounts`], and that function's return type fails when the new field
 /// is pushed into the array without bumping this constant.
-pub(crate) const NUM_TABLE_KINDS: usize = 15;
+pub(crate) const NUM_TABLE_KINDS: usize = 21;
 
 /// Every per-table count, in declared order.
 ///
@@ -256,6 +290,12 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         bytewise,
         store,
         cpu32,
+        keccak,
+        keccak_rnd,
+        ecsm,
+        ecdas,
+        hint,
+        commit,
         blake3,
     } = table_counts;
     [
@@ -273,6 +313,15 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         bytewise as u64,
         store as u64,
         cpu32 as u64,
+        // The six accelerator chips. Counted rather than fixed, so an epoch that
+        // never reaches one carries no table for it; each is 0 or 1 today and
+        // `TableCounts::validate` refuses anything higher.
+        keccak as u64,
+        keccak_rnd as u64,
+        ecsm as u64,
+        ecdas as u64,
+        hint as u64,
+        commit as u64,
         // 0 or 1, and the one count the verifier cannot derive for itself —
         // binding it is what stops prover and verifier building different AIR
         // sets from the same bytes (see `TableCounts::blake3`).
@@ -299,14 +348,19 @@ pub(crate) fn absorb_table_counts(
 
 /// Domain tag for the multilinear path. A WHIR proof and a FRI proof must
 /// never share a transcript prefix.
-pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V1";
+pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V2";
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
 /// `pub(crate)` so the LFM statement replay emits the identical tag instead of
 /// duplicating the literal: a second copy would drift silently on a version
 /// bump, and the tag existing at all depends on both sides agreeing on it.
-pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V3";
+///
+/// ⚠ V5 for the reason [`DOMAIN_TAG`] is: the lineage's V3 and main's V4 are
+/// different encodings of the same statement, and the merged one appends both
+/// additions. The GLOBAL tag stays at V2 — the cross-epoch statement binds no
+/// per-table counts, so nothing in its encoding moved.
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V5";
 pub(crate) const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

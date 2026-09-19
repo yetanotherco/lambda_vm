@@ -68,8 +68,12 @@ mod imp {
         FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update,
     };
 
+    /// The `usize` accumulates bytes absorbed for the CURRENT hash, so
+    /// `finalize` can report the permutation count (`bytes / 136 + 1`). It resets
+    /// to zero on `reset` / `finalize_into_reset`, and `finalize_into` consumes
+    /// `self`.
     #[derive(Clone, Default)]
-    pub struct PlatformKeccak256(sha3::Keccak256);
+    pub struct PlatformKeccak256(sha3::Keccak256, usize);
 
     impl HashMarker for PlatformKeccak256 {}
 
@@ -81,7 +85,10 @@ mod imp {
         #[inline(always)]
         fn update(&mut self, data: &[u8]) {
             // Absorption — the guest's dominant keccak cost (many small
-            // `stream_bytes` absorbs), which no finalize counter would see.
+            // `stream_bytes` absorbs), which no finalize counter would see. The
+            // running byte total is what lets `finalize` report a permutation
+            // count as well.
+            self.1 += data.len();
             crate::hash_metrics::count_absorb(data.len());
             Update::update(&mut self.0, data);
         }
@@ -90,7 +97,7 @@ mod imp {
     impl FixedOutput for PlatformKeccak256 {
         #[inline(always)]
         fn finalize_into(self, out: &mut Output<Self>) {
-            crate::hash_metrics::count_total();
+            crate::hash_metrics::count_finalize(self.1);
             FixedOutput::finalize_into(self.0, out);
         }
     }
@@ -98,6 +105,7 @@ mod imp {
     impl Reset for PlatformKeccak256 {
         #[inline(always)]
         fn reset(&mut self) {
+            self.1 = 0;
             Reset::reset(&mut self.0);
         }
     }
@@ -105,7 +113,8 @@ mod imp {
     impl FixedOutputReset for PlatformKeccak256 {
         #[inline(always)]
         fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
-            crate::hash_metrics::count_total();
+            crate::hash_metrics::count_finalize(self.1);
+            self.1 = 0;
             FixedOutputReset::finalize_into_reset(&mut self.0, out);
         }
     }

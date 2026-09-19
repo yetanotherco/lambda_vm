@@ -13,6 +13,12 @@
 //! `PlatformKeccak256 = sha3::Keccak256` and every counter call compiles to
 //! nothing, so the prover is provably unchanged. With the feature on (host only),
 //! the host `PlatformKeccak256` wrapper counts, per keccak op:
+//! * `perms` — keccak-f permutations, THE unit the recursion guest pays (one
+//!   `keccak_permute` syscall each): `sum over hashes of (absorbed_bytes / 136 + 1)`.
+//!   Guest-faithful regardless of host call shape — a 64-byte Merkle parent is 1 perm
+//!   here (2 updates + finalize) and 1 on the guest (`keccak256_pair`) — so it is
+//!   self-validatable against a measured `keccak_permute` census. Keccak only: the
+//!   algebraic sponge's finalizes arrive through [`count_total`] and bump nothing here;
 //! * `total` — every finalize (leaf / node / transcript squeeze / program-id fold);
 //!   `merkle`/`merkle_nodes`/`grinding` split it (keccak-only, disjoint subsets);
 //! * `absorb_calls` / `absorb_bytes` — every `Update::update` (ABSORPTION). This is
@@ -30,6 +36,9 @@
 /// feature / on the guest). `total` is finalizes; `absorb_*` is absorption.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
+    /// keccak-f permutations — the unit the guest pays (one `keccak_permute` each).
+    /// Keccak-only, so it is zero on an all-algebraic configuration.
+    pub perms: u64,
     /// Every keccak-256 finalize.
     pub total: u64,
     /// Merkle finalizes (keccak-guarded subset of `total`).
@@ -148,6 +157,10 @@ mod imp {
     use super::Counts;
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    /// keccak-256 rate in bytes (1088 bits): bytes absorbed per permutation.
+    const RATE: usize = 136;
+
+    static PERMS: AtomicU64 = AtomicU64::new(0);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
     static MERKLE: AtomicU64 = AtomicU64::new(0);
     static MERKLE_NODES: AtomicU64 = AtomicU64::new(0);
@@ -204,7 +217,10 @@ mod imp {
     }
 
     /// A Merkle parent (auth-path) compression. Subset of [`count_merkle`];
-    /// same keccak-only guard.
+    /// same keccak-only guard. Every parent must ALSO call [`count_merkle`] so
+    /// `merkle_nodes ⊆ merkle` — on the byte path that is the backend's job (see
+    /// `merkle_tree::backends::field_element`), on the algebraic path
+    /// [`count_merkle_node_direct`] does both itself.
     #[inline(always)]
     pub fn count_merkle_node<D: 'static>() {
         if core::any::TypeId::of::<D>()
@@ -219,6 +235,23 @@ mod imp {
     #[inline(always)]
     pub fn count_grinding() {
         GRINDING.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A KECCAK finalize of a hash that absorbed `nbytes`. Bumps the finalize
+    /// count and the permutation count (`nbytes / RATE + 1` — the full blocks
+    /// absorbed plus the padded final block), the unit the guest pays.
+    ///
+    /// ⚠ Why this and [`count_total`] both exist. Only the byte sponges know how
+    /// many bytes went into the hash they are finalizing: the host
+    /// `PlatformKeccak256` wrapper accumulates them and calls this. The algebraic
+    /// backend sponges FELTS and has no byte count to report, so it calls
+    /// `count_total` and leaves `perms` alone — which is correct, since `perms`
+    /// counts keccak-f. Collapsing the two would either invent a byte count for
+    /// RPX or lose the permutation count for keccak.
+    #[inline(always)]
+    pub fn count_finalize(nbytes: usize) {
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        PERMS.fetch_add((nbytes / RATE + 1) as u64, Ordering::Relaxed);
     }
 
     /// A keccak absorb (`Update::update`) of `nbytes` — the guest's dominant
@@ -319,6 +352,7 @@ mod imp {
 
     /// Zero all counters.
     pub fn reset() {
+        PERMS.store(0, Ordering::Relaxed);
         TOTAL.store(0, Ordering::Relaxed);
         MERKLE.store(0, Ordering::Relaxed);
         MERKLE_NODES.store(0, Ordering::Relaxed);
@@ -339,6 +373,7 @@ mod imp {
 
     pub fn snapshot() -> Counts {
         Counts {
+            perms: PERMS.load(Ordering::Relaxed),
             total: TOTAL.load(Ordering::Relaxed),
             merkle: MERKLE.load(Ordering::Relaxed),
             merkle_nodes: MERKLE_NODES.load(Ordering::Relaxed),
@@ -364,6 +399,8 @@ mod imp {
 mod imp {
     use super::Counts;
 
+    #[inline(always)]
+    pub fn count_finalize(_nbytes: usize) {}
     #[inline(always)]
     pub fn count_total() {}
     #[inline(always)]
@@ -393,8 +430,8 @@ mod imp {
 }
 
 pub use imp::{
-    count_absorb, count_grinding, count_merkle, count_merkle_direct, count_merkle_node,
-    count_merkle_node_direct, count_total, count_transcript_absorb,
+    count_absorb, count_finalize, count_grinding, count_merkle, count_merkle_direct,
+    count_merkle_node, count_merkle_node_direct, count_total, count_transcript_absorb,
     count_transcript_misaligned_absorb, count_transcript_squeeze, count_transcript_state, reset,
     snapshot,
 };
