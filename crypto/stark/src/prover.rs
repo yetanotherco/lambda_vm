@@ -683,6 +683,16 @@ pub struct MainRoots {
 }
 
 /// One height group's FRI: the instance every member of the group folds into.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
 pub struct GroupFri<FieldExtension: IsField> {
     pub layer_roots: Vec<Commitment>,
     pub final_poly_coeffs: Vec<FieldElement<FieldExtension>>,

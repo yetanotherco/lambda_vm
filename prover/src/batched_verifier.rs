@@ -20,7 +20,7 @@ use stark::proof::options::ProofOptions;
 use stark::proof::stark::StarkProof;
 
 use crate::Error;
-use crate::logup_phase::BatchedProof;
+use crate::batched_proof::BatchedProof;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -123,6 +123,19 @@ pub fn verify(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
+    verify_with_precomputed(proof, elf_bytes, proof_options, None, None)
+}
+
+/// [`verify`] with the ELF-only preprocessed roots supplied instead of
+/// recomputed. The recursion guest holds them already; recomputing DECODE and
+/// every data page in-VM is the single most expensive thing a verifier can do.
+pub fn verify_with_precomputed(
+    proof: &BatchedProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<stark::config::Commitment>,
+    page_commitments: Option<&[(u64, stark::config::Commitment)]>,
+) -> Result<bool, Error> {
     let table_counts = &proof.table_counts;
     table_counts.validate()?;
     let n = proof.tables.len();
@@ -170,10 +183,10 @@ pub fn verify(
         false,
         &page_configs,
         table_counts,
-        None,
+        decode_commitment,
         true,
         None,
-        None,
+        page_commitments,
         None,
     );
     let airs = vm_airs.air_refs();

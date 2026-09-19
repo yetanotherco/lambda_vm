@@ -12,7 +12,7 @@
 
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
-#[cfg(feature = "parallel")]
+pub mod batched_proof;
 pub mod batched_verifier;
 #[cfg(feature = "parallel")]
 pub mod challenge_phase;

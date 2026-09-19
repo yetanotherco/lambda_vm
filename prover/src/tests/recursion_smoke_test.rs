@@ -970,6 +970,67 @@ fn test_dump_recursion_input() {
     // public output), computed here while the `ContinuationProof` bundle
     // still exists (`encode_continuation_guest_input` consumes it) — lets a
     // consumer check the pre-proved fixture without re-deriving it.
+    // `RECURSION_DUMP_BATCHED=1` proves the inner program with the
+    // prove-and-retire pipeline's batched path and dumps a `BatchedProof`
+    // blob for the `batched` guest, so the two proof layouts can be compared
+    // on guest cycles.
+    if std::env::var("RECURSION_DUMP_BATCHED").is_ok() {
+        let opts = preset.options();
+        let elf = executor::elf::Elf::load(&inner_elf_bytes).expect("load inner ELF");
+        let max_rows = crate::tables::MaxRowsConfig::default();
+        eprintln!(
+            "[dump-input] proving inner batched (blowup={}, fri_queries={}) ...",
+            opts.blowup_factor, opts.fri_number_of_queries
+        );
+        let committed = crate::commit_phase::run_to_end(&elf, &inner_input, &max_rows, &opts)
+            .expect("commit pass");
+        let challenge = crate::challenge_phase::run(&committed, &elf, &inner_elf_bytes, &opts)
+            .expect("challenge pass");
+        drop(committed);
+        let batched =
+            crate::logup_phase::run_batched(&elf, &inner_input, &max_rows, &opts, &challenge)
+                .expect("batched pass");
+        let opened = crate::logup_phase::run_open(
+            &elf,
+            &inner_input,
+            &max_rows,
+            &opts,
+            &challenge,
+            &batched,
+        )
+        .expect("open pass");
+        let proof = crate::logup_phase::assemble_batched_proof(batched, opened)
+            .expect("assemble batched proof");
+        assert!(
+            crate::batched_verifier::verify(&proof, &inner_elf_bytes, &opts)
+                .expect("batched verify errored"),
+            "batched proof must verify on host before dumping"
+        );
+        let public_output = proof.public_output.clone();
+        let (decode, pages) =
+            crate::recursion::precomputed_commitments(&inner_elf_bytes, &opts).expect("roots");
+        let id = crate::recursion::program_id_from_elf(&inner_elf_bytes, &decode, &pages)
+            .expect("program id");
+        let blob = crate::recursion::encode_batched_guest_input(proof, &inner_elf_bytes, &opts)
+            .expect("encode batched guest input");
+        eprintln!("[dump-input] batched blob bytes: {}", blob.len());
+        assert!(
+            blob.len() <= executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
+            "batched recursion input exceeds MAX_PRIVATE_INPUT_SIZE"
+        );
+        let path = "/tmp/recursion_input.bin";
+        std::fs::write(path, &blob).expect("write blob");
+        let mut sidecar = id.to_vec();
+        sidecar.extend_from_slice(&public_output);
+        std::fs::write(format!("{path}.expected"), &sidecar).expect("write sidecar");
+        eprintln!(
+            "[dump-input] preset={} inner={inner_label} wrote {} bytes to {path}",
+            preset.name(),
+            blob.len()
+        );
+        return;
+    }
+
     let (blob, expected_sidecar) = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
         Ok(s) => {
             // No recursion-cont-blowup8.elf is built (RECURSION_CONT_PRESETS
