@@ -7334,6 +7334,142 @@ where
 /// prefix would fix the collision; a refusal also stops a first run from
 /// quietly filling someone else's cache, which is the failure that is hard to
 /// notice later.
+/// Read the WHIR base's stage breakdown back and check it closes.
+///
+/// ★ WHY A CHECK AND NOT JUST A TABLE. The whole point of the instrument is to
+/// choose round 2's lever from it, so the table has to be trustworthy before it
+/// is quoted. The trust comes from CLOSURE: each thread's stages partition that
+/// thread's own epoch wall, so a stage whose timer is missing shows up as
+/// remainder, and the check names the epoch and the stage family that lost it.
+///
+/// ⛔ WHAT THIS DELIBERATELY DOES NOT CHECK. It does NOT assert that the
+/// producer's sum plus the prover's sum equals the base wall. They run on two
+/// threads at once over an unbuffered channel, so the identity is false by
+/// construction: the base wall is epoch 0's preparation plus the proofs plus
+/// whatever waiting the pipeline did, and `Σ producer + Σ prover` double-counts
+/// every overlap. Writing it as an equality would redden on a CORRECT
+/// instrument, and a check that fails on the honest path gets its tolerance
+/// widened until it cannot fail at all. What IS asserted about the pipeline is
+/// the pair of INEQUALITIES that a two-thread pipeline really does satisfy.
+///
+/// The bottleneck reading — which of the two threads set the wall — is REPORTED
+/// and not asserted. It is the answer this instrument exists to buy, and an
+/// assert on it would be pre-judging it.
+fn whir_base_split_readback(base_secs: f64) {
+    const TOL: f64 = 0.03;
+    let (producer, prover) = multilinear::whir_split::drain();
+    if producer.is_empty() && prover.is_empty() {
+        println!(
+            "   WHIR BASE SPLIT: NOT TAKEN (LAMBDA_VM_BASE_SPLIT is unset) — \
+             no stage lines, no closure check"
+        );
+        return;
+    }
+
+    let epochs: Vec<_> = prover.iter().filter(|r| !r.is_global()).collect();
+    let global: Vec<_> = prover.iter().filter(|r| r.is_global()).collect();
+    let sum = |f: &dyn Fn(&multilinear::whir_split::ProverSplit) -> f64| -> f64 {
+        epochs.iter().map(|r| f(r)).sum()
+    };
+    let psum = |f: &dyn Fn(&multilinear::whir_split::ProducerSplit) -> f64| -> f64 {
+        producer.iter().map(f).sum()
+    };
+
+    let p_exec = psum(&|r| r.execute);
+    let p_coll = psum(&|r| r.collect);
+    let p_build = psum(&|r| r.build);
+    let p_hand = psum(&|r| r.handoff);
+    let p_wall = psum(&|r| r.wall);
+    let v_prep = sum(&|r| r.prep);
+    let v_absorb = sum(&|r| r.absorb);
+    let v_commit = sum(&|r| r.commit);
+    let v_prove = sum(&|r| r.prove);
+    let v_wall = sum(&|r| r.wall);
+    let v_challenge = sum(&|r| r.challenge);
+    let v_argue = sum(&|r| r.argue);
+    let v_groups = sum(&|r| r.open_groups);
+    let v_prepared = sum(&|r| r.open_prepared);
+    let g_wall: f64 = global.iter().map(|r| r.wall).sum();
+
+    let pct = |x: f64| 100.0 * x / base_secs;
+    println!(
+        "   ── WHIR BASE SPLIT over {} epochs, base wall {base_secs:.1}s ──",
+        epochs.len()
+    );
+    println!(
+        "   producer[Σ] execute {p_exec:.1}s ({:.1}%) · collect {p_coll:.1}s ({:.1}%) · \
+build {p_build:.1}s ({:.1}%) · handoff {p_hand:.1}s ({:.1}%) · wall {p_wall:.1}s ({:.1}%)",
+        pct(p_exec),
+        pct(p_coll),
+        pct(p_build),
+        pct(p_hand),
+        pct(p_wall)
+    );
+    println!(
+        "   prover[Σ]   prep {v_prep:.1}s ({:.1}%) · absorb {v_absorb:.2}s · \
+commit {v_commit:.1}s ({:.1}%) · prove {v_prove:.1}s ({:.1}%) · wall {v_wall:.1}s ({:.1}%)",
+        pct(v_prep),
+        pct(v_commit),
+        pct(v_prove),
+        pct(v_wall)
+    );
+    println!(
+        "   inside prove[Σ] challenge {v_challenge:.2}s · argue {v_argue:.1}s ({:.1}%) · \
+open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
+        pct(v_argue),
+        pct(v_groups),
+        pct(v_prepared)
+    );
+    println!(
+        "   global (in base) wall {g_wall:.1}s ({:.1}%)",
+        pct(g_wall)
+    );
+    if let Some(slow) = epochs
+        .iter()
+        .filter_map(|r| r.max_table.clone().map(|(n, s)| (s, n)))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+    {
+        println!(
+            "   slowest single table in any epoch: {} at {:.2}s",
+            slow.1, slow.0
+        );
+    }
+    if prover.iter().any(|r| r.overlapped) {
+        println!("   ⛔ OVERLAPPED: two proves were in flight — the inner slots are MIXED");
+    }
+
+    // ── the closure arms, run by the instrument's OWN checker ──
+    // One implementation, and it is the one with unit tests that feed it
+    // manufactured omissions (`multilinear::whir_split`'s
+    // `closure_refuses_every_manufactured_omission`). A second copy written out
+    // here would be the copy nothing had ever seen fail.
+    if let Err(why) = multilinear::whir_split::check_closure(&producer, &prover, base_secs, TOL) {
+        panic!("WHIR BASE SPLIT does not close: {why}");
+    }
+    println!(
+        "   WHIR BASE SPLIT: closure GREEN (arms A-D at {:.0}% tolerance)",
+        100.0 * TOL
+    );
+
+    // ── the reading this instrument exists to buy: REPORTED, never asserted ──
+    let verdict = if p_hand >= 0.10 * p_wall {
+        "THE PROVER IS THE BOTTLENECK (the producer waits at the hand-off; \
+         nothing spent on execute/collect/build buys wall)"
+    } else {
+        "THE PRODUCER IS THE BOTTLENECK for at least part of the run (it never \
+         waits, so the prover idled instead)"
+    };
+    println!(
+        "   BOTTLENECK: handoff is {:.1}% of the producer's wall ⇒ {verdict}",
+        100.0 * p_hand / p_wall.max(1e-9),
+    );
+    println!(
+        "   headroom if the producer were free: Σ producer {p_wall:.1}s vs \
+Σ prover + global {:.1}s",
+        v_wall + g_wall,
+    );
+}
+
 #[test]
 #[ignore = "box tier, production scale: the WHIR base, its level 0 and the interior"]
 fn the_whir_production_tree_composes_to_a_root() {
@@ -7573,6 +7709,7 @@ fn the_whir_production_tree_composes_to_a_root() {
     );
     mark("AFTER the WHIR base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the WHIR base"));
+    whir_base_split_readback(base_secs);
 
     let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
     let shape = tree_shape(bundle.num_epochs(), fan_in);

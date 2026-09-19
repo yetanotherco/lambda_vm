@@ -985,6 +985,13 @@ pub fn prove_global<H>(
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    // ★ THE GLOBAL STAGE IS INSIDE THE BASE'S WALL. It runs after the last
+    // epoch, on the caller's thread, and the harness's `base (WHIR)` window
+    // brackets it — so it belongs in the table, under its own index, and must
+    // never be averaged in with the epochs.
+    let __ws_wall = multilinear::whir_split::mark();
+    let __ws_prep = multilinear::whir_split::mark();
+    let __ws_index = multilinear::whir_split::GLOBAL_INDEX;
     // Each cell's final state; the boundaries are in epoch order, so the last
     // fini wins.
     let mut final_state: crate::tables::global_memory::FiniStateMap =
@@ -1043,6 +1050,15 @@ where
         .collect();
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
+    // The argument can only see a table's INDEX — a committed table is a
+    // layout and a trace, it carries no name. The names live here, so they are
+    // sent down in the order the argument will walk them.
+    multilinear::whir_split::set_table_names(
+        pairs
+            .iter()
+            .map(|(air, _, _)| air.name().to_string())
+            .collect(),
+    );
 
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
@@ -1063,6 +1079,10 @@ where
         );
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
+    let __ws_airs = committed.len();
+    let __ws_prep_s = multilinear::whir_split::stage_done(__ws_index, "prep", __ws_prep);
+
+    let __ws_absorb = multilinear::whir_split::mark();
     // ★ `H` is the CALLER's. The transcript's hash is part of the configuration
     // either way; what changed is who chooses it, and the bound on
     // `multi_prove` still rejects any other spelling.
@@ -1077,8 +1097,12 @@ where
         &table_num_vars,
         &config,
     );
+    let __ws_absorb_s = multilinear::whir_split::stage_done(__ws_index, "absorb", __ws_absorb);
+
+    let __ws_commit = multilinear::whir_split::mark();
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
     // ⚠ THE PROVER'S OWN CONFIGS, which is the same source its page AIRs and
     // their traces came from. The verifier builds this from the ELF; for a
     // genesis page the two are the same bytes, and where they are not — the
@@ -1098,6 +1122,7 @@ where
         .as_ref()
         .map(|g| multilinear::stacking::borrow(&g.columns))
         .unwrap_or_default();
+    let __ws_prove = multilinear::whir_split::mark();
     let proof = multilinear_table::multi_prove(
         &committed,
         &config,
@@ -1105,6 +1130,18 @@ where
         genesis.as_ref().map(|g| g.opening(&borrowed)),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_global", __ws_wall);
+    multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
+        index: __ws_index,
+        prep: __ws_prep_s,
+        absorb: __ws_absorb_s,
+        commit: __ws_commit_s,
+        prove: __ws_prove_s,
+        wall: __ws_wall_s,
+        airs: __ws_airs,
+        ..Default::default()
+    });
 
     Ok(GlobalProof {
         proof,
@@ -1508,6 +1545,20 @@ pub fn prove_epoch<H>(
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    // ── the prover thread's four stages, under `LAMBDA_VM_BASE_SPLIT=1` ──
+    // They PARTITION the call: `prep` to the end of the layouts, `absorb` over
+    // the host sponge, `commit` over `commit_grouped`, `prove` over
+    // `multi_prove`. The producer's four (in `for_each_epoch`) run on the OTHER
+    // thread at the same time, so the two sums must never be added — what the
+    // pair says is which of the two set the base's wall.
+    // ⚠ THE LABEL IS 1-BASED AND THE PRODUCER'S INDEX IS 0-BASED
+    // (`epoch_label(i) = i + 1`). Both sides of the table must key on the same
+    // number or the join is silently off by one — the producer's epoch 0 would
+    // pair with the prover's epoch 1 and every stage would be attributed to the
+    // neighbouring epoch. The 0-based index is the key.
+    let __ws_index = label.saturating_sub(1);
+    let __ws_wall = multilinear::whir_split::mark();
+    let __ws_prep = multilinear::whir_split::mark();
     // The bookend's range checks are lookups into BITWISE, so its
     // multiplicities have to carry them.
     crate::tables::bitwise::update_multiplicities(
@@ -1555,6 +1606,15 @@ where
         .collect();
     let table_num_vars: Vec<u8> = shapes.iter().map(|&(_, n)| n as u8).collect();
     let config = chain_config(&shapes);
+    // The argument can only see a table's INDEX — a committed table is a
+    // layout and a trace, it carries no name. The names live here, so they are
+    // sent down in the order the argument will walk them.
+    multilinear::whir_split::set_table_names(
+        pairs
+            .iter()
+            .map(|(air, _, _)| air.name().to_string())
+            .collect(),
+    );
 
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
@@ -1578,7 +1638,10 @@ where
     }
     let sizes = epoch_groups(committed.len());
     prepared.agrees_with(&config)?;
+    let __ws_airs = committed.len();
+    let __ws_prep_s = multilinear::whir_split::stage_done(__ws_index, "prep", __ws_prep);
 
+    let __ws_absorb = multilinear::whir_split::mark();
     // ★ The transcript's hash is part of the configuration, and `H` is the
     // caller's dispatch. The bound on `multi_prove`/`multi_verify` rejects any
     // other spelling.
@@ -1593,10 +1656,16 @@ where
         &table_num_vars,
         &config,
     );
+    let __ws_absorb_s = multilinear::whir_split::stage_done(__ws_index, "absorb", __ws_absorb);
+
+    let __ws_commit = multilinear::whir_split::mark();
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_commit_s = multilinear::whir_split::stage_done(__ws_index, "commit", __ws_commit);
+
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
     let decode_columns = prepared.settled_at(decode_at);
+    let __ws_prove = multilinear::whir_split::mark();
     let proof = multilinear_table::multi_prove(
         &committed,
         &config,
@@ -1604,6 +1673,18 @@ where
         Some(prepared.opening(&borrowed, &decode_columns)),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let __ws_prove_s = multilinear::whir_split::stage_done(__ws_index, "prove", __ws_prove);
+    let __ws_wall_s = multilinear::whir_split::stage_done(__ws_index, "prove_epoch", __ws_wall);
+    multilinear::whir_split::push_prover(multilinear::whir_split::ProverSplit {
+        index: __ws_index,
+        prep: __ws_prep_s,
+        absorb: __ws_absorb_s,
+        commit: __ws_commit_s,
+        prove: __ws_prove_s,
+        wall: __ws_wall_s,
+        airs: __ws_airs,
+        ..Default::default()
+    });
 
     Ok(EpochProof {
         proof,

@@ -1169,6 +1169,16 @@ pub(crate) fn for_each_epoch(
             }
         };
 
+        // ── the producer's four stages, under `LAMBDA_VM_BASE_SPLIT=1` ──
+        // The wall is opened first and closed last, so the four stages
+        // PARTITION it with no gap: `execute` runs to the cycle-count check,
+        // `collect` from the label to the image advance, `build` over the trace
+        // tables, `handoff` over the call to `each`. Σ(stages) = wall by
+        // construction — which is the point: the only thing that can break the
+        // identity is a stage whose timer is missing, and that is what the
+        // harness's check is for.
+        let __bs_epoch = multilinear::whir_split::mark();
+        let __bs_exec = multilinear::whir_split::mark();
         let logs = match executor
             .resume_with_limit(epoch_size)
             .map_err(|e| Error::Execution(format!("{e}")))?
@@ -1183,7 +1193,9 @@ pub(crate) fn for_each_epoch(
                 logs.len()
             )));
         }
+        let __bs_exec_s = multilinear::whir_split::stage_done(index, "execute", __bs_exec);
 
+        let __bs_collect = multilinear::whir_split::mark();
         let label = local_to_global::epoch_label(index);
         let collected = Traces::collect_epoch(artifacts, &image, &register_init, &logs, is_final)?;
         let boundary = Arc::new(local_to_global::epoch_boundary(
@@ -1196,7 +1208,9 @@ pub(crate) fn for_each_epoch(
         for cell in boundary.iter() {
             image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
+        let __bs_collect_s = multilinear::whir_split::stage_done(index, "collect", __bs_collect);
 
+        let __bs_build = multilinear::whir_split::mark();
         let traces = Traces::build_from_collected(
             artifacts,
             collected,
@@ -1211,6 +1225,21 @@ pub(crate) fn for_each_epoch(
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )?;
+        let __bs_build_s = multilinear::whir_split::stage_done(index, "build", __bs_build);
+
+        // ★ THE BACKPRESSURE IS THE MEASUREMENT. Under
+        // [`for_each_epoch_overlapped`] `each` is a closure whose whole body is
+        // a blocking `send` on an UNBUFFERED channel, so this stage is the
+        // producer waiting for the prover to take the epoch: `handoff` ≫ 0 says
+        // the prover is the bottleneck and nothing spent on the three stages
+        // above buys wall; `handoff` ≈ 0 says the producer is, and the prover
+        // idled instead. No other stage on either thread can answer that.
+        //
+        // ⚠ Under a DIRECT `for_each_epoch` caller (the epoch-program and
+        // bench tests) `each` is the whole prove, so `handoff` names that
+        // instead. None of those sets the knob; the WHIR base is the only
+        // caller that does, and it goes through the overlapped form.
+        let __bs_handoff = multilinear::whir_split::mark();
         each(
             PreparedEpoch {
                 index,
@@ -1222,6 +1251,16 @@ pub(crate) fn for_each_epoch(
             },
             &boundaries,
         )?;
+        let __bs_handoff_s = multilinear::whir_split::stage_done(index, "handoff", __bs_handoff);
+        let __bs_epoch_s = multilinear::whir_split::stage_done(index, "epoch", __bs_epoch);
+        multilinear::whir_split::push_producer(multilinear::whir_split::ProducerSplit {
+            index,
+            execute: __bs_exec_s,
+            collect: __bs_collect_s,
+            build: __bs_build_s,
+            handoff: __bs_handoff_s,
+            wall: __bs_epoch_s,
+        });
         index += 1;
     }
 
@@ -2180,6 +2219,20 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// [`stark::prove_split`] gives: the record is produced by a binary that does
 /// not enable the feature, and a split taken from a different binary describes
 /// a different run.
+///
+/// ★ ONE KNOB, BOTH PIPELINES. This name also turns on the WHIR base's stages
+/// — the producer's four in [`for_each_epoch`] and the prover's in
+/// [`crate::multilinear_continuation::prove_epoch`] — and it means the same
+/// thing on both: one line per pipeline stage per epoch, in this format.
+///
+/// ⛔ IT DID NOT USED TO. The LFM tree launcher has exported
+/// `LAMBDA_VM_BASE_SPLIT=1` on the WHIR arm since that arm existed, "byte
+/// identical to the D-S exports" — and it reached nothing, because the WHIR
+/// base does not go through the [`prove_continuation`] below. Fifteen epochs
+/// and 57% of the block's wall printed as one number, under a knob the log
+/// showed as set. A knob that names a measurement on one pipeline and nothing
+/// at all on another is worse than a missing one: the export is the evidence a
+/// reader uses to believe the breakdown was taken.
 fn base_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("LAMBDA_VM_BASE_SPLIT") {

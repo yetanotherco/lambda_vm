@@ -29,6 +29,7 @@ pub mod whir_commit;
 pub mod whir_eval;
 pub mod whir_hash;
 pub mod whir_round;
+pub mod whir_split;
 pub mod zerocheck;
 
 use math::field::{element::FieldElement, traits::IsField};

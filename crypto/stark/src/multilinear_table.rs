@@ -1238,12 +1238,19 @@ where
     // the proof would be a field a reader assumes is checked.
     // `StackedCommitment::roots` builds a fresh `Vec`, so it is bound here
     // rather than borrowed from a temporary.
+    // ── the argument's split, under `LAMBDA_VM_BASE_SPLIT=1` ──────────────
+    // The guard counts concurrent proves so a record that could have mixed two
+    // says so; it releases on DROP, which is what the `?`s below need.
+    let _split = multilinear::whir_split::begin_prove();
+
     let prepared_roots: Vec<Commitment> = prepared
         .as_ref()
         .map(|p| p.commitment.roots())
         .unwrap_or_default();
+    let __sp_challenge = multilinear::whir_split::mark();
     let (z, alpha, beta) =
         absorb_roots_and_challenge::<E, T>(transcript, committed.roots(), &prepared_roots);
+    multilinear::whir_split::add(&multilinear::whir_split::CHALLENGE, __sp_challenge);
 
     let mut tables = Vec::with_capacity(committed.tables().len());
     // One point and one claimed value per **column**, in the global column
@@ -1254,9 +1261,17 @@ where
     // commitment may span several tables, so every start is kept rather than
     // the one a single-table opening needed.
     let mut table_starts = Vec::with_capacity(committed.tables().len());
-    for table in committed.tables() {
+    for (__sp_at, table) in committed.tables().iter().enumerate() {
         table_starts.push(points.len());
+        // ⛔ SERIAL, and the instrument says so rather than a reader inferring
+        // it: this loop has no rayon and no `k`, so `ARGUE` is a WALL as well
+        // as a sum. The per-table maximum is kept beside it because the sum
+        // alone cannot tell fifty even tables from one that dominates, and
+        // those two want opposite levers.
+        let __sp_table = multilinear::whir_split::mark();
         let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
+        let __sp_secs = multilinear::whir_split::add(&multilinear::whir_split::ARGUE, __sp_table);
+        multilinear::whir_split::note_table(__sp_at, __sp_secs);
         for _ in 0..table.num_committed_columns() {
             points.push(point.clone());
         }
@@ -1268,6 +1283,8 @@ where
     // are in the global column order, so a group takes the slice its tables
     // span.
     let mut columns = Vec::with_capacity(committed.groups().len());
+    multilinear::whir_split::note_groups(committed.groups().len());
+    let __sp_groups = multilinear::whir_split::mark();
     let mut table_at = 0usize;
     let mut column_at = 0usize;
     for (group, &size) in committed.groups().iter().zip(committed.sizes()) {
@@ -1304,6 +1321,9 @@ where
     // and therefore the same bytes as the `Shared` form it replaces:
     // `Claimed::point` hands back that one point for every column under either
     // variant, and `Claimed` reaches nothing but the weight.
+    multilinear::whir_split::add(&multilinear::whir_split::OPEN_GROUPS, __sp_groups);
+
+    let __sp_prepared = multilinear::whir_split::mark();
     let preprocessed = match prepared {
         Some(prepared) => {
             if prepared.at.len() != prepared.columns.len() {
@@ -1335,6 +1355,7 @@ where
         }
         None => None,
     };
+    multilinear::whir_split::add(&multilinear::whir_split::OPEN_PREPARED, __sp_prepared);
 
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
