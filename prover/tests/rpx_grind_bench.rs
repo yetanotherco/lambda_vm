@@ -205,6 +205,87 @@ fn what_one_grind_costs_at_each_launch_geometry() {
         print_arm(name, *knobs, &times[a], &times[0], &nonces[0]);
     }
 
+    // ⛔ THE NOISE FLOOR, ON A LINE OF ITS OWN AND NAMED.
+    //
+    // v3's launcher read this by COLUMN POSITION — `awk '{print $5}'` over the
+    // repeated control's row — and `control AGAIN` is two words, so it read the
+    // `ns/perm` column instead of the ratio and declared the procedure 327%
+    // unstable on a run whose ratio was 1.000. A verdict read by position
+    // breaks the first time a label gains a space. This line exists so nothing
+    // downstream has to count spaces to find the truth.
+    let floor_ratios: Vec<f64> = times[n - 1]
+        .iter()
+        .zip(&times[0])
+        .map(|(a, b)| a / b)
+        .collect();
+    let floor = median(&floor_ratios);
+    println!(
+        "\nNOISE FLOOR: repeated control median per-seed ratio {floor:.4} \
+         (|1 - r| = {:.4}; the procedure's own movement — no arm may claim less)",
+        (1.0 - floor).abs()
+    );
+
+    // ── THE DISTRIBUTION, because a flat median with a falling mean is a
+    // distribution statement and deciles are the cheapest way to make it one.
+    println!("\n=== THE PER-SEED RATIO, BY DECILE ===");
+    print!("{:<18}", "arm");
+    for d in 1..10 {
+        print!("{:>7}", format!("p{}0", d));
+    }
+    println!();
+    for (a, (name, _)) in arms.iter().enumerate() {
+        let mut rs: Vec<f64> = times[a].iter().zip(&times[0]).map(|(x, y)| x / y).collect();
+        rs.sort_by(|x, y| x.partial_cmp(y).expect("no NaN in a ratio"));
+        print!("{name:<18}");
+        for d in 1..10 {
+            print!("{:>7.3}", rs[(d * rs.len()) / 10]);
+        }
+        println!();
+    }
+
+    // ★ THE TWENTY SEEDS THAT MOVE THE MEAN, for the arm that moves it most.
+    //
+    // The mean falls while every median stays flat, so a minority of seeds
+    // carries the saving. These are that minority, with the one quantity that
+    // actually differs between the arms for a given seed: the LAUNCH COUNT.
+    // It is DERIVED, not instrumented — the loop advances `base` by the block
+    // each miss and returns on the block containing the hit, so the count is
+    // `h / block + 1` exactly.
+    let worst = (1..n)
+        .min_by(|a, b| mean(&times[*a]).total_cmp(&mean(&times[*b])))
+        .expect("at least one arm beside the control");
+    let (worst_name, worst_knobs) = arms[worst];
+    let ctl_block = arms[0].1.block(GRINDING_FACTOR);
+    let arm_block = worst_knobs.block(GRINDING_FACTOR);
+    println!("\n=== THE 20 SEEDS THAT MOVE THE MEAN MOST — {worst_name} vs the control ===");
+    println!(
+        "{:>5} {:>12} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "seed", "h", "ctl ms", "arm ms", "delta ms", "ctl lch", "arm lch"
+    );
+    let mut order: Vec<usize> = (0..RUNS).collect();
+    order.sort_by(|x, y| {
+        (times[worst][*y] - times[0][*y])
+            .abs()
+            .total_cmp(&(times[worst][*x] - times[0][*x]).abs())
+    });
+    for s in order.into_iter().take(20) {
+        let h = nonces[0][s];
+        println!(
+            "{s:>5} {h:>12} {:>9.3} {:>9.3} {:>9.3} {:>9} {:>9}",
+            times[0][s],
+            times[worst][s],
+            times[worst][s] - times[0][s],
+            h / ctl_block + 1,
+            h / arm_block + 1,
+        );
+    }
+    println!(
+        "  ⭐ if these are the LARGEST-h seeds and their `arm lch` is > 1, the effect \
+         lives in the miss-and-relaunch path or in what a long sustained launch costs \
+         under the power limiter — and the card drew its full board power on this run. \
+         If they are ordinary-h seeds, neither candidate survives."
+    );
+
     // ── THE CALIBRATION CONTROL ────────────────────────────────────────────
     let control_mean = mean(&times[0]);
     let projected = control_mean * BASE_GRINDS / 1000.0;
