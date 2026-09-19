@@ -167,6 +167,13 @@ mod tests {
              nothing and this suite would be green against arithmetic it never ran"
         );
         println!("GENESIS FIXTURE: {} genesis pages, {entries} nonzero entries", genesis.len());
+        // The census the block's cap is owed, printed at the shape that exists.
+        println!(
+            "{}",
+            crate::lfm::whir_global::genesis_census_line(
+                &crate::lfm::whir_global::genesis_census(&global, &airs)
+            )
+        );
 
         let arena = whir_global_arena(&global, &airs);
         let program = whir_global_program(&global, &airs);

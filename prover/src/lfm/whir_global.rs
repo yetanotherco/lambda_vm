@@ -921,3 +921,86 @@ pub fn global_cost(
     cost.constants = pool.constant_values().to_vec();
     cost
 }
+
+// =============================================================================
+// The genesis census — the measurement the cap is owed
+// =============================================================================
+
+/// One page table's genesis cost, as the quantity the leg is linear in.
+#[derive(Debug, Clone, Copy)]
+pub struct GenesisEntry {
+    /// Where this page sits among the cross-epoch tables.
+    pub table: usize,
+    /// Its route — a private page contributes no genesis entries at all.
+    pub route: GlobalRoute,
+    /// Rows in the preprocessed columns, which is the page size.
+    pub rows: usize,
+    /// Surviving entries in INIT: the nonzero genesis bytes.
+    pub entries: usize,
+}
+
+/// ★ THE CENSUS THE CAP IS SIZED AGAINST, and it needs no prove.
+///
+/// [`super::preprocessed::MAX_SPARSE_ENTRIES`] is a budget, and the quantity
+/// that decides whether a real block fits under it — how many nonzero genesis
+/// bytes the touched non-private pages carry between them — is a function of the
+/// ELF and the touched page list alone. So this walks the AIR set the verifier
+/// built and counts, with no proving anywhere in it.
+///
+/// ⚠ Read it as a COUNT, not as a cost: the rows it implies are
+/// `entries × num_vars` plus the per-page ramp and complements, and
+/// [`global_cost`] is where those are added up. Two spellings of the row
+/// arithmetic would be two places for it to drift.
+pub fn genesis_census(
+    global: &WhirRealGlobal,
+    airs: &[&dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >],
+) -> Vec<GenesisEntry> {
+    let routes = GlobalRoute::table_routes(global.num_epochs, &global.page_is_private);
+    routes
+        .iter()
+        .enumerate()
+        .skip(global.num_epochs)
+        .map(|(table, &route)| {
+            let columns = airs[table].precomputed_columns();
+            let rows = columns.first().map_or(0, Vec::len);
+            let entries = match route {
+                GlobalRoute::GenesisPage => {
+                    super::preprocessed::sparse_entries(&[columns[1].as_slice()])
+                }
+                _ => 0,
+            };
+            GenesisEntry {
+                table,
+                route,
+                rows,
+                entries,
+            }
+        })
+        .collect()
+}
+
+/// The census as one line, for a box run's log.
+///
+/// ★ IT PRINTS THE SPLIT AND THE TOTAL, because the split is what decides
+/// whether a cap is the right instrument at all: many pages with a handful of
+/// entries each is a different situation from one dense page, and a total alone
+/// cannot tell them apart.
+pub fn genesis_census_line(census: &[GenesisEntry]) -> String {
+    let genesis = census
+        .iter()
+        .filter(|e| e.route == GlobalRoute::GenesisPage)
+        .count();
+    let private = census.len() - genesis;
+    let total: usize = census.iter().map(|e| e.entries).sum();
+    let worst = census.iter().map(|e| e.entries).max().unwrap_or(0);
+    format!(
+        "GENESIS CENSUS: {} pages = {genesis} genesis + {private} private; {total} nonzero \
+         entries, worst page {worst}; cap {}",
+        census.len(),
+        super::preprocessed::MAX_SPARSE_ENTRIES,
+    )
+}
