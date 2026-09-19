@@ -877,7 +877,7 @@ lint:
 	# `hash-metrics` passes have no cuda, so until this line the whole model was
 	# compiled by nothing and a box run was its first compiler. No GPU needed;
 	# cuda clippy builds against the cubin stubs like the pass above.
-	cargo clippy -p lambda-vm-prover --all-targets --features cuda,hash-metrics -- -D warnings
+	cargo clippy -p lambda-vm-prover --all-targets --features cuda,hash-metrics -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

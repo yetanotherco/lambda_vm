@@ -1100,7 +1100,7 @@ fn global_stack(
         .collect();
     let config = crate::multilinear_prove::chain_config(&shapes);
     let plan = air_set.genesis_stack();
-    let shape = (!plan.is_empty()).then(|| transcript_pin::StackShape {
+    let shape = (!plan.is_empty()).then_some(transcript_pin::StackShape {
         // Two preprocessed columns per dense page, which is what `at` holds.
         columns: plan.at.len(),
         // Every genesis page is one page tall, so the stack is a rectangle.
