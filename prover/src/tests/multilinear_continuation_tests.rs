@@ -1768,7 +1768,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     // would not say which rule produced it, and the two are separately wrong in
     // different ways.
     let num_vars = crate::continuation::PAGE_NUM_VARS;
-    let marginal = crate::continuation::marginal_stacked_rows(num_vars, plan.n_fixed);
+    let marginal = crate::continuation::GENESIS_PAGE_MARGINAL_ROWS;
     println!(
         "GENESIS ROUTING: {} of {} pages stacked {dense_bases:02x?}; the sparse form \
          would have cost {dense_total} rows for them and costs {sparse_total} for the \
@@ -1779,7 +1779,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         plan.routes.len(),
         plan.n_fixed,
         plan.routes.iter().filter(|r| r.has_init).count(),
-        crate::continuation::candidate_threshold_entries(num_vars, plan.n_fixed),
+        crate::continuation::candidate_threshold_entries(num_vars),
         plan.routes.iter().filter(|r| r.candidate).count(),
         plan.savings,
         crate::continuation::PREPARED_LEG_ROWS,
@@ -1800,20 +1800,25 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     );
     // The two parts' own pre-registrations, so a green here cannot come from
     // the right set reached by the wrong arithmetic.
+    // ⚠ `n_fixed` DECIDES NOTHING — the rule reads one literal. It is asserted
+    // because THIS run standing at the height the literal was MEASURED at is
+    // what makes that literal the right charge for it; a taller run would be
+    // charged too little, and this is where that is read.
     assert_eq!(
         plan.n_fixed, 24,
         "thirty genesis pages: 18 + ceil(log2(60))"
     );
+    assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
     assert_eq!(
-        marginal, 103,
-        "one eq and its join, two indicators, one Sub"
+        marginal, 109,
+        "the measured literal, UNPINNED and a floor until V1j's pin lands"
     );
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
         "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_261);
+    assert_eq!(plan.savings, 10_248_243);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.

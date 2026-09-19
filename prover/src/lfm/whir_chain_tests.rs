@@ -1077,10 +1077,9 @@ fn the_production_chain_emits_its_closed_form() {
 /// in the one place the form exists.
 ///
 /// ⚠ IT IS NOT WHAT A PAGE IS CHARGED. What one more carried page adds to the
-/// leg is `continuation::marginal_stacked_rows`, pinned by
-/// [`the_marginal_the_routing_rule_charges_is_the_one_the_emitter_bills`]. The
-/// two terms are separate because the costs are: one chain, however many pages
-/// ride it.
+/// leg is `continuation::GENESIS_PAGE_MARGINAL_ROWS`, a measured literal whose
+/// pin lives in `whir_stacked_tests`. The two terms are separate because the
+/// costs are: one chain, however many pages ride it.
 ///
 /// ★ WHAT THE CONSTANT IS: 175,066 rows, the chain over a stacked family
 /// polynomial at 24 variables. The block's stack is THREE columns of 2^18 — 20
@@ -1182,40 +1181,40 @@ fn the_blocks_genesis_routing_is_insensitive_to_the_chain_figure() {
 #[test]
 fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
     use crate::continuation::{
-        PAGE_NUM_VARS, chain_is_paid, densest_sparse_entries, fixed_stack_vars, page_savings,
-        sparse_leg_rows,
+        GENESIS_PAGE_MARGINAL_ROWS, PAGE_NUM_VARS, PREPARED_LEG_ROWS, chain_is_paid,
+        densest_sparse_entries, page_savings, sparse_leg_rows,
     };
     let num_vars = PAGE_NUM_VARS;
     let cap = super::preprocessed::MAX_SPARSE_INIT_ENTRIES;
+    let densest_sparse = densest_sparse_entries(num_vars);
 
-    // The block's own posture first: thirty genesis pages, so part 1 charges at
-    // 24 variables.
-    let n_fixed = fixed_stack_vars(num_vars, 30);
-    let densest_sparse = densest_sparse_entries(num_vars, n_fixed);
+    // ⛔ BOTH CONTRASTS WITH THE RETIRED RULE, because they are different
+    // quantities and both have been quoted. Its BREAK-EVEN (the least S it
+    // carried) was 9,725 against this rule's 9,731; its DENSEST SPARSE page
+    // carried 9,724 against this rule's 9,730. `<= 60,000` is true of all four,
+    // which is exactly why a test left at either old number stays green while
+    // measuring a rule that no longer exists.
+    let retired_break_even = (PREPARED_LEG_ROWS - num_vars) / num_vars + 1;
     println!(
-        "ROUTE OVERLAP: at {n_fixed} fixed variables the densest page the rule can leave \
-         sparse carries {densest_sparse} entries, against a sparse-leg cap of {cap} \
-         (the retired single-page rule's number was 9,724)"
+        "ROUTE OVERLAP: at marginal {GENESIS_PAGE_MARGINAL_ROWS} the densest page the \
+         rule can leave sparse carries {densest_sparse} entries and the least it \
+         carries is {}, against a sparse-leg cap of {cap}. The retired single-page \
+         rule's pair was {} and {retired_break_even}.",
+        densest_sparse + 1,
+        retired_break_even - 1,
     );
+    assert_eq!(retired_break_even, 9_725);
     assert_eq!(
         densest_sparse, 9_730,
-        "the bound the cap must clear is the two-part rule's, and it is not the \
-         retired rule's 9,724"
+        "the bound the cap must clear is the two-part rule's, and it is neither the \
+         retired rule's 9,724 nor its 9,725"
     );
 
     // ⚠ EXACT, BOTH WAYS — a bound asserted only from above could be any number
     // larger than the truth. The page at the bound must route sparse and the one
     // above it must not, or `densest_sparse_entries` is inverting the wrong form.
-    assert!(!chain_is_paid(page_savings(
-        num_vars,
-        n_fixed,
-        densest_sparse
-    )));
-    assert!(chain_is_paid(page_savings(
-        num_vars,
-        n_fixed,
-        densest_sparse + 1
-    )));
+    assert!(!chain_is_paid(page_savings(num_vars, densest_sparse)));
+    assert!(chain_is_paid(page_savings(num_vars, densest_sparse + 1)));
 
     assert!(
         densest_sparse <= cap,
@@ -1224,58 +1223,58 @@ fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
          without the other"
     );
 
-    // ⛔ AND THE MARGIN MUST NOT CLOSE AS THE PAGE COUNT GROWS. The marginal
-    // carries `ceil(log2(2P))`, so the bound creeps up with the number of
-    // touched genesis pages — slowly, but the block's thirty is not a ceiling
-    // anybody has proved. Swept to a million pages, which is four orders past
-    // any run this prover has seen.
-    //
-    // ⚠ PAST 64 PAGES THIS SWEEP IS AN OVER-ESTIMATE AND NOT A MODEL: the real
-    // stack would spill into several polynomials (see
-    // `the_single_chain_term_prices_a_stack_of_at_most_sixty_four_pages`), each
-    // standing at `MAX_STACK_VARS` rather than the height charged here. A
-    // taller charge gives a LARGER bound, so the assertion only gets harder —
-    // which is the direction a sweep past its own model should err in.
-    let mut pages = 1usize;
-    while pages <= 1 << 20 {
-        let bound = densest_sparse_entries(num_vars, fixed_stack_vars(num_vars, pages));
+    // ⛔ AND THE MARGIN MUST NOT CLOSE WHEN THE LITERAL MOVES. The marginal is
+    // UNPINNED and is a FLOOR, so V1j's pin lands at or above it and the bound
+    // rises one entry per `num_vars` rows. The overlap is asserted over every
+    // marginal up to four orders past the current value, which is where the
+    // arithmetic says it would finally close:
+    // `(PREPARED_LEG_ROWS + m - num_vars) / num_vars <= cap` fails above
+    // `m = 904,952`.
+    let mut m = GENESIS_PAGE_MARGINAL_ROWS;
+    while m <= 900_000 {
+        let bound = (PREPARED_LEG_ROWS + m - num_vars) / num_vars;
         assert!(
             bound <= cap,
-            "at {pages} genesis pages the rule can leave a page of {bound} entries \
-             sparse, and the sparse leg refuses above {cap}"
+            "at marginal {m} the rule can leave a page of {bound} entries sparse, and \
+             the sparse leg refuses above {cap}"
         );
-        // The sparse leg it would then emit must also be a leg, not a claim:
-        // the bound is a nonzero count and the cap is one too.
+        // The sparse leg it would then emit must be a leg, not a claim.
         assert!(sparse_leg_rows(num_vars, bound) > 0);
-        pages *= 2;
+        m = (m * 2).max(m + 1);
     }
+    // ⚠ AND THE CHECK CAN FAIL: one marginal past that point must breach the
+    // cap, or the sweep above proves nothing about where the margin closes.
+    assert!((PREPARED_LEG_ROWS + 1_000_000 - num_vars) / num_vars > cap);
 }
 
-/// ⛔⛔ PART 1's MARGINAL, PINNED AGAINST THE EMITTER THAT CHARGES IT.
+/// ⛔⛔ A LOWER BOUND ON PART 1's MARGINAL, READ OFF THE EMITTER — AND
+/// DELIBERATELY NOT A PIN.
 ///
-/// `crate::continuation::marginal_stacked_rows` is a closed form written in a
-/// module that cannot see `crate::lfm` — the layering that keeps the routing
-/// rule evaluable by the verifier. So the form is a TRANSCRIPTION of
-/// [`super::whir_stacked::weight_at_rows`], and a transcription with no reading
-/// behind it is a number, not a form.
+/// `crate::continuation::GENESIS_PAGE_MARGINAL_ROWS` is a MEASURED LITERAL, and
+/// its pin — an EQUALITY against the differenced `stacked_verify_cost` — lives
+/// in `whir_stacked_tests` and belongs to the lane that owns that cost form.
 ///
-/// ★ THE READING IS A DIFFERENCE, NOT A TOTAL, because that is what a marginal
-/// is: the same layout at `P` and at `P + 1` pages, inside ONE power-of-two
-/// bracket so the stack height does not move between them, and the emitter's
-/// own row count differenced across the pair.
+/// ⛔ THIS TEST MUST NOT ASSERT THAT EQUALITY, and the reason is the whole
+/// point of a pin. [`super::whir_stacked::weight_at_rows`] is a PARTIAL view:
+/// it carries the `eq` and the prefix indicators, while `stacked_verify_cost`
+/// pays three more terms per column outside it — and a fourth, an absorb into a
+/// THREADED sponge whose row cost depends on where the previous columns left
+/// the buffer. A second equality here, against the partial form, would
+/// CONTRADICT the real pin the day it lands, and two pins on one constant is
+/// precisely the duplication a pin exists to prevent.
 ///
-/// ★ AND IT SHOWS THE ONE TERM THAT IS AMORTISED RATHER THAN DERIVED. The
-/// difference comes out at exactly `90 + 2 * (n_stack - num_vars)` — the eq
-/// with its join and the two prefix indicators — and the form charges ONE ROW
-/// MORE. That row is the shared `Sub`, whose true marginal inside a bracket is
-/// zero: `weight_at_rows` emits one per prefix POSITION any column reads as a
-/// zero bit, and a bracket's positions are all already read. Charging it per
-/// page is deliberate and conservative, and this is where a reader sees the
-/// difference between the charge and the cost.
+/// ★ WHAT IT DOES ASSERT, and it is worth having: the two terms
+/// `weight_at_rows` DOES account for, differenced across one more page inside
+/// ONE power-of-two bracket so the stack height does not move — `eq` 90 plus
+/// two indicators of six — and that the literal is at least that plus the
+/// amortised `Sub`. An inequality cannot conflict with a measurement.
 #[test]
-fn the_marginal_the_routing_rule_charges_is_the_one_the_emitter_bills() {
+fn the_marginal_is_at_least_what_the_weight_closure_alone_bills() {
     use super::whir_stacked::weight_at_rows;
-    use crate::continuation::{PAGE_NUM_VARS, PAGE_PREPROCESSED_COLUMNS, marginal_stacked_rows};
+    use crate::continuation::{
+        GENESIS_PAGE_MARGINAL_ROWS, MARGINAL_MEASURED_AT_VARS, PAGE_NUM_VARS,
+        PAGE_PREPROCESSED_COLUMNS,
+    };
 
     // A page's two preprocessed columns settle at ONE point — its table's — so
     // the groups are the pages.
@@ -1289,39 +1288,39 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_emitter_bills() {
         (layout, group_of)
     };
 
-    // 29 and 30 pages both stand at 24 variables, which is the block's posture
-    // and the height the rule charges the block at.
+    // 29 and 30 pages both stand at the height the literal was measured at, and
+    // in ONE polynomial — or the difference would span two chains.
     let (at_29, groups_29) = layout_for(29);
     let (at_30, groups_30) = layout_for(30);
-    assert_eq!(at_29.n_stack(), 24, "the pair must share a stack height");
-    assert_eq!(at_30.n_stack(), 24);
+    assert_eq!(at_29.n_stack(), MARGINAL_MEASURED_AT_VARS);
+    assert_eq!(at_30.n_stack(), MARGINAL_MEASURED_AT_VARS);
     assert_eq!(at_30.num_polys(), 1, "or the difference spans two chains");
 
     let rows_29 = weight_at_rows(&at_29, 0, &groups_29);
     let rows_30 = weight_at_rows(&at_30, 0, &groups_30);
     let billed = rows_30 - rows_29;
-    let charged = marginal_stacked_rows(PAGE_NUM_VARS, 24);
     println!(
-        "MARGINAL: the emitter bills {billed} rows for the thirtieth page \
-         ({rows_29} -> {rows_30} at {} variables); the rule charges {charged}",
+        "MARGINAL: the weight closure alone bills {billed} rows for the thirtieth page \
+         ({rows_29} -> {rows_30} at {} variables); the literal charges {GENESIS_PAGE_MARGINAL_ROWS}",
         at_30.n_stack()
     );
 
-    // The two derived terms, to the row.
+    // The two terms this form accounts for, to the row.
     assert_eq!(
         billed,
-        90 + PAGE_PREPROCESSED_COLUMNS * (24 - PAGE_NUM_VARS)
+        90 + PAGE_PREPROCESSED_COLUMNS * (MARGINAL_MEASURED_AT_VARS - PAGE_NUM_VARS)
     );
     assert_eq!(billed, 102);
-    // And the amortised one, which is the whole of the gap.
-    assert_eq!(
-        charged,
-        billed + 1,
-        "the rule charges one row per page for the shared Sub, whose marginal inside a \
-         bracket is zero — if this gap is anything but 1, a term has moved and the \
-         form's doc is describing a cost it no longer has"
+
+    // ⛔ A LOWER BOUND, NEVER AN EQUALITY. The `+ 1` is the amortised shared
+    // `Sub`, whose true marginal inside a bracket is zero and which the literal
+    // charges anyway; everything above that is the per-column and sponge terms
+    // this form cannot see.
+    assert!(
+        GENESIS_PAGE_MARGINAL_ROWS >= billed + 1,
+        "the literal charges {GENESIS_PAGE_MARGINAL_ROWS} rows for a page the weight \
+         closure alone bills {billed} for: it is below a term it must contain"
     );
-    assert_eq!(charged, 103);
 }
 
 /// ⚠ A LIMIT OF PART 2's SINGLE CHAIN TERM, STATED WHERE IT CAN BE MEASURED.
