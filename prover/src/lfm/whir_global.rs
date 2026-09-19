@@ -728,9 +728,10 @@ pub fn whir_global_program(
     // ⚠ `page_bases` is the list AS IT TRAVELS, which is also the order the AIRs
     // are built in — `global_memory_configs` maps it one-to-one. `absorb_global`
     // absorbs exactly what `verify_global`'s caller handed it, so a program that
-    // absorbed the sorted form would derive a different `z` for any bundle whose
-    // list arrived out of order — and the AIRs are
-    // built from, which is a different job done in a different place.
+    // sorted the list before absorbing it would derive a different `z` for any
+    // bundle whose list arrived out of order. ⇒ Take it as it travels: the same
+    // list builds the AIRs, so absorbing it and indexing by it are the SAME
+    // order rather than two that have to be kept in step.
     let mut transcript = WhirTranscript::new();
     super::whir_statement::emit_global_statement(
         &mut transcript,
