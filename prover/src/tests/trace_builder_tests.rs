@@ -1857,6 +1857,10 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
         resident.cpus.len(),
         "CPU: the closed chunks plus the tail are not the run's chunks"
     );
+    // How many kinds took the `produced > 0` branch below. The elided branch is
+    // nearly free to satisfy, so without this a fixture that used none of these
+    // kinds would pass the loop while checking nothing.
+    let mut with_a_tail = 0usize;
     for (kind, produced) in [
         (TableKind::Memw, resident.memws.len()),
         (TableKind::MemwAligned, resident.memw_aligneds.len()),
@@ -1873,12 +1877,36 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
             closed_of(kind),
             "{kind:?}: the leftover disagrees with what was committed"
         );
-        assert!(
-            closed_of(kind) < produced,
-            "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
-            closed_of(kind)
-        );
+        if produced == 0 {
+            // An optional kind the run never used is left out of the proof
+            // entirely, so there is nothing to close and no tail to keep:
+            // "closed + tail == produced" holds at 0 + 0 == 0.
+            //
+            // The assertion below cannot say that. It reads `closed <
+            // produced`, which asserts a tail always exists — true only while
+            // every kind carried at least one padded chunk. That is the old
+            // rule surviving in a test, the same rule the walk itself was
+            // still applying.
+            assert_eq!(
+                closed_of(kind),
+                0,
+                "{kind:?}: the run produced no table of this kind, but the walk closed {} chunk(s)",
+                closed_of(kind)
+            );
+        } else {
+            with_a_tail += 1;
+            assert!(
+                closed_of(kind) < produced,
+                "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
+                closed_of(kind)
+            );
+        }
     }
+    assert!(
+        with_a_tail >= 3,
+        "only {with_a_tail} of these kinds produced a table, so the closed-plus-tail \
+         check barely ran — the fixture no longer exercises what this test is for"
+    );
 }
 
 /// Commit plus Challenge must cover every chunked table, each under the root
