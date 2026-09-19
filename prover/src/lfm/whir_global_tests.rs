@@ -294,14 +294,18 @@ mod tests {
         // leg forgot to name what it interns, which is how the roots block's
         // form was closed twice after coming up short. Printed before the
         // assert, so one run names the gap instead of one run per guess.
-        let interned: Vec<crate::lfm::LfmWord> = program
+        // ⚠ THE ADDRESS IS CARRIED WITH THE VALUE, and that is what turns an
+        // unnamed word from a number nobody can place into a leg with a name.
+        let interned_at: Vec<(u64, crate::lfm::LfmWord)> = program
             .instrs
             .iter()
             .filter_map(|i| match i {
-                crate::lfm::instr::Instr::Const { value, .. } => Some(*value),
+                crate::lfm::instr::Instr::Const { out, value, .. } => Some((out.0, *value)),
                 _ => None,
             })
             .collect();
+        let interned: Vec<crate::lfm::LfmWord> =
+            interned_at.iter().map(|(_, word)| *word).collect();
         let unnamed: Vec<&crate::lfm::LfmWord> = interned
             .iter()
             .filter(|w| !cost.constants.contains(w))
@@ -318,8 +322,22 @@ mod tests {
                 unnamed.len(),
                 unemitted.len(),
             );
+            // ⛔⛔ AN UNNAMED WORD IS NAMED BY ITS NEIGHBOURS, NOT BY ITS VALUE.
+            // Three rounds of this gap were closed by reading emitters and
+            // matching value SHAPES — the Newton pairs, the coset fold's
+            // generator powers — and each round cost a box run because a value
+            // alone says nothing about who interned it. `locate_addr` is the
+            // tool this codebase already has for exactly that question: it
+            // reports the instruction that wrote a cell and its neighbours, so
+            // the leg that interned a constant is READ rather than guessed.
+            //
+            // ⚠ It costs nothing on the success path: this block runs only when
+            // a word is already unaccounted for.
             for w in unnamed.iter().take(40) {
                 println!("  UNNAMED  {w:?}");
+                if let Some((addr, _)) = interned_at.iter().find(|(_, word)| word == *w) {
+                    println!("{}", crate::lfm::executor::locate_addr(&program, *addr));
+                }
             }
             for w in unemitted.iter().take(40) {
                 println!("  UNEMITTED {w:?}");
