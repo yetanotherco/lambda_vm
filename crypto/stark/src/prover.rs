@@ -935,9 +935,11 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 ///
 /// Holding one of these makes this process's device admission regime the byte
 /// budget, and the prove-and-retire passes' serial window is refused for as
-/// long as it lives. The budget, the admission rule and the concurrency below
-/// are unchanged by that: the regime token is a separate field, claimed on
-/// construction and released by its own `Drop`.
+/// long as it lives. Constructing one WAITS for a window another thread has
+/// open, which is bounded by that window's single round-1 call. The budget,
+/// the admission rule and the concurrency below are unchanged by either: the
+/// regime token is a separate field, claimed on construction and released by
+/// its own `Drop`.
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
@@ -960,8 +962,9 @@ struct VramPermit<'a> {
 }
 
 impl VramGate {
-    /// Fails only when a prove-and-retire serial device window is open in this
-    /// process; see [`crate::device_window`].
+    /// Waits for a serial device window another thread holds, and fails only
+    /// when THIS thread holds one — a claim that would wait for a window only
+    /// its own caller can release. See [`crate::device_window`].
     fn new(budget: u64) -> Result<Self, crate::device_window::DeviceRegimeError> {
         Ok(Self {
             used: std::sync::Mutex::new(0),
@@ -1986,6 +1989,22 @@ pub trait IsStarkProver<
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
         let bus_public_inputs = if air.has_aux_trace() {
+            // The one place this pass reaches the card. Declining the resident
+            // aux build does not keep the build off the device: `build_
+            // auxiliary_trace` falls through to `logup_gpu::
+            // try_build_term_columns_gpu`, which computes every term column
+            // there. That entry had no admission of any kind, which is the
+            // two-regimes-one-card hazard arriving by a third route.
+            //
+            // The window is taken HERE and not at the top of this function on
+            // purpose: above, it would also serialise the host main LDE and
+            // both Merkle trees, which are the bulk of round 1 and never touch
+            // the card.
+            //
+            // Bound to a NAMED guard. `let _ = …` would drop it on the spot
+            // and leave a no-op that compiles and reads correctly.
+            #[cfg(feature = "cuda")]
+            let _device_window = crate::device_window::SerialWindow::enter()?;
             Self::build_aux_trace_on_host(air, trace, challenges)
         } else {
             None

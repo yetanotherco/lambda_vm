@@ -89,6 +89,97 @@ impl<'a> BuildAux<'a> {
     }
 }
 
+/// Run `run_one` over every item, in item order, failing on the first error.
+///
+/// Three passes drive their batch identically, and the cuda arm is why this is
+/// one function rather than three copies of a cfg cascade that all have to
+/// agree.
+///
+/// Without `cuda` this is exactly what those cascades were: rayon when the
+/// `parallel` feature is on, a plain iterator when it is not. The bytes, the
+/// order and the concurrency of a CPU pass are unchanged.
+///
+/// With `cuda` the work inside `run_one` takes the serial device window, which
+/// BLOCKS on a condition variable. A rayon worker blocked there starves the
+/// pool the admitted table is itself using — `compute_logup_term_column` goes
+/// through `par_iter` — so the driver is OS threads, the way
+/// `stark::prover`'s `run_admitted` is and for the same reason. The window,
+/// not the worker count, is what bounds device concurrency there.
+#[cfg(feature = "cuda")]
+fn drive<I: Send, T: Send>(
+    items: Vec<I>,
+    run_one: impl Fn(I) -> Result<T, Error> + Sync,
+) -> Result<Vec<T>, Error> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A poisoned lock here carries nothing a caller could use: the guarded
+    // state is one slot of one batch, and the panic that poisoned it is
+    // already on its way up. Recover rather than turn it into a second panic
+    // from every other worker.
+    fn recover<G>(r: Result<G, std::sync::PoisonError<G>>) -> G {
+        r.unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    let n = items.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let queue: Vec<Mutex<Option<I>>> = items.into_iter().map(|i| Mutex::new(Some(i))).collect();
+    let slots: Vec<Mutex<Option<Result<T, Error>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |p| p.get())
+        .min(n);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= n {
+                        return;
+                    }
+                    let Some(item) = recover(queue[idx].lock()).take() else {
+                        continue;
+                    };
+                    *recover(slots[idx].lock()) = Some(run_one(item));
+                }
+            });
+        }
+    });
+
+    // Item order, never completion order: the fold pass downstream is a
+    // function of the walk and not of which thread finished first.
+    let mut out = Vec::with_capacity(n);
+    for (idx, slot) in slots.into_iter().enumerate() {
+        match recover(slot.into_inner()) {
+            Some(Ok(value)) => out.push(value),
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(Error::Prover(format!(
+                    "logup drive: item {idx} of {n} was never run"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(all(not(feature = "cuda"), feature = "parallel"))]
+fn drive<I: Send, T: Send>(
+    items: Vec<I>,
+    run_one: impl Fn(I) -> Result<T, Error> + Sync,
+) -> Result<Vec<T>, Error> {
+    use rayon::prelude::*;
+    items.into_par_iter().map(run_one).collect()
+}
+
+#[cfg(all(not(feature = "cuda"), not(feature = "parallel")))]
+fn drive<I, T>(items: Vec<I>, run_one: impl Fn(I) -> Result<T, Error>) -> Result<Vec<T>, Error> {
+    items.into_iter().map(run_one).collect()
+}
+
 /// One batch, in parallel. Each table runs against its own transcript fork, so
 /// nothing crosses between them — the shared state is only where results land.
 fn rounds_batch(
@@ -97,8 +188,6 @@ fn rounds_batch(
     done: &Proofs,
     items: Vec<Item>,
 ) -> Result<(), Error> {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
     let run_one = |(kind, chunk, mut trace): Item| {
@@ -117,10 +206,7 @@ fn rounds_batch(
         .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
         Ok((idx, rounds))
     };
-    #[cfg(feature = "parallel")]
-    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
-    #[cfg(not(feature = "parallel"))]
-    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    let built = drive(items, run_one);
     done.lock().expect("logup results").extend(built?);
     Ok(())
 }
@@ -334,8 +420,6 @@ fn assemble(
     resident: &mut Resident,
     challenge: &Challenge,
 ) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
     let order = &challenge.order;
     let airs = &challenge.airs;
 
@@ -367,16 +451,10 @@ fn assemble(
     // Independent tables, most of them small: one at a time would leave the
     // machine idle after the walk.
     let jobs = resident_jobs(airs, resident, order, "logup phase")?;
-    #[cfg(feature = "parallel")]
-    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
-        .into_par_iter()
-        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
-        .collect::<Result<_, _>>()?;
-    #[cfg(not(feature = "parallel"))]
-    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
-        .into_iter()
-        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
-        .collect::<Result<_, _>>()?;
+    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> =
+        drive(jobs, |(idx, air, trace)| {
+            build(idx, air, trace).map(|proof| (idx, proof))
+        })?;
     for (idx, proof) in built {
         slots[idx] = Some(proof);
     }
@@ -483,8 +561,6 @@ fn deep_batch(
     done: &Deeps,
     items: Vec<Item>,
 ) -> Result<(), Error> {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
     let run_one = |(kind, chunk, mut trace): Item| {
@@ -504,10 +580,7 @@ fn deep_batch(
         .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
         Ok((idx, deep))
     };
-    #[cfg(feature = "parallel")]
-    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
-    #[cfg(not(feature = "parallel"))]
-    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    let built = drive(items, run_one);
     // Folded in a fixed order within the batch, so the sequence is a function
     // of the walk and not of which thread finished first.
     let mut built = built?;
@@ -624,8 +697,6 @@ pub fn run_batched(
     let airs = &challenge.airs;
     let n = order.len();
     {
-        #[cfg(feature = "parallel")]
-        use rayon::prelude::*;
         let mut state = done.lock().expect("fold state");
         let build = |idx: usize,
                      air: &crate::VmAir,
@@ -645,16 +716,7 @@ pub fn run_batched(
         // The codewords are independent and computed in parallel; the fold
         // itself is sequential and keeps this order, which the proof records.
         let jobs = resident_jobs(airs, &mut resident, order, "batched phase")?;
-        #[cfg(feature = "parallel")]
-        let deeps: Vec<(usize, Deep)> = jobs
-            .into_par_iter()
-            .map(|(idx, air, trace)| build(idx, air, trace))
-            .collect::<Result<_, _>>()?;
-        #[cfg(not(feature = "parallel"))]
-        let deeps: Vec<(usize, Deep)> = jobs
-            .into_iter()
-            .map(|(idx, air, trace)| build(idx, air, trace))
-            .collect::<Result<_, _>>()?;
+        let deeps: Vec<(usize, Deep)> = drive(jobs, |(idx, air, trace)| build(idx, air, trace))?;
         for (idx, deep) in deeps {
             fold_one(&mut state, idx, deep);
         }
@@ -765,8 +827,6 @@ fn open_batch(
     done: &Opens,
     items: Vec<Item>,
 ) -> Result<(), Error> {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
     let run_one = |(kind, chunk, mut trace): Item| {
@@ -787,10 +847,7 @@ fn open_batch(
         .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
         Ok((idx, opening))
     };
-    #[cfg(feature = "parallel")]
-    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
-    #[cfg(not(feature = "parallel"))]
-    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    let built = drive(items, run_one);
     done.lock().expect("openings").extend(built?);
     Ok(())
 }
@@ -889,18 +946,7 @@ pub fn run_open(
     };
     let jobs = resident_jobs(airs, &mut resident, order, "open pass")?;
     {
-        #[cfg(feature = "parallel")]
-        use rayon::prelude::*;
-        #[cfg(feature = "parallel")]
-        let opened = jobs
-            .into_par_iter()
-            .map(|(idx, air, trace)| build(idx, air, trace))
-            .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(not(feature = "parallel"))]
-        let opened = jobs
-            .into_iter()
-            .map(|(idx, air, trace)| build(idx, air, trace))
-            .collect::<Result<Vec<_>, _>>()?;
+        let opened = drive(jobs, |(idx, air, trace)| build(idx, air, trace))?;
         opens.extend(opened);
     }
 

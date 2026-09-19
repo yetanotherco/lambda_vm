@@ -12,9 +12,19 @@
 //! Neither can see the other's accounting, so a process that ran both would
 //! spend the same card twice — the two-gates-one-card condition that caused
 //! the production base-prove aborts. This module makes that unreachable rather
-//! than merely unlikely: a live byte-budget regime refuses a serial window, a
-//! live serial window refuses a byte-budget regime, and each is released by
-//! its guard's `Drop`.
+//! than merely unlikely, and it is deliberately ASYMMETRIC:
+//!
+//! - a live byte-budget regime REFUSES a serial window, because that regime
+//!   lives for a whole `multi_prove` and a window that waited for it would
+//!   wait unboundedly;
+//! - an open serial window makes a byte-budget claim WAIT, because a window
+//!   lives for one round-1 call and is already closing.
+//!
+//! The asymmetry is about lifetime, not taste, and it is what makes a process
+//! that reaches for both correct rather than merely diagnosed. Nothing can
+//! cycle: a window holder never waits for a gate. Each is released by its
+//! guard's `Drop`. Each direction also refuses the SAME thread asking twice,
+//! which would otherwise be a permanent hang rather than an error.
 //!
 //! Nothing here touches CUDA or reads a device, so the rule and its tests run
 //! on a card-free build exactly as they run on the prover.
@@ -59,9 +69,9 @@ const SERIAL_REFUSED: &str = "the monolithic byte-budget admission gate is live 
      the prove-and-retire serial device window cannot open beside it \
      (one card, one admission regime per process)";
 
-const BUDGET_REFUSED: &str = "a prove-and-retire serial device window is open in this process; \
-     the monolithic byte-budget admission gate cannot be created beside it \
-     (one card, one admission regime per process)";
+const BUDGET_SELF_DEADLOCK: &str = "this thread holds the prove-and-retire serial device window, \
+     so it cannot also claim the monolithic byte-budget gate: that claim waits for a window only \
+     this thread can release";
 
 const REENTRY_REFUSED: &str = "this thread already holds the prove-and-retire serial device \
      window; entering it twice would deadlock";
@@ -169,13 +179,35 @@ pub struct ByteBudgetRegime(());
 impl ByteBudgetRegime {
     /// Claim the byte-budget regime for this process.
     ///
-    /// Refuses while a [`SerialWindow`] is open. Several byte-budget regimes
-    /// may be live at once; see this module's note on why that count is not
-    /// capped here.
+    /// WAITS while another thread holds a [`SerialWindow`], rather than
+    /// refusing. The wait is bounded by one round-1 call, which is the whole
+    /// life of a window, while a byte-budget gate lives for a whole
+    /// `multi_prove` — so waiting on the short thing is what makes a process
+    /// that uses both correct instead of merely diagnosed. Nothing can cycle:
+    /// a window holder never waits for a gate.
+    ///
+    /// REFUSES in one case, and it is the mirror of [`SerialWindow::enter`]'s
+    /// re-entry guard: a thread that itself holds the window would wait for a
+    /// window only it can release. That is a permanent hang, so it is named
+    /// instead.
+    ///
+    /// Several byte-budget regimes may be live at once; see this module's note
+    /// on why that count is not capped here.
     pub fn claim() -> Result<Self, DeviceRegimeError> {
+        let me = std::thread::current().id();
         let mut state = regimes();
-        if state.serial_holder.is_some() {
-            return Err(DeviceRegimeError(BUDGET_REFUSED));
+        loop {
+            match state.serial_holder {
+                None => break,
+                Some(holder) if holder == me => {
+                    return Err(DeviceRegimeError(BUDGET_SELF_DEADLOCK));
+                }
+                Some(_) => {
+                    state = RELEASED
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
         }
         state.byte_budget += 1;
         Ok(Self(()))
