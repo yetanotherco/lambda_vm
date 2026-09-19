@@ -946,6 +946,11 @@ struct VramGate {
     /// `ByteBudgetRegime::claim`, so a `VramGate` cannot exist without the
     /// regime being claimed — the rule is enforced by construction rather
     /// than by a check someone could move or delete.
+    ///
+    /// This field IS the enforcement, and no test polices it: an unconstructible
+    /// bad state beats a checked one, so the compiler is the only thing that has
+    /// to be right here. A test asserting "`new` claims the regime" would be a
+    /// test of something the type system already refuses to let go wrong.
     _regime: crate::device_window::ByteBudgetRegime,
 }
 

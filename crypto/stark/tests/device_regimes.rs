@@ -12,6 +12,12 @@
 //! refuse and fail an unrelated test. Cargo gives each integration file its
 //! own process, so nothing here can collide with those — and the lock below
 //! keeps these four from colliding with each other.
+//!
+//! ⛔ SO DO NOT MOVE THEM INTO THE UNIT TESTS FOR TIDINESS. The named tests are
+//! `prove_verify_roundtrip_tests` and `air_tests`, both of which reach
+//! `test_utils::multi_prove_ram` and `.unwrap()` the result; a window held
+//! anywhere in that binary turns one of them red at random. The isolation is
+//! the point of the file, not an accident of where it was written.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;

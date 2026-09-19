@@ -111,7 +111,14 @@ impl SerialWindow {
     /// Blocks while another thread holds it — that wait IS the mutual
     /// exclusion. Refuses, rather than waiting, when the monolithic
     /// byte-budget gate is live in this process, and refuses a thread that
-    /// already holds the window instead of letting it block on itself.
+    /// already holds the window instead of letting it block on itself. The
+    /// refusal says "this thread", which is the whole of the information: the
+    /// error is returned to the offending thread itself, so its identity adds
+    /// nothing a caller could act on.
+    ///
+    /// Only OS driver threads may call this, never a rayon worker — the same
+    /// rule `VramGate::acquire` carries and for the same reason: a worker
+    /// blocked here starves the pool the admitted table is using.
     pub fn enter() -> Result<Self, DeviceRegimeError> {
         let me = std::thread::current().id();
         let mut state = regimes();
@@ -148,6 +155,14 @@ impl Drop for SerialWindow {
 /// `VramGate` carries one of these as a private field, which is what makes the
 /// rule unconstructible-by-design: there is no way to build a byte-budget gate
 /// without claiming the regime, and no way to drop one without releasing it.
+///
+/// CLAIMED UNCONDITIONALLY, with no `cuda` gate, and that is deliberate. The
+/// rule is one admission regime per PROCESS, not one per card: a build without
+/// `cuda` then runs the identical logic, so the tests that check the rule test
+/// the shipping path rather than a cfg-shaped copy of it. A card-free process
+/// does end up enforcing a rule that can only matter on a card, and that cost —
+/// one uncontended mutex per prove — is paid so the rule cannot be cfg'd out of
+/// existence by a build that happens not to have a card today.
 #[derive(Debug)]
 pub struct ByteBudgetRegime(());
 
