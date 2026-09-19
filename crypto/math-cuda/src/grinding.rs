@@ -420,6 +420,106 @@ fn search(arm: Arm, inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Opti
     }
 }
 
+/// ⛔ DIAGNOSTIC: what one grind EXECUTED, beside what it returned.
+///
+/// Every field is counted ON THE DEVICE by the threads that did the work, so
+/// `executed - (h + stride)` is a READ rather than a model. See
+/// [`search_counted`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrindCounts {
+    /// The nonce the search returned — must equal the shipped kernel's.
+    pub nonce: u64,
+    /// Permutations every thread of every launch actually ran.
+    pub executed: u64,
+    /// The most iterations any single thread ran, over every launch.
+    pub max_iters: u64,
+    /// Threads that left by the loop bound rather than by the early exit.
+    pub ran_to_end: u64,
+    /// Launches this search made: the hit's block, plus every miss before it.
+    pub launches: u64,
+}
+
+/// ⛔ THE DIAGNOSTIC TWIN OF [`search`], RPX ONLY, ON NO PROVING PATH.
+///
+/// Identical walk, identical exits, identical `atomicMin` — plus three device
+/// counters. It exists to separate two explanations of the same slow launch
+/// that no stopwatch can tell apart: MORE PERMUTATIONS (a thread that did not
+/// observe the early exit and kept hashing) against THE SAME PERMUTATIONS MORE
+/// SLOWLY (a cost outside this loop entirely).
+///
+/// ⚠ ITS OWN ADMISSIBILITY IS THE CALLER'S JOB, and it is not optional: a
+/// counted kernel with different register pressure has different occupancy and
+/// therefore measures a different kernel. The bench asserts this twin
+/// reproduces the shipped kernel's milliseconds per seed within the measured
+/// noise floor, and reports the instrument as having changed the phenomenon if
+/// it does not.
+///
+/// The counters accumulate ACROSS the launches of one search — `atomicAdd` for
+/// the two sums, `atomicMax` for the deepest thread — so a miss-and-relaunch
+/// seed reports the whole search and not only its last block. `launches` says
+/// how many blocks that was.
+///
+/// Returns `None` for the same reasons [`search`] does, plus a factor outside
+/// the supported range.
+pub fn search_counted(inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Option<GrindCounts> {
+    if !(GRIND_MIN_FACTOR..=64).contains(&grinding_factor) {
+        return None;
+    }
+    let limit: u64 = 1u64 << (64 - grinding_factor);
+
+    let be = backend().ok()?;
+    let stream = be.next_stream();
+    let inner_dev = stream.clone_htod(inner.as_slice()).ok()?;
+
+    let count = knobs.block(grinding_factor);
+    let cfg = LaunchConfig {
+        grid_dim: (knobs.grid, 1, 1),
+        block_dim: (RPX_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let sentinel = [u64::MAX];
+    let mut result_dev = stream.clone_htod(&sentinel).ok()?;
+    // One slot each, zeroed once and accumulated into by every launch.
+    let zeros = [0u64; 3];
+    let mut counts_dev = stream.clone_htod(&zeros).ok()?;
+
+    let mut base: u64 = 0;
+    let mut launches: u64 = 0;
+    loop {
+        stream.memcpy_htod(&sentinel, &mut result_dev).ok()?;
+        launches += 1;
+        // SAFETY: the same contract as `search`'s launch, with three more
+        // device words the kernel only ever adds into or maxes against.
+        unsafe {
+            stream
+                .launch_builder(&be.rpx_grind_search_counted)
+                .arg(&inner_dev)
+                .arg(&limit)
+                .arg(&base)
+                .arg(&count)
+                .arg(&mut result_dev)
+                .arg(&mut counts_dev)
+                .launch(cfg)
+                .ok()?;
+        }
+        let host = stream.clone_dtoh(&result_dev).ok()?;
+        stream.synchronize().ok()?;
+        if host[0] != u64::MAX {
+            let counts = stream.clone_dtoh(&counts_dev).ok()?;
+            stream.synchronize().ok()?;
+            return Some(GrindCounts {
+                nonce: host[0],
+                executed: counts[0],
+                max_iters: counts[1],
+                ran_to_end: counts[2],
+                launches,
+            });
+        }
+        base = base.checked_add(count)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The knobs' parser and their launch arithmetic, card-free: nothing here

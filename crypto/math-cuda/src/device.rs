@@ -258,6 +258,11 @@ pub struct Backend {
     pub rpx_merkle_tail: CudaFunction,
     pub rpx_permute_probe: CudaFunction,
     pub rpx_grind_search: CudaFunction,
+    /// ⛔ DIAGNOSTIC ONLY — the grind search with its executed-permutation
+    /// counters. Nothing on a proving path launches it; its one caller is
+    /// [`crate::grinding::search_counted`], which reads whether a slow launch
+    /// does MORE work or the same work more slowly.
+    pub rpx_grind_search_counted: CudaFunction,
 
     // rpx.cubin — the algebraic hash's twins of the keccak entries above.
     // Only the ones the WHIR path reaches are bound: the coset leaves, the two
@@ -810,6 +815,7 @@ impl Backend {
             rpx_leaves_base_coset: rpx.load_function("rpx_leaves_base_coset")?,
             rpx_leaves_ext3_coset: rpx.load_function("rpx_leaves_ext3_coset")?,
             rpx_grind_search: rpx.load_function("rpx_grind_search")?,
+            rpx_grind_search_counted: rpx.load_function("rpx_grind_search_counted")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
