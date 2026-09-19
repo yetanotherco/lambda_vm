@@ -174,7 +174,8 @@ impl GlobalRoute {
     /// The route each table takes, in the AIR set's own order.
     ///
     /// `page_is_private` is one flag per PAGE table, in the page family's order
-    /// — the canonical order `global_memory_configs` builds in, which is the
+    /// — the order `global_memory_configs` builds in, which is the list's own
+    /// order one-to-one and is the
     /// order the AIRs are in.
     pub fn table_routes(num_epochs: usize, page_is_private: &[bool]) -> Vec<Self> {
         let mut routes = vec![Self::Bookend; num_epochs];
@@ -191,14 +192,24 @@ impl GlobalRoute {
 
 /// One page table's identity, from the config the AIR was built from.
 ///
-/// ⚠ `base` is the CANONICAL list's, not the wire list's: `global_memory_configs`
-/// canonicalises, and the AIRs are in that order. The wire list is what the
-/// STATEMENT absorbs and they are different jobs — mixing them up is how a
-/// bundle whose page list arrived out of order would derive one `z` and be
-/// argued at another.
+/// ⛔ CORRECTED: `global_memory_configs` does NOT canonicalise. ✓ It hands its
+/// argument straight to `global_memory_configs_from_init_page_data`, which is a
+/// ONE-TO-ONE `page_bases.iter().map(…)` — no sort, no dedup. So
+/// `pages[i].base` IS `page_bases[i]`, the AIR order IS the wire order, and
+/// there is no second list to mix this one up with. An earlier version of this
+/// doc claimed the opposite and reasoned from it.
+///
+/// ⚠ WHERE CANONICALITY ACTUALLY COMES FROM, since the word still belongs
+/// somewhere: the PROVER builds the list through
+/// `continuation::touched_page_bases`, whose `BTreeSet` makes it sorted and
+/// deduped. On the VERIFIER's side it is a CLAIM, not a guarantee — and it does
+/// not need to be one, because it is bound twice over: `absorb_global` absorbs
+/// the list before any challenge, and a restated set leaves the GlobalMemory
+/// bus unbalanced or the AIR count mismatched. That is why the emitter can take
+/// the list as given.
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalPage {
-    /// The page's base address, canonical order.
+    /// The page's base address, in the list's own order.
     pub base: u64,
     /// Whether it is a private-input page — the one bit that picks the route.
     pub is_private: bool,
@@ -714,10 +725,11 @@ pub fn whir_global_program(
 
     // 1. The statement, which is entirely program text.
     //
-    // ⚠ `page_bases` is the WIRE list, not the canonicalised one. `absorb_global`
+    // ⚠ `page_bases` is the list AS IT TRAVELS, which is also the order the AIRs
+    // are built in — `global_memory_configs` maps it one-to-one. `absorb_global`
     // absorbs exactly what `verify_global`'s caller handed it, so a program that
     // absorbed the sorted form would derive a different `z` for any bundle whose
-    // list arrived out of order — and the canonical list is what the AIRs are
+    // list arrived out of order — and the AIRs are
     // built from, which is a different job done in a different place.
     let mut transcript = WhirTranscript::new();
     super::whir_statement::emit_global_statement(
@@ -1091,7 +1103,7 @@ pub fn global_cost(
 /// One page's genesis cost, as the quantities the cap is set against.
 #[derive(Debug, Clone, Copy)]
 pub struct GenesisEntry {
-    /// The page's base address, canonical order.
+    /// The page's base address, in the list's own order.
     pub page_base: u64,
     /// A private-input page contributes no genesis entries at all: its INIT is
     /// a committed main column the verifier never recomputes.
