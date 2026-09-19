@@ -8162,15 +8162,24 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     let t_all = Instant::now();
     let bundle = crate::multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &inner)
         .expect("the fixture continuation must prove under WHIR");
+    // ⛔ THE BASE WALL IS TAKEN HERE, NOT RECOMPUTED BELOW. `t_all` keeps
+    // running for the whole tree, so a second `elapsed()` further down would
+    // hand the split a denominator that includes level 0 and the interior, and
+    // every stage's share would read far too small.
+    let base_secs = t_all.elapsed().as_secs_f64();
     assert!(
         bundle.num_epochs() >= 2,
         "a one-epoch run chains nothing and would make the interior vacuous"
     );
     println!(
-        "   FIXTURE base (WHIR): {} epochs in {:.1}s",
+        "   FIXTURE base (WHIR): {} epochs in {base_secs:.1}s",
         bundle.num_epochs(),
-        t_all.elapsed().as_secs_f64()
     );
+    // ★ THE SAME READ-BACK THE PRODUCTION ARM RUNS. It belongs in BOTH arms and
+    // not only in the production one: this is the arm the gate can afford, so
+    // an instrument checked only in the arm that needs a block and a card is an
+    // instrument nothing gates.
+    whir_base_split_readback(base_secs);
 
     let elf = executor::elf::Elf::load(&elf_bytes).expect("the fixture ELF must load");
     let shape = tree_shape(bundle.num_epochs(), fan_in);
