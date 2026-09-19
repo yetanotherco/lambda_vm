@@ -751,6 +751,15 @@ pub fn prove_global(
 /// `page_bases` and `num_epochs` are the bundle's, and both are bound into the
 /// transcript and pinned by the bus: a wrong set leaves the GlobalMemory bus
 /// unbalanced or the AIR count mismatched.
+///
+/// ★ THE DISPATCH IS HERE, and the bookend form below takes `H`. That is the
+/// arrangement the epoch half already has ([`verify_epoch`] against
+/// [`verify_epoch_bookend`]), and moving it out was not a tidy-up: a caller
+/// that needs to ask "was this bundle proven under `H`" cannot be handed a
+/// function that reads the process knob for itself. Nothing about what is
+/// checked changes — this entry point picks the same `H` from the same knob the
+/// macro read one level down — which is what the byte gate and the transcript
+/// pin pair say when they do not move.
 pub fn verify_global(
     elf: &Elf,
     elf_bytes: &[u8],
@@ -760,16 +769,18 @@ pub fn verify_global(
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<bool, Error> {
-    Ok(verify_global_bookends(
-        elf,
-        elf_bytes,
-        global,
-        num_epochs,
-        page_bases,
-        num_private_input_pages,
-        opts,
-    )?
-    .is_some())
+    crate::with_whir_hash!(|H| {
+        Ok(verify_global_bookends::<H>(
+            elf,
+            elf_bytes,
+            global,
+            num_epochs,
+            page_bases,
+            num_private_input_pages,
+            opts,
+        )?
+        .is_some())
+    })
 }
 
 /// The cross-epoch proof's AIR set, OWNED — because everything downstream
@@ -788,7 +799,7 @@ pub fn verify_global(
 /// The AIRs are boxed only so their concrete type does not have to be spelled
 /// here — [`WhirEpochAirs`] boxes its bookend for the same reason, and a `&dyn
 /// AIR` is a `&dyn AIR` either way.
-pub(crate) struct WhirGlobalAirs {
+pub struct WhirGlobalAirs {
     /// One local-to-global bookend per epoch, in epoch-label order.
     bookends: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
     /// One GLOBAL_MEMORY table per touched page, in the canonical page-base
@@ -802,7 +813,7 @@ impl WhirGlobalAirs {
     /// ⚠ The order IS the proof's layout — `multi_verify` matches AIRs to
     /// sub-proofs positionally — and it is written once, here, because it used
     /// to be written at the call site.
-    pub(crate) fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+    pub fn refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             Vec::with_capacity(self.bookends.len() + self.pages.len());
         for air in self.bookends.iter().chain(&self.pages) {
@@ -815,7 +826,7 @@ impl WhirGlobalAirs {
     ///
     /// [`global_groups`] over this set's OWN two families, so a caller cannot
     /// restate the split from a table count it arrived at some other way.
-    pub(crate) fn groups(&self) -> Vec<usize> {
+    pub fn groups(&self) -> Vec<usize> {
         global_groups(self.bookends.len(), self.pages.len())
     }
 }
@@ -881,8 +892,25 @@ pub(crate) fn global_airs_for(
 /// [`verify_global`], handing back the roots each epoch's bookend was
 /// committed under — which is what the binding compares. `None` is a proof
 /// that does not verify.
+///
+/// ★ `pub(crate)` AND GENERIC, for the two reasons the epoch half is:
+///
+/// **The hash is the caller's.** `whir_hash_knob::selected()` is a cached
+/// process setting — it says what THIS PROCESS proves under, never what the
+/// bundle in front of it was proven under. The agreement is the verification
+/// itself: the transcript's sponge is part of the configuration, so a bundle
+/// proven under another hash diverges from the first squeeze. A function that
+/// read the knob for itself could not be asked the question, which is why
+/// `an_epoch_proven_under_one_hash_is_refused_under_the_other` could only ever
+/// exist on the epoch side. See
+/// `multilinear_continuation_tests::a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other`.
+///
+/// **The roots are the binding's.** [`verify_global`] answers `bool`, and the
+/// cross-epoch wrap's published set is these roots — so a driver that could
+/// only reach the `bool` had to re-derive them from `stacks`, which is a second
+/// spelling of the two lines below.
 #[allow(clippy::too_many_arguments)]
-fn verify_global_bookends(
+pub(crate) fn verify_global_bookends<H>(
     elf: &Elf,
     elf_bytes: &[u8],
     global: &GlobalProof,
@@ -890,7 +918,10 @@ fn verify_global_bookends(
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
-) -> Result<Option<Vec<Vec<Commitment>>>, Error> {
+) -> Result<Option<Vec<Vec<Commitment>>>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     // ★ THE ONE DERIVATION. An emitter of the cross-epoch program builds its
     // set through this same function.
     let air_set = global_airs_for(elf, opts, num_epochs, page_bases, num_private_input_pages);
@@ -941,10 +972,11 @@ fn verify_global_bookends(
     let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
 
     // The cross-epoch bus has no counterparty in the statement: it must vanish.
-    let verdict = crate::with_whir_hash!(|H| {
-        // ★ Inside the dispatch, because the transcript's hash is part of
-        // the configuration and `H` does not exist outside this block. The
-        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
+    let verdict = {
+        // ★ `H` is the CALLER's now. The transcript's hash is part of the
+        // configuration either way; what changed is who chooses it, and the
+        // bound on `multi_prove`/`multi_verify` still rejects any other
+        // spelling.
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
         absorb_global(
@@ -967,7 +999,7 @@ fn verify_global_bookends(
             &mut transcript,
             None,
         )
-    });
+    };
     if verdict.is_err() {
         return Ok(None);
     }
@@ -1222,16 +1254,21 @@ pub fn verify_continuation(
         return Ok(false);
     };
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let Some(chained) = verify_global_bookends(
-        &elf,
-        elf_bytes,
-        &bundle.global,
-        bundle.epochs.len(),
-        &bundle.touched_page_bases,
-        bundle.num_private_input_pages,
-        opts,
-    )?
-    else {
+    // The dispatch, as above `verify_epochs_bookends`' own loop: this entry
+    // point verifies under the process's hash, and the bookend form is told
+    // which so a caller that needs to say can.
+    let chained = crate::with_whir_hash!(|H| {
+        verify_global_bookends::<H>(
+            &elf,
+            elf_bytes,
+            &bundle.global,
+            bundle.epochs.len(),
+            &bundle.touched_page_bases,
+            bundle.num_private_input_pages,
+            opts,
+        )
+    })?;
+    let Some(chained) = chained else {
         return Ok(false);
     };
 

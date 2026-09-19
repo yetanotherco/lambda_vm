@@ -169,6 +169,13 @@ mod tests {
     #[test]
     fn a_tampered_cross_epoch_root_does_not_harvest() {
         let (elf_bytes, opts, mut b) = bundle();
+        // ★ THE HONEST-PATH CONTROL. A refusal arm on its own is satisfied by a
+        // driver that refuses everything, so the untampered bundle has to harvest
+        // through the same call first.
+        assert!(
+            real_global_from_whir_continuation(&opts, &elf_bytes, &b).is_ok(),
+            "the untampered bundle does not harvest, so the refusal below proves nothing"
+        );
         assert!(
             !b.global.proof.roots.is_empty(),
             "the cross-epoch proof commits nothing, so there is no root to move"
@@ -206,6 +213,13 @@ mod tests {
     #[test]
     fn a_restated_page_set_does_not_harvest() {
         let (elf_bytes, opts, mut b) = bundle();
+        // ★ THE HONEST-PATH CONTROL. A refusal arm on its own is satisfied by a
+        // driver that refuses everything, so the untampered bundle has to harvest
+        // through the same call first.
+        assert!(
+            real_global_from_whir_continuation(&opts, &elf_bytes, &b).is_ok(),
+            "the untampered bundle does not harvest, so the refusal below proves nothing"
+        );
         assert!(
             !b.touched_page_bases.is_empty(),
             "the run touched no memory, so there is nothing to restate"
@@ -229,6 +243,13 @@ mod tests {
     #[test]
     fn a_bundle_with_no_epochs_is_refused_by_name() {
         let (elf_bytes, opts, mut b) = bundle();
+        // ★ THE HONEST-PATH CONTROL. A refusal arm on its own is satisfied by a
+        // driver that refuses everything, so the untampered bundle has to harvest
+        // through the same call first.
+        assert!(
+            real_global_from_whir_continuation(&opts, &elf_bytes, &b).is_ok(),
+            "the untampered bundle does not harvest, so the refusal below proves nothing"
+        );
         b.epochs.clear();
         let message = match real_global_from_whir_continuation(&opts, &elf_bytes, &b) {
             Ok(_) => panic!("a bundle with no epochs was harvested"),

@@ -1,26 +1,3 @@
-#![allow(dead_code)]
-//! # ⛔ THE `dead_code` ALLOW, ITS CONDITION, AND WHAT IT COSTS WHILE IT STANDS
-//!
-//! This module is in the LIBRARY target, where every item is unreachable until
-//! something PUBLICLY reachable uses it — and `make lint`'s first arm compiles
-//! the lib target alone under `-D warnings`, so the whole class is a hard error
-//! there while `cargo test` uses every item and reports nothing. Measured, not
-//! assumed: without that line `cargo clippy -p lambda-vm-prover --lib` gives
-//! three errors — the struct never constructed, `airs`/`num_tables` never used,
-//! and the driver never called — because the only callers are this module's
-//! tests.
-//!
-//! ★ THE CONDITION IS A PRODUCTION READER, NOT A PRODUCTION SIGNATURE, and that
-//! distinction is [`super::whir_real_epoch`]'s scar: its allow was written to
-//! come out "the moment `whir_epoch_program` takes a `WhirRealEpoch`", that
-//! happened, and removing the allow put seven errors back — `dead_code` asks
-//! what is REACHABLE, not what is named. So this comes out when the cross-epoch
-//! program builder both TAKES a [`WhirRealGlobal`] and READS its fields; if it
-//! is still here after that lands, something did not get wired.
-//!
-//! ⚠ What it costs meanwhile, stated so nobody has to guess: a genuinely unused
-//! item added to this module is not reported while it stands.
-//!
 //! The WHIR cross-epoch driver: the one global input a block's tree needs.
 //!
 //! [`crate::lfm::whir_real_epoch`] is the level-0 analogue and this reads the
@@ -73,20 +50,20 @@ use crate::multilinear_continuation::{ContinuationProof, GlobalProof, WhirGlobal
 /// cannot see is a challenge it cannot reproduce.
 pub struct WhirRealGlobal {
     /// The cross-epoch proof itself, cloned out of the bundle.
-    pub(crate) proof: GlobalProof,
+    pub proof: GlobalProof,
     /// `statement::elf_digest(elf_bytes)` — the program this run was of.
-    pub(crate) elf_digest: [u8; 32],
+    pub elf_digest: [u8; 32],
     /// The run's epoch count, which is also the bookend count.
-    pub(crate) num_epochs: usize,
+    pub num_epochs: usize,
     /// How many of the touched pages are private-input pages, which is what
     /// decides each page table's preprocessed route.
-    pub(crate) num_private_input_pages: usize,
+    pub num_private_input_pages: usize,
     /// The bundle's touched page list, as it travels — the canonical order the
     /// AIRs are built in is the config build's, not necessarily this.
-    pub(crate) page_bases: Vec<u64>,
+    pub page_bases: Vec<u64>,
     /// The parameters the cross-epoch argument ran at, rebuilt from the shapes
     /// rather than carried.
-    pub(crate) config: ChainConfig,
+    pub config: ChainConfig,
     /// `(width, num_vars)` per table in sub-proof order: **the widths are the
     /// AIRs' and only the heights are the proof's.**
     ///
@@ -96,7 +73,7 @@ pub struct WhirRealGlobal {
     /// derive a different query count from the one the proof was argued at.
     /// That is the epoch driver's own scar, and it is sharper here because a
     /// cross-epoch set is two families wide.
-    pub(crate) shapes: Vec<(usize, usize)>,
+    pub shapes: Vec<(usize, usize)>,
     /// How the tables are committed: `num_epochs` singletons, then the pages.
     ///
     /// ★ Taken from the AIR SET's own split, never respelled from
@@ -104,7 +81,7 @@ pub struct WhirRealGlobal {
     /// derivation of the thing [`WhirGlobalAirs`] exists to hold once, and the
     /// two are not even trivially equal: the set's page count is the
     /// CANONICALISED list's, not the wire list's.
-    pub(crate) sizes: Vec<usize>,
+    pub sizes: Vec<usize>,
     /// The AIR set, owned, built through
     /// [`crate::multilinear_continuation::global_airs_for`] — the same function
     /// the verifier builds through.
@@ -122,9 +99,9 @@ pub struct WhirRealGlobal {
     /// This is the content of the published set: `GlobalLayout` publishes `z`,
     /// `alpha`, then these as lanes, and the root node compares them against
     /// the fold the interior carried up.
-    pub(crate) bookend_roots: Vec<Vec<Commitment>>,
+    pub bookend_roots: Vec<Vec<Commitment>>,
     /// What the cross-epoch wrap publishes, as a type rather than a count.
-    pub(crate) published: GlobalLayout,
+    pub published: GlobalLayout,
     /// ⛔ RESERVED, AND EMPTY ON EVERY PATH THAT EXISTS TODAY: the roots of a
     /// MULTILINEAR commitment over the page family's INIT columns, for the
     /// prepared opening a cross-epoch program needs instead of folding ≈9.2 M
@@ -141,7 +118,7 @@ pub struct WhirRealGlobal {
     /// thousands of rows later. Whoever fills it takes the value from the very
     /// `Prepared` object the host verification consumed, and states the pin it
     /// owes where the root is interned.
-    pub(crate) prepared_roots: Option<Vec<Commitment>>,
+    pub prepared_roots: Option<Vec<Commitment>>,
 }
 
 impl WhirRealGlobal {
@@ -151,7 +128,7 @@ impl WhirRealGlobal {
     /// ⚠ Borrowed, because the layouts built from it borrow in turn: a
     /// `layouts` field beside this one would be self-referential, which is the
     /// same reason a `statements` field is not on the epoch's driver output.
-    pub(crate) fn airs(&self) -> &WhirGlobalAirs {
+    pub fn airs(&self) -> &WhirGlobalAirs {
         &self.airs
     }
 
@@ -162,45 +139,64 @@ impl WhirRealGlobal {
     /// (the harvest refuses otherwise), and that is the point: reading the
     /// proof's own field back through a second name would be a count that
     /// cannot disagree with itself.
-    pub(crate) fn num_tables(&self) -> usize {
+    pub fn num_tables(&self) -> usize {
         self.airs.refs().len()
     }
 }
 
 /// [`WhirRealGlobal`] for the cross-epoch half of an existing WHIR continuation
-/// bundle.
+/// bundle, verified under the hash this PROCESS is set to.
+///
+/// The split mirrors [`crate::multilinear_continuation::verify_global`] against
+/// `verify_global_bookends::<H>`, and
+/// [`super::whir_real_epoch::real_epoch_from_whir_continuation`] against its own
+/// `_under` form: one entry point that dispatches on the knob for production,
+/// one that takes `H` so the hash agreement can be argued about — and tested —
+/// at all.
+pub fn real_global_from_whir_continuation(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+) -> Result<WhirRealGlobal, String> {
+    crate::with_whir_hash!(|H| {
+        real_global_from_whir_continuation_under::<H>(opts, elf_bytes, bundle)
+    })
+}
+
+/// [`real_global_from_whir_continuation`], told which hash to verify under.
 ///
 /// ★ THE PROOF IS VERIFIED BEFORE IT IS HARVESTED, for the epoch driver's
 /// reason: an input built from a proof nobody checked pushes the failure into
 /// the guest, where it costs a whole wrap prove to discover and reads as an
 /// emitter bug.
 ///
-/// ⚠ THE HASH AGREEMENT IS THE PROCESS KNOB'S HERE, NOT THE CALLER'S, and that
-/// is a real difference from the epoch driver. `verify_epoch_bookend::<H>` is
-/// generic, so `real_epoch_from_whir_continuation_under::<H>` can ask "was this
-/// bundle proven under `H`" cryptographically. The cross-epoch verifier
-/// dispatches on `whir_hash_knob::selected()` INSIDE itself, so this harvest
-/// verifies under whatever hash the process is set to and cannot be told
-/// otherwise. A bundle proven under the other hash still fails — every
-/// challenge diverges from the first squeeze — but it fails against the
-/// process's choice rather than the caller's, and no `_under::<H>` form can be
-/// honest until the verifier's dispatch moves out to its callers the way the
-/// epoch half's already has.
-pub fn real_global_from_whir_continuation(
+/// ★ AND THIS IS WHERE THE HASH AGREEMENT LIVES, which is why the function is
+/// generic rather than reading the knob. `whir_hash_knob::selected()` is a
+/// cached process setting: it says what THIS PROCESS proves under, never what
+/// the bundle in front of it was proven under. The agreement is the
+/// verification — the transcript's sponge is part of the configuration, so a
+/// bundle proven under another hash diverges from the first squeeze and fails
+/// here. See
+/// `crate::tests::multilinear_continuation_tests::a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other`.
+pub fn real_global_from_whir_continuation_under<H>(
     opts: &crate::ProofOptions,
     elf_bytes: &[u8],
     bundle: &ContinuationProof,
-) -> Result<WhirRealGlobal, String> {
+) -> Result<WhirRealGlobal, String>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
     let num_epochs = bundle.epochs.len();
     if num_epochs == 0 {
         return Err("a bundle with no epochs has no cross-epoch proof to harvest".to_string());
     }
 
-    // ★ The acceptance check, through the verifier's own entry point — which
+    // ★ The acceptance check, through the verifier's own bookend form — which
     // builds its AIR set through `global_airs_for`, the same function this
-    // harvest calls below.
-    let accepted = crate::multilinear_continuation::verify_global(
+    // harvest calls below, and which hands back the roots the binding compares
+    // instead of a bare `bool`.
+    let verified = crate::multilinear_continuation::verify_global_bookends::<H>(
         &elf,
         elf_bytes,
         &bundle.global,
@@ -210,15 +206,15 @@ pub fn real_global_from_whir_continuation(
         opts,
     )
     .map_err(|e| format!("the cross-epoch proof could not be verified: {e:?}"))?;
-    if !accepted {
+    let Some(bookend_roots) = verified else {
         return Err(format!(
             "the cross-epoch proof of this bundle does not verify under {}. Either the \
              bundle is not the one this ELF and these options describe, or it was proven \
              under a different hash — which is checked cryptographically and not by a tag, \
              since a WHIR proof's bytes are hash-agnostic by design",
-            crate::whir_hash_knob::selected().name(),
+            <H as multilinear::whir_hash::WhirHash>::NAME,
         ));
-    }
+    };
 
     // ★ THE VERIFIER'S OWN DERIVATION, not a second one that agrees.
     let airs = crate::multilinear_continuation::global_airs_for(
@@ -244,28 +240,18 @@ pub fn real_global_from_whir_continuation(
     let config = crate::multilinear_prove::chain_config(&shapes);
     let sizes = airs.groups();
 
-    // ⚠ A SECOND SPELLING OF TWO LINES THE VERIFIER ALREADY RAN, and it is here
-    // only because `verify_global_bookends` — which computes exactly this and
-    // returns it — is private to `multilinear_continuation` while
-    // `verify_global` hands back a bare `bool`. The inputs are the ones derived
-    // above, so the two cannot drift on anything but those two lines; making
-    // the bookend form reachable would remove even that, and is the change this
-    // comment exists to justify rather than to excuse.
-    let (stacks, _domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)
-        .map_err(|e| format!("the cross-epoch stacks: {e:?}"))?;
-    let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
-    let bookend_roots: Vec<Vec<Commitment>> = bundle
-        .global
-        .l2g_roots(&polys)
-        .ok_or_else(|| {
-            format!(
-                "the cross-epoch proof carries {} roots, too few for {num_epochs} bookends",
-                bundle.global.proof.roots.len(),
-            )
-        })?
-        .into_iter()
-        .map(<[_]>::to_vec)
-        .collect();
+    // ★ The bookend roots are the VERIFICATION's, taken from the object that
+    // accepted the proof rather than re-derived from `stacks` here. An earlier
+    // draft re-derived them because only the `bool` form was reachable, and a
+    // second spelling of the group split is exactly the drift this campaign
+    // keeps finding — the same argument `global_airs_for` makes for the AIR
+    // set, applied to the values the published set carries.
+    if bookend_roots.len() != num_epochs {
+        return Err(format!(
+            "the cross-epoch proof chained {} bookends and the run has {num_epochs} epochs",
+            bookend_roots.len(),
+        ));
+    }
 
     Ok(WhirRealGlobal {
         proof: bundle.global.clone(),
