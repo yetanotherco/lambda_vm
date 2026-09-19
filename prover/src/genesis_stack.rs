@@ -88,6 +88,16 @@ use stark::multilinear_table::PreparedColumn;
 /// a prepared opening names a column index instead of a prefix length.
 pub const INIT_PREPROCESSED_COLUMN: usize = 1;
 
+/// A page table's height in variables.
+///
+/// ⚠ DERIVED FROM [`page::DEFAULT_PAGE_SIZE`] AND NOT FROM A PROOF. Every
+/// GLOBAL_MEMORY table is one page tall, and `page::preprocessed_columns` builds
+/// columns of exactly that many rows, so this is a property of the page and not
+/// a claim a bundle gets to make. A proof asserting some other height for a page
+/// table already fails: its statement's variable count would not match the
+/// preprocessed column the verifier rebuilt.
+pub const PAGE_NUM_VARS: usize = page::DEFAULT_PAGE_SIZE.trailing_zeros() as usize;
+
 /// The rows the in-guest verifier spends discharging one page's INIT by the
 /// sparse closed form: `MLE(r) = sum_{v_i != 0} v_i * eq(r, i)`, which is
 /// `num_vars` complements hoisted plus `num_vars` rows per nonzero entry.
@@ -268,6 +278,17 @@ mod tests {
     const BLOCK_ZERO_PAGES: usize = 27;
     const BLOCK_PAGE_VARS: usize = 18;
     const BLOCK_CENSUS_LEG_ROWS: usize = 10_249_056;
+
+    /// The census was read at one page size, and the form is evaluated at
+    /// another only if this stops holding.
+    #[test]
+    fn the_blocks_page_height_is_the_page_size_the_code_uses() {
+        assert_eq!(
+            PAGE_NUM_VARS, BLOCK_PAGE_VARS,
+            "the box census was read at 2^{BLOCK_PAGE_VARS}-row pages; every number \
+             below is evaluated at that height"
+        );
+    }
 
     #[test]
     fn the_sparse_form_reproduces_the_blocks_census_to_the_row() {

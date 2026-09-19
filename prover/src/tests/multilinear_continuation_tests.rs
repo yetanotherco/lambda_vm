@@ -1215,3 +1215,139 @@ fn a_cross_epoch_proof_verifies_under_the_hash_it_was_proven_under_and_no_other(
         "the two hashes produced byte-identical table arguments"
     );
 }
+
+/// ★★★★ THE PREPARED GENESIS OPENING, END TO END ON A DENSE PAGE.
+///
+/// `dense_data_page_touch` is `data_page_touch` with its touched cell surrounded
+/// by non-zero bytes, so the page it lives on crosses
+/// `genesis_stack`'s threshold whatever offset the linker put `.data` at. It is
+/// the only fixture in the tree whose cross-epoch proof carries a prepared
+/// opening at all — every other one is entirely sparse and takes the `None`
+/// path, which is why this guest had to be written rather than an assertion
+/// added.
+///
+/// ⚠ WHAT THIS DOES AND DOES NOT COVER. It exercises the PROTOCOL: the stack is
+/// committed, its root absorbed in the roots block, the opening produced, and
+/// the three dense-page INIT checks skipped in favour of it. It does NOT
+/// exercise the threshold's decision at BLOCK scale — one page is not the
+/// block's three, and the census is the only reading of that. Stated so nobody
+/// reads a green here as covering the block.
+#[test]
+fn a_dense_genesis_page_is_carried_by_a_prepared_opening() {
+    let elf_bytes = asm_elf_bytes("dense_data_page_touch");
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &[], 3);
+
+    // The plan, from the VERIFIER's own configs — the ELF's.
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::genesis_stack::plan(
+        &configs,
+        boundaries.len(),
+        crate::genesis_stack::PAGE_NUM_VARS,
+    );
+    for route in &plan.routes {
+        println!(
+            "DENSE FIXTURE PAGE {:#x}: nonzero {} has_init {} dense {}",
+            route.page_base, route.nonzero, route.has_init, route.dense
+        );
+    }
+    // ⚠ THE PRECONDITION, ASSERTED. Without a dense page this test would take
+    // the `None` path and pass while checking nothing about the opening.
+    assert_eq!(
+        plan.at.len(),
+        1,
+        "the fixture must put exactly one page over the threshold; it put {}",
+        plan.at.len()
+    );
+    assert_eq!(
+        plan.at[0].column,
+        crate::genesis_stack::INIT_PREPROCESSED_COLUMN
+    );
+
+    let global = crate::with_whir_hash!(|H| {
+        multilinear_continuation::prove_global::<H>(
+            &boundaries,
+            &elf_bytes,
+            &init_page_data,
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("the cross-epoch proof over a dense genesis page");
+
+    // The opening exists, and its root is NOT among the carried ones — the
+    // verifier derives it, and a copy in the proof would be a value a reader
+    // assumes is checked.
+    assert!(
+        global.proof.preprocessed.is_some(),
+        "a dense page was planned but the proof carries no prepared opening"
+    );
+
+    let verdict = crate::with_whir_hash!(|H| {
+        multilinear_continuation::verify_global_bookends::<H>(
+            &elf,
+            &elf_bytes,
+            &global,
+            boundaries.len(),
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("the cross-epoch verifier errored on an honest bundle");
+    assert!(
+        verdict.is_some(),
+        "an honest cross-epoch proof with a prepared genesis opening was refused"
+    );
+}
+
+/// ★★ THE SPARSE FIXTURES STILL CARRY NO OPENING, and their proofs are the ones
+/// they were.
+///
+/// The honest control for the route as a whole: a run whose genesis is entirely
+/// sparse must take the `None` path. If it did not, every fixture in this suite
+/// would be paying for a commitment it has no use for, and the claim that this
+/// change moves no proof anything in flight depends on would be false.
+#[test]
+fn a_sparse_genesis_page_set_carries_no_prepared_opening() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &input, 2);
+
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::genesis_stack::plan(
+        &configs,
+        boundaries.len(),
+        crate::genesis_stack::PAGE_NUM_VARS,
+    );
+    let worst = plan.routes.iter().map(|r| r.nonzero).max().unwrap_or(0);
+    println!(
+        "SPARSE FIXTURE: {} pages, worst nonzero {worst}, sparse rows {}",
+        plan.routes.len(),
+        plan.sparse_rows
+    );
+    assert!(
+        plan.is_empty(),
+        "this fixture's genesis crossed the threshold, so it is no longer the \
+         sparse control this test is"
+    );
+
+    let global = crate::with_whir_hash!(|H| {
+        multilinear_continuation::prove_global::<H>(
+            &boundaries,
+            &elf_bytes,
+            &init_page_data,
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("prove");
+    assert!(
+        global.proof.preprocessed.is_none(),
+        "a sparse page set produced a prepared opening it has no use for"
+    );
+}
