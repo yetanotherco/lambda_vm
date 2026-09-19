@@ -4724,7 +4724,7 @@ mod tests {
     ///
     /// `data_page_touch`'s one data page carries 112 nonzero genesis bytes. It
     /// passes part 1 comfortably — 2,034 rows against a 111-row marginal — and
-    /// part 2 refuses it, because 1,931 saved rows do not buy a 175,066-row
+    /// part 2 refuses it, because 1,923 saved rows do not buy a 175,066-row
     /// chain. ⚠ THAT IS THE INTERESTING BRANCH AND IT IS WHY THE FIELD
     /// `candidate` EXISTS: under the retired rule this page failed the only
     /// test there was, and "no opening" meant "nobody wanted it".
@@ -4735,8 +4735,21 @@ mod tests {
         assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
         assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 112), 2_034);
         assert!(plan.routes[0].candidate, "2,034 rows against the marginal");
-        assert_eq!(plan.savings, 2_034 - BLOCK_MARGINAL);
-        assert_eq!(plan.savings, 1_931);
+        // ⛔ ONE DERIVATION, AND THE VALUE IN THE MESSAGE. This line used to be
+        // followed by `assert_eq!(plan.savings, 1_931)` — the same quantity a
+        // second time, as a bare literal computed under the retired 103. It
+        // named no symbol, so the sweep that re-pointed every reference to the
+        // marginal could not see it, and the form moved the savings to 1,923
+        // underneath it. ⇒ a number a reader wants is a MESSAGE, never a second
+        // assertion: the second one drifts, and it drifts silently until the
+        // day the first one moves.
+        assert_eq!(
+            plan.savings,
+            2_034 - BLOCK_MARGINAL,
+            "the sparse leg pinned just above (2,034) less what the block's bracket \
+             charges a carried page ({BLOCK_MARGINAL}), which is {} rows",
+            plan.savings
+        );
         assert!(!chain_is_paid(plan.savings));
         assert!(
             plan.is_empty(),
