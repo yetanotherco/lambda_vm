@@ -164,6 +164,25 @@ impl GlobalRoute {
     }
 }
 
+/// One page table's identity, from the config the AIR was built from.
+///
+/// ⚠ `base` is the CANONICAL list's, not the wire list's: `global_memory_configs`
+/// canonicalises, and the AIRs are in that order. The wire list is what the
+/// STATEMENT absorbs and they are different jobs — mixing them up is how a
+/// bundle whose page list arrived out of order would derive one `z` and be
+/// argued at another.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalPage {
+    /// The page's base address, canonical order.
+    pub base: u64,
+    /// Whether it is a private-input page — the one bit that picks the route.
+    pub is_private: bool,
+    /// How many genesis bytes the ELF loads into it. Zero for a zero-init page
+    /// (stack, heap, BSS) and for a private one, whose genesis the verifier
+    /// never sees.
+    pub init_len: usize,
+}
+
 // =============================================================================
 // The plan
 // =============================================================================
@@ -189,6 +208,18 @@ pub struct GlobalPlan<'a> {
     preprocessed: Vec<Vec<Vec<FE>>>,
     /// Each table's route, decided before anything is emitted.
     route_of: Vec<GlobalRoute>,
+    /// Per PAGE table, in the AIR set's own order: the page's base and whether
+    /// it is a private-input page.
+    ///
+    /// ⛔ THE CONFIG'S OWN FLAG, NOT A COUNT OF COLUMNS. The emitter has to
+    /// know which pages carry INIT, and the tempting source is how many
+    /// preprocessed columns each AIR presents. That is a guard written on the
+    /// answer: a page whose INIT column vanished upstream would present one
+    /// column, be routed as private, and have its genesis checked by nothing —
+    /// the reading could not move under the failure it exists to catch. So this
+    /// is `PageConfig::is_private_input` of the very configs the AIR set was
+    /// built from, and the column count becomes the CROSS-CHECK instead.
+    pages: Vec<GlobalPage>,
     group_layouts: Vec<StackedLayout>,
     group_domains: Vec<Domain<GoldilocksField>>,
 }
@@ -214,7 +245,22 @@ impl<'a> GlobalPlan<'a> {
             FieldExtension = GoldilocksExtension,
             PublicInputs = (),
         >],
+        elf_bytes: &[u8],
     ) -> Self {
+        // ⛔ THE ELF IS NAMED, AND IT IS REFUSED IF IT IS NOT THE VERIFIED ONE.
+        // The genesis binding IS the ELF, so the emitter takes it explicitly
+        // rather than trusting a flag somebody computed elsewhere — and the
+        // digest the harvest recorded is what says this is the same program the
+        // cross-epoch proof was accepted against. An emitter handed another
+        // ELF would intern another page's genesis bytes and the refusal would
+        // land hundreds of thousands of rows later, at execution, with nothing
+        // naming the cause.
+        assert_eq!(
+            crate::statement::elf_digest(elf_bytes),
+            global.elf_digest,
+            "the cross-epoch program must be emitted against the ELF its proof was \
+             verified against"
+        );
         let shapes = global.shapes.clone();
         assert_eq!(
             airs.len(),
@@ -268,7 +314,36 @@ impl<'a> GlobalPlan<'a> {
         let preprocessed: Vec<Vec<Vec<FE>>> =
             airs.iter().map(|air| air.precomputed_columns()).collect();
 
-        let routes = GlobalRoute::table_routes(global.num_epochs, &global.page_is_private);
+        // ⚠ ONE CALL OF `global_memory_configs`, with the arguments
+        // `global_airs_for` itself passed — so the configs cannot describe a
+        // different page set from the AIRs. A second SPELLING of the rule would
+        // be the drift this avoids; a second CALL of one function on one set of
+        // arguments cannot disagree with itself.
+        let elf = executor::elf::Elf::load(elf_bytes).expect("the inner ELF must load");
+        let pages: Vec<GlobalPage> = crate::continuation::global_memory_configs(
+            &global.page_bases,
+            &elf,
+            global.num_private_input_pages,
+        )
+        .iter()
+        .map(|config| GlobalPage {
+            base: config.page_base,
+            is_private: config.is_private_input,
+            init_len: config.init_values.as_ref().map_or(0, Vec::len),
+        })
+        .collect();
+        assert_eq!(
+            pages.len() + global.num_epochs,
+            airs.len(),
+            "the cross-epoch layout has {} tables and {} bookends, which leaves {} pages, \
+             and the ELF's page configs describe {}",
+            airs.len(),
+            global.num_epochs,
+            airs.len().saturating_sub(global.num_epochs),
+            pages.len(),
+        );
+        let private: Vec<bool> = pages.iter().map(|p| p.is_private).collect();
+        let routes = GlobalRoute::table_routes(global.num_epochs, &private);
         assert_eq!(
             routes.len(),
             airs.len(),
@@ -298,6 +373,7 @@ impl<'a> GlobalPlan<'a> {
             buses,
             preprocessed,
             route_of: routes,
+            pages,
             group_layouts,
             group_domains,
         }
@@ -356,6 +432,11 @@ impl<'a> GlobalPlan<'a> {
     /// The routes, for a census or a gate to read without rebuilding them.
     pub fn table_routes(&self) -> &[GlobalRoute] {
         &self.route_of
+    }
+
+    /// The page family's bases and privacy, in the AIR set's own page order.
+    pub fn pages(&self) -> &[GlobalPage] {
+        &self.pages
     }
 
     /// Each commitment group's chain shape, in group order.
@@ -534,8 +615,9 @@ pub fn whir_global_arena(
         FieldExtension = GoldilocksExtension,
         PublicInputs = (),
     >],
+    elf_bytes: &[u8],
 ) -> Vec<Vec<LfmWord>> {
-    let plan = GlobalPlan::build(global, airs);
+    let plan = GlobalPlan::build(global, airs, elf_bytes);
     let proof = &global.proof.proof;
     assert!(
         proof.preprocessed.is_none(),
@@ -585,10 +667,11 @@ pub fn whir_global_program(
         FieldExtension = GoldilocksExtension,
         PublicInputs = (),
     >],
+    elf_bytes: &[u8],
 ) -> LfmProgram {
-    let plan = GlobalPlan::build(global, airs);
+    let plan = GlobalPlan::build(global, airs, elf_bytes);
     let proof = &global.proof.proof;
-    let words = whir_global_arena(global, airs);
+    let words = whir_global_arena(global, airs, elf_bytes);
     let total = words[0].len() as u32;
 
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
@@ -839,8 +922,9 @@ pub fn global_cost(
         FieldExtension = GoldilocksExtension,
         PublicInputs = (),
     >],
+    elf_bytes: &[u8],
 ) -> GlobalCost {
-    let plan = GlobalPlan::build(global, airs);
+    let plan = GlobalPlan::build(global, airs, elf_bytes);
     let shapes = plan.table_shapes();
     let views: Vec<Vec<&[FE]>> = plan
         .preprocessed
@@ -917,7 +1001,7 @@ pub fn global_cost(
     cost.publics += global.published.total();
     cost.publish_ops += global.published.num_epochs * UNPACK_ROWS_PER_EPOCH;
 
-    cost.hints += whir_global_arena(global, airs)[0].len();
+    cost.hints += whir_global_arena(global, airs, elf_bytes)[0].len();
     cost.constants = pool.constant_values().to_vec();
     cost
 }
@@ -926,81 +1010,110 @@ pub fn global_cost(
 // The genesis census — the measurement the cap is owed
 // =============================================================================
 
-/// One page table's genesis cost, as the quantity the leg is linear in.
+/// One page's genesis cost, as the quantities the cap is set against.
 #[derive(Debug, Clone, Copy)]
 pub struct GenesisEntry {
-    /// Where this page sits among the cross-epoch tables.
-    pub table: usize,
-    /// Its route — a private page contributes no genesis entries at all.
-    pub route: GlobalRoute,
-    /// Rows in the preprocessed columns, which is the page size.
+    /// The page's base address, canonical order.
+    pub page_base: u64,
+    /// A private-input page contributes no genesis entries at all: its INIT is
+    /// a committed main column the verifier never recomputes.
+    pub is_private: bool,
+    /// Genesis bytes the ELF loads into the page. Everything past this is read
+    /// as zero, which is where the sparsity comes from.
+    pub init_len: usize,
+    /// Rows in the preprocessed columns — the page size.
     pub rows: usize,
-    /// Surviving entries in INIT: the nonzero genesis bytes.
+    /// Surviving entries in INIT: the NONZERO genesis bytes. Not `init_len`,
+    /// because a genesis byte may itself be zero.
     pub entries: usize,
+    /// Rows the sparse leg emits for this page: the hoisted complements plus
+    /// `num_vars` an entry.
+    pub leg_rows: usize,
 }
 
-/// ★ THE CENSUS THE CAP IS SIZED AGAINST, and it needs no prove.
+/// ★★ THE CENSUS THE CAP IS SIZED AGAINST — PROVE-FREE AND CARD-FREE.
 ///
-/// [`super::preprocessed::MAX_SPARSE_ENTRIES`] is a budget, and the quantity
-/// that decides whether a real block fits under it — how many nonzero genesis
-/// bytes the touched non-private pages carry between them — is a function of the
-/// ELF and the touched page list alone. So this walks the AIR set the verifier
-/// built and counts, with no proving anywhere in it.
+/// [`super::preprocessed::MAX_SPARSE_INIT_ENTRIES`] is a placeholder, and the
+/// quantity that decides whether a real block fits under it is a function of the
+/// ELF and the touched page list alone. Neither needs a proof: the page list is
+/// an EXECUTION fact — which cells cross an epoch boundary — and
+/// `continuation::block_page_census` produces it by running the guest with every
+/// prove and trace build omitted.
 ///
-/// ⚠ Read it as a COUNT, not as a cost: the rows it implies are
-/// `entries × num_vars` plus the per-page ramp and complements, and
-/// [`global_cost`] is where those are added up. Two spellings of the row
-/// arithmetic would be two places for it to drift.
+/// So this takes the two, rebuilds the page configs through the verifier's own
+/// `global_memory_configs`, and counts. Nothing here touches an AIR, a proof or
+/// a card.
+///
+/// ⚠ IT COUNTS, IT DOES NOT PRICE. The rows a page costs are `leg_rows`, and
+/// they are computed here from [`super::preprocessed::sparse_mle_rows`] rather
+/// than spelled again — two spellings of the row arithmetic would be two places
+/// for it to drift.
 pub fn genesis_census(
-    global: &WhirRealGlobal,
-    airs: &[&dyn stark::traits::AIR<
-        Field = GoldilocksField,
-        FieldExtension = GoldilocksExtension,
-        PublicInputs = (),
-    >],
-) -> Vec<GenesisEntry> {
-    let routes = GlobalRoute::table_routes(global.num_epochs, &global.page_is_private);
-    routes
+    elf_bytes: &[u8],
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+) -> Result<Vec<GenesisEntry>, String> {
+    let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("the ELF must load: {e}"))?;
+    let configs = crate::continuation::global_memory_configs(page_bases, &elf, num_private_input_pages);
+    Ok(configs
         .iter()
-        .enumerate()
-        .skip(global.num_epochs)
-        .map(|(table, &route)| {
-            let columns = airs[table].precomputed_columns();
-            let rows = columns.first().map_or(0, Vec::len);
-            let entries = match route {
-                GlobalRoute::GenesisPage => {
-                    super::preprocessed::sparse_entries(&[columns[1].as_slice()])
-                }
-                _ => 0,
+        .map(|config| {
+            let columns = crate::tables::page::preprocessed_columns(config);
+            let rows = columns[0].len();
+            let num_vars = rows.trailing_zeros() as usize;
+            let (entries, leg_rows) = if config.is_private_input {
+                // Its INIT is never recomputed and never interned, so it has no
+                // genesis entries — zero here is a FACT about the route, not a
+                // column that happened to be empty.
+                (0usize, 0usize)
+            } else {
+                let init: &[FE] = &columns[1];
+                (
+                    super::preprocessed::sparse_entries(&[init]),
+                    super::preprocessed::sparse_mle_rows(&[init], num_vars),
+                )
             };
             GenesisEntry {
-                table,
-                route,
+                page_base: config.page_base,
+                is_private: config.is_private_input,
+                init_len: config.init_values.as_ref().map_or(0, Vec::len),
                 rows,
                 entries,
+                leg_rows,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// The census as one line, for a box run's log.
 ///
-/// ★ IT PRINTS THE SPLIT AND THE TOTAL, because the split is what decides
-/// whether a cap is the right instrument at all: many pages with a handful of
-/// entries each is a different situation from one dense page, and a total alone
-/// cannot tell them apart.
+/// ★ IT PRINTS THE SPLIT, THE TOTAL AND THE WORST PAGE, because the total alone
+/// cannot tell "many pages with a handful of entries each" from "one dense
+/// page", and those are different situations for a cap: the first fits under a
+/// larger bound, the second does not fit under any bound worth having.
 pub fn genesis_census_line(census: &[GenesisEntry]) -> String {
-    let genesis = census
-        .iter()
-        .filter(|e| e.route == GlobalRoute::GenesisPage)
-        .count();
+    let genesis = census.iter().filter(|e| !e.is_private).count();
     let private = census.len() - genesis;
     let total: usize = census.iter().map(|e| e.entries).sum();
     let worst = census.iter().map(|e| e.entries).max().unwrap_or(0);
+    let rows: usize = census.iter().map(|e| e.leg_rows).sum();
     format!(
         "GENESIS CENSUS: {} pages = {genesis} genesis + {private} private; {total} nonzero \
-         entries, worst page {worst}; cap {}",
+         entries, worst page {worst}; {rows} leg rows; cap {} entries",
         census.len(),
-        super::preprocessed::MAX_SPARSE_ENTRIES,
+        super::preprocessed::MAX_SPARSE_INIT_ENTRIES,
+    )
+}
+
+/// One page's line, in the ruling's own column order.
+///
+/// ⚠ `init_len` AND `entries` BOTH, because they differ and the difference is
+/// the point: a page can load a thousand genesis bytes of which most are zero,
+/// and it is the nonzero count that the leg pays for.
+pub fn genesis_entry_line(entry: &GenesisEntry) -> String {
+    format!(
+        "  page {:#018x}: private={} init_values={} rows={} nonzero={} leg_rows={}",
+        entry.page_base, entry.is_private, entry.init_len, entry.rows, entry.entries,
+        entry.leg_rows,
     )
 }

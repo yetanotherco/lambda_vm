@@ -98,7 +98,7 @@ mod tests {
         }
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
-        let routes = GlobalPlan::build(&global, &airs).table_routes().to_vec();
+        let routes = GlobalPlan::build(&global, &airs, &elf_bytes).table_routes().to_vec();
         println!(
             "PRIVATE-PAGE FIXTURE: {} tables = {} bookends + {} pages, routes {:?}",
             routes.len(),
@@ -115,8 +115,8 @@ mod tests {
             "this fixture's pages are private; the genesis route is gated by the other one"
         );
 
-        let arena = whir_global_arena(&global, &airs);
-        let program = whir_global_program(&global, &airs);
+        let arena = whir_global_arena(&global, &airs, &elf_bytes);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
         assert_eq!(
             program.arena_schema.lens,
             vec![arena[0].len() as u32],
@@ -132,7 +132,7 @@ mod tests {
         let (elf_bytes, opts, bundle) = genesis_page_bundle();
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
-        let plan = GlobalPlan::build(&global, &airs);
+        let plan = GlobalPlan::build(&global, &airs, &elf_bytes);
         let routes = plan.table_routes().to_vec();
         let genesis: Vec<usize> = routes
             .iter()
@@ -146,36 +146,39 @@ mod tests {
              every assertion below would be vacuous"
         );
 
-        // ⛔ THE ANTI-VACUITY COUNT. A sparse leg over an all-zero column emits
-        // no operation at all, so a green run against one says nothing about the
-        // arithmetic. The surviving-entry count is PRINTED and asserted nonzero.
-        let mut entries = 0usize;
-        for &table in &genesis {
-            let columns = airs[table].precomputed_columns();
-            let init: &[FE] = &columns[1];
-            let here = crate::lfm::preprocessed::sparse_entries(&[init]);
-            println!(
-                "GENESIS PAGE at table {table}: INIT {} rows, {here} nonzero",
-                init.len(),
-            );
-            entries += here;
+        // ⛔ THE ANTI-VACUITY COUNT, AND IT NAMES THE PAGE. A sparse leg over an
+        // all-zero column emits no operation at all, so a green run against one
+        // says nothing about the arithmetic. The surviving-entry count is
+        // PRINTED beside the page's base and its `init_values` length — three
+        // numbers, because `init_values.len()` and the nonzero count differ and
+        // the difference is what the leg is paid for — and asserted nonzero.
+        let census = crate::lfm::whir_global::genesis_census(
+            &elf_bytes,
+            &global.page_bases,
+            global.num_private_input_pages,
+        )
+        .expect("the census reads off the same ELF the harvest verified");
+        println!("{}", crate::lfm::whir_global::genesis_census_line(&census));
+        for entry in &census {
+            println!("{}", crate::lfm::whir_global::genesis_entry_line(entry));
         }
+        let entries: usize = census.iter().map(|e| e.entries).sum();
         assert!(
             entries > 0,
             "the genesis fixture's INIT columns are all zero, so the sparse leg emitted \
              nothing and this suite would be green against arithmetic it never ran"
         );
-        println!("GENESIS FIXTURE: {} genesis pages, {entries} nonzero entries", genesis.len());
-        // The census the block's cap is owed, printed at the shape that exists.
-        println!(
-            "{}",
-            crate::lfm::whir_global::genesis_census_line(
-                &crate::lfm::whir_global::genesis_census(&global, &airs)
-            )
+        // The plan and the census must agree about which pages are genesis —
+        // two derivations off one `global_memory_configs` call, and a gate that
+        // says so rather than leaving them to be assumed equal.
+        assert_eq!(
+            genesis.len(),
+            census.iter().filter(|e| !e.is_private).count(),
+            "the plan's routes and the census disagree about the genesis pages"
         );
 
-        let arena = whir_global_arena(&global, &airs);
-        let program = whir_global_program(&global, &airs);
+        let arena = whir_global_arena(&global, &airs, &elf_bytes);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
         execute_against(&program, &arena);
     }
 
@@ -190,8 +193,8 @@ mod tests {
         let (elf_bytes, opts, bundle) = genesis_page_bundle();
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
-        let program = whir_global_program(&global, &airs);
-        let cost = global_cost(&global, &airs);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
+        let cost = global_cost(&global, &airs, &elf_bytes);
 
         let consts = program
             .instrs
@@ -236,48 +239,66 @@ mod tests {
         );
     }
 
-    /// ⛔ A TABLE WHOSE PREPROCESSED COLUMNS NO ROUTE COVERS FAILS THE BUILD.
+    /// ⛔ A TABLE WHOSE PREPROCESSED COLUMNS NO ROUTE COVERS FAILS THE BUILD —
+    /// DIRECTION ONE: the route expects MORE columns than the AIR presents.
     ///
-    /// The route is decided by the family and the page's own config, and the
-    /// column count is the CROSS-CHECK. Here the config is restated — a page the
-    /// AIR set built with INIT is told it is private — and the build must refuse
-    /// rather than route it as OFFSET-only and leave the genesis column checked
-    /// by nothing.
+    /// The route is decided by the family and the page's own config; the column
+    /// count is the CROSS-CHECK. Here the DECLARED INPUT is restated — a bundle
+    /// whose page is private says it has none — so the config build classifies
+    /// the page as a genesis page and the route expects OFFSET and INIT, while
+    /// the AIR set the proof was verified against presents OFFSET alone.
     ///
-    /// ⚠ This is the mutation's shape, made reachable as a test: it is the exact
-    /// defect a column-count key would wave through.
+    /// ⚠ THIS RESTATES AN INPUT, NOT A DERIVED FLAG, and that is the point: a
+    /// wrong `num_private_input_pages` is exactly the lie the cross-check
+    /// exists to catch, and it is the lie a column-count key would wave through
+    /// by routing the page as private and checking its genesis with nothing.
     #[test]
     #[should_panic(expected = "preprocessed columns")]
-    fn a_page_routed_against_its_own_config_is_refused() {
-        let (elf_bytes, opts, bundle) = genesis_page_bundle();
-        let mut global = harvest(&elf_bytes, &opts, &bundle);
-        let genesis = global
-            .page_is_private
-            .iter()
-            .position(|private| !*private)
-            .expect("the genesis fixture has a non-private page");
-        global.page_is_private[genesis] = true;
-        let airs = global.airs().refs();
-        let _ = GlobalPlan::build(&global, &airs);
-    }
-
-    /// ⛔ AND THE OTHER DIRECTION, because one arm of a two-arm guard is half a
-    /// guard: a private page told it carries a genesis column must also be
-    /// refused, and for the same reason — it would index a column the AIR never
-    /// presented.
-    #[test]
-    #[should_panic(expected = "preprocessed columns")]
-    fn a_private_page_routed_as_genesis_is_refused() {
+    fn a_page_the_routes_expect_more_columns_from_is_refused() {
         let (elf_bytes, opts, bundle) = private_page_bundle();
         let mut global = harvest(&elf_bytes, &opts, &bundle);
-        let private = global
-            .page_is_private
-            .iter()
-            .position(|private| *private)
-            .expect("this fixture's page is private");
-        global.page_is_private[private] = false;
         let airs = global.airs().refs();
-        let _ = GlobalPlan::build(&global, &airs);
+        assert_eq!(
+            airs[global.num_epochs].precomputed_columns().len(),
+            1,
+            "this fixture's page is private, so its AIR presents OFFSET alone — without \
+             that the refusal below would fire for another reason"
+        );
+        global.num_private_input_pages = 0;
+        let _ = GlobalPlan::build(&global, &airs, &elf_bytes);
+    }
+
+    /// ⛔ AND DIRECTION TWO, because one arm of a two-arm guard is half a guard:
+    /// the route expects FEWER columns than the AIR presents.
+    ///
+    /// Here the AIR SET is the one that disagrees. It is rebuilt through the
+    /// verifier's own `global_airs_for` with the private count zeroed, so its
+    /// page AIR carries OFFSET and INIT, while the driver's own count still
+    /// says private and the route expects OFFSET alone. That is the realistic
+    /// failure of this design — the AIR set and the config source disagreeing —
+    /// and it is why the two are built from one call with one set of arguments
+    /// in production.
+    #[test]
+    #[should_panic(expected = "preprocessed columns")]
+    fn a_page_the_routes_expect_fewer_columns_from_is_refused() {
+        let (elf_bytes, opts, bundle) = private_page_bundle();
+        let global = harvest(&elf_bytes, &opts, &bundle);
+        let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+        let other = crate::multilinear_continuation::global_airs_for(
+            &elf,
+            &opts,
+            global.num_epochs,
+            &global.page_bases,
+            0,
+        );
+        let refs = other.refs();
+        assert_eq!(
+            refs[global.num_epochs].precomputed_columns().len(),
+            2,
+            "the rebuilt set must present OFFSET and INIT, or this arm refuses for \
+             another reason than the one it is written for"
+        );
+        let _ = GlobalPlan::build(&global, &refs, &elf_bytes);
     }
 
     /// ★★ THE PUBLISHED SET, WORD FOR WORD — and every word against a
@@ -305,8 +326,8 @@ mod tests {
         let (elf_bytes, opts, bundle) = genesis_page_bundle();
         let global = harvest(&elf_bytes, &opts, &bundle);
         let airs = global.airs().refs();
-        let program = whir_global_program(&global, &airs);
-        let arena = whir_global_arena(&global, &airs);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
+        let arena = whir_global_arena(&global, &airs, &elf_bytes);
         let exec = crate::lfm::execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
             .expect("the machine must execute the cross-epoch proof the host accepted");
         let public = &exec.public_words;
@@ -432,22 +453,22 @@ mod tests {
         // REFUSES and the refusal is the finding — printing the number before
         // the build is what makes that legible instead of a panic with no
         // context.
-        let census = crate::lfm::whir_global::genesis_census(&global, &airs);
+        let census = crate::lfm::whir_global::genesis_census(
+            &elf_bytes,
+            &global.page_bases,
+            global.num_private_input_pages,
+        )
+        .expect("the census reads off the same ELF the harvest verified");
         println!("{}", crate::lfm::whir_global::genesis_census_line(&census));
         for entry in &census {
-            if entry.entries > 0 {
-                println!(
-                    "  page table {} ({:?}): {} rows, {} nonzero",
-                    entry.table, entry.route, entry.rows, entry.entries
-                );
-            }
+            println!("{}", crate::lfm::whir_global::genesis_entry_line(entry));
         }
 
         let started = std::time::Instant::now();
-        let program = whir_global_program(&global, &airs);
+        let program = whir_global_program(&global, &airs, &elf_bytes);
         let built = started.elapsed();
-        let arena = whir_global_arena(&global, &airs);
-        let cost = global_cost(&global, &airs);
+        let arena = whir_global_arena(&global, &airs, &elf_bytes);
+        let cost = global_cost(&global, &airs, &elf_bytes);
         println!(
             "GLOBAL PROGRAM: {} tables = {} bookends + {} pages; {} instrs \
              (ops {} + consts {} + hints {} + publics {}); {} arena words; \
@@ -473,6 +494,109 @@ mod tests {
             program.instrs.len(),
             cost.instructions(),
             "the assembled emission against the form, at the block's own shape"
+        );
+    }
+
+    /// ★★★ THE CENSUS INSTRUMENT — PROVE-FREE, CARD-FREE, AND THE NUMBER THE
+    /// CAP IS SET FROM.
+    ///
+    /// It runs the guest ONCE with every prove and trace build omitted
+    /// (`continuation::block_page_census`), takes the touched page list and the
+    /// private-page count from that execution, rebuilds the page configs through
+    /// the verifier's own `global_memory_configs`, and counts the nonzero genesis
+    /// bytes per page. No proof, no AIR, no card, no bundle.
+    ///
+    /// ⚠ THE TOUCHED PAGE LIST IS AN EXECUTION FACT — which cells cross an epoch
+    /// boundary — so it is a function of the ELF, the INPUT and the epoch size
+    /// together. All three are named on the output line, and the first two are
+    /// REFUSED unless the caller states their full sha256: a census quoted
+    /// against the wrong input is the campaign's own recurring defect, and a
+    /// guard that accepts an unnamed input cannot tell the two apart.
+    ///
+    /// ⛔ IT REFUSES RATHER THAN SKIPS when the shas are unstated, and SKIPS
+    /// with its own line when the ELF is simply absent. Two distinct outcomes,
+    /// because "could not run the probe" and "ran it and the input is wrong" are
+    /// different findings and a single refusal would report only its own
+    /// hypothesis.
+    #[test]
+    #[ignore = "the box runs it: one execution of the block guest, no proving"]
+    fn the_block_genesis_census() {
+        let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+        let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+        let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(21);
+
+        let Some(elf_bytes) = bench_elf_if_present(&name) else {
+            println!(
+                "GENESIS-CENSUS SKIPPED - no ELF named {name} in \
+                 executor/program_artifacts/{{rust,asm}}; set LAMBDA_VM_BENCH_ELF"
+            );
+            return;
+        };
+        let input = crate::tests::multilinear_bench_tests::input_bytes(&input_name);
+
+        // ⛔ THE GUARD, AND IT MUST BE ABLE TO REFUSE THE RUN IT IS HANDED.
+        // Both shas at FULL width: a diagnostic that can agree while the values
+        // differ is not a diagnostic.
+        let elf_sha = sha256_hex(&elf_bytes);
+        let input_sha = sha256_hex(&input);
+        let want_elf = std::env::var("LAMBDA_VM_CENSUS_ELF_SHA256").unwrap_or_else(|_| {
+            panic!(
+                "this census is quoted as a fact about ONE program and ONE input, so it \
+                 refuses to run unnamed. Set LAMBDA_VM_CENSUS_ELF_SHA256={elf_sha} and \
+                 LAMBDA_VM_CENSUS_INPUT_SHA256={input_sha}"
+            )
+        });
+        let want_input = std::env::var("LAMBDA_VM_CENSUS_INPUT_SHA256").unwrap_or_else(|_| {
+            panic!("LAMBDA_VM_CENSUS_INPUT_SHA256 is unset; the input here is {input_sha}")
+        });
+        assert_eq!(elf_sha, want_elf, "the ELF is not the one this census was asked for");
+        assert_eq!(
+            input_sha, want_input,
+            "the INPUT is not the one this census was asked for, and the touched page \
+             list is a function of it"
+        );
+        println!(
+            "GENESIS-CENSUS elf {name} sha {elf_sha} ({} bytes)  input {} sha {input_sha} \
+             ({} bytes)  epoch 2^{epoch_size_log2}",
+            elf_bytes.len(),
+            if input_name.is_empty() { "<none>" } else { &input_name },
+            input.len(),
+        );
+
+        let started = std::time::Instant::now();
+        let pages = crate::continuation::block_page_census(&elf_bytes, &input, epoch_size_log2)
+            .expect("the guest runs to completion");
+        println!(
+            "EXECUTION: {} epochs, {} touched pages, {} private-input pages, in {:.1}s",
+            pages.num_epochs,
+            pages.touched_page_bases.len(),
+            pages.num_private_input_pages,
+            started.elapsed().as_secs_f64(),
+        );
+
+        let census = crate::lfm::whir_global::genesis_census(
+            &elf_bytes,
+            &pages.touched_page_bases,
+            pages.num_private_input_pages,
+        )
+        .expect("the page configs rebuild from the ELF");
+        for entry in &census {
+            println!("{}", crate::lfm::whir_global::genesis_entry_line(entry));
+        }
+        println!("{}", crate::lfm::whir_global::genesis_census_line(&census));
+
+        // ⛔ NOT AN ASSERT ON THE TOTAL. That number is what this arm exists to
+        // READ, and asserting it here would pin the posture and make the cap a
+        // thing the test agrees with rather than a thing the reading decides.
+        // What is asserted is that the census covered the pages the execution
+        // found — a count that can disagree.
+        assert_eq!(
+            census.len(),
+            pages.touched_page_bases.len(),
+            "the census must cover every page the execution touched"
         );
     }
 

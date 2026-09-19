@@ -505,7 +505,7 @@ pub fn offset_ramp_at(point: &[FEE]) -> FEE {
 /// (`2^n` = 262,144) at about fourteen thousand.
 ///
 /// ⚠ WHICH IS WHY THE CAP EXISTS AND IS A REFUSAL — see
-/// [`MAX_SPARSE_ENTRIES`]. A dense column has no cheap route on this path at
+/// [`MAX_SPARSE_INIT_ENTRIES`]. A dense column has no cheap route on this path at
 /// all, and the honest outcome is a build that fails naming both numbers, never
 /// a program nobody can prove.
 ///
@@ -520,7 +520,7 @@ pub fn offset_ramp_at(point: &[FEE]) -> FEE {
 ///
 /// # Panics
 ///
-/// On a column whose length is not `2^num_vars`, and above [`MAX_SPARSE_ENTRIES`]
+/// On a column whose length is not `2^num_vars`, and above [`MAX_SPARSE_INIT_ENTRIES`]
 /// surviving entries. Both are emit-time shape refusals, the
 /// `epoch_verify.rs:171-179` idiom.
 pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) -> Vec<Ext> {
@@ -535,9 +535,9 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
     }
     let entries = sparse_entries(columns);
     assert!(
-        entries <= MAX_SPARSE_ENTRIES,
+        entries <= MAX_SPARSE_INIT_ENTRIES,
         "these preprocessed columns carry {entries} nonzero entries, which this leg \
-         emits {} rows for; the cap is {MAX_SPARSE_ENTRIES} entries. A column this \
+         emits {} rows for; the cap is {MAX_SPARSE_INIT_ENTRIES} entries. A column this \
          dense has no closed form and no opening on the cross-epoch path — see this \
          module's note on why `Prepared` cannot carry one — so it needs the protocol \
          change, not a bigger cap",
@@ -575,6 +575,18 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
                     });
                 }
                 let eq = eq.expect("a point with at least one variable");
+                // ⛔ THE INTERNED GENESIS BYTE, AND THE STATEMENT IT OWES.
+                // This constant is a byte of the page's genesis image, read
+                // from the ELF and frozen into the program text — the same
+                // standing as the interned DECODE root, and bound the same way:
+                // by the attestation id over the ELF digest, not by anything
+                // inside one program. So the obligation carried out of band is
+                // NOT "a root equals `compute_precomputed_commitment`'s
+                // inputs"; it is **the interned entries are the ELF's genesis
+                // bytes at those page bases**. The value gate against
+                // `Mle::evaluate_in` over the real column establishes it at
+                // fixture scale and the block instrument at block scale.
+                // Recorded as owed, never described as covered.
                 let coefficient = b.ext_const(&value.to_extension::<GoldilocksExtension>());
                 acc = Some(match acc {
                     None => b.emul(coefficient, eq),
@@ -594,17 +606,28 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
 ///
 /// The leg is `O(entries × num_vars)`, so a dense page column at eighteen
 /// variables would emit about 4.7 M rows and nothing in the program would say
-/// so. This bounds the whole family's contribution to roughly a million rows at
-/// eighteen variables, which is the order the cross-epoch program's other legs
-/// cost between them.
+/// so.
 ///
-/// ⚠ THE NUMBER IS A BUDGET AND IT IS OWED A CENSUS. It is set so the assembled
-/// cross-epoch program stays inside the campaign's pre-registered 2–4 M band,
-/// and the quantity that decides whether a real block fits — how many nonzero
-/// genesis bytes its touched non-private pages carry — has not been measured.
-/// Raising it is a decision about the program's size and must be taken against
-/// that census, never against a build that failed.
-pub const MAX_SPARSE_ENTRIES: usize = 60_000;
+/// ⚠⚠ THIS NUMBER IS A PLACEHOLDER AND IT IS OWED A CENSUS — said here rather
+/// than left for a reader to take it for a measurement. The quantity that
+/// decides whether a real block fits is how many nonzero genesis bytes its
+/// touched non-private pages carry between them, and
+/// [`crate::lfm::whir_global::genesis_census`] is the instrument that reads it:
+/// prove-free and card-free, off one execution of the guest. Until that reading
+/// exists this bound is a round number sized to keep the family's contribution
+/// near a million rows — the order the cross-epoch program's other legs cost
+/// between them, inside the campaign's pre-registered 2–4 M band — and nothing
+/// at fixture scale comes near it, so no gate exercises it.
+///
+/// ⇒ WHEN THE CENSUS READS AND THE BLOCK DOES NOT FIT, the answer is NOT a
+/// bigger cap. It is the fallback the cross-epoch proof format can still take
+/// while nothing in flight depends on it: a host commitment over the page
+/// family's INIT columns, absorbed in the roots block, opened through a
+/// `Prepared` that names a TABLE LIST rather than one table — a change to the
+/// cross-epoch prover, its verifier and its proof bytes. The refusal below
+/// names it, so the choice is made against the number rather than against a
+/// build that failed.
+pub const MAX_SPARSE_INIT_ENTRIES: usize = 60_000;
 
 /// Surviving entries across a set of columns: what the leg's cost is linear in.
 ///

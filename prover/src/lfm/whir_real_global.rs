@@ -125,26 +125,6 @@ pub struct WhirRealGlobal {
     pub(crate) bookend_roots: Vec<Vec<Commitment>>,
     /// What the cross-epoch wrap publishes, as a type rather than a count.
     pub(crate) published: GlobalLayout,
-    /// ★ PER PAGE TABLE, IN THE AIR SET'S OWN ORDER: whether that page is a
-    /// private-input page — the one bit that decides its preprocessed route.
-    ///
-    /// ⛔ IT IS THE CONFIG'S FLAG, NOT A COUNT OF COLUMNS. The emitter has to
-    /// know which pages carry INIT, and the tempting source is how many
-    /// preprocessed columns each AIR presents. That is a guard written on the
-    /// answer: a page whose INIT column vanished upstream would present one
-    /// column, be routed as private, and have its genesis checked by nothing —
-    /// the reading could not move under the failure it exists to catch. So this
-    /// is `PageConfig::is_private_input` of the very configs the AIR set was
-    /// built from, and the column count becomes the emitter's CROSS-CHECK
-    /// instead of its key.
-    ///
-    /// ⚠ A SECOND CALL OF `global_memory_configs`, not a second spelling of it.
-    /// `global_airs_for` ran it internally and kept only the AIRs; this runs the
-    /// same function on the same three arguments, so the two cannot disagree on
-    /// anything but the arguments, which are derived once above. Exposing the
-    /// configs from [`WhirGlobalAirs`] would remove even that, and is the change
-    /// this comment exists to justify rather than to excuse.
-    pub(crate) page_is_private: Vec<bool>,
     /// ⛔ RESERVED, AND EMPTY ON EVERY PATH THAT EXISTS TODAY: the roots of a
     /// MULTILINEAR commitment over the page family's INIT columns, for the
     /// prepared opening a cross-epoch program needs instead of folding ≈9.2 M
@@ -161,22 +141,6 @@ pub struct WhirRealGlobal {
     /// thousands of rows later. Whoever fills it takes the value from the very
     /// `Prepared` object the host verification consumed, and states the pin it
     /// owes where the root is interned.
-    ///
-    /// ⛔⛔ AND IT STAYS `None`, BECAUSE THE OBJECT CANNOT EXIST ON THIS PATH —
-    /// measured by reading, not assumed. `multi_prove` lifts a prepared
-    /// commitment's roots into the ROOTS BLOCK
-    /// (`absorb_roots_and_challenge(transcript, committed.roots(), &prepared_roots)`),
-    /// and both `prove_global` and `verify_global_bookends` pass `None`, so
-    /// those roots are empty in every cross-epoch proof that exists. A program
-    /// that absorbed one would absorb a root the honest proof never absorbed,
-    /// derive a different `z`, and stop executing at the first table. Separately,
-    /// `Prepared` names ONE table and settles its columns with `Claimed::Shared`
-    /// at that table's single reduced point, while a cross-epoch INIT family
-    /// spans one page table per touched page, each with its own point. So an
-    /// INIT opening is not a machine-side addition: it is a change to the
-    /// cross-epoch prover, its verifier, its proof bytes and `Prepared`'s shape.
-    /// Until that is taken, [`crate::lfm::whir_global`] checks the genesis
-    /// columns themselves and this field is honestly empty.
     pub(crate) prepared_roots: Option<Vec<Commitment>>,
 }
 
@@ -280,25 +244,6 @@ pub fn real_global_from_whir_continuation(
     let config = crate::multilinear_prove::chain_config(&shapes);
     let sizes = airs.groups();
 
-    // The route decision, from the configs the AIR set was built from — see the
-    // field's own doc for why it is not the column count.
-    let page_is_private: Vec<bool> = crate::continuation::global_memory_configs(
-        &bundle.touched_page_bases,
-        &elf,
-        bundle.num_private_input_pages,
-    )
-    .iter()
-    .map(|config| config.is_private_input)
-    .collect();
-    if page_is_private.len() + num_epochs != air_refs.len() {
-        return Err(format!(
-            "the cross-epoch layout has {} tables and {num_epochs} bookends, which leaves              {} pages, and the ELF's page configs describe {}",
-            air_refs.len(),
-            air_refs.len().saturating_sub(num_epochs),
-            page_is_private.len(),
-        ));
-    }
-
     // ⚠ A SECOND SPELLING OF TWO LINES THE VERIFIER ALREADY RAN, and it is here
     // only because `verify_global_bookends` — which computes exactly this and
     // returns it — is private to `multilinear_continuation` while
@@ -333,7 +278,6 @@ pub fn real_global_from_whir_continuation(
         sizes,
         airs,
         bookend_roots,
-        page_is_private,
         published: GlobalLayout {
             num_epochs,
             lanes_per_root: lanes_per_root(),
