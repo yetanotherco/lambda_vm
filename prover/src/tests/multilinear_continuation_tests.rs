@@ -1438,62 +1438,163 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
     .expect("the production stack")
     .expect("a non-empty plan must produce a stack");
 
-    // The independent half: the same page bases in the same order, the bytes
-    // read straight out of the ELF's segments.
+    // The independent half: each stacked column rebuilt from ITS OWN closed
+    // form, selected by `entry.column`.
+    //
+    // ⛔⛔ THIS IS WHERE THIS TEST WAS WRONG, AND THE SHAPE IS WORTH MORE THAN
+    // THE BUG. Written before the both-columns ruling, it read only
+    // `entry.table` and rebuilt EVERY entry from the ELF's bytes — so once a
+    // dense page began stacking `[OFFSET, INIT]` it committed `[INIT, INIT]`
+    // against the production stack and reported a mismatch it had manufactured
+    // itself. A second derivation that ignores part of what it is deriving is
+    // not an independent check; it is a different object.
+    //
+    // ⚠ NEITHER ARM CALLS `page::preprocessed_columns` OR `page::offset_column`.
+    // The ramp is written out here. Built through the function under test, the
+    // two halves would agree for any pair of agreeing bugs — the same reason
+    // [`elf_genesis_byte`] exists.
+    type Fe = math::field::element::FieldElement<crate::test_utils::F>;
     let page_size = 1u64 << crate::continuation::PAGE_NUM_VARS;
+    let rebuild = |entry: &stark::multilinear_table::PreparedColumn| -> Vec<Fe> {
+        let base = configs[entry.table - boundaries.len()].page_base;
+        match entry.column {
+            // OFFSET: the row index. The same column for every page of this
+            // size, independent of the program entirely.
+            //
+            // ⚠ It reads like `page::offset_column()` because `0..page_size`
+            // has one spelling — but it is not a CALL to it, and that is the
+            // whole of the independence here: a ramp that started at 1, or ran
+            // to `page_size` inclusive, would redden this while agreeing with
+            // itself everywhere else.
+            0 => (0..page_size).map(Fe::from).collect(),
+            // INIT: this page's genesis bytes, out of the ELF's own segments.
+            1 => (0..page_size)
+                .map(|offset| Fe::from(u64::from(elf_genesis_byte(&elf, base + offset))))
+                .collect(),
+            other => panic!(
+                "the stack names preprocessed column {other} of table {}, and a genesis \
+                 page presents {}. There is no independent derivation for it here, and \
+                 rebuilding an unknown column as INIT is exactly the defect this test \
+                 carried: it would compare a stack of the wrong columns and blame the \
+                 root.",
+                entry.table,
+                crate::continuation::PAGE_PREPROCESSED_COLUMNS
+            ),
+        }
+    };
     let rebuilt: Vec<multilinear::mle::Mle<crate::test_utils::F>> = plan
         .at
         .iter()
-        .map(|entry| {
-            let base = configs[entry.table - boundaries.len()].page_base;
-            let values: Vec<_> = (0..page_size)
-                .map(|offset| {
-                    math::field::element::FieldElement::<crate::test_utils::F>::from(u64::from(
-                        elf_genesis_byte(&elf, base + offset),
-                    ))
-                })
-                .collect();
-            multilinear::mle::Mle::new(values).expect("mle")
-        })
+        .map(|entry| multilinear::mle::Mle::new(rebuild(entry)).expect("mle"))
         .collect();
 
-    // ⚠ ANTI-VACUITY: two all-zero stacks match and say nothing. The fixture is
-    // dense by construction, and each rebuilt column is asserted to carry at
-    // least what put its page over the threshold — so this compares the bytes
-    // that matter and not a pair of empty pages.
+    // ⚠ ANTI-VACUITY, PER COLUMN KIND — two all-zero stacks match and say
+    // nothing. Each kind is asserted against the count only IT can have:
+    //
+    // - INIT must clear the density floor that put its page in the stack. An
+    //   INIT column below it means the two halves are reading different pages.
+    // - OFFSET is the ramp `0..page_size`, so exactly one entry of it is zero
+    //   and its count is `page_size - 1`: pinned EXACTLY, not by a floor.
+    //   ⛔ This is the reading that names the old defect outright. An OFFSET
+    //   entry rebuilt from the ELF's bytes prints the INIT count instead of
+    //   262,143 — which is what the failing log showed, twice.
     let floor = crate::continuation::PREPARED_LEG_ROWS / crate::continuation::PAGE_NUM_VARS;
+    let ramp_nonzero = page_size as usize - 1;
     for (column, entry) in rebuilt.iter().zip(&plan.at) {
-        let zero = math::field::element::FieldElement::<crate::test_utils::F>::from(0u64);
+        let zero = Fe::from(0u64);
         let nonzero = column.evals().iter().filter(|v| **v != zero).count();
         println!(
-            "PROVENANCE table {} rebuilt nonzero {nonzero} (floor {floor})",
-            entry.table
+            "PROVENANCE table {} column {} rebuilt nonzero {nonzero} (INIT floor {floor}, \
+             OFFSET exactly {ramp_nonzero})",
+            entry.table, entry.column
         );
-        assert!(
-            nonzero > floor,
-            "the rebuilt column has {nonzero} nonzero entries, at or below the {floor} \
-             that put this page in the stack — the two halves are reading different pages"
-        );
+        if entry.column == 0 {
+            assert_eq!(
+                nonzero, ramp_nonzero,
+                "stack column {} of table {} is this page's OFFSET ramp, whose only zero \
+                 is row 0 — a count of {nonzero} means it was rebuilt as something else",
+                entry.column, entry.table
+            );
+        } else {
+            assert!(
+                nonzero > floor,
+                "the rebuilt INIT column has {nonzero} nonzero entries, at or below the \
+                 {floor} that put this page in the stack — the two halves are reading \
+                 different pages"
+            );
+        }
     }
 
-    let independent =
+    let commit_independently = |columns: &[multilinear::mle::Mle<crate::test_utils::F>]| {
         multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
             stark::multilinear_table::global_layout(&[(
-                rebuilt.len(),
+                columns.len(),
                 crate::continuation::PAGE_NUM_VARS,
             )])
             .expect("layout"),
-            &multilinear::stacking::borrow(&rebuilt),
+            &multilinear::stacking::borrow(columns),
             None,
             &config,
         )
-        .expect("the independent stack");
+        .expect("the independent stack")
+    };
 
+    // THE HONEST CONTROL, FIRST: the two derivations agree.
+    let independent = commit_independently(&rebuilt);
     assert_eq!(
         production.roots,
         independent.roots(),
         "the genesis stack's root is not the commitment to the ELF's own bytes at those \
          page bases — the pin this root owes could not be stated"
+    );
+
+    // ⛔ AND THE COMPARISON IS EXECUTED ON A STATE IT MUST REFUSE. One that has
+    // only ever run on agreeing inputs is one nobody has seen work. A single
+    // byte of ONE rebuilt INIT column is moved and the same commitment taken
+    // again; the roots must then differ. INIT and not OFFSET on purpose: INIT
+    // is the column this opening exists to settle.
+    let init_at = plan
+        .at
+        .iter()
+        .position(|entry| entry.column == 1)
+        .expect("a dense page stacks an INIT column");
+    let mut moved: Vec<Vec<Fe>> = rebuilt
+        .iter()
+        .map(|column| column.evals().to_vec())
+        .collect();
+    let zero = Fe::from(0u64);
+    let byte = moved[init_at]
+        .iter()
+        .position(|value| *value != zero)
+        .expect("a dense INIT column has a nonzero byte to move");
+    moved[init_at][byte] += Fe::from(1u64);
+    let moved: Vec<multilinear::mle::Mle<crate::test_utils::F>> = moved
+        .into_iter()
+        .map(|values| multilinear::mle::Mle::new(values).expect("mle"))
+        .collect();
+    assert_ne!(
+        production.roots,
+        commit_independently(&moved).roots(),
+        "one genesis byte was moved in stack column {init_at} at offset {byte} and the \
+         root did not change: this comparison cannot see a wrong stack, so its green says \
+         nothing"
+    );
+
+    // ⛔⛔ THE FOURTH OWED PIN, NOW STATEABLE. The statement owed out of band is
+    // the line below: this root, over this guest named by sha, this many
+    // columns at this height, under this hash. Nothing inside the program
+    // checks it. The BLOCK's own root is read by
+    // `the_blocks_dense_pages_are_the_three_the_threshold_pre_registers` on the
+    // box; this is the fixture-scale half of the same pin.
+    println!(
+        "GENESIS STACK ROOT {:02x?} guest dense_data_page_touch sha {} ({} bytes)  \
+         columns {} at {} variables  hash {}",
+        production.roots,
+        sha256_hex(&elf_bytes),
+        elf_bytes.len(),
+        plan.at.len(),
+        crate::continuation::PAGE_NUM_VARS,
+        <KeccakWhir as multilinear::whir_hash::WhirHash>::NAME,
     );
 }
 
