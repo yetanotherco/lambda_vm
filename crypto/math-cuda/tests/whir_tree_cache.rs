@@ -70,7 +70,7 @@
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
 use math_cuda::DeviceHash;
-use math_cuda::whir::{leaf_hash_calls, reset_leaf_hash_calls};
+use math_cuda::whir::{leaf_hash_calls, retention_report, tree_builds};
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
@@ -522,20 +522,39 @@ fn the_process_wide_counter_tracks_the_same_passes() {
     let _exclusive = exclusive();
     let hash = key::<KeccakWhir>();
 
-    reset_leaf_hash_calls();
+    // ⛔ DELTAS, NOT ABSOLUTES. These three counters are process-wide and no
+    // longer resettable as a set, and the retention makes them diverge on
+    // purpose, so the assertions below are about what THIS codeword moved.
+    let at = || (tree_builds(), leaf_hash_calls(), retention_report().5);
+
+    let (b0, p0, s0) = at();
     let (codeword, _root) = commit_on_device(12, 4, hash);
-    let after_commit = leaf_hash_calls();
-    assert_eq!(after_commit, 1, "one commit, one leaf-hash pass");
+    let (b1, p1, s1) = at();
+    assert_eq!(b1 - b0, 1, "one commit, one tree assembled");
+    assert_eq!(p1 - p0, 1, "and it paid for its own leaf pass");
+    assert_eq!(s1 - s0, 0, "with nothing yet in hand to reuse");
 
     let _ = codeword.paths(4, &[0, 1], hash).expect("paths");
+    let (b2, p2, s2) = at();
+    assert_eq!(b2 - b1, 1, "the opening assembles its own tree");
+    // ★ THE LINE THAT CHANGED WITH H4's REPLACEMENT. This used to assert the
+    // global counter moved by one too, because a tree and a leaf pass were the
+    // same event. They are not any more: the tree is assembled, the leaves are
+    // not re-hashed, and a 1 here is the retention failing to serve.
+    assert_eq!(p2 - p1, 0, "and does NOT re-hash the leaves");
+    assert_eq!(s2 - s1, 1, "the saving is counted where it happens");
+
+    // ⭐ THE ACCOUNTING IDENTITY, which is what the old equality became and
+    // which fails in BOTH directions: a tree that skipped its pass without
+    // recording a saving breaks it, and so does a saving recorded for a tree
+    // that was never assembled.
     assert_eq!(
-        leaf_hash_calls(),
-        after_commit + 1,
-        "an opening builds a tree, so the global counter must move by one"
-    );
-    assert_eq!(
-        codeword.tree_builds(),
-        leaf_hash_calls(),
-        "with one codeword in flight the two counters must agree"
+        b2 - b0,
+        (p2 - p0) + (s2 - s0),
+        "every tree either paid for its leaf pass or reused one; trees {}, \
+         passes {}, savings {}",
+        b2 - b0,
+        p2 - p0,
+        s2 - s0
     );
 }
