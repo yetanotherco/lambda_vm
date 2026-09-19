@@ -664,8 +664,44 @@ fn f1_fixture_bundle() -> (
     (elf_bytes, opts, bundle)
 }
 
-/// ★ THE ASSEMBLY'S RESIDUAL, PRE-REGISTERED: F1's const-free form is ONE
-/// instruction OVER the emitted program, per epoch.
+/// ★ THE ASSEMBLY'S RESIDUAL AT THIS FIXTURE'S POSTURE: F1's const-free form is
+/// ONE instruction OVER the emitted program, per epoch.
+///
+/// ⛔⛔ **POSTURE-SPECIFIC, AND THE VALUE IS NOT +1 AT THE BLOCK.** This is
+/// `ops_gap` — `f1.operations() - (measured - LFM_CONST)` — and it reads:
+///
+/// | posture | tables per epoch | `ops_gap` |
+/// |---|---|---|
+/// | this fixture, `epoch_size_log2 = 2` | 25 and 26 | **+1** on all three epochs |
+/// | the block at `LAMBDA_VM_MAX_ROWS_LOG2=21` | 26 and 27 | **−1** on five wraps, **−2** on ten |
+///
+/// A two-row swing with the posture, so it is a constant of THIS bundle and not
+/// a constant of the spine. The earlier doc here claimed the latter on the
+/// evidence of three fixture epochs, and the block's fifteen refuted it; the
+/// scoring is sh4 (`90797d63`, the record posture) against wt3 (`bad7caca`).
+///
+/// ⛔ AND THE HYPOTHESIS THIS DOC USED TO CARRY IS FALSIFIED. It read: "a
+/// squeeze whose buffered felt count is off by a little moves `ceil(f/4)` packs
+/// by one while leaving `ceil(f/8)` permutations alone, which is exactly what is
+/// observed — `LFM_HASH` matches to the row at every shape." `LFM_HASH` matches
+/// at every FIXTURE shape and misses by one on TEN of the block's fifteen
+/// wraps. The exact per-wrap decomposition is `ops_gap = -1 + dP`, with
+/// `dP = f1.perms - LFM_HASH` in `{0, -1}` — two separable one-row effects, and
+/// the second one IS the permutations term.
+///
+/// ✓ And the arithmetic rules out the obvious mechanism for that second effect:
+/// a single mis-filled squeeze cannot give Δrows 1 with Δperms 1, because
+/// `ceil(f/8)` is constant across each 4-block on which `ceil(f/4)` is constant.
+/// What fits is a REDISTRIBUTION across two adjacent hashes — F1 hashing eight
+/// felts once where the emitter hashes four twice, which is +1 row and +1 perm
+/// exactly. ? INFERRED selector, 17 of 18 points: the CHAIN COUNT's parity, the
+/// one exception being the block's only publishing epoch. Falsifier: any
+/// even-chain epoch reading `dP` −1, or any odd-chain non-publishing epoch
+/// reading 0.
+///
+/// ⚠ THE DISCRIMINATOR THIS FIXTURE CANNOT PROVIDE is an ODD chain count — all
+/// three of its epochs stack to two — which is also why the value here is not
+/// evidence about the block's.
 ///
 /// ⛔ NAMED, not absorbed. Where it is NOT: every LEG form this composes is
 /// already gated exact against an emitted program — V1g's roots block 33/33 at
@@ -673,19 +709,11 @@ fn f1_fixture_bundle() -> (
 /// preprocessed routes 295/153/453; V1h's spine 18/18, table walk 999/999 and
 /// groups 1458/1458. So the row is in what no leg gate covers: the ASSEMBLY —
 /// the epoch-level alpha ladder, the published set, the arena, and the sponge
-/// ENTRY threaded from leg to leg. The threading is the leading hypothesis by
-/// its signature: a squeeze whose buffered felt count is off by a little moves
-/// `ceil(f/4)` packs by one while leaving `ceil(f/8)` permutations alone, which
-/// is exactly what is observed — `LFM_HASH` matches to the row at every shape.
+/// ENTRY threaded from leg to leg.
 ///
-/// What makes it a CONSTANT of the spine rather than a term: it reads +1 at
-/// every epoch of the fixture bundle, at 25 tables and at 26, and on a SILENT
-/// epoch as well as a PUBLISHING one. A per-table or per-group error could not
-/// hold still across those.
-///
-/// It is 1 row in 514,730–546,933 at fixture scale and 1 in 2.5–3.2 M at the
-/// block's, so it changes no conclusion; it is asserted rather than tolerated so
-/// that a change in any term has to move it.
+/// It is 1 row in 514,730–546,933 here and 1 or 2 in 2.5–3.2 M at the block, so
+/// it changes no conclusion; it is asserted rather than tolerated so that a
+/// change in any term has to move it.
 const SPINE_RESIDUAL: i64 = 1;
 
 /// The nine workload chips, in the census's own order. `LFM_RANGE` and
@@ -948,17 +976,23 @@ fn the_f1_reproduces_the_emitted_epoch_program() {
         println!("{index:>6} {tables:>8} {measured:>12} {ops_gap:>12} {pool_gap:>10}");
     }
 
-    // ⛔ THE CHAIN-SCALING QUESTION, AND THE ANSWER IS THAT THIS FIXTURE CANNOT
-    // ASK IT. At the block, the shape log gives epoch 12 one more chain and six
-    // more rounds than epoch 0 while the run's wrap 12 reads 44,669 FEWER
-    // instructions — either two runs describing different epochs, or a form that
-    // does not scale in the chain count. ★ MEASURED HERE: all three fixture
-    // epochs carry exactly TWO chains, so F1 being exact at all three says
-    // NOTHING about what one more chain costs. The groups term still moves
+    // ⛔ THE CHAIN-SCALING QUESTION, AND THIS FIXTURE STILL CANNOT ASK IT — but
+    // the block instrument has now answered it. ★ MEASURED HERE: all three
+    // fixture epochs carry exactly TWO chains, so F1 being exact at all three
+    // says NOTHING about what one more chain costs. The groups term still moves
     // (325,823 / 299,031 / 314,356) but that is `n_stack`, not the chain count.
-    // ⇒ No shape this laptop can prove discriminates it, and the block
-    // instrument is the only instrument. Printed rather than asserted, because
-    // what it records is a LIMIT of the fixture.
+    //
+    // ✓ RESOLVED ELSEWHERE, and the contradiction that used to stand here is
+    // RETRACTED: it read "the shape log gives epoch 12 one more chain and six
+    // more rounds than epoch 0 while wrap 12 reads 44,669 FEWER instructions".
+    // Both halves came from runs at DIFFERENT table-chunking postures — the
+    // shape walk at the production per-table caps (34 tables), the tree at a
+    // uniform 2^21 (27). At the record posture sh4 gives epoch 12 NINE chains,
+    // the same as epoch 0, and F1 reproduces all fifteen wraps within one row.
+    // There was no scaling defect; there were two postures.
+    //
+    // Printed rather than asserted, because what it records is a LIMIT of the
+    // fixture.
     println!("\n== the chain term, where F1 is exact ==");
     println!(
         "{:>6} {:>7} {:>12} {:>10} {:>13}",
