@@ -220,9 +220,19 @@ fn what_the_slow_grind_launches_actually_execute() {
             );
 
             // The model: every nonce below the hit, plus one stride round for
-            // the threads that were mid-permutation when it landed. Misses
-            // before the hitting block cost their whole block.
-            let ideal = (counts.launches - 1) * block + counts.nonce + stride;
+            // the threads that were mid-permutation when it landed.
+            //
+            // ⛔ IT IS `nonce + stride`, FULL STOP, AND THE MISSED BLOCKS ARE
+            // ALREADY IN IT. The first draft added `(launches − 1) · block` on
+            // top, reasoning that a missed block costs its whole `count`. It
+            // does — but `nonce` is ABSOLUTE, so those nonces are counted once
+            // already and the term double-counted them. The symptom was a
+            // NEGATIVE overrun on exactly the arms where searches miss (scan 1
+            // read −4.17 strides, which is not a quantity that can be negative),
+            // while scan 8 and scan 64 were untouched because at those block
+            // sizes every seed here hits on its first launch.
+            let ideal = counts.nonce + stride;
+            let _ = block;
             let overrun = counts.executed as i128 - ideal as i128;
             ship_ms.push(t_ship);
             cnt_ms.push(t_cnt);
