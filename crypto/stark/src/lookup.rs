@@ -1182,10 +1182,13 @@ where
         // Without `parallel`: sequential over pairs, sequential over rows.
         let interactions = &self.auxiliary_trace_build_data.interactions;
 
-        // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
-        // debug-checks): build the aux columns on device and keep them resident
-        // for the aux LDE (no term-column download). Returns the table
-        // contribution; the host set_aux + CPU accumulate below are skipped.
+        // GPU-resident aux build (Goldilocks + ext3, not debug-checks, and only
+        // while `resident_aux_ok` holds — every caller that reads the aux
+        // columns out of the host trace clears it, disk-spill and
+        // prove-and-retire round 1 among them): build the aux columns on device
+        // and keep them resident for the aux LDE (no term-column download).
+        // Returns the table contribution; the host set_aux + CPU accumulate
+        // below are skipped.
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         if trace.resident_aux_ok()
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(

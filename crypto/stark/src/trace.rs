@@ -35,8 +35,11 @@ where
     /// round-trip. None on the CPU / download path.
     #[cfg(feature = "cuda")]
     pub(crate) aux_resident: Option<math_cuda::logup::ResidentAux>,
-    /// Whether the GPU-resident aux build is allowed (false under disk-spill,
-    /// which needs the aux columns in the host trace to spill them).
+    /// Whether the GPU-resident aux build is allowed. Cleared by any caller
+    /// that will read the aux columns out of the HOST trace, because the
+    /// resident build leaves nothing there: disk-spill, which spills them from
+    /// the host trace, and every prove-and-retire round 1, through
+    /// `IsStarkProver::build_aux_trace_on_host`.
     #[cfg(feature = "cuda")]
     pub(crate) resident_aux_ok: bool,
     /// Trace-domain main columns kept resident on device from the R1 main LDE
@@ -260,13 +263,15 @@ where
         self.aux_resident.as_ref()
     }
 
-    /// Whether the GPU-resident aux build is allowed (false under disk-spill).
+    /// Whether the GPU-resident aux build is allowed (cleared whenever the
+    /// caller will read the aux columns out of the host trace).
     #[cfg(feature = "cuda")]
     pub fn resident_aux_ok(&self) -> bool {
         self.resident_aux_ok
     }
 
-    /// Disable the GPU-resident aux build (host trace needed, e.g. disk-spill).
+    /// Disable the GPU-resident aux build, for a caller that reads the aux
+    /// columns out of the host trace: disk-spill, and prove-and-retire round 1.
     #[cfg(feature = "cuda")]
     pub fn set_resident_aux_ok(&mut self, ok: bool) {
         self.resident_aux_ok = ok;
