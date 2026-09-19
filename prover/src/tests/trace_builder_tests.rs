@@ -1259,6 +1259,88 @@ fn build_chunk_matches_the_full_table_build() {
     }
 }
 
+/// `num_chunks` must agree with `build_table` on an EMPTY table, both ways.
+///
+/// The two read the same `always_present` predicate for opposite consumers:
+/// `build_table` produces the tables, `num_chunks` sizes the placeholder
+/// layout the prove-and-retire path commits against before any trace exists.
+/// A disagreement leaves the layout holding a slot the build never fills, and
+/// every chunked table after it is proved under a neighbour's AIR index —
+/// which no later check catches, because each table is individually valid.
+///
+/// ⚠ THE DISAGREEMENT CAN ONLY EXIST WHEN A KIND HAS NO OPS. With ops, both
+/// sides take the same `div_ceil` branch and cannot differ, so a fixture that
+/// exercises every kind proves nothing here: the case lives at zero. That is
+/// why this builds from an empty `CollectedOps` and asserts BOTH sides of the
+/// predicate — the elided kinds at zero, and the always-present ones at their
+/// one padded chunk, so the rule reads as elision and not as a blanket zero.
+#[test]
+fn num_chunks_agrees_with_build_table_on_an_empty_kind() {
+    use crate::tables::trace_builder::{CollectedOps, TableKind};
+
+    let empty = CollectedOps::default();
+    let max_rows = crate::tables::MaxRowsConfig::default();
+    let built = |kind: TableKind| {
+        empty
+            .build_table(
+                kind,
+                &max_rows,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            )
+            .expect("build")
+            .len()
+    };
+
+    for kind in [
+        TableKind::Memw,
+        TableKind::MemwAligned,
+        TableKind::Load,
+        TableKind::Lt,
+        TableKind::Shift,
+        TableKind::Mul,
+        TableKind::Dvrm,
+        TableKind::Branch,
+        TableKind::Eq,
+        TableKind::Bytewise,
+        TableKind::Store,
+        TableKind::Cpu32,
+    ] {
+        assert!(
+            !kind.always_present(),
+            "{kind:?} is listed here as elidable but calls itself always present"
+        );
+        assert_eq!(
+            built(kind),
+            0,
+            "{kind:?}: an empty optional table must build no chunks at all"
+        );
+        assert_eq!(
+            empty.num_chunks(kind, &max_rows),
+            built(kind),
+            "{kind:?}: num_chunks disagrees with build_table on an EMPTY optional table — \
+             the placeholder layout would hold a chunk the build never produces"
+        );
+    }
+
+    for kind in [TableKind::Cpu, TableKind::MemwRegister] {
+        assert!(
+            kind.always_present(),
+            "{kind:?} is listed here as always present but calls itself elidable"
+        );
+        assert_eq!(
+            built(kind),
+            1,
+            "{kind:?}: an always-present table must still build its one padded chunk"
+        );
+        assert_eq!(
+            empty.num_chunks(kind, &max_rows),
+            built(kind),
+            "{kind:?}: num_chunks disagrees with build_table on an empty always-present table"
+        );
+    }
+}
+
 /// `chunk_shape` must agree with the chunk it declines to build, for every kind.
 ///
 /// It reads the shape off op counts and a constant width instead of generating
