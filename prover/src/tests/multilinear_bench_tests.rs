@@ -382,6 +382,31 @@ mod transcript_pin {
     pub const ELF_LEN: usize = 3_948_504;
     pub const EPOCH_LOG2: u32 = 21;
 
+    /// ★★★ THE UNIFORM TABLE CAP these counts were measured at, and it is part
+    /// of the pin's IDENTITY rather than a footnote.
+    ///
+    /// ⛔ THE DEFECT THIS EXISTS AGAINST, measured: run lb11 proved the pinned
+    /// guest at the pinned epoch size and failed with `the PROVE-side
+    /// transcript counts moved — left: (407292, 149121, 3411) right: (585245,
+    /// 186256, 3251)`. Nothing was wrong with either side. The constants had
+    /// been measured with `LAMBDA_VM_MAX_ROWS_LOG2` UNSET — the production
+    /// per-table caps, which chunk CPU into four, MEMW_R into five and LT into
+    /// two, so an epoch carries 34 tables — and lb11 ran at the record posture,
+    /// a uniform `2^21`, where the same block's epoch carries **27**. Same
+    /// guest, same epoch size, different epochs; and [`super::pin_applies`]
+    /// could not tell, so a run at a posture nobody pinned was "the pinned
+    /// configuration" by the pin's own identity.
+    ///
+    /// The states column is where it is legible without any of this context:
+    /// 3,251 is the cap-less grind count and 3,411 the record posture's, and
+    /// the grind count is one state read per check.
+    ///
+    /// ⇒ The RECORD posture is the pinned one. A run at any other cap — the
+    /// production values included — SKIPS and says so, naming both caps. It
+    /// never passes and it never panics: another posture is not a defect, it is
+    /// a different measurement.
+    pub const MAX_ROWS_LOG2: u32 = 21;
+
     /// Epoch proofs in the pinned run. Part of the measured shape, like the ELF
     /// and the epoch size: 2^21 epochs over this guest is fifteen of them, which
     /// is also where `OWED`'s thirty squeezes come from (two per epoch call).
@@ -405,30 +430,51 @@ mod transcript_pin {
     /// branch while claiming to describe the protocol. The bases below are
     /// branch-independent; the branch supplies its own kind count.
     ///
-    /// ⚠ PROVENANCE, and one half of it is a PREDICTION. The box measured
-    /// `583_924 / 584_061` at `c73568f4` (run a2q, both hashes, against the
-    /// `8f826601` fixture). The computed statement padding adds exactly one
-    /// absorb per statement — fifteen epoch statements and one cross-epoch
-    /// statement, sixteen — giving `583_940 / 584_077`, from which
-    /// `EPOCHS * 14 = 210` is subtracted here. The `+16` has not been measured
-    /// yet; these constants are what will say so if it is wrong.
+    /// ⛔ AND THE BASE IS POSTURE-SPECIFIC, which the paragraph above does NOT
+    /// cover. "Branch-independent" is true across TABLE-KIND branches and false
+    /// across table-CHUNKING postures: the base counts the per-table walk and
+    /// the chains of every epoch, and how many of each an epoch has is what
+    /// [`MAX_ROWS_LOG2`] decides. The cap-less pair was `583_730 / 583_867`;
+    /// the record posture's is below, and the two are 177,953 apart on the
+    /// prove line. Neither is wrong — they are two postures, and the identity
+    /// now carries which.
     ///
-    /// ⚠ A SECOND PREDICTION rides on top, and it is NOT symmetric between the
-    /// two sides. W1-B's out-of-band opening puts DECODE's derived root into
-    /// each epoch's roots block: the prover absorbs it once per epoch, the
-    /// verifier twice (`multi_verify` and the `owed` replay). So at fourteen
-    /// kinds this lineage predicts prove `583_730 + 210 + 15 = 583_955` and
-    /// verify `583_867 + 210 + 30 = 584_107`.
+    /// MEASURED: run lb11 at `whir/lfm-l0-main-sync` @ `892c7d1bc` on FAST
+    /// (`--features cuda,hash-metrics`, `LAMBDA_VM_WHIR_HASH=rpx`, the budget
+    /// to the driver's query, never-purge, guest `8f826601…ec80a` 3,948,504 B,
+    /// input `573004e6…f17f` 1,110,183 B, `LAMBDA_VM_MAX_ROWS_LOG2=21`), which
+    /// read PROVE `(407292, 149121, 3411)` and VERIFY `(407452, 149151, 3411)`.
+    /// The base is that total less the terms this module derives —
+    /// [`table_count_absorbs`] at 15 x 21 = 315, the derived root's 15 (prove)
+    /// or 30 (verify), and `15 x 79` for the prepared opening — so a branch
+    /// that changes a derived term still moves the totals without anyone
+    /// editing a literal. It carries NO genesis-stack term: lb11's guest had
+    /// none, and the stack's own cost is [`genesis_stack_terms`].
     ///
-    /// ★ The prove line coincides with the pair `whir/lfm` shows at FIFTEEN
-    /// table kinds (`583_730 + 225`), and for a different reason — one branch's
-    /// extra table count against another's extra root. The verify lines do NOT
-    /// coincide, because the replay absorbs the root a second time and a table
-    /// count is absorbed once. Reading one as evidence for the other would be
-    /// reading a coincidence.
-    pub const PROVE_BASE_ABSORBS: u64 = 583_730;
+    /// ★★ AND THAT IS WHY CARRYING THESE ONTO THIS BRANCH IS A VERIFIED MOVE
+    /// RATHER THAN A NEW LITERAL. Composed with the terms this module derives
+    /// AND with the genesis stack's, they reproduce runs lb17/lb18 — the
+    /// measurement taken at this lineage's own tip — on all six numbers and
+    /// with no residue:
+    ///
+    /// ```text
+    /// prove   absorbs  405_777 + 315 + 15 + 15x79 + 77 = 407_369   measured 407_369
+    /// prove   squeezes 146_091 + 15x202 + 200          = 149_321   measured 149_321
+    /// states  3_156 + 15x17 + 17                       =   3_428   measured   3_428
+    /// verify  absorbs  405_922 + 315 + 30 + 15x79 + 77 = 407_529   measured 407_529
+    /// verify  squeezes 146_121 + 15x202 + 200          = 149_351   measured 149_351
+    /// ```
+    ///
+    /// A carried constant that did not compose would be a number answering a
+    /// retired question; these are the only values of the base for which the
+    /// derived terms land on the measurement.
+    ///
+    /// ⛔ WHAT IS NOT DERIVED, said plainly: the base itself. Deriving it needs
+    /// the whole per-table walk's transcript cost at this posture, which no
+    /// form in this tree computes.
+    pub const PROVE_BASE_ABSORBS: u64 = 405_777;
     /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
-    pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
+    pub const VERIFY_BASE_ABSORBS: u64 = 405_922;
 
     /// Absorbs the per-table counts contribute to a whole continuation proof.
     pub const fn table_count_absorbs() -> u64 {
@@ -525,6 +571,126 @@ mod transcript_pin {
         )
     }
 
+    /// The DENSE-GENESIS STACK's shape, as the run's own plan states it.
+    ///
+    /// ⚠ NOT A THRESHOLD, AND THIS TYPE CARRIES NO OPINION ABOUT ONE. Which
+    /// pages are dense enough to be stacked is decided in exactly one place,
+    /// `continuation::genesis_stack_plan`, and it is READ from there through
+    /// the verifier's own `global_airs_for(..).genesis_stack()`. A second
+    /// spelling of the rule here would be a pin describing a stack the prover
+    /// does not build — which is the whole failure mode this module exists
+    /// against, one level up.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StackShape {
+        /// Stacked columns: `GenesisStackPlan::at`'s length, which is
+        /// `PAGE_PREPROCESSED_COLUMNS` — `OFFSET` and `INIT` — per dense page.
+        pub columns: usize,
+        /// Each column's height in variables. Every genesis page is one page
+        /// tall, so the stack is a rectangle and this is `PAGE_NUM_VARS`.
+        pub num_vars: usize,
+    }
+
+    /// ★★ WHAT THE GENESIS STACK COSTS THE WHOLE RUN'S TRANSCRIPT — `(0, 0, 0)`
+    /// when the run has no dense page, derived from the stack's SHAPE otherwise.
+    ///
+    /// ⛔ THE CONTROL THIS ANSWERS, measured: runs lb17 and lb18 read
+    /// `+77 absorbs / +200 squeezes / +17 states on BOTH sides` and `+1 device
+    /// commit` against the pinned pair, at two different tips with identical
+    /// numbers. The pin's constants were taken before W1i put the stacked INIT
+    /// polynomial of the dense genesis pages into the cross-epoch statement;
+    /// what follows is those four numbers reached from the code, so the next
+    /// shape change moves them on its own.
+    ///
+    /// ★ ONCE FOR THE RUN, NOT ONCE PER EPOCH. The stack belongs to the
+    /// CROSS-EPOCH proof — `prove_global` commits it and hands it to
+    /// `multi_prove` as that proof's prepared opening — so unlike
+    /// [`prepared_opening_per_epoch`] this term is not multiplied by
+    /// [`EPOCHS`].
+    ///
+    /// ★ AND THE SAME ON BOTH SIDES, which is why it is not part of [`OWED`].
+    /// DECODE's derived root costs the verifier twice because the EPOCH path
+    /// replays the roots block in `multilinear_continuation::owed`; the
+    /// cross-epoch path has no replay, so the stack's root is absorbed exactly
+    /// once on each side and the whole opening is run by both. A term that
+    /// moved one line and not the other would show up in
+    /// `the_pinned_constants_differ_by_owed` and nowhere else.
+    ///
+    /// The terms, each against the site that pays it:
+    ///
+    /// * the stack's roots in the cross-epoch roots block — one per stacked
+    ///   polynomial, absorbed by `multilinear_table::absorb_roots` from the
+    ///   `prepared_roots` list `multi_prove` builds;
+    /// * one claimed value per stacked column, absorbed by
+    ///   `stacked_eval::prove`, then ONE batching challenge drawn — the same
+    ///   two terms [`prepared_opening_per_epoch`] opens with;
+    /// * then `layout.num_polys()` chains through `whir_chain`, at
+    ///   `config.schedule(layout.n_stack())`, priced exactly as the prepared
+    ///   opening's chains are and for the same reasons — see that function's
+    ///   round-by-round reading, which is the one this shares.
+    ///
+    /// ⚠ The roots block's own three challenges (`z`, `alpha`, `beta`) are
+    /// drawn ONCE per proof however many roots were absorbed, so the stack adds
+    /// to the absorb column there and nothing to the squeeze column. A term
+    /// added to both would be an extra squeeze this pin would then be unable to
+    /// see.
+    pub fn genesis_stack_terms(
+        shape: Option<StackShape>,
+        config: &multilinear::whir_chain::ChainConfig,
+    ) -> (u64, u64, u64) {
+        let Some(shape) = shape else {
+            return (0, 0, 0);
+        };
+        let layout = genesis_stack_layout(shape);
+        let schedule = config.schedule(layout.n_stack());
+
+        let rounds = schedule.len() as u64;
+        let folded: u64 = schedule.iter().sum::<usize>() as u64;
+        let queries = config.num_queries as u64;
+        let per_round_query_squeezes = queries.div_ceil(CANDIDATES_PER_SQUEEZE);
+
+        let grinds = 3 * rounds - 1;
+        let chain_absorbs = grinds + 2 * folded + 2 * (rounds - 1) + 1;
+        let chain_squeezes = folded + 2 * (rounds - 1) + rounds * per_round_query_squeezes;
+
+        let polys = layout.num_polys() as u64;
+        (
+            polys + layout.placements().len() as u64 + polys * chain_absorbs,
+            1 + polys * chain_squeezes,
+            polys * grinds,
+        )
+    }
+
+    /// The layout the genesis stack is committed under — from the same
+    /// `global_layout` call `genesis_prepared_for` makes, over the same
+    /// rectangle, so this cannot describe a stack the prover does not build.
+    pub fn genesis_stack_layout(shape: StackShape) -> multilinear::stacking::StackedLayout {
+        stark::multilinear_table::global_layout(&[(shape.columns, shape.num_vars)])
+            .expect("the genesis stack's layout")
+    }
+
+    /// Device commits the genesis stack costs the whole run: its held
+    /// commitment, plus the chain's successor codewords.
+    ///
+    /// ⚠ ONE TERM MORE THAN [`prepared_fold_commits_per_epoch`] BECAUSE THE
+    /// HELD HALF IS NOT SHARED. DECODE's commitment is a function of the ELF
+    /// and is built once and reused by all fifteen epochs, so `commits`
+    /// counts it once for the run. The stack's is built once per `prove_global`
+    /// CALL and belongs to that one proof — and counting held commitments with
+    /// a `find_map` over the proof list, which stops at the first proof that
+    /// has one, is exactly how the stack's went uncounted and the model read
+    /// 1,187 against a counter of 1,188.
+    pub fn genesis_stack_commits(
+        shape: Option<StackShape>,
+        config: &multilinear::whir_chain::ChainConfig,
+    ) -> u64 {
+        let Some(shape) = shape else {
+            return 0;
+        };
+        let layout = genesis_stack_layout(shape);
+        let rounds = config.schedule(layout.n_stack()).len() as u64;
+        layout.num_polys() as u64 * rounds
+    }
+
     /// Device commits one prepared opening costs per epoch: the chain's
     /// successor codewords, `R - 1` of them per stacked polynomial.
     pub fn prepared_fold_commits_per_epoch(shape: (usize, usize)) -> u64 {
@@ -572,29 +738,64 @@ mod transcript_pin {
         2 * EPOCHS * DERIVED_ROOTS_PER_EPOCH
     }
 
-    /// The squeezes and states a continuation cost BEFORE the prepared opening
-    /// was wired: run a2q's measurement at `c73568f4`, carried unchanged.
+    /// The squeezes and states a continuation cost before the prepared opening
+    /// and the genesis stack, at the RECORD posture — run lb11's measurement,
+    /// the same one [`PROVE_BASE_ABSORBS`] comes from and at the same cap.
     ///
     /// The two sides differ by `owed`'s thirty squeezes and by nothing else, and
     /// neither side reads a transcript state outside a grind check, which is why
     /// the state base is one number for both.
-    pub const PROVE_BASE_SQUEEZES: u64 = 183_226;
+    ///
+    /// ⚠ POSTURE-SPECIFIC, like the absorb base. The cap-less pair was
+    /// `183_226 / 183_256` with `2_996` states; a run at the production caps
+    /// SKIPS rather than comparing against these.
+    pub const PROVE_BASE_SQUEEZES: u64 = 146_091;
     /// See [`PROVE_BASE_SQUEEZES`].
-    pub const VERIFY_BASE_SQUEEZES: u64 = 183_256;
+    pub const VERIFY_BASE_SQUEEZES: u64 = 146_121;
     /// See [`PROVE_BASE_SQUEEZES`]. One state read per grind check, both sides.
-    pub const BASE_STATES: u64 = 2_996;
+    pub const BASE_STATES: u64 = 3_156;
+
+    /// The genesis stack as a run states it: its shape and the chain config the
+    /// cross-epoch proof argues at, or `None` for a run with no dense page.
+    ///
+    /// ⚠ CARRIED AS ONE VALUE because the two halves have to come from the same
+    /// derivation. The shape decides `n_stack` and the config decides the
+    /// schedule that `n_stack` is folded by; taking them from two places is how
+    /// a count comes to describe a stack at one posture folded at another.
+    #[derive(Clone, Debug)]
+    pub struct Stack {
+        pub shape: Option<StackShape>,
+        pub config: multilinear::whir_chain::ChainConfig,
+    }
+
+    impl Stack {
+        pub fn terms(&self) -> (u64, u64, u64) {
+            genesis_stack_terms(self.shape, &self.config)
+        }
+    }
 
     /// (absorbs, squeezes, states) after `prove_continuation`.
     ///
     /// ⚠ A FUNCTION, not a constant, because the opening's terms come out of
     /// `schedule()` and that allocates. The shape it is evaluated at is asserted
     /// against the ELF before any comparison is made.
-    pub fn prove(shape: (usize, usize)) -> (u64, u64, u64) {
+    ///
+    /// ⚠ AND `stack` IS THE RUN'S, not a constant of this guest. The bases were
+    /// measured by a run whose genesis was entirely sparse, so a `None` here
+    /// reproduces them exactly; the block's three dense pages add
+    /// [`genesis_stack_terms`] on top. Hard-coding the block's stack would make
+    /// this pin unable to describe the very run its bases came from.
+    pub fn prove(shape: (usize, usize), stack: &Stack) -> (u64, u64, u64) {
         let (a, s, t) = prepared_opening_per_epoch(shape);
+        let (ga, gs, gt) = stack.terms();
         (
-            PROVE_BASE_ABSORBS + table_count_absorbs() + prove_derived_root_absorbs() + EPOCHS * a,
-            PROVE_BASE_SQUEEZES + EPOCHS * s,
-            BASE_STATES + EPOCHS * t,
+            PROVE_BASE_ABSORBS
+                + table_count_absorbs()
+                + prove_derived_root_absorbs()
+                + EPOCHS * a
+                + ga,
+            PROVE_BASE_SQUEEZES + EPOCHS * s + gs,
+            BASE_STATES + EPOCHS * t + gt,
         )
     }
 
@@ -605,15 +806,22 @@ mod transcript_pin {
     /// So the new term moves both lines by the same amount and
     /// `the_pinned_constants_differ_by_owed` stays a live check rather than one
     /// the new term could have absorbed.
-    pub fn verify(shape: (usize, usize)) -> (u64, u64, u64) {
+    ///
+    /// ★ The genesis stack's term is the same on both sides for a SECOND
+    /// reason, and the two must not be conflated: `owed` is the EPOCH path's
+    /// replay, and the stack lives in the cross-epoch proof, which has no
+    /// replay at all.
+    pub fn verify(shape: (usize, usize), stack: &Stack) -> (u64, u64, u64) {
         let (a, s, t) = prepared_opening_per_epoch(shape);
+        let (ga, gs, gt) = stack.terms();
         (
             VERIFY_BASE_ABSORBS
                 + table_count_absorbs()
                 + verify_derived_root_absorbs()
-                + EPOCHS * a,
-            VERIFY_BASE_SQUEEZES + EPOCHS * s,
-            BASE_STATES + EPOCHS * t,
+                + EPOCHS * a
+                + ga,
+            VERIFY_BASE_SQUEEZES + EPOCHS * s + gs,
+            BASE_STATES + EPOCHS * t + gt,
         )
     }
 
@@ -632,6 +840,19 @@ mod transcript_pin {
     /// `rounds.len() - 1` folds per epoch plus a single commitment — the
     /// residency claim, arriving here as arithmetic.
     ///
+    /// ⛔ AND THE GENESIS STACK IS A SECOND HELD COMMITMENT WITH A DIFFERENT
+    /// SCOPE, which is the defect this signature exists against. Both openings
+    /// arrive in a `MultiProof::preprocessed`, so a model that walked a flat
+    /// list of proofs counted the stack's FOLDS — they are per opening, and
+    /// there is one opening — while counting its HELD commitment not at all:
+    /// the held term was a `find_map`, which stops at the first proof carrying
+    /// a `preprocessed`, and the epoch proofs come first. Runs lb17 and lb18
+    /// read that as `left: 1188 / right: 1187`, one commit apart, at two tips
+    /// with identical counters. The two scopes are now two arguments and two
+    /// terms: DECODE's commitment is a function of the ELF and is held across
+    /// every epoch; the stack's is built once per `prove_global` call and
+    /// belongs to that one proof. Neither can be inferred from slice order.
+    ///
     /// ⚠ AND THE ASSUMPTION THIS CARRIES, because it is shape-dependent and
     /// silent. The counter counts DEVICE commits, and a polynomial too small for
     /// the device is committed on the host, where a FOLD commit is counted
@@ -648,37 +869,90 @@ mod transcript_pin {
     /// prepared group's folds per epoch and its single held commitment — and
     /// what runs only on the box is the summation over the bundle's chains.
     #[cfg(feature = "cuda")]
-    pub fn commits(
-        proofs: &[&stark::multilinear_table::MultiProof<
-            crate::test_utils::F,
-            crate::test_utils::E,
-        >],
-    ) -> u64 {
-        let rounds: u64 = proofs
+    pub type Proof =
+        stark::multilinear_table::MultiProof<crate::test_utils::F, crate::test_utils::E>;
+
+    /// One commit per chain round, over a proof's own commitment groups.
+    #[cfg(feature = "cuda")]
+    fn chain_commits(proof: &Proof) -> u64 {
+        proof
+            .columns
             .iter()
-            .flat_map(|p| &p.columns)
             .flat_map(|group| &group.polys)
             .map(|poly| poly.rounds.len() as u64)
-            .sum();
-        let prepared_folds: u64 = proofs
-            .iter()
-            .flat_map(|p| p.preprocessed.iter())
-            .flat_map(|opening| &opening.polys)
-            .map(|poly| poly.rounds.len() as u64 - 1)
-            .sum();
-        // The held commitment: one per stacked polynomial of the prepared
-        // group, counted ONCE for the run however many epochs open it.
-        let held: u64 = proofs
-            .iter()
-            .find_map(|p| p.preprocessed.as_ref())
-            .map(|opening| opening.polys.len() as u64)
-            .unwrap_or(0);
-        rounds + prepared_folds + held
+            .sum()
     }
 
-    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: 137, which is
-    /// `Sum roots.len()` over the 15 epoch calls, measured.
-    pub const OWED_CARRIED_ABSORBS: u64 = 137;
+    /// The successor codewords one prepared opening commits: `R - 1` per
+    /// stacked polynomial. The initial commitment is NOT here — it is held, and
+    /// who holds it is the caller's to say.
+    #[cfg(feature = "cuda")]
+    fn prepared_fold_commits(proof: &Proof) -> u64 {
+        proof
+            .preprocessed
+            .iter()
+            .flat_map(|opening| &opening.polys)
+            .map(|poly| poly.rounds.len() as u64 - 1)
+            .sum()
+    }
+
+    /// The held commitment a proof's prepared opening was made against: one per
+    /// stacked polynomial.
+    #[cfg(feature = "cuda")]
+    fn held_commits(proof: &Proof) -> u64 {
+        proof
+            .preprocessed
+            .as_ref()
+            .map(|opening| opening.polys.len() as u64)
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn commits(epochs: &[&Proof], global: &Proof) -> u64 {
+        let chains: u64 =
+            epochs.iter().copied().map(chain_commits).sum::<u64>() + chain_commits(global);
+        let folds: u64 = epochs
+            .iter()
+            .copied()
+            .map(prepared_fold_commits)
+            .sum::<u64>()
+            + prepared_fold_commits(global);
+        // DECODE's commitment is a function of the ELF: built once and held,
+        // however many epochs open it. Taken from the first epoch that carries
+        // one, because that is the one commitment all of them share.
+        let decode_held: u64 = epochs
+            .iter()
+            .copied()
+            .find(|p| p.preprocessed.is_some())
+            .map(held_commits)
+            .unwrap_or(0);
+        // The genesis stack's commitment is built once per `prove_global` call
+        // and is this proof's alone, so it is counted here and not folded into
+        // the term above.
+        let stack_held = held_commits(global);
+        chains + folds + decode_held + stack_held
+    }
+
+    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: `Sum
+    /// roots.len()` over the 15 epoch calls.
+    ///
+    /// ⚠ POSTURE-SPECIFIC, like the bases. An epoch's carried roots are one per
+    /// stacked polynomial of every commitment group — which is exactly its
+    /// CHAIN count — so this is `Sum chains(epoch)` over the block's fifteen
+    /// epochs and nothing else, and how many chains an epoch has is what
+    /// [`MAX_ROWS_LOG2`] decides. At the record posture the fifteen epochs give
+    /// 9, 9, 9, 12, 12, 11, 10, 9, 9, 9, 9, 9, 9, 10, 9, which sums to **145**;
+    /// at the cap-less posture it was 137.
+    ///
+    /// ★ AND IT IS CHECKED AGAINST THE RUN'S OWN PROOF rather than left as a
+    /// literal: [`super::check_transcript_pins`] sums `roots.len()` over the
+    /// bundle's fifteen epoch proofs and asserts it equals this. That is the
+    /// same quantity from the object the measurement came out of, so a posture
+    /// change reddens here by name instead of arriving as "the counts moved".
+    ///
+    /// ⚠ The genesis stack adds NOTHING to this. `owed` is the epoch path's
+    /// replay and the stack lives in the cross-epoch proof, which has none.
+    pub const OWED_CARRIED_ABSORBS: u64 = 145;
 
     /// `owed`'s own cost, stated rather than left as a subtraction: the carried
     /// roots plus DECODE's derived one, `2 x 15` squeezes, and no state read.
@@ -701,10 +975,26 @@ mod transcript_pin {
 /// forging an ELF: a sha that agrees on a prefix and differs in the tail is one
 /// `format!` away, which is the case that actually occurred.
 #[cfg(feature = "hash-metrics")]
-fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
+fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32, max_rows_log2: Option<u32>) -> bool {
     sha == transcript_pin::ELF_SHA256
         && len == transcript_pin::ELF_LEN
         && epoch_size_log2 == transcript_pin::EPOCH_LOG2
+        && max_rows_log2 == Some(transcript_pin::MAX_ROWS_LOG2)
+}
+
+/// How the pinned cap and a run's cap are SHOWN — a cap-less run has to be
+/// legible as such.
+///
+/// `None` prints as the production caps rather than as an empty field, because
+/// "unset" is not the absence of a posture: it selects the per-table values,
+/// which is the posture the old constants were measured at and the one that
+/// made this pin fail while looking like it applied.
+#[cfg(feature = "hash-metrics")]
+fn cap_label(max_rows_log2: Option<u32>) -> String {
+    match max_rows_log2 {
+        Some(n) => format!("uniform 2^{n}"),
+        None => "UNSET (the production per-table caps)".to_string(),
+    }
 }
 
 /// The line a skipped pin prints.
@@ -715,18 +1005,145 @@ fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
 /// its own output. A diagnostic that can agree while the values differ is not a
 /// diagnostic.
 #[cfg(feature = "hash-metrics")]
-fn pin_skip_line(sha: &str, len: usize, epoch_size_log2: u32) -> String {
+fn pin_skip_line(
+    sha: &str,
+    len: usize,
+    epoch_size_log2: u32,
+    max_rows_log2: Option<u32>,
+) -> String {
     format!(
-        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}); \
-         pinned {} ({} bytes, epoch 2^{})",
+        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}, table cap {}); \
+         pinned {} ({} bytes, epoch 2^{}, table cap {})",
         "WHIR",
         sha,
         len,
         epoch_size_log2,
+        cap_label(max_rows_log2),
         transcript_pin::ELF_SHA256,
         transcript_pin::ELF_LEN,
         transcript_pin::EPOCH_LOG2,
+        cap_label(Some(transcript_pin::MAX_ROWS_LOG2)),
     )
+}
+
+/// What a pinned RUN states about itself, beyond the ELF — the facts the
+/// derived terms are evaluated at.
+///
+/// ⚠ AN `Option` AT THE CALL, AND THE `None` IS NOT A DEFAULT. The guard half
+/// of the pin has to be reachable without a proof (see
+/// [`the_transcript_pin_skips_a_guest_it_does_not_recognise`]), and the
+/// assertion half cannot run without one. So a `None` that gets PAST the guard
+/// panics rather than substituting zeros: a stack term silently taken as zero
+/// on a run that has a stack is the exact shape of a pin that passes while
+/// describing something else.
+///
+/// ⚠ OWNED, NOT BORROWED FROM THE BUNDLE, and the reason is where the pins are
+/// called from: after the results table, so a red pin costs nothing that was
+/// measured — by which point the bundle has been dropped. Every field is read
+/// off the proof inside the measured arm and carried out as a number.
+#[cfg(feature = "hash-metrics")]
+struct RunFacts {
+    /// Epoch proofs the run produced. Three pinned terms are multiplied by it.
+    epochs: u64,
+    /// `Sum roots.len()` over those epoch proofs — one root per chain, which is
+    /// `owed`'s carried half.
+    carried_roots: u64,
+    /// The cross-epoch proof's prepared opening, as the PROOF states it: one
+    /// entry per stacked polynomial. Empty when the proof carries none.
+    stack_chains: Vec<StackChain>,
+    stack: transcript_pin::Stack,
+}
+
+/// One chain of the cross-epoch prepared opening, as the proof states it.
+#[cfg(feature = "hash-metrics")]
+struct StackChain {
+    /// Variables folded in each round — `sumcheck.len()` per round, which is
+    /// the schedule the chain actually ran.
+    folds: Vec<usize>,
+    /// Positions opened per round, from the first round's block.
+    queries: usize,
+}
+
+/// The cross-epoch proof's chain config and genesis-stack plan, DERIVED THE WAY
+/// THE VERIFIER DERIVES THEM.
+///
+/// ⛔ THROUGH `global_airs_for`, AND THAT IS THE POINT. The threshold that
+/// decides which genesis pages are stacked lives in `genesis_stack_plan`, and
+/// the AIR set is the one object that knows the bookend offset its
+/// `PreparedColumn` indices are relative to. Reaching either of them another
+/// way here — re-calling `global_memory_configs`, or re-evaluating the density
+/// rule — would be a second derivation of the very thing the pin claims to
+/// describe, which is what that function's own doc refuses. The page configs
+/// come from the ELF and the public shape comes from the bundle, exactly as
+/// `verify_global_bookends` takes them.
+#[cfg(feature = "hash-metrics")]
+fn global_stack(
+    elf_bytes: &[u8],
+    bundle: &crate::multilinear_continuation::ContinuationProof,
+    opts: &crate::ProofOptions,
+) -> transcript_pin::Stack {
+    let elf = Elf::load(elf_bytes).expect("the proven guest loads");
+    let air_set = crate::multilinear_continuation::global_airs_for(
+        &elf,
+        opts,
+        bundle.num_epochs(),
+        &bundle.touched_page_bases,
+        bundle.num_private_input_pages,
+    );
+    // The same two lines `verify_global_bookends` builds its config from: each
+    // AIR's main width, and the height the proof states.
+    let shapes: Vec<(usize, usize)> = air_set
+        .refs()
+        .iter()
+        .zip(&bundle.global.table_num_vars)
+        .map(|(air, &num_vars)| (air.trace_layout().0, num_vars as usize))
+        .collect();
+    let config = crate::multilinear_prove::chain_config(&shapes);
+    let plan = air_set.genesis_stack();
+    let shape = (!plan.is_empty()).then_some(transcript_pin::StackShape {
+        // Two preprocessed columns per dense page, which is what `at` holds.
+        columns: plan.at.len(),
+        // Every genesis page is one page tall, so the stack is a rectangle.
+        num_vars: crate::continuation::PAGE_NUM_VARS,
+    });
+    transcript_pin::Stack { shape, config }
+}
+
+/// Everything about a run the pins are evaluated at, read off its bundle.
+#[cfg(feature = "hash-metrics")]
+fn run_facts(
+    elf_bytes: &[u8],
+    bundle: &crate::multilinear_continuation::ContinuationProof,
+    opts: &crate::ProofOptions,
+) -> RunFacts {
+    let stack_chains = bundle
+        .global
+        .proof
+        .preprocessed
+        .iter()
+        .flat_map(|opening| &opening.polys)
+        .map(|poly| StackChain {
+            folds: poly.rounds.iter().map(|r| r.sumcheck.len()).collect(),
+            queries: poly
+                .rounds
+                .first()
+                .map(|r| match &r.openings {
+                    multilinear::whir_chain::RoundOpenings::Base(p) => p.current.len(),
+                    multilinear::whir_chain::RoundOpenings::Extension(p) => p.current.len(),
+                })
+                .expect("a chain has at least one round"),
+        })
+        .collect();
+    RunFacts {
+        epochs: bundle.num_epochs() as u64,
+        carried_roots: bundle
+            .epochs
+            .iter()
+            .map(|e| e.proof.roots.len() as u64)
+            .sum(),
+        stack_chains,
+        stack: global_stack(elf_bytes, bundle, opts),
+    }
 }
 
 /// Asserts the pinned pair, or says out loud why it did not.
@@ -734,6 +1151,7 @@ fn pin_skip_line(sha: &str, len: usize, epoch_size_log2: u32) -> String {
 fn check_transcript_pins(
     elf: &[u8],
     epoch_size_log2: u32,
+    run: Option<&RunFacts>,
     prove: &crypto::hash_metrics::Counts,
     verify: &crypto::hash_metrics::Counts,
 ) {
@@ -743,13 +1161,66 @@ fn check_transcript_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+    // ⚠ THE SAME READER THE PROVER USES, not a second parse of the same
+    // variable: `MaxRowsConfig::default` is what chunked the epochs whose
+    // transcript this is, and it reaches the posture through this function.
+    let max_rows_log2 = crate::tables::max_rows_log2_override();
+    if !pin_applies(&sha, elf.len(), epoch_size_log2, max_rows_log2) {
         // Never silent. A skipped assert that prints nothing is
         // indistinguishable from one that passed, which is the failure this
         // whole pin exists against.
-        println!("{}", pin_skip_line(&sha, elf.len(), epoch_size_log2));
+        println!(
+            "{}",
+            pin_skip_line(&sha, elf.len(), epoch_size_log2, max_rows_log2)
+        );
         return;
     }
+
+    // ⚠ PAST THE GUARD WITH NO PROOF IS A DEFECT, NOT A DEGENERATE CASE. See
+    // [`RunFacts`]: substituting zeros here would make the stack term vanish on
+    // a run that has a stack, and the pin would then pass by describing a
+    // different run.
+    let run = run.expect(
+        "the transcript pin applies to this run, but the bundle its derived \
+         terms are evaluated at was not supplied",
+    );
+    let stack = &run.stack;
+
+    // ★ THE EPOCH COUNT IS THE RUN'S, and the pin multiplies three terms by it.
+    // Asserted rather than assumed, because a guest that produced fourteen
+    // epochs would otherwise move every derived term at once and arrive as "the
+    // counts moved".
+    assert_eq!(
+        run.epochs,
+        transcript_pin::EPOCHS,
+        "the pinned guest proved {} epochs at 2^{epoch_size_log2}; the pin was \
+         derived at {}",
+        run.epochs,
+        transcript_pin::EPOCHS,
+    );
+
+    // ★★ `owed`'s CARRIED HALF, AGAINST THE RUN'S OWN PROOF. An epoch's carried
+    // roots are one per stacked polynomial of every commitment group, and that
+    // list is `EpochProof::proof.roots`. Summing it is the same quantity the
+    // constant states, taken from the object the measurement came out of — so a
+    // posture that moved the chain count reddens by this name instead of as an
+    // unexplained delta on both pinned lines.
+    assert_eq!(
+        run.carried_roots,
+        transcript_pin::OWED_CARRIED_ABSORBS,
+        "the bundle's epochs carry {} roots between them - one per chain - and \
+         `owed`'s carried half is pinned at {}; the chain count moved, which is \
+         the table-chunking posture moving",
+        run.carried_roots,
+        transcript_pin::OWED_CARRIED_ABSORBS,
+    );
+
+    // ★★ AND THE GENESIS STACK THE TERMS WERE DERIVED AT IS THE ONE THE PROOF
+    // CARRIES. `stack` comes from the verifier's own plan; this says the
+    // cross-epoch proof actually contains the opening that plan implies, and
+    // with the round structure the terms were priced at. Without it the stack
+    // term would be a statement about a plan rather than about this run.
+    assert_stack_matches_proof(stack, &run.stack_chains);
 
     // ★ THE SHAPE IS DERIVED FROM THIS GUEST, NOT ASSUMED. Every term the
     // prepared opening contributes is a function of the DECODE group's shape,
@@ -777,11 +1248,75 @@ fn check_transcript_pins(
             c.transcript_states,
         )
     };
-    assert_pinned_pair(shape, triple(prove), triple(verify));
+    assert_pinned_pair(shape, stack, triple(prove), triple(verify));
     println!(
         "{:<12} transcript pin OK (both sides, and the owed delta)",
         "WHIR"
     );
+}
+
+/// The genesis stack the pin priced against the one the proof carries.
+///
+/// ⛔ THIS IS WHAT KEEPS THE STACK TERM A CHECK. Its counts come out of
+/// `config.schedule(n_stack)` over a plan the VERIFIER derives from the ELF; if
+/// the cross-epoch proof held a different opening — a chain of a different
+/// length, a different number of stacked polynomials, a different fold
+/// schedule, a different query count — the terms would be arithmetic about
+/// something that did not happen and the pinned totals would still be whatever
+/// they were. Every quantity the terms use is read back off the cross-epoch
+/// `MultiProof` — in [`run_facts`], while the bundle is still alive — and
+/// compared here.
+///
+/// ⚠ `Q` is read from a round's opening block rather than from the config,
+/// because that is the number `whir_chain::verify` itself checks
+/// (`openings.current.len() != config.num_queries`) and therefore the number
+/// the transcript's query draws were made at.
+#[cfg(feature = "hash-metrics")]
+fn assert_stack_matches_proof(stack: &transcript_pin::Stack, chains: &[StackChain]) {
+    let Some(shape) = stack.shape else {
+        assert!(
+            chains.is_empty(),
+            "the run's genesis plan stacks no page, but the cross-epoch proof \
+             carries a prepared opening of {} chains",
+            chains.len(),
+        );
+        return;
+    };
+    assert!(
+        !chains.is_empty(),
+        "the run's genesis plan stacks {} columns, but the cross-epoch proof \
+         carries no prepared opening",
+        shape.columns,
+    );
+
+    let layout = transcript_pin::genesis_stack_layout(shape);
+    let schedule = stack.config.schedule(layout.n_stack());
+    assert_eq!(
+        chains.len(),
+        layout.num_polys(),
+        "the genesis stack's layout is {} stacked polynomials at n_stack {}; \
+         the cross-epoch opening carries {}",
+        layout.num_polys(),
+        layout.n_stack(),
+        chains.len(),
+    );
+    for (i, chain) in chains.iter().enumerate() {
+        assert_eq!(
+            chain.folds,
+            schedule,
+            "the genesis stack's chain {i} folds {:?}; n_stack {} at folding {} \
+             schedules {schedule:?}",
+            chain.folds,
+            layout.n_stack(),
+            stack.config.log_folding,
+        );
+        assert_eq!(
+            chain.queries, stack.config.num_queries,
+            "the genesis stack's chain {i} opens {} positions a round; the \
+             cross-epoch config draws {}",
+            chain.queries, stack.config.num_queries,
+        );
+    }
 }
 
 /// The DECODE group's shape — columns, and log2 of the rows — as the ELF
@@ -814,7 +1349,12 @@ fn decode_prepared_shape(elf_bytes: &[u8]) -> (usize, usize) {
 /// every branch reachable from a laptop, which is why the four tests below
 /// exist and why three of them are `should_panic`.
 #[cfg(feature = "hash-metrics")]
-fn assert_pinned_pair(shape: (usize, usize), prove: (u64, u64, u64), verify: (u64, u64, u64)) {
+fn assert_pinned_pair(
+    shape: (usize, usize),
+    stack: &transcript_pin::Stack,
+    prove: (u64, u64, u64),
+    verify: (u64, u64, u64),
+) {
     // Only the state columns are destructured: the two lines are compared whole
     // against their pins, and the delta between them is a property of the
     // CONSTANTS rather than of a measurement — see
@@ -824,12 +1364,12 @@ fn assert_pinned_pair(shape: (usize, usize), prove: (u64, u64, u64), verify: (u6
 
     assert_eq!(
         prove,
-        transcript_pin::prove(shape),
+        transcript_pin::prove(shape, stack),
         "the PROVE-side transcript counts moved"
     );
     assert_eq!(
         verify,
-        transcript_pin::verify(shape),
+        transcript_pin::verify(shape, stack),
         "the VERIFY-side transcript counts moved"
     );
 
@@ -888,19 +1428,197 @@ fn the_pinned_pair_is_the_measurement() {
         1 + folded + 2 * (rounds - 1) + rounds * queries.div_ceil(4),
         grinds,
     );
+
+    // The cross-epoch proof's chain posture, through the one function that
+    // decides it. `one_stack(n, 1)` is `n`, so a one-column shape pins the
+    // tallest stacked polynomial exactly — and the query count is 112 for every
+    // height the block's cross-epoch tables can reach. The RUNTIME pin does not
+    // rely on that: it evaluates the terms at the run's own config.
+    let config = crate::multilinear_prove::chain_config(&[(1, 21)]);
+    assert_eq!(
+        (config.log_folding, config.num_queries),
+        (4, 112),
+        "the cross-epoch chain posture moved; every stack term below is priced \
+         at folding 4 and 112 queries"
+    );
+
+    // ★ THE STACK-LESS PAIR FIRST — the run the bases were measured at (lb11,
+    // whose genesis was entirely sparse, so its cross-epoch proof carried no
+    // prepared opening at all). A `None` stack has to reproduce those totals
+    // exactly, or the stack term is a re-baseline wearing an addition's clothes.
+    let sparse = transcript_pin::Stack {
+        shape: None,
+        config,
+    };
+    assert_eq!(
+        sparse.terms(),
+        (0, 0, 0),
+        "a run with no dense genesis page must cost the transcript nothing; \
+         `genesis_prepared_for` returns `None` and the proof is byte for byte \
+         the one it was before this route existed"
+    );
     assert_pinned_pair(
         transcript_pin::DECODE_PREPARED_SHAPE,
+        &sparse,
         (
-            583_730 + counts + 15 + 15 * opening.0,
-            183_226 + 15 * opening.1,
-            2_996 + 15 * opening.2,
+            405_777 + counts + 15 + 15 * opening.0,
+            146_091 + 15 * opening.1,
+            3_156 + 15 * opening.2,
         ),
         (
-            583_867 + counts + 30 + 15 * opening.0,
-            183_256 + 15 * opening.1,
-            2_996 + 15 * opening.2,
+            405_922 + counts + 30 + 15 * opening.0,
+            146_121 + 15 * opening.1,
+            3_156 + 15 * opening.2,
         ),
     );
+
+    // ★★ THEN THE BLOCK'S PAIR, whose genesis stacks three dense pages: two
+    // preprocessed columns each, six columns of 2^18, one stacked polynomial at
+    // n_stack 21, six rounds at fold width four. Written out as the arithmetic
+    // — the stack's roots in the cross-epoch roots block, one claimed value per
+    // stacked column and one batching challenge, then the chain — so that a
+    // schedule or a layout that moved disagrees with this spelling rather than
+    // moving both sides of the comparison together.
+    // The literal 18 below is a page's height; bound here so it cannot drift
+    // away from the constant the prover stacks at.
+    assert_eq!(crate::continuation::PAGE_NUM_VARS, 18);
+    let (s_rounds, s_folded) = (6u64, 21u64);
+    let s_grinds = 3 * s_rounds - 1;
+    let stack = (
+        1 + 6 + s_grinds + 2 * s_folded + 2 * (s_rounds - 1) + 1,
+        1 + s_folded + 2 * (s_rounds - 1) + s_rounds * queries.div_ceil(4),
+        s_grinds,
+    );
+    let block = transcript_pin::Stack {
+        shape: Some(transcript_pin::StackShape {
+            columns: 6,
+            num_vars: 18,
+        }),
+        config,
+    };
+    assert_eq!(
+        block.terms(),
+        stack,
+        "the block's genesis stack priced from `schedule()` disagrees with the \
+         same arithmetic written out"
+    );
+    assert_pinned_pair(
+        transcript_pin::DECODE_PREPARED_SHAPE,
+        &block,
+        (
+            405_777 + counts + 15 + 15 * opening.0 + stack.0,
+            146_091 + 15 * opening.1 + stack.1,
+            3_156 + 15 * opening.2 + stack.2,
+        ),
+        (
+            405_922 + counts + 30 + 15 * opening.0 + stack.0,
+            146_121 + 15 * opening.1 + stack.1,
+            3_156 + 15 * opening.2 + stack.2,
+        ),
+    );
+}
+
+/// ★★ THE STACK'S TERMS ARE THE SCHEDULE ITS SHAPE IMPLIES, at both shapes the
+/// tree can reach — and the expectations are ARITHMETIC, not results.
+///
+/// ⛔ WHY TWO SHAPES AND NOT ONE. A form pinned at a single shape is a constant
+/// with extra steps: every term could be wrong in a way that happens to sum
+/// right there. The two shapes differ in the one input the whole derivation
+/// hangs off — `one_stack(18, columns)`, which is 19 for a lone dense page and
+/// 21 for the block's three — and they differ in the ROUND COUNT that falls out
+/// of it, so a mistake in the round structure cannot be flat across both.
+///
+/// The fixture's dense guest (`dense_data_page_touch`) is the 19; the block's
+/// plan is the 21.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_genesis_stack_is_the_schedule_the_shape_implies() {
+    // The cross-epoch posture, through the one function that decides it —
+    // `one_stack(n, 1)` is `n`, so a one-column shape pins the tallest stacked
+    // polynomial exactly. Stated here because the literal triple at the end of
+    // this test is only the block's numbers at THIS posture; the runtime pin
+    // evaluates the same form at the run's own config and does not rely on it.
+    let config = crate::multilinear_prove::chain_config(&[(1, 21)]);
+    assert_eq!(
+        (config.log_blowup, config.log_folding, config.num_queries),
+        (2, 4, 112),
+        "the cross-epoch chain posture moved"
+    );
+    let per_round_queries = (config.num_queries as u64).div_ceil(4);
+
+    // A shape, and the terms spelled from it rather than from `schedule()`.
+    let expect = |columns: usize, n_stack: u64, rounds: u64| {
+        let grinds = 3 * rounds - 1;
+        (
+            // the stack's one root, absorbed in the cross-epoch roots block
+            1
+                // one claimed value per stacked column
+                + columns as u64
+                // the chain: nonces, sumcheck evaluations, successor roots and
+                // out-of-domain values on the non-final rounds, and the final
+                // folded constant
+                + grinds
+                + 2 * n_stack
+                + 2 * (rounds - 1)
+                + 1,
+            // the batching challenge, then the chain's own draws
+            1 + n_stack + 2 * (rounds - 1) + rounds * per_round_queries,
+            grinds,
+        )
+    };
+
+    for (columns, n_stack, rounds) in [(2usize, 19u64, 5u64), (6, 21, 6)] {
+        let shape = transcript_pin::StackShape {
+            columns,
+            num_vars: crate::continuation::PAGE_NUM_VARS,
+        };
+        let layout = transcript_pin::genesis_stack_layout(shape);
+        assert_eq!(
+            (layout.n_stack() as u64, layout.num_polys()),
+            (n_stack, 1),
+            "{columns} columns of 2^{} stack into one polynomial at {n_stack} \
+             variables",
+            crate::continuation::PAGE_NUM_VARS,
+        );
+        assert_eq!(
+            config.schedule(layout.n_stack()).len() as u64,
+            rounds,
+            "n_stack {n_stack} at fold width {} is {rounds} rounds",
+            config.log_folding,
+        );
+        assert_eq!(
+            transcript_pin::genesis_stack_terms(Some(shape), &config),
+            expect(columns, n_stack, rounds),
+            "the stack's terms at {columns} columns / n_stack {n_stack}"
+        );
+        // The card's side of the same shape: the held commitment plus the
+        // chain's successor codewords, which is one commit per round.
+        assert_eq!(
+            transcript_pin::genesis_stack_commits(Some(shape), &config),
+            rounds,
+            "the stack costs one device commit per chain round at n_stack \
+             {n_stack}"
+        );
+    }
+
+    // ★ AND THE BLOCK'S NUMBERS, stated once so the measurement they explain is
+    // legible here: runs lb17 and lb18 read +77 absorbs, +200 squeezes and +17
+    // states on BOTH sides against a pin taken before the stack existed.
+    let block = transcript_pin::StackShape {
+        columns: 6,
+        num_vars: crate::continuation::PAGE_NUM_VARS,
+    };
+    assert_eq!(
+        transcript_pin::genesis_stack_terms(Some(block), &config),
+        (77, 200, 17)
+    );
+
+    // Nothing stacked, nothing owed.
+    assert_eq!(
+        transcript_pin::genesis_stack_terms(None, &config),
+        (0, 0, 0)
+    );
+    assert_eq!(transcript_pin::genesis_stack_commits(None, &config), 0);
 }
 
 /// The shape DERIVER, exercised on a guest a laptop has.
@@ -994,14 +1712,37 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
     );
 }
 
+/// The genesis stack the pinned run carries, for the tests below that need one
+/// as an INPUT rather than as an expectation.
+///
+/// ⚠ Never used by [`the_pinned_pair_is_the_measurement`], which spells the
+/// stack's arithmetic out instead: a test whose expectation comes from the same
+/// call as its subject is the check that cannot fail.
+#[cfg(feature = "hash-metrics")]
+fn pinned_stack() -> transcript_pin::Stack {
+    transcript_pin::Stack {
+        shape: Some(transcript_pin::StackShape {
+            columns: 6,
+            num_vars: crate::continuation::PAGE_NUM_VARS,
+        }),
+        config: crate::multilinear_prove::chain_config(&[(1, 21)]),
+    }
+}
+
 /// ★ One unit on the prove line fails on the prove assertion.
 #[cfg(feature = "hash-metrics")]
 #[test]
 #[should_panic(expected = "the PROVE-side transcript counts moved")]
 fn a_prove_count_off_by_one_is_rejected() {
     let shape = transcript_pin::DECODE_PREPARED_SHAPE;
-    let (a, s, t) = transcript_pin::prove(shape);
-    assert_pinned_pair(shape, (a + 1, s, t), transcript_pin::verify(shape));
+    let stack = pinned_stack();
+    let (a, s, t) = transcript_pin::prove(shape, &stack);
+    assert_pinned_pair(
+        shape,
+        &stack,
+        (a + 1, s, t),
+        transcript_pin::verify(shape, &stack),
+    );
 }
 
 /// ★ One unit on the verify line fails on the verify assertion.
@@ -1010,8 +1751,14 @@ fn a_prove_count_off_by_one_is_rejected() {
 #[should_panic(expected = "the VERIFY-side transcript counts moved")]
 fn a_verify_count_off_by_one_is_rejected() {
     let shape = transcript_pin::DECODE_PREPARED_SHAPE;
-    let (a, s, t) = transcript_pin::verify(shape);
-    assert_pinned_pair(shape, transcript_pin::prove(shape), (a + 1, s, t));
+    let stack = pinned_stack();
+    let (a, s, t) = transcript_pin::verify(shape, &stack);
+    assert_pinned_pair(
+        shape,
+        &stack,
+        transcript_pin::prove(shape, &stack),
+        (a + 1, s, t),
+    );
 }
 
 /// ★★ The per-branch term is a TERM, not a re-baseline.
@@ -1064,19 +1811,22 @@ fn the_per_branch_term_is_the_table_kind_count() {
         "the pin's per-branch term is not `epochs x kinds`"
     );
     let shape = transcript_pin::DECODE_PREPARED_SHAPE;
+    let stack = pinned_stack();
     let opening_absorbs =
         transcript_pin::EPOCHS * transcript_pin::prepared_opening_per_epoch(shape).0;
     assert_eq!(
-        transcript_pin::prove(shape).0 - transcript_pin::PROVE_BASE_ABSORBS,
+        transcript_pin::prove(shape, &stack).0 - transcript_pin::PROVE_BASE_ABSORBS,
         transcript_pin::table_count_absorbs()
             + transcript_pin::prove_derived_root_absorbs()
-            + opening_absorbs,
+            + opening_absorbs
+            + stack.terms().0,
     );
     assert_eq!(
-        transcript_pin::verify(shape).0 - transcript_pin::VERIFY_BASE_ABSORBS,
+        transcript_pin::verify(shape, &stack).0 - transcript_pin::VERIFY_BASE_ABSORBS,
         transcript_pin::table_count_absorbs()
             + transcript_pin::verify_derived_root_absorbs()
-            + opening_absorbs,
+            + opening_absorbs
+            + stack.terms().0,
     );
 }
 
@@ -1100,16 +1850,29 @@ fn the_per_branch_term_is_the_table_kind_count() {
 #[test]
 fn the_pinned_constants_differ_by_owed() {
     let shape = transcript_pin::DECODE_PREPARED_SHAPE;
-    let (pa, ps, pt) = transcript_pin::prove(shape);
-    let (va, vs, vt) = transcript_pin::verify(shape);
-    assert_eq!(
-        (va - pa, vs - ps, vt - pt),
-        transcript_pin::OWED,
-        "the two pinned lines no longer differ by `owed` — one was re-baselined \
-         without the other, or the protocol changed"
-    );
+    // ⚠ EVALUATED AT BOTH STACK POSTURES, because the claim is that the genesis
+    // stack does NOT enter `owed`. It costs both sides the same amount — the
+    // cross-epoch proof has no replay — so the difference between the two lines
+    // has to be the same with a stack and without one. A term that leaked into
+    // one line only would show up here and in no other test.
+    for stack in [
+        pinned_stack(),
+        transcript_pin::Stack {
+            shape: None,
+            config: crate::multilinear_prove::chain_config(&[(1, 21)]),
+        },
+    ] {
+        let (pa, ps, pt) = transcript_pin::prove(shape, &stack);
+        let (va, vs, vt) = transcript_pin::verify(shape, &stack);
+        assert_eq!(
+            (va - pa, vs - ps, vt - pt),
+            transcript_pin::OWED,
+            "the two pinned lines no longer differ by `owed` — one was \
+             re-baselined without the other, or the protocol changed"
+        );
+    }
 
-    // …and `owed` is itself derived, not observed: 137 absorbs is one per root
+    // …and `owed` is itself derived, not observed: the absorbs are one per root
     // over the 15 epoch calls, 30 squeezes is two per call. Stating the shape
     // means a future epoch count cannot silently keep the old constant.
     let (oa, os, ot) = transcript_pin::OWED;
@@ -1129,13 +1892,85 @@ fn the_pinned_constants_differ_by_owed() {
         transcript_pin::prove_derived_root_absorbs(),
         "`owed` no longer absorbs DECODE's derived root once per epoch"
     );
-    // ⚠ Only the DERIVED half of the absorb count is asserted, above. The
-    // carried half is `Sum roots.len()` over the epochs — data from the table
-    // shapes, not something derivable here — so any predicate this test could
-    // write about it would be either circular (comparing the constant to
-    // itself) or vacuous. An earlier draft had `oa % 1 == 0`, which is true of
-    // every integer. That half is pinned by `VERIFY - PROVE` above and by V1's
-    // closed form, which is where it belongs.
+    // ⚠ Only the DERIVED half of the absorb count is asserted here, and that is
+    // a limit of this test rather than of the pin. The carried half is
+    // `Sum roots.len()` over the epochs — data from the table shapes at this
+    // posture, which no form in this tree computes — so any predicate written
+    // about it HERE would be either circular (comparing the constant to itself)
+    // or vacuous. An earlier draft had `oa % 1 == 0`, which is true of every
+    // integer. It is checked where it can fail instead: `check_transcript_pins`
+    // sums the bundle's own epoch roots against it, on the run the constant
+    // describes.
+}
+
+/// ⛔ THE TABLE CAP IS A MEASUREMENT, not a role the identity merely has a slot
+/// for.
+///
+/// A pin whose identity carried the cap but whose VALUE drifted would skip on
+/// the record posture and apply to some other one, silently — the same failure
+/// as the fabricated sha tail, one field over.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pinned_table_cap_is_the_record_posture() {
+    assert_eq!(
+        transcript_pin::MAX_ROWS_LOG2,
+        21,
+        "the record posture is a uniform 2^21 cap: the WHIR tree, the D-S \
+         control and the block artifact all export LAMBDA_VM_MAX_ROWS_LOG2=21, \
+         and these constants were measured there"
+    );
+}
+
+/// ★ The guard REFUSES every posture but the pinned one, including the cap-less
+/// default the old constants were measured at.
+///
+/// ⛔ EXECUTED ON A STATE IT MUST ACCEPT AND ON STATES IT MUST REFUSE. The
+/// accepting arm is what makes the refusals mean something: a guard that
+/// refused everything would pass a test that only tried wrong values.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_pin_applies_only_at_the_posture_it_was_measured_at() {
+    let pinned = Some(transcript_pin::MAX_ROWS_LOG2);
+    assert!(
+        pin_applies(
+            transcript_pin::ELF_SHA256,
+            transcript_pin::ELF_LEN,
+            transcript_pin::EPOCH_LOG2,
+            pinned,
+        ),
+        "the pinned identity must be accepted by its own guard"
+    );
+    // `None` is the production per-table caps — a real posture, and the one
+    // that made this pin fail while looking like it applied.
+    for cap in [
+        None,
+        Some(transcript_pin::MAX_ROWS_LOG2 - 1),
+        Some(transcript_pin::MAX_ROWS_LOG2 + 1),
+    ] {
+        assert!(
+            !pin_applies(
+                transcript_pin::ELF_SHA256,
+                transcript_pin::ELF_LEN,
+                transcript_pin::EPOCH_LOG2,
+                cap,
+            ),
+            "a run at table cap {} is not the pinned configuration",
+            cap_label(cap),
+        );
+    }
+    // And the skip line names BOTH caps, or a reader cannot tell which posture
+    // they ran at.
+    let line = pin_skip_line(
+        transcript_pin::ELF_SHA256,
+        transcript_pin::ELF_LEN,
+        transcript_pin::EPOCH_LOG2,
+        None,
+    );
+    assert!(
+        line.contains("UNSET (the production per-table caps)")
+            && line.contains(&format!("uniform 2^{}", transcript_pin::MAX_ROWS_LOG2)),
+        "the skip line must name the run's cap and the pinned one: {line}"
+    );
 }
 
 /// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
@@ -1166,7 +2001,8 @@ fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
         !pin_applies(
             &near_miss,
             transcript_pin::ELF_LEN,
-            transcript_pin::EPOCH_LOG2
+            transcript_pin::EPOCH_LOG2,
+            Some(transcript_pin::MAX_ROWS_LOG2),
         ),
         "a sha differing only after position 16 was accepted: the comparison is \
          looking at a prefix"
@@ -1177,6 +2013,7 @@ fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
         &near_miss,
         transcript_pin::ELF_LEN,
         transcript_pin::EPOCH_LOG2,
+        Some(transcript_pin::MAX_ROWS_LOG2),
     );
     assert!(
         line.contains(&near_miss),
@@ -1241,10 +2078,14 @@ fn the_transcript_pin_skips_a_guest_it_does_not_recognise() {
         ..Default::default()
     };
 
+    // ⚠ `None` FOR THE RUN'S FACTS, and that strengthens this test rather than
+    // weakening it: past the guard the pin panics on a `None`, so a call that
+    // returns proves the guard returned first on the identity alone.
     // Wrong bytes, wrong length.
     check_transcript_pins(
         b"not an elf",
         transcript_pin::EPOCH_LOG2,
+        None,
         &nonsense,
         &nonsense,
     );
@@ -1255,6 +2096,7 @@ fn the_transcript_pin_skips_a_guest_it_does_not_recognise() {
     check_transcript_pins(
         &same_length,
         transcript_pin::EPOCH_LOG2,
+        None,
         &nonsense,
         &nonsense,
     );
@@ -1292,7 +2134,11 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     // is a gate on a measurement, and a gate that destroys its own subject is
     // worth one line of plumbing to avoid.
     #[cfg(feature = "hash-metrics")]
-    let mut pinned: Option<(crypto::hash_metrics::Counts, crypto::hash_metrics::Counts)> = None;
+    let mut pinned: Option<(
+        crypto::hash_metrics::Counts,
+        crypto::hash_metrics::Counts,
+        RunFacts,
+    )> = None;
     // The device commit count, read where the read-0 line below reads it so the
     // two can never describe different windows.
     #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
@@ -1367,12 +2213,17 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         {
             // The model beside the reading, taken from the bundle that produced
             // it so the two cannot describe different runs.
-            let mut proofs: Vec<&stark::multilinear_table::MultiProof<_, _>> =
+            //
+            // ⚠ THE EPOCHS AND THE CROSS-EPOCH PROOF GO IN SEPARATELY, because
+            // the two prepared openings they carry are held at different
+            // scopes — DECODE's once per ELF, the genesis stack's once per
+            // `prove_global` call. Flattening them into one list is what let
+            // the stack's held commitment go uncounted.
+            let epoch_proofs: Vec<&stark::multilinear_table::MultiProof<_, _>> =
                 bundle.epochs.iter().map(|e| &e.proof).collect();
-            proofs.push(&bundle.global.proof);
             device_commits = Some((
                 multilinear::gpu::commit_calls(),
-                transcript_pin::commits(&proofs),
+                transcript_pin::commits(&epoch_proofs, &bundle.global.proof),
             ));
         }
         // ★★ WHICH SPONGE THE TRANSCRIPT RAN ON, per arm and on BOTH sides.
@@ -1413,7 +2264,16 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
         {
             let verify_counts = crypto::hash_metrics::snapshot();
             print_transcript_counts("WHIR verify", &verify_counts);
-            pinned = Some((prove_counts, verify_counts));
+            // ★ READ HERE, WHERE THE BUNDLE STILL EXISTS. The pins themselves
+            // run after the results table — a red one must not cost a
+            // measurement — and the bundle does not live that long, so every
+            // fact the derived terms need is taken off it now and carried out
+            // as numbers.
+            pinned = Some((
+                prove_counts,
+                verify_counts,
+                run_facts(&bytes, &bundle, &opts),
+            ));
         }
         whir = Some((prove, start.elapsed(), size, epochs));
     }
@@ -1445,10 +2305,16 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
     // The pins, after the table. A red one from here costs nothing that was
     // measured.
     #[cfg(feature = "hash-metrics")]
-    if let Some((prove_counts, verify_counts)) = pinned {
+    if let Some((prove_counts, verify_counts, run)) = pinned {
         #[cfg(feature = "cuda")]
         check_device_pins(&bytes, epoch_size_log2, device_commits, &prove_counts);
-        check_transcript_pins(&bytes, epoch_size_log2, &prove_counts, &verify_counts);
+        check_transcript_pins(
+            &bytes,
+            epoch_size_log2,
+            Some(&run),
+            &prove_counts,
+            &verify_counts,
+        );
     }
 }
 
@@ -1465,8 +2331,10 @@ RAYON_NUM_THREADS={threads}, backend={backend}"
 ///
 /// The commit line is not an identity either, but it is not a literal: the
 /// bundle's own chains sum to it, one commit per chain round, with DECODE's
-/// prepared polynomial held once and its folds paid per epoch. See
-/// [`transcript_pin::commits`], including the admission assumption it carries.
+/// prepared polynomial held once for the run and its folds paid per epoch, and
+/// the genesis stack's held once for the cross-epoch proof with its own folds
+/// beside them. See [`transcript_pin::commits`], including the admission
+/// assumption it carries.
 #[cfg(all(feature = "cuda", feature = "hash-metrics"))]
 fn check_device_pins(
     elf: &[u8],
@@ -1480,7 +2348,12 @@ fn check_device_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+    if !pin_applies(
+        &sha,
+        elf.len(),
+        epoch_size_log2,
+        crate::tables::max_rows_log2_override(),
+    ) {
         println!(
             "{:<12} device pin SKIPPED - see the transcript pin's line",
             "WHIR"
@@ -1502,7 +2375,8 @@ fn check_device_pins(
         commits, model,
         "the device commit count moved: the bundle's own chains sum to {model} \
          commits — one per chain round, with DECODE's prepared polynomial held \
-         and its folds paid per epoch — and the counter read {commits}"
+         once for the run and its folds paid per epoch, and the genesis stack's \
+         held once for the cross-epoch proof — and the counter read {commits}"
     );
     println!(
         "{:<12} device pin OK (commits {commits}, grinds {grinds} = states)",

@@ -121,6 +121,27 @@ pub struct MaxRowsConfig {
     pub cpu32: usize,
 }
 
+/// The uniform table cap this process proves at, or `None` for the production
+/// per-table values.
+///
+/// ★ ONE READER, AND IT IS THIS ONE. [`MaxRowsConfig::default`] is what decides
+/// how an epoch is chunked, so anything that wants to describe the posture a
+/// run was proven at has to ask the same question the same way. A second parse
+/// of `LAMBDA_VM_MAX_ROWS_LOG2` somewhere else is how a label comes to name a
+/// posture the epochs were not chunked at — and the transcript pin is exactly
+/// such a label, since its counts ARE the chunking.
+pub(crate) fn max_rows_log2_override() -> Option<u32> {
+    let v = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2").ok()?;
+    let n: u32 = v
+        .parse()
+        .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
+    assert!(
+        (5..=26).contains(&n),
+        "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
+    );
+    Some(n)
+}
+
 impl Default for MaxRowsConfig {
     /// The production values from [`max_rows`], unless
     /// `LAMBDA_VM_MAX_ROWS_LOG2` overrides them with one uniform cap.
@@ -135,14 +156,7 @@ impl Default for MaxRowsConfig {
     /// leg the recursion wrap pays for. Tall-table postures (2^24) trade chunk
     /// parallelism for fewer legs.
     fn default() -> Self {
-        if let Ok(v) = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2") {
-            let n: u32 = v
-                .parse()
-                .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
-            assert!(
-                (5..=26).contains(&n),
-                "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
-            );
+        if let Some(n) = max_rows_log2_override() {
             return Self::uniform(1 << n);
         }
         Self {
