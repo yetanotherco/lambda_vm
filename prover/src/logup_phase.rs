@@ -108,7 +108,7 @@ impl<'a> BuildAux<'a> {
 #[cfg(feature = "cuda")]
 fn drive<I: Send, T: Send>(
     items: Vec<I>,
-    run_one: impl Fn(I) -> Result<T, Error> + Sync,
+    run_one: impl Fn(I) -> Result<T, Error> + Sync + Send,
 ) -> Result<Vec<T>, Error> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -169,7 +169,7 @@ fn drive<I: Send, T: Send>(
 #[cfg(all(not(feature = "cuda"), feature = "parallel"))]
 fn drive<I: Send, T: Send>(
     items: Vec<I>,
-    run_one: impl Fn(I) -> Result<T, Error> + Sync,
+    run_one: impl Fn(I) -> Result<T, Error> + Sync + Send,
 ) -> Result<Vec<T>, Error> {
     use rayon::prelude::*;
     items.into_par_iter().map(run_one).collect()
