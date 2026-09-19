@@ -122,6 +122,31 @@ const UNPACK_ROWS_PER_EPOCH: usize = 1;
 /// under the failure it exists to catch. The count is the CROSS-CHECK instead:
 /// [`GlobalPlan::build`] refuses any table whose family and config do not agree
 /// with the number of columns its AIR presents, and the refusal names both.
+///
+/// # ⚠ WHICH FIXTURE GATES WHICH ARM, said here so no reader infers coverage
+///
+/// The three arms are NOT gated by one run, and one of them was not gateable at
+/// all until a second fixture was found:
+///
+/// | arm | what gates it | what that fixture cannot show |
+/// |---|---|---|
+/// | [`Self::Bookend`] | both fixtures; every cross-epoch proof has them | — |
+/// | [`Self::PrivatePage`] | `test_private_input_xpage` | its ONLY page is private, so it never reaches the genesis arm |
+/// | [`Self::GenesisPage`] | `data_page_touch` | its genesis column is a handful of `.data` bytes, not a block's |
+///
+/// `test_private_input_xpage`'s cross-epoch proof is three bookends and ONE
+/// page, and that page is a private-input page — so a suite built on it alone
+/// would gate two arms of three and read as if it gated all of them.
+/// `data_page_touch` loads, increments and stores a static `.dword`, so its
+/// touched page is genuinely ELF-backed and its INIT column is NONZERO; that is
+/// what makes the genesis arm reachable at fixture scale at all.
+///
+/// ⛔ NEITHER FIXTURE SHOWS THE MIX. A block's cross-epoch proof carries both
+/// kinds of page at once and a sixteen-group split; at fixture scale the page
+/// group is a singleton and shape-identical to a bookend's. The route table's
+/// behaviour ON A MIXED SET is therefore established by the block instrument,
+/// not by these two, and saying so is the difference between a stated gap and a
+/// false guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalRoute {
     /// A local-to-global bookend: no preprocessed columns.
