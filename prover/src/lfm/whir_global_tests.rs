@@ -337,6 +337,115 @@ mod tests {
         );
     }
 
+    /// ★★ THE PUBLISHED SET, WORD FOR WORD — and every word against a
+    /// derivation that does not come from this program.
+    ///
+    /// The count comes through `GlobalLayout`'s own accessor, never `2 + epochs
+    /// × lanes` spelled again; and each epoch's four published lanes are
+    /// compared against `WhirRealGlobal::bookend_roots`, which the DRIVER took
+    /// from the host verification's own return through `GlobalProof::l2g_roots`.
+    /// The emitter reached the same roots by a different route — accumulating
+    /// `num_polys()` over the group layouts it built — so the two index
+    /// arithmetics have to agree, which is the whole content of the check.
+    ///
+    /// ⛔ THIS IS THE ARM A WRONG-EPOCH ROOT HAS TO FAIL, and it is why the
+    /// sixteen-group split exists: every bookend is committed ALONE precisely so
+    /// that root `k` can be tied to the epoch that committed it. A program that
+    /// published epoch `k`'s root in epoch `j`'s slot would leave the root node
+    /// comparing a fold against a permuted list — and nothing else in this suite
+    /// could see it, because the program would execute perfectly.
+    #[test]
+    fn the_cross_epoch_wrap_publishes_every_bookend_root_at_its_own_epoch() {
+        use crate::lfm::algebraic_commit::commitment_to_digest;
+        use math::field::traits::IsPrimeField;
+
+        let (elf_bytes, opts, bundle) = genesis_page_bundle();
+        let global = harvest(&elf_bytes, &opts, &bundle);
+        let airs = global.airs().refs();
+        let program = whir_global_program(&global, &airs);
+        let arena = whir_global_arena(&global, &airs);
+        let exec = crate::lfm::execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the machine must execute the cross-epoch proof the host accepted");
+        let public = &exec.public_words;
+
+        // ---- the COUNT, through the layout's OWN accessor
+        let layout = &global.published;
+        assert_eq!(
+            public.len(),
+            layout.total(),
+            "the cross-epoch wrap publishes `z`, `alpha` and one root per epoch"
+        );
+        assert_eq!(
+            program.public_len as usize,
+            public.len(),
+            "the program declares the words the execution produced"
+        );
+
+        // ⛔ ANTI-VACUITY, on the ANSWERS: two epochs whose roots were EQUAL
+        // would make a transposition invisible, and the arm would be green
+        // against a defect it is written for.
+        let digests: Vec<[FE; 4]> = (0..layout.num_epochs)
+            .map(|k| {
+                assert_eq!(
+                    global.bookend_roots[k].len(),
+                    1,
+                    "epoch {k}'s bookend is one stacked polynomial here"
+                );
+                commitment_to_digest(&global.bookend_roots[k][0])
+            })
+            .collect();
+        for k in 0..digests.len() {
+            for j in (k + 1)..digests.len() {
+                assert_ne!(
+                    digests[k], digests[j],
+                    "epochs {k} and {j} committed their bookends under the SAME root, so \
+                     transposing the two published runs is invisible and this arm cannot \
+                     see the defect it exists for"
+                );
+            }
+        }
+
+        // ---- each epoch's lanes, against the driver's own roots
+        for (k, digest) in digests.iter().enumerate() {
+            for (w, lane) in digest.iter().enumerate() {
+                assert_eq!(
+                    published_base(public, layout.l2g_word(k, w), "bookend lane"),
+                    crate::tables::types::GoldilocksField::canonical(lane.value()),
+                    "epoch {k}, lane {w} — the root the cross-epoch proof committed that \
+                     epoch's bookend under, as the root node reads it back"
+                );
+            }
+        }
+        println!(
+            "CROSS-EPOCH PUBLISHED: {} words = 2 + {} epochs x {} lanes",
+            public.len(),
+            layout.num_epochs,
+            layout.lanes_per_root,
+        );
+    }
+
+    /// One published word's base value, with its upper lanes asserted zero.
+    ///
+    /// ⚠ A base publish that carried anything in lanes 1..4 would be read by an
+    /// aggregation node as the low lane alone, silently. The assert is what
+    /// makes that a failure instead of a truncation.
+    fn published_base(
+        public: &[(u32, crate::lfm::LfmWord)],
+        at: usize,
+        what: &str,
+    ) -> u64 {
+        use math::field::traits::IsPrimeField;
+        let word = &public[at].1;
+        for (lane, value) in word.iter().enumerate().skip(1) {
+            assert_eq!(
+                crate::tables::types::GoldilocksField::canonical(value.value()),
+                0,
+                "{what}: lane {lane} of a base publish must be zero"
+            );
+        }
+        crate::tables::types::GoldilocksField::canonical(word[0].value())
+    }
+
     /// Runs the program against the arena the builder wrote, which is the whole
     /// execution gate: a misaligned arena hands the machine somebody else's
     /// field element and the argument stops satisfying its own refusals.

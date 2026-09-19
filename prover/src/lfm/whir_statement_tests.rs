@@ -300,6 +300,73 @@ fn the_global_pad_is_the_one_the_block_measured() {
     );
 }
 
+/// ⛔ THE GLOBAL PAD IDENTITY, SWEPT — because its sibling above pins it at ONE
+/// shape, and at that shape the pad is ZERO.
+///
+/// `the_global_pad_is_the_one_the_block_measured` asserts
+/// `pad = (2 − epochs − pages) mod 8` against the byte stream at the block's
+/// fifteen epochs and thirty-five pages. Both sides are 0 there. A form that was
+/// wrong by a multiple of eight — or wrong in a way that happens to vanish at
+/// that one residue — would agree with the stream and the test would be green:
+/// the quantity it reads cannot move under a whole class of the errors it exists
+/// to catch.
+///
+/// So this sweeps the shape and asserts two things the single-shape arm cannot:
+/// that the identity holds at EVERY residue, and that the sweep actually
+/// REACHES the nonzero ones. Without that second assertion a sweep that happened
+/// to visit only pad-0 shapes would be the same vacuous check with more
+/// iterations.
+#[test]
+fn the_global_pad_identity_holds_at_every_residue() {
+    let elf = digest(0x35);
+    let mut seen = [false; 8];
+    for epochs in 1usize..=16 {
+        for pages in 0usize..=16 {
+            let page_bases: Vec<u64> = (0..pages as u64).map(|i| i * 4096).collect();
+            let table_num_vars: Vec<u8> = vec![14u8; epochs + pages];
+            let bytes = global_statement_bytes(&GlobalStatement {
+                elf_digest: &elf,
+                num_epochs: epochs as u64,
+                num_private_input_pages: 0,
+                page_bases: &page_bases,
+                table_num_vars: &table_num_vars,
+                config: &config(),
+            });
+            let cost = statement_cost(&bytes);
+            // The stream's own pad, measured.
+            assert_eq!(
+                cost.len,
+                134 + 8 * pages + table_num_vars.len(),
+                "the fixed part is 134 bytes at every shape"
+            );
+            // ★ The RECORDED form, evaluated at this shape. `page_bases` is
+            // eight bytes an entry and cannot move the alignment, which is why
+            // only the table count appears in it.
+            let recorded = (2 + 64 - epochs - pages) % 8;
+            assert_eq!(
+                recorded,
+                cost.pad,
+                "the recorded `(2 - epochs - pages) mod 8` missed the stream's pad at \
+                 {epochs} epochs and {pages} pages: form {recorded}, stream {}",
+                cost.pad,
+            );
+            seen[cost.pad] = true;
+        }
+    }
+    println!(
+        "global pad residues reached by the sweep: {:?}",
+        (0..8).filter(|r| seen[*r]).collect::<Vec<_>>()
+    );
+    // ⛔ THE ANTI-VACUITY ASSERT. A sweep that only ever saw pad 0 would agree
+    // with any form that is right at zero, which is the defect the single-shape
+    // arm has and the reason this one exists.
+    assert!(
+        seen.iter().all(|reached| *reached),
+        "the sweep must reach every residue, or the identity is pinned only where it \
+         happens to vanish"
+    );
+}
+
 /// ★ GATE THREE: the row form. A statement costs its interned constants and no
 /// operation at all.
 #[test]
