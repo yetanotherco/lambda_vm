@@ -33,6 +33,52 @@
 //!    group, there is a real miss-path effect to explain.
 //! 5. The COMBINED arms, in case the two effects are real and additive.
 //!
+//! # v5 — the scan factor swept UPWARD, because `count` is the only thing left
+//!
+//! v3 and v4 settled the shape and killed two of the three candidates. The
+//! typical seed does not see the knob (the per-seed median ratios read 1.000 /
+//! 0.999 / 0.988 and the `h`-split is equal in both columns), yet the MEANS
+//! fall to 0.804 at scan 1, so a minority of seeds carries a large absolute
+//! saving. v4's top-20 named that minority and it is not what anyone predicted:
+//! they are SMALL-`h` seeds (258k-512k, well inside 2^20), ONE launch at both
+//! arms, and it is the CONTROL that is slow by 5-11 ms while scan 1 costs what
+//! `h + stride` predicts. The power limiter is out (these are not the long
+//! seeds), the miss-and-relaunch path is out (one launch at both arms), and the
+//! volatile load's per-iteration cost is out (the same iterations either way).
+//!
+//! ⛔ So read what is left. For a one-launch seed the host does NOTHING that
+//! scales with `count`: `search` sends one 8-byte sentinel, launches at a grid
+//! fixed by the knob, copies 8 bytes back and synchronises. Inside the kernel
+//! `count` reaches exactly one thing — the loop bound `i < count`. Work is
+//! `h + stride` ONLY IF the early exit stops every thread; a thread that does
+//! not observe the `atomicMin` runs to `count`, and its waste is proportional
+//! to `count`. That is the one hypothesis the data has not ruled out, and it
+//! predicts something the knob can test without touching the kernel.
+//!
+//! ⭐ **Sweep the scan factor UP.** If the excess is bounded by `count` it must
+//! be roughly proportional to it: `excess(k) ∝ (k − 1)·2^20`, so normalised to
+//! the control the slope reads (k − 1)/7 — 0.14, 0.43, 1.00, 2.14, 4.43, 9.00
+//! at k = 2, 4, 8, 16, 32, 64. If the excess saturates instead, every ratio
+//! above k = 8 reads ~1.00 and this hypothesis dies with the other three. The
+//! two branches are a factor of EIGHT apart at k = 64; no clock ramp, thermal
+//! drift, ordering or seed spread produces that.
+//!
+//! The `COUNT SLOPE` section prints that ratio against its prediction, by name,
+//! so the verdict is not recomputed downstream — v3's lesson, which cost this
+//! file a noise floor that could not pass.
+//!
+//! ⚠ **This measures wasted work, never a wrong answer.** The nonce lists are
+//! identical across every arm and that is asserted before any timing is read:
+//! the search returns the globally smallest valid nonce whatever the block
+//! size. A straggler burns permutations it did not need to burn. Nothing here
+//! is a soundness finding and nothing here moves a proof byte.
+//!
+//! The grid arms are kept and extended to the same question from the other
+//! side: if more resident blocks mean more readers contending the `atomicMin`'s
+//! cache line, a wide grid should make stragglers WORSE and a tight `count`
+//! should mask it — so `grid 4096` is run at scan 8 AND at scan 1. That is one
+//! prediction, not an assumption, and the run is free to refuse it.
+//!
 //! ```text
 //! cargo test -p lambda-vm-prover --release --features cuda \
 //!     --test rpx_grind_bench -- --ignored --nocapture
@@ -87,9 +133,9 @@ fn arms() -> Vec<(&'static str, Knobs)> {
             },
         ),
         (
-            "scan 4",
+            "scan 1",
             Knobs {
-                scan: 4,
+                scan: 1,
                 grid: 1024,
             },
         ),
@@ -101,21 +147,34 @@ fn arms() -> Vec<(&'static str, Knobs)> {
             },
         ),
         (
-            "scan 1",
+            "scan 4",
             Knobs {
-                scan: 1,
+                scan: 4,
                 grid: 1024,
             },
         ),
-        ("grid 256", Knobs { scan: 8, grid: 256 }),
-        ("grid 512", Knobs { scan: 8, grid: 512 }),
         (
-            "grid 2048",
+            "scan 16",
             Knobs {
-                scan: 8,
-                grid: 2048,
+                scan: 16,
+                grid: 1024,
             },
         ),
+        (
+            "scan 32",
+            Knobs {
+                scan: 32,
+                grid: 1024,
+            },
+        ),
+        (
+            "scan 64",
+            Knobs {
+                scan: 64,
+                grid: 1024,
+            },
+        ),
+        ("grid 512", Knobs { scan: 8, grid: 512 }),
         (
             "grid 4096",
             Knobs {
@@ -124,7 +183,13 @@ fn arms() -> Vec<(&'static str, Knobs)> {
             },
         ),
         ("scan 1 grid 512", Knobs { scan: 1, grid: 512 }),
-        ("scan 1 grid 256", Knobs { scan: 1, grid: 256 }),
+        (
+            "scan 1 grid 4096",
+            Knobs {
+                scan: 1,
+                grid: 4096,
+            },
+        ),
         (
             "control AGAIN",
             Knobs {
@@ -134,6 +199,26 @@ fn arms() -> Vec<(&'static str, Knobs)> {
         ),
     ]
 }
+
+/// ★ The scan column, in the order the slope is read down.
+///
+/// Every name here must appear in [`arms`] — asserted, not assumed, because a
+/// renamed arm would otherwise drop silently out of the slope and the verdict
+/// would be computed over fewer points than it claims. Every entry shares the
+/// record grid, so `count` is the only thing that moves down this column.
+const SCAN_COLUMN: [(&str, u32); 7] = [
+    ("scan 1", 1),
+    ("scan 2", 2),
+    ("scan 4", 4),
+    ("control 8/1024", 8),
+    ("scan 16", 16),
+    ("scan 32", 32),
+    ("scan 64", 64),
+];
+
+/// The arm the slope's excess is measured against: the tightest cap in the
+/// sweep, where a straggler can waste least.
+const SLOPE_BASE: &str = "scan 1";
 
 #[test]
 #[ignore = "device benchmark; run with --ignored --nocapture on the GPU box"]
@@ -280,10 +365,75 @@ fn what_one_grind_costs_at_each_launch_geometry() {
         );
     }
     println!(
-        "  ⭐ if these are the LARGEST-h seeds and their `arm lch` is > 1, the effect \
-         lives in the miss-and-relaunch path or in what a long sustained launch costs \
-         under the power limiter — and the card drew its full board power on this run. \
-         If they are ordinary-h seeds, neither candidate survives."
+        "  ⭐ v4 ALREADY READ THIS TABLE and it killed three candidates: the movers are \
+         SMALL-h seeds taking ONE launch at BOTH arms, and the CONTROL is the slow one. \
+         So not the power limiter (these are not the long seeds), not the miss-and-relaunch \
+         path (one launch either way), not the volatile load's per-iteration cost (the same \
+         iterations either way). What is left is a thread that did not stop, and the COUNT \
+         SLOPE below is what tests it."
+    );
+
+    // ── ★ THE COUNT SLOPE — v5's verdict, computed here and named ──────────
+    //
+    // ⛔ Printed BESIDE its prediction and read by NAME, so no launcher has to
+    // recompute it or count columns to find it. That is v3's lesson: its noise
+    // floor was read by column position, `control AGAIN` is two words, and the
+    // verdict it produced could not pass on any run.
+    //
+    // The excess is measured against the TIGHTEST cap in the sweep rather than
+    // against a model: at scan 1 a straggler can waste at most 2^20 nonces, so
+    // whatever sits above that arm is what a larger `count` bought. No fitted
+    // constant enters, which is what keeps this from being a model checking
+    // itself.
+    let at = |name: &str| -> usize {
+        arms.iter()
+            .position(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("the scan column names `{name}`, which is not an arm"))
+    };
+    let base_mean = mean(&times[at(SLOPE_BASE)]);
+    let ctl_excess = mean(&times[at("control 8/1024")]) - base_mean;
+    println!("\n=== THE COUNT SLOPE (pre-registered: excess proportional to count - 2^20) ===");
+    println!(
+        "{:<18} {:>11} {:>10} {:>11} {:>12} {:>11}",
+        "arm", "count", "mean ms", "excess ms", "vs control", "PREDICTED"
+    );
+    for (name, k) in SCAN_COLUMN {
+        let a = at(name);
+        let excess = mean(&times[a]) - base_mean;
+        let block = Knobs {
+            scan: k,
+            grid: 1024,
+        }
+        .block(GRINDING_FACTOR);
+        println!(
+            "{name:<18} {block:>11} {:>10.3} {:>11.3} {:>12.3} {:>11.3}",
+            mean(&times[a]),
+            excess,
+            excess / ctl_excess,
+            (f64::from(k) - 1.0) / 7.0,
+        );
+    }
+    if ctl_excess.abs() < 1.0e-3 {
+        println!(
+            "  ⛔ THE CONTROL SHOWS NO EXCESS over {SLOPE_BASE} ({ctl_excess:.6} ms), so the \
+             `vs control` column is a ratio to zero and says NOTHING. That is itself the \
+             answer: without an excess at the record posture there is no tail to explain."
+        );
+    }
+    println!(
+        "  ⭐ COUNT-BOUND if `vs control` tracks `PREDICTED` up the sweep (2.14 / 4.43 / 9.00 \
+         at k = 16 / 32 / 64): a subset of threads runs to `count` because it never observed \
+         the early exit, and the scan factor is a CAP on that waste, not a performance knob."
+    );
+    println!(
+        "  ⭐ SATURATED if every ratio at k >= 8 reads ~1.00: the excess is a fixed per-launch \
+         cost that merely correlates with the scan factor, the straggler hypothesis dies with \
+         the other three, and that cost owes a name."
+    );
+    println!(
+        "  ⚠ WASTED WORK, NEVER A WRONG ANSWER: the nonce control above already asserted that \
+         every arm returned the identical nonce list. Whatever this column reads, no proof \
+         byte moves and no verifier check is touched."
     );
 
     // ── THE CALIBRATION CONTROL ────────────────────────────────────────────
@@ -315,6 +465,25 @@ fn what_one_grind_costs_at_each_launch_geometry() {
          ONE launch and run the identical kernel at every arm, so no knob can touch them. \
          An arm whose gain is the SAME on both groups is not the knob — it is the procedure. \
          A gain living only in `h>=blk` is a real miss-path effect and owes a mechanism."
+    );
+    println!(
+        "  ⭐ v5's VERDICT IS THE COUNT SLOPE, and it was written down before the run: \
+         COUNT-BOUND means `vs control` follows `PREDICTED` to 9.00 at scan 64; SATURATED \
+         means it flattens at ~1.00 from scan 8 up. Nothing between those two readings is \
+         claimed here, and the arms that decide it are the three ABOVE the record posture — \
+         which no earlier version of this bench ever ran."
+    );
+    println!(
+        "  ⭐ THE GRID PAIR TESTS THE SAME DEFECT FROM THE BLOCK-COUNT SIDE: `grid 4096` at \
+         scan 8 against `grid 4096` at scan 1. If wide grids make stragglers worse by \
+         contending the atomicMin's line, the wide arm should hurt at scan 8 and be MASKED \
+         at scan 1, where `count` caps the waste. Equal damage at both caps refuses that \
+         unification and leaves the grid column its own explanation."
+    );
+    println!(
+        "  ⚠ EVERY ARM HERE IS A MEASUREMENT, NOT A PROPOSAL. The record posture is scan 8 / \
+         grid 1024 and this run changes no default. Scan 16, 32 and 64 exist to make the \
+         waste visible by exaggerating it; they are not candidates for anything."
     );
 }
 
