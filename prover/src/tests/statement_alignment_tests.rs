@@ -339,9 +339,16 @@ fn counts() -> TableCounts {
         bytewise: 12,
         store: 13,
         cpu32: 14,
-        // Not 15: this field is 0 or 1, "did the workload use BLAKE3", not a
-        // chunk count. Only the NUMBER of counts moves a statement's length, so
-        // the value is free; 1 keeps the struct inside its own domain.
+        // These seven are 0-or-1 presence flags ("did the workload reach this
+        // chip"), not chunk counts. Only the NUMBER of counts moves a
+        // statement's length, so the values are free; 1 keeps the struct inside
+        // its own domain.
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        commit: 1,
         blake3: 1,
     }
 }

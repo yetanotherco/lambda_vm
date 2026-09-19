@@ -401,11 +401,24 @@ pub fn verify_with_options(
         proof.proof.tables.len(),
     )?;
 
-    let expected = proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    // Checked: the counts are prover-supplied and release builds wrap on
+    // overflow, so a plain sum would let one astronomically large field still
+    // match the sub-proof count and reach `VmAirs::new`, which sizes a `Vec`
+    // from that field directly.
+    let Some(expected) = proof
+        .table_counts
+        .total()
+        .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
+        .and_then(|t| t.checked_add(page_configs.len()))
+    else {
+        return Err(Error::InvalidTableCounts(
+            "the table counts do not sum to a usize".to_string(),
+        ));
+    };
     if expected != proof.proof.tables.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {expected}, but the proof carries {} tables",
-            proof.table_counts.total(),
+            expected - FIXED_TABLE_COUNT - page_configs.len(),
             page_configs.len(),
             proof.proof.tables.len(),
         )));

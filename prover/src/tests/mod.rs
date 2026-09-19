@@ -107,6 +107,9 @@ pub mod shape_profile_tests;
 pub mod transcript_counts;
 
 pub mod shift_tests;
+
+#[cfg(test)]
+pub mod skip_empty_tables_tests;
 #[cfg(test)]
 pub mod statement_alignment_tests;
 #[cfg(test)]

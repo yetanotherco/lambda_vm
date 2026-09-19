@@ -43,7 +43,9 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         // Merkle auth-path (node) compression; keccak-only guard, no-op without
-        // the feature.
+        // the feature. Unlike `field_element_vector`, this backend does not route
+        // through `hash_streamed`, so count BOTH here to keep `nodes ⊆ merkle`.
+        crate::hash_metrics::count_merkle::<D>();
         crate::hash_metrics::count_merkle_node::<D>();
         let mut hasher = D::new();
         hasher.update(left);

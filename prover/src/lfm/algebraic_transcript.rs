@@ -698,12 +698,27 @@ mod tests {
             bytewise: 22,
             store: 23,
             cpu32: 24,
+            keccak: 1,
+            keccak_rnd: 1,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 1,
+            commit: 1,
             blake3: 1,
         };
-        let count_array: [u64; NUM_TABLE_COUNTS] =
-            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1];
+        // ⚠ Written out rather than taken from `table_count_values`, on purpose:
+        // the point of this test is that the MACHINE side reproduces the host
+        // encoding, so the machine's array must be an independent statement of
+        // it. Sharing the helper would compare the host with itself.
+        let count_array: [u64; NUM_TABLE_COUNTS] = [
+            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1, 1, 1, 1, 1, 1, 1,
+        ];
         const PAGES: usize = 6;
         const FPLD: u8 = 3;
+        // The statement's last byte. `false` is the role fourteen of a block's
+        // fifteen epochs carry, so it is the one worth fixing here; the final
+        // epoch's `true` differs by one byte and by nothing structural.
+        const IS_FINAL: bool = false;
 
         // Machine-side halves: four bytes each, LITTLE-endian, the arena layout.
         let to_halves = |bytes: &[u8]| -> Vec<FE> {
@@ -727,6 +742,7 @@ mod tests {
             num_private_input_pages: PAGES as u64,
             fri_final_poly_log_degree: FPLD,
             page_ranges: page_ranges.iter().map(|r| (r.base, r.count)).collect(),
+            is_final: IS_FINAL,
         };
 
         for hasher in ALGEBRAIC {
@@ -737,6 +753,7 @@ mod tests {
                 &mut host,
                 StatementKind::ContinuationEpoch {
                     epoch_label: EPOCH_LABEL,
+                    is_final: IS_FINAL,
                 },
                 &elf_digest,
                 &public_output,
