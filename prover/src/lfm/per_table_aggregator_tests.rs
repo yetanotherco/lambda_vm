@@ -7089,6 +7089,217 @@ where
     (children, layouts, labels)
 }
 
+/// What the WHIR global stage hands the root: the child, and the layout that
+/// child published.
+///
+/// ⛔ TWO FIELDS AND NOT THE HARVEST. The STARK stage returns `(RealGlobal,
+/// RealChild)` and its caller keeps the harvest alive to the root for one
+/// number (`g.num_l2g`). A [`super::whir_real_global::WhirRealGlobal`] owns a
+/// clone of the cross-epoch proof and the whole cross-epoch AIR set — 50 AIRs on
+/// the block — and holding that across every interior level would put it in the
+/// host peak of stages that cannot read it. ⇒ it is dropped inside the stage and
+/// what survives is the child plus two `usize`s.
+pub(super) struct WhirGlobalChild {
+    /// The child the root takes, in the same shape every other child arrives in.
+    pub(super) child: RealChild,
+    /// What that child published.
+    ///
+    /// ⛔ COPIED OFF THE DRIVER'S OWN `WhirRealGlobal::published`, never rebuilt
+    /// from `proof_arena::lanes_per_root()`. The layout has exactly one
+    /// derivation — the harvest's — and this is a transcription of it. A second
+    /// call to `lanes_per_root()` here would be a second source for the indices
+    /// [`super::block_root::emit_l2g_compare`] reads, and a wrong layout there is
+    /// silent and downstream.
+    pub(super) published: super::block_root::GlobalLayout,
+}
+
+/// ★★★ THE ROOT'S EXTRA CHILD, UNDER WHIR — the cross-epoch memory proof,
+/// wrapped as one LFM child.
+///
+/// # ⛔ A SIBLING OF [`prove_global_child`], NOT A GENERALISATION OF IT, AND THE
+/// REASON IS A TYPE
+///
+/// ✓ VERIFIED that one takes `bundle: &crate::continuation::ContinuationProof`
+/// — the STARK bundle — and returns `Option<(RealGlobal, RealChild)>`. The WHIR
+/// bundle is [`crate::multilinear_continuation::ContinuationProof`], a distinct
+/// `rkyv` type, and the harvest of its cross-epoch half is
+/// [`super::whir_real_global::WhirRealGlobal`]. Two families of proof, two
+/// harvests, two emitters — and one child type, because the child is where they
+/// meet.
+///
+/// # ★ THERE IS NO "WHIR `RealChild`" TO WRITE, and that is worth saying once
+///
+/// ✓ [`RealChild`] holds `artifacts`, `opts`, `public_words`, `tables`, `legs`
+/// and `z_alpha`: the harvest of an LFM PROOF, with nothing in it that knows
+/// what that proof verified. [`root_program`] takes one, and
+/// [`super::block_root::emit_l2g_compare`] reads it through
+/// [`super::block_root::GlobalLayout`] — which is the very layout
+/// [`super::whir_global::whir_global_program`] publishes against, word for word.
+/// So the WHIR global child IS a `RealChild` and only its PRODUCER is new.
+///
+/// # ⛔ IT RETURNS A `Result`, AND NEVER A `None` THE CALLER TURNS INTO A `return`
+///
+/// ✓ The STARK stage's `None` is `LFM_TREE_SIZE_GLOBAL`'s named stop and its
+/// caller re-raises it as `return` (the `let Some(..) else { return; }` below
+/// `prove_global_child`'s second call site). A WHIR stage inheriting that shape
+/// would end the run GREEN having composed no artifact at all — the failure that
+/// reads as success, and the one W1f's handoff warned this lane about by name.
+/// There is no sizing arm here and nothing to stop for, so every path either
+/// produces the child or REFUSES WITH THE REASON, in
+/// [`super::block_root::why_posture_identity_cannot_run`]'s shape: the reason
+/// travels as a value and the caller panics with it.
+///
+/// # ⚠ THE HASH IS THE PROCESS'S, and a wrong one has already been refused
+///
+/// `H` comes from `with_whir_hash!` at the call site, exactly as level 0's does,
+/// while the cross-epoch program's own sponge is `WrapHash::production()` — the
+/// compile-time RPX pin. So a non-RPX process hash is unprovable here for
+/// precisely the reason it is unprovable at level 0, and `whir_level_zero` has
+/// already refused it by the time this runs. ⛔ NO SECOND COPY OF THAT CHECK: it
+/// would sit downstream of the one that fires and could never be the check that
+/// failed.
+///
+/// # What it reads, and what it does not
+///
+/// ✓ Everything is in the bundle — `global`, `epochs.len()`,
+/// `touched_page_bases`, `num_private_input_pages` — so no epoch is re-proved.
+/// ⛔ And it reads NOTHING any level-0 wrap produced: the register chain and the
+/// labels are bound between siblings by `emit_chain_bindings`, and the memory
+/// chain closes at the ROOT, where `emit_l2g_compare` refolds the interior's
+/// published digests against this child's flat root list.
+fn prove_whir_global_child<H>(
+    bundle: &crate::multilinear_continuation::ContinuationProof,
+    elf_bytes: &[u8],
+    inner: &crate::ProofOptions,
+    wrap_opts: &crate::ProofOptions,
+    ceiling: &Result<f64, String>,
+    fan_in: usize,
+) -> Result<WhirGlobalChild, String>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    use super::program_census::build_artifacts_counted;
+    use super::proof::lfm_prove;
+    use std::time::Instant;
+
+    // ⛔ THE HARVEST VERIFIES BEFORE IT HANDS ANYTHING BACK, and `?` is what
+    // makes its refusal travel as a reason rather than as a panic from inside a
+    // driver the harness cannot annotate.
+    let t_harvest = Instant::now();
+    let global = super::whir_real_global::real_global_from_whir_continuation_under::<H>(
+        inner, elf_bytes, bundle,
+    )?;
+    let harvest_secs = t_harvest.elapsed().as_secs_f64();
+
+    let num_epochs = global.num_epochs;
+    let num_tables = global.num_tables();
+    // ⛔ THE LAYOUT IS THE DRIVER'S, COPIED — see the field's own doc.
+    let published = super::block_root::GlobalLayout {
+        num_epochs: global.published.num_epochs,
+        lanes_per_root: global.published.lanes_per_root,
+    };
+    let published_words = published.total();
+
+    // ⚠ `airs` BORROWS `global`, and the plan inside both builders borrows
+    // `airs`. All three live in this scope and none of them leaves it: what
+    // leaves is the child and two numbers.
+    let t_emit = Instant::now();
+    let airs = global.airs().refs();
+    let program = super::whir_global::whir_global_program(&global, &airs, elf_bytes);
+    let arenas = super::whir_global::whir_global_arena(&global, &airs, elf_bytes);
+    let emit_secs = t_emit.elapsed().as_secs_f64();
+    println!(
+        "\n   ★ THE WHIR GLOBAL WRAP (the root's extra child): {num_tables} cross-epoch \
+         sub-proofs over {num_epochs} epochs and {} touched pages\n     harvested + \
+         verified in {harvest_secs:.1}s · emitted in {emit_secs:.1}s",
+        bundle.touched_page_bases.len(),
+    );
+    // ★ THE PANEL BEFORE THE PROVE, as every other stage takes it: the
+    // pre-registration hangs on `LFM_HASH`'s committed height, which is read off
+    // this panel and never inferred from a ratio.
+    let (cells, instrs) = census_and_panel(&program, "the WHIR GLOBAL wrap", fan_in);
+
+    let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    #[cfg(feature = "cuda")]
+    stark::gpu_lde::reset_all_gpu_call_counters();
+    let sampler = HostSampler::start();
+    let t_prove = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, wrap_opts)
+        .map_err(|e| format!("the WHIR GLOBAL wrap did not prove: {e:?}"))?;
+    let prove_secs = t_prove.elapsed().as_secs_f64();
+    let (peak, at) = sampler.stop();
+
+    // ⛔ THE LAYOUT MUST DESCRIBE WHAT WAS PUBLISHED. Every index the root's L2G
+    // compare reads is measured from `GlobalLayout`, so a published set of
+    // another width shifts all of them at once — silently, and a whole root
+    // emission downstream.
+    if proved.public_words.len() != published_words {
+        return Err(format!(
+            "the WHIR GLOBAL wrap published {} words and its layout says {published_words} \
+             (z, alpha, then {num_epochs} bookend roots at {} lanes each). Every index \
+             the root's L2G compare reads is shifted by this, so it must refuse here \
+             rather than compare the wrong words",
+            proved.public_words.len(),
+            published.lanes_per_root,
+        ));
+    }
+
+    // ⚠ THE DEVICE, ASSERTED WHERE THIS PROCESS ACTUALLY PROVED. There is no
+    // cache on this path and no `load` mode, so unlike the STARK stage there is
+    // no arm on which a zero count is the correct observation.
+    #[cfg(feature = "cuda")]
+    {
+        let calls = stark::gpu_lde::gpu_lde_calls()
+            + stark::gpu_lde::gpu_merkle_tree_calls()
+            + stark::gpu_lde::gpu_fri_calls();
+        assert!(
+            calls > 0,
+            "the WHIR GLOBAL wrap reached the device ZERO times — it proved on the \
+             HOST with cuda compiled in, so its peak is not a production figure"
+        );
+        println!("     GPU dispatches during the WHIR GLOBAL wrap: {calls}");
+        assert_the_rpx_grind_reached_the_device("WHIR GLOBAL wrap");
+    }
+
+    // ⛔ ONE HOST VERIFY, AND IT IS THIS ONE.
+    //
+    // The STARK stage verifies explicitly AND then `real_child` verifies again.
+    // ✓ Its three stated reasons are all inapplicable here: there is no `k > 1`
+    // arm that skips `real_child` (this stage never slices), no proof that came
+    // off a disk through `rkyv` (it caches nothing), and the third — "an
+    // invariant living in a call this stage merely happens to make is one
+    // somebody can delete without noticing" — is answered by taking the verify
+    // through `real_child_timed`, which RETURNS its seconds so the stage PRINTS
+    // them. A number a stage prints is not an invariant hidden inside a harvest.
+    let (child, verify_secs) = real_child_timed(artifacts, wrap_opts.clone(), &proved);
+    println!(
+        "   whir global IDENTITY: program_id {} · heights {:?} · blake3 chunk heights {:?} \
+         · published {} words · {cells} cells ({instrs} instructions)",
+        child
+            .artifacts
+            .program_id
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        child.artifacts.log_heights,
+        child.artifacts.blake3_chunk_log_heights,
+        child.public_words.len(),
+    );
+    println!(
+        "     the WHIR GLOBAL wrap: prove {prove_secs:.1}s · verify {verify_secs:.1}s · \
+         {} published words ({num_epochs} bookend roots) · host peak {peak:.3} GiB at \
+         t={at:.1}{}",
+        child.public_words.len(),
+        match ceiling {
+            Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
+            Err(_) => String::new(),
+        },
+    );
+    mark("AFTER the WHIR global child");
+    Ok(WhirGlobalChild { child, published })
+}
+
 /// ★★★ THE WHIR PRODUCTION TREE — the WHIR base, one LFM wrap per epoch, and
 /// the same interior above them.
 ///
@@ -7097,10 +7308,23 @@ where
 /// [`compose_interior_levels`] verbatim, so the interior numbers of a WHIR run
 /// are this file's own code producing them rather than a second driver's.
 ///
-/// ⛔ IT COMPOSES THE INTERIOR AND STOPS. There is no cross-epoch WHIR program
-/// yet, so there is no global child and no block-artifact root, and the run says
-/// so in its own output rather than ending green over a stage nobody ran. Every
-/// root and global knob is REFUSED rather than ignored.
+/// ★★★ IT COMPOSES THE BLOCK ARTIFACT. Level 0 is followed by the WHIR GLOBAL
+/// stage — [`prove_whir_global_child`], the sibling of [`prove_global_child`]
+/// over the WHIR types — and the interior by the block-artifact ROOT over
+/// `fan_in + 1` children, the global child being the extra one.
+///
+/// ⛔ THE ROOT IS NAMED, NOT INFERRED: `LFM_TREE_PROVE_ROOT=1` together with
+/// `LFM_TREE_ROOT_OPTION=A|B`, which carries no default. Unset, the run proves
+/// the global child, closes the interior, and says in its own output that it is
+/// not the artifact — rather than ending green over a stage nobody ran.
+///
+/// ⛔ ONE DIFFERENCE FROM THE STARK ARM, AND IT IS NOT A STYLE CHOICE: there the
+/// root arm REQUIRES `A_CACHE_DIR`, because it proves a root over a tree it
+/// LOADS. This driver caches nothing (see below), so it proves base → level 0 →
+/// global → interior → root in ONE run. The slicing and caching knobs stay
+/// refused with it: the WHIR cross-epoch wrap is UNSLICED, so `LFM_TREE_GLOBAL_K`,
+/// `LFM_TREE_PARENT_MODE` and `LFM_TREE_SIZE_GLOBAL` name stages that do not
+/// exist on this path at all.
 ///
 /// ⛔ AND IT REFUSES A CACHE DIRECTORY, which the STARK tree requires for some
 /// arms. `stage_path` names a stage `<dir>/<stage>.rkyv`, so a WHIR run sharing
@@ -7115,6 +7339,8 @@ where
 fn the_whir_production_tree_composes_to_a_root() {
     use super::epoch_tests::EpochInputs;
     use super::per_table_aggregator::{FAN_IN, tree_node_count, tree_shape};
+    use super::program_census::build_artifacts_counted;
+    use super::proof::lfm_prove;
     use std::time::Instant;
 
     // ⛔ THE DEVICE, ASSERTED IN-PROCESS, for the STARK harness's own reason: a
@@ -7139,24 +7365,60 @@ fn the_whir_production_tree_composes_to_a_root() {
         "A_BUNDLE_MODE is set and this driver does NOT consult it — the level range \
          names the experiment. Unset it and use LFM_TREE_LEVELS"
     );
-    for var in [
-        "LFM_TREE_PROVE_ROOT",
-        "LFM_TREE_SIZE_ROOT",
-        "LFM_TREE_ROOT_OPTION",
-        "LFM_TREE_ROOT_MODE",
-        "LFM_TREE_STOP_AFTER_GLOBAL",
-        "LFM_TREE_SIZE_GLOBAL",
-        "LFM_TREE_GLOBAL_K",
-        "LFM_TREE_GLOBAL_MODE",
-        "LFM_TREE_PARENT_MODE",
-        "LFM_TREE_TOP_OVERLAP",
+    // ⛔ THE KNOBS THAT NAME STAGES THIS DRIVER DOES NOT HAVE — refused rather
+    // than ignored, A_BUNDLE_MODE's own rule, and each with ITS OWN reason. A
+    // blanket message would have survived the global stage landing and gone on
+    // saying "the cross-epoch WHIR program is not written" about knobs whose
+    // real objection is something else entirely.
+    for (var, why) in [
+        (
+            "LFM_TREE_SIZE_ROOT",
+            "the sizing arm emits BOTH root options and proves neither, which \
+             needs two interior levels held live at once and a cache to size \
+             from. This driver proves the ONE option it is given",
+        ),
+        (
+            "LFM_TREE_ROOT_MODE",
+            "it selects prove-or-load for a `block-root.rkyv` this driver never \
+             writes: nothing on this path caches",
+        ),
+        (
+            "LFM_TREE_STOP_AFTER_GLOBAL",
+            "the global stage is part of the pipeline now, and with no cache a \
+             run that stopped after it would leave nothing for a later run to \
+             reuse — the next one re-proves the base regardless",
+        ),
+        (
+            "LFM_TREE_SIZE_GLOBAL",
+            "it sizes the SLICES of a sliced global wrap; the WHIR cross-epoch \
+             wrap is unsliced and there is no partition to size",
+        ),
+        (
+            "LFM_TREE_GLOBAL_K",
+            "the WHIR cross-epoch wrap is UNSLICED: one program, one proof, one \
+             child, and no parent that folds k of them",
+        ),
+        (
+            "LFM_TREE_GLOBAL_MODE",
+            "it selects prove-or-load for a cached global stage; nothing on this \
+             path caches",
+        ),
+        (
+            "LFM_TREE_PARENT_MODE",
+            "it selects prove-or-load for the PARENT of k slices, and there are \
+             no slices",
+        ),
+        (
+            "LFM_TREE_TOP_OVERLAP",
+            "it makes the global stage task 0 of level 0's own pool. Here the \
+             stage runs AFTER level 0 so a level-0 wall from this binary stays \
+             comparable to every earlier WHIR run; overlapping it is an \
+             optimisation round's item, not an unset knob's",
+        ),
     ] {
         assert!(
             std::env::var(var).is_err(),
-            "{var} is set. This driver has NO global wrap and NO root stage — the \
-             cross-epoch WHIR program is not written — so the knob would be set and \
-             silently ignored, which is the failure A_BUNDLE_MODE's refusal exists \
-             for. Unset it"
+            "{var} is set and this driver does NOT consult it: {why}. Unset it"
         );
     }
     assert!(
@@ -7177,6 +7439,42 @@ fn the_whir_production_tree_composes_to_a_root() {
         (2..=4).contains(&fan_in),
         "LFM_CENSUS_FAN_IN must be in 2..=4, got {fan_in}"
     );
+    // ⛔ THE ROOT IS NAMED, AND ITS OPTION CARRIES NO DEFAULT — the STARK
+    // driver's rule, verbatim, because it is a rule about the ARTIFACT and not
+    // about which base produced the children. The option changes the root's
+    // child count and therefore its sub-proof count, which is what decides
+    // whether `LFM_HASH` crosses a power of two; a default here would silently
+    // become the answer to a question a measurement was supposed to settle.
+    let prove_root = std::env::var("LFM_TREE_PROVE_ROOT").is_ok();
+    assert!(
+        !prove_root || std::env::var("LFM_TREE_LEVELS").is_err(),
+        "LFM_TREE_PROVE_ROOT decides where the interior STOPS — the root's \
+         children are the OUTPUT of level `RootOption::child_level(top)` — so \
+         LFM_TREE_LEVELS would be a second and contradictory spelling of the same \
+         stopping point. Name one"
+    );
+    let root_option: Option<super::block_root::RootOption> = match (
+        prove_root,
+        std::env::var("LFM_TREE_ROOT_OPTION").ok().as_deref(),
+    ) {
+        (false, None) => None,
+        (false, Some(v)) => panic!(
+            "LFM_TREE_ROOT_OPTION=`{v}` is set but LFM_TREE_PROVE_ROOT is not, so \
+             this run emits no root and the option has no effect. Set \
+             LFM_TREE_PROVE_ROOT=1 to prove one, or unset the option"
+        ),
+        (true, None) => panic!(
+            "LFM_TREE_PROVE_ROOT is set and LFM_TREE_ROOT_OPTION is NOT. The root \
+             takes either the top interior level's nodes (`A`) or the single node \
+             above them (`B`) plus the global child, and the two are different \
+             programs with different sub-proof counts. This driver must not guess, \
+             and must not carry a default that silently becomes the answer"
+        ),
+        (true, Some(v)) => Some(
+            super::block_root::RootOption::parse(v)
+                .unwrap_or_else(|e| panic!("LFM_TREE_ROOT_OPTION: {e}")),
+        ),
+    };
     let spec = std::env::var("LFM_TREE_LEVELS").unwrap_or_else(|_| "all".to_string());
     let (lo, hi_req): (usize, Option<usize>) = match spec.as_str() {
         "all" => (0, None),
@@ -7204,10 +7502,21 @@ fn the_whir_production_tree_composes_to_a_root() {
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(
-        "★★★ WHIR PRODUCTION TREE (INTERIOR ONLY — no global wrap, no block-artifact root)\n   \
+        "★★★ WHIR PRODUCTION TREE — {}\n   \
          guest {}, {} input bytes, 2^{} cycles/epoch, fan-in {fan_in}\n   \
          inner blowup {} / {} q · wrap blowup {} / {} q\n   \
          levels: prove 0..={} · cache: NONE\n   cgroup ceiling: {}",
+        match root_option {
+            Some(o) => format!(
+                "base, level 0, the GLOBAL stage, the interior and the \
+                 BLOCK-ARTIFACT ROOT ({})",
+                o.describe()
+            ),
+            None => "base, level 0, the GLOBAL stage and the interior — NO ROOT \
+                     (LFM_TREE_PROVE_ROOT is unset, so this is not the block \
+                     artifact)"
+                .to_string(),
+        },
         inputs.label,
         inputs.private_input.len(),
         inputs.epoch_log2,
@@ -7215,9 +7524,14 @@ fn the_whir_production_tree_composes_to_a_root() {
         inner.fri_number_of_queries,
         wrap_opts.blowup_factor,
         wrap_opts.fri_number_of_queries,
-        match hi_req {
-            Some(h) => h.to_string(),
-            None => "top".to_string(),
+        // ⛔ NOT `hi_req` ALONE. Under a named root option the interior stops at
+        // `RootOption::child_level(top)`, which this line is printed too early
+        // to know — so it says which rule decides rather than a number that
+        // would be wrong.
+        match (root_option, hi_req) {
+            (Some(o), _) => format!("the child level of root option {}", o.describe()),
+            (None, Some(h)) => h.to_string(),
+            (None, None) => "top".to_string(),
         },
         match &ceiling {
             Ok(g) => format!("{g:.2} GiB"),
@@ -7264,6 +7578,15 @@ fn the_whir_production_tree_composes_to_a_root() {
     let shape = tree_shape(bundle.num_epochs(), fan_in);
     let top = shape.len();
     let hi = hi_req.unwrap_or(top).min(top);
+    // ★ THE LOOP STOPS AT THE LEVEL THE ROOT'S CHILDREN COME FROM, and that
+    // level is `RootOption::child_level` — the one named rule the STARK driver
+    // reads as well, rather than index arithmetic written out twice. Under A it
+    // is `top - 1`, so the level-`top` node is never proved: it is not a child
+    // of anything. Under B it is `top` and the tree closes as always.
+    let hi = match root_option {
+        Some(o) => o.child_level(top),
+        None => hi,
+    };
     println!(
         "   ★ SHAPE from {} epochs at fan-in {fan_in}: {top} levels, {} nodes",
         bundle.num_epochs(),
@@ -7326,16 +7649,37 @@ fn the_whir_production_tree_composes_to_a_root() {
         println!("   {}", stats.describe("level 0"));
     }
 
-    // ---- ⛔ AND NOT THE GLOBAL WRAP. Stated here, where the STARK tree proves
-    // one, so the absence is legible in the log at the point it happens rather
-    // than only in a summary at the end.
-    println!(
-        "\n   ⛔ NO GLOBAL WRAP AND NO BLOCK-ARTIFACT ROOT. The cross-epoch WHIR \
-         program does not exist yet, so this run composes the interior over {} \
-         level-0 wraps and stops. It is NOT the block artifact, and the tree it \
-         closes to is NOT a proof of the block.\n",
-        children.len()
-    );
+    // ---- level 0's OTHER child: the WHIR GLOBAL WRAP.
+    //
+    // ⓘ WHERE THE STARK HARNESS RUNS `prove_global_child`, and AFTER level 0 for
+    // a reason. ✓ The stage reads only the base bundle — its signature says so —
+    // so it COULD run beside the level; placing it after keeps a level-0 wall
+    // from this binary comparable to every earlier WHIR run. Overlapping it is
+    // an optimisation round's item, and `LFM_TREE_TOP_OVERLAP` is refused above
+    // until it is one.
+    //
+    // ⛔ AND A REFUSAL, NEVER A `return`. `prove_whir_global_child` hands back
+    // the reason it could not build, and a run with no global child has no extra
+    // child for a root and no block artifact to compose: it must be RED, not
+    // green over a stage nobody ran. That is the shape the STARK caller's
+    // `let Some(..) else { return; }` does NOT have, and inheriting it was the
+    // named hazard this stage was written against.
+    let global = crate::with_whir_hash!(|H| {
+        prove_whir_global_child::<H>(
+            &bundle,
+            &inputs.elf_bytes,
+            &inner,
+            &wrap_opts,
+            &ceiling,
+            fan_in,
+        )
+    })
+    .unwrap_or_else(|why| {
+        panic!(
+            "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no extra \
+             child for a root and no block artifact to compose: {why}"
+        )
+    });
 
     // ---- levels 1..=hi, in the one interior both production trees share.
     let interior = compose_interior_levels(
@@ -7388,6 +7732,207 @@ fn the_whir_production_tree_composes_to_a_root() {
         println!("{l:>5} {a:>5} {cells:>12} {instrs:>13} {peak:>9.3} {at:>10.1} {wall:>9.1}");
     }
 
+    // ---- ★★★ THE BLOCK-ARTIFACT ROOT, over `fan_in + 1` children.
+    match root_option {
+        None => println!(
+            "\n   ⛔ NO BLOCK-ARTIFACT ROOT, AND THE RUN SAYS SO. LFM_TREE_PROVE_ROOT \
+             is unset, so this run proved the global child, closed the interior over \
+             {closed} proof(s), and stopped. It is NOT the block artifact. \
+             LFM_TREE_PROVE_ROOT=1 with LFM_TREE_ROOT_OPTION=A|B composes one\n"
+        ),
+        Some(option) => {
+            // ⛔ THE ROOT COUNTS ITS CHILDREN, HERE, WHERE THE LEVELS ARE STILL IN
+            // VIEW. ✓ `child_level` is the same named rule `hi` was set from
+            // above, so the two cannot drift; what this compares is the number of
+            // proofs actually in hand against the number that level produced —
+            // which is the check a skipped global stage, or a capture taken one
+            // level low, has to get past. Otherwise it lands inside
+            // `emit_l2g_compare`'s refold guard a whole root emission later, and
+            // ONLY where the two counts differ: where they happen to agree, the
+            // root compares a fold of the wrong depth and an HONEST prover fails.
+            let child_level = option.child_level(top);
+            let want = if child_level == 0 {
+                bundle.num_epochs()
+            } else {
+                shape[child_level - 1].arities.len()
+            };
+            assert_eq!(
+                closed,
+                want,
+                "option {} takes the OUTPUT of level {child_level} ({want} proofs) \
+                 and this run holds {closed}",
+                option.describe(),
+            );
+            // ⛔ ONE OPTION DECIDES BOTH the children this run harvested and the
+            // fold shape the compare refolds with: `emit_l2g_compare` regroups
+            // the global child's FLAT root list exactly as the interior did, and
+            // a shape built for the other option compares a fold of the wrong
+            // depth — a failure on COMPLETENESS, with an honest prover behind it.
+            let fold_shape = option.fold_shape(bundle.num_epochs(), fan_in);
+            let block_range = (
+                crate::tables::local_to_global::epoch_label(0),
+                crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+            );
+            let refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+            // ⛔ `AssertOnly`, NAMED HERE and handed to BOTH the emitter and the
+            // width assert. The interior's L2G digest is tree-shaped, so its
+            // VALUE depends on fan-in and depth: publishing it would let two
+            // honest provers at different postures emit different artifact bytes.
+            let publishes = super::block_root::RootPublishSet::AssertOnly;
+            let t_emit = Instant::now();
+            let program = root_program(
+                &children,
+                &layouts,
+                &refs,
+                block_range,
+                &global.child,
+                &global.published,
+                &fold_shape,
+                publishes,
+            );
+            let sub_proofs: usize =
+                children.iter().map(|c| c.tables.len()).sum::<usize>() + global.child.tables.len();
+            println!(
+                "\n★★★ THE WHIR BLOCK-ARTIFACT ROOT — option {}\n   {closed} interior \
+                 children + the global child = {} children, {sub_proofs} sub-proofs \
+                 ({} of them the global child's) · emitted in {:.1}s",
+                option.describe(),
+                closed + 1,
+                global.child.tables.len(),
+                t_emit.elapsed().as_secs_f64(),
+            );
+            // ★ THE PANEL BEFORE THE PROVE, as every other stage takes it.
+            let (root_cells, root_instrs) =
+                census_and_panel(&program, "the WHIR BLOCK-ARTIFACT ROOT", fan_in);
+            // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes
+            // LAST: `emit_block_root` declares every interior child's arenas
+            // before the global child's, so the arenas are a plain concatenation
+            // in that order.
+            let arenas: Vec<Vec<LfmWord>> = children
+                .iter()
+                .chain(std::iter::once(&global.child))
+                .flat_map(child_arena_words)
+                .collect();
+            let artifacts =
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            #[cfg(feature = "cuda")]
+            stark::gpu_lde::reset_all_gpu_call_counters();
+            let sampler = HostSampler::start();
+            let t_stage = Instant::now();
+            let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+                .unwrap_or_else(|e| panic!("★ THE WHIR BLOCK-ARTIFACT ROOT MUST PROVE: {e:?}"));
+            let stage_secs = t_stage.elapsed().as_secs_f64();
+            let (peak, at) = sampler.stop();
+
+            // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER. `root_schema_words`
+            // takes no epoch count and no arity, so a mismatch means the artifact
+            // acquired a dependence on HOW WE PROVED IT. ⛔ Do not widen this
+            // assert: a tolerance here would hide exactly that.
+            let out_halves = layouts.last().expect("nonempty").out_halves;
+            let num_reg = layouts[0].num_reg;
+            let want_words = super::block_root::root_schema_words(num_reg, out_halves, publishes);
+            assert_eq!(
+                proved.public_words.len(),
+                want_words,
+                "★ THE ARTIFACT IS THE WRONG WIDTH: the root published {} words and \
+                 root_schema_words({num_reg} registers, {out_halves} output halves, \
+                 AssertOnly) is {want_words}. That signature takes NO epoch count and \
+                 NO arity, so this is the artifact acquiring a dependence on the \
+                 proving strategy",
+                proved.public_words.len(),
+            );
+            // ⛔ VERIFIED HERE, and by this stage. A root that PROVES and does not
+            // VERIFY is the failure that reads as success.
+            let t_verify = Instant::now();
+            assert!(
+                super::proof::verify_against_artifacts(
+                    &artifacts,
+                    &proved.proof,
+                    &proved.public_words,
+                    &wrap_opts
+                ),
+                "★ THE WHIR BLOCK-ARTIFACT ROOT DOES NOT VERIFY. Nothing may be \
+                 reported or claimed from a proof production would reject"
+            );
+            let verify_secs = t_verify.elapsed().as_secs_f64();
+            #[cfg(feature = "cuda")]
+            {
+                let calls = stark::gpu_lde::gpu_lde_calls()
+                    + stark::gpu_lde::gpu_merkle_tree_calls()
+                    + stark::gpu_lde::gpu_fri_calls();
+                assert!(
+                    calls > 0,
+                    "the WHIR BLOCK-ARTIFACT ROOT reached the device ZERO times — it \
+                     proved on the HOST with cuda compiled in, so its peak is not a \
+                     production figure"
+                );
+                println!("     GPU dispatches during the WHIR BLOCK-ARTIFACT ROOT: {calls}");
+                assert_the_rpx_grind_reached_the_device("WHIR BLOCK-ARTIFACT ROOT");
+            }
+            println!(
+                "   whir root IDENTITY: program_id {} · heights {:?} · blake3 chunk \
+                 heights {:?} · published {} words · {root_cells} cells \
+                 ({root_instrs} instructions)",
+                artifacts
+                    .program_id
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                artifacts.log_heights,
+                artifacts.blake3_chunk_log_heights,
+                proved.public_words.len(),
+            );
+            println!(
+                "\n★★★ THE BLOCK IS COMPRESSED UNDER WHIR — the block-artifact ROOT \
+                 PROVED AND VERIFIED\n   option {}\n   stage {stage_secs:.1}s · verify \
+                 {verify_secs:.1}s · {} published words (= root_schema_words({num_reg}, \
+                 {out_halves}, AssertOnly), and NOTHING L2G-shaped)\n   host peak \
+                 {peak:.3} GiB at t={at:.1}{}\n   ⚠ the DEVICE peak is the prover's own \
+                 VRAM accounting above, not a harness sample — this harness counts \
+                 dispatches, it does not size the card",
+                option.describe(),
+                proved.public_words.len(),
+                match &ceiling {
+                    Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * peak / c),
+                    Err(_) => String::new(),
+                },
+            );
+            // ⛔ THE STANDING CAVEAT, PRINTED WITH THE CLAIM AND NOT LEFT TO A DOC.
+            println!(
+                "   ⛔ CAVEAT, unchanged by this proof and by design: the attestation \
+                 is NOT self-enforcing. The guest uses supplied roots verbatim, and \
+                 the binding happens OUTSIDE — `recursion::check_attestation` \
+                 recomputes the id from an ELF the consumer trusts, host-side. \
+                 \"One proof for this block\" terminates there"
+            );
+            // ⛔ AND THE SECOND RUNG OF THE LADDER, WHICH THIS RUN DOES NOT REACH.
+            println!(
+                "   ⛔ NOT YET \"PINNED\": that rung needs the tamper arms green in a \
+                 `--lib` run — lfm::block_root's five, and the WHIR cross-epoch \
+                 arms. This run PROVES; it runs none of them, so a root proved \
+                 without them is a demonstration with a stated gap, not a soundness \
+                 claim"
+            );
+            // ★ THE TWO-POSTURE BYTE-IDENTITY CHECK, REFUSED BY NAME. A
+            // one-posture "identical" is a check that cannot fail, which is worse
+            // than no check because it produces evidence.
+            let runs = vec![super::block_root::ArtifactUnderPosture {
+                posture: format!(
+                    "WHIR base, {} epochs at 2^{}, fan-in {fan_in}, root option {}",
+                    bundle.num_epochs(),
+                    inputs.epoch_log2,
+                    if option.replaces_top() { "A" } else { "B" },
+                ),
+                words: proved.public_words.clone(),
+            }];
+            match super::block_root::why_posture_identity_cannot_run(&runs) {
+                Some(why) => println!("\n   ⚠ {why}"),
+                None => super::block_root::assert_artifact_is_posture_independent(&runs),
+            }
+        }
+    }
+
     let (run_peak, run_at) = whole_run.stop();
     println!(
         "\n★★★ WHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",
@@ -7411,7 +7956,8 @@ fn the_whir_production_tree_composes_to_a_root() {
 /// never be exercised off the box, and a path that only ever runs on the box is
 /// a path nobody can debug. This runs the identical sequence — WHIR base, the
 /// generic level 0 with both derivations hoisted, the schema check per wrap,
-/// `compose_interior_levels` above it — on three tiny epochs.
+/// the GLOBAL stage between level 0 and level 1, `compose_interior_levels`, and
+/// the block-artifact ROOT over `fan_in + 1` children — on three tiny epochs.
 ///
 /// ⛔ NOT A MEASUREMENT, AND NOTHING FROM IT IS A D4 TERM. What it does NOT have,
 /// listed so no number taken from it is quoted as a production one:
@@ -7438,14 +7984,30 @@ fn the_whir_production_tree_composes_to_a_root() {
 ///   `LAMBDA_VM_WHIR_HASH=rpx` in its environment. Level 0 refuses anything else
 ///   rather than letting the mismatch surface as a `DivByZero` inside the prove;
 ///   the refusal is in `whir_level_zero` and its comment says why.
+/// - ⛔ ONE CROSS-EPOCH PAGE, AND IT IS THE PRIVATE-INPUT ONE. At
+///   `test_private_input_xpage` the cross-epoch shape is FOUR tables — three
+///   bookends and one page — because `touched_page_bases` lists only pages
+///   carrying cells that CROSS an epoch boundary. So the OFFSET+INIT route that
+///   30 of the block's 35 pages take has NO TABLE here and no gate here: the
+///   block under the box is that route's only gate, which is what
+///   `whir_global`'s own route table says per route.
+/// - ROOT OPTION A ONLY. The root REPLACES the top interior level; option B —
+///   the root sitting above a closed interior — is never emitted at fixture
+///   scale. What covers both is the child-count guard below, which reads
+///   `RootOption::child_level` rather than a hard-coded level.
 ///
 /// What it DOES establish is the half a byte gate cannot: that the sequence runs
 /// end to end, that the publish set and `SchemaLayout::wrap` agree, that both
-/// hoists reach every harvest, and that the interior accepts a WHIR child.
+/// hoists reach every harvest, that the interior accepts a WHIR child, that the
+/// cross-epoch wrap PROVES (V1j's arms only ever executed its program), and that
+/// the root's L2G compare accepts the interior's fold against the global child's
+/// flat root list — the one check the two halves of the pipeline meet in.
 #[test]
-#[ignore = "fixture scale, card-free, but minutes long: run it with --ignored"]
-fn the_whir_fixture_tree_composes_through_the_same_interior() {
+#[ignore = "fixture scale, card-free, but many minutes long: run it with --ignored"]
+fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     use super::per_table_aggregator::{tree_node_count, tree_shape};
+    use super::program_census::build_artifacts_counted;
+    use super::proof::lfm_prove;
     use std::time::Instant;
 
     // ⓘ NO `cuda` ASSERT HERE, and that is the whole point of this arm — see the
@@ -7494,10 +8056,37 @@ fn the_whir_fixture_tree_composes_through_the_same_interior() {
         "one level-0 wrap per epoch"
     );
 
+    // ---- the GLOBAL stage, where the production driver runs it: between level
+    // 0 and level 1. ⛔ A REFUSAL, NEVER A `return` — see the stage's own doc.
+    let global = crate::with_whir_hash!(|H| {
+        prove_whir_global_child::<H>(&bundle, &elf_bytes, &inner, &wrap_opts, &ceiling, fan_in)
+    })
+    .unwrap_or_else(|why| panic!("★ THE FIXTURE WHIR GLOBAL WRAP COULD NOT BE BUILT: {why}"));
+    // ⛔ ONE BOOKEND ROOT PER EPOCH, checked against the BUNDLE rather than
+    // against the layout that emitted it: `GlobalLayout::total()` and the
+    // stage's own width assert are both derived from `published.num_epochs`, so
+    // comparing them would be one number checked against itself. The bundle's
+    // epoch count is the second source.
+    assert_eq!(
+        global.published.num_epochs,
+        bundle.num_epochs(),
+        "the global child must publish one bookend root per epoch of the run"
+    );
+
+    // ⛔ THE ROOT OPTION IS A NAMED INPUT HERE TOO, and A is named because it is
+    // what the box arm runs (`LFM_TREE_PROVE_ROOT=1 LFM_TREE_ROOT_OPTION=A`).
+    // Everything below reads it through `RootOption`'s own accessors rather than
+    // through a level index written out again.
+    let option = super::block_root::RootOption::A;
+    let child_level = option.child_level(top);
+
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
-            hi: top,
+            // ★ THE INTERIOR STOPS WHERE THE ROOT'S CHILDREN COME FROM. Under A
+            // that is `top - 1`, so the level-`top` node is never proved — it is
+            // not a child of anything.
+            hi: child_level,
             top,
             size_root: false,
             fan_in,
@@ -7514,48 +8103,148 @@ fn the_whir_fixture_tree_composes_through_the_same_interior() {
         interior.top_level.is_none(),
         "the sizing arm is off, so no level may be held back"
     );
-    // ⓘ Owed here as well, and not because this arm runs anything after it:
-    // `compose_interior_levels` ARMS the interior's own sibling count inside,
-    // so a caller that armed 1 before level 0 no longer has 1 when it returns.
-    // The reset belongs to whoever called it, in both drivers.
+    // ⓘ Owed here as well: `compose_interior_levels` ARMS the interior's own
+    // sibling count inside, so a caller that armed 1 before level 0 no longer
+    // has 1 when it returns. The reset belongs to whoever called it, in both
+    // drivers — and this arm DOES run stages after it now.
     super::device_permit::arm(1);
+    let children = interior.children;
+    let layouts = interior.layouts;
+    let labels = interior.labels;
+
+    // ⛔ THE ROOT COUNTS ITS CHILDREN, and this is the guard a skipped global
+    // stage or a capture taken one level low has to get past. At three epochs
+    // and fan-in 2 the tree is `[[2, 1], [2]]`: `top` is 2, A's children are
+    // level 1's OUTPUT — 2 proofs — and the root takes those plus the global
+    // child, three in all.
+    let want = if child_level == 0 {
+        bundle.num_epochs()
+    } else {
+        shape[child_level - 1].arities.len()
+    };
     assert_eq!(
-        interior.children.len(),
-        1,
-        "the fixture interior must close to exactly one proof"
+        children.len(),
+        want,
+        "option {} takes the OUTPUT of level {child_level} ({want} proofs) and \
+         this run holds {}",
+        option.describe(),
+        children.len(),
     );
     assert_eq!(
-        interior.layouts.len(),
-        1,
-        "one layout for the closing proof"
+        layouts.len(),
+        children.len(),
+        "one layout per child the root takes"
     );
     assert_eq!(
-        interior.labels.len(),
-        1,
-        "one label run for the closing proof"
+        labels.len(),
+        children.len(),
+        "one label run per child the root takes"
     );
-    // ★ THE LABEL RUN IS THE WHOLE BLOCK, and it is the one assert here that a
-    // tree built over the wrong children would fail: the root's range must run
-    // from the first epoch's label to the last's, which is a fact about WHICH
-    // wraps the interior consumed rather than about how many.
+    // ★ THE LABEL RUN SPANS THE WHOLE BLOCK, and it is the assert here that a
+    // tree built over the wrong wraps would fail: the first child's run must
+    // start at epoch 0's label and the last child's must end at the final
+    // epoch's. That is a fact about WHICH wraps the interior consumed rather
+    // than about how many, and it survives the root taking several children.
     assert_eq!(
-        interior.labels[0],
-        vec![
-            crate::tables::local_to_global::epoch_label(0),
-            crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
-        ],
-        "the closing proof must span every epoch of the run"
+        labels[0][0],
+        crate::tables::local_to_global::epoch_label(0),
+        "the root's first child must start at the first epoch"
     );
+    assert_eq!(
+        *labels
+            .last()
+            .expect("one label run per child")
+            .last()
+            .expect("a label run is never empty"),
+        crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+        "the root's last child must end at the last epoch"
+    );
+    // ⓘ Only levels 1..=`child_level` ran, so the report is short of
+    // `tree_node_count` by exactly the levels the root replaces.
+    let interior_nodes: usize = shape[..child_level].iter().map(|l| l.arities.len()).sum();
     assert_eq!(
         interior.report.len(),
-        tree_node_count(&shape),
-        "one report row per interior node"
+        interior_nodes,
+        "one report row per interior node PROVED — levels 1..={child_level} of \
+         {top}, since option {} replaces the rest",
+        option.describe(),
+    );
+    assert!(
+        interior_nodes < tree_node_count(&shape),
+        "option A must leave the top level unproved, or this fixture is not \
+         exercising the root-replaces-top shape at all"
+    );
+
+    // ---- ★★★ THE BLOCK-ARTIFACT ROOT, over `fan_in + 1` children.
+    let fold_shape = option.fold_shape(bundle.num_epochs(), fan_in);
+    let block_range = (
+        crate::tables::local_to_global::epoch_label(0),
+        crate::tables::local_to_global::epoch_label(bundle.num_epochs() as u64 - 1),
+    );
+    let refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
+    let publishes = super::block_root::RootPublishSet::AssertOnly;
+    let program = root_program(
+        &children,
+        &layouts,
+        &refs,
+        block_range,
+        &global.child,
+        &global.published,
+        &fold_shape,
+        publishes,
+    );
+    let sub_proofs: usize =
+        children.iter().map(|c| c.tables.len()).sum::<usize>() + global.child.tables.len();
+    println!(
+        "   FIXTURE ROOT — option {}: {} interior children + the global child = \
+         {} children, {sub_proofs} sub-proofs",
+        option.describe(),
+        children.len(),
+        children.len() + 1,
+    );
+    let (root_cells, root_instrs) = census_and_panel(&program, "the FIXTURE WHIR ROOT", fan_in);
+    // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST.
+    let arenas: Vec<Vec<LfmWord>> = children
+        .iter()
+        .chain(std::iter::once(&global.child))
+        .flat_map(child_arena_words)
+        .collect();
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let t_root = Instant::now();
+    let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
+        .unwrap_or_else(|e| panic!("★ THE FIXTURE WHIR ROOT MUST PROVE: {e:?}"));
+    let root_secs = t_root.elapsed().as_secs_f64();
+    // ⛔ THE ARTIFACT'S WIDTH, AND NOTHING WIDER — `root_schema_words` takes no
+    // epoch count and no arity, so a mismatch means the artifact acquired a
+    // dependence on how we proved it.
+    let out_halves = layouts.last().expect("nonempty").out_halves;
+    let num_reg = layouts[0].num_reg;
+    let want_words = super::block_root::root_schema_words(num_reg, out_halves, publishes);
+    assert_eq!(
+        proved.public_words.len(),
+        want_words,
+        "the fixture artifact is the wrong width: the root published {} words and \
+         root_schema_words({num_reg}, {out_halves}, AssertOnly) is {want_words}",
+        proved.public_words.len(),
+    );
+    assert!(
+        super::proof::verify_against_artifacts(
+            &artifacts,
+            &proved.proof,
+            &proved.public_words,
+            &wrap_opts
+        ),
+        "the fixture WHIR block-artifact root must verify"
     );
     println!(
-        "   ★ FIXTURE WHIR TREE CLOSED to 1 proof over {} epochs in {:.1}s — \
-         NOT a measurement (CPU, blowup {}, {} queries)",
-        bundle.num_epochs(),
+        "   ★ FIXTURE WHIR BLOCK ARTIFACT: the root PROVED AND VERIFIED over {} \
+         children in {root_secs:.1}s · {} published words · {root_cells} cells \
+         ({root_instrs} instructions)\n   ★ whole arm {:.1}s over {} epochs — NOT \
+         a measurement (CPU, blowup {}, {} queries)",
+        children.len() + 1,
+        proved.public_words.len(),
         t_all.elapsed().as_secs_f64(),
+        bundle.num_epochs(),
         inner.blowup_factor,
         inner.fri_number_of_queries,
     );
