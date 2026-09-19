@@ -131,9 +131,10 @@ Each run prints the pass timings, `Trace build (prove-and-retire): N tables, T s
 
 Verification on its own: `cli verify <proof> <elf>` for a per-table proof
 written with `--output`. The `hash-metrics` feature that prints a verify's
-keccak count comes from #987, which is **not on this branch** — the verify-hash
-column in §6 was measured on a tree that has it, and cannot be reproduced here
-until this branch is rebased onto it.
+keccak count arrived with the merge of `main` (#987), so the verify-hash column
+in §6 can now be reproduced on this branch — through `lambda-vm-prover` or
+`crypto` directly. The CLI has no passthrough for it yet, so enabling it from
+`cli trace-build` needs one adding to `bin/cli/Cargo.toml`.
 
 ## 5. What verifies, and with what
 
