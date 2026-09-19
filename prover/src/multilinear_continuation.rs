@@ -1168,8 +1168,21 @@ pub fn verify_global(
 pub struct WhirGlobalAirs {
     /// One local-to-global bookend per epoch, in epoch-label order.
     bookends: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
-    /// One GLOBAL_MEMORY table per touched page, in the canonical page-base
-    /// order [`crate::continuation::global_memory_configs`] hands back.
+    /// One GLOBAL_MEMORY table per touched page, one for one with `page_bases`
+    /// and in its order.
+    ///
+    /// ⚠ THE ORDER IS THE CALLER'S, NOT `global_memory_configs`'. ✓ That
+    /// function is a one-to-one `map` over the page bases it is given, with no
+    /// sort, dedup or filter, so it PRESERVES an order rather than imposing
+    /// one. Canonicality — sorted and deduped — comes from
+    /// [`crate::continuation::touched_page_bases`], which collects through a
+    /// `BTreeSet`, and on the VERIFIER side the list arrives in the bundle,
+    /// where it is a CLAIM rather than a fact. It is bound by `absorb_global`
+    /// and by the GlobalMemory bus, which is what makes a wrong list a refusal;
+    /// it is not made canonical here. An earlier draft of this doc credited
+    /// this function with the canonicalisation, which would have left a reader
+    /// believing a duplicate base was impossible on the path where it is merely
+    /// caught.
     pages: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
     /// The configs those page AIRs were built from, in the same order.
     ///
@@ -1390,7 +1403,24 @@ where
     let (stacks, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
     // Each bookend is a group of its own, so its roots are the group's — as
     // many as the stack split it into.
-    let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
+    //
+    // ⛔ AN `Err` AND NOT A SLICE PANIC. `stacks[..num_epochs]` panicked with
+    // "range end index 3 out of range for slice of length 2" when a mutation
+    // made the split disagree with the epoch count — a prover-side panic on a
+    // path whose contract is to REJECT a proof, which is the no-prod-panic
+    // policy's exact shape. It is not attacker-reachable as written, because
+    // `global_groups` builds `sizes` from the same `num_epochs` two lines up,
+    // so the length is right by construction; a panic that is unreachable today
+    // and unreachable by construction are different things, and only one of
+    // them survives someone rewriting the construction.
+    let bookend_stacks = stacks.get(..num_epochs).ok_or_else(|| {
+        Error::InvalidTableCounts(format!(
+            "the cross-epoch split has {} commitment groups and this bundle claims \
+             {num_epochs} epochs, so there is no bookend group per epoch",
+            stacks.len(),
+        ))
+    })?;
+    let polys: Vec<usize> = bookend_stacks.iter().map(|l| l.num_polys()).collect();
 
     // ⛔ THE GENESIS STACK IS DERIVED, NEVER READ FROM THE PROOF, which is the
     // same rule `PreparedCheck::roots` carries: a root taken from the bundle
