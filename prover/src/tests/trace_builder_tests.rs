@@ -1277,13 +1277,32 @@ fn chunk_shape_matches_the_built_chunk() {
     let lt_ops: Vec<_> = (0..8u64)
         .map(|i| crate::tables::lt::LtOperation::new(i % 3, i % 3 + 1, false))
         .collect();
+    // SHIFT is a plain kind (no dedup): 20 ops over a limit of 8 give chunks of
+    // 8/8/4, i.e. row counts of 8/8/4. Sizes above 4 matter — an empty op list
+    // pads to 4, so a fixture whose chunks all land on 4 compares the padding
+    // floor against itself and would pass even if the row rule were wrong.
+    let shift_ops: Vec<_> = (0..20u64)
+        .map(|i| crate::tables::shift::ShiftOperation::new(i, i % 5, false, false, false))
+        .collect();
+    // MUL deduplicates like LT, and its rows are keyed on the op with the lo/hi
+    // flag folded into the multiplicity: 12 entries, 3 distinct.
+    let mul_ops: Vec<_> = (0..6u64)
+        .flat_map(|i| {
+            let op = crate::tables::mul::MulOperation::new(i % 3, false, i % 3 + 1, false);
+            [(op.clone(), false), (op, true)]
+        })
+        .collect();
     let routed = CollectedOps {
         lt_ops,
+        shift_ops,
+        mul_ops,
         ..Default::default()
     };
 
     let max_rows = crate::tables::MaxRowsConfig {
         lt: 16,
+        shift: 8,
+        mul: 16,
         ..Default::default()
     };
 
@@ -1292,7 +1311,24 @@ fn chunk_shape_matches_the_built_chunk() {
         4,
         "the LT fixture must exercise deduplication (8 ops, 3 distinct)"
     );
+    assert_eq!(
+        routed.chunk_shape(TableKind::Mul, 0, &max_rows).0,
+        4,
+        "the MUL fixture must exercise deduplication (12 entries, 3 distinct)"
+    );
+    assert_eq!(
+        routed.num_chunks(TableKind::Shift, &max_rows),
+        3,
+        "the SHIFT fixture must split into several chunks, or the plain path is \
+         only ever checked on one"
+    );
+    assert_eq!(
+        routed.chunk_shape(TableKind::Shift, 0, &max_rows).0,
+        8,
+        "the SHIFT fixture must produce chunks wider than the 4-row padding floor"
+    );
 
+    let mut populated = 0usize;
     for kind in [
         TableKind::Cpu,
         TableKind::Memw,
@@ -1316,8 +1352,19 @@ fn chunk_shape_matches_the_built_chunk() {
                 (built.num_rows(), built.num_main_columns),
                 "{kind:?} chunk {chunk}: declared shape differs from the built one"
             );
+            if routed.buffered(kind) > 0 {
+                populated += 1;
+            }
         }
     }
+    // A kind with no ops pads to the same 4 rows on both sides, so it pins the
+    // column width and nothing else. Without at least a few populated kinds this
+    // whole loop is a constant compared against itself.
+    assert!(
+        populated >= 3,
+        "the fixture must give several kinds real ops, or the row half of the \
+         comparison is vacuous (populated chunks: {populated})"
+    );
 }
 
 /// Collecting an execution chunk by chunk must produce exactly what collecting

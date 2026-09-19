@@ -172,9 +172,6 @@ pub fn generate_decode_trace(
     (trace, pc_to_row)
 }
 
-/// Updates multiplicities in the DECODE trace table.
-///
-/// For each PC in `lookups`, increments the MU column in the corresponding row.
 /// Add `count` lookups of `pc` at once.
 ///
 /// The per-lookup form needs one entry per executed cycle, which a prover that
@@ -196,6 +193,9 @@ pub fn add_multiplicities(
     }
 }
 
+/// Updates multiplicities in the DECODE trace table.
+///
+/// For each PC in `lookups`, increments the MU column in the corresponding row.
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     pc_to_row: &PcToRow,

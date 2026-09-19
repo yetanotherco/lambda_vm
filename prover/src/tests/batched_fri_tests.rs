@@ -146,7 +146,6 @@ fn alpha_moves_when_any_table_moves() {
         lde_size: 8,
         trace_rows: 4,
         deep: Vec::new(),
-        air_index: seed as usize,
         bus_contribution: Some(FieldElement::<E>::from(seed)),
         main_roots: stark::prover::MainRoots {
             precomputed: None,
@@ -640,5 +639,52 @@ fn a_tampered_batched_proof_is_rejected() {
     proof.table_counts.cpu += 1;
     rejected(&proof, "a layout with one more CPU chunk");
     proof.table_counts.cpu -= 1;
+    accepted(&proof);
+
+    // A group's FRI layer commitment. This is the one thing batching actually
+    // relocated — per table before, per group now — so it is the commitment most
+    // worth pinning. It is bound only indirectly: the seed absorbs each layer
+    // root, so changing one moves the group's query indices.
+    //
+    // Groups at or below the terminal size commit no layers at all, so pick one
+    // that has some. Asserting that such a group exists keeps this from becoming
+    // a tamper that silently does nothing if the fixture's shape changes.
+    let with_layers = proof
+        .groups
+        .iter()
+        .position(|(_, fri)| !fri.layer_roots.is_empty())
+        .expect("the fixture must produce at least one group that commits FRI layers");
+    proof.groups[with_layers].1.layer_roots[0][0] ^= 1;
+    rejected(&proof, "a group's FRI layer root");
+    proof.groups[with_layers].1.layer_roots[0][0] ^= 1;
+    accepted(&proof);
+
+    // A table's round-1 main commitment.
+    proof.tables[0].main_root[0] ^= 1;
+    rejected(&proof, "a main trace root");
+    proof.tables[0].main_root[0] ^= 1;
+    accepted(&proof);
+
+    // A table's composition commitment, which the fold seed absorbs directly.
+    proof.tables[0].composition_poly_root[0] ^= 1;
+    rejected(&proof, "a composition root");
+    proof.tables[0].composition_poly_root[0] ^= 1;
+    accepted(&proof);
+
+    // An out-of-domain value, the other thing the fold seed binds.
+    let orig = *proof.tables[0].trace_ood.get(0, 0);
+    proof.tables[0].trace_ood.set(0, 0, &orig + &one);
+    rejected(&proof, "an out-of-domain trace value");
+    proof.tables[0].trace_ood.set(0, 0, orig);
+    accepted(&proof);
+
+    // A block whose advertised dimensions disagree with its data length. The
+    // verifier must REJECT this, not panic: the fold seed indexes both
+    // out-of-domain blocks at the dimensions the proof declares, so the shape
+    // has to be pinned to the AIR before that read rather than after it.
+    let orig_width = proof.tables[0].trace_ood.width;
+    proof.tables[0].trace_ood.width += 1;
+    rejected(&proof, "an out-of-domain block with a lying width");
+    proof.tables[0].trace_ood.width = orig_width;
     accepted(&proof);
 }

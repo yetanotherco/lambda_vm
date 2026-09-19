@@ -282,6 +282,7 @@ dependencies = [
  "env_logger",
  "executor",
  "lambda-vm-prover",
+ "log",
  "rkyv",
  "serde_cbor",
  "stark",

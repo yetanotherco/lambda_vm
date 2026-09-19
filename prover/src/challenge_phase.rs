@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -46,7 +47,7 @@ pub struct Challenge {
     /// (DECODE from the ELF, one per ELF data page, ...) are the bulk of this pass.
     pub(crate) airs: crate::VmAirs,
     /// The transcript right after the sampling, which every later pass forks
-    /// per table. Kept rather than rebuilt: re-absorbing 227 roots to get back
+    /// per table. Kept rather than rebuilt: re-absorbing every root to get back
     /// to this state is both slower and a second place for the order to be
     /// wrong.
     pub transcript: DefaultTranscript<GoldilocksExtension>,
@@ -159,12 +160,17 @@ fn assemble_roots(
         (&airs.register, &remaining.register, "REGISTER"),
     ];
     // Small tables, many of them: one commit at a time leaves most cores idle.
-    roots.extend(
-        fixed
-            .par_iter()
-            .map(|(air, trace, name)| commit_resident(air, trace, name))
-            .collect::<Result<Vec<_>, _>>()?,
-    );
+    #[cfg(feature = "parallel")]
+    let fixed_roots = fixed
+        .par_iter()
+        .map(|(air, trace, name)| commit_resident(air, trace, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let fixed_roots = fixed
+        .iter()
+        .map(|(air, trace, name)| commit_resident(air, trace, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    roots.extend(fixed_roots);
     if airs.include_halt {
         roots.push(commit_resident(&airs.halt, &remaining.halt, "HALT")?);
     }
@@ -184,12 +190,17 @@ fn assemble_roots(
             // PAGE is built from the ELF image rather than from an op list, so
             // it is never retired and is committed here with the rest.
             let pages: Vec<_> = page_airs.by_ref().collect();
-            roots.extend(
-                pages
-                    .par_iter()
-                    .map(|(air, trace)| commit_resident(air, trace, "PAGE"))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            #[cfg(feature = "parallel")]
+            let page_roots = pages
+                .par_iter()
+                .map(|(air, trace)| commit_resident(air, trace, "PAGE"))
+                .collect::<Result<Vec<_>, _>>()?;
+            #[cfg(not(feature = "parallel"))]
+            let page_roots = pages
+                .iter()
+                .map(|(air, trace)| commit_resident(air, trace, "PAGE"))
+                .collect::<Result<Vec<_>, _>>()?;
+            roots.extend(page_roots);
             continue;
         };
         for chunk in 0..count_for(table_counts, kind) {

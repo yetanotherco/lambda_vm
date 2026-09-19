@@ -97,28 +97,30 @@ fn rounds_batch(
     done: &Proofs,
     items: Vec<Item>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
-    let built: Result<Vec<_>, Error> = items
-        .into_par_iter()
-        .map(|(kind, chunk, mut trace)| {
-            let idx = order.index_of(kind, chunk).ok_or_else(|| {
-                Error::Prover(format!(
-                    "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
-                ))
-            })?;
-            let mut transcript = fork(&challenge.transcript, idx, n);
-            let rounds = prove_table(
-                airs.get(kind).as_ref(),
-                &mut trace,
-                &challenge.challenges,
-                &mut transcript,
-            )
-            .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
-            Ok((idx, rounds))
-        })
-        .collect();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let rounds = prove_table(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+        )
+        .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, rounds))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
     done.lock().expect("logup results").extend(built?);
     Ok(())
 }
@@ -235,6 +237,7 @@ fn assemble(
     resident: &mut Resident,
     challenge: &Challenge,
 ) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
     let order = &challenge.order;
     let airs = &challenge.airs;
@@ -299,8 +302,14 @@ fn assemble(
             .ok_or_else(|| Error::Prover(format!("logup phase: page {i} is not in the layout")))?;
         jobs.push((idx, air, trace));
     }
+    #[cfg(feature = "parallel")]
     let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
         .into_par_iter()
+        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
+        .collect::<Result<_, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
+        .into_iter()
         .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
         .collect::<Result<_, _>>()?;
     for (idx, proof) in built {
@@ -393,29 +402,31 @@ fn deep_batch(
     done: &Deeps,
     items: Vec<Item>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
-    let built: Result<Vec<_>, Error> = items
-        .into_par_iter()
-        .map(|(kind, chunk, mut trace)| {
-            let idx = order.index_of(kind, chunk).ok_or_else(|| {
-                Error::Prover(format!(
-                    "batched phase: {kind:?} chunk {chunk} is not in the layout"
-                ))
-            })?;
-            let mut transcript = fork(&challenge.transcript, idx, n);
-            let deep = deep_of(
-                airs.get(kind).as_ref(),
-                &mut trace,
-                &challenge.challenges,
-                &mut transcript,
-                challenge.roots.get(idx).cloned(),
-            )
-            .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
-            Ok((idx, deep))
-        })
-        .collect();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "batched phase: {kind:?} chunk {chunk} is not in the layout"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let deep = deep_of(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+            challenge.roots.get(idx).cloned(),
+        )
+        .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, deep))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
     // Folded in a fixed order within the batch, so the sequence is a function
     // of the walk and not of which thread finished first.
     let mut built = built?;
@@ -532,6 +543,7 @@ pub fn run_batched(
     let airs = &challenge.airs;
     let n = order.len();
     {
+        #[cfg(feature = "parallel")]
         use rayon::prelude::*;
         let mut state = done.lock().expect("fold state");
         let build = |idx: usize,
@@ -584,8 +596,14 @@ pub fn run_batched(
             })?;
             jobs.push((idx, air, trace));
         }
+        #[cfg(feature = "parallel")]
         let deeps: Vec<(usize, Deep)> = jobs
             .into_par_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<_, _>>()?;
+        #[cfg(not(feature = "parallel"))]
+        let deeps: Vec<(usize, Deep)> = jobs
+            .into_iter()
             .map(|(idx, air, trace)| build(idx, air, trace))
             .collect::<Result<_, _>>()?;
         for (idx, deep) in deeps {
@@ -610,13 +628,9 @@ pub fn run_batched(
     // One FRI per accumulator, and the mapping from table to group.
     let mut group_of = vec![usize::MAX; n];
     let sizes: Vec<usize> = acc.keys().copied().collect();
-    for (&idx, _) in tables.iter().map(|(i, t)| (i, t)) {
-        let rows = tables
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, t)| t.trace_rows)
-            .expect("table just listed");
-        let lde = rows * proof_options.blowup_factor as usize;
+    for (idx, table) in tables.iter() {
+        let lde = table.trace_rows * proof_options.blowup_factor as usize;
+        let idx = *idx;
         group_of[idx] = sizes.iter().position(|s| *s == lde).ok_or_else(|| {
             Error::Prover(format!(
                 "batched phase: table {idx} has no group of size {lde}"
@@ -701,30 +715,32 @@ fn open_batch(
     done: &Opens,
     items: Vec<Item>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
     let order = &challenge.order;
     let n = order.len();
-    let built: Result<Vec<_>, Error> = items
-        .into_par_iter()
-        .map(|(kind, chunk, mut trace)| {
-            let idx = order.index_of(kind, chunk).ok_or_else(|| {
-                Error::Prover(format!(
-                    "open pass: {kind:?} chunk {chunk} is not in the layout"
-                ))
-            })?;
-            let mut transcript = fork(&challenge.transcript, idx, n);
-            let opening = open_of(
-                airs.get(kind).as_ref(),
-                &mut trace,
-                &challenge.challenges,
-                &mut transcript,
-                iotas_of(batched, idx)?,
-                take_kept(batched, idx),
-            )
-            .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
-            Ok((idx, opening))
-        })
-        .collect();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "open pass: {kind:?} chunk {chunk} is not in the layout"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let opening = open_of(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+            iotas_of(batched, idx)?,
+            take_kept(batched, idx),
+        )
+        .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, opening))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
     done.lock().expect("openings").extend(built?);
     Ok(())
 }
@@ -855,12 +871,19 @@ pub fn run_open(
         jobs.push((idx, air, trace));
     }
     {
+        #[cfg(feature = "parallel")]
         use rayon::prelude::*;
-        opens.extend(
-            jobs.into_par_iter()
-                .map(|(idx, air, trace)| build(idx, air, trace))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        #[cfg(feature = "parallel")]
+        let opened = jobs
+            .into_par_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(not(feature = "parallel"))]
+        let opened = jobs
+            .into_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<Vec<_>, _>>()?;
+        opens.extend(opened);
     }
 
     opens.sort_by_key(|(idx, _)| *idx);

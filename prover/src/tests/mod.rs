@@ -1,7 +1,7 @@
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
-#[cfg(feature = "parallel")]
-mod batched_fri_tests;
+#[cfg(test)]
+pub mod batched_fri_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
@@ -12,8 +12,8 @@ pub mod branch_bus_tests;
 pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod bytewise_tests;
-#[cfg(feature = "parallel")]
-mod challenge_phase_tests;
+#[cfg(test)]
+pub mod challenge_phase_tests;
 #[cfg(test)]
 pub mod commit_tests;
 #[cfg(test)]

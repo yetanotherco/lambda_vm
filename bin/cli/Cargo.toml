@@ -14,12 +14,19 @@ clap = { version = "4.3.10", features = ["derive"] }
 rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
 tempfile = "3"
 tikv-jemallocator = "0.6"
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+# No `stats` by default: that feature propagates to tikv-jemalloc-sys and builds
+# jemalloc with `--enable-stats`, i.e. counters on the malloc fast path, for every
+# binary. `keep_large_buffers_warm` needs only `raw`/`mallctl`; the heap tracker is
+# what needs the counters, and it is behind `jemalloc-stats`.
+tikv-jemalloc-ctl = { version = "0.6" }
 tikv-jemalloc-sys = "0.6"
 env_logger = "0.11"
+# Used by `keep_large_buffers_warm`, whose body is Linux-only — so a macOS build
+# will not catch its absence.
+log = "0.4"
 
 [features]
-jemalloc-stats = []
+jemalloc-stats = ["tikv-jemalloc-ctl/stats"]
 disk-spill = ["prover/disk-spill"]
 instruments = ["prover/instruments", "stark/instruments"]
 # GPU profiling build (Nsight): CUDA prover + instruments spans + NVTX ranges.

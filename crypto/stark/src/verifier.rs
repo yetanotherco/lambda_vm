@@ -1455,12 +1455,13 @@ pub trait IsStarkVerifier<
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
-    /// already been replayed and the RAP challenges are known.
-    /// Rounds 2 and 3 of a table's transcript: the constraint coefficients, the
-    /// out-of-domain point and the DEEP coefficients. The per-table proof goes
+    /// already been replayed and the RAP challenges are known: the constraint
+    /// coefficients, the out-of-domain point, and round 4's DEEP coefficients.
+    ///
+    /// Stops where the two proof formats part company. The per-table proof goes
     /// on to its own FRI from here; the batched proof samples its fold
     /// coefficient instead.
-    fn replay_rounds_2_and_3(
+    fn replay_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         public_inputs: &PI,
@@ -1591,7 +1592,7 @@ pub trait IsStarkVerifier<
             transition_coeffs,
             trace_term_coeffs,
             gammas,
-        } = Self::replay_rounds_2_and_3(
+        } = Self::replay_rounds_2_to_4(
             air,
             proof,
             public_inputs,
