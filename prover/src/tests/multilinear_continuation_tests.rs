@@ -1351,3 +1351,140 @@ fn a_sparse_genesis_page_set_carries_no_prepared_opening() {
         "a sparse page set produced a prepared opening it has no use for"
     );
 }
+
+/// The ELF's genesis byte at `address`, derived from the `PT_LOAD` segments
+/// DIRECTLY — never through `build_initial_image_paged` or
+/// `page::preprocessed_columns`.
+///
+/// ⚠ THE INDEPENDENCE IS THE WHOLE VALUE. The provenance test below compares
+/// the interned root against a stack built from this; built through the same
+/// function the code under test uses, it would compare a value with itself and
+/// pass for any pair of agreeing bugs. A byte outside every segment is zero,
+/// which is the same rule a short `PageConfig::init_values` encodes.
+fn elf_genesis_byte(elf: &Elf, address: u64) -> u8 {
+    for segment in &elf.data {
+        let end = segment
+            .base_addr
+            .saturating_add(segment.values.len() as u64 * 4);
+        if address < segment.base_addr || address >= end {
+            continue;
+        }
+        let offset = address - segment.base_addr;
+        let word = segment.values[(offset / 4) as usize];
+        // RISC-V is little-endian: byte `k` of a word is bits `8k..8k+8`.
+        return (word >> (8 * (offset % 4))) as u8;
+    }
+    0
+}
+
+/// ⛔⛔ THE FOURTH OWED PER-ELF PIN, AND ITS PROVENANCE.
+///
+/// The in-guest verifier cannot recompute the genesis stack's commitment, so it
+/// interns the ROOT as program text exactly as it interns DECODE's. The
+/// statement owed out of band is **"this root is the commitment to the ELF's
+/// genesis bytes at the dense page bases, under this blowup and folding"**, and
+/// it is OWED rather than covered: nothing inside the program checks it.
+///
+/// This is the evidence for that statement. It rebuilds the stacked columns
+/// from the ELF's `PT_LOAD` segments byte by byte — a second derivation on
+/// purpose, see [`elf_genesis_byte`] — commits them through the same
+/// `global_layout` and the same config the production path uses, and compares
+/// the ROOTS.
+///
+/// ⛔ AND THESE ARE NOT THE 35 UNIVARIATE ROOTS. `recursion::precomputed_commitments`
+/// builds one Merkle root per page config over that page's LDE codeword; those
+/// are what the attestation's `program_id` folds, and no multilinear verifier
+/// ever compares one. A stacked WHIR commitment over the same columns has no
+/// per-page subtree to match against them. Two different objects over the same
+/// bytes, and only one of them is this.
+#[test]
+fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
+    use multilinear::whir_hash::KeccakWhir;
+
+    let elf_bytes = asm_elf_bytes("dense_data_page_touch");
+    let (elf, boundaries, _init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &[], 3);
+
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::genesis_stack::plan(
+        &configs,
+        boundaries.len(),
+        crate::genesis_stack::PAGE_NUM_VARS,
+    );
+    assert!(
+        !plan.is_empty(),
+        "the fixture must carry a stack, or there is no root to have provenance"
+    );
+
+    // Both halves commit under ONE config, so a difference in the roots is a
+    // difference in the BYTES and not in the parameters.
+    let config = crate::multilinear_prove::chain_config(&[(
+        plan.at.len(),
+        crate::genesis_stack::PAGE_NUM_VARS,
+    )]);
+    let production = multilinear_continuation::genesis_prepared_for::<KeccakWhir>(
+        &configs,
+        plan.clone(),
+        &config,
+    )
+    .expect("the production stack")
+    .expect("a non-empty plan must produce a stack");
+
+    // The independent half: the same page bases in the same order, the bytes
+    // read straight out of the ELF's segments.
+    let page_size = 1u64 << crate::genesis_stack::PAGE_NUM_VARS;
+    let rebuilt: Vec<multilinear::mle::Mle<crate::test_utils::F>> = plan
+        .at
+        .iter()
+        .map(|entry| {
+            let base = configs[entry.table - boundaries.len()].page_base;
+            let values: Vec<_> = (0..page_size)
+                .map(|offset| {
+                    math::field::element::FieldElement::<crate::test_utils::F>::from(u64::from(
+                        elf_genesis_byte(&elf, base + offset),
+                    ))
+                })
+                .collect();
+            multilinear::mle::Mle::new(values).expect("mle")
+        })
+        .collect();
+
+    // ⚠ ANTI-VACUITY: two all-zero stacks match and say nothing. The fixture is
+    // dense by construction, and each rebuilt column is asserted to carry at
+    // least what put its page over the threshold — so this compares the bytes
+    // that matter and not a pair of empty pages.
+    let floor = crate::genesis_stack::PREPARED_LEG_ROWS / crate::genesis_stack::PAGE_NUM_VARS;
+    for (column, entry) in rebuilt.iter().zip(&plan.at) {
+        let zero = math::field::element::FieldElement::<crate::test_utils::F>::from(0u64);
+        let nonzero = column.evals().iter().filter(|v| **v != zero).count();
+        println!(
+            "PROVENANCE table {} rebuilt nonzero {nonzero} (floor {floor})",
+            entry.table
+        );
+        assert!(
+            nonzero > floor,
+            "the rebuilt column has {nonzero} nonzero entries, at or below the {floor} \
+             that put this page in the stack — the two halves are reading different pages"
+        );
+    }
+
+    let independent =
+        multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
+            stark::multilinear_table::global_layout(&[(
+                rebuilt.len(),
+                crate::genesis_stack::PAGE_NUM_VARS,
+            )])
+            .expect("layout"),
+            &multilinear::stacking::borrow(&rebuilt),
+            None,
+            &config,
+        )
+        .expect("the independent stack");
+
+    assert_eq!(
+        production.roots,
+        independent.roots(),
+        "the genesis stack's root is not the commitment to the ELF's own bytes at those \
+         page bases — the pin this root owes could not be stated"
+    );
+}

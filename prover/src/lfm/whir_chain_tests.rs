@@ -1065,3 +1065,77 @@ fn the_production_chain_emits_its_closed_form() {
         "the production shape's permutations"
     );
 }
+
+/// ⛔ THE GENESIS THRESHOLD'S BUDGET, ASSERTED WHERE IT CAN BE COMPUTED.
+///
+/// `crate::genesis_stack::PREPARED_LEG_ROWS` is the row budget a page must beat
+/// before the cross-epoch proof carries its INIT column in a prepared opening.
+/// It is a CONSTANT there rather than a call, because that module sits below
+/// `crate::lfm` — a routing rule the prover, the verifier and the emitter must
+/// all agree on cannot depend on the emitter's row accounting. This is the
+/// assertion that pays for the constant, in the one place the form exists.
+///
+/// ★ WHAT THE CONSTANT IS: 175,066 rows, the chain over a stacked family
+/// polynomial at 24 variables. The block's stack is THREE columns of 2^18 — 20
+/// variables — so it is charged at a figure larger than it can cost, which is
+/// the conservative direction: a page must be worth more than the stack could
+/// possibly cost before it joins.
+///
+/// ⚠ CONFIGURATION IS PART OF THE NUMBER. Chain rows move with blowup, folding
+/// and the query count, so this asserts at the shape the campaign's production
+/// figures are quoted at — the same `config(112, 20)` the chain's own F1 above
+/// uses. A posture change reddens this rather than silently retuning a routing
+/// rule nobody is looking at.
+///
+/// It asserts a BAND and not an equality: the constant's job is to be larger
+/// than the 20-variable stack and no larger than the 24-variable one it was
+/// read from. An equality would redden on any change to the schedule, which is
+/// a different finding from "the routing rule has drifted".
+#[test]
+fn the_genesis_threshold_budget_is_in_band_at_the_production_shape() {
+    let at_20 = chain_shape_rows(&ChainShape::new(&config(112, 20), 20));
+    let at_24 = chain_shape_rows(&ChainShape::new(&config(112, 20), 24));
+    let budget = crate::genesis_stack::PREPARED_LEG_ROWS;
+    println!(
+        "GENESIS BUDGET: {budget} rows against a chain of {at_20} at 20 variables and \
+         {at_24} at 24, Q=112 grind=20 blowup=2 fold=4"
+    );
+    assert!(
+        at_20 < at_24,
+        "a stack of fewer variables must cost fewer chain rows, or the budget's \
+         conservatism argument does not hold ({at_20} at 20, {at_24} at 24)"
+    );
+    assert!(
+        budget >= at_20,
+        "the threshold charges {budget} rows for a stack that costs {at_20} at the \
+         block's 20 variables: pages would be left sparse that the opening could carry"
+    );
+    assert!(
+        budget <= at_24,
+        "the threshold charges {budget} rows for a stack that costs at most {at_24}: \
+         the budget has drifted above the cost it stands for"
+    );
+}
+
+/// ★ AND THE ROUTING DECISION DOES NOT SIT NEAR THAT BAND.
+///
+/// The block's three dense pages cost 2,100,474, 4,127,238 and 4,020,858 rows
+/// by the sparse form, and its 27 zero pages cost 18 each. Whatever the chain
+/// figure moves to within any plausible posture, the same three pages are
+/// selected — which is the argument that this is a routing rule rather than a
+/// tuning knob, made against the cost form rather than against the constant.
+#[test]
+fn the_blocks_genesis_routing_is_insensitive_to_the_chain_figure() {
+    let cheapest_dense = 2_100_474usize;
+    let dearest_sparse = 18usize;
+    for stack_vars in 18..=25 {
+        let rows = chain_shape_rows(&ChainShape::new(&config(112, 20), stack_vars));
+        assert!(
+            dearest_sparse <= rows && rows < cheapest_dense,
+            "at {stack_vars} stacked variables the chain costs {rows} rows, which falls \
+             outside ({dearest_sparse}, {cheapest_dense}) — the block's selection would \
+             change with the posture and the pre-registered three pages are no longer \
+             a property of the run"
+        );
+    }
+}
