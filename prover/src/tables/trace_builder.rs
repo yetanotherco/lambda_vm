@@ -1510,13 +1510,18 @@ impl WalkLeftover {
         }
 
         AccumulatedTables {
-            commits: accel_of(&self.tail.commit_ops, commit::generate_commit_trace),
-            keccaks: accel_of(&self.tail.keccak_ops, keccak::generate_keccak_trace),
-            keccak_rnds: accel_of(&keccak_rnd_ops, keccak_rnd::generate_keccak_rnd_trace),
+            // In `ACCEL_ORDER`, which is where that order is defined. Named
+            // here only so the reader can check them against it.
+            accel: [
+                /* Commit    */ accel_of(&self.tail.commit_ops, commit::generate_commit_trace),
+                /* Keccak    */ accel_of(&self.tail.keccak_ops, keccak::generate_keccak_trace),
+                /* KeccakRnd */
+                accel_of(&keccak_rnd_ops, keccak_rnd::generate_keccak_rnd_trace),
+                /* Ecsm      */ accel_of(&self.tail.ecsm_ops, ecsm::generate_ecsm_trace),
+                /* Ecdas     */ accel_of(&self.tail.ecdas_ops, ecdas::generate_ecdas_trace),
+                /* Hint      */ accel_of(&self.tail.hint_ops, hint::generate_hint_trace),
+            ],
             keccak_rc,
-            ecsms: accel_of(&self.tail.ecsm_ops, ecsm::generate_ecsm_trace),
-            ecdases: accel_of(&self.tail.ecdas_ops, ecdas::generate_ecdas_trace),
-            hints: accel_of(&self.tail.hint_ops, hint::generate_hint_trace),
         }
     }
 
@@ -1626,18 +1631,18 @@ pub type HaltAndRegister = (
 );
 
 /// The tables built once, at the end, from an accumulated op list.
-///
-/// The accelerator chips are `Vec`s of at most one table, matching the shape
-/// `Traces` gives them: a run that never reaches a chip carries no table for it
-/// at all rather than a padded one, so the count is what the AIR layout reads.
 pub struct AccumulatedTables {
-    pub commits: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub keccaks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub keccak_rnds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// One slot per accelerator chip, in `streaming::ACCEL_ORDER`. Each holds
+    /// at most one table and is empty when the run never reached that chip, so
+    /// its length is what the AIR layout counts.
+    ///
+    /// Indexed by that order rather than held in six named fields: every pass
+    /// walks these in AIR order, and a named list is a list that gets re-typed
+    /// in the next file and drifts. `iter()` here is in the order by
+    /// construction.
+    pub accel: [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 6],
+    /// KECCAK_RC is preprocessed and always present, so it is not one of them.
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
-    pub ecsms: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub ecdases: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// The tables `cpu32_chip_op` appends to.

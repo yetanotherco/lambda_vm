@@ -44,22 +44,131 @@ pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
 /// and the chunked groups — see [`accel_lengths`].
 pub(crate) const NUM_FIXED_AIRS: usize = 4;
 
-/// The accelerator groups, in the order `VmAirs::air_trace_pairs` emits them:
-/// COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, after HALT and before the
-/// chunked groups.
+/// One accelerator chip's group of AIRs.
 ///
-/// Each is 1 when the run reached that chip and 0 when it did not, so their
-/// total shifts every chunked index below them. Taken from the counts rather
-/// than assumed, for the reason `AirOrder` gives: the order is the protocol.
+/// A chip the run never reached has no table and no AIR, so these are
+/// variable-length groups between HALT and the chunked groups rather than
+/// fixed slots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AccelGroup {
+    Commit = 0,
+    Keccak = 1,
+    KeccakRnd = 2,
+    Ecsm = 3,
+    Ecdas = 4,
+    Hint = 5,
+}
+
+/// The accelerator groups in the order `VmAirs::air_trace_pairs` emits them.
+///
+/// **This is the only place that order is written.** Every pass reads it from
+/// here and indexes the tables by it; none re-types the list. The last reorder
+/// desynchronised three hand-written copies of it at once, and the failure is
+/// silent — a proof whose roots are absorbed in the wrong order simply does not
+/// verify, with nothing pointing at the list that was missed.
+pub(crate) const ACCEL_ORDER: [AccelGroup; 6] = [
+    AccelGroup::Commit,
+    AccelGroup::Keccak,
+    AccelGroup::KeccakRnd,
+    AccelGroup::Ecsm,
+    AccelGroup::Ecdas,
+    AccelGroup::Hint,
+];
+
+// `slot` is the enum's discriminant and `ACCEL_ORDER` is a list; two encodings
+// of one order is how it drifts. This refuses to compile unless they agree, so
+// reordering the list without reordering the discriminants is a build error
+// rather than a proof that does not verify.
+const _: () = {
+    let mut i = 0;
+    while i < ACCEL_ORDER.len() {
+        assert!(
+            ACCEL_ORDER[i].slot() == i,
+            "ACCEL_ORDER must list the groups in discriminant order"
+        );
+        i += 1;
+    }
+};
+
+impl AccelGroup {
+    /// Position in [`ACCEL_ORDER`], which is also the index into
+    /// `AccumulatedTables::accel`.
+    pub(crate) const fn slot(self) -> usize {
+        self as usize
+    }
+
+    /// The name the transcript's diagnostics use for this chip.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            AccelGroup::Commit => "COMMIT",
+            AccelGroup::Keccak => "KECCAK",
+            AccelGroup::KeccakRnd => "KECCAK_RND",
+            AccelGroup::Ecsm => "ECSM",
+            AccelGroup::Ecdas => "ECDAS",
+            AccelGroup::Hint => "HINT",
+        }
+    }
+
+    /// How many AIRs this group has, from the counts the statement binds.
+    pub(crate) fn count(self, counts: &crate::TableCounts) -> usize {
+        match self {
+            AccelGroup::Commit => counts.commit,
+            AccelGroup::Keccak => counts.keccak,
+            AccelGroup::KeccakRnd => counts.keccak_rnd,
+            AccelGroup::Ecsm => counts.ecsm,
+            AccelGroup::Ecdas => counts.ecdas,
+            AccelGroup::Hint => counts.hint,
+        }
+    }
+
+    /// The same field, to be written by a pass that counts the tables it found.
+    pub(crate) fn count_slot(self, counts: &mut crate::TableCounts) -> &mut usize {
+        match self {
+            AccelGroup::Commit => &mut counts.commit,
+            AccelGroup::Keccak => &mut counts.keccak,
+            AccelGroup::KeccakRnd => &mut counts.keccak_rnd,
+            AccelGroup::Ecsm => &mut counts.ecsm,
+            AccelGroup::Ecdas => &mut counts.ecdas,
+            AccelGroup::Hint => &mut counts.hint,
+        }
+    }
+
+    /// This group's AIRs. Read-only, so every group can be borrowed at once.
+    pub(crate) fn airs(self, airs: &crate::VmAirs) -> &[crate::VmAir] {
+        match self {
+            AccelGroup::Commit => &airs.commits,
+            AccelGroup::Keccak => &airs.keccaks,
+            AccelGroup::KeccakRnd => &airs.keccak_rnds,
+            AccelGroup::Ecsm => &airs.ecsms,
+            AccelGroup::Ecdas => &airs.ecdases,
+            AccelGroup::Hint => &airs.hints,
+        }
+    }
+
+    /// This group's tables on the all-at-once path, where they are named fields
+    /// rather than an ordered array.
+    pub(crate) fn traces(
+        self,
+        traces: &Traces,
+    ) -> &[TraceTable<GoldilocksField, GoldilocksExtension>] {
+        match self {
+            AccelGroup::Commit => &traces.commits,
+            AccelGroup::Keccak => &traces.keccaks,
+            AccelGroup::KeccakRnd => &traces.keccak_rnds,
+            AccelGroup::Ecsm => &traces.ecsms,
+            AccelGroup::Ecdas => &traces.ecdases,
+            AccelGroup::Hint => &traces.hints,
+        }
+    }
+}
+
+/// How many AIRs each accelerator group has, in [`ACCEL_ORDER`].
+///
+/// An accelerator chip is proved as one table or not at all, so a count above
+/// one is a malformed layout rather than a bigger one. [`AirOrder::new`]
+/// refuses it instead of laying it out.
 pub(crate) fn accel_lengths(counts: &crate::TableCounts) -> [usize; 6] {
-    [
-        counts.commit,
-        counts.keccak,
-        counts.keccak_rnd,
-        counts.ecsm,
-        counts.ecdas,
-        counts.hint,
-    ]
+    ACCEL_ORDER.map(|g| g.count(counts))
 }
 
 /// Where each table sits in `VmAirs::air_trace_pairs`.
@@ -78,12 +187,32 @@ pub(crate) struct AirOrder {
 }
 
 impl AirOrder {
-    pub(crate) fn new(counts: crate::TableCounts, include_halt: bool, num_pages: usize) -> Self {
-        Self {
+    /// Refuses an accelerator count above one rather than laying it out.
+    ///
+    /// Each accelerator chip is proved as a single table, so two is not a
+    /// larger layout but a malformed one, and every chunked index below it
+    /// would be shifted by the difference. The counts reach here from a proof
+    /// on the verifying side, so this is the boundary where they stop being
+    /// trusted.
+    pub(crate) fn new(
+        counts: crate::TableCounts,
+        include_halt: bool,
+        num_pages: usize,
+    ) -> Result<Self, crate::Error> {
+        for group in ACCEL_ORDER {
+            let n = group.count(&counts);
+            if n > 1 {
+                return Err(crate::Error::Prover(format!(
+                    "AIR order: {} has {n} tables; an accelerator chip has at most one",
+                    group.name()
+                )));
+            }
+        }
+        Ok(Self {
             counts,
             include_halt,
             num_pages,
-        }
+        })
     }
 
     /// The index of the first chunked table, after the fixed ones, HALT and the
@@ -168,15 +297,8 @@ impl StreamingProvider {
         traces: &Traces,
         include_halt: bool,
     ) -> Self {
-        // Order fixed by `VmAirs::air_trace_pairs`; all resident, none retired.
-        let accel = [
-            traces.commits.len(),
-            traces.keccaks.len(),
-            traces.keccak_rnds.len(),
-            traces.ecsms.len(),
-            traces.ecdases.len(),
-            traces.hints.len(),
-        ];
+        // From `ACCEL_ORDER`, not a second list; all resident, none retired.
+        let accel = ACCEL_ORDER.map(|g| g.traces(traces).len());
         let group_lengths = [
             traces.cpus.len(),
             traces.lts.len(),

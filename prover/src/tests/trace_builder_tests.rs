@@ -2138,20 +2138,42 @@ fn the_accumulated_tables_match_the_ordinary_build() {
         let (data, _) = t.main_data_row_major();
         data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
     };
-    for (name, a, b) in [
-        ("COMMIT", &built.commit, &resident.commit),
-        ("KECCAK", &built.keccak, &resident.keccak),
-        ("KECCAK_RND", &built.keccak_rnd, &resident.keccak_rnd),
-        ("KECCAK_RC", &built.keccak_rc, &resident.keccak_rc),
-        ("ECSM", &built.ecsm, &resident.ecsm),
-        ("ECDAS", &built.ecdas, &resident.ecdas),
-        ("HINT", &built.hint, &resident.hint),
-    ] {
-        assert_eq!(flat(a), flat(b), "{name} differs from the ordinary build");
+    assert_eq!(
+        flat(&built.keccak_rc),
+        flat(&resident.keccak_rc),
+        "KECCAK_RC differs from the ordinary build"
+    );
+    // Walked in `ACCEL_ORDER`, the one place that order lives. A chip the run
+    // never reached is absent on both sides, so this now also pins that the two
+    // paths agree on which tables EXIST — not only on the rows of the ones they
+    // both built.
+    for group in crate::streaming::ACCEL_ORDER {
+        let a = &built.accel[group.slot()];
+        let b = group.traces(&resident);
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{} exists on one path and not the other",
+            group.name()
+        );
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                flat(x),
+                flat(y),
+                "{} table {i} differs from the ordinary build",
+                group.name()
+            );
+        }
     }
+    let keccaks = &built.accel[crate::streaming::AccelGroup::Keccak.slot()];
     assert!(
-        flat(&built.keccak).iter().any(|v| *v != 0),
+        keccaks.len() == 1 && flat(&keccaks[0]).iter().any(|v| *v != 0),
         "the fixture must exercise KECCAK, or this proves nothing"
+    );
+    assert!(
+        built.accel[crate::streaming::AccelGroup::Hint.slot()].is_empty(),
+        "the fixture makes no hint ecall, so HINT must be elided on both paths, \
+         or the empty half of this comparison is vacuous"
     );
 }
 

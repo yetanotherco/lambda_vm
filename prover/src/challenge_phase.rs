@@ -28,7 +28,7 @@ use stark::prover::MainRoots;
 use crate::Error;
 use crate::commit_phase::Committed;
 use crate::statement::{StatementKind, absorb_statement};
-use crate::streaming::{GROUP_ORDER, NUM_FIXED_AIRS};
+use crate::streaming::{ACCEL_ORDER, GROUP_ORDER, NUM_FIXED_AIRS};
 use crate::tables::trace_builder::{AccumulatedTables, TableKind, runtime_page_ranges};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::{TableCounts, VmAirs};
@@ -120,7 +120,7 @@ pub fn run(
         table_counts,
         airs.include_halt,
         remaining.page_configs.len(),
-    );
+    )?;
     Ok(Challenge {
         challenges,
         roots,
@@ -164,32 +164,23 @@ fn assemble_roots(
     if airs.include_halt {
         resident.push((&airs.halt, &remaining.halt, "HALT"));
     }
-    let accel: [(
-        &[crate::VmAir],
-        &[TraceTable<GoldilocksField, GoldilocksExtension>],
-        &str,
-    ); 6] = [
-        (&airs.commits, &accumulated.commits, "COMMIT"),
-        (&airs.keccaks, &accumulated.keccaks, "KECCAK"),
-        (&airs.keccak_rnds, &accumulated.keccak_rnds, "KECCAK_RND"),
-        (&airs.ecsms, &accumulated.ecsms, "ECSM"),
-        (&airs.ecdases, &accumulated.ecdases, "ECDAS"),
-        (&airs.hints, &accumulated.hints, "HINT"),
-    ];
-    for (group_airs, traces, name) in accel {
+    for group in ACCEL_ORDER {
+        let group_airs = group.airs(airs);
+        let traces = &accumulated.accel[group.slot()];
         // A chip the run never reached has neither an AIR nor a trace. Zipping
         // two lists that disagreed would silently commit the shorter one and
         // leave the layout short of a root, so the disagreement is rejected
         // here instead of being absorbed.
         if group_airs.len() != traces.len() {
             return Err(Error::Prover(format!(
-                "challenge phase: {name} has {} AIRs and {} traces",
+                "challenge phase: {} has {} AIRs and {} traces",
+                group.name(),
                 group_airs.len(),
                 traces.len()
             )));
         }
         for (air, trace) in group_airs.iter().zip(traces.iter()) {
-            resident.push((air, trace, name));
+            resident.push((air, trace, group.name()));
         }
     }
     // Small tables, many of them: one commit at a time leaves most cores idle.
@@ -290,13 +281,16 @@ pub(crate) fn count_chunks_by_kind(
         bytewise: 0,
         store: 0,
         cpu32: 0,
-        commit: accumulated.commits.len(),
-        keccak: accumulated.keccaks.len(),
-        keccak_rnd: accumulated.keccak_rnds.len(),
-        ecsm: accumulated.ecsms.len(),
-        ecdas: accumulated.ecdases.len(),
-        hint: accumulated.hints.len(),
+        commit: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
     };
+    for group in ACCEL_ORDER {
+        *group.count_slot(&mut counts) = accumulated.accel[group.slot()].len();
+    }
     for (kind, chunk) in chunks {
         let slot = slot_for(&mut counts, kind);
         *slot = (*slot).max(chunk + 1);

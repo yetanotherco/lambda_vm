@@ -21,7 +21,7 @@ use stark::prover::IsStarkProver;
 use crate::Error;
 use crate::challenge_phase::Challenge;
 use crate::pass::{self, ChunkAirs, Resident, Visitor};
-use crate::streaming::NUM_FIXED_AIRS;
+use crate::streaming::{ACCEL_ORDER, NUM_FIXED_AIRS};
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::TableKind;
 use crate::tables::types::*;
@@ -258,15 +258,7 @@ fn resident_jobs<'a>(
         accumulated,
         ..
     } = resident;
-    let crate::tables::trace_builder::AccumulatedTables {
-        commits,
-        keccaks,
-        keccak_rnds,
-        keccak_rc,
-        ecsms,
-        ecdases,
-        hints,
-    } = accumulated;
+    let crate::tables::trace_builder::AccumulatedTables { accel, keccak_rc } = accumulated;
 
     // The tables every proof has. Typed at `NUM_FIXED_AIRS`, so this list and
     // the constant every AIR index is counted from cannot drift apart silently.
@@ -292,22 +284,14 @@ fn resident_jobs<'a>(
     }
 
     // The accelerator groups, each present only when the run reached the chip.
-    let accel: [(
-        &'a [crate::VmAir],
-        &'a mut Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-        &str,
-    ); 6] = [
-        (&airs.commits, commits, "COMMIT"),
-        (&airs.keccaks, keccaks, "KECCAK"),
-        (&airs.keccak_rnds, keccak_rnds, "KECCAK_RND"),
-        (&airs.ecsms, ecsms, "ECSM"),
-        (&airs.ecdases, ecdases, "ECDAS"),
-        (&airs.hints, hints, "HINT"),
-    ];
-    for (group_airs, traces, name) in accel {
+    // `accel` is stored in `ACCEL_ORDER`, so zipping the two is the order by
+    // construction — there is no second list here to get wrong.
+    for (group, traces) in ACCEL_ORDER.into_iter().zip(accel.iter_mut()) {
+        let group_airs = group.airs(airs);
         if group_airs.len() != traces.len() {
             return Err(Error::Prover(format!(
-                "{context}: {name} has {} AIRs and {} traces",
+                "{context}: {} has {} AIRs and {} traces",
+                group.name(),
                 group_airs.len(),
                 traces.len()
             )));
