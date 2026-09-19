@@ -457,3 +457,240 @@ pub fn offset_ramp_at(point: &[FEE]) -> FEE {
     }
     acc
 }
+
+// =============================================================================
+// The SPARSE route — the cross-epoch proof's page INIT columns
+// =============================================================================
+
+/// ⛔ WHY INIT IS NOT A PREPARED OPENING, WHICH IS THE FIRST THING TO READ HERE.
+///
+/// A page's INIT column is its genesis bytes: a function of the program, not of
+/// the row index, so [`emit_offset_ramp`]'s kind of closed form does not exist
+/// for it. DECODE's answer to exactly that problem is a PREPARED OPENING
+/// against a commitment pinned in the program text — and on the cross-epoch
+/// path that answer is **unavailable**, for two reasons that are worth stating
+/// where somebody would otherwise reach for it:
+///
+/// 1. **The transcript.** `multi_prove` absorbs a prepared commitment's roots in
+///    the roots block — `absorb_roots_and_challenge(transcript, committed.roots(),
+///    &prepared_roots)` — and `prove_global` / `verify_global_bookends` both pass
+///    `None`, so those roots are EMPTY in every cross-epoch proof that exists. A
+///    program that absorbed an INIT root would absorb a root the honest proof
+///    never absorbed, derive a different `z`, and stop executing at the first
+///    table. The opening is not a machine-side addition; it is a change to the
+///    cross-epoch prover, its verifier and its proof bytes.
+/// 2. **The shape of `Prepared`.** It names ONE table and settles its columns
+///    with `Claimed::Shared` at that table's single reduced point, because
+///    DECODE's five columns share one. The cross-epoch INIT family spans one
+///    page table per touched page, each with its OWN reduced point.
+///
+/// ⇒ So the leg below is not a cheaper opening. It is the fold itself, emitted
+/// only where the column is not zero — which is the whole cost, because a page's
+/// genesis is zero everywhere past `init_values.len()` and an all-zero page
+/// (stack, heap, BSS) emits nothing at all.
+///
+/// ★ THE CLOSED FORM, which is the host's own definition restricted to the
+/// support:
+///
+/// ```text
+///   MLE(r) = Σ_i v_i · eq(r, i) = Σ_{i : v_i ≠ 0} v_i · eq(r, i)
+/// ```
+///
+/// `eq(r, i)` is a product of one factor per variable, each `r_k` or `1 − r_k`,
+/// so a single entry costs `num_vars` rows and a zero entry costs none. Against
+/// [`emit_const_mle_at`], which builds the whole `eq` TABLE first, this trades
+/// `2^{n+1} − 3` rows of table for `n − 1` rows per surviving entry: at
+/// `n = 18` the table alone is 524,285 rows and the sparse form is 18 per entry,
+/// so the two cross at about thirty thousand entries and the host's own fold
+/// (`2^n` = 262,144) at about fourteen thousand.
+///
+/// ⚠ WHICH IS WHY THE CAP EXISTS AND IS A REFUSAL — see
+/// [`MAX_SPARSE_ENTRIES`]. A dense column has no cheap route on this path at
+/// all, and the honest outcome is a build that fails naming both numbers, never
+/// a program nobody can prove.
+///
+/// ⚠ THE BIT ORDER IS TAKEN FROM [`emit_const_mle_at`], NEVER ASSUMED. That
+/// emitter doubles its table with `point[0]` MOST significant, so entry `j` is
+/// the row whose index is `j` and index bit `k` (counting from the least
+/// significant) is carried by `point[num_vars − 1 − k]`. The same convention is
+/// spelled once, below, and a reversed one is a different value at every point
+/// but the symmetric ones — which is a named test arm rather than a comment.
+///
+/// Returns one value per column, in the order given.
+///
+/// # Panics
+///
+/// On a column whose length is not `2^num_vars`, and above [`MAX_SPARSE_ENTRIES`]
+/// surviving entries. Both are emit-time shape refusals, the
+/// `epoch_verify.rs:171-179` idiom.
+pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) -> Vec<Ext> {
+    let num_vars = point.len();
+    let height = 1usize << num_vars;
+    for column in columns {
+        assert_eq!(
+            column.len(),
+            height,
+            "a preprocessed column must have one entry per row of its table"
+        );
+    }
+    let entries = sparse_entries(columns);
+    assert!(
+        entries <= MAX_SPARSE_ENTRIES,
+        "these preprocessed columns carry {entries} nonzero entries, which this leg \
+         emits {} rows for; the cap is {MAX_SPARSE_ENTRIES} entries. A column this \
+         dense has no closed form and no opening on the cross-epoch path — see this \
+         module's note on why `Prepared` cannot carry one — so it needs the protocol \
+         change, not a bigger cap",
+        entries * num_vars,
+    );
+
+    let one = b.ext_const(&FEE::one());
+    // The complements, hoisted: every entry's `eq` reads from these, and a
+    // column with a hundred entries would otherwise pay for them a hundred
+    // times. Emitted for every variable rather than for the ones some entry
+    // happens to clear, so the count is a function of the SHAPE and not of the
+    // data — which is what lets `sparse_mle_rows` be evaluated before the
+    // program is built.
+    let complements: Vec<Ext> = point.iter().map(|&p| b.esub(one, p)).collect();
+
+    columns
+        .iter()
+        .map(|column| {
+            let mut acc: Option<Ext> = None;
+            for (row, value) in column.iter().enumerate() {
+                if *value == FE::zero() {
+                    continue;
+                }
+                // `point[level]` carries index bit `num_vars − 1 − level`.
+                let mut eq: Option<Ext> = None;
+                for (level, &p) in point.iter().enumerate() {
+                    let factor = if (row >> (num_vars - 1 - level)) & 1 == 1 {
+                        p
+                    } else {
+                        complements[level]
+                    };
+                    eq = Some(match eq {
+                        None => factor,
+                        Some(running) => b.emul(running, factor),
+                    });
+                }
+                let eq = eq.expect("a point with at least one variable");
+                let coefficient = b.ext_const(&value.to_extension::<GoldilocksExtension>());
+                acc = Some(match acc {
+                    None => b.emul(coefficient, eq),
+                    Some(running) => b.emul_add(coefficient, eq, running),
+                });
+            }
+            // ⛔ An all-zero column IS the interned zero, and it is the common
+            // case: every stack, heap and BSS page's genesis is zero to the last
+            // byte. The leg emits no operation for it at all.
+            acc.unwrap_or_else(|| b.ext_const(&FEE::zero()))
+        })
+        .collect()
+}
+
+/// ⛔ The most surviving entries [`emit_sparse_mle_at`] will serve — A CAP, NOT
+/// A TUNING KNOB, and the sibling of [`MAX_CONST_MLE_VARS`].
+///
+/// The leg is `O(entries × num_vars)`, so a dense page column at eighteen
+/// variables would emit about 4.7 M rows and nothing in the program would say
+/// so. This bounds the whole family's contribution to roughly a million rows at
+/// eighteen variables, which is the order the cross-epoch program's other legs
+/// cost between them.
+///
+/// ⚠ THE NUMBER IS A BUDGET AND IT IS OWED A CENSUS. It is set so the assembled
+/// cross-epoch program stays inside the campaign's pre-registered 2–4 M band,
+/// and the quantity that decides whether a real block fits — how many nonzero
+/// genesis bytes its touched non-private pages carry — has not been measured.
+/// Raising it is a decision about the program's size and must be taken against
+/// that census, never against a build that failed.
+pub const MAX_SPARSE_ENTRIES: usize = 60_000;
+
+/// Surviving entries across a set of columns: what the leg's cost is linear in.
+///
+/// Named rather than spelled inline at the three places that need it — the
+/// emitter's cap, the row form and the constant pool — because a count that is
+/// re-spelled is a count that can disagree with itself.
+pub fn sparse_entries(columns: &[&[FE]]) -> usize {
+    columns.iter().map(|column| const_column_rows(column)).sum()
+}
+
+/// INSTRUCTIONS [`emit_sparse_mle_at`] emits, CONST-FREE.
+///
+/// The hoisted complements, one `Sub` per variable, then per surviving entry the
+/// `num_vars − 1` products of its `eq` and the one `Mul`/`MulAdd` that weighs it
+/// and accumulates it — `num_vars` rows an entry.
+///
+/// ⚠ ZERO for an all-zero set, and that is the point of the route rather than an
+/// edge case: the complements are still emitted (the shape is a shape), but no
+/// entry is. A caller reading a zero here is reading a genuinely free leg.
+pub fn sparse_mle_rows(columns: &[&[FE]], num_vars: usize) -> usize {
+    num_vars + sparse_entries(columns) * num_vars
+}
+
+/// The `LFM_CONST` words [`emit_sparse_mle_at`] interns, deduplicated and BY
+/// VALUE, so a caller can union them into the one pool its program has.
+///
+/// The same three kinds [`const_mle_constants`] names — the shared `one` the
+/// complements subtract from, each DISTINCT surviving coefficient, and
+/// `FEE::zero()` for a column that is entirely zero and therefore IS that
+/// constant.
+///
+/// ⚠ A page's genesis is BYTES, so the distinct coefficients number at most 255
+/// however many entries survive; a form that charged one constant per entry
+/// would over-count a real page by orders of magnitude.
+pub fn sparse_mle_constants(columns: &[&[FE]]) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = vec![ext_word(&FEE::one())];
+    for column in columns {
+        if column.iter().all(|value| *value == FE::zero()) {
+            let zero = ext_word(&FEE::zero());
+            if !words.contains(&zero) {
+                words.push(zero);
+            }
+        }
+        for value in column.iter() {
+            if *value == FE::zero() {
+                continue;
+            }
+            let word = ext_word(&value.to_extension::<GoldilocksExtension>());
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+    }
+    words
+}
+
+/// The host's own sparse form, for the differential.
+///
+/// ⚠ A THIRD DERIVATION, deliberately, exactly as [`offset_ramp_at`] is: the
+/// test compares the EMITTED value against `Mle::evaluate_in` over the real
+/// column (the fold being replaced) AND against this (the arithmetic being
+/// claimed). Comparing the emitter against only this one would be two halves
+/// that share an author.
+pub fn sparse_mle_at(column: &[FE], point: &[FEE]) -> FEE {
+    let num_vars = point.len();
+    assert_eq!(
+        column.len(),
+        1usize << num_vars,
+        "a column must have one entry per row of its table"
+    );
+    let one = FEE::one();
+    let mut acc = FEE::zero();
+    for (row, value) in column.iter().enumerate() {
+        if *value == FE::zero() {
+            continue;
+        }
+        let mut eq = one.clone();
+        for (level, p) in point.iter().enumerate() {
+            let factor = if (row >> (num_vars - 1 - level)) & 1 == 1 {
+                p.clone()
+            } else {
+                &one - p
+            };
+            eq = &eq * &factor;
+        }
+        acc = &acc + &(&eq * &value.to_extension::<GoldilocksExtension>());
+    }
+    acc
+}

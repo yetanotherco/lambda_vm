@@ -815,6 +815,30 @@ pub enum PreprocessedRoute<'a> {
     /// KECCAK_RC and REGISTER: one shared `eq(point, ·)` per table with each
     /// column folded against it, one row per NONZERO entry.
     ConstMle(&'a [&'a [FE]]),
+    /// ★ A CROSS-EPOCH PAGE TABLE, and the only route an epoch never takes.
+    ///
+    /// `GLOBAL_MEMORY` carries OFFSET — the identity ramp, whose extension is
+    /// `Σ_k 2^k · r_k` and costs `num_vars − 1` rows — and, on any page that is
+    /// not a private-input page, INIT: that page's genesis bytes, discharged by
+    /// [`super::preprocessed::emit_sparse_mle_at`] because they are a function
+    /// of the program rather than of the row index and the cross-epoch proof
+    /// has no prepared opening to settle them with.
+    ///
+    /// ⚠ BOTH COLUMNS ARE CARRIED, not just the one that needs deciding. The
+    /// leg asserts each against the table's own claimed value through
+    /// [`preprocessed_targets`], and the cost form reads `num_vars` off OFFSET's
+    /// own length rather than taking it from a caller — a page whose columns
+    /// were not `2^num_vars` tall would be a table nobody meant to build.
+    ///
+    /// `init` is `None` exactly on a private-input page, where INIT is a
+    /// committed main column the verifier never recomputes
+    /// (`continuation.rs:241-251`). That `None` is the ROUTE TABLE's decision,
+    /// taken from the page's own config, and never inferred from how many
+    /// columns the AIR happened to present.
+    Page {
+        offset: &'a [FE],
+        init: Option<&'a [FE]>,
+    },
 }
 
 /// One table's preprocessed plan: what a prepared opening settled, and how
@@ -980,6 +1004,28 @@ fn emit_preprocessed_leg(
             }
             return;
         }
+        PreprocessedRoute::Page { offset, init } => {
+            assert_eq!(
+                plan.settled, 0,
+                "a cross-epoch page's columns are checked in the program, not settled \
+                 by an opening the cross-epoch proof does not carry"
+            );
+            let columns = 1 + usize::from(init.is_some());
+            let targets = preprocessed_targets(slot_of, shape.kinds, columns);
+            assert_eq!(
+                offset.len(),
+                1usize << verdict.point.len(),
+                "OFFSET must have one entry per row of its table"
+            );
+            let ramp = super::preprocessed::emit_offset_ramp(b, &verdict.point);
+            b.assert_eq_ext(ramp, verdict.column_values[targets[0]]);
+            if let Some(init) = init {
+                let values =
+                    super::preprocessed::emit_sparse_mle_at(b, &[*init], &verdict.point);
+                b.assert_eq_ext(values[0], verdict.column_values[targets[1]]);
+            }
+            return;
+        }
         PreprocessedRoute::ConstMle(columns) => columns,
     };
 
@@ -1075,6 +1121,23 @@ fn preprocessed_leg_cost(plan: &PreprocessedPlan<'_>, leg: &mut Cost) {
         PreprocessedRoute::Bitwise => {
             leg.ops(bitwise_preprocessed_rows());
             leg.ops(NUM_PRECOMPUTED_COLS * ASSERT_EQ_ROWS);
+        }
+        PreprocessedRoute::Page { offset, init } => {
+            let num_vars = offset.len().trailing_zeros() as usize;
+            leg.ops(super::preprocessed::offset_ramp_rows(num_vars));
+            for word in super::preprocessed::offset_ramp_constants() {
+                leg.constant_word(word);
+            }
+            let mut columns = 1usize;
+            if let Some(init) = init {
+                columns += 1;
+                let init: [&[FE]; 1] = [*init];
+                leg.ops(super::preprocessed::sparse_mle_rows(&init, num_vars));
+                for word in super::preprocessed::sparse_mle_constants(&init) {
+                    leg.constant_word(word);
+                }
+            }
+            leg.ops(columns * ASSERT_EQ_ROWS);
         }
         PreprocessedRoute::ConstMle(columns) => {
             let remaining = &columns[plan.settled..];
@@ -1457,7 +1520,12 @@ pub fn whir_epoch_arena(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> Vec<Vec<L
 }
 
 /// One table's proof words, in the order [`whir_epoch_program`] hints them.
-fn push_table_words(
+///
+/// ⚠ `pub(crate)` because the CROSS-EPOCH arena writes its tables the same way
+/// and the order is a CONTRACT, not a coincidence: a second spelling of it in
+/// `whir_global` is exactly the drift that hands the machine somebody else's
+/// field element with every value gate still green.
+pub(crate) fn push_table_words(
     words: &mut Vec<LfmWord>,
     table: &stark::multilinear_table::TableProof<GoldilocksExtension>,
 ) {
@@ -1754,7 +1822,10 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
 }
 
 /// One table's hinted wires, OWNED, because `TableProofWires` borrows them.
-struct TableWires {
+///
+/// ⚠ `pub(crate)` for [`push_table_words`]' reason: the cross-epoch program
+/// hints its tables through the same pair.
+pub(crate) struct TableWires {
     bus_output: (Ext, Ext),
     gkr: Vec<super::whir_gkr::GkrLayerWires>,
     sumcheck: Vec<Vec<Ext>>,
@@ -1764,7 +1835,7 @@ struct TableWires {
 }
 
 impl TableWires {
-    fn borrow(&self) -> TableProofWires<'_> {
+    pub(crate) fn borrow(&self) -> TableProofWires<'_> {
         TableProofWires {
             bus_output: self.bus_output,
             gkr: &self.gkr,
@@ -1779,7 +1850,7 @@ impl TableWires {
 }
 
 /// Hints one table's proof, in [`push_table_words`]' order.
-fn hint_table_wires(
+pub(crate) fn hint_table_wires(
     b: &mut LfmBuilder,
     arena: super::instr::ArenaId,
     at: &mut u32,
@@ -1845,13 +1916,13 @@ fn hint_table_wires(
 /// already hinted, and [`Self::polys`] takes them by reference: a second copy
 /// would let a prover absorb one root into the transcript and open the chain
 /// against another, with an honest arena looking identical to every value gate.
-struct GroupChains {
-    finals: Vec<Ext>,
-    storage: Vec<super::whir_chain::RoundStorage>,
+pub(crate) struct GroupChains {
+    pub(crate) finals: Vec<Ext>,
+    pub(crate) storage: Vec<super::whir_chain::RoundStorage>,
 }
 
 /// Hints one group's chains, in [`whir_epoch_arena`]'s order.
-fn hint_group_chains(
+pub(crate) fn hint_group_chains(
     b: &mut LfmBuilder,
     arena: super::instr::ArenaId,
     at: &mut u32,
