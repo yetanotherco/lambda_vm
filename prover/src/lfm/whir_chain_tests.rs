@@ -1266,10 +1266,17 @@ fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
 /// ★ WHAT IT DOES ASSERT, and it is worth having: the two terms
 /// `weight_at_rows` DOES account for, differenced across one more page inside
 /// ONE power-of-two bracket so the stack height does not move — `eq` 90 plus
-/// two indicators of six — and that the literal is at least that plus the
-/// amortised `Sub`. An inequality cannot conflict with a measurement.
+/// two indicators of six — and that the literal is at least that plus one. An
+/// inequality cannot conflict with a measurement.
+///
+/// ⚠ THE `+ 1` IS THE SHARED `Sub`, AND DIFFERENCING IS WHAT SHOWS IT IS NOT A
+/// MARGINAL. `weight_at_rows` emits one per prefix POSITION any column reads as
+/// a zero bit, which is per-POLYNOMIAL: across 29 and 30 pages at one height
+/// the term contributes ZERO, which is why `billed` is 102 and not 103. The
+/// literal charges it anyway, so `>= billed + 1` is exactly the statement that
+/// the literal contains every term this form can see.
 #[test]
-fn the_marginal_is_at_least_what_the_weight_closure_alone_bills() {
+fn the_marginal_is_at_least_what_the_weight_term_bills() {
     use super::whir_stacked::weight_at_rows;
     use crate::continuation::{
         GENESIS_PAGE_MARGINAL_ROWS, MARGINAL_MEASURED_AT_VARS, PAGE_NUM_VARS,

@@ -680,8 +680,17 @@ pub(crate) const MARGINAL_MEASURED_AT_VARS: usize = 24;
 /// the other's lacked. A number two careful readings disagreed about is not a
 /// closed form; it is a measurement wearing one.
 ///
-/// **What the 103 accounted for** (`lfm::whir_stacked::weight_at_rows:89-106`,
-/// `lfm::whir_poly:47-55`), kept here because it explains the MAGNITUDE:
+/// **WHAT THE VALUE IS, AND WHY IT IS THIS ONE.** 103 is what the retired form
+/// actually charged, so the literal starts as a faithful record of today's
+/// behaviour and every consequence documented against it — `τ = 5`, the
+/// lone-page pair `(9,730, 9,731)` — is true on the day it lands. ⚠ IT IS NOT
+/// A FLOOR AND MUST NOT BE CALLED ONE: the deterministic marginal READ off the
+/// cost form is 108, so this understates by at least five and part 1 is that
+/// much too eager until the pin lands. It is wrong in a DOCUMENTED direction,
+/// which is the whole of why it was chosen over a guess.
+///
+/// **The three terms it accounts for** (`lfm::whir_stacked::weight_at_rows`,
+/// `lfm::whir_poly`), kept because they explain the magnitude:
 ///
 /// 1. **One `eq` plus the `MulAdd` that joins its group** — a page's two
 ///    preprocessed columns settle at ONE point, its own table's reduced point,
@@ -690,42 +699,49 @@ pub(crate) const MARGINAL_MEASURED_AT_VARS: usize = 24;
 /// 2. **One prefix indicator per stacked column**, `max(n_stack - num_vars, 1)`
 ///    rows apiece, [`PAGE_PREPROCESSED_COLUMNS`] to a page: 12 at
 ///    [`MARGINAL_MEASURED_AT_VARS`].
-/// 3. **One shared `Sub`** — ⚠ AMORTISED, NOT DERIVED. `weight_at_rows` emits
-///    one per prefix POSITION any column of the polynomial reads as a zero bit.
-///    It is shared across the whole stack and has NO per-page marginal at all;
-///    one per page is a charge, not a reading.
+/// 3. **One shared `Sub`** — ⛔ AND THIS TERM IS NOT A MARGINAL AT ALL.
+///    `weight_at_rows` emits one per prefix POSITION any column of the
+///    polynomial reads as a zero bit. It is per-POLYNOMIAL, so DIFFERENCED
+///    ACROSS ONE MORE PAGE IT CONTRIBUTES ZERO; the "≤ 1, amortised" it was
+///    carried as was a fudge, and differencing is what exposed it.
 ///
-/// **What it missed** — `stacked_verify_cost:465-490` pays three more terms per
-/// COLUMN outside `weight_at_rows`, so +6 per page: `absorb_unpack_rows()` (1),
+/// **What it misses.** `stacked_verify_cost` pays three more terms per COLUMN
+/// outside `weight_at_rows`, so +6 per page: `absorb_unpack_rows()` (1),
 /// `challenge_powers_rows(columns)` (marginal 1) and
-/// `columns_of(layout, poly).len()` (1). That is the 109.
+/// `columns_of(layout, poly).len()` (1). With the shared `Sub` differencing to
+/// zero, the deterministic marginal is `102 + 6 = 108`.
 ///
 /// ⛔ **AND A FOURTH TERM HAS NO CLOSED FORM AT ALL.** The same function
 /// absorbs `COORDINATES_PER_EXT` per column into a THREADED sponge, whose row
-/// cost depends on where the previous columns left the buffer. A per-page
-/// marginal is therefore not a function of the page alone, and no hand-written
-/// form can be exact — which is why a hand-folded correction would be worse
-/// than the understatement it fixed: it would still be missing this and would
-/// now LOOK complete.
+/// cost depends on where the previous columns left the buffer. Call its
+/// per-page contribution `s`: six more felts into a duplex is either nothing or
+/// one block's worth, depending on fill. A per-page marginal is therefore not a
+/// function of the page alone, and no hand-written form can be exact — which is
+/// why a hand-folded correction would be worse than the understatement it
+/// fixed: it would still be missing this and would now LOOK complete.
 ///
-/// ⚠ **UNPINNED. 109 IS A FLOOR, READ OFF THE SOURCE AND NOT BUILT**, so the
-/// true marginal is 109 plus a sponge term that can only add. It therefore
-/// UNDERSTATES, which makes part 1 slightly too eager, and
-/// `the_ruled_boundaries_hold_for_every_marginal_in_band` is what bounds the
-/// damage: the block's dense set is the same for any marginal in
-/// `[19, 2_100_474]`. The pin that turns this into a measurement lives in
-/// `lfm` and is V1j's — it differences `stacked_verify_cost` at 29 and 30 dense
-/// pages, both of which stand at [`MARGINAL_MEASURED_AT_VARS`] in ONE
-/// polynomial, and asserts EQUALITY with this literal. ⛔ Nothing else may
-/// assert equality with it: a second pin is the duplication the pin exists to
-/// prevent.
+/// ⚠ **UNPINNED, AND WHAT THE PIN IS EXPECTED TO SAY.** The pin lives in `lfm`
+/// and belongs to the lane that owns the cost form; it differences
+/// `stacked_verify_cost` at 29 and 30 dense pages, both of which stand at
+/// [`MARGINAL_MEASURED_AT_VARS`] in ONE polynomial, and measures `108 + s`.
+/// This literal moves to that number when it lands, and
+/// `the_ruled_boundaries_hold_for_every_marginal_in_band` is what says which
+/// consequences move with it:
+///
+/// | measured | `τ` | the lone-page pair |
+/// |---|---|---|
+/// | 108, 109 | 6 | unchanged, `(9,730, 9,731)` |
+/// | 110 and up | 6 | moves to `(9,731, 9,732)` |
+///
+/// ⛔ Nothing but that pin may assert equality with this literal: a second pin
+/// is the duplication the pin exists to prevent.
 ///
 /// ★ **AND ONE LITERAL IS WHY THE THREE PARTIES AGREE.** Prover, verifier and
 /// emitter reach the same candidate set by reading one number, not by
 /// evaluating one formula the same way. That is strictly stronger than the
 /// set-independence the fixed height bought, and it is the second reason the
 /// fixed bound was the right ruling.
-pub(crate) const GENESIS_PAGE_MARGINAL_ROWS: usize = 109;
+pub(crate) const GENESIS_PAGE_MARGINAL_ROWS: usize = 103;
 
 /// PART 1: whether a page is even a CANDIDATE — whether keeping it sparse costs
 /// more than carrying it would add to the leg.
@@ -747,13 +763,13 @@ pub(crate) fn is_candidate(num_vars: usize, nonzero: usize) -> bool {
 /// `div_ceil` would hand back an `S` whose leg EQUALS the marginal rather than
 /// exceeding it.
 ///
-/// ⚠ IT IS 6 AT THE LITERAL, AND IT WAS 5 AT THE RETIRED 103 — `τ` is DERIVED
-/// from the marginal and is not itself a ruled quantity. It holds at 5 for a
-/// marginal in `[90, 107]` and at 6 from 108, and the only page the difference
-/// reclassifies is one carrying five nonzero genesis bytes. Neither the block
-/// (0, or 116,692 and up) nor any fixture (112, 65,652) sits there;
-/// `the_ruled_boundaries_hold_for_every_marginal_in_band` is the reading of
-/// that rather than the assurance.
+/// ⚠ `τ` IS DERIVED FROM THE MARGINAL AND IS NOT ITSELF A RULED QUANTITY. It
+/// is 5 at this literal and holds at 5 for a marginal in `[90, 107]`, becoming
+/// 6 from 108 — so the pin's expected `108 + s` will move it. The only page
+/// that difference reclassifies is one carrying five nonzero genesis bytes, and
+/// neither the block (0, or 116,692 and up) nor any fixture (112, 65,652) sits
+/// there; `the_ruled_boundaries_hold_for_every_marginal_in_band` is the reading
+/// of that rather than the assurance.
 ///
 /// ⚠ ONE FORM, NOT TWO. Part 1 could as easily be the comparison
 /// `sparse_leg_rows(..) > GENESIS_PAGE_MARGINAL_ROWS`, and the two agree for
@@ -809,12 +825,12 @@ pub(crate) fn chain_is_paid(total_savings: usize) -> bool {
 /// this. So the one number covers both ways a page can end up sparse.
 ///
 /// ⛔ AND IT MOVES WITH THE LITERAL — one entry per `num_vars` rows. It is
-/// 9,730 at the current 109 and the boundary pair `(9,730 sparse, 9,731 dense)`
-/// holds only for a marginal in `[92, 109]`, standing on ONE ROW at the top of
-/// that band. Since the literal is a FLOOR, V1j's pin landing above 109 moves
-/// the pair to `(9,731, 9,732)`. That is why no test hard-codes it: they assert
-/// this function and `+ 1`, and the band assertion names the new pair when it
-/// moves. The cap-overlap conclusion is untouched either way — the margin to
+/// 9,730 at the current 103, and the pair `(9,730 sparse, 9,731 dense)` holds
+/// only for a marginal in `[92, 109]`: six rows of headroom above this literal.
+/// The pin is expected at `108 + s`, so `s >= 2` moves the pair to
+/// `(9,731, 9,732)`. That is why no test hard-codes it: they assert this
+/// function and `+ 1`, and the band assertion names the new pair when it moves.
+/// The cap-overlap conclusion is untouched either way — the margin to
 /// `MAX_SPARSE_INIT_ENTRIES` is six-fold.
 pub(crate) fn densest_sparse_entries(num_vars: usize) -> usize {
     if num_vars == 0 {
@@ -4089,26 +4105,27 @@ mod tests {
             MARGINAL_MEASURED_AT_VARS,
             "18 + ceil(log2(60))"
         );
-        assert_eq!(GENESIS_PAGE_MARGINAL_ROWS, 109);
+        assert_eq!(GENESIS_PAGE_MARGINAL_ROWS, 103);
 
-        // τ from the literal: `18 + 18*S > 109` ⇒ S >= 6.
-        assert_eq!(candidate_threshold_entries(BLOCK_PAGE_VARS), 6);
-        assert!(!is_candidate(BLOCK_PAGE_VARS, 5));
-        assert!(is_candidate(BLOCK_PAGE_VARS, 6));
+        // τ from the literal: `18 + 18*S > 103` ⇒ S >= 5.
+        assert_eq!(candidate_threshold_entries(BLOCK_PAGE_VARS), 5);
+        assert!(!is_candidate(BLOCK_PAGE_VARS, 4));
+        assert!(is_candidate(BLOCK_PAGE_VARS, 5));
         // ⚠ FLOOR PLUS ONE AND NOT `div_ceil`: τ's leg must EXCEED the
         // marginal, never meet it.
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 5) <= GENESIS_PAGE_MARGINAL_ROWS);
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 6) > GENESIS_PAGE_MARGINAL_ROWS);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 4) <= GENESIS_PAGE_MARGINAL_ROWS);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 5) > GENESIS_PAGE_MARGINAL_ROWS);
 
-        // ⛔ THE LITERAL IS A FLOOR AND THE CODE SAYS WHICH WAY THAT ERRS. Its
-        // three accounted terms come to 103 and the three per-column terms
-        // outside them add 6; the threaded-sponge term can only add more. So
-        // the true marginal is at or above this, part 1 is at worst too eager,
-        // and the band test is what bounds that.
+        // ⛔ AND THE DIRECTION IT ERRS IN, NAMED. The literal records the three
+        // terms `weight_at_rows` accounts for; the cost form pays three more per
+        // COLUMN outside it, and the shared `Sub` differences to zero, so the
+        // deterministic marginal is 108. This UNDERSTATES by at least five, and
+        // an understated marginal makes part 1 too eager — the band test bounds
+        // that rather than assuring it is small.
         assert!(
-            GENESIS_PAGE_MARGINAL_ROWS >= 103,
-            "the eq (90), the two indicators (12) and the amortised Sub (1) are \
-             accounted for in any reading of the cost form"
+            GENESIS_PAGE_MARGINAL_ROWS < 108,
+            "the literal records what the rule charges TODAY; if it has reached the \
+             deterministic reading then the pin has landed and this framing is stale"
         );
     }
 
@@ -4192,7 +4209,7 @@ mod tests {
             .map(|&(_, _, rows)| rows - BLOCK_MARGINAL)
             .sum();
         assert_eq!(plan.savings, expected);
-        assert_eq!(plan.savings, 10_248_243);
+        assert_eq!(plan.savings, 10_248_261);
         assert!(chain_is_paid(plan.savings));
 
         // ⚠ THE SET AND ITS ORDER, not a count: the stack's column order IS
@@ -4235,13 +4252,12 @@ mod tests {
     /// ⛔⛔ THE BOUNDARY IS DERIVED FROM THE LITERAL AND IS NOT HARD-CODED HERE,
     /// and that is deliberate. It is `densest_sparse_entries()` and one more,
     /// and it MOVES one entry per `num_vars` rows of marginal. At the current
-    /// 109 it is the ruled pair (9,730 sparse, 9,731 dense) — standing on ONE
-    /// ROW, since a lone page of 9,731 saves 175,067 against a 175,066 chain —
-    /// and the pair holds only for a marginal in `[92, 109]`. The literal is a
-    /// FLOOR, so V1j's pin landing above 109 moves the pair to (9,731, 9,732).
-    /// A test that hard-coded it would go red saying nothing; this one names
-    /// the new pair, and `the_ruled_boundaries_hold_for_every_marginal_in_band`
-    /// states the band.
+    /// 103 it is the ruled pair (9,730 sparse, 9,731 dense), which holds for a
+    /// marginal in `[92, 109]` — six rows of headroom. The pin is expected at
+    /// `108 + s`, so `s >= 2` moves the pair to (9,731, 9,732). A test that
+    /// hard-coded it would go red saying nothing; this one names the new pair,
+    /// and `the_ruled_boundaries_hold_for_every_marginal_in_band` states the
+    /// band.
     ///
     /// ⛔ THE RETIRED BREAK-EVEN WAS 9,725, and the entries between it and this
     /// boundary are why every bound derived from the old rule has to be
@@ -4253,7 +4269,9 @@ mod tests {
         let dense_at = sparse_at + 1;
         println!(
             "LONE BOUNDARY at marginal {GENESIS_PAGE_MARGINAL_ROWS}: {sparse_at} sparse, \
-             {dense_at} dense (the ruled pair is 9730/9731, held for a marginal in [92, 109])"
+             {dense_at} dense; the ruled pair 9730/9731 holds for a marginal in \
+             [92, 109], so there are {} rows of headroom above this literal",
+            109 - GENESIS_PAGE_MARGINAL_ROWS
         );
         assert_eq!(
             (sparse_at, dense_at),
@@ -4285,12 +4303,13 @@ mod tests {
             );
         }
 
-        // ⛔ ONE ROW OF MARGIN, ASSERTED SO NOBODY HAS TO REDISCOVER IT. The
-        // page just over the boundary clears the chain by a single row at this
-        // literal, so any increase at all moves the pair.
+        // ⛔ HOW MUCH MARGIN THE PAIR HAS, ASSERTED SO NOBODY REDISCOVERS IT.
+        // The page just over the boundary clears the chain by seven rows at this
+        // literal, which is six rows of headroom in the marginal: the pin is
+        // expected at 108 + s, so `s >= 2` moves the pair.
         assert_eq!(
             page_savings(BLOCK_PAGE_VARS, dense_at),
-            PREPARED_LEG_ROWS + 1
+            PREPARED_LEG_ROWS + 7
         );
 
         // The retired rule's break-even, kept here as the contrast and nowhere
@@ -4309,8 +4328,8 @@ mod tests {
     /// where every fixture in the tree sits.
     ///
     /// `data_page_touch`'s one data page carries 112 nonzero genesis bytes. It
-    /// passes part 1 comfortably — 2,034 rows against a 109-row marginal — and
-    /// part 2 refuses it, because 1,925 saved rows do not buy a 175,066-row
+    /// passes part 1 comfortably — 2,034 rows against a 103-row marginal — and
+    /// part 2 refuses it, because 1,931 saved rows do not buy a 175,066-row
     /// chain. ⚠ THAT IS THE INTERESTING BRANCH AND IT IS WHY THE FIELD
     /// `candidate` EXISTS: under the retired rule this page failed the only
     /// test there was, and "no opening" meant "nobody wanted it".
@@ -4322,7 +4341,7 @@ mod tests {
         assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 112), 2_034);
         assert!(plan.routes[0].candidate, "2,034 rows against the marginal");
         assert_eq!(plan.savings, 2_034 - BLOCK_MARGINAL);
-        assert_eq!(plan.savings, 1_925);
+        assert_eq!(plan.savings, 1_931);
         assert!(!chain_is_paid(plan.savings));
         assert!(
             plan.is_empty(),
@@ -4360,12 +4379,12 @@ mod tests {
 
         // Neither one pays for the chain alone.
         let alone = page_savings(BLOCK_PAGE_VARS, 5_000);
-        assert_eq!(alone, 89_909);
+        assert_eq!(alone, 89_915);
         assert!(!chain_is_paid(alone));
         // Together they do, and BOTH are carried — the set is paid for or none
         // of it is.
         assert_eq!(plan.savings, 2 * alone);
-        assert_eq!(plan.savings, 179_818);
+        assert_eq!(plan.savings, 179_830);
         assert!(chain_is_paid(plan.savings));
         assert_eq!(plan.dense_pages(), vec![0, 1]);
 
@@ -4606,16 +4625,43 @@ mod tests {
             densest(m0)
         );
         assert_eq!(tau_is_five, (90, 107));
-        assert_eq!(tau(m0), 6, "the literal is past the τ = 5 band, by one");
         assert_eq!(lone_pair, (92, 109));
         assert!(
-            m0 <= lone_pair.1,
+            tau_is_five.0 <= m0 && m0 <= tau_is_five.1,
+            "τ is no longer 5 at the literal; it is {} and the band is {tau_is_five:?}",
+            tau(m0)
+        );
+        assert!(
+            lone_pair.0 <= m0 && m0 <= lone_pair.1,
             "the literal has left the band the ruled (9730, 9731) pair holds in; the \
              boundary is now ({}, {}) and every quotation of 9,730 must be re-read",
             densest(m0),
             densest(m0) + 1
         );
-        // ⛔ AND IT SITS ON THE EDGE. One more row of marginal moves the pair.
-        assert_eq!(m0, lone_pair.1, "the literal is at the TOP of that band");
+
+        // ⛔⛔ AND THE PIN'S EXPECTED READING, PRE-REGISTERED AGAINST THESE
+        // BANDS. The cost form's deterministic marginal is 108 and the
+        // threaded-sponge term adds an unmeasured `s`:
+        //
+        //   108, 109  → τ becomes 6, the lone pair is UNCHANGED
+        //   110 and up → τ becomes 6 AND the pair moves to (9,731, 9,732)
+        //
+        // Executed, so the table in the literal's doc is a reading and not a
+        // claim, and so the consequence is already written down when the pin
+        // lands.
+        for m in [108usize, 109] {
+            assert_eq!(tau(m), 6);
+            assert_eq!(densest(m), 9_730, "the pair survives a measurement of {m}");
+        }
+        for m in [110usize, 111, 130] {
+            assert_eq!(tau(m), 6);
+            assert_eq!(densest(m), 9_731, "a measurement of {m} moves the pair");
+        }
+
+        // ⚠ AND THE POINT THE RETIRED IMMATERIALITY TEST MADE, KEPT AS ONE
+        // POINT OF THIS SWEEP: the two per-column terms that reading first
+        // found (+4, so 107) move nothing at all.
+        assert_eq!(tau(m0 + 4), 5);
+        assert_eq!(densest(m0 + 4), 9_730);
     }
 }

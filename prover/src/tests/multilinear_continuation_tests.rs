@@ -1810,15 +1810,16 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     );
     assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
     assert_eq!(
-        marginal, 109,
-        "the measured literal, UNPINNED and a floor until V1j's pin lands"
+        marginal, 103,
+        "the literal: what the rule charges today, UNPINNED — the pin is expected to \
+         measure 108 plus the threaded-sponge term"
     );
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
         "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_243);
+    assert_eq!(plan.savings, 10_248_261);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.
