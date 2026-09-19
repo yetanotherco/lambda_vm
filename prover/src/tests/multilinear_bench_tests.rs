@@ -382,9 +382,34 @@ mod transcript_pin {
     pub const ELF_LEN: usize = 3_948_504;
     pub const EPOCH_LOG2: u32 = 21;
 
+    /// ★★★ THE UNIFORM TABLE CAP these counts were measured at, and it is part
+    /// of the pin's IDENTITY rather than a footnote.
+    ///
+    /// ⛔ THE DEFECT THIS EXISTS AGAINST, measured: run lb11 at the merged tip
+    /// proved the pinned guest at the pinned epoch size and failed with `the
+    /// PROVE-side transcript counts moved — left: (407292, 149121, 3411) right:
+    /// (585245, 186256, 3251)`. Nothing was wrong with either side. The
+    /// constants had been measured with `LAMBDA_VM_MAX_ROWS_LOG2` UNSET — the
+    /// production per-table caps, which chunk CPU into four, MEMW_R into five
+    /// and LT into two, so an epoch carries 34 tables — and lb11 ran at the
+    /// record posture, a uniform `2^21`, where the same block's epoch carries
+    /// **27**. Same guest, same epoch size, different epochs; and
+    /// `pin_applies` could not tell, so a run at a posture nobody pinned was
+    /// "the pinned configuration" by the pin's own identity.
+    ///
+    /// The states column is where it is legible without any of this context:
+    /// 3,251 is the cap-less grind count (lb8) and 3,411 the record posture's
+    /// (lb9), and the grind count is one state read per check.
+    ///
+    /// ⇒ The RECORD posture is the pinned one. A run at any other cap — the
+    /// production values included — SKIPS and says so, naming both caps. It
+    /// never passes and it never panics: another posture is not a defect, it is
+    /// a different measurement.
+    pub const MAX_ROWS_LOG2: u32 = 21;
+
     /// Epoch proofs in the pinned run. Part of the measured shape, like the ELF
     /// and the epoch size: 2^21 epochs over this guest is fifteen of them, which
-    /// is also where `OWED`'s thirty squeezes come from (two per epoch call).
+    /// is also where `owed`'s thirty squeezes come from (two per epoch call).
     pub const EPOCHS: u64 = 15;
 
     /// ★★ THE ABSORB COUNTS ARE A BASE PLUS A PER-BRANCH TERM, and the term is
@@ -426,9 +451,35 @@ mod transcript_pin {
     /// coincide, because the replay absorbs the root a second time and a table
     /// count is absorbed once. Reading one as evidence for the other would be
     /// reading a coincidence.
-    pub const PROVE_BASE_ABSORBS: u64 = 583_730;
+    /// ⚠⚠ AND THE BASE IS A POSTURE MEASUREMENT, which is the whole of the
+    /// lb11 lesson. The doc above says the bases are "branch-independent", and
+    /// that is true across TABLE-KIND branches and false across table-CHUNKING
+    /// postures: the base counts the per-table walk and the chains of every
+    /// epoch, and how many of each an epoch has is what
+    /// [`MAX_ROWS_LOG2`] decides. The cap-less pair was `583_730 / 583_867`;
+    /// the record posture's is below, and the two are 177,953 apart on the
+    /// prove line. Neither is wrong — they are two postures, and the identity
+    /// now carries which.
+    ///
+    /// MEASURED: run lb11 at `whir/lfm-l0-main-sync` @ `892c7d1bc` on FAST
+    /// (`whir_lb10.sh`, `--features cuda,hash-metrics`, `LAMBDA_VM_WHIR_HASH=rpx`,
+    /// the budget to the driver's query, never-purge, guest
+    /// `8f826601…ec80a` 3,948,504 B, input `573004e6…f17f` 1,110,183 B,
+    /// `LAMBDA_VM_MAX_ROWS_LOG2=21`), which read PROVE
+    /// `(407292, 149121, 3411)` and VERIFY `(407452, 149151, 3411)`. The base
+    /// is that total less the terms this module derives —
+    /// `table_count_absorbs()` at 15 x 21 = 315, the derived root's 15 (prove)
+    /// or 30 (verify), and `15 x 79` for the prepared opening — so a branch
+    /// that changes a derived term still moves the totals without anyone
+    /// editing a literal.
+    ///
+    /// ⛔ WHAT IS NOT DERIVED, said plainly: the base itself. Deriving it needs
+    /// the whole per-table walk's transcript cost at this posture, which no
+    /// form in this tree computes. [`owed_carried_absorbs`] below is the one
+    /// term that moved from measured to derived.
+    pub const PROVE_BASE_ABSORBS: u64 = 405_777;
     /// The verify side's base. See [`PROVE_BASE_ABSORBS`].
-    pub const VERIFY_BASE_ABSORBS: u64 = 583_867;
+    pub const VERIFY_BASE_ABSORBS: u64 = 405_922;
 
     /// Absorbs the per-table counts contribute to a whole continuation proof.
     pub const fn table_count_absorbs() -> u64 {
@@ -562,12 +613,12 @@ mod transcript_pin {
     /// The verifier absorbs the derived root in `multi_verify`'s roots block
     /// AND again in the `owed` replay, which has to see the same block or it
     /// draws challenges no table is checked at. So the term is doubled here and
-    /// the second half of it is also what [`OWED`] grows by.
+    /// the second half of it is also what [`owed`] grows by.
     ///
     /// ⚠ Writing one term for both sides is the mistake this split exists to
     /// prevent, and it was made: a single `derived_root_absorbs()` on both lines
     /// put VERIFY at `584_092`, and `the_pinned_constants_differ_by_owed` caught
-    /// it because the pair then differed by 137 while `OWED` said 152.
+    /// it because the pair then differed by 137 while `owed` said 152.
     pub const fn verify_derived_root_absorbs() -> u64 {
         2 * EPOCHS * DERIVED_ROOTS_PER_EPOCH
     }
@@ -578,11 +629,20 @@ mod transcript_pin {
     /// The two sides differ by `owed`'s thirty squeezes and by nothing else, and
     /// neither side reads a transcript state outside a grind check, which is why
     /// the state base is one number for both.
-    pub const PROVE_BASE_SQUEEZES: u64 = 183_226;
+    /// ⚠ RE-MEASURED AT THE RECORD POSTURE with the absorb bases — see
+    /// [`PROVE_BASE_ABSORBS`]. The cap-less pair was `183_226 / 183_256`.
+    /// ★ The squeeze gap between the two sides is `2 x EPOCHS` at BOTH
+    /// postures, which is what says the posture moved the walk and not `owed`.
+    pub const PROVE_BASE_SQUEEZES: u64 = 146_091;
     /// See [`PROVE_BASE_SQUEEZES`].
-    pub const VERIFY_BASE_SQUEEZES: u64 = 183_256;
+    pub const VERIFY_BASE_SQUEEZES: u64 = 146_121;
     /// See [`PROVE_BASE_SQUEEZES`]. One state read per grind check, both sides.
-    pub const BASE_STATES: u64 = 2_996;
+    ///
+    /// ⚠ RE-MEASURED: `2_996` cap-less, `3_156` at the record posture. The
+    /// column is the grind count, and lb9 pre-registered it as EXPECTED to
+    /// differ from lb8's — 3,411 total against 3,251 — which is the reading
+    /// that identified the lb11 failure as a posture and not a regression.
+    pub const BASE_STATES: u64 = 3_156;
 
     /// (absorbs, squeezes, states) after `prove_continuation`.
     ///
@@ -676,9 +736,28 @@ mod transcript_pin {
         rounds + prepared_folds + held
     }
 
-    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: 137, which is
-    /// `Sum roots.len()` over the 15 epoch calls, measured.
-    pub const OWED_CARRIED_ABSORBS: u64 = 137;
+    /// `owed`'s absorbs BEFORE W1-B's out-of-band opening existed: `Sum
+    /// roots.len()` over the 15 epoch calls.
+    ///
+    /// ★★★ DERIVED, not measured, and that is new. An epoch's carried roots are
+    /// one per stacked polynomial of every commitment group — which is exactly
+    /// its CHAIN count — so this term is `Sum chains(epoch)` over the block's
+    /// fifteen epochs and nothing else. At the record posture sh4's fifteen
+    /// shapes give 9, 9, 9, 12, 12, 11, 10, 9, 9, 9, 9, 9, 9, 10, 9, which sums
+    /// to **145**; at the cap-less posture it was 137. Both are the chain sum
+    /// at their own posture, which is why this constant moved with the cap and
+    /// why it is now computed from the shape table instead of carried.
+    ///
+    /// ⓘ This closes the caveat `the_pinned_constants_differ_by_owed` used to
+    /// carry — "data from the table shapes, not something derivable here". The
+    /// shape table is now in the tree, so it is derivable here, and the test
+    /// asserts it against the fixture rather than against itself.
+    pub fn owed_carried_absorbs() -> u64 {
+        crate::lfm::whir_epoch_f1_tests::sh4_epoch_shapes()
+            .iter()
+            .map(|&(_, _, g0_polys, _, bk_polys)| (g0_polys + bk_polys) as u64)
+            .sum()
+    }
 
     /// `owed`'s own cost, stated rather than left as a subtraction: the carried
     /// roots plus DECODE's derived one, `2 x 15` squeezes, and no state read.
@@ -688,11 +767,13 @@ mod transcript_pin {
     /// is discarded must not pay a squeeze nobody reads — and `hash_metrics`
     /// counts squeezes on a clone like any other transcript, so a third draw
     /// would show up right here as `3 x 15`.
-    pub const OWED: (u64, u64, u64) = (
-        OWED_CARRIED_ABSORBS + prove_derived_root_absorbs(),
-        2 * EPOCHS,
-        0,
-    );
+    pub fn owed() -> (u64, u64, u64) {
+        (
+            owed_carried_absorbs() + prove_derived_root_absorbs(),
+            2 * EPOCHS,
+            0,
+        )
+    }
 }
 
 /// Whether the pinned counts describe THIS run.
@@ -701,10 +782,26 @@ mod transcript_pin {
 /// forging an ELF: a sha that agrees on a prefix and differs in the tail is one
 /// `format!` away, which is the case that actually occurred.
 #[cfg(feature = "hash-metrics")]
-fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
+fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32, max_rows_log2: Option<u32>) -> bool {
     sha == transcript_pin::ELF_SHA256
         && len == transcript_pin::ELF_LEN
         && epoch_size_log2 == transcript_pin::EPOCH_LOG2
+        && max_rows_log2 == Some(transcript_pin::MAX_ROWS_LOG2)
+}
+
+/// How the pinned cap and a run's cap are SHOWN — a cap-less run has to be
+/// legible as such.
+///
+/// `None` prints as the production caps rather than as an empty field, because
+/// "unset" is not the absence of a posture: it selects the per-table values,
+/// which is the posture the old constants were measured at and the one that
+/// made this pin fail while looking like it applied.
+#[cfg(feature = "hash-metrics")]
+fn cap_label(max_rows_log2: Option<u32>) -> String {
+    match max_rows_log2 {
+        Some(n) => format!("uniform 2^{n}"),
+        None => "UNSET (the production per-table caps)".to_string(),
+    }
 }
 
 /// The line a skipped pin prints.
@@ -715,17 +812,24 @@ fn pin_applies(sha: &str, len: usize, epoch_size_log2: u32) -> bool {
 /// its own output. A diagnostic that can agree while the values differ is not a
 /// diagnostic.
 #[cfg(feature = "hash-metrics")]
-fn pin_skip_line(sha: &str, len: usize, epoch_size_log2: u32) -> String {
+fn pin_skip_line(
+    sha: &str,
+    len: usize,
+    epoch_size_log2: u32,
+    max_rows_log2: Option<u32>,
+) -> String {
     format!(
-        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}); \
-         pinned {} ({} bytes, epoch 2^{})",
+        "{:<12} transcript pin SKIPPED - elf sha {} ({} bytes, epoch 2^{}, table cap {}); \
+         pinned {} ({} bytes, epoch 2^{}, table cap {})",
         "WHIR",
         sha,
         len,
         epoch_size_log2,
+        cap_label(max_rows_log2),
         transcript_pin::ELF_SHA256,
         transcript_pin::ELF_LEN,
         transcript_pin::EPOCH_LOG2,
+        cap_label(Some(transcript_pin::MAX_ROWS_LOG2)),
     )
 }
 
@@ -743,11 +847,15 @@ fn check_transcript_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+    // ⚠ THE SAME READER THE PROVER USES, not a second parse of the same
+    // variable: `MaxRowsConfig::default` calls this too, so the posture the pin
+    // checks is by construction the posture the epochs were chunked at.
+    let cap = crate::tables::max_rows_log2_override();
+    if !pin_applies(&sha, elf.len(), epoch_size_log2, cap) {
         // Never silent. A skipped assert that prints nothing is
         // indistinguishable from one that passed, which is the failure this
         // whole pin exists against.
-        println!("{}", pin_skip_line(&sha, elf.len(), epoch_size_log2));
+        println!("{}", pin_skip_line(&sha, elf.len(), epoch_size_log2, cap));
         return;
     }
 
@@ -834,7 +942,7 @@ fn assert_pinned_pair(shape: (usize, usize), prove: (u64, u64, u64), verify: (u6
     );
 
     // ⚠ NO `owed` ASSERTION HERE, and its absence is deliberate. Once both
-    // lines match their pins, their difference is forced — `OWED` is
+    // lines match their pins, their difference is forced — `owed` is
     // `VERIFY - PROVE` by construction, so a third runtime assertion could
     // never fire. Writing its test is what exposed that: the constructed
     // counter-example was rejected by the VERIFY assertion two lines up,
@@ -891,15 +999,31 @@ fn the_pinned_pair_is_the_measurement() {
     assert_pinned_pair(
         transcript_pin::DECODE_PREPARED_SHAPE,
         (
-            583_730 + counts + 15 + 15 * opening.0,
-            183_226 + 15 * opening.1,
-            2_996 + 15 * opening.2,
+            405_777 + counts + 15 + 15 * opening.0,
+            146_091 + 15 * opening.1,
+            3_156 + 15 * opening.2,
         ),
         (
-            583_867 + counts + 30 + 15 * opening.0,
-            183_256 + 15 * opening.1,
-            2_996 + 15 * opening.2,
+            405_922 + counts + 30 + 15 * opening.0,
+            146_121 + 15 * opening.1,
+            3_156 + 15 * opening.2,
         ),
+    );
+
+    // ⛔⛔ AND THE TIE TO THE BOX LINE, which is what the re-spelling above
+    // cannot give on its own: both spellings could drift together. lb11's
+    // measured pair at the record posture, written out whole, once.
+    assert_eq!(
+        transcript_pin::prove(transcript_pin::DECODE_PREPARED_SHAPE),
+        (407_292, 149_121, 3_411),
+        "the pin no longer reproduces lb11's measured PROVE line at \
+         LAMBDA_VM_MAX_ROWS_LOG2=21"
+    );
+    assert_eq!(
+        transcript_pin::verify(transcript_pin::DECODE_PREPARED_SHAPE),
+        (407_452, 149_151, 3_411),
+        "the pin no longer reproduces lb11's measured VERIFY line at \
+         LAMBDA_VM_MAX_ROWS_LOG2=21"
     );
 }
 
@@ -1104,7 +1228,7 @@ fn the_pinned_constants_differ_by_owed() {
     let (va, vs, vt) = transcript_pin::verify(shape);
     assert_eq!(
         (va - pa, vs - ps, vt - pt),
-        transcript_pin::OWED,
+        transcript_pin::owed(),
         "the two pinned lines no longer differ by `owed` — one was re-baselined \
          without the other, or the protocol changed"
     );
@@ -1112,7 +1236,7 @@ fn the_pinned_constants_differ_by_owed() {
     // …and `owed` is itself derived, not observed: 137 absorbs is one per root
     // over the 15 epoch calls, 30 squeezes is two per call. Stating the shape
     // means a future epoch count cannot silently keep the old constant.
-    let (oa, os, ot) = transcript_pin::OWED;
+    let (oa, os, ot) = transcript_pin::owed();
     assert_eq!(
         os,
         2 * transcript_pin::EPOCHS,
@@ -1125,17 +1249,139 @@ fn the_pinned_constants_differ_by_owed() {
     // `multi_verify` and the root reaching the replay — could be re-pinned one
     // at a time, which is exactly the drift that made this branch red.
     assert_eq!(
-        oa - transcript_pin::OWED_CARRIED_ABSORBS,
+        oa - transcript_pin::owed_carried_absorbs(),
         transcript_pin::prove_derived_root_absorbs(),
         "`owed` no longer absorbs DECODE's derived root once per epoch"
     );
-    // ⚠ Only the DERIVED half of the absorb count is asserted, above. The
-    // carried half is `Sum roots.len()` over the epochs — data from the table
-    // shapes, not something derivable here — so any predicate this test could
-    // write about it would be either circular (comparing the constant to
-    // itself) or vacuous. An earlier draft had `oa % 1 == 0`, which is true of
-    // every integer. That half is pinned by `VERIFY - PROVE` above and by V1's
-    // closed form, which is where it belongs.
+    // ★★★ AND THE CARRIED HALF IS NOW DERIVED TOO, which this test used to say
+    // it could not be. The old comment read "data from the table shapes, not
+    // something derivable here", and it was right only because the shape table
+    // was not in the tree. It is now: an epoch's carried roots are one per
+    // stacked polynomial of every commitment group, which is its chain count,
+    // so the term is the chain sum over the block's fifteen epochs. Asserted
+    // against the FIXTURE rather than against the constant, so it is not a
+    // comparison of a number with itself.
+    let chains: u64 = crate::lfm::whir_epoch_f1_tests::sh4_epoch_shapes()
+        .iter()
+        .map(|&(_, _, g0, _, bk)| (g0 + bk) as u64)
+        .sum();
+    assert_eq!(
+        chains, 145,
+        "the record posture's fifteen epochs carry 145 chains in total (sh4: \
+         9, 9, 9, 12, 12, 11, 10, 9, 9, 9, 9, 9, 9, 10, 9)"
+    );
+    assert_eq!(
+        transcript_pin::owed_carried_absorbs(),
+        chains,
+        "`owed`'s carried absorbs are one per carried root, and a carried root \
+         is one per chain — if these part company the pin is describing a \
+         different epoch layout from the one the shape table records"
+    );
+    // ⛔ The check that says the derivation is not a coincidence of arithmetic:
+    // lb11 measured VERIFY - PROVE at 160 absorbs on the absorb line, and
+    // 145 + 15 is that number. A cap-less run reads 152 = 137 + 15, and 137 is
+    // the chain sum at 34 tables per epoch. One form, two postures.
+    assert_eq!(oa, 160, "`owed` absorbs 160 at the record posture");
+}
+
+/// ★★★ THE TABLE CAP IS PART OF THE PIN'S IDENTITY — the lb11 defect, as a test.
+///
+/// The pin's three fields used to be the guest sha, its length and the epoch
+/// size. A run that matched all three at a DIFFERENT table-chunking posture was
+/// therefore "the pinned configuration", and it read a different transcript
+/// because its epochs carried 27 tables instead of 34. It failed as "the counts
+/// moved" — the one message that says nothing about which side is wrong.
+///
+/// Both halves are asserted, because either alone would pass a broken pin:
+/// the cap must be COMPARED (a mismatch does not apply), and the skip line must
+/// SAY SO (a diagnostic that omits the field it refused on is the same defect
+/// the sha's `[..16]` display was).
+///
+/// ⚠ And a cap-less run must skip as well. `None` is not "no posture": it
+/// selects the production per-table caps, which is precisely the posture the
+/// old constants were measured at.
+#[cfg(feature = "hash-metrics")]
+#[test]
+fn the_table_cap_is_part_of_the_pin_identity() {
+    // ⛔ THE VALUE, not only the role. `MAX_ROWS_LOG2` is a MEASUREMENT — it
+    // names the posture every constant below it was taken at — so it is pinned
+    // like one. Without this the cap could drift to a posture nobody measured
+    // and every test in this module would still be self-consistent.
+    assert_eq!(
+        transcript_pin::MAX_ROWS_LOG2,
+        21,
+        "the record posture is a uniform 2^21 cap: the WHIR tree, the D-S \
+         control and the block artifact all export LAMBDA_VM_MAX_ROWS_LOG2=21, \
+         and lb11's constants were measured there"
+    );
+    // …and it is the posture the shape table `owed_carried_absorbs` reads from.
+    // A cap moved without the shape table moving is a pin whose derived term
+    // describes a different epoch layout from its identity.
+    let tables: Vec<usize> = crate::lfm::whir_epoch_f1_tests::sh4_epoch_shapes()
+        .iter()
+        .map(|&(t, ..)| t)
+        .collect();
+    assert_eq!(
+        (tables.iter().copied().max(), tables.iter().copied().min()),
+        (Some(27), Some(26)),
+        "at a uniform 2^21 cap the block's epochs carry 27 tables (26 at epoch \
+         13); the shape table says {tables:?}, which is another posture"
+    );
+
+    let pinned = Some(transcript_pin::MAX_ROWS_LOG2);
+    assert!(
+        pin_applies(
+            transcript_pin::ELF_SHA256,
+            transcript_pin::ELF_LEN,
+            transcript_pin::EPOCH_LOG2,
+            pinned
+        ),
+        "the pinned configuration must apply to itself"
+    );
+
+    for other in [
+        None,
+        Some(transcript_pin::MAX_ROWS_LOG2 - 1),
+        Some(transcript_pin::MAX_ROWS_LOG2 + 1),
+    ] {
+        assert!(
+            !pin_applies(
+                transcript_pin::ELF_SHA256,
+                transcript_pin::ELF_LEN,
+                transcript_pin::EPOCH_LOG2,
+                other
+            ),
+            "a run at table cap {other:?} was accepted as the pinned \
+             configuration; the same guest at another cap chunks its epochs \
+             differently and reads a different transcript"
+        );
+        let line = pin_skip_line(
+            transcript_pin::ELF_SHA256,
+            transcript_pin::ELF_LEN,
+            transcript_pin::EPOCH_LOG2,
+            other,
+        );
+        assert!(
+            line.contains(&cap_label(other)),
+            "the skip line does not name the RUN's table cap: {line}"
+        );
+        assert!(
+            line.contains(&cap_label(pinned)),
+            "the skip line does not name the PINNED table cap: {line}"
+        );
+        assert_ne!(
+            cap_label(other),
+            cap_label(pinned),
+            "the two labels must differ for a genuine mismatch"
+        );
+    }
+
+    // The cap-less case reads as the production caps rather than as a blank,
+    // which is what makes the lb11 line legible to the next reader.
+    assert!(
+        cap_label(None).contains("production"),
+        "an unset cap must print as the posture it selects, not as nothing"
+    );
 }
 
 /// ★★ A sha that agrees on a PREFIX is refused, and the skip line shows why.
@@ -1166,7 +1412,8 @@ fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
         !pin_applies(
             &near_miss,
             transcript_pin::ELF_LEN,
-            transcript_pin::EPOCH_LOG2
+            transcript_pin::EPOCH_LOG2,
+            Some(transcript_pin::MAX_ROWS_LOG2)
         ),
         "a sha differing only after position 16 was accepted: the comparison is \
          looking at a prefix"
@@ -1177,6 +1424,7 @@ fn a_sha_agreeing_only_on_the_prefix_is_refused_and_says_so() {
         &near_miss,
         transcript_pin::ELF_LEN,
         transcript_pin::EPOCH_LOG2,
+        Some(transcript_pin::MAX_ROWS_LOG2),
     );
     assert!(
         line.contains(&near_miss),
@@ -1480,7 +1728,12 @@ fn check_device_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if !pin_applies(&sha, elf.len(), epoch_size_log2) {
+    if !pin_applies(
+        &sha,
+        elf.len(),
+        epoch_size_log2,
+        crate::tables::max_rows_log2_override(),
+    ) {
         println!(
             "{:<12} device pin SKIPPED - see the transcript pin's line",
             "WHIR"

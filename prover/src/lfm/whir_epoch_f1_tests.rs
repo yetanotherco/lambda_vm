@@ -1530,7 +1530,7 @@ fn the_production_chain_terms_at_epoch_zero() {
 /// `ChainShape` is `(config, n_stack)` — no AIR, no per-table census, no card.
 /// So the chain half of all fifteen wraps is a laptop computation from these
 /// five numbers per epoch.
-fn sh4_epoch_shapes() -> Vec<(usize, usize, usize, usize, usize)> {
+pub(crate) fn sh4_epoch_shapes() -> Vec<(usize, usize, usize, usize, usize)> {
     vec![
         (27, 25, 8, 25, 1),
         (27, 25, 8, 24, 1),

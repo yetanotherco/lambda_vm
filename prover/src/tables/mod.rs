@@ -121,6 +121,28 @@ pub struct MaxRowsConfig {
     pub cpu32: usize,
 }
 
+/// The uniform table cap this process is configured with, or `None` for the
+/// production per-table values.
+///
+/// ★ THE ONE READER, and it is extracted rather than copied. The table cap is
+/// not only a prover resource knob — it decides how many sub-proofs an epoch
+/// carries (27 tables under a uniform `2^21` against 34 under the production
+/// values on block 25368371), so it is part of the SHAPE any measurement
+/// describes. Anything that pins a measured quantity has to be able to say
+/// which posture it was measured at, and a second copy of this parse is how two
+/// postures get quoted as one.
+pub(crate) fn max_rows_log2_override() -> Option<u32> {
+    let v = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2").ok()?;
+    let n: u32 = v
+        .parse()
+        .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
+    assert!(
+        (5..=26).contains(&n),
+        "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
+    );
+    Some(n)
+}
+
 impl Default for MaxRowsConfig {
     /// The production values from [`max_rows`], unless
     /// `LAMBDA_VM_MAX_ROWS_LOG2` overrides them with one uniform cap.
@@ -135,14 +157,7 @@ impl Default for MaxRowsConfig {
     /// leg the recursion wrap pays for. Tall-table postures (2^24) trade chunk
     /// parallelism for fewer legs.
     fn default() -> Self {
-        if let Ok(v) = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2") {
-            let n: u32 = v
-                .parse()
-                .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
-            assert!(
-                (5..=26).contains(&n),
-                "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
-            );
+        if let Some(n) = max_rows_log2_override() {
             return Self::uniform(1 << n);
         }
         Self {
