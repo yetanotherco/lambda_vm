@@ -1811,16 +1811,17 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     );
     assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
     assert_eq!(
-        marginal, 111,
-        "the MAXIMUM of the per-page spread {109, 110, 111}, UNPINNED — the threaded \
-         sponge makes the marginal depend on WHICH page is added"
+        marginal, 103,
+        "the retired three-term reading, UNPINNED — the threaded sponge makes the \
+         true marginal depend on WHICH page is added, spreading {109, 110, 111} at \
+         this height"
     );
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
         "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_237);
+    assert_eq!(plan.savings, 10_248_261);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.

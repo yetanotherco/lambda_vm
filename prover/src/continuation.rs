@@ -672,72 +672,71 @@ pub(crate) fn fixed_stack_vars(num_vars: usize, genesis_pages: usize) -> usize {
 /// (`the_ruled_boundaries_hold_for_every_marginal_in_band`).
 pub(crate) const MARGINAL_MEASURED_AT_VARS: usize = 24;
 
-/// PART 1's term: the rows ONE MORE carried page adds to the prepared leg —
-/// the MAXIMUM of a cost that varies with WHICH page is added.
+/// PART 1's term: the rows ONE MORE carried page adds to the prepared leg.
 ///
-/// ⛔⛔ THERE IS NO SINGLE PER-PAGE MARGINAL, AND THAT IS THE FINDING, not a
-/// caveat on one. The leg's sponge is THREADED: every column absorbs
-/// `COORDINATES_PER_EXT` = 3 coordinates into one buffer and a single squeeze
-/// follows, costing `squeeze_rows(f) = f.div_ceil(4) + f.div_ceil(8) + 1`. A
-/// page is two columns, so **6 felts — which divides neither 4 nor 8**. The
-/// squeeze's cost therefore steps irregularly as pages are added, and
-/// differencing across one more page gives
+/// ⛔⛔ THIS IS NOT A CONSTANT OF THE PROTOCOL, AND IT IS NOT EVEN A CONSTANT.
+/// The value here is the retired three-term reading — `eq` 90, two prefix
+/// indicators 12, one shared `Sub` 1 — kept only until the FORM below replaces
+/// it. Three shapes have been tried and the arithmetic was never the problem:
+///
+/// 1. a FORMULA, wrong because it omitted terms;
+/// 2. a LITERAL, wrong because the quantity is not constant;
+/// 3. a FORMULA again, whose one irreducible term is a measured BOUND.
+///
+/// **WHY A LITERAL CANNOT WORK.** The leg's sponge is THREADED: every column
+/// absorbs `COORDINATES_PER_EXT` = 3 coordinates into one buffer and a single
+/// squeeze follows, costing `squeeze_rows(f) = f.div_ceil(4) + f.div_ceil(8)
+/// + 1`. A page is two columns — **6 felts, which divides neither 4 nor 8** —
+/// so differencing across one more page gives `s = [2, 3, 1, 3]` repeating with
+/// period 4. The marginal depends on WHICH page is added, not merely that one
+/// was. ⇒ `s` is provably bounded: 6 felts move `div_ceil(4)` by 1 or 2 and
+/// `div_ceil(8)` by 0 or 1, so `s <= 3` at every page count.
+///
+/// **AND WHY A LITERAL IS ALSO BRACKET-SCOPED.** The indicator term is
+/// `2 * max(n_fixed - num_vars, 1)`, which grows two rows per prefix bit, so
+/// the spread climbs with the run's own height:
+///
+/// | `n_fixed` | genesis pages | marginal |
+/// |---|---|---|
+/// | 24 | 17…32 | 109…111 |
+/// | 25 | 33…64 | 111…113 |
+///
+/// Any single number is an upper bound for one bracket and an understatement
+/// above it, and nothing in the rule says which bracket it was chosen for.
+///
+/// ⇒ **THE FORM THAT IS COMING**, which restores this to a function of the
+/// height part 1 already evaluates at, with every term derived and one measured
+/// bound:
 ///
 /// ```text
-/// s = [2, 3, 1, 3] repeating, period 4, over P = 17..=32
-/// per-page marginal = 90 (eq) + 12 (indicators) + 6 (per-column) + s
-///                   = {109, 110, 111}
+/// marginal(n_fixed) = 90 + 2*max(n_fixed - 18, 1) + 6 + MAX_SPONGE_MARGINAL
 /// ```
 ///
-/// ⇒ **The literal is the MAXIMUM of that spread**, so part 1 demands a page
-/// beat the DEAREST position it could occupy and part 2's savings are
-/// understated. Both parts are conservative, and all three parties still read
-/// ONE number — which is what the single literal was for. An average would
-/// charge some pages less than they cost.
-///
-/// **The three terms the spread is built on** (`lfm::whir_stacked`,
-/// `lfm::whir_poly`), which explain its magnitude:
-///
-/// 1. **One `eq` plus the `MulAdd` joining its group** — a page's two
-///    preprocessed columns settle at ONE point, its own table's, so they are
-///    one group: `4n + (n - 1) = 89` at `n = 18`, and the join makes 90.
-/// 2. **One prefix indicator per stacked column**, `max(n_stack - num_vars, 1)`
-///    rows apiece, [`PAGE_PREPROCESSED_COLUMNS`] to a page: 12 at
-///    [`MARGINAL_MEASURED_AT_VARS`].
-/// 3. **Three more terms per COLUMN outside `weight_at_rows`** —
-///    `absorb_unpack_rows()`, `challenge_powers_rows(columns)` and
-///    `columns_of(..).len()`, one row each, so +6 a page.
+/// where the `+ 6` is the three per-COLUMN terms outside `weight_at_rows`
+/// (`absorb_unpack_rows`, `challenge_powers_rows`, `columns_of(..).len()`, one
+/// row each, two columns to a page) and `MAX_SPONGE_MARGINAL` is 3. It gives
+/// 111 at the block's height and 113 one bracket up.
 ///
 /// ⛔ A FOURTH TERM, the shared `Sub`, IS NOT IN THE MARGINAL AT ALL: it is
 /// emitted once per prefix POSITION any column reads as a zero bit, which is
-/// per-POLYNOMIAL, so differenced across one more page it contributes ZERO.
-/// It was once carried here as "≤ 1, amortised"; differencing is what exposed
-/// that as a fudge.
+/// per-POLYNOMIAL, so differenced across one more page it contributes ZERO. It
+/// was once carried here as "≤ 1, amortised"; differencing exposed that as a
+/// fudge, and it is why the form's `+ 6` sits beside a 102 and not a 103.
 ///
-/// ⚠ **DERIVED, NOT MEASURED — by two independent readings that agree, which
-/// is not a build.** It also ASSUMES `chain_sponge`'s per-polynomial cost is
+/// ⚠ **DERIVED, NOT MEASURED** — by two independent readings that agree, which
+/// is not a build — and ASSUMING `chain_sponge`'s per-polynomial cost is
 /// P-independent, which it should be because a squeeze leaves `DIGEST_FELTS`
-/// buffered whatever preceded it. The pin in `lfm` settles all of this, and it
-/// asserts the MAXIMUM and the SPREAD rather than a value — an equality
-/// against one number is unsatisfiable for a cost that has three.
-///
-/// ⚠⚠ **AND IT BOUNDS THE MEASURED BRACKET, NOT EVERY RUN.** `s` itself is
-/// bounded at 3 for any page count (6 felts move `div_ceil(4)` by 1-2 and
-/// `div_ceil(8)` by 0-1), but the INDICATOR term grows two rows per prefix bit
-/// as the stack gets taller: a run of 33..=64 genesis pages stands at
-/// `n_stack` 25 and costs up to **113** a page. So this literal is an upper
-/// bound where the block is and an UNDERSTATEMENT above it — the same
-/// direction [`MARGINAL_MEASURED_AT_VARS`] names in words, now priced. Raising
-/// it to 113 would bound every single-polynomial stack and would move NO ruled
-/// consequence (`τ` and the lone pair are identical across 110..=125); it is
-/// left at the measured bracket's maximum because that is what was ruled.
+/// buffered whatever preceded it. The pin in `lfm` settles it and lands the
+/// form with the value; until then this literal UNDERSTATES by at least six,
+/// which makes part 1 slightly too eager and is bounded by
+/// `the_ruled_boundaries_hold_for_every_marginal_in_band`.
 ///
 /// ⓘ **THE BLOCK IS CHARGED ABOVE ITS OWN STACK, WHICH IS THE POINT OF THE
 /// FIXED BOUND.** Its three dense pages are six columns, so its real stack
-/// stands at `n_stack` 21 with a prefix of 3: its true weight marginal is 96,
-/// not the 102 charged here. Six rows a page of conservatism from the prefix
-/// alone, before `s`.
-pub(crate) const GENESIS_PAGE_MARGINAL_ROWS: usize = 111;
+/// stands at `n_stack` 21 with a prefix of 3: its true weight marginal is 96
+/// against the 102 the form charges at 24. Six rows a page of conservatism from
+/// the prefix alone, before `s`.
+pub(crate) const GENESIS_PAGE_MARGINAL_ROWS: usize = 103;
 
 /// PART 1: whether a page is even a CANDIDATE — whether keeping it sparse costs
 /// more than carrying it would add to the leg.
@@ -760,9 +759,10 @@ pub(crate) fn is_candidate(num_vars: usize, nonzero: usize) -> bool {
 /// exceeding it.
 ///
 /// ⚠ `τ` IS DERIVED FROM THE MARGINAL AND IS NOT ITSELF A RULED QUANTITY. It
-/// is 6 at this literal, holding at 6 for a marginal in `[108, 125]` and at 5
-/// on `[90, 107]` — the retired three-term 103 sat in that lower band. The only
-/// page the difference reclassifies is one carrying five nonzero genesis bytes,
+/// is 5 at this literal, holding at 5 for a marginal in `[90, 107]`, at 6 on
+/// `[108, 125]` and at 7 on `[126, 143]` — so the form's 111 will make it 6.
+/// The only page that difference reclassifies is one carrying five nonzero
+/// genesis bytes,
 /// and neither the block (0, or 116,692 and up) nor any fixture (112, 65,652)
 /// sits there; `the_ruled_boundaries_hold_for_every_marginal_in_band` is the
 /// reading of that rather than the assurance.
@@ -821,9 +821,9 @@ pub(crate) fn chain_is_paid(total_savings: usize) -> bool {
 /// this. So the one number covers both ways a page can end up sparse.
 ///
 /// ⛔ AND IT MOVES WITH THE LITERAL — one entry per `num_vars` rows. It is
-/// **9,731** at the current 111, so the pair is `(9,731 sparse, 9,732 dense)`,
-/// which holds for a marginal in `[110, 127]`. The retired 103 put it at
-/// `(9,730, 9,731)` on `[92, 109]`. That is why no test hard-codes it: they
+/// **9,730** at this literal, so the pair is `(9,730 sparse, 9,731 dense)`,
+/// which holds for a marginal in `[92, 109]`; the form's 111 moves it to
+/// `(9,731, 9,732)`, which holds on `[110, 127]`. That is why no test hard-codes it: they
 /// assert this function and `+ 1`, and the band assertion names the pair when
 /// it moves. The cap-overlap conclusion is untouched at any of these values —
 /// the margin to `MAX_SPARSE_INIT_ENTRIES` is six-fold.
@@ -4100,32 +4100,33 @@ mod tests {
             MARGINAL_MEASURED_AT_VARS,
             "18 + ceil(log2(60))"
         );
-        assert_eq!(GENESIS_PAGE_MARGINAL_ROWS, 111);
+        assert_eq!(GENESIS_PAGE_MARGINAL_ROWS, 103);
 
-        // τ from the literal: `18 + 18*S > 111` ⇒ S >= 6.
-        assert_eq!(candidate_threshold_entries(BLOCK_PAGE_VARS), 6);
-        assert!(!is_candidate(BLOCK_PAGE_VARS, 5));
-        assert!(is_candidate(BLOCK_PAGE_VARS, 6));
+        // τ from the literal: `18 + 18*S > 103` ⇒ S >= 5.
+        assert_eq!(candidate_threshold_entries(BLOCK_PAGE_VARS), 5);
+        assert!(!is_candidate(BLOCK_PAGE_VARS, 4));
+        assert!(is_candidate(BLOCK_PAGE_VARS, 5));
         // ⚠ FLOOR PLUS ONE AND NOT `div_ceil`: τ's leg must EXCEED the
         // marginal, never meet it.
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 5) <= GENESIS_PAGE_MARGINAL_ROWS);
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 6) > GENESIS_PAGE_MARGINAL_ROWS);
+        let tau = candidate_threshold_entries(BLOCK_PAGE_VARS);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, tau - 1) <= GENESIS_PAGE_MARGINAL_ROWS);
+        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, tau) > GENESIS_PAGE_MARGINAL_ROWS);
 
-        // ⛔ THE LITERAL IS THE MAXIMUM OF A SPREAD, NOT A READING OF ONE
-        // POSITION. Its deterministic terms alone are 102 + 6 = 108, and the
-        // threaded sponge adds 1, 2 or 3 depending on WHICH page is added; 111
-        // is the dearest of those. A literal under 108 would charge less than
-        // even the cheapest position costs.
+        // ⛔ THE ONE BOUND THAT HOLDS WHATEVER THIS VALUE BECOMES: the marginal
+        // must exceed what `weight_at_rows` alone bills for a page at the
+        // charging height, which is 102 (eq 90 + two indicators of six). Every
+        // shape this number has taken — the three-term 103, the spread's
+        // maximum 111, the form's 113 one bracket up — clears it, and a value
+        // under it would charge less than a term it provably contains.
         //
-        // ⚠ A `const` ASSERT, NOT A RUNTIME ONE: the day someone moves this
-        // below the deterministic floor the tree stops COMPILING, rather than
-        // failing a test nobody ran.
+        // ⚠ A `const` ASSERT, NOT A RUNTIME ONE: breaking it stops the tree
+        // COMPILING rather than failing a test nobody ran.
         const {
             assert!(
-                GENESIS_PAGE_MARGINAL_ROWS >= 108,
-                "the literal is the MAXIMUM of the per-page spread, and 108 is that \
-                 spread's deterministic floor (eq 90 + indicators 12 + six per-column \
-                 rows); under it the rule undercharges every position"
+                GENESIS_PAGE_MARGINAL_ROWS > 102,
+                "the marginal must exceed the 102 rows the weight closure alone bills \
+                 a page at the charging height; `whir_chain_tests` reads that 102 off \
+                 the emitter rather than restating it"
             )
         };
     }
@@ -4197,7 +4198,7 @@ mod tests {
         assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
 
         // Part 1: the three, and only the three. The 27 zero pages cost 18 rows
-        // sparse against a 111-row marginal, so carrying one would COST rows.
+        // sparse against a 103-row marginal, so carrying one would COST rows.
         assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 0), 18);
         assert!(!is_candidate(BLOCK_PAGE_VARS, 0));
         assert_eq!(
@@ -4211,7 +4212,7 @@ mod tests {
             .map(|&(_, _, rows)| rows - BLOCK_MARGINAL)
             .sum();
         assert_eq!(plan.savings, expected);
-        assert_eq!(plan.savings, 10_248_237);
+        assert_eq!(plan.savings, 10_248_261);
         assert!(chain_is_paid(plan.savings));
 
         // ⚠ THE SET AND ITS ORDER, not a count: the stack's column order IS
@@ -4231,10 +4232,29 @@ mod tests {
     #[test]
     fn nothing_on_the_block_sits_near_the_threshold() {
         let least_dense = BLOCK_DENSE.iter().map(|&(_, _, r)| r).min().expect("three");
-        // Part 1: the cheapest carried page clears the marginal 20,000-fold,
-        // and the dearest sparse one misses it by 5.7x.
+        // Part 1: the cheapest carried page clears the marginal 20,000-fold.
         assert!(least_dense > 10_000 * GENESIS_PAGE_MARGINAL_ROWS);
-        assert!(sparse_leg_rows(BLOCK_PAGE_VARS, 0) * 6 < GENESIS_PAGE_MARGINAL_ROWS);
+
+        // ⛔ AND THE ZERO PAGES' MARGIN IS A RATIO WITH A FLOOR, NOT A FIXED
+        // FACTOR. This read `* 6 <`, which was true while the literal was 109,
+        // FALSE at 103, and true again at the coming form's 111 — a margin
+        // stated as a multiple of a number that moves is an assertion about a
+        // draft, and it reddened the gate for exactly that reason. It is now
+        // the ratio it IS, printed, floored at the weakest value any candidate
+        // marginal gives.
+        let zero_page = sparse_leg_rows(BLOCK_PAGE_VARS, 0);
+        let margin = GENESIS_PAGE_MARGINAL_ROWS / zero_page;
+        println!(
+            "ZERO-PAGE MARGIN: an all-zero page costs {zero_page} rows against a \
+             {GENESIS_PAGE_MARGINAL_ROWS}-row marginal — a factor of {margin}"
+        );
+        assert!(
+            margin >= 5,
+            "an all-zero page costs {zero_page} rows against a marginal of {}, within \
+             a factor of {margin} of qualifying — the 27 zero pages are supposed to \
+             fail part 1 by a wide margin",
+            GENESIS_PAGE_MARGINAL_ROWS
+        );
         // Part 2: the CHEAPEST carried page is worth twelve chains on its own,
         // and the three together fifty-eight, so no plausible re-sizing of the
         // budget changes the block's answer.
@@ -4276,10 +4296,10 @@ mod tests {
         );
         assert_eq!(
             (sparse_at, dense_at),
-            (9_731, 9_732),
+            (9_730, 9_731),
             "the pair at this literal. If it moved, read the marginal: this pair \
-             holds across [110, 127], and the retired 103 put it at (9,730, 9,731) \
-             across [92, 109]"
+             holds across [92, 109], and the coming form's 111 moves it to \
+             (9,731, 9,732), which holds across [110, 127]"
         );
 
         for (nonzero, carried) in [(sparse_at, false), (dense_at, true)] {
@@ -4311,7 +4331,7 @@ mod tests {
         // expected at 108 + s, so `s >= 2` moves the pair.
         assert_eq!(
             page_savings(BLOCK_PAGE_VARS, dense_at),
-            PREPARED_LEG_ROWS + 17
+            PREPARED_LEG_ROWS + 7
         );
 
         // The retired rule's break-even, kept here as the contrast and nowhere
@@ -4330,8 +4350,8 @@ mod tests {
     /// where every fixture in the tree sits.
     ///
     /// `data_page_touch`'s one data page carries 112 nonzero genesis bytes. It
-    /// passes part 1 comfortably — 2,034 rows against a 111-row marginal — and
-    /// part 2 refuses it, because 1,923 saved rows do not buy a 175,066-row
+    /// passes part 1 comfortably — 2,034 rows against a 103-row marginal — and
+    /// part 2 refuses it, because 1,931 saved rows do not buy a 175,066-row
     /// chain. ⚠ THAT IS THE INTERESTING BRANCH AND IT IS WHY THE FIELD
     /// `candidate` EXISTS: under the retired rule this page failed the only
     /// test there was, and "no opening" meant "nobody wanted it".
@@ -4343,7 +4363,7 @@ mod tests {
         assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 112), 2_034);
         assert!(plan.routes[0].candidate, "2,034 rows against the marginal");
         assert_eq!(plan.savings, 2_034 - BLOCK_MARGINAL);
-        assert_eq!(plan.savings, 1_923);
+        assert_eq!(plan.savings, 1_931);
         assert!(!chain_is_paid(plan.savings));
         assert!(
             plan.is_empty(),
@@ -4381,12 +4401,12 @@ mod tests {
 
         // Neither one pays for the chain alone.
         let alone = page_savings(BLOCK_PAGE_VARS, 5_000);
-        assert_eq!(alone, 89_907);
+        assert_eq!(alone, 89_915);
         assert!(!chain_is_paid(alone));
         // Together they do, and BOTH are carried — the set is paid for or none
         // of it is.
         assert_eq!(plan.savings, 2 * alone);
-        assert_eq!(plan.savings, 179_814);
+        assert_eq!(plan.savings, 179_830);
         assert!(chain_is_paid(plan.savings));
         assert_eq!(plan.dense_pages(), vec![0, 1]);
 
@@ -4626,56 +4646,69 @@ mod tests {
             tau(m0),
             densest(m0)
         );
+        // ⛔ THE BANDS ARE COMPLETE AT THE TOP, WHICH THEY WERE NOT. τ was
+        // tabled as "5 on [90, 107], 6 from 108" and then asserted at m = 130,
+        // where it is 7 — an open-ended "from" is not a band, and the sweep ran
+        // past the end of the one that had been written down. All three
+        // sub-bands are asserted here, with both of their edges.
         assert_eq!(tau_is_five, (90, 107));
+        assert_eq!(band(&|m| tau(m) == 6), (108, 125));
+        assert_eq!(band(&|m| tau(m) == 7), (126, 143));
         assert_eq!(lone_pair, (92, 109));
-        // ⛔ THE LITERAL SITS IN NEITHER OF THOSE — it is 111, and both bands
-        // above belong to the retired 103. The bands are facts about the FORMS
-        // and do not move; which one the literal falls in is what moved, and
-        // that is the whole reason they are asserted separately from it.
-        assert!(m0 > tau_is_five.1 && m0 > lone_pair.1);
-        let tau_is_six = band(&|m| tau(m) == 6);
-        let pair_9731 =
-            band(&|m| !chain_is_paid(savings(m, 9_731)) && chain_is_paid(savings(m, 9_732)));
-        assert_eq!(tau_is_six, (108, 125));
-        assert_eq!(pair_9731, (110, 127));
-        assert!(
-            tau_is_six.0 <= m0 && m0 <= tau_is_six.1,
-            "τ is no longer 6 at the literal; it is {} and the band is {tau_is_six:?}",
-            tau(m0)
+        assert_eq!(band(&|m| densest(m) == 9_731), (110, 127));
+        assert_eq!(band(&|m| densest(m) == 9_732), (128, 145));
+
+        // ⛔ AND WHERE THE LITERAL FALLS IS COMPUTED, NOT HARD-CODED. Every
+        // earlier version named the band it expected, so each time the literal
+        // moved this reddened on the naming rather than on the finding. It now
+        // asserts only that the literal lies inside the band for ITS OWN value
+        // — true at the current 103, at the coming form's 111, and at the 113 a
+        // taller bracket costs — and PRINTS which bands those are.
+        let my_tau = tau(m0);
+        let my_pair = densest(m0);
+        assert_eq!(my_tau, candidate_threshold_entries(BLOCK_PAGE_VARS));
+        assert_eq!(my_pair, densest_sparse_entries(BLOCK_PAGE_VARS));
+        let tau_band = band(&|m| tau(m) == my_tau);
+        let pair_band = band(&|m| densest(m) == my_pair);
+        println!(
+            "LITERAL {m0}: τ = {my_tau} over {tau_band:?}, pair ({my_pair}, {}) over \
+             {pair_band:?}",
+            my_pair + 1
         );
-        assert!(
-            pair_9731.0 <= m0 && m0 <= pair_9731.1,
-            "the literal has left the band the (9,731, 9,732) pair holds in; the \
-             boundary is now ({}, {}) and every quotation of 9,731 must be re-read",
-            densest(m0),
-            densest(m0) + 1
-        );
+        assert!(tau_band.0 <= m0 && m0 <= tau_band.1);
+        assert!(pair_band.0 <= m0 && m0 <= pair_band.1);
 
         // ⛔⛔ THE WHOLE SPREAD, EXECUTED. The per-page marginal is not one
-        // number: the threaded sponge makes it 109, 110 or 111 by position, and
-        // the literal is the dearest. Every member of that spread is walked
-        // here, so the table in the literal's doc is a reading and not a claim.
+        // number: the threaded sponge makes it 109, 110 or 111 by position at
+        // the charging height. ⚠ The literal is BELOW that spread today — it is
+        // the retired three-term reading — and the coming form raises it into
+        // the range. Walking every member means the table in the literal's doc
+        // is a reading and not a claim.
+        assert!(
+            m0 < 109,
+            "the literal is the retired reading, under the spread"
+        );
         for m in [109usize, 110, 111] {
             assert_eq!(tau(m), 6, "τ is 6 across the whole spread");
         }
         assert_eq!(
             densest(109),
             9_730,
-            "the cheapest position sits in the OLD pair"
+            "the cheapest position keeps today's pair"
         );
         for m in [110usize, 111] {
             assert_eq!(densest(m), 9_731);
         }
-        // ⇒ AND THAT IS WHY THE MAXIMUM IS THE RIGHT CHOICE RATHER THAN A
-        // MIDPOINT: τ is invariant across the spread, so the only quantity the
-        // choice decides is the pair, and taking the dearest position makes
-        // part 1 conservative at every position for the price of one entry.
+        // ⇒ AND THAT IS WHY THE FORM TAKES THE MAXIMUM RATHER THAN A MIDPOINT:
+        // τ is invariant across the spread, so the only quantity the choice
+        // decides is the pair, and charging the dearest position is
+        // conservative everywhere for the price of one entry.
 
-        // ⚠ THE 113 A TALLER RUN WOULD COST, for the reader who checks whether
-        // this literal bounds every run: it does not. The indicator term grows
-        // two rows per prefix bit, so a stack at `n_stack` 25 costs up to 113 a
-        // page — and it would move NEITHER quantity, both bands reaching 125
-        // and 127.
+        // ⚠ THE 113 A TALLER RUN COSTS. The indicator term grows two rows per
+        // prefix bit, so a stack at `n_stack` 25 reaches 113 a page — which is
+        // why no single literal is an upper bound and the form takes `n_fixed`
+        // as its argument. It moves NEITHER quantity, both bands reaching past
+        // it.
         assert_eq!(tau(113), 6);
         assert_eq!(densest(113), 9_731);
     }
