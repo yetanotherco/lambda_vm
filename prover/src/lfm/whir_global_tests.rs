@@ -30,9 +30,8 @@ mod tests {
     use crate::lfm::whir_real_epoch::whir_process_posture_note;
     use crate::lfm::whir_real_global::{WhirRealGlobal, real_global_from_whir_continuation};
     use crate::multilinear_continuation;
-    use crate::tables::types::{FE, FEE};
+    use crate::tables::types::FE;
     use crate::test_utils::asm_elf_bytes;
-    use multilinear::mle::Mle;
     use stark::proof::options::ProofOptions;
 
     /// A run whose cross-epoch proof carries ONE PRIVATE page — the OFFSET-only
@@ -279,62 +278,6 @@ mod tests {
         global.page_is_private[private] = false;
         let airs = global.airs().refs();
         let _ = GlobalPlan::build(&global, &airs);
-    }
-
-    /// ★ THE SPARSE LEG AGAINST THE FOLD IT REPLACES, AND AGAINST A THIRD
-    /// DERIVATION — the OFFSET ramp's own pattern.
-    ///
-    /// Three derivations, no two sharing an author: `Mle::evaluate_in` over the
-    /// REAL INIT column (the host fold this leg exists to avoid), the host's own
-    /// sparse form, and the emitted program's value. And a fourth arm that is
-    /// the point of the exercise: the REVERSED bit order gives a DIFFERENT
-    /// value, so the convention is observable rather than agreed-with-itself.
-    #[test]
-    fn the_sparse_leg_computes_what_the_hosts_fold_computes() {
-        use crate::lfm::preprocessed::{sparse_entries, sparse_mle_at};
-        // A small column with the shape a page's genesis has: mostly zero, a few
-        // bytes near the front. Small enough that the FOLD is cheap to run here,
-        // which is what makes the differential possible at all.
-        let num_vars = 6usize;
-        let height = 1usize << num_vars;
-        let mut column = vec![FE::zero(); height];
-        for (offset, byte) in [0xF0u64, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]
-            .into_iter()
-            .enumerate()
-        {
-            column[offset] = FE::from(byte);
-        }
-        column[height - 1] = FE::from(7u64);
-        let entries = sparse_entries(&[column.as_slice()]);
-        assert_eq!(entries, 9, "the support this arm is written against");
-
-        // An asymmetric point, because a symmetric one cannot tell the bit
-        // orders apart.
-        let point: Vec<FEE> = (0..num_vars)
-            .map(|k| FEE::from(3u64 + 11 * k as u64))
-            .collect();
-
-        let folded = Mle::new(column.clone())
-            .expect("a power-of-two column")
-            .evaluate_in(&point)
-            .expect("the fold");
-        let claimed = sparse_mle_at(&column, &point);
-        assert_eq!(
-            folded, claimed,
-            "the sparse form must be the fold it replaces, on the same column at the \
-             same point"
-        );
-
-        // ⛔ THE ANTI-AGREEMENT ARM. Reversing the bit order is a different
-        // number at every point but the symmetric ones, and if it were not this
-        // whole convention would be unobservable.
-        let reversed: Vec<FEE> = point.iter().rev().cloned().collect();
-        assert_ne!(
-            sparse_mle_at(&column, &reversed),
-            folded,
-            "the bit order is not observable at this point, so no arm of this suite \
-             can see it reversed — pick another point"
-        );
     }
 
     /// ★★ THE PUBLISHED SET, WORD FOR WORD — and every word against a

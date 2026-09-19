@@ -545,3 +545,193 @@ fn the_offset_ramp_is_cheaper_than_the_fold_it_replaces() {
          saving this leg exists for"
     );
 }
+
+// =============================================================================
+// The SPARSE leg — the cross-epoch proof's page INIT columns
+// =============================================================================
+
+/// The sparse leg alone, over one column, publishing its one value.
+///
+/// The control arm publishes the interned ZERO — which is exactly what the
+/// emitter returns for a column with no surviving entry, and therefore exactly
+/// what a leg whose coefficient loop emitted nothing would return. Both arms
+/// publish ONE word, so the publish cancels out of the delta and what is left is
+/// the leg.
+fn sparse_only_program(column: &[FE], num_vars: usize, leg: bool) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(num_vars as u32);
+    let point: Vec<_> = (0..num_vars)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let out = if leg {
+        super::preprocessed::emit_sparse_mle_at(&mut b, &[column], &point)[0]
+    } else {
+        b.ext_const(&FEE::zero())
+    };
+    b.public(out.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the sparse leg must be admissible");
+    program
+}
+
+/// A real page's genesis column: the bytes an ELF data page loads, zero to the
+/// end of the page.
+///
+/// ★ THE REAL OBJECT, not a hand-built vector. `page::preprocessed_columns` is
+/// what `global_memory_air` hands the verifier, column 1 is INIT, and the whole
+/// claim of the sparse route is about THAT column's shape — mostly zero, with a
+/// short nonzero prefix. A synthetic column could be sparse for reasons the real
+/// one is not.
+fn real_genesis_column(bytes: &[u8]) -> Vec<FE> {
+    let config = crate::tables::page::PageConfig::with_data(0, bytes.to_vec());
+    let mut columns = crate::tables::page::preprocessed_columns(&config);
+    assert_eq!(columns.len(), 2, "a non-private page carries OFFSET and INIT");
+    columns.remove(1)
+}
+
+/// ★★ THE SPARSE LEG AGAINST THE FOLD IT REPLACES, AND AGAINST A THIRD
+/// DERIVATION — the ramp's own pattern, over a real page's INIT column.
+///
+/// Three derivations and no two share an author: `Mle::evaluate_in` over the
+/// real `2^18` column (the host fold this leg exists to avoid), the host's own
+/// [`super::preprocessed::sparse_mle_at`] (the arithmetic being claimed), and
+/// the EMITTED program's published value.
+#[test]
+fn the_sparse_leg_computes_what_the_hosts_genesis_fold_computes() {
+    // Eight nonzero bytes with no repeats, so the distinct-coefficient pool is
+    // eight and a dropped entry moves the answer.
+    let bytes = [0xF0u8, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12];
+    let column = real_genesis_column(&bytes);
+    let num_vars = column.len().trailing_zeros() as usize;
+    assert_eq!(1usize << num_vars, column.len(), "a page is a power of two tall");
+    let entries = super::preprocessed::sparse_entries(&[column.as_slice()]);
+    assert_eq!(
+        entries,
+        bytes.len(),
+        "the support this arm is written against: every genesis byte is nonzero \
+         and the rest of the page is zero"
+    );
+
+    let mle = Mle::new(column.clone()).expect("a power-of-two column");
+    let program = sparse_only_program(&column, num_vars, true);
+
+    for seed in [0x5a17_0001u64, 0x5a17_0002, 0x5a17_0003] {
+        let point = sample_point_n(seed, num_vars);
+        let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the sparse leg executes");
+        assert_eq!(exec.public_words.len(), 1, "the leg publishes one value");
+        let got = word_as_ext(&exec.public_words[0].1).expect("an extension value");
+
+        let folded = mle
+            .evaluate_in::<GoldilocksExtension>(&point)
+            .expect("the column has num_vars variables");
+        let closed = super::preprocessed::sparse_mle_at(&column, &point);
+
+        // ⛔ ANTI-VACUITY ON THE ANSWER (instance 72). A leg whose coefficient
+        // loop emitted nothing returns the interned ZERO, and at a random point
+        // over a column with support the true value is not zero.
+        assert_ne!(
+            got,
+            FEE::zero(),
+            "seed {seed:#x}: the sparse leg returned zero, which is what a leg that \
+             emitted nothing over a column with {entries} surviving entries would return"
+        );
+        assert_eq!(
+            got, folded,
+            "seed {seed:#x}: the EMITTED sparse leg disagrees with the host's \
+             2^{num_vars} fold over the same column"
+        );
+        assert_eq!(
+            got, closed,
+            "seed {seed:#x}: the emitted leg disagrees with the host closed form it mirrors"
+        );
+    }
+}
+
+/// ⛔ THE BIT ORDER IS OBSERVABLE, so the convention is pinned rather than
+/// agreed with itself.
+///
+/// The emitter's order is taken from `emit_const_mle_at` — `point[0]` binds the
+/// HIGH index bit. Reversing the point must give a DIFFERENT value against the
+/// real fold; if it did not, no arm of this suite could see the convention
+/// reversed and the comment claiming it would be the only thing holding it.
+#[test]
+fn the_sparse_legs_bit_order_is_observable() {
+    let column = real_genesis_column(&[0x01u8, 0x02, 0x03, 0x04]);
+    let num_vars = column.len().trailing_zeros() as usize;
+    let mle = Mle::new(column.clone()).expect("a power-of-two column");
+    let program = sparse_only_program(&column, num_vars, true);
+
+    let point = sample_point_n(0x5a17_0b17, num_vars);
+    let reversed: Vec<FEE> = point.iter().rev().cloned().collect();
+
+    let run = |p: &[FEE]| {
+        let arenas = vec![p.iter().map(ext_word).collect::<Vec<_>>()];
+        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            .expect("the sparse leg executes");
+        word_as_ext(&exec.public_words[0].1).expect("an extension value")
+    };
+
+    let forward = run(&point);
+    let backward = run(&reversed);
+    assert_eq!(
+        forward,
+        mle.evaluate_in::<GoldilocksExtension>(&point)
+            .expect("the fold"),
+        "the emitted leg is the fold at the point as given"
+    );
+    assert_ne!(
+        forward, backward,
+        "the two bit orders agree at this point, so a reversed convention would be \
+         invisible here — pick another point"
+    );
+    assert_ne!(
+        backward,
+        mle.evaluate_in::<GoldilocksExtension>(&point)
+            .expect("the fold"),
+        "the REVERSED order must disagree with the fold, which is what makes the \
+         convention a checkable fact rather than a shared assumption"
+    );
+}
+
+/// ★ THE ROW FORM, against the emitter, as a DELTA between the two arms.
+///
+/// `sparse_mle_rows` is a claim about cost and the value gate above is a claim
+/// about arithmetic; a leg can satisfy either alone. The delta cancels the
+/// hints, the publish and the compiler's own overhead, so what is left is the
+/// leg — and the constant pool is asserted BOTH ways, by count and by value.
+#[test]
+fn the_sparse_leg_emits_its_row_form() {
+    for bytes in [vec![0xABu8, 0xCD, 0xEF], Vec::new(), vec![7u8; 5]] {
+        let column = real_genesis_column(&bytes);
+        let num_vars = column.len().trailing_zeros() as usize;
+        let leg = sparse_only_program(&column, num_vars, true);
+        let control = sparse_only_program(&column, num_vars, false);
+
+        let emitted = (leg.instrs.len() - const_rows(&leg))
+            - (control.instrs.len() - const_rows(&control));
+        let predicted = super::preprocessed::sparse_mle_rows(&[column.as_slice()], num_vars);
+        let constants = super::preprocessed::sparse_mle_constants(&[column.as_slice()]);
+        println!(
+            "sparse leg over {} genesis bytes at {num_vars} vars: {emitted} rows emitted, \
+             {predicted} predicted, {} constants named, {} interned",
+            bytes.len(),
+            constants.len(),
+            const_rows(&leg),
+        );
+        assert_eq!(
+            emitted, predicted,
+            "the sparse leg's row form missed the emitter over {} genesis bytes",
+            bytes.len()
+        );
+        // ⚠ The control interns the ZERO it publishes, and the leg interns it
+        // too when the column is empty — so the pools are compared by the form's
+        // own list, which names that zero exactly when the emitter does.
+        assert_eq!(
+            const_rows(&leg),
+            constants.len(),
+            "the pool the form names is the pool the emitter interns"
+        );
+    }
+}
