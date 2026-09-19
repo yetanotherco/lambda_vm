@@ -186,11 +186,32 @@ pub static OOD: Slot = Slot::new();
 /// the Merkle tree on device per query batch.
 pub static QUERIES: Slot = Slot::new();
 
-/// The six, as taken at the group-loop boundary, awaiting the record.
-static CHAIN_AT_GROUPS: Mutex<[f64; 6]> = Mutex::new([0.0; 6]);
+/// The ROUND LOOP's own wall, summed over rounds — the six measured against
+/// their container rather than against `open_groups` directly.
+///
+/// ★ WHY A SEVENTH NUMBER RATHER THAN A WIDER TOLERANCE. The six closed to
+/// +1.4% on the laptop and +5.1% on the box, because what they leave out is
+/// roughly FIXED per epoch while the window they sit in shrinks on a faster
+/// machine. Widening the tolerance to admit 5% would have been the move that
+/// makes a check unable to fail — and it would have been wrong about the cause,
+/// because the gap is NOT round bookkeeping:
+///
+/// `Factors::from_shares` runs in `prove_shared`, and `stacked_eval::prove`
+/// builds the weights and the stacked polys — all inside `open_groups` and
+/// OUTSIDE the round loop entirely. That is a setup phase, the same class of
+/// miss as the out-of-domain grind, not a scattering of small gaps.
+///
+/// So the round's wall is measured, and the two remainders are NAMED and
+/// reported separately: `round_other` is the loop's own bookkeeping between
+/// windows, `setup_tail` is everything outside the loop. The reading says which
+/// of the two owns the gap; neither is inferred.
+pub static ROUND: Slot = Slot::new();
 
-/// Park the six for the record being built one layer up.
-pub fn note_chain(chain: [f64; 6]) {
+/// The six, as taken at the group-loop boundary, awaiting the record.
+static CHAIN_AT_GROUPS: Mutex<([f64; 6], f64)> = Mutex::new(([0.0; 6], 0.0));
+
+/// Park the six and the round wall for the record being built one layer up.
+pub fn note_chain(chain: ([f64; 6], f64)) {
     if !enabled() {
         return;
     }
@@ -199,16 +220,19 @@ pub fn note_chain(chain: [f64; 6]) {
     }
 }
 
-/// Read and clear the six chain slots, in record order.
-pub fn take_chain() -> [f64; 6] {
-    [
-        GRIND.take(),
-        SUMCHECK.take(),
-        FOLD.take(),
-        COMMIT_FOLDED.take(),
-        OOD.take(),
-        QUERIES.take(),
-    ]
+/// Read and clear the six chain slots (in record order) and the round wall.
+pub fn take_chain() -> ([f64; 6], f64) {
+    (
+        [
+            GRIND.take(),
+            SUMCHECK.take(),
+            FOLD.take(),
+            COMMIT_FOLDED.take(),
+            OOD.take(),
+            QUERIES.take(),
+        ],
+        ROUND.take(),
+    )
 }
 
 /// Close a region opened by [`mark`] into `slot`, returning its seconds.
@@ -363,6 +387,9 @@ pub struct ProverSplit {
     /// queries. The prepared opening keeps its wall and no breakdown — it is
     /// 2.5% of the base, and six more fields would not move a ranking.
     pub chain: [f64; 6],
+    /// The round loop's own wall, summed over rounds. The six live inside it;
+    /// everything else in `open_groups` lives outside it.
+    pub chain_round_wall: f64,
 }
 
 /// The six chain slots' names, in record order — so a message can name the one
@@ -390,8 +417,20 @@ impl ProverSplit {
     pub fn prove_other(&self) -> f64 {
         self.prove - self.challenge - self.argue - self.open_groups - self.open_prepared
     }
-    /// What the six chain slots leave over inside `open_groups` — the round
-    /// loop's own overhead, and nothing else.
+    /// The round loop's own bookkeeping: its wall, less the six windows inside
+    /// it. Must be ≥ 0 — a negative value means the six overlap or reach
+    /// outside the loop.
+    pub fn round_other(&self) -> f64 {
+        self.chain_round_wall - self.chain.iter().sum::<f64>()
+    }
+    /// Everything inside `open_groups` that is NOT the round loop: the factors
+    /// built from the weight shares, the stacked polys, the domain clone, the
+    /// proof assembled after the last round. Must be ≥ 0.
+    pub fn setup_tail(&self) -> f64 {
+        self.open_groups - self.chain_round_wall
+    }
+    /// What the six leave over inside `open_groups`, whatever its cause. Kept
+    /// because it is the number the first two defects showed up in.
     pub fn chain_other(&self) -> f64 {
         self.open_groups - self.chain.iter().sum::<f64>()
     }
@@ -427,16 +466,18 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.open_groups = OPEN_GROUPS.take();
     rec.open_prepared = OPEN_PREPARED.take();
     rec.groups = GROUPS.swap(0, Ordering::Relaxed);
-    // ⓘ NOT taken here. The six are read at the end of the GROUP loop, where
-    // the prepared opening has not run yet; by this point they would carry
-    // DECODE's chain too. `rec.chain` is already filled by the caller.
-    // Anything still in them is the prepared opening's, and clearing it keeps
-    // it out of the next epoch.
+    // ⓘ THE SLOTS ARE DISCARDED HERE, NOT READ. By this point they hold the
+    // PREPARED opening's chain — the group openings' were taken and parked at
+    // the end of the group loop, before DECODE's ran. Reading them now would
+    // put DECODE's chain under `open_groups`'s name. So: drop what they hold
+    // (which also keeps it out of the next epoch), then take the parked pair.
     let _ = take_chain();
-    rec.chain = CHAIN_AT_GROUPS
+    let (chain, round_wall) = CHAIN_AT_GROUPS
         .lock()
-        .map(|mut h| std::mem::replace(&mut *h, [0.0; 6]))
-        .unwrap_or([0.0; 6]);
+        .map(|mut h| std::mem::replace(&mut *h, ([0.0; 6], 0.0)))
+        .unwrap_or(([0.0; 6], 0.0));
+    rec.chain = chain;
+    rec.chain_round_wall = round_wall;
     let names = TABLE_NAMES
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
@@ -471,7 +512,8 @@ pub fn push_prover(mut rec: ProverSplit) {
          open_groups {open_groups:.2} ({groups} groups) · \
          open_prepared {open_prepared:.2} · other {prove_other:.2} || \
          chain[Σ groups] grind {c0:.2} · sumcheck {c1:.2} · fold {c2:.2} · \
-         commit_folded {c3:.2} · ood {c4:.2} · queries {c5:.2} · other {c6:.2}",
+         commit_folded {c3:.2} · ood {c4:.2} · queries {c5:.2} || \
+         round_wall {cw:.2} · round_other {c6:.2} · setup_tail {cst:.2}",
         tainted = if rec.overlapped { " ⛔OVERLAPPED" } else { "" },
         airs = rec.airs,
         wall = rec.wall,
@@ -492,7 +534,9 @@ pub fn push_prover(mut rec: ProverSplit) {
         c3 = rec.chain[3],
         c4 = rec.chain[4],
         c5 = rec.chain[5],
-        c6 = rec.chain_other(),
+        cw = rec.chain_round_wall,
+        c6 = rec.round_other(),
+        cst = rec.setup_tail(),
     );
 
     if let Ok(mut held) = PROVER.lock() {
@@ -567,34 +611,50 @@ pub fn check_closure(
                 100.0 * r.prove_other() / r.prove.max(1e-9),
             ));
         }
-        // Arm E: the six chain slots partition `open_groups`, one level below
-        // arm B. `open_groups` is the largest single term in the base, and
-        // until 2b it was one number.
-        if r.chain_other().abs() > tol * r.open_groups.max(1e-9) {
-            let named: Vec<String> = CHAIN_NAMES
+        // Arm E: the chain's two remainders must be NON-NEGATIVE.
+        //
+        // ⛔ NOT "the six sum to `open_groups`". With the round wall measured,
+        // `Σ(six) + round_other + setup_tail = open_groups` is an IDENTITY —
+        // the two remainders are defined as the differences — so asserting it
+        // would be a check that cannot fail, which is worse than no check.
+        //
+        // What can fail, and did twice: a remainder going NEGATIVE. That is not
+        // drift. It means the parts are not parts, and it has two causes — a
+        // window reaching outside what contains it, and windows that overlap
+        // and double-count. `round_other < 0` says the six overlap or escape
+        // the loop; `setup_tail < 0` says the loop's wall escapes
+        // `open_groups`. Both are structural errors in the instrument, and
+        // neither is reachable by construction.
+        let slots = || -> String {
+            CHAIN_NAMES
                 .iter()
                 .zip(r.chain.iter())
                 .map(|(n, v)| format!("{n} {v:.3}"))
-                .collect();
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        if r.round_other() < -tol * r.open_groups.max(1e-9) {
             return Err(format!(
-                "arm E: {who}'s chain does not close — open_groups {:.3}s but \
-                 the six sum to {:.3}s, leaving {:.3}s ({:.1}%) unattributed \
-                 inside the round loop{}. Slots: {}.",
+                "arm E: {who}'s six do not fit the round loop — the loop's wall \
+                 is {:.3}s but the six inside it sum to {:.3}s, leaving \
+                 {:.3}s. NEGATIVE, so the six overlap each other or reach \
+                 outside the loop: they are not a partition of it. Slots: {}.",
+                r.chain_round_wall,
+                r.chain.iter().sum::<f64>(),
+                r.round_other(),
+                slots(),
+            ));
+        }
+        if r.setup_tail() < -tol * r.open_groups.max(1e-9) {
+            return Err(format!(
+                "arm E: {who}'s round loop does not fit its opening — \
+                 open_groups is {:.3}s but the loop's wall is {:.3}s, leaving \
+                 {:.3}s. NEGATIVE, so the loop's window reaches outside the \
+                 opening that contains it. Slots: {}.",
                 r.open_groups,
-                r.open_groups - r.chain_other(),
-                r.chain_other(),
-                100.0 * r.chain_other() / r.open_groups.max(1e-9),
-                // ⛔ A NEGATIVE remainder is not "a bit of drift": it means the
-                // slots hold time from outside the window, so the sum is of
-                // parts that are not parts. It gets its own words, because
-                // reading it as a small overshoot is how it survives.
-                if r.chain_other() < 0.0 {
-                    " — NEGATIVE, so the slots carry time from OUTSIDE the \
-                     group loop and the window is not what it claims"
-                } else {
-                    ""
-                },
-                named.join(" · "),
+                r.chain_round_wall,
+                r.setup_tail(),
+                slots(),
             ));
         }
     }
@@ -783,11 +843,15 @@ mod tests {
                 wall: 5.0,
                 challenge: 0.1,
                 argue: 1.9,
-                open_groups: 0.8,
-                open_prepared: 0.2,
+                open_groups: 0.9,
+                open_prepared: 0.1,
                 // The six partition `open_groups`: 0.3 + 0.2 + 0.1 + 0.1 +
                 // 0.05 + 0.05 = 0.8.
                 chain: [0.3, 0.2, 0.1, 0.1, 0.05, 0.05],
+                // The loop's wall contains the six (0.80) with 0.05 of its own
+                // bookkeeping; `open_groups` 0.80 would then leave -0.05 of
+                // setup_tail, so the opening is 0.90 and setup_tail is 0.05.
+                chain_round_wall: 0.85,
                 ..Default::default()
             })
             .collect();
@@ -848,17 +912,46 @@ mod tests {
         assert!(err.starts_with("arm C:"), "expected arm C, got: {err}");
         assert!(err.contains("epoch 0"), "arm C must name the epoch: {err}");
 
-        // Arm E: one of the SIX chain slots omitted. Arms A and B still close
-        // — `open_groups` is unchanged and so is `prove` — so arm E is the
-        // only arm that can see it, which is the whole reason it exists.
+        // Arm E, failure 1: the six OVERLAP or escape the loop, so they sum to
+        // more than the loop's own wall. This is the shape both real defects
+        // took — a window secured at one edge, then two windows nesting around
+        // the same grind — and it is NEGATIVE, not drift.
         let (producer, mut prover, base) = honest();
-        prover[1].chain[5] = 0.0;
+        prover[1].chain[0] = 0.60; // grind 0.30 -> 0.60: the six now exceed 0.85
         let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
         assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
         assert!(err.contains("epoch 1"), "arm E must name the epoch: {err}");
         assert!(
-            err.contains("queries 0.000"),
-            "arm E must print the six by NAME so the missing one is visible: {err}",
+            err.contains("NEGATIVE"),
+            "arm E must say what a negative remainder means: {err}"
+        );
+        assert!(
+            err.contains("grind 0.600"),
+            "arm E must print the six by NAME so the culprit is visible: {err}",
+        );
+
+        // Arm E, failure 2: the loop's wall escapes the opening that contains
+        // it. A different structural error, and only the second bound sees it.
+        let (producer, mut prover, base) = honest();
+        prover[2].chain_round_wall = 1.50; // > open_groups 0.90
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 2"), "{err}");
+        assert!(
+            err.contains("reaches outside the opening"),
+            "the second bound must name its own failure: {err}",
+        );
+
+        // ⛔ AND THE CASE THAT MUST **NOT** REDDEN: one of the six simply
+        // small. With the round wall measured, a slot reading low is a
+        // READING, not an error — the time lands in `round_other`, which is
+        // named. An arm that reddened here would be asserting an identity.
+        let (producer, mut prover, base) = honest();
+        prover[0].chain[5] = 0.0;
+        assert_eq!(
+            check_closure(&producer, &prover, base, 0.03),
+            Ok(()),
+            "a small slot is a reading; only a NEGATIVE remainder is an error",
         );
 
         // Arm D, first inequality: a thread claiming more than the pipeline.

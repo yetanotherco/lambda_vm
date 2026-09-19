@@ -714,6 +714,13 @@ where
     let mut final_value = FieldElement::<E>::zero();
 
     for (r, &k) in schedule.iter().enumerate() {
+        // The loop's OWN wall, so the six are measured against the thing that
+        // contains them rather than against `open_groups` two layers up. What
+        // sits between this and `open_groups` — `Factors::from_shares`, the
+        // weights, the stacked polys, the domain clone, the proof assembled
+        // after the last round — is reported as `setup_tail`, named rather
+        // than left as a gap for a tolerance to swallow.
+        let __wc_round = crate::whir_split::mark();
         // ── the round's six slots, under `LAMBDA_VM_BASE_SPLIT=1` ──
         // They partition the round, so `open_groups - Σ(six)` is loop overhead
         // and nothing else. All three grinds share one slot: they are the same
@@ -827,6 +834,7 @@ where
             nonces,
             openings,
         });
+        crate::whir_split::add(&crate::whir_split::ROUND, __wc_round);
         if let Some(next) = next {
             current = Current::Extension(next);
         }
