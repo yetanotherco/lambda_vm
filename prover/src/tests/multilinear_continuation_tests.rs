@@ -8,6 +8,30 @@
 //! both ends — argue correctly under WHIR, and that everything the chain rests
 //! on is rejected when it is restated: the register carry, the bookend root,
 //! and the touched page set.
+//!
+//! # ⛔ WHICH OF THESE CAN SEE A BROKEN VERIFIER, AND WHICH CANNOT
+//!
+//! Measured, not assumed: breaking the cross-epoch AIR set reddens exactly the
+//! tests that assert a bundle VERIFIES. Everything asserting a REFUSAL stays
+//! green through any breakage, because a verifier that rejects everything
+//! rejects the tampered bundle too — so a refusal arm alone is a check that
+//! cannot fail the other way.
+//!
+//! ⇒ **Every refusal test here first asserts its UNTAMPERED bundle verifies
+//! through the same call.** That honest-path control is what makes a refusal
+//! arm able to see a broken verifier, and it is not optional: mutating
+//! `global_airs_for` to build the set one page short reddened only
+//! `a_continuation_proves_and_verifies` before the controls were added.
+//!
+//! ⚠ AND ONE REFUSAL HERE IS SATISFIED BY THE WRONG HALF.
+//! `a_bookend_that_is_not_the_one_chained_is_rejected` moves a byte of a root
+//! that lives inside the EPOCH's own proof, so the epoch half refuses and
+//! `verify_continuation` returns before the cross-epoch half runs at all — its
+//! doc's claim that "both halves still verify on their own" does not hold for
+//! the tamper it performs. The binding it is named for,
+//! `proved == chained`, is reached instead by
+//! [`a_swapped_bookend_root_is_caught_by_the_binding`], which swaps two epochs'
+//! roots inside the CROSS-EPOCH proof and leaves both halves valid.
 
 use executor::elf::Elf;
 use stark::proof::options::ProofOptions;
@@ -338,6 +362,115 @@ fn an_epoch_proven_under_one_hash_is_refused_under_the_other() {
         "an epoch proven under keccak was ACCEPTED by a verifier configured with \
          RPX; the level-0 driver's whole hash agreement rests on that being \
          impossible"
+    );
+}
+
+/// ★★ THE CROSS-EPOCH HALF OF THE HASH AGREEMENT — the sibling of
+/// [`an_epoch_proven_under_one_hash_is_refused_under_the_other`], and the test
+/// that makes `real_global_from_whir_continuation_under::<H>`'s name true.
+///
+/// It could not be written at all until `verify_global_bookends` took `H`: a
+/// function that reads `whir_hash_knob::selected()` for itself can only be
+/// asked what the PROCESS proves under, never what the bundle in front of it
+/// was proven under. The knob is a setting; the agreement is the verification,
+/// because the transcript's sponge is part of the configuration and every
+/// challenge diverges from the first squeeze.
+///
+/// ★ THE SHAPE IS KNOB-INDEPENDENT, deliberately. `prove_continuation`
+/// dispatches on the knob, so this suite's bundle is proven under whichever
+/// hash the process was started with — asserting "keccak accepts" would pass
+/// for the wrong reason under `LAMBDA_VM_WHIR_HASH=rpx`. The property asserted
+/// is that **exactly one of the two hashes accepts**, which is at once the
+/// control and the refusal: a verifier accepting everything fails it, and so
+/// does one accepting nothing.
+///
+/// ⚠ WHAT THE LAST ASSERTION CAN AND CANNOT CATCH. Comparing the DISPATCHING
+/// entry point against the explicit arm is what would see `verify_global`'s
+/// dispatch pinned to one hash — but only when the process is set to the OTHER
+/// one. Under a default keccak suite a dispatch pinned to keccak is
+/// indistinguishable from a correct one here; a dispatch pinned to RPX is not.
+/// Stated so nobody reads this as covering both directions.
+#[test]
+fn a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other() {
+    use multilinear::whir_hash::{KeccakWhir, RpxWhir, WhirHash};
+
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    let elf = Elf::load(&elf_bytes).expect("load");
+
+    let verdict_under =
+        |name: &str, verdict: Result<Option<Vec<Vec<stark::config::Commitment>>>, crate::Error>| {
+            verdict
+                .unwrap_or_else(|e| panic!("the cross-epoch proof errored under {name}: {e:?}"))
+                .is_some()
+        };
+    let keccak = verdict_under(
+        <KeccakWhir as WhirHash>::NAME,
+        multilinear_continuation::verify_global_bookends::<KeccakWhir>(
+            &elf,
+            &elf_bytes,
+            &bundle.global,
+            bundle.num_epochs(),
+            &bundle.touched_page_bases,
+            bundle.num_private_input_pages,
+            &opts,
+        ),
+    );
+    let rpx = verdict_under(
+        <RpxWhir as WhirHash>::NAME,
+        multilinear_continuation::verify_global_bookends::<RpxWhir>(
+            &elf,
+            &elf_bytes,
+            &bundle.global,
+            bundle.num_epochs(),
+            &bundle.touched_page_bases,
+            bundle.num_private_input_pages,
+            &opts,
+        ),
+    );
+
+    assert!(
+        keccak != rpx,
+        "the cross-epoch proof was accepted under BOTH hashes or under NEITHER \
+         (keccak {keccak}, rpx {rpx}); the driver's hash agreement rests on exactly \
+         one of them accepting"
+    );
+
+    // Which one it is has to be the hash this process proved it under, and the
+    // DISPATCHING entry point has to reach the same verdict.
+    let setting = crate::whir_hash_knob::selected().name();
+    // ★ PRINTED, because which direction this run exercises is not a property
+    // of the code — it is a property of the process the suite was started in,
+    // and the last assertion below can only see a dispatch pinned to the OTHER
+    // hash. A reader of the log should not have to infer which arm was live.
+    println!(
+        "CROSS-EPOCH HASH AGREEMENT: process {setting}; accepted under keccak256 {keccak}, \
+         under rpx256 {rpx}"
+    );
+    let expected = if setting == <KeccakWhir as WhirHash>::NAME {
+        keccak
+    } else {
+        rpx
+    };
+    assert!(
+        expected,
+        "the bundle does not verify under {setting}, the very hash this process proved it with"
+    );
+    let dispatched = multilinear_continuation::verify_global(
+        &elf,
+        &elf_bytes,
+        &bundle.global,
+        bundle.num_epochs(),
+        &bundle.touched_page_bases,
+        bundle.num_private_input_pages,
+        &opts,
+    )
+    .expect("the dispatching entry point");
+    assert_eq!(
+        dispatched, expected,
+        "`verify_global` did not verify under {setting}, the hash its own knob names"
     );
 }
 
@@ -687,15 +820,28 @@ fn the_bookend_roots_are_consecutive_windows() {
     );
 }
 
-/// The binding is what makes the two halves one proof: swapping an epoch's
-/// bookend root has to be caught even though both halves still verify on their
-/// own.
+/// A moved bookend root is rejected.
+///
+/// ⚠ AND THE HALF THAT REJECTS IT IS THE EPOCH'S, NOT THE BINDING'S. The root
+/// this moves is the last of epoch 0's OWN proof, so the epoch's `multi_verify`
+/// refuses it and `verify_continuation` returns before the cross-epoch half is
+/// reached — established by a mutation that broke the cross-epoch AIR set and
+/// left this test green. It is kept for what it does cover, and its old claim
+/// that "both halves still verify on their own" is withdrawn:
+/// [`a_swapped_bookend_root_is_caught_by_the_binding`] is the one that reaches
+/// `proved == chained`.
 #[test]
 fn a_bookend_that_is_not_the_one_chained_is_rejected() {
     let (elf_bytes, input) = a_run_that_touches_memory();
     let opts = ProofOptions::default_test_options();
     let mut bundle =
         multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    // ★ THE HONEST-PATH CONTROL. Without it a verifier broken in any way keeps
+    // this test green, because it asserts only that something was refused.
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "the untampered bundle does not verify, so the refusal below proves nothing"
+    );
     let last = bundle.epochs[0].proof.roots.len() - 1;
     bundle.epochs[0].proof.roots[last][0] ^= 1;
     assert!(
@@ -716,6 +862,13 @@ fn a_restated_touched_page_set_is_rejected() {
         !bundle.touched_page_bases.is_empty(),
         "the run touched memory"
     );
+    // ★ THE HONEST-PATH CONTROL, and here it is the one that carries the
+    // weight: the refusal below accepts `Err` as well as `Ok(false)`, so
+    // without this line a verifier that errored on every bundle would pass.
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "the untampered bundle does not verify, so the refusal below proves nothing"
+    );
     bundle.touched_page_bases.pop();
     assert!(
         matches!(
@@ -723,6 +876,67 @@ fn a_restated_touched_page_set_is_rejected() {
             Ok(false) | Err(_)
         ),
         "a restated touched page set was accepted"
+    );
+}
+
+/// ★★ THE BINDING ITSELF, reached with BOTH HALVES VALID — the check
+/// `verify_continuation` ends on (`proved == chained`) and the one thing that
+/// makes the epochs and the cross-epoch proof one proof rather than two about
+/// unrelated tables.
+///
+/// Nothing else in this file reaches it. The arm above moves a root inside an
+/// epoch's own proof, so the epoch half refuses first; a restated page set
+/// changes the table count, so the cross-epoch half errors first. The tamper
+/// that reaches the comparison has to leave every root a VALID commitment and
+/// only put them in the wrong ORDER: swapping two epochs' bookend windows
+/// inside the CROSS-EPOCH proof does exactly that. Each half still argues about
+/// tables it committed; what is false is which epoch's bookend the cross-epoch
+/// proof says it chained.
+///
+/// ⚠ WHAT THIS FIXTURE CAN AND CANNOT SHOW. The run has three epochs and one
+/// page, so there are two distinct bookends to swap and the tamper is
+/// constructible — but each bookend's window is ONE root here, so the swap does
+/// not exercise the multi-polynomial windows that a long epoch produces on a
+/// block (where a bookend needing two polynomials widens its window). The
+/// assertion that the two roots differ before the swap is what stops this from
+/// silently becoming a no-op if a future fixture commits them identically.
+#[test]
+fn a_swapped_bookend_root_is_caught_by_the_binding() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let mut bundle =
+        multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts).expect("prove");
+    let epochs = bundle.num_epochs();
+    assert!(
+        epochs >= 2,
+        "a one-epoch run has no second bookend to swap with"
+    );
+
+    // ★ THE HONEST-PATH CONTROL.
+    assert!(
+        multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "the untampered bundle does not verify, so the refusal below proves nothing"
+    );
+
+    // The bookends are the first commitment groups, one root each at this
+    // fixture, so epochs 0 and 1 are roots 0 and 1 of the CROSS-EPOCH proof.
+    // Both stay valid commitments to tables the proof really committed; only
+    // the order changes, which is the one thing the binding exists to catch.
+    let windows = bundle
+        .global
+        .l2g_roots(&vec![1usize; epochs])
+        .expect("the bookends are committed first");
+    assert_eq!(windows.len(), epochs);
+    assert_ne!(
+        windows[0], windows[1],
+        "the two bookends committed to the same root, so swapping them is a no-op"
+    );
+    bundle.global.proof.roots.swap(0, 1);
+
+    assert!(
+        !multilinear_continuation::verify_continuation(&elf_bytes, &bundle, &opts).expect("verify"),
+        "the cross-epoch proof claimed to chain a bookend that is not epoch 0's, and the \
+         binding accepted it"
     );
 }
 
