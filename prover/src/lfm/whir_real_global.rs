@@ -102,23 +102,31 @@ pub struct WhirRealGlobal {
     pub bookend_roots: Vec<Vec<Commitment>>,
     /// What the cross-epoch wrap publishes, as a type rather than a count.
     pub published: GlobalLayout,
-    /// ⛔ RESERVED, AND EMPTY ON EVERY PATH THAT EXISTS TODAY: the roots of a
-    /// MULTILINEAR commitment over the page family's INIT columns, for the
-    /// prepared opening a cross-epoch program needs instead of folding ≈9.2 M
-    /// genesis rows.
+    /// The genesis stack this bundle's cross-epoch proof carries, or `None`
+    /// when its genesis is entirely sparse — which most runs are.
+    ///
+    /// ★ TAKEN FROM THE VERY VERIFICATION THAT CONSUMED IT, never rebuilt. It
+    /// carries the roots AND the `StackedLayout` and `Domain` the host
+    /// committed under, because an emitter handed only the roots would have to
+    /// derive those two a second time, and a second derivation of the object
+    /// the host actually committed is the defect this whole struct's
+    /// single-derivation rule exists to prevent.
     ///
     /// ⚠ NOT the 35 per-page roots `recursion::precomputed_commitments` builds.
     /// Those are UNIVARIATE Merkle roots over each page's LDE codeword, they
     /// are what the attestation's `program_id` folds, and **the multilinear
-    /// path never compares one of them** — `verify_global_bookends` checks
-    /// INIT by folding the columns rebuilt from the ELF, with no opening and no
-    /// root at all. Two objects with confusable names, one of which no verifier
-    /// on this path reads: filling this field from that list would build a
-    /// program whose arena matched word for word and refused hundreds of
-    /// thousands of rows later. Whoever fills it takes the value from the very
-    /// `Prepared` object the host verification consumed, and states the pin it
-    /// owes where the root is interned.
-    pub prepared_roots: Option<Vec<Commitment>>,
+    /// path never compares one of them**. Two objects with confusable names
+    /// over the same bytes: filling this from that list would build a program
+    /// whose arena matched word for word and refused hundreds of thousands of
+    /// rows later.
+    ///
+    /// ⛔ AND ITS ROOTS ARE THE FOURTH OWED PER-ELF PIN, for the DENSE pages
+    /// only. The pages left to the sparse form owe a DIFFERENT thing — their
+    /// nonzero genesis entries interned as program constants, bound by the
+    /// program id — and the two obligations must never be written as one
+    /// sentence, or whichever is actually unchecked looks covered by the other.
+    /// See [`crate::multilinear_continuation::GlobalPrepared`].
+    pub prepared: Option<crate::multilinear_continuation::GlobalPrepared>,
 }
 
 impl WhirRealGlobal {
@@ -206,7 +214,7 @@ where
         opts,
     )
     .map_err(|e| format!("the cross-epoch proof could not be verified: {e:?}"))?;
-    let Some(bookend_roots) = verified else {
+    let Some(verified) = verified else {
         return Err(format!(
             "the cross-epoch proof of this bundle does not verify under {}. Either the \
              bundle is not the one this ELF and these options describe, or it was proven \
@@ -215,6 +223,14 @@ where
             <H as multilinear::whir_hash::WhirHash>::NAME,
         ));
     };
+    // Both halves of the verdict, taken from the verification that produced
+    // them: the roots the epoch binding compares, and the genesis stack the
+    // emitter opens. Re-deriving either is what this return type exists to
+    // prevent.
+    let crate::multilinear_continuation::GlobalVerdict {
+        bookend_roots,
+        prepared,
+    } = verified;
 
     // ★ THE VERIFIER'S OWN DERIVATION, not a second one that agrees.
     let airs = crate::multilinear_continuation::global_airs_for(
@@ -268,8 +284,9 @@ where
             num_epochs,
             lanes_per_root: lanes_per_root(),
         },
-        // ⛔ There is no INIT opening yet, and `None` is the honest state of it.
-        // See the field's own doc for the list it must NOT be filled from.
-        prepared_roots: None,
+        // From the verdict above, which is the object the verification
+        // consumed. `None` here means this run's genesis was entirely sparse,
+        // not that the route is unbuilt.
+        prepared,
     })
 }

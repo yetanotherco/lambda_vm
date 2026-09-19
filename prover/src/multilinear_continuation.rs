@@ -177,19 +177,35 @@ impl<H> DecodePrepared<H>
 where
     H: multilinear::whir_hash::WhirHash,
 {
+    /// Where DECODE's prepared columns are settled: its own table, its own
+    /// leading preprocessed columns.
+    ///
+    /// ★ DECODE IS THE SINGLE-TABLE CASE OF A GENERAL SHAPE. A prepared
+    /// commitment now names a `(table, preprocessed column)` per stacked column,
+    /// because the cross-epoch genesis stack spans one table per dense page and
+    /// settles column 1 — INIT — of each. DECODE spans one table and settles its
+    /// prefix, so this is [`multilinear_table::leading_columns`] and nothing
+    /// about what DECODE means has changed. The epoch byte gate says so by not
+    /// moving: the single-table case produces the same weight shares under
+    /// `Claimed::PerColumn` as under the `Shared` it replaces.
+    pub(crate) fn settled_at(&self, table: usize) -> Vec<multilinear_table::PreparedColumn> {
+        multilinear_table::leading_columns(table, self.columns.len())
+    }
+
     /// What the prover opens at `table`'s reduced point.
     ///
-    /// `borrowed` is the caller's because [`multilinear_table::Prepared`] holds
-    /// a slice of references and a self-referential struct cannot hand one out.
+    /// `borrowed` and `at` are the caller's because
+    /// [`multilinear_table::Prepared`] holds slices and a self-referential
+    /// struct cannot hand one out.
     pub(crate) fn opening<'a>(
         &'a self,
         borrowed: &'a [&'a Mle<F>],
-        table: usize,
+        at: &'a [multilinear_table::PreparedColumn],
     ) -> multilinear_table::Prepared<'a, F, H> {
         multilinear_table::Prepared {
             commitment: &self.commitment,
             columns: borrowed,
-            table,
+            at,
         }
     }
 
@@ -215,15 +231,323 @@ where
     }
 
     /// What the verifier settles the opening against.
-    pub(crate) fn check(&self, table: usize) -> multilinear_table::PreparedCheck<'_, F> {
+    ///
+    /// `at` is the caller's, and must be the SAME slice the opening was built
+    /// from — it drives both the columns the opening settles and the checks
+    /// `check_preprocessed` skips. [`Self::settled_at`] is how both sides get
+    /// one.
+    pub(crate) fn check<'a>(
+        &'a self,
+        at: &'a [multilinear_table::PreparedColumn],
+    ) -> multilinear_table::PreparedCheck<'a, F> {
         multilinear_table::PreparedCheck {
             roots: &self.roots,
             layout: self.commitment.layout(),
             domain: self.commitment.domain(),
-            table,
-            columns: self.columns.len(),
+            at,
         }
     }
+}
+
+/// The cross-epoch genesis stack: the dense pages' INIT columns committed as one
+/// polynomial, to be opened at each of those pages' own reduced points.
+///
+/// # Why the cross-epoch proof grew a prepared opening
+///
+/// A genesis page's INIT column is checked by the host with a fold and by the
+/// machine with the sparse closed form — one term per nonzero entry. On block
+/// 25368371 that is 10,249,056 rows for INIT alone, against a 2-4 M band for the
+/// whole cross-epoch program, and three pages of thirty carry all of it
+/// (`crate::continuation`'s genesis-stack section). Those three go into this commitment instead; the
+/// other twenty-seven keep the sparse form, for which they cost the interned
+/// zero.
+///
+/// # How it differs from [`DecodePrepared`], which it is modelled on
+///
+/// DECODE's commitment covers ONE table's LEADING preprocessed columns, all
+/// settled at that table's single reduced point. This covers ONE COLUMN of each
+/// of SEVERAL tables — INIT, which is preprocessed column 1 — each settled at
+/// its own page table's point. That is what
+/// [`multilinear_table::PreparedColumn`] carries and why `Prepared` names a list
+/// rather than a table and a count.
+///
+/// ⛔ ITS ROOT IS THE FOURTH OWED PER-ELF PIN, and it is owed, not covered. The
+/// machine cannot recompute this commitment in-guest, so it interns the root as
+/// program text exactly as it interns DECODE's. The statement owed out of band
+/// is **"this root is the commitment to the ELF's genesis bytes at the dense
+/// page bases, under this blowup and folding"**, and it is verified once per ELF
+/// against the same page configs `global_memory_configs` builds. It must never
+/// be described as covered by anything inside the program.
+///
+/// ⛔ AND IT IS NOT THE ATTESTATION'S PAGE LIST. `recursion::precomputed_commitments`
+/// builds one UNIVARIATE Merkle root per page config over that page's LDE
+/// codeword; those are what `program_id` folds, and no multilinear verifier ever
+/// compares one. A stacked WHIR commitment over the same columns has no per-page
+/// subtree to match against them. Two confusable names, one object; see the
+/// warning at `crate::lfm::whir_real_global`'s own field.
+pub(crate) struct GenesisPrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// Which pages it carries and where each column is settled.
+    pub plan: crate::continuation::GenesisStackPlan,
+    /// The stacked columns, in stack order — page-base order.
+    pub columns: Vec<Mle<F>>,
+    /// Derived, never read from a proof.
+    pub roots: Vec<Commitment>,
+    pub commitment: multilinear::stacked_eval::StackedCommitment<F, H>,
+    /// The parameters it was committed under — see [`Self::agrees_with`].
+    log_blowup: usize,
+    log_folding: usize,
+}
+
+impl<H> GenesisPrepared<H>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    /// What the prover opens, at the dense pages' own reduced points.
+    ///
+    /// `borrowed` is the caller's for the reason [`DecodePrepared::opening`]'s
+    /// is: [`multilinear_table::Prepared`] holds a slice of references and a
+    /// self-referential struct cannot hand one out.
+    pub(crate) fn opening<'a>(
+        &'a self,
+        borrowed: &'a [&'a Mle<F>],
+    ) -> multilinear_table::Prepared<'a, F, H> {
+        multilinear_table::Prepared {
+            commitment: &self.commitment,
+            columns: borrowed,
+            at: &self.plan.at,
+        }
+    }
+
+    /// What the verifier settles the opening against.
+    ///
+    /// ★ THE SAME `at` DRIVES BOTH HALVES and neither side is handed one
+    /// separately: it is the plan's, and the plan is a function of the page
+    /// configs. A prover and a verifier that derived their own lists could skip
+    /// a preprocessed check the opening did not settle.
+    pub(crate) fn check(&self) -> multilinear_table::PreparedCheck<'_, F> {
+        multilinear_table::PreparedCheck {
+            roots: &self.roots,
+            layout: self.commitment.layout(),
+            domain: self.commitment.domain(),
+            at: &self.plan.at,
+        }
+    }
+
+    /// The blowup and folding this commitment was built under must be the ones
+    /// the proof argues at.
+    ///
+    /// ⚠ VACUOUS ON THE PATH THAT EXISTS TODAY, AND KEPT ANYWAY — with its
+    /// condition stated, which is the difference between a check that cannot
+    /// fire and a check whose caller has not arrived. [`genesis_prepared_for`]
+    /// builds the commitment from the very `config` the same call hands
+    /// `multi_prove`, so the two cannot disagree there. It fires the day this
+    /// becomes a per-ELF cache — the obvious optimisation, since the stack is a
+    /// function of the ELF and of nothing the run chose — which is exactly when
+    /// [`DecodePrepared::agrees_with`] stops being vacuous for DECODE too.
+    /// `StackedCommitment::commit` reads these two and never `num_queries`, so
+    /// they are the whole of what a cached commitment must agree on.
+    pub(crate) fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
+        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
+            return Err(Error::Prover(format!(
+                "the genesis stack was committed at blowup {} / folding {}, and this \
+                 cross-epoch proof argues at blowup {} / folding {}",
+                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
+            )));
+        }
+        Ok(())
+    }
+
+    /// What an EMITTER needs to build the prepared leg, taken from the very
+    /// objects this verification consumed.
+    ///
+    /// ⛔⛔ NOTHING HERE IS RE-DERIVED, AND THAT IS THE POINT. An emitter handed
+    /// only the roots would have to rebuild the `StackedLayout` from the column
+    /// heights and the `Domain` from the config — two second derivations of the
+    /// stack the host actually committed, which is instance 74's shape one level
+    /// down: an arena that matches word for word and a program that refuses
+    /// hundreds of thousands of rows later. The layout and the domain are
+    /// CLONED off the commitment, so the leg is emitted against the object the
+    /// verification accepted or against nothing.
+    pub(crate) fn published(&self) -> GlobalPrepared {
+        GlobalPrepared {
+            roots: self.roots.clone(),
+            at: self.plan.at.clone(),
+            layout: self.commitment.layout().clone(),
+            domain: self.commitment.domain().clone(),
+            log_blowup: self.log_blowup,
+            log_folding: self.log_folding,
+        }
+    }
+}
+
+/// The genesis stack as an EMITTER consumes it: the roots it must intern, where
+/// each stacked column is settled, and the shape it is opened against.
+///
+/// ⛔ ITS ROOTS ARE THE FOURTH OWED PER-ELF PIN, and they are owed for the DENSE
+/// PAGES ONLY. The machine cannot recompute this commitment in-guest, so it
+/// interns the roots as program text exactly as it interns DECODE's, and the
+/// statement owed out of band is **"these roots are the commitment to the ELF's
+/// genesis bytes at the dense page bases, under this blowup and folding"**. It
+/// must never be described as covered by anything inside the program.
+///
+/// ⛔ THE SPARSE PAGES OWE SOMETHING ELSE, AND THE TWO MUST NOT MERGE INTO ONE
+/// SENTENCE. A page left to the sparse closed form has no root here at all: its
+/// nonzero genesis entries are interned as program CONSTANTS, bound by the
+/// program id the way DECODE's instruction table is. One obligation is about a
+/// commitment; the other is about values. Writing them as one would leave
+/// whichever is actually unchecked looking covered by the other.
+///
+/// ⛔ AND THESE ARE NOT THE 35 UNIVARIATE ROOTS. `recursion::precomputed_commitments`
+/// builds one Merkle root per page config over that page's LDE codeword; those
+/// are what the attestation's `program_id` folds, and no multilinear verifier
+/// ever compares one. A stacked WHIR commitment over the same columns has no
+/// per-page subtree to match against them.
+#[derive(Clone, Debug)]
+pub struct GlobalPrepared {
+    /// Derived from the ELF by the verifier, never read from the proof.
+    pub roots: Vec<Commitment>,
+    /// Where each stacked column is settled, in stack order — both preprocessed
+    /// columns of each dense page, dense pages in canonical page-base order.
+    pub at: Vec<multilinear_table::PreparedColumn>,
+    /// The layout the host committed under, cloned rather than rebuilt.
+    pub layout: multilinear::stacking::StackedLayout,
+    /// The domain the host committed under, cloned rather than rebuilt.
+    pub domain: multilinear::whir::Domain<F>,
+    pub log_blowup: usize,
+    pub log_folding: usize,
+}
+
+impl GlobalPrepared {
+    /// The layout and the domain TOGETHER, because an emitter needs both and
+    /// reaching them through two calls invites one of them to be re-derived.
+    pub fn stacked(
+        &self,
+    ) -> (
+        &multilinear::stacking::StackedLayout,
+        &multilinear::whir::Domain<F>,
+    ) {
+        (&self.layout, &self.domain)
+    }
+
+    /// The same assertion [`GenesisPrepared::agrees_with`] makes, for a consumer
+    /// that holds the published form rather than the commitment.
+    pub fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
+        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
+            return Err(Error::Prover(format!(
+                "the genesis stack was committed at blowup {} / folding {}, and this \
+                 program is emitted against blowup {} / folding {}",
+                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The genesis stack for a page family, or `None` when nothing is dense enough
+/// to be worth one.
+///
+/// ★ `None` IS THE HONEST STATE AND IT IS NOT A DEGENERATE CASE. A run whose
+/// genesis is entirely sparse — every fixture in this suite — carries no
+/// prepared opening, absorbs no extra root, and produces the cross-epoch proof
+/// byte for byte as it was before this route existed. That is what lets this
+/// land without moving any proof anything in flight depends on, and it is also
+/// the reason the path has no gate at fixture scale until a dense-page guest
+/// exists.
+///
+/// ⚠ BOTH SIDES CALL THIS WITH THEIR OWN CONFIGS, and they must agree. They do,
+/// for the genesis pages: the prover's come from the run's init page data and
+/// the verifier's from the ELF, and a genesis page's bytes are the ELF's either
+/// way. Private-input pages are where the two lists differ, and
+/// [`crate::continuation::genesis_stack_plan`] excludes them before the threshold is even
+/// evaluated — see its module header for what a threshold that read those bytes
+/// would do. A disagreement that survived all that changes the absorbed root and
+/// kills the transcript at the first challenge, which is a refusal and not a
+/// forgery.
+///
+/// ⚠ NO `agrees_with` HERE, AND THE ABSENCE IS THE POINT. [`DecodePrepared`]
+/// asserts its commitment's blowup and folding against each epoch's config,
+/// because it is built ONCE PER ELF at a config of its own shape, before any
+/// epoch exists. This one is built per proof from the very `config` the same
+/// call then hands `multi_prove`, so the two cannot disagree and a check
+/// comparing them could not fail. The day this becomes a per-ELF cache — the
+/// obvious optimisation, since it is a function of the ELF and of nothing the
+/// run chose — that assertion stops being vacuous and has to come back with it.
+///
+/// # Cost, stated
+///
+/// One commitment over `n_dense * 2^18` field elements, per prove and per
+/// verify. On the block that is three columns at twenty stacked variables;
+/// DECODE's equivalent is one commitment over 2^23 for a whole run. What it
+/// buys is 10,249,056 rows of in-guest sparse evaluation, which is the trade.
+pub(crate) fn genesis_prepared_for<H>(
+    configs: &[crate::tables::page::PageConfig],
+    plan: crate::continuation::GenesisStackPlan,
+    config: &ChainConfig,
+) -> Result<Option<GenesisPrepared<H>>, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    let columns: Vec<Mle<F>> = crate::continuation::genesis_stack_columns(configs, &plan)
+        .into_iter()
+        .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("genesis: {e:?}"))))
+        .collect::<Result<_, _>>()?;
+    // ⛔⛔ THE STACK'S COLUMN ORDER IS A CONTRACT, AND IT IS ASSERTED HERE
+    // RATHER THAN AGREED. `genesis_stack_columns` and `GenesisStackPlan::at`
+    // are built by two walks of the same `dense_pages()` list, so they agree by
+    // construction — and "by construction" is exactly the kind of agreement
+    // that survives a refactor of one walk and not the other. Column `k` of the
+    // commitment is settled at `at[k]`, so a length mismatch or a reorder would
+    // settle one page's values against another page's commitment with every
+    // individual value gate still green.
+    if columns.len() != plan.at.len() {
+        return Err(Error::Prover(format!(
+            "the genesis stack has {} columns and {} destinations",
+            columns.len(),
+            plan.at.len(),
+        )));
+    }
+    // Every page is one page tall, so the stack is a rectangle and its shape is
+    // the count and that height — not something read off the first column.
+    let shape = [(columns.len(), crate::continuation::PAGE_NUM_VARS)];
+    for (column, entry) in columns.iter().zip(&plan.at) {
+        if column.num_vars() != crate::continuation::PAGE_NUM_VARS {
+            return Err(Error::Prover(format!(
+                "the genesis column for table {} is {} variables, not {}",
+                entry.table,
+                column.num_vars(),
+                crate::continuation::PAGE_NUM_VARS,
+            )));
+        }
+    }
+    let layout =
+        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+        layout,
+        &multilinear::stacking::borrow(&columns),
+        None,
+        config,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let roots = commitment.roots();
+    if roots.is_empty() {
+        return Err(Error::Prover(
+            "the genesis stack commits to nothing".to_string(),
+        ));
+    }
+    Ok(Some(GenesisPrepared {
+        plan,
+        columns,
+        roots,
+        commitment,
+        log_blowup: config.log_blowup,
+        log_folding: config.log_folding,
+    }))
 }
 
 thread_local! {
@@ -633,14 +957,34 @@ pub(crate) fn global_groups(num_epochs: usize, num_pages: usize) -> Vec<usize> {
 
 /// Proves the cross-epoch memory chain: each epoch's bookend, and one
 /// global-memory table per page the run touched.
-pub fn prove_global(
+///
+/// ★ GENERIC OVER THE HASH, and the dispatch belongs to its CALLER — the
+/// arrangement [`prove_epoch`] and [`verify_global_bookends`] already have, and
+/// for the same two reasons.
+///
+/// **A caller cannot be asked a question this function answers for itself.**
+/// `whir_hash_knob::selected()` is a cached process setting: it says what THIS
+/// PROCESS proves under, never what a bundle in front of it was proven under.
+/// While the knob was read here, a test could not prove a bundle under a named
+/// hash without re-implementing the prover, which is why the cross-epoch
+/// execution arms had to be `#[ignore]`d with a posture guard instead.
+///
+/// **And an out-of-band commitment's type names the hash.** The genesis stack
+/// this hands to [`multilinear_table::multi_prove`] is a
+/// `StackedCommitment<F, H>`, so it cannot be built outside a dispatch and
+/// passed in — the same argument that made `prove_epoch` generic so DECODE's
+/// commitment could outlive one call.
+pub fn prove_global<H>(
     boundaries: &[std::sync::Arc<Vec<CellBoundary>>],
     elf_bytes: &[u8],
     init_page_data: &std::collections::HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
-) -> Result<GlobalProof, Error> {
+) -> Result<GlobalProof, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     // Each cell's final state; the boundaries are in epoch order, so the last
     // fini wins.
     let mut final_state: crate::tables::global_memory::FiniStateMap =
@@ -719,26 +1063,48 @@ pub fn prove_global(
         );
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
-    let proof = crate::with_whir_hash!(|H| {
-        // ★ Inside the dispatch, because the transcript's hash is part of
-        // the configuration and `H` does not exist outside this block. The
-        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_global(
-            &mut transcript,
-            &statement::elf_digest(elf_bytes),
-            boundaries.len(),
-            num_private_input_pages,
-            page_bases,
-            &table_num_vars,
-            &config,
-        );
-        let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?
-    });
+    // ★ `H` is the CALLER's. The transcript's hash is part of the configuration
+    // either way; what changed is who chooses it, and the bound on
+    // `multi_prove` still rejects any other spelling.
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_global(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        boundaries.len(),
+        num_private_input_pages,
+        page_bases,
+        &table_num_vars,
+        &config,
+    );
+    let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    // ⚠ THE PROVER'S OWN CONFIGS, which is the same source its page AIRs and
+    // their traces came from. The verifier builds this from the ELF; for a
+    // genesis page the two are the same bytes, and where they are not — the
+    // private-input pages — the plan has already excluded them. A disagreement
+    // that got past that absorbs a different root and kills the transcript at
+    // the first challenge.
+    let genesis_plan = crate::continuation::genesis_stack_plan(
+        &gm_configs,
+        boundaries.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    let genesis = genesis_prepared_for::<H>(&gm_configs, genesis_plan, &config)?;
+    if let Some(genesis) = genesis.as_ref() {
+        genesis.agrees_with(&config)?;
+    }
+    let borrowed = genesis
+        .as_ref()
+        .map(|g| multilinear::stacking::borrow(&g.columns))
+        .unwrap_or_default();
+    let proof = multilinear_table::multi_prove(
+        &committed,
+        &config,
+        &mut transcript,
+        genesis.as_ref().map(|g| g.opening(&borrowed)),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     Ok(GlobalProof {
         proof,
@@ -802,9 +1168,32 @@ pub fn verify_global(
 pub struct WhirGlobalAirs {
     /// One local-to-global bookend per epoch, in epoch-label order.
     bookends: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
-    /// One GLOBAL_MEMORY table per touched page, in the canonical page-base
-    /// order [`crate::continuation::global_memory_configs`] hands back.
+    /// One GLOBAL_MEMORY table per touched page, one for one with `page_bases`
+    /// and in its order.
+    ///
+    /// ⚠ THE ORDER IS THE CALLER'S, NOT `global_memory_configs`'. ✓ That
+    /// function is a one-to-one `map` over the page bases it is given, with no
+    /// sort, dedup or filter, so it PRESERVES an order rather than imposing
+    /// one. Canonicality — sorted and deduped — comes from
+    /// [`crate::continuation::touched_page_bases`], which collects through a
+    /// `BTreeSet`, and on the VERIFIER side the list arrives in the bundle,
+    /// where it is a CLAIM rather than a fact. It is bound by `absorb_global`
+    /// and by the GlobalMemory bus, which is what makes a wrong list a refusal;
+    /// it is not made canonical here. An earlier draft of this doc credited
+    /// this function with the canonicalisation, which would have left a reader
+    /// believing a duplicate base was impossible on the path where it is merely
+    /// caught.
     pages: Vec<Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>,
+    /// The configs those page AIRs were built from, in the same order.
+    ///
+    /// ★ CARRIED, NOT REBUILT, AND THAT IS THE POINT OF CARRYING THEM. The
+    /// genesis stack's membership is decided from these — which pages are dense
+    /// enough to be worth a prepared opening — and a verifier that called
+    /// [`crate::continuation::global_memory_configs`] again to get them would be
+    /// the second derivation this whole struct exists to prevent. Two call sites
+    /// that agree today is the shape that let REGISTER's preprocessed columns
+    /// and its root describe different tables.
+    configs: Vec<crate::tables::page::PageConfig>,
 }
 
 impl WhirGlobalAirs {
@@ -828,6 +1217,35 @@ impl WhirGlobalAirs {
     /// restate the split from a table count it arrived at some other way.
     pub fn groups(&self) -> Vec<usize> {
         global_groups(self.bookends.len(), self.pages.len())
+    }
+
+    /// The page configs, in the page family's own order.
+    pub fn configs(&self) -> &[crate::tables::page::PageConfig] {
+        &self.configs
+    }
+
+    /// Which of those pages a prepared opening carries, with the table indices
+    /// taken from THIS set's own bookend count.
+    ///
+    /// ⚠ The `table` index a stacked column names is an index into
+    /// [`refs`](Self::refs) — bookends included — because that is the order the
+    /// proof is matched in. Deriving it here from `self.bookends.len()` is why a
+    /// caller cannot arrive at the offset some other way.
+    ///
+    /// ⚠ `pub(crate)` AND NOT `pub`, THOUGH `WhirGlobalAirs` IS PUBLIC. The
+    /// plan it hands back is a crate-private type, so a `pub` method here is a
+    /// `private_interfaces` error. Widening the TYPE instead would CASCADE —
+    /// `GenesisStackPlan::routes` is a `Vec<PageRoute>` and `PageRoute` is
+    /// crate-private too — so two types' fields would become public API. The
+    /// only caller is in this crate and the emitter that will consume it is as
+    /// well, so the narrow fix is also the honest one: widening later is
+    /// trivial and reversible, publishing two types' fields is not.
+    pub(crate) fn genesis_stack(&self) -> crate::continuation::GenesisStackPlan {
+        crate::continuation::genesis_stack_plan(
+            &self.configs,
+            self.bookends.len(),
+            crate::continuation::PAGE_NUM_VARS,
+        )
     }
 }
 
@@ -886,7 +1304,32 @@ pub(crate) fn global_airs_for(
                 as Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>
         })
         .collect();
-    WhirGlobalAirs { bookends, pages }
+    // ⚠ The very configs the AIRs were built from travel with them. The genesis
+    // stack's membership is decided from these, and a consumer that rebuilt them
+    // would be deriving the page family twice.
+    WhirGlobalAirs {
+        bookends,
+        pages,
+        configs: gm_configs,
+    }
+}
+
+/// What a successful cross-epoch verification leaves for its caller.
+///
+/// ★ BOTH FIELDS ARE HERE FOR ONE REASON: a caller that could only reach the
+/// `bool` had to RE-DERIVE them. The bookend roots came back from a second
+/// spelling of the group split; the prepared stack would come back from a
+/// second derivation of the layout and domain the host actually committed. A
+/// verification that hands back what it consumed is what makes "the program is
+/// emitted against the objects the verifier accepted" true by construction
+/// rather than by a comment.
+pub(crate) struct GlobalVerdict {
+    /// The roots each epoch's bookend was committed under, in epoch order —
+    /// what the epoch/cross-epoch binding compares.
+    pub bookend_roots: Vec<Vec<Commitment>>,
+    /// The genesis stack, when this run had one. `None` is the honest state of
+    /// a run whose genesis is entirely sparse, and most are.
+    pub prepared: Option<GlobalPrepared>,
 }
 
 /// [`verify_global`], handing back the roots each epoch's bookend was
@@ -918,7 +1361,7 @@ pub(crate) fn verify_global_bookends<H>(
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
-) -> Result<Option<Vec<Vec<Commitment>>>, Error>
+) -> Result<Option<GlobalVerdict>, Error>
 where
     H: multilinear::whir_hash::WhirHash,
 {
@@ -969,7 +1412,36 @@ where
     let (stacks, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
     // Each bookend is a group of its own, so its roots are the group's — as
     // many as the stack split it into.
-    let polys: Vec<usize> = stacks[..num_epochs].iter().map(|l| l.num_polys()).collect();
+    //
+    // ⛔ AN `Err` AND NOT A SLICE PANIC. `stacks[..num_epochs]` panicked with
+    // "range end index 3 out of range for slice of length 2" when a mutation
+    // made the split disagree with the epoch count — a prover-side panic on a
+    // path whose contract is to REJECT a proof, which is the no-prod-panic
+    // policy's exact shape. It is not attacker-reachable as written, because
+    // `global_groups` builds `sizes` from the same `num_epochs` two lines up,
+    // so the length is right by construction; a panic that is unreachable today
+    // and unreachable by construction are different things, and only one of
+    // them survives someone rewriting the construction.
+    let bookend_stacks = stacks.get(..num_epochs).ok_or_else(|| {
+        Error::InvalidTableCounts(format!(
+            "the cross-epoch split has {} commitment groups and this bundle claims \
+             {num_epochs} epochs, so there is no bookend group per epoch",
+            stacks.len(),
+        ))
+    })?;
+    let polys: Vec<usize> = bookend_stacks.iter().map(|l| l.num_polys()).collect();
+
+    // ⛔ THE GENESIS STACK IS DERIVED, NEVER READ FROM THE PROOF, which is the
+    // same rule `PreparedCheck::roots` carries: a root taken from the bundle
+    // would be a value absorbed before it was checked. It is recomputed here
+    // from the page configs the AIR set was built from — the ELF's — so the
+    // columns this settles are the columns the genesis binding is about.
+    // ⚠ THE PLAN IS THE AIR SET'S OWN. Its table indices come from that set's
+    // bookend count, so a caller cannot arrive at the offset another way.
+    let genesis = genesis_prepared_for::<H>(air_set.configs(), air_set.genesis_stack(), &config)?;
+    if let Some(genesis) = genesis.as_ref() {
+        genesis.agrees_with(&config)?;
+    }
 
     // The cross-epoch bus has no counterparty in the statement: it must vanish.
     let verdict = {
@@ -997,15 +1469,19 @@ where
             &FieldElement::<E>::zero(),
             &config,
             &mut transcript,
-            None,
+            genesis.as_ref().map(|g| g.check()),
         )
     };
     if verdict.is_err() {
         return Ok(None);
     }
-    Ok(global
-        .l2g_roots(&polys)
-        .map(|groups| groups.into_iter().map(<[_]>::to_vec).collect()))
+    Ok(global.l2g_roots(&polys).map(|groups| GlobalVerdict {
+        bookend_roots: groups.into_iter().map(<[_]>::to_vec).collect(),
+        // ⚠ FROM THE VERY OBJECT THIS VERIFICATION CONSUMED, never rebuilt by
+        // the caller. That is instance 74's rule verbatim, and it is why this
+        // travels with the roots rather than being reachable some other way.
+        prepared: genesis.as_ref().map(GenesisPrepared::published),
+    }))
 }
 
 /// Proves one epoch: its tables plus the local-to-global bookend, against one
@@ -1120,11 +1596,12 @@ where
     let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let borrowed = multilinear::stacking::borrow(&prepared.columns);
+    let decode_columns = prepared.settled_at(decode_at);
     let proof = multilinear_table::multi_prove(
         &committed,
         &config,
         &mut transcript,
-        Some(prepared.opening(&borrowed, decode_at)),
+        Some(prepared.opening(&borrowed, &decode_columns)),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -1221,14 +1698,21 @@ pub fn prove_continuation(
     // One source of truth: the same list drives the committed tables and
     // travels in the bundle, so the two cannot diverge.
     let touched_page_bases = crate::continuation::touched_page_bases(&boundaries);
-    let global = prove_global(
-        &boundaries,
-        elf_bytes,
-        &init_page_data,
-        &touched_page_bases,
-        num_private_input_pages,
-        opts,
-    )?;
+    // ★ THE DISPATCH IS HERE, as it is above the epoch loop — and the two are
+    // now the same knob read in one shape rather than two places that happened
+    // to agree. A hash a caller could choose for the epochs and not for the
+    // cross-epoch proof would be a bundle whose two halves were argued under
+    // different sponges.
+    let global = crate::with_whir_hash!(|H| {
+        prove_global::<H>(
+            &boundaries,
+            elf_bytes,
+            &init_page_data,
+            &touched_page_bases,
+            num_private_input_pages,
+            opts,
+        )
+    })?;
 
     Ok(ContinuationProof {
         epochs,
@@ -1276,7 +1760,7 @@ pub fn verify_continuation(
     // chained are the same table, or neither half says anything about the
     // other. Comparing the groups whole is also what catches a bookend the two
     // sides stacked differently.
-    Ok(proved == chained)
+    Ok(proved == chained.bookend_roots)
 }
 
 /// Proves every epoch of a run, in order, chaining the register file.
@@ -1582,7 +2066,8 @@ where
     // once here rather than twice at the two call sites, because "twice" is
     // precisely how the replay came to absorb a shorter roots block than the
     // verification did.
-    let check = prepared.check(decode_at);
+    let decode_columns = prepared.settled_at(decode_at);
+    let check = prepared.check(&decode_columns);
     let derived = check.roots;
     // ★ `owed` replays this transcript to draw `z` and `alpha`, which are a
     // function of the configuration's sponge. Computing them against a

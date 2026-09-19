@@ -587,6 +587,9 @@ fn prove_eq_with_prepared(
         &config(),
     )?;
 
+    // The leading `refs.len()` preprocessed columns of `table_index` — the
+    // single-table case of a prepared commitment, which is what this fixture is.
+    let prepared_at = multilinear_table::leading_columns(table_index, refs.len());
     let mut prover = DefaultTranscript::<Ext>::new(b"w1b-step2");
     multilinear_table::multi_prove(
         &committed,
@@ -595,7 +598,7 @@ fn prove_eq_with_prepared(
         prepared.then(|| multilinear_table::Prepared {
             commitment: &out_of_band,
             columns: &refs,
-            table: table_index,
+            at: &prepared_at,
         }),
     )
 }
@@ -688,4 +691,222 @@ fn a_prepared_commitment_aimed_at_no_table_is_rejected() {
         matches!(err, multilinear::Error::UnknownPolynomial { .. }),
         "expected the index to be reported as unknown, got {err:?}"
     );
+}
+
+/// ★★★ ONE PREPARED STACK, TWO TABLES, TWO POINTS.
+///
+/// DECODE's prepared commitment covers ONE table's leading preprocessed columns,
+/// so every column in it shares that table's single reduced point. The
+/// cross-epoch genesis opening covers one GLOBAL_MEMORY table PER DENSE PAGE,
+/// each with a reduced point of its own — which is why
+/// [`multilinear_table::Prepared`] names a LIST of
+/// [`multilinear_table::PreparedColumn`] rather than a table and a count.
+///
+/// This is that shape at two tables: EQ and LT in one proof, a stack over EQ's
+/// columns `{0, 1}` and LT's columns `{0, 1}`, settled at the two points those
+/// two arguments reduced to.
+///
+/// ⚠ BOTH OF EACH TABLE'S COLUMNS, because `check_preprocessed` skips a PREFIX.
+/// A stack over column 1 alone would be inexpressible as a count, and
+/// `prefix_at` refuses it rather than letting the count reinterpret it — which
+/// [`a_prepared_stack_that_is_not_a_prefix_is_refused`] is the arm for.
+///
+/// ⚠ EQ AND LT AND NOT TWO COPIES OF ONE TABLE, deliberately. The swap arm is a
+/// no-op — and therefore a test that cannot fail — if the two tables' columns
+/// can coincide. Two different tables with different traces cannot, and the
+/// assertion below says so before anything is proven.
+fn prove_and_verify_two_table_prepared(
+    prover_at: &[multilinear_table::PreparedColumn],
+    verifier_at: &[multilinear_table::PreparedColumn],
+) -> Result<(), multilinear::Error> {
+    let options = ProofOptions::default_test_options();
+    let eq_air = create_eq_air(&options);
+    let lt_air = create_lt_air(&options);
+    let eq_columns = generate_eq_trace(&eq_operations()).columns_main();
+    let lt_columns = generate_lt_trace(&lt_operations()).columns_main();
+
+    let eq_vars = eq_columns[0].len().trailing_zeros() as usize;
+    let lt_vars = lt_columns[0].len().trailing_zeros() as usize;
+
+    // The two preprocessed columns each table presents — the same shape a
+    // cross-epoch genesis page has, where they are OFFSET and INIT.
+    let preprocessed_of = |columns: &[Vec<FieldElement<Fp>>]| -> Vec<multilinear::mle::Mle<Fp>> {
+        columns[..2]
+            .iter()
+            .map(|c| multilinear::mle::Mle::new(c.clone()).expect("mle"))
+            .collect()
+    };
+    let eq_preprocessed = preprocessed_of(&eq_columns);
+    let lt_preprocessed = preprocessed_of(&lt_columns);
+
+    // ⚠ ANTI-VACUITY, asserted before the proof: if the two tables' stacked
+    // columns were equal the swap arm would be a no-op and could not fail.
+    assert_ne!(
+        eq_preprocessed[1].evals(),
+        lt_preprocessed[1].evals(),
+        "the two tables' stacked columns are identical, so swapping them proves nothing"
+    );
+
+    let eq_layout = || {
+        TableLayout::<Fp, Ext>::new(
+            eq_air.constraint_program(),
+            eq_air.constraints_meta(),
+            eq_air.bus_interactions(),
+            eq::cols::NUM_COLUMNS,
+            eq_vars,
+            Uniforms::default(),
+        )
+    };
+    let lt_layout = || {
+        TableLayout::<Fp, Ext>::new(
+            lt_air.constraint_program(),
+            lt_air.constraints_meta(),
+            lt_air.bus_interactions(),
+            lt::cols::NUM_COLUMNS,
+            lt_vars,
+            Uniforms::default(),
+        )
+    };
+
+    let tables = vec![
+        CommittedTable::from_layout(eq_layout()?, |col| eq_columns[col as usize].clone())?,
+        CommittedTable::from_layout(lt_layout()?, |col| lt_columns[col as usize].clone())?,
+    ];
+    let committed = CommittedTables::<_, _, KeccakWhir>::commit(tables, &config())?;
+
+    // The stack: both of table 0's preprocessed columns, then both of table 1's.
+    // The ORDER is the contract — run `k` of the commitment settles table `k`.
+    let stack_refs: Vec<&multilinear::mle::Mle<Fp>> = vec![
+        &eq_preprocessed[0],
+        &eq_preprocessed[1],
+        &lt_preprocessed[0],
+        &lt_preprocessed[1],
+    ];
+    let out_of_band = multilinear::stacked_eval::StackedCommitment::<Fp, KeccakWhir>::commit(
+        multilinear_table::global_layout(&[(2, eq_vars), (2, lt_vars)])?,
+        &stack_refs,
+        None,
+        &config(),
+    )?;
+
+    let mut prover = DefaultTranscript::<Ext>::new(b"w1i-two-table");
+    let proof = multilinear_table::multi_prove(
+        &committed,
+        &config(),
+        &mut prover,
+        Some(multilinear_table::Prepared {
+            commitment: &out_of_band,
+            columns: &stack_refs,
+            at: prover_at,
+        }),
+    )?;
+
+    // The verifier rebuilds both layouts from the AIRs alone and carries each
+    // table's preprocessed columns, so the checks the opening replaces are
+    // checks that exist to be replaced.
+    let eq_verifier = eq_layout()?;
+    let lt_verifier = lt_layout()?;
+    let statements: Vec<TableStatement<'_, Fp, Ext>> = vec![
+        eq_verifier.statement_with_preprocessed(&eq_preprocessed),
+        lt_verifier.statement_with_preprocessed(&lt_preprocessed),
+    ];
+
+    // Neither table's bus balances alone; what they owe together is what they
+    // produced. The balance is not what is under test here.
+    let mut owed = ExtE::zero();
+    for table in &proof.tables {
+        owed += multilinear_table::contribution(&table.bus_output)
+            .ok_or(multilinear::Error::BusImbalance)?;
+    }
+
+    let roots = out_of_band.roots();
+    let mut verifier = DefaultTranscript::<Ext>::new(b"w1i-two-table");
+    multilinear_table::multi_verify::<_, _, _, KeccakWhir>(
+        &proof,
+        &statements,
+        std::slice::from_ref(committed.groups()[0].layout()),
+        std::slice::from_ref(committed.groups()[0].domain()),
+        committed.sizes(),
+        &owed,
+        &config(),
+        &mut verifier,
+        Some(multilinear_table::PreparedCheck {
+            roots: &roots,
+            layout: out_of_band.layout(),
+            domain: out_of_band.domain(),
+            at: verifier_at,
+        }),
+    )
+}
+
+/// Both preprocessed columns of table 0, then both of table 1 — the stack's own
+/// column order.
+fn two_table_at() -> Vec<multilinear_table::PreparedColumn> {
+    let mut at = multilinear_table::leading_columns(0, 2);
+    at.extend(multilinear_table::leading_columns(1, 2));
+    at
+}
+
+/// ★ THE HONEST CONTROL, and it comes first: a stack spanning two tables, whose
+/// columns are settled at two different reduced points, verifies.
+///
+/// Without this the refusals below would be satisfied by a path that rejects
+/// everything.
+#[test]
+fn a_prepared_stack_settles_two_tables_at_their_own_points() {
+    let at = two_table_at();
+    prove_and_verify_two_table_prepared(&at, &at)
+        .expect("an honest two-table prepared opening must verify");
+}
+
+/// ★★ EACH TABLE'S COLUMNS ARE BOUND TO ITS OWN POINT, adversarially.
+///
+/// The verifier is told the stack holds LT's columns first and EQ's second,
+/// while the commitment holds them the other way round. Every root, every table
+/// argument and every carried value is the honest one — only the DESTINATION of
+/// each run moves. On the cross-epoch path this is one dense page's genesis
+/// being settled against another page's claim, which is the forgery the opening
+/// exists to stop, and it is why the stack's column order is a contract rather
+/// than a convention.
+#[test]
+fn a_prepared_stack_with_two_tables_swapped_is_refused() {
+    let honest = two_table_at();
+    let mut swapped = multilinear_table::leading_columns(1, 2);
+    swapped.extend(multilinear_table::leading_columns(0, 2));
+    let err = prove_and_verify_two_table_prepared(&honest, &swapped)
+        .expect_err("a stack settled against the wrong tables' claims must be refused");
+    println!("SWAPPED-TABLES REFUSAL: {err:?}");
+}
+
+/// ⛔ A STACK THAT IS NOT A PREFIX IS REFUSED RATHER THAN REINTERPRETED.
+///
+/// `check_preprocessed` skips a table's FIRST `n` preprocessed columns, so a
+/// commitment over `{1, 0}` — or over `{1}` alone — cannot be expressed by the
+/// count that drives it. `PreparedColumn` CAN describe one, which is exactly why
+/// `prefix_at` has to refuse it: reinterpreted as a count it would have the host
+/// skip columns the opening never settled, with every value gate still green.
+#[test]
+fn a_prepared_stack_that_is_not_a_prefix_is_refused() {
+    let honest = two_table_at();
+    // Table 0's two columns named in the wrong order.
+    let mut reversed = vec![honest[1], honest[0]];
+    reversed.extend_from_slice(&honest[2..]);
+    let err = prove_and_verify_two_table_prepared(&honest, &reversed)
+        .expect_err("a non-prefix prepared commitment must be refused");
+    println!("NON-PREFIX REFUSAL: {err:?}");
+}
+
+/// ⛔ AND SO IS A STACK WHOSE TABLES INTERLEAVE.
+///
+/// The opening takes each table's claims as the contiguous run
+/// `values[start..start + n]`. Entries interleaved with another table's would
+/// settle this table's commitment against a slice that is not its own, so
+/// contiguity is part of the contract and not a tidiness rule.
+#[test]
+fn a_prepared_stack_whose_tables_interleave_is_refused() {
+    let honest = two_table_at();
+    let interleaved = vec![honest[0], honest[2], honest[1], honest[3]];
+    let err = prove_and_verify_two_table_prepared(&honest, &interleaved)
+        .expect_err("an interleaved prepared commitment must be refused");
+    println!("INTERLEAVED REFUSAL: {err:?}");
 }

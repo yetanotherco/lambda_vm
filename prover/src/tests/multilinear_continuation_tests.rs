@@ -401,7 +401,8 @@ fn a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other() {
     let elf = Elf::load(&elf_bytes).expect("load");
 
     let verdict_under =
-        |name: &str, verdict: Result<Option<Vec<Vec<stark::config::Commitment>>>, crate::Error>| {
+        |name: &str,
+         verdict: Result<Option<multilinear_continuation::GlobalVerdict>, crate::Error>| {
             verdict
                 .unwrap_or_else(|e| panic!("the cross-epoch proof errored under {name}: {e:?}"))
                 .is_some()
@@ -1067,4 +1068,787 @@ fn the_global_airs_describe_the_cross_epoch_proof_they_were_asked_for() {
         refs.len(),
         bases.len(),
     );
+}
+
+/// The cross-epoch inputs a caller of [`multilinear_continuation::prove_global`]
+/// needs, WITHOUT proving a single epoch.
+///
+/// `for_each_epoch` is the same function `prove_continuation` walks the run
+/// with, and its closure is what proves an epoch — so passing a closure that
+/// does nothing hands back exactly the boundaries the real prover would have
+/// chained, at the cost of the execution alone. That matters: re-deriving the
+/// boundaries in a test would be a second spelling of the epoch split, which is
+/// the thing the cross-epoch proof is about.
+/// What [`cross_epoch_inputs`] hands back: the loaded ELF, every epoch's
+/// boundary, the init page data, the touched page bases, and how many of those
+/// are private-input pages.
+type CrossEpochInputs = (
+    Elf,
+    Vec<std::sync::Arc<Vec<local_to_global::CellBoundary>>>,
+    std::collections::HashMap<u64, Vec<u8>>,
+    Vec<u64>,
+    usize,
+);
+
+fn cross_epoch_inputs(elf_bytes: &[u8], input: &[u8], epoch_size_log2: u32) -> CrossEpochInputs {
+    let elf = Elf::load(elf_bytes).expect("load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let boundaries = continuation::for_each_epoch(
+        &elf,
+        input,
+        epoch_size_log2,
+        &artifacts,
+        |_prepared, _so_far| Ok(()),
+    )
+    .expect("walk the run");
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(&elf, input),
+    );
+    let page_bases = continuation::touched_page_bases(&boundaries);
+    let num_private = crate::tables::page::private_input_page_count(input);
+    (elf, boundaries, init_page_data, page_bases, num_private)
+}
+
+/// ★★★ THE CROSS-EPOCH HASH AGREEMENT, IN BOTH DIRECTIONS AND WITHOUT THE KNOB.
+///
+/// [`a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other`] can
+/// only assert that EXACTLY ONE hash accepts, because `prove_continuation`
+/// dispatches on the process knob and the test cannot say which hash its bundle
+/// was proven under. Its own doc says so: under a default keccak suite, a
+/// verifier dispatch pinned to keccak is indistinguishable from a correct one.
+///
+/// With [`multilinear_continuation::prove_global`] generic, the prover can be
+/// ASKED. Each proof is built under a named hash and checked under both, so the
+/// diagonal must accept and the off-diagonal must refuse — four readings whose
+/// pattern is fixed regardless of what `LAMBDA_VM_WHIR_HASH` is set to when the
+/// suite runs.
+///
+/// ⚠ THE HONEST CONTROL IS THE DIAGONAL, and it is asserted first: a verifier
+/// that refuses everything satisfies both refusals and fails both acceptances.
+#[test]
+fn a_cross_epoch_proof_verifies_under_the_hash_it_was_proven_under_and_no_other() {
+    use multilinear::whir_hash::{KeccakWhir, RpxWhir, WhirHash};
+
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &input, 2);
+
+    let keccak_proof = multilinear_continuation::prove_global::<KeccakWhir>(
+        &boundaries,
+        &elf_bytes,
+        &init_page_data,
+        &page_bases,
+        num_private,
+        &opts,
+    )
+    .expect("prove the cross-epoch chain under keccak256");
+    let rpx_proof = multilinear_continuation::prove_global::<RpxWhir>(
+        &boundaries,
+        &elf_bytes,
+        &init_page_data,
+        &page_bases,
+        num_private,
+        &opts,
+    )
+    .expect("prove the cross-epoch chain under rpx256");
+
+    let accepts = |proof: &multilinear_continuation::GlobalProof, rpx: bool| -> bool {
+        let verdict = if rpx {
+            multilinear_continuation::verify_global_bookends::<RpxWhir>(
+                &elf,
+                &elf_bytes,
+                proof,
+                boundaries.len(),
+                &page_bases,
+                num_private,
+                &opts,
+            )
+        } else {
+            multilinear_continuation::verify_global_bookends::<KeccakWhir>(
+                &elf,
+                &elf_bytes,
+                proof,
+                boundaries.len(),
+                &page_bases,
+                num_private,
+                &opts,
+            )
+        };
+        verdict.expect("the cross-epoch verifier errored").is_some()
+    };
+
+    // The control first: each proof verifies under the hash it names.
+    assert!(
+        accepts(&keccak_proof, false),
+        "a proof built under {} was refused under {}",
+        <KeccakWhir as WhirHash>::NAME,
+        <KeccakWhir as WhirHash>::NAME
+    );
+    assert!(
+        accepts(&rpx_proof, true),
+        "a proof built under {} was refused under {}",
+        <RpxWhir as WhirHash>::NAME,
+        <RpxWhir as WhirHash>::NAME
+    );
+    // Then the refusals, which the control has now earned.
+    assert!(
+        !accepts(&keccak_proof, true),
+        "a proof built under {} was ACCEPTED under {}: the transcript's sponge is \
+         not part of the configuration after all",
+        <KeccakWhir as WhirHash>::NAME,
+        <RpxWhir as WhirHash>::NAME
+    );
+    assert!(
+        !accepts(&rpx_proof, false),
+        "a proof built under {} was ACCEPTED under {}",
+        <RpxWhir as WhirHash>::NAME,
+        <KeccakWhir as WhirHash>::NAME
+    );
+
+    // ⚠ And the two proofs are not the same object: if they were, the four
+    // readings above would be about one proof and the pattern would mean
+    // nothing.
+    let a = rkyv::to_bytes::<rkyv::rancor::Error>(&keccak_proof.proof.tables).expect("serialize");
+    let b = rkyv::to_bytes::<rkyv::rancor::Error>(&rpx_proof.proof.tables).expect("serialize");
+    assert_ne!(
+        a.as_ref(),
+        b.as_ref(),
+        "the two hashes produced byte-identical table arguments"
+    );
+}
+
+/// ★★★★ THE PREPARED GENESIS OPENING, END TO END ON A DENSE PAGE.
+///
+/// `dense_data_page_touch` is `data_page_touch` with its touched cell surrounded
+/// by non-zero bytes, so the page it lives on crosses
+/// the genesis-stack threshold whatever offset the linker put `.data` at. It is
+/// the only fixture in the tree whose cross-epoch proof carries a prepared
+/// opening at all — every other one is entirely sparse and takes the `None`
+/// path, which is why this guest had to be written rather than an assertion
+/// added.
+///
+/// ⚠ WHAT THIS DOES AND DOES NOT COVER. It exercises the PROTOCOL: the stack is
+/// committed, its root absorbed in the roots block, the opening produced, and
+/// the three dense-page INIT checks skipped in favour of it. It does NOT
+/// exercise the threshold's decision at BLOCK scale — one page is not the
+/// block's three, and the census is the only reading of that. Stated so nobody
+/// reads a green here as covering the block.
+#[test]
+fn a_dense_genesis_page_is_carried_by_a_prepared_opening() {
+    let elf_bytes = asm_elf_bytes("dense_data_page_touch");
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &[], 3);
+
+    // The plan, from the VERIFIER's own configs — the ELF's.
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::continuation::genesis_stack_plan(
+        &configs,
+        boundaries.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    for route in &plan.routes {
+        println!(
+            "DENSE FIXTURE PAGE {:#x}: nonzero {} has_init {} candidate {} dense {}",
+            route.page_base, route.nonzero, route.has_init, route.candidate, route.dense
+        );
+    }
+    // ⚠ THE PRECONDITION, ASSERTED. Without a dense page this test would take
+    // the `None` path and pass while checking nothing about the opening.
+    assert_eq!(
+        plan.dense_pages().len(),
+        1,
+        "the fixture must put exactly one page over the threshold; it put {}",
+        plan.dense_pages().len()
+    );
+    // ⚠ BOTH of that page's preprocessed columns, which is what keeps
+    // `check_preprocessed`'s prefix contract expressible. See
+    // `continuation::PAGE_PREPROCESSED_COLUMNS`.
+    assert_eq!(
+        plan.at,
+        stark::multilinear_table::leading_columns(
+            plan.at[0].table,
+            crate::continuation::PAGE_PREPROCESSED_COLUMNS
+        ),
+        "a dense page must stack its whole preprocessed prefix"
+    );
+
+    let global = crate::with_whir_hash!(|H| {
+        multilinear_continuation::prove_global::<H>(
+            &boundaries,
+            &elf_bytes,
+            &init_page_data,
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("the cross-epoch proof over a dense genesis page");
+
+    // The opening exists, and its root is NOT among the carried ones — the
+    // verifier derives it, and a copy in the proof would be a value a reader
+    // assumes is checked.
+    assert!(
+        global.proof.preprocessed.is_some(),
+        "a dense page was planned but the proof carries no prepared opening"
+    );
+
+    let verdict = crate::with_whir_hash!(|H| {
+        multilinear_continuation::verify_global_bookends::<H>(
+            &elf,
+            &elf_bytes,
+            &global,
+            boundaries.len(),
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("the cross-epoch verifier errored on an honest bundle");
+    assert!(
+        verdict.is_some(),
+        "an honest cross-epoch proof with a prepared genesis opening was refused"
+    );
+}
+
+/// ★★ THE SPARSE FIXTURES STILL CARRY NO OPENING, and their proofs are the ones
+/// they were.
+///
+/// The honest control for the route as a whole: a run whose genesis is entirely
+/// sparse must take the `None` path. If it did not, every fixture in this suite
+/// would be paying for a commitment it has no use for, and the claim that this
+/// change moves no proof anything in flight depends on would be false.
+#[test]
+fn a_sparse_genesis_page_set_carries_no_prepared_opening() {
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &input, 2);
+
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::continuation::genesis_stack_plan(
+        &configs,
+        boundaries.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    let worst = plan.routes.iter().map(|r| r.nonzero).max().unwrap_or(0);
+    // ⚠ THE SAVINGS ARE PART OF THE READING. Under the two-part rule an empty
+    // plan has two causes — no page cleared part 1, or the candidates could not
+    // pay for the chain — and "no opening" alone does not say which. The line
+    // prints the candidate count and the savings so the log does.
+    println!(
+        "SPARSE FIXTURE: {} pages, worst nonzero {worst}, sparse rows {}, candidates {}, \
+         savings {} against a {}-row chain",
+        plan.routes.len(),
+        plan.sparse_rows,
+        plan.routes.iter().filter(|route| route.candidate).count(),
+        plan.savings,
+        crate::continuation::PREPARED_LEG_ROWS,
+    );
+    assert!(
+        !crate::continuation::chain_is_paid(plan.savings),
+        "part 2 must be what refuses here"
+    );
+    assert!(
+        plan.is_empty(),
+        "this fixture's genesis crossed the threshold, so it is no longer the \
+         sparse control this test is"
+    );
+
+    let global = crate::with_whir_hash!(|H| {
+        multilinear_continuation::prove_global::<H>(
+            &boundaries,
+            &elf_bytes,
+            &init_page_data,
+            &page_bases,
+            num_private,
+            &opts,
+        )
+    })
+    .expect("prove");
+    assert!(
+        global.proof.preprocessed.is_none(),
+        "a sparse page set produced a prepared opening it has no use for"
+    );
+}
+
+/// The ELF's genesis byte at `address`, derived from the `PT_LOAD` segments
+/// DIRECTLY — never through `build_initial_image_paged` or
+/// `page::preprocessed_columns`.
+///
+/// ⚠ THE INDEPENDENCE IS THE WHOLE VALUE. The provenance test below compares
+/// the interned root against a stack built from this; built through the same
+/// function the code under test uses, it would compare a value with itself and
+/// pass for any pair of agreeing bugs. A byte outside every segment is zero,
+/// which is the same rule a short `PageConfig::init_values` encodes.
+fn elf_genesis_byte(elf: &Elf, address: u64) -> u8 {
+    for segment in &elf.data {
+        let end = segment
+            .base_addr
+            .saturating_add(segment.values.len() as u64 * 4);
+        if address < segment.base_addr || address >= end {
+            continue;
+        }
+        let offset = address - segment.base_addr;
+        let word = segment.values[(offset / 4) as usize];
+        // RISC-V is little-endian: byte `k` of a word is bits `8k..8k+8`.
+        return (word >> (8 * (offset % 4))) as u8;
+    }
+    0
+}
+
+/// ⛔⛔ THE FOURTH OWED PER-ELF PIN, AND ITS PROVENANCE.
+///
+/// The in-guest verifier cannot recompute the genesis stack's commitment, so it
+/// interns the ROOT as program text exactly as it interns DECODE's. The
+/// statement owed out of band is **"this root is the commitment to the ELF's
+/// genesis bytes at the dense page bases, under this blowup and folding"**, and
+/// it is OWED rather than covered: nothing inside the program checks it.
+///
+/// This is the evidence for that statement. It rebuilds the stacked columns
+/// from the ELF's `PT_LOAD` segments byte by byte — a second derivation on
+/// purpose, see [`elf_genesis_byte`] — commits them through the same
+/// `global_layout` and the same config the production path uses, and compares
+/// the ROOTS.
+///
+/// ⛔ AND THESE ARE NOT THE 35 UNIVARIATE ROOTS. `recursion::precomputed_commitments`
+/// builds one Merkle root per page config over that page's LDE codeword; those
+/// are what the attestation's `program_id` folds, and no multilinear verifier
+/// ever compares one. A stacked WHIR commitment over the same columns has no
+/// per-page subtree to match against them. Two different objects over the same
+/// bytes, and only one of them is this.
+#[test]
+fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
+    use multilinear::whir_hash::KeccakWhir;
+
+    let elf_bytes = asm_elf_bytes("dense_data_page_touch");
+    let (elf, boundaries, _init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &[], 3);
+
+    let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
+    let plan = crate::continuation::genesis_stack_plan(
+        &configs,
+        boundaries.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    assert!(
+        !plan.is_empty(),
+        "the fixture must carry a stack, or there is no root to have provenance"
+    );
+    // ⚠ AND WHY it carries one: part 1 made it a candidate and part 2 paid for
+    // the chain. An absence here would otherwise be consistent with either.
+    println!(
+        "PROVENANCE PLAN: n_fixed {} savings {} chain {} candidates {}",
+        plan.n_fixed,
+        plan.savings,
+        crate::continuation::PREPARED_LEG_ROWS,
+        plan.routes.iter().filter(|route| route.candidate).count(),
+    );
+    assert!(crate::continuation::chain_is_paid(plan.savings));
+
+    // Both halves commit under ONE config, so a difference in the roots is a
+    // difference in the BYTES and not in the parameters.
+    let config = crate::multilinear_prove::chain_config(&[(
+        plan.at.len(),
+        crate::continuation::PAGE_NUM_VARS,
+    )]);
+    let production = multilinear_continuation::genesis_prepared_for::<KeccakWhir>(
+        &configs,
+        plan.clone(),
+        &config,
+    )
+    .expect("the production stack")
+    .expect("a non-empty plan must produce a stack");
+
+    // The independent half: each stacked column rebuilt from ITS OWN closed
+    // form, selected by `entry.column`.
+    //
+    // ⛔⛔ THIS IS WHERE THIS TEST WAS WRONG, AND THE SHAPE IS WORTH MORE THAN
+    // THE BUG. Written before the both-columns ruling, it read only
+    // `entry.table` and rebuilt EVERY entry from the ELF's bytes — so once a
+    // dense page began stacking `[OFFSET, INIT]` it committed `[INIT, INIT]`
+    // against the production stack and reported a mismatch it had manufactured
+    // itself. A second derivation that ignores part of what it is deriving is
+    // not an independent check; it is a different object.
+    //
+    // ⚠ NEITHER ARM CALLS `page::preprocessed_columns` OR `page::offset_column`.
+    // The ramp is written out here. Built through the function under test, the
+    // two halves would agree for any pair of agreeing bugs — the same reason
+    // [`elf_genesis_byte`] exists.
+    type Fe = math::field::element::FieldElement<crate::test_utils::F>;
+    let page_size = 1u64 << crate::continuation::PAGE_NUM_VARS;
+    let rebuild = |entry: &stark::multilinear_table::PreparedColumn| -> Vec<Fe> {
+        let base = configs[entry.table - boundaries.len()].page_base;
+        match entry.column {
+            // OFFSET: the row index. The same column for every page of this
+            // size, independent of the program entirely.
+            //
+            // ⚠ It reads like `page::offset_column()` because `0..page_size`
+            // has one spelling — but it is not a CALL to it, and that is the
+            // whole of the independence here: a ramp that started at 1, or ran
+            // to `page_size` inclusive, would redden this while agreeing with
+            // itself everywhere else.
+            0 => (0..page_size).map(Fe::from).collect(),
+            // INIT: this page's genesis bytes, out of the ELF's own segments.
+            1 => (0..page_size)
+                .map(|offset| Fe::from(u64::from(elf_genesis_byte(&elf, base + offset))))
+                .collect(),
+            other => panic!(
+                "the stack names preprocessed column {other} of table {}, and a genesis \
+                 page presents {}. There is no independent derivation for it here, and \
+                 rebuilding an unknown column as INIT is exactly the defect this test \
+                 carried: it would compare a stack of the wrong columns and blame the \
+                 root.",
+                entry.table,
+                crate::continuation::PAGE_PREPROCESSED_COLUMNS
+            ),
+        }
+    };
+    let rebuilt: Vec<multilinear::mle::Mle<crate::test_utils::F>> = plan
+        .at
+        .iter()
+        .map(|entry| multilinear::mle::Mle::new(rebuild(entry)).expect("mle"))
+        .collect();
+
+    // ⚠ ANTI-VACUITY, PER COLUMN KIND — two all-zero stacks match and say
+    // nothing. Each kind is asserted against the count only IT can have:
+    //
+    // - INIT must clear the fill this guest was BUILT with: `dense_data_page_
+    //   touch` surrounds its touched cell with 32 KiB of non-zero bytes on each
+    //   side, so the counter's own page holds at least one side's worth
+    //   whatever offset the linker chose. ⛔ THE FLOOR IS THE GUEST'S, NOT THE
+    //   ROUTING RULE'S: a page can be carried while holding far fewer entries
+    //   than that (two pages of 5,000 share a chain), so a floor taken from the
+    //   threshold would be true here only by accident of this fixture.
+    // - OFFSET is the ramp `0..page_size`, so exactly one entry of it is zero
+    //   and its count is `page_size - 1`: pinned EXACTLY, not by a floor.
+    //   ⛔ This is the reading that names the old defect outright. An OFFSET
+    //   entry rebuilt from the ELF's bytes prints the INIT count instead of
+    //   262,143 — which is what the failing log showed, twice.
+    let floor = 32_768usize;
+    let ramp_nonzero = page_size as usize - 1;
+    for (column, entry) in rebuilt.iter().zip(&plan.at) {
+        let zero = Fe::from(0u64);
+        let nonzero = column.evals().iter().filter(|v| **v != zero).count();
+        println!(
+            "PROVENANCE table {} column {} rebuilt nonzero {nonzero} (INIT floor {floor}, \
+             OFFSET exactly {ramp_nonzero})",
+            entry.table, entry.column
+        );
+        if entry.column == 0 {
+            assert_eq!(
+                nonzero, ramp_nonzero,
+                "stack column {} of table {} is this page's OFFSET ramp, whose only zero \
+                 is row 0 — a count of {nonzero} means it was rebuilt as something else",
+                entry.column, entry.table
+            );
+        } else {
+            assert!(
+                nonzero > floor,
+                "the rebuilt INIT column has {nonzero} nonzero entries, at or below the \
+                 {floor} that put this page in the stack — the two halves are reading \
+                 different pages"
+            );
+        }
+    }
+
+    let commit_independently = |columns: &[multilinear::mle::Mle<crate::test_utils::F>]| {
+        multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
+            stark::multilinear_table::global_layout(&[(
+                columns.len(),
+                crate::continuation::PAGE_NUM_VARS,
+            )])
+            .expect("layout"),
+            &multilinear::stacking::borrow(columns),
+            None,
+            &config,
+        )
+        .expect("the independent stack")
+    };
+
+    // THE HONEST CONTROL, FIRST: the two derivations agree.
+    let independent = commit_independently(&rebuilt);
+    assert_eq!(
+        production.roots,
+        independent.roots(),
+        "the genesis stack's root is not the commitment to the ELF's own bytes at those \
+         page bases — the pin this root owes could not be stated"
+    );
+
+    // ⛔ AND THE COMPARISON IS EXECUTED ON A STATE IT MUST REFUSE. One that has
+    // only ever run on agreeing inputs is one nobody has seen work. A single
+    // byte of ONE rebuilt INIT column is moved and the same commitment taken
+    // again; the roots must then differ. INIT and not OFFSET on purpose: INIT
+    // is the column this opening exists to settle.
+    let init_at = plan
+        .at
+        .iter()
+        .position(|entry| entry.column == 1)
+        .expect("a dense page stacks an INIT column");
+    let mut moved: Vec<Vec<Fe>> = rebuilt
+        .iter()
+        .map(|column| column.evals().to_vec())
+        .collect();
+    let zero = Fe::from(0u64);
+    let byte = moved[init_at]
+        .iter()
+        .position(|value| *value != zero)
+        .expect("a dense INIT column has a nonzero byte to move");
+    moved[init_at][byte] += Fe::from(1u64);
+    let moved: Vec<multilinear::mle::Mle<crate::test_utils::F>> = moved
+        .into_iter()
+        .map(|values| multilinear::mle::Mle::new(values).expect("mle"))
+        .collect();
+    assert_ne!(
+        production.roots,
+        commit_independently(&moved).roots(),
+        "one genesis byte was moved in stack column {init_at} at offset {byte} and the \
+         root did not change: this comparison cannot see a wrong stack, so its green says \
+         nothing"
+    );
+
+    // ⛔⛔ THE FOURTH OWED PIN, NOW STATEABLE. The statement owed out of band is
+    // the line below: this root, over this guest named by sha, this many
+    // columns at this height, under this hash. Nothing inside the program
+    // checks it. The BLOCK's own root is read by
+    // `the_blocks_dense_pages_are_the_three_the_threshold_pre_registers` on the
+    // box; this is the fixture-scale half of the same pin.
+    println!(
+        "GENESIS STACK ROOT {:02x?} guest dense_data_page_touch sha {} ({} bytes)  \
+         columns {} at {} variables  hash {}",
+        production.roots,
+        sha256_hex(&elf_bytes),
+        elf_bytes.len(),
+        plan.at.len(),
+        crate::continuation::PAGE_NUM_VARS,
+        <KeccakWhir as multilinear::whir_hash::WhirHash>::NAME,
+    );
+}
+
+/// The bench ELF by name, or `None` when it is simply not built here.
+fn bench_elf_if_present(name: &str) -> Option<Vec<u8>> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("executor/program_artifacts");
+    for dir in ["rust", "asm"] {
+        if let Ok(bytes) = std::fs::read(root.join(dir).join(format!("{name}.elf"))) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// ⛔⛔ THE PRE-REGISTRATION, READ OFF THE REAL ELF INSTEAD OF COPIED.
+///
+/// The split's unit tests in `continuation` encode the block's census — 116,692 nonzero
+/// entries at `0x0`, 229,290 at `0x40000`, 223,380 at `0x280000`, zero at the
+/// other 27 — as numbers I typed from a box log. That is enough to check the
+/// closed form's ARITHMETIC and not enough to check that the form, run against
+/// the actual program, selects those three pages. A routing rule whose
+/// pre-registration rests on a transcription is a rule nobody has tested.
+///
+/// This runs the block guest once — no proving, no card, the same shape as
+/// `whir_global_tests::the_block_genesis_census` — rebuilds the page configs
+/// from the ELF, evaluates [`crate::continuation::genesis_stack_plan`] on them, and asserts
+/// the dense set is EXACTLY those three bases.
+///
+/// ⛔ IT REFUSES RATHER THAN SKIPS when the shas are unstated, and SKIPS with
+/// its own line when the ELF is simply absent. Two outcomes, two meanings: a
+/// census quoted as a fact about one program and one input must not be
+/// producible from an unnamed pair, and a missing build product is not a
+/// failure of this check.
+#[test]
+#[ignore = "the box runs it: one execution of the block guest, no proving"]
+fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
+    // What the ruling names, and what this arm exists to confirm against the ELF.
+    const PRE_REGISTERED: [u64; 3] = [0x0, 0x40000, 0x280000];
+
+    let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+    let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+    let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21);
+
+    let Some(elf_bytes) = bench_elf_if_present(&name) else {
+        println!(
+            "GENESIS-ROUTING SKIPPED - no ELF named {name} in \
+             executor/program_artifacts/{{rust,asm}}; set LAMBDA_VM_BENCH_ELF"
+        );
+        return;
+    };
+    let input = crate::tests::multilinear_bench_tests::input_bytes(&input_name);
+
+    let elf_sha = sha256_hex(&elf_bytes);
+    let input_sha = sha256_hex(&input);
+    let want_elf = std::env::var("LAMBDA_VM_CENSUS_ELF_SHA256").unwrap_or_else(|_| {
+        panic!(
+            "this routing is quoted as a fact about ONE program and ONE input, so it \
+             refuses to run unnamed. Set LAMBDA_VM_CENSUS_ELF_SHA256={elf_sha} and \
+             LAMBDA_VM_CENSUS_INPUT_SHA256={input_sha}"
+        )
+    });
+    let want_input = std::env::var("LAMBDA_VM_CENSUS_INPUT_SHA256").unwrap_or_else(|_| {
+        panic!("LAMBDA_VM_CENSUS_INPUT_SHA256 is unset; the input here is {input_sha}")
+    });
+    assert_eq!(
+        elf_sha, want_elf,
+        "the ELF is not the one this routing was asked for"
+    );
+    assert_eq!(
+        input_sha, want_input,
+        "the INPUT is not the one this routing was asked for, and the touched page \
+         list is a function of it"
+    );
+    println!(
+        "GENESIS-ROUTING elf {name} sha {elf_sha} ({} bytes)  input {} sha {input_sha} \
+         ({} bytes)  epoch 2^{epoch_size_log2}",
+        elf_bytes.len(),
+        if input_name.is_empty() {
+            "<none>"
+        } else {
+            &input_name
+        },
+        input.len(),
+    );
+
+    let started = std::time::Instant::now();
+    let pages = continuation::block_page_census(&elf_bytes, &input, epoch_size_log2)
+        .expect("the guest runs to completion");
+    let elf = Elf::load(&elf_bytes).expect("load");
+    let configs = continuation::global_memory_configs(
+        &pages.touched_page_bases,
+        &elf,
+        pages.num_private_input_pages,
+    );
+    let plan = crate::continuation::genesis_stack_plan(
+        &configs,
+        pages.num_epochs,
+        crate::continuation::PAGE_NUM_VARS,
+    );
+    println!(
+        "EXECUTION: {} epochs, {} touched pages, {} private, in {:.1}s",
+        pages.num_epochs,
+        pages.touched_page_bases.len(),
+        pages.num_private_input_pages,
+        started.elapsed().as_secs_f64(),
+    );
+
+    let mut sparse_total = 0usize;
+    let mut dense_total = 0usize;
+    for route in &plan.routes {
+        let rows =
+            crate::continuation::sparse_leg_rows(crate::continuation::PAGE_NUM_VARS, route.nonzero);
+        if route.dense {
+            dense_total += rows;
+        } else if route.has_init {
+            sparse_total += rows;
+        }
+        println!(
+            "ROUTE {:#x}: nonzero {} has_init {} candidate {} dense {} sparse_rows {rows}",
+            route.page_base, route.nonzero, route.has_init, route.candidate, route.dense
+        );
+    }
+
+    let dense_bases: Vec<u64> = plan
+        .routes
+        .iter()
+        .filter(|r| r.dense)
+        .map(|r| r.page_base)
+        .collect();
+    // ⚠ BOTH PARTS, AND BOTH OF THEIR INPUTS. A line quoting only the answer
+    // would not say which rule produced it, and the two are separately wrong in
+    // different ways.
+    let num_vars = crate::continuation::PAGE_NUM_VARS;
+    let marginal = crate::continuation::GENESIS_PAGE_MARGINAL_ROWS;
+    println!(
+        "GENESIS ROUTING: {} of {} pages stacked {dense_bases:02x?}; the sparse form \
+         would have cost {dense_total} rows for them and costs {sparse_total} for the \
+         rest. PART 1 at n_fixed {} ({} genesis pages): marginal {marginal} rows, so a \
+         candidate needs {} nonzero entries; {} candidates. PART 2: savings {} against a \
+         {}-row chain, {}",
+        dense_bases.len(),
+        plan.routes.len(),
+        plan.n_fixed,
+        plan.routes.iter().filter(|r| r.has_init).count(),
+        crate::continuation::candidate_threshold_entries(num_vars),
+        plan.routes.iter().filter(|r| r.candidate).count(),
+        plan.savings,
+        crate::continuation::PREPARED_LEG_ROWS,
+        if crate::continuation::chain_is_paid(plan.savings) {
+            "PAID"
+        } else {
+            "REFUSED — every candidate stays sparse"
+        },
+    );
+
+    // ⚠ THE ASSERTION IS THE SET AND ITS ORDER, not a count. Three pages of the
+    // wrong three would pass a count, and the stack's column order IS page-base
+    // order, so the order is part of what the opening means.
+    assert_eq!(
+        dense_bases,
+        PRE_REGISTERED.to_vec(),
+        "the threshold selected a different set of pages than the ruling names"
+    );
+    // The two parts' own pre-registrations, so a green here cannot come from
+    // the right set reached by the wrong arithmetic.
+    // ⚠ `n_fixed` DECIDES NOTHING — the rule reads one literal. It is asserted
+    // because THIS run standing at the height the literal was MEASURED at is
+    // what makes that literal the right charge for it; a taller run would be
+    // charged too little, and this is where that is read.
+    assert_eq!(
+        plan.n_fixed, 24,
+        "thirty genesis pages: 18 + ceil(log2(60))"
+    );
+    assert_eq!(plan.n_fixed, crate::continuation::MARGINAL_MEASURED_AT_VARS);
+    assert_eq!(
+        marginal, 103,
+        "the retired three-term reading, UNPINNED — the threaded sponge makes the \
+         true marginal depend on WHICH page is added, spreading {{109, 110, 111}} at \
+         this height"
+    );
+    assert_eq!(
+        plan.routes.iter().filter(|r| r.candidate).count(),
+        PRE_REGISTERED.len(),
+        "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
+    );
+    assert_eq!(plan.savings, 10_248_261);
+    assert!(crate::continuation::chain_is_paid(plan.savings));
+    // And the pages left behind must be genuinely cheap, or the hybrid is not
+    // the win the ruling claimed.
+    assert!(
+        sparse_total < dense_total / 100,
+        "the sparse remainder is {sparse_total} rows against {dense_total} stacked: \
+         the split is not the concentration the census read"
+    );
+
+    // ⛔⛔ THE FOURTH OWED PIN, AT THE BLOCK. The in-guest verifier interns this
+    // root as program text and nothing inside the program checks it; the
+    // statement owed out of band is this line. `a_dense_genesis_page_is_carried
+    // _by_a_prepared_opening`'s sibling states the same thing at fixture scale,
+    // and `the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages`
+    // is where the derivation is checked against the ELF's own bytes.
+    let config = crate::multilinear_prove::chain_config(&[(plan.at.len(), num_vars)]);
+    crate::with_whir_hash!(|H| {
+        let prepared =
+            multilinear_continuation::genesis_prepared_for::<H>(&configs, plan.clone(), &config)
+                .expect("the block's genesis stack")
+                .expect("three dense pages must produce a stack");
+        println!(
+            "GENESIS STACK ROOT {:02x?} elf {elf_sha} input {input_sha} columns {} at \
+             {num_vars} variables hash {}",
+            prepared.roots,
+            plan.at.len(),
+            <H as multilinear::whir_hash::WhirHash>::NAME,
+        );
+    });
 }

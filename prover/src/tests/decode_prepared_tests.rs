@@ -148,8 +148,8 @@ fn the_two_hashes_commit_the_same_columns_to_different_roots() {
         "the two hashes disagree on how many polynomials the group has"
     );
     assert_eq!(
-        keccak.check(0).columns,
-        rpx.check(0).columns,
+        keccak.settled_at(0).len(),
+        rpx.settled_at(0).len(),
         "the two hashes disagree on how many columns the group covers"
     );
 }
@@ -177,8 +177,9 @@ fn the_group_shape_is_the_one_the_program_implies() {
     assert_eq!(rows, 2_048);
 
     let p = prepared::<KeccakWhir>(&instrs, 1);
-    let check = p.check(0);
-    assert_eq!(check.columns, 5);
+    let settled = p.settled_at(0);
+    let check = p.check(&settled);
+    assert_eq!(check.at.len(), 5);
     assert_eq!(
         check.layout.num_polys(),
         1,

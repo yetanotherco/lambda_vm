@@ -663,6 +663,94 @@ where
     }
 }
 
+/// Where one stacked column of a prepared commitment is settled: a table, and
+/// **which** of that table's preprocessed columns.
+///
+/// ★ THE TABLE INDEX IS WHAT GENERALISED; THE COLUMN INDEX IS WHAT KEEPS IT
+/// HONEST. DECODE's prepared commitment covers ONE table's leading five columns.
+/// The cross-epoch genesis stack covers one table PER DENSE PAGE, each settled
+/// at its own reduced point — so the opening needed a table LIST, which is the
+/// change. The column index rides along because a list of tables alone cannot
+/// say WHICH columns of each, and the contract those columns must satisfy is
+/// exact: see [`prefix_at`].
+///
+/// ⚠ A CROSS-EPOCH PAGE'S STACK CARRIES BOTH ITS COLUMNS, and that is a cost
+/// paid to avoid changing a contract. A GLOBAL_MEMORY page presents
+/// `[OFFSET, INIT]`; only INIT is worth an opening, since OFFSET is the identity
+/// ramp whose extension costs `num_vars − 1` rows to check outright. But
+/// `check_preprocessed` skips a PREFIX, and `{1}` is not one — so the stack
+/// takes `{0, 1}`, the page loses its ramp, and `settled_out_of_band` stays a
+/// count. On the block that is 51 rows lost against 282 gained, about 230 on a
+/// hybrid costing order `10^5`.
+///
+/// ⚠ BOTH FIELDS ARE PART OF THE STATEMENT, NOT HINTS. The opening binds this
+/// column to ONE table's reduced point, and a prover who could aim a pinned
+/// column at another table's point — or at another of the same table's columns
+/// — would be settling it against challenges it was never bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedColumn {
+    /// Which table's reduced point this column is settled at.
+    pub table: usize,
+    /// Which of that table's PREPROCESSED columns it is, by index.
+    pub column: usize,
+}
+
+/// Where `table`'s prepared columns sit in `at`, and how many there are —
+/// `None` when the commitment does not cover that table at all.
+///
+/// ⛔⛔ **THE PREFIX CONTRACT, CHECKED RATHER THAN ASSUMED.**
+/// [`check_preprocessed`] settles a table's FIRST `n` preprocessed columns:
+/// it iterates `.skip(settled_out_of_band)`, and the in-guest mirror does the
+/// same with `&columns[plan.settled..]`. So a commitment covering a table's
+/// columns `{1}` — or `{0, 2}` — is INEXPRESSIBLE, and a caller that built one
+/// would have the host skip the wrong columns while the opening settled others,
+/// with every value gate still green.
+///
+/// A leading COUNT could not express that defect because it could not describe
+/// the intent either. [`PreparedColumn`] can, so this is where the two meet:
+/// the entries for one table must be CONTIGUOUS in `at` and must be exactly
+/// `0..n`, and anything else is an error rather than a silent reinterpretation.
+///
+/// ⚠ CONTIGUITY IS PART OF IT, not a tidiness rule. The opening's claimed
+/// values are taken as the run `values[start .. start + n]` of that table's own
+/// columns, so entries interleaved with another table's would settle this
+/// table's commitment against a slice that is not its own.
+fn prefix_at(at: &[PreparedColumn], table: usize) -> Result<Option<(usize, usize)>, MlError> {
+    let Some(first) = at.iter().position(|c| c.table == table) else {
+        return Ok(None);
+    };
+    let n = at[first..].iter().take_while(|c| c.table == table).count();
+    // Contiguous: nothing belonging to this table sits outside that run.
+    if at.iter().filter(|c| c.table == table).count() != n {
+        return Err(MlError::QueryCountMismatch {
+            expected: n,
+            got: at.iter().filter(|c| c.table == table).count(),
+        });
+    }
+    // And the run is the prefix `0..n`, in order.
+    for (offset, entry) in at[first..first + n].iter().enumerate() {
+        if entry.column != offset {
+            return Err(MlError::UnknownPolynomial {
+                index: entry.column,
+                len: n,
+            });
+        }
+    }
+    Ok(Some((first, n)))
+}
+
+/// One table's leading `columns` preprocessed columns — what a prepared
+/// commitment over a single table's prefix covers, which is DECODE's case.
+///
+/// Returned OWNED because [`Prepared`] borrows the slice and a self-referential
+/// struct cannot hand one out; the caller holds it for as long as the opening,
+/// exactly as it already holds the borrowed column references.
+pub fn leading_columns(table: usize, columns: usize) -> Vec<PreparedColumn> {
+    (0..columns)
+        .map(|column| PreparedColumn { table, column })
+        .collect()
+}
+
 /// What the verifier needs to settle a prepared commitment it derived itself.
 ///
 /// ⚠ `roots` are DERIVED — recomputed from the ELF by the verifier — never read
@@ -676,13 +764,12 @@ where
     pub roots: &'a [Commitment],
     pub layout: &'a StackedLayout,
     pub domain: &'a Domain<F>,
-    /// Whose reduced point the opening is settled at.
-    pub table: usize,
-    /// How many of that table's columns the commitment covers.
-    pub columns: usize,
+    /// Where each stacked column is settled, parallel to the stack's columns.
+    pub at: &'a [PreparedColumn],
 }
 
-/// A commitment built OUTSIDE this proof, to be opened at one table's point.
+/// A commitment built OUTSIDE this proof, opened at the points of the tables
+/// whose preprocessed columns it covers.
 ///
 /// DECODE's five preprocessed columns are ELF-derived: the same bytes in every
 /// epoch of every run of that program. Committing them per epoch and then
@@ -690,11 +777,13 @@ where
 /// chose. This carries a commitment built once per ELF, so the epoch pays an
 /// opening instead of five 2^20 folds.
 ///
-/// ⚠ The `table` index is part of the statement, not a hint. The opening binds
-/// these columns to ONE table's reduced point, and which table that is must be
-/// asserted rather than inferred from position — a prover who could aim the
-/// pinned columns at a different table's point would be settling them against
-/// challenges they were never bound to.
+/// ★ ONE STACK, SEVERAL TABLES, SEVERAL POINTS — and no new machinery for it.
+/// The cross-epoch proof's genesis pages are one table each, so their INIT
+/// columns are claimed at as many different reduced points as there are dense
+/// pages. [`stacked_eval::Claimed::PerColumn`] has always resolved the point
+/// per column — it is what every group opening in [`multi_prove`] already uses
+/// — so the generality was in the opening all along and only this struct named
+/// a single table. See [`PreparedColumn`].
 pub struct Prepared<'a, F, H>
 where
     F: IsFFTField + IsPrimeField + 'static,
@@ -705,8 +794,8 @@ where
     pub commitment: &'a StackedCommitment<F, H>,
     /// The columns it was committed over, in that order.
     pub columns: &'a [&'a Mle<F>],
-    /// Whose reduced point the opening is at.
-    pub table: usize,
+    /// Where each of those columns is settled, in the same order.
+    pub at: &'a [PreparedColumn],
 }
 
 /// Every table's argument, and the **one** opening that settles all of them.
@@ -946,16 +1035,26 @@ where
 /// the proof settled on and demands the same value. Costs one pass over each
 /// such column, which is what recomputing a preprocessed commitment costs on
 /// the univariate side.
-/// ★★ `settled_out_of_band` is how many of this table's leading preprocessed
+/// ★★ `settled_out_of_band` is how many of this table's LEADING preprocessed
 /// columns a PREPARED OPENING already settled, and it is the whole saving: those
 /// columns are tied to an ELF-derived commitment by an opening at this very
 /// point, so evaluating their MLEs here would prove the same thing a second time
 /// at `5 * 2^20` folds an epoch.
 ///
+/// ⚠ A LEADING COUNT AND NOT A SET, deliberately, and a prepared commitment is
+/// shaped to fit it rather than the other way round. A cross-epoch genesis page
+/// presents `[OFFSET, INIT]` and only INIT is worth an opening — but `{1}` is
+/// not a prefix, so the stack carries BOTH of that page's columns and settles
+/// `2`. The page loses its OFFSET ramp, which on the block is 51 rows against
+/// the 282 the three extra stack columns cost: about 230 rows on a hybrid
+/// costing order `10^5`, in exchange for this contract not moving. See
+/// [`prefix_at`], which is where a commitment that cannot be expressed as a
+/// prefix is refused rather than silently reinterpreted.
+///
 /// ⚠ It must be driven by the same `PreparedCheck` value that drives the
 /// opening, never by a flag a caller sets on its own — otherwise it is a switch
-/// that turns off a check with nothing put in its place. The caller asserts it
-/// covers no more columns than the opening does; see `multi_verify`.
+/// that turns off a check with nothing put in its place. The caller derives both
+/// from one `at` slice; see `multi_verify`.
 fn check_preprocessed<F, E>(
     statement: TableStatement<'_, F, E>,
     reduced: &claim_reduce::ReducedClaim<E>,
@@ -1004,6 +1103,97 @@ where
     }
     Ok(())
 }
+
+/// `at` as validated `(table, count)` runs, in stack order.
+///
+/// ★ ONE WALK DOES BOTH JOBS: it is where the prefix and contiguity contracts
+/// of [`prefix_at`] are enforced, and it is where the stack's COLUMN ORDER is
+/// pinned. `at` must visit each table once, in the order the stack's columns
+/// were committed, so run `k` of the commitment settles table `k`'s claims. A
+/// reordering would settle one table's columns against another's commitment
+/// while every individual value gate stayed green — the failure the AIR set's
+/// single-derivation rule exists to prevent, one level down.
+fn prepared_runs(at: &[PreparedColumn]) -> Result<Vec<(usize, usize)>, MlError> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < at.len() {
+        let table = at[i].table;
+        let (first, n) = prefix_at(at, table)?.ok_or(MlError::UnknownPolynomial {
+            index: table,
+            len: at.len(),
+        })?;
+        // The walk is in `at` order, so a table's run must begin where we are.
+        // A table seen twice reaches here with `first` behind `i`.
+        if first != i {
+            return Err(MlError::QueryCountMismatch {
+                expected: i,
+                got: first,
+            });
+        }
+        runs.push((table, n));
+        i += n;
+    }
+    Ok(runs)
+}
+
+/// What [`prepared_claims`] hands back: the point each settled column is claimed
+/// at, and the value it is claimed to take there, both in stack order.
+///
+/// ⚠ NAMED ONLY TO KEEP THAT SIGNATURE READABLE, and it carries no bound — a
+/// bound on a type alias is not enforced, and `FieldElement`'s own is checked
+/// at every use. That is the form `sumcheck::RoundGroup` and
+/// `batch::ResidentProof` already take in this workspace.
+type PreparedClaims<E> = (Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>);
+
+/// The points and claimed values a prepared opening is settled against, gathered
+/// in stack order.
+///
+/// ★ A GATHER AND NOT ONE SLICE, which is the difference a multi-table prepared
+/// commitment makes. A single table's prepared prefix is one contiguous run of
+/// the global column order — `&points[at..at + width]`, as it always was. A
+/// stack spanning three genesis pages is THREE such runs at three different
+/// tables' offsets, and no single slice names them.
+///
+/// ⚠ Each run is still CONTIGUOUS and still that table's own leading columns,
+/// which is what keeps [`check_preprocessed`]'s prefix contract intact: the
+/// columns this settles are exactly the columns that check skips.
+///
+/// ⚠ The values are the ones THOSE TABLES' OWN arguments settled on. That is
+/// what makes the opening a check on the pinned columns rather than on a second
+/// copy of them, and it is why no separate equality is asserted anywhere.
+fn prepared_claims<E: IsField>(
+    runs: &[(usize, usize)],
+    points: &[Vec<FieldElement<E>>],
+    values: &[FieldElement<E>],
+) -> Result<PreparedClaims<E>, MlError> {
+    let mut at_points = Vec::new();
+    let mut at_values = Vec::new();
+    for &(start, n) in runs {
+        let end = start + n;
+        at_points.extend(
+            points
+                .get(start..end)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: end,
+                    got: points.len(),
+                })?
+                .iter()
+                .cloned(),
+        );
+        at_values.extend(
+            values
+                .get(start..end)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: end,
+                    got: values.len(),
+                })?
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok((at_points, at_values))
+}
+
 /// Proves every table in one transcript, against one commitment.
 ///
 /// The LogUp challenges are drawn **once**, after the commitment roots are
@@ -1060,14 +1250,12 @@ where
     // order the stack was built in.
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
-    // Where the prepared columns' table starts in the global column order. Its
-    // columns all share one reduced point, so the offset is all the opening
-    // needs to find both the point and the claimed values.
-    let mut prepared_at: Option<usize> = None;
-    for (index, table) in committed.tables().iter().enumerate() {
-        if prepared.as_ref().is_some_and(|p| p.table == index) {
-            prepared_at = Some(points.len());
-        }
+    // Where each table's columns start in the global column order. A prepared
+    // commitment may span several tables, so every start is kept rather than
+    // the one a single-table opening needed.
+    let mut table_starts = Vec::with_capacity(committed.tables().len());
+    for table in committed.tables() {
+        table_starts.push(points.len());
         let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
         for _ in 0..table.num_committed_columns() {
             points.push(point.clone());
@@ -1105,29 +1293,42 @@ where
         column_at += width;
     }
 
-    // The out-of-band opening, at the target table's reduced point. `Shared`
-    // rather than `PerColumn` because every one of these columns is settled at
-    // the SAME point — the one that table's argument reduced to — which is what
-    // makes the opened values comparable to that table's own claimed values.
+    // The out-of-band opening, each column at the reduced point of the table
+    // whose preprocessed column it is. `PerColumn` because those points are in
+    // general different — a cross-epoch genesis page is a table of its own — and
+    // settling each column at its own table's point is what makes the opened
+    // values comparable to that table's own claimed values.
+    //
+    // ⚠ A single-table prepared commitment is the special case where every one
+    // of these points is the same one, and it produces the same weight shares
+    // and therefore the same bytes as the `Shared` form it replaces:
+    // `Claimed::point` hands back that one point for every column under either
+    // variant, and `Claimed` reaches nothing but the weight.
     let preprocessed = match prepared {
         Some(prepared) => {
-            let at = prepared_at.ok_or(MlError::UnknownPolynomial {
-                index: prepared.table,
-                len: committed.tables().len(),
-            })?;
-            let width = prepared.columns.len();
-            if at + width > values.len() {
+            if prepared.at.len() != prepared.columns.len() {
                 return Err(MlError::QueryCountMismatch {
-                    expected: at + width,
-                    got: values.len(),
+                    expected: prepared.columns.len(),
+                    got: prepared.at.len(),
                 });
             }
+            let runs: Vec<(usize, usize)> = prepared_runs(prepared.at)?
+                .into_iter()
+                .map(|(table, n)| {
+                    let start = *table_starts.get(table).ok_or(MlError::UnknownPolynomial {
+                        index: table,
+                        len: table_starts.len(),
+                    })?;
+                    Ok((start, n))
+                })
+                .collect::<Result<_, MlError>>()?;
+            let (at_points, at_values) = prepared_claims(&runs, &points, &values)?;
             Some(stacked_eval::prove::<F, E, T, H>(
                 prepared.commitment,
                 prepared.columns,
                 None,
-                &Claimed::Shared(&points[at]),
-                &values[at..at + width],
+                &Claimed::PerColumn(&at_points),
+                &at_values,
                 config,
                 transcript,
             )?)
@@ -1211,24 +1412,27 @@ where
     let mut balance = FieldElement::<E>::zero();
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
-    // Where the prepared columns' table starts in the global column order, so
-    // the opening can be settled at that table's point against that table's own
-    // claimed values.
-    let mut prepared_at: Option<usize> = None;
+    // Where each table's columns start in the global column order. A prepared
+    // commitment may span several tables, so every start is kept.
+    let mut table_starts = Vec::with_capacity(statements.len());
     for (index, (table, statement)) in proof.tables.iter().zip(statements).enumerate() {
-        // ★ ONE VALUE drives both halves: the columns the opening settles are
-        // the columns `check_preprocessed` may skip. A second, independent knob
-        // would be a way to switch off a check with nothing in its place.
+        table_starts.push(points.len());
+        // ★ ONE VALUE drives both halves: the count the opening settles is the
+        // count `check_preprocessed` skips, and both come off the same `at`
+        // slice. A second, independent knob would be a way to switch off a check
+        // with nothing in its place.
+        //
+        // ⚠ `prefix_at` is what makes the COUNT safe here. `at` names a column
+        // per stacked column, so it CAN describe a non-prefix that this count
+        // could not express — and `prefix_at` refuses that rather than letting
+        // the count silently reinterpret it as `0..n`.
         let settled = match prepared.as_ref() {
-            Some(p) if p.table == index => {
-                prepared_at = Some(points.len());
-                p.columns
-            }
-            _ => 0,
+            Some(p) => prefix_at(p.at, index)?.map(|(_, n)| n).unwrap_or(0),
+            None => 0,
         };
-        // ⚠ THE ASSERT THAT MATTERS. The opening covers `p.columns` of this
-        // table; skipping more than that would drop a preprocessed check
-        // nothing replaced.
+        // ⚠ THE ASSERT THAT MATTERS. The opening covers `settled` of this
+        // table's columns; skipping more than that would drop a preprocessed
+        // check nothing replaced.
         if settled > statement.preprocessed.len() {
             return Err(MlError::QueryCountMismatch {
                 expected: statement.preprocessed.len(),
@@ -1283,20 +1487,16 @@ where
     // ★★★ THE PREPARED OPENING, and check (d) with it.
     //
     // (d) is NOT a separate assertion here, and that is deliberate. The values
-    // handed to `stacked_eval::verify` are the ones THIS TABLE's own argument
-    // settled on — `values[at .. at + n]` — so the opening has to prove the
-    // pinned commitment takes exactly those values at exactly that point. Two
-    // copies of the same columns are tied by the check that already exists
+    // handed to `stacked_eval::verify` are the ones EACH COLUMN'S OWN TABLE
+    // settled on, gathered at that table's point — so the opening has to prove
+    // the pinned commitment takes exactly those values at exactly those points.
+    // Two copies of the same columns are tied by the check that already exists
     // rather than by an equality someone has to remember to write.
     //
     // The alternative shape — verify the opening against its own claimed
-    // values, then assert those equal the table's — is one line longer and one
+    // values, then assert those equal the tables' — is one line longer and one
     // line forgettable. This one cannot be omitted without deleting the call.
     if let Some(prepared) = prepared {
-        let at = prepared_at.ok_or(MlError::UnknownPolynomial {
-            index: prepared.table,
-            len: proof.tables.len(),
-        })?;
         let opening = proof
             .preprocessed
             .as_ref()
@@ -1304,18 +1504,23 @@ where
                 expected: 1,
                 got: 0,
             })?;
-        if at + prepared.columns > values.len() {
-            return Err(MlError::QueryCountMismatch {
-                expected: at + prepared.columns,
-                got: values.len(),
-            });
-        }
+        let runs: Vec<(usize, usize)> = prepared_runs(prepared.at)?
+            .into_iter()
+            .map(|(table, n)| {
+                let start = *table_starts.get(table).ok_or(MlError::UnknownPolynomial {
+                    index: table,
+                    len: table_starts.len(),
+                })?;
+                Ok((start, n))
+            })
+            .collect::<Result<_, MlError>>()?;
+        let (at_points, at_values) = prepared_claims(&runs, &points, &values)?;
         stacked_eval::verify::<F, E, T, H>(
             opening,
             prepared.layout,
             prepared.roots,
-            &Claimed::Shared(&points[at]),
-            &values[at..at + prepared.columns],
+            &Claimed::PerColumn(&at_points),
+            &at_values,
             prepared.domain,
             config,
             transcript,

@@ -1065,3 +1065,308 @@ fn the_production_chain_emits_its_closed_form() {
         "the production shape's permutations"
     );
 }
+
+/// ⛔ THE GENESIS THRESHOLD'S BUDGET, ASSERTED WHERE IT CAN BE COMPUTED.
+///
+/// `crate::continuation::PREPARED_LEG_ROWS` is PART 2's term: the rows the
+/// stacked chain costs ONCE, which the candidate set's total savings must
+/// exceed before any page is carried. It is a CONSTANT there rather than a
+/// call, because that module sits below `crate::lfm` — a routing rule the
+/// prover, the verifier and the emitter must all agree on cannot depend on the
+/// emitter's row accounting. This is the assertion that pays for the constant,
+/// in the one place the form exists.
+///
+/// ⚠ IT IS NOT WHAT A PAGE IS CHARGED. What one more carried page adds to the
+/// leg is `continuation::GENESIS_PAGE_MARGINAL_ROWS`, a measured literal whose
+/// pin lives in `whir_stacked_tests`. The two terms are separate because the
+/// costs are: one chain, however many pages ride it.
+///
+/// ★ WHAT THE CONSTANT IS: 175,066 rows, the chain over a stacked family
+/// polynomial at 24 variables. The block's stack is THREE columns of 2^18 — 20
+/// variables — so it is charged at a figure larger than it can cost, which is
+/// the conservative direction: a page must be worth more than the stack could
+/// possibly cost before it joins.
+///
+/// ⚠ CONFIGURATION IS PART OF THE NUMBER. Chain rows move with blowup, folding
+/// and the query count, so this asserts at the shape the campaign's production
+/// figures are quoted at — the same `config(112, 20)` the chain's own F1 above
+/// uses. A posture change reddens this rather than silently retuning a routing
+/// rule nobody is looking at.
+///
+/// It asserts a BAND and not an equality: the constant's job is to be larger
+/// than the 20-variable stack and no larger than the 24-variable one it was
+/// read from. An equality would redden on any change to the schedule, which is
+/// a different finding from "the routing rule has drifted".
+#[test]
+fn the_genesis_threshold_budget_is_in_band_at_the_production_shape() {
+    let at_20 = chain_shape_rows(&ChainShape::new(&config(112, 20), 20));
+    let at_24 = chain_shape_rows(&ChainShape::new(&config(112, 20), 24));
+    let budget = crate::continuation::PREPARED_LEG_ROWS;
+    println!(
+        "GENESIS BUDGET: {budget} rows against a chain of {at_20} at 20 variables and \
+         {at_24} at 24, Q=112 grind=20 blowup=2 fold=4"
+    );
+    assert!(
+        at_20 < at_24,
+        "a stack of fewer variables must cost fewer chain rows, or the budget's \
+         conservatism argument does not hold ({at_20} at 20, {at_24} at 24)"
+    );
+    assert!(
+        budget >= at_20,
+        "the threshold charges {budget} rows for a stack that costs {at_20} at the \
+         block's 20 variables: pages would be left sparse that the opening could carry"
+    );
+    assert!(
+        budget <= at_24,
+        "the threshold charges {budget} rows for a stack that costs at most {at_24}: \
+         the budget has drifted above the cost it stands for"
+    );
+}
+
+/// ★ AND THE ROUTING DECISION DOES NOT SIT NEAR THAT BAND.
+///
+/// The block's three dense pages cost 2,100,474, 4,127,238 and 4,020,858 rows
+/// by the sparse form, and its 27 zero pages cost 18 each. Whatever the chain
+/// figure moves to within any plausible posture, the same three pages are
+/// selected — which is the argument that this is a routing rule rather than a
+/// tuning knob, made against the cost form rather than against the constant.
+#[test]
+fn the_blocks_genesis_routing_is_insensitive_to_the_chain_figure() {
+    let cheapest_dense = 2_100_474usize;
+    let dearest_sparse = 18usize;
+    for stack_vars in 18..=25 {
+        let rows = chain_shape_rows(&ChainShape::new(&config(112, 20), stack_vars));
+        assert!(
+            dearest_sparse <= rows && rows < cheapest_dense,
+            "at {stack_vars} stacked variables the chain costs {rows} rows, which falls \
+             outside ({dearest_sparse}, {cheapest_dense}) — the block's selection would \
+             change with the posture and the pre-registered three pages are no longer \
+             a property of the run"
+        );
+    }
+}
+
+/// ⛔⛔ THE THRESHOLD AND THE SPARSE CAP MUST NOT DISAGREE, OR THE PROGRAM
+/// CANNOT BE BUILT AT ALL.
+///
+/// Two independent rules decide what happens to a genesis page. The two-part
+/// routing rule in `crate::continuation` decides whether the PREPARED OPENING
+/// carries it; [`super::preprocessed::MAX_SPARSE_INIT_ENTRIES`] decides whether
+/// the sparse leg is willing to EMIT it, and refuses above the cap because a
+/// column that dense has no cheap closed form.
+///
+/// If the threshold ever left a page sparse that the cap then refused, the page
+/// would have no route at all: too dense to emit, not dense enough to stack,
+/// and the emit-time refusal would fire on a program nobody could fix by
+/// changing either constant alone. The two rules must therefore overlap, with
+/// the threshold strictly the tighter one.
+///
+/// ⛔⛔ AND THE BOUND IS RE-DERIVED FROM THE LIVE RULE, NOT CARRIED OVER. Under
+/// the retired single-page rule the densest page left sparse carried 9,724
+/// entries; under the two-part rule it carries 9,730, because a page is now
+/// charged its own marginal on top of the chain. ⚠ BOTH ARE `<= 60,000`, so a
+/// test left at the old number stays GREEN while measuring a rule that no
+/// longer exists — which is the only reason this is worth saying twice.
+/// [`crate::continuation::densest_sparse_entries`] is where the quantity now
+/// lives, so it moves when the rule does.
+///
+/// ★ THIS IS THE STATE THE BLOCK WAS ACTUALLY IN. V1j's block bundle arm
+/// refused at that cap — "these preprocessed columns carry 116692 nonzero
+/// entries ... the cap is 60000 entries" for page `0x0` — because the prepared
+/// route did not exist yet and every genesis page went to the sparse leg. Once
+/// the threshold routes the dense pages to the opening, no page reaching the
+/// sparse leg can be within six times the cap, and ⛔ THE CAP SHOULD NEVER FIRE
+/// AGAIN. A refusal from it after this lands is not a page that needs a bigger
+/// cap; it is these two constants having drifted apart.
+#[test]
+fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
+    use crate::continuation::{
+        GENESIS_PAGE_MARGINAL_ROWS, PAGE_NUM_VARS, PREPARED_LEG_ROWS, chain_is_paid,
+        densest_sparse_entries, page_savings, sparse_leg_rows,
+    };
+    let num_vars = PAGE_NUM_VARS;
+    let cap = super::preprocessed::MAX_SPARSE_INIT_ENTRIES;
+    let densest_sparse = densest_sparse_entries(num_vars);
+
+    // ⛔ BOTH CONTRASTS WITH THE RETIRED RULE, because they are different
+    // quantities and both have been quoted. Its BREAK-EVEN (the least S it
+    // carried) was 9,725 against this rule's 9,731; its DENSEST SPARSE page
+    // carried 9,724 against this rule's 9,730. `<= 60,000` is true of all four,
+    // which is exactly why a test left at either old number stays green while
+    // measuring a rule that no longer exists.
+    let retired_break_even = (PREPARED_LEG_ROWS - num_vars) / num_vars + 1;
+    println!(
+        "ROUTE OVERLAP: at marginal {GENESIS_PAGE_MARGINAL_ROWS} the densest page the \
+         rule can leave sparse carries {densest_sparse} entries and the least it \
+         carries is {}, against a sparse-leg cap of {cap}. The retired single-page \
+         rule's pair was {} and {retired_break_even}; the coming form's 111 gives \
+         9,731.",
+        densest_sparse + 1,
+        retired_break_even - 1,
+    );
+    assert_eq!(retired_break_even, 9_725);
+    assert_eq!(
+        densest_sparse, 9_730,
+        "the bound the cap must clear is the two-part rule's AT THIS LITERAL; the \
+         retired single-page rule's pair was 9,724 / 9,725 and the coming form's 111 \
+         gives 9,731 — all four clear the cap, which is exactly why this must be \
+         re-derived rather than re-read"
+    );
+
+    // ⚠ EXACT, BOTH WAYS — a bound asserted only from above could be any number
+    // larger than the truth. The page at the bound must route sparse and the one
+    // above it must not, or `densest_sparse_entries` is inverting the wrong form.
+    assert!(!chain_is_paid(page_savings(num_vars, densest_sparse)));
+    assert!(chain_is_paid(page_savings(num_vars, densest_sparse + 1)));
+
+    assert!(
+        densest_sparse <= cap,
+        "a page carrying {densest_sparse} entries routes SPARSE and is then REFUSED by \
+         the {cap}-entry cap: it has no route at all, and neither constant can be fixed \
+         without the other"
+    );
+
+    // ⛔ AND THE MARGIN MUST NOT CLOSE WHEN THE LITERAL MOVES. The marginal is
+    // UNPINNED and is a FLOOR, so V1j's pin lands at or above it and the bound
+    // rises one entry per `num_vars` rows. The overlap is asserted over every
+    // marginal up to four orders past the current value, which is where the
+    // arithmetic says it would finally close:
+    // `(PREPARED_LEG_ROWS + m - num_vars) / num_vars <= cap` fails above
+    // `m = 904,952`.
+    let mut m = GENESIS_PAGE_MARGINAL_ROWS;
+    while m <= 900_000 {
+        let bound = (PREPARED_LEG_ROWS + m - num_vars) / num_vars;
+        assert!(
+            bound <= cap,
+            "at marginal {m} the rule can leave a page of {bound} entries sparse, and \
+             the sparse leg refuses above {cap}"
+        );
+        // The sparse leg it would then emit must be a leg, not a claim.
+        assert!(sparse_leg_rows(num_vars, bound) > 0);
+        m = (m * 2).max(m + 1);
+    }
+    // ⚠ AND THE CHECK CAN FAIL: one marginal past that point must breach the
+    // cap, or the sweep above proves nothing about where the margin closes.
+    assert!((PREPARED_LEG_ROWS + 1_000_000 - num_vars) / num_vars > cap);
+}
+
+/// ⛔⛔ A LOWER BOUND ON PART 1's MARGINAL, READ OFF THE EMITTER — AND
+/// DELIBERATELY NOT A PIN.
+///
+/// `crate::continuation::GENESIS_PAGE_MARGINAL_ROWS` is a MEASURED LITERAL, and
+/// its pin — an EQUALITY against the differenced `stacked_verify_cost` — lives
+/// in `whir_stacked_tests` and belongs to the lane that owns that cost form.
+///
+/// ⛔ THIS TEST MUST NOT ASSERT THAT EQUALITY, and the reason is the whole
+/// point of a pin. [`super::whir_stacked::weight_at_rows`] is a PARTIAL view:
+/// it carries the `eq` and the prefix indicators, while `stacked_verify_cost`
+/// pays three more terms per column outside it — and a fourth, an absorb into a
+/// THREADED sponge whose row cost depends on where the previous columns left
+/// the buffer. A second equality here, against the partial form, would
+/// CONTRADICT the real pin the day it lands, and two pins on one constant is
+/// precisely the duplication a pin exists to prevent.
+///
+/// ★ WHAT IT DOES ASSERT, and it is worth having: the two terms
+/// `weight_at_rows` DOES account for, differenced across one more page inside
+/// ONE power-of-two bracket so the stack height does not move — `eq` 90 plus
+/// two indicators of six — and that the literal is at least that plus one. An
+/// inequality cannot conflict with a measurement.
+///
+/// ⚠ THE `+ 1` IS THE SHARED `Sub`, AND DIFFERENCING IS WHAT SHOWS IT IS NOT A
+/// MARGINAL. `weight_at_rows` emits one per prefix POSITION any column reads as
+/// a zero bit, which is per-POLYNOMIAL: across 29 and 30 pages at one height
+/// the term contributes ZERO, which is why `billed` is 102 and not 103. The
+/// literal charges it anyway, so `>= billed + 1` is exactly the statement that
+/// the literal contains every term this form can see.
+#[test]
+fn the_marginal_is_at_least_what_the_weight_term_bills() {
+    use super::whir_stacked::weight_at_rows;
+    use crate::continuation::{
+        GENESIS_PAGE_MARGINAL_ROWS, MARGINAL_MEASURED_AT_VARS, PAGE_NUM_VARS,
+        PAGE_PREPROCESSED_COLUMNS,
+    };
+
+    // A page's two preprocessed columns settle at ONE point — its table's — so
+    // the groups are the pages.
+    let layout_for = |pages: usize| {
+        let columns = pages * PAGE_PREPROCESSED_COLUMNS;
+        let layout = stark::multilinear_table::global_layout(&[(columns, PAGE_NUM_VARS)])
+            .expect("a stack of whole pages");
+        let group_of: Vec<usize> = (0..columns)
+            .map(|column| column / PAGE_PREPROCESSED_COLUMNS)
+            .collect();
+        (layout, group_of)
+    };
+
+    // 29 and 30 pages both stand at the height the literal was measured at, and
+    // in ONE polynomial — or the difference would span two chains.
+    let (at_29, groups_29) = layout_for(29);
+    let (at_30, groups_30) = layout_for(30);
+    assert_eq!(at_29.n_stack(), MARGINAL_MEASURED_AT_VARS);
+    assert_eq!(at_30.n_stack(), MARGINAL_MEASURED_AT_VARS);
+    assert_eq!(at_30.num_polys(), 1, "or the difference spans two chains");
+
+    let rows_29 = weight_at_rows(&at_29, 0, &groups_29);
+    let rows_30 = weight_at_rows(&at_30, 0, &groups_30);
+    let billed = rows_30 - rows_29;
+    println!(
+        "MARGINAL: the weight closure alone bills {billed} rows for the thirtieth page \
+         ({rows_29} -> {rows_30} at {} variables); the literal charges {GENESIS_PAGE_MARGINAL_ROWS}",
+        at_30.n_stack()
+    );
+
+    // The two terms this form accounts for, to the row.
+    assert_eq!(
+        billed,
+        90 + PAGE_PREPROCESSED_COLUMNS * (MARGINAL_MEASURED_AT_VARS - PAGE_NUM_VARS)
+    );
+    assert_eq!(billed, 102);
+
+    // ⛔ A LOWER BOUND, NEVER AN EQUALITY. The `+ 1` is the amortised shared
+    // `Sub`, whose true marginal inside a bracket is zero and which the literal
+    // charges anyway; everything above that is the per-column and sponge terms
+    // this form cannot see.
+    assert!(
+        GENESIS_PAGE_MARGINAL_ROWS > billed,
+        "the literal charges {GENESIS_PAGE_MARGINAL_ROWS} rows for a page the weight \
+         closure alone bills {billed} for: it is below a term it must contain"
+    );
+}
+
+/// ⚠ A LIMIT OF PART 2's SINGLE CHAIN TERM, STATED WHERE IT CAN BE MEASURED.
+///
+/// [`crate::continuation::PREPARED_LEG_ROWS`] prices ONE chain, and one chain
+/// is what the stack costs while its columns fit one polynomial.
+/// `global_layout` caps a stack at [`stark::multilinear_table::MAX_STACK_VARS`]
+/// and spills the rest into another polynomial, each of which runs its own
+/// chain — so past that width part 2 is weighing a set against a fraction of
+/// what carrying it costs.
+///
+/// ⛔ THIS IS A PRICING LIMIT AND NOT A SOUNDNESS ONE. All three parties still
+/// reach the same set from the same data; the rule would simply buy pages whose
+/// keep it had under-quoted. It is recorded rather than guarded because the
+/// block sits 21x under it and no run this prover has seen comes near — and if
+/// one ever does, the fix is a chain term that counts polynomials, not a bigger
+/// constant.
+#[test]
+fn the_single_chain_term_prices_a_stack_of_at_most_sixty_four_pages() {
+    use crate::continuation::{PAGE_NUM_VARS, PAGE_PREPROCESSED_COLUMNS};
+    let per_page = PAGE_PREPROCESSED_COLUMNS;
+    let max_stack_vars = stark::multilinear_table::MAX_STACK_VARS;
+
+    let polys_at = |pages: usize| {
+        stark::multilinear_table::global_layout(&[(pages * per_page, PAGE_NUM_VARS)])
+            .expect("a stack of whole pages")
+            .num_polys()
+    };
+    // `2 * pages * 2^18` cells must fit `2^25`.
+    let widest = 1 << (max_stack_vars - PAGE_NUM_VARS - 1);
+    assert_eq!(widest, 64);
+    assert_eq!(polys_at(widest), 1, "the last width that is one chain");
+    assert!(
+        polys_at(widest + 1) > 1,
+        "one page past it must spill, or this boundary is not where it is claimed"
+    );
+    // The block carries three.
+    assert_eq!(polys_at(3), 1);
+}

@@ -135,11 +135,18 @@ mod tests {
             "the published set has unclaimed words"
         );
 
-        // ⛔ The reserved field is EMPTY, and it stays empty until an INIT
-        // opening exists. A harvest that filled it from
+        // ⛔ THIS FIXTURE'S GENESIS IS ENTIRELY SPARSE, so the harvest carries
+        // no stack — and that is a reading about the FIXTURE, not about the
+        // route being unbuilt. Its one page is `test_private_input_xpage`'s,
+        // far below the density threshold, so the cross-epoch proof takes the
+        // `None` path and is byte for byte the one it was before the prepared
+        // opening existed. A harvest that filled this from
         // `recursion::precomputed_commitments`' per-page univariate roots would
         // be carrying objects no verifier on this path ever compares.
-        assert!(g.prepared_roots.is_none());
+        assert!(
+            g.prepared.is_none(),
+            "this fixture's genesis is sparse, so there is no stack to publish"
+        );
 
         println!(
             "CROSS-EPOCH HARVEST: {} tables = {} bookends + {pages} pages, {} groups, \
