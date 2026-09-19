@@ -1410,9 +1410,15 @@ impl WalkLeftover {
 
     /// Build every chunk still held for `kind`, draining it.
     ///
-    /// An empty list still yields one padded chunk when the walk never closed
-    /// any, matching `chunk_and_generate`: the table exists in the proof with
-    /// the shape the verifier expects.
+    /// A kind that ends the run with no ops and no closed chunk yields one
+    /// padded chunk if it is always in the proof, and nothing at all if it is
+    /// elided when empty — through the same `always_present` predicate
+    /// `build_table` and `num_chunks` read, so the walk and the all-at-once
+    /// build agree on which tables exist.
+    ///
+    /// This is the walk's half of that agreement and it is easy to miss: the
+    /// other two are in one file beside each other, this one is reached only
+    /// through `pass::finish`.
     pub(crate) fn take_remaining(
         &mut self,
         kind: TableKind,
@@ -1424,7 +1430,8 @@ impl WalkLeftover {
             out.push(self.tail.take_front(kind, limit, max_rows));
         }
         let left = self.tail.buffered(kind);
-        if left > 0 || (out.is_empty() && self.emitted(kind) == 0) {
+        let pad_an_empty_table = out.is_empty() && self.emitted(kind) == 0 && kind.always_present();
+        if left > 0 || pad_an_empty_table {
             out.push(self.tail.take_front(kind, left, max_rows));
         }
         out
