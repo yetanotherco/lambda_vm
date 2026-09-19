@@ -633,6 +633,24 @@ pub fn check_closure(
                 .collect::<Vec<_>>()
                 .join(" · ")
         };
+        // ⛔ ORDER MATTERS, and the first draft had it wrong. CONTAINMENT
+        // failures are checked before the ACCOUNTING one: a loop wall that
+        // escapes its opening also leaves a huge positive `round_other`, so
+        // with the accounting check first it was reported as "a slot is not
+        // being added" — the wrong defect, named confidently. Structure first,
+        // then arithmetic.
+        if r.setup_tail() < -tol * r.open_groups.max(1e-9) {
+            return Err(format!(
+                "arm E: {who}'s round loop does not fit its opening — \
+                 open_groups is {:.3}s but the loop's wall is {:.3}s, leaving \
+                 {:.3}s. NEGATIVE, so the loop's window reaches outside the \
+                 opening that contains it. Slots: {}.",
+                r.open_groups,
+                r.chain_round_wall,
+                r.setup_tail(),
+                slots(),
+            ));
+        }
         if r.round_other() < -tol * r.open_groups.max(1e-9) {
             return Err(format!(
                 "arm E: {who}'s six do not fit the round loop — the loop's wall \
@@ -645,16 +663,36 @@ pub fn check_closure(
                 slots(),
             ));
         }
-        if r.setup_tail() < -tol * r.open_groups.max(1e-9) {
+        // ⛔⛔ AND AN UPPER BOUND, because dropping it cost the arm its power.
+        // Asserting only `>= 0` made a MISSING slot invisible: omit one of the
+        // six and Σ(six) shrinks, so `round_other = round_wall − Σ(six)` GROWS
+        // — positive, allowed, unseen. The gate proved it: the same mutation
+        // arm E caught before the round wall existed sailed through after it.
+        //
+        // The identity was not the thing to remove; asserting the identity was.
+        // `round_other` is the loop's own bookkeeping between windows and reads
+        // **0.00 on every record** on a correct instrument, so a few percent of
+        // the loop's wall is enormous headroom on the honest path AND trips on
+        // any omitted slot bigger than that. `setup_tail` keeps only `>= 0`:
+        // it is legitimately un-slotted work outside the loop, and bounding it
+        // would be asserting a size nobody measured.
+        if r.round_other() > tol * r.chain_round_wall.max(1e-9) {
+            let named: Vec<String> = CHAIN_NAMES
+                .iter()
+                .zip(r.chain.iter())
+                .map(|(n, v)| format!("{n} {v:.3}"))
+                .collect();
             return Err(format!(
-                "arm E: {who}'s round loop does not fit its opening — \
-                 open_groups is {:.3}s but the loop's wall is {:.3}s, leaving \
-                 {:.3}s. NEGATIVE, so the loop's window reaches outside the \
-                 opening that contains it. Slots: {}.",
-                r.open_groups,
+                "arm E: {who}'s six do not account for the round loop — the \
+                 loop's wall is {:.3}s but the six inside it sum to only \
+                 {:.3}s, leaving {:.3}s ({:.1}%) unattributed. The loop's own \
+                 bookkeeping is ~0 on a correct instrument, so a gap this size \
+                 is a SLOT THAT IS NOT BEING ADDED. Slots: {}.",
                 r.chain_round_wall,
-                r.setup_tail(),
-                slots(),
+                r.chain.iter().sum::<f64>(),
+                r.round_other(),
+                100.0 * r.round_other() / r.chain_round_wall.max(1e-9),
+                named.join(" · "),
             ));
         }
     }
@@ -848,10 +886,15 @@ mod tests {
                 // The six partition `open_groups`: 0.3 + 0.2 + 0.1 + 0.1 +
                 // 0.05 + 0.05 = 0.8.
                 chain: [0.3, 0.2, 0.1, 0.1, 0.05, 0.05],
-                // The loop's wall contains the six (0.80) with 0.05 of its own
-                // bookkeeping; `open_groups` 0.80 would then leave -0.05 of
-                // setup_tail, so the opening is 0.90 and setup_tail is 0.05.
-                chain_round_wall: 0.85,
+                // ⛔ THE WALL MUST MODEL A CORRECT INSTRUMENT. The six sum to
+                // 0.80 and the loop's own bookkeeping reads ~0 on every real
+                // record, so the wall is 0.81 — 1.2% of remainder, inside the
+                // 3% bound. The first draft used 0.85 (5.9%) and the fixture
+                // itself tripped the bound it was written to test: a fixture
+                // that is not a correct instrument makes every arm meaningless.
+                // `open_groups` 0.90 leaves setup_tail 0.09, positive, which is
+                // where the un-slotted setup legitimately lives.
+                chain_round_wall: 0.81,
                 ..Default::default()
             })
             .collect();
@@ -942,16 +985,33 @@ mod tests {
             "the second bound must name its own failure: {err}",
         );
 
-        // ⛔ AND THE CASE THAT MUST **NOT** REDDEN: one of the six simply
-        // small. With the round wall measured, a slot reading low is a
-        // READING, not an error — the time lands in `round_other`, which is
-        // named. An arm that reddened here would be asserting an identity.
+        // ⛔⛔ Arm E, failure 3: ONE OF THE SIX ZEROED, the round wall
+        // UNCHANGED — a slot whose timer is gone. This is the case the first
+        // version of the seventh slot could not see: Σ(six) shrinks, the
+        // remainder grows, and `>= 0` alone calls that fine. It is the whole
+        // reason `round_other` carries an upper bound.
+        let (producer, mut prover, base) = honest();
+        prover[0].chain[0] = 0.0; // grind 0.30 gone; round_wall still 0.85
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 0"), "{err}");
+        assert!(
+            err.contains("SLOT THAT IS NOT BEING ADDED"),
+            "arm E must name the cause, not just the gap: {err}",
+        );
+        assert!(err.contains("grind 0.000"), "and print the six: {err}");
+
+        // ⛔ AND THE CASE THAT MUST **NOT** REDDEN: a slot legitimately SMALL
+        // rather than missing. `queries` reads 0.00 on a card-free fixture
+        // because the codewords are tiny — a reading, not an error — and the
+        // round wall shrinks with it, so the remainder does not grow.
         let (producer, mut prover, base) = honest();
         prover[0].chain[5] = 0.0;
+        prover[0].chain_round_wall = 0.76; // the wall loses it too
         assert_eq!(
             check_closure(&producer, &prover, base, 0.03),
             Ok(()),
-            "a small slot is a reading; only a NEGATIVE remainder is an error",
+            "a slot that is genuinely small is a reading, not a missing timer",
         );
 
         // Arm D, first inequality: a thread claiming more than the pipeline.
