@@ -472,8 +472,22 @@ mod tests {
         use crate::lfm::algebraic_commit::commitment_to_digest;
         use math::field::traits::IsPrimeField;
 
-        let (elf_bytes, opts, bundle) = genesis_page_bundle();
+        // ⛔⛔ THE PRIVATE-PAGE BUNDLE, AND THE REASON IS THIS ARM'S WHOLE
+        // POINT. `data_page_touch` runs to ONE epoch — its published set is
+        // `2 + 1 × 4` words, which the box read as `publics 6`. With one epoch
+        // the pairwise-distinctness guard below iterates zero times, AND
+        // reversing the published order is the IDENTITY, so the transposition
+        // mutation this arm exists for could not fire. A check that cannot fail
+        // and a mutation that cannot fire, from the same fixture choice.
+        // `test_private_input_xpage` runs to THREE, so both become real.
+        let (elf_bytes, opts, bundle) = private_page_bundle();
         let global = harvest(&elf_bytes, &opts, &bundle);
+        assert!(
+            global.num_epochs >= 2,
+            "this arm is about which epoch each root belongs to, and a run of {} epoch(s) \
+             cannot tell a permutation from the identity",
+            global.num_epochs,
+        );
         let airs = global.airs().refs();
         let program = whir_global_program(&global, &airs, &elf_bytes);
         let arena = whir_global_arena(&global, &airs, &elf_bytes);
