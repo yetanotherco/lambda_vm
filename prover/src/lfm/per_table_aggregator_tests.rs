@@ -7420,6 +7420,42 @@ open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
         pct(v_groups),
         pct(v_prepared)
     );
+    // ★ THE CHAIN, AND THE QUERY OPENINGS INSIDE IT — summed over the EPOCH
+    // records only. The global stage carries its own and is reported on its own
+    // line below; folding the two would make a ranking nobody could attribute.
+    let c = |i: usize| sum(&|r| r.chain[i]);
+    let q = |i: usize| sum(&|r| r.queries[i]);
+    let queries_secs = c(5);
+    let share = |x: f64| 100.0 * x / queries_secs.max(1e-9);
+    println!(
+        "   chain[Σ epochs] grind {:.2}s · sumcheck {:.2}s · fold {:.2}s · \
+commit_folded {:.2}s · ood {:.2}s · queries {:.2}s",
+        c(0),
+        c(1),
+        c(2),
+        c(3),
+        c(4),
+        queries_secs
+    );
+    // ⭐ `tree_rebuild`'s SHARE is round 3's kill condition, computed here
+    // rather than by whoever reads the log: retention removes the rebuilds and
+    // nothing else, so if they are not the bulk of the query openings the
+    // lever is dead before any lifetime code is written.
+    println!(
+        "   queries[Σ epochs] query_sample {:.2}s ({:.0}%) · tree_rebuild {:.2}s ({:.0}%) · \
+coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {} over {} rounds in {} chains",
+        q(0),
+        share(q(0)),
+        q(1),
+        share(q(1)),
+        q(2),
+        share(q(2)),
+        q(3),
+        share(q(3)),
+        epochs.iter().map(|r| r.rebuild_calls).sum::<u64>(),
+        epochs.iter().map(|r| r.round_count).sum::<u64>(),
+        epochs.iter().map(|r| r.chain_count).sum::<u64>()
+    );
     println!(
         "   global (in base) wall {g_wall:.1}s ({:.1}%)",
         pct(g_wall)
@@ -7447,7 +7483,7 @@ open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
         panic!("WHIR BASE SPLIT does not close: {why}");
     }
     println!(
-        "   WHIR BASE SPLIT: closure GREEN (arms A-E at {:.0}% tolerance)",
+        "   WHIR BASE SPLIT: closure GREEN (arms A-F at {:.0}% tolerance)",
         100.0 * TOL
     );
 
