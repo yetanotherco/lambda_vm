@@ -1580,14 +1580,17 @@ fn continuation_phases() {
     );
     let num_private_input_pages = crate::tables::page::private_input_page_count(&inputs);
     let page_bases = crate::continuation::touched_page_bases(&boundaries);
-    multilinear_continuation::prove_global(
-        &boundaries,
-        &bytes,
-        &init_page_data,
-        &page_bases,
-        num_private_input_pages,
-        &opts,
-    )
+    // The dispatch is the caller's now, as it already was for the epochs above.
+    crate::with_whir_hash!(|H| {
+        multilinear_continuation::prove_global::<H>(
+            &boundaries,
+            &bytes,
+            &init_page_data,
+            &page_bases,
+            num_private_input_pages,
+            &opts,
+        )
+    })
     .expect("the cross-epoch proof");
     let global = start.elapsed();
     let total = whole.elapsed();

@@ -656,14 +656,34 @@ pub(crate) fn global_groups(num_epochs: usize, num_pages: usize) -> Vec<usize> {
 
 /// Proves the cross-epoch memory chain: each epoch's bookend, and one
 /// global-memory table per page the run touched.
-pub fn prove_global(
+///
+/// ★ GENERIC OVER THE HASH, and the dispatch belongs to its CALLER — the
+/// arrangement [`prove_epoch`] and [`verify_global_bookends`] already have, and
+/// for the same two reasons.
+///
+/// **A caller cannot be asked a question this function answers for itself.**
+/// `whir_hash_knob::selected()` is a cached process setting: it says what THIS
+/// PROCESS proves under, never what a bundle in front of it was proven under.
+/// While the knob was read here, a test could not prove a bundle under a named
+/// hash without re-implementing the prover, which is why the cross-epoch
+/// execution arms had to be `#[ignore]`d with a posture guard instead.
+///
+/// **And an out-of-band commitment's type names the hash.** The genesis stack
+/// this hands to [`multilinear_table::multi_prove`] is a
+/// `StackedCommitment<F, H>`, so it cannot be built outside a dispatch and
+/// passed in — the same argument that made `prove_epoch` generic so DECODE's
+/// commitment could outlive one call.
+pub fn prove_global<H>(
     boundaries: &[std::sync::Arc<Vec<CellBoundary>>],
     elf_bytes: &[u8],
     init_page_data: &std::collections::HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
-) -> Result<GlobalProof, Error> {
+) -> Result<GlobalProof, Error>
+where
+    H: multilinear::whir_hash::WhirHash,
+{
     // Each cell's final state; the boundaries are in epoch order, so the last
     // fini wins.
     let mut final_state: crate::tables::global_memory::FiniStateMap =
@@ -742,26 +762,24 @@ pub fn prove_global(
         );
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
-    let proof = crate::with_whir_hash!(|H| {
-        // ★ Inside the dispatch, because the transcript's hash is part of
-        // the configuration and `H` does not exist outside this block. The
-        // bound on `multi_prove`/`multi_verify` rejects any other spelling.
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_global(
-            &mut transcript,
-            &statement::elf_digest(elf_bytes),
-            boundaries.len(),
-            num_private_input_pages,
-            page_bases,
-            &table_num_vars,
-            &config,
-        );
-        let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?;
-        multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
-            .map_err(|e| Error::Prover(format!("{e:?}")))?
-    });
+    // ★ `H` is the CALLER's. The transcript's hash is part of the configuration
+    // either way; what changed is who chooses it, and the bound on
+    // `multi_prove` still rejects any other spelling.
+    let mut transcript =
+        DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+    absorb_global(
+        &mut transcript,
+        &statement::elf_digest(elf_bytes),
+        boundaries.len(),
+        num_private_input_pages,
+        page_bases,
+        &table_num_vars,
+        &config,
+    );
+    let committed = CommittedTables::<_, _, H>::commit_grouped(committed, &sizes, &config)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript, None)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     Ok(GlobalProof {
         proof,
@@ -1245,14 +1263,21 @@ pub fn prove_continuation(
     // One source of truth: the same list drives the committed tables and
     // travels in the bundle, so the two cannot diverge.
     let touched_page_bases = crate::continuation::touched_page_bases(&boundaries);
-    let global = prove_global(
-        &boundaries,
-        elf_bytes,
-        &init_page_data,
-        &touched_page_bases,
-        num_private_input_pages,
-        opts,
-    )?;
+    // ★ THE DISPATCH IS HERE, as it is above the epoch loop — and the two are
+    // now the same knob read in one shape rather than two places that happened
+    // to agree. A hash a caller could choose for the epochs and not for the
+    // cross-epoch proof would be a bundle whose two halves were argued under
+    // different sponges.
+    let global = crate::with_whir_hash!(|H| {
+        prove_global::<H>(
+            &boundaries,
+            elf_bytes,
+            &init_page_data,
+            &touched_page_bases,
+            num_private_input_pages,
+            opts,
+        )
+    })?;
 
     Ok(ContinuationProof {
         epochs,

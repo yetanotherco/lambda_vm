@@ -1068,3 +1068,150 @@ fn the_global_airs_describe_the_cross_epoch_proof_they_were_asked_for() {
         bases.len(),
     );
 }
+
+/// The cross-epoch inputs a caller of [`multilinear_continuation::prove_global`]
+/// needs, WITHOUT proving a single epoch.
+///
+/// `for_each_epoch` is the same function `prove_continuation` walks the run
+/// with, and its closure is what proves an epoch — so passing a closure that
+/// does nothing hands back exactly the boundaries the real prover would have
+/// chained, at the cost of the execution alone. That matters: re-deriving the
+/// boundaries in a test would be a second spelling of the epoch split, which is
+/// the thing the cross-epoch proof is about.
+fn cross_epoch_inputs(
+    elf_bytes: &[u8],
+    input: &[u8],
+    epoch_size_log2: u32,
+) -> (
+    Elf,
+    Vec<std::sync::Arc<Vec<local_to_global::CellBoundary>>>,
+    std::collections::HashMap<u64, Vec<u8>>,
+    Vec<u64>,
+    usize,
+) {
+    let elf = Elf::load(elf_bytes).expect("load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let boundaries = continuation::for_each_epoch(
+        &elf,
+        input,
+        epoch_size_log2,
+        &artifacts,
+        |_prepared, _so_far| Ok(()),
+    )
+    .expect("walk the run");
+    let init_page_data = crate::tables::trace_builder::build_init_page_data(
+        &crate::tables::trace_builder::build_initial_image_paged(&elf, input),
+    );
+    let page_bases = continuation::touched_page_bases(&boundaries);
+    let num_private = crate::tables::page::private_input_page_count(input);
+    (elf, boundaries, init_page_data, page_bases, num_private)
+}
+
+/// ★★★ THE CROSS-EPOCH HASH AGREEMENT, IN BOTH DIRECTIONS AND WITHOUT THE KNOB.
+///
+/// [`a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other`] can
+/// only assert that EXACTLY ONE hash accepts, because `prove_continuation`
+/// dispatches on the process knob and the test cannot say which hash its bundle
+/// was proven under. Its own doc says so: under a default keccak suite, a
+/// verifier dispatch pinned to keccak is indistinguishable from a correct one.
+///
+/// With [`multilinear_continuation::prove_global`] generic, the prover can be
+/// ASKED. Each proof is built under a named hash and checked under both, so the
+/// diagonal must accept and the off-diagonal must refuse — four readings whose
+/// pattern is fixed regardless of what `LAMBDA_VM_WHIR_HASH` is set to when the
+/// suite runs.
+///
+/// ⚠ THE HONEST CONTROL IS THE DIAGONAL, and it is asserted first: a verifier
+/// that refuses everything satisfies both refusals and fails both acceptances.
+#[test]
+fn a_cross_epoch_proof_verifies_under_the_hash_it_was_proven_under_and_no_other() {
+    use multilinear::whir_hash::{KeccakWhir, RpxWhir, WhirHash};
+
+    let (elf_bytes, input) = a_run_that_touches_memory();
+    let opts = ProofOptions::default_test_options();
+    let (elf, boundaries, init_page_data, page_bases, num_private) =
+        cross_epoch_inputs(&elf_bytes, &input, 2);
+
+    let keccak_proof = multilinear_continuation::prove_global::<KeccakWhir>(
+        &boundaries,
+        &elf_bytes,
+        &init_page_data,
+        &page_bases,
+        num_private,
+        &opts,
+    )
+    .expect("prove the cross-epoch chain under keccak256");
+    let rpx_proof = multilinear_continuation::prove_global::<RpxWhir>(
+        &boundaries,
+        &elf_bytes,
+        &init_page_data,
+        &page_bases,
+        num_private,
+        &opts,
+    )
+    .expect("prove the cross-epoch chain under rpx256");
+
+    let accepts = |proof: &multilinear_continuation::GlobalProof, rpx: bool| -> bool {
+        let verdict = if rpx {
+            multilinear_continuation::verify_global_bookends::<RpxWhir>(
+                &elf,
+                &elf_bytes,
+                proof,
+                boundaries.len(),
+                &page_bases,
+                num_private,
+                &opts,
+            )
+        } else {
+            multilinear_continuation::verify_global_bookends::<KeccakWhir>(
+                &elf,
+                &elf_bytes,
+                proof,
+                boundaries.len(),
+                &page_bases,
+                num_private,
+                &opts,
+            )
+        };
+        verdict.expect("the cross-epoch verifier errored").is_some()
+    };
+
+    // The control first: each proof verifies under the hash it names.
+    assert!(
+        accepts(&keccak_proof, false),
+        "a proof built under {} was refused under {}",
+        <KeccakWhir as WhirHash>::NAME,
+        <KeccakWhir as WhirHash>::NAME
+    );
+    assert!(
+        accepts(&rpx_proof, true),
+        "a proof built under {} was refused under {}",
+        <RpxWhir as WhirHash>::NAME,
+        <RpxWhir as WhirHash>::NAME
+    );
+    // Then the refusals, which the control has now earned.
+    assert!(
+        !accepts(&keccak_proof, true),
+        "a proof built under {} was ACCEPTED under {}: the transcript's sponge is \
+         not part of the configuration after all",
+        <KeccakWhir as WhirHash>::NAME,
+        <RpxWhir as WhirHash>::NAME
+    );
+    assert!(
+        !accepts(&rpx_proof, false),
+        "a proof built under {} was ACCEPTED under {}",
+        <RpxWhir as WhirHash>::NAME,
+        <KeccakWhir as WhirHash>::NAME
+    );
+
+    // ⚠ And the two proofs are not the same object: if they were, the four
+    // readings above would be about one proof and the pattern would mean
+    // nothing.
+    let a = rkyv::to_bytes::<rkyv::rancor::Error>(&keccak_proof.proof.tables).expect("serialize");
+    let b = rkyv::to_bytes::<rkyv::rancor::Error>(&rpx_proof.proof.tables).expect("serialize");
+    assert_ne!(
+        a.as_ref(),
+        b.as_ref(),
+        "the two hashes produced byte-identical table arguments"
+    );
+}
