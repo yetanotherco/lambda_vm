@@ -401,7 +401,8 @@ fn a_cross_epoch_proof_proven_under_one_hash_is_refused_under_the_other() {
     let elf = Elf::load(&elf_bytes).expect("load");
 
     let verdict_under =
-        |name: &str, verdict: Result<Option<Vec<Vec<stark::config::Commitment>>>, crate::Error>| {
+        |name: &str,
+         verdict: Result<Option<multilinear_continuation::GlobalVerdict>, crate::Error>| {
             verdict
                 .unwrap_or_else(|e| panic!("the cross-epoch proof errored under {name}: {e:?}"))
                 .is_some()
@@ -1220,7 +1221,7 @@ fn a_cross_epoch_proof_verifies_under_the_hash_it_was_proven_under_and_no_other(
 ///
 /// `dense_data_page_touch` is `data_page_touch` with its touched cell surrounded
 /// by non-zero bytes, so the page it lives on crosses
-/// `genesis_stack`'s threshold whatever offset the linker put `.data` at. It is
+/// the genesis-stack threshold whatever offset the linker put `.data` at. It is
 /// the only fixture in the tree whose cross-epoch proof carries a prepared
 /// opening at all — every other one is entirely sparse and takes the `None`
 /// path, which is why this guest had to be written rather than an assertion
@@ -1241,10 +1242,10 @@ fn a_dense_genesis_page_is_carried_by_a_prepared_opening() {
 
     // The plan, from the VERIFIER's own configs — the ELF's.
     let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
-    let plan = crate::genesis_stack::plan(
+    let plan = crate::continuation::genesis_stack_plan(
         &configs,
         boundaries.len(),
-        crate::genesis_stack::PAGE_NUM_VARS,
+        crate::continuation::PAGE_NUM_VARS,
     );
     for route in &plan.routes {
         println!(
@@ -1255,14 +1256,21 @@ fn a_dense_genesis_page_is_carried_by_a_prepared_opening() {
     // ⚠ THE PRECONDITION, ASSERTED. Without a dense page this test would take
     // the `None` path and pass while checking nothing about the opening.
     assert_eq!(
-        plan.at.len(),
+        plan.dense_pages().len(),
         1,
         "the fixture must put exactly one page over the threshold; it put {}",
-        plan.at.len()
+        plan.dense_pages().len()
     );
+    // ⚠ BOTH of that page's preprocessed columns, which is what keeps
+    // `check_preprocessed`'s prefix contract expressible. See
+    // `continuation::PAGE_PREPROCESSED_COLUMNS`.
     assert_eq!(
-        plan.at[0].column,
-        crate::genesis_stack::INIT_PREPROCESSED_COLUMN
+        plan.at,
+        stark::multilinear_table::leading_columns(
+            plan.at[0].table,
+            crate::continuation::PAGE_PREPROCESSED_COLUMNS
+        ),
+        "a dense page must stack its whole preprocessed prefix"
     );
 
     let global = crate::with_whir_hash!(|H| {
@@ -1318,10 +1326,10 @@ fn a_sparse_genesis_page_set_carries_no_prepared_opening() {
         cross_epoch_inputs(&elf_bytes, &input, 2);
 
     let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
-    let plan = crate::genesis_stack::plan(
+    let plan = crate::continuation::genesis_stack_plan(
         &configs,
         boundaries.len(),
-        crate::genesis_stack::PAGE_NUM_VARS,
+        crate::continuation::PAGE_NUM_VARS,
     );
     let worst = plan.routes.iter().map(|r| r.nonzero).max().unwrap_or(0);
     println!(
@@ -1406,10 +1414,10 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
         cross_epoch_inputs(&elf_bytes, &[], 3);
 
     let configs = continuation::global_memory_configs(&page_bases, &elf, num_private);
-    let plan = crate::genesis_stack::plan(
+    let plan = crate::continuation::genesis_stack_plan(
         &configs,
         boundaries.len(),
-        crate::genesis_stack::PAGE_NUM_VARS,
+        crate::continuation::PAGE_NUM_VARS,
     );
     assert!(
         !plan.is_empty(),
@@ -1420,7 +1428,7 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
     // difference in the BYTES and not in the parameters.
     let config = crate::multilinear_prove::chain_config(&[(
         plan.at.len(),
-        crate::genesis_stack::PAGE_NUM_VARS,
+        crate::continuation::PAGE_NUM_VARS,
     )]);
     let production = multilinear_continuation::genesis_prepared_for::<KeccakWhir>(
         &configs,
@@ -1432,7 +1440,7 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
 
     // The independent half: the same page bases in the same order, the bytes
     // read straight out of the ELF's segments.
-    let page_size = 1u64 << crate::genesis_stack::PAGE_NUM_VARS;
+    let page_size = 1u64 << crate::continuation::PAGE_NUM_VARS;
     let rebuilt: Vec<multilinear::mle::Mle<crate::test_utils::F>> = plan
         .at
         .iter()
@@ -1453,7 +1461,7 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
     // dense by construction, and each rebuilt column is asserted to carry at
     // least what put its page over the threshold — so this compares the bytes
     // that matter and not a pair of empty pages.
-    let floor = crate::genesis_stack::PREPARED_LEG_ROWS / crate::genesis_stack::PAGE_NUM_VARS;
+    let floor = crate::continuation::PREPARED_LEG_ROWS / crate::continuation::PAGE_NUM_VARS;
     for (column, entry) in rebuilt.iter().zip(&plan.at) {
         let zero = math::field::element::FieldElement::<crate::test_utils::F>::from(0u64);
         let nonzero = column.evals().iter().filter(|v| **v != zero).count();
@@ -1472,7 +1480,7 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
         multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
             stark::multilinear_table::global_layout(&[(
                 rebuilt.len(),
-                crate::genesis_stack::PAGE_NUM_VARS,
+                crate::continuation::PAGE_NUM_VARS,
             )])
             .expect("layout"),
             &multilinear::stacking::borrow(&rebuilt),
@@ -1512,7 +1520,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// ⛔⛔ THE PRE-REGISTRATION, READ OFF THE REAL ELF INSTEAD OF COPIED.
 ///
-/// `genesis_stack`'s unit tests encode the block's census — 116,692 nonzero
+/// The split's unit tests in `continuation` encode the block's census — 116,692 nonzero
 /// entries at `0x0`, 229,290 at `0x40000`, 223,380 at `0x280000`, zero at the
 /// other 27 — as numbers I typed from a box log. That is enough to check the
 /// closed form's ARITHMETIC and not enough to check that the form, run against
@@ -1521,7 +1529,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// This runs the block guest once — no proving, no card, the same shape as
 /// `whir_global_tests::the_block_genesis_census` — rebuilds the page configs
-/// from the ELF, evaluates [`crate::genesis_stack::plan`] on them, and asserts
+/// from the ELF, evaluates [`crate::continuation::genesis_stack_plan`] on them, and asserts
 /// the dense set is EXACTLY those three bases.
 ///
 /// ⛔ IT REFUSES RATHER THAN SKIPS when the shas are unstated, and SKIPS with
@@ -1593,10 +1601,10 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         &elf,
         pages.num_private_input_pages,
     );
-    let plan = crate::genesis_stack::plan(
+    let plan = crate::continuation::genesis_stack_plan(
         &configs,
         pages.num_epochs,
-        crate::genesis_stack::PAGE_NUM_VARS,
+        crate::continuation::PAGE_NUM_VARS,
     );
     println!(
         "EXECUTION: {} epochs, {} touched pages, {} private, in {:.1}s",
@@ -1609,10 +1617,8 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     let mut sparse_total = 0usize;
     let mut dense_total = 0usize;
     for route in &plan.routes {
-        let rows = crate::genesis_stack::sparse_leg_rows(
-            crate::genesis_stack::PAGE_NUM_VARS,
-            route.nonzero,
-        );
+        let rows =
+            crate::continuation::sparse_leg_rows(crate::continuation::PAGE_NUM_VARS, route.nonzero);
         if route.dense {
             dense_total += rows;
         } else if route.has_init {
@@ -1638,9 +1644,9 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         plan.routes.len(),
         dense_total,
         sparse_total,
-        crate::genesis_stack::PREPARED_LEG_ROWS,
-        (crate::genesis_stack::PREPARED_LEG_ROWS - crate::genesis_stack::PAGE_NUM_VARS)
-            / crate::genesis_stack::PAGE_NUM_VARS
+        crate::continuation::PREPARED_LEG_ROWS,
+        (crate::continuation::PREPARED_LEG_ROWS - crate::continuation::PAGE_NUM_VARS)
+            / crate::continuation::PAGE_NUM_VARS
             + 1,
     );
 

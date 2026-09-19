@@ -1068,7 +1068,7 @@ fn the_production_chain_emits_its_closed_form() {
 
 /// ⛔ THE GENESIS THRESHOLD'S BUDGET, ASSERTED WHERE IT CAN BE COMPUTED.
 ///
-/// `crate::genesis_stack::PREPARED_LEG_ROWS` is the row budget a page must beat
+/// `crate::continuation::PREPARED_LEG_ROWS` is the row budget a page must beat
 /// before the cross-epoch proof carries its INIT column in a prepared opening.
 /// It is a CONSTANT there rather than a call, because that module sits below
 /// `crate::lfm` — a routing rule the prover, the verifier and the emitter must
@@ -1095,7 +1095,7 @@ fn the_production_chain_emits_its_closed_form() {
 fn the_genesis_threshold_budget_is_in_band_at_the_production_shape() {
     let at_20 = chain_shape_rows(&ChainShape::new(&config(112, 20), 20));
     let at_24 = chain_shape_rows(&ChainShape::new(&config(112, 20), 24));
-    let budget = crate::genesis_stack::PREPARED_LEG_ROWS;
+    let budget = crate::continuation::PREPARED_LEG_ROWS;
     println!(
         "GENESIS BUDGET: {budget} rows against a chain of {at_20} at 20 variables and \
          {at_24} at 24, Q=112 grind=20 blowup=2 fold=4"
