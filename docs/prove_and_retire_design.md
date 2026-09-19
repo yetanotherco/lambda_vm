@@ -43,7 +43,10 @@ chunks somewhere the monolithic build does not — which would move their roots
 and cost the byte-identical property of §3. Their op lists are held to the end
 and chunked in `pass::finish`. The tables that cannot be chunked at all — the
 preprocessed ones, the accumulators (KECCAK, ECSM, …), REGISTER, HALT, one PAGE
-per page — are the *residents*, handed over when the walk ends.
+per page — are the *residents*, handed over when the walk ends. An accelerator
+resident is absent entirely when the run never reached its chip, so those six
+are variable-length groups in the AIR order rather than fixed slots, and every
+chunked index sits below however many of them the run produced.
 
 So what the walk holds is one chunk per table of the first group, plus the
 residents, plus the op lists of the second group and of BITWISE. The last term

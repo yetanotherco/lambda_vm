@@ -227,6 +227,119 @@ pub fn run(
     Ok(LogUp { tables, resident })
 }
 
+/// One resident table, with the AIR index it answers to.
+type ResidentJob<'a> = (
+    usize,
+    &'a crate::VmAir,
+    &'a mut TraceTable<GoldilocksField, GoldilocksExtension>,
+);
+
+/// Every resident table paired with its AIR and its index, in
+/// `VmAirs::air_trace_pairs` order.
+///
+/// One list, read by all three passes over the resident set. The order is the
+/// protocol — each table's transcript fork is domain-separated by its index —
+/// so a pass that spells the order out for itself is a chance to prove a table
+/// under its neighbour's index. `context` names the pass in the errors.
+fn resident_jobs<'a>(
+    airs: &'a crate::VmAirs,
+    resident: &'a mut Resident,
+    order: &crate::streaming::AirOrder,
+    context: &str,
+) -> Result<Vec<ResidentJob<'a>>, Error> {
+    // Destructured rather than borrowed field by field: these borrows are all
+    // live at once and have to be provably disjoint.
+    let Resident {
+        bitwise,
+        decode,
+        halt,
+        register,
+        pages,
+        accumulated,
+        ..
+    } = resident;
+    let crate::tables::trace_builder::AccumulatedTables {
+        commits,
+        keccaks,
+        keccak_rnds,
+        keccak_rc,
+        ecsms,
+        ecdases,
+        hints,
+    } = accumulated;
+
+    // The tables every proof has. Typed at `NUM_FIXED_AIRS`, so this list and
+    // the constant every AIR index is counted from cannot drift apart silently.
+    let fixed: [(
+        &'a crate::VmAir,
+        &'a mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ); NUM_FIXED_AIRS] = [
+        (&airs.bitwise, bitwise),
+        (&airs.decode, decode),
+        (&airs.keccak_rc, keccak_rc),
+        (&airs.register, register),
+    ];
+    let mut jobs: Vec<ResidentJob<'a>> = fixed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (air, trace))| (idx, air, trace))
+        .collect();
+
+    let mut idx = NUM_FIXED_AIRS;
+    if airs.include_halt {
+        jobs.push((idx, &airs.halt, halt));
+        idx += 1;
+    }
+
+    // The accelerator groups, each present only when the run reached the chip.
+    let accel: [(
+        &'a [crate::VmAir],
+        &'a mut Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+        &str,
+    ); 6] = [
+        (&airs.commits, commits, "COMMIT"),
+        (&airs.keccaks, keccaks, "KECCAK"),
+        (&airs.keccak_rnds, keccak_rnds, "KECCAK_RND"),
+        (&airs.ecsms, ecsms, "ECSM"),
+        (&airs.ecdases, ecdases, "ECDAS"),
+        (&airs.hints, hints, "HINT"),
+    ];
+    for (group_airs, traces, name) in accel {
+        if group_airs.len() != traces.len() {
+            return Err(Error::Prover(format!(
+                "{context}: {name} has {} AIRs and {} traces",
+                group_airs.len(),
+                traces.len()
+            )));
+        }
+        for (air, trace) in group_airs.iter().zip(traces.iter_mut()) {
+            jobs.push((idx, air, trace));
+            idx += 1;
+        }
+    }
+
+    // `idx` has now counted the same prefix `AirOrder` computes from the table
+    // counts, by walking the tables instead. CPU is the first chunked group and
+    // is always present, so its chunk 0 sits exactly here. Two independent
+    // counts of the prefix; if they disagree every chunked table would be
+    // proved under a neighbour's index, which no later check would catch.
+    if order.index_of(TableKind::Cpu, 0) != Some(idx) {
+        return Err(Error::Prover(format!(
+            "{context}: resident tables end at AIR index {idx}, but the layout puts \
+             the first chunked table at {:?}",
+            order.index_of(TableKind::Cpu, 0)
+        )));
+    }
+
+    for (i, (air, trace)) in airs.pages.iter().zip(pages.iter_mut()).enumerate() {
+        let page_idx = order
+            .page_index(i)
+            .ok_or_else(|| Error::Prover(format!("{context}: page {i} is not in the layout")))?;
+        jobs.push((page_idx, air, trace));
+    }
+    Ok(jobs)
+}
+
 /// Every table's rounds 2-3 in `VmAirs::air_trace_pairs` order.
 ///
 /// The chunked tables come back keyed by the index the walk resolved; the
@@ -267,41 +380,9 @@ fn assemble(
             .map_err(|e| Error::Prover(format!("logup phase: table {idx}: {e}")))
     };
 
-    let fixed: [(
-        &crate::VmAir,
-        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    ); NUM_FIXED_AIRS] = [
-        (&airs.bitwise, &mut resident.bitwise),
-        (&airs.decode, &mut resident.decode),
-        (&airs.commit, &mut resident.accumulated.commit),
-        (&airs.keccak, &mut resident.accumulated.keccak),
-        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
-        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-        (&airs.ecsm, &mut resident.accumulated.ecsm),
-        (&airs.ecdas, &mut resident.accumulated.ecdas),
-        (&airs.hint, &mut resident.accumulated.hint),
-        (&airs.register, &mut resident.register),
-    ];
     // Independent tables, most of them small: one at a time would leave the
     // machine idle after the walk.
-    let mut jobs: Vec<(
-        usize,
-        &crate::VmAir,
-        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    )> = fixed
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (air, trace))| (idx, air, trace))
-        .collect();
-    if airs.include_halt {
-        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
-    }
-    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
-        let idx = order
-            .page_index(i)
-            .ok_or_else(|| Error::Prover(format!("logup phase: page {i} is not in the layout")))?;
-        jobs.push((idx, air, trace));
-    }
+    let jobs = resident_jobs(airs, resident, order, "logup phase")?;
     #[cfg(feature = "parallel")]
     let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
         .into_par_iter()
@@ -577,41 +658,9 @@ pub fn run_batched(
             .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
             Ok((idx, deep))
         };
-        let fixed: [(
-            &crate::VmAir,
-            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-        ); NUM_FIXED_AIRS] = [
-            (&airs.bitwise, &mut resident.bitwise),
-            (&airs.decode, &mut resident.decode),
-            (&airs.commit, &mut resident.accumulated.commit),
-            (&airs.keccak, &mut resident.accumulated.keccak),
-            (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
-            (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-            (&airs.ecsm, &mut resident.accumulated.ecsm),
-            (&airs.ecdas, &mut resident.accumulated.ecdas),
-            (&airs.hint, &mut resident.accumulated.hint),
-            (&airs.register, &mut resident.register),
-        ];
         // The codewords are independent and computed in parallel; the fold
         // itself is sequential and keeps this order, which the proof records.
-        let mut jobs: Vec<(
-            usize,
-            &crate::VmAir,
-            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-        )> = fixed
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (air, trace))| (idx, air, trace))
-            .collect();
-        if airs.include_halt {
-            jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
-        }
-        for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
-            let idx = order.page_index(i).ok_or_else(|| {
-                Error::Prover(format!("batched phase: page {i} is not in the layout"))
-            })?;
-            jobs.push((idx, air, trace));
-        }
+        let jobs = resident_jobs(airs, &mut resident, order, "batched phase")?;
         #[cfg(feature = "parallel")]
         let deeps: Vec<(usize, Deep)> = jobs
             .into_par_iter()
@@ -854,39 +903,7 @@ pub fn run_open(
         .map_err(|e| Error::Prover(format!("open pass: table {idx}: {e}")))?;
         Ok((idx, opening))
     };
-    let fixed: [(
-        &crate::VmAir,
-        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    ); NUM_FIXED_AIRS] = [
-        (&airs.bitwise, &mut resident.bitwise),
-        (&airs.decode, &mut resident.decode),
-        (&airs.commit, &mut resident.accumulated.commit),
-        (&airs.keccak, &mut resident.accumulated.keccak),
-        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
-        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-        (&airs.ecsm, &mut resident.accumulated.ecsm),
-        (&airs.ecdas, &mut resident.accumulated.ecdas),
-        (&airs.hint, &mut resident.accumulated.hint),
-        (&airs.register, &mut resident.register),
-    ];
-    let mut jobs: Vec<(
-        usize,
-        &crate::VmAir,
-        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    )> = fixed
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (air, trace))| (idx, air, trace))
-        .collect();
-    if airs.include_halt {
-        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
-    }
-    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
-        let idx = order
-            .page_index(i)
-            .ok_or_else(|| Error::Prover(format!("open pass: page {i} is not in the layout")))?;
-        jobs.push((idx, air, trace));
-    }
+    let jobs = resident_jobs(airs, &mut resident, order, "open pass")?;
     {
         #[cfg(feature = "parallel")]
         use rayon::prelude::*;

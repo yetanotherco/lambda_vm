@@ -1357,9 +1357,10 @@ fn chunk_shape_matches_the_built_chunk() {
             }
         }
     }
-    // A kind with no ops pads to the same 4 rows on both sides, so it pins the
-    // column width and nothing else. Without at least a few populated kinds this
-    // whole loop is a constant compared against itself.
+    // A kind with no ops is left out of the layout entirely, so the loop above
+    // only visits chunks that exist and every comparison it makes is over real
+    // rows. CPU and MEMW_R are the exceptions — they keep their padded chunk —
+    // but a fixture that populated neither would leave nothing to compare.
     assert!(
         populated >= 3,
         "the fixture must give several kinds real ops, or the row half of the \

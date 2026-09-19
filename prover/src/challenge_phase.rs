@@ -29,7 +29,7 @@ use crate::Error;
 use crate::commit_phase::Committed;
 use crate::statement::{StatementKind, absorb_statement};
 use crate::streaming::{GROUP_ORDER, NUM_FIXED_AIRS};
-use crate::tables::trace_builder::{TableKind, runtime_page_ranges};
+use crate::tables::trace_builder::{AccumulatedTables, TableKind, runtime_page_ranges};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::{TableCounts, VmAirs};
 use executor::elf::Elf;
@@ -73,6 +73,7 @@ pub fn run(
             .chunks
             .iter()
             .map(|(kind, chunk, _)| (*kind, *chunk)),
+        &remaining.accumulated,
     );
     let airs = VmAirs::new(
         elf,
@@ -143,6 +144,9 @@ fn assemble_roots(
     let accumulated = &remaining.accumulated;
 
     let mut roots = Vec::new();
+    // The tables every proof has. The array length is `NUM_FIXED_AIRS` by type,
+    // so this list and the constant the AIR indices are computed from cannot
+    // drift apart without the compiler saying so.
     let fixed: [(
         &crate::VmAir,
         &TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -150,30 +154,56 @@ fn assemble_roots(
     ); NUM_FIXED_AIRS] = [
         (&airs.bitwise, &remaining.bitwise, "BITWISE"),
         (&airs.decode, &remaining.decode, "DECODE"),
-        (&airs.commit, &accumulated.commit, "COMMIT"),
-        (&airs.keccak, &accumulated.keccak, "KECCAK"),
-        (&airs.keccak_rnd, &accumulated.keccak_rnd, "KECCAK_RND"),
         (&airs.keccak_rc, &accumulated.keccak_rc, "KECCAK_RC"),
-        (&airs.ecsm, &accumulated.ecsm, "ECSM"),
-        (&airs.ecdas, &accumulated.ecdas, "ECDAS"),
-        (&airs.hint, &accumulated.hint, "HINT"),
         (&airs.register, &remaining.register, "REGISTER"),
     ];
+    let mut resident = fixed.to_vec();
+    // HALT, then the accelerator groups: `VmAirs::air_trace_pairs` order, which
+    // is the order the transcript absorbs and the order every AIR index is
+    // counted in.
+    if airs.include_halt {
+        resident.push((&airs.halt, &remaining.halt, "HALT"));
+    }
+    let accel: [(
+        &[crate::VmAir],
+        &[TraceTable<GoldilocksField, GoldilocksExtension>],
+        &str,
+    ); 6] = [
+        (&airs.commits, &accumulated.commits, "COMMIT"),
+        (&airs.keccaks, &accumulated.keccaks, "KECCAK"),
+        (&airs.keccak_rnds, &accumulated.keccak_rnds, "KECCAK_RND"),
+        (&airs.ecsms, &accumulated.ecsms, "ECSM"),
+        (&airs.ecdases, &accumulated.ecdases, "ECDAS"),
+        (&airs.hints, &accumulated.hints, "HINT"),
+    ];
+    for (group_airs, traces, name) in accel {
+        // A chip the run never reached has neither an AIR nor a trace. Zipping
+        // two lists that disagreed would silently commit the shorter one and
+        // leave the layout short of a root, so the disagreement is rejected
+        // here instead of being absorbed.
+        if group_airs.len() != traces.len() {
+            return Err(Error::Prover(format!(
+                "challenge phase: {name} has {} AIRs and {} traces",
+                group_airs.len(),
+                traces.len()
+            )));
+        }
+        for (air, trace) in group_airs.iter().zip(traces.iter()) {
+            resident.push((air, trace, name));
+        }
+    }
     // Small tables, many of them: one commit at a time leaves most cores idle.
     #[cfg(feature = "parallel")]
-    let fixed_roots = fixed
+    let resident_roots = resident
         .par_iter()
         .map(|(air, trace, name)| commit_resident(air, trace, name))
         .collect::<Result<Vec<_>, _>>()?;
     #[cfg(not(feature = "parallel"))]
-    let fixed_roots = fixed
+    let resident_roots = resident
         .iter()
         .map(|(air, trace, name)| commit_resident(air, trace, name))
         .collect::<Result<Vec<_>, _>>()?;
-    roots.extend(fixed_roots);
-    if airs.include_halt {
-        roots.push(commit_resident(&airs.halt, &remaining.halt, "HALT")?);
-    }
+    roots.extend(resident_roots);
 
     let mut by_slot: HashMap<(TableKind, usize), &MainRoots> = HashMap::new();
     for (kind, chunk, root) in &committed.chunks {
@@ -236,8 +266,14 @@ fn commit_resident(
 /// Taken as `(kind, chunk)` pairs rather than as a phase's own output, because
 /// every pass over the execution produces the same layout and each has its own
 /// per-chunk payload.
+///
+/// The accelerator chips are not `TableKind`s and never appear in the chunk
+/// stream, so their counts come from `accumulated`, the tables the walk left
+/// behind. A chip the run did not reach has no table there and so counts zero,
+/// which is what leaves it out of the layout entirely.
 pub(crate) fn count_chunks_by_kind(
     chunks: impl Iterator<Item = (TableKind, usize)>,
+    accumulated: &AccumulatedTables,
 ) -> TableCounts {
     let mut counts = TableCounts {
         cpu: 0,
@@ -254,6 +290,12 @@ pub(crate) fn count_chunks_by_kind(
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        commit: accumulated.commits.len(),
+        keccak: accumulated.keccaks.len(),
+        keccak_rnd: accumulated.keccak_rnds.len(),
+        ecsm: accumulated.ecsms.len(),
+        ecdas: accumulated.ecdases.len(),
+        hint: accumulated.hints.len(),
     };
     for (kind, chunk) in chunks {
         let slot = slot_for(&mut counts, kind);

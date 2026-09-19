@@ -36,9 +36,31 @@ pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
     Some(TableKind::Cpu32),
 ];
 
-/// Number of singleton tables emitted before the chunked groups: BITWISE,
-/// DECODE, COMMIT, KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS, HINT, REGISTER.
-pub(crate) const NUM_FIXED_AIRS: usize = 10;
+/// Number of tables that are in every proof, emitted before HALT: BITWISE,
+/// DECODE, KECCAK_RC, REGISTER.
+///
+/// The accelerator chips used to be here too. They are now elided when the run
+/// does not reach them, so they are variable-length groups sitting between HALT
+/// and the chunked groups — see [`accel_lengths`].
+pub(crate) const NUM_FIXED_AIRS: usize = 4;
+
+/// The accelerator groups, in the order `VmAirs::air_trace_pairs` emits them:
+/// COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, after HALT and before the
+/// chunked groups.
+///
+/// Each is 1 when the run reached that chip and 0 when it did not, so their
+/// total shifts every chunked index below them. Taken from the counts rather
+/// than assumed, for the reason `AirOrder` gives: the order is the protocol.
+pub(crate) fn accel_lengths(counts: &crate::TableCounts) -> [usize; 6] {
+    [
+        counts.commit,
+        counts.keccak,
+        counts.keccak_rnd,
+        counts.ecsm,
+        counts.ecdas,
+        counts.hint,
+    ]
+}
 
 /// Where each table sits in `VmAirs::air_trace_pairs`.
 ///
@@ -64,9 +86,12 @@ impl AirOrder {
         }
     }
 
-    /// The index of the first chunked table, after the fixed ones and HALT.
+    /// The index of the first chunked table, after the fixed ones, HALT and the
+    /// accelerator groups.
     fn first_chunked(&self) -> usize {
-        NUM_FIXED_AIRS + usize::from(self.include_halt)
+        NUM_FIXED_AIRS
+            + usize::from(self.include_halt)
+            + accel_lengths(&self.counts).iter().sum::<usize>()
     }
 
     fn group_len(&self, group: Option<TableKind>) -> usize {
@@ -133,12 +158,25 @@ impl StreamingProvider {
     /// the chunked groups and is emitted only for a final epoch, so getting it
     /// wrong shifts every slot by one and hands each table the trace of its
     /// neighbour. It is taken from the caller's `VmAirs` rather than assumed.
+    ///
+    /// The accelerator groups shift the slots the same way and for the same
+    /// reason — a chip the run never reached has no table at all — so they are
+    /// read off the traces here rather than counted as a constant.
     pub(crate) fn new(
         routed: CollectedOps,
         max_rows: MaxRowsConfig,
         traces: &Traces,
         include_halt: bool,
     ) -> Self {
+        // Order fixed by `VmAirs::air_trace_pairs`; all resident, none retired.
+        let accel = [
+            traces.commits.len(),
+            traces.keccaks.len(),
+            traces.keccak_rnds.len(),
+            traces.ecsms.len(),
+            traces.ecdases.len(),
+            traces.hints.len(),
+        ];
         let group_lengths = [
             traces.cpus.len(),
             traces.lts.len(),
@@ -157,7 +195,8 @@ impl StreamingProvider {
             traces.cpu32s.len(),
         ];
 
-        let mut slots = vec![None; NUM_FIXED_AIRS + usize::from(include_halt)];
+        let mut slots =
+            vec![None; NUM_FIXED_AIRS + usize::from(include_halt) + accel.iter().sum::<usize>()];
         for (kind, len) in GROUP_ORDER.iter().zip(group_lengths.iter()) {
             for chunk in 0..*len {
                 slots.push(kind.map(|k| (k, chunk)));
