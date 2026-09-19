@@ -1139,3 +1139,53 @@ fn the_blocks_genesis_routing_is_insensitive_to_the_chain_figure() {
         );
     }
 }
+
+/// ⛔⛔ THE THRESHOLD AND THE SPARSE CAP MUST NOT DISAGREE, OR THE PROGRAM
+/// CANNOT BE BUILT AT ALL.
+///
+/// Two independent rules decide what happens to a genesis page.
+/// `continuation::is_dense` decides whether the PREPARED OPENING carries it;
+/// [`super::preprocessed::MAX_SPARSE_INIT_ENTRIES`] decides whether the sparse
+/// leg is willing to EMIT it, and refuses above the cap because a column that
+/// dense has no cheap closed form.
+///
+/// If the threshold ever left a page sparse that the cap then refused, the page
+/// would have no route at all: too dense to emit, not dense enough to stack,
+/// and the emit-time refusal would fire on a program nobody could fix by
+/// changing either constant alone. The two rules must therefore overlap, with
+/// the threshold strictly the tighter one.
+///
+/// ★ THIS IS THE STATE THE BLOCK WAS ACTUALLY IN. V1j's block bundle arm
+/// refused at that cap — "these preprocessed columns carry 116692 nonzero
+/// entries ... the cap is 60000 entries" for page `0x0` — because the prepared
+/// route did not exist yet and every genesis page went to the sparse leg. Once
+/// the threshold routes the dense pages to the opening, no page reaching the
+/// sparse leg can be within six times the cap, and ⛔ THE CAP SHOULD NEVER FIRE
+/// AGAIN. A refusal from it after this lands is not a page that needs a bigger
+/// cap; it is these two constants having drifted apart.
+#[test]
+fn every_page_the_threshold_leaves_sparse_is_one_the_sparse_leg_will_emit() {
+    let num_vars = crate::continuation::PAGE_NUM_VARS;
+    // The largest nonzero count that still routes sparse.
+    let break_even = (crate::continuation::PREPARED_LEG_ROWS - num_vars) / num_vars + 1;
+    let densest_sparse = break_even - 1;
+    let cap = super::preprocessed::MAX_SPARSE_INIT_ENTRIES;
+    println!(
+        "ROUTE OVERLAP: the densest page left sparse carries {densest_sparse} entries \
+         against a sparse-leg cap of {cap}"
+    );
+    assert!(
+        crate::continuation::is_dense(num_vars, break_even),
+        "the break-even must be dense, or this test is measuring the wrong number"
+    );
+    assert!(
+        !crate::continuation::is_dense(num_vars, densest_sparse),
+        "the entry below the break-even must be sparse"
+    );
+    assert!(
+        densest_sparse <= cap,
+        "a page carrying {densest_sparse} entries routes SPARSE and is then REFUSED by \
+         the {cap}-entry cap: it has no route at all, and neither constant can be fixed \
+         without the other"
+    );
+}
