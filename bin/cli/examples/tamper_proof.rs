@@ -110,8 +110,8 @@ fn main() -> std::process::ExitCode {
                         None => anchor = Some((r, c)),
                         Some((r0, c0)) => {
                             if ood.get(r, c) != ood.get(r0, c0) {
-                                let a = ood.get(r0, c0).clone();
-                                let b = ood.get(r, c).clone();
+                                let a = *ood.get(r0, c0);
+                                let b = *ood.get(r, c);
                                 ood.set(r0, c0, b);
                                 ood.set(r, c, a);
                                 swapped = Some(((r0, c0), (r, c)));
