@@ -1720,6 +1720,75 @@ fn recorded_draws(
 /// publishing epoch": V1g's two complementary closure mutations showed that at
 /// index 0 the dropped-commit-index mutation computes the same thing, so a
 /// fixture that published at index 0 would leave that defect invisible.
+/// ★★ THE EPOCH PROGRAM'S NEWTON POOL, MEASURED FOR THE FIRST TIME.
+///
+/// The cross-epoch F1 found that `whir_poly`'s interpolation weights were
+/// interned by every sumcheck leg and named by no form, because the only form
+/// there returned a COUNT and a pool needs VALUES. The epoch program has the
+/// identical gap and has never had it measured — no F1 here compares a pool at
+/// all, only staged row deltas — so this reads the number off the assembled
+/// program.
+///
+/// ⚠ IT ASSERTS WHAT IS EXACT AND PRINTS THE REST. The Newton set through the
+/// degree the program reaches MUST be interned, which can fail; the remaining
+/// constants are reported rather than pinned, because naming them is other
+/// forms' work and this arm exists to give that work a number to aim at.
+#[test]
+fn the_epoch_programs_newton_pool_is_measured() {
+    let (elf_bytes, opts, bundle) = driver_bundle();
+    let index = bundle.epochs.len() - 1;
+    let epoch = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<
+        multilinear::whir_hash::RpxWhir,
+    >(&opts, &elf_bytes, &bundle, index, None, None)
+    .expect("the last epoch harvests");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("the inner ELF loads");
+    let airs = crate::multilinear_continuation::epoch_airs_for(
+        &elf,
+        &opts,
+        &bundle.epochs[index],
+        &epoch.position.register_init,
+        epoch.position.is_final,
+        epoch.position.label,
+        Some(epoch.decode_commitment),
+    );
+    let refs = airs.refs();
+    let program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
+
+    let interned: Vec<crate::lfm::LfmWord> = program
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            crate::lfm::instr::Instr::Const { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect();
+    let degree = super::whir_poly::interned_newton_degree(&interned);
+    let newton = super::whir_poly::sumcheck_round_constants(degree);
+    let others = interned.len().saturating_sub(newton.len());
+    println!(
+        "EPOCH NEWTON POOL: D = {degree}; {} of {} interned constants are Newton pairs, \
+         {others} are not ({} instructions, {} tables)",
+        newton.len(),
+        interned.len(),
+        program.instrs.len(),
+        refs.len(),
+    );
+
+    // ⛔ ANTI-VACUITY: a program that interned no Newton word at all would make
+    // the subset check below trivially true.
+    assert!(
+        degree >= 2,
+        "the epoch program interned no Newton pair, so this measurement has no subject"
+    );
+    for word in &newton {
+        assert!(
+            interned.contains(word),
+            "the Newton set through degree {degree} is not fully interned, which \
+             contradicts the degree this program was read at"
+        );
+    }
+}
+
 fn driver_bundle() -> (
     Vec<u8>,
     crate::ProofOptions,

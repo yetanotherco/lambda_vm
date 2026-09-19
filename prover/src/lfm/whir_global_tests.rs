@@ -351,6 +351,17 @@ mod tests {
             unnamed.len(),
             cost.newton_degree,
         );
+        // ★ THE DEGREE, FROM TWO SOURCES. `cost.newton_degree` is derived from
+        // the SHAPES; this reads it back out of the words the compiled program
+        // actually holds. A disagreement means a leg runs at a degree no shape
+        // predicts, or a form names one no leg reaches.
+        let read_back = crate::lfm::whir_poly::interned_newton_degree(&interned);
+        assert_eq!(
+            read_back, cost.newton_degree,
+            "the program has interned the Newton set through degree {read_back}, and the \
+             shapes predict {}",
+            cost.newton_degree,
+        );
         assert_eq!(
             consts,
             cost.constants.len(),

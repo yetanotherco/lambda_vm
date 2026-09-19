@@ -166,6 +166,35 @@ pub fn sumcheck_round_constants(degree: usize) -> Vec<LfmWord> {
     words
 }
 
+/// ★ The largest degree whose Newton set a pool has FULLY interned — the same
+/// quantity as a program's maximum sumcheck degree, read off the PROGRAM
+/// instead of off its shapes.
+///
+/// ⛔ TWO SOURCES FOR ONE NUMBER, WHICH IS THE POINT. A caller derives the
+/// maximum degree from the shapes (`GKR_SUMCHECK_DEGREE`, `REDUCE_DEGREE`, the
+/// chain's, and each table's `sumcheck_degree()`); this derives it from the
+/// words the compiled program actually holds. They must agree, and a
+/// disagreement is a real finding: either a leg runs at a degree no shape
+/// predicts, or a form names a degree no leg reaches.
+///
+/// ⚠ `1` when nothing is interned, because degree 1 runs no Newton step — the
+/// same clamp the emitter and the forms use, so "no steps" and "one step's
+/// worth of nothing" are the same answer here as everywhere else.
+pub fn interned_newton_degree(pool: &[LfmWord]) -> usize {
+    let mut degree = 1usize;
+    loop {
+        let next = degree + 1;
+        if sumcheck_round_constants(next)
+            .iter()
+            .all(|word| pool.contains(word))
+        {
+            degree = next;
+        } else {
+            return degree;
+        }
+    }
+}
+
 /// The two constants Newton step `j` interns: `(1/(j+1), −j/(j+1))`.
 ///
 /// ★ **ONE DERIVATION, TWO CALLERS.** [`emit_newton_step`] interns exactly these
