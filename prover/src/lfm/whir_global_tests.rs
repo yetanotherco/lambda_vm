@@ -257,14 +257,24 @@ mod tests {
     fn a_page_the_routes_expect_more_columns_from_is_refused() {
         let (elf_bytes, opts, bundle) = private_page_bundle();
         let mut global = harvest(&elf_bytes, &opts, &bundle);
-        let airs = global.airs().refs();
-        assert_eq!(
-            airs[global.num_epochs].precomputed_columns().len(),
-            1,
-            "this fixture's page is private, so its AIR presents OFFSET alone — without \
-             that the refusal below would fire for another reason"
-        );
+        // ⚠ THE PRECONDITION IS READ IN ITS OWN SCOPE, so the borrow it takes
+        // ends before the restatement below. `airs()` borrows the whole driver,
+        // and the lie this arm tells is a field of it.
+        {
+            let airs = global.airs().refs();
+            assert_eq!(
+                airs[global.num_epochs].precomputed_columns().len(),
+                1,
+                "this fixture's page is private, so its AIR presents OFFSET alone — \
+                 without that the refusal below would fire for another reason"
+            );
+        }
+        // ⛔ THE LIE, and it is an INPUT: the bundle's page is a private-input
+        // page and this says the run had none. The AIR set is UNCHANGED — it is
+        // the one the proof was verified against — so the route now expects
+        // OFFSET and INIT from a table presenting OFFSET alone.
         global.num_private_input_pages = 0;
+        let airs = global.airs().refs();
         let _ = GlobalPlan::build(&global, &airs, &elf_bytes);
     }
 
