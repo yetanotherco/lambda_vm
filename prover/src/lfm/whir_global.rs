@@ -1046,10 +1046,19 @@ pub fn global_cost(
         plan.config(),
         walk.entry,
     );
-    for group in &groups {
+    let chain_shapes = plan.group_shapes();
+    for ((group, shape), domain) in groups.iter().zip(&chain_shapes).zip(&plan.group_domains) {
         cost.groups += group.operations();
         cost.perms += group.perms();
         for word in group.own_constants() {
+            pool.constant_word(word);
+        }
+        // ⛔ THE CHAINS' FOLD CONSTANTS, which `own_constants` disclaims in its
+        // own doc and which no form named until now. A UNION per chain over
+        // that chain's own domains — never a max, because round `r` folds over
+        // a SQUARED domain and the same exponents under a different generator
+        // are different field elements.
+        for word in super::whir_chain::chain_fold_constants(shape, domain) {
             pool.constant_word(word);
         }
     }

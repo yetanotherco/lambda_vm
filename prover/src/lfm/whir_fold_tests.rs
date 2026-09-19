@@ -9,7 +9,7 @@ use super::builder::{Bit, Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
-use super::whir_fold::{emit_fold_coset, fold_coset_consts, fold_coset_rows};
+use super::whir_fold::{emit_fold_coset, fold_coset_constants, fold_coset_consts, fold_coset_rows};
 use super::word::{LfmWord, ext_word, word_as_ext};
 
 type F = GoldilocksField;
@@ -110,6 +110,45 @@ fn the_fold_emits_its_closed_form() {
             "a block of {block} on 2^{log_domain}: the interned constants must be the ones \
              the shape names, and none of them may collide"
         );
+        // ★★ THE VALUES, NOT ONLY THE COUNT. The count above cannot tell a pool
+        // WHICH words to hold, and a program-level pool needs exactly that —
+        // which is how these went unnamed in the cross-epoch F1 while this very
+        // test was green on their number.
+        let named = fold_coset_constants(
+            &Domain::<F>::new(log_domain).expect("a domain of that size"),
+            levels,
+            index_bits,
+        );
+        let interned: Vec<LfmWord> = program
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                super::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            named.len(),
+            interned.len(),
+            "a block of {block} on 2^{log_domain}: the values form names {} words and the \
+             emitter interns {}",
+            named.len(),
+            interned.len(),
+        );
+        for word in &named {
+            assert!(
+                interned.contains(word),
+                "a block of {block} on 2^{log_domain}: the values form names a word the \
+                 emitter does not intern, so a pool built from it would over-count"
+            );
+        }
+        for word in &interned {
+            assert!(
+                named.contains(word),
+                "a block of {block} on 2^{log_domain}: the emitter interns a word no form \
+                 names — the same gap, one level down"
+            );
+        }
         assert_eq!(
             measured, predicted,
             "a block of {block} on 2^{log_domain} at {index_bits} index bits must emit its \
