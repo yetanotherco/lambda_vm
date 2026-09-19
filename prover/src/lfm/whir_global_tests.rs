@@ -367,6 +367,137 @@ mod tests {
         );
     }
 
+    /// ★★ THE BOX ARM: the cross-epoch program at a REAL BLOCK's shape, with
+    /// the census the genesis cap is owed.
+    ///
+    /// `#[ignore]`d because it proves a whole continuation. Everything it
+    /// prints is a MEASUREMENT and nothing it asserts is a count, deliberately:
+    /// the shapes are the block's and pinning them would pin the posture, which
+    /// moves. What it asserts is structural and holds for any program — that
+    /// every table has a route, that the published set is the layout's, and
+    /// that the program the emitter built is the one the arena fills.
+    ///
+    /// ⚠ IT SKIPS RATHER THAN FAILS when the block ELF is absent, and says so
+    /// on its own line, so a laptop run cannot be read as a block run. The ELF's
+    /// FULL 64-hex sha256 is printed — full, never a prefix: a diagnostic that
+    /// can agree while the values differ is not a diagnostic.
+    ///
+    /// ⛔ THE NUMBER THE CAP IS WAITING FOR is `GENESIS CENSUS`. It is a
+    /// function of the ELF and the touched page list alone, so it needs no card
+    /// and no second run — but it does need a real block's page set, which is
+    /// why it lives here rather than in the fixture arms.
+    #[test]
+    #[ignore = "the box runs it: a real block bundle under the process hash"]
+    fn the_block_bundle_builds_its_cross_epoch_program() {
+        let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
+        let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
+        let epoch_size_log2: u32 = std::env::var("LAMBDA_VM_BENCH_EPOCH_LOG2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
+        let Some(elf_bytes) = bench_elf_if_present(&name) else {
+            println!(
+                "GLOBAL-PROGRAM SKIPPED - no ELF named {name} in \
+                 executor/program_artifacts/{{rust,asm}}; set LAMBDA_VM_BENCH_ELF to a \
+                 program that exists"
+            );
+            return;
+        };
+        let input = crate::tests::multilinear_bench_tests::input_bytes(&input_name);
+        let opts = ProofOptions::default_test_options();
+        println!(
+            "GLOBAL-PROGRAM fixture {name} sha {} ({} bytes)  input {} ({} bytes)  epoch 2^{}",
+            sha256_hex(&elf_bytes),
+            elf_bytes.len(),
+            if input_name.is_empty() { "<none>" } else { &input_name },
+            input.len(),
+            epoch_size_log2,
+        );
+        if let Some(note) = whir_process_posture_note() {
+            println!("{note}");
+        }
+
+        let bundle = multilinear_continuation::prove_continuation(
+            &elf_bytes,
+            &input,
+            epoch_size_log2,
+            &opts,
+        )
+        .expect("prove the continuation under the process hash");
+        let global = harvest(&elf_bytes, &opts, &bundle);
+        let airs = global.airs().refs();
+
+        // ★ THE CENSUS FIRST, because if it is over the cap the program build
+        // REFUSES and the refusal is the finding — printing the number before
+        // the build is what makes that legible instead of a panic with no
+        // context.
+        let census = crate::lfm::whir_global::genesis_census(&global, &airs);
+        println!("{}", crate::lfm::whir_global::genesis_census_line(&census));
+        for entry in &census {
+            if entry.entries > 0 {
+                println!(
+                    "  page table {} ({:?}): {} rows, {} nonzero",
+                    entry.table, entry.route, entry.rows, entry.entries
+                );
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let program = whir_global_program(&global, &airs);
+        let built = started.elapsed();
+        let arena = whir_global_arena(&global, &airs);
+        let cost = global_cost(&global, &airs);
+        println!(
+            "GLOBAL PROGRAM: {} tables = {} bookends + {} pages; {} instrs \
+             (ops {} + consts {} + hints {} + publics {}); {} arena words; \
+             {} published; built in {:.2}s",
+            global.num_tables(),
+            global.num_epochs,
+            global.num_tables() - global.num_epochs,
+            program.instrs.len(),
+            cost.operations(),
+            cost.constants.len(),
+            cost.hints,
+            cost.publics,
+            arena[0].len(),
+            program.public_len,
+            built.as_secs_f64(),
+        );
+
+        // Structural, and true of any program: the layout's words, and one hint
+        // per word the filler writes.
+        assert_eq!(program.public_len as usize, global.published.total());
+        assert_eq!(program.arena_schema.lens, vec![arena[0].len() as u32]);
+        assert_eq!(
+            program.instrs.len(),
+            cost.instructions(),
+            "the assembled emission against the form, at the block's own shape"
+        );
+    }
+
+    /// The block ELF, if the artifacts hold one — SKIP, never panic, because
+    /// this suite's contract on a laptop is to say it did not run.
+    fn bench_elf_if_present(name: &str) -> Option<Vec<u8>> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("executor/program_artifacts");
+        for dir in ["rust", "asm"] {
+            if let Ok(bytes) = std::fs::read(root.join(dir).join(format!("{name}.elf"))) {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// One published word's base value, with its upper lanes asserted zero.
     ///
     /// ⚠ A base publish that carried anything in lanes 1..4 would be read by an
