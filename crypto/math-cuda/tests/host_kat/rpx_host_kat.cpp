@@ -1097,7 +1097,31 @@ void permute_probe_matches_the_oracle_table() {
 // ---------------------------------------------------------------------------
 uint64_t run_grind(const uint64_t inner[4], uint8_t factor, uint64_t base, uint64_t count) {
     const uint64_t limit = (uint64_t)1 << (64 - factor);
-    uint64_t result = UINT64_MAX;
+    // ⛔⛔ `unsigned long long`, NOT `uint64_t`, AND THAT DIFFERENCE WAS THE BUG.
+    // The kernel takes `volatile unsigned long long *` because that is the type
+    // CUDA's `atomicMin` overload wants, so this object's address is handed out
+    // under it. `uint64_t` is `unsigned long long` on Darwin/arm64 and
+    // `unsigned long` on LP64 glibc — a DIFFERENT type of the same width — so on
+    // Linux the cast type-punned, and with `#include "rpx.cu"` putting the whole
+    // kernel in this translation unit, GCC 13.3 at -O2 was free under TBAA to
+    // assume a write through `unsigned long long *` could not touch an
+    // `unsigned long`, and to keep `result` in a register across the inlined call.
+    //
+    // It did. `run_grind` returned `UINT64_MAX` for every input on the box, so
+    // every check below that expects the SENTINEL passed vacuously while every
+    // check that expects a FOUND nonce failed — six rows, at every sha back to
+    // the gated base `c00342c1f`, while the same source passed on a clang/arm64
+    // laptop where the two types coincide. Measured on the box 2026-09-20:
+    // `-O2` → 6 failures; `-O2 -fno-strict-aliasing` → all pass; `-O0` → all pass.
+    //
+    // ⚠ NONE OF THAT WAS EVER A STATEMENT ABOUT THE DEVICE GRIND. This file is a
+    // HOST replay of the kernel source through `cuda_host_shim.h`; the defect
+    // was in the harness holding the result, not in the kernel it was testing.
+    // ⛔ Do not "tidy" this back to `uint64_t`: matching the pointer type the
+    // kernel is given is what makes the access well-defined, and the box gate
+    // carries a mutation that restores `uint64_t` and requires those six rows
+    // back — so the tidy-up would be caught, loudly, by a red nobody wants again.
+    unsigned long long result = UINT64_MAX;
     CUDA_HOST_SINGLE_THREAD();
     rpx_grind_search(inner, limit, base, count, (volatile unsigned long long *)&result);
     return result;

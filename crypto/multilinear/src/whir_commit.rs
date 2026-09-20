@@ -308,9 +308,22 @@ where
     /// them.
     pub fn open_many(&self, indices: &[usize]) -> Result<Vec<CosetOpening<F>>, Error> {
         let num_leaves = self.num_leaves();
+        // ★ ONE CALL, ONE DEVICE TREE REBUILD. Counted rather than inferred:
+        // `whir_round::prove` opens the current commitment AND its successor,
+        // so a non-final round passes here twice, and `check_closure`'s arm F
+        // asserts the total against the rounds that produced it.
+        crate::whir_split::bump(&crate::whir_split::REBUILD_CALLS);
+        // ⛔ THE SPLIT IS HERE AND NOT INSIDE `paths()`. On the device arm
+        // `paths()` is a range check, ONE device call and a `map` into `Proof`,
+        // so splitting inside it would weigh the rebuild against host
+        // bookkeeping and read ~100% every time. What competes with the rebuild
+        // is the COSET GATHER, which is the next statement, not a nested one.
+        let __wq_tree = crate::whir_split::mark();
         let proofs = self.paths(indices)?;
+        crate::whir_split::add(&crate::whir_split::TREE_REBUILD, __wq_tree);
 
         let block = 1usize << self.log_folding;
+        let __wq_gather = crate::whir_split::mark();
         let blocks: Vec<Vec<FieldElement<F>>> = match &self.codeword {
             Codeword::Host(values) => indices
                 .iter()
@@ -331,11 +344,16 @@ where
             }
         };
 
-        Ok(blocks
+        crate::whir_split::add(&crate::whir_split::COSET_GATHER, __wq_gather);
+
+        let __wq_assemble = crate::whir_split::mark();
+        let openings: Vec<CosetOpening<F>> = blocks
             .into_iter()
             .zip(proofs)
             .map(|(values, proof)| CosetOpening { values, proof })
-            .collect())
+            .collect();
+        crate::whir_split::add(&crate::whir_split::OPEN_ASSEMBLE, __wq_assemble);
+        Ok(openings)
     }
 
     /// One authentication path per index, from wherever the tree is.

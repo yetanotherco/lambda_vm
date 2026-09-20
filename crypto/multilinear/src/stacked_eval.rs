@@ -107,6 +107,22 @@ where
         // sixteen, and what the difference buys is the widest tables getting a
         // device at all. If the card will not promise it, each commitment
         // promises its own, which is the conservative accounting.
+        //
+        // ★ AND THE LEAF LAYERS ARE NOW IN THIS NUMBER, as a named term rather
+        // than as a surprise. A commitment that is opened keeps the leaf layer
+        // its commit hashed — `num_leaves × 32` = `C · 2^(5−k)` bytes at fold
+        // width `k`, a QUARTER of a base codeword at the production `k = 4` —
+        // so a group of `n` commitments holds `n · C/4` more than the codewords
+        // alone. It is not reserved here, because the width is not known until
+        // the tree is built: each codeword grows THIS reservation when it
+        // captures (`DeviceCodeword::capture_leaves`), and `grow` refuses
+        // without changing anything when the budget will not take it. A refused
+        // retention costs the leaf pass again and nothing else.
+        //
+        // ⚠ A TREE is still not in this number and must never be. H4 kept the
+        // whole node array — twice these bytes — and the card reached 96%, after
+        // which commits fell back to the host at ~1.5 GiB each. The layer is
+        // half of what that held and two thirds of what it saved.
         let room = sources.first().and_then(|poly| {
             let codeword_bytes = (1u64 << (poly.num_vars() + config.log_blowup)) * 8;
             crate::gpu::reserve_room(codeword_bytes)

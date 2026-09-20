@@ -258,6 +258,11 @@ pub struct Backend {
     pub rpx_merkle_tail: CudaFunction,
     pub rpx_permute_probe: CudaFunction,
     pub rpx_grind_search: CudaFunction,
+    /// ⛔ DIAGNOSTIC ONLY — the grind search with its executed-permutation
+    /// counters. Nothing on a proving path launches it; its one caller is
+    /// [`crate::grinding::search_counted`], which reads whether a slow launch
+    /// does MORE work or the same work more slowly.
+    pub rpx_grind_search_counted: CudaFunction,
 
     // rpx.cubin — the algebraic hash's twins of the keccak entries above.
     // Only the ones the WHIR path reaches are bound: the coset leaves, the two
@@ -473,6 +478,7 @@ impl DeviceReservation {
             ) {
                 Ok(_) => {
                     self.bytes.fetch_add(extra, Ordering::Relaxed);
+                    note_reserved(held + extra);
                     return true;
                 }
                 Err(seen) => held = seen,
@@ -549,6 +555,111 @@ pub fn drain_and_trim() -> Result<()> {
 /// the type that spends them.
 pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
     backend().ok()?.reserve(bytes)
+}
+
+/// Argue-surface device fallbacks: the reservation refusals in math-cuda's
+/// `sumcheck`, `gkr` and `columns`, counted where each one's `reserve` returns
+/// `None` and its work moves to the host.
+///
+/// ⛔ WHY THIS EXISTS. Until this counter the only fallback number the campaign
+/// read was `multilinear::gpu::host_fallbacks()`, which has ONE caller — the
+/// COMMIT path (`multilinear/src/whir_chain.rs`) — so every `host fallbacks 0`
+/// certified that no COMMITMENT fell back and said NOTHING about the per-table
+/// ARGUMENT. wt16 was net-negative for exactly that blind spot: the leaf-layer
+/// retention grew `be.reserved`, argue's `reserve` then refused and moved to
+/// the host UNCOUNTED, and the slot-level reading looked like a clean win.
+/// Read beside `host_fallbacks()`, this makes "the device did the work"
+/// distinguishable from "it quietly did not" on the argue surface.
+///
+/// SCOPE, stated precisely. The FIVE argue-side `reserve`→`None` sites in
+/// `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1), `columns.rs`
+/// (×1). This is NOT the whole device surface, and it does not claim to be:
+/// `multilinear/src/gpu.rs` holds two further argue-side sites — `:177`
+/// (`reserve_room`) and `:1572` (the GKR tree) — whose `None` still falls to
+/// the host uncounted. Those are a documented FOLLOW-UP, out of this counter's
+/// scope, because each needs its caller traced before it can honestly be
+/// labelled a fallback. A THIRD site there, `:1551`, is a SPECULATIVE reserve
+/// whose `None` selects a lazy path that is STILL on the device — NOT a
+/// fallback, and it must never be counted. Putting a wrong site into the very
+/// counter meant to end false numbers is the one thing to avoid.
+static DEVICE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Argue-surface device fallbacks this process has taken — see
+/// [`DEVICE_FALLBACKS`] for the enumerated sites and the scope it does not
+/// cover. Read alongside `multilinear::gpu::host_fallbacks()` (the commit-side
+/// count) for both surfaces.
+pub fn device_fallbacks() -> u64 {
+    DEVICE_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Zero the process-wide counter. For a test that wants to assert a delta, and
+/// for a harness that reads one prove's worth from a reused process.
+pub fn reset_device_fallbacks() {
+    DEVICE_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// Record one argue-side reservation refusal — bumped at each of the five
+/// sites [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
+pub(crate) fn note_device_fallback() {
+    DEVICE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ★ The high-water mark of `be.reserved` — the PEAK simultaneous device
+/// reservation this process reached, updated wherever the total rises
+/// ([`Backend::reserve`] and [`DeviceReservation::grow`]).
+///
+/// This is the reservation quantity argue's `reserve` is checked against, which
+/// the raw device trace cannot report: the raw peak includes the never-purge
+/// pool's retained blocks and sits above the reservation budget, while THIS is
+/// exactly what the budget gates. A control run reads argue's peak reservation
+/// demand here; and while the evictable retention holds only spare bytes, this
+/// stays below the budget by construction.
+static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `be.reserved` just rose to `now`, keeping the peak.
+fn note_reserved(now: u64) {
+    RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+}
+
+/// The peak simultaneous device reservation this process reached — see
+/// [`RESERVED_HIGH_WATER`].
+pub fn reserved_high_water() -> u64 {
+    RESERVED_HIGH_WATER.load(Ordering::Relaxed)
+}
+
+/// Zero the reservation high-water. For a test asserting a delta.
+pub fn reset_reserved_high_water() {
+    RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
+}
+
+/// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs
+/// so the allocator can reclaim spare retained bytes UNDER PRESSURE, on a real
+/// caller's behalf, without `device.rs` depending on `whir.rs`.
+///
+/// This is what makes the retention a PRIORITY scheme, not a byte race
+/// ([[gpu-two-vramgates-overlap]]): it holds only genuinely-spare bytes, and the
+/// instant a real caller (argue) cannot get its reservation, the layers are
+/// given back. A plain `fn` pointer — Send + Sync, no allocation — installed once
+/// via `OnceLock`; it takes a byte TARGET and returns how many it actually freed.
+///
+/// ⛔ CONTRACT the evictor MUST honour (see `whir::evict_retained_layers`): it
+/// frees by dropping retained layers and calling `DeviceReservation::shrink`, and
+/// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
+/// called it and deadlock.
+static EVICTOR: OnceLock<fn(u64) -> u64> = OnceLock::new();
+
+/// Install the retention evictor. Idempotent — only the first install sticks.
+pub fn set_retention_evictor(evictor: fn(u64) -> u64) {
+    let _ = EVICTOR.set(evictor);
+}
+
+/// Ask the retention to give back at least `target` bytes of budget; returns how
+/// many it freed (0 if none is installed or nothing was reclaimable).
+fn try_evict_retained(target: u64) -> u64 {
+    match EVICTOR.get() {
+        Some(evict) => evict(target),
+        None => 0,
+    }
 }
 
 /// Allocates on `stream`, and if the device says no, gives the pool's retained
@@ -810,6 +921,7 @@ impl Backend {
             rpx_leaves_base_coset: rpx.load_function("rpx_leaves_base_coset")?,
             rpx_leaves_ext3_coset: rpx.load_function("rpx_leaves_ext3_coset")?,
             rpx_grind_search: rpx.load_function("rpx_grind_search")?,
+            rpx_grind_search_counted: rpx.load_function("rpx_grind_search_counted")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
@@ -954,9 +1066,25 @@ impl Backend {
     /// has a host path. The budget binds only when several proofs share a
     /// card: one of them is enough to fill it.
     pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        let mut evicted = false;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
             if held.saturating_add(bytes) > self.vram_budget_bytes {
+                // ★ Before giving up, ask the retention for spare bytes ONCE. The
+                // retention holds only genuinely-spare leaf layers and gives them
+                // back here, so a real caller (argue) is never displaced by a
+                // cache — the fix for wt16, where the retention won the shared
+                // budget and argue fell to the host. Bounded to one pass by
+                // `evicted`, so a persistent miss returns None (and the call
+                // site's `note_device_fallback` counts it) rather than spinning.
+                if !evicted {
+                    evicted = true;
+                    let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;
+                    if try_evict_retained(deficit) > 0 {
+                        held = self.reserved.load(Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 return None;
             }
             match self.reserved.compare_exchange_weak(
@@ -966,6 +1094,7 @@ impl Backend {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    note_reserved(held + bytes);
                     return Some(DeviceReservation {
                         bytes: AtomicU64::new(bytes),
                     });
@@ -1382,5 +1511,84 @@ impl Backend {
             None => self.ctx.new_event(None)?,
         };
         Ok(PooledEvent { event: Some(ev) })
+    }
+}
+
+#[cfg(test)]
+mod device_fallback_counter_tests {
+    use super::{
+        device_fallbacks, note_device_fallback, note_reserved, reserved_high_water,
+        reset_device_fallbacks, reset_reserved_high_water,
+    };
+    use std::sync::Mutex;
+
+    /// The counter is process-wide, so a test asserting an absolute value
+    /// serialises against anything else in this binary that might move it.
+    static COUNTER: Mutex<()> = Mutex::new(());
+
+    /// The plumbing, card-free: a bump reads as one, bumps accumulate, and a
+    /// reset reads as zero. This is the CONTROL for the box test — if
+    /// `note`/`device_fallbacks`/`reset` did not agree here, no site test could
+    /// be trusted.
+    #[test]
+    fn note_bumps_read_and_reset_zeroes() {
+        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        reset_device_fallbacks();
+        assert_eq!(device_fallbacks(), 0, "reset must zero the counter");
+        note_device_fallback();
+        assert_eq!(device_fallbacks(), 1, "one note reads one");
+        note_device_fallback();
+        assert_eq!(device_fallbacks(), 2, "notes accumulate");
+        reset_device_fallbacks();
+        assert_eq!(device_fallbacks(), 0, "reset must zero it again");
+    }
+
+    /// ⛔ THE FOUR UNDRIVEN SITES' FALSIFIER. The box test drives ONE site
+    /// (`DeviceColumns::upload`); this arm is what lets the other four fail
+    /// without four card fixtures. `note_device_fallback` must be CALLED at
+    /// exactly the five argue-surface sites the counter's doc enumerates —
+    /// three in `sumcheck.rs`, one in `gkr.rs`, one in `columns.rs`. Removing
+    /// the call at ANY site changes the tuple and reddens this test by name,
+    /// which localises the loss to the file it happened in.
+    ///
+    /// The pattern carries the `crate::device::` prefix so it counts CALLS and
+    /// never the definition (`pub(crate) fn note_device_fallback`).
+    #[test]
+    fn note_device_fallback_is_called_at_exactly_the_five_argue_sites() {
+        const PATTERN: &str = "crate::device::note_device_fallback()";
+        let sumcheck = include_str!("sumcheck.rs").matches(PATTERN).count();
+        let gkr = include_str!("gkr.rs").matches(PATTERN).count();
+        let columns = include_str!("columns.rs").matches(PATTERN).count();
+        assert_eq!(
+            (sumcheck, gkr, columns),
+            (3, 1, 1),
+            "the argue-surface device-fallback counter must be bumped at exactly \
+             the five sites the counter's doc names: sumcheck ×3, gkr ×1, \
+             columns ×1 (found sumcheck {sumcheck}, gkr {gkr}, columns {columns})"
+        );
+    }
+
+    /// The reservation high-water is a MONOTONE peak: it takes the max, so a
+    /// smaller rise never lowers it and a larger one raises it. Card-free — it
+    /// exercises `note_reserved` directly (the same call `reserve`/`grow` make on
+    /// every successful rise of `be.reserved`), so a peak that failed to track
+    /// would show here before any card run relied on the number.
+    #[test]
+    fn reserved_high_water_keeps_the_max() {
+        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero the high-water");
+        note_reserved(100);
+        assert_eq!(reserved_high_water(), 100, "the first rise sets the peak");
+        note_reserved(50);
+        assert_eq!(
+            reserved_high_water(),
+            100,
+            "a smaller rise must not lower it"
+        );
+        note_reserved(200);
+        assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero it again");
     }
 }

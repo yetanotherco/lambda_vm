@@ -130,6 +130,7 @@ impl DeviceFractionTree {
         // The levels above the input layer halve, so the whole tree is twice
         // it — and the input layer is `p` and `q` together.
         let Some(room) = be.reserve(p.len() as u64 * 8 * 4) else {
+            crate::device::note_device_fallback();
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));

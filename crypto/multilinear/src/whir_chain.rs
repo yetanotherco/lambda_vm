@@ -704,6 +704,9 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    // One chain, counted — arm F's identity is per chain, and a group can open
+    // several (`stacked_eval::prove` runs one per commitment).
+    crate::whir_split::bump(&crate::whir_split::CHAIN_COUNT);
     let schedule = config.schedule(num_vars);
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
@@ -721,6 +724,9 @@ where
         // after the last round — is reported as `setup_tail`, named rather
         // than left as a gap for a tolerance to swallow.
         let __wc_round = crate::whir_split::mark();
+        // One per iteration, so arm F can derive the `open_many` calls this
+        // loop should have made (`2R − 1` per chain) from the run's own count.
+        crate::whir_split::bump(&crate::whir_split::ROUND_COUNT);
         // ── the round's six slots, under `LAMBDA_VM_BASE_SPLIT=1` ──
         // They partition the round, so `open_groups - Σ(six)` is loop overhead
         // and nothing else. All three grinds share one slot: they are the same
@@ -929,9 +935,13 @@ where
     T: IsTranscript<N>,
     H: WhirHash,
 {
+    let __wq_sample = crate::whir_split::mark();
     let queries: Vec<usize> = (0..config.num_queries)
         .map(|_| transcript.sample_u64(current.num_leaves() as u64) as usize)
         .collect();
+    crate::whir_split::add(&crate::whir_split::QUERY_SAMPLE, __wq_sample);
+    // ⛔ ONE `open_many` here, not two: the final round has no successor to
+    // open. That is the `− 1` in arm F's `2R − 1`.
     Ok(RoundProof {
         current: current.open_many(&queries)?,
         next: Vec::new(),

@@ -944,3 +944,129 @@ extern "C" __global__ void rpx_grind_search(const uint64_t *inner_felts,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ⛔ A DIAGNOSTIC TWIN, NEVER A PROVING PATH.
+//
+// `rpx_grind_search` above is the shipped kernel and this file does not change
+// it. This twin is the same search with three counters, and it exists to answer
+// ONE question that no timing can: when a launch is slow, does it EXECUTE MORE
+// PERMUTATIONS, or the same ones more slowly?
+//
+// The question is not idle. The paired microbench reads a mean 20% above the
+// model on the record posture while the MEDIAN seed sits on it, and the excess
+// saturates in `count` rather than growing with it: converted to iterations per
+// thread the excess fits `T·(1 − e^(−(N−8)/τ))` with τ ≈ 19 on three
+// independent points. That is the shape of a thread that keeps scanning for a
+// bounded TIME after the answer is known — a poll of `*result` served stale —
+// and not the shape of a thread running to the loop bound. `executed` settles
+// it: stale polls mean real extra permutations, bounded by time and therefore
+// the SAME at scan 8 and scan 64; anything else means the work is unchanged and
+// the cost is outside this loop.
+//
+// ⚠ WASTED WORK, NEVER A WRONG ANSWER. The search returns the globally smallest
+// valid nonce whatever any thread does after the `atomicMin`, which is why the
+// counters can be read at leisure while the answer stays pinned by
+// `gpu_grind_returns_smallest_valid_nonce`. Nothing here is a soundness matter.
+//
+// ⛔ `#if defined(__CUDACC__)`, and that is deliberate rather than defensive:
+// the host-KAT compiles this file through `cuda_host_shim.h`, which supplies
+// `gridDim`, `blockDim` and `atomicMin` but NOT `__shfl_down_sync`. A KAT has
+// no answer to check here anyway — this kernel produces no digest — and its
+// nonce agreement with the shipped kernel is asserted on the device, seed by
+// seed, by the bench that launches it.
+//
+// SIZING, before the first cubin, by the rule this file learnt the hard way
+// (`permute` stays a called function; see its CODE SHAPE note): one more
+// `permute` CALL SITE, not one more inlined copy, so this adds an entry of
+// order 150-250 PTX lines against a file of 6,241 — not a duplicated
+// permutation body. If the `.ptx` grows by thousands, something inlined that
+// must not.
+#if defined(__CUDACC__)
+
+// One warp's reduction of a sum and a max, so the counters cost four atomics a
+// warp instead of one per thread.
+//
+// ⛔ A per-thread `atomicAdd` would be 131,072 serialised updates of one L2
+// line per launch — the same order as the 5-11 ms effect being measured. An
+// instrument that manufactures its own signal answers a different question.
+// Every thread in a warp reaches this (the loop's `break`s leave the loop, not
+// the function), so the full mask is correct.
+// ⛔ `unsigned long long`, NOT `uint64_t`, and that is not a style choice. The
+// shuffle intrinsics are overloaded on `int`, `unsigned int`, `long long`,
+// `unsigned long long`, `float` and `double`. On an LP64 host `uint64_t` is
+// `unsigned long`, which is NONE of them — the call would be ambiguous or
+// absent rather than wrong, so it fails at compile time on the box and not
+// here, where no nvcc runs. The file already casts for exactly this reason
+// where it calls `atomicMin`.
+__device__ __forceinline__ void warp_reduce_counts(unsigned long long &sum,
+                                                   unsigned long long &max_v,
+                                                   unsigned long long &ends) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+        ends += __shfl_down_sync(0xffffffffu, ends, off);
+        const unsigned long long other = __shfl_down_sync(0xffffffffu, max_v, off);
+        if (other > max_v) max_v = other;
+    }
+}
+
+// The three counters live in ONE device array so a search reads them back in a
+// single copy: `counts[COUNT_EXECUTED]` and `counts[COUNT_RAN_TO_END]` are
+// accumulated with `atomicAdd` across every launch of the search,
+// `counts[COUNT_MAX_ITERS]` with `atomicMax`. The host mirrors these names.
+__device__ constexpr int COUNT_EXECUTED = 0;
+__device__ constexpr int COUNT_MAX_ITERS = 1;
+__device__ constexpr int COUNT_RAN_TO_END = 2;
+
+extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
+                                                    uint64_t limit,
+                                                    uint64_t base,
+                                                    uint64_t count,
+                                                    volatile unsigned long long *result,
+                                                    unsigned long long *counts) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint64_t f0 = inner_felts[0], f1 = inner_felts[1], f2 = inner_felts[2],
+                   f3 = inner_felts[3];
+    // Permutations THIS thread ran. Counted after both exit tests and before
+    // the sponge, so it counts work done and never work declined.
+    uint64_t iters = 0;
+    // Did this thread leave by the loop bound rather than by an early exit?
+    // Only meaningful for a thread that did some work: a thread whose `tid` is
+    // past `count` never enters the loop and must not be scored as having
+    // scanned to the end.
+    uint64_t to_end = 0;
+    uint64_t i = tid;
+    for (; i < count; i += stride) {
+        uint64_t nonce = base + i;
+        if (nonce < base) break;
+        if (nonce >= (uint64_t)*result) break;
+        ++iters;
+        rpx::Sponge sp;
+        sp.init(GRIND_FELTS);
+        sp.absorb(f0);
+        sp.absorb(f1);
+        sp.absorb(f2);
+        sp.absorb(f3);
+        sp.absorb(goldilocks::canonical(nonce));
+        uint64_t digest[rpx::DIGEST_FELTS];
+        sp.finalize(digest);
+        if (digest[0] < limit) {
+            atomicMin((unsigned long long *)result, (unsigned long long)nonce);
+        }
+    }
+    if (i >= count && iters > 0) to_end = 1;
+
+    unsigned long long sum = (unsigned long long)iters;
+    unsigned long long max_v = (unsigned long long)iters;
+    unsigned long long ends = (unsigned long long)to_end;
+    warp_reduce_counts(sum, max_v, ends);
+    if ((threadIdx.x & 31u) == 0u) {
+        atomicAdd(&counts[COUNT_EXECUTED], sum);
+        atomicAdd(&counts[COUNT_RAN_TO_END], ends);
+        atomicMax(&counts[COUNT_MAX_ITERS], max_v);
+    }
+}
+
+#endif  // __CUDACC__

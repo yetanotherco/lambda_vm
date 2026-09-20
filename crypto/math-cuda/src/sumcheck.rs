@@ -584,6 +584,7 @@ pub fn evaluate_many_base(
         // of the card: the caller's fallback is to evaluate the columns one at
         // a time, which needs almost nothing.
         let Some(_room) = crate::device::reserve(group_len as u64 * per_column) else {
+            crate::device::note_device_fallback();
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
@@ -753,6 +754,7 @@ impl DeviceFactors {
 
         let be = backend()?;
         let Some(room) = be.reserve(factors.len() as u64 * span as u64 * 8) else {
+            crate::device::note_device_fallback();
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
@@ -820,6 +822,7 @@ impl DeviceFactors {
         // What stays: the factors. The base columns they are gathered from are
         // a third of that and are freed as soon as the gather has read them.
         let Some(room) = be.reserve(width as u64 * rows as u64 * 24) else {
+            crate::device::note_device_fallback();
             return Err(cudarc::driver::DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
