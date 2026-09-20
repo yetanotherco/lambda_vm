@@ -393,13 +393,47 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     // sample.
     math_cuda::device::drain_and_trim().expect("drain");
     let free_before = be.free_vram_bytes().expect("cuMemGetInfo");
+    // ★ THE SECOND INSTRUMENT, and it is the one that can tell the two stories
+    // apart. `free_vram_bytes` is the DRIVER's count and includes whatever the
+    // pool is sitting on; `reserved_bytes` is what the CODE promised and is
+    // blind to the pool by construction. Their difference is the pool's, and
+    // printing it turns "either the pool retained a block or the code holds one
+    // more" from a question into a read.
+    let reserved_before = be.reserved_bytes();
 
     let held: Vec<_> = (0..4)
         .map(|_| commit_on_device(num_vars, log_folding, hash))
         .collect();
 
+    // ⛔ SYMMETRIC SAMPLING, AND THIS LINE IS THE FIX. `free_before` is taken
+    // AFTER a drain and this one was not, so the difference measured the code
+    // plus every transient the four commits made — and with the pool set to
+    // retain all freed blocks, that is all of them. A delta between two samples
+    // is about the code only if both are taken at the same pool state.
+    //
+    // ★ WHAT IT COST, and why a widened bound was the wrong repair. The run of
+    // 2026-09-20 read `taken` = 301,989,888 B — EXACTLY nine codewords, on a
+    // bound of nine, where the model says eight are held. The old one-sided
+    // bound was `8 × codeword` against four codewords held, so it carried 128
+    // MiB of margin the pool had been living in unnoticed; the leaf-layer
+    // retention did not add pool retention, it CONSUMED that margin. And the
+    // slack was never sized against the transients anyway: the node buffer
+    // `build_tree` allocates is `(2L−1)·32` = 64 MiB, twice the bound's 32.
+    //
+    // The same run's mutation arm settles which it is. Holding a whole node
+    // array instead of a layer moved the measurement to 480 MiB where the code
+    // then holds 384 — an excess of 96 against the honest run's 32, tripling
+    // while the holding grew by half. No "the code holds one more object" form
+    // fits both (`4×(cw+tree)+tree` = 448, `+cw` = 416; `5×(cw+tree)` = 480 fits
+    // MUT C exactly and dies on the honest run, where `5×(cw+leaf)` = 320 ≠ 288).
+    // Every peak-demand model misses on BOTH sides (320 and 448 predicted), which
+    // is the signature of driver suballocation and not of anything this tree
+    // accounts for. ⇒ `free_vram_bytes()` cannot carry a bound this tight
+    // unless both samples are drained.
+    math_cuda::device::drain_and_trim().expect("drain");
     let free_after = be.free_vram_bytes().expect("cuMemGetInfo");
     let taken = free_before.saturating_sub(free_after);
+    let promised = be.reserved_bytes().saturating_sub(reserved_before);
 
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
     let leaves = ((1u64 << num_vars) << 2) >> log_folding;
@@ -417,27 +451,56 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     let bound = expect + codeword_bytes;
     let floor = 4 * codeword_bytes;
     let mib = |b: u64| b / (1 << 20);
+    // ★ THE TWO ACCOUNTINGS, SIDE BY SIDE, IN WHICHEVER MESSAGE FIRES. A failure
+    // here used to say only how many bytes the DRIVER lost, which cannot
+    // distinguish "the pool retained a block" from "the code holds one more" —
+    // and those call for opposite repairs. `promised` is the code's own number
+    // and is blind to the pool; the per-codeword pair says how many layers are
+    // actually in hand. `driver − promised` is the pool's share, and it should
+    // now be small: the drain above is what makes that true.
+    let ledger = {
+        let per: Vec<String> = held
+            .iter()
+            .map(|(c, _)| {
+                format!(
+                    "{}/{}",
+                    mib(c.reserved_bytes()),
+                    mib(c.retained_leaf_bytes())
+                )
+            })
+            .collect();
+        format!(
+            "driver {} MiB · promised {} MiB · pool share {} MiB · per codeword \
+             reserved/retained MiB: [{}]",
+            mib(taken),
+            mib(promised),
+            mib(taken.saturating_sub(promised)),
+            per.join(", ")
+        )
+    };
     assert!(
         taken < bound,
         "four unopened commitments took {} MiB from the device. Four codewords \
          and their leaf layers are {} MiB and the bound is {} MiB; a TREE is {} \
          MiB, so four of those kept would read {} MiB. Something bigger than a \
-         leaf layer is held per commitment.",
+         leaf layer is held per commitment.\n   {}",
         mib(taken),
         mib(expect),
         mib(bound),
         mib(tree_bytes),
         mib(4 * (codeword_bytes + tree_bytes)),
+        ledger,
     );
     assert!(
         taken > floor,
         "four unopened commitments took only {} MiB, which is at or under the {} \
          MiB their codewords alone need. The leaf layers ({} MiB for four) are \
          NOT being held — either the capture never ran or the budget refused it, \
-         and in both cases every opening will re-hash its leaves.",
+         and in both cases every opening will re-hash its leaves.\n   {}",
         mib(taken),
         mib(floor),
         mib(4 * leaf_bytes),
+        ledger,
     );
 
     // The commitments are alive up to here, which is the whole point: a `drop`
