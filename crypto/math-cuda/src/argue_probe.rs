@@ -27,6 +27,7 @@
 //! another's (gkr's layer sumcheck inside a reserve). A finer per-surface TIME /
 //! device-vs-host split is STEP 2b, added only if the byte roofline is borderline.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The three argue device surfaces, matching the crates the reserve sites live
@@ -84,6 +85,40 @@ pub fn surface_totals(surface: Surface) -> (u64, u64) {
     )
 }
 
+// ── device-busy sizing (round-3 argue idle-fraction discriminator) ──────────
+//
+// The concurrency lever is soundness-dead (the whole argue is one sequential
+// Fiat-Shamir chain — the transcript order IS the proof), so argue's ~2% util is
+// mostly INHERENT per-round host-sync latency. This measures how much of the
+// argue wall the round kernels are actually BUSY: the sizing timer records CUDA
+// events around the sumcheck round kernels and reads the elapsed after the
+// EXISTING per-round synchronize(), accumulating device-busy nanoseconds. idle =
+// argue_wall − device_busy sizes the total gap; the recoverable-WITHOUT-a-rewrite
+// fraction is only what transcript-independent prefetch can fill (the
+// orchestration read sizes that), so a large idle here is NOT a large recoverable
+// win by itself.
+
+static DEVICE_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Enabled only when `LAMBDA_VM_ARGUE_BUSY_PROBE` is set — read ONCE and cached,
+/// so a production round() pays a single relaxed bool load and nothing else. The
+/// event recording (and its one-time timing-event creation) happens only when on.
+pub fn busy_probe_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("LAMBDA_VM_ARGUE_BUSY_PROBE").is_some())
+}
+
+/// Add device-busy nanoseconds measured across one round's kernels.
+pub fn add_device_busy_ns(ns: u64) {
+    DEVICE_BUSY_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// Device-busy nanoseconds accumulated over the run (round kernels only; fold and
+/// setup are excluded, so idle = wall − this is a slight OVER-estimate).
+pub fn device_busy_ns() -> u64 {
+    DEVICE_BUSY_NS.load(Ordering::Relaxed)
+}
+
 /// Zero every surface — call before a run whose totals are to be read, exactly
 /// as the fallback counter is reset.
 pub fn reset() {
@@ -91,4 +126,5 @@ pub fn reset() {
         c.bytes.store(0, Ordering::Relaxed);
         c.calls.store(0, Ordering::Relaxed);
     }
+    DEVICE_BUSY_NS.store(0, Ordering::Relaxed);
 }

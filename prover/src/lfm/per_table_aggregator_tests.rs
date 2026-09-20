@@ -8184,6 +8184,14 @@ fn the_whir_production_tree_composes_to_a_root() {
              columns {co_b} B / {co_c} ops · total {} B",
             sc_b + gk_b + co_b
         );
+        // Device-busy sizing (only when LAMBDA_VM_ARGUE_BUSY_PROBE is set): the
+        // seconds the sumcheck round kernels were actually executing. idle =
+        // `argue` wall (printed above) − this. The idle is mostly inherent
+        // Fiat-Shamir per-round host-sync latency (round-overlap is soundness-dead),
+        // so the recoverable-without-a-rewrite part is only what transcript-
+        // independent prefetch can fill. 0.000 s ⇒ the probe env was not set.
+        let busy_s = math_cuda::argue_probe::device_busy_ns() as f64 / 1.0e9;
+        println!("   argue device-busy (round kernels): {busy_s:.3} s — idle = argue wall − this");
     }
     // The PEAK simultaneous device reservation the run reached — the quantity
     // argue's `reserve` is checked against (not the raw device peak, which the
