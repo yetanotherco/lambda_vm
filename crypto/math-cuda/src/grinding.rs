@@ -437,6 +437,11 @@ pub struct GrindCounts {
     pub ran_to_end: u64,
     /// Launches this search made: the hit's block, plus every miss before it.
     pub launches: u64,
+    /// The poll period (`k`) this search launched the twin with, echoed back
+    /// from the launch so a report quotes the knob READ on the path rather than
+    /// the one the caller believes it passed. `1` is the shipped
+    /// every-iteration poll; the sweep uses powers of two.
+    pub poll_period: u64,
 }
 
 /// ⛔ THE DIAGNOSTIC TWIN OF [`search`], RPX ONLY, ON NO PROVING PATH.
@@ -459,10 +464,32 @@ pub struct GrindCounts {
 /// seed reports the whole search and not only its last block. `launches` says
 /// how many blocks that was.
 ///
+/// `poll_period` sets how often each thread polls `*result` for the early
+/// exit: every iteration at `1` (the shipped kernel's rate), every `k`-th at
+/// `k`, staggered across threads so the request rate falls by `k` in both
+/// average and peak. It exists to test whether the stale-poll overrun is
+/// contention on that one address — lower the rate and read whether the overrun
+/// falls (contention) or rises (a poll that is simply too coarse). It must be a
+/// power of two; it changes only how much a thread over-scans, never the nonce
+/// the search returns.
+///
 /// Returns `None` for the same reasons [`search`] does, plus a factor outside
-/// the supported range.
-pub fn search_counted(inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Option<GrindCounts> {
+/// the supported range or a `poll_period` that is zero or not a power of two.
+pub fn search_counted(
+    inner: &[u64; 4],
+    grinding_factor: u8,
+    knobs: Knobs,
+    poll_period: u64,
+) -> Option<GrindCounts> {
     if !(GRIND_MIN_FACTOR..=64).contains(&grinding_factor) {
+        return None;
+    }
+    // The kernel derives its stagger mask as `poll_period - 1` and polls when
+    // `(n + tid) & mask == 0`, which is a clean period of `poll_period` only
+    // when `poll_period` is a power of two. `poll_period == 1` (mask 0) polls
+    // every iteration — the shipped kernel's rate, the sweep's control; a zero
+    // would wrap the mask to all-ones and poll essentially never. Reject both.
+    if poll_period == 0 || !poll_period.is_power_of_two() {
         return None;
     }
     let limit: u64 = 1u64 << (64 - grinding_factor);
@@ -500,6 +527,7 @@ pub fn search_counted(inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Op
                 .arg(&count)
                 .arg(&mut result_dev)
                 .arg(&mut counts_dev)
+                .arg(&poll_period)
                 .launch(cfg)
                 .ok()?;
         }
@@ -514,6 +542,7 @@ pub fn search_counted(inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Op
                 max_iters: counts[1],
                 ran_to_end: counts[2],
                 launches,
+                poll_period,
             });
         }
         base = base.checked_add(count)?;
