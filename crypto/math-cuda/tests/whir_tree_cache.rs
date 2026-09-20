@@ -478,6 +478,22 @@ fn a_group_holds_only_its_codewords_before_any_open() {
             per.join(", ")
         )
     };
+    // ⛔ UNCONDITIONAL, AND THAT IS THE WHOLE POINT. Built only inside the
+    // assertion messages, this line appears ONLY when the test fails — so on
+    // the honest path the numbers were inferred from a pass and never read.
+    //
+    // What a pass alone establishes is `driver < bound`, i.e. pool share under
+    // one codeword, and NOTHING narrower. The mutation run that keeps a whole
+    // node array reads `pool share 64 MiB` even after the symmetric drain — a
+    // fragmentation floor of one largest transient, because a best-effort
+    // `trim` cannot release a chunk still backing a live allocation. If the
+    // honest path sits anywhere near that, this guard has a margin of a few MiB
+    // and will flake, and nobody would learn it from a green run.
+    //
+    // ⇒ printed every time, under `--nocapture`, which is how the box gate runs
+    // this suite. The number becomes a READ, and a ceiling can be asserted
+    // against it once its honest value is known.
+    println!("   group guard: {ledger}");
     assert!(
         taken < bound,
         "four unopened commitments took {} MiB from the device. Four codewords \
