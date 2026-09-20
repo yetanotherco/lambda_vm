@@ -66,7 +66,10 @@ impl DeviceColumns {
         }
         let total: usize = columns.iter().map(|c| c.len()).sum();
         let be = backend().ok()?;
-        let room = be.reserve(total as u64 * 8)?;
+        let Some(room) = be.reserve(total as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
         let stream = be.next_stream();
         // SAFETY: every element is written by the copies below.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;

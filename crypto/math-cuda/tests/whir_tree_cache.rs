@@ -637,3 +637,65 @@ fn the_process_wide_counter_tracks_the_same_passes() {
         s2 - s0
     );
 }
+
+/// ⛔ THE ARGUE-SURFACE DEVICE-FALLBACK COUNTER FIRES AT A REAL SITE.
+///
+/// wt16 read as a win at the slot level because argue's per-table device work
+/// fell back to the host UNCOUNTED — `multilinear::gpu::host_fallbacks()`
+/// counts the COMMIT path only. `math_cuda::device::device_fallbacks()` is the
+/// counter that closes that blind spot; this test proves it actually moves when
+/// an argue-surface `reserve` is refused, using the cheapest of the five sites,
+/// `DeviceColumns::upload`.
+///
+/// It forces the refusal WITHOUT a budget setter and WITHOUT allocating any
+/// device memory: `Backend::reserve` is a pure atomic bump on the reservation
+/// total (no `cuMemAlloc`), so reserving the whole remaining budget makes every
+/// later `reserve` return `None` at no memory cost. The reservation is dropped
+/// at the end, giving the budget back.
+///
+/// The gate mutation is deleting the `note_device_fallback()` call at
+/// `columns.rs`'s `reserve`→`None` site: the count then reads 0 and the final
+/// assertion reddens by name. The four undriven sites are covered card-free by
+/// `note_device_fallback_is_called_at_exactly_the_five_argue_sites` in
+/// `device.rs`.
+#[test]
+fn an_argue_reservation_refusal_bumps_the_device_fallback_counter() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("device fallback test needs a GPU");
+
+    // Take the whole remaining budget as one reservation — an atomic bump, no
+    // device memory — so any further `reserve` must be refused. Held to the end
+    // of the test, then dropped.
+    let remaining = be.vram_budget_bytes().saturating_sub(be.reserved_bytes());
+    let _hog = math_cuda::device::reserve(remaining)
+        .expect("reserving the remaining budget is an accounting move and cannot fail");
+    assert_eq!(
+        be.reserved_bytes(),
+        be.vram_budget_bytes(),
+        "the budget is now fully promised, so the next reserve must be refused"
+    );
+
+    math_cuda::device::reset_device_fallbacks();
+    assert_eq!(
+        math_cuda::device::device_fallbacks(),
+        0,
+        "the counter starts this measurement at zero"
+    );
+
+    // The cheapest argue site: one column of one element wants 8 bytes the
+    // budget cannot promise, so `upload` returns `None` at its `reserve` and
+    // the site records the fallback.
+    let refused = math_cuda::columns::DeviceColumns::upload(&[&[0u64]]);
+    assert!(
+        refused.is_none(),
+        "with the budget fully promised, the device upload must decline"
+    );
+    assert_eq!(
+        math_cuda::device::device_fallbacks(),
+        1,
+        "an argue-surface reserve was refused, so the device-fallback counter \
+         must read exactly one — a 0 here is the counter not wired to the site"
+    );
+
+    // `_hog` is dropped here at scope end, returning the reserved budget.
+}
