@@ -328,3 +328,69 @@ fn columns_folded_together_match_one_at_a_time() {
         }
     }
 }
+
+// ⛔ ROUND-3 ARGUE DISCRIMINATOR — an ncu MICRO-BENCH, on no production path.
+//
+// The census put argue at ~2% of the HBM roofline and single-digit-% of compute
+// on LARGE kernels — GPU-under-utilized, not floored. This bench builds a
+// BLOCK-SCALE sumcheck (num_vars = 21, the KECCAK_RND scale, the census
+// byte-leader) with a Builder-lowered program at the tested (width 4, degree 5)
+// shape, and runs a handful of round + fold launches so Nsight Compute can
+// profile `sumcheck_round_ext3` (and `sum_partials_ext3` / `sumcheck_fold_ext3`)
+// at realistic dims. NO host cross-check (a 2^21 host round is far too slow) and
+// NO correctness claim — parity is `device_rounds_match_the_host_sumcheck`'s job;
+// this exists ONLY to hand the profiler one representative launch.
+//
+// ⚠ ncu -c 1 profiles ONE kernel = that kernel's OWN occupancy/SoL during
+// execution. It does NOT show the INTER-round host-sync idle (round() does a full
+// stream synchronize every round to cross the transcript answer to the host —
+// sumcheck.rs's own note: "more time than the rounds themselves"), which is a
+// TIMELINE property for nsys, not ncu. So this answers "is the round kernel
+// itself under-occupied?" — the complement to the host-sync finding.
+//
+// Build the binary, then profile:
+//   cargo test -p math-cuda --release --test sumcheck --no-run
+//   ncu --set full --section SpeedOfLight --section WarpStateStats \
+//       --section Occupancy --section MemoryWorkloadAnalysis \
+//       -k regex:'sumcheck_round_ext3' -c 1 \
+//       <target/release/deps/sumcheck-*> ncu_sumcheck_round_block_scale --exact --ignored
+#[test]
+#[ignore = "ncu micro-bench; run under Nsight Compute on a profiler-capable GPU box"]
+fn ncu_sumcheck_round_block_scale() {
+    const NUM_VARS: usize = 21; // KECCAK_RND scale — the census byte-leader rounds
+    const WIDTH: usize = 4;
+    const DEGREE: usize = 5; // the tested (width 4, degree 5) shape, at block scale
+
+    let factors: Vec<Mle<Ext3>> = (0..WIDTH).map(|k| factor(NUM_VARS, k as u64 + 1)).collect();
+    let program = program(WIDTH);
+    let lowered = lower(&program).expect("ext3 lowers");
+    let raw: Vec<&[u64]> = factors
+        .iter()
+        .map(|f| unsafe {
+            core::slice::from_raw_parts(f.evals().as_ptr() as *const u64, f.len() * 3)
+        })
+        .collect();
+    let mut session = math_cuda::sumcheck::SumcheckSession::new(
+        &raw,
+        &lowered.nodes,
+        &lowered.consts,
+        lowered.num_slots,
+        lowered.root_slot,
+    )
+    .expect("a session (needs a GPU)");
+
+    let mut t = Vec::new();
+    for node in 1..=DEGREE {
+        t.extend_from_slice(&ext3_raw(&FE::from(node as u64)).expect("ext3"));
+    }
+
+    // Rounds from 2^21 downward; ncu profiles the first (largest) round kernel.
+    // A handful of large rounds is what the profiler needs — the tiny late rounds
+    // are not representative. No host check; correctness is pinned elsewhere.
+    for _ in 0..6 {
+        let _ = session.round(&t).expect("a round");
+        session
+            .fold(&ext3_raw(&FE::from(3u64)).expect("ext3"))
+            .expect("a fold");
+    }
+}
