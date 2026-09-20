@@ -632,6 +632,36 @@ pub fn reset_reserved_high_water() {
     RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
 }
 
+/// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs
+/// so the allocator can reclaim spare retained bytes UNDER PRESSURE, on a real
+/// caller's behalf, without `device.rs` depending on `whir.rs`.
+///
+/// This is what makes the retention a PRIORITY scheme, not a byte race
+/// ([[gpu-two-vramgates-overlap]]): it holds only genuinely-spare bytes, and the
+/// instant a real caller (argue) cannot get its reservation, the layers are
+/// given back. A plain `fn` pointer — Send + Sync, no allocation — installed once
+/// via `OnceLock`; it takes a byte TARGET and returns how many it actually freed.
+///
+/// ⛔ CONTRACT the evictor MUST honour (see `whir::evict_retained_layers`): it
+/// frees by dropping retained layers and calling `DeviceReservation::shrink`, and
+/// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
+/// called it and deadlock.
+static EVICTOR: OnceLock<fn(u64) -> u64> = OnceLock::new();
+
+/// Install the retention evictor. Idempotent — only the first install sticks.
+pub fn set_retention_evictor(evictor: fn(u64) -> u64) {
+    let _ = EVICTOR.set(evictor);
+}
+
+/// Ask the retention to give back at least `target` bytes of budget; returns how
+/// many it freed (0 if none is installed or nothing was reclaimable).
+fn try_evict_retained(target: u64) -> u64 {
+    match EVICTOR.get() {
+        Some(evict) => evict(target),
+        None => 0,
+    }
+}
+
 /// Allocates on `stream`, and if the device says no, gives the pool's retained
 /// blocks back and asks once more.
 ///
@@ -1036,9 +1066,25 @@ impl Backend {
     /// has a host path. The budget binds only when several proofs share a
     /// card: one of them is enough to fill it.
     pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        let mut evicted = false;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
             if held.saturating_add(bytes) > self.vram_budget_bytes {
+                // ★ Before giving up, ask the retention for spare bytes ONCE. The
+                // retention holds only genuinely-spare leaf layers and gives them
+                // back here, so a real caller (argue) is never displaced by a
+                // cache — the fix for wt16, where the retention won the shared
+                // budget and argue fell to the host. Bounded to one pass by
+                // `evicted`, so a persistent miss returns None (and the call
+                // site's `note_device_fallback` counts it) rather than spinning.
+                if !evicted {
+                    evicted = true;
+                    let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;
+                    if try_evict_retained(deficit) > 0 {
+                        held = self.reserved.load(Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 return None;
             }
             match self.reserved.compare_exchange_weak(

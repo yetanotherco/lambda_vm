@@ -5,14 +5,14 @@
 //! one NTT onto the blown-up domain, then the strided-coset leaf hash and the
 //! Merkle tree. Parity against that pipeline is checked by `tests/whir_commit.rs`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, Weak};
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::Result;
-use crate::device::{alloc_or_trim, backend};
+use crate::device::{DeviceReservation, alloc_or_trim, backend};
 
 /// Leaf-hash passes over a codeword — one per tree actually built.
 ///
@@ -149,6 +149,128 @@ impl Drop for RetainedLeaves {
     }
 }
 
+/// Retention evictions this process has done, and the bytes they gave back — the
+/// evictable scheme working under pressure. `evicted > 0` with `device fallbacks
+/// 0` is argue getting its budget FROM the retention instead of from the host.
+static RETAIN_EVICTED: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BYTES_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// (evictions, bytes evicted) this process — see [`RETAIN_EVICTED`].
+pub fn retention_evictions() -> (u64, u64) {
+    (
+        RETAIN_EVICTED.load(Ordering::Relaxed),
+        RETAIN_BYTES_EVICTED.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether the leaf-layer retention is enabled this process. `LFM_WHIR_RETENTION=0`
+/// turns it OFF (capture becomes a no-op), which is how the ABBA's control arm
+/// runs off the SAME binary as the retention arm — the two differ only by this
+/// flag. Read once and cached; default ON.
+fn retention_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LFM_WHIR_RETENTION")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// A handle the allocator can walk to reclaim a codeword's retained layer under
+/// pressure. Both are `Weak`, so the registry never keeps a codeword alive:
+/// `leaves` points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the
+/// MUTEX outlives any single layer, so this entry SURVIVES an eviction and a
+/// later re-capture refills the same `Option` — and `room` at its reservation, so
+/// the freed bytes can be `shrink`-ed back into the budget. A dead `leaves`
+/// upgrade means the codeword is gone and the eviction walk prunes the entry.
+struct RetentionHandle {
+    leaves: Weak<Mutex<Option<RetainedLeaves>>>,
+    room: Weak<DeviceReservation>,
+}
+
+/// Every retaining codeword's handle, registered once at its first capture and
+/// pruned when the codeword drops. Walked only on the rare eviction path.
+static RETENTION_REGISTRY: Mutex<Vec<RetentionHandle>> = Mutex::new(Vec::new());
+
+/// Install [`evict_retained_layers`] as the allocator's evictor, once.
+fn ensure_evictor_installed() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| crate::device::set_retention_evictor(evict_retained_layers));
+}
+
+/// Register a codeword's layer slot + reservation for eviction. Called OUTSIDE
+/// the layer lock (it takes only the registry lock), so the one lock nesting in
+/// the system is the evictor's registry→layer and there is no cycle.
+fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>, room: &Arc<DeviceReservation>) {
+    let handle = RetentionHandle {
+        leaves: Arc::downgrade(leaves),
+        room: Arc::downgrade(room),
+    };
+    if let Ok(mut reg) = RETENTION_REGISTRY.lock() {
+        reg.push(handle);
+    }
+}
+
+/// ⛔ THE EVICTOR — installed into `device::reserve`, called on its budget-miss
+/// path on the RESERVING thread. Frees at least `target` bytes of BUDGET by
+/// dropping retained leaf layers, FIFO (oldest first), pruning dead entries as it
+/// goes; returns the bytes freed.
+///
+/// SAFETY, the load-bearing facts:
+/// - NO REENTRANCY. It calls only `room.shrink` (a lock-free `be.reserved`
+///   subtract) and drops `RetainedLeaves` (a counter subtract + a stream-ordered
+///   free). It NEVER calls `reserve`/`grow`, so it cannot re-enter the allocator
+///   that called it.
+/// - NO UAF. It takes the layer out UNDER the codeword's own `leaves` mutex, so a
+///   concurrent [`serve_retained_leaves`] either ran first (its `memcpy_dtod` is
+///   already enqueued on the codeword's stream) or sees `None` and rebuilds. The
+///   evicted `nodes` was allocated on that SAME stream, and cudarc 0.19.4
+///   `CudaSlice::drop` (core.rs:776-795) first waits on the slice's own read/write
+///   events, then frees on the slice's OWN stream — `free_async(ptr,
+///   self.stream.cu_stream)` when `has_async_alloc`, else `synchronize()` +
+///   `free_sync`. So the free is ordered after any serve copy on that stream (or
+///   a full device sync). The only unsafe shape — an async free on a DIFFERENT
+///   stream than the copy — cannot arise here: both are the codeword's stream.
+/// - LOCK ORDER. Registry mutex, then ONE layer mutex at a time (released before
+///   the next); `be.reserved` is lock-free. Capture registers OUTSIDE the layer
+///   lock, so nothing ever holds layer→registry — acyclic.
+/// - `shrink` frees the BUDGET, not the bytes: never-purge keeps the raw device
+///   allocation pooled for reuse, and the budget is exactly what argue's
+///   `reserve` is gated on ([[gpu-two-vramgates-overlap]]).
+fn evict_retained_layers(target: u64) -> u64 {
+    let mut freed = 0u64;
+    let mut reg = match RETENTION_REGISTRY.lock() {
+        Ok(reg) => reg,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.retain(|handle| {
+        let Some(leaves) = handle.leaves.upgrade() else {
+            return false; // the codeword is gone; prune this dead entry
+        };
+        if freed >= target {
+            return true; // enough freed; keep the rest for next time
+        }
+        // Take the layer out under its own mutex — a concurrent serve holds this
+        // same lock across its copy enqueue, so the free cannot race it.
+        let taken = match leaves.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(layer) = taken {
+            let bytes = layer.bytes;
+            drop(layer); // RetainedLeaves::drop: live -= bytes; nodes freed (stream-ordered)
+            if let Some(room) = handle.room.upgrade() {
+                room.shrink(bytes); // give the BUDGET back to argue
+            }
+            freed += bytes;
+            RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
+            RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
+        }
+        true // keep the entry: the mutex lives with the codeword and may refill
+    });
+    freed
+}
+
 /// May a layer built under `kept` be served for a tree asked for under `want`?
 ///
 /// ⛔ A FREE FUNCTION ON PURPOSE. Everything else on this path needs a device,
@@ -228,6 +350,11 @@ pub struct DeviceCodeword {
     /// A tree is NOT in this number, because a tree is never held past the
     /// call that builds it — see [`with_tree`](Self::with_tree).
     room: Arc<crate::device::DeviceReservation>,
+    /// Whether this codeword has been registered with the eviction registry.
+    /// Set once, on the first capture, so a rebuild-after-eviction re-capture
+    /// does not push a duplicate handle. `Arc` so all clones share the one flag,
+    /// as they share `leaves` and `room`.
+    registered: Arc<AtomicBool>,
 }
 
 impl DeviceCodeword {
@@ -379,6 +506,15 @@ impl DeviceCodeword {
         log_folding: usize,
         hash: crate::DeviceHash,
     ) {
+        // ⛔ LFM_WHIR_RETENTION=0 disables the retention entirely (the ABBA's
+        // control arm, off the SAME binary): capture is a no-op, nothing is
+        // retained, and the print reads admitted 0. Default ON.
+        if !retention_enabled() {
+            return;
+        }
+        // Install the evictor before any layer exists, so a later `reserve` that
+        // needs the budget can reclaim one. Idempotent (a `Once`).
+        ensure_evictor_installed();
         let Ok(mut held) = self.leaves.lock() else {
             return;
         };
@@ -417,6 +553,14 @@ impl DeviceCodeword {
             num_leaves,
             bytes,
         });
+        // Release the layer lock BEFORE touching the registry, so the only lock
+        // nesting anywhere is the evictor's registry→layer — acyclic. Register
+        // ONCE: the handle is a Weak to this mutex, survives an eviction, and a
+        // re-capture refills the same slot, so a second push would only duplicate.
+        drop(held);
+        if !self.registered.swap(true, Ordering::Relaxed) {
+            register_retained(&self.leaves, &self.room);
+        }
     }
 
     /// One refusal, with the headroom the budget had the FIRST time it happened
@@ -826,6 +970,7 @@ fn commit_from(
         leaf_passes: BuildCount::default(),
         leaves: Arc::new(Mutex::new(None)),
         room: Arc::new(room),
+        registered: Arc::new(AtomicBool::new(false)),
     };
     let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
@@ -1077,6 +1222,9 @@ pub fn fold_resident(
         // The fold lives inside the room the codeword it came from promised:
         // it is half of it, and that one is still alive.
         room: codeword.room.clone(),
+        // A fold is its own codeword for retention too: its own slot, its own
+        // registry entry once it captures.
+        registered: Arc::new(AtomicBool::new(false)),
     })
 }
 

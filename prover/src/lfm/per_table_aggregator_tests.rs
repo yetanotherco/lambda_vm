@@ -7468,14 +7468,16 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
     // says so in words: the launcher refuses to report a block number without
     // this line, exactly as it refuses one without the grind-knobs banner.
     let (admitted, refused, asked, got, headroom, saved) = math_cuda::whir::retention_report();
+    let (evicted, evicted_bytes) = math_cuda::whir::retention_evictions();
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
-        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {} · peak simultaneous footprint {:.0} MiB{}",
+        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {} · peak simultaneous footprint {:.0} MiB · evicted {evicted} ({:.0} MiB){}",
         mib(asked),
         mib(got),
         math_cuda::whir::leaf_hash_calls(),
         math_cuda::whir::tree_builds(),
         mib(math_cuda::whir::retained_bytes_peak()),
+        mib(evicted_bytes),
         if refused > 0 {
             format!(
                 " · FIRST REFUSAL at {:.0} MiB of budget headroom",

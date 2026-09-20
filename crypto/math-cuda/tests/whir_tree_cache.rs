@@ -744,3 +744,67 @@ fn the_live_footprint_and_reserved_high_water_track_the_retention() {
          balances the admit, or the live footprint would only ever rise"
     );
 }
+
+/// ⛔ A BUDGET MISS EVICTS A RETAINED LAYER AND THE RESERVE THEN SUCCEEDS.
+///
+/// The whole point of the evictable retention: when a real caller (argue, here a
+/// bare reserve) cannot get its bytes, the retention gives a layer back rather
+/// than the caller falling to the host. Committing captures ONE base layer (no
+/// folds), so exactly one layer is in the registry. Then the budget is filled to
+/// leave LESS free than the layer's bytes, so a reserve of the layer's size must
+/// miss — and it SUCCEEDS only because the evictor reclaims the layer. The
+/// mutation that disables the evictor (skip the consult in reserve, or never
+/// install it) makes this reserve return None and the test panic on the expect.
+#[test]
+fn a_budget_miss_evicts_a_retained_layer_and_the_reserve_succeeds() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("eviction test needs a GPU");
+
+    // Commit captures the base leaf layer; hold the codeword so the layer stays.
+    let (codeword, _root) = commit_on_device(14, 4, key::<RpxWhir>());
+    let layer_bytes = codeword.retained_leaf_bytes();
+    assert!(
+        layer_bytes > 0,
+        "precondition: the commit must have retained a layer"
+    );
+    let (evictions_before, _) = math_cuda::whir::retention_evictions();
+
+    // Fill the budget to leave a gap SMALLER than the layer, so a reserve of the
+    // layer's size cannot fit without eviction. reserve is a pure atomic bump,
+    // so the hog costs no device memory.
+    let gap = layer_bytes / 2;
+    let hog_bytes = be
+        .vram_budget_bytes()
+        .saturating_sub(be.reserved_bytes())
+        .saturating_sub(gap);
+    let _hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+    assert!(
+        be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < layer_bytes,
+        "the free budget must now be below the layer size, so the next reserve misses"
+    );
+
+    // This would return None without the evictor; with it, the layer is freed
+    // and the reserve succeeds.
+    let got = math_cuda::device::reserve(layer_bytes).expect(
+        "the reserve must SUCCEED by evicting the retained layer — a None here \
+                 is the evictor not consulted, or eviction freeing nothing",
+    );
+
+    let (evictions_after, bytes_evicted) = math_cuda::whir::retention_evictions();
+    assert!(
+        evictions_after > evictions_before,
+        "an eviction must have been recorded ({evictions_before} -> {evictions_after})"
+    );
+    assert!(
+        bytes_evicted >= layer_bytes,
+        "the eviction must have freed at least the layer's bytes"
+    );
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        0,
+        "the evicted codeword's layer slot must read None (the sole registered layer)"
+    );
+
+    drop(got);
+    drop(_hog);
+}
