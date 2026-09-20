@@ -8148,6 +8148,23 @@ fn the_whir_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+
+    // ⛔ THE FALLBACK COUNTS, WHOLE-RUN SCOPE, ALWAYS PRINTED — two DIFFERENT
+    // device surfaces, each of which silently moves work to the host and leaves
+    // only host memory and a utilisation dip as its symptoms:
+    //   · commit fallbacks — a WHIR commitment declined the device
+    //     (`multilinear::gpu::host_fallbacks`, one call site, the commit path);
+    //   · device fallbacks — an argue-surface reservation was refused in
+    //     math-cuda (sumcheck/gkr/columns; `math_cuda::device::device_fallbacks`).
+    // wt16 read as a slot-level win because THIS second number had no name: the
+    // leaf-layer retention took the shared budget and argue fell to the host
+    // uncounted. Printed here, whole-run, so the launcher can refuse a block
+    // number unless BOTH read zero.
+    println!("   commit fallbacks {}", multilinear::gpu::host_fallbacks());
+    println!(
+        "   device fallbacks {}",
+        math_cuda::device::device_fallbacks()
+    );
 }
 
 /// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small
