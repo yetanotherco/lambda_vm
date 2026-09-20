@@ -549,6 +549,21 @@ pub fn search_counted(
     }
 }
 
+/// Round-3 occupancy discriminator: the SHIPPED grind kernel's registers/thread
+/// and blocks/SM as the current build compiled it. Reads the ACHIEVED cap (from
+/// the loaded function) so a sweep over `LAMBDA_VM_RPX_MAXRREGCOUNT` builds can
+/// plot the grind's throughput against its real occupancy, not the requested
+/// cap. Diagnostic; touches no production path.
+pub fn grind_occupancy() -> Option<(u32, u32)> {
+    let be = backend().ok()?;
+    let regs = be.rpx_grind_search.num_regs().ok()?.max(0) as u32;
+    let blocks_per_sm = be
+        .rpx_grind_search
+        .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)
+        .ok()?;
+    Some((regs, blocks_per_sm))
+}
+
 #[cfg(test)]
 mod tests {
     //! The knobs' parser and their launch arithmetic, card-free: nothing here

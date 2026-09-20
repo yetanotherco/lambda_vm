@@ -755,3 +755,77 @@ pub fn permute_probe(states: &[[u64; STATE_FELTS]]) -> Result<Vec<[u64; STATE_FE
         })
         .collect())
 }
+
+/// One point of the round-3 occupancy discriminator: the pure permutation's
+/// throughput and the register cap the current build actually achieved.
+///
+/// NOT a production path. It exists to answer whether the RPX permutation is
+/// latency-bound (raising occupancy — fewer registers per thread, more blocks
+/// per SM — speeds it) or compute/issue-bound (it does not), which decides round
+/// 3's landing lever. The register cap is a whole-cubin `-maxrregcount` set at
+/// build time (`LAMBDA_VM_RPX_MAXRREGCOUNT`); one build gives one point, so the
+/// caller runs this once per cap and reads the curve across builds.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeSweepPoint {
+    /// States permuted per launch.
+    pub n: u64,
+    /// Timed launches (excludes a warm-up launch).
+    pub iters: u64,
+    /// Wall time for the `iters` launches (host-to-device copy done ONCE before
+    /// the clock, so the cross-build delta is kernel time, not transfer).
+    pub secs: f64,
+    /// The probe kernel's registers/thread as compiled — the ACHIEVED cap, read
+    /// back from the loaded function, not the requested `-maxrregcount`.
+    pub regs: u32,
+    /// Blocks/SM the driver reports resident at [`RPX_BLOCK_DIM`] for that cap.
+    pub blocks_per_sm: u32,
+}
+
+/// Time `iters` launches of the permute probe over `n` states and report the
+/// achieved register cap. See [`ProbeSweepPoint`]. Deterministic dummy states;
+/// the outputs are not checked here (parity is [`permute_probe`]'s job, and a
+/// register cap cannot change a result — it only moves spills and occupancy).
+pub fn permute_probe_sweep(n: usize, iters: usize) -> Result<ProbeSweepPoint> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let flat: Vec<u64> = (0..(n as u64) * (STATE_FELTS as u64)).collect();
+    let states_dev = stream.clone_htod(&flat)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(n * STATE_FELTS)?;
+    let n_u64 = n as u64;
+    let cfg = rpx_launch_cfg(n_u64);
+    // Warm-up (cubin resident, caches primed), excluded by name.
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_permute_probe)
+            .arg(&states_dev)
+            .arg(&n_u64)
+            .arg(&mut out_dev)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            stream
+                .launch_builder(&be.rpx_permute_probe)
+                .arg(&states_dev)
+                .arg(&n_u64)
+                .arg(&mut out_dev)
+                .launch(cfg)?;
+        }
+    }
+    stream.synchronize()?;
+    let secs = start.elapsed().as_secs_f64();
+    let regs = be.rpx_permute_probe.num_regs().unwrap_or(0).max(0) as u32;
+    let blocks_per_sm = be
+        .rpx_permute_probe
+        .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)
+        .unwrap_or(0);
+    Ok(ProbeSweepPoint {
+        n: n_u64,
+        iters: iters as u64,
+        secs,
+        regs,
+        blocks_per_sm,
+    })
+}
