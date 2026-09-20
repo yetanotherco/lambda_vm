@@ -8168,6 +8168,23 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
     );
+    // ★ ROUND-3 ARGUE DISCRIMINATOR (diagnostic): per-surface DEVICE-path reserved
+    // bytes + op counts, whole-run. Divided by the `argue` wall time printed
+    // above, the total bytes give an achieved HBM bandwidth — near the ~1.7 TB/s
+    // roofline ⇒ argue is MEMORY-bound (an MLE layout/reuse lever exists); far
+    // below ⇒ the resident data is cache-reused and argue is COMPUTE-bound near a
+    // floor. Reserved bytes ≈ HBM working set; see math_cuda::argue_probe.
+    {
+        use math_cuda::argue_probe::{Surface, surface_totals};
+        let (sc_b, sc_c) = surface_totals(Surface::Sumcheck);
+        let (gk_b, gk_c) = surface_totals(Surface::Gkr);
+        let (co_b, co_c) = surface_totals(Surface::Columns);
+        println!(
+            "   argue probe: sumcheck {sc_b} B / {sc_c} ops · gkr {gk_b} B / {gk_c} ops · \
+             columns {co_b} B / {co_c} ops · total {} B",
+            sc_b + gk_b + co_b
+        );
+    }
     // The PEAK simultaneous device reservation the run reached — the quantity
     // argue's `reserve` is checked against (not the raw device peak, which the
     // never-purge pool inflates above the budget). A control run reads argue's

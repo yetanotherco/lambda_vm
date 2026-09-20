@@ -70,6 +70,7 @@ impl DeviceColumns {
             crate::device::note_device_fallback();
             return None;
         };
+        crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
         let stream = be.next_stream();
         // SAFETY: every element is written by the copies below.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;

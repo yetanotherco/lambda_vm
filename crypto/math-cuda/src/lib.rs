@@ -5,6 +5,7 @@
 //! Everything else (`ntt`, element-wise arith) is either internal to those
 //! pipelines or used by the parity test suite.
 
+pub mod argue_probe;
 pub mod barycentric;
 pub mod blake3;
 pub mod columns;

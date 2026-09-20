@@ -589,6 +589,10 @@ pub fn evaluate_many_base(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            group_len as u64 * per_column,
+        );
         // Read where they lie when they are already there; a copy otherwise.
         let uploaded;
         let base = match &columns {
@@ -759,6 +763,10 @@ impl DeviceFactors {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            factors.len() as u64 * span as u64 * 8,
+        );
         let stream = be.next_stream();
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, factors.len() * span) }?;
         for (k, factor) in factors.iter().enumerate() {
@@ -827,6 +835,10 @@ impl DeviceFactors {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            width as u64 * rows as u64 * 24,
+        );
         let stream = be.next_stream();
 
         let span = rows * 3;
