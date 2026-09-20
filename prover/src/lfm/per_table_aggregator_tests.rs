@@ -7470,11 +7470,12 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
     let (admitted, refused, asked, got, headroom, saved) = math_cuda::whir::retention_report();
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
-        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {}{}",
+        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {} · peak simultaneous footprint {:.0} MiB{}",
         mib(asked),
         mib(got),
         math_cuda::whir::leaf_hash_calls(),
         math_cuda::whir::tree_builds(),
+        mib(math_cuda::whir::retained_bytes_peak()),
         if refused > 0 {
             format!(
                 " · FIRST REFUSAL at {:.0} MiB of budget headroom",
@@ -8164,6 +8165,15 @@ fn the_whir_production_tree_composes_to_a_root() {
     println!(
         "   device fallbacks {}",
         math_cuda::device::device_fallbacks()
+    );
+    // The PEAK simultaneous device reservation the run reached — the quantity
+    // argue's `reserve` is checked against (not the raw device peak, which the
+    // never-purge pool inflates above the budget). A control run reads argue's
+    // reservation demand here; while the evictable retention holds only spare
+    // bytes, this stays below the budget by construction.
+    println!(
+        "   reserved high-water {:.0} MiB",
+        math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
     );
 }
 

@@ -70,6 +70,19 @@ static RETAIN_FIRST_REFUSAL_HEADROOM: AtomicU64 = AtomicU64::new(0);
 /// Leaf passes SKIPPED because a matching layer was in hand. The saving, counted
 /// where it happens rather than inferred from two other counters.
 static LEAF_PASSES_SAVED: AtomicU64 = AtomicU64::new(0);
+/// ★ The SIMULTANEOUS retained device bytes held RIGHT NOW — `fetch_add` on
+/// admit, `fetch_sub` in [`RetainedLeaves`]'s `Drop`. Unlike
+/// [`RETAIN_BYTES_ADMITTED`], which only ever rises (cumulative over the run),
+/// this rises and falls with the live layers, so it is the TRUE footprint: the
+/// quantity that contends with argue for the shared budget, and the one an
+/// eviction gives back. wt16 reported the cumulative 39,057 MiB and had no name
+/// for the ~2 GiB that actually bound.
+static RETAIN_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
+/// ★ The PEAK of [`RETAIN_BYTES_LIVE`] over the run — the number the print wants.
+/// The instantaneous live count is ~0 by the time the base readback prints (the
+/// codewords, and their layers, have dropped), so the reporting quantity is this
+/// high-water: the largest simultaneous retained footprint the run ever held.
+static RETAIN_BYTES_LIVE_PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// What the leaf-layer retention did this process: admitted, refused, the bytes
 /// on each side, the headroom at the first refusal, and the leaf passes skipped.
@@ -82,6 +95,24 @@ pub fn retention_report() -> (u64, u64, u64, u64, u64, u64) {
         RETAIN_FIRST_REFUSAL_HEADROOM.load(Ordering::Relaxed),
         LEAF_PASSES_SAVED.load(Ordering::Relaxed),
     )
+}
+
+/// ★ The retained leaf-layer device bytes held RIGHT NOW — the live footprint,
+/// as opposed to `retention_report`'s cumulative `admitted` bytes. This is the
+/// quantity that contends with argue for the budget; a reading well below the
+/// cumulative total is the layers being freed as their codewords drop (or an
+/// eviction giving them back).
+pub fn retained_bytes_live() -> u64 {
+    RETAIN_BYTES_LIVE.load(Ordering::Relaxed)
+}
+
+/// ★ The PEAK simultaneous retained device footprint over the run — the largest
+/// [`retained_bytes_live`] ever reached. This is the number that bound argue in
+/// wt16 (~2 GiB); the instantaneous count is ~0 once the codewords drop, so this
+/// is what a report prints. Process-wide and monotone (a high-water), so a fresh
+/// process — which is how the launcher runs each prove — starts it at 0.
+pub fn retained_bytes_peak() -> u64 {
+    RETAIN_BYTES_LIVE_PEAK.load(Ordering::Relaxed)
 }
 
 /// A leaf layer kept past the call that built it — and NOTHING else.
@@ -106,6 +137,16 @@ struct RetainedLeaves {
     hash: crate::DeviceHash,
     num_leaves: usize,
     bytes: u64,
+}
+
+impl Drop for RetainedLeaves {
+    /// The other half of the live-footprint accounting: whatever admitted the
+    /// layer added to [`RETAIN_BYTES_LIVE`] is given back when the layer drops —
+    /// with its codeword, or when an eviction sets the slot to `None`. `nodes`
+    /// (a `CudaSlice`) frees its device bytes on the line after this returns.
+    fn drop(&mut self) {
+        RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 /// May a layer built under `kept` be served for a tree asked for under `want`?
@@ -364,6 +405,11 @@ impl DeviceCodeword {
         }
         RETAIN_ADMITTED.fetch_add(1, Ordering::Relaxed);
         RETAIN_BYTES_ADMITTED.fetch_add(bytes, Ordering::Relaxed);
+        // The live footprint rises here and falls in `RetainedLeaves`'s Drop, so
+        // the two balance over the layer's lifetime; the peak is kept for the
+        // print, since the instantaneous count is ~0 by the time it is read.
+        let now_live = RETAIN_BYTES_LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        RETAIN_BYTES_LIVE_PEAK.fetch_max(now_live, Ordering::Relaxed);
         *held = Some(RetainedLeaves {
             nodes: copy,
             log_folding,

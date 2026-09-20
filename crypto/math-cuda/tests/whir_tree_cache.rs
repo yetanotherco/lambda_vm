@@ -699,3 +699,48 @@ fn an_argue_reservation_refusal_bumps_the_device_fallback_counter() {
 
     // `_hog` is dropped here at scope end, returning the reserved budget.
 }
+
+/// ⛔ THE LIVE FOOTPRINT AND RESERVED HIGH-WATER TRACK THE RETENTION.
+///
+/// The two instruments the evictable retention is built on: `retained_bytes_live`
+/// (the SIMULTANEOUS footprint, not the cumulative `held`) and `reserved_high_water`
+/// (the peak `be.reserved`, the quantity argue's `reserve` is checked against).
+/// This proves both move with a real retention and, crucially, that the layer's
+/// bytes are GIVEN BACK when its codeword drops — the balance the eviction relies
+/// on. A broken `RetainedLeaves::drop` leaves the live count high and reddens the
+/// final assertion; a missing `note_reserved` leaves the high-water below the
+/// live reserved total and reddens the middle one.
+#[test]
+fn the_live_footprint_and_reserved_high_water_track_the_retention() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("footprint test needs a GPU");
+    let live_before = math_cuda::whir::retained_bytes_live();
+    {
+        let (codeword, _root) = commit_on_device(14, 4, key::<RpxWhir>());
+        let _ = codeword
+            .paths(4, &[0, 1, 7], key::<RpxWhir>())
+            .expect("paths");
+        // A leaf layer is captured and held on the codeword.
+        let live = math_cuda::whir::retained_bytes_live();
+        assert!(
+            live > live_before,
+            "a held leaf layer must raise the live footprint (live {live}, before {live_before})"
+        );
+        assert!(
+            math_cuda::whir::retained_bytes_peak() >= live,
+            "the peak footprint must be at least the current live count"
+        );
+        assert!(
+            math_cuda::device::reserved_high_water() >= be.reserved_bytes(),
+            "the reservation high-water must be at least the current reserved total \
+             — note_reserved must fire on every rise of be.reserved"
+        );
+    }
+    // The codeword — and, synchronously in its Drop, the retained layer — is gone.
+    assert_eq!(
+        math_cuda::whir::retained_bytes_live(),
+        live_before,
+        "dropping the codeword must give the layer's bytes back: RetainedLeaves::drop \
+         balances the admit, or the live footprint would only ever rise"
+    );
+}

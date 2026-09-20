@@ -478,6 +478,7 @@ impl DeviceReservation {
             ) {
                 Ok(_) => {
                     self.bytes.fetch_add(extra, Ordering::Relaxed);
+                    note_reserved(held + extra);
                     return true;
                 }
                 Err(seen) => held = seen,
@@ -601,6 +602,34 @@ pub fn reset_device_fallbacks() {
 /// sites [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
 pub(crate) fn note_device_fallback() {
     DEVICE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ★ The high-water mark of `be.reserved` — the PEAK simultaneous device
+/// reservation this process reached, updated wherever the total rises
+/// ([`Backend::reserve`] and [`DeviceReservation::grow`]).
+///
+/// This is the reservation quantity argue's `reserve` is checked against, which
+/// the raw device trace cannot report: the raw peak includes the never-purge
+/// pool's retained blocks and sits above the reservation budget, while THIS is
+/// exactly what the budget gates. A control run reads argue's peak reservation
+/// demand here; and while the evictable retention holds only spare bytes, this
+/// stays below the budget by construction.
+static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `be.reserved` just rose to `now`, keeping the peak.
+fn note_reserved(now: u64) {
+    RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+}
+
+/// The peak simultaneous device reservation this process reached — see
+/// [`RESERVED_HIGH_WATER`].
+pub fn reserved_high_water() -> u64 {
+    RESERVED_HIGH_WATER.load(Ordering::Relaxed)
+}
+
+/// Zero the reservation high-water. For a test asserting a delta.
+pub fn reset_reserved_high_water() {
+    RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
 }
 
 /// Allocates on `stream`, and if the device says no, gives the pool's retained
@@ -1019,6 +1048,7 @@ impl Backend {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    note_reserved(held + bytes);
                     return Some(DeviceReservation {
                         bytes: AtomicU64::new(bytes),
                     });
@@ -1440,7 +1470,10 @@ impl Backend {
 
 #[cfg(test)]
 mod device_fallback_counter_tests {
-    use super::{device_fallbacks, note_device_fallback, reset_device_fallbacks};
+    use super::{
+        device_fallbacks, note_device_fallback, note_reserved, reserved_high_water,
+        reset_device_fallbacks, reset_reserved_high_water,
+    };
     use std::sync::Mutex;
 
     /// The counter is process-wide, so a test asserting an absolute value
@@ -1487,5 +1520,29 @@ mod device_fallback_counter_tests {
              the five sites the counter's doc names: sumcheck ×3, gkr ×1, \
              columns ×1 (found sumcheck {sumcheck}, gkr {gkr}, columns {columns})"
         );
+    }
+
+    /// The reservation high-water is a MONOTONE peak: it takes the max, so a
+    /// smaller rise never lowers it and a larger one raises it. Card-free — it
+    /// exercises `note_reserved` directly (the same call `reserve`/`grow` make on
+    /// every successful rise of `be.reserved`), so a peak that failed to track
+    /// would show here before any card run relied on the number.
+    #[test]
+    fn reserved_high_water_keeps_the_max() {
+        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero the high-water");
+        note_reserved(100);
+        assert_eq!(reserved_high_water(), 100, "the first rise sets the peak");
+        note_reserved(50);
+        assert_eq!(
+            reserved_high_water(),
+            100,
+            "a smaller rise must not lower it"
+        );
+        note_reserved(200);
+        assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero it again");
     }
 }
