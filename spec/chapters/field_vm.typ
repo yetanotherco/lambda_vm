@@ -227,7 +227,7 @@ Since the degree of these $f_(i)(x)$ can grow too large to express in a single p
 we perform a _"degree split"_:
 $ f_(i)(x) = f_(i, 0)(x) + x^(d - 1) (f_(i, 1)(x) + x^(d - 2) (f_(i, 2) + x^(d - 2) (f_(i, 3) + ...))), $
 for a maximal constraint degree $d$.
-Here, $deg f_(i, 0) <= d - 2$ and $deg f_(i, k) <= d - 3$.
+Here, $deg(f_(i, 0)) <= d - 2$ and $deg(f_(i, k)) <= d - 3$.
 We denote by $t + 1$ the number of non-zero $f_(i, k)$ for fixed $i$.
 This allows us to first compute the values of
 $#`argument_registers[i]`^(d - 1)$, $#`argument_registers[i]`^(2d - 3)$ and so on
@@ -241,7 +241,7 @@ The coefficients for all $f_(i, k)$ are pre-computed once, based on the choices 
 and used through the `MUX` constant columns.
 In this way, $f_(i, 0)$ can have degree at most $d - 2$, as it gets multiplied with $#`imm`_0$ and the register value,
 and the other $f_(i, k)$ can have degree at most $d - 3$, as they also get multiplied with the appropriate power of $x$.
-This leads to a total degree of $op("deg") f_(i) = d - 1 + t dot (d - 2) - 1$ for a maximal number of registers $N + 2 <= op("deg") f_(i) + 1$.
+This leads to a total degree of $deg(f_(i)) = d - 1 + t dot (d - 2) - 1$ for a maximal number of registers $N + 2 <= deg(f_(i)) + 1$.
 Hence, for a fixed choice of $d$ and $t$, this scheme can support up to $N <= (t + 1) dot (d - 2) - 1$ general purpose registers.
 Currently, the parametrization is set to be $(d, N, t) = (5, 5, 1)$.
 
@@ -292,7 +292,7 @@ $ g(x) = (x - 0) dot (x - 1) dot ... dot (x - (N + 1)), $
 which has degree $N + 2$.
 Our polynomial approach to multiplexing already provides a way to evaluate a polynomial of degree $<= N + 1$,
 which falls short of one coefficient to evaluate $g$.
-However, recall that $op("deg") f_(i,t) <= d - 2$, and unlike in multiplexing,
+However, recall that $deg(f_(i,t)) <= d - 2$, and unlike in multiplexing,
 $g$ needs no further multiplications to be used in an arithmetic constraint.
 So we can simply add one extra coefficient to the last split polynomial to achieve our goal.#footnote[
   We can in theory choose any of the split polynomials to increase, but we need to ensure
