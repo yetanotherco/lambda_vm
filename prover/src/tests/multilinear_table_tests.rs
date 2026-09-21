@@ -525,68 +525,147 @@ fn the_whole_instruction_set_is_proved_and_verified() {
     }
 }
 
-/// And over a Rust program that calls the keccak precompile — which brings
-/// KECCAK, KECCAK_RND and KECCAK_RC in, **and** writes public output, so the
-/// statement's share of the bus is load-bearing here and nowhere else.
-///
-/// ⚠ THE ONLY CASE WITHOUT AN ORDERED CENSUS, and deliberately so. The two
-/// above are pinned to sets MEASURED at `788f36a19`; this one PASSED that run,
-/// so its assertion never fired and never printed its set, and pinning a list
-/// nobody has read would be a literal invented to match a bound. It keeps the
-/// bound and gains the checks its own doc has always claimed instead.
-///
-/// The presence checks are the point: `>= 20` never once asserted that the
-/// keccak family or COMMIT is argued here, which is the entire reason this case
-/// exists next to the two asm ones. Since #977 those tables are counted, so a
-/// workload that stopped reaching the precompile would silently drop them and
-/// still clear any bound this case could carry. Both assertions print the whole
-/// set, so the run that fails one is also the run that supplies the census.
-#[test]
-fn a_program_using_a_precompile_is_proved_and_verified() {
+/// Proves and verifies the guest at `executor/program_artifacts/rust/<name>.elf`,
+/// returning the argued tables by name.
+fn prove_and_verify_rust_guest(name: &str) -> Vec<String> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
-        .join("executor/program_artifacts/rust/keccak.elf");
+        .join("executor/program_artifacts/rust")
+        .join(format!("{name}.elf"));
     let bytes = std::fs::read(&root).unwrap_or_else(|_| panic!("read {}", root.display()));
-    let elf = Elf::load(&bytes).expect("load keccak.elf");
+    let elf = Elf::load(&bytes).unwrap_or_else(|e| panic!("load {name}.elf: {e:?}"));
     let logs = Executor::new(&elf, vec![])
         .expect("executor")
         .run()
         .expect("run")
         .logs;
+    prove_and_verify_all_tables(elf, &logs)
+}
 
-    let argued = prove_and_verify_all_tables(elf, &logs);
+/// Is `family`, or `family` plus a chunk index, among the argued tables?
+///
+/// "Equal, or followed by `[`" — never a bare prefix, which would let
+/// `KECCAK_RC` answer for `KECCAK`.
+fn argues(argued: &[String], family: &str) -> bool {
+    argued.iter().any(|n| {
+        let s = n.as_str();
+        s == family || (s.starts_with(family) && s[family.len()..].starts_with('['))
+    })
+}
+
+/// And over a Rust program that calls the keccak PRECOMPILE — the
+/// `keccak_permute` ecall — so KECCAK and KECCAK_RND are argued, **and** which
+/// writes public output, so the statement's share of the bus is load-bearing.
+///
+/// ⛔ THIS CASE PROVED THE WRONG GUEST UNTIL NOW, and the bound is what hid it.
+/// It loaded `keccak.elf`, which is `executor/programs/rust/keccak` — a guest
+/// whose `Cargo.toml` depends on `tiny-keccak` and whose `main` hashes in
+/// SOFTWARE, issuing no syscall but `commit`. It has never touched a precompile.
+/// The measured census at `413b3a3b7` carries COMMIT[0] and no keccak table at
+/// all, which is what finally said so.
+///
+/// ★ And the claim was false BEFORE #977 too — it was merely unfalsifiable.
+/// KECCAK and KECCAK_RND were always-on then, so they appeared in the table set
+/// of every workload, reached or not, and a doc sentence about which tables the
+/// program "brings in" described MACHINE shape while reading like program
+/// behaviour. `892c7d1bc` (main's `c2ac5d546`, #977) made them counted, which
+/// turned a latent falsehood into a visible one. Another instance of the
+/// pattern in `SOUNDNESS.md`: a claim no assertion defended.
+///
+/// The accelerator guest it should have used is `keccak_precompile`, whose
+/// `main` calls `lambda_vm_syscalls::keccak::keccak256` over five padding edge
+/// cases. It is built by the Makefile's `RUST_PROGRAM_DIRS` wildcard like every
+/// other guest, and before this commit **nothing in the prover proved it** — its
+/// only reference in the tree is `executor/tests/rust.rs`, which runs it in the
+/// executor and never proves it. So the suite had no precompile coverage on the
+/// multilinear path at all.
+///
+/// ⚠ The census here is by PRESENCE, not an ordered list: this guest has never
+/// been proved on this path, so there is no measured set to pin, and inventing
+/// one would repeat the mistake above. Its cost is likewise unmeasured — five
+/// `keccak256` calls including a multi-block input.
+///
+/// ✓ The ELF resolves on a CI prover shard exactly as `keccak.elf` does, and
+/// this is written down so the next reader does not re-ask: the lineage's
+/// prover-tests job runs `make compile-programs-asm`, `make compile-programs-rust`
+/// and `make compile-recursion-elfs` before `cargo nextest run`, and
+/// `compile-programs-rust` builds every directory under
+/// `executor/programs/rust/` through the `RUST_PROGRAM_DIRS` wildcard — this
+/// guest included, with no per-program list to extend.
+#[test]
+fn a_program_using_a_precompile_is_proved_and_verified() {
+    let argued = prove_and_verify_rust_guest("keccak_precompile");
     assert_eq!(
         always_on_prefix(&argued),
         ALWAYS_ON_TABLES,
         "every argued set opens with the always-on tables; argued: {}",
         argued.join(" ")
     );
-    // The tables this case is ABOUT, by presence rather than by a full census.
-    // KECCAK_RC is excluded from the prefix match on purpose — it is always-on
-    // and asserted above, so matching it here would let a run that reaches no
-    // precompile at all satisfy a check named for one.
-    for family in ["KECCAK_RND", "COMMIT"] {
-        // The name is either the bare family or the family plus a chunk index,
-        // so the match is "equal, or followed by `[`" — never a bare prefix,
-        // which would let `KECCAK_RC` answer for `KECCAK`.
+    // KECCAK_RC is deliberately NOT in this list: it is always-on and asserted
+    // in the prefix above, so matching it here would let a run that reaches no
+    // precompile satisfy a check named for one — which is exactly how the
+    // software guest passed as a precompile test for as long as it did.
+    for family in ["KECCAK", "KECCAK_RND", "COMMIT"] {
         assert!(
-            argued.iter().any(|n| {
-                let s = n.as_str();
-                s == family || (s.starts_with(family) && s[family.len()..].starts_with('['))
-            }),
+            argues(&argued, family),
             "{family} must be argued — it is what this case exists for, and \
              since #977 it is a counted table that an unreached workload drops \
              silently; argued: {}",
             argued.join(" ")
         );
     }
-    assert!(
-        argued.len() >= 20,
-        "argued {}, fewer than the 20 this workload reached when the bound was \
-         written: {}",
-        argued.len(),
-        argued.join(" ")
+}
+
+/// The SOFTWARE-hash guest, kept because it is the widest live table set in the
+/// suite — and it is the one the precompile case above used to prove.
+///
+/// `executor/programs/rust/keccak` hashes with `tiny-keccak` in guest code, so
+/// it reaches no accelerator and argues the RV64 core broadly instead: 21
+/// tables, including MEMW, LOAD, STORE, BRANCH and EQ — the five families
+/// `the_whole_instruction_set_is_proved_and_verified` does NOT reach despite its
+/// name. A Rust guest doing ordinary work exercises more of the VM than the asm
+/// fixture named for the instruction set, which is worth keeping a case for.
+///
+/// It also carries public output (COMMIT[0]) and two PAGE tables, one of them
+/// the stack page — the only case here that does either.
+///
+/// MEASURED at `413b3a3b7`, box, CPU-only, no campaign env.
+#[test]
+fn a_software_hash_guest_argues_the_widest_table_set() {
+    let argued = prove_and_verify_rust_guest("keccak");
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "COMMIT[0]",
+            "CPU[0]",
+            "LT[0]",
+            "SHIFT[0]",
+            "MEMW[0]",
+            "MEMW_A[0]",
+            "LOAD[0]",
+            "MUL[0]",
+            "BRANCH[0]",
+            "PAGE:0x0",
+            "PAGE:0xfffffffffffc0000",
+            "MEMW_R[0]",
+            "EQ[0]",
+            "BYTEWISE[0]",
+            "STORE[0]",
+            "CPU32[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed. NOTE what is absent and must stay absent: \
+         KECCAK, KECCAK_RND, ECSM, ECDAS and HINT. This guest hashes in \
+         software, and an accelerator appearing here means it is proving \
+         something else — which is precisely the confusion the precompile case \
+         above lived in. A separate `!argues(..)` loop would restate the list \
+         and could only fire after this assertion already had."
     );
 }
 
