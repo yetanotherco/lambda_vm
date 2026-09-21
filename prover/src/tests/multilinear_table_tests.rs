@@ -260,7 +260,13 @@ fn layout_dyn<'a>(
 /// counterparty is not another table but the statement, so the tables only sum
 /// to zero for a program that outputs nothing. `compute_commit_bus_offset` is
 /// the same quantity the univariate verifier demands.
-fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
+///
+/// ★ Returns the argued tables BY NAME, in `air_trace_pairs` order, because a
+/// count cannot say which. Since #977 the set is workload-dependent — an empty
+/// table is elided rather than padded — so "how many" stopped being the
+/// question and "which ones" became it: a count cannot tell a table that
+/// vanished from one that gained a chunk while another vanished.
+fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> Vec<String> {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, logs, &Default::default(), &[]).unwrap();
     let public_output = traces.public_output_bytes.clone();
@@ -298,6 +304,13 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         })
         .collect();
 
+    // Captured before `tables` is moved into the commitment, and from `pairs`
+    // rather than from the AIR set, so it is the proof's own sub-proof order.
+    let names: Vec<String> = pairs
+        .iter()
+        .map(|(air, _, _)| air.name().to_string())
+        .collect();
+
     let mut tables = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter().zip(&shapes) {
         let columns = trace.columns_main();
@@ -309,6 +322,11 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         );
     }
     let count = tables.len();
+    assert_eq!(
+        names.len(),
+        count,
+        "one name per argued table, or the census below describes another proof"
+    );
     // Every table's columns in one commitment: 55 of them still open once.
     let committed =
         CommittedTables::<_, _, KeccakWhir>::commit(tables, &config()).expect("commit every table");
@@ -362,7 +380,7 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     )
     .expect("the whole table set verifies");
 
-    count
+    names
 }
 
 /// **The whole VM through the multilinear path**: every live table of a real
@@ -375,7 +393,12 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
 fn every_live_table_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("sub");
     let argued = prove_and_verify_all_tables(elf, &logs);
-    assert!(argued >= 20, "expected the full table set, argued {argued}");
+    assert!(
+        argued.len() >= 20,
+        "expected the full table set, argued {}: {}",
+        argued.len(),
+        argued.join(" ")
+    );
 }
 
 /// The same over the whole 64-bit instruction set, which lights up the tables a
@@ -383,7 +406,13 @@ fn every_live_table_is_proved_and_verified() {
 #[test]
 fn the_whole_instruction_set_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("all_instructions_64");
-    assert!(prove_and_verify_all_tables(elf, &logs) >= 20);
+    let argued = prove_and_verify_all_tables(elf, &logs);
+    assert!(
+        argued.len() >= 20,
+        "expected the full table set, argued {}: {}",
+        argued.len(),
+        argued.join(" ")
+    );
 }
 
 /// And over a Rust program that calls the keccak precompile — which brings
@@ -403,7 +432,13 @@ fn a_program_using_a_precompile_is_proved_and_verified() {
         .expect("run")
         .logs;
 
-    assert!(prove_and_verify_all_tables(elf, &logs) >= 20);
+    let argued = prove_and_verify_all_tables(elf, &logs);
+    assert!(
+        argued.len() >= 20,
+        "expected the full table set, argued {}: {}",
+        argued.len(),
+        argued.join(" ")
+    );
 }
 
 /// A proof is only a proof if it can leave the process. Round-trips a real
