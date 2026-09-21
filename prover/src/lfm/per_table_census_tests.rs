@@ -608,11 +608,85 @@ fn the_block_rule_is_hash_invariant_on_every_tenant_group() {
 /// This is the one number in the census that, if wrong, moves the headline
 /// ratio by a third and in the flattering direction, so it is asserted against
 /// the recorded run rather than left to the tenant table's spelling.
+///
+/// ⚠⚠ **THIS TEST IS RED, AND IT IS RIGHT TO BE.** `BLAKE3_TENANT_SOCKET` is
+/// `Test`; `BLOCK_HASHER` has been `Rpx` since `603c1e155` (2026-09-08). The
+/// record this census is a ratio against is
+/// `bench_cache/optladder_2026-08-21/TIP/tip-wrappt-24.stdout` — eighteen days
+/// older than the pin. The assertion is not a stale literal to re-bless; it is
+/// the instrument saying the module may be measuring a shape nothing proves.
+/// Moving the constant to `Rpx` is NOT the fix: `RECORDED` is the *`Test`*
+/// socket's width pair, and `wrap_tests.rs`'s own note puts the socket at 436
+/// columns for RPO against 28 idle — so the chip this census calls absent could
+/// be present, in the direction the paragraph above calls flattering.
+///
+/// ★ **WHAT IT NEEDS, AND WHAT IT DOES NOT.** The panel below prints every
+/// tenant's measured `LFM_HASH` width beside the record, flagging the one whose
+/// hasher IS the pin, so one cheap CPU run settles the pair. It prints BEFORE
+/// the assertions so a red run still yields the measurement.
+///
+/// ⛔ **DO NOT schedule the 2^24 real-block run for this.** The quantities
+/// split, and only the first is in question:
+///
+/// | quantity | depends on | needs a re-record? |
+/// |---|---|---|
+/// | socket WIDTH (main, aux) | the `HasherKind` alone | no — static per tag |
+/// | idle socket HEIGHT (4 rows, 0 used) | the group floor | no — static |
+/// | non-hash heights, the 670,468,916 non-hash cells | the workload | no — socket-independent |
+/// | the 0.774× lever-0 ratio | arithmetic over the above | no — recompute |
+///
+/// `tenant_log_heights` overrides `h[HASH_SLOT]` only for ALGEBRAIC tenants, and
+/// every non-hash height is socket-independent, so `RECORDED_WRAP_LOG_HEIGHTS`
+/// survives the pin move intact. What is stale is one width pair, the socket
+/// identity, and the ratio that is arithmetic over them.
+///
+/// ⚠ And the obvious cheap run does NOT answer it: `wrap_tests::the_wrap_census`
+/// reaches `lfm_chip_census`, which is `lfm_chip_census_with_hasher(program,
+/// HasherKind::default())` and `HasherKind::default()` is `Test` — so it reports
+/// this very pair under ANY pin. That is why the panel below names its hasher on
+/// every line: a census that does not is not evidence about `BLOCK_HASHER`.
 #[test]
 fn the_blake3_tenant_socket_matches_the_record() {
     /// `LFM_HASH` as `tip-wrappt-24.stdout`'s CHIP CENSUS reports it: 28 main
     /// value columns over the 13-column preprocessed prefix, 3 ext aux.
     const RECORDED: (usize, usize) = (28, 3);
+
+    let opts = wrap_options();
+
+    // ★ MEASURED FIRST, ASSERTED SECOND — the ordering is the point. The socket
+    // assertion below fires before any tenant is built, so while it is red this
+    // panel is the only way the measurement reaches a log. Every line names its
+    // hasher, because a width without the tag that produced it is the mistake
+    // this whole finding is about.
+    println!(
+        "\n★ LFM_HASH SOCKET WIDTH BY TENANT — BLOCK_HASHER is {:?}",
+        crate::hash_pin::BLOCK_HASHER
+    );
+    for tenant in TENANTS.iter() {
+        let airs = tenant.airs(&opts);
+        let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
+        let hash = tables
+            .iter()
+            .find(|t| t.name == "LFM_HASH")
+            .expect("every tenant carries LFM_HASH");
+        println!(
+            "   {:>8}  hasher {:<9?} algebraic {:<5}  LFM_HASH {:>5} main + {} ext aux{}",
+            tenant.label,
+            tenant.hasher,
+            tenant.algebraic,
+            hash.main_cols,
+            hash.aux_cols,
+            if tenant.hasher == crate::hash_pin::BLOCK_HASHER {
+                "   <== THE PIN"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "   RECORDED {RECORDED:?} — tip-wrappt-24.stdout, 2026-08-21, taken \
+         BEFORE the RPX pin of 603c1e155 (2026-09-08)"
+    );
 
     // ★ The tenant's socket IS the pin's, not a value chosen here. A branch that
     // re-pins `BLOCK_HASHER` moves what a BLAKE3-tenant wrap proof actually
@@ -621,10 +695,11 @@ fn the_blake3_tenant_socket_matches_the_record() {
         BLAKE3_TENANT_SOCKET,
         crate::hash_pin::BLOCK_HASHER,
         "the BLAKE3 tenant's LFM_HASH socket must be the build's own pin — the \
-         recorded census this census is a ratio against was produced under it"
+         recorded census this census is a ratio against was produced under it. \
+         The panel above has the measured width for every tenant; read the line \
+         marked THE PIN"
     );
 
-    let opts = wrap_options();
     for tenant in TENANTS.iter().filter(|t| !t.algebraic) {
         let airs = tenant.airs(&opts);
         let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
