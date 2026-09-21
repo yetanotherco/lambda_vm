@@ -86,6 +86,9 @@ pub mod recursion_soundness_gap_poc;
 pub mod register_tests;
 #[cfg(test)]
 pub mod shift_tests;
+
+#[cfg(test)]
+pub mod skip_empty_tables_tests;
 #[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
