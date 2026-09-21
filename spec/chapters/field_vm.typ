@@ -187,14 +187,15 @@ Then, to facilitate function calls, we describe a possible implementation of the
 
 ```
 CALL target:
-  FMA [fp] == fp, hint out
-  FMA [fp - i] == STORED_REG_i
-  FMA [fp + 1] == (PC + 2)
-  FMA PC == target, hint out
-  FMA fp == [fp], hint out
+  FMA [fp] == fp, hint out       // Hint a new frame address, store the old fp
+  FMA [fp - i] == STORED_REG_i   // Store on the caller side of the frame
+  FMA [fp + 1] == (PC + 2)       // Store the return address to the frame
+  FMA PC == target, hint out     // Hint the PC to jump
+                                 // Returning jumps here
+  FMA fp == [fp], hint out       // Hint the old frame pointer to restore it
 
 RET:
-  FMA PC == [fp + 1], hint out
+  FMA PC == [fp + 1], hint out   // Hint the PC to jump to the stored return address
 ```
 
 As a halting state, we choose to let the VM loop to itself at `PC = 0`, hinting all inputs.
