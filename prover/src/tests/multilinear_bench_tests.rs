@@ -2658,7 +2658,8 @@ fn phases() {
     let mut table_proofs = Vec::with_capacity(committed.tables().len());
     for table in committed.tables() {
         let (proof, point) =
-            multilinear_table::prove(table, &z, &alpha, &beta, &mut transcript).expect("table");
+            multilinear_table::prove(table, &z, &alpha, &beta, &mut transcript, None)
+                .expect("table");
         for _ in 0..table.num_committed_columns() {
             points.push(point.clone());
         }
