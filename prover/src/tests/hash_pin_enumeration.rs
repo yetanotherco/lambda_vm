@@ -79,6 +79,14 @@ const CONFIG_ALLOWED: &[&str] = &[
     "CommitmentHash",
     "StarkHash",
     "DeviceTreeBackend",
+    // ★ `GrindingDigest<H>` is generic over the hash tag and selects nothing on
+    // its own — the same class as `StarkHash` above, and it joined this list
+    // rather than `BLESSED` for that reason: blessing the FILE would have
+    // excused every future mention in it, where allowing the hash-agnostic
+    // GENERIC keeps the gate on the concrete tags a caller pairs it with.
+    // Added when `80d746321` gave `lfm/algebraic_commit.rs` a host grinding
+    // test spelling `GrindingDigest<RpxStarkHash>`.
+    "GrindingDigest",
 ];
 
 /// Every item named from `stark::config` on this line, `use` lists included.
@@ -196,6 +204,27 @@ const BLESSED: &[(&str, &str)] = &[
         "lfm/machine_tests.rs",
         "Host-side BYTE-transcript differentials: the oracle for the machine's \
          byte `TranscriptReplay` arm is deliberately the byte transcript.",
+    ),
+    (
+        "lfm/algebraic_commit.rs",
+        "One mention, and it is a CROSS-HASH CONTROL that names its hash rather \
+         than defaulting to it — the opposite of what this gate is for. \
+         `the_host_search_finds_a_valid_nonce_under_rpx` (added by `80d746321`) \
+         grinds under `GrindingDigest<RpxStarkHash>`, then declares \
+         `GrindingDigest<Blake3StarkHash>` to prove a BLAKE3-ground nonce does \
+         NOT satisfy the RPX predicate. Delete that second type and the test \
+         becomes a tautology: `generate_nonce::<RpxGrind>` could hash anything \
+         and every other assertion would still hold. \
+         ✓ REACHABILITY, named as this list demands rather than left at \
+         'test-only': the CONSUMERS are `stark::grinding::generate_nonce::<T>` \
+         and `is_valid_nonce::<T>`, both generic over the tag passed at the \
+         call site, so no global is read and nothing is handed a defaulted \
+         hash. The value never leaves the `#[test]` body — no artifact, no \
+         commitment, no trace is built from it — so the paired-default failure \
+         this list exists to catch (a default handed to a consumer that follows \
+         the pin) has no subject here. `GrindingDigest` itself is hash-agnostic \
+         and lives in CONFIG_ALLOWED; this entry covers only the concrete \
+         `Blake3StarkHash`, which must keep flagging everywhere else.",
     ),
 ];
 

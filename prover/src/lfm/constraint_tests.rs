@@ -1477,10 +1477,19 @@ fn quotient_rows(artifact: &ConstraintArtifact, log2_trace_length: u32) -> usize
 ///
 /// The composition is `others/lfm-constraint-lowering-design.md` §8.2.2's, which
 /// `tests::constraint_artifact_tests::continuation_epoch_constraint_leg` derives
-/// from the real epoch shape and pins against a measured 24/25 sub-proof count:
-/// 14 split-table families at one chunk each, plus the nine fixed tables an
-/// intermediate epoch carries (all ten on the final one), plus one L2G_MEMORY.
-/// PAGE does not appear — epochs pass `page_configs = &[]`.
+/// from the real epoch shape and pins against a measured 25/26 sub-proof
+/// CEILING: 14 split-table families at one chunk each, plus the nine
+/// always-on-or-accelerator tables an intermediate epoch can carry (all ten on
+/// the final one), plus one L2G_MEMORY. PAGE does not appear — epochs pass
+/// `page_configs = &[]`.
+///
+/// ⚠ THE FIXED TERM IS A CEILING SINCE #977, not a floor. That PR took
+/// `FIXED_TABLE_COUNT` 11 → 5, moving COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS
+/// and HINT into `TableCounts` — a run that never reaches one carries no
+/// sub-proof for it. So the sums below are what a workload that calls every
+/// accelerator pays, which is the right figure for a budget and the wrong one
+/// for a specific epoch: `epoch_verify_tests` measures 16 on the fibonacci
+/// fixture, which reaches none of the six.
 ///
 /// ### What this instrument cannot see
 ///
@@ -1499,8 +1508,16 @@ fn continuation_epoch_constraint_leg_cost() {
         "CPU", "LT", "SHIFT", "EQ", "BYTEWISE", "STORE", "CPU32", "MEMW", "MEMW_A", "MEMW_R",
         "LOAD", "MUL", "DVRM", "BRANCH",
     ];
-    /// `FIXED_TABLE_COUNT`'s ten, which contribute exactly one sub-proof each
-    /// regardless of `TableCounts`. HALT is last: an intermediate epoch drops it.
+    /// The ten an epoch can carry outside the split families: `FIXED_TABLE_COUNT`'s
+    /// five (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT), which contribute one
+    /// sub-proof each regardless of `TableCounts`, plus five of the six
+    /// accelerators #977 moved into `TableCounts`. HALT is last: an intermediate
+    /// epoch drops it.
+    ///
+    /// ⚠ HINT is the sixth accelerator and is absent from this list, which is
+    /// why the enumeration is ten where the pre-#977 constant said eleven. The
+    /// omission is inherited, not deliberate, and it makes these sums a LOWER
+    /// bound on the accelerator-inclusive ceiling.
     const FIXED: &[&str] = &[
         "BITWISE",
         "DECODE",
@@ -1554,16 +1571,16 @@ fn continuation_epoch_constraint_leg_cost() {
     let design_intermediate = families_unfused + fixed_unfused + l2g_unfused;
 
     println!(
-        "\ncontinuation epoch, constraint leg (minimum shape, 25 sub-proofs)\n\
+        "\ncontinuation epoch, constraint leg (minimum shape, 25-sub-proof ceiling)\n\
          \x20 14 split families        {families:>7}  (unfused {families_unfused})\n\
          \x20  9 fixed, no HALT        {fixed_no_halt:>7}  (unfused {fixed_unfused})\n\
          \x20  1 L2G_MEMORY            {l2g:>7}  (unfused {l2g_unfused})\n\
          \x20 INTERMEDIATE leg         {intermediate:>7}  vs the design's {design_intermediate}\n\
          \x20 + recombination @ log2(N) = {LOG2_TRACE_LENGTH}  {recombination:>7}  \
          (zerofier, beta-fold, one division, claimed-parts Horner, assert)\n\
-         \x20 INTERMEDIATE total       {:>7}  over 25 sub-proofs\n\
+         \x20 INTERMEDIATE total       {:>7}  over <=25 sub-proofs\n\
          \x20 FINAL epoch (+HALT)      {final_leg:>7} leg, {final_total} total, \
-         over 25 sub-proofs",
+         over <=26 sub-proofs",
         intermediate + recombination
     );
 

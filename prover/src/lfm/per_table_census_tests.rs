@@ -608,23 +608,162 @@ fn the_block_rule_is_hash_invariant_on_every_tenant_group() {
 /// This is the one number in the census that, if wrong, moves the headline
 /// ratio by a third and in the flattering direction, so it is asserted against
 /// the recorded run rather than left to the tenant table's spelling.
+///
+/// ⚠⚠ **THIS TEST WAS RED, AND THE DEFECT WAS THE ASSERTION, NOT THE NUMBER.**
+/// It required `BLAKE3_TENANT_SOCKET == hash_pin::BLOCK_HASHER`, which has been
+/// false since `603c1e155` (2026-09-08) re-pinned the block path to RPX. The
+/// obvious readings were both wrong:
+///
+/// - *Re-bless the pair.* No. `RECORDED` is a faithful record of the BLAKE3
+///   tenant, and that tenant did not change when the block path's pin did.
+/// - *Point the constant at `Rpx`.* No, and this is the interesting one. A
+///   tenant's socket width is a property of the build that PRODUCED the wrap
+///   proof, not of the build reading it. A byte-arm program emits no
+///   `Instr::Hash` and never consults the socket, so a BLAKE3-committing build
+///   has no reason to instantiate an algebraic one. Giving this tenant a
+///   316-column socket would price a build nobody would ship and would move the
+///   lever-0 baseline while doing it.
+///
+/// So the constant and the pair both STAND, and the 0.774× stands with them.
+/// What is replaced is the assertion, which tied a COUNTERFACTUAL tenant to the
+/// CURRENT build's pin — a category error that a pin move was always going to
+/// expose. The check it was reaching for is the one now in the body: production
+/// must be the ALGEBRAIC tenant.
+///
+/// ★ **THE MEASURED PANEL**, printed BEFORE any assertion so a red run still
+/// yields numbers. ✓ MEASURED at `c8c7c036e` on the box, CPU-only, env clean —
+/// `LFM_HASH` main columns by socket: **Test 28, Rpx 316, Rpo 436, Poseidon
+/// 612**, 3 ext aux throughout. Two things fall out. The pinned socket is 316,
+/// not the 436 the RPO figure in `wrap_tests.rs` would have suggested. And it
+/// is 11× the idle 28 rather than the 106× a BLAKE3 socket would have been, so
+/// the failure mode this test's first paragraph warns about is real but far
+/// smaller than the 2,980-column case that motivated it.
+///
+/// ⛔ **DO NOT schedule the 2^24 real-block run for this.** The quantities
+/// split, and only the first is in question:
+///
+/// | quantity | depends on | needs a re-record? |
+/// |---|---|---|
+/// | socket WIDTH (main, aux) | the `HasherKind` alone | no — static per tag |
+/// | idle socket HEIGHT (4 rows, 0 used) | the group floor | no — static |
+/// | non-hash heights, the 670,468,916 non-hash cells | the workload | no — socket-independent |
+/// | the 0.774× lever-0 ratio | arithmetic over the above | no — recompute |
+///
+/// `tenant_log_heights` overrides `h[HASH_SLOT]` only for ALGEBRAIC tenants, and
+/// every non-hash height is socket-independent, so `RECORDED_WRAP_LOG_HEIGHTS`
+/// survives the pin move intact.
+///
+/// ✓ And in the end NOTHING in that table needed re-recording — the panel
+/// settled it. The question the split was framed against, "which of these does
+/// the pin move invalidate?", turns out to have the answer "none", because the
+/// BLAKE3 tenant is modelled at its OWN build's pin and not at this build's.
+/// The table stays because it is the reasoning that would be needed again if
+/// the COMMITMENT pin moved, which is the move that would actually reach these
+/// numbers — and because it is what says the expensive run is never the answer
+/// to a socket-width question.
+///
+/// ⚠ And the obvious cheap run does NOT answer it: `wrap_tests::the_wrap_census`
+/// reaches `lfm_chip_census`, which is `lfm_chip_census_with_hasher(program,
+/// HasherKind::default())` and `HasherKind::default()` is `Test` — so it reports
+/// this very pair under ANY pin. That is why the panel below names its hasher on
+/// every line: a census that does not is not evidence about `BLOCK_HASHER`.
 #[test]
 fn the_blake3_tenant_socket_matches_the_record() {
     /// `LFM_HASH` as `tip-wrappt-24.stdout`'s CHIP CENSUS reports it: 28 main
     /// value columns over the 13-column preprocessed prefix, 3 ext aux.
     const RECORDED: (usize, usize) = (28, 3);
 
-    // ★ The tenant's socket IS the pin's, not a value chosen here. A branch that
-    // re-pins `BLOCK_HASHER` moves what a BLAKE3-tenant wrap proof actually
-    // carries, and this census would then be measuring a shape nothing proves.
-    assert_eq!(
-        BLAKE3_TENANT_SOCKET,
-        crate::hash_pin::BLOCK_HASHER,
-        "the BLAKE3 tenant's LFM_HASH socket must be the build's own pin — the \
-         recorded census this census is a ratio against was produced under it"
+    let opts = wrap_options();
+
+    // ★ MEASURED FIRST, ASSERTED SECOND — the ordering is the point. The socket
+    // assertion below fires before any tenant is built, so while it is red this
+    // panel is the only way the measurement reaches a log. Every line names its
+    // hasher, because a width without the tag that produced it is the mistake
+    // this whole finding is about.
+    println!(
+        "\n★ LFM_HASH SOCKET WIDTH BY TENANT — BLOCK_HASHER is {:?}",
+        crate::hash_pin::BLOCK_HASHER
+    );
+    for tenant in TENANTS.iter() {
+        let airs = tenant.airs(&opts);
+        let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
+        let hash = tables
+            .iter()
+            .find(|t| t.name == "LFM_HASH")
+            .expect("every tenant carries LFM_HASH");
+        println!(
+            "   {:>8}  hasher {:<9?} algebraic {:<5}  LFM_HASH {:>5} main + {} ext aux{}",
+            tenant.label,
+            tenant.hasher,
+            tenant.algebraic,
+            hash.main_cols,
+            hash.aux_cols,
+            if tenant.hasher == crate::hash_pin::BLOCK_HASHER {
+                "   <== THE PIN"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "   RECORDED {RECORDED:?} — tip-wrappt-24.stdout, 2026-08-21, taken \
+         BEFORE the RPX pin of 603c1e155 (2026-09-08)"
     );
 
-    let opts = wrap_options();
+    // ★★ WHAT THE OLD ASSERTION GOT WRONG, and it is a modelling error rather
+    // than a stale number. It read
+    //
+    //     assert_eq!(BLAKE3_TENANT_SOCKET, hash_pin::BLOCK_HASHER)
+    //
+    // — "the BLAKE3 tenant's socket must be the build's own pin". That ties a
+    // COUNTERFACTUAL tenant to the CURRENT build. The BLAKE3 tenant models a
+    // wrap proof produced by a BLAKE3-COMMITTING build, and a tenant's socket
+    // width is a property of the build that PRODUCED the proof, not of the one
+    // reading it. A byte-arm program emits no `Instr::Hash` and never consults
+    // the socket, so a BLAKE3-committing build has no reason to instantiate an
+    // algebraic one: `Test` is that build's own pin, and 28 columns is a
+    // faithful record of it. Re-pointing the constant at `Rpx` would price a
+    // build nobody would ship — a 316-column socket paid for and never used —
+    // and would move the lever-0 baseline in the process.
+    //
+    // So NOTHING here is re-blessed: `BLAKE3_TENANT_SOCKET` stays `Test`,
+    // `RECORDED` stays `(28, 3)`, and the 0.774× the module reports stands. The
+    // panel above is what settles that, and the measured widths are
+    // Test 28 / Rpx 316 / Rpo 436 / Poseidon 612 main, 3 ext aux throughout.
+    //
+    // ★ WHAT THE ASSERTION WAS REACHING FOR is below, and it is checkable:
+    // production must be the ALGEBRAIC tenant, and one tenant must model it.
+    // ✓ VERIFIED at `c8c7c036e`: `hash_pin::BlockStarkHash = RpxStarkHash`, so
+    // `BLOCK_COMMITMENT_HASH` is `Rpx256`, and `WrapHash::production()` maps
+    // Rpo256/Rpx256/Poseidon to `Algebraic`. The production wrap therefore
+    // EMITS `Instr::Hash` and USES the socket — it is the RPX tenant, not the
+    // BLAKE3 one. Both halves can fail: a pin moved to a byte commitment hash
+    // fails the first, and a TENANTS table that stopped covering the pin fails
+    // the second.
+    assert_eq!(
+        WrapHash::production(),
+        WrapHash::Algebraic,
+        "the production wrap is the tenant this census prices as `algebraic`. \
+         If `BLOCK_COMMITMENT_HASH` has moved to a byte hash, production is a \
+         BYTE tenant, the baseline and the subject of the lever-0 ratio swap \
+         places, and every ratio in this module needs re-reading before it is \
+         quoted"
+    );
+    assert!(
+        TENANTS
+            .iter()
+            .any(|t| t.algebraic && t.hasher == crate::hash_pin::BLOCK_HASHER),
+        "no tenant models the production wrap: the pin is {:?} and the \
+         algebraic tenants are {:?}. The census would then be pricing only \
+         builds nobody ships",
+        crate::hash_pin::BLOCK_HASHER,
+        TENANTS
+            .iter()
+            .filter(|t| t.algebraic)
+            .map(|t| (t.label, t.hasher))
+            .collect::<Vec<_>>()
+    );
+
     for tenant in TENANTS.iter().filter(|t| !t.algebraic) {
         let airs = tenant.airs(&opts);
         let tables = tenant_tables(tenant, &airs, &tenant.present_log_heights());
