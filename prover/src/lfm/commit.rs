@@ -206,7 +206,20 @@ pub fn commit_group_device_or_host(
             true,
         );
         DEVICE_PEAK_BYTES.fetch_max(set.total(), std::sync::atomic::Ordering::Relaxed);
-        if let Some(root) = stark::gpu_lde::try_commit_row_major::<
+        // ⛔ ROUND-3 TREE PROBE (diagnostic, OFF by default). The card permit is
+        // held across the WHOLE of `build_artifacts_with_hasher`, and THIS call
+        // is the only device work inside it. So `Σ dispatch` against that hold
+        // says how much of an exclusive card hold is actually spent on the card:
+        // far below it and the permit is held over HOST work, which is a lever
+        // with a mechanism rather than a floor.
+        //
+        // ⚠ A HOST STOPWATCH, NOT A CUDA EVENT, and that is the point:
+        // `try_commit_row_major` blocks until it has a root, so the wall around
+        // it brackets the dispatch without adding a synchronize the device path
+        // would otherwise not have. The measurement cannot perturb what it
+        // measures.
+        let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
+        let committed = stark::gpu_lde::try_commit_row_major::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
         >(
@@ -216,7 +229,11 @@ pub fn commit_group_device_or_host(
             group.width,
             options.blowup_factor as usize,
             &FE::from(options.coset_offset),
-        ) {
+        );
+        if let Some(t) = probe_t {
+            super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
+        }
+        if let Some(root) = committed {
             DEVICE_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return root;
         }

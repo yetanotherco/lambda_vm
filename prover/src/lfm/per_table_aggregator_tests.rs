@@ -2563,6 +2563,46 @@ fn mark(label: &str) {
     println!("   MARK {label}: live {rss:?} GiB / high-water {hwm:?} GiB / t={t:.1}");
 }
 
+/// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — one line per tree stage, and NOTHING at
+/// all unless `LAMBDA_VM_TREE_BUSY_PROBE` is set.
+///
+/// ★ WHAT IT IS FOR. The tree phase's serialising resource is
+/// [`super::device_permit`] — mutual exclusion over a proof's two device phases,
+/// because two proofs in flight can budget the card twice over. So the ceiling
+/// on every concurrency lever in this phase is `Σ held`, and `held / stage wall`
+/// is the reading that separates "the card is the wall" (a floor: the only
+/// remaining lever is the permutation, already at its arithmetic floor) from
+/// "the host is the wall" (a lever: overlap independent stages).
+///
+/// ⚠ `take` CLEARS, so the stages must be priced IN ORDER and each call must
+/// bracket exactly one stage. Reading two stages against one set of counters is
+/// how a late stage comes to look card-bound because an early one was.
+fn tree_probe_line(stage: &str, wall_secs: f64) {
+    if !super::tree_probe::enabled() {
+        return;
+    }
+    let stats = super::tree_probe::take();
+    let reserved = cut_reserved_high_water();
+    let run_reserved = super::tree_probe::note_reserved_high_water(reserved);
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "   {}",
+        stats.describe(stage, wall_secs, mib(reserved), mib(run_reserved)),
+    );
+}
+
+/// Read the device reservation high-water and ZERO it, so the next stage
+/// reports its own. In BYTES.
+///
+/// ⛔ HERE AND NOT IN `tree_probe`: `math-cuda` is a DEV-dependency of this
+/// crate, so only `cfg(test)` code can name it. The probe module keeps the
+/// running maximum; this reads and cuts the counter.
+fn cut_reserved_high_water() -> u64 {
+    let now = math_cuda::device::reserved_high_water();
+    math_cuda::device::reset_reserved_high_water();
+    now
+}
+
 /// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
 ///
 /// Everything measured so far is FIXTURE scale, where a node's children are
@@ -7779,6 +7819,46 @@ fn the_whir_production_tree_composes_to_a_root() {
     mark("AFTER the WHIR base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the WHIR base"));
     whir_base_split_readback(base_secs);
+    // ⛔ ROUND-3 TREE PROBE, ARMED AT THE BASE BOUNDARY (diagnostic, OFF by
+    // default — `LAMBDA_VM_TREE_BUSY_PROBE`). Everything below this line is the
+    // tree/wrap phase, and the probe prices each of its four stages against the
+    // permit that serialises them. The base's own holds are discarded here so
+    // level 0 reports its own, and the device reservation high-water is cut at
+    // the same boundary for the same reason — the base's reservation dominates
+    // the run and would otherwise be the only number any stage could report.
+    if super::tree_probe::enabled() {
+        let _ = super::tree_probe::take();
+        let base_reserved = cut_reserved_high_water();
+        let _ = super::tree_probe::note_reserved_high_water(base_reserved);
+        println!(
+            "   TREE PROBE armed at the base boundary: the base's device reservation \
+             high-water was {:.0} MiB; every figure below is the TREE phase's own",
+            base_reserved as f64 / (1024.0 * 1024.0),
+        );
+        // ⛔ THE KNOBS THE DISPATCH TOTAL DEPENDS ON, SHOWN READ ON THE PATH.
+        // Both artifact-commit walks go through `map_maybe_parallel`, so the
+        // `device commit dispatch` figure below is WORKER-SECONDS with up to
+        // `groups_in_flight` overlapping — quoting it as a fraction of a wall
+        // without these two numbers beside it is how a reader turns concurrency
+        // into a bug report.
+        println!(
+            "   TREE PROBE knobs READ: LFM_ARTIFACT_PARALLEL={} · \
+             LFM_ARTIFACT_GROUPS_IN_FLIGHT={} ⇒ up to {} device commits overlap \
+             inside ONE build_artifacts hold",
+            u8::from(super::commit::parallel_build()),
+            super::registry::groups_in_flight(),
+            // ⚠ THE `parallel` FEATURE IS PART OF THE ANSWER, not a detail:
+            // `map_maybe_parallel`'s rayon arm is `#[cfg(feature = "parallel")]`,
+            // so on a build without it the knob can read 1 and nothing overlaps.
+            // A banner that quoted the knob alone would name a concurrency the
+            // binary cannot have.
+            if cfg!(feature = "parallel") && super::commit::parallel_build() {
+                super::registry::groups_in_flight()
+            } else {
+                1
+            },
+        );
+    }
 
     let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
     let shape = tree_shape(bundle.num_epochs(), fan_in);
@@ -7854,6 +7934,7 @@ fn the_whir_production_tree_composes_to_a_root() {
     if let Some(stats) = super::program_census::end_level() {
         println!("   {}", stats.describe("level 0"));
     }
+    tree_probe_line("level 0", level0_wall);
 
     // ---- level 0's OTHER child: the WHIR GLOBAL WRAP.
     //
@@ -7870,6 +7951,7 @@ fn the_whir_production_tree_composes_to_a_root() {
     // green over a stage nobody ran. That is the shape the STARK caller's
     // `let Some(..) else { return; }` does NOT have, and inheriting it was the
     // named hazard this stage was written against.
+    let t_global_stage = Instant::now();
     let global = crate::with_whir_hash!(|H| {
         prove_whir_global_child::<H>(
             &bundle,
@@ -7886,8 +7968,19 @@ fn the_whir_production_tree_composes_to_a_root() {
              child for a root and no block artifact to compose: {why}"
         )
     });
+    // ⭐ THE STAGE THIS LANE EXISTS FOR. The global child runs ALONE between
+    // level 0 and the interior, with the permit armed at 1, so its held time
+    // lands in no existing summary. `card-held` well under this wall is the
+    // measure of what folding it into level 0's pool (the STARK driver's
+    // `LFM_TREE_TOP_OVERLAP`) could recover; near the wall says it is card-bound
+    // and there is nothing to fold.
+    tree_probe_line(
+        "the WHIR GLOBAL child (runs ALONE)",
+        t_global_stage.elapsed().as_secs_f64(),
+    );
 
     // ---- levels 1..=hi, in the one interior both production trees share.
+    let t_interior = Instant::now();
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
@@ -7916,6 +8009,31 @@ fn the_whir_production_tree_composes_to_a_root() {
         interior.top_level.is_none(),
         "the sizing arm is off, so no level may be held back"
     );
+    // ⭐ THE INTERIOR'S OWN PERMIT LINE, AND THE REASON IT IS TAKEN HERE.
+    //
+    // ⛔ `compose_interior_levels` prints `PermitStats` only from its BARRIER
+    // loop. The production harness runs `LFM_TREE_LEVEL_POOL=1` with
+    // `LFM_TREE_LEVEL_POOL_FROM` at its default 1, so `barrier_levels` is 0, the
+    // barrier loop runs ZERO levels and the whole interior goes through the
+    // POOLED span — which calls no `take_stats`. ⇒ on the configuration that
+    // actually runs, the one reading that says whether the card or the host
+    // bound the interior is not printed at all.
+    //
+    // ✓ Taken in the CALLER, so `compose_interior_levels` stays byte-identical
+    // and the STARK driver is untouched. The counters hold exactly the
+    // interior's own: level 0 cleared them above, and the global child between
+    // them ran unarmed, where `Drop` accumulates nothing into `HELD_NANOS`.
+    let interior_wall = t_interior.elapsed().as_secs_f64();
+    if super::tree_probe::enabled() {
+        let permit = super::device_permit::take_stats();
+        if permit.acquisitions > 0 {
+            println!(
+                "   interior (levels 1..={hi}): {}",
+                permit.describe(interior_wall)
+            );
+        }
+    }
+    tree_probe_line(&format!("the interior (levels 1..={hi})"), interior_wall);
     // The interior is done, and the reset is the CALLER's — the same line the
     // STARK harness carries immediately after its own call to
     // `compose_interior_levels`. It stays outside the function on purpose: the
@@ -7947,6 +8065,7 @@ fn the_whir_production_tree_composes_to_a_root() {
              LFM_TREE_PROVE_ROOT=1 with LFM_TREE_ROOT_OPTION=A|B composes one\n"
         ),
         Some(option) => {
+            let t_root_stage = Instant::now();
             // ⛔ THE ROOT COUNTS ITS CHILDREN, HERE, WHERE THE LEVELS ARE STILL IN
             // VIEW. ✓ `child_level` is the same named rule `hi` was set from
             // above, so the two cannot drift; what this compares is the number of
@@ -8136,6 +8255,14 @@ fn the_whir_production_tree_composes_to_a_root() {
                 Some(why) => println!("\n   ⚠ {why}"),
                 None => super::block_root::assert_artifact_is_posture_independent(&runs),
             }
+            // ⓘ The last tree stage, and it runs alone like the global child —
+            // with nothing after it to overlap with. It is priced for the same
+            // reason the others are: a stage nobody measured is a stage nobody
+            // can rule out.
+            tree_probe_line(
+                "the BLOCK-ARTIFACT ROOT (runs ALONE)",
+                t_root_stage.elapsed().as_secs_f64(),
+            );
         }
     }
 
@@ -8202,6 +8329,23 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   reserved high-water {:.0} MiB",
         math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
     );
+    // ⛔ THE PROBE'S ONE COST, PRINTED WHERE IT BITES RATHER THAN LEFT IN A DOC.
+    // Splitting the reservation high-water per tree stage means CUTTING a
+    // process-wide counter at each boundary, so with the probe ON the line
+    // immediately above reads the LAST stage rather than the run. The probe
+    // keeps its own running maximum and prints it here so the whole-run figure
+    // is never lost — and with the probe off nothing is cut and that line means
+    // exactly what it always meant.
+    if super::tree_probe::enabled() {
+        println!(
+            "   ⚠ TREE PROBE IS ON: the `reserved high-water` line above is the LAST \
+             STAGE's, not the run's — the probe cut the counter at every tree-stage \
+             boundary. THE WHOLE-RUN FIGURE IS {:.0} MiB (probe-tracked maximum)",
+            super::tree_probe::run_reserved_high_water()
+                .max(math_cuda::device::reserved_high_water()) as f64
+                / (1024.0 * 1024.0),
+        );
+    }
 }
 
 /// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small
