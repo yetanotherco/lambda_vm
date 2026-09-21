@@ -4,7 +4,6 @@
 // Equation formatting
 #show: equate.with(breakable: true, sub-numbering: true, number-mode: "label")
 #set math.equation(numbering: "(1.1)")
-#show math.equation.where(block: false): box
 
 In this section, we discuss, in order, 
 + the multiplication and addition of limb-decomposed integers (involving carries), 
