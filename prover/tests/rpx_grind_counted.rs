@@ -260,11 +260,24 @@ fn what_lowering_the_grind_poll_rate_does_to_the_overrun() {
     }
 
     // ── the cross-k IDENTICAL-NONCE soundness control ───────────────────────
+    //
+    // ⛔ THE BOUNDS ARE THE CHECK, so they are spelled out rather than trusted
+    // to an iterator that looks equivalent. `nonces` is
+    // `vec![Vec::with_capacity(RUNS); n_arms]` and the seed loop pushes exactly
+    // once per (seed, arm) with no early exit, so `nonces.len() == n_arms` and
+    // every row is `RUNS` long: iterating `nonces[0]` is the old `0..RUNS`, and
+    // `take(n_arms).skip(1)` is the old `1..n_arms`.
+    //
+    // ⚠ CLIPPY'S OWN SUGGESTION HERE IS WRONG. `needless_range_loop` offers
+    // `for <item> in nonces.iter().take(n_arms).skip(1)` for the OUTER loop too,
+    // which drops the `s` index — and the body needs both indices, because the
+    // comparison is `nonces[a][s]` against `nonces[0][s]`. Taking that
+    // suggestion would have compared whole arms instead of per-seed nonces and
+    // turned a control that can fail into one that cannot.
     let mut nonce_mismatch = 0usize;
-    for s in 0..RUNS {
-        let n0 = nonces[0][s];
-        for a in 1..n_arms {
-            if nonces[a][s] != n0 {
+    for (s, n0) in nonces[0].iter().enumerate() {
+        for arm in nonces.iter().take(n_arms).skip(1) {
+            if arm[s] != *n0 {
                 nonce_mismatch += 1;
             }
         }
