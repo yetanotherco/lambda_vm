@@ -784,7 +784,11 @@ fn continuation_epoch_constraint_leg() {
         crate::FIXED_TABLE_COUNT,
         "the always-on list must name every FIXED_TABLE_COUNT table"
     );
-    let fixed_final: Vec<&str> = always_on.iter().chain(accelerators.iter()).copied().collect();
+    let fixed_final: Vec<&str> = always_on
+        .iter()
+        .chain(accelerators.iter())
+        .copied()
+        .collect();
 
     let families_instr: usize = families.iter().map(|l| get(l)).sum();
     let fixed_final_instr: usize = fixed_final.iter().map(|l| get(l)).sum();
