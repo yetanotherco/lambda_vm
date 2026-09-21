@@ -109,9 +109,6 @@ static WAITED_NS: AtomicU64 = AtomicU64::new(0);
 /// Nanoseconds inside the device commit dispatch, and how many groups reached it.
 static DEVICE_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 static DEVICE_COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
-/// The largest device reservation high-water any stage has reported — see
-/// [`Stats::describe`]'s caveat.
-static RUN_RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 /// Record one released card permit: which phase it was, how long it was held,
 /// and how long its holder queued for it.
@@ -164,24 +161,16 @@ impl Stats {
 
     /// ★ THE LINE THE DISCRIMINATOR IS READ OFF.
     ///
-    /// `reserved_mib` is this stage's own device reservation high-water, taken
-    /// by the caller across the stage; `run_reserved_mib` is the largest any
-    /// stage has reported so far.
-    ///
-    /// ⛔ THE CAVEAT IS PRINTED, NOT LEFT TO A DOC. Splitting the reservation
-    /// high-water per stage means RESETTING a process-wide counter at each
-    /// boundary, so with the probe ON the harness's own whole-run
-    /// `reserved high-water` line reads the LAST stage rather than the run.
-    /// `run_reserved_mib` is this probe's own running maximum and is the figure
-    /// to quote instead. With the probe off nothing is reset and that line
-    /// means exactly what it always meant.
-    pub fn describe(
-        &self,
-        stage: &str,
-        wall_secs: f64,
-        reserved_mib: f64,
-        run_reserved_mib: f64,
-    ) -> String {
+    /// ⛔ NO DEVICE-MEMORY FIELD, and its removal is a finding rather than a
+    /// simplification. Splitting `math_cuda::device::reserved_high_water` per
+    /// stage means CUTTING a process-wide counter at every boundary, which
+    /// costs the harness's own whole-run `reserved high-water` line its
+    /// meaning — and the free read of wt27/wt28 showed the number was not worth
+    /// that: the whole-run figure is 25,003 MiB against a 32,607 MiB card, the
+    /// 10 Hz `nvidia-smi` trace the harness already keeps splits device memory
+    /// by phase, and no tree stage is anywhere near the budget. A measurement
+    /// that degrades an existing one has to buy more than that.
+    pub fn describe(&self, stage: &str, wall_secs: f64) -> String {
         let held = self.held_secs();
         let pct = |x: f64| {
             if wall_secs > 0.0 {
@@ -195,8 +184,7 @@ impl Stats {
              [build_artifacts {:.1}s/{} · multi_prove {:.1}s/{} · other {:.1}s/{}] · \
              queued {:.1}s · device commit dispatch {:.1}s WORKER-SEC over {} group(s) \
              ({:.0}% of the build_artifacts hold — worker-seconds over a wall, so \
-             above 100% is concurrency) · reserved high-water {reserved_mib:.0} MiB \
-             (run max so far {run_reserved_mib:.0} MiB)",
+             above 100% is concurrency)",
             pct(held),
             self.holds(),
             self.build_nanos as f64 / 1e9,
@@ -230,26 +218,6 @@ pub fn take() -> Stats {
         device_commit_calls: DEVICE_COMMIT_CALLS.swap(0, Ordering::Relaxed),
         device_commit_nanos: DEVICE_COMMIT_NS.swap(0, Ordering::Relaxed),
     }
-}
-
-/// Fold one stage's device reservation high-water into this probe's running
-/// maximum, and return that maximum. Both in BYTES.
-///
-/// ⛔ THE READ AND THE RESET STAY WITH THE CALLER, and that is forced rather
-/// than chosen: `math-cuda` is a DEV-dependency of this crate (`prover/Cargo.toml`,
-/// `[dev-dependencies]`), so the library half of the probe cannot name
-/// `math_cuda::device::reserved_high_water` at all — only the `cfg(test)` driver
-/// can. Splitting it here keeps the probe compiling in a plain library build.
-pub fn note_reserved_high_water(stage_bytes: u64) -> u64 {
-    RUN_RESERVED_HIGH_WATER
-        .fetch_max(stage_bytes, Ordering::Relaxed)
-        .max(stage_bytes)
-}
-
-/// This probe's own running maximum of the device reservation high-water, in
-/// BYTES — the figure to quote when the probe is on.
-pub fn run_reserved_high_water() -> u64 {
-    RUN_RESERVED_HIGH_WATER.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -311,20 +279,19 @@ mod tests {
             device_commit_nanos: 1_000_000_000,
             ..Stats::default()
         };
-        let line = s.describe("level 0", 20.0, 9123.0, 25001.0);
+        let line = s.describe("level 0", 20.0);
         assert!(line.contains("card-held 10.0s (50%)"), "{line}");
         assert!(line.contains("over 4 hold(s)"), "{line}");
         assert!(
             line.contains("dispatch 1.0s WORKER-SEC over 9 group(s) (25% of the"),
             "{line}"
         );
-        assert!(line.contains("run max so far 25001 MiB"), "{line}");
     }
 
     /// ⛔ A stage with no holds must not divide by zero into a fake percentage.
     #[test]
     fn an_empty_stage_reports_zero_rather_than_nan() {
-        let line = Stats::default().describe("nothing", 0.0, 0.0, 0.0);
+        let line = Stats::default().describe("nothing", 0.0);
         assert!(line.contains("card-held 0.0s (0%)"), "{line}");
         assert!(line.contains("over 0 group(s) (0% of the"), "{line}");
     }

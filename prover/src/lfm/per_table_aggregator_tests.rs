@@ -2581,26 +2581,10 @@ fn tree_probe_line(stage: &str, wall_secs: f64) {
     if !super::tree_probe::enabled() {
         return;
     }
-    let stats = super::tree_probe::take();
-    let reserved = cut_reserved_high_water();
-    let run_reserved = super::tree_probe::note_reserved_high_water(reserved);
-    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
         "   {}",
-        stats.describe(stage, wall_secs, mib(reserved), mib(run_reserved)),
+        super::tree_probe::take().describe(stage, wall_secs),
     );
-}
-
-/// Read the device reservation high-water and ZERO it, so the next stage
-/// reports its own. In BYTES.
-///
-/// ⛔ HERE AND NOT IN `tree_probe`: `math-cuda` is a DEV-dependency of this
-/// crate, so only `cfg(test)` code can name it. The probe module keeps the
-/// running maximum; this reads and cuts the counter.
-fn cut_reserved_high_water() -> u64 {
-    let now = math_cuda::device::reserved_high_water();
-    math_cuda::device::reset_reserved_high_water();
-    now
 }
 
 /// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
@@ -7828,12 +7812,9 @@ fn the_whir_production_tree_composes_to_a_root() {
     // the run and would otherwise be the only number any stage could report.
     if super::tree_probe::enabled() {
         let _ = super::tree_probe::take();
-        let base_reserved = cut_reserved_high_water();
-        let _ = super::tree_probe::note_reserved_high_water(base_reserved);
         println!(
-            "   TREE PROBE armed at the base boundary: the base's device reservation \
-             high-water was {:.0} MiB; every figure below is the TREE phase's own",
-            base_reserved as f64 / (1024.0 * 1024.0),
+            "   TREE PROBE armed at the base boundary: the base's own card holds are \
+             discarded here, so every figure below is the TREE phase's own"
         );
         // ⛔ THE KNOBS THE DISPATCH TOTAL DEPENDS ON, SHOWN READ ON THE PATH.
         // Both artifact-commit walks go through `map_maybe_parallel`, so the
@@ -8023,17 +8004,17 @@ fn the_whir_production_tree_composes_to_a_root() {
     // and the STARK driver is untouched. The counters hold exactly the
     // interior's own: level 0 cleared them above, and the global child between
     // them ran unarmed, where `Drop` accumulates nothing into `HELD_NANOS`.
-    let interior_wall = t_interior.elapsed().as_secs_f64();
-    if super::tree_probe::enabled() {
-        let permit = super::device_permit::take_stats();
-        if permit.acquisitions > 0 {
-            println!(
-                "   interior (levels 1..={hi}): {}",
-                permit.describe(interior_wall)
-            );
-        }
-    }
-    tree_probe_line(&format!("the interior (levels 1..={hi})"), interior_wall);
+    // ⓘ The interior's line stays because the four stage lines PARTITION the tree
+    // phase and `take` clears — a stage that printed nothing would fold its holds
+    // into the next one's. It is not here to decide anything: the interior's
+    // permit-held fraction is already settled at 0.92 from the `CARD HOLD` lines
+    // of wt27 and wt28, which is a FLOOR under the mutual-exclusion permit.
+    // ⛔ And NO `device_permit::take_stats()` call beside it: that counter belongs
+    // to the lines the drivers already print, and reading it CLEARS it.
+    tree_probe_line(
+        &format!("the interior (levels 1..={hi})"),
+        t_interior.elapsed().as_secs_f64(),
+    );
     // The interior is done, and the reset is the CALLER's — the same line the
     // STARK harness carries immediately after its own call to
     // `compose_interior_levels`. It stays outside the function on purpose: the
@@ -8329,23 +8310,6 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   reserved high-water {:.0} MiB",
         math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
     );
-    // ⛔ THE PROBE'S ONE COST, PRINTED WHERE IT BITES RATHER THAN LEFT IN A DOC.
-    // Splitting the reservation high-water per tree stage means CUTTING a
-    // process-wide counter at each boundary, so with the probe ON the line
-    // immediately above reads the LAST stage rather than the run. The probe
-    // keeps its own running maximum and prints it here so the whole-run figure
-    // is never lost — and with the probe off nothing is cut and that line means
-    // exactly what it always meant.
-    if super::tree_probe::enabled() {
-        println!(
-            "   ⚠ TREE PROBE IS ON: the `reserved high-water` line above is the LAST \
-             STAGE's, not the run's — the probe cut the counter at every tree-stage \
-             boundary. THE WHOLE-RUN FIGURE IS {:.0} MiB (probe-tracked maximum)",
-            super::tree_probe::run_reserved_high_water()
-                .max(math_cuda::device::reserved_high_water()) as f64
-                / (1024.0 * 1024.0),
-        );
-    }
 }
 
 /// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small
