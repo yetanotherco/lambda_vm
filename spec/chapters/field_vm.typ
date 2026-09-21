@@ -228,7 +228,8 @@ for $i = j in [0, N + 1]$ and $f_(i)(j) = 0$ for $i != j in [0, N + 1]$.#footnot
 ]
 Since the degree of these $f_(i)(x)$ can grow too large to express in a single polynomial constraint,
 we perform a _"degree split"_:
-$ f_(i)(x) = f_(i, 0)(x) + x^(d - 1) (f_(i, 1)(x) + x^(d - 2) (f_(i, 2) + x^(d - 2) (f_(i, 3) + ...))), $
+$ f_(i)(x) &= f_(i, 0)(x) + x^(d - 1) (f_(i, 1)(x) + x^(d - 2) (f_(i, 2) + x^(d - 2) (f_(i, 3) + ...)))\
+           &= 1 dot f_(i,0)(x) + x^(d - 1) f_(i,1)(x) + ... + x^(d - 1 + (t - 1) dot (d - 2)) f(i, t)(x), $
 for a maximal constraint degree $d$.
 Here, $deg(f_(i, 0)) <= d - 2$ and $deg(f_(i, k)) <= d - 3$.
 We denote by $t + 1$ the number of non-zero $f_(i, k)$ for fixed $i$.
