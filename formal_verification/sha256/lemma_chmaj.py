@@ -15,6 +15,8 @@ The `255 - e_byte` operand is the complement form sha256_common.rs `byte_bits`
 emits so that NOT needs no extra opsel; that it really is bitwise NOT on a byte
 is part of what this lemma checks.
 """
+import sys
+
 from z3 import BitVec, BitVecVal, Concat, Solver, sat, unsat
 
 WB = 8
@@ -82,3 +84,12 @@ if __name__ == "__main__":
                     ("ch:  (e&f)+(!e&g) == Ch", check_ch()),
                     ("maj: (a&b)+(c&(a^b)) == Maj", check_maj())]:
         print(f"  {name:<30} {r}")
+
+    bad = 0
+    if positive_control() is not True:
+        print("  FAIL positive control"); bad += 1
+    if check_ch("ch_no_not") != sat or check_maj("maj_uses_b_not_c") != sat:
+        print("  FAIL a control did not flip"); bad += 1
+    if check_complement() != unsat or check_ch() != unsat or check_maj() != unsat:
+        print("  FAIL a lemma is not unsat"); bad += 1
+    sys.exit(1 if bad else 0)

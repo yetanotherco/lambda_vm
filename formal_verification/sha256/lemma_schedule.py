@@ -37,6 +37,8 @@ WIDTH AUDIT
 Non-overflow side condition: four 32-bit values sum below 2^34, and the model
 computes in 48 bits.
 """
+import sys
+
 from z3 import BitVec, BitVecVal, Or, Solver, ULE, ZeroExt, sat, unsat
 
 from lemma_sigma import circuit_sigma
@@ -142,3 +144,16 @@ if __name__ == "__main__":
     print("  w[i] uniquely the low 32 bits of the recurrence:", check())
     print("  a zero-MU row cannot claim reads:                ",
           "unsat (forced)" if check_mu_gate() == unsat else "sat !!!")
+
+    bad = 0
+    if positive_control() is not True:
+        print("  FAIL positive control"); bad += 1
+    for bug in ["drop_halfword_bounds", "drop_back7", "sigma_swap"]:
+        if check(bug) != sat:
+            print(f"  FAIL control {bug} did not flip"); bad += 1
+    for bug in ["drop_mu_gate", "drop_mu_bit_bound"]:
+        if check_mu_gate(bug) != sat:
+            print(f"  FAIL control {bug} did not flip"); bad += 1
+    if check() != unsat or check_mu_gate() != unsat:
+        print("  FAIL a lemma is not unsat"); bad += 1
+    sys.exit(1 if bad else 0)

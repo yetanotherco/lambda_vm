@@ -19,6 +19,8 @@ RS = {
     "sha256_schedule.rs": ROOT / "prover/src/tables/sha256_schedule.rs",
     "sha256_common.rs": ROOT / "prover/src/tables/sha256_common.rs",
     "sha256.rs": ROOT / "executor/src/sha256.rs",
+    "templates.rs": ROOT / "prover/src/constraints/templates.rs",
+    "core.rs": ROOT / "prover/src/tables/sha256.rs",
 }
 
 # what each cited range must still contain, so a citation that drifted onto
@@ -41,6 +43,8 @@ EXPECT = [
     ("sha256_schedule.rs", 158, 160, "check_bits"),
     ("sha256.rs", 3, 12, "pub const K"),
     ("sha256.rs", 13, 15, "pub const IV"),
+    ("templates.rs", 334, 374, "pub fn emit_add_pair"),
+    ("templates.rs", 342, 347, "INV_SHIFT_32"),
 ]
 
 bad = 0

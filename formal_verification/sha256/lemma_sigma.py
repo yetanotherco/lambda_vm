@@ -13,6 +13,8 @@ What is proven: for every assignment of the 32 bit columns satisfying
 `check_bits` (sha256_common.rs `check_bits`, x*(x-1)=0), the value
 `sigma(b, c, kind)` emits equals rotr/shr-xor of the word those bits recompose.
 """
+import sys
+
 from z3 import BitVec, BitVecVal, LShR, Solver, ULE, ZeroExt, sat, unsat
 
 WB = 8    # bit columns: 8-bit vectors with an explicit ULE(.,1), never a 1-bit
@@ -110,3 +112,15 @@ if __name__ == "__main__":
         t0 = time.time()
         r = check(k)
         print(f"  {NAMES[k]:<30} {str(r):<6} ({time.time() - t0:.1f}s)")
+
+    bad = 0
+    for k in range(4):
+        if positive_control(k) is not True:
+            print(f"  FAIL positive control {k}"); bad += 1
+    for bug in ["off_by_one_rot", "wrong_kind", "drop_bit_bounds"]:
+        if check(2, bug) != sat:
+            print(f"  FAIL control {bug} did not flip"); bad += 1
+    for k in range(4):
+        if check(k) != unsat:
+            print(f"  FAIL lemma kind {k}"); bad += 1
+    sys.exit(1 if bad else 0)

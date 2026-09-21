@@ -17,6 +17,8 @@ The pieces enter as free 32-bit values, already proven equal to their spec
 counterparts, so this query is pure arithmetic and every dropped or misplaced
 term is falsifiable here.
 """
+import sys
+
 from z3 import BitVec, BitVecVal, Or, Solver, ULE, sat, unsat
 
 W = 48
@@ -83,3 +85,13 @@ if __name__ == "__main__":
 
     print("\n=== the lemma: the grouping is the spec's ===")
     print("  circuit round == FIPS 180-4 round:", check())
+
+    bad = 0
+    if positive_control() is not True:
+        print("  FAIL positive control"); bad += 1
+    for bug in ["drop_h_from_temp1", "drop_k", "maj_in_temp1", "out_e_uses_temp2"]:
+        if check(bug) != sat:
+            print(f"  FAIL control {bug} did not flip"); bad += 1
+    if check() != unsat:
+        print("  FAIL the lemma is not unsat"); bad += 1
+    sys.exit(1 if bad else 0)

@@ -37,6 +37,8 @@ Non-overflow side condition: temp1+temp2 sums seven 32-bit values, so it is
 below 7*2^32 < 2^35 and the 48-bit model arithmetic cannot wrap where the field
 arithmetic would not.
 """
+import sys
+
 from z3 import BitVec, BitVecVal, LShR, Solver, ULE, sat, unsat
 
 W = 48
@@ -110,3 +112,12 @@ if __name__ == "__main__":
     print("\n=== the lemma: the additions force out_a and out_e ===")
     r = check()
     print(f"  out_a, out_e uniquely the low 32 bits: {r}")
+
+    bad = 0
+    if positive_control() is not True:
+        print("  FAIL positive control"); bad += 1
+    if check("drop_halfword_bounds") != sat:
+        print("  FAIL drop_halfword_bounds did not flip"); bad += 1
+    if check() != unsat:
+        print("  FAIL the lemma is not unsat"); bad += 1
+    sys.exit(1 if bad else 0)
