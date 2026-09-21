@@ -174,9 +174,9 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
 /// Keccak-256 of exactly two concatenated 32-byte nodes (64 bytes) — the fixed
 /// shape of every Merkle parent hash. 64 bytes fit the 136-byte rate in one
 /// block, so this skips the incremental sponge entirely: load the eight data
-/// lanes straight from `left`/`right`, XOR the `pad10*1` bits in place, run one
-/// permutation, squeeze four lanes. Byte-identical to feeding `left` then
-/// `right` through the streaming [`Keccak256`] and finalizing.
+/// lanes straight from `left`/`right`, write the `pad10*1` bits into their
+/// lanes, run one permutation, squeeze four lanes. Byte-identical to feeding
+/// `left` then `right` through the streaming [`Keccak256`] and finalizing.
 ///
 /// The nodes are only byte-aligned, so lanes are assembled with `from_le_bytes`
 /// over owned arrays — never an aligned doubleword load, which the VM would trap
@@ -186,13 +186,17 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
         let w: &[u8; 8] = b[i * 8..i * 8 + 8].try_into().unwrap();
         u64::from_le_bytes(*w)
     };
-    // Every lane written once, in one literal: zeroing all 25 and then
-    // overwriting 10 of them costs a memset per call, and this is the guest's
-    // hottest call. Bytes 0..64 span rate lanes 0..8 (0..4 from `left`, 4..8
-    // from `right`); pad10*1 for a 64-byte message at rate 136 puts the
-    // delimiter at byte 64 (lane 8, low byte) and the final bit at the last
-    // rate byte (byte 135, lane 16 high byte). Those lanes start zero, so the
-    // XORs the sponge would do are plain assignments.
+    // Lane indices the literal below hardcodes: the message fits one block, so
+    // pad10*1 puts the delimiter at byte 64 (lane 8, low byte) and the final
+    // bit at the last rate byte (byte 135, lane 16 high byte).
+    const MSG_BYTES: usize = 32 + 32;
+    const DELIMITER_LANE: usize = MSG_BYTES / 8;
+    const LAST_RATE_LANE: usize = RATE_LANES - 1;
+    const _: () = assert!(MSG_BYTES < RATE_BYTES && DELIMITER_LANE == 8 && LAST_RATE_LANE == 16);
+    // Every lane written once: zeroing all 25 and then overwriting 10 costs a
+    // memset per call, and this is the guest's hottest call. Bytes 0..64 span
+    // rate lanes 0..8 (0..4 from `left`, 4..8 from `right`). Both pad lanes
+    // start zero, so the XORs the sponge would do are plain assignments.
     let mut state: [u64; 25] = [
         lane(left, 0),
         lane(left, 1),
@@ -220,7 +224,6 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
         0,
         0,
     ];
-    const _: () = assert!(RATE_LANES - 1 == 16);
     keccak_permute(&mut state);
 
     let mut out = [0u8; 32];
