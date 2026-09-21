@@ -688,3 +688,43 @@ fn a_tampered_batched_proof_is_rejected() {
     proof.tables[0].trace_ood.width = orig_width;
     accepted(&proof);
 }
+
+/// The lying width again, delivered the way a guest gets it: as bytes.
+///
+/// `a_tampered_batched_proof_is_rejected` mounts this on a proof in memory,
+/// which was the only way to mount it while `BatchedProof` had no derives —
+/// the reason the guard that rejects it was documented as unreachable from
+/// bytes. Serializing the format is the point of the batched path, so the
+/// shape has to be pinned on the way out of the archive too.
+///
+/// Rejection may come from rkyv's validation or from the verifier's own shape
+/// check; which one catches it is not the property under test. What is: a
+/// blob whose advertised width disagrees with its data yields no attestation,
+/// and does not panic.
+#[test]
+fn a_lying_width_is_rejected_when_the_proof_arrives_as_bytes() {
+    let (elf_bytes, proof_options, mut proof) = batched_proof_of_fib();
+
+    // The honest proof attests after the round trip, so what the second half
+    // catches is the tamper and not the encoding.
+    let blob =
+        crate::recursion::encode_batched_guest_input(proof.clone(), &elf_bytes, &proof_options)
+            .expect("encode the untouched proof");
+    assert!(
+        crate::recursion::verify_batched_and_attest(&blob, &proof_options)
+            .expect("verify the untouched blob")
+            .is_some(),
+        "the untouched proof does not attest after a round trip through bytes"
+    );
+
+    proof.tables[0].trace_ood.width += 1;
+    let blob = crate::recursion::encode_batched_guest_input(proof, &elf_bytes, &proof_options)
+        .expect("encode the tampered proof");
+    assert!(
+        !matches!(
+            crate::recursion::verify_batched_and_attest(&blob, &proof_options),
+            Ok(Some(_))
+        ),
+        "a block with a lying width attested after a round trip through bytes"
+    );
+}
