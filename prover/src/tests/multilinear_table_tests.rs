@@ -383,41 +383,164 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> Vec<String> {
     names
 }
 
+/// The `FIXED_TABLE_COUNT` always-on tables, in `air_trace_pairs` order — the
+/// prefix EVERY argued set opens with, whatever the workload runs.
+///
+/// One copy, shared by the cases below, because it is the half of each census
+/// that is machine shape rather than program shape: a workload cannot add to it
+/// or take from it. The counted tables that follow are the program's own.
+const ALWAYS_ON_TABLES: [&str; 5] = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
+
+/// The shared prefix of `argued`, as `&str` so it compares against the literal
+/// censuses below.
+fn always_on_prefix(argued: &[String]) -> Vec<&str> {
+    argued
+        .iter()
+        .take(ALWAYS_ON_TABLES.len())
+        .map(String::as_str)
+        .collect()
+}
+
+/// [`ALWAYS_ON_TABLES`] is a census OF `FIXED_TABLE_COUNT`, so it must not be
+/// able to drift from it silently — the failure the sibling list in
+/// `constraint_artifact_tests` actually had, where it named eleven while the
+/// constant said five.
+#[test]
+fn the_always_on_prefix_is_the_constants_own() {
+    assert_eq!(
+        ALWAYS_ON_TABLES.len(),
+        crate::FIXED_TABLE_COUNT,
+        "the always-on prefix must name every FIXED_TABLE_COUNT table"
+    );
+}
+
 /// **The whole VM through the multilinear path**: every live table of a real
 /// run proved in one multi-table proof and verified, buses included.
 ///
 /// The traces come from the executor, not from hand-written operations, so the
 /// widths, the interaction counts, the packings and the multiplicity patterns
 /// are whatever the VM actually produces.
+///
+/// ★ THE SET BY NAME, NOT A COUNT, and the reason is #977. This asserted
+/// `>= 20` until the main-sync merge `892c7d1bc` (main's `c2ac5d546`, #977)
+/// took `FIXED_TABLE_COUNT` 11 -> 5 and made COMMIT, KECCAK, KECCAK_RND, ECSM,
+/// ECDAS and HINT counted: an empty table is now ELIDED from the proof rather
+/// than padded into it, so the argued set is workload-dependent and "the full
+/// table set" stopped being a thing a bound could describe. It read 10 here.
+///
+/// A count is the wrong instrument for that move twice over. It cannot tell a
+/// table that VANISHED from one that gained a chunk while another vanished, and
+/// it says nothing about ORDER — which `air_trace_pairs` calls the proof's
+/// sub-proof layout in as many words, since `air_refs` must reproduce it. The
+/// ordered census fails on any of the three and names which.
+///
+/// MEASURED at `788f36a19`, box, CPU-only, no campaign env. `[0]` is a chunk
+/// index and `PAGE:0x0` a page base, both as `AIR::name` renders them.
 #[test]
 fn every_live_table_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("sub");
     let argued = prove_and_verify_all_tables(elf, &logs);
-    assert!(
-        argued.len() >= 20,
-        "expected the full table set, argued {}: {}",
-        argued.len(),
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
         argued.join(" ")
+    );
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "CPU[0]",
+            "LT[0]",
+            "MEMW_A[0]",
+            "PAGE:0x0",
+            "MEMW_R[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed"
     );
 }
 
-/// The same over the whole 64-bit instruction set, which lights up the tables a
-/// two-instruction program never reaches.
+/// The same over the whole 64-bit instruction set, which lights up tables a
+/// two-instruction program never reaches: SHIFT, MUL, DVRM, BYTEWISE and CPU32,
+/// five more than `sub`'s ten.
+///
+/// ⚠ AND IT IS NOT THE FULL TABLE SET, which is what the old `>= 20` bound and
+/// its "expected the full table set" message both claimed. Fifteen tables are
+/// argued, and six counted families are absent: MEMW (the unaligned one; only
+/// MEMW_A and MEMW_R appear), LOAD, STORE, BRANCH, EQ and COMMIT — plus every
+/// accelerator. Since #977 an absent table means a table with NO ROWS, so this
+/// says the `all_instructions_64` fixture executes no branch, no load, no store
+/// and no `eq`, which is a narrower program than its name suggests.
+///
+/// That gap is PINNED rather than fixed here: widening the fixture is a change
+/// to `executor/programs/asm`, and this census is what would notice it. A
+/// family arriving fails this test saying which, which is the outcome to want.
+///
+/// MEASURED at `788f36a19`, box, CPU-only, no campaign env.
 #[test]
 fn the_whole_instruction_set_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("all_instructions_64");
     let argued = prove_and_verify_all_tables(elf, &logs);
-    assert!(
-        argued.len() >= 20,
-        "expected the full table set, argued {}: {}",
-        argued.len(),
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
         argued.join(" ")
     );
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "CPU[0]",
+            "LT[0]",
+            "SHIFT[0]",
+            "MEMW_A[0]",
+            "MUL[0]",
+            "DVRM[0]",
+            "PAGE:0x0",
+            "MEMW_R[0]",
+            "BYTEWISE[0]",
+            "CPU32[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed"
+    );
+    // NON-VACUITY against the case above: this fixture must actually reach
+    // further than `sub` did, or the two censuses are one test written twice.
+    for wider in ["SHIFT[0]", "MUL[0]", "DVRM[0]", "BYTEWISE[0]", "CPU32[0]"] {
+        assert!(
+            argued.iter().any(|n| n == wider),
+            "{wider} is what this case adds over `sub`; argued: {}",
+            argued.join(" ")
+        );
+    }
 }
 
 /// And over a Rust program that calls the keccak precompile — which brings
 /// KECCAK, KECCAK_RND and KECCAK_RC in, **and** writes public output, so the
 /// statement's share of the bus is load-bearing here and nowhere else.
+///
+/// ⚠ THE ONLY CASE WITHOUT AN ORDERED CENSUS, and deliberately so. The two
+/// above are pinned to sets MEASURED at `788f36a19`; this one PASSED that run,
+/// so its assertion never fired and never printed its set, and pinning a list
+/// nobody has read would be a literal invented to match a bound. It keeps the
+/// bound and gains the checks its own doc has always claimed instead.
+///
+/// The presence checks are the point: `>= 20` never once asserted that the
+/// keccak family or COMMIT is argued here, which is the entire reason this case
+/// exists next to the two asm ones. Since #977 those tables are counted, so a
+/// workload that stopped reaching the precompile would silently drop them and
+/// still clear any bound this case could carry. Both assertions print the whole
+/// set, so the run that fails one is also the run that supplies the census.
 #[test]
 fn a_program_using_a_precompile_is_proved_and_verified() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -433,9 +556,35 @@ fn a_program_using_a_precompile_is_proved_and_verified() {
         .logs;
 
     let argued = prove_and_verify_all_tables(elf, &logs);
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
+        argued.join(" ")
+    );
+    // The tables this case is ABOUT, by presence rather than by a full census.
+    // KECCAK_RC is excluded from the prefix match on purpose — it is always-on
+    // and asserted above, so matching it here would let a run that reaches no
+    // precompile at all satisfy a check named for one.
+    for family in ["KECCAK_RND", "COMMIT"] {
+        // The name is either the bare family or the family plus a chunk index,
+        // so the match is "equal, or followed by `[`" — never a bare prefix,
+        // which would let `KECCAK_RC` answer for `KECCAK`.
+        assert!(
+            argued.iter().any(|n| {
+                let s = n.as_str();
+                s == family || (s.starts_with(family) && s[family.len()..].starts_with('['))
+            }),
+            "{family} must be argued — it is what this case exists for, and \
+             since #977 it is a counted table that an unreached workload drops \
+             silently; argued: {}",
+            argued.join(" ")
+        );
+    }
     assert!(
         argued.len() >= 20,
-        "expected the full table set, argued {}: {}",
+        "argued {}, fewer than the 20 this workload reached when the bound was \
+         written: {}",
         argued.len(),
         argued.join(" ")
     );
