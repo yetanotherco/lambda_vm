@@ -72,8 +72,9 @@ The `d` argument to the instruction obtains its register value from the future s
 == Register hinting
 
 Each general-purpose register in the current state can be marked as _hinted_ by the acting instruction.
-This means that from the current state onwards, the register can take a value
-that is independent from the previous value, except as constrained by the instruction.
+This means that from the current state onwards,#footnote[Until it is hinted again.]
+the register can take a value that is independent from the previous value,
+except as constrained by the instruction.
 Additionally, the _output_ can be marked as hinted, meaning that the register used in the `d` argument
 will change from the future state onwards, and as such in the `d` argument too.
 This applies to the _register_ of the `d` argument, regardless of the additional immediates and `MEM[]`
@@ -171,7 +172,8 @@ along with informing potential optimizations that remove unused capabilities
 
 Since the VM makes use of read-only memory, traditional usage of a program stack does not work.
 We assume that each function invocation (unless other optimizations apply) will have an associated _frame_,
-pointed to by a _frame pointer_ `fp`, one of the general purpose registers.
+pointed to by a _frame pointer_ `fp`.
+We assume here that `fp` is one of the general purpose registers.
 Observe that we let `fp` point into the middle of the frame, such that the information relevant to the callee
 starts at offset 0.
 In this frame, the following data is stored:
@@ -286,7 +288,7 @@ Doing so would require the elements being combined into one column to be range c
 of the interaction, ideally without needing any extra interactions or committed columns.
 For `Bit` variables, this is no problem with the `IS_BIT` template from @isbit.
 For `argument_registers` however, which should be in the range $[0, N + 1]$,
-which upon first attempt cannot be checked with a constraint of degree $<= d$.
+a first attempt to range-check with a constraint of degree $<= d$ fails.
 The standard way to construct the range-check polynomial $g$ would be to choose
 $ g(x) = (x - 0) dot (x - 1) dot ... dot (x - (N + 1)), $
 which has degree $N + 2$.
