@@ -15,6 +15,8 @@ instruments = ["stark/instruments"]
 nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+# Host-only verify-hash counter for `test_count_recursion_hashes` (see `hash_metrics`).
+hash-metrics = ["crypto/hash-metrics"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

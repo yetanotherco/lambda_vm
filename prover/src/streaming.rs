@@ -36,9 +36,27 @@ pub(crate) const GROUP_ORDER: [Option<TableKind>; 15] = [
     Some(TableKind::Cpu32),
 ];
 
-/// Number of singleton tables emitted before the chunked groups: BITWISE,
-/// DECODE, COMMIT, KECCAK, KECCAK_RND, KECCAK_RC, ECSM, ECDAS, HINT, REGISTER.
-pub(crate) const NUM_FIXED_AIRS: usize = 10;
+/// Number of singleton tables emitted before HALT: BITWISE, DECODE, KECCAK_RC,
+/// REGISTER.
+///
+/// The six accelerators used to sit here too. #977 moved them after HALT, as
+/// groups reporting 0 or 1 — `TableCounts::validate` rejects more — so a run
+/// that never calls one pays no table for it. `accel_lengths` is where that
+/// order lives now.
+pub(crate) const NUM_FIXED_AIRS: usize = 4;
+
+/// The accelerator counts in the order `VmAirs::air_trace_pairs` emits them,
+/// between HALT and the chunked groups. The order is the protocol.
+pub(crate) fn accel_lengths(counts: &crate::TableCounts) -> [usize; 6] {
+    [
+        counts.commit,
+        counts.keccak,
+        counts.keccak_rnd,
+        counts.ecsm,
+        counts.ecdas,
+        counts.hint,
+    ]
+}
 
 /// Where each table sits in `VmAirs::air_trace_pairs`.
 ///
@@ -66,7 +84,20 @@ impl AirOrder {
 
     /// The index of the first chunked table, after the fixed ones and HALT.
     fn first_chunked(&self) -> usize {
-        NUM_FIXED_AIRS + usize::from(self.include_halt)
+        NUM_FIXED_AIRS
+            + usize::from(self.include_halt)
+            + accel_lengths(&self.counts).iter().sum::<usize>()
+    }
+
+    /// The AIR index of accelerator `slot` (0..6, in `accel_lengths` order), or
+    /// `None` when the run produced no table for it.
+    pub(crate) fn accel_index(&self, slot: usize) -> Option<usize> {
+        let lens = accel_lengths(&self.counts);
+        if lens.get(slot).copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        let before: usize = lens[..slot].iter().sum();
+        Some(NUM_FIXED_AIRS + usize::from(self.include_halt) + before)
     }
 
     fn group_len(&self, group: Option<TableKind>) -> usize {
@@ -157,7 +188,16 @@ impl StreamingProvider {
             traces.cpu32s.len(),
         ];
 
-        let mut slots = vec![None; NUM_FIXED_AIRS + usize::from(include_halt)];
+        // The fixed singletons, HALT, then one slot per accelerator the run
+        // produced: all resident, so all `None`, but they shift every chunked
+        // slot after them.
+        let accel_slots = traces.commits.len()
+            + traces.keccaks.len()
+            + traces.keccak_rnds.len()
+            + traces.ecsms.len()
+            + traces.ecdases.len()
+            + traces.hints.len();
+        let mut slots = vec![None; NUM_FIXED_AIRS + usize::from(include_halt) + accel_slots];
         for (kind, len) in GROUP_ORDER.iter().zip(group_lengths.iter()) {
             for chunk in 0..*len {
                 slots.push(kind.map(|k| (k, chunk)));

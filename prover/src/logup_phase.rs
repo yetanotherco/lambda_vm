@@ -273,13 +273,7 @@ fn assemble(
     ); NUM_FIXED_AIRS] = [
         (&airs.bitwise, &mut resident.bitwise),
         (&airs.decode, &mut resident.decode),
-        (&airs.commit, &mut resident.accumulated.commit),
-        (&airs.keccak, &mut resident.accumulated.keccak),
-        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
         (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-        (&airs.ecsm, &mut resident.accumulated.ecsm),
-        (&airs.ecdas, &mut resident.accumulated.ecdas),
-        (&airs.hint, &mut resident.accumulated.hint),
         (&airs.register, &mut resident.register),
     ];
     // Independent tables, most of them small: one at a time would leave the
@@ -295,6 +289,24 @@ fn assemble(
         .collect();
     if airs.include_halt {
         jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+    }
+    // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+    // the run never called: an absent kind has an empty AIR vec and no
+    // slot. `accel_index` is the single authority for where each lands.
+    for (slot, (air_vec, trace)) in [
+        (&airs.commits, &mut resident.accumulated.commit),
+        (&airs.keccaks, &mut resident.accumulated.keccak),
+        (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+        (&airs.ecsms, &mut resident.accumulated.ecsm),
+        (&airs.ecdases, &mut resident.accumulated.ecdas),
+        (&airs.hints, &mut resident.accumulated.hint),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+            jobs.push((idx, air, trace));
+        }
     }
     for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
         let idx = order
@@ -583,13 +595,7 @@ pub fn run_batched(
         ); NUM_FIXED_AIRS] = [
             (&airs.bitwise, &mut resident.bitwise),
             (&airs.decode, &mut resident.decode),
-            (&airs.commit, &mut resident.accumulated.commit),
-            (&airs.keccak, &mut resident.accumulated.keccak),
-            (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
             (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-            (&airs.ecsm, &mut resident.accumulated.ecsm),
-            (&airs.ecdas, &mut resident.accumulated.ecdas),
-            (&airs.hint, &mut resident.accumulated.hint),
             (&airs.register, &mut resident.register),
         ];
         // The codewords are independent and computed in parallel; the fold
@@ -605,6 +611,24 @@ pub fn run_batched(
             .collect();
         if airs.include_halt {
             jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+        }
+        // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+        // the run never called: an absent kind has an empty AIR vec and no
+        // slot. `accel_index` is the single authority for where each lands.
+        for (slot, (air_vec, trace)) in [
+            (&airs.commits, &mut resident.accumulated.commit),
+            (&airs.keccaks, &mut resident.accumulated.keccak),
+            (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+            (&airs.ecsms, &mut resident.accumulated.ecsm),
+            (&airs.ecdases, &mut resident.accumulated.ecdas),
+            (&airs.hints, &mut resident.accumulated.hint),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+                jobs.push((idx, air, trace));
+            }
         }
         for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
             let idx = order.page_index(i).ok_or_else(|| {
@@ -860,13 +884,7 @@ pub fn run_open(
     ); NUM_FIXED_AIRS] = [
         (&airs.bitwise, &mut resident.bitwise),
         (&airs.decode, &mut resident.decode),
-        (&airs.commit, &mut resident.accumulated.commit),
-        (&airs.keccak, &mut resident.accumulated.keccak),
-        (&airs.keccak_rnd, &mut resident.accumulated.keccak_rnd),
         (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
-        (&airs.ecsm, &mut resident.accumulated.ecsm),
-        (&airs.ecdas, &mut resident.accumulated.ecdas),
-        (&airs.hint, &mut resident.accumulated.hint),
         (&airs.register, &mut resident.register),
     ];
     let mut jobs: Vec<(
@@ -880,6 +898,24 @@ pub fn run_open(
         .collect();
     if airs.include_halt {
         jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+    }
+    // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+    // the run never called: an absent kind has an empty AIR vec and no
+    // slot. `accel_index` is the single authority for where each lands.
+    for (slot, (air_vec, trace)) in [
+        (&airs.commits, &mut resident.accumulated.commit),
+        (&airs.keccaks, &mut resident.accumulated.keccak),
+        (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+        (&airs.ecsms, &mut resident.accumulated.ecsm),
+        (&airs.ecdases, &mut resident.accumulated.ecdas),
+        (&airs.hints, &mut resident.accumulated.hint),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+            jobs.push((idx, air, trace));
+        }
     }
     for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
         let idx = order

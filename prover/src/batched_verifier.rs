@@ -173,11 +173,15 @@ pub fn verify(
         num_private_input_pages,
         n,
     )?;
-    let expected = table_counts.total() + crate::FIXED_TABLE_COUNT + page_configs.len();
+    // `total()` is checked: a proof whose counts sum past `usize` is rejected
+    // here rather than wrapping into a plausible-looking expectation.
+    let total = table_counts.total().ok_or_else(|| {
+        Error::InvalidTableCounts("table_counts total overflows usize".to_string())
+    })?;
+    let expected = total + crate::FIXED_TABLE_COUNT + page_configs.len();
     if expected != n {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + {} fixed + {} pages = {expected}, but the proof has {n} tables",
-            table_counts.total(),
+            "table_counts total ({total}) + {} fixed + {} pages = {expected}, but the proof has {n} tables",
             crate::FIXED_TABLE_COUNT,
             page_configs.len(),
         )));

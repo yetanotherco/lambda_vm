@@ -1872,11 +1872,21 @@ fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
             closed_of(kind),
             "{kind:?}: the leftover disagrees with what was committed"
         );
-        assert!(
-            closed_of(kind) < produced,
-            "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
-            closed_of(kind)
-        );
+        if produced == 0 {
+            // #977: a kind the run never used has no table at all, so there is
+            // no tail to leave — and nothing may have been closed for it.
+            assert_eq!(
+                closed_of(kind),
+                0,
+                "{kind:?}: the ordinary build has no table, but chunks were closed"
+            );
+        } else {
+            assert!(
+                closed_of(kind) < produced,
+                "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
+                closed_of(kind)
+            );
+        }
     }
 }
 
@@ -2137,16 +2147,38 @@ fn the_accumulated_tables_match_the_ordinary_build() {
         let (data, _) = t.main_data_row_major();
         data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
     };
-    for (name, a, b) in [
-        ("COMMIT", &built.commit, &resident.commit),
-        ("KECCAK", &built.keccak, &resident.keccak),
-        ("KECCAK_RND", &built.keccak_rnd, &resident.keccak_rnd),
-        ("KECCAK_RC", &built.keccak_rc, &resident.keccak_rc),
-        ("ECSM", &built.ecsm, &resident.ecsm),
-        ("ECDAS", &built.ecdas, &resident.ecdas),
-        ("HINT", &built.hint, &resident.hint),
-    ] {
-        assert_eq!(flat(a), flat(b), "{name} differs from the ordinary build");
+    assert_eq!(
+        flat(&built.keccak_rc),
+        flat(&resident.keccak_rc),
+        "KECCAK_RC differs from the ordinary build"
+    );
+    // The accelerators are `Vec` on the ordinary side since #977: a kind the run
+    // never called has no table there, and `present` is the accumulated side's
+    // answer to the same question. The table itself cannot be asked — it is
+    // padded, so a kind the run never called still has rows.
+    for (slot, (name, a, b)) in [
+        ("COMMIT", &built.commit, resident.commits.first()),
+        ("KECCAK", &built.keccak, resident.keccaks.first()),
+        (
+            "KECCAK_RND",
+            &built.keccak_rnd,
+            resident.keccak_rnds.first(),
+        ),
+        ("ECSM", &built.ecsm, resident.ecsms.first()),
+        ("ECDAS", &built.ecdas, resident.ecdases.first()),
+        ("HINT", &built.hint, resident.hints.first()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            built.present[slot],
+            b.is_some(),
+            "{name}: the two builds disagree on whether the run called it"
+        );
+        if let Some(b) = b {
+            assert_eq!(flat(a), flat(b), "{name} differs from the ordinary build");
+        }
     }
     assert!(
         flat(&built.keccak).iter().any(|v| *v != 0),

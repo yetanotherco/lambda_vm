@@ -68,12 +68,26 @@ pub fn run(
     proof_options: &ProofOptions,
 ) -> Result<Challenge, Error> {
     let remaining = &committed.remaining;
-    let table_counts = count_chunks_by_kind(
+    let mut table_counts = count_chunks_by_kind(
         committed
             .chunks
             .iter()
             .map(|(kind, chunk, _)| (*kind, *chunk)),
     );
+    // The accelerators are resident: this approach accumulates one table per
+    // kind across the whole run, so each reports 1 when it has rows and 0 when
+    // the run never called it. That is the shape #977 expects, and the only one
+    // `TableCounts::validate` accepts — it rejects any accelerator count above 1.
+    {
+        let [commit, keccak, keccak_rnd, ecsm, ecdas, hint] = remaining.accumulated.present;
+        table_counts.commit = usize::from(commit);
+        table_counts.keccak = usize::from(keccak);
+        table_counts.keccak_rnd = usize::from(keccak_rnd);
+        table_counts.ecsm = usize::from(ecsm);
+        table_counts.ecdas = usize::from(ecdas);
+        table_counts.hint = usize::from(hint);
+    }
+    let table_counts = table_counts;
     let airs = VmAirs::new(
         elf,
         proof_options,
@@ -150,13 +164,7 @@ fn assemble_roots(
     ); NUM_FIXED_AIRS] = [
         (&airs.bitwise, &remaining.bitwise, "BITWISE"),
         (&airs.decode, &remaining.decode, "DECODE"),
-        (&airs.commit, &accumulated.commit, "COMMIT"),
-        (&airs.keccak, &accumulated.keccak, "KECCAK"),
-        (&airs.keccak_rnd, &accumulated.keccak_rnd, "KECCAK_RND"),
         (&airs.keccak_rc, &accumulated.keccak_rc, "KECCAK_RC"),
-        (&airs.ecsm, &accumulated.ecsm, "ECSM"),
-        (&airs.ecdas, &accumulated.ecdas, "ECDAS"),
-        (&airs.hint, &accumulated.hint, "HINT"),
         (&airs.register, &remaining.register, "REGISTER"),
     ];
     // Small tables, many of them: one commit at a time leaves most cores idle.
@@ -173,6 +181,22 @@ fn assemble_roots(
     roots.extend(fixed_roots);
     if airs.include_halt {
         roots.push(commit_resident(&airs.halt, &remaining.halt, "HALT")?);
+    }
+
+    // Then the accelerators, in `air_trace_pairs` order, skipping the ones the
+    // run never called. An absent kind has an empty AIR vec and contributes no
+    // root — the order is the protocol, so both sides drop the same slot.
+    for (air_vec, trace, name) in [
+        (&airs.commits, &accumulated.commit, "COMMIT"),
+        (&airs.keccaks, &accumulated.keccak, "KECCAK"),
+        (&airs.keccak_rnds, &accumulated.keccak_rnd, "KECCAK_RND"),
+        (&airs.ecsms, &accumulated.ecsm, "ECSM"),
+        (&airs.ecdases, &accumulated.ecdas, "ECDAS"),
+        (&airs.hints, &accumulated.hint, "HINT"),
+    ] {
+        if let Some(air) = air_vec.first() {
+            roots.push(commit_resident(air, trace, name)?);
+        }
     }
 
     let mut by_slot: HashMap<(TableKind, usize), &MainRoots> = HashMap::new();
@@ -254,6 +278,12 @@ pub(crate) fn count_chunks_by_kind(
         bytewise: 0,
         store: 0,
         cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        commit: 0,
     };
     for (kind, chunk) in chunks {
         let slot = slot_for(&mut counts, kind);
