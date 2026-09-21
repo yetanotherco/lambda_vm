@@ -1,8 +1,8 @@
 //! ★ The assembled epoch verifier — spine plus legs — run on a real
 //! continuation epoch proof.
 //!
-//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 115 of a
-//! real 25-sub-proof epoch's challenges against production's own replay. Every
+//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 79 of a
+//! real 16-sub-proof epoch's challenges against production's own replay. Every
 //! verification leg, meanwhile, was driven by its own isolation program with
 //! HINTED challenges. This module hangs the legs off the spine: per sub-proof the
 //! OOD grid is rebuilt from the two pruned blocks the transcript absorbed, the
@@ -19,7 +19,7 @@
 //! `assert_word_eq_lanes` against a root the transcript absorbed, and the FRI
 //! chain ends in `assert_eq_ext` against the terminal polynomial. A program that
 //! executes at all has passed them. So the differential that remains is the
-//! spine's — the 115 challenges, still checked — plus the fact of execution, and
+//! spine's — the 79 challenges, still checked — plus the fact of execution, and
 //! the falsification tests below are what turn "it executed" into evidence, by
 //! showing what does NOT execute.
 //!
@@ -27,7 +27,7 @@
 //!
 //! The preset. The fixture epoch is proved at the MIN preset (blowup 2, one
 //! query per table, grinding factor 1), because that is what
-//! `proof_fixture::fixture_options` gives and what keeps a 25-sub-proof epoch
+//! `proof_fixture::fixture_options` gives and what keeps a 16-sub-proof epoch
 //! provable in a unit test. Every per-query cost here is therefore ONE query's,
 //! and the blowup-8 predictions the phase pinned (73 queries, 14,454 FRI
 //! permutations per sub-proof) are reached by scaling, not by measurement — the
@@ -341,12 +341,12 @@ impl TableLegs {
 /// continuation epoch proof that production accepts.
 ///
 /// What executing proves, stated precisely. Every check is an assert inside the
-/// program, so reaching the end means: all 25 quotient identities held at the
-/// spine's own `z` and `β`; every one of the 25 sub-proofs' opened row pairs
+/// program, so reaching the end means: all 16 quotient identities held at the
+/// spine's own `z` and `β`; every one of the 16 sub-proofs' opened row pairs
 /// hashed to a leaf that walked to the root the transcript absorbed, at the index
 /// the transcript sampled; every DEEP reconstruction fed a FRI chain that folded
 /// to the terminal polynomial the transcript absorbed; and the LogUp closure
-/// reached production's COMMIT-bus target. The 115 published challenges are
+/// reached production's COMMIT-bus target. The 79 published challenges are
 /// checked against production's replay on top, so the Fiat-Shamir the whole thing
 /// hangs from is still differentialled.
 #[test]
@@ -425,11 +425,44 @@ fn the_assembled_epoch_verifier_runs() {
     // bisect priced — a near-empty always-on table is four challenges here and
     // +31.2% of the wrap's cells at the secure preset.
     //
+    // ★ And then FURTHER the same way, for the same reason at six times the
+    // size.
+    //
+    // MOVER: `892c7d1bc` (main's `c2ac5d546`, #977) — arm (i), the TABLE SET.
+    // That merge's two arms are (i) the table set shrank, empty tables now
+    // being elided rather than padded, and (ii) the absorbed epoch statement
+    // grew 49 bytes. This pin is on (i); `blake3_chip_tests`'
+    // STATEMENT_REPLAY_BLAKE3_ROWS and `machine_tests`' statement byte length
+    // are on (ii).
+    //
+    // #977 did to the six accelerator
+    // chips what #903's revert did to BLAKE3: `FIXED_TABLE_COUNT` 11 → 5, with
+    // `commit`, `keccak`, `keccak_rnd`, `ecsm`, `ecdas` and `hint` becoming
+    // `TableCounts` fields that a run which never reaches them reports as zero.
+    // This fixture epoch reaches none of the six, so 25 → 16 and 115 → 79.
+    // Six of the nine are those accelerators: the pre-#977 25 was 14 split
+    // families + 10 intermediate fixed (11 less HALT) + 1 L2G_MEMORY, and the
+    // fixed term is now 4, which lands at 19. The remaining three are split
+    // families this fixture leaves empty, and they are NOT named here because
+    // the measurement does not name them — only `e.tables.len()` is read.
+    //
+    // The accounting below is what says the whole move is empty tables at four
+    // challenges each: every one of them opens nothing, so it contributes a
+    // (β, z, γ) triple and one query index and no DEEP zeta, exactly as an
+    // always-on table did. If that model is wrong for any of the nine, the
+    // `checked` assertion two below fails and says so.
+    //
+    // The identity is spelled with both sides positive because `SUB_PROOFS` is
+    // now BELOW the 24 it used to be measured against, and `SUB_PROOFS - 24` on
+    // a `usize` is an underflow rather than a failed assertion. Moved this way
+    // it still fails — in either direction — if the four-challenge model stops
+    // describing the move.
+    //
     // `LFM_BLAKE3` (P-a Stage 5) does NOT appear in either number: it is a chip
     // of the LFM machine, counted by `NUM_LFM_CHIPS`, and this is the RV64
     // epoch the LFM machine verifies.
-    const SUB_PROOFS: usize = 25;
-    const CHALLENGES_AT_MIN_PRESET: usize = 115;
+    const SUB_PROOFS: usize = 16;
+    const CHALLENGES_AT_MIN_PRESET: usize = 79;
     const CHALLENGES_PER_ALWAYS_ON_TABLE: usize = 4;
     assert_eq!(
         e.tables.len(),
@@ -438,9 +471,10 @@ fn the_assembled_epoch_verifier_runs() {
          function of"
     );
     assert_eq!(
-        CHALLENGES_AT_MIN_PRESET,
-        111 + CHALLENGES_PER_ALWAYS_ON_TABLE * (SUB_PROOFS - 24),
-        "the always-on tables account for the whole move from the original 111"
+        CHALLENGES_AT_MIN_PRESET + CHALLENGES_PER_ALWAYS_ON_TABLE * 24,
+        111 + CHALLENGES_PER_ALWAYS_ON_TABLE * SUB_PROOFS,
+        "the tables that left the proof account for the whole move from the \
+         original 111"
     );
     assert_eq!(
         checked, CHALLENGES_AT_MIN_PRESET,
@@ -581,7 +615,7 @@ fn the_assembled_epoch_verifier_runs() {
     println!(
         "\x20 constraint leg inside the assembled verifier: {constraint_alu} ALU \
          rows lowering ({constraint_unfused} unfused) + {recombination} \
-         recombination = {} over 25 sub-proofs  [pinned: see the run output]\
+         recombination = {} over 16 sub-proofs  [pinned: see the run output]\
          \n\x20 that is {:.1}% of the legs' {} instructions",
         constraint_alu + recombination,
         100.0 * (constraint_alu + recombination) as f64
@@ -665,7 +699,7 @@ fn the_assembled_epoch_verifier_runs() {
     // The pinned 213,744 came from `join_tests::join_leg_cost`, whose stated
     // assumptions are: all 28 PRODUCTION AIRs, every trace at a UNIFORM
     // 2^20, blowup 8, 73 queries, and NO FRI (the joined leg has none). The
-    // measurement above is: this epoch's 25 sub-proofs, at their REAL trace
+    // measurement above is: this epoch's 16 sub-proofs, at their REAL trace
     // lengths, blowup 2, one query, FRI included. Three parameters differ, so
     // the two numbers cannot be compared directly — they are projected onto each
     // other one parameter at a time instead, which is also what says which
@@ -801,7 +835,7 @@ fn the_assembled_epoch_verifier_runs() {
         "\n  RECONCILIATION against the pinned blowup-8 predictions (projections \
          from shapes — this run is at the min preset and measures none of them):\n\
          \x20 openings only, 73 queries, UNIFORM 2^20 (deep-join's own \
-         assumption, over this epoch's 25 sub-proofs): {}   [pinned: see the run output \
+         assumption, over this epoch's 16 sub-proofs): {}   [pinned: see the run output \
          over all 28 production AIRs]\n\
          \x20 openings only, 73 queries, this epoch's REAL trace lengths: {}\n\
          \x20 openings + FRI, 73 queries, real lengths: {}\n\

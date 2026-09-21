@@ -19,11 +19,23 @@ draw counts. Acceptable — hence a rider, not a fix.
 
 ## 2. One-byte pad at the end of the statement encoding
 
+**★ RESOLVED — the pad arrived, and nobody aimed it here.** #977 took the six
+accelerator chips out of `FIXED_TABLE_COUNT` (11 → 5) and made them counted, so
+the statement absorbs six more `u64` counts (`NUM_TABLE_COUNTS` 15 → 21, `+48`,
+which moves no shift), and the same PR appended `is_final` as the statement's
+last byte (`+1`). `215 + 49 = 264 ≡ 0 (mod 4)`. The constant term's own shift is
+gone; the cursor Phase A inherits is now `L mod 4` alone, so the splice is free
+whenever `L ≡ 0 (mod 4)` instead of `L ≡ 1`. The domain tag went to
+`LAMBDAVM_CONTINUATION_EPOCH_V5` along the way, so the tag bump the note at the
+bottom asks for was paid too. Everything below is the analysis as it stood, kept
+for the arithmetic; the numbers in it are the pre-#977 encoding.
+
 **What:** pad the continuation-epoch statement so its length is `≡ 0 (mod 4)`.
 
-**Why:** the encoding is `207 + L + 16R` bytes (not 223 — an arithmetic slip in
-the first report, now machine-checked by
-`epoch_statement_cursor_is_three_plus_output_len`). Every subsequent absorb
+**Why:** the encoding is `264 + L + 16R` bytes (207 when this was written, then
+215 with `TableCounts::blake3`; not 223 — an arithmetic slip in the first
+report, now machine-checked by
+`epoch_statement_cursor_is_the_output_len_alone`). Every subsequent absorb
 inherits the resulting cursor — including all of Phase A, whose roots are
 individually 32-byte-aligned but land misaligned because they inherit the
 statement's cursor. (Alignment is a property of the CURSOR, not of the field:
