@@ -59,7 +59,7 @@ We index the registers from $0$ to $N + 1$ in the order above, so `ZERO` gets in
 The `ZERO` register indicates whether the previous instruction had a zero result,
 i.e. $next("ZERO") <=> #`d` = 0$.
 The `PC` register stores the program counter: the address of the current instruction,
-and --- except when branches are taken, through register hinting --- is incremented by one
+and --- except when branches are taken, through register hinting --- is incremented by $1$
 for every consecutive state.
 As the name implies, the general purpose registers are available for arbitrary usage.
 
@@ -92,8 +92,8 @@ Additionally, output hinting allows for `PC` to be hinted,#footnote[
 
 In contrast, input hinting does not look like any traditional model of execution,
 instead allowing to update one or more values in the state, as long as the resulting state still satisfies
-the FMA constraint.
-This can, e.g., be used to compute field inverses and square roots, which have a degree 2 constraint
+the `FMA` constraint.
+This can, e.g., be used to compute field inverses and square roots, which have a degree-2 constraint
 on the result.
 There may even be situations where hinting multiple values can be chosen simultaneously, such as a decomposition
 $a = b + c$ in a divide-and-conquer algorithm.
