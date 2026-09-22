@@ -2845,6 +2845,11 @@ fn test_verify_rejects_zero_table_counts() {
             ecdas: 0,
             hint: 0,
             commit: 0,
+            sha256: 0,
+            sha256_round: 0,
+            sha256_schedule: 0,
+            sha256_rotxor: 0,
+            sha256_k: 0,
         },
         ..vm_proof
     };
@@ -2936,6 +2941,11 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         ecdas: 0,
         hint: 0,
         commit: 0,
+        sha256: 0,
+        sha256_round: 0,
+        sha256_schedule: 0,
+        sha256_rotxor: 0,
+        sha256_k: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -3972,4 +3982,45 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         ),
         "epoch Memory bus must balance with L2G bookend + PAGE excluding touched cells"
     );
+}
+
+#[test]
+fn test_prove_elfs_sha256() {
+    let (elf, logs, _) = run_asm_elf("test_sha256");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    let expected = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
+        0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
+        0x15, 0xad,
+    ];
+    assert_eq!(traces.public_output_bytes, expected);
+    assert!(prove_and_verify_vm_minimal(&elf, &mut traces));
+}
+
+#[test]
+fn test_prove_elfs_sha256_overlap_and_tampering() {
+    let (elf, logs, _) = run_asm_elf("test_sha256_overlap");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(prove_and_verify_vm_minimal(&elf, &mut traces));
+    // Each mutation preserves the original memory/output claims. It must fail
+    // either local arithmetic or the cross-table lookup that authenticates it.
+    for target in 0..5 {
+        let mut traces =
+            Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+        let (table, col) = match target {
+            0 => (&mut traces.sha256s[0], crate::tables::sha256::OUT),
+            1 => (&mut traces.sha256s[0], crate::tables::sha256::PTR),
+            2 => (&mut traces.sha256_rounds[0], crate::tables::sha256_round::K),
+            3 => (&mut traces.sha256_schedules[0], 3),
+            _ => (&mut traces.sha256_rotxors[0], 32),
+        };
+        let old = *table.main_table.get(0, col);
+        table.main_table.set(0, col, old + FieldElement::<F>::one());
+        assert!(
+            !prove_and_verify_vm_minimal(&elf, &mut traces),
+            "accepted tamper {target}"
+        );
+    }
 }

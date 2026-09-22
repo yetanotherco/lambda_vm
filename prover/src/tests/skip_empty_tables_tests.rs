@@ -100,6 +100,11 @@ fn every_table_participates_in_the_bus() {
         ecdas: 1,
         hint: 1,
         commit: 1,
+        sha256: 1,
+        sha256_round: 1,
+        sha256_schedule: 1,
+        sha256_rotxor: 1,
+        sha256_k: 1,
     };
     let airs = VmAirs::new(
         &elf,
@@ -158,6 +163,11 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecdas,
         hint,
         commit,
+        sha256,
+        sha256_round,
+        sha256_schedule,
+        sha256_rotxor,
+        sha256_k,
     } = counts;
     [
         ("CPU", cpu),
@@ -180,6 +190,11 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECDAS", ecdas),
         ("HINT", hint),
         ("COMMIT", commit),
+        ("SHA256", sha256),
+        ("SHA256ROUND", sha256_round),
+        ("SHA256MSGSCHED", sha256_schedule),
+        ("ROTXOR", sha256_rotxor),
+        ("SHA256_K", sha256_k),
     ]
     .into_iter()
     .map(|(name, _count)| name)
@@ -237,6 +252,9 @@ fn no_present_table_contributes_zero_to_the_bus() {
         "test_keccak",
         "test_ecsm",
         "test_commit_4",
+        // Reaches the five SHA-256 tables, which are droppable like the other
+        // accelerators and so have to be weighed here too.
+        "test_sha256",
     ];
 
     let mut droppable: Vec<&'static str> = Vec::new();

@@ -1,0 +1,32 @@
+.globl main
+main:
+ la a0, state
+ la a1, message
+ li a7, -1
+ ecall
+ la a0, state
+ la a1, state
+ li a7, -1
+ ecall
+ la a0, state
+ la a1, state
+ addi a1, a1, 3
+ li a7, -1
+ ecall
+ li a0, 1
+ la a1, state
+ li a2, 32
+ li a7, 64
+ ecall
+ li a0, 0
+ li a7, 93
+ ecall
+.data
+.byte 0
+state:
+.byte 106,9,230,103,187,103,174,133,60,110,243,114,165,79,245,58,81,14,82,127,155,5,104,140,31,131,217,171,91,224,205,25
+.byte 0,0
+message:
+.byte 97,98,99,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,24
+
+.zero 64

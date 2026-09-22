@@ -1,4 +1,4 @@
-//! Prints static `(bitwise, keccak_rc, zero_page)` preprocessed-table commitments
+//! Prints static `(bitwise, keccak_rc, sha256_k, zero_page)` preprocessed-table commitments
 //! for a fixed set of `blowup_factor` values. The output is pasted into the
 //! `static_commitment` match bodies in `prover/src/tables/{bitwise,keccak_rc}.rs`
 //! and the `static_zero_page_commitment` match body in `prover/src/tables/page.rs`.
@@ -13,7 +13,7 @@
 //! `keccak_rc.rs` and `static_zero_page_commitment` in `page.rs` for when
 //! it's actually appropriate to bless new bytes.
 
-use lambda_vm_prover::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page};
+use lambda_vm_prover::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page, sha256_k};
 use stark::config::Commitment;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
@@ -36,7 +36,7 @@ fn format_commitment(commitment: &Commitment) -> String {
 fn main() {
     println!(
         "// Paste these match arms into the `static_commitment` match bodies\n\
-         // in `prover/src/tables/{{bitwise,keccak_rc}}.rs` and the\n\
+         // in `prover/src/tables/{{bitwise,keccak_rc,sha256_k}}.rs` and the\n\
          // `static_zero_page_commitment` match body in `prover/src/tables/page.rs`.\n"
     );
 
@@ -53,6 +53,7 @@ fn main() {
 
         let bitwise = bitwise::compute_preprocessed_commitment(&options);
         let keccak_rc = keccak_rc::compute_preprocessed_commitment(&options);
+        let sha256_k = sha256_k::compute_preprocessed_commitment(&options);
         let zero_page = page::compute_precomputed_commitment(&zero_page_config, &options);
         let private_page = page::compute_offset_only_commitment(&options);
 
@@ -62,12 +63,15 @@ fn main() {
              {blowup} => Some({bitwise_fmt}),\n\
              // ---- keccak_rc:\n        \
              {blowup} => Some({keccak_fmt}),\n\
+             // ---- sha256_k:\n        \
+             {blowup} => Some({sha256_k_fmt}),\n\
              // ---- zero_page:\n        \
              {blowup} => Some({zero_page_fmt}),\n\
              // ---- private_page (OFFSET only):\n        \
              {blowup} => Some({private_page_fmt}),\n",
             bitwise_fmt = format_commitment(&bitwise),
             keccak_fmt = format_commitment(&keccak_rc),
+            sha256_k_fmt = format_commitment(&sha256_k),
             zero_page_fmt = format_commitment(&zero_page),
             private_page_fmt = format_commitment(&private_page),
         );

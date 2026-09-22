@@ -113,6 +113,28 @@ fn all_table_windows_match_captured_ir() {
     assert_ood_window_matches_ir(&create_keccak_rnd_air(&opts), true, "KECCAK_RND");
     assert_ood_window_matches_ir(&create_keccak_rc_air(&opts), true, "KECCAK_RC");
     assert_ood_window_matches_ir(&create_ecsm_air(&opts), true, "ECSM");
+    assert_ood_window_matches_ir(&crate::test_utils::create_sha256_air(&opts), true, "sha256");
+    assert_ood_window_matches_ir(
+        &crate::test_utils::create_sha256_round_air(&opts),
+        true,
+        "sha256_round",
+    );
+    assert_ood_window_matches_ir(
+        &crate::test_utils::create_sha256_schedule_air(&opts),
+        true,
+        "sha256_schedule",
+    );
+    assert_ood_window_matches_ir(
+        &crate::test_utils::create_sha256_rotxor_air(&opts),
+        true,
+        "sha256_rotxor",
+    );
+    assert_ood_window_matches_ir(
+        &crate::test_utils::create_sha256_k_air(&opts),
+        true,
+        "sha256_k",
+    );
+
     assert_ood_window_matches_ir(&create_ecdas_air(&opts), true, "ECDAS");
     assert_ood_window_matches_ir(&create_hint_air(&opts), true, "HINT");
 }
