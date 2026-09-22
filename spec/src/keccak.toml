@@ -21,7 +21,7 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "state_ptr"
-type = [["DWordHL", 5], 5]
+type = [["DWordWHH", 5], 5]
 desc = "memory addresses storing the entire state"
 pad = ["*", 8, ["arr", 
         ["arr", 0, 1, 2, 3, 4],
@@ -69,10 +69,18 @@ ref = "keccak:c:state_ptr"
 [[constraints.mem]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
-iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
+input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 0]]
+iters = [["x", 0, 4], ["y", 0, 4]]
 multiplicity = "μ"
-ref = "keccak:c:range_state_ptr"
+ref = "keccak:c:range_state_ptr_lo"
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 2], ["idx", ["idx", ["idx", "state_ptr", "x"], "y"], 1]]
+iters = [["x", 0, 4], ["y", 0, 4]]
+multiplicity = "μ"
+ref = "keccak:c:range_state_ptr_hi"
 
 [[constraints.mem]]
 kind = "interaction"

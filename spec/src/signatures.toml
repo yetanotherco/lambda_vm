@@ -170,6 +170,12 @@ tag = "IS_B20"
 kind = "interaction"
 input = ["B20"]
 
+# IS_B48[X, Y]
+[[signatures]]
+tag = "IS_B48"
+kind = "interaction"
+input = ["Word", "Half"]
+
 # HWSL[res; X, shift]
 [[signatures]]
 tag = "HWSL"

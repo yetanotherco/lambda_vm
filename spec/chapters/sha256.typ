@@ -7,6 +7,7 @@
   render_constraint_table,
   render_chip_assumptions,
   render_chip_padding_table,
+  compute_nr_interactions
 )
 
 #let config = load_config()
@@ -39,8 +40,9 @@ Most of the structure and variable naming follows the pseudocode of the wikipedi
 == Columns
 #let nr_variables = total_nr_variables(sha256chip)
 #let nr_columns = total_nr_instantiated_columns(sha256chip, config)
+#let nr_interactions = compute_nr_interactions(sha256chip)
 
-The #sha256 chip leverages #nr_variables variables, spanning #nr_columns columns:
+The #sha256 chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(sha256chip, config)
 
 == Constraints
