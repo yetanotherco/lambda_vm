@@ -45,6 +45,7 @@
     )),
     ("ECALLS", (
       ("about_ecalls", [About `ECALL`], <ecall>),
+      ("is_b48", [`IS_B48`], <is-b48>),
       ("halt", [`HALT` chip], <halt>),
       ("commit", [`COMMIT` chip], <commit>),
       ("sha256", [`SHA256` accelerator], <sha256>),

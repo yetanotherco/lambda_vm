@@ -8,19 +8,19 @@ pad = 0
 
 [[variables.input]]
 name = "addr_xG"
-type = ["DWordHL", 4]
+type = ["DWordWHH", 4]
 desc = "address at which `x`-coordinate of start point `G` is stored"
 pad = 0
 
 [[variables.input]]
 name = "addr_k"
-type = ["DWordHL", 4]
+type = ["DWordWHH", 4]
 desc = "address at which scalar `k` is stored"
 pad = 0
 
 [[variables.input]]
 name = "addr_xR"
-type = ["DWordHL", 4]
+type = ["DWordWHH", 4]
 desc = "address to which the `x`-coordinate of result point `R` is to be written"
 pad = 0
 
@@ -267,10 +267,18 @@ ref = "ec:c:read_addr_xG"
 [[constraints.read_xG]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", "addr_xG", "i"], "j"]]
-iters = [["i", 0, 3], ["j", 0, 3]]
+input = [["idx", ["idx", "addr_xG", "i"], 0]]
+iters = [["i", 0, 3]]
 multiplicity = "μ"
-ref = "ec:c:range_addr_xG"
+ref = "ec:c:range_addr_xG_lo"
+
+[[constraints.read_xG]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", "addr_xG", "i"], 2], ["idx", ["idx", "addr_xG", "i"], 1]]
+iters = [["i", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_xG_hi"
 
 [[constraints.read_xG]]
 kind = "template"
@@ -488,10 +496,18 @@ ref = "ec:c:read_addr_k"
 [[constraints.verify_k]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", "addr_k", "i"], "j"]]
-iters = [["i", 0, 3], ["j", 0, 3]]
+input = [["idx", ["idx", "addr_k", "i"], 0]]
+iters = [["i", 0, 3]]
 multiplicity = "μ"
-ref = "ec:c:range_addr_k"
+ref = "ec:c:range_addr_k_lo"
+
+[[constraints.verify_k]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", "addr_k", "i"], 2], ["idx", ["idx", "addr_k", "i"], 1]]
+iters = [["i", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_k_hi"
 
 [[constraints.verify_k]]
 kind = "template"
@@ -649,10 +665,18 @@ ref = "ec:c:load_addr_xR"
 [[constraints.write_xR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", "addr_xR", "i"], "j"]]
-iters = [["i", 0, 3], ["j", 0, 3]]
+input = [["idx", ["idx", "addr_xR", "i"], 0]]
+iters = [["i", 0, 3]]
 multiplicity = "μ"
-ref = "ec:c:range_addr_xR"
+ref = "ec:c:range_addr_xR_lo"
+
+[[constraints.write_xR]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", "addr_xR", "i"], 2], ["idx", ["idx", "addr_xR", "i"], 1]]
+iters = [["i", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_xR_hi"
 
 [[constraints.write_xR]]
 kind = "template"

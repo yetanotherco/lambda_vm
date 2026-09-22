@@ -1,0 +1,31 @@
+name = "IS_B48"
+
+[[variables.input]]
+name = "value"
+type = ["Half", 3]
+desc = "`B48` being range checked"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+pad = 0
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "value", "i"]]
+iter = ["i", 0, 2]
+multiplicity = "μ"
+ref = "b48:c:range_value"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["+", ["idx", "value", 1], ["*", ["^", 2, 16], ["idx", "value", 2]]], ["idx", "value", 0]]
+multiplicity = ["-", "μ"]
+ref = "b48:c:b48"

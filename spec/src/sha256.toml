@@ -15,7 +15,7 @@ pad = 0
 
 [[variables.input]]
 name = "h_addr"
-type = ["DWordHL", 4]
+type = ["DWordWHH", 4]
 desc = "The addresses of the doublewords of `h`"
 pad = ["arr", 0, 8, 16, 24]
 
@@ -27,7 +27,7 @@ pad = 0
 
 [[variables.input]]
 name = "m_addr"
-type = ["DWordHL", 8]
+type = ["DWordWHH", 8]
 desc = "The addresses of the doublewords of `m`"
 pad = ["arr", 0, 8, 16, 24, 32, 40, 48, 56]
 
@@ -63,9 +63,16 @@ cond = "μ"
 [[constraints.memory]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", "m_addr", "i"], "j"]]
+input = [["idx", ["idx", "m_addr", "i"], 0]]
 multiplicity = "μ"
-iters = [["i", 0, 7], ["j", 0, 3]]
+iters = [["i", 0, 7]]
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", "m_addr", "i"], 2], ["idx", ["idx", "m_addr", "i"], 1]]
+multiplicity = "μ"
+iters = [["i", 0, 7]]
 
 [[constraints.memory]]
 kind = "template"
@@ -110,9 +117,16 @@ cond = "μ"
 [[constraints.memory]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", ["idx", "h_addr", "i"], "j"]]
+input = [["idx", ["idx", "h_addr", "i"], 0]]
 multiplicity = "μ"
-iters = [["i", 0, 3], ["j", 0, 3]]
+iters = [["i", 0, 3]]
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "IS_B48"
+input = [["idx", ["idx", "h_addr", "i"], 2], ["idx", ["idx", "h_addr", "i"], 1]]
+multiplicity = "μ"
+iters = [["i", 0, 3]]
 
 [[constraints.memory]]
 kind = "template"
