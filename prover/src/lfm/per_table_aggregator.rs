@@ -654,17 +654,43 @@ pub fn emit_chain_bindings(
 
 // ============================ the aggregation node ========================
 
-/// Children per node — the tree's arity.
+/// Children per node on the STARK tree — that tree's arity.
 ///
 /// A DEFAULT, not an assumption: every emitter below takes a slice, so the
 /// arity is whatever the caller passes and nothing here depends on this value.
-/// It exists so the tree builder has one place to change.
+/// It exists so the STARK tree builder has one place to change.
 ///
 /// Two is the brief's working default and three is COORD's tie-break, on the
 /// grounds that over ten epochs it is 5 distinct programs / 7 proofs / 3 levels
 /// against two's 6 / 11 / 4. The measured host peak decides; until it has, the
 /// conservative value stands.
+///
+/// ⛔ **AND ON THIS TREE IT STILL STANDS, for a CARD reason rather than a host
+/// one.** The STARK arity-3 interior node does not fit the device: measured,
+/// ds15/ds16. The host peak that settles the question for [`WHIR_FAN_IN`] says
+/// nothing about a node that aborts on VRAM before its host working set is ever
+/// live, so the two trees answer to different constraints and get one constant
+/// each. Every STARK tree number on record — the D-S arms, PR #999 — was taken
+/// at two, and this constant is what keeps them comparable.
 pub const FAN_IN: usize = 2;
+
+/// Children per node on the WHIR tree — that tree's arity, and THREE.
+///
+/// ★ **THE MEASUREMENT [`FAN_IN`]'s doc was waiting for, on the tree that has
+/// it.** "The measured host peak decides; until it has, the conservative value
+/// stands" names one condition, and on this path it is met: the arity-3 tree
+/// peaks at 31.1-31.5 GiB against a 33.5 GiB gate, with `device fallbacks 0` and
+/// `commit fallbacks 0` on every arm. Three fits, and it is worth −8.05 s of
+/// card time on the interior (wt29-32, A/B/B/A, 15 wrap `program_id`s and the
+/// `whir global IDENTITY` unmoved).
+///
+/// ⚠ **A SECOND CONSTANT RATHER THAN A NEW VALUE IN THE FIRST, deliberately.**
+/// Both tree drivers read their arity as the fallback for `LFM_CENSUS_FAN_IN`,
+/// so moving the shared constant would silently re-base every STARK tree number
+/// on record. The cost is that "one place to change" becomes one place PER TREE;
+/// the benefit is that a WHIR posture cannot move a STARK measurement, which is
+/// the property the campaign's comparisons rest on.
+pub const WHIR_FAN_IN: usize = 3;
 
 /// A digest rebuilt from the lanes a child PUBLISHED for it.
 ///
