@@ -35,14 +35,14 @@ Let $BB := { zero, one }$ denote the boolean set and let
 $programSpace := {program: inputSpace times witnessSpace to BB}$ denote 
 the set of functions mapping the (public) input space $inputSpace$ and (private) 
 witness space $witnessSpace$ to this set.
-We define instance space $instanceSpace := programSpace times inputSpace = {program: witnessSpace to BB}$;
+We define instance space $instanceSpace := programSpace times inputSpace tilde.equiv {program: witnessSpace to BB}$;
 program-input pairs $(program, input) in instanceSpace$ 
 are henceforth referred to as _function instances_, or simply _instances_.
 Where the individual components of the pair are irrelevant, an instance is 
 denoted as $instance in instanceSpace$.
 
-We define relation $relation subset instanceSpace times witnessSpace$ where $((program, input), witness) in relation$ if $program(input, witness) = 1$.
-This relation induces the language $language subset instanceSpace$ of _solvable instances_,
+We define relation $relation subset.eq instanceSpace times witnessSpace$ where $((program, input), witness) in relation$ if $program(input, witness) = 1$.
+This relation induces the language $language subset.eq instanceSpace$ of _solvable instances_,
 where $instance in language$ if there exists a witness $witness$ for which $(instance, witness)in relation$.
 
 Lastly, we introduce the instance commitment function $c: instanceSpace to commitmentSpace$.
@@ -358,7 +358,7 @@ by means of sharing _the root of their merkle-tree_.
 
 Aside from this proof-system level commitment contraption, we can additionally leverage
 the `COMMIT` chip to commit to individual bytes in the input.
-Any values sent by the guest program to `std::out` are recorded in this chip's
+Any values sent by the guest program to `stdout` are recorded in this chip's
 table, with the table set up such that it causes an imbalance in the interaction logic
 of the proof system during proving.
 During verification, it can be verified that this imbalance is caused by the 
@@ -387,7 +387,7 @@ means of the Fiat-Shamir transformation.
 
 *`RiscV-VM` subalgorithm*
 $tilde(v)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
-- `COMMIT`s to $comm(instance), comm(instance2)$ by sending both halves to `std::out`.
+- `COMMIT`s to $comm(instance), comm(instance2)$ by sending both halves to `stdout`.
 - derives challenges from $proof$ by means of Fiat-Shamir, and assert that they 
   match those located in $record$ at the expected location.
 - Performs the binary arithmetic steps required to verify that $proof$ attests
