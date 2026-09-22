@@ -131,6 +131,21 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
 /// destructured in `absorb_statement` and then left out of the array it
 /// absorbs compiles clean and changes nothing about the state, which is a
 /// prover-chosen number the verifier would no longer be bound to.
+///
+/// ★ THE PROBE COUNT IS THE CONSTANT'S, NOT A LITERAL. It was `20` and read
+/// 21, because the main-sync merge `892c7d1bc` (main's `c2ac5d546`, #977) took
+/// `FIXED_TABLE_COUNT` 11 -> 5 and moved COMMIT into `TableCounts` alongside
+/// the five accelerators already there — ✓ VERIFIED, `pub commit: usize` is
+/// absent at `892c7d1bc^1` and present now. `each_count_mut` grew the field and
+/// the literal did not.
+///
+/// A bare literal here is the wrong shape twice over: it says nothing about
+/// WHICH count is missing, and it is a second copy of a length
+/// `statement::NUM_TABLE_KINDS` already holds — the same number
+/// `table_count_values` returns as `[u64; NUM_TABLE_KINDS]` and the guest
+/// absorbs as `statement_replay::NUM_TABLE_COUNTS`. Pinned against the
+/// constant, a field added to `TableCounts` without a probe fails here, and one
+/// added to the encoding without a field fails to compile.
 #[test]
 fn state_depends_on_every_table_count() {
     let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 7);
@@ -139,7 +154,11 @@ fn state_depends_on_every_table_count() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(names.len(), 20, "every count must be probed");
+    assert_eq!(
+        names.len(),
+        crate::statement::NUM_TABLE_KINDS,
+        "every count the statement encodes must be probed; probing {names:?}"
+    );
 
     for name in names {
         let mut counts = sample_counts();

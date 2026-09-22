@@ -716,17 +716,27 @@ fn epoch_chunk_multiplier() {
 ///
 /// ```text
 ///   14 split-table families (>= 1 chunk each)
-/// + FIXED_TABLE_COUNT       (10 final, 9 intermediate — HALT only on the last)
+/// + FIXED_TABLE_COUNT       (5 final, 4 intermediate — HALT only on the last)
+/// + up to 6 accelerators    (COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT —
+///                            one each, and only when the workload reaches it)
 /// + 1 L2G_MEMORY
 /// ```
 ///
-/// which gives **24 sub-proofs intermediate, 25 final** — independently measured
-/// on the LFM fibonacci epoch fixture. This test asserts that arithmetic so the
-/// composition is pinned rather than inferred: if the epoch shape changes, the
-/// count here stops matching the measured one and this fails.
+/// which gives **25 sub-proofs intermediate and 26 final AT MOST**, and 19 / 20
+/// for a workload that calls no accelerator. This test asserts that arithmetic
+/// so the composition is pinned rather than inferred: if the epoch shape
+/// changes, the count here stops matching and this fails.
 ///
-/// The instruction total is then a minimum, since it assumes one chunk per
-/// family — a larger epoch adds chunks of the CHEAP AIRs (see
+/// ★ The ceiling is what moved. MOVER: `892c7d1bc` (main's `c2ac5d546`, #977)
+/// — arm (i), the TABLE SET; arm (ii) is the +49-byte epoch statement, pinned
+/// in `machine_tests` and `blake3_chip_tests`. #977 took the six accelerators out of
+/// `FIXED_TABLE_COUNT` (11 → 5), so the 25/26 that used to be THE composition
+/// is now its upper bound — the same count, reached only by a workload that
+/// touches every accelerator. `epoch_verify_tests` measures the other end on
+/// the fibonacci fixture, which reaches none of the six and carries 16.
+///
+/// The instruction total is a minimum in the other axis, since it assumes one
+/// chunk per family — a larger epoch adds chunks of the CHEAP AIRs (see
 /// `epoch_chunk_multiplier`).
 #[test]
 fn continuation_epoch_constraint_leg() {
@@ -746,33 +756,39 @@ fn continuation_epoch_constraint_leg() {
     // sub-proof each REGARDLESS of TableCounts, because a zero-row table still
     // needs its proof or its constraints drop out of verification. HALT is the
     // one an intermediate epoch omits.
+    let always_on = ["BITWISE", "DECODE", "HALT", "KECCAK_RC", "REGISTER"];
+    // ★ THE SIX THAT LEFT, and they left the way BLAKE3 did. #977 — on this
+    // lineage, the merge `892c7d1bc` — took
+    // `FIXED_TABLE_COUNT` 11 → 5 and made these six `TableCounts` fields, so a
+    // run that never reaches one carries no sub-proof for it — the same EC
+    // campaign argument (PR #871) that moved BLAKE3 out first, applied to the
+    // rest of the accelerator group.
     //
-    // ⚠ BLAKE3 is deliberately NOT here. It left this list when it became
-    // `TableCounts::blake3`, a 0-or-1 count — a workload that never executes a
-    // BLAKE3 syscall carries no BLAKE3 sub-proof at all, so the counts below are
-    // the blake3-free shape and a blake3-using epoch is one higher. HINT was
-    // missing from this list outright, which is why it read 10 while the
-    // constant said 11.
-    let fixed_final = [
-        "BITWISE",
-        "DECODE",
-        "HALT",
-        "COMMIT",
-        "KECCAK",
-        "KECCAK_RND",
-        "KECCAK_RC",
-        "REGISTER",
-        "ECSM",
-        "ECDAS",
-        "HINT",
-    ];
+    // They stay in the COST sum below because the sum is a ceiling: a workload
+    // that calls every accelerator pays all eleven legs, and that is the figure
+    // the recursion budget has to clear. What changed is that the figure is now
+    // a MAXIMUM rather than a floor — a workload reaching none of the six pays
+    // `always_on` plus the families alone.
+    //
+    // ⚠ BLAKE3 is deliberately in NEITHER list. It is `TableCounts::blake3`, a
+    // 0-or-1 count, and it is not in `TableCounts::total`'s accelerator group
+    // either, so the counts below are the blake3-free shape and a blake3-using
+    // epoch is one higher.
+    let accelerators = ["COMMIT", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS", "HINT"];
     // The list is a census OF the constant, so it must not be able to drift from
-    // it silently — the failure this pin previously had.
+    // it silently — the failure this pin previously had. It is `always_on` and
+    // not the eleven that the constant counts, which is exactly the assertion
+    // that went red on the main-sync port and named its own cause.
     assert_eq!(
-        fixed_final.len(),
+        always_on.len(),
         crate::FIXED_TABLE_COUNT,
         "the always-on list must name every FIXED_TABLE_COUNT table"
     );
+    let fixed_final: Vec<&str> = always_on
+        .iter()
+        .chain(accelerators.iter())
+        .copied()
+        .collect();
 
     let families_instr: usize = families.iter().map(|l| get(l)).sum();
     let fixed_final_instr: usize = fixed_final.iter().map(|l| get(l)).sum();
@@ -788,17 +804,19 @@ fn continuation_epoch_constraint_leg() {
         (n_intermediate, n_final),
         (25, 26),
         "epoch sub-proof composition no longer reproduces the measured 25 intermediate / \
-         26 final (blake3-free; a BLAKE3-using epoch is one higher)"
+         26 final CEILING (every accelerator reached; blake3-free, and a BLAKE3-using \
+         epoch is one higher)"
     );
 
     println!(
-        "\ncontinuation epoch constraint leg (minimum: one chunk per family)\n  \
+        "\ncontinuation epoch constraint leg (every accelerator reached, one chunk per family)\n  \
            14 split families      {families_instr}\n  \
-           10 fixed (no HALT)     {fixed_intermediate_instr}\n  \
+           4 fixed + 6 accel      {fixed_intermediate_instr}   (no HALT)\n  \
            1 L2G_MEMORY           {l2g}\n  \
            INTERMEDIATE epoch     {intermediate} instr over {n_intermediate} sub-proofs\n  \
            FINAL epoch (+HALT)    {final_epoch} instr over {n_final} sub-proofs\n  \
-           fixed share            {:.0}% — the leg is workload-INDEPENDENT\n",
+           fixed+accel share      {:.0}% — the 4 fixed legs are workload-INDEPENDENT, \
+           the 6 accelerator legs are not\n",
         100.0 * fixed_intermediate_instr as f64 / intermediate as f64
     );
 
