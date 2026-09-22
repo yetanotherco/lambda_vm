@@ -159,6 +159,8 @@ such that either half can be executed on a VM with an instruction set tailored t
 while maintaining completeness and soundness of the verification.
 
 == Communication
+#let product(f, g) = $(#f and #g)$
+
 When executing the two verification-algorithm halves on distinct VMs,
 no direct communication between both algorithms is possible,
 even if both VMs are proven using the same proof system.
@@ -225,11 +227,11 @@ $
 		dot tilde(v)_1(comm(instance), [proof, d(comm(instance), proof)]).
 $
 where $d(comm(instance), proof)$ denotes the record deriviation function.
-We introduce the function product $(f || g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
+We introduce the function product $(product(f, g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
 This then allows us to express
 $
 	prove(verify(comm(instance), dot); proof)
-	&= prove((tilde(v)_0 || tilde(v)_1)(comm(instance), dot); [proof, record])
+	&= prove(product(tilde(v)_0, tilde(v)_1)(comm(instance), dot); [proof, record])
 	&= proof',
 $
 with $record := d(comm(instance), proof)$.
@@ -238,7 +240,7 @@ Summarizing, we have now expressed recursive verification in terms of a
 split verifier, where the same instance-proof-record triple was provided to 
 both verification halves.
 The produced proof $proof'$ now attests to $instance in language$ when
-$verify(comm((tilde(v)_0 || tilde(v)_1)(comm(instance), dot)), proof') = 1$.
+$verify(comm(product(tilde(v)_0, tilde(v)_1)(comm(instance), dot)), proof') = 1$.
 
 = Split proving
 #et("todo")
@@ -283,34 +285,33 @@ jointly form a valid split of $verify^*$, since
 $
 	verify^*([comm(x), comm(y)], [proof, b])
 	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
-	&= (tilde(verify)_0 || tilde(verify)_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
-	&= (tilde(verify)^*_0 || tilde(verify)^*_1)([comm(x), comm(y)], [[proof, b], r]),\
+	&= product(tilde(verify)_0, tilde(verify)_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+	&= product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(x), comm(y)], [[proof, b], r]),\
 $
 when
 $r = d([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
-By selecting $(comm(x), comm(y)) = (comm(instance), comm(tilde(v)^*_0 || tilde(v)^*_1))$, 
+By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(tilde(v)^*_0, tilde(v)^*_1)))$, 
 we now obtain
 $
-	(tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r])
-	// &= tilde(verify)^*_0([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r]) dot tilde(verify)^*_1([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [[proof, b], r])\
-	&= verify^*([comm(instance), comm(tilde(verify)^*_0 || tilde(verify)^*_1)], [proof, b])\
-	&= verify(Delta_commitmentSpace (comm(instance), comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), b), proof)\
-	&= Delta_BB (verify(comm(instance), proof), verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof), b)\
-	&= verify(comm(instance), proof) dot (1-b) + verify(comm((tilde(verify)^*_0 || tilde(verify)^*_1)([comm(instance),comm(tilde(verify)^*_0 || tilde(verify)^*_1)], dot)), proof) dot b,
+	product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], [[proof, b], r])
+	&= verify^*([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], [proof, b])\
+	&= verify(Delta_commitmentSpace (comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), b), proof)\
+	&= Delta_BB (verify(comm(instance), proof), verify(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), proof), b)\
+	&= verify(comm(instance), proof) dot (1-b) + verify(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), proof) dot b,
 $
 i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does when $b=1$.
 Importantly, this can be achieved recursively, as
 $
 	#h(8em) // alignment purposes
 	&prove(instance; witness) &&to proof_(0),\
-	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(0), 0], r_(0)]) &&to [proof_(1), 1],\
-	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(1), 1], r_(1)]) &&to [proof_(2), 1],\
-	&prove((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot); [[proof_(2), 1], r_(2)]) &&to [proof_(3), 1],
+	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(0), 0], r_(0)]) &&to [proof_(1), 1],\
+	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(1), 1], r_(1)]) &&to [proof_(2), 1],\
+	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(2), 1], r_(2)]) &&to [proof_(3), 1],
   &&#h(8em)text(italic("etc."))
 $
 with
 $
-	r_i :&= d(comm((tilde(verify)^*_0||tilde(verify)^*_1)([comm(instance), comm(tilde(verify)^*_0||tilde(verify)^*_1)], dot)), [proof_i, 1-delta_(i,0)]).
+	r_i :&= d(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), [proof_i, 1-delta_(i,0)]).
 $
 
 = The theory applied
@@ -377,7 +378,7 @@ to the commitments $comm(x)$ and $comm(y)$ it is provided, and using the same co
 to balance the proof's interaction logic when $b=1$, the ultimate verifier of the
 final proof can be confident that the same verification algorithm was used
 at every recursion step when verifying 
-$(comm(x), comm(y)) = (comm(instance), comm(tilde(v)_b || tilde(v)_f))$.
+$(comm(x), comm(y)) = (comm(instance), comm(product(tilde(v)_b, tilde(v)_f)))$.
 
 == Summary
 
