@@ -1,5 +1,17 @@
-//! ★★ H4's result of record — a commitment does NOT keep its tree, and the
-//! bytes it holds are only its codeword.
+//! ★★ H4's result of record, and what replaced it — a commitment does NOT keep
+//! its TREE; it keeps its LEAF LAYER, and the bytes it holds are its codeword
+//! and that layer.
+//!
+//! ⛔ H4's finding stands and is not edited away below: keeping the whole node
+//! array LOST, measured on the card at about +15 s, because the retention is
+//! one object per commitment IN THE GROUP and ten of those put the device at
+//! 96%. What changed is WHICH object. A tree is `2·num_leaves − 1` nodes; its
+//! leaf layer is `num_leaves` of them — half the bytes — and the leaf pass it
+//! saves is two thirds of a base tree's permutations and six sevenths of an
+//! extension one, because a leaf absorbs a whole `2^k` coset while an inner
+//! node absorbs two digests. Half the memory for most of the saving is a
+//! different trade from the one H4 measured, and these tests now pin BOTH
+//! sides of it: the layer must be held, and a whole tree must still never be.
 //!
 //! Needs a GPU:
 //!
@@ -58,7 +70,7 @@
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
 use math_cuda::DeviceHash;
-use math_cuda::whir::{leaf_hash_calls, reset_leaf_hash_calls};
+use math_cuda::whir::{leaf_hash_calls, retention_report, tree_builds};
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
@@ -140,11 +152,26 @@ fn a_commitment_hashes_its_leaves_once_per_tree_it_builds() {
             "{name}: the commit itself must hash the leaves exactly once"
         );
 
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: the commit hashes the leaves once"
+        );
+
         let _ = codeword.paths(4, &[0, 1, 7], hash).expect("paths");
         assert_eq!(
             codeword.tree_builds(),
             2,
             "{name}: an opening builds its own tree — a 1 here means one is kept"
+        );
+        // ★ THE OTHER DIRECTION, and it is the whole point of the change: the
+        // tree was rebuilt, but its LEAF LAYER was not re-hashed. A 2 here is
+        // the retention not working.
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: the opening must serve the retained leaf layer — a 2 here \
+             means the layer was not kept, or not matched"
         );
 
         // …and again, because a cache that served once and then evicted would
@@ -154,6 +181,17 @@ fn a_commitment_hashes_its_leaves_once_per_tree_it_builds() {
             codeword.tree_builds(),
             3,
             "{name}: and a second opening builds a third"
+        );
+        assert_eq!(
+            codeword.leaf_passes(),
+            1,
+            "{name}: and still one leaf pass — a layer that served once and was \
+             then evicted would read 2 here"
+        );
+        assert!(
+            codeword.retained_leaf_bytes() > 0,
+            "{name}: the codeword reports no retained layer, so the counts above \
+             are agreeing about the wrong thing"
         );
     }
 }
@@ -355,29 +393,130 @@ fn a_group_holds_only_its_codewords_before_any_open() {
     // sample.
     math_cuda::device::drain_and_trim().expect("drain");
     let free_before = be.free_vram_bytes().expect("cuMemGetInfo");
+    // ★ THE SECOND INSTRUMENT, and it is the one that can tell the two stories
+    // apart. `free_vram_bytes` is the DRIVER's count and includes whatever the
+    // pool is sitting on; `reserved_bytes` is what the CODE promised and is
+    // blind to the pool by construction. Their difference is the pool's, and
+    // printing it turns "either the pool retained a block or the code holds one
+    // more" from a question into a read.
+    let reserved_before = be.reserved_bytes();
 
     let held: Vec<_> = (0..4)
         .map(|_| commit_on_device(num_vars, log_folding, hash))
         .collect();
 
+    // ⛔ SYMMETRIC SAMPLING, AND THIS LINE IS THE FIX. `free_before` is taken
+    // AFTER a drain and this one was not, so the difference measured the code
+    // plus every transient the four commits made — and with the pool set to
+    // retain all freed blocks, that is all of them. A delta between two samples
+    // is about the code only if both are taken at the same pool state.
+    //
+    // ★ WHAT IT COST, and why a widened bound was the wrong repair. The run of
+    // 2026-09-20 read `taken` = 301,989,888 B — EXACTLY nine codewords, on a
+    // bound of nine, where the model says eight are held. The old one-sided
+    // bound was `8 × codeword` against four codewords held, so it carried 128
+    // MiB of margin the pool had been living in unnoticed; the leaf-layer
+    // retention did not add pool retention, it CONSUMED that margin. And the
+    // slack was never sized against the transients anyway: the node buffer
+    // `build_tree` allocates is `(2L−1)·32` = 64 MiB, twice the bound's 32.
+    //
+    // The same run's mutation arm settles which it is. Holding a whole node
+    // array instead of a layer moved the measurement to 480 MiB where the code
+    // then holds 384 — an excess of 96 against the honest run's 32, tripling
+    // while the holding grew by half. No "the code holds one more object" form
+    // fits both (`4×(cw+tree)+tree` = 448, `+cw` = 416; `5×(cw+tree)` = 480 fits
+    // MUT C exactly and dies on the honest run, where `5×(cw+leaf)` = 320 ≠ 288).
+    // Every peak-demand model misses on BOTH sides (320 and 448 predicted), which
+    // is the signature of driver suballocation and not of anything this tree
+    // accounts for. ⇒ `free_vram_bytes()` cannot carry a bound this tight
+    // unless both samples are drained.
+    math_cuda::device::drain_and_trim().expect("drain");
     let free_after = be.free_vram_bytes().expect("cuMemGetInfo");
     let taken = free_before.saturating_sub(free_after);
+    let promised = be.reserved_bytes().saturating_sub(reserved_before);
 
     let codeword_bytes = ((1u64 << num_vars) << 2) * 8;
     let leaves = ((1u64 << num_vars) << 2) >> log_folding;
+    let leaf_bytes = leaves * 32;
     let tree_bytes = (2 * leaves - 1) * 32;
-    let bound = 8 * codeword_bytes;
+    // ⛔ TWO-SIDED, AND AGAINST THE FORM RATHER THAN A MULTIPLE. The layers must
+    // be HELD (so more than the codewords alone) and a whole TREE must still
+    // never be (so less than four of those). At this shape — `log_folding = 2`,
+    // chosen by the comment above because it makes a tree two codewords — a
+    // leaf layer is exactly ONE codeword, so the three cases are 128, 256 and
+    // 384 MiB and the bound sits between the last two with one codeword of
+    // slack. A one-sided bound passed either way and is what let the old
+    // arithmetic sit on its own edge.
+    let expect = 4 * (codeword_bytes + leaf_bytes);
+    let bound = expect + codeword_bytes;
+    let floor = 4 * codeword_bytes;
     let mib = |b: u64| b / (1 << 20);
+    // ★ THE TWO ACCOUNTINGS, SIDE BY SIDE, IN WHICHEVER MESSAGE FIRES. A failure
+    // here used to say only how many bytes the DRIVER lost, which cannot
+    // distinguish "the pool retained a block" from "the code holds one more" —
+    // and those call for opposite repairs. `promised` is the code's own number
+    // and is blind to the pool; the per-codeword pair says how many layers are
+    // actually in hand. `driver − promised` is the pool's share, and it should
+    // now be small: the drain above is what makes that true.
+    let ledger = {
+        let per: Vec<String> = held
+            .iter()
+            .map(|(c, _)| {
+                format!(
+                    "{}/{}",
+                    mib(c.reserved_bytes()),
+                    mib(c.retained_leaf_bytes())
+                )
+            })
+            .collect();
+        format!(
+            "driver {} MiB · promised {} MiB · pool share {} MiB · per codeword \
+             reserved/retained MiB: [{}]",
+            mib(taken),
+            mib(promised),
+            mib(taken.saturating_sub(promised)),
+            per.join(", ")
+        )
+    };
+    // ⛔ UNCONDITIONAL, AND THAT IS THE WHOLE POINT. Built only inside the
+    // assertion messages, this line appears ONLY when the test fails — so on
+    // the honest path the numbers were inferred from a pass and never read.
+    //
+    // What a pass alone establishes is `driver < bound`, i.e. pool share under
+    // one codeword, and NOTHING narrower. The mutation run that keeps a whole
+    // node array reads `pool share 64 MiB` even after the symmetric drain — a
+    // fragmentation floor of one largest transient, because a best-effort
+    // `trim` cannot release a chunk still backing a live allocation. If the
+    // honest path sits anywhere near that, this guard has a margin of a few MiB
+    // and will flake, and nobody would learn it from a green run.
+    //
+    // ⇒ printed every time, under `--nocapture`, which is how the box gate runs
+    // this suite. The number becomes a READ, and a ceiling can be asserted
+    // against it once its honest value is known.
+    println!("   group guard: {ledger}");
     assert!(
         taken < bound,
         "four unopened commitments took {} MiB from the device. Four codewords \
-         are {} MiB and the bound is {} MiB; a tree is {} MiB, so four of those \
-         kept would read {} MiB. Something is held per commitment.",
+         and their leaf layers are {} MiB and the bound is {} MiB; a TREE is {} \
+         MiB, so four of those kept would read {} MiB. Something bigger than a \
+         leaf layer is held per commitment.\n   {}",
         mib(taken),
-        mib(4 * codeword_bytes),
+        mib(expect),
         mib(bound),
         mib(tree_bytes),
         mib(4 * (codeword_bytes + tree_bytes)),
+        ledger,
+    );
+    assert!(
+        taken > floor,
+        "four unopened commitments took only {} MiB, which is at or under the {} \
+         MiB their codewords alone need. The leaf layers ({} MiB for four) are \
+         NOT being held — either the capture never ran or the budget refused it, \
+         and in both cases every opening will re-hash its leaves.\n   {}",
+        mib(taken),
+        mib(floor),
+        mib(4 * leaf_bytes),
+        ledger,
     );
 
     // The commitments are alive up to here, which is the whole point: a `drop`
@@ -406,11 +545,29 @@ fn a_tree_is_built_for_the_blocking_that_is_asked_for() {
         2,
         "the opening must build a tree for the blocking it was given"
     );
+    // ★ THE KEY, ASSERTED WHERE IT CAN FAIL. The retained layer was built at
+    // k=4; this opening is at k=2 and describes a DIFFERENT tree, so the layer
+    // must not be served and the leaves must be hashed again. A 1 here is a
+    // cache ignoring its key, which is the one way this change could hand back
+    // paths that are internally consistent and wrong.
+    assert_eq!(
+        codeword.leaf_passes(),
+        2,
+        "a k=2 opening must NOT be served the k=4 leaf layer"
+    );
 
     // And the rebuild answered the question that was asked: at k=2 the tree has
     // four times the leaves, so each path is two levels deeper.
     let at_four = codeword.paths(4, &[0, 1], hash).expect("paths at k=4");
     assert_eq!(codeword.tree_builds(), 3, "and a third for the k=4 opening");
+    // …and the k=4 layer IS still there and IS served, so the key rejects a
+    // mismatch without throwing away a match. Without this line the test above
+    // would also pass on a cache that had simply stopped working.
+    assert_eq!(
+        codeword.leaf_passes(),
+        2,
+        "the k=4 opening matches the retained layer's key and must not re-hash"
+    );
     assert_eq!(
         at_two.len(),
         at_four.len() + 2 * 2 * 32,
@@ -444,20 +601,210 @@ fn the_process_wide_counter_tracks_the_same_passes() {
     let _exclusive = exclusive();
     let hash = key::<KeccakWhir>();
 
-    reset_leaf_hash_calls();
+    // ⛔ DELTAS, NOT ABSOLUTES. These three counters are process-wide and no
+    // longer resettable as a set, and the retention makes them diverge on
+    // purpose, so the assertions below are about what THIS codeword moved.
+    let at = || (tree_builds(), leaf_hash_calls(), retention_report().5);
+
+    let (b0, p0, s0) = at();
     let (codeword, _root) = commit_on_device(12, 4, hash);
-    let after_commit = leaf_hash_calls();
-    assert_eq!(after_commit, 1, "one commit, one leaf-hash pass");
+    let (b1, p1, s1) = at();
+    assert_eq!(b1 - b0, 1, "one commit, one tree assembled");
+    assert_eq!(p1 - p0, 1, "and it paid for its own leaf pass");
+    assert_eq!(s1 - s0, 0, "with nothing yet in hand to reuse");
 
     let _ = codeword.paths(4, &[0, 1], hash).expect("paths");
+    let (b2, p2, s2) = at();
+    assert_eq!(b2 - b1, 1, "the opening assembles its own tree");
+    // ★ THE LINE THAT CHANGED WITH H4's REPLACEMENT. This used to assert the
+    // global counter moved by one too, because a tree and a leaf pass were the
+    // same event. They are not any more: the tree is assembled, the leaves are
+    // not re-hashed, and a 1 here is the retention failing to serve.
+    assert_eq!(p2 - p1, 0, "and does NOT re-hash the leaves");
+    assert_eq!(s2 - s1, 1, "the saving is counted where it happens");
+
+    // ⭐ THE ACCOUNTING IDENTITY, which is what the old equality became and
+    // which fails in BOTH directions: a tree that skipped its pass without
+    // recording a saving breaks it, and so does a saving recorded for a tree
+    // that was never assembled.
     assert_eq!(
-        leaf_hash_calls(),
-        after_commit + 1,
-        "an opening builds a tree, so the global counter must move by one"
+        b2 - b0,
+        (p2 - p0) + (s2 - s0),
+        "every tree either paid for its leaf pass or reused one; trees {}, \
+         passes {}, savings {}",
+        b2 - b0,
+        p2 - p0,
+        s2 - s0
+    );
+}
+
+/// ⛔ THE ARGUE-SURFACE DEVICE-FALLBACK COUNTER FIRES AT A REAL SITE.
+///
+/// wt16 read as a win at the slot level because argue's per-table device work
+/// fell back to the host UNCOUNTED — `multilinear::gpu::host_fallbacks()`
+/// counts the COMMIT path only. `math_cuda::device::device_fallbacks()` is the
+/// counter that closes that blind spot; this test proves it actually moves when
+/// an argue-surface `reserve` is refused, using the cheapest of the five sites,
+/// `DeviceColumns::upload`.
+///
+/// It forces the refusal WITHOUT a budget setter and WITHOUT allocating any
+/// device memory: `Backend::reserve` is a pure atomic bump on the reservation
+/// total (no `cuMemAlloc`), so reserving the whole remaining budget makes every
+/// later `reserve` return `None` at no memory cost. The reservation is dropped
+/// at the end, giving the budget back.
+///
+/// The gate mutation is deleting the `note_device_fallback()` call at
+/// `columns.rs`'s `reserve`→`None` site: the count then reads 0 and the final
+/// assertion reddens by name. The four undriven sites are covered card-free by
+/// `note_device_fallback_is_called_at_exactly_the_five_argue_sites` in
+/// `device.rs`.
+#[test]
+fn an_argue_reservation_refusal_bumps_the_device_fallback_counter() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("device fallback test needs a GPU");
+
+    // Take the whole remaining budget as one reservation — an atomic bump, no
+    // device memory — so any further `reserve` must be refused. Held to the end
+    // of the test, then dropped.
+    let remaining = be.vram_budget_bytes().saturating_sub(be.reserved_bytes());
+    let _hog = math_cuda::device::reserve(remaining)
+        .expect("reserving the remaining budget is an accounting move and cannot fail");
+    assert_eq!(
+        be.reserved_bytes(),
+        be.vram_budget_bytes(),
+        "the budget is now fully promised, so the next reserve must be refused"
+    );
+
+    math_cuda::device::reset_device_fallbacks();
+    assert_eq!(
+        math_cuda::device::device_fallbacks(),
+        0,
+        "the counter starts this measurement at zero"
+    );
+
+    // The cheapest argue site: one column of one element wants 8 bytes the
+    // budget cannot promise, so `upload` returns `None` at its `reserve` and
+    // the site records the fallback.
+    let refused = math_cuda::columns::DeviceColumns::upload(&[&[0u64]]);
+    assert!(
+        refused.is_none(),
+        "with the budget fully promised, the device upload must decline"
     );
     assert_eq!(
-        codeword.tree_builds(),
-        leaf_hash_calls(),
-        "with one codeword in flight the two counters must agree"
+        math_cuda::device::device_fallbacks(),
+        1,
+        "an argue-surface reserve was refused, so the device-fallback counter \
+         must read exactly one — a 0 here is the counter not wired to the site"
     );
+
+    // `_hog` is dropped here at scope end, returning the reserved budget.
+}
+
+/// ⛔ THE LIVE FOOTPRINT AND RESERVED HIGH-WATER TRACK THE RETENTION.
+///
+/// The two instruments the evictable retention is built on: `retained_bytes_live`
+/// (the SIMULTANEOUS footprint, not the cumulative `held`) and `reserved_high_water`
+/// (the peak `be.reserved`, the quantity argue's `reserve` is checked against).
+/// This proves both move with a real retention and, crucially, that the layer's
+/// bytes are GIVEN BACK when its codeword drops — the balance the eviction relies
+/// on. A broken `RetainedLeaves::drop` leaves the live count high and reddens the
+/// final assertion; a missing `note_reserved` leaves the high-water below the
+/// live reserved total and reddens the middle one.
+#[test]
+fn the_live_footprint_and_reserved_high_water_track_the_retention() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("footprint test needs a GPU");
+    let live_before = math_cuda::whir::retained_bytes_live();
+    {
+        let (codeword, _root) = commit_on_device(14, 4, key::<RpxWhir>());
+        let _ = codeword
+            .paths(4, &[0, 1, 7], key::<RpxWhir>())
+            .expect("paths");
+        // A leaf layer is captured and held on the codeword.
+        let live = math_cuda::whir::retained_bytes_live();
+        assert!(
+            live > live_before,
+            "a held leaf layer must raise the live footprint (live {live}, before {live_before})"
+        );
+        assert!(
+            math_cuda::whir::retained_bytes_peak() >= live,
+            "the peak footprint must be at least the current live count"
+        );
+        assert!(
+            math_cuda::device::reserved_high_water() >= be.reserved_bytes(),
+            "the reservation high-water must be at least the current reserved total \
+             — note_reserved must fire on every rise of be.reserved"
+        );
+    }
+    // The codeword — and, synchronously in its Drop, the retained layer — is gone.
+    assert_eq!(
+        math_cuda::whir::retained_bytes_live(),
+        live_before,
+        "dropping the codeword must give the layer's bytes back: RetainedLeaves::drop \
+         balances the admit, or the live footprint would only ever rise"
+    );
+}
+
+/// ⛔ A BUDGET MISS EVICTS A RETAINED LAYER AND THE RESERVE THEN SUCCEEDS.
+///
+/// The whole point of the evictable retention: when a real caller (argue, here a
+/// bare reserve) cannot get its bytes, the retention gives a layer back rather
+/// than the caller falling to the host. Committing captures ONE base layer (no
+/// folds), so exactly one layer is in the registry. Then the budget is filled to
+/// leave LESS free than the layer's bytes, so a reserve of the layer's size must
+/// miss — and it SUCCEEDS only because the evictor reclaims the layer. The
+/// mutation that disables the evictor (skip the consult in reserve, or never
+/// install it) makes this reserve return None and the test panic on the expect.
+#[test]
+fn a_budget_miss_evicts_a_retained_layer_and_the_reserve_succeeds() {
+    let _exclusive = exclusive();
+    let be = math_cuda::device::backend().expect("eviction test needs a GPU");
+
+    // Commit captures the base leaf layer; hold the codeword so the layer stays.
+    let (codeword, _root) = commit_on_device(14, 4, key::<RpxWhir>());
+    let layer_bytes = codeword.retained_leaf_bytes();
+    assert!(
+        layer_bytes > 0,
+        "precondition: the commit must have retained a layer"
+    );
+    let (evictions_before, _) = math_cuda::whir::retention_evictions();
+
+    // Fill the budget to leave a gap SMALLER than the layer, so a reserve of the
+    // layer's size cannot fit without eviction. reserve is a pure atomic bump,
+    // so the hog costs no device memory.
+    let gap = layer_bytes / 2;
+    let hog_bytes = be
+        .vram_budget_bytes()
+        .saturating_sub(be.reserved_bytes())
+        .saturating_sub(gap);
+    let _hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+    assert!(
+        be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < layer_bytes,
+        "the free budget must now be below the layer size, so the next reserve misses"
+    );
+
+    // This would return None without the evictor; with it, the layer is freed
+    // and the reserve succeeds.
+    let got = math_cuda::device::reserve(layer_bytes).expect(
+        "the reserve must SUCCEED by evicting the retained layer — a None here \
+                 is the evictor not consulted, or eviction freeing nothing",
+    );
+
+    let (evictions_after, bytes_evicted) = math_cuda::whir::retention_evictions();
+    assert!(
+        evictions_after > evictions_before,
+        "an eviction must have been recorded ({evictions_before} -> {evictions_after})"
+    );
+    assert!(
+        bytes_evicted >= layer_bytes,
+        "the eviction must have freed at least the layer's bytes"
+    );
+    assert_eq!(
+        codeword.retained_leaf_bytes(),
+        0,
+        "the evicted codeword's layer slot must read None (the sole registered layer)"
+    );
+
+    drop(got);
+    drop(_hog);
 }

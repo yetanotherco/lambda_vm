@@ -7420,6 +7420,75 @@ open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
         pct(v_groups),
         pct(v_prepared)
     );
+    // ★ THE CHAIN, AND THE QUERY OPENINGS INSIDE IT — summed over the EPOCH
+    // records only. The global stage carries its own and is reported on its own
+    // line below; folding the two would make a ranking nobody could attribute.
+    let c = |i: usize| sum(&|r| r.chain[i]);
+    let q = |i: usize| sum(&|r| r.queries[i]);
+    let queries_secs = c(5);
+    let share = |x: f64| 100.0 * x / queries_secs.max(1e-9);
+    println!(
+        "   chain[Σ epochs] grind {:.2}s · sumcheck {:.2}s · fold {:.2}s · \
+commit_folded {:.2}s · ood {:.2}s · queries {:.2}s",
+        c(0),
+        c(1),
+        c(2),
+        c(3),
+        c(4),
+        queries_secs
+    );
+    // ⭐ `tree_rebuild`'s SHARE is round 3's kill condition, computed here
+    // rather than by whoever reads the log: retention removes the rebuilds and
+    // nothing else, so if they are not the bulk of the query openings the
+    // lever is dead before any lifetime code is written.
+    println!(
+        "   queries[Σ epochs] query_sample {:.2}s ({:.0}%) · tree_rebuild {:.2}s ({:.0}%) · \
+coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {} over {} rounds in {} chains",
+        q(0),
+        share(q(0)),
+        q(1),
+        share(q(1)),
+        q(2),
+        share(q(2)),
+        q(3),
+        share(q(3)),
+        epochs.iter().map(|r| r.rebuild_calls).sum::<u64>(),
+        epochs.iter().map(|r| r.round_count).sum::<u64>(),
+        epochs.iter().map(|r| r.chain_count).sum::<u64>()
+    );
+    // ⛔ THE RETENTION LINE IS REQUIRED, and it prints on every run including
+    // the ones that retain nothing.
+    //
+    // The leaf-layer retention has a REFUSAL PATH — `DeviceReservation::grow`
+    // declines without changing anything when the budget will not take the
+    // bytes, and the commitment then pays its leaf pass again. That path is
+    // what makes the scheme safe to run at full size, and it is also what makes
+    // a silent zero indistinguishable from a lever that never fired. So the
+    // counts are printed rather than inferred, and a run with nothing to report
+    // says so in words: the launcher refuses to report a block number without
+    // this line, exactly as it refuses one without the grind-knobs banner.
+    let (admitted, refused, asked, got, headroom, saved) = math_cuda::whir::retention_report();
+    let (evicted, evicted_bytes) = math_cuda::whir::retention_evictions();
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "   retention[leaf layers] admitted {admitted} · refused {refused} · asked {:.0} MiB · held {:.0} MiB · leaf passes saved {saved} · leaf_passes {} of tree_builds {} · peak simultaneous footprint {:.0} MiB · evicted {evicted} ({:.0} MiB){}",
+        mib(asked),
+        mib(got),
+        math_cuda::whir::leaf_hash_calls(),
+        math_cuda::whir::tree_builds(),
+        mib(math_cuda::whir::retained_bytes_peak()),
+        mib(evicted_bytes),
+        if refused > 0 {
+            format!(
+                " · FIRST REFUSAL at {:.0} MiB of budget headroom",
+                mib(headroom)
+            )
+        } else if admitted == 0 {
+            " · NOT TAKEN: no leaf layer was retained in this run".to_string()
+        } else {
+            String::new()
+        },
+    );
     println!(
         "   global (in base) wall {g_wall:.1}s ({:.1}%)",
         pct(g_wall)
@@ -7447,7 +7516,7 @@ open_groups {v_groups:.1}s ({:.1}%) · open_prepared {v_prepared:.1}s ({:.1}%)",
         panic!("WHIR BASE SPLIT does not close: {why}");
     }
     println!(
-        "   WHIR BASE SPLIT: closure GREEN (arms A-E at {:.0}% tolerance)",
+        "   WHIR BASE SPLIT: closure GREEN (arms A-F at {:.0}% tolerance)",
         100.0 * TOL
     );
 
@@ -8082,6 +8151,32 @@ fn the_whir_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+
+    // ⛔ THE FALLBACK COUNTS, WHOLE-RUN SCOPE, ALWAYS PRINTED — two DIFFERENT
+    // device surfaces, each of which silently moves work to the host and leaves
+    // only host memory and a utilisation dip as its symptoms:
+    //   · commit fallbacks — a WHIR commitment declined the device
+    //     (`multilinear::gpu::host_fallbacks`, one call site, the commit path);
+    //   · device fallbacks — an argue-surface reservation was refused in
+    //     math-cuda (sumcheck/gkr/columns; `math_cuda::device::device_fallbacks`).
+    // wt16 read as a slot-level win because THIS second number had no name: the
+    // leaf-layer retention took the shared budget and argue fell to the host
+    // uncounted. Printed here, whole-run, so the launcher can refuse a block
+    // number unless BOTH read zero.
+    println!("   commit fallbacks {}", multilinear::gpu::host_fallbacks());
+    println!(
+        "   device fallbacks {}",
+        math_cuda::device::device_fallbacks()
+    );
+    // The PEAK simultaneous device reservation the run reached — the quantity
+    // argue's `reserve` is checked against (not the raw device peak, which the
+    // never-purge pool inflates above the budget). A control run reads argue's
+    // reservation demand here; while the evictable retention holds only spare
+    // bytes, this stays below the budget by construction.
+    println!(
+        "   reserved high-water {:.0} MiB",
+        math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
+    );
 }
 
 /// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small

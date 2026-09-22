@@ -93,12 +93,17 @@ where
     T: IsTranscript<N>,
     H: WhirHash,
 {
+    // The transcript squeezes that choose the indices, and the map onto the
+    // successor's leaves. Host work, and the only part of a round's openings
+    // that is not `open_many`.
+    let __wq_sample = crate::whir_split::mark();
     let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
 
     let leaves: Vec<usize> = queries
         .iter()
         .map(|q| leaf_and_slot(*q, next.num_leaves()).0)
         .collect();
+    crate::whir_split::add(&crate::whir_split::QUERY_SAMPLE, __wq_sample);
 
     Ok(RoundProof {
         current: current.open_many(&queries)?,
