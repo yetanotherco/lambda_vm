@@ -988,8 +988,14 @@ pub struct DeviceTree {
     rebuild: Option<Box<dyn Fn() -> Option<math_cuda::gkr::InputLayer> + Send + Sync>>,
     num_layers: usize,
     input_num_vars: usize,
-    /// Read at build: whoever asks may be asking after the levels are gone.
-    output: ([u64; 3], [u64; 3]),
+    /// The output fraction, read off the top level.
+    ///
+    /// Populated at build on the eager path (whoever asks may be asking after
+    /// the levels are gone). Left empty by the prefetch build so the fold
+    /// kernels stay in flight and are not waited on here; [`Self::output`] then
+    /// reads it from the retained tree on first access, at the consume site,
+    /// which is before any level is spent.
+    output: std::sync::OnceLock<([u64; 3], [u64; 3])>,
     /// The room the whole thing promised itself, the handed-back layer
     /// included.
     _room: Option<math_cuda::device::DeviceReservation>,
@@ -1098,13 +1104,15 @@ where
     let input_num_vars = tree.layer_num_vars(num_layers - 1);
     TREE_CALLS.fetch_add(1, Ordering::Relaxed);
     // This one keeps its input layer: it was uploaded whole, so there is
-    // nothing cheaper to hand back.
+    // nothing cheaper to hand back. Eager: the output is read at build.
+    let output_cell = std::sync::OnceLock::new();
+    let _ = output_cell.set(output);
     Some(DeviceTree {
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: None,
         num_layers,
         input_num_vars,
-        output,
+        output: output_cell,
         _room: None,
     })
 }
@@ -1124,6 +1132,12 @@ impl DeviceTree {
     }
 
     /// The output fraction, which is what says whether the bus balances.
+    ///
+    /// On the eager path the value was read at build and is returned straight.
+    /// On the prefetch path it was left for here: the top fraction is read off
+    /// the retained tree now — the one device sync the prefetch deferred — and
+    /// cached. This runs at the consume site, before GKR spends any level, so
+    /// the top is still there to read.
     pub(crate) fn output<E>(
         &self,
     ) -> Result<
@@ -1136,8 +1150,31 @@ impl DeviceTree {
     where
         E: math::field::traits::IsField + 'static,
     {
-        let (p, q) = self.output;
+        let (p, q) = self.materialized_output()?;
         Ok((ext3_from_raw::<E>(&p), ext3_from_raw::<E>(&q)))
+    }
+
+    /// The output limbs, reading them off the device on first access for a tree
+    /// the prefetch build left unread, then caching. `DeviceFailed` if the
+    /// retained tree is gone or the device read fails — the caller falls back
+    /// to a host build, and the transcript has not moved yet at this point.
+    fn materialized_output(&self) -> Result<([u64; 3], [u64; 3]), crate::Error> {
+        if let Some(v) = self.output.get() {
+            return Ok(*v);
+        }
+        let read = {
+            let held = self.tree.lock().map_err(|_| crate::Error::DeviceFailed {
+                stage: "gkr tree output",
+            })?;
+            let tree = held.as_ref().ok_or(crate::Error::DeviceFailed {
+                stage: "gkr tree output",
+            })?;
+            tree.output().map_err(|_| crate::Error::DeviceFailed {
+                stage: "gkr tree output",
+            })?
+        };
+        let _ = self.output.set(read);
+        Ok(read)
     }
 
     /// A level's halves back here, for the levels near the output that GKR
@@ -1534,6 +1571,54 @@ pub fn input_layer_tree<E>(
 where
     E: math::field::traits::IsField + 'static,
 {
+    input_layer_tree_impl(factors, numerators, denominators, false)
+}
+
+/// The prefetch sibling of [`input_layer_tree`]: builds the tree WITHOUT
+/// reading its output fraction, so its fold kernels stay in flight and overlap
+/// the caller's argue instead of being waited on here. The output is read at
+/// the consume site (`DeviceTree::output`), by which time the kernels have run.
+///
+/// `None` unless a second tree fits WITHOUT evicting the round-2 retained
+/// layers: prefetch is subordinate to argue and to retention, never displacing
+/// either. The headroom is the budget's free bytes (`vram_budget_bytes` less
+/// what is already reserved, which INCLUDES retention), checked against the
+/// carry peak so the build's own reservations then never need to evict.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree_deferred<E>(
+    factors: std::sync::Arc<DeviceFactors>,
+    numerators: Vec<crate::program::Program<E>>,
+    denominators: Vec<crate::program::Program<E>>,
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let rows = factors.0.len();
+    let slots = numerators.len().next_power_of_two();
+    let full = slots * rows;
+    // The carry peak — also what `from_device` reserves internally — so a pass
+    // here means none of the build's reservations displaces anything.
+    let need = (4 * full) as u64 * 24;
+    let be = math_cuda::device::backend().ok()?;
+    if be.vram_budget_bytes().saturating_sub(be.reserved_bytes()) < need {
+        return None;
+    }
+    input_layer_tree_impl(factors, numerators, denominators, true)
+}
+
+/// `defer` skips the one output read (the sync), leaving it for the consume
+/// site; everything else is identical, so the eager caller is byte-for-byte the
+/// path it always was.
+#[cfg(feature = "cuda")]
+fn input_layer_tree_impl<E>(
+    factors: std::sync::Arc<DeviceFactors>,
+    numerators: Vec<crate::program::Program<E>>,
+    denominators: Vec<crate::program::Program<E>>,
+    defer: bool,
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
     let rows = factors.0.len();
     let slots = numerators.len().next_power_of_two();
     let full = slots * rows;
@@ -1553,7 +1638,10 @@ where
         drop(carried);
         let (p, q) = write_input_layer(&factors, &numerators, &denominators, true)?;
         let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream, p, q).ok()?;
-        let output = tree.output().ok()?;
+        let output = std::sync::OnceLock::new();
+        if !defer {
+            let _ = output.set(tree.output().ok()?);
+        }
         let num_layers = tree.num_layers();
         let input_num_vars = tree.layer_num_vars(num_layers - 1);
         TREE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1576,7 +1664,10 @@ where
     let tree =
         math_cuda::gkr::DeviceFractionTree::from_padded_input(stream.clone(), p, q, real, num_vars)
             .ok()?;
-    let output = tree.output().ok()?;
+    let output = std::sync::OnceLock::new();
+    if !defer {
+        let _ = output.set(tree.output().ok()?);
+    }
     let num_layers = tree.num_layers();
 
     let rebuild = move || {
@@ -1602,6 +1693,18 @@ where
 
 #[cfg(not(feature = "cuda"))]
 pub fn input_layer_tree<E>(
+    _factors: std::sync::Arc<DeviceFactors>,
+    _numerators: Vec<crate::program::Program<E>>,
+    _denominators: Vec<crate::program::Program<E>>,
+) -> Option<DeviceTree>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn input_layer_tree_deferred<E>(
     _factors: std::sync::Arc<DeviceFactors>,
     _numerators: Vec<crate::program::Program<E>>,
     _denominators: Vec<crate::program::Program<E>>,

@@ -215,6 +215,56 @@ pub fn resident_tree<E: IsField + 'static>(
     crate::gkr::FractionTree::from_device(tree).ok()
 }
 
+/// A device fraction tree built ahead of its turn, its output fraction left
+/// unread so the fold kernels stay in flight — see [`resident_tree_deferred`].
+/// Finalized at the consume site with [`Self::into_tree`].
+pub struct PrefetchedTree<E: IsField> {
+    device: crate::gpu::DeviceTree,
+    _marker: core::marker::PhantomData<E>,
+}
+
+impl<E: IsField + 'static> PrefetchedTree<E> {
+    /// Read the output fraction (the sync the prefetch deferred) and wrap the
+    /// tree for `prove`. `None` on a device read failure — the caller then
+    /// builds host-side; the transcript has not moved here, so that is sound.
+    pub fn into_tree(self) -> Option<crate::gkr::FractionTree<E>> {
+        crate::gkr::FractionTree::from_device(self.device).ok()
+    }
+}
+
+/// The prefetch sibling of [`resident_tree`]: builds the device tree WITHOUT
+/// reading its output, so the fold kernels overlap the caller's argue instead
+/// of being waited on. `None` when the device declines (as [`resident_tree`])
+/// OR there is no non-evicting VRAM headroom for a second tree — prefetch is
+/// subordinate to argue and to the round-2 retention, displacing neither.
+pub fn resident_tree_deferred<E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    factors: std::sync::Arc<crate::gpu::DeviceFactors>,
+) -> Option<PrefetchedTree<E>> {
+    if interactions.is_empty() {
+        return None;
+    }
+    let emit = |side: &Affine<E>| {
+        let mut builder = Builder::<E>::new();
+        let root = side.emit(&mut builder);
+        builder.finish(root).ok()
+    };
+    let numerators: Vec<Program<E>> = interactions
+        .iter()
+        .map(|i| emit(&i.numerator))
+        .collect::<Option<_>>()?;
+    let denominators: Vec<Program<E>> = interactions
+        .iter()
+        .map(|i| emit(&i.denominator))
+        .collect::<Option<_>>()?;
+
+    let device = crate::gpu::input_layer_tree_deferred(factors, numerators, denominators)?;
+    Some(PrefetchedTree {
+        device,
+        _marker: core::marker::PhantomData,
+    })
+}
+
 /// What the batch needs to settle a bus's input-layer claim.
 pub struct BusStatements<'a, E: IsField> {
     pub numerator: Rule<'a, E>,

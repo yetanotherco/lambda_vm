@@ -90,6 +90,7 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) 
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
     println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_LINEINFO");
+    println!("cargo:rerun-if-env-changed=LAMBDA_VM_RPX_MAXRREGCOUNT");
 
     // When nvcc is missing from PATH, emit an empty cubin stub so the crate
     // still compiles. include_bytes! in src/device.rs needs the file to exist
@@ -130,6 +131,19 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) 
     // change codegen, but keep it opt-in so production cubins stay byte-stable.
     if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
         cmd.arg("-lineinfo");
+    }
+    // Opt-in per-thread register cap for the round-3 occupancy discriminator.
+    // Capping registers lets more blocks reside per SM, tracing the RPX
+    // permutation's throughput-vs-occupancy curve across separate builds (the
+    // production grind kernel cannot carry a per-kernel `__launch_bounds__`, and
+    // it is what this sweep must move). Empty/unset/"0" ⇒ no cap ⇒ production
+    // cubins stay byte-stable, exactly like `-lineinfo` above. Diagnostic only;
+    // never set in a production or bench build.
+    if let Ok(r) = env::var("LAMBDA_VM_RPX_MAXRREGCOUNT")
+        && !r.is_empty()
+        && r != "0"
+    {
+        cmd.arg(format!("-maxrregcount={r}"));
     }
     let status = cmd
         .arg("-o")

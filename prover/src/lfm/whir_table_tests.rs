@@ -350,8 +350,9 @@ fn real_proof(
 
     let (z, alpha, beta) = table_challenges();
     let mut prover = HostTranscript::new(&[]);
-    let (proof, _point) = stark::multilinear_table::prove(&table, &z, &alpha, &beta, &mut prover)
-        .expect("the table proves");
+    let (proof, _point) =
+        stark::multilinear_table::prove(&table, &z, &alpha, &beta, &mut prover, None)
+            .expect("the table proves");
     (proof, Vec::new(), cols)
 }
 

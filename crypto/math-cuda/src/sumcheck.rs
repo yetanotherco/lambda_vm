@@ -98,6 +98,17 @@ pub struct SumcheckSession {
     r_dev: CudaSlice<u64>,
 }
 
+thread_local! {
+    // ROUND-3 ARGUE DEVICE-BUSY SIZING (diagnostic; `LAMBDA_VM_ARGUE_BUSY_PROBE`).
+    // A reusable TIMING-enabled CUDA event pair — created ONCE per thread, never
+    // per round (a mid-prove cuEventCreate convoys the driver lock), and reused to
+    // bracket the round kernels. Off by default: production round() only ever
+    // reads the cached flag and skips all of this.
+    static BUSY_EVENTS: std::cell::RefCell<
+        Option<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 impl SumcheckSession {
     /// Uploads `factors` (each `2^num_vars` ext3 values, interleaved as three
     /// u64 per element) and the lowered program.
@@ -322,6 +333,20 @@ impl SumcheckSession {
         };
         let num_nodes = self.num_nodes as u64;
         let num_t_u32 = num_t as u32;
+        // Round-3 argue device-busy sizing: bracket the round kernels with a
+        // reusable event pair, read the elapsed after the EXISTING sync below.
+        let busy_probe = crate::argue_probe::busy_probe_enabled();
+        if busy_probe {
+            BUSY_EVENTS.with(|cell| -> Result<()> {
+                let mut ev = cell.borrow_mut();
+                if ev.is_none() {
+                    let f = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                    *ev = Some((be.ctx.new_event(Some(f))?, be.ctx.new_event(Some(f))?));
+                }
+                ev.as_ref().unwrap().0.record(&self.stream)?;
+                Ok(())
+            })?;
+        }
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_round_ext3)
@@ -356,8 +381,24 @@ impl SumcheckSession {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
+        if busy_probe {
+            BUSY_EVENTS.with(|cell| -> Result<()> {
+                cell.borrow().as_ref().unwrap().1.record(&self.stream)?;
+                Ok(())
+            })?;
+        }
         let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
+        if busy_probe {
+            BUSY_EVENTS.with(|cell| -> Result<()> {
+                let ev = cell.borrow();
+                let (start, end) = ev.as_ref().unwrap();
+                crate::argue_probe::add_device_busy_ns(
+                    (start.elapsed_ms(end)? as f64 * 1.0e6) as u64,
+                );
+                Ok(())
+            })?;
+        }
         Ok(sums)
     }
 
@@ -589,6 +630,10 @@ pub fn evaluate_many_base(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            group_len as u64 * per_column,
+        );
         // Read where they lie when they are already there; a copy otherwise.
         let uploaded;
         let base = match &columns {
@@ -759,6 +804,10 @@ impl DeviceFactors {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            factors.len() as u64 * span as u64 * 8,
+        );
         let stream = be.next_stream();
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, factors.len() * span) }?;
         for (k, factor) in factors.iter().enumerate() {
@@ -827,6 +876,10 @@ impl DeviceFactors {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Sumcheck,
+            width as u64 * rows as u64 * 24,
+        );
         let stream = be.next_stream();
 
         let span = rows * 3;

@@ -1,77 +1,74 @@
-//! ★ STAGE B: do the slow grind launches do MORE WORK, or the same work slower?
+//! ★ ROUND 3: is the grind's stale-poll overrun CONTENTION on one address?
 //!
-//! # What the timings could not answer
+//! # What is being decided
 //!
-//! `rpx_grind_bench` reads a mean about 20% above the model at the record
-//! posture while the MEDIAN seed sits exactly on it, so a minority of launches
-//! carries a large absolute cost. Three candidates died to that bench: the
-//! power limiter (the movers are SMALL-`h` seeds, not long sustained launches),
-//! the miss-and-relaunch path (the movers take ONE launch at both arms) and the
-//! volatile load's per-iteration cost (the same iterations either way).
+//! The grind is the single largest remaining stage on the WHIR block. O3's
+//! stage B established the shape of the cost: threads keep scanning for a
+//! bounded TIME after the answer is known (the excess saturates above `count`
+//! rather than growing with it, and fits `T·(1 − e^(−(N−8)/τ))` with τ ≈ 19), a
+//! poll of `*result` served stale — not threads running to the loop bound. O4
+//! then read the SASS: the poll is already `LDG.E.64.STRONG.SYS` inside the
+//! loop, the strongest system-scope load, so a cache qualifier cannot help
+//! (`__ldcg`/`__ldcv` are WEAKER and dead). The one surviving explanation is
+//! CONTENTION: 131,072 resident threads each issue that system-scope 8-byte load
+//! to ONE address every permutation, and the finder's `atomicMin` queues behind
+//! the flood, so the answer takes longer to land and to propagate — and while it
+//! is stale, threads over-scan.
 //!
-//! v5 swept the scan factor UPWARD to test the last one standing — threads
-//! running to the loop bound. They do not: the excess SATURATES above `count`
-//! = 2^23 instead of growing with it (`vs control` 1.05 at scan 16, 32 and 64
-//! against a prediction of 2.14, 4.43 and 9.00).
+//! Contention cannot be tested by raising the grid (grid 1024 already holds
+//! 131,072 of the card's 174,080 resident threads). It CAN be tested by lowering
+//! the poll RATE. `rpx_grind_search_counted` gained a `poll_period` launch
+//! parameter: it polls `*result` only every `poll_period`-th iteration,
+//! STAGGERED by thread so at any one iteration only `1/poll_period` of the
+//! threads issue the load — the average AND the peak request rate both fall by
+//! `poll_period`, with the same residency, the same loop bound, the same nonce
+//! order. Only the flood on that address changes.
 //!
-//! But it does not saturate immediately either. Converted to iterations per
-//! thread, `N = count / stride`, the excess fits a bounded quantity approached
-//! geometrically:
+//! # ★ THE SIGN, PRE-REGISTERED (before the run; judged against it after)
 //!
-//! ```text
-//!   N    8     16     32     64    128    256    512
-//!   ms   0   0.354  0.763  1.004  1.055  1.057  1.060
-//!   excess = T·(1 − e^(−(N−8)/τ)),  T ≈ 1.06 ms,  τ ≈ 19 iterations
-//! ```
+//! The measured quantity is the OVERRUN — `executed − ideal`, `ideal =
+//! nonce + stride` — in strides (≈ mean extra iterations per thread), at the
+//! record posture scan 8 / grid 1024, as `poll_period` (`k`) rises 1 → 4 → 16 →
+//! 64:
 //!
-//! Three independent points agree on τ within 4%. That is the shape of a
-//! thread that keeps scanning for a bounded TIME after the answer is known —
-//! about 19 further iterations, a per-iteration stopping probability near 5% —
-//! and NOT the shape of one running to the loop bound. One iteration at grid
-//! 1024 is 131,072 permutations, ≈ 0.56 ms at the bench's own 4.27 ns/perm, so
-//! 19 iterations is ≈ 10.6 ms, which is where v4's top movers sat (5-11 ms).
+//! - overrun FALLS as k rises ⇒ CONTENTION. The flood is the cause; the fix is a
+//!   warp-lane poll + `__shfl_sync` broadcast (32× fewer requests) and/or one
+//!   thread per block polling a `__shared__` cell holding the VALUE (not a flag).
+//! - overrun RISES ≈ linearly in k ⇒ the poll is merely coarser (a thread that
+//!   polls every k-th iteration over-scans up to k−1 extra iterations after the
+//!   answer lands, ≈ (k−1)/2 on average). The whole "poll less" family dies
+//!   together and the only survivor is the LDL.64 sponge lever.
+//! - FLAT ⇒ neither; a different discriminator is owed.
 //!
-//! ⚠ That is a three-point fit with two parameters, measured against a baseline
-//! (scan 1, eight iterations) that may itself be carrying capped excess. It is
-//! a hypothesis, not a reading. This file replaces it with a reading.
+//! A SIGN, not a magnitude — it survives a mispredicted size, which O3's τ ≈ 19
+//! did not. The `(k−1)/2` granularity term is exactly the "rises ≈ linearly"
+//! prediction; the `adjusted = overrun − (k−1)/2` column removes it to isolate
+//! the contention component, which matters most at k=64 where granularity alone
+//! is +31.5 strides and can dominate. k=4 and k=16 are the primary reads.
 //!
-//! # What this measures
+//! # The controls, both mandatory
 //!
-//! `rpx_grind_search_counted` counts, on the device, the permutations its
-//! threads actually ran. So `executed − (h + stride)` is the overrun, per
-//! search, as a number rather than a model — with `max_iters` saying how deep
-//! the deepest thread went and `ran_to_end` how many threads left by the loop
-//! bound rather than by the early exit.
-//!
-//! **PRE-REGISTERED, before the run:**
-//!
-//! - STALE-POLL: the overrun is ≈ 0 on most searches and ≈ 19 × stride on a
-//!   minority — and on those, *the same at scan 8 and at scan 64*, because a
-//!   stop bounded by time does not care about the bound. `max_iters` reads
-//!   `ceil(h/stride) + ~20`, never `count/stride`. ⭐ `ran_to_end` is the
-//!   discriminator: near ZERO at scan 64, where 512 iterations are available
-//!   and a thread stops after ~19; NONZERO at scan 1, where the cap of 8 bites
-//!   first.
-//! - NO OVERRUN: `executed − (h + stride)` is ≈ 0 everywhere, including on the
-//!   slow searches. Then no thread over-scans, the slow launches run the SAME
-//!   permutations more slowly, the whole straggler family is dead, and the cost
-//!   is outside this loop and owes a name.
-//!
-//! # ⛔ The control that decides whether this file may be read at all
-//!
-//! A counted kernel with different register pressure has different occupancy
-//! and therefore measures a different kernel. Every arm therefore runs the
-//! SHIPPED kernel on the same seed immediately beside the counted one, and the
-//! two must agree on the nonce (always) and on the milliseconds (within the
-//! procedure's own noise floor). If the milliseconds disagree, this run reports
-//! that the instrument changed the phenomenon and draws no conclusion.
+//! - ADMISSIBILITY at k=1: the counted twin at `poll_period = 1` polls every
+//!   iteration, the shipped kernel's rate, so its milliseconds must reproduce
+//!   the shipped kernel's within the noise floor. If they do not, the counters
+//!   changed the kernel's occupancy and NO sign may be read from the sweep. At
+//!   k>1 the twin is DELIBERATELY different (that is the manipulation), so its
+//!   ms are reported as a POLL EFFECT, never gated.
+//! - SOUNDNESS: the winning nonce is IDENTICAL across every k, for every seed.
+//!   The poll can only make a thread STOP scanning early; `*result` holds
+//!   `U64_MAX` or a nonce that passed `digest[0] < limit`; a thread's nonces
+//!   only increase; `atomicMin` only ever LOWERS `*result`, so a staler value is
+//!   a LARGER one and polling less can only DELAY an exit, never accept a wrong
+//!   nonce or change the one a launch returns. This control is what witnesses
+//!   that; if any k changes a winning nonce, the argument is wrong and we stop.
 //!
 //! ```text
 //! cargo test -p lambda-vm-prover --release --features cuda \
 //!     --test rpx_grind_counted -- --ignored --nocapture
 //! ```
 //!
-//! Needs a GPU. Changes no default and no shipped kernel.
+//! Needs a GPU. Changes no default and no shipped kernel — the `poll_period`
+//! parameter lives only on the diagnostic twin, which is on no proving path.
 #![cfg(feature = "cuda")]
 
 use std::time::Instant;
@@ -86,54 +83,33 @@ type RpxGrind = GrindingDigest<RpxStarkHash>;
 /// The production grinding factor: this is about the launch, not the bits.
 const GRINDING_FACTOR: u8 = 20;
 
-/// The same 256 seeds v5 used, so the two runs describe the same population.
+/// The same 256 seeds O3 used, so this run describes the same population.
 const RUNS: usize = 256;
 
-/// The noise floor v5 measured on this box: the repeated control's median
-/// per-seed ratio came back 0.9992. The admissibility control below allows
-/// five times that, because it compares two DIFFERENT kernels and a tie is not
-/// what is being claimed — only that the twin did not change the phenomenon.
+/// The noise floor O3 measured on this box: the repeated control's median
+/// per-seed ratio came back 0.9992. The admissibility control allows five times
+/// that, because it compares two DIFFERENT kernels (counted vs shipped) and only
+/// claims the twin did not change the phenomenon, not that they tie.
 const ADMISSIBLE_MS_RATIO: f64 = 0.05;
 
-/// The arms: the two scan factors that bracket the saturation, the one above
-/// it, and the grid that moves the typical seed.
-fn arms() -> Vec<(&'static str, Knobs)> {
+/// The margin, in strides, a mean overrun must move across the sweep to be read
+/// as a sign rather than run-to-run noise. This is a SIGN read; the authoritative
+/// call is made by hand from the printed table, this only keeps the automated
+/// verdict from flapping on noise.
+const SIGN_MARGIN_STRIDES: f64 = 1.0;
+
+/// The four arms: the SAME record posture (scan 8, grid 1024) at four poll
+/// periods. Only the poll rate changes — that is the whole manipulation.
+fn arms() -> Vec<(&'static str, Knobs, u64)> {
+    let posture = Knobs {
+        scan: 8,
+        grid: 1024,
+    };
     vec![
-        (
-            "scan 1",
-            Knobs {
-                scan: 1,
-                grid: 1024,
-            },
-        ),
-        (
-            "scan 8 (record)",
-            Knobs {
-                scan: 8,
-                grid: 1024,
-            },
-        ),
-        (
-            "scan 64",
-            Knobs {
-                scan: 64,
-                grid: 1024,
-            },
-        ),
-        (
-            "scan 8 grid 4096",
-            Knobs {
-                scan: 8,
-                grid: 4096,
-            },
-        ),
-        (
-            "scan 1 grid 4096",
-            Knobs {
-                scan: 1,
-                grid: 4096,
-            },
-        ),
+        ("k=1 (shipped rate)", posture, 1),
+        ("k=4", posture, 4),
+        ("k=16", posture, 16),
+        ("k=64", posture, 64),
     ]
 }
 
@@ -153,11 +129,11 @@ fn shipped(seed: &[u8; 32], knobs: Knobs) -> (u64, f64) {
     (nonce, started.elapsed().as_secs_f64() * 1000.0)
 }
 
-/// The counted twin, timed the same way.
-fn counted(seed: &[u8; 32], knobs: Knobs) -> (GrindCounts, f64) {
+/// The counted twin at a given poll period, timed the same way.
+fn counted(seed: &[u8; 32], knobs: Knobs, poll_period: u64) -> (GrindCounts, f64) {
     let felts = inner_hash_felts::<RpxGrind>(seed, GRINDING_FACTOR);
     let started = Instant::now();
-    let counts = math_cuda::grinding::search_counted(&felts, GRINDING_FACTOR, knobs)
+    let counts = math_cuda::grinding::search_counted(&felts, GRINDING_FACTOR, knobs, poll_period)
         .expect("counted RPX grind (needs a GPU)");
     (counts, started.elapsed().as_secs_f64() * 1000.0)
 }
@@ -166,51 +142,72 @@ fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
 }
 
-fn median(xs: &[f64]) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a timing"));
-    v[v.len() / 2]
+/// One arm's aggregate read, computed once and used by both the per-arm print
+/// and the cross-arm verdict — so the verdict is not recomputed by whoever reads
+/// the log (the failure mode that produced a verdict which could not pass).
+struct ArmRead {
+    name: &'static str,
+    poll_period: u64,
+    /// mean overrun over the seeds, in strides ≈ mean extra iterations/thread.
+    overrun_strides: f64,
+    /// `overrun_strides − (k−1)/2`: the granularity term removed, leaving the
+    /// stale-window (contention) component.
+    adjusted: f64,
+    ran_to_end: u64,
+    max_iters: u64,
+    /// `Some` only for the k=1 arm; `None` for the k>1 arms, which are meant to
+    /// differ from the shipped kernel.
+    admissible: Option<bool>,
 }
 
 #[test]
 #[ignore = "device diagnostic; run with --ignored --nocapture on the GPU box"]
-fn what_the_slow_grind_launches_actually_execute() {
+fn what_lowering_the_grind_poll_rate_does_to_the_overrun() {
     let arms = arms();
+    let n_arms = arms.len();
     let seeds: Vec<[u8; 32]> = (0..RUNS).map(seed_for).collect();
+    let block_dim = math_cuda::grinding::RPX_BLOCK_DIM;
 
-    // Warm-up, excluded by name, on BOTH kernels: the first launch of each
-    // pays its own cubin load.
+    // Warm-up, excluded by name, on BOTH kernels: the first launch of each pays
+    // its own cubin load.
     let w1 = shipped(&seeds[0], Knobs::DEFAULT);
-    let w2 = counted(&seeds[0], Knobs::DEFAULT);
+    let w2 = counted(&seeds[0], Knobs::DEFAULT, 1);
     println!(
         "WARM-UP (EXCLUDED): shipped {:.3} ms, counted {:.3} ms, nonces {} / {}",
         w1.1, w2.1, w1.0, w2.0.nonce
     );
 
-    // Per arm: the mean overrun in strides, the summed `ran_to_end`, and
-    // whether the twin was admissible. The cross-arm verdict is computed from
-    // these HERE rather than by whoever reads the log — the same reason the
-    // count slope is printed beside its prediction in `rpx_grind_bench`.
-    let mut summary: Vec<(&'static str, f64, u64, bool)> = Vec::new();
+    // Per-arm accumulators, indexed by the canonical arm order.
+    let mut ship_ms: Vec<Vec<f64>> = vec![Vec::with_capacity(RUNS); n_arms];
+    let mut cnt_ms: Vec<Vec<f64>> = vec![Vec::with_capacity(RUNS); n_arms];
+    let mut overruns: Vec<Vec<f64>> = vec![Vec::with_capacity(RUNS); n_arms]; // permutations
+    let mut to_end_sum: Vec<u64> = vec![0; n_arms];
+    let mut max_iters_max: Vec<u64> = vec![0; n_arms];
+    let mut affected: Vec<usize> = vec![0; n_arms];
+    // The winning nonce per seed at each arm — the cross-k soundness control.
+    let mut nonces: Vec<Vec<u64>> = vec![Vec::with_capacity(RUNS); n_arms];
+    // The poll_period the launch REPORTS back, so the banner quotes the knob as
+    // it reached the search, not as the caller believes it passed it.
+    let mut poll_seen: Vec<u64> = vec![0; n_arms];
 
-    for (name, knobs) in arms.iter() {
-        let stride = knobs.stride(math_cuda::grinding::RPX_BLOCK_DIM);
-        let block = knobs.block(GRINDING_FACTOR);
-        let mut ship_ms = Vec::with_capacity(RUNS);
-        let mut cnt_ms = Vec::with_capacity(RUNS);
-        let mut rows: Vec<(usize, GrindCounts, f64, f64, i128)> = Vec::with_capacity(RUNS);
+    for (s, seed) in seeds.iter().enumerate() {
+        // Rotate the arm order per seed so any drift over the run spreads across
+        // arms rather than loading onto the last one, and pair shipped-vs-counted
+        // adjacently so a clock that drifts drifts through both.
+        for j in 0..n_arms {
+            let a = (j + s) % n_arms;
+            let (name, knobs, poll_period) = arms[a];
+            let stride = knobs.stride(block_dim);
 
-        for (s, seed) in seeds.iter().enumerate() {
-            // Paired and adjacent, so a clock that drifts drifts through both.
-            let (nonce, t_ship) = shipped(seed, *knobs);
-            let (counts, t_cnt) = counted(seed, *knobs);
+            let (nonce, t_ship) = shipped(seed, knobs);
+            let (counts, t_cnt) = counted(seed, knobs, poll_period);
 
             // ⛔ THE ANSWER IS PINNED FIRST. A diagnostic that returns a
             // different nonce is measuring a different search.
             assert_eq!(
                 counts.nonce, nonce,
-                "{name}, seed {s}: the counted kernel returned {} and the \
-                 shipped kernel {nonce} — they are not running the same search",
+                "{name}, seed {s}: the counted kernel returned {} and the shipped \
+                 kernel {nonce} — they are not running the same search",
                 counts.nonce
             );
             assert!(
@@ -218,146 +215,220 @@ fn what_the_slow_grind_launches_actually_execute() {
                 "{name}, seed {s}: nonce {} fails is_valid_nonce",
                 counts.nonce
             );
-
-            // The model: every nonce below the hit, plus one stride round for
-            // the threads that were mid-permutation when it landed.
-            //
-            // ⛔ IT IS `nonce + stride`, FULL STOP, AND THE MISSED BLOCKS ARE
-            // ALREADY IN IT. The first draft added `(launches − 1) · block` on
-            // top, reasoning that a missed block costs its whole `count`. It
-            // does — but `nonce` is ABSOLUTE, so those nonces are counted once
-            // already and the term double-counted them. The symptom was a
-            // NEGATIVE overrun on exactly the arms where searches miss (scan 1
-            // read −4.17 strides, which is not a quantity that can be negative),
-            // while scan 8 and scan 64 were untouched because at those block
-            // sizes every seed here hits on its first launch.
-            let ideal = counts.nonce + stride;
-            let _ = block;
-            let overrun = counts.executed as i128 - ideal as i128;
-            ship_ms.push(t_ship);
-            cnt_ms.push(t_cnt);
-            rows.push((s, counts, t_ship, t_cnt, overrun));
-        }
-
-        // ── the admissibility control, before any reading ──────────────────
-        let (m_ship, m_cnt) = (mean(&ship_ms), mean(&cnt_ms));
-        let ratio = m_cnt / m_ship;
-        let admissible = (ratio - 1.0).abs() <= ADMISSIBLE_MS_RATIO;
-        println!(
-            "\n=== {name}: count {block}, stride {stride}, {} iterations available ===",
-            block / stride
-        );
-        println!(
-            "ADMISSIBILITY: shipped {m_ship:.3} ms vs counted {m_cnt:.3} ms, ratio {ratio:.4} \
-             (allowed |1 - r| <= {ADMISSIBLE_MS_RATIO}) => {}",
-            if admissible {
-                "ADMISSIBLE — the twin did not change the phenomenon"
-            } else {
-                "NOT ADMISSIBLE — the counters changed the kernel; read no overrun from this arm"
-            }
-        );
-
-        let overruns: Vec<f64> = rows.iter().map(|r| r.4 as f64).collect();
-        let affected = rows.iter().filter(|r| r.4 > stride as i128).count();
-        let to_end: u64 = rows.iter().map(|r| r.1.ran_to_end).sum();
-        println!(
-            "OVERRUN (executed - ideal), permutations: mean {:.0} · median {:.0} · \
-             in strides mean {:.2} · searches overrunning by > 1 stride {affected}/{RUNS}",
-            mean(&overruns),
-            median(&overruns),
-            mean(&overruns) / stride as f64,
-        );
-        println!(
-            "RAN_TO_END (threads leaving by the loop bound, summed over {RUNS} searches): \
-             {to_end}"
-        );
-        summary.push((name, mean(&overruns) / stride as f64, to_end, admissible));
-
-        // The ten searches with the largest overrun, with everything that could
-        // explain them.
-        let mut order: Vec<usize> = (0..RUNS).collect();
-        order.sort_by(|a, b| rows[*b].4.cmp(&rows[*a].4));
-        println!(
-            "{:>5} {:>12} {:>8} {:>14} {:>11} {:>10} {:>9} {:>9}",
-            "seed",
-            "h",
-            "launches",
-            "overrun perms",
-            "in strides",
-            "max_iters",
-            "ship ms",
-            "cnt ms"
-        );
-        for &i in order.iter().take(10) {
-            let (s, c, t_ship, t_cnt, over) = &rows[i];
-            println!(
-                "{s:>5} {:>12} {:>8} {over:>14} {:>11.2} {:>10} {t_ship:>9.3} {t_cnt:>9.3}",
-                c.nonce,
-                c.launches,
-                *over as f64 / stride as f64,
-                c.max_iters,
+            // The knob must reach the launch: the twin echoes back the
+            // poll_period it was launched with.
+            assert_eq!(
+                counts.poll_period, poll_period,
+                "{name}, seed {s}: the launch used poll_period {} not {poll_period}",
+                counts.poll_period
             );
+
+            // ideal = every nonce below the hit, plus one stride round for the
+            // threads mid-permutation when it landed. `nonce` is absolute, so
+            // any missed blocks are already counted in it (O3's double-count
+            // trap): it is `nonce + stride`, full stop. Every seed here hits on
+            // its first launch at scan 8.
+            let ideal = counts.nonce + stride;
+            let overrun = counts.executed as i128 - ideal as i128;
+
+            ship_ms[a].push(t_ship);
+            cnt_ms[a].push(t_cnt);
+            overruns[a].push(overrun as f64);
+            to_end_sum[a] += counts.ran_to_end;
+            if counts.max_iters > max_iters_max[a] {
+                max_iters_max[a] = counts.max_iters;
+            }
+            if overrun > stride as i128 {
+                affected[a] += 1;
+            }
+            nonces[a].push(counts.nonce);
+            poll_seen[a] = counts.poll_period;
         }
     }
 
-    // ── ★ THE VERDICT, by name, beside what each branch predicted ──────────
-    let at =
-        |n: &str| -> Option<&(&'static str, f64, u64, bool)> { summary.iter().find(|r| r.0 == n) };
+    // ── the KNOBS banner: the poll period varied and reached the search ──────
+    for (a, (name, knobs, poll_period)) in arms.iter().enumerate() {
+        println!(
+            "★ GRIND KNOBS: {name} — scan {} grid {} poll_period {} (launch reported {})",
+            knobs.scan, knobs.grid, poll_period, poll_seen[a]
+        );
+        assert_eq!(
+            poll_seen[a], *poll_period,
+            "{name}: the launch reported poll_period {} not {poll_period}",
+            poll_seen[a]
+        );
+    }
+
+    // ── the cross-k IDENTICAL-NONCE soundness control ───────────────────────
+    //
+    // ⛔ THE BOUNDS ARE THE CHECK, so they are spelled out rather than trusted
+    // to an iterator that looks equivalent. `nonces` is
+    // `vec![Vec::with_capacity(RUNS); n_arms]` and the seed loop pushes exactly
+    // once per (seed, arm) with no early exit, so `nonces.len() == n_arms` and
+    // every row is `RUNS` long: iterating `nonces[0]` is the old `0..RUNS`, and
+    // `take(n_arms).skip(1)` is the old `1..n_arms`.
+    //
+    // ⚠ CLIPPY'S OWN SUGGESTION HERE IS WRONG. `needless_range_loop` offers
+    // `for <item> in nonces.iter().take(n_arms).skip(1)` for the OUTER loop too,
+    // which drops the `s` index — and the body needs both indices, because the
+    // comparison is `nonces[a][s]` against `nonces[0][s]`. Taking that
+    // suggestion would have compared whole arms instead of per-seed nonces and
+    // turned a control that can fail into one that cannot.
+    let mut nonce_mismatch = 0usize;
+    for (s, n0) in nonces[0].iter().enumerate() {
+        for arm in nonces.iter().take(n_arms).skip(1) {
+            if arm[s] != *n0 {
+                nonce_mismatch += 1;
+            }
+        }
+    }
+    println!(
+        "\nSOUNDNESS (identical winning nonce across all k, per seed): {nonce_mismatch} \
+         mismatch(es) over {RUNS} seeds"
+    );
+    assert_eq!(
+        nonce_mismatch, 0,
+        "a poll period changed a winning nonce — the soundness argument is wrong, stop"
+    );
+
+    // ── per-arm read + admissibility (k=1) / poll effect (k>1) ──────────────
+    let m_cnt_k1 = mean(&cnt_ms[0]); // arm 0 is k=1 by construction
+    let mut summary: Vec<ArmRead> = Vec::with_capacity(n_arms);
+    for a in 0..n_arms {
+        let (name, knobs, poll_period) = arms[a];
+        let stride = knobs.stride(block_dim) as f64;
+        let block = knobs.block(GRINDING_FACTOR);
+        let o_perms_mean = mean(&overruns[a]);
+        let o_strides = o_perms_mean / stride;
+        let granularity = (poll_period as f64 - 1.0) / 2.0;
+        let adjusted = o_strides - granularity;
+
+        println!(
+            "\n=== {name}: poll_period {poll_period}, count {block}, stride {}, {} iterations available ===",
+            knobs.stride(block_dim),
+            block / knobs.stride(block_dim)
+        );
+
+        let m_ship = mean(&ship_ms[a]);
+        let m_cnt = mean(&cnt_ms[a]);
+        let admissible = if poll_period == 1 {
+            let ratio = m_cnt / m_ship;
+            let ok = (ratio - 1.0).abs() <= ADMISSIBLE_MS_RATIO;
+            println!(
+                "ADMISSIBILITY: shipped {m_ship:.3} ms vs counted {m_cnt:.3} ms, ratio {ratio:.4} \
+                 (allowed |1 - r| <= {ADMISSIBLE_MS_RATIO}) => {}",
+                if ok {
+                    "ADMISSIBLE — the twin did not change the phenomenon"
+                } else {
+                    "NOT ADMISSIBLE — the counters changed the kernel; read no sign from this sweep"
+                }
+            );
+            Some(ok)
+        } else {
+            let ratio = m_cnt / m_cnt_k1;
+            println!(
+                "POLL EFFECT: counted(k={poll_period}) {m_cnt:.3} ms vs counted(k=1) \
+                 {m_cnt_k1:.3} ms, ms ratio {ratio:.4} (informational; the sign is read from the \
+                 overrun below, not the wall clock)"
+            );
+            None
+        };
+
+        println!(
+            "OVERRUN (executed - ideal): mean {o_perms_mean:.0} perms · in strides {o_strides:.2} · \
+             granularity (k-1)/2 = {granularity:.1} · adjusted (overrun - granularity) {adjusted:.2} \
+             · searches overrunning > 1 stride {}/{RUNS}",
+            affected[a]
+        );
+        println!(
+            "RAN_TO_END (threads leaving by the loop bound, summed over {RUNS}): {} · deepest \
+             thread (max_iters) {}",
+            to_end_sum[a], max_iters_max[a]
+        );
+
+        summary.push(ArmRead {
+            name,
+            poll_period,
+            overrun_strides: o_strides,
+            adjusted,
+            ran_to_end: to_end_sum[a],
+            max_iters: max_iters_max[a],
+            admissible,
+        });
+    }
+
+    // ── ★ THE VERDICT, by name, beside what each branch predicted ───────────
     println!("\n=== ★ THE OVERRUN VERDICT ===");
     println!(
-        "{:<20} {:>16} {:>14} {:>14}",
-        "arm", "overrun/stride", "ran_to_end", "admissible"
+        "{:<20} {:>12} {:>16} {:>12} {:>12} {:>12} {:>10}",
+        "arm",
+        "poll_period",
+        "overrun/stride",
+        "granularity",
+        "adjusted",
+        "ran_to_end",
+        "max_iters"
     );
-    for (name, over, ends, ok) in &summary {
-        println!("{name:<20} {over:>16.2} {ends:>14} {:>14}", ok);
+    for r in &summary {
+        let gran = (r.poll_period as f64 - 1.0) / 2.0;
+        println!(
+            "{:<20} {:>12} {:>16.2} {:>12.1} {:>12.2} {:>12} {:>10}",
+            r.name, r.poll_period, r.overrun_strides, gran, r.adjusted, r.ran_to_end, r.max_iters
+        );
     }
-    match (at("scan 8 (record)"), at("scan 64")) {
-        (Some(s8), Some(s64)) if s8.3 && s64.3 => {
-            // Time-bounded means the SAME overrun however much room the loop
-            // bound leaves; count-bounded would have grown eightfold here.
-            let grew = s64.1 / s8.1.max(1e-9);
-            if s8.1 > 5.0 && (0.5..=2.0).contains(&grew) {
+
+    let at = |pp: u64| -> Option<&ArmRead> { summary.iter().find(|r| r.poll_period == pp) };
+    let adm_k1 = at(1).and_then(|r| r.admissible).unwrap_or(false);
+    match (adm_k1, at(1), at(16)) {
+        (false, _, _) => println!(
+            "  ⛔ NO VERDICT: the k=1 arm was NOT ADMISSIBLE (or absent); its counters describe a \
+             kernel with different occupancy from the one that ships, so the sweep's baseline is void."
+        ),
+        (true, Some(r1), Some(r16)) => {
+            let (o1, o16) = (r1.overrun_strides, r16.overrun_strides);
+            let adj16 = r16.adjusted;
+            if o16 < o1 - SIGN_MARGIN_STRIDES {
                 println!(
-                    "  ⇒ STALE-POLL: the overrun is {:.1} strides at scan 8 and {:.1} at scan \
-                     64, a ratio of {grew:.2} where a loop-bound cause would read about 8. \
-                     Threads DO execute extra permutations and the excess is bounded by TIME, \
-                     not by `count` — a poll of `*result` served stale. The fix is reader-side.",
-                    s8.1, s64.1
+                    "  ⇒ CONTENTION: overrun FELL {o1:.2} -> {o16:.2} strides (k=1 -> k=16) as the \
+                     poll rate dropped 16x. The stale-poll overrun is driven by contention on the \
+                     one *result address; a warp-lane (__shfl_sync) or per-block (__shared__ cell \
+                     holding the VALUE) poll is the fix. Granularity-adjusted k=16 = {adj16:.2} vs \
+                     k=1 {o1:.2}."
                 );
-            } else if s8.1 <= 1.0 && s64.1 <= 1.0 {
+            } else if o16 > o1 + SIGN_MARGIN_STRIDES {
                 println!(
-                    "  ⇒ NO OVERRUN: {:.2} and {:.2} strides. Nothing over-scans; the slow \
-                     launches run the SAME permutations more slowly, the straggler family is \
-                     dead, and the cost is outside this loop and owes a name.",
-                    s8.1, s64.1
+                    "  ⇒ POLL FAMILY DEAD: overrun ROSE {o1:.2} -> {o16:.2} strides (k=1 -> k=16); \
+                     polling less only wastes more scanning. Granularity alone predicts +{:.1}; \
+                     granularity-adjusted k=16 = {adj16:.2} vs k=1 {o1:.2} (≈ equal ⇒ the rise is \
+                     pure granularity). The LDL.64 sponge lever is the only survivor.",
+                    (16.0 - 1.0) / 2.0
                 );
             } else {
                 println!(
-                    "  ⇒ NEITHER BRANCH: {:.2} strides at scan 8 and {:.2} at scan 64 (ratio \
-                     {grew:.2}) match neither pre-registered reading. Report it unresolved \
-                     rather than rounding it to a verdict.",
-                    s8.1, s64.1
+                    "  ⇒ FLAT: overrun barely moved {o1:.2} -> {o16:.2} strides at 16x fewer polls; \
+                     neither contention nor a granularity-linear rise. A different discriminator is \
+                     owed."
                 );
             }
         }
-        (Some(_), Some(_)) => println!(
-            "  ⛔ NO VERDICT: one of the two arms was NOT ADMISSIBLE, so its counters describe \
-             a kernel with different occupancy from the one that ships."
+        _ => println!(
+            "  ⛔ NO VERDICT: the k=1 and k=16 arms the verdict is written over did not both run."
         ),
-        _ => {
-            println!("  ⛔ NO VERDICT: the two arms the verdict is written over did not both run.")
-        }
     }
 
+    // How to read it, pre-registered — worded to AVOID the verdict's own branch
+    // markers, so a launcher that counts those markers is not fooled by its own
+    // explanation (O3's stage-B miscount).
     println!(
         "\n=== HOW TO READ IT (pre-registered, not re-derived) ===\n  \
-         STALE-POLL: the overrun is ~0 on most searches and ~19 strides on a minority, the \
-         SAME on those at scan 8 and scan 64; max_iters ~ ceil(h/stride) + 20, never \
-         count/stride; ran_to_end near ZERO at scan 64 and NONZERO at scan 1.\n  \
-         NO OVERRUN: the overrun is ~0 everywhere including the slow searches — nothing \
-         over-scans, the slow launches run the same permutations more slowly, and the cost \
-         is outside this loop.\n  \
-         ⚠ An arm reported NOT ADMISSIBLE says nothing either way: its counters describe a \
-         kernel with different occupancy from the one that ships."
+         Overrun FALLING as the poll period rises => the flood on *result is the cause; the \
+         poll-less fix (warp-lane or per-block, the cell holding the VALUE) lives.\n  \
+         Overrun RISING ~linearly in the poll period => the poll is merely coarser (each thread \
+         over-scans ~(k-1)/2 iterations after the answer lands); that whole fix family is closed \
+         and only the LDL.64 sponge lever remains.\n  \
+         No movement => a different discriminator is owed.\n  \
+         k=64 is granularity-dominant ((k-1)/2 = 31.5 strides), so it confirms the trend; k=4 and \
+         k=16 are the primary reads. The 'adjusted' column removes the (k-1)/2 granularity term to \
+         isolate the contention component at every k."
     );
 }

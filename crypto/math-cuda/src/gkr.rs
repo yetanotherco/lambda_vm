@@ -135,6 +135,7 @@ impl DeviceFractionTree {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
             ));
         };
+        crate::argue_probe::note_device(crate::argue_probe::Surface::Gkr, p.len() as u64 * 8 * 4);
         let input = DeviceLayer {
             p: Arc::new(p),
             q: Arc::new(q),

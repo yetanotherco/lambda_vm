@@ -1019,12 +1019,26 @@ __device__ constexpr int COUNT_EXECUTED = 0;
 __device__ constexpr int COUNT_MAX_ITERS = 1;
 __device__ constexpr int COUNT_RAN_TO_END = 2;
 
+// ⭐ THE POLL-RATE KNOB (`poll_period`, the RPX grind k-sweep's k). The shipped
+// kernel polls `*result` every iteration; this twin polls it every
+// `poll_period`-th iteration, STAGGERED across threads. It answers whether the
+// stale-poll overrun is driven by CONTENTION on that one address: 131,072
+// resident threads each issue a system-scope load to it every permutation, and
+// the finder's `atomicMin` queues behind that flood. If lowering the poll rate
+// makes the overrun FALL, contention is the cause and a warp- or block-level
+// poll is the fix; if it RISES ~linearly in `poll_period`, polling less just
+// wastes more scanning and the poll family is dead. `poll_period == 1`
+// reproduces the shipped every-iteration poll exactly, which is the sweep's
+// admissibility control. ⚠ Wasted work, never a wrong answer — the search still
+// returns the globally smallest valid nonce whatever the poll rate; see the
+// soundness note above.
 extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
                                                     uint64_t limit,
                                                     uint64_t base,
                                                     uint64_t count,
                                                     volatile unsigned long long *result,
-                                                    unsigned long long *counts) {
+                                                    unsigned long long *counts,
+                                                    uint64_t poll_period) {
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     const uint64_t f0 = inner_felts[0], f1 = inner_felts[1], f2 = inner_felts[2],
@@ -1037,11 +1051,25 @@ extern "C" __global__ void rpx_grind_search_counted(const uint64_t *inner_felts,
     // past `count` never enters the loop and must not be scored as having
     // scanned to the end.
     uint64_t to_end = 0;
+    // ⭐ STAGGERED POLL. `poll_period` is a power of two (caller-guaranteed), so
+    // the period is a bitmask; `(n + tid) & poll_mask == 0` fires once every
+    // `poll_period` iterations with a phase that differs per thread, so at any
+    // one iteration only 1/poll_period of threads issue the system-scope load.
+    // A synchronised `n & poll_mask` would fire on the SAME iteration for every
+    // thread, holding the peak request rate constant and changing only the duty
+    // cycle. poll_mask == 0 (poll_period == 1) polls every iteration, identical
+    // to the shipped kernel.
+    const uint64_t poll_mask = poll_period - 1;
+    // This thread's own loop-iteration counter, kept independent of `i / stride`
+    // (that identity holds only while `tid < stride`; a counter cannot be broken
+    // by a future change to the indexing).
+    uint64_t n = 0;
     uint64_t i = tid;
     for (; i < count; i += stride) {
         uint64_t nonce = base + i;
         if (nonce < base) break;
-        if (nonce >= (uint64_t)*result) break;
+        if (((n + tid) & poll_mask) == 0 && nonce >= (uint64_t)*result) break;
+        ++n;
         ++iters;
         rpx::Sponge sp;
         sp.init(GRIND_FELTS);
