@@ -69,6 +69,7 @@ use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as hal
 use crate::tables::hint::{
     HintConstraints, bus_interactions as hint_bus_interactions, cols as hint_cols,
 };
+use crate::tables::is_b48::{bus_interactions as is_b48_bus_interactions, cols as is_b48_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
 };
@@ -912,6 +913,23 @@ pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstr
         1,
         HintConstraints,
         "HINT",
+    )
+}
+
+/// Create the IS_B48 AIR: the `IS_B48[Word, Half]` range-check provider.
+///
+/// No polynomial constraints. Its four interactions carry the whole argument:
+/// three `IS_HALF` sends pin the limbs to `[0, 2^16)` against BITWISE, and the
+/// `IS_B48` receive offers the resulting `(Word, Half)` tuple to callers. A row
+/// with `mu = 0` is inert on both sides, so nothing needs to constrain `mu`.
+pub fn create_is_b48_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        is_b48_cols::NUM_COLUMNS,
+        is_b48_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "IS_B48",
     )
 }
 

@@ -53,10 +53,10 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_is_b48_air,
+    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -119,6 +119,10 @@ pub struct TableCounts {
     pub ecsm: usize,
     pub ecdas: usize,
     pub hint: usize,
+    /// IS_B48 range-check chip. Not an accelerator itself — it backs the
+    /// `IsB48` bus that the accelerators send on — but it is counted and
+    /// omitted on the same terms.
+    pub is_b48: usize,
     pub commit: usize,
 }
 
@@ -151,6 +155,7 @@ impl TableCounts {
             self.ecsm,
             self.ecdas,
             self.hint,
+            self.is_b48,
             self.commit,
         ]
         .into_iter()
@@ -211,6 +216,7 @@ impl TableCounts {
             ("ecsm", self.ecsm),
             ("ecdas", self.ecdas),
             ("hint", self.hint),
+            ("is_b48", self.is_b48),
             ("commit", self.commit),
         ];
         for (name, count) in at_most_one {
@@ -593,6 +599,7 @@ pub(crate) struct VmAirs {
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub is_b48s: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -630,6 +637,7 @@ impl VmAirs {
                 self.ecsms.len(),
                 self.ecdases.len(),
                 self.hints.len(),
+                self.is_b48s.len(),
                 self.pages.len(),
                 self.memw_registers.len(),
                 self.eqs.len(),
@@ -653,6 +661,7 @@ impl VmAirs {
                 traces.ecsms.len(),
                 traces.ecdases.len(),
                 traces.hints.len(),
+                traces.is_b48s.len(),
                 traces.pages.len(),
                 traces.memw_registers.len(),
                 traces.eqs.len(),
@@ -687,6 +696,9 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.is_b48s.iter().zip(traces.is_b48s.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
 
@@ -774,6 +786,9 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.hints {
+            refs.push(air.as_ref());
+        }
+        for air in &self.is_b48s {
             refs.push(air.as_ref());
         }
 
@@ -971,6 +986,12 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let is_b48s: Vec<_> = (0..table_counts.is_b48)
+            .map(|i| {
+                Box::new(create_is_b48_air(proof_options).with_name(&format!("IS_B48[{i}]")))
+                    as VmAir
+            })
+            .collect();
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -1092,6 +1113,7 @@ impl VmAirs {
             ecsms,
             ecdases,
             hints,
+            is_b48s,
             register,
             pages,
             memw_registers,

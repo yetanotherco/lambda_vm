@@ -28,6 +28,7 @@ fn sample_counts() -> TableCounts {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
+        is_b48: 1,
         commit: 1,
     }
 }
@@ -97,6 +98,7 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ecsm,
         ecdas,
         hint,
+        is_b48,
         commit,
     } = counts;
     vec![
@@ -119,12 +121,13 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ("ecsm", ecsm),
         ("ecdas", ecdas),
         ("hint", hint),
+        ("is_b48", is_b48),
         ("commit", commit),
     ]
 }
 
 /// Every count has to reach the transcript, not just the one a test happened
-/// to pick. The V4 encoding added six accelerator counts; a field that is
+/// to pick. The V5 encoding added the IS_B48 count; a field that is
 /// destructured in `absorb_statement` and then left out of the array it
 /// absorbs compiles clean and changes nothing about the state, which is a
 /// prover-chosen number the verifier would no longer be bound to.
@@ -136,7 +139,7 @@ fn state_depends_on_every_table_count() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(names.len(), 20, "every count must be probed");
+    assert_eq!(names.len(), 21, "every count must be probed");
 
     for name in names {
         let mut counts = sample_counts();

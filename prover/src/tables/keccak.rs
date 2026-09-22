@@ -4,7 +4,7 @@
 //! sends input state to the round chip via the Keccak bus, and receives the output
 //! state after 24 rounds.
 //!
-//! ## Column layout (~511 columns)
+//! ## Column layout (~486 columns)
 //!
 //! | Group          | Size | Description                                    |
 //! |----------------|------|------------------------------------------------|
@@ -12,8 +12,15 @@
 //! | addr           |    8 | State address as DWordBL (8 bytes)             |
 //! | input_state    |  200 | Input state bytes [5][5][8]                    |
 //! | output_state   |  200 | Output state bytes [5][5][8]                   |
-//! | state_ptr      |  100 | Per-lane DWordHL addresses [25][4]             |
+//! | state_ptr      |   75 | Per-lane DWordWHH addresses [25][3]            |
 //! | mu             |    1 | Multiplicity flag                              |
+//!
+//! The 25 lane pointers are contiguous (`addr + 8*lane`), so their top 48 bits
+//! are the same value up to a 64 KiB boundary crossing. Rather than range-check
+//! four `Half` limbs each, every lane checks its low limb with `IS_HALF` and
+//! defers the top 48 bits to the IS_B48 chip, which collapses the repeats onto
+//! one row. That drops 25 columns and 50 bus interactions from this table; see
+//! `spec/src/is_b48.toml`.
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -41,12 +48,12 @@ pub mod cols {
     // output_state[5][5][8] = 200 bytes
     pub const OUTPUT_STATE: usize = INPUT_STATE + 200; // 210
 
-    // state_ptr[25][4] = 100 halfwords (DWordHL per lane)
+    // state_ptr[25][3] = 75 limbs (DWordWHH per lane: Half, Half, Word)
     pub const STATE_PTR: usize = OUTPUT_STATE + 200; // 410
 
-    pub const MU: usize = STATE_PTR + 100; // 510
+    pub const MU: usize = STATE_PTR + 75; // 485
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 511
+    pub const NUM_COLUMNS: usize = MU + 1; // 486
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -69,10 +76,13 @@ pub mod cols {
         OUTPUT_STATE + (x + 5 * y) * 8 + byte
     }
 
-    /// Index into state_ptr[lane_idx][halfword] (DWordHL = 4 halfwords)
+    /// Index into state_ptr[lane_idx][limb] (DWordWHH = Half, Half, Word).
+    ///
+    /// Limbs are stored low-first: `limb` 0 and 1 are the `Half`s covering bits
+    /// [0, 16) and [16, 32), limb 2 is the `Word` covering bits [32, 64).
     #[inline]
-    pub const fn state_ptr(lane_idx: usize, hw: usize) -> usize {
-        STATE_PTR + lane_idx * 4 + hw
+    pub const fn state_ptr(lane_idx: usize, limb: usize) -> usize {
+        STATE_PTR + lane_idx * 3 + limb
     }
 }
 
@@ -133,7 +143,7 @@ pub fn generate_keccak_trace(
                 .state_addr
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
-            table.set_dword_hl(row_idx, cols::state_ptr(lane_idx, 0), ptr);
+            table.set_dword_whh(row_idx, cols::state_ptr(lane_idx, 0), ptr);
         }
 
         // mu = 1 (real row)
@@ -141,7 +151,7 @@ pub fn generate_keccak_trace(
     }
 
     // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
-    // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
+    // Limbs 1 and 2 stay zero since 8*24 = 192 fits in the low halfword.
     // mu = 0 gates all bus interactions and the ADD constraint, so these values
     // only need to satisfy the pad requirement, not reconstruct a real address.
     for row_idx in n..num_rows {
@@ -324,18 +334,36 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 4. IS_HALF range checks on state_ptr (100 interactions)
+    // 4. Range checks on state_ptr (50 interactions).
+    //
+    // Each lane pointer is a DWordWHH: the low `Half` is checked here directly,
+    // and its top 48 bits — limb 2 (the `Word`, bits [32, 64)) and limb 1 (the
+    // `Half`, bits [16, 32)) — go to the IS_B48 chip as one `IS_B48[Word, Half]`
+    // tuple. All 25 lanes of a call share that tuple unless the buffer crosses a
+    // 64 KiB boundary, so IS_B48 answers them from one or two rows.
     for lane_idx in 0..25 {
-        for hw in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
-                Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
-                    start_column: cols::state_ptr(lane_idx, hw),
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::state_ptr(lane_idx, 0),
+                packing: Packing::Direct,
+            }],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::IsB48,
+            Multiplicity::Column(cols::MU),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::state_ptr(lane_idx, 2),
                     packing: Packing::Direct,
-                }],
-            ));
-        }
+                },
+                BusValue::Packed {
+                    start_column: cols::state_ptr(lane_idx, 1),
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
     }
 
     // 5. Alignment: addr[0] & 7 = 0, which enforces addr % 8 == 0.
@@ -385,7 +413,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         let x = lane_idx % 5;
         let y = lane_idx / 5;
 
-        // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
+        // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = the DWordWHH `Word`.
         let addr_lo = BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
@@ -396,16 +424,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 column: cols::state_ptr(lane_idx, 1),
             },
         ]);
-        let addr_hi = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::state_ptr(lane_idx, 2),
-            },
-            LinearTerm::Column {
-                coefficient: 65536,
-                column: cols::state_ptr(lane_idx, 3),
-            },
-        ]);
+        let addr_hi = BusValue::Packed {
+            start_column: cols::state_ptr(lane_idx, 2),
+            packing: Packing::Direct,
+        };
 
         let mut values = Vec::with_capacity(24);
         // old[0..8] = input_state bytes (the value being read)
@@ -458,7 +480,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The KECCAK core table's 51 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
 ///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
-///   `state_ptr` DWordHL);
+///   `state_ptr` DWordWHH);
 /// - idx 50:   `μ · carry_1 = 0` (top-lane no-overflow), where `carry_1` is the
 ///   high carry of `addr + 192 = state_ptr[24]`.
 #[derive(Clone, Copy)]
@@ -481,7 +503,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
                 &[cols::MU],
                 &AddOperand::from_dword_bl(cols::ADDR),
                 &AddOperand::constant(offset),
-                &AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
+                &AddOperand::from_dword_whh(cols::state_ptr(lane_idx, 0)),
             );
         }
 
@@ -497,9 +519,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
             + b.main(0, cols::addr(5)) * c256
             + b.main(0, cols::addr(6)) * c65536.clone()
             + b.main(0, cols::addr(7)) * c16777216;
-        let ptr_lo =
-            b.main(0, cols::state_ptr(24, 0)) + b.main(0, cols::state_ptr(24, 1)) * c65536.clone();
-        let ptr_hi = b.main(0, cols::state_ptr(24, 2)) + b.main(0, cols::state_ptr(24, 3)) * c65536;
+        let ptr_lo = b.main(0, cols::state_ptr(24, 0)) + b.main(0, cols::state_ptr(24, 1)) * c65536;
+        // DWordWHH: the high 32 bits are one `Word` column, not two halves.
+        let ptr_hi = b.main(0, cols::state_ptr(24, 2));
 
         let inv_2_32 = b.const_base(INV_SHIFT_32);
         let c192 = b.const_base(192);

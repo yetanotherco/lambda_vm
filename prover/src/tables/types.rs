@@ -359,6 +359,24 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Wide range check (IS_B48 table provides)
+    // =========================================================================
+    /// `IS_B48[W, H]`: range check that `W` is a `Word` and `H` a `Half`, i.e.
+    /// that the 48-bit value `H + 2^16 * W` decomposes into three 16-bit limbs.
+    ///
+    /// Unlike the range checks above this one is not served by BITWISE — 2^48
+    /// rows do not fit in a table. The IS_B48 chip provides it instead by
+    /// holding the three limbs as columns and sending each to BITWISE's
+    /// [`IsHalfword`](BusId::IsHalfword), so one row covers every caller that
+    /// asks about the same 48 bits.
+    ///
+    /// A chip range-checking a 64-bit address sends one `IsHalfword` for the low
+    /// limb and one `IsB48` for the top 48 bits, rather than four `IsHalfword`s.
+    /// Spec: `spec/src/is_b48.toml`, `spec/chapters/is_b48.typ`.
+    // ID 29 is reserved for the removed `ServeK` bus (#753).
+    IsB48 = 32,
 }
 
 impl BusId {
@@ -388,6 +406,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::IsB48 => "IsB48",
         }
     }
 }
@@ -420,6 +439,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::IsB48),
             other => Err(other),
         }
     }

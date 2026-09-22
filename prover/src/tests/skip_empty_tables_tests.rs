@@ -99,6 +99,7 @@ fn every_table_participates_in_the_bus() {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
+        is_b48: 1,
         commit: 1,
     };
     let airs = VmAirs::new(
@@ -157,6 +158,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecsm,
         ecdas,
         hint,
+        is_b48,
         commit,
     } = counts;
     [
@@ -179,6 +181,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECSM", ecsm),
         ("ECDAS", ecdas),
         ("HINT", hint),
+        ("IS_B48", is_b48),
         ("COMMIT", commit),
     ]
     .into_iter()
@@ -376,10 +379,10 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
-        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt,
-        memw, memw_aligned, mul, shift, store,
+        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, is_b48, keccak, keccak_rnd,
+        load, lt, memw, memw_aligned, mul, shift, store,
     };
-    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 19] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
         ("MEMW_A", memw_aligned::bus_interactions()),
@@ -397,6 +400,7 @@ fn no_optional_table_uses_a_constant_multiplicity() {
         ("ECSM", ecsm::bus_interactions()),
         ("ECDAS", ecdas::bus_interactions()),
         ("HINT", hint::bus_interactions()),
+        ("IS_B48", is_b48::bus_interactions()),
         ("COMMIT", commit::bus_interactions()),
     ];
     for (name, interactions) in optional {
@@ -565,12 +569,13 @@ fn an_accelerator_count_above_one_is_rejected() {
     // Named setters rather than a match with a catch-all: a wrong field would
     // otherwise pass the assertion below while testing the wrong count.
     type SetCount = fn(&mut TableCounts);
-    let inflate: [(&str, SetCount); 6] = [
+    let inflate: [(&str, SetCount); 7] = [
         ("keccak", |c| c.keccak = 2),
         ("keccak_rnd", |c| c.keccak_rnd = 2),
         ("ecsm", |c| c.ecsm = 2),
         ("ecdas", |c| c.ecdas = 2),
         ("hint", |c| c.hint = 2),
+        ("is_b48", |c| c.is_b48 = 2),
         ("commit", |c| c.commit = 2),
     ];
     for (name, set_to_two) in inflate {
@@ -620,9 +625,10 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the six.
+/// ecall now carries none of the seven — IS_B48 included, since the only chip
+/// that sends on its bus today is KECCAK.
 #[test]
-fn a_run_without_accelerators_omits_all_six() {
+fn a_run_without_accelerators_omits_all_seven() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
@@ -634,6 +640,7 @@ fn a_run_without_accelerators_omits_all_six() {
         ("ecsm", counts.ecsm),
         ("ecdas", counts.ecdas),
         ("hint", counts.hint),
+        ("is_b48", counts.is_b48),
         ("commit", counts.commit),
     ] {
         assert_eq!(

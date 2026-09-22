@@ -2844,6 +2844,7 @@ fn test_verify_rejects_zero_table_counts() {
             ecsm: 0,
             ecdas: 0,
             hint: 0,
+            is_b48: 0,
             commit: 0,
         },
         ..vm_proof
@@ -2935,6 +2936,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         ecsm: 0,
         ecdas: 0,
         hint: 0,
+        is_b48: 0,
         commit: 0,
     };
     let airs = VmAirs::new(

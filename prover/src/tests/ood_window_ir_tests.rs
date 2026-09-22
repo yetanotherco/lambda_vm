@@ -115,4 +115,5 @@ fn all_table_windows_match_captured_ir() {
     assert_ood_window_matches_ir(&create_ecsm_air(&opts), true, "ECSM");
     assert_ood_window_matches_ir(&create_ecdas_air(&opts), true, "ECDAS");
     assert_ood_window_matches_ir(&create_hint_air(&opts), true, "HINT");
+    assert_ood_window_matches_ir(&create_is_b48_air(&opts), true, "IS_B48");
 }

@@ -109,6 +109,7 @@ impl core::ops::Deref for AddTerms {
 /// - Constants: `AddOperand::constant(42)` → lo=42, hi=0
 /// - Word → DWordWL: `AddOperand::from_word(col)` → lo=col, hi=0
 /// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
+/// - DWordWHH → DWordWL: `AddOperand::from_dword_whh(col)` → repack 2 halves + word
 /// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
 /// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +183,37 @@ impl AddOperand {
                     column: start_column + 3,
                 },
             ]),
+        }
+    }
+
+    /// DWordWHH → DWordWL: repack two halves and a word into 2 words.
+    ///
+    /// The spec's `DWordWHH` names the digits most-significant-first, but trace
+    /// columns are stored low-first (see [`VmTable::set_dword_whh`]), so the
+    /// layout here is `[h0, h1, w2]`:
+    /// lo = h[0] + 2^16 * h[1]
+    /// hi = w[2]
+    ///
+    /// Cheaper than [`from_dword_hl`](AddOperand::from_dword_hl): the high limb
+    /// is a single column rather than a two-term combination.
+    ///
+    /// [`VmTable::set_dword_whh`]: crate::tables::types::VmTable::set_dword_whh
+    pub fn from_dword_whh(start_column: usize) -> Self {
+        AddOperand::Linear {
+            lo: AddTerms::of(&[
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 1,
+                },
+            ]),
+            hi: AddTerms::of(&[AddLinearTerm::Column {
+                coefficient: 1,
+                column: start_column + 2,
+            }]),
         }
     }
 

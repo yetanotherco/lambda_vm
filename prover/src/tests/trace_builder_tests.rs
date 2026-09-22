@@ -630,8 +630,73 @@ mod keccak_tests {
         // θ/ρ halfword shifts are enforced by inline μ-gated identities on the
         // keccak_rnd chip, so no HWSL lookups are emitted (was 24 * 120).
         assert_eq!(hwsl, 0, "Hwsl count");
-        assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 105 + 24 * 1028, "Total bitwise ops");
+        // One per lane, for the low limb of state_ptr only: the top 48 bits go
+        // to the IS_B48 chip, whose own IS_HALF sends are counted separately by
+        // `collect_bitwise_from_b48` (and weighted by that chip's multiplicity,
+        // so the total reaching BITWISE per call is unchanged at 100).
+        assert_eq!(is_half, 25, "IsHalf count");
+        assert_eq!(ops.len(), 30 + 24 * 1028, "Total bitwise ops");
+    }
+
+    /// The IS_HALF traffic BITWISE has to account for is unchanged by the move to
+    /// IS_B48 — 100 per keccak call — it just arrives from two chips instead of
+    /// one: 25 from KECCAK's low limbs and 75 from the IS_B48 chip, which sends
+    /// three per row weighted by that row's multiplicity.
+    ///
+    /// This is the invariant a wrong weight breaks silently. Counting one per
+    /// request instead of `mu` per row would undercount BITWISE's multiplicity
+    /// column, and the only symptom is an unbalanced bus at proving time with no
+    /// pointer to the cause.
+    #[test]
+    fn keccak_and_is_b48_together_send_the_same_is_half_traffic() {
+        use crate::tables::bitwise::{BitwiseHistogram, BitwiseOperation};
+
+        let (kop, _) = make_keccak_ops();
+
+        // A 200-byte state at 0x1000 sits inside one 64 KiB page, so all 25
+        // lanes share one prefix: one row carrying mu = 25.
+        let b48_ops = collect_b48_from_keccak(&[kop.clone()]);
+        assert_eq!(b48_ops.len(), 25, "one request per lane pointer");
+        let merged = crate::tables::is_b48::merge_operations(&b48_ops);
+        assert_eq!(merged, vec![(b48_ops[0], 25)]);
+
+        let count_is_half = |hist: &BitwiseHistogram| -> u64 {
+            let mut trace = crate::tables::bitwise::generate_bitwise_trace();
+            hist.fill_multiplicities(&mut trace);
+            (0..trace.num_rows())
+                .map(|row| {
+                    *trace
+                        .main_table
+                        .get(row, crate::tables::bitwise::cols::MU_IS_HALF)
+                        .value()
+                })
+                .sum()
+        };
+
+        let mut from_keccak = BitwiseHistogram::new();
+        let keccak_ops: Vec<BitwiseOperation> = collect_bitwise_from_keccak(&[kop])
+            .into_iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
+            .collect();
+        from_keccak.add_ops(&keccak_ops);
+        assert_eq!(count_is_half(&from_keccak), 25);
+
+        let mut from_b48 = BitwiseHistogram::new();
+        collect_bitwise_from_b48(&b48_ops, &mut from_b48);
+        assert_eq!(
+            count_is_half(&from_b48),
+            75,
+            "three limbs x mu = 25, not three x one row"
+        );
+
+        let mut both = BitwiseHistogram::new();
+        both.add_ops(&keccak_ops);
+        collect_bitwise_from_b48(&b48_ops, &mut both);
+        assert_eq!(
+            count_is_half(&both),
+            100,
+            "the same IS_HALF traffic as before the split"
+        );
     }
 
     #[test]
@@ -729,8 +794,8 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            134,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+            84,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 25 IS_HALF (state_ptr low limb) + 25 IS_B48 (state_ptr top 48 bits) + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
@@ -749,7 +814,11 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_column_counts() {
-        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(
+            core_cols::NUM_COLUMNS,
+            486,
+            "KECCAK core columns (state_ptr is DWordWHH: 3 limbs per lane, not 4)"
+        );
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
             1480,

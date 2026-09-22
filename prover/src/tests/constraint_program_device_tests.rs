@@ -182,4 +182,5 @@ fn all_table_programs_lower_and_match_folders() {
     check_air_device(&create_ecsm_air(&opts), "ECSM");
     check_air_device(&create_ecdas_air(&opts), "ECDAS");
     check_air_device(&create_hint_air(&opts), "HINT");
+    check_air_device(&create_is_b48_air(&opts), "IS_B48");
 }
