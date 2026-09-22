@@ -3492,9 +3492,17 @@ fn tree_siblings() -> usize {
 /// a TASK INSIDE level 0's pool instead of as a `K=1` stage between level 0 and
 /// level 1.
 ///
-/// Unset is today's shape, so the control arm and the candidate arm are the same
-/// binary. `LFM_TREE_TOP_OVERLAP=1` turns it on; an empty value reads as unset,
-/// for `resolve_siblings`' reason.
+/// ★ **THE DEFAULT IS PER DRIVER, and only the default.** The WHIR tree runs the
+/// overlap unset, because it is measured there: −3.85 s alone and −11.85 s with
+/// fan-in 3 (wt33-38, A/B/B/A, the bit-exactness gates held). The STARK tree
+/// keeps it off unset, so every STARK number on record stays comparable and an
+/// arm that changes only the interior is still the same experiment it was.
+///
+/// ⛔ `LFM_TREE_TOP_OVERLAP` still decides it on BOTH drivers and means the same
+/// thing on both: `1` on, `0` off, and an empty value reads as unset — for
+/// `resolve_siblings`' reason — so neither default can be reached only by
+/// unsetting. `0` is the way back on the WHIR path and the only way to name the
+/// control arm explicitly.
 /// One slot of a pool whose tasks are not all the same kind.
 ///
 /// Level 0's pool proves epoch wraps; under `LFM_TREE_TOP_OVERLAP` one of its
@@ -3582,9 +3590,17 @@ fn parse_positive(var: &str, default: usize) -> usize {
     }
 }
 
-fn tree_top_overlap() -> bool {
+/// `LFM_TREE_TOP_OVERLAP`, resolved against the CALLER'S default — see the knob's
+/// own doc above [`PoolOut`] for what it selects and why the two trees differ.
+///
+/// ⛔ THE DEFAULT IS A PARAMETER RATHER THAN A SECOND FUNCTION so the parse, the
+/// explicit `0`, the explicit `1` and the panic on anything else are written
+/// ONCE. A driver may choose which arm an unset knob lands on; it may not
+/// acquire its own spelling of the knob.
+fn tree_top_overlap(default: bool) -> bool {
     match std::env::var("LFM_TREE_TOP_OVERLAP").ok().as_deref() {
-        None | Some("") | Some("0") => false,
+        None | Some("") => default,
+        Some("0") => false,
         Some("1") => true,
         Some(other) => panic!("LFM_TREE_TOP_OVERLAP must be `0` or `1`, got `{other}`"),
     }
@@ -6234,7 +6250,11 @@ fn the_production_tree_composes_to_a_root() {
     // ⛔ INDEX 0 so a free worker picks it up immediately. It is ~10 s against a
     // wrap's ~14.6 worker-seconds; queued last it would BE the tail and the
     // lever would pay for itself twice.
-    let top_overlap = tree_top_overlap();
+    //
+    // ⛔ `false` IS THE STARK TREE'S DEFAULT AND STAYS ONE. The WHIR driver runs
+    // the overlap unset; this one does not, so an unset knob here selects exactly
+    // the shape every STARK number on record was taken at.
+    let top_overlap = tree_top_overlap(false);
     let l0_offset = usize::from(top_overlap);
     if top_overlap {
         println!(
@@ -7107,11 +7127,25 @@ where
     //
     // ⛔ INDEX 0, so a free worker picks it up immediately. Queued last it would
     // BE the tail and the lever would pay for itself twice.
+    // ⓘ PRINTED ON BOTH ARMS, because on this tree the overlap is the DEFAULT.
+    // A banner that appeared only when the lever was on named the arm precisely
+    // while an unset knob selected the other one; now that unset selects the
+    // overlap, silence would name the arm a reader is least likely to expect.
+    // ⛔ The on-arm line still begins `★ TOP OVERLAP:` exactly, so the gate that
+    // greps for it across a run is unchanged; the off-arm line is deliberately a
+    // different prefix and cannot be mistaken for it.
     let l0_offset = usize::from(top_overlap);
     if top_overlap {
         println!(
             "   ★ TOP OVERLAP: the WHIR GLOBAL child runs as task 0 of level 0's \
-             pool (LFM_TREE_TOP_OVERLAP=1; unset = the K=1 stage after level 0)"
+             pool (the default; LFM_TREE_TOP_OVERLAP=0 puts it back as the K=1 \
+             stage after level 0)"
+        );
+    } else {
+        println!(
+            "   ★ TOP OVERLAP OFF: the WHIR GLOBAL child runs as the K=1 stage \
+             after level 0 (LFM_TREE_TOP_OVERLAP=0; unset = task 0 of level 0's \
+             pool)"
         );
     }
     // ⓘ Boxed for the same reason the STARK level boxes its slots: the two
@@ -7638,7 +7672,7 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
 #[ignore = "box tier, production scale: the WHIR base, its level 0 and the interior"]
 fn the_whir_production_tree_composes_to_a_root() {
     use super::epoch_tests::EpochInputs;
-    use super::per_table_aggregator::{FAN_IN, tree_node_count, tree_shape};
+    use super::per_table_aggregator::{WHIR_FAN_IN, tree_node_count, tree_shape};
     use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
     use std::time::Instant;
@@ -7722,11 +7756,21 @@ fn the_whir_production_tree_composes_to_a_root() {
          — no WHIR tree has been proved. Unset it"
     );
 
+    // ★ THREE UNSET, AND FROM THIS TREE'S OWN CONSTANT. `WHIR_FAN_IN` is not
+    // `FAN_IN`: the STARK tree keeps two because its arity-3 node does not fit
+    // the card (ds15/ds16), and this tree takes three because the host peak the
+    // shared constant's doc was waiting on now exists — 31.1-31.5 GiB of a 33.5
+    // gate, `device fallbacks 0` and `commit fallbacks 0` on every arm — and it
+    // is worth −8.05 s of interior card time (wt29-32).
+    //
+    // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the same parse and the same
+    // 2..=4 bound as the STARK driver. What changed is which value an unset
+    // variable selects, and nothing else.
     let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
-        Err(_) => FAN_IN,
+        Err(_) => WHIR_FAN_IN,
     };
     assert!(
         (2..=4).contains(&fan_in),
@@ -7943,10 +7987,10 @@ fn the_whir_production_tree_composes_to_a_root() {
     super::device_permit::arm(l0_siblings);
     let level0_sampler = HostSampler::start();
 
-    // ★ ROUND 3's KNOB, RESOLVED BEFORE THE LEVEL AND PRINTED BY IT. Unset or
-    // `0` is today's shape exactly — the global stage runs as a `K = 1` stage
-    // after level 0 — so the control arm and the candidate arm are ONE binary.
-    // `1` makes the global child task 0 of level 0's pool.
+    // ★ ROUND 3's KNOB, RESOLVED BEFORE THE LEVEL AND PRINTED BY IT — AND ON
+    // THIS TREE IT IS THE DEFAULT. Unset, the global child is task 0 of level
+    // 0's pool; `0` puts it back as the `K = 1` stage after level 0, which is the
+    // control arm and is still ONE binary away.
     //
     // ⛔ WHY THIS STOPPED BEING A REFUSAL. The refusal that used to sit in the
     // list above said, in as many words, "overlapping it is an optimisation
@@ -7954,7 +7998,14 @@ fn the_whir_production_tree_composes_to_a_root() {
     // own stage is 6.5 s of which 4.4 s is host work performed with NO other
     // proof on the card (measured, wt27/wt28 `CARD HOLD` brackets), because the
     // stage runs alone between level 0 and the interior.
-    let top_overlap = tree_top_overlap();
+    //
+    // ⛔ AND WHY IT STOPPED BEING AN UNSET KNOB. The lever was A/B/B/A'd on this
+    // driver — −3.85 s alone (wt33-36) and −11.85 s beside fan-in 3 (wt37-38,
+    // 128.3 s against 140.2) — with the 15 wrap `program_id`s and the `whir
+    // global IDENTITY` unmoved on both arms. A default that reproduces the
+    // landed number is the point: a run with no knobs set must be the measured
+    // configuration, not the configuration the launcher happened to remember.
+    let top_overlap = tree_top_overlap(true);
     // ⓘ ONE LINE PER ARM, which is the whole reason level 0 is a function: the
     // macro duplicates whatever is written here.
     let (mut children, mut layouts, mut labels, overlapped_global) = crate::with_whir_hash!(|H| {
@@ -7997,19 +8048,21 @@ fn the_whir_production_tree_composes_to_a_root() {
 
     // ---- level 0's OTHER child: the WHIR GLOBAL WRAP.
     //
-    // ⓘ ITS WORK MAY ALREADY BE DONE. Under `LFM_TREE_TOP_OVERLAP=1` this value
-    // was produced by a task inside level 0's own pool; unset, it is proved right
-    // here, exactly where the stage has always run. ★ EITHER WAY IT IS CONSUMED
-    // AT THIS POINT IN THE PROGRAM, so nothing downstream can tell which — the
-    // root reads `global.child` and `global.published` from the same place in the
-    // same order.
+    // ⓘ ITS WORK IS NORMALLY ALREADY DONE. Unset, and under
+    // `LFM_TREE_TOP_OVERLAP=1`, this value was produced by a task inside level
+    // 0's own pool; under `LFM_TREE_TOP_OVERLAP=0` it is proved right here, where
+    // the stage ran before the lever landed. ★ EITHER WAY IT IS CONSUMED AT THIS
+    // POINT IN THE PROGRAM, so nothing downstream can tell which — the root reads
+    // `global.child` and `global.published` from the same place in the same
+    // order.
     //
-    // ⓘ WHERE THE STARK HARNESS RUNS `prove_global_child`, and after level 0 by
-    // default for a reason. ✓ The stage reads only the base bundle — its
+    // ⓘ WHERE THE STARK HARNESS RUNS `prove_global_child`, and where this driver
+    // runs it on the `0` arm. ✓ The stage reads only the base bundle — its
     // signature says so, and its own doc adds "it reads NOTHING any level-0 wrap
-    // produced" — so it CAN run beside the level. Leaving it here on the unset
-    // arm keeps a level-0 wall from this binary comparable to every earlier WHIR
-    // run.
+    // produced" — so it CAN run beside the level, which is why unset now does.
+    // ⛔ Keeping the code path here is what makes `0` a real control rather than
+    // a removed option: a level-0 wall from this binary is still comparable to
+    // every WHIR run taken before the lever, by naming one variable.
     //
     // ⛔ AND A REFUSAL, NEVER A `return`. `prove_whir_global_child` hands back
     // the reason it could not build, and a run with no global child has no extra
