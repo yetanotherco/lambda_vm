@@ -915,6 +915,21 @@ pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstr
     )
 }
 
+/// Create the unified MEMMOVE AIR: one streaming copy primitive for memcpy/memmove,
+/// memset and the commit byte loop, selected by the decoded functionality columns.
+pub fn create_memmove_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::memmove::MemmoveConstraints> {
+    build_air(
+        crate::tables::memmove::cols::NUM_COLUMNS,
+        crate::tables::memmove::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::memmove::MemmoveConstraints,
+        "MEMMOVE",
+    )
+}
+
 /// Create COMMIT AIR with constraints and bus interactions.
 pub fn create_commit_air(proof_options: &ProofOptions) -> ConcreteVmAir<CommitConstraints> {
     build_air(

@@ -372,3 +372,33 @@ pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>
     let root_1 = bit(b, c1, carry_1);
     b.emit_base(idx + 1, root_1);
 }
+
+/// A 64-bit ADD that rejects unsigned overflow on active, non-terminal rows —
+/// those where the `active_column` value minus the `end_column` value equals 1.
+///
+/// The low-word carry remains boolean on every row. On active non-terminal
+/// rows, the high-word carry is constrained to zero instead of merely boolean,
+/// so `lhs + rhs` cannot wrap modulo `2^64`. Terminal and padding rows leave the
+/// high carry unconstrained because their computed successor is not consumed.
+pub fn emit_add_pair_no_overflow<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    active_column: usize,
+    end_column: usize,
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) {
+    let inv_2_32 = b.const_base(INV_SHIFT_32);
+    let carry_0 = (add_operand_lo(b, lhs) + add_operand_lo(b, rhs) - add_operand_lo(b, sum))
+        * inv_2_32.clone();
+    let carry_1 = (add_operand_hi(b, lhs) + add_operand_hi(b, rhs) + carry_0.clone()
+        - add_operand_hi(b, sum))
+        * inv_2_32;
+
+    let one = b.one();
+    b.emit_base(idx, carry_0.clone() * (one - carry_0));
+
+    let active = b.main(0, active_column) - b.main(0, end_column);
+    b.emit_base(idx + 1, active * carry_1);
+}
