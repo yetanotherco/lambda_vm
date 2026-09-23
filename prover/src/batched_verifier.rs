@@ -141,14 +141,14 @@ pub fn verify(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
-    verify_with_precomputed(proof, elf_bytes, proof_options, None, None)
+    verify_with_precomputed(proof.clone(), elf_bytes, proof_options, None, None)
 }
 
 /// [`verify`] with the ELF-only preprocessed roots supplied instead of
 /// recomputed. The recursion guest holds them already; recomputing DECODE and
 /// every data page in-VM is the single most expensive thing a verifier can do.
 pub fn verify_with_precomputed(
-    proof: &BatchedProof,
+    proof: BatchedProof,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     decode_commitment: Option<stark::config::Commitment>,
@@ -282,31 +282,43 @@ pub fn verify_with_precomputed(
     }
 
     // Each table as the ordinary verifier reads one, with the FRI left empty.
-    let tables: Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>> = proof
-        .tables
-        .iter()
-        .zip(proof.openings.iter())
+    //
+    // Taken by value: every field below used to be cloned, and the openings are
+    // the bulk of a batched proof — copying them was 5.3% of the recursion
+    // guest, spent duplicating what the blob already holds. Nothing reads the
+    // proof after this point; `groups`, `group_of` and `fold_order` are moved
+    // out here and used below.
+    let BatchedProof {
+        tables: proof_tables,
+        openings,
+        groups: proof_groups,
+        group_of,
+        fold_order,
+        ..
+    } = proof;
+    let tables: Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>> = proof_tables
+        .into_iter()
+        .zip(openings)
         .map(|(t, opening)| StarkProof {
             trace_length: t.trace_rows,
             lde_trace_main_merkle_root: t.main_root,
             lde_trace_aux_merkle_root: t.aux_root,
             lde_trace_precomputed_merkle_root: t.precomputed_root,
-            trace_ood_evaluations: t.trace_ood.clone(),
-            trace_ood_next_evaluations: t.trace_ood_next.clone(),
+            trace_ood_evaluations: t.trace_ood,
+            trace_ood_next_evaluations: t.trace_ood_next,
             composition_poly_root: t.composition_poly_root,
-            composition_poly_parts_ood_evaluation: t.parts_ood.clone(),
+            composition_poly_parts_ood_evaluation: t.parts_ood,
             fri_layers_merkle_roots: Vec::new(),
             fri_final_poly_coeffs: Vec::new(),
             query_list: Vec::new(),
-            deep_poly_openings: opening.clone(),
+            deep_poly_openings: opening,
             nonce: None,
-            bus_public_inputs: t.bus_public_inputs.clone(),
+            bus_public_inputs: t.bus_public_inputs,
             public_inputs: (),
         })
         .collect();
     let blowup = proof_options.blowup_factor as usize;
-    let groups: Vec<BatchedGroup<'_, GoldilocksExtension>> = proof
-        .groups
+    let groups: Vec<BatchedGroup<'_, GoldilocksExtension>> = proof_groups
         .iter()
         .map(|(lde_size, fri)| BatchedGroup {
             trace_rows: lde_size / blowup,
@@ -318,9 +330,9 @@ pub fn verify_with_precomputed(
         &airs,
         &public_inputs,
         &tables,
-        &proof.group_of,
+        &group_of,
         &groups,
-        &proof.fold_order,
+        &fold_order,
         &transcript,
         &logup,
     ))

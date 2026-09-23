@@ -302,8 +302,11 @@ pub fn verify_batched_and_attest(
     let input = rkyv::from_bytes::<BatchedGuestInput, RkyvError>(archive)
         .map_err(|e| Error::Execution(format!("batched blob validation failed: {e}")))?;
 
+    // `public_output` before the proof is consumed: the verifier takes it by
+    // value so the guest does not pay for copying the openings.
+    let public_output = input.proof.public_output.clone();
     if !crate::batched_verifier::verify_with_precomputed(
-        &input.proof,
+        input.proof,
         &input.inner_elf,
         proof_options,
         Some(input.decode_commitment),
@@ -318,7 +321,7 @@ pub fn verify_batched_and_attest(
         &input.page_commitments,
     )?;
     let mut attestation = id.to_vec();
-    attestation.extend_from_slice(&input.proof.public_output);
+    attestation.extend_from_slice(&public_output);
     Ok(Some(attestation))
 }
 
