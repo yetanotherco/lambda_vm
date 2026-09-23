@@ -513,7 +513,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
+    uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.3
     with:
       custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
     secrets:
@@ -527,7 +527,7 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
-    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
+    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.3
     with:
       model: opus
       max_turns: 50
