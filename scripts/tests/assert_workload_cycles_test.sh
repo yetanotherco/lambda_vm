@@ -6,7 +6,7 @@
 #
 # Fake CLIs instead of the real one: the property under test is the decision, not the
 # executor. Real runs of both floors are in the commit that introduced them (a pre-SSZ
-# fixture at 496 cycles against 37,137,748 for the real block).
+# fixture at 496 cycles against 30,497,198 for the real block).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

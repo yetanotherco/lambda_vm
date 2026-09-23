@@ -315,14 +315,15 @@ test-rust: compile-programs-rust
 # tooling/ethrex-fixtures/README.md carries what the workload costs and how to pick
 # the epoch size; the converter's README covers converting a cache by hand.
 ETHREX_REAL_BLOCK_NETWORK := mainnet
-ETHREX_REAL_BLOCK := 25453112
-# WHY THIS BLOCK: 25368371 was the pre-bump default, and under Amsterdam its
-# transactions lose so much gas to the new state-gas model that the workload drops
-# to 20.36M cycles against the 30.50M the retired fixture cost on today's guest. A
-# screen of twelve real mainnet blocks (our two release caches plus ethrex's curated
-# zkevm_bench corpus) put this one closest: 37.14M cycles, +22% against that target,
-# where 25368371 is -33% and the next candidate up (25087308) is +197%. Reverts are
-# not a selection criterion — every pre-Amsterdam block loses 26-50% of its
+ETHREX_REAL_BLOCK := 25368371
+# WHY THIS BLOCK: it is the pre-bump default, and rebuilt on its own witness trie it
+# costs 30.50M cycles, what the retired fixture cost on today's guest. An earlier
+# rebuild re-inserted the witness leaves into a fresh ~275-account trie, 3-4 levels
+# deep where mainnet's is ~9, which dropped this block to 20.36M cycles and moved the
+# pin to 25453112; the drop was the shallow trie, not the fork. Rebuilt on the witness
+# trie, its keccak/Mcycle, ecsm/Mcycle and keccak/ecsm sit inside the spread of five
+# 24-60M-gas blocks rebuilt the same way (tooling/ethrex-fixtures/README.md). Reverts
+# are not a selection criterion — every pre-Amsterdam block loses 26-50% of its
 # transactions to the fork, which is a property of the fork and not of the block.
 #
 # The fixture is GENERATED from the cache below, not fetched. The pinned guest
@@ -334,7 +335,7 @@ ETHREX_REAL_BLOCK := 25453112
 # through the guest before writing it. Nothing to publish, and it works offline
 # once the cache is there. Read the caveat in tooling/ethrex-fixtures/README.md
 # before quoting numbers: Amsterdam's gas model (EIP-8037 state gas, cold access
-# 2600 -> 3000) makes 10 of this block's Osaka-era transactions run out of gas.
+# 2600 -> 3000) makes 12 of this block's 29 Osaka-era transactions revert.
 #
 # The digest below is what keeps a stale fixture out of a benchmark. Generating
 # validates the block, but generation only happens when the file is MISSING (see
@@ -348,12 +349,12 @@ ETHREX_REAL_BLOCK := 25453112
 # or moving the ethrex rev changes it: run `make regen-real-block-fixture`, take
 # the new digest, and paste it here. Leaving it empty disables the check and says
 # so out loud.
-ETHREX_REAL_BLOCK_FIXTURE_SHA256 := 08a52e10c2f89870dade14f7b0dfe01625e57416afbff664ad31fcd067233eea
+ETHREX_REAL_BLOCK_FIXTURE_SHA256 := f78c7e8dbcfdcdcf2c2bff2bd81c2268c4f06f340c6fd8d7144b7baec9774ded
 # The block's source cache: an ethrex-replay dump, fork-independent, still the one
 # hosted in bench-fixtures-v1. Only the fixture rebuild reads it; converter TESTS
 # use a different, upstream-pinned cache (below).
-ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25453112.json
-ETHREX_REAL_BLOCK_CACHE_SHA256 := 20ffbbc1b051df9dfa6285f0ea7bd3f6d054db883aba92230ea20350f1b1d4ad
+ETHREX_REAL_BLOCK_CACHE_URL := https://github.com/yetanotherco/lambda_vm/releases/download/bench-fixtures-v1/cache_mainnet_25368371.json
+ETHREX_REAL_BLOCK_CACHE_SHA256 := 7aa88a5f7c5755b7575870f95e6c5c26186947f5e9e0d52199148c74e2a2736b
 
 ETHREX_REAL_BLOCK_ID := $(ETHREX_REAL_BLOCK_NETWORK)_$(ETHREX_REAL_BLOCK)
 ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_$(ETHREX_REAL_BLOCK_ID).bin

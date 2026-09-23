@@ -19,9 +19,9 @@
 #          128 GiB box (tooling/ethrex-fixtures/README.md, "Choosing the epoch size").
 #
 # Pick the workload that matches the run you are localizing, because the symbol mix
-# follows the block: the real default is 37,137,748 cycles, 6,003 keccak calls and 164
+# follows the block: the real default is 30,497,198 cycles, 6,492 keccak calls and 116
 # ecsm calls, and the synthetic option (20 plain transfers) shifts that to 7,029,393
-# cycles, 486 keccak, 80 ecsm — a keccak:ecsm ratio of 37:1 against 6:1, so a hot symbol
+# cycles, 486 keccak, 80 ecsm — a keccak:ecsm ratio of 56:1 against 6:1, so a hot symbol
 # in one need not be hot in the other.
 #
 # Both counts are deterministic for a given ELF and input, and belong to the ethrex rev
@@ -29,9 +29,9 @@
 # guest optimisation, and possibly with the compiler, which the Makefile does not pin.
 # See "Pin the ELF whenever you quote a cycle count" in tooling/ethrex-fixtures/README.md.
 #
-# WORKLOAD=real also switches to a continuation prove (monolithic would need ~182 GB at
-# that trace length), which is ~125 s per recording on the bench runner — five
-# recordings, so budget ~11 min of proving, plus ~790 MB of disk per bundle and ~45 GiB
+# WORKLOAD=real also switches to a continuation prove (monolithic would need ~150 GB at
+# that trace length), which is ~110 s per recording on the bench runner — five
+# recordings, so budget ~10 min of proving, plus ~640 MB of disk per bundle and ~45 GiB
 # of RAM at the default epoch.
 #
 # Produces:

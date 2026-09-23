@@ -150,7 +150,7 @@ jobs:
       # no fixture to run against -- so until this step existed the block every benchmark
       # proves was never once executed by the VM in CI: `test_ethrex_real_block_vm` is
       # `#[ignore]`d, `make test-ethrex` skips it by name and the gate's `--skip
-      # test_ethrex_real_block` substring drops it too. It is 37.1M cycles, seconds of
+      # test_ethrex_real_block` substring drops it too. It is 30.5M cycles, seconds of
       # work, so the reason it stayed out was the missing fixture and not its cost.
       - name: Check the real block through the guest ELF
         if: steps.fixture.outputs.present == 'true'

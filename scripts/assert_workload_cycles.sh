@@ -29,7 +29,7 @@ set -euo pipefail
 
 # Far above a rejected run (496 cycles) and far below the smallest honest one.
 #
-# The real block runs 37.1M cycles today, so 20M is ~45% of margin: enough for a guest
+# The real block runs 30.5M cycles today, so 20M is ~34% of margin: enough for a guest
 # change that genuinely gets cheaper, and still 40,000x above a rejection. A floor of 1M
 # would have tolerated a 97% collapse, which is the only kind of breakage this can see --
 # WHICH block is being proven is pinned by the fixture's sha256 and by the ethrex rev, not

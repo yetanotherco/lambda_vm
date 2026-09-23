@@ -71,9 +71,9 @@ env:
   ELF: executor/program_artifacts/rust/ethrex.elf
   # The workload: a real Ethereum block. WHICH block lives in
   # the Makefile and nowhere else — nothing in this file names one, so a repoint
-  # moves this job without editing it. At the current default that is 37,137,748
-  # cycles, 6,003 keccak calls and 164 ecsm calls: 13.6x the work of the synthetic
-  # block (ethrex_bench_4, 2,727,681 cycles) with a keccak:ecrecover mix of 37:1
+  # moves this job without editing it. At the current default that is 30,497,198
+  # cycles, 6,492 keccak calls and 116 ecsm calls: 11.2x the work of the synthetic
+  # block (ethrex_bench_4, 2,727,681 cycles) with a keccak:ecrecover mix of 56:1
   # against its 13:1. That is the whole point — a prover change can move the
   # synthetic number and the real one in opposite directions.
   #
@@ -94,19 +94,19 @@ env:
   # Continuations are mandatory here, not a preference: a monolithic prove costs
   # ~4.9 GB of peak heap per million cycles on this workload family (from the
   # measured growth fit, 10,728 MB + 2,007 MB/transfer at R^2 = 0.998), so the
-  # current default would need ~182 GB and a heavier candidate far more.
+  # current default would need ~150 GB and a heavier candidate far more.
   # `--continuations` makes peak heap a function of the epoch size instead of the
   # trace length. Costs move with the block; what this one costs is in
   # tooling/ethrex-fixtures/README.md.
   #
-  # Budget ~790 MB of disk for the bundle each run (measured: 828,430,552 bytes) —
+  # Budget ~640 MB of disk for the bundle each run (measured: 641,703,936 bytes) —
   # hence the `rm -f` after every prove. A heavier block pushes it past 2 GiB, which
   # needs rkyv `pointer_width_64` in the PROVER's bundle serialisation; a PR branch
   # predating that fix fails at write time rather than mismeasuring.
   #
-  # Epoch 2^22, measured on THIS runner on 2026-09-08 (box idle): mean 125.33 s over
-  # 14 proves, sd 1.58 s, CV 1.26%, 44.81 GiB peak RSS, 790 MB bundle; verifying one
-  # bundle is 12.0 s.
+  # Epoch 2^22, measured on THIS runner on 2026-09-23 (box idle): mean 110.31 s wall
+  # over 5 proves, sd 0.77 s, CV 0.70%, 42.0-46.8 GiB peak RSS, 8 epochs, 642 MB
+  # bundle; verifying one bundle is 10.65 s.
   #
   # Memory, not speed, is what picks 2^22. The epoch trade-off was swept on the
   # previous block (2^21 +13.7% wall / -12 GiB, 2^23 -7.5% wall / +16 GiB): peak RSS
@@ -118,8 +118,8 @@ env:
   # The pre-bump numbers this replaces (block 25368371, 50.78M cycles, 158.8 s at
   # 2^22 on this runner, ~52 GB) measured a DIFFERENT workload: that fixture was an
   # rkyv ProgramInput, which the pinned guest rejects. Do not compare across the
-  # bump. This block was picked to land as close to it as an Amsterdam rebuild can —
-  # see the screen in the Makefile's ETHREX_REAL_BLOCK comment.
+  # bump. It is the same block, rebuilt as Amsterdam on its own witness trie — see
+  # the Makefile's ETHREX_REAL_BLOCK comment.
   #
   # Deliberately NOT the CLI's DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2, which stays 20 so
   # a laptop can still prove; and not the GPU path's 2^22, which happens to coincide

@@ -64,7 +64,7 @@ fn test_ethrex_empty_block() {
     run_fixture("ethrex_empty_block.bin");
 }
 
-const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25453112.bin";
+const REAL_BLOCK_FIXTURE: &str = "ethrex_mainnet_25368371.bin";
 
 /// Host-only acceptance gate for the real SSZ stateless fixture produced by
 /// `tooling/ethrex-fixtures --bin real_block`. The fixture name is pinned here
@@ -133,7 +133,7 @@ fn no_bls_backend_linked() {
 /// fixtures (a ~550 KB witness, real contract execution).
 ///
 /// Deliberately excluded from the PR CI step, which otherwise runs everything via
-/// `--include-ignored`. Not for its runtime -- the block executes in 37.1M cycles,
+/// `--include-ignored`. Not for its runtime -- the block executes in 30.5M cycles,
 /// seconds of work -- but because the PR gate has no fixture: it is generated from a
 /// replay cache by the ethrex host tooling, which that job does not build. The job
 /// that does is the real-block usability screen in

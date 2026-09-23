@@ -74,7 +74,7 @@ ethrex_bench_4.bin
 
 The blocks above are synthetic. For a representative workload — real contract
 execution, real trie depth, real bytecode — `make ethrex-real-block-fixture`
-BUILDS `ethrex_mainnet_25453112.bin` from the block's replay cache, which is the
+BUILDS `ethrex_mainnet_25368371.bin` from the block's replay cache, which is the
 only fetched artifact; nothing about the fixture is published, because the pinned
 guest decodes only the Amsterdam schema and no hosted artifact for a pre-Amsterdam
 block can be valid. It is gitignored rather than committed, so its digest lives

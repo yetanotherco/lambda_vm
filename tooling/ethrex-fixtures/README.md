@@ -47,22 +47,29 @@ cargo run --release --bin real_block -- <ethrex-replay-cache.json> <output.bin>
 make regen-real-block-fixture
 ```
 
-It reads an ethrex-replay cache, installs the block's pre-state into an
-in-memory store **keyed the way the tries are keyed** — `keccak(address)` and
-`keccak(slot)`, so no key preimages are needed and every account and slot the
-block touches arrives intact — registers a parent header at the block's real
-height, replays the transactions in the block's own order through the t8n
-entry point, and validates the result through the native guest before writing.
+It reads an ethrex-replay cache, installs the block's own witness tries into an
+in-memory store **as they are** — every node at its path, pruned siblings left as
+hashes, so the installed state trie hashes to the real parent's state root and
+keeps mainnet's depth — adds the two EIP-8282 predeploys Amsterdam requires,
+registers a parent header at the block's real height, replays the transactions in
+the block's own order through the t8n entry point, and validates the result
+through the native guest before writing.
 
-Output for mainnet 25453112, whose 38 transactions consumed 4,238,394 gas on mainnet
+The depth is the point. The guest hashes every node on the path from each
+touched account and slot to the root, and mainnet's trie puts accounts ~9 levels
+down. Re-inserting only the block's leaves into a fresh trie, which is what this
+tool did before, leaves ~275 accounts 3-4 levels deep: on this block that is
+20.36M cycles instead of 30.50M, with the keccak share cut by more than half.
+
+Output for mainnet 25368371, whose 29 transactions consumed 2,428,684 gas on mainnet
 under Osaka (the `rebuilt` line reports what they consume here, under Amsterdam):
 
 ```
-installed   132 accounts / 261 storage slots / 132 codes
-rebuilt     #25453112 (38/38 txs, 3761976 gas, 10 reverted)
+installed   93 accounts / 117 storage slots / 91 codes
+rebuilt     #25368371 (29/29 txs, 1803938 gas, 12 reverted)
 ```
 
-### Why 10 transactions revert, and why that is not a defect here
+### Why 12 transactions revert, and why that is not a defect here
 
 Those transactions were signed with gas limits computed under Osaka. Amsterdam
 changes the gas model: cold account access goes from 2600 to 3000, and EIP-8037
@@ -80,28 +87,36 @@ a criterion for picking one.
 
 Reverting is separate from being *dropped*: a reverted transaction was applied and
 paid for its gas, while a dropped one never entered the block. This block applies
-all 38 of its transactions, and the generator refuses to write a fixture that
+all 29 of its transactions, and the generator refuses to write a fixture that
 applies fewer, because every other guard would still pass — a block with fewer
 transactions is a valid block, so the loss would show up only as a smaller
 benchmark. Screening candidate blocks does need the partial ones, so pass
-`REAL_BLOCK_ALLOW_DROPS=1` for that; note also that the generator is not universal
-(block 25087563 fails with `StateRootMismatch`), which is why screening is a
-required step before pinning a different block. What the screen was for is weight: the retired
-fixture cost 30.50M cycles on today's guest, and this block rebuilds to 37.14M
-(+22%), the closest of the twelve — 25368371 comes in at -33% and the next
-candidate up, 25087308, at +197%. Several blocks end up consuming *more* gas than
-they did on mainnet (+7% to +22%), because Amsterdam makes the surviving
-transactions dearer.
+`REAL_BLOCK_ALLOW_DROPS=1` for that; note also that the generator is not universal,
+which is why screening is a required step before pinning a different block. A
+transaction that under Amsterdam reads state its mainnet execution never touched
+hits a pruned node, and the generator refuses the block (25087407, 25087416 and
+25087554 do this); 25087563 reads a BLOCKHASH deeper than the cache's headers.
+Several blocks end up consuming *more* gas than they did on mainnet (+7% to +22%),
+because Amsterdam makes the surviving transactions dearer.
+
+What the screen measures is shape. Rebuilt on their witness tries, five 24-60M-gas
+blocks put keccak/Mcycle · ecsm/Mcycle · keccak/ecsm at a geometric mean of
+174 · 2.88 · 60.4, each 0.10-0.37 from it (Euclidean distance in log space). This
+block lands at 213 · 3.80 · 56.0, 0.35 away, inside that spread; 25453112, the
+previous pin, lands at 0.26. Small blocks sit ~20% high on keccak/Mcycle, likely
+because a big block's touched keys share the top of the trie.
 
 So what this fixture is, is a *real-mix* Amsterdam block — real contract code,
-real calldata, real signatures, real trie depth — and not a replay of mainnet
-economics. For workloads whose gas limits were computed for Amsterdam, use the
+real calldata, real signatures, mainnet's trie depth — and not a replay of mainnet
+economics. The rebuilt parent is not the real one (the two predeploys change its
+state root), so the two MEV transactions that check `blockhash(n-1)` revert. For workloads whose gas limits were computed for Amsterdam, use the
 EEST benchmark fixtures upstream publishes with `tests-zkevm-benchmark`: they carry
 `statelessInputBytes` the guest reads as-is, one dimension stressed per fixture,
 which is the part a real block does not give.
 
-Measured on the guest ELF at ethrex `8effcb06`: **37,137,748 cycles**, 6,003
-keccak calls, 164 ECSM calls. Fixture: 549,144 bytes.
+Measured on the guest ELF at ethrex `8effcb06`: **30,497,198 cycles**, 6,492
+keccak calls, 116 ECSM calls, identical on macOS/arm64 and the Linux x86-64 runner.
+Fixture: 506,993 bytes.
 
 **Pin the ELF whenever you quote a cycle count.** The three counts are
 deterministic for a given ELF and input, and they move with anything that changes
@@ -117,21 +132,28 @@ The compiler is not pinned either — the guest embeds C (`secp256k1-sys`) and t
 Makefile pins target flags but not `cc` — so in principle two boxes with different
 clang majors can disagree. In practice the effect is small and not well
 characterised: the one figure recorded in this repo is 0.13 % on a different
-block, while this block came out at exactly 37,137,386 on both macOS/arm64 and the
-Linux x86-64 runner at the previous pin, from ELF binaries that were themselves
-different. Quote the rev; do not assume the machine matters, and do not assume it
+block, while the previous pin (25453112, shallow rebuild) came out at exactly
+37,137,386 on both macOS/arm64 and the Linux x86-64 runner, from ELF binaries that
+were themselves different. Quote the rev; do not assume the machine matters, and do not assume it
 does not.
 
 ### Choosing the epoch size, and what the workload costs
 
 Measured on the bench runner (`vm-benchmarks-1`, which is also the CI
 self-hosted `bench` runner: 96 cores / 125 GB) with the guest ELF at ethrex
-`2cb18b0b`, over 14 proves across two sittings:
+`8effcb06`, the cli built with `jemalloc-stats`, 5 proves interleaved with 5 of
+the previous workload (25453112 on the shallow rebuild, 37.14M cycles) on the same
+binary, one verify after each:
 
-| | mean | sd | CV | peak RSS | proof | verify |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| epoch 2^22, 14 proves | **125.33 s** | 1.58 s | 1.26 % | 44.8 GiB | 790 MB | 12.0 s |
-| of those, the 5 that got the most CPU | 124.47 s | 0.43 s | 0.34 % | | | |
+| epoch 2^22 | wall mean | sd | CV | epochs | peak RSS | proof | verify |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **this block**, 5 proves | **110.31 s** | 0.77 s | 0.70 % | 8 | 42.0-46.8 GiB | 641.7 MB | 10.65 s |
+| previous workload, 5 proves | 126.08 s | 0.61 s | 0.49 % | 9 | 40.9-43.9 GiB | 748.5 MB | 12.08 s |
+
+Every pair came out 12.0-13.6 % faster on this block, and the proof is 14.3 %
+smaller; peak RSS and jemalloc peak heap overlap between the two, as expected when
+the epoch size and not the block sets them. An earlier 14-prove sitting on the
+previous workload at `2cb18b0b` gave 125.33 s (sd 1.58 s), in line with its row.
 
 2^22 is what `/bench`, `/bench-abba` and the GPU bench pin. The epoch trade-off
 itself was swept on the previous block (2^21 costs +13.7 % of wall to save
@@ -140,8 +162,9 @@ than by the block, so that shape carries over even though the seconds do not.
 2^23 would take this workload past 50 GiB against the runner's 64 GiB floor,
 which is why memory and not speed picks the default.
 
-The two rows are the same binary on the same block; what separates them is how
-much of the shared box each prove got. Wall time here is a function of CPU share,
+Both rows ran on a quiet box (every prove got 74-76 cores' worth of CPU); on a
+shared one the spread widens with how much of it each prove gets, as the earlier
+sitting showed. Wall time here is a function of CPU share,
 not of the prover, so quote a spread only together with the condition it was
 measured under — `scripts/bench_abba.sh` records the CPU share of every prove and
 flags a contended batch, and its comments carry the measurement. A two-sided 95 %
@@ -150,4 +173,4 @@ busy one, which is why a sub-2 % claim needs `/bench N` or the ABBA tiebreaker
 rather than a re-read of a three-run table.
 
 Continuations are not optional here: monolithic proving costs ~4.9 GB of peak
-heap per million cycles on this family, so 37.14M cycles would need ~182 GB.
+heap per million cycles on this family, so 30.50M cycles would need ~150 GB.
