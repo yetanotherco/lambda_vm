@@ -11,78 +11,54 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// jemalloc serves allocations of 8 MiB and up from one shared arena and purges each of
-/// them the moment it is freed, whatever the decay says, unless decay is disabled for that
-/// arena (`extent_may_force_decay`). A prover that allocates and drops one trace-sized
-/// buffer after another then refaults and re-zeroes the same pages for every chunk.
-/// Disable the arena's decay and purge it on our own clock instead: hot buffers are
-/// reused across threads, cold ones still go back to the OS.
-///
-/// The index is `opt.narenas`: jemalloc 5 reserves the slot immediately after the
-/// automatic arenas for the oversize arena (`arena_init_huge`, `huge_arena_ind =
-/// narenas_total_get()`), and `opt.oversize_threshold` defaults to the same 8 MiB.
-///
-/// Linux only: elsewhere jemalloc is built without background threads and the decay
-/// mallctl traps.
-///
-/// Called only from the paths that allocate trace-sized buffers, not from `main`:
-/// it disables an arena's decay for the life of the process and leaves a purge
-/// thread behind, which is not something `cli verify` or `--help` should pay, and
-/// it would otherwise change the allocator under every baseline measured with
-/// this binary.
-fn keep_large_buffers_warm() {
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::ptr::null_mut;
-        use std::time::Duration;
-        use tikv_jemalloc_ctl::raw;
+// jemalloc, never purging.
+//
+// The allocator itself is unchanged: jemalloc is here because the platform
+// allocator keeps freed arena chunks resident, and on the recursion campaign's
+// branch the same proves read up to 13 GiB higher under glibc. What this sets
+// is jemalloc's *decay* timers, which hand freed pages back to the OS. The
+// prover allocates and frees multi-hundred-MiB host buffers continuously, so
+// those pages come straight back as minor faults on the worker threads.
+//
+// Measured on an RTX 5090 box on the recursion campaign's branches, ABBA in
+// each, every arm at one commit and one set of knobs:
+//   * the WHIR prover (keccak, `whir/lfm` @ 64393da9) — 39.69-39.88 s a block
+//     with this setting against 43.94-44.07 s without, the default costing
+//     +13 M minor faults and +15 s of system time per run on this arm;
+//   * the per-table STARK tree (0e4f4610) — 187 / 163 / 166 / 171 s, both
+//     never-purge arms under both default arms, 5-24 s a block, with the proof
+//     bytes unmoved (30 identical lines, 0 differing).
+// The cost is peak RSS: +1.4 GiB and +2.9-3.3 GiB respectively, a ninth to a
+// quarter of the 13 GiB the allocator choice itself is worth — which is why the
+// lever is the decay setting and not the allocator. `background_thread:true` recovers
+// none of it: the cost is the re-touch, not the `madvise` call.
+//
+// This binary's own pipeline has not been measured under the setting; the
+// numbers above are from the campaign's branches, where the prover's
+// allocation pattern is the same.
+//
+// `_RJEM_MALLOC_CONF` in the environment still overrides this, which is how a
+// measurement arm puts the default policy back. It has to be that spelling:
+// `tikv-jemalloc-sys` builds with `--with-jemalloc-prefix=_rjem_` under default
+// features, and jemalloc then reads one env name chosen at configure time
+// (`jemalloc.c`, `obtain_malloc_conf` source 3) — so plain `MALLOC_CONF` is read
+// by nothing here and sets an arm to the default policy without saying it did
+// not. The file source is prefixed too: `/etc/_rjem_malloc.conf`.
+//
+// jemalloc reads this symbol as a `const char *` before `main` is entered, so
+// the value has to be in the initializer, and the name is the prefixed one
+// `tikv-jemalloc-sys` declares (`#[cfg_attr(prefixed, link_name =
+// "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked.
+// `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc, but
+// it carries its own copy of this block and reads its own process — it pins the
+// pattern, not this export. Deleting the lines below turns nothing red.
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
-        const PURGE_EVERY: Duration = Duration::from_secs(10);
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> =
+    Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
 
-        // The arena only exists after the first large allocation.
-        std::hint::black_box(vec![0u8; 16 << 20]);
-        // SAFETY: `opt.narenas` is `unsigned`, the decay knob is `ssize_t`, and `purge`
-        // takes no value.
-        unsafe {
-            let huge_arena = match raw::read::<u32>(b"opt.narenas\0") {
-                Ok(n) => n,
-                Err(e) => {
-                    // Not fatal, but the run is then indistinguishable from one
-                    // where the knob worked — which is exactly what makes a
-                    // memory measurement unreadable. Say so.
-                    log::warn!(
-                        "keep_large_buffers_warm: cannot read opt.narenas ({e}); \
-                                the oversize arena keeps jemalloc's default decay"
-                    );
-                    return;
-                }
-            };
-            let decay = format!("arena.{huge_arena}.dirty_decay_ms\0");
-            if let Err(e) = raw::write(decay.as_bytes(), -1i64) {
-                log::warn!(
-                    "keep_large_buffers_warm: cannot disable decay on arena \
-                            {huge_arena} ({e}); the oversize arena keeps jemalloc's default"
-                );
-                return;
-            }
-            log::debug!("keep_large_buffers_warm: decay disabled on arena {huge_arena}");
-            let purge = CString::new(format!("arena.{huge_arena}.purge")).unwrap();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(PURGE_EVERY);
-                    tikv_jemalloc_sys::mallctl(
-                        purge.as_ptr(),
-                        null_mut(),
-                        null_mut(),
-                        null_mut(),
-                        0,
-                    );
-                }
-            });
-        }
-    }
-}
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
@@ -1414,9 +1390,6 @@ fn cmd_trace_build(
         }
     };
     let outcome = if prove_and_retire {
-        // The walk allocates and drops one trace-sized buffer after another,
-        // which is the pattern this works around.
-        keep_large_buffers_warm();
         run_approach_1(
             &elf,
             &elf_data,
