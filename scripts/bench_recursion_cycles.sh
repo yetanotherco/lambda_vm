@@ -335,8 +335,11 @@ valid_result() {
 # (n_transfers, mode) — see its README. In the CI flow scripts/bench_verify.sh has
 # already generated the 20-tx fixture into the checkout, so step 2 below hits and nothing
 # is rebuilt here. A ref that bumps the pinned ethrex rev makes these bytes undecodable
-# for that side; the blob dump then fails loudly rather than silently benching a
-# different block.
+# for that side -- and since that bump the inner guest answers an input it cannot decode
+# by committing `successful_validation = 0` and exiting cleanly, so the dump succeeds and
+# yields a blob of a program that gave up after a few hundred cycles. Nothing about that
+# looks wrong downstream, which is why the fixture is floor-checked against the ref's own
+# inner ELF before the measurement below (scripts/assert_workload_cycles.sh).
 resolve_block_fixture() {
   local txs="$1"
   # The checkout copy WINS over the $WORK cache whenever it exists. $WORK lives forever on
@@ -623,6 +626,16 @@ measure_ref() {
     mv -f "$measure_cli.tmp" "$measure_cli"
   else
     echo "==> [$role] reusing cached measuring CLI ($measure_cli)" >&2
+  fi
+
+  # 2c-bis. The blob is only as good as the block it was dumped from. `resolve_block_fixture`
+  # reuses whatever is on disk (the sizes other than 4tx are gitignored), and a copy from
+  # before an ethrex rev bump is rejected by this ref's inner guest rather than failing, so
+  # check the pair now -- after the measuring CLI exists and before any number is recorded.
+  if [ "$is_block" = 1 ]; then
+    "$ROOT/scripts/assert_workload_cycles.sh" \
+      "$measure_cli" "$wt/executor/program_artifacts/rust/ethrex.elf" \
+      "$block_fixture" synthetic >&2
   fi
 
   # 2d. Measure: one deterministic execute --cycles run. Time it (CI feasibility).

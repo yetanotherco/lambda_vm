@@ -38,7 +38,7 @@
 #          large continuation trace where GPU-residency wins are visible).
 #          Ignored when WORKLOAD=real.
 #        WORKLOAD=real|synthetic (default real) which block to prove. `real`
-#          fetches the real-block fixture (block identity lives in the Makefile) and
+#          builds the real-block fixture (block identity lives in the Makefile) and
 #          forces --continuations; TX_COUNT and CONTINUATIONS do not apply to it.
 #
 #   On WORKLOAD: a real block is keccak- and trie-bound, while the synthetic option is
@@ -48,17 +48,23 @@
 #   WORKLOAD=synthetic to reproduce a number recorded against that fixture.
 #
 #   Sizing at WORKLOAD=real, from the paired t-test (resolvable 95% delta =
-#   t* x sd / sqrt(N)). The pair-delta sd on the bench runner is NOT yet measured; the
-#   two columns bracket it between 1.0% (the GPU box's measured 0.64% plus margin) and
-#   2.0% (sqrt(2) x the runner's measured 1.43% single-run CV):
+#   1.96 x sd / sqrt(N), the normal approximation -- the exact t* at these pair counts is
+#   10-20% larger, so read every cell below as a floor). The two columns are the same
+#   runner under two conditions, not a guess bracketing an unknown: its variance is
+#   contention, so the single-run CV is
+#   0.34% across the proves that got the most CPU and 1.26% across all of a 14-prove
+#   baseline. sd of a pair delta is sqrt(2) x that. Keep this table in sync with the one
+#   in .github/workflows/bench-abba.yml:
 #
-#     pairs   wall      resolves (sd 2.0% / sd 1.0%)
-#      8      ~50 min    1.7% / 0.8%
-#     12      ~72 min    1.3% / 0.6%   <- workflow default
-#     20      ~1h55m     0.9% / 0.5%
-#     32      ~3h        0.7% / 0.4%
+#     pairs   wall      resolves (quiet box, sd 0.49% / shared, sd 1.78%)
+#      8      ~41 min    0.34% / 1.24%
+#     12      ~58 min    0.28% / 1.01%   <- workflow default
+#     20      ~1h31m     0.21% / 0.78%
+#     32      ~2h22m     0.16% / 0.62%
 #
-#   Wall assumes epoch 2^22 (158.8 s per prove, two per pair) plus ~8 min of setup.
+#   Wall assumes epoch 2^22 (~125 s per prove, two per pair) plus ~8 min of setup. Read
+#   the column the run earned: the exclusivity line printed after the pairs reports the
+#   CPU share of every prove and flags any under 90% of the batch's best.
 #   The first real ABBA run MEASURES that sd — read it off the `sd` field of the
 #   paired-t line printed below — and this table should be re-pinned to it.
 #
@@ -142,21 +148,56 @@ fi
 mkdir -p "$WORK"
 
 # --- 1. Guest ELF + fixture (identical for both sides; build once if missing) ---
+# Kills the whole process GROUP, not just the `make`: signalling the make alone leaves its
+# cargo and rustc children running, reparented and still compiling, which on the shared bench
+# runner is exactly the contention the next batch would measure. `set -m` at the launch below
+# is what gives the job a group of its own. Unset PID (WORKLOAD=synthetic) and an
+# already-reaped one both fall through.
+kill_fixture() {
+  [ -n "${FIXTURE_PID:-}" ] || return 0
+  kill -- "-$FIXTURE_PID" 2>/dev/null || kill "$FIXTURE_PID" 2>/dev/null || true
+  wait "$FIXTURE_PID" 2>/dev/null || true
+}
 if [ ! -f "$ELF_REL" ]; then
   echo "==> Building ethrex guest ELF (missing)"
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   make "$ELF_REL"
 fi
 if [ "$WORKLOAD" = "real" ]; then
-  # ~1 MB, gitignored, never in a fresh checkout — and a rented GPU box is always a
-  # fresh checkout. Fetched by URL + sha256, not built: no converter, no ethrex host
-  # dependency tree, so this costs seconds on the box. Unconditional on purpose: the
-  # target hashes whatever is on disk on every invocation, which is what catches a
-  # copy left behind by an earlier run in the same rental. A match costs ~35 ms.
-  echo "==> Verifying ethrex real-block fixture (fetches on a digest miss)"
-  make ethrex-real-block-fixture
-elif [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
+  # Gitignored, never in a fresh checkout — and a rented GPU box is always a fresh
+  # checkout. Built from the block's replay cache (fetched by URL + sha256): ethrex 25's
+  # guest decodes only the Amsterdam schema, so no hosted artifact for this block can be
+  # valid. The generator validates the block through the guest before writing.
+  #
+  # Backgrounded so it runs UNDER step 2's prover builds instead of before them. On a
+  # persistent runner the fixture is already on disk and this is a ~35 ms digest check;
+  # on a freshly rented, hourly-billed box it is a cold cargo build of the ethrex host
+  # tree, and that is minutes the two builds would otherwise pay one after the other.
+  # Separate workspace and target dir, so they compile in parallel -- what they do share
+  # is cargo's package-cache lock, which serialises downloads for a few seconds and
+  # nothing else. Nothing before the cycle floor reads the fixture, which is where this
+  # is waited on.
+  echo "==> Building ethrex real-block fixture (from its replay cache; in background)"
+  # Job control on for this launch only, so the job leads its own process group and
+  # kill_fixture can take the whole build tree down. Off again immediately: it also changes
+  # how the shell signals and reports jobs, and nothing else here wants that.
+  set -m
+  make ethrex-real-block-fixture > "$WORK/fixture_build.log" 2>&1 &
+  FIXTURE_PID=$!
+  set +m
+  # A failure below must not leave a cargo build running: on the shared bench runner the
+  # next batch would measure against it. No-op once the wait below has reaped it.
+  trap kill_fixture EXIT
+else
+  # UNCONDITIONAL, unlike the real block's digest check: these names carry neither the rev
+  # nor the schema (`ethrex_<n>_transfers.bin` is untracked, `ethrex_bench_20.bin` is
+  # gitignored), so a copy left by an earlier ethrex rev is reused byte for byte and no
+  # digest anywhere would notice. The floor below catches the rev bumps that make the
+  # guest REJECT the file; it cannot catch a file that is merely a different valid block.
+  # Regenerating is what makes that impossible, and it is nearly free: the generator is
+  # deterministic, so a fixture that was already right is rewritten identically, and the
+  # cargo build is a no-op on a warm target dir.
+  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture"
   ( cd tooling/ethrex-fixtures && cargo build --release )
   tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
 fi
@@ -176,8 +217,12 @@ elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A $BENCH_FEATURES" ] || \
   need_build=1
 fi
 if [ "$need_build" = "1" ]; then
+  # `cleanup` removes the worktree and NOTHING else, because it is also called on the
+  # success path below, where the fixture build must survive. Killing it belongs to the
+  # EXIT trap only -- which has to name both, since `trap ... EXIT` here replaces the one
+  # step 1 set for the fixture.
   cleanup() { git worktree remove --force "$WT" 2>/dev/null || true; }
-  trap cleanup EXIT
+  trap 'cleanup; kill_fixture' EXIT
   git worktree remove --force "$WT" 2>/dev/null || true
   echo "==> Building both prover binaries in isolated worktree $WT"
   git worktree add --detach "$WT" "$SHA_B" >/dev/null
@@ -204,20 +249,86 @@ if [ "$need_build" = "1" ]; then
     echo "$1 $BENCH_FEATURES" > "$WORK/$2.sha"
   }
   build_cli "$SHA_B" cli_B
+  # Surface a fixture-build failure after the FIRST prover build instead of after both. A
+  # bad cache URL or a broken generator takes seconds to fail while the build takes tens of
+  # minutes, and on an hourly-billed rental those minutes are paid twice before anything
+  # says so. Non-blocking on purpose: still running means the parallelism is working, and
+  # the wait further down handles that case. Reaping here also RETIRES the pid -- the EXIT
+  # trap must not `kill -- -$FIXTURE_PID` a number the kernel may have handed to someone
+  # else, and the wait below must not wait on a child that no longer exists.
+  if [ -n "${FIXTURE_PID:-}" ] && ! kill -0 "$FIXTURE_PID" 2>/dev/null; then
+    if ! wait "$FIXTURE_PID"; then
+      # Retire the pid before exiting too: the EXIT trap below would otherwise signal a
+      # process group this build no longer owns.
+      unset FIXTURE_PID
+      echo "ERROR: the real-block fixture could not be built (it failed while the first" >&2
+      echo "       prover binary was building):" >&2
+      cat "$WORK/fixture_build.log" >&2
+      exit 1
+    fi
+    FIXTURE_DONE=1
+    unset FIXTURE_PID
+  fi
   build_cli "$SHA_A" cli_A
   cleanup
-  trap - EXIT
+  # Back to step 1's trap, not `trap - EXIT`: the fixture build is still running and an
+  # abort between here and the wait below should still take it down.
+  trap kill_fixture EXIT
 else
   echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
+if [ "$WORKLOAD" = "real" ]; then
+  # `FIXTURE_DONE` means the build above already reaped it; waiting again would be a wait
+  # on a non-child, which reports failure for a build that succeeded.
+  if [ -z "${FIXTURE_DONE:-}" ] && ! wait "$FIXTURE_PID"; then
+    echo "ERROR: the real-block fixture could not be built:" >&2
+    cat "$WORK/fixture_build.log" >&2
+    exit 1
+  fi
+  trap - EXIT
+  echo "==> Fixture ready: $INPUT_REL"
+fi
+
+# Both workloads, not just `real`: the synthetic fixture is generated only when MISSING
+# (above), so a file left by an earlier ethrex rev is reused as-is, and since the bump a
+# rejected input is committed rather than aborted. The floors and the reasoning live in
+# the script, which the other benchmark entry points share.
+#
+# Runs after step 2 and reuses `cli_B`: the baseline prover executes the workload just as
+# well as a freshly built one, and building a third binary here would be a full extra
+# release build -- at the repo root with default features, so sharing neither the
+# worktree's target dir nor its feature set. Free on a warm runner, a cold build on paid
+# time on a rented GPU box.
+"$ROOT/scripts/assert_workload_cycles.sh" "$WORK/cli_B" "$ELF" "$INPUT" "$WORKLOAD"
+
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
+# Every prove also records the share of CPU it actually got. On a shared box that
+# is the difference between a number and a coincidence: measured on the bench
+# runner, wall time and CPU share correlate at -0.98 across a ten-prove sweep,
+# perfectly monotonic, and a colleague's job landing mid-sweep cost 47 of 75 cores
+# and +73% of wall. So the spread this script reports is a property of how
+# exclusive the box was, not of the prover -- gated to the runs that got the most
+# CPU, the same sweep's CV falls from 1.54% to 0.34%. The ABBA pairing cancels most
+# of it (both sides meet the same neighbours), which is why this flags rather than
+# discards; a flagged batch is one whose spread should not be read as prover noise.
+CPU_SHARES="$WORK/cpu_shares.txt"; : > "$CPU_SHARES"
+TIME_BIN=""
+if /usr/bin/time -f %P true >/dev/null 2>&1; then TIME_BIN=/usr/bin/time; fi
+
 run_prove() {  # $1=binary -> echoes proving time (s)
-  local out t
+  local out t share tf
+  tf="$(mktemp)"
   # shellcheck disable=SC2086  # CONT_ARGS is intentionally word-split (0 or 2 args)
-  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
-  rm -f "$PROOF"
+  if [ -n "$TIME_BIN" ]; then
+    out="$($TIME_BIN -f '%P' -o "$tf" "$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
+  else
+    out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
+  fi
+  share="$(tr -d '%' < "$tf" | tr -d '[:space:]')"
+  rm -f "$tf" "$PROOF"
+  case "$share" in ''|*[!0-9]*) : ;; *) echo "$share" >> "$CPU_SHARES" ;; esac
   t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
   if [ -z "$t" ]; then
     echo "ERROR: could not parse 'Proving time' from cli output:" >&2
@@ -239,6 +350,48 @@ for i in $(seq 1 "$N_PAIRS"); do
   printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
     "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
 done
+
+# Exclusivity report. Self-calibrating: the best prove of this batch defines what
+# the box can give, so a run well under it met a neighbour. No box-specific
+# constant, which matters because this script also runs on rented 16-32 core GPU
+# hosts where an absolute percentage means nothing.
+#
+# ALWAYS prints one `==> Exclusivity:` line, including when there is nothing to report.
+# Two reasons. The comment posted by bench-abba.yml and benchmark-gpu.yml starts at this
+# marker, and the table below tells the reader to pick a column by it, so a run that
+# printed nothing would send them to a line they never see. And silence here is
+# ambiguous: a box with no `/usr/bin/time` (the rented GPU images are minimal -- they do
+# not even ship python3) records no share at all, which would read exactly like a quiet
+# box.
+excl=""
+if [ -s "$CPU_SHARES" ]; then
+  excl="$(awk '
+    { n++; s[n]=$1; if ($1>mx) mx=$1; if (mn==0 || $1<mn) mn=$1 }
+    END {
+      if (n < 2 || mx == 0) exit 0
+      floor = 0.90 * mx
+      for (i=1;i<=n;i++) if (s[i] < floor) bad++
+      printf "==> Exclusivity: CPU share %d%%-%d%% of %d proves", mn, mx, n
+      if (bad) {
+        printf ", %d below 90%% of the best\n", bad
+        printf "    Something else was on the box. The pairing absorbs most of it, but do\n"
+        printf "    not read this batch spread as prover noise, and re-run on a quiet box\n"
+        printf "    before quoting a resolvable delta.\n"
+      } else {
+        printf ", all within 10%% of the best\n"
+      }
+    }' "$CPU_SHARES")"
+fi
+if [ -z "$excl" ]; then
+  if [ -z "$TIME_BIN" ]; then
+    excl="==> Exclusivity: NOT MEASURED -- no \`/usr/bin/time -f %P\` on this box, so no
+    CPU share was recorded. Install it (\`apt-get install -y time\`) to get the report;
+    until then read the batch spread as unqualified."
+  else
+    excl="==> Exclusivity: NOT MEASURED -- fewer than two proves reported a CPU share."
+  fi
+fi
+printf '%s\n' "$excl"
 
 # --- 4. Paired t-test + robust median/Wilcoxon ---
 python3 - "$WORK/pairs.csv" <<'PY'

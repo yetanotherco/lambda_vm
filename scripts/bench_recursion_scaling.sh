@@ -44,6 +44,10 @@ WORK="$(mktemp -d /tmp/recursion_scaling.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 CLI=target/release/cli
+# Owned by scripts/assert_workload_cycles.sh, which the other benchmark entry points call
+# outright; this sweep already measures the count it would re-measure, so it takes the
+# floor and checks its own number.
+SYNTHETIC_FLOOR="$(scripts/assert_workload_cycles.sh --floor synthetic)"
 ART=executor/program_artifacts/recursion
 ETHREX=executor/program_artifacts/rust/ethrex.elf
 
@@ -73,6 +77,17 @@ for P in $PRESETS; do
       echo "txs=$N preset=$P inner_cycles=FAILED" >> "$RESULTS"
       echo "ERROR: [${P}/${N}tx] inner cycle measurement failed for $FIX" >&2
       continue
+    fi
+    # A count is not enough: since the ethrex 26 bump the guest answers an input it cannot
+    # decode by committing `successful_validation = 0` and exiting, which reads as a few
+    # hundred cycles rather than as a failure. These fixtures are gitignored and generated
+    # only when missing, so a pre-bump copy survives a rev bump on a persistent runner and
+    # the whole sweep would scale a null workload. Floor from the one place that owns it.
+    if [ "$ic" -lt "$SYNTHETIC_FLOOR" ]; then
+      echo "txs=$N preset=$P inner_cycles=REJECTED" >> "$RESULTS"
+      echo "ERROR: [${P}/${N}tx] $FIX executes only $ic cycles, below the $SYNTHETIC_FLOOR" >&2
+      echo "       floor: the guest rejected it. Delete it and let this script regenerate it." >&2
+      exit 1
     fi
 
     echo "==> [${P}/${N}tx] proving inner continuation (epoch=2^${EPOCH_LOG2}) ..." >&2
