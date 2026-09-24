@@ -718,30 +718,19 @@ fn a_device_resident_tree_without_a_cap_read_is_an_error() {
 #[test]
 #[ignore = "requires a GPU; run with --features cuda -- --ignored"]
 fn device_trees_serve_their_caps() {
-    use crate::examples::read_only_memory_logup::{
-        LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
-    };
+    // An `AirWithBuses` table: the device composition arm needs the AIR's
+    // constraint program, which the hand-written example AIRs do not supply
+    // (`LogReadOnlyRAP` here panicked in `constraint_program` on the box).
+    use crate::examples::bus_permutation::{bus_permutation_air, bus_permutation_trace};
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
-    type Pi = LogReadOnlyPublicInputs<F>;
+    type Pi = ();
 
     let rows = 1usize << 14;
-    let addresses: Vec<FE> = (0..rows as u64)
-        .map(|i| FE::from((i * 7919) % 4099 + 1))
-        .collect();
-    let values: Vec<FE> = addresses.iter().map(|a| *a * FE::from(10u64)).collect();
     let prove_at = |policy| {
         let opts = options(policy, 30, 2);
-        let mut trace = read_only_logup_trace::<F, E>(addresses.clone(), values.clone());
-        let cols = trace.columns_main();
-        let pi = Pi {
-            a0: cols[0][0],
-            v0: cols[1][0],
-            a_sorted_0: cols[2][0],
-            v_sorted_0: cols[3][0],
-            m0: cols[4][0],
-        };
-        let air = LogReadOnlyRAP::<F, E>::new(&opts);
-        let proof = Prover::prove(&air, &mut trace, &pi, &mut DefaultTranscript::<E>::new(&[]))
+        let mut trace = bus_permutation_trace(rows);
+        let air = bus_permutation_air(&opts);
+        let proof = Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<E>::new(&[]))
             .expect("prove");
         (air, proof)
     };
