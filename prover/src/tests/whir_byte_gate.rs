@@ -200,6 +200,7 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     };
 
     let options = ProofOptions::default_test_options();

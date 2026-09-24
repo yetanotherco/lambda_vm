@@ -42,6 +42,7 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
     coset_offset: 3,
     grinding_factor: 1,
     fri_final_poly_log_degree: 7,
+    format: stark::proof::options::ProofFormat::DEFAULT,
 };
 
 /// The recursion verifier's build presets. Each fixes the guest's
@@ -265,6 +266,21 @@ pub fn program_id_from_elf(
     ))
 }
 
+/// The RV64 recursion guest verifies today's proof format only: its presets
+/// fix the options at build time, and the archived verifier it runs is not
+/// threaded with the ZF format levers. A non-default format must never reach
+/// it, so both guest entry points refuse one up front instead of verifying a
+/// proof under a format the guest was not built for.
+fn require_default_format(proof_options: &ProofOptions) -> Result<(), Error> {
+    if proof_options.has_default_format() {
+        Ok(())
+    } else {
+        Err(Error::Execution(String::from(
+            "the recursion guest verifies default-format proofs only (ZF format levers off)",
+        )))
+    }
+}
+
 /// Verify the guest's private-input blob ([`encode_guest_input`]) in place and,
 /// on success, produce the attestation bytes the recursion guest commits:
 /// `program_id(elf, roots) || inner_public_output`. `Ok(None)` means the
@@ -279,6 +295,7 @@ pub fn verify_and_attest_blob(
     blob: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
+    require_default_format(proof_options)?;
     let verification = crate::verify_recursion_blob(blob, proof_options)?;
     if !verification.ok {
         return Ok(None);
@@ -313,6 +330,8 @@ pub fn verify_continuation_and_attest(
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
     use rkyv::rancor::Error as RkyvError;
+
+    require_default_format(proof_options)?;
 
     let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
         Error::Execution(String::from(

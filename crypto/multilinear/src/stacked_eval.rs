@@ -494,6 +494,7 @@ mod tests {
             log_folding: 2,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: crate::whir_chain::ChainFormat::DEFAULT,
         }
     }
 

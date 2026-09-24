@@ -760,6 +760,9 @@ pub(crate) fn absorb_epoch(
         log_folding,
         num_queries,
         grind,
+        // ⚠ Format, NOT absorbed: verifier-side constants (see
+        // `lfm::whir_statement::push_config`, the emitter's twin of this).
+        format: _,
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
@@ -922,6 +925,9 @@ pub(crate) fn absorb_global(
         log_folding,
         num_queries,
         grind,
+        // ⚠ Format, NOT absorbed: verifier-side constants (see
+        // `lfm::whir_statement::push_config`, the emitter's twin of this).
+        format: _,
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());

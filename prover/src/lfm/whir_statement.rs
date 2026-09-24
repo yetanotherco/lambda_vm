@@ -102,6 +102,12 @@ fn push_config(bytes: &mut Vec<u8>, config: &ChainConfig) {
         log_folding,
         num_queries,
         grind,
+        // ⚠ NOT absorbed: the format (cap policy, fold schedule) is a set of
+        // verifier-side constants, like the STARK cap. Absorbing it would move
+        // this statement's bytes, and every WHIR transcript KAT, at the
+        // default. A lane that changes a lever's effect on the statement
+        // decides that here, explicitly.
+        format: _,
     } = config;
     for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
         bytes.extend_from_slice(&value.to_le_bytes());

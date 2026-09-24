@@ -2678,7 +2678,8 @@ fn the_production_leaf_node_measures() {
     );
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     println!(
         "★ PRODUCTION LEAF NODE: FAN-IN {fan_in} · guest {}, {} input bytes, \
@@ -5926,7 +5927,8 @@ fn the_production_tree_composes_to_a_root() {
     };
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(
@@ -7835,7 +7837,8 @@ fn the_whir_production_tree_composes_to_a_root() {
     );
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(

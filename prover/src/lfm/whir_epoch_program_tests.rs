@@ -888,6 +888,7 @@ fn walk_config() -> multilinear::whir_chain::ChainConfig {
         log_folding: 2,
         num_queries: 3,
         grind: multilinear::whir_chain::GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     }
 }
 

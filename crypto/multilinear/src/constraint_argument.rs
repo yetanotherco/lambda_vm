@@ -926,6 +926,7 @@ mod tests {
             log_folding: 2,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: crate::whir_chain::ChainFormat::DEFAULT,
         }
     }
 
@@ -1129,6 +1130,7 @@ mod tests {
             log_folding: 2,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: crate::whir_chain::ChainFormat::DEFAULT,
         };
         // Domain in Goldilocks, values in its degree-3 extension.
         let trace = CommittedTrace::<F, Ext>::commit(columns, &cfg).unwrap();
@@ -1179,6 +1181,7 @@ mod tests {
             log_folding: 2,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: crate::whir_chain::ChainFormat::DEFAULT,
         };
         let trace = CommittedTrace::<F, Ext>::commit(columns, &cfg).unwrap();
         let roots = trace.roots();

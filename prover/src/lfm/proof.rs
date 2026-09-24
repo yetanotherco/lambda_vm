@@ -546,9 +546,25 @@ fn expected_public_balance(
 /// coefficients it merely absorbs. Inner epochs are NOT touched by this
 /// choice: the wrap PROGRAM is a function of the inner proof's options, so
 /// this constructor moves no program identity.
+///
+/// ★ A PRODUCTION FORMAT SITE: the process's [`ZfFormat`](crate::zf_format::ZfFormat)
+/// is stamped on here (`LAMBDA_VM_ZF_CAP`, `_FRI`, `_ONE_ROW`), so every LFM
+/// proof — wraps, nodes, the root — and every emitter that derives its shape
+/// from these options sees one format. Unset knobs give today's options.
 pub fn aggregation_wrap_options() -> ProofOptions {
     let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
         .expect("blowup=4 is valid");
     opts.fri_final_poly_log_degree = 8;
-    opts
+    crate::zf_format::ZfFormat::global().options(opts)
+}
+
+/// The STARK block's base-epoch options: the blowup-4 preset the production
+/// tree proves its epochs under, with the process's
+/// [`ZfFormat`](crate::zf_format::ZfFormat) stamped on — a PRODUCTION FORMAT
+/// SITE, like [`aggregation_wrap_options`].
+///
+/// Not [`crate::recursion::Preset::options`] itself: that value also fixes
+/// the RV64 recursion guest's verifier, which stays default-format only.
+pub fn block_base_options() -> ProofOptions {
+    crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
 }

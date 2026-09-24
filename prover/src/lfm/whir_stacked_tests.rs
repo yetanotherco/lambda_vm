@@ -342,6 +342,7 @@ fn group_config(group: &Group) -> ChainConfig {
         log_folding: 2,
         num_queries: group.num_queries,
         grind: GrindBits::uniform(group.grind),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     }
 }
 
