@@ -1,3 +1,4 @@
+pub mod checkpoint_tests;
 pub mod ecsm_tests;
 pub mod flamegraph_tests;
 pub mod hint_tests;

@@ -53,6 +53,12 @@ compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` fe
     all(feature = "blowup4", feature = "blowup8"),
 ))]
 compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` features");
+#[cfg(any(
+    all(feature = "continuation", feature = "batched"),
+    all(feature = "continuation", feature = "owned"),
+    all(feature = "batched", feature = "owned"),
+))]
+compile_error!("`continuation`, `batched` and `owned` are mutually exclusive proof layouts");
 
 /// The build preset fixing the inner `ProofOptions` (see the module docs).
 #[cfg(feature = "min")]
@@ -88,7 +94,7 @@ pub fn main() -> ! {
     // not self-enforcing here.
     let options = PRESET.options();
 
-    #[cfg(not(feature = "continuation"))]
+    #[cfg(not(any(feature = "continuation", feature = "batched", feature = "owned")))]
     let attestation = lambda_vm_prover::recursion::verify_and_attest_blob(blob, &options)
         .expect("verify errored")
         .expect("inner proof failed verification");
@@ -97,6 +103,16 @@ pub fn main() -> ! {
     let attestation = lambda_vm_prover::recursion::verify_continuation_and_attest(blob, &options)
         .expect("verify errored")
         .expect("inner continuation proof failed verification");
+
+    #[cfg(feature = "batched")]
+    let attestation = lambda_vm_prover::recursion::verify_batched_and_attest(blob, &options)
+        .expect("verify errored")
+        .expect("inner batched proof failed verification");
+
+    #[cfg(feature = "owned")]
+    let attestation = lambda_vm_prover::recursion::verify_owned_and_attest(blob, &options)
+        .expect("verify errored")
+        .expect("inner proof failed verification");
 
     lambda_vm_syscalls::syscalls::commit(&attestation);
     lambda_vm_syscalls::syscalls::sys_halt();

@@ -12,13 +12,20 @@
 
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
+pub mod batched_proof;
+pub mod batched_verifier;
+pub mod challenge_phase;
+pub mod commit_phase;
 pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod logup_phase;
 mod paged_mem;
+pub mod pass;
+pub(crate) mod streaming;
 pub use stark::profile_markers;
 pub mod recursion;
 mod statement;
@@ -1313,25 +1320,73 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("trace_build");
 
+    // The storage mode and `LAMBDA_STREAM_LDE=auto` read the same analytical
+    // peak estimate, so the log pre-pass behind it is paid once, and only when
+    // something actually asks for it.
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
         let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
+        if stark::prover::streaming_retire_lde_is_auto() {
+            stark::prover::set_retire_lde(auto_storage::decide_retire_lde(
+                &lengths,
+                proof_options.blowup_factor,
+            ));
+        }
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
+    // The estimate lives behind `disk-spill` (so do `TableLengths` and the
+    // storage mode it feeds). Say so instead of silently proving with the mode
+    // off, which would read as "auto decided no".
+    #[cfg(not(feature = "disk-spill"))]
+    if stark::prover::streaming_retire_lde_is_auto() {
+        log::warn!(
+            "LAMBDA_STREAM_LDE=auto needs the `disk-spill` feature for the peak-RAM estimate; \
+             proving with the main LDE resident. Pass LAMBDA_STREAM_LDE=1 to force it on."
+        );
+    }
+
+    // Retiring the LDE also retires the traces: the same flag, one rung further
+    // down the same ladder. The chunked tables come back as placeholders and the
+    // provider rebuilds each chunk at the two points the prover needs it.
+    let retire_traces = stark::prover::streaming_retire_lde();
+    // The public output is all this path still needs from the run above; keeping
+    // it lets the logs go before the build, which is the phase that peaks.
+    let executor_output = result.return_values.memory_values.clone();
+    let (mut traces, streaming) = if retire_traces {
+        // The collector walks the execution itself, one chunk of logs at a time,
+        // so this run's logs are dead weight from here on. Freeing them costs a
+        // second execution and is the shape the Commit phase needs: a prover
+        // that walks an execution instead of being handed it whole.
+        drop(result);
+        let (traces, routed) = Traces::from_elf_and_logs_streaming(
+            &program,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        // This path always proves a single, final epoch, so HALT is present —
+        // passed explicitly rather than assumed, because the slot map is only
+        // correct if it agrees with `VmAirs::air_trace_pairs`.
+        let provider = streaming::StreamingProvider::new(routed, max_rows.clone(), &traces, true);
+        (traces, Some(provider))
+    } else {
+        let traces = Traces::from_elf_and_logs(
+            &program,
+            &result.logs,
+            max_rows,
+            private_inputs,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        drop(result);
+        (traces, None)
+    };
     debug_assert_eq!(
-        traces.public_output_bytes, result.return_values.memory_values,
+        traces.public_output_bytes, executor_output,
         "public output diverged between executor view and trace reconstruction"
     );
-    drop(result);
 
     #[cfg(feature = "instruments")]
     drop(__sp);
@@ -1392,11 +1447,14 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
+    let proof = Prover::multi_prove_with_provider(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
+        streaming
+            .as_ref()
+            .map(|p| p as &dyn stark::prover::TraceProvider<_, _>),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     #[cfg(feature = "instruments")]

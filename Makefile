@@ -73,8 +73,15 @@ RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
 # `continuation` feature: verify a multi-epoch ContinuationProof bundle instead
 # of a monolithic VmProof. Only the presets the benchmarks actually measure.
 RECURSION_CONT_PRESETS := min blowup2 blowup4
+# `batched` feature: verify a BatchedProof (one FRI per domain height) instead
+# of a monolithic VmProof.
+RECURSION_BATCHED_PRESETS := min blowup2
+# `owned` feature: the monolithic proof, deserialized instead of read in place.
+RECURSION_OWNED_PRESETS := blowup2
 RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS))) \
-	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS)))
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-batched-, $(addsuffix .elf, $(RECURSION_BATCHED_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-owned-, $(addsuffix .elf, $(RECURSION_OWNED_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -247,6 +254,22 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RE
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
+
+# Batched variants: same crate, `batched` feature on top of the preset feature
+# -> recursion-batched-<preset>-bench -> recursion-batched-<preset>.elf.
+define recursion_batched_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-batched-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-batched-$(1)-bench,--features "batched $(1)")
+endef
+$(foreach preset,$(RECURSION_BATCHED_PRESETS),$(eval $(call recursion_batched_verifier_rule,$(preset))))
+
+# Owned variants: same crate and the same blob as the default guest, read via
+# one rkyv deserialize instead of in place.
+define recursion_owned_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-owned-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-owned-$(1)-bench,--features "owned $(1)")
+endef
+$(foreach preset,$(RECURSION_OWNED_PRESETS),$(eval $(call recursion_owned_verifier_rule,$(preset))))
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

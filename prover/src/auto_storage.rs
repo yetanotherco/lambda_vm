@@ -233,6 +233,29 @@ pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
     mode
 }
 
+/// Whether to retire each table's main LDE after the Round 1 commit, from the
+/// same analytical estimate that picks the storage mode.
+///
+/// Policy: retire exactly when the estimate does not fit under the safety
+/// threshold — the regime where the prover is about to swap or die, and where
+/// trading ~11 % of prove time for the N-wide main-LDE term is the trade you
+/// want. Below the threshold the term is affordable and the time is not worth
+/// paying. Resolves `LAMBDA_STREAM_LDE=auto`; an explicit `0`/`1` overrides it.
+pub fn decide_retire_lde(lengths: &TableLengths, blowup_factor: u8) -> bool {
+    let estimated = peak_bytes(lengths, blowup_factor, storage_estimate_parallelism());
+    let retire = retire_lde_for(estimated, available_ram_bytes());
+    log::info!("estimated_peak_bytes: {estimated}, retire_lde: {retire}");
+    retire
+}
+
+/// The policy itself, over an explicit estimate and available RAM: retire on
+/// exactly the inputs that pick `Disk`, so the two memory levers share one
+/// trigger and one safety margin. Unknown available RAM retires, matching the
+/// storage mode's conservative default.
+pub(crate) fn retire_lde_for(estimated: u64, available: Option<u64>) -> bool {
+    select_storage_mode(estimated, available) == StorageMode::Disk
+}
+
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
 ///
 /// `table_parallelism` is how many tables' rounds 2-4 transients this assumes

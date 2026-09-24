@@ -1099,3 +1099,1264 @@ fn test_local_to_global_traces_from_real_execution() {
         assert_eq!(trace.num_rows(), expected_rows);
     }
 }
+
+/// Two builds of the same logs must produce byte-identical traces.
+///
+/// The dedup'd tables (LT, MUL, DVRM, BRANCH, EQ, BYTEWISE) collect their rows
+/// out of a `HashMap`, whose iteration order std randomizes per instance — so
+/// the rows were identical in content but arbitrary in order. Harmless while a
+/// trace is built once, fatal for rebuilding a retired one: the rebuild has to
+/// hash to the root the first build committed.
+///
+/// Fails if any of the `sort_unstable_by` calls after those dedups is removed.
+#[test]
+fn trace_build_is_deterministic_across_builds() {
+    type TT = stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >;
+
+    // Several DISTINCT ops per table, so each dedup'd `unique_ops` holds more
+    // than one element and its order can actually vary.
+    let mut logs = vec![
+        make_slt_log(0x1000, 5, 10, 1),
+        make_slt_log(0x1004, 200, 7, 0),
+        make_slt_log(0x1008, 42, 42, 0),
+        make_slt_log(0x100c, 1, 999, 1),
+        make_blt_log(0x1010, 3, 4, true),
+        make_blt_log(0x1014, 50, 9, false),
+        make_blt_log(0x1018, 77, 77, false),
+    ];
+    let mut instrs = vec![
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
+    ];
+    append_ecall(&mut logs, &mut instrs);
+    let instructions = make_instructions(&logs, &instrs);
+    let max_rows = Default::default();
+
+    let a = Traces::from_logs(&logs, instructions.clone(), &max_rows).unwrap();
+    let b = Traces::from_logs(&logs, instructions, &max_rows).unwrap();
+
+    fn flat(t: &TT) -> Vec<u64> {
+        let (data, _cols) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect()
+    }
+    fn eq_chunks(x: &[TT], y: &[TT], name: &str) {
+        assert_eq!(
+            x.len(),
+            y.len(),
+            "{name}: chunk count differs across builds"
+        );
+        for (i, (s, m)) in x.iter().zip(y.iter()).enumerate() {
+            assert_eq!(
+                flat(s),
+                flat(m),
+                "{name} chunk {i}: trace data differs across builds (non-deterministic order)"
+            );
+        }
+    }
+    eq_chunks(&a.lts, &b.lts, "LT");
+    eq_chunks(&a.muls, &b.muls, "MUL");
+    eq_chunks(&a.dvrms, &b.dvrms, "DVRM");
+    eq_chunks(&a.branches, &b.branches, "BRANCH");
+    eq_chunks(&a.eqs, &b.eqs, "EQ");
+    eq_chunks(&a.bytewises, &b.bytewises, "BYTEWISE");
+    eq_chunks(&a.cpus, &b.cpus, "CPU");
+    eq_chunks(&a.memws, &b.memws, "MEMW");
+    eq_chunks(&a.shifts, &b.shifts, "SHIFT");
+    eq_chunks(&a.loads, &b.loads, "LOAD");
+}
+
+/// `build_chunk(kind, i)` must equal `build_table(kind)[i]`, byte for byte.
+///
+/// This is the equality the streaming prover rests on: Round 1 commits the
+/// table built one way, and the fused chain rebuilds the chunk it needs the
+/// other way. If they ever diverge, the rebuilt trace hashes to a root the
+/// verifier will not accept.
+#[test]
+fn build_chunk_matches_the_full_table_build() {
+    use crate::tables::trace_builder::{CollectedOps, TableKind};
+
+    // More ops than the chunk limit below, so several chunks exist and the
+    // last one is short.
+    let lt_ops: Vec<_> = (0..10u64)
+        .map(|i| crate::tables::lt::LtOperation::new(i, i * 7 + 1, false))
+        .collect();
+    let routed = CollectedOps {
+        lt_ops,
+        ..Default::default()
+    };
+
+    let max_rows = crate::tables::MaxRowsConfig {
+        lt: 4,
+        ..Default::default()
+    };
+
+    let whole = routed
+        .build_table(
+            TableKind::Lt,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("full build");
+    assert_eq!(
+        whole.len(),
+        routed.num_chunks(TableKind::Lt, &max_rows),
+        "num_chunks disagrees with what build_table produced"
+    );
+
+    for (i, expected) in whole.iter().enumerate() {
+        let one = routed.build_chunk(TableKind::Lt, i, &max_rows);
+        let (a, _) = expected.main_data_row_major();
+        let (b, _) = one.main_data_row_major();
+        assert_eq!(
+            a.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+            b.iter().map(|fe| *fe.value()).collect::<Vec<_>>(),
+            "chunk {i}: on-demand build differs from the full build"
+        );
+    }
+}
+
+/// `chunk_shape` must agree with the chunk it declines to build, for every kind.
+///
+/// It reads the shape off op counts and a constant width instead of generating
+/// a trace, which is only valid while every generator pads to
+/// `count.next_power_of_two().max(4)`. This is the test that fails if one of
+/// them ever stops.
+#[test]
+fn chunk_shape_matches_the_built_chunk() {
+    use crate::tables::trace_builder::{CollectedOps, TableKind};
+
+    // Ops with deliberate repeats, so the deduplicating kinds and the plain ones
+    // disagree on count and the distinction is actually exercised.
+    // 8 ops, 3 distinct: the deduplicating rule pads to 4 rows where counting
+    // them raw would pad to 8. Without that gap the test would pass even if
+    // `chunk_shape` ignored deduplication entirely.
+    let lt_ops: Vec<_> = (0..8u64)
+        .map(|i| crate::tables::lt::LtOperation::new(i % 3, i % 3 + 1, false))
+        .collect();
+    // SHIFT is a plain kind (no dedup): 20 ops over a limit of 8 give chunks of
+    // 8/8/4, i.e. row counts of 8/8/4. Sizes above 4 matter — an empty op list
+    // pads to 4, so a fixture whose chunks all land on 4 compares the padding
+    // floor against itself and would pass even if the row rule were wrong.
+    let shift_ops: Vec<_> = (0..20u64)
+        .map(|i| crate::tables::shift::ShiftOperation::new(i, i % 5, false, false, false))
+        .collect();
+    // MUL deduplicates like LT, and its rows are keyed on the op with the lo/hi
+    // flag folded into the multiplicity: 12 entries, 3 distinct.
+    let mul_ops: Vec<_> = (0..6u64)
+        .flat_map(|i| {
+            let op = crate::tables::mul::MulOperation::new(i % 3, false, i % 3 + 1, false);
+            [(op.clone(), false), (op, true)]
+        })
+        .collect();
+    let routed = CollectedOps {
+        lt_ops,
+        shift_ops,
+        mul_ops,
+        ..Default::default()
+    };
+
+    let max_rows = crate::tables::MaxRowsConfig {
+        lt: 16,
+        shift: 8,
+        mul: 16,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        routed.chunk_shape(TableKind::Lt, 0, &max_rows).0,
+        4,
+        "the LT fixture must exercise deduplication (8 ops, 3 distinct)"
+    );
+    assert_eq!(
+        routed.chunk_shape(TableKind::Mul, 0, &max_rows).0,
+        4,
+        "the MUL fixture must exercise deduplication (12 entries, 3 distinct)"
+    );
+    assert_eq!(
+        routed.num_chunks(TableKind::Shift, &max_rows),
+        3,
+        "the SHIFT fixture must split into several chunks, or the plain path is \
+         only ever checked on one"
+    );
+    assert_eq!(
+        routed.chunk_shape(TableKind::Shift, 0, &max_rows).0,
+        8,
+        "the SHIFT fixture must produce chunks wider than the 4-row padding floor"
+    );
+
+    let mut populated = 0usize;
+    for kind in [
+        TableKind::Cpu,
+        TableKind::Memw,
+        TableKind::MemwAligned,
+        TableKind::MemwRegister,
+        TableKind::Load,
+        TableKind::Lt,
+        TableKind::Shift,
+        TableKind::Mul,
+        TableKind::Dvrm,
+        TableKind::Branch,
+        TableKind::Eq,
+        TableKind::Bytewise,
+        TableKind::Store,
+        TableKind::Cpu32,
+    ] {
+        for chunk in 0..routed.num_chunks(kind, &max_rows) {
+            let built = routed.build_chunk(kind, chunk, &max_rows);
+            assert_eq!(
+                routed.chunk_shape(kind, chunk, &max_rows),
+                (built.num_rows(), built.num_main_columns),
+                "{kind:?} chunk {chunk}: declared shape differs from the built one"
+            );
+            if routed.buffered(kind) > 0 {
+                populated += 1;
+            }
+        }
+    }
+    // A kind with no ops pads to the same 4 rows on both sides, so it pins the
+    // column width and nothing else. Without at least a few populated kinds this
+    // whole loop is a constant compared against itself.
+    assert!(
+        populated >= 3,
+        "the fixture must give several kinds real ops, or the row half of the \
+         comparison is vacuous (populated chunks: {populated})"
+    );
+}
+
+/// Collecting an execution chunk by chunk must produce exactly what collecting
+/// it all at once produces.
+///
+/// This is what lets the prover walk an execution instead of starting from a
+/// materialized log of the whole thing. It holds because phases 1-3 are
+/// segment-local once `MemoryState` and `RegisterState` are carried: the LT ops
+/// a memory access implies come from the timestamps that access already
+/// carries, not from an ordering over the whole run.
+///
+/// Compared through the built traces rather than the op lists, since that is
+/// what the commitment is taken over.
+#[test]
+fn collect_streaming_matches_collect_epoch() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig::default();
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let at_once =
+        T::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collect at once");
+    let streamed =
+        T::collect_epoch_streaming(&artifacts, &elf, vec![], &image, &register_init, true)
+            .expect("collect streaming");
+
+    let build = |collected| {
+        T::build_from_collected(
+            &artifacts,
+            collected,
+            Some(&image),
+            &register_init,
+            &max_rows,
+            &[],
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("build")
+    };
+    let a = build(at_once);
+    let b = build(streamed);
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<_>>()
+    };
+    let same = |x: &[_], y: &[_], name: &str| {
+        assert_eq!(x.len(), y.len(), "{name}: chunk count differs");
+        for (i, (p, q)) in x.iter().zip(y.iter()).enumerate() {
+            assert_eq!(flat(p), flat(q), "{name} chunk {i} differs");
+        }
+    };
+    same(&a.cpus, &b.cpus, "CPU");
+    same(&a.memws, &b.memws, "MEMW");
+    same(&a.lts, &b.lts, "LT");
+    same(&a.loads, &b.loads, "LOAD");
+    same(&a.shifts, &b.shifts, "SHIFT");
+    same(&a.branches, &b.branches, "BRANCH");
+    same(&a.memw_registers, &b.memw_registers, "MEMW_R");
+    assert_eq!(flat(&a.bitwise), flat(&b.bitwise), "BITWISE differs");
+    assert_eq!(flat(&a.register), flat(&b.register), "REGISTER differs");
+}
+
+/// The Commit-phase walk must hand out exactly the chunks the all-at-once build
+/// produces, in the same order.
+///
+/// It is the same equality `build_chunk` rests on, one level up: a table closed
+/// mid-execution and a table built from the finished op list have to be the
+/// same table, or committing early means committing something else.
+fn assert_walk_matches(fixture: &str, max_rows: crate::tables::MaxRowsConfig, min_split: usize) {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{
+        DecodeArtifacts, TableKind, Traces as T, build_initial_image,
+    };
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes(fixture);
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    // Small enough that the walk closes several chunks before the run ends,
+    // which is the case that matters — a single tail chunk would prove nothing.
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let collected =
+        T::collect_epoch(&artifacts, &image, &register_init, &logs, true).expect("collect");
+    let expected = T::build_from_collected(
+        &artifacts,
+        collected,
+        Some(&image),
+        &register_init,
+        &max_rows,
+        &[],
+        true,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("build");
+
+    let mut seen: Vec<(TableKind, usize, Vec<u64>)> = Vec::new();
+    T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |kind, chunk, table| {
+            let (data, _) = table.main_data_row_major();
+            seen.push((kind, chunk, data.iter().map(|fe| *fe.value()).collect()));
+        },
+    )
+    .expect("walk");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    let check = |kind: TableKind,
+                 want: &[stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >]| {
+        let got: Vec<_> = seen.iter().filter(|(k, _, _)| *k == kind).collect();
+        // The walk emits only the chunks that filled up during the run; the
+        // partial tail waits for the end-of-run finalization, which still
+        // appends to these lists. So the emitted chunks are a prefix.
+        assert_eq!(
+            got.len(),
+            want.len().saturating_sub(1),
+            "{kind:?}: the walk should emit every chunk but the tail"
+        );
+        for (i, (_, chunk, data)) in got.iter().enumerate() {
+            assert_eq!(*chunk, i, "{kind:?}: chunks arrived out of order");
+            assert_eq!(*data, flat(&want[i]), "{kind:?} chunk {i} differs");
+        }
+    };
+    // Only the tables this fixture actually splits are worth asserting on: a
+    // table with one chunk compares an empty prefix and proves nothing.
+    let chunked: Vec<&str> = [
+        ("CPU", expected.cpus.len()),
+        ("MEMW", expected.memws.len()),
+        ("MEMW_A", expected.memw_aligneds.len()),
+        ("MEMW_R", expected.memw_registers.len()),
+        ("LOAD", expected.loads.len()),
+        ("BRANCH", expected.branches.len()),
+        ("EQ", expected.eqs.len()),
+        ("BYTEWISE", expected.bytewises.len()),
+        ("STORE", expected.stores.len()),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 1)
+    .map(|(name, _)| name)
+    .collect();
+    assert!(
+        chunked.len() >= min_split,
+        "{fixture} must split at least {min_split} tables mid-walk, split: {chunked:?}"
+    );
+
+    check(TableKind::Cpu, &expected.cpus);
+    check(TableKind::Memw, &expected.memws);
+    check(TableKind::MemwAligned, &expected.memw_aligneds);
+    check(TableKind::MemwRegister, &expected.memw_registers);
+    check(TableKind::Load, &expected.loads);
+    check(TableKind::Cpu32, &expected.cpu32s);
+    check(TableKind::Branch, &expected.branches);
+    check(TableKind::Eq, &expected.eqs);
+    check(TableKind::Bytewise, &expected.bytewises);
+    check(TableKind::Store, &expected.stores);
+}
+
+#[test]
+fn commit_walk_emits_the_same_chunks() {
+    // Limits small enough that several tables close chunks mid-walk.
+    assert_walk_matches(
+        "fib_iterative_160k",
+        crate::tables::MaxRowsConfig {
+            cpu: 1 << 15,
+            memw: 1 << 10,
+            load: 1 << 10,
+            branch: 1 << 12,
+            eq: 1 << 12,
+            bytewise: 1 << 12,
+            store: 1 << 12,
+            ..Default::default()
+        },
+        3,
+    );
+}
+
+/// The same, on a program that uses the word instructions.
+///
+/// `cpu32_chip_op` appends to SHIFT, MUL and DVRM for every `*W` op, so those
+/// tables are not final when a segment ends. A fibonacci fixture has no word
+/// instructions and would let a table that is closed too early pass unnoticed;
+/// this one would not.
+#[test]
+fn commit_walk_emits_the_same_chunks_with_word_instructions() {
+    assert_walk_matches("basic_arith_32", crate::tables::MaxRowsConfig::small(), 1);
+}
+
+/// A chunk committed during the walk must carry the root the normal prover
+/// gives that same chunk.
+///
+/// This is what makes Approach 1's Commit phase legitimate rather than merely
+/// convenient: the phase closes a table before the tables after it exist and
+/// puts its commitment in the transcript then and there. If that commitment
+/// differed from the one the all-at-once prover would produce, everything
+/// downstream — challenges, openings, the verifier — would be reading a
+/// different table.
+#[test]
+fn chunks_committed_during_the_walk_carry_the_normal_roots() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{
+        DecodeArtifacts, TableKind, Traces as T, build_initial_image,
+    };
+    use executor::elf::Elf;
+    use stark::prover::IsStarkProver;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 15,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let traces = T::from_elf_and_logs(
+        &elf,
+        &executor::vm::execution::Executor::new(&elf, vec![])
+            .expect("executor")
+            .run()
+            .expect("run")
+            .logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    let counts = traces.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+
+    // The AIR each emitted chunk belongs to, by kind and position.
+    let air_for = |kind: TableKind, chunk: usize| match kind {
+        TableKind::Cpu => airs.cpus.get(chunk).map(|a| a.as_ref()),
+        TableKind::Memw => airs.memws.get(chunk).map(|a| a.as_ref()),
+        TableKind::MemwAligned => airs.memw_aligneds.get(chunk).map(|a| a.as_ref()),
+        TableKind::MemwRegister => airs.memw_registers.get(chunk).map(|a| a.as_ref()),
+        TableKind::Load => airs.loads.get(chunk).map(|a| a.as_ref()),
+        TableKind::Cpu32 => airs.cpu32s.get(chunk).map(|a| a.as_ref()),
+        TableKind::Branch => airs.branches.get(chunk).map(|a| a.as_ref()),
+        TableKind::Eq => airs.eqs.get(chunk).map(|a| a.as_ref()),
+        TableKind::Bytewise => airs.bytewises.get(chunk).map(|a| a.as_ref()),
+        TableKind::Store => airs.stores.get(chunk).map(|a| a.as_ref()),
+        _ => None,
+    };
+
+    type P = stark::prover::Prover<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >;
+    let commit_root = |air: &dyn stark::traits::AIR<
+        Field = crate::tables::types::GoldilocksField,
+        FieldExtension = crate::tables::types::GoldilocksExtension,
+        PublicInputs = (),
+    >,
+                       t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| { <P as IsStarkProver<_, _, _>>::commit_table_root(air, t) };
+
+    let mut checked = 0usize;
+    T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |kind, chunk, table| {
+            let Some(air) = air_for(kind, chunk) else {
+                return;
+            };
+            let walked = commit_root(air, &table).expect("the walk's chunk commits");
+            let resident = match kind {
+                TableKind::Cpu => &traces.cpus[chunk],
+                TableKind::Memw => &traces.memws[chunk],
+                TableKind::MemwAligned => &traces.memw_aligneds[chunk],
+                TableKind::MemwRegister => &traces.memw_registers[chunk],
+                TableKind::Load => &traces.loads[chunk],
+                TableKind::Cpu32 => &traces.cpu32s[chunk],
+                TableKind::Branch => &traces.branches[chunk],
+                TableKind::Eq => &traces.eqs[chunk],
+                TableKind::Bytewise => &traces.bytewises[chunk],
+                TableKind::Store => &traces.stores[chunk],
+                _ => unreachable!(),
+            };
+            let expected = commit_root(air, resident).expect("the resident chunk commits");
+            assert_eq!(
+                walked, expected,
+                "{kind:?} chunk {chunk}: committed during the walk under a different root"
+            );
+            checked += 1;
+        },
+    )
+    .expect("walk");
+
+    assert!(
+        checked > 0,
+        "the fixture must close at least one chunk mid-walk"
+    );
+}
+
+/// No table CPU32 feeds may be closed early by the Commit-phase walk.
+///
+/// `cpu32_chip_op` appends to SHIFT, MUL and DVRM once per word instruction, so
+/// those are not final when a segment ends — closing one early would cut its
+/// chunks somewhere the finished run does not.
+///
+/// Stated as an invariant rather than left to a fixture: catching it by data
+/// needs a program with word instructions AND enough of the affected ops to
+/// split a chunk, and a fixture that stops meeting that quietly stops testing
+/// it. SHIFT was in fact closed early until this was noticed.
+#[test]
+fn cpu32_appends_are_excluded_from_early_closing() {
+    use crate::tables::trace_builder::{CHUNKED_KINDS, CPU32_APPENDS_TO};
+
+    for kind in CPU32_APPENDS_TO {
+        assert!(
+            !CHUNKED_KINDS.contains(&kind),
+            "{kind:?} takes ops from cpu32_chip_op after a segment ends, so the walk \
+             must not close it early"
+        );
+    }
+}
+
+/// The Commit phase must commit every chunk it closes under the root the
+/// ordinary prover gives that chunk, and hand back the rest of the run.
+///
+/// This is the pass end to end: it walks the execution, commits and drops each
+/// table as it fills, and returns what it could not close. Two things have to
+/// hold for that to be a prover and not just a producer — the commitments have
+/// to be the right ones, and nothing may fall between the chunks it closed and
+/// the tail it kept.
+#[test]
+fn the_commit_phase_commits_what_it_closes_and_keeps_the_rest() {
+    use crate::tables::trace_builder::{TableKind, Traces as T};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase =
+        crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit phase");
+    assert!(
+        !phase.closed.is_empty(),
+        "the fixture must close at least one chunk mid-walk"
+    );
+
+    // Every commitment must be the one the resident chunk carries.
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    let counts = resident.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        false,
+        &resident.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    type P = stark::prover::Prover<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >;
+    use stark::prover::IsStarkProver;
+    for (kind, chunk, root) in &phase.closed {
+        let (air, table) = match kind {
+            TableKind::Cpu => (airs.cpus[*chunk].as_ref(), &resident.cpus[*chunk]),
+            TableKind::Memw => (airs.memws[*chunk].as_ref(), &resident.memws[*chunk]),
+            TableKind::MemwAligned => (
+                airs.memw_aligneds[*chunk].as_ref(),
+                &resident.memw_aligneds[*chunk],
+            ),
+            TableKind::MemwRegister => (
+                airs.memw_registers[*chunk].as_ref(),
+                &resident.memw_registers[*chunk],
+            ),
+            TableKind::Load => (airs.loads[*chunk].as_ref(), &resident.loads[*chunk]),
+            TableKind::Cpu32 => (airs.cpu32s[*chunk].as_ref(), &resident.cpu32s[*chunk]),
+            TableKind::Branch => (airs.branches[*chunk].as_ref(), &resident.branches[*chunk]),
+            TableKind::Eq => (airs.eqs[*chunk].as_ref(), &resident.eqs[*chunk]),
+            TableKind::Bytewise => (airs.bytewises[*chunk].as_ref(), &resident.bytewises[*chunk]),
+            TableKind::Store => (airs.stores[*chunk].as_ref(), &resident.stores[*chunk]),
+            other => unreachable!("{other:?} is not closed mid-walk"),
+        };
+        let expected =
+            <P as IsStarkProver<_, _, _>>::commit_table_root(air, table).expect("resident commits");
+        assert_eq!(
+            *root, expected,
+            "{kind:?} chunk {chunk}: the Commit phase used a different root"
+        );
+    }
+
+    // And nothing falls between what it closed and what it kept: the chunks it
+    // closed plus the tail it kept are the chunks the resident build produced.
+    // Exact for CPU, which is one op per executed cycle and takes nothing from
+    // the end-of-run finalization; a bound elsewhere, since that finalization
+    // appends after the last cycle and can spill the tail into another chunk.
+    assert_eq!(
+        phase.walked.leftover.cycles(),
+        logs.len(),
+        "the walk executed a different number of cycles than the straight run"
+    );
+    let closed_of = |kind: TableKind| phase.closed.iter().filter(|(k, _, _)| *k == kind).count();
+    assert_eq!(
+        closed_of(TableKind::Cpu) + 1,
+        resident.cpus.len(),
+        "CPU: the closed chunks plus the tail are not the run's chunks"
+    );
+    for (kind, produced) in [
+        (TableKind::Memw, resident.memws.len()),
+        (TableKind::MemwAligned, resident.memw_aligneds.len()),
+        (TableKind::MemwRegister, resident.memw_registers.len()),
+        (TableKind::Load, resident.loads.len()),
+        (TableKind::Cpu32, resident.cpu32s.len()),
+        (TableKind::Branch, resident.branches.len()),
+        (TableKind::Eq, resident.eqs.len()),
+        (TableKind::Bytewise, resident.bytewises.len()),
+        (TableKind::Store, resident.stores.len()),
+    ] {
+        assert_eq!(
+            phase.walked.leftover.emitted(kind),
+            closed_of(kind),
+            "{kind:?}: the leftover disagrees with what was committed"
+        );
+        if produced == 0 {
+            // #977: a kind the run never used has no table at all, so there is
+            // no tail to leave — and nothing may have been closed for it.
+            assert_eq!(
+                closed_of(kind),
+                0,
+                "{kind:?}: the ordinary build has no table, but chunks were closed"
+            );
+        } else {
+            assert!(
+                closed_of(kind) < produced,
+                "{kind:?}: closed {} of the run's {produced} chunks, leaving no tail",
+                closed_of(kind)
+            );
+        }
+    }
+}
+
+/// Commit plus Challenge must cover every chunked table, each under the root
+/// the ordinary prover gives it.
+///
+/// Together the two passes are supposed to account for the chunked side of the
+/// proof with nothing missing and nothing committed twice: the chunks closed
+/// mid-walk, the tails padded at the end, and the tables the walk could not
+/// close at all. Checked against a real proof's roots, in position, so a table
+/// committed under the wrong root or in the wrong slot fails here.
+#[test]
+fn the_two_phases_cover_every_chunked_table() {
+    use crate::tables::trace_builder::{TableKind, Traces as T};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 1 << 15,
+        memw: 1 << 10,
+        load: 1 << 10,
+        branch: 1 << 12,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
+    let closed = phase.closed.clone();
+    let (rest, _) =
+        crate::commit_phase::commit_remaining(phase.walked, &[], &max_rows, &proof_options)
+            .expect("challenge");
+
+    let mut got: HashMap<(TableKind, usize), _> = HashMap::new();
+    for (kind, chunk, root) in closed.into_iter().chain(rest) {
+        assert!(
+            got.insert((kind, chunk), root).is_none(),
+            "{kind:?} chunk {chunk} was committed twice"
+        );
+    }
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+    let counts = resident.table_counts();
+    let airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        false,
+        &resident.page_configs,
+        &counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    type P = stark::prover::Prover<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+        (),
+    >;
+    use stark::prover::IsStarkProver;
+
+    let groups: [(TableKind, &Vec<_>, &Vec<_>); 4] = [
+        (TableKind::Cpu, &airs.cpus, &resident.cpus),
+        (TableKind::Branch, &airs.branches, &resident.branches),
+        (TableKind::Lt, &airs.lts, &resident.lts),
+        (TableKind::Memw, &airs.memws, &resident.memws),
+    ];
+    let mut checked = 0usize;
+    for (kind, kind_airs, kind_traces) in groups {
+        assert_eq!(
+            kind_airs.len(),
+            kind_traces.len(),
+            "{kind:?}: AIR and trace counts disagree"
+        );
+        for (chunk, (air, table)) in kind_airs.iter().zip(kind_traces.iter()).enumerate() {
+            let expected = <P as IsStarkProver<_, _, _>>::commit_table_root(air.as_ref(), table)
+                .expect("resident commits");
+            let actual = got
+                .get(&(kind, chunk))
+                .unwrap_or_else(|| panic!("{kind:?} chunk {chunk} was never committed"));
+            assert_eq!(
+                *actual, expected,
+                "{kind:?} chunk {chunk}: committed under a different root"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 4, "the fixture must cover several chunks");
+}
+
+/// A retired chunk must leave its BITWISE lookups behind.
+///
+/// BITWISE counts lookups from tables the Commit phase closes and drops, so the
+/// contribution has to be taken while the chunk still exists. If it is not, the
+/// table comes out short and the bus stops balancing — a failure that surfaces
+/// at verification, far from the chunk that caused it.
+///
+/// The limits here are small for the kinds that owe BITWISE, so most of their
+/// lookups belong to chunks that were closed and dropped rather than to the
+/// tail. Removing the fold that runs before a chunk is drained fails this.
+#[test]
+fn retiring_a_chunk_keeps_its_bitwise_lookups() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{
+        DecodeArtifacts, TableKind, Traces as T, WalkLeftover, build_initial_image,
+    };
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig {
+        memw_aligned: 1 << 10,
+        memw_register: 1 << 10,
+        branch: 1 << 10,
+        eq: 1 << 10,
+        bytewise: 1 << 10,
+        store: 1 << 10,
+        ..Default::default()
+    };
+
+    let mut retired = 0usize;
+    let mut leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |kind, _, _| {
+            if matches!(
+                kind,
+                TableKind::MemwAligned
+                    | TableKind::MemwRegister
+                    | TableKind::Branch
+                    | TableKind::Eq
+                    | TableKind::Bytewise
+                    | TableKind::Store
+            ) {
+                retired += 1;
+            }
+        },
+    )
+    .expect("walk");
+    assert!(
+        retired > 1,
+        "the fixture must retire chunks that owe BITWISE, or this proves nothing"
+    );
+    leftover.finalize(&max_rows);
+
+    let mut hist = leftover.bitwise_histogram();
+    leftover.build_pages(&image, &[], &mut hist);
+    let built = WalkLeftover::build_bitwise_from(&hist);
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(
+        flat(&built),
+        flat(&resident.bitwise),
+        "the lookups of the retired chunks are missing from BITWISE"
+    );
+}
+
+/// The tables built from accumulated op lists must match the ordinary build.
+///
+/// COMMIT, KECCAK and its round tables, and the accelerator tables are written
+/// once at the end from everything the run produced. The Commit phase drops the
+/// chunked tables as it goes but has to keep feeding these, so the risk is the
+/// opposite one: an op list quietly not accumulated comes out as an empty table
+/// that still looks well-formed.
+#[test]
+fn the_accumulated_tables_match_the_ordinary_build() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    // Uses keccak and the commit ecall, so the tables under test are not empty.
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_keccak");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    let max_rows = crate::tables::MaxRowsConfig::default();
+
+    let mut leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |_, _, _| {},
+    )
+    .expect("walk");
+    leftover.finalize(&max_rows);
+    let built = leftover.build_accumulated();
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(
+        flat(&built.keccak_rc),
+        flat(&resident.keccak_rc),
+        "KECCAK_RC differs from the ordinary build"
+    );
+    // The accelerators are `Vec` on the ordinary side since #977: a kind the run
+    // never called has no table there, and `present` is the accumulated side's
+    // answer to the same question. The table itself cannot be asked — it is
+    // padded, so a kind the run never called still has rows.
+    for (slot, (name, a, b)) in [
+        ("COMMIT", &built.commit, resident.commits.first()),
+        ("KECCAK", &built.keccak, resident.keccaks.first()),
+        (
+            "KECCAK_RND",
+            &built.keccak_rnd,
+            resident.keccak_rnds.first(),
+        ),
+        ("ECSM", &built.ecsm, resident.ecsms.first()),
+        ("ECDAS", &built.ecdas, resident.ecdases.first()),
+        ("HINT", &built.hint, resident.hints.first()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            built.present[slot],
+            b.is_some(),
+            "{name}: the two builds disagree on whether the run called it"
+        );
+        if let Some(b) = b {
+            assert_eq!(flat(a), flat(b), "{name} differs from the ordinary build");
+        }
+    }
+    assert!(
+        flat(&built.keccak).iter().any(|v| *v != 0),
+        "the fixture must exercise KECCAK, or this proves nothing"
+    );
+}
+
+/// DECODE's multiplicities must survive the chunks being dropped.
+///
+/// Every executed cycle looks DECODE up at its pc, and every padding row looks
+/// it up at the padding pc. The Commit phase drops the CPU ops that carry those
+/// pcs, so the lookups have to be counted while they still exist — by pc, since
+/// listing them costs one entry per cycle, which is the thing being avoided.
+#[test]
+fn decode_multiplicities_survive_retiring_the_cpu_chunks() {
+    use crate::tables::register::register_init_from_entry_point;
+    use crate::tables::trace_builder::{DecodeArtifacts, Traces as T, build_initial_image};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    let artifacts = DecodeArtifacts::from_elf(&elf).expect("decode artifacts");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register_init_from_entry_point(elf.entry_point);
+    // Several CPU chunks, so most of the lookups belong to chunks that were
+    // closed and dropped rather than to the tail. Deliberately NOT a power of
+    // two: a full chunk then pads, and the padding lookups are a term that a
+    // power-of-two limit would leave at zero and therefore untested.
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 10_000,
+        ..Default::default()
+    };
+
+    let mut closed_cpu = 0usize;
+    let mut leftover = T::walk_and_emit_chunks(
+        &artifacts,
+        &elf,
+        vec![],
+        &image,
+        &register_init,
+        &max_rows,
+        |kind, _, _| {
+            if kind == crate::tables::trace_builder::TableKind::Cpu {
+                closed_cpu += 1;
+            }
+        },
+    )
+    .expect("walk");
+    // DECODE is built in the end-of-run phase, after finalization freezes the
+    // padding count; building it before would read a tail that is still growing.
+    leftover.finalize(&max_rows);
+    assert!(
+        closed_cpu > 1,
+        "the fixture must drop several CPU chunks, or the counting is untested"
+    );
+    let built = leftover.build_decode(
+        artifacts.decode_trace.clone(),
+        &artifacts.decode_pc_to_row,
+        &max_rows,
+    );
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(
+        flat(&built),
+        flat(&resident.decode),
+        "DECODE's multiplicities differ from the ordinary build"
+    );
+}
+
+/// The end-of-run phase must produce every non-chunked table the ordinary build
+/// produces, identically.
+///
+/// These are the tables that cannot be closed while the run continues: HALT
+/// comes from the terminating ECALL, REGISTER's final PC token has to match the
+/// last padding write, PAGE reads the memory image at the last cycle, and
+/// BITWISE owes lookups that include PAGE's. Each depends on state the walk had
+/// to carry rather than on an op list it could keep.
+#[test]
+fn the_end_of_run_tables_match_the_ordinary_build() {
+    use crate::tables::trace_builder::Traces as T;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("fib_iterative_160k");
+    let elf = Elf::load(&elf_bytes).expect("ELF load");
+    // Not a power of two, so the CPU chunks pad and REGISTER's final PC token
+    // depends on a padding count the walk had to accumulate.
+    let max_rows = crate::tables::MaxRowsConfig {
+        cpu: 10_000,
+        ..Default::default()
+    };
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+
+    let phase = crate::commit_phase::run(&elf, &[], &max_rows, &proof_options).expect("commit");
+    let (_, rest) =
+        crate::commit_phase::commit_remaining(phase.walked, &[], &max_rows, &proof_options)
+            .expect("challenge");
+
+    let logs = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run")
+        .logs;
+    let resident = T::from_elf_and_logs(
+        &elf,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("traces");
+
+    let flat = |t: &stark::trace::TraceTable<
+        crate::tables::types::GoldilocksField,
+        crate::tables::types::GoldilocksExtension,
+    >| {
+        let (data, _) = t.main_data_row_major();
+        data.iter().map(|fe| *fe.value()).collect::<Vec<u64>>()
+    };
+    assert_eq!(flat(&rest.halt), flat(&resident.halt), "HALT differs");
+    {
+        let a = flat(&rest.register);
+        let b = flat(&resident.register);
+        let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+        eprintln!(
+            "REGISTER: len {} vs {}, first diff at {:?} -> {:?} vs {:?}",
+            a.len(),
+            b.len(),
+            first,
+            first.map(|i| a[i]),
+            first.map(|i| b[i])
+        );
+    }
+    assert_eq!(
+        flat(&rest.register),
+        flat(&resident.register),
+        "REGISTER differs"
+    );
+    assert_eq!(flat(&rest.decode), flat(&resident.decode), "DECODE differs");
+    assert_eq!(
+        flat(&rest.bitwise),
+        flat(&resident.bitwise),
+        "BITWISE differs"
+    );
+    assert_eq!(
+        rest.pages.len(),
+        resident.pages.len(),
+        "a different number of PAGE tables"
+    );
+    assert!(
+        !rest.pages.is_empty(),
+        "the fixture must produce PAGE tables"
+    );
+    for (i, (a, b)) in rest.pages.iter().zip(resident.pages.iter()).enumerate() {
+        assert_eq!(flat(a), flat(b), "PAGE {i} differs");
+    }
+}

@@ -290,6 +290,43 @@ pub struct MultiProveTiming {
     pub heap_snapshots: Vec<HeapSnapshot>,
 }
 
+/// Residency accounting for the retire-LDE / retire-traces modes.
+///
+/// The honest budget, not an estimate: how many times a main LDE was actually
+/// materialized, how many retired-chunk traces were actually built, and how
+/// many shapes were answered without building one. A mode that trades time for
+/// memory has to be able to say what the trade cost, or the next change to it
+/// is guesswork.
+static MAIN_LDE_EXPANSIONS: AtomicU64 = AtomicU64::new(0);
+static RETIRED_TRACE_BUILDS: AtomicU64 = AtomicU64::new(0);
+static RETIRED_SHAPE_QUERIES: AtomicU64 = AtomicU64::new(0);
+
+/// A main LDE was materialized from a trace — the Round 1 commit, or a rebuild
+/// after it was retired. One per table is the floor; anything above it is what
+/// the barriers cost.
+pub fn count_main_lde_expansion() {
+    MAIN_LDE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A retired chunk's trace was built from its routed ops.
+pub fn count_retired_trace_build() {
+    RETIRED_TRACE_BUILDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A retired chunk's shape was derived from op counts, with no trace built.
+pub fn count_retired_shape_query() {
+    RETIRED_SHAPE_QUERIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(main LDE expansions, retired trace builds, shapes answered build-free)`.
+pub fn residency_counts() -> (u64, u64, u64) {
+    (
+        MAIN_LDE_EXPANSIONS.load(Ordering::Relaxed),
+        RETIRED_TRACE_BUILDS.load(Ordering::Relaxed),
+        RETIRED_SHAPE_QUERIES.load(Ordering::Relaxed),
+    )
+}
+
 /// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.
 static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
@@ -365,6 +402,9 @@ pub fn take_r1_sub() -> Round1SubOps {
 /// In practice this is safe because store/take pairs always execute within the
 /// same rayon task closure.
 pub fn reset_all() {
+    MAIN_LDE_EXPANSIONS.store(0, Ordering::Relaxed);
+    RETIRED_TRACE_BUILDS.store(0, Ordering::Relaxed);
+    RETIRED_SHAPE_QUERIES.store(0, Ordering::Relaxed);
     R1_MAIN_LDE_US.store(0, Ordering::Relaxed);
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
     R1_AUX_LDE_US.store(0, Ordering::Relaxed);

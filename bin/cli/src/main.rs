@@ -86,6 +86,14 @@ fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>>
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
 /// thread-local caches — `epoch::advance()` just merges cached counters.
+///
+/// `stats.allocated` is live bytes, not resident pages, so the mark is real
+/// simultaneous residency rather than an allocator watermark that freed memory
+/// keeps propping up. What it does not say on its own is *when* the mark was
+/// set, which is what makes a peak actionable — a peak inside one table's work
+/// and a peak spread across every table call for opposite fixes. The tracker
+/// therefore also records how far into the run the mark was set, to be read
+/// against the phase timeline.
 #[cfg(feature = "jemalloc-stats")]
 mod heap_tracker {
     use std::sync::Arc;
@@ -98,6 +106,8 @@ mod heap_tracker {
     pub struct HeapTracker {
         stop: Arc<AtomicBool>,
         peak: Arc<AtomicUsize>,
+        /// Milliseconds from `start()` to the sample that set `peak`.
+        peak_at_ms: Arc<AtomicUsize>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -105,35 +115,47 @@ mod heap_tracker {
         pub fn start() -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let peak = Arc::new(AtomicUsize::new(0));
+            let peak_at_ms = Arc::new(AtomicUsize::new(0));
             let stop_clone = stop.clone();
             let peak_clone = peak.clone();
+            let peak_at_clone = peak_at_ms.clone();
+            let started = std::time::Instant::now();
 
             let handle = thread::spawn(move || {
-                while !stop_clone.load(Ordering::Relaxed) {
-                    // Refresh jemalloc's cached stats
+                // Records the elapsed time of the sample that raised the mark,
+                // so a peak can be placed against the phase timeline instead of
+                // being a number with no location.
+                let sample = |peak: &AtomicUsize, at: &AtomicUsize| {
                     epoch::advance().ok();
-                    if let Ok(allocated) = stats::allocated::read() {
-                        peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                    if let Ok(allocated) = stats::allocated::read()
+                        && allocated > peak.fetch_max(allocated, Ordering::Relaxed)
+                    {
+                        at.store(started.elapsed().as_millis() as usize, Ordering::Relaxed);
                     }
+                };
+                while !stop_clone.load(Ordering::Relaxed) {
+                    sample(&peak_clone, &peak_at_clone);
                     thread::sleep(Duration::from_millis(10));
                 }
                 // One final sample after stop signal
-                epoch::advance().ok();
-                if let Ok(allocated) = stats::allocated::read() {
-                    peak_clone.fetch_max(allocated, Ordering::Relaxed);
-                }
+                sample(&peak_clone, &peak_at_clone);
             });
 
             Self {
                 stop,
                 peak,
+                peak_at_ms,
                 handle: Some(handle),
             }
         }
 
-        pub fn stop(mut self) -> usize {
+        /// `(peak bytes, milliseconds into the run when it was set)`.
+        pub fn stop(mut self) -> (usize, usize) {
             self.shutdown();
-            self.peak.load(Ordering::Relaxed)
+            (
+                self.peak.load(Ordering::Relaxed),
+                self.peak_at_ms.load(Ordering::Relaxed),
+            )
         }
 
         fn shutdown(&mut self) {
@@ -277,6 +299,61 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
     },
+
+    /// Build the traces without proving, to compare what each production path
+    /// holds. Peak heap is per process, so each path is measured on its own run.
+    TraceBuild {
+        /// Path to the ELF file
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Path to the private input file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        private_input: Option<PathBuf>,
+
+        /// Prove-and-retire (the spec's Approach 1): walk the execution,
+        /// committing and retiring each table as it fills, instead of building
+        /// every trace first.
+        #[arg(long)]
+        prove_and_retire: bool,
+
+        /// How far down Approach 1's pipeline to run. Only meaningful with
+        /// --prove-and-retire; each stage includes the ones before it.
+        #[arg(
+            long,
+            value_enum,
+            default_value = "logup",
+            requires = "prove_and_retire"
+        )]
+        through: Stage,
+
+        /// Assemble the per-table proof the LogUp stage leaves and run the
+        /// ordinary verifier on it, after the timings are reported.
+        #[arg(long, requires = "prove_and_retire")]
+        verify: bool,
+
+        /// Write the assembled per-table proof here (implies the assembly, not
+        /// the verification).
+        #[arg(short, long, requires = "prove_and_retire", value_hint = ValueHint::FilePath)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Approach 1's passes, in order.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum Stage {
+    /// Walk and commit every chunk's main trace.
+    Commit,
+    /// Also commit the tables that stay, and sample the shared challenge.
+    Challenge,
+    /// Also walk again to build and commit the auxiliary columns.
+    Logup,
+    /// Instead of one FRI per table, fold them by domain, open at the group's
+    /// indices, and assemble the batched proof.
+    Batched,
+    /// Only the walk: replay the execution and rebuild every table, proving
+    /// nothing. The floor each pass pays.
+    Walk,
 }
 
 fn main() -> ExitCode {
@@ -342,6 +419,21 @@ fn main() -> ExitCode {
             }
         }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+        Commands::TraceBuild {
+            elf,
+            private_input,
+            prove_and_retire,
+            through,
+            verify,
+            output,
+        } => cmd_trace_build(
+            elf,
+            private_input,
+            prove_and_retire,
+            through,
+            verify,
+            output,
+        ),
     }
 }
 
@@ -718,7 +810,12 @@ fn cmd_prove(
     #[cfg(feature = "jemalloc-stats")]
     {
         let peak_bytes = tracker.stop();
-        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
+        let (peak_bytes, peak_at_ms) = peak_bytes;
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
     }
     ExitCode::SUCCESS
 }
@@ -892,7 +989,12 @@ fn cmd_prove_continuation(
     #[cfg(feature = "jemalloc-stats")]
     {
         let peak_bytes = tracker.stop();
-        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
+        let (peak_bytes, peak_at_ms) = peak_bytes;
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
     }
     ExitCode::SUCCESS
 }
@@ -1012,6 +1114,367 @@ fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("--epoch-size-log2 must be an integer, got `{value}`"))?;
     continuation_epoch_size(epoch_size_log2)?;
     Ok(epoch_size_log2)
+}
+
+/// Approach 1's pipeline, as far as `through`.
+///
+/// Each stage is measured in its own process because peak heap is per process,
+/// and reported as the number of tables it accounted for — chunks for the
+/// Commit phase, every table in AIR order once the later passes have run.
+fn run_approach_1(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    max_rows: &prover::tables::MaxRowsConfig,
+    options: &stark::proof::options::ProofOptions,
+    through: Stage,
+    verify: bool,
+) -> Result<(usize, Option<prover::VmProof>), String> {
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    let t0 = std::time::Instant::now();
+    if through == Stage::Walk {
+        let resident = prover::logup_phase::walk_only(elf, private_inputs, max_rows)
+            .map_err(|e| format!("{e:?}"))?;
+        println!("  walk only          {:>8.2}s", t0.elapsed().as_secs_f64());
+        return Ok((resident.pages.len(), None));
+    }
+    let committed = prover::commit_phase::run_to_end(elf, private_inputs, max_rows, options)
+        .map_err(|e| format!("{e:?}"))?;
+    let t_commit = t0.elapsed();
+    if through == Stage::Commit {
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+        return Ok((committed.chunks.len(), None));
+    }
+    let t1 = std::time::Instant::now();
+    let challenge = prover::challenge_phase::run(&committed, elf, elf_bytes, options)
+        .map_err(|e| format!("{e:?}"))?;
+    // The mains are committed; nothing downstream reads their traces again.
+    drop(committed);
+    let t_challenge = t1.elapsed();
+    if through == Stage::Challenge {
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+        println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
+        return Ok((challenge.roots.len(), None));
+    }
+    // The batched path replaces the per-table prove; running both would measure
+    // neither.
+    if through == Stage::Batched {
+        let t3 = std::time::Instant::now();
+        let batched =
+            prover::logup_phase::run_batched(elf, private_inputs, max_rows, options, &challenge)
+                .map_err(|e| format!("{e:?}"))?;
+        let t_fold = t3.elapsed();
+        let t4 = std::time::Instant::now();
+        let opened = prover::logup_phase::run_open(
+            elf,
+            private_inputs,
+            max_rows,
+            options,
+            &challenge,
+            &batched,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let tables = batched.tables.len();
+        let groups = batched.groups.len();
+        let t_open = t4.elapsed();
+        let proof = prover::logup_phase::assemble_batched_proof(batched, opened)
+            .map_err(|e| format!("{e:?}"))?;
+        println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+        println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
+        println!("  pass 3-4 (deep+fold) {:>7.2}s", t_fold.as_secs_f64());
+        println!("  pass 5 (open)      {:>8.2}s", t_open.as_secs_f64());
+        report_span_totals();
+        report_batched_size(&proof, tables, groups);
+        if verify {
+            let started = std::time::Instant::now();
+            match prover::batched_verifier::verify(&proof, elf_bytes, options) {
+                Ok(true) => println!(
+                    "Batched proof verifies: {tables} tables in {groups} groups, {:.3}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Ok(false) => return Err("batched proof REJECTED by the verifier".into()),
+                Err(e) => return Err(format!("batched proof verification error: {e}")),
+            }
+        }
+        return Ok((tables, None));
+    }
+
+    let t2 = std::time::Instant::now();
+    let logup = prover::logup_phase::run(elf, private_inputs, max_rows, options, &challenge)
+        .map_err(|e| format!("{e:?}"))?;
+    let t_prove = t2.elapsed();
+    println!("  pass 1 (commit)    {:>8.2}s", t_commit.as_secs_f64());
+    println!("  pass 2 (challenge) {:>8.2}s", t_challenge.as_secs_f64());
+    println!("  pass 3 (prove)     {:>8.2}s", t_prove.as_secs_f64());
+    report_span_totals();
+    report_fri_shape(&logup.tables);
+    let tables = logup.tables.len();
+    let proof = verify.then(|| prover::logup_phase::assemble_vm_proof(logup, &challenge));
+    Ok((tables, proof))
+}
+
+/// What the batched proof weighs, against what the per-table one weighs.
+///
+/// The prize was priced before any of this was built: the per-table FRI data
+/// was 57.9% of the proof. This is the same measurement on the other side —
+/// what a table still carries once the layers, the final polynomial, the
+/// queries and the nonce belong to its group.
+fn report_batched_size(proof: &prover::logup_phase::BatchedProof, tables: usize, groups: usize) {
+    let mut per_table = 0usize;
+    for (t, o) in proof.tables.iter().zip(proof.openings.iter()) {
+        per_table += serde_cbor::to_vec(&t.trace_ood)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&t.trace_ood_next)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&t.parts_ood)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(o).map(|v| v.len()).unwrap_or(0)
+            + 32 * 4;
+    }
+    let mut per_group = 0usize;
+    for (_, fri) in proof.groups.iter() {
+        per_group += serde_cbor::to_vec(&fri.layer_roots)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&fri.final_poly_coeffs)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&fri.query_list)
+                .map(|v| v.len())
+                .unwrap_or(0);
+    }
+    let total = per_table + per_group;
+    println!(
+        "Batched: {tables} tables over {groups} groups; {} MB per table + {} MB per group = {} MB",
+        per_table / (1024 * 1024),
+        per_group / (1024 * 1024),
+        total / (1024 * 1024),
+    );
+}
+
+/// Where the time went, summed per span label.
+///
+/// The prover's own spans are per table and there are hundreds of them, so the raw
+/// timeline is unreadable; what answers "where is the time" is the total per
+/// label. Sums exceed wall time, because tables run concurrently — the ratios
+/// between labels are the point, not the absolute figures.
+fn report_span_totals() {
+    #[cfg(feature = "instruments")]
+    {
+        use std::collections::BTreeMap;
+        let spans = stark::instruments::take_timeline();
+        let mut by_label: BTreeMap<&str, (std::time::Duration, usize)> = BTreeMap::new();
+        for s in &spans {
+            let e = by_label.entry(s.label).or_default();
+            e.0 += s.wall;
+            e.1 += 1;
+        }
+        let mut rows: Vec<_> = by_label.into_iter().collect();
+        rows.sort_by_key(|(_, (d, _))| std::cmp::Reverse(*d));
+        println!("  --- summed over tables (concurrent, so > wall) ---");
+        for (label, (d, n)) in rows.into_iter().take(12) {
+            println!("  {label:<28} {:>8.2}s  x{n}", d.as_secs_f64());
+        }
+    }
+}
+
+/// What one FRI per table costs, and what batching by height would collapse.
+///
+/// Step 0 of the batched-FRI analysis: the prize is the per-table FRI data, and
+/// batching can only merge tables that share a domain exactly — Lambda's fold
+/// squares the coset offset each layer, so a short table over `offset·<w>` does
+/// not line up with a tall fold over `offset²·<w>`. So the number worth knowing
+/// is how many tables collapse into how many distinct heights, against the
+/// bytes that would be saved.
+fn report_fri_shape(
+    proofs: &[stark::proof::stark::StarkProof<
+        prover::tables::types::GoldilocksField,
+        prover::tables::types::GoldilocksExtension,
+        (),
+    >],
+) {
+    use std::collections::BTreeMap;
+
+    let mut by_height: BTreeMap<usize, usize> = BTreeMap::new();
+    let (mut fri_bytes, mut total_bytes) = (0usize, 0usize);
+    for p in proofs {
+        *by_height.entry(p.trace_length).or_default() += 1;
+        fri_bytes += serde_cbor::to_vec(&p.fri_layers_merkle_roots)
+            .map(|v| v.len())
+            .unwrap_or(0)
+            + serde_cbor::to_vec(&p.fri_final_poly_coeffs)
+                .map(|v| v.len())
+                .unwrap_or(0)
+            + serde_cbor::to_vec(&p.query_list)
+                .map(|v| v.len())
+                .unwrap_or(0);
+        total_bytes += serde_cbor::to_vec(p).map(|v| v.len()).unwrap_or(0);
+    }
+    println!(
+        "FRI: {} tables over {} distinct heights; per-table FRI data {} MB of {} MB ({:.1}%)",
+        proofs.len(),
+        by_height.len(),
+        fri_bytes / (1024 * 1024),
+        total_bytes / (1024 * 1024),
+        100.0 * fri_bytes as f64 / total_bytes.max(1) as f64,
+    );
+    for (rows, tables) in by_height.iter().rev() {
+        println!("  {rows:>9} rows x{tables}");
+    }
+}
+
+/// Build the traces one way or the other, so the two production paths can be
+/// compared on what they hold. Nothing is proved: this measures the side of the
+/// prover that Approach 1's Commit phase replaces.
+fn cmd_trace_build(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    prove_and_retire: bool,
+    through: Stage,
+    verify: bool,
+    output: Option<PathBuf>,
+) -> ExitCode {
+    // Only the per-table proof is serializable today, so `--output` with any
+    // other stage would walk the whole execution and then write nothing. Say so
+    // before spending the walk rather than exiting 0 in silence.
+    if output.is_some() && prove_and_retire && through != Stage::Logup {
+        eprintln!(
+            "--output writes the per-table proof, which only `--through logup` assembles; \
+             `--through {}` has no serializable proof yet (see docs/prove_and_retire_design.md \u{00A7}10).",
+            match through {
+                Stage::Walk => "walk",
+                Stage::Commit => "commit",
+                Stage::Challenge => "challenge",
+                Stage::Batched => "batched",
+                Stage::Logup => unreachable!(),
+            }
+        );
+        return ExitCode::FAILURE;
+    }
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elf = match executor::elf::Elf::load(&elf_data) {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("Failed to load ELF: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
+    let started = std::time::Instant::now();
+
+    let max_rows = prover::tables::MaxRowsConfig::default();
+    let options = match stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("bad proof options: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = if prove_and_retire {
+        run_approach_1(
+            &elf,
+            &elf_data,
+            &private_inputs,
+            &max_rows,
+            &options,
+            through,
+            verify || output.is_some(),
+        )
+    } else {
+        prover::commit_phase::build_resident(&elf, &private_inputs, &max_rows)
+            .map(|t| (t.cpus.len(), None))
+            .map_err(|e| format!("{e:?}"))
+    };
+
+    let elapsed = started.elapsed();
+    let proof = match outcome {
+        Ok((n, proof)) => {
+            println!(
+                "Trace build ({}): {n} tables, {:.3}s",
+                if prove_and_retire {
+                    "prove-and-retire"
+                } else {
+                    "resident"
+                },
+                elapsed.as_secs_f64()
+            );
+            proof
+        }
+        Err(e) => {
+            eprintln!("trace build failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let (peak_bytes, peak_at_ms) = tracker.stop();
+        println!(
+            "Peak heap: {} MB (at {:.1}s)",
+            peak_bytes / (1024 * 1024),
+            peak_at_ms as f64 / 1000.0
+        );
+    }
+
+    let Some(proof) = proof else {
+        return ExitCode::SUCCESS;
+    };
+    if let Some(path) = output {
+        let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed to serialize the A1 proof: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            eprintln!("Failed to write {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "A1 proof written: {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    }
+    if verify {
+        let started = std::time::Instant::now();
+        match prover::verify_with_options(&proof, &elf_data, &options, None, None) {
+            Ok(true) => println!(
+                "A1 proof verifies: {} tables, {:.3}s",
+                proof.proof.proofs.len(),
+                started.elapsed().as_secs_f64()
+            ),
+            Ok(false) => {
+                eprintln!("A1 proof REJECTED by the verifier");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("A1 proof verification error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

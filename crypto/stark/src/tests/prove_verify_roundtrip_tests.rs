@@ -245,3 +245,127 @@ fn create_mul_air(
         EmptyConstraints,
     )
 }
+
+/// THE retire-LDE correctness invariant: a proof produced with
+/// `LAMBDA_STREAM_LDE=1` must be byte-identical to one produced with the flag
+/// off. Retiring changes only *when* the main LDE exists — dropped after the
+/// Round 1 commit, rebuilt from the same trace through the same production
+/// row-major coset LDE inside the table's fused chain — never its contents.
+/// A mismatch means the rebuild diverged from what was committed.
+///
+/// Skipped under `cuda`: there `retire_leaves` returns `None` unconditionally
+/// and `retire_main_lde` is compiled out, so both arms would take the resident
+/// path and the assertion would compare a proof against itself.
+///
+/// The env var is process-global. `cargo nextest`, which is what CI runs, gives
+/// each test its own process; a plain `cargo test` does not, so under `make
+/// test` the other proving tests in this binary may observe the flag while this
+/// one holds it. That costs those tests the mode they meant to exercise, not
+/// memory safety: `std::env`'s own `RwLock` serialises every Rust-side reader
+/// against the write. The proper fix is this test's own integration binary, the
+/// way `prover/tests/gpu_force_downgrade.rs` does it.
+#[test]
+#[cfg(not(feature = "cuda"))]
+fn retire_lde_proof_is_byte_identical() {
+    fn prove_once() -> Vec<u8> {
+        let add_column = vec![
+            FE::one(),
+            FE::zero(),
+            FE::one(),
+            FE::zero(),
+            FE::one(),
+            FE::one(),
+            FE::zero(),
+            FE::zero(),
+        ];
+        let mul_column = vec![
+            FE::zero(),
+            FE::one(),
+            FE::zero(),
+            FE::one(),
+            FE::zero(),
+            FE::zero(),
+            FE::one(),
+            FE::one(),
+        ];
+        let a_column = (1..=8u64).map(FE::from).collect::<Vec<_>>();
+        let b_column = (1..=8u64).map(|i| FE::from(i * 10)).collect::<Vec<_>>();
+        let c_column = vec![
+            FE::from(11),
+            FE::from(40),
+            FE::from(33),
+            FE::from(160),
+            FE::from(55),
+            FE::from(66),
+            FE::from(490),
+            FE::from(640),
+        ];
+        let mut cpu_trace = crate::trace::TraceTable::from_columns_main(
+            vec![add_column, mul_column, a_column, b_column, c_column],
+            1,
+        );
+
+        let add_a = vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)];
+        let add_b = vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)];
+        let add_c = vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)];
+        let add_m = vec![FE::one(), FE::one(), FE::one(), FE::one()];
+        let mut add_trace =
+            crate::trace::TraceTable::from_columns_main(vec![add_a, add_b, add_c, add_m], 1);
+
+        let mul_a = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
+        let mul_b = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
+        let mul_c = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
+        let mul_m = vec![FE::one(), FE::one(), FE::one(), FE::one()];
+        let mut mul_trace =
+            crate::trace::TraceTable::from_columns_main(vec![mul_a, mul_b, mul_c, mul_m], 1);
+
+        let proof_options = ProofOptions::default_test_options();
+        let cpu_air = create_cpu_air(&proof_options);
+        let add_air = create_add_air(&proof_options);
+        let mul_air = create_mul_air(&proof_options);
+
+        #[allow(clippy::type_complexity)]
+        let air_trace_pairs: Vec<(
+            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+            &mut crate::trace::TraceTable<F, E>,
+            &(),
+        )> = vec![
+            (&cpu_air, &mut cpu_trace, &()),
+            (&add_air, &mut add_trace, &()),
+            (&mul_air, &mut mul_trace, &()),
+        ];
+
+        let proofs =
+            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        serde_cbor::to_vec(&proofs).expect("serialize proofs")
+    }
+
+    let prev = std::env::var("LAMBDA_STREAM_LDE").ok();
+
+    // SAFETY: the only writer in this binary, and every reader of it goes
+    // through `std::env`, which serialises reads against writes on its own
+    // lock. Restored below.
+    unsafe { std::env::set_var("LAMBDA_STREAM_LDE", "0") };
+    assert!(
+        !crate::prover::streaming_retire_lde(),
+        "the flag did not take: this test would compare a proof against itself"
+    );
+    let resident = prove_once();
+
+    unsafe { std::env::set_var("LAMBDA_STREAM_LDE", "1") };
+    assert!(
+        crate::prover::streaming_retire_lde(),
+        "the flag did not take: this test would compare a proof against itself"
+    );
+    let retired = prove_once();
+
+    match prev {
+        Some(v) => unsafe { std::env::set_var("LAMBDA_STREAM_LDE", v) },
+        None => unsafe { std::env::remove_var("LAMBDA_STREAM_LDE") },
+    }
+
+    assert_eq!(
+        resident, retired,
+        "retire-LDE proof must be byte-identical to the resident-LDE proof"
+    );
+}

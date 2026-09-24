@@ -523,6 +523,7 @@ const _: () = {
 /// [`update_multiplicities`] produces (both just sum the same lookups per cell).
 ///
 /// Memory: `NUM_ROWS * NUM_LOOKUP_TYPES * 8` bytes = 2^20 * 10 * 8 = 80 MiB.
+#[derive(PartialEq, Eq)]
 pub(crate) struct BitwiseHistogram {
     counters: Box<[u64]>,
 }

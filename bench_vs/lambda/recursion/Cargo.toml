@@ -21,6 +21,15 @@ blowup8 = []
 # memory-bounded inner prove) instead of a monolithic VmProof. Selects the
 # `recursion-cont-<preset>-bench` bins below.
 continuation = []
+# Orthogonal to the presets: verify a BatchedProof (one FRI per domain height
+# instead of one per table) instead of a monolithic VmProof. Selects the
+# `recursion-batched-<preset>-bench` bins below. Mutually exclusive with
+# `continuation` — main.rs guards it.
+batched = []
+# Orthogonal to the presets: verify the same monolithic VmProof as the default
+# guest, but deserialized into owned values instead of read in place. Exists to
+# price zero-copy against an owned copy in guest cycles.
+owned = []
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
@@ -59,6 +68,21 @@ required-features = ["continuation", "blowup2"]
 name = "recursion-cont-blowup4-bench"
 path = "src/main.rs"
 required-features = ["continuation", "blowup4"]
+
+[[bin]]
+name = "recursion-batched-min-bench"
+path = "src/main.rs"
+required-features = ["batched", "min"]
+
+[[bin]]
+name = "recursion-batched-blowup2-bench"
+path = "src/main.rs"
+required-features = ["batched", "blowup2"]
+
+[[bin]]
+name = "recursion-owned-blowup2-bench"
+path = "src/main.rs"
+required-features = ["owned", "blowup2"]
 
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [

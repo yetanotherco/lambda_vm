@@ -84,6 +84,16 @@ where
     pub grinding_seed: [u8; 32],
 }
 
+/// The challenges of rounds 2 and 3 alone: what a table's fork yields before
+/// any FRI, which is where a batched proof parts ways with a per-table one.
+pub struct RoundsChallenges<FieldExtension: IsField> {
+    pub z: FieldElement<FieldExtension>,
+    pub boundary_coeffs: Vec<FieldElement<FieldExtension>>,
+    pub transition_coeffs: Vec<FieldElement<FieldExtension>>,
+    pub trace_term_coeffs: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub gammas: Vec<FieldElement<FieldExtension>>,
+}
+
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
 
 /// Deep-composition sums that are identical across all FRI queries of a
@@ -1445,16 +1455,21 @@ pub trait IsStarkVerifier<
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
-    /// already been replayed and the RAP challenges are known.
-    fn replay_rounds_after_round_1(
+    /// already been replayed and the RAP challenges are known: the constraint
+    /// coefficients, the out-of-domain point, and round 4's DEEP coefficients.
+    ///
+    /// Stops where the two proof formats part company. The per-table proof goes
+    /// on to its own FRI from here; the batched proof samples its fold
+    /// coefficient instead.
+    fn replay_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        rap_challenges: Vec<FieldElement<FieldExtension>>,
+        rap_challenges: &[FieldElement<FieldExtension>],
         layout: &crate::ood::OodLayout,
-    ) -> Challenges<FieldExtension>
+    ) -> RoundsChallenges<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1475,7 +1490,7 @@ pub trait IsStarkVerifier<
         let num_boundary_constraints = air
             .boundary_constraints(
                 public_inputs,
-                &rap_challenges,
+                rap_challenges,
                 bus_public_inputs.as_ref(),
                 trace_length,
             )
@@ -1549,6 +1564,43 @@ pub trait IsStarkVerifier<
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
+        RoundsChallenges {
+            z,
+            boundary_coeffs,
+            transition_coeffs,
+            trace_term_coeffs,
+            gammas,
+        }
+    }
+
+    fn replay_rounds_after_round_1(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        public_inputs: &PI,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+        layout: &crate::ood::OodLayout,
+    ) -> Challenges<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let RoundsChallenges {
+            z,
+            boundary_coeffs,
+            transition_coeffs,
+            trace_term_coeffs,
+            gammas,
+        } = Self::replay_rounds_2_to_4(
+            air,
+            proof,
+            public_inputs,
+            domain,
+            transcript,
+            &rap_challenges,
+            layout,
+        );
         let merkle_roots = proof.fri_layers_merkle_roots();
         let mut zetas = merkle_roots
             .iter()

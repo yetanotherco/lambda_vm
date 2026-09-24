@@ -106,7 +106,7 @@ const MASK_254: u64 = 254;
 /// A single BRANCH operation to be added to the trace.
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BranchOperation {
     /// Current program counter (64-bit)
     pub pc: u64,
@@ -163,7 +163,12 @@ pub fn generate_branch_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    // Sorted, not `HashMap` order: std randomizes iteration per instance, so two
+    // builds of the same logs produced the same rows in a different order. Harmless
+    // for a single build, fatal for rebuilding a retired trace — the rebuilt table
+    // must hash to the root its first build committed.
+    let mut unique_ops: Vec<_> = op_map.into_iter().collect();
+    unique_ops.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),

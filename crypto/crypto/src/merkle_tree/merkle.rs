@@ -282,6 +282,73 @@ where
         self.create_proof(merkle_path)
     }
 
+    /// Free the leaf half of the node buffer, keeping the inner nodes
+    /// (`nodes[0..leaves_len - 1]`, root at index 0). Roughly halves the tree's
+    /// footprint.
+    ///
+    /// Every node an opening needs is retained except one: the leaf-level
+    /// sibling, which the caller regenerates and hands to
+    /// [`get_proof_by_pos_with_leaf_sibling`](Self::get_proof_by_pos_with_leaf_sibling).
+    ///
+    /// `leaves_len` is checked against the buffer rather than trusted, so this
+    /// is a no-op — returning `false` — on a tree that was already dropped, on a
+    /// single-leaf or root-only tree, on disk-spill mmap backing, and on a wrong
+    /// `leaves_len`. Truncating twice would silently eat inner nodes.
+    pub fn drop_leaves(&mut self, leaves_len: usize) -> bool {
+        if leaves_len <= 1 || self.is_root_only() {
+            return false;
+        }
+        #[cfg(feature = "disk-spill")]
+        if self.mmap_backing.is_some() {
+            return false;
+        }
+        // A full tree, and only a full tree, has exactly `2 * leaves_len - 1`
+        // nodes. Anything else means this is not the shape we were told.
+        if self.nodes.len() != 2 * leaves_len - 1 {
+            return false;
+        }
+        self.nodes.truncate(leaves_len - 1);
+        self.nodes.shrink_to_fit();
+        true
+    }
+
+    /// Leaf index whose hash must be regenerated to open position `pos`.
+    pub fn sibling_leaf_position(pos: usize) -> usize {
+        pos ^ 1
+    }
+
+    /// Opening for `pos` on a tree whose leaves were dropped, with the
+    /// leaf-level sibling supplied by the caller (see
+    /// [`sibling_leaf_position`](Self::sibling_leaf_position)).
+    ///
+    /// Byte-identical to what [`get_proof_by_pos`](Self::get_proof_by_pos) would
+    /// return on the full tree: same bottom node, and every node above it read
+    /// from the retained inner nodes at the same indices.
+    pub fn get_proof_by_pos_with_leaf_sibling(
+        &self,
+        pos: usize,
+        leaves_len: usize,
+        sibling_leaf: B::Node,
+    ) -> Option<Proof<B::Node>> {
+        if leaves_len <= 1 || pos >= leaves_len || self.is_root_only() {
+            return None;
+        }
+        let mut merkle_path = Vec::with_capacity(leaves_len.trailing_zeros() as usize);
+        merkle_path.push(sibling_leaf);
+
+        let mut node = parent_index(pos + leaves_len - 1);
+        while node != ROOT {
+            // `node_get`, not `self.nodes` directly: every other read in this
+            // file goes through it for the disk-spill mmap indirection. The two
+            // are mutually exclusive today — `drop_leaves` refuses an mmap-backed
+            // tree — but a direct read would silently yield `None` here if that
+            // ever stopped holding, and the prover's opening path unwraps this.
+            merkle_path.push(self.node_get(sibling_index(node))?.clone());
+            node = parent_index(node);
+        }
+        self.create_proof(merkle_path)
+    }
+
     /// Creates a proof from a Merkle pasth
     fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
         Some(Proof { merkle_path })

@@ -1,0 +1,960 @@
+//! Approach 1's proving pass: walk the execution again and prove each table
+//! against the challenge the Commit phase produced.
+//!
+//! The spec's third step is a re-execution. It has to be: the LogUp columns are
+//! a function of the challenge, and the challenge is not known until every main
+//! root has been absorbed — by which time the tables that produced them are
+//! gone. The ordinary prover avoids the second walk by keeping every trace
+//! resident across the Round 1 barrier, which is exactly the residency this
+//! approach refuses to pay.
+//!
+//! So the tables are rebuilt. `build_main` is deterministic, so the trace a
+//! chunk gets here is byte-identical to the one the Commit phase committed, and
+//! the aux columns are therefore the ones that root answers for.
+
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use stark::proof::options::ProofOptions;
+use stark::proof::stark::StarkProof;
+use stark::prover::IsStarkProver;
+
+use crate::Error;
+use crate::challenge_phase::Challenge;
+use crate::pass::{self, ChunkAirs, Resident, Visitor};
+use crate::streaming::NUM_FIXED_AIRS;
+use crate::tables::MaxRowsConfig;
+use crate::tables::trace_builder::TableKind;
+use crate::tables::types::*;
+use executor::elf::Elf;
+use math::field::element::FieldElement;
+use stark::trace::TraceTable;
+
+/// What the pass produced.
+pub struct LogUp {
+    /// One proof per table, in `VmAirs::air_trace_pairs` order.
+    pub tables: Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>,
+    /// The tables the pass could not retire, rebuilt by this walk.
+    pub resident: Resident,
+}
+
+/// The pass's output as the proof the ordinary verifier takes: the same
+/// `MultiProof` the monolithic prover emits, with the layout the walk resolved.
+pub fn assemble_vm_proof(logup: LogUp, challenge: &Challenge) -> crate::VmProof {
+    let resident = &logup.resident;
+    crate::VmProof {
+        proof: stark::proof::stark::MultiProof {
+            proofs: logup.tables,
+        },
+        runtime_page_ranges: crate::tables::trace_builder::runtime_page_ranges(
+            &resident.page_configs,
+        ),
+        table_counts: challenge.order.counts().clone(),
+        public_output: resident.public_output.clone(),
+        num_private_input_pages: resident
+            .page_configs
+            .iter()
+            .filter(|c| c.is_private_input)
+            .count(),
+    }
+}
+
+type Item = (
+    TableKind,
+    usize,
+    TraceTable<GoldilocksField, GoldilocksExtension>,
+);
+
+/// One table's finished proof, tagged with where it sits in the AIR order.
+type Proved = (usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>);
+
+/// Where a batch of proofs lands. Shared because the batch runs in parallel.
+type Proofs = std::sync::Mutex<Vec<Proved>>;
+
+struct BuildAux<'a> {
+    batch: pass::Batched<'a, Item>,
+}
+
+impl<'a> BuildAux<'a> {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        done: &'a Proofs,
+    ) -> Self {
+        Self {
+            batch: pass::Batched::new(scope, move |items| {
+                rounds_batch(airs, challenge, done, items)
+            }),
+        }
+    }
+}
+
+/// One batch, in parallel. Each table runs against its own transcript fork, so
+/// nothing crosses between them — the shared state is only where results land.
+fn rounds_batch(
+    airs: &ChunkAirs,
+    challenge: &Challenge,
+    done: &Proofs,
+    items: Vec<Item>,
+) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let n = order.len();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "logup phase: {kind:?} chunk {chunk} is not in the layout the Commit phase produced"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let rounds = prove_table(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+        )
+        .map_err(|e| Error::Prover(format!("logup phase: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, rounds))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    done.lock().expect("logup results").extend(built?);
+    Ok(())
+}
+
+impl Visitor for BuildAux<'_> {
+    fn table(
+        &mut self,
+        kind: TableKind,
+        chunk: usize,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> Result<(), Error> {
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
+    }
+}
+
+/// A table's own transcript: the shared state after the challenge, separated by
+/// AIR index. Reproduces the fused prover's forking exactly — a single-table
+/// proof takes no index, and getting that wrong shifts every challenge.
+#[cfg(test)]
+pub(crate) fn fork_for(
+    challenge: &Challenge,
+    idx: usize,
+    num_airs: usize,
+) -> DefaultTranscript<GoldilocksExtension> {
+    fork(&challenge.transcript, idx, num_airs)
+}
+
+/// Rebuild only the tables a pass cannot retire, for a caller that wants one of
+/// them without proving the run.
+/// The walk with nothing done to any table: what the execution costs to
+/// replay and rebuild, on its own. This is the floor every pass pays, and the
+/// number the pipeline can at best hide behind the proving.
+pub fn walk_only(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+) -> Result<pass::Resident, Error> {
+    struct Skip;
+    impl Visitor for Skip {
+        fn table(
+            &mut self,
+            _kind: TableKind,
+            _chunk: usize,
+            _trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    pass::run(elf, private_input, max_rows, &mut Skip)
+}
+
+fn fork(
+    shared: &DefaultTranscript<GoldilocksExtension>,
+    idx: usize,
+    num_airs: usize,
+) -> DefaultTranscript<GoldilocksExtension> {
+    let mut t = shared.clone();
+    if num_airs > 1 {
+        t.append_bytes(&(idx as u64).to_le_bytes());
+    }
+    t
+}
+
+fn prove_table(
+    air: &dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >,
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    challenges: &[FieldElement<GoldilocksExtension>],
+    transcript: &mut DefaultTranscript<GoldilocksExtension>,
+) -> Result<StarkProof<GoldilocksField, GoldilocksExtension, ()>, String> {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    <P as IsStarkProver<_, _, _>>::prove_table_from_trace(air, &(), trace, challenges, transcript)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Run the LogUp pass over `elf`, against the challenge `challenge` sampled.
+///
+/// `challenge` has to come from the Commit phase's roots over this same
+/// execution: an aux trace built against a different challenge commits to a bus
+/// the main traces never balanced.
+pub fn run(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+    challenge: &Challenge,
+) -> Result<LogUp, Error> {
+    let airs = ChunkAirs::new(proof_options);
+    let done = std::sync::Mutex::new(Vec::new());
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = BuildAux::new(s, &airs, challenge, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
+
+    let chunks = done.into_inner().expect("logup results");
+    let tables = assemble(chunks, &mut resident, challenge)?;
+    Ok(LogUp { tables, resident })
+}
+
+/// Every table's rounds 2-3 in `VmAirs::air_trace_pairs` order.
+///
+/// The chunked tables come back keyed by the index the walk resolved; the
+/// tables that stay have theirs built here, as the Challenge phase built their
+/// mains.
+fn assemble(
+    chunks: Vec<Proved>,
+    resident: &mut Resident,
+    challenge: &Challenge,
+) -> Result<Vec<StarkProof<GoldilocksField, GoldilocksExtension, ()>>, Error> {
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let airs = &challenge.airs;
+
+    let mut slots: Vec<Option<StarkProof<GoldilocksField, GoldilocksExtension, ()>>> =
+        (0..order.len()).map(|_| None).collect();
+    for (idx, rounds) in chunks {
+        let slot = slots
+            .get_mut(idx)
+            .ok_or_else(|| Error::Prover(format!("logup phase: table {idx} is past the layout")))?;
+        if slot.is_some() {
+            return Err(Error::Prover(format!(
+                "logup phase: table {idx} was built twice"
+            )));
+        }
+        *slot = Some(rounds);
+    }
+
+    let ch = &challenge.challenges;
+    let n = order.len();
+    let build = |idx: usize,
+                 air: &crate::VmAir,
+                 trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+     -> Result<StarkProof<GoldilocksField, GoldilocksExtension, ()>, Error> {
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        prove_table(air.as_ref(), trace, ch, &mut transcript)
+            .map_err(|e| Error::Prover(format!("logup phase: table {idx}: {e}")))
+    };
+
+    let fixed: [(
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ); NUM_FIXED_AIRS] = [
+        (&airs.bitwise, &mut resident.bitwise),
+        (&airs.decode, &mut resident.decode),
+        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
+        (&airs.register, &mut resident.register),
+    ];
+    // Independent tables, most of them small: one at a time would leave the
+    // machine idle after the walk.
+    let mut jobs: Vec<(
+        usize,
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    )> = fixed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (air, trace))| (idx, air, trace))
+        .collect();
+    if airs.include_halt {
+        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+    }
+    // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+    // the run never called: an absent kind has an empty AIR vec and no
+    // slot. `accel_index` is the single authority for where each lands.
+    for (slot, (air_vec, trace)) in [
+        (&airs.commits, &mut resident.accumulated.commit),
+        (&airs.keccaks, &mut resident.accumulated.keccak),
+        (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+        (&airs.ecsms, &mut resident.accumulated.ecsm),
+        (&airs.ecdases, &mut resident.accumulated.ecdas),
+        (&airs.hints, &mut resident.accumulated.hint),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+            jobs.push((idx, air, trace));
+        }
+    }
+    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+        let idx = order
+            .page_index(i)
+            .ok_or_else(|| Error::Prover(format!("logup phase: page {i} is not in the layout")))?;
+        jobs.push((idx, air, trace));
+    }
+    #[cfg(feature = "parallel")]
+    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
+        .into_par_iter()
+        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
+        .collect::<Result<_, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let built: Vec<(usize, StarkProof<GoldilocksField, GoldilocksExtension, ()>)> = jobs
+        .into_iter()
+        .map(|(idx, air, trace)| build(idx, air, trace).map(|proof| (idx, proof)))
+        .collect::<Result<_, _>>()?;
+    for (idx, proof) in built {
+        slots[idx] = Some(proof);
+    }
+
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            slot.ok_or_else(|| Error::Prover(format!("logup phase: table {idx} was never built")))
+        })
+        .collect()
+}
+
+pub use crate::batched_proof::{BatchedProof, Open, TablePublic};
+
+/// One FRI per height group, instead of one per table.
+pub struct Batched {
+    /// Per table, in AIR order: what it contributes besides its codeword.
+    pub tables: Vec<TablePublic>,
+    /// Per group, in ascending domain size: the domain and its FRI instance —
+    /// layers, final polynomial, the shared query indices and their
+    /// decommitments.
+    pub groups: Vec<(usize, stark::prover::GroupFri<GoldilocksExtension>)>,
+    /// How many tables each group folded, so the collapse is visible.
+    pub members: Vec<usize>,
+    /// Which group each table belongs to, by AIR index — the group whose query
+    /// indices its openings answer.
+    pub group_of: Vec<usize>,
+    /// The AIR indices in the order they were folded. The coefficient of a
+    /// table depends on every table folded before it, so the verifier has to
+    /// replay this order and the proof carries it.
+    pub fold_order: Vec<usize>,
+    /// The chunk layout, which the verifier needs to rebuild the AIRs.
+    pub table_counts: crate::TableCounts,
+    /// Per table, by AIR index: its composition parts over the LDE domain when
+    /// the fold pass kept them (`A1_KEEP_COMPOSITION`), taken by the Open pass.
+    pub composition_ldes: Vec<std::sync::Mutex<Option<CompositionLde>>>,
+    pub resident: Resident,
+}
+
+type Deep = stark::prover::TableDeep<GoldilocksExtension>;
+type CompositionLde = Vec<Vec<FieldElement<GoldilocksExtension>>>;
+
+/// Whether the fold pass keeps each table's composition parts for the Open
+/// pass: memory for the constraint evaluation the rebuild would repeat.
+fn keep_composition() -> bool {
+    std::env::var("A1_KEEP_COMPOSITION").is_ok_and(|v| v != "0")
+}
+/// What the fold walk carries between batches.
+///
+/// The seed and the accumulators are advanced sequentially — the coefficient of
+/// a table depends on every table folded before it — while the codewords that
+/// feed them are computed in parallel. So the expensive half stays concurrent
+/// and only the folding is serialised.
+struct FoldState {
+    seed: DefaultTranscript<GoldilocksExtension>,
+    /// One accumulator per distinct domain, and the rows behind it.
+    acc: std::collections::BTreeMap<usize, (Vec<FieldElement<GoldilocksExtension>>, usize, usize)>,
+    /// The AIR indices in the order they were folded, which the proof carries
+    /// so a verifier can replay the same sequence of coefficients.
+    order: Vec<usize>,
+    tables: Vec<(usize, TablePublic)>,
+    kept: Vec<(usize, CompositionLde)>,
+}
+
+type Deeps = std::sync::Mutex<FoldState>;
+
+struct BuildDeep<'a> {
+    batch: pass::Batched<'a, Item>,
+}
+
+impl<'a> BuildDeep<'a> {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        done: &'a Deeps,
+    ) -> Self {
+        Self {
+            batch: pass::Batched::new(scope, move |items| deep_batch(airs, challenge, done, items)),
+        }
+    }
+}
+
+fn deep_batch(
+    airs: &ChunkAirs,
+    challenge: &Challenge,
+    done: &Deeps,
+    items: Vec<Item>,
+) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let n = order.len();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "batched phase: {kind:?} chunk {chunk} is not in the layout"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let deep = deep_of(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+            challenge.roots.get(idx).cloned(),
+        )
+        .map_err(|e| Error::Prover(format!("batched phase: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, deep))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    // Folded in a fixed order within the batch, so the sequence is a function
+    // of the walk and not of which thread finished first.
+    let mut built = built?;
+    built.sort_by_key(|(idx, _)| *idx);
+    let mut state = done.lock().expect("fold state");
+    for (idx, deep) in built {
+        fold_one(&mut state, idx, deep);
+    }
+    Ok(())
+}
+
+/// Absorb a table, draw its coefficient, add it to its group, drop it.
+fn fold_one(state: &mut FoldState, idx: usize, mut deep: Deep) {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    if let Some(lde) = deep.composition_lde.take() {
+        state.kept.push((idx, lde));
+    }
+    let coefficient = <P as IsStarkProver<_, _, _>>::fold_coefficient(&mut state.seed, &deep);
+    let entry = state
+        .acc
+        .entry(deep.lde_size)
+        .or_insert_with(|| (Vec::new(), deep.trace_rows, 0));
+    <P as IsStarkProver<_, _, _>>::accumulate(&mut entry.0, &coefficient, &deep.deep);
+    entry.2 += 1;
+    state.order.push(idx);
+    state.tables.push((
+        idx,
+        TablePublic {
+            trace_rows: deep.trace_rows,
+            main_root: deep.main_roots.main,
+            precomputed_root: deep.main_roots.precomputed,
+            aux_root: deep.aux_root,
+            composition_poly_root: deep.composition_poly_root,
+            trace_ood: deep.trace_ood,
+            trace_ood_next: deep.trace_ood_next,
+            parts_ood: deep.parts_ood,
+            bus_public_inputs: deep.bus_public_inputs,
+        },
+    ));
+    // `deep` dies here, which is the whole point.
+}
+
+fn deep_of(
+    air: &dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >,
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    challenges: &[FieldElement<GoldilocksExtension>],
+    transcript: &mut DefaultTranscript<GoldilocksExtension>,
+    known_main: Option<stark::prover::MainRoots>,
+) -> Result<Deep, String> {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    <P as IsStarkProver<_, _, _>>::deep_for_table(
+        air,
+        &(),
+        trace,
+        challenges,
+        transcript,
+        known_main,
+        keep_composition(),
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+impl Visitor for BuildDeep<'_> {
+    fn table(
+        &mut self,
+        kind: TableKind,
+        chunk: usize,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> Result<(), Error> {
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
+    }
+}
+
+/// Walk the execution and fold every table into one FRI per height group.
+///
+/// The codewords are held, not the LDEs they came from — one extension element
+/// per row instead of every column — which is what lets the fold wait until
+/// every table is done without walking the execution a third time.
+///
+/// Grouping is by exact domain and can only be: the fold squares the coset
+/// offset each layer, so a short codeword never lines up with a tall fold.
+pub fn run_batched(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+    challenge: &Challenge,
+) -> Result<Batched, Error> {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+
+    let chunk_airs = ChunkAirs::new(proof_options);
+    let done = std::sync::Mutex::new(FoldState {
+        seed: challenge.transcript.clone(),
+        acc: std::collections::BTreeMap::new(),
+        order: Vec::new(),
+        tables: Vec::new(),
+        kept: Vec::new(),
+    });
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = BuildDeep::new(s, &chunk_airs, challenge, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
+
+    // The tables the walk could not retire, folded after it in AIR order.
+    let order = &challenge.order;
+    let airs = &challenge.airs;
+    let n = order.len();
+    {
+        #[cfg(feature = "parallel")]
+        use rayon::prelude::*;
+        let mut state = done.lock().expect("fold state");
+        let build = |idx: usize,
+                     air: &crate::VmAir,
+                     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+         -> Result<(usize, Deep), Error> {
+            let mut transcript = fork(&challenge.transcript, idx, n);
+            let deep = deep_of(
+                air.as_ref(),
+                trace,
+                &challenge.challenges,
+                &mut transcript,
+                challenge.roots.get(idx).cloned(),
+            )
+            .map_err(|e| Error::Prover(format!("batched phase: table {idx}: {e}")))?;
+            Ok((idx, deep))
+        };
+        let fixed: [(
+            &crate::VmAir,
+            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        ); NUM_FIXED_AIRS] = [
+            (&airs.bitwise, &mut resident.bitwise),
+            (&airs.decode, &mut resident.decode),
+            (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
+            (&airs.register, &mut resident.register),
+        ];
+        // The codewords are independent and computed in parallel; the fold
+        // itself is sequential and keeps this order, which the proof records.
+        let mut jobs: Vec<(
+            usize,
+            &crate::VmAir,
+            &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+        )> = fixed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (air, trace))| (idx, air, trace))
+            .collect();
+        if airs.include_halt {
+            jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+        }
+        // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+        // the run never called: an absent kind has an empty AIR vec and no
+        // slot. `accel_index` is the single authority for where each lands.
+        for (slot, (air_vec, trace)) in [
+            (&airs.commits, &mut resident.accumulated.commit),
+            (&airs.keccaks, &mut resident.accumulated.keccak),
+            (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+            (&airs.ecsms, &mut resident.accumulated.ecsm),
+            (&airs.ecdases, &mut resident.accumulated.ecdas),
+            (&airs.hints, &mut resident.accumulated.hint),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+                jobs.push((idx, air, trace));
+            }
+        }
+        for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+            let idx = order.page_index(i).ok_or_else(|| {
+                Error::Prover(format!("batched phase: page {i} is not in the layout"))
+            })?;
+            jobs.push((idx, air, trace));
+        }
+        #[cfg(feature = "parallel")]
+        let deeps: Vec<(usize, Deep)> = jobs
+            .into_par_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<_, _>>()?;
+        #[cfg(not(feature = "parallel"))]
+        let deeps: Vec<(usize, Deep)> = jobs
+            .into_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<_, _>>()?;
+        for (idx, deep) in deeps {
+            fold_one(&mut state, idx, deep);
+        }
+    }
+
+    let FoldState {
+        mut seed,
+        acc,
+        order: fold_order,
+        mut tables,
+        kept,
+    } = done.into_inner().expect("fold state");
+    if tables.len() != n {
+        return Err(Error::Prover(format!(
+            "batched phase: {} tables for a layout of {n}",
+            tables.len()
+        )));
+    }
+
+    // One FRI per accumulator, and the mapping from table to group.
+    let mut group_of = vec![usize::MAX; n];
+    let sizes: Vec<usize> = acc.keys().copied().collect();
+    for (idx, table) in tables.iter() {
+        let lde = table.trace_rows * proof_options.blowup_factor as usize;
+        let idx = *idx;
+        group_of[idx] = sizes.iter().position(|s| *s == lde).ok_or_else(|| {
+            Error::Prover(format!(
+                "batched phase: table {idx} has no group of size {lde}"
+            ))
+        })?;
+    }
+
+    let any = chunk_airs.get(TableKind::Cpu).as_ref();
+    let (mut groups, mut members) = (Vec::new(), Vec::new());
+    for (lde_size, (codeword, trace_rows, count)) in acc {
+        let fri = <P as IsStarkProver<_, _, _>>::batch_fri(any, codeword, trace_rows, &mut seed)
+            .ok_or_else(|| Error::Prover(format!("batched phase: no FRI for size {lde_size}")))?;
+        groups.push((lde_size, fri));
+        members.push(count);
+    }
+
+    tables.sort_by_key(|(idx, _)| *idx);
+    let composition_ldes: Vec<std::sync::Mutex<Option<CompositionLde>>> = (0..tables.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    for (idx, lde) in kept {
+        *composition_ldes[idx].lock().expect("kept composition") = Some(lde);
+    }
+    Ok(Batched {
+        tables: tables.into_iter().map(|(_, t)| t).collect(),
+        fold_order,
+        groups,
+        members,
+        group_of,
+        table_counts: challenge.order.counts().clone(),
+        composition_ldes,
+        resident,
+    })
+}
+
+/// What the Open pass produced: every table's rows at its group's indices.
+pub struct Opened {
+    /// One entry per table, in AIR order.
+    pub openings:
+        Vec<stark::proof::stark::DeepPolynomialOpenings<GoldilocksField, GoldilocksExtension>>,
+    pub resident: Resident,
+}
+
+type Opens = std::sync::Mutex<Vec<(usize, Open)>>;
+
+struct OpenTables<'a> {
+    batch: pass::Batched<'a, Item>,
+}
+
+impl<'a> OpenTables<'a> {
+    fn new(
+        scope: &'a std::thread::Scope<'a, '_>,
+        airs: &'a ChunkAirs,
+        challenge: &'a Challenge,
+        batched: &'a Batched,
+        done: &'a Opens,
+    ) -> Self {
+        Self {
+            batch: pass::Batched::new(scope, move |items| {
+                open_batch(airs, challenge, batched, done, items)
+            }),
+        }
+    }
+}
+
+fn iotas_of(batched: &Batched, idx: usize) -> Result<&[usize], Error> {
+    let g = *batched
+        .group_of
+        .get(idx)
+        .ok_or_else(|| Error::Prover(format!("open pass: table {idx} has no group")))?;
+    let (_, fri) = batched
+        .groups
+        .get(g)
+        .ok_or_else(|| Error::Prover(format!("open pass: table {idx} points at group {g}")))?;
+    Ok(&fri.iotas)
+}
+
+fn open_batch(
+    airs: &ChunkAirs,
+    challenge: &Challenge,
+    batched: &Batched,
+    done: &Opens,
+    items: Vec<Item>,
+) -> Result<(), Error> {
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+    let order = &challenge.order;
+    let n = order.len();
+    let run_one = |(kind, chunk, mut trace): Item| {
+        let idx = order.index_of(kind, chunk).ok_or_else(|| {
+            Error::Prover(format!(
+                "open pass: {kind:?} chunk {chunk} is not in the layout"
+            ))
+        })?;
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let opening = open_of(
+            airs.get(kind).as_ref(),
+            &mut trace,
+            &challenge.challenges,
+            &mut transcript,
+            iotas_of(batched, idx)?,
+            take_kept(batched, idx),
+        )
+        .map_err(|e| Error::Prover(format!("open pass: {kind:?} chunk {chunk}: {e}")))?;
+        Ok((idx, opening))
+    };
+    #[cfg(feature = "parallel")]
+    let built: Result<Vec<_>, Error> = items.into_par_iter().map(run_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Result<Vec<_>, Error> = items.into_iter().map(run_one).collect();
+    done.lock().expect("openings").extend(built?);
+    Ok(())
+}
+
+fn open_of(
+    air: &dyn stark::traits::AIR<
+        Field = GoldilocksField,
+        FieldExtension = GoldilocksExtension,
+        PublicInputs = (),
+    >,
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    challenges: &[FieldElement<GoldilocksExtension>],
+    transcript: &mut DefaultTranscript<GoldilocksExtension>,
+    iotas: &[usize],
+    kept: Option<CompositionLde>,
+) -> Result<Open, String> {
+    type P = stark::prover::Prover<GoldilocksField, GoldilocksExtension, ()>;
+    match kept {
+        Some(lde) => <P as IsStarkProver<_, _, _>>::open_for_table_kept(
+            air, trace, challenges, transcript, iotas, lde,
+        ),
+        None => <P as IsStarkProver<_, _, _>>::open_for_table(
+            air,
+            &(),
+            trace,
+            challenges,
+            transcript,
+            iotas,
+        ),
+    }
+    .map_err(|e| format!("{e:?}"))
+}
+
+fn take_kept(batched: &Batched, idx: usize) -> Option<CompositionLde> {
+    batched
+        .composition_ldes
+        .get(idx)
+        .and_then(|slot| slot.lock().expect("kept composition").take())
+}
+
+impl Visitor for OpenTables<'_> {
+    fn table(
+        &mut self,
+        kind: TableKind,
+        chunk: usize,
+        trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> Result<(), Error> {
+        self.batch.push((kind, chunk, trace))
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.batch.drain()
+    }
+}
+
+/// Approach 1's fifth pass: walk the execution once more and open every table
+/// at the indices its group settled on.
+///
+/// The last walk, and the one the spec puts last for a reason — the indices do
+/// not exist until the batched FRI is over, so nothing here could have been
+/// folded into an earlier pass.
+pub fn run_open(
+    elf: &Elf,
+    private_input: &[u8],
+    max_rows: &MaxRowsConfig,
+    proof_options: &ProofOptions,
+    challenge: &Challenge,
+    batched: &Batched,
+) -> Result<Opened, Error> {
+    let chunk_airs = ChunkAirs::new(proof_options);
+    let done = std::sync::Mutex::new(Vec::new());
+    let mut resident = std::thread::scope(|s| {
+        let mut visitor = OpenTables::new(s, &chunk_airs, challenge, batched, &done);
+        pass::run(elf, private_input, max_rows, &mut visitor)
+    })?;
+    let mut opens = done.into_inner().expect("openings");
+
+    let order = &challenge.order;
+    let airs = &challenge.airs;
+    let n = order.len();
+    let build = |idx: usize,
+                 air: &crate::VmAir,
+                 trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>|
+     -> Result<(usize, Open), Error> {
+        let mut transcript = fork(&challenge.transcript, idx, n);
+        let opening = open_of(
+            air.as_ref(),
+            trace,
+            &challenge.challenges,
+            &mut transcript,
+            iotas_of(batched, idx)?,
+            take_kept(batched, idx),
+        )
+        .map_err(|e| Error::Prover(format!("open pass: table {idx}: {e}")))?;
+        Ok((idx, opening))
+    };
+    let fixed: [(
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ); NUM_FIXED_AIRS] = [
+        (&airs.bitwise, &mut resident.bitwise),
+        (&airs.decode, &mut resident.decode),
+        (&airs.keccak_rc, &mut resident.accumulated.keccak_rc),
+        (&airs.register, &mut resident.register),
+    ];
+    let mut jobs: Vec<(
+        usize,
+        &crate::VmAir,
+        &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    )> = fixed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (air, trace))| (idx, air, trace))
+        .collect();
+    if airs.include_halt {
+        jobs.push((NUM_FIXED_AIRS, &airs.halt, &mut resident.halt));
+    }
+    // Then the accelerators, in `air_trace_pairs` order, skipping the ones
+    // the run never called: an absent kind has an empty AIR vec and no
+    // slot. `accel_index` is the single authority for where each lands.
+    for (slot, (air_vec, trace)) in [
+        (&airs.commits, &mut resident.accumulated.commit),
+        (&airs.keccaks, &mut resident.accumulated.keccak),
+        (&airs.keccak_rnds, &mut resident.accumulated.keccak_rnd),
+        (&airs.ecsms, &mut resident.accumulated.ecsm),
+        (&airs.ecdases, &mut resident.accumulated.ecdas),
+        (&airs.hints, &mut resident.accumulated.hint),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let (Some(air), Some(idx)) = (air_vec.first(), order.accel_index(slot)) {
+            jobs.push((idx, air, trace));
+        }
+    }
+    for (i, (air, trace)) in airs.pages.iter().zip(resident.pages.iter_mut()).enumerate() {
+        let idx = order
+            .page_index(i)
+            .ok_or_else(|| Error::Prover(format!("open pass: page {i} is not in the layout")))?;
+        jobs.push((idx, air, trace));
+    }
+    {
+        #[cfg(feature = "parallel")]
+        use rayon::prelude::*;
+        #[cfg(feature = "parallel")]
+        let opened = jobs
+            .into_par_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(not(feature = "parallel"))]
+        let opened = jobs
+            .into_iter()
+            .map(|(idx, air, trace)| build(idx, air, trace))
+            .collect::<Result<Vec<_>, _>>()?;
+        opens.extend(opened);
+    }
+
+    opens.sort_by_key(|(idx, _)| *idx);
+    if opens.len() != n {
+        return Err(Error::Prover(format!(
+            "open pass: {} tables for a layout of {n}",
+            opens.len()
+        )));
+    }
+    Ok(Opened {
+        openings: opens.into_iter().map(|(_, o)| o).collect(),
+        resident,
+    })
+}
+
+/// Assemble what the batched and Open passes produced.
+///
+/// Takes them rather than running them, so the two walks stay independently
+/// testable and a caller can measure either on its own.
+pub fn assemble_batched_proof(batched: Batched, opened: Opened) -> Result<BatchedProof, Error> {
+    if batched.tables.len() != opened.openings.len() {
+        return Err(Error::Prover(format!(
+            "assemble: {} tables against {} openings",
+            batched.tables.len(),
+            opened.openings.len()
+        )));
+    }
+    Ok(BatchedProof {
+        tables: batched.tables,
+        table_counts: batched.table_counts,
+        fold_order: batched.fold_order,
+        openings: opened.openings,
+        group_of: batched.group_of,
+        groups: batched.groups,
+        public_output: opened.resident.public_output,
+        page_configs: opened.resident.page_configs,
+    })
+}

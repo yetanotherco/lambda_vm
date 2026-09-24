@@ -18,6 +18,7 @@
     - [Lookup argument](./cryptography/lookup.md)
 - [Virtual machine](./virtual_machine/introduction.md)
 - [Continuations design](./continuations_design.md)
+- [Prove-and-retire design](./prove_and_retire_design.md)
 
 ## Getting started
 

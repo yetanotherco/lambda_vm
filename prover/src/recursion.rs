@@ -193,6 +193,138 @@ pub fn encode_continuation_guest_input(
     Ok(blob)
 }
 
+/// [`verify_and_attest_blob`], but the monolithic blob is deserialized into
+/// owned values first instead of being read in place.
+///
+/// Same proof, same verifier, same attestation — only the read path differs.
+/// Zero-copy saves the guest a full owned copy of the proof; what it costs is
+/// an archived-pointer dereference on every field access, and the verifier
+/// touches most fields many times. This exists to price that trade in guest
+/// cycles, which is what an outer prover pays for.
+pub fn verify_owned_and_attest(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let archive_bytes = crate::recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(crate::RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            &aligned_fallback
+        };
+    let input = rkyv::from_bytes::<crate::GuestInput, RkyvError>(archive)
+        .map_err(|e| Error::Execution(format!("blob validation failed: {e}")))?;
+
+    let ok = crate::verify_with_options(
+        &input.vm_proof,
+        &input.inner_elf,
+        proof_options,
+        Some(input.decode_commitment),
+        Some(&input.page_commitments),
+    )?;
+    if !ok {
+        return Ok(None);
+    }
+
+    let id = program_id_from_elf(
+        &input.inner_elf,
+        &input.decode_commitment,
+        &input.page_commitments,
+    )?;
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&input.vm_proof.public_output);
+    Ok(Some(attestation))
+}
+
+/// The batched guest's private-input layout (the `batched` guest feature).
+/// Mirrors [`crate::GuestInput`] with the monolithic proof replaced by a
+/// [`BatchedProof`]: one FRI per domain height instead of one per table.
+/// Rkyv-archived on the same magic-prefixed wire format as the other two
+/// blobs; the guest is feature-pinned to one layout, and a blob of another
+/// kind fails the bytecheck validation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct BatchedGuestInput {
+    pub proof: crate::batched_proof::BatchedProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+/// Build the batched guest's private-input blob for `proof` of `inner_elf`.
+pub fn encode_batched_guest_input(
+    proof: crate::batched_proof::BatchedProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) = precomputed_commitments(inner_elf, opts)?;
+    let input = BatchedGuestInput {
+        proof,
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
+/// [`verify_and_attest_blob`]'s logic for a batched proof: verify it against
+/// the supplied roots and attest `program_id(elf, roots) || public_output`.
+/// The batched verifier works on owned values, so the archive is deserialized
+/// once rather than read in place.
+pub fn verify_batched_and_attest(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
+        Error::Execution(String::from("batched recursion blob: bad magic or version"))
+    })?;
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(crate::RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            &aligned_fallback
+        };
+    let input = rkyv::from_bytes::<BatchedGuestInput, RkyvError>(archive)
+        .map_err(|e| Error::Execution(format!("batched blob validation failed: {e}")))?;
+
+    // `public_output` before the proof is consumed: the verifier takes it by
+    // value so the guest does not pay for copying the openings.
+    let public_output = input.proof.public_output.clone();
+    if !crate::batched_verifier::verify_with_precomputed(
+        input.proof,
+        &input.inner_elf,
+        proof_options,
+        Some(input.decode_commitment),
+        Some(&input.page_commitments),
+    )? {
+        return Ok(None);
+    }
+
+    let id = program_id_from_elf(
+        &input.inner_elf,
+        &input.decode_commitment,
+        &input.page_commitments,
+    )?;
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&public_output);
+    Ok(Some(attestation))
+}
+
 /// Domain tag for [`program_id`].
 const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
 
