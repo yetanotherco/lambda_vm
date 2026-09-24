@@ -2,7 +2,13 @@ use crate::proof::options::{GoldilocksCubicProofOptions, ProofOptions, ProofOpti
 
 #[test]
 fn jbr_queries_match_expected_values() {
-    // Verified against zisk's pil2-proofman-js security calculator
+    // These counts were verified against zisk's pil2-proofman-js security
+    // calculator, which runs at the historical Johnson gap of 1/300.
+    // ⚠ Blowups 2 and 4 now use a re-tuned gap, so their agreement with that
+    // calculator is no longer the reason they hold — the (gap, budget) pair is
+    // chosen to keep the count fixed, and `the_production_posture_is_pinned`
+    // is what states that intent. Blowups 8, 32 and 64 are still on 1/300 and
+    // still match the calculator directly.
     assert_eq!(
         GoldilocksCubicProofOptions::with_blowup(2)
             .unwrap()
@@ -69,12 +75,64 @@ fn default_grinding_is_20() {
 fn custom_grinding() {
     let opts = GoldilocksCubicProofOptions::with_params(4, 128, 22).unwrap();
     assert_eq!(opts.grinding_factor, 22);
-    // More grinding → fewer queries needed
+    // More grinding → fewer queries needed, HOLDING THE BUDGET FIXED. Both
+    // sides must pass the same `security_bits`: `with_blowup` carries a
+    // per-blowup budget, so comparing against it would attribute a budget
+    // difference to grinding and read backwards the moment the two diverge.
     assert!(
         opts.fri_number_of_queries
-            < GoldilocksCubicProofOptions::with_blowup(4)
+            < GoldilocksCubicProofOptions::with_params(4, 128, 20)
                 .unwrap()
                 .fri_number_of_queries
+    );
+}
+
+/// ★ The posture pin. Every one of these numbers is a deliberate choice, and
+/// the defect it guards is a constant drifting silently: the Johnson gap sat at
+/// 1/300 for a year while nothing recomputed what it cost.
+///
+/// ⚠ QUERY COUNTS MUST NOT MOVE. The re-tune is free precisely because it holds
+/// 219 / 110 / 73 — the gap feeds both `eps_C` and `bits_per_query`, so the
+/// budget moves with it to keep the count fixed. A query count changing here
+/// means the (gap, budget) pair is wrong, not that this test is stale.
+#[test]
+fn the_production_posture_is_pinned() {
+    // (blowup, security_bits, grinding, queries)
+    let expected = [(2u8, 118u8, 20u8, 219usize), (4, 120, 20, 110)];
+    for (blowup, bits, grinding, queries) in expected {
+        let opts = GoldilocksCubicProofOptions::with_blowup(blowup).expect("valid blowup");
+        assert_eq!(
+            opts.fri_number_of_queries, queries,
+            "blowup {blowup}: query count moved — the re-tune is only free if it does not"
+        );
+        assert_eq!(opts.grinding_factor, grinding, "blowup {blowup}: grinding");
+        // The budget is not stored on ProofOptions, so pin it the only way it
+        // is observable: passing the same budget explicitly must reproduce the
+        // count `with_blowup` produces.
+        assert_eq!(
+            GoldilocksCubicProofOptions::with_params(blowup, bits, grinding)
+                .expect("valid params")
+                .fri_number_of_queries,
+            queries,
+            "blowup {blowup}: with_blowup must be passing security_bits {bits}"
+        );
+    }
+
+    // ⚠ blowup 8 is NOT re-tuned: its delivered bits are not computed, so it
+    // keeps the historical gap and the 128 budget rather than inheriting a
+    // neighbour's constant. 73 queries either way — the claim is what differs.
+    assert_eq!(
+        GoldilocksCubicProofOptions::with_blowup(8)
+            .unwrap()
+            .fri_number_of_queries,
+        73
+    );
+    assert_eq!(
+        GoldilocksCubicProofOptions::with_params(8, 128, 20)
+            .unwrap()
+            .fri_number_of_queries,
+        73,
+        "blowup 8 must still be on the 128 budget"
     );
 }
 
