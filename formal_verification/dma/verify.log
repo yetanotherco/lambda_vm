@@ -1,0 +1,70 @@
+============================================================================
+DMA memcpy chip -- z3 gate
+============================================================================
+  solver: z3 5.0.0
+  legend: unsat = proved | sat = counterexample found | unknown = TIMED OUT (failure)
+
+=== LAYER 1: field-exact rows ===
+  MAIN 0  row == oracle row                 -> unsat   (want unsat)
+  MAIN 1  end <=> count == 0                -> unsat   (want unsat)
+  MAIN 2  count wraps only on terminal row  -> unsat   (want unsat)
+  MAIN 2b one-byte row has zero lanes 1..7  -> unsat   (want unsat)
+  MAIN 2c one ecall asks for <= 256 bytes  -> unsat   (want unsat)
+  MAIN 3  successor exact + well formed     -> unsat   (want unsat)
+
+=== LAYER 2: chain structure, DmaNext as a free bijection ===
+  CHAIN   2 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   3 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   4 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN   5 rows, any balanced structure   -> unsat   (want unsat)
+  CHAIN-F 2 rows, field-exact              -> unsat   (want unsat)
+  CHAIN-F 3 rows, field-exact              -> unsat   (want unsat)
+
+  -- Layer 2 controls --
+  positive: 2-row premise set satisfiable  -> sat   (want sat)
+  positive: 3-row premise set satisfiable  -> sat   (want sat)
+  positive: 4-row premise set satisfiable  -> sat   (want sat)
+  positive: 2-row field-exact premise set   -> sat   (want sat)
+  negative: drop `count` from the tuple       -> sat   (want sat)
+  negative: drop `src` from the tuple       -> sat   (want sat)
+  negative: drop `dst` from the tuple       -> sat   (want sat)
+
+=== NEGATIVE CONTROLS -- drop one premise, expect a forgery ===
+  drop_halfword_count_decr     -> sat   (want sat)
+  drop_halfword_src_incr       -> sat   (want sat)
+  drop_zero_end                -> sat   (want sat)
+  drop_lt_tail                 -> sat   (want sat)
+  drop_no_overflow_src         -> sat   (want sat)
+  drop_tail_lane_zero          -> sat   (want sat)
+  drop_lt_bound                -> sat   (want sat)
+  drop_reg32                   -> sat   (want sat)
+  drop_halfword_dst_incr       -> sat   (want sat)
+  drop_no_overflow_dst         -> sat   (want sat)
+
+=== WIDTH AUDIT -- bound necessity at the boundary (field level) ===
+  Zero sum identity, bounds present        -> unsat  (want unsat)
+  Zero sum identity, bounds DROPPED        -> sat    (want sat)
+  no-overflow, halfword bounds present     -> unsat  (want unsat)
+  no-overflow, halfword bounds DROPPED     -> sat    (want sat)
+  truncation at count=7, LT pin present    -> unsat  (want unsat)
+  truncation at count=7, LT pin DROPPED    -> sat    (want sat)
+
+=== POSITIVE CONTROLS -- oracle-pinned completeness sweep ===
+  PASS  5153 honest rows + 257 padding rows over 257 lengths, all accepted
+
+============================================================================
+VERDICT
+============================================================================
+  layer 1 (row semantics)              : True
+  layer 2 (chain structure)            : True
+  layer 2 controls (pos + neg)         : True
+  negative controls all SAT            : True   (10/10)
+  width audit (bound necessity)        : True
+  completeness sweep SAT               : True
+
+  Scope: Layer 2 proves the tiling among groups with exactly ONE head
+  row. Two DMA calls are separated by the `ts` in both DmaNext tuples,
+  which `ChainRow` does not model -- see `check_chain`'s docstring and
+  the textual guard in audit_transcription.py.
+
+  OVERALL: PASS

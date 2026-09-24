@@ -32,6 +32,10 @@ rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "byt
 
 [dev-dependencies]
 env_logger = "*"
+# Reads the DMA oracle's canonical column expansions in
+# `prover/src/tests/dma_tests.rs`. Dev-only, and the version is already resolved
+# for `executor`, `crypto/math` and `tooling/*`, so this pulls in nothing new.
+serde_json = "1.0"
 criterion = { version = "0.5", default-features = false }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

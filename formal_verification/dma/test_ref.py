@@ -1,0 +1,409 @@
+"""
+Validation harness for `dma_ref.py`, and the emitter for the canonical vectors.
+
+Five independent anchors. Each one SKIPs on its own if its dependency is
+missing; a missing anchor never cascades into the others and never lets the
+banner claim more than actually ran (the two harness defects the BLAKE3
+campaign had to fix after the fact -- see README.md).
+
+  [1] libc `memmove`         -- an implementation nobody here wrote
+  [2] CPython slice assign   -- a second such implementation
+  [3] row/bus <-> byte level -- the decomposition really implements the copy
+  [4] chunking composition   -- the guest stub really implements a long memcpy
+  [5] mutation sweep         -- the anchors above are sensitive, not vacuous
+
+Anchors 1 and 2 pin the *semantics*. Anchor 3 is the one the chip depends on:
+it is the only check that the row sequence the AIR proves is the byte copy the
+guest asked for. Anchor 5 is what makes 1-4 worth running.
+
+    python3 test_ref.py           # run everything, emit the vectors
+    python3 test_ref.py --quick   # skip the exhaustive length sweeps
+"""
+
+import ctypes
+import ctypes.util
+import json
+import os
+import random
+import sys
+
+import dma_ref as ref
+from dma_ref import DMA_MEMCPY_MAX_BYTES as MAX
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VECTORS = os.path.join(HERE, "canonical_dma_vectors.json")
+ROW_TABLE = os.path.join(HERE, "canonical_dma_rows.txt")
+
+#: Overlap configurations every sweep runs. `delta = dst - src`.
+#: 0 is the aliasing case; +-1/+-7 straddle a wide row; +-8 is exactly one row;
+#: +-9/+-64 are the near cases; +-2048 is disjoint.
+#: Bounded by REGION/4 so `src_off + delta` and `+ MAX` stay inside the buffer --
+#: an out-of-range offset would make the libc anchor read past its own buffer and
+#: "pass" on garbage.
+DELTAS = [0, 1, -1, 7, -7, 8, -8, 9, -9, 64, -64, 255, -255, 2048, -2048]
+
+BASE = 0x10_0000
+REGION = 8192
+#: Every sweep copies from here, so both overlap directions have room.
+SRC_OFF = REGION // 2
+MID = BASE + SRC_OFF
+
+assert all(0 <= SRC_OFF + d and SRC_OFF + d + MAX <= REGION for d in DELTAS), \
+    "a delta would put the destination outside the test region"
+
+
+def _region(seed: int, size: int) -> dict:
+    """A deterministic pseudo-random byte region based at `BASE`."""
+    rng = random.Random(seed)
+    return {BASE + i: rng.randrange(256) for i in range(size)}
+
+
+# ---------------------------------------------------------------------------
+# [1] libc memmove
+# ---------------------------------------------------------------------------
+
+def anchor_libc(quick: bool):
+    """Differential against the platform C library's own `memmove`.
+
+    Genuinely non-circular: `dma_ref.memcpy_ref` and libc share no code, and
+    libc is the definition the guest's compiler-builtin `memcpy` was replacing.
+    Overlap is included, which is where `memcpy` and `memmove` diverge and
+    where the executor's snapshot buffer is the deciding implementation choice.
+    """
+    path = ctypes.util.find_library("c")
+    if path is None:
+        return None, "libc not found"
+    # `find_library` returning a path does NOT mean it loads: it can hand back a
+    # GNU ld linker script (`libc.so`), an arch-mismatched hit from the ldconfig
+    # cache, or a path that has since gone (chroot, slim container). An uncaught
+    # OSError here killed the whole run before anchors 2-5 and before any banner
+    # printed -- breaking this module's "a missing anchor never cascades" promise.
+    try:
+        libc = ctypes.CDLL(path)
+        libc.memmove.restype = ctypes.c_void_p
+        libc.memmove.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    except (OSError, AttributeError) as exc:
+        return None, f"libc at {path} is not loadable ({exc})"
+
+    cases = 0
+    lengths = range(0, MAX + 1) if not quick else [0, 1, 7, 8, 9, 15, 16, 255, MAX]
+    for n in lengths:
+        for delta in DELTAS:
+            src_off = SRC_OFF
+            dst_off = src_off + delta
+            initial = _region(n * 131 + delta, REGION)
+
+            buf = ctypes.create_string_buffer(
+                bytes(initial.get(BASE + i, 0) for i in range(REGION)), REGION)
+            libc.memmove(ctypes.byref(buf, dst_off), ctypes.byref(buf, src_off), n)
+            expected = list(buf.raw[:REGION])
+
+            got = ref.memcpy_ref(initial, BASE + dst_off, BASE + src_off, n)
+            actual = [got.get(BASE + i, 0) for i in range(REGION)]
+            if actual != expected:
+                return False, f"n={n} delta={delta}: disagrees with libc memmove"
+            cases += 1
+    return True, f"{cases} cases x overlap/alignment, all agree"
+
+
+# ---------------------------------------------------------------------------
+# [2] CPython slice assignment
+# ---------------------------------------------------------------------------
+
+def anchor_slice_assign(quick: bool):
+    """Differential against `bytearray[a:b] = bytearray[c:d]`.
+
+    CPython materialises the right-hand slice first, so this is a `memmove` too,
+    written by yet another set of hands. Cheap, and it catches a snapshot bug
+    even on a platform whose libc anchor is unavailable.
+    """
+    cases = 0
+    lengths = range(0, MAX + 1) if not quick else [0, 1, 8, 9, 200, MAX]
+    for n in lengths:
+        for delta in DELTAS:
+            src_off = SRC_OFF
+            dst_off = src_off + delta
+            initial = _region(n * 977 + delta, REGION)
+
+            buf = bytearray(initial.get(BASE + i, 0) for i in range(REGION))
+            buf[dst_off:dst_off + n] = buf[src_off:src_off + n]
+
+            got = ref.memcpy_ref(initial, BASE + dst_off, BASE + src_off, n)
+            if [got.get(BASE + i, 0) for i in range(REGION)] != list(buf):
+                return False, f"n={n} delta={delta}: disagrees with slice assignment"
+            cases += 1
+    return True, f"{cases} cases x overlap/alignment, all agree"
+
+
+# ---------------------------------------------------------------------------
+# [3] row/bus level <-> byte level
+# ---------------------------------------------------------------------------
+
+def anchor_row_level(quick: bool, widths=None, ops=None):
+    """The decomposition the AIR proves implements the copy the guest asked for.
+
+    Four claims, all over every length 0..MAX x every overlap configuration:
+      (a) replaying the MEMW multiset reproduces `memcpy_ref` byte for byte;
+      (b) the row widths sum to `n` and the row `src`/`dst`/`count` sequence is
+          exactly `src + prefix`, `dst + prefix`, `n - prefix`;
+      (c) there is exactly one `first` row and exactly one `end` row, the `end`
+          row has `count == 0`, and no other row does;
+      (d) the greedy width loop equals the closed form `[8]*(n//8) + [1]*(n%8)`.
+
+    `widths`/`ops` are injection points for the mutation sweep.
+    """
+    widths = widths or ref.row_widths
+    ops = ops or ref.memw_ops
+
+    lengths = range(0, MAX + 1) if not quick else [0, 1, 7, 8, 9, 16, 27, 255, MAX]
+    for n in lengths:
+        if widths(n) != [8] * (n // 8) + [1] * (n % 8):
+            return False, f"n={n}: greedy widths disagree with the closed form"
+        if sum(widths(n)) != n:
+            return False, f"n={n}: widths sum to {sum(widths(n))}"
+
+        for delta in DELTAS:
+            src = MID
+            dst = MID + delta
+            initial = _region(n * 31 + delta, REGION)
+
+            replayed = ref.replay_memw(ops(1000, dst, src, n, initial), initial)
+            expected = ref.memcpy_ref(initial, dst, src, n)
+            if replayed != expected:
+                return False, f"n={n} delta={delta}: MEMW replay != memcpy_ref"
+
+            rows = ref.row_decomposition(1000, dst, src, n, initial)
+            if sum(1 for r in rows if r.first) != 1:
+                return False, f"n={n}: not exactly one first row"
+            if sum(1 for r in rows if r.end) != 1:
+                return False, f"n={n}: not exactly one end row"
+            if not rows[-1].end or rows[-1].count != 0:
+                return False, f"n={n}: last row is not the terminal row"
+            if any(r.count == 0 for r in rows[:-1]):
+                return False, f"n={n}: a data row has count == 0"
+
+            offset = 0
+            for row, width in zip(rows[:-1], widths(n)):
+                if (row.src, row.dst, row.count, row.width) != (
+                        src + offset, dst + offset, n - offset, width):
+                    return False, f"n={n} delta={delta}: row at offset {offset} is wrong"
+                if row.value[width:] != [0] * (8 - width):
+                    return False, f"n={n}: unused value lanes are not zero"
+                offset += width
+    return True, f"{len(list(lengths))} lengths x {len(DELTAS)} overlaps, replay == memcpy_ref"
+
+
+# ---------------------------------------------------------------------------
+# [4] the guest stub's chunking
+# ---------------------------------------------------------------------------
+
+def anchor_chunking(quick: bool, chunk=None):
+    """`chunk_ecalls` composed over the reference is a `memcpy` of any length.
+
+    Three claims: no chunk exceeds the bound (an oversized chunk is what the
+    executor rejects); the chunk count is `ceil(n / MAX)`; and for
+    non-overlapping ranges the composition equals a single `memcpy_ref`.
+    Overlap is deliberately excluded here -- see `guest_memcpy`'s docstring and
+    ORACLE.md O2.
+    """
+    chunk = chunk or ref.chunk_ecalls
+    lengths = list(range(0, 1100)) if not quick else [0, 1, 255, MAX, 257, 512, 1000]
+    for n in lengths:
+        calls = chunk(0x2_0000, 0x1_0000, n)
+        if any(c > MAX for (_, _, c) in calls):
+            return False, f"n={n}: a chunk exceeds {MAX} bytes"
+        if len(calls) != (n + MAX - 1) // MAX:
+            return False, f"n={n}: {len(calls)} chunks, expected {(n + MAX - 1) // MAX}"
+        if sum(c for (_, _, c) in calls) != n:
+            return False, f"n={n}: chunks cover {sum(c for (_, _, c) in calls)} bytes"
+
+        initial = _region(n, REGION)
+        composed = dict(initial)
+        for cdst, csrc, cn in calls:
+            composed = ref.memcpy_ref(composed, cdst, csrc, cn)
+        # The whole-length expectation cannot come from `memcpy_ref` -- that
+        # models ONE ecall and rejects n > MAX. Spell the copy out instead.
+        expected = dict(initial)
+        for i in range(n):
+            expected[0x2_0000 + i] = initial.get(0x1_0000 + i, 0)
+        if composed != expected:
+            return False, f"n={n}: chunked copy != a plain byte-by-byte copy"
+
+        effect, returned = ref.guest_memcpy(initial, 0x2_0000, 0x1_0000, n)
+        if returned != 0x2_0000:
+            return False, f"n={n}: memcpy must return dst"
+        if effect != expected:
+            return False, f"n={n}: guest_memcpy disagrees with a plain copy"
+    return True, f"{len(lengths)} lengths, chunk count and composition both exact"
+
+
+# ---------------------------------------------------------------------------
+# Canonical vectors
+# ---------------------------------------------------------------------------
+
+#: Hand-picked so every structural case is covered exactly once: empty, a lone
+#: tail byte, a full wide row, wide+tail, the widest tail (7), an unaligned
+#: unaligned-overlapping copy, both overlap directions, a page-crossing copy,
+#: and the maximum chunk (which has no tail row at all).
+CANONICAL_CASES = [
+    ("empty", 0x1000, 0x2000, 0),
+    ("single byte", 0x1000, 0x2000, 1),
+    ("one wide row", 0x1000, 0x2000, 8),
+    ("wide plus tail", 0x1000, 0x2000, 9),
+    ("widest tail", 0x1000, 0x2000, 7),
+    ("unaligned body and tail", 0x2005, 0x1003, 27),
+    ("forward overlap", 0x3004, 0x3000, 24),
+    ("backward overlap", 0x3000, 0x3004, 24),
+    ("page crossing", 0x0FFC, 0x1FFC, 16),
+    ("maximum chunk", 0x1000, 0x2000, MAX),
+]
+
+
+def emit_vectors():
+    """Write `canonical_dma_vectors.json`: the pinned cases with their full
+    row-and-column expansion, so the Rust side can be checked against this
+    model without re-deriving it."""
+    vectors = []
+    for name, dst, src, n in CANONICAL_CASES:
+        memory = {src + i: (i * 7 + 3) & 0xFF for i in range(n)}
+        rows = ref.row_decomposition(0x30, dst, src, n, memory)
+        vectors.append({
+            "name": name,
+            "timestamp": 0x30,
+            "dst": dst,
+            "src": src,
+            "count": n,
+            "widths": ref.row_widths(n),
+            "data_rows": len(rows) - 1,
+            "rows": [
+                {
+                    "src": r.src, "dst": r.dst, "count": r.count,
+                    "first": r.first, "end": r.end, "tail": r.tail,
+                    "width": r.width, "value": r.value,
+                    "columns": ref.row_columns(r),
+                }
+                for r in rows
+            ],
+            "memw": [
+                {
+                    "is_register": o.is_register, "address": o.address,
+                    "timestamp": o.timestamp, "width": o.width,
+                    "value": list(o.value), "is_write": o.is_write,
+                }
+                for o in ref.memw_ops(0x30, dst, src, n, memory)
+            ],
+        })
+    with open(VECTORS, "w") as f:
+        json.dump(vectors, f, indent=1)
+        f.write("\n")
+    emit_row_table(vectors)
+    return vectors
+
+
+def emit_row_table(vectors):
+    """Write `canonical_dma_rows.txt`: the same vectors, line-oriented.
+
+    The JSON is the rich artifact — it carries the full per-row column expansion
+    the z3 gate pins. This file exists because the Rust side has no JSON parser
+    (the prover crate has no `serde_json`, and adding a dependency for a fixture
+    is not worth it), and a hand-rolled scanner over nested JSON is exactly the
+    kind of fragile coupling that goes stale silently: the first attempt broke on
+    the `columns` sub-object repeating the `src`/`dst`/`count` keys.
+
+    One record per line, `|`-separated, so `include_str!` + `split('|')` is the
+    whole parser and a malformed line is a hard error:
+
+        vector|<name>|<dst>|<src>|<count>|<data_row_count>
+        row|<src>|<dst>|<count>|<tail 0|1>|<width>
+    """
+    lines = [
+        "# Generated by test_ref.py — do not edit by hand.",
+        "# Consumed by prover/src/tests/dma_tests.rs via include_str!.",
+        "# vector|name|dst|src|count|data_rows      row|src|dst|count|tail|width",
+    ]
+    for vector in vectors:
+        data_rows = [r for r in vector["rows"] if not r["end"]]
+        lines.append("vector|{}|{}|{}|{}|{}".format(
+            vector["name"], vector["dst"], vector["src"],
+            vector["count"], len(data_rows)))
+        for row in data_rows:
+            lines.append("row|{}|{}|{}|{}|{}".format(
+                row["src"], row["dst"], row["count"],
+                1 if row["tail"] else 0, row["width"]))
+    with open(ROW_TABLE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+
+def _anchor_mutations(quick: bool):
+    """Delegates to `tamper_test.py`, imported late to avoid a circular import."""
+    from tamper_test import anchor_mutations
+    return anchor_mutations(quick)
+
+
+def main():
+    quick = "--quick" in sys.argv
+    print("=" * 72)
+    print("DMA memcpy oracle -- validation harness" + ("  (--quick)" if quick else ""))
+    print("=" * 72)
+
+    anchors = [
+        ("[1] libc memmove", anchor_libc),
+        ("[2] CPython slice assignment", anchor_slice_assign),
+        ("[3] row/bus level <-> byte level", anchor_row_level),
+        ("[4] guest stub chunking", anchor_chunking),
+        ("[5] tamper tests (tamper_test.py)", _anchor_mutations),
+    ]
+    results = {}
+    for name, run in anchors:
+        print(f"\n  {name}")
+        ok, detail = run(quick)
+        results[name] = ok
+        label = {True: "PASS", False: "FAIL", None: "SKIP"}[ok]
+        print(f"      {label}  {detail}")
+
+    print("\n" + "=" * 72)
+    ran = [n for n, ok in results.items() if ok is not None]
+    failed = [n for n, ok in results.items() if ok is False]
+    skipped = [n for n, ok in results.items() if ok is None]
+    if failed:
+        status = "NOT VALIDATED"
+    elif not ran:
+        status = "NOT VALIDATED"
+    elif skipped:
+        status = "PARTIALLY VALIDATED"
+    else:
+        status = "VALIDATED"
+    # The token itself carries any reduction. A CI job or a human greps for
+    # "VALIDATED", so a degraded or shortened run must not print the bare word.
+    qualifiers = []
+    if skipped:
+        qualifiers.append(f"{len(skipped)} anchor(s) skipped")
+    if quick:
+        qualifiers.append("--quick, reduced sweeps")
+    suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
+    print(f"VALIDATION STATUS: {status}{suffix}")
+    print(f"  anchored on : {', '.join(n for n in ran if results[n]) or 'nothing'}")
+    if skipped:
+        print(f"  NOT anchored on: {', '.join(skipped)}")
+    if failed:
+        print(f"  FAILING     : {', '.join(failed)}")
+    if quick:
+        print("  NOTE: --quick skipped the exhaustive 0..256 length sweeps.")
+
+    if not failed:
+        vectors = emit_vectors()
+        print(f"\n  emitted {len(vectors)} canonical vectors -> "
+              f"{os.path.basename(VECTORS)} + {os.path.basename(ROW_TABLE)}")
+
+    print("=" * 72)
+    # Distinct exit codes: 0 full board, 1 a real failure, 2 ran but degraded.
+    # A skipped external anchor used to exit 0, indistinguishable from a clean run.
+    if failed:
+        sys.exit(1)
+    sys.exit(2 if skipped else 0)
+
+
+if __name__ == "__main__":
+    main()
