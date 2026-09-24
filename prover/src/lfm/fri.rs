@@ -32,13 +32,14 @@
 //! also mirrors the CPU layout only — `fri/mod.rs` has cuda fast paths that
 //! claim the same layout, unverified here and never run by the machine.
 
-use stark::proof::options::ProofOptions;
+use stark::proof::options::{FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 use crate::tables::types::FE;
 
 use super::builder::{Bit, Ext, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
 use super::instr::ArenaId;
+use super::merkle_cap::CapCells;
 use super::sub_proof::{self, GroupShape};
 
 /// The compile-time shape of one sub-proof's FRI verification.
@@ -58,6 +59,10 @@ pub struct FriShape {
     pub coset_offset: u64,
     /// Queries the sub-proof carries.
     pub num_queries: usize,
+    /// The inner proof's FORMAT (design/CAP.md, design/FRI.md): its Merkle cap
+    /// policy caps every committed layer tree. A verifier constant, taken from
+    /// the inner proof's options — never from the proof.
+    pub format: ProofFormat,
 }
 
 impl FriShape {
@@ -73,6 +78,7 @@ impl FriShape {
             final_poly_log_degree: options.fri_final_poly_log_degree as u32,
             coset_offset: options.coset_offset,
             num_queries: options.fri_number_of_queries,
+            format: options.format,
         }
     }
 
@@ -120,13 +126,48 @@ impl FriShape {
         1usize << self.effective_k()
     }
 
-    /// Merkle path length for committed layer `i`: that layer's codeword is
+    /// Tree depth of committed layer `i`: that layer's codeword is
     /// `2^(n−i−1)` long and its leaves are pairs, so the tree has `2^(n−i−2)`
     /// leaves.
-    pub fn layer_path_len(self, layer: usize) -> usize {
+    pub fn layer_depth(self, layer: usize) -> usize {
         (self.log2_lde_length as usize)
             .checked_sub(layer + 2)
             .expect("layer index must be below num_committed")
+    }
+
+    /// Merkle-cap height of committed layer `i`'s tree under the format's cap
+    /// policy: every layer tree is opened once per query (`0` = uncapped).
+    /// The same function the host prover and verifier use
+    /// (`stark::merkle_caps::StarkCaps`), at the same depth.
+    pub fn layer_cap(self, layer: usize) -> usize {
+        self.format
+            .merkle_cap
+            .height(self.num_queries, self.layer_depth(layer))
+    }
+
+    /// Merkle path length a query's opening of committed layer `i` carries:
+    /// the tree's depth less its cap height (the owner path's cap is split off
+    /// into the caps arena).
+    pub fn layer_path_len(self, layer: usize) -> usize {
+        self.layer_depth(layer) - self.layer_cap(layer)
+    }
+
+    /// Arena words the committed layers' caps occupy, once per sub-proof.
+    pub fn cap_words(self, digest_words: usize) -> usize {
+        (0..self.num_committed())
+            .map(|i| match self.layer_cap(i) {
+                0 => 0,
+                c => (1usize << c) * digest_words,
+            })
+            .sum()
+    }
+
+    /// Permutations the committed layers' cap checks cost, once per
+    /// sub-proof: `2^c − 1` parents per capped layer.
+    pub fn cap_permutations(self) -> usize {
+        (0..self.num_committed())
+            .map(|i| super::merkle_cap::cap_root_permutations(self.layer_cap(i)))
+            .sum()
     }
 
     /// Merkle path steps one query walks across every committed layer.
@@ -152,7 +193,9 @@ impl FriShape {
     /// as its leaf-ordering parity and `bits[i+1..]` as its walk, and
     /// `bits[i+1..].len() = n − i − 2 = layer_path_len(i)` exactly — the layer
     /// tree's depth is not a separate fact to keep in sync, it is what is left
-    /// of the index after the folds already performed.
+    /// of the index after the folds already performed. (Under a Merkle cap the
+    /// top `layer_cap(i)` of those bits pick the cap node instead of being
+    /// walked; the split is the cap's own, [`CapCells::verify_path`].)
     pub fn index_bits(self) -> usize {
         self.log2_lde_length as usize - 1
     }
@@ -175,6 +218,13 @@ impl FriShape {
 
     /// Invariants a caller cannot assemble their way out of.
     pub fn check(self) {
+        assert!(
+            self.format.fri_mode == FriMode::Pair && self.format.one_row == OneRowMode::Off,
+            "the in-guest FRI verifier implements pair layers with row-pair openings \
+             only: {:?} / {:?}",
+            self.format.fri_mode,
+            self.format.one_row
+        );
         assert!(
             self.blowup_log >= 1,
             "a blowup of 1 is not a low-degree extension"
@@ -271,6 +321,9 @@ pub struct LayerCommitment {
     /// of four felts. `edsl::assert_digest_eq_lanes` zips a digest against these
     /// and asserts the widths agree, so it works at either width unchanged.
     pub root_lanes: Vec<[Felt; 4]>,
+    /// The layer tree's authenticated Merkle cap, when the format caps it
+    /// (see [`super::sub_proof::GroupCommitment::cap`]). `None` = today.
+    pub cap: Option<CapCells>,
 }
 
 impl LayerCommitment {
@@ -286,7 +339,10 @@ impl LayerCommitment {
                 b.unpack(w)
             })
             .collect();
-        LayerCommitment { root_lanes }
+        LayerCommitment {
+            root_lanes,
+            cap: None,
+        }
     }
 
     /// A layer commitment over lanes the caller already holds.
@@ -297,8 +353,73 @@ impl LayerCommitment {
     /// [`super::sub_proof::GroupCommitment::from_lanes`] for the same argument at
     /// the trace trees.
     pub fn from_lanes(root_lanes: Vec<[Felt; 4]>) -> Self {
-        LayerCommitment { root_lanes }
+        LayerCommitment {
+            root_lanes,
+            cap: None,
+        }
     }
+
+    /// Hint this layer tree's height-`c` cap out of `arena` at `base` and
+    /// authenticate it against the root lanes, once per tree (see
+    /// [`super::sub_proof::GroupCommitment::hint_cap`]). Returns the next free
+    /// word; `c = 0` hints nothing.
+    pub fn hint_cap(&mut self, b: &mut LfmBuilder, arena: ArenaId, base: u32, c: usize) -> u32 {
+        if c == 0 {
+            return base;
+        }
+        let (cap, next) =
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+        self.cap = Some(cap);
+        next
+    }
+
+    /// Authenticate an opened leaf of this layer at the tree's WHOLE leaf
+    /// index: against the cap when capped, else against the root lanes (the
+    /// uncapped emission is today's, instruction for instruction).
+    fn authenticate(
+        &self,
+        b: &mut LfmBuilder,
+        leaf: WrapDigest,
+        index_bits: &[Bit],
+        siblings: &[WrapDigest],
+    ) {
+        match &self.cap {
+            None => {
+                let root = edsl::wrap_merkle_walk(b, leaf, index_bits, siblings);
+                edsl::assert_digest_eq_lanes(b, root, &self.root_lanes);
+            }
+            Some(cap) => cap.verify_path(b, leaf, index_bits, siblings),
+        }
+    }
+
+    fn cap_height(&self) -> usize {
+        self.cap.as_ref().map_or(0, CapCells::height)
+    }
+}
+
+/// Hint and authenticate every capped committed layer's cap, in layer order,
+/// out of `arena` from word 0 — once per sub-proof. The words it reads are
+/// exactly [`FriShape::cap_words`].
+pub fn hint_layer_caps(
+    b: &mut LfmBuilder,
+    shape: FriShape,
+    arena: ArenaId,
+    layers: &mut [LayerCommitment],
+) {
+    assert_eq!(
+        layers.len(),
+        shape.num_committed(),
+        "one commitment per layer"
+    );
+    let mut at = 0u32;
+    for (i, layer) in layers.iter_mut().enumerate() {
+        at = layer.hint_cap(b, arena, at, shape.layer_cap(i));
+    }
+    assert_eq!(
+        at as usize,
+        shape.cap_words(edsl::digest_words(b) as usize),
+        "the FRI caps fill exactly what the shape declares"
+    );
 }
 
 /// A sub-proof's FRI data that does not depend on the query.
@@ -360,6 +481,9 @@ pub struct FriArenas {
     /// Per query, per committed layer: the symmetric evaluation, then the
     /// sibling digests (two words per level).
     pub queries: ArenaId,
+    /// Per capped committed layer, its `2^c` cap digests — declared only when
+    /// the format caps some layer ([`FriShape::cap_words`] `> 0`).
+    pub caps: Option<ArenaId>,
 }
 
 /// Declare the FRI arenas and hoist everything a query does not depend on.
@@ -378,10 +502,15 @@ pub fn declare_fri(
     let coeffs = b.declare_arena(shape.num_terminal_coeffs() as u32);
     let queries =
         b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
+    let cap_words = shape.cap_words(edsl::digest_words(b) as usize);
+    let caps = (cap_words > 0).then(|| b.declare_arena(cap_words as u32));
 
-    let layers = (0..c)
+    let mut layers: Vec<LayerCommitment> = (0..c)
         .map(|i| LayerCommitment::hint(b, roots, edsl::digest_words(b) * i as u32))
         .collect();
+    if let Some(caps) = caps {
+        hint_layer_caps(b, shape, caps, &mut layers);
+    }
     let zeta_cells = (0..num_zetas as u32)
         .map(|i| b.hint_word(zetas, i).as_ext())
         .collect();
@@ -395,6 +524,7 @@ pub fn declare_fri(
             zetas,
             coeffs,
             queries,
+            caps,
         },
         FriCommitments {
             layers,
@@ -532,6 +662,13 @@ pub fn emit_query_fri(
     );
     assert_eq!(fri.layers.len(), c, "one commitment per committed layer");
     assert_eq!(openings.len(), c, "one opening per committed layer");
+    for (i, layer) in fri.layers.iter().enumerate() {
+        assert_eq!(
+            layer.cap_height(),
+            shape.layer_cap(i),
+            "layer {i} is capped at the shape's height"
+        );
+    }
     assert_eq!(
         fri.coeffs.len(),
         shape.num_terminal_coeffs(),
@@ -578,8 +715,9 @@ pub fn emit_query_fri(
         // at 0 and `(r, l)` at 1, so this IS that conditional.
         let (first, second) = b.select(q.bits[i], v.as_cell(), opening.sym.as_cell());
         let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
-        let root = edsl::wrap_merkle_walk(b, leaf, &q.bits[i + 1..], &opening.siblings);
-        edsl::assert_digest_eq_lanes(b, root, &fri.layers[i].root_lanes);
+        // `bits[i+1..]` is this layer tree's whole leaf index; a cap walks its
+        // low bits and muxes the top ones.
+        fri.layers[i].authenticate(b, leaf, &q.bits[i + 1..], &opening.siblings);
 
         // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
         // squaring per layer (`verifier.rs:692-697`).

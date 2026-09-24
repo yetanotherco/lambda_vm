@@ -70,6 +70,9 @@ pub(super) struct HostSubProof {
     claimed_parts: Vec<FEE>,
     /// One root per group, in `SubProofShape::groups` order.
     roots: Vec<Commitment>,
+    /// Every group's Merkle cap in group order, split off query 0's path; empty
+    /// when the format caps nothing.
+    trace_caps: Vec<Commitment>,
     /// `[query][group]`.
     openings: Vec<Vec<HostGroupOpening>>,
     pub(super) iotas: Vec<usize>,
@@ -134,12 +137,38 @@ pub(super) fn build_host_sub_proof(
 
     let blowup = air.options().blowup_factor as usize;
     let lde_length = view.trace_length() * blowup;
+    let merkle_depth = lde_length.trailing_zeros() as usize - 1;
+    let opts = air.options();
+    let trace_cap = opts
+        .format
+        .merkle_cap
+        .height(opts.fri_number_of_queries, merkle_depth);
     let shape = SubProofShape {
         deep: deep.clone(),
         trace_groups,
-        merkle_depth: lde_length.trailing_zeros() as usize - 1,
+        merkle_depth,
         log2_lde_length: lde_length.trailing_zeros(),
         coset_offset: FE::from(air.options().coset_offset),
+        trace_cap,
+    };
+    // Query 0 of a capped tree is its owner: its path carries the cap after
+    // the `D − c` siblings. The query arena takes the siblings, the caps
+    // arena the caps (group order).
+    let mut trace_caps: Vec<Commitment> = Vec::new();
+    let mut split = |q: usize, path: &[Commitment]| -> Vec<Commitment> {
+        if trace_cap == 0 || q != 0 {
+            assert_eq!(
+                path.len(),
+                merkle_depth - trace_cap,
+                "query {q}: a path to the cap"
+            );
+            return path.to_vec();
+        }
+        let (siblings, cap) =
+            crypto::merkle_tree::cap::split_owner_path(path, merkle_depth, trace_cap)
+                .expect("the owner path is D − c + 2^c long");
+        trace_caps.extend_from_slice(cap);
+        siblings.to_vec()
     };
 
     let mut roots = vec![];
@@ -187,7 +216,7 @@ pub(super) fn build_host_sub_proof(
                     .chain(p.evaluations_sym())
                     .map(|v| base_word(*v))
                     .collect(),
-                siblings: p.merkle_path().to_vec(),
+                siblings: split(q, p.merkle_path()),
             });
         }
         let m = o.main_trace_polys();
@@ -198,7 +227,7 @@ pub(super) fn build_host_sub_proof(
                 .chain(m.evaluations_sym())
                 .map(|v| base_word(*v))
                 .collect(),
-            siblings: m.merkle_path().to_vec(),
+            siblings: split(q, m.merkle_path()),
         });
         if aux_width > 0 {
             let a = o.aux_trace_polys().expect("aux opening");
@@ -209,7 +238,7 @@ pub(super) fn build_host_sub_proof(
                     .chain(a.evaluations_sym())
                     .map(ext_word)
                     .collect(),
-                siblings: a.merkle_path().to_vec(),
+                siblings: split(q, a.merkle_path()),
             });
         }
         let c = o.composition_poly();
@@ -220,7 +249,7 @@ pub(super) fn build_host_sub_proof(
                 .chain(c.evaluations_sym())
                 .map(ext_word)
                 .collect(),
-            siblings: c.merkle_path().to_vec(),
+            siblings: split(q, c.merkle_path()),
         });
         openings.push(groups);
 
@@ -290,6 +319,7 @@ pub(super) fn build_host_sub_proof(
         ood,
         claimed_parts: sp.claimed_parts.clone(),
         roots,
+        trace_caps,
         openings,
         iotas: sp.challenges.iotas.clone(),
         zetas: sp.challenges.zetas.clone(),
@@ -302,13 +332,18 @@ pub(super) fn build_host_sub_proof(
 impl HostSubProof {
     /// The arenas [`emit_sub_proof`] declares, in its declaration order.
     pub(super) fn arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
-        vec![
+        let mut out = vec![
             vec![ext_word(&self.gamma), ext_word(&self.zeta)],
             self.ood.iter().map(ext_word).collect(),
             self.claimed_parts.iter().map(ext_word).collect(),
             super::proof_arena::commitments_to_arena(&self.roots),
             self.query_arena(queries),
-        ]
+        ];
+        // The caps arena, declared by the emitter only when the shape caps.
+        if self.shape.trace_cap > 0 {
+            out.push(super::proof_arena::commitments_to_arena(&self.trace_caps));
+        }
+        out
     }
 
     /// Per query: the index, then per group the row-pair values and the
@@ -565,6 +600,7 @@ fn shape_for(
         merkle_depth: (log2_trace_length + log2_blowup) as usize - 1,
         log2_lde_length: log2_trace_length + log2_blowup,
         coset_offset: FE::from(3u64),
+        trace_cap: 0,
     }
 }
 
@@ -1739,6 +1775,7 @@ fn the_exposed_bits_are_the_cells_the_walk_consumed() {
 // ==================== FRI slice 1: the fold layout ====================
 
 use super::fri::FriShape;
+use stark::proof::options::ProofFormat;
 
 /// ★ The shape mirror against production's observable BEHAVIOUR on the real
 /// proof — the vector lengths the verifier structurally enforces.
@@ -1848,6 +1885,7 @@ fn the_fold_layout_is_right_off_productions_constants() {
             final_poly_log_degree: k,
             coset_offset: 3,
             num_queries: 1,
+            format: ProofFormat::DEFAULT,
         };
         shape.check();
         let got = (
@@ -1898,6 +1936,7 @@ fn the_fri_sizing_prediction() {
             final_poly_log_degree: 7,
             coset_offset: 3,
             num_queries: queries,
+            format: ProofFormat::DEFAULT,
         };
         shape.check();
         println!(

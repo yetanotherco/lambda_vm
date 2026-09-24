@@ -125,6 +125,7 @@ impl TableVerifyShape {
             self.main_width <= self.sub.deep.num_total_cols,
             "the aux columns start inside the row"
         );
+        self.check_caps();
     }
 
     /// Arena words this sub-proof's trace openings occupy, at `digest_words`
@@ -138,6 +139,24 @@ impl TableVerifyShape {
     /// sibling digest.
     pub fn fri_words(&self, digest_words: usize) -> usize {
         self.num_queries * self.fri.query_words(digest_words)
+    }
+
+    /// Arena words this sub-proof's Merkle caps occupy, once per sub-proof:
+    /// the committed matrices' caps (group order), then the committed FRI
+    /// layers' (layer order). Zero at the default format.
+    pub fn cap_words(&self, digest_words: usize) -> usize {
+        self.sub.cap_words(digest_words) + self.fri.cap_words(digest_words)
+    }
+
+    fn check_caps(&self) {
+        assert_eq!(
+            self.sub.trace_cap,
+            self.fri
+                .format
+                .merkle_cap
+                .height(self.num_queries, self.sub.merkle_depth),
+            "the trace trees' cap is the format's, at their depth and query count"
+        );
     }
 }
 
@@ -156,14 +175,22 @@ pub struct TableQueryArenas {
     /// Per query, per committed FRI layer: the symmetric evaluation then the
     /// sibling digests.
     pub fri: ArenaId,
+    /// The sub-proof's Merkle caps ([`TableVerifyShape::cap_words`]), declared
+    /// only when the format caps some tree — so the default format's arena
+    /// schema, program and program id are today's.
+    pub caps: Option<ArenaId>,
 }
 
 /// Declare the query arenas for one sub-proof.
 pub fn declare_table_arenas(b: &mut LfmBuilder, shape: &TableVerifyShape) -> TableQueryArenas {
     let digest_words = super::edsl::digest_words(b) as usize;
+    let openings = b.declare_arena(shape.opening_words(digest_words) as u32);
+    let fri = b.declare_arena(shape.fri_words(digest_words) as u32);
+    let cap_words = shape.cap_words(digest_words);
     TableQueryArenas {
-        openings: b.declare_arena(shape.opening_words(digest_words) as u32),
-        fri: b.declare_arena(shape.fri_words(digest_words) as u32),
+        openings,
+        fri,
+        caps: (cap_words > 0).then(|| b.declare_arena(cap_words as u32)),
     }
 }
 
@@ -304,7 +331,7 @@ pub fn emit_table_verification(
     );
 
     // ---- the FRI commitments, likewise from the transcript's own cells.
-    let fri = FriCommitments {
+    let mut fri = FriCommitments {
         layers: absorbs
             .fri_roots
             .iter()
@@ -313,6 +340,32 @@ pub fn emit_table_verification(
         zetas: challenges.zetas.clone(),
         coeffs: absorbs.fri_coeffs.to_vec(),
     };
+
+    // ---- the Merkle caps, once per tree, against the SAME root cells the
+    // transcript absorbed (design/CAP.md §6.1): the matrices in group order,
+    // then the FRI layers. Every opening below is checked against these cells.
+    let digest_words = super::edsl::digest_words(b) as usize;
+    assert_eq!(
+        arenas.caps.is_some(),
+        shape.cap_words(digest_words) > 0,
+        "a caps arena exists exactly when the format caps some tree"
+    );
+    if let Some(caps) = arenas.caps {
+        let mut at = 0u32;
+        for c in &mut commitments {
+            at = c.hint_cap(b, caps, at, shape.sub.trace_cap);
+        }
+        assert_eq!(at as usize, shape.sub.cap_words(digest_words));
+        let mut fri_at = at;
+        for (i, layer) in fri.layers.iter_mut().enumerate() {
+            fri_at = layer.hint_cap(b, caps, fri_at, shape.fri.layer_cap(i));
+        }
+        assert_eq!(
+            fri_at as usize,
+            shape.cap_words(digest_words),
+            "the caps arena is filled exactly"
+        );
+    }
 
     // ---- (4) per query: authenticate, fold DEEP, then fold FRI.
     let stride = shape
@@ -331,7 +384,7 @@ pub fn emit_table_verification(
                         c
                     })
                     .collect();
-                let siblings = (0..shape.sub.merkle_depth)
+                let siblings = (0..shape.sub.path_len())
                     .map(|_| {
                         // The stride follows the DIGEST's width, not a literal.
                         let d = super::edsl::hint_digest(b, arenas.openings, cursor);
@@ -544,7 +597,7 @@ pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations_at_rate(&shape.sub, rate_felts)
         + fri_leaf_permutations_at_rate(&shape.fri, rate_felts)
-        + groups * shape.sub.merkle_depth
+        + groups * shape.sub.path_len()
         + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
@@ -593,8 +646,25 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
         .sum();
     let fri_leaves = shape.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
     let per_query =
-        leaves + fri_leaves + groups * shape.sub.merkle_depth + shape.fri.path_steps_per_query();
+        leaves + fri_leaves + groups * shape.sub.path_len() + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
+}
+
+/// Permutations one sub-proof's Merkle cap checks cost, ONCE per sub-proof
+/// (not per query): every capped tree hashes its `2^c` cap up to its root,
+/// `2^c − 1` parents (design/CAP.md §6.1 `cap_permutations`). Zero at the
+/// default format.
+pub fn cap_permutations(shape: &TableVerifyShape) -> usize {
+    shape.sub.cap_permutations() + shape.fri.cap_permutations()
+}
+
+/// Every permutation one sub-proof's verification legs cost:
+/// [`query_permutations_for`] (per query, with the capped path lengths) plus
+/// [`cap_permutations`] (once). This is the closed form the emitted legs are
+/// pinned against at every format; at the default it IS
+/// [`query_permutations_for`].
+pub fn table_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize {
+    query_permutations_for(shape, hash) + cap_permutations(shape)
 }
 
 /// Keccak permutations one sub-proof's whole query verification costs, from
@@ -608,7 +678,7 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
 pub fn query_permutations(shape: &TableVerifyShape) -> usize {
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations(&shape.sub)
-        + groups * shape.sub.merkle_depth
+        + groups * shape.sub.path_len()
         + shape.fri.permutations_per_query();
     shape.num_queries * per_query
 }

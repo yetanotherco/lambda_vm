@@ -409,6 +409,10 @@ fn table_shape(
         merkle_depth: log2_lde_length as usize - 1,
         log2_lde_length,
         coset_offset: FE::from(opts.coset_offset),
+        trace_cap: opts
+            .format
+            .merkle_cap
+            .height(opts.fri_number_of_queries, log2_lde_length as usize - 1),
     };
     let has_aux_trace = air.has_aux_trace();
     let fri = FriShape::from_options(opts, log2_lde_length);
@@ -517,7 +521,8 @@ fn bill(tables: &[TableShape], hash: WrapHash, hash_chip: &str) -> (Bill, usize)
             .map(|g| blocks_for(group_leaf_felts(g), hash))
             .sum();
         let fri_leaves = t.verify.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
-        let parents = groups.len() * t.verify.sub.merkle_depth;
+        // Paths stop at the trees' cap (`merkle_depth − trace_cap`).
+        let parents = groups.len() * t.verify.sub.path_len();
         let fri_paths = t.verify.fri.path_steps_per_query();
 
         b.trace_leaves += leaves;
