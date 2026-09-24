@@ -248,14 +248,16 @@ impl FromStr for OneRowMode {
 /// lands.
 pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
-/// `FriMode::Dp` (S3) is implemented on the HOST paths only:
+/// `FriMode::Dp` (S3) is implemented on the prover paths and the host verifier:
 /// - the CPU prover (group-leaf layer commits, the scheduled folds, group
 ///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
-/// - on a `cuda` build every device FRI arm (DEEP→FRI on device, the device
-///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
-///   table runs the CPU FRI loop (DEEP may still run on the device).
+/// - on a `cuda` build the device FRI arms (DEEP→FRI on device, the device
+///   layer commit, the device query gather) run both encodings: the group
+///   loop (`gpu_lde::fri_commit_gpu_drive_groups`,
+///   `math_cuda::fri::FriCommitState::fold_and_commit_group`) is the CPU
+///   loop's device twin, byte for byte (`tests::zf_fri_device_tests`).
 ///
-/// NOT implemented: device group-leaf FRI (lane I-FRI-D), the in-guest (LFM)
+/// NOT implemented: the in-guest (LFM)
 /// verifier of a `Dp` proof (lane I-FRI-G: `lfm::fri::FriShape` still derives
 /// the legacy layout, so an LFM wrap or node over a `Dp` proof fails at emit
 /// time), and the RV64 recursion guest (default-only by RULINGS 11; it refuses

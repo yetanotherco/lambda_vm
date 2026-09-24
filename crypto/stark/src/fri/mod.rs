@@ -1,5 +1,7 @@
 #[cfg(any(test, feature = "test-utils"))]
 pub mod capture;
+#[cfg(all(feature = "cuda", any(test, feature = "test-utils")))]
+pub mod device_parity;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
@@ -95,8 +97,10 @@ where
 /// families share, which today's layer trees already rely on (built with
 /// `H::Pair`, verified with `H::Batched`).
 ///
-/// Every device FRI arm is taken only for the legacy encoding: a group-encoded
-/// layout always runs this CPU loop.
+/// The device arm (`try_fri_commit_gpu`) runs both encodings: today's loop for
+/// the legacy one and its group twin otherwise. One-row layouts are not
+/// implemented on the device and always take the CPU loop
+/// ([`commit_phase_cpu_with_layout`]).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn commit_phase_with_layout<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
@@ -104,7 +108,7 @@ pub(crate) fn commit_phase_with_layout<
     T: IsStarkTranscript<E, F> + Clone,
     H: StarkHash,
 >(
-    mut evals: Vec<FieldElement<E>>,
+    evals: Vec<FieldElement<E>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
@@ -125,7 +129,7 @@ where
     // error restores state and lets the CPU loop below run as if the GPU
     // had never been tried.
     #[cfg(feature = "cuda")]
-    if layout.is_legacy() {
+    if !layout.one_row {
         // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
         // drives the same commit phase on-device (Goldilocks + Ext3, above the
         // LDE size threshold, and only when folding actually happens) and returns
@@ -139,12 +143,47 @@ where
             domain_size,
             blowup_log,
             final_poly_log_degree,
+            layout,
             inv_twiddles,
         ) {
             return result;
         }
     }
+    commit_phase_cpu_with_layout::<F, E, T, H>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+    )
+}
 
+/// The CPU loop of [`commit_phase_with_layout`], with no device arm: what every
+/// build runs when the device declines, and the host reference the device
+/// parity tests compare against.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn commit_phase_cpu_with_layout<
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    T: IsStarkTranscript<E, F> + Clone,
+    H: StarkHash,
+>(
+    mut evals: Vec<FieldElement<E>>,
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+) -> (Vec<FieldElement<E>>, Vec<FriLayer<E, H::Pair<E>>>)
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
     debug_assert_eq!(evals.len(), domain_size);
     // Caller-enforced twiddle sizing (Domain::fri_inv_twiddles): the folding
     // loop below indexes `inv_twiddles[..len/2]` per layer.
@@ -340,8 +379,9 @@ where
 /// [`query_phase`] itself (device arm included); the group encoding opens, per
 /// committed layer `j`, the whole group `evaluation[leaf·2^{d_j} ..][..2^{d_j}]`
 /// (the query's own value included, FRI.md §3.4) and the path of
-/// `leaf = p >> d_j`, then moves to `p >> d_j`. Host layers only: a group
-/// layout never takes the device commit.
+/// `leaf = p >> d_j`, then moves to `p >> d_j` — on the device when the layers
+/// are device-resident (`try_fri_query_phase_gpu_groups`), else by the host
+/// walk ([`query_phase_groups_host`]).
 pub(crate) fn query_phase_with_layout<F: IsField + 'static, H: StarkHash>(
     fri_layers: &[FriLayer<F, H::Pair<F>>],
     iotas: &[usize],
@@ -353,6 +393,25 @@ where
     if layout.is_legacy() {
         return query_phase::<F, H>(fri_layers, iotas);
     }
+    #[cfg(feature = "cuda")]
+    if let Some(decommits) =
+        crate::gpu_lde::try_fri_query_phase_gpu_groups::<F, H::Pair<F>>(fri_layers, iotas, layout)
+    {
+        return decommits;
+    }
+    query_phase_groups_host::<F, H>(fri_layers, iotas, layout)
+}
+
+/// The host walk of [`query_phase_with_layout`]'s group encoding over host
+/// layer trees (the device parity tests' reference).
+pub(crate) fn query_phase_groups_host<F: IsField + 'static, H: StarkHash>(
+    fri_layers: &[FriLayer<F, H::Pair<F>>],
+    iotas: &[usize],
+    layout: &FriFoldLayout,
+) -> Vec<FriDecommitment<F>>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
     debug_assert_eq!(fri_layers.len(), layout.num_committed);
     iotas
         .iter()
