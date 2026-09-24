@@ -2360,3 +2360,43 @@ fn the_end_of_run_tables_match_the_ordinary_build() {
         assert_eq!(flat(a), flat(b), "PAGE {i} differs");
     }
 }
+
+#[test]
+fn page_configs_match_the_byte_image_derivation() {
+    use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image};
+    use std::collections::BTreeSet;
+
+    let mut checked = 0;
+    for name in ["fibonacci", "keccak", "allocator", "ethrex"] {
+        let Ok(bytes) = std::fs::read(format!(
+            "{}/executor/program_artifacts/rust/{name}.elf",
+            env!("CARGO_MANIFEST_DIR").trim_end_matches("/prover")
+        )) else {
+            continue;
+        };
+        let elf = executor::elf::Elf::load(&bytes).expect("load elf");
+
+        let init_page_data = build_init_page_data(&build_initial_image(&elf, &[]));
+        let bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
+        let expected: Vec<_> = bases
+            .into_iter()
+            .map(|base| (base, init_page_data.get(&base).cloned().unwrap()))
+            .collect();
+
+        let got = Traces::page_configs_from_elf(&elf);
+        checked += 1;
+        assert_eq!(got.len(), expected.len(), "{name}: page count");
+        for (cfg, (base, data)) in got.iter().zip(expected.iter()) {
+            assert_eq!(cfg.page_base, *base, "{name}: page base");
+            assert_eq!(
+                cfg.init_values.as_deref(),
+                Some(data.as_slice()),
+                "{name}: init values at 0x{base:x}"
+            );
+        }
+    }
+    assert!(
+        checked > 0,
+        "no Rust ELF artifacts found to compare against"
+    );
+}
