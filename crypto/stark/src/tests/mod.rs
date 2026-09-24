@@ -25,5 +25,7 @@ pub mod small_trace_tests;
 pub mod table_disk_spill_tests;
 pub mod terminal_tests;
 pub mod trace_test_helpers;
+#[cfg(feature = "cuda")]
+pub mod zf_fri_device_tests;
 pub mod zf_fri_vectors;
 pub mod zf_golden_tests;

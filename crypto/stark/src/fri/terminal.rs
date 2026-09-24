@@ -132,7 +132,8 @@ impl FriFoldLayout {
     }
 
     /// Whether this layout uses today's FRI encoding (see
-    /// [`Self::legacy_encoding`]). Every device FRI arm is gated on this.
+    /// [`Self::legacy_encoding`]). The device FRI arms branch on this: today's
+    /// pair loop, or its group-leaf twin.
     pub(crate) fn is_legacy(&self) -> bool {
         self.legacy_encoding
     }

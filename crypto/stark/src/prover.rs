@@ -2811,10 +2811,11 @@ pub trait IsStarkProver<
         let __ps_df = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        // Device FRI implements the legacy encoding only: any other format
-        // takes the host arm below (which may still compute DEEP on device).
+        // Device FRI implements the pair and group (S3) encodings; a one-row
+        // layout (not implemented on the device) takes the host arm below
+        // (which may still compute DEEP on device).
         #[cfg(feature = "cuda")]
-        let precomputed_fri = if !fri_layout.is_legacy() {
+        let precomputed_fri = if fri_layout.one_row {
             None
         } else {
             Self::try_compute_deep_dev(
@@ -2839,6 +2840,7 @@ pub trait IsStarkProver<
                     &coset_offset,
                     domain.blowup_factor.trailing_zeros(),
                     air.options().fri_final_poly_log_degree as u32,
+                    &fri_layout,
                     domain.fri_inv_twiddles(),
                     !round_1_result.lde_trace.host_trace_empty(),
                 )

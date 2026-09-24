@@ -312,6 +312,248 @@ impl FriCommitState {
         };
         Ok((layer_evals, out, tree))
     }
+
+    /// One binary fold of the current codeword with `zeta_raw` into a fresh
+    /// buffer (the same `fri_fold_ext3` launch as [`Self::fold_and_commit_layer`]),
+    /// then the twiddle update for the halved domain. The output becomes the
+    /// current codeword; the input is released once no caller holds it.
+    fn fold_once(&mut self, be: &crate::device::Backend, zeta_raw: [u64; 3]) -> Result<()> {
+        let n_out = self.current_n / 2;
+        assert!(n_out >= 1, "fold_once: nothing left to fold");
+        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_out_u64 = n_out as u64;
+        // SAFETY: the fold kernel writes all 3 * n_out slots before any read.
+        let mut out = unsafe { self.stream.alloc::<u64>(3 * n_out) }?;
+        unsafe {
+            self.stream
+                .launch_builder(&be.fri_fold_ext3)
+                .arg(self.current.as_ref())
+                .arg(&n_out_u64)
+                .arg(&self.inv_tw)
+                .arg(&zeta_dev)
+                .arg(&mut out)
+                .launch(cfg)?;
+        }
+        // `new[j] = old[2j]^2` into a fresh buffer (see `fold_and_commit_layer`
+        // for why not in place).
+        let tw_next = n_out / 2;
+        if tw_next > 0 {
+            // SAFETY: the update kernel writes all tw_next slots.
+            let mut tw_out = unsafe { self.stream.alloc::<u64>(tw_next) }?;
+            let cfg = LaunchConfig {
+                grid_dim: ((tw_next as u32).div_ceil(128), 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let tw_next_u64 = tw_next as u64;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_update_twiddles)
+                    .arg(&self.inv_tw)
+                    .arg(&mut tw_out)
+                    .arg(&tw_next_u64)
+                    .launch(cfg)?;
+            }
+            self.inv_tw = tw_out;
+        }
+        self.current = Arc::new(out);
+        self.current_n = n_out;
+        Ok(())
+    }
+
+    /// The S3 (higher-arity committed FRI) step: fold the current codeword
+    /// `zeta_powers.len()` times — fold `ℓ` with `zeta_powers[ℓ]`, which the
+    /// caller sets to `ζ^{2^ℓ}` — then commit the result as a layer whose leaf
+    /// `g` hashes the `2^group_log` consecutive ext3 values
+    /// `[g·2^group_log, (g+1)·2^group_log)` (the configured hash's `Batched`
+    /// leaf over the group), with the pair-hash inner tree on top.
+    ///
+    /// The fold count and the group size are separate on purpose: committed
+    /// layer `j` is reached by the PREVIOUS layer's `d_{j−1}` folds and grouped
+    /// by its own `d_j` (FRI.md §3.1). Only the last fold's output is kept; the
+    /// intermediate codewords are released as the chain advances.
+    ///
+    /// Returns what [`Self::fold_and_commit_layer`] returns: the layer's evals
+    /// (host copy only when `want_host`), the resident evals, and the resident
+    /// tree with its root D2H'd.
+    #[allow(clippy::type_complexity)]
+    pub fn fold_and_commit_group(
+        &mut self,
+        zeta_powers: &[[u64; 3]],
+        group_log: u32,
+        want_host: bool,
+    ) -> Result<(
+        Option<Vec<u64>>,
+        Arc<CudaSlice<u64>>,
+        crate::lde::GpuMerkleTree,
+    )> {
+        #[cfg(feature = "test-faults")]
+        check_fault_injection()?;
+        let be = backend()?;
+        for &z in zeta_powers {
+            self.fold_once(be, z)?;
+        }
+        let n = self.current_n;
+        assert!(
+            group_log >= 1 && (n >> group_log) >= 2 && (n >> group_log) << group_log == n,
+            "fold_and_commit_group: a layer of {n} values cannot hold >= 2 groups of 2^{group_log}"
+        );
+        let num_leaves = n >> group_log;
+        let nodes_dev = commit_group_leaves(
+            &self.stream,
+            be,
+            self.hash,
+            self.current.as_ref(),
+            num_leaves,
+            1u64 << group_log,
+        )?;
+
+        let n_evals = 3 * n;
+        let pending = if want_host {
+            Some(crate::device::async_dtoh_via(
+                &self.stream,
+                be.pinned_staging(),
+                &be.ctx,
+                self.current.as_ref(),
+                n_evals,
+            )?)
+        } else {
+            None
+        };
+        // The pageable root copy drains the stream, the evals DMA included.
+        let mut root = [0u8; 32];
+        self.stream
+            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        let layer_evals = match pending {
+            Some(p) => {
+                let mut v = vec![0u64; n_evals];
+                p.wait_into_u64(&mut v)?;
+                Some(v)
+            }
+            None => None,
+        };
+        let tree = crate::lde::GpuMerkleTree {
+            nodes: Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        };
+        Ok((layer_evals, Arc::clone(&self.current), tree))
+    }
+
+    /// Fold the current codeword `zeta_powers.len()` times (fold `ℓ` with
+    /// `zeta_powers[ℓ]`) and copy the result to the host, with no commitment:
+    /// the S3 fold into the terminal codeword after the last committed layer.
+    pub fn fold_to_host(&mut self, zeta_powers: &[[u64; 3]]) -> Result<Vec<u64>> {
+        #[cfg(feature = "test-faults")]
+        check_fault_injection()?;
+        let be = backend()?;
+        for &z in zeta_powers {
+            self.fold_once(be, z)?;
+        }
+        let out = self.stream.clone_dtoh(self.current.as_ref())?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
+}
+
+/// Hash `num_leaves` group leaves of `group` consecutive ext3 values each from
+/// the interleaved `evals` (`3 · num_leaves · group` u64) and build the inner
+/// tree on top: the full `(2·num_leaves − 1) · 32`-byte node buffer, root at 0.
+fn commit_group_leaves(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    hash: DeviceHash,
+    evals: &CudaSlice<u64>,
+    num_leaves: usize,
+    group: u64,
+) -> Result<CudaSlice<u8>> {
+    assert!(num_leaves >= 2 && num_leaves.is_power_of_two());
+    assert!(evals.len() as u64 >= 3 * num_leaves as u64 * group);
+    let tight_total_nodes = 2 * num_leaves - 1;
+    // SAFETY: the leaf kernel writes the leaves [num_leaves-1, 2*num_leaves-1)
+    // and the inner-level walk every node [0, num_leaves-1) before any read.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
+    let leaves_offset_bytes = (num_leaves - 1) * 32;
+    {
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        let num_leaves_u64 = num_leaves as u64;
+        let (kernel, cfg) = match hash {
+            DeviceHash::Keccak256 => (
+                &be.keccak_fri_group_leaves_ext3,
+                crate::merkle::keccak_launch_cfg(num_leaves_u64),
+            ),
+            DeviceHash::Blake3 => (
+                &be.blake3_fri_group_leaves_ext3,
+                crate::blake3::blake3_launch_cfg(num_leaves_u64),
+            ),
+            DeviceHash::Rpx256 => (
+                &be.rpx_fri_group_leaves_ext3,
+                crate::rpx::rpx_launch_cfg(num_leaves_u64),
+            ),
+            DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+                unimplemented!("{hash:?} device commit not yet ported (FRI group leaves)")
+            }
+        };
+        unsafe {
+            stream
+                .launch_builder(kernel)
+                .arg(evals)
+                .arg(&num_leaves_u64)
+                .arg(&group)
+                .arg(&mut leaves_view)
+                .launch(cfg)?;
+        }
+    }
+    match hash {
+        DeviceHash::Keccak256 => crate::merkle::build_inner_tree_levels(
+            stream.as_ref(),
+            be,
+            &mut nodes_dev,
+            num_leaves,
+            DeviceHash::Keccak256,
+        )?,
+        DeviceHash::Blake3 => {
+            crate::blake3::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?
+        }
+        DeviceHash::Rpx256 => {
+            crate::rpx::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?
+        }
+        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+            unimplemented!("{hash:?} device commit not yet ported (FRI group inner tree levels)")
+        }
+    }
+    Ok(nodes_dev)
+}
+
+/// Parity harness (not a production path): commit an interleaved ext3 eval
+/// vector as an S3 group-leaf FRI layer — leaf `g` = the `2^group_log`
+/// consecutive values from `g·2^group_log` — under `hash`, and return the full
+/// host node buffer (`(2·num_leaves − 1) · 32` bytes, standard layout) so tests
+/// can compare it node for node with the host tree. Production commits through
+/// [`FriCommitState::fold_and_commit_group`], over the same kernels.
+pub fn build_fri_group_tree_from_evals_ext3(
+    evals: &[u64],
+    group_log: u32,
+    hash: DeviceHash,
+) -> Result<Vec<u8>> {
+    assert!(evals.len().is_multiple_of(3));
+    let n = evals.len() / 3;
+    let num_leaves = n >> group_log;
+    assert!(num_leaves << group_log == n, "whole groups only");
+    let be = backend()?;
+    let stream = be.next_stream();
+    let evals_dev = stream.clone_htod(evals)?;
+    let nodes_dev =
+        commit_group_leaves(&stream, be, hash, &evals_dev, num_leaves, 1u64 << group_log)?;
+    let out = stream.clone_dtoh(&nodes_dev)?;
+    stream.synchronize()?;
+    Ok(out)
 }
 
 /// Gather interleaved ext3 elements at `positions` from a resident evals

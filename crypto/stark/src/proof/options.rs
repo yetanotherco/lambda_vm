@@ -248,20 +248,21 @@ impl FromStr for OneRowMode {
 /// default-only (RULINGS 11).
 pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
-/// `FriMode::Dp` (S3) is implemented on the HOST paths only:
+/// `FriMode::Dp` (S3) is implemented on the prover paths and the host verifier:
 /// - the CPU prover (group-leaf layer commits, the scheduled folds, group
 ///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
-/// - on a `cuda` build every device FRI arm (DEEP→FRI on device, the device
-///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
-///   table runs the CPU FRI loop (DEEP may still run on the device).
+/// - on a `cuda` build the device FRI arms (DEEP→FRI on device, the device
+///   layer commit, the device query gather) run both encodings: the group
+///   loop (`gpu_lde::fri_commit_gpu_drive_groups`,
+///   `math_cuda::fri::FriCommitState::fold_and_commit_group`) is the CPU
+///   loop's device twin, byte for byte (`tests::zf_fri_device_tests`).
 ///
 /// - the in-guest (LFM) STARK verifier (G1 + G2): `lfm::fri::FriShape` takes
 ///   the same schedule, and the emitter verifies group layers (slot check,
 ///   group leaf, group fold), so an LFM wrap or node verifies a `Dp` proof.
 ///
-/// NOT implemented: device group-leaf FRI (lane I-FRI-D) and the RV64
-/// recursion guest (default-only by RULINGS 11; it refuses a non-default
-/// format).
+/// NOT implemented: the RV64 recursion guest (default-only by RULINGS 11; it
+/// refuses a non-default format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
 /// See [`MERKLE_CAP_IMPLEMENTED`].

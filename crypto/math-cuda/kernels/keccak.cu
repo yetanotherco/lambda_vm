@@ -465,6 +465,37 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 }
 
 // ---------------------------------------------------------------------------
+// FRI GROUP-leaf hashing (S3, higher-arity committed FRI layers).
+//
+// Leaf `tid` hashes the `group` consecutive ext3 values
+// `evals[tid*group .. (tid+1)*group]` of an interleaved eval vector — the
+// `3*group` contiguous u64s at `evals_interleaved + tid*group*3` — each value
+// as its three components in canonical big-endian order. That is the host
+// `Batched` leaf over the group (`hash_data_from_slices(group, [])`), and at
+// `group = 2` exactly `keccak_fri_leaves_ext3`'s byte stream. No bit reversal.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak_fri_group_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_leaves * group u64s
+    uint64_t num_leaves,
+    uint64_t group,                      // ext3 values per leaf (2^d)
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+    uint32_t rate_pos = 0;
+
+    const uint64_t *g = evals_interleaved + tid * group * 3;
+    for (uint64_t i = 0; i < 3 * group; ++i) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(g[i])));
+    }
+
+    finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
 // Merkle inner-tree pair hash: one level of the inner Merkle tree.
 //
 // `nodes` is the full Merkle node buffer (length `2*leaves_len - 1`, each

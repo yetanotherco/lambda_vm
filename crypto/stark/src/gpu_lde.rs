@@ -3672,7 +3672,7 @@ where
 /// a byte-identical pre-GPU transcript state and produces the same proof
 /// it would have produced had the GPU never been tried. This requires the
 /// concrete transcript type to support snapshot semantics via `Clone`.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn try_fri_commit_gpu<F, E, T, B>(
     evals: &[FieldElement<E>],
     transcript: &mut T,
@@ -3680,7 +3680,79 @@ pub(crate) fn try_fri_commit_gpu<F, E, T, B>(
     domain_size: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     inv_twiddles: &[FieldElement<F>],
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    // Host-evals entry: the caller works with host copies, keep draining them.
+    try_fri_commit_gpu_evals::<F, E, T, B>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+        true,
+    )
+}
+
+/// [`try_fri_commit_gpu`] with the layers' host copies optional: `want_host =
+/// false` keeps each committed layer's evals resident only (`gpu_evals`), the
+/// shape the device-only envelope produces — so the device query phase's
+/// resident gathers can be tested from host evals.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn try_fri_commit_gpu_resident<F, E, T, B>(
+    evals: &[FieldElement<E>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    try_fri_commit_gpu_evals::<F, E, T, B>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+        false,
+    )
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn try_fri_commit_gpu_evals<F, E, T, B>(
+    evals: &[FieldElement<E>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+    want_host: bool,
 ) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
@@ -3740,7 +3812,6 @@ where
         Ok(s) => s,
         Err(_) => return None,
     };
-    // Host-evals entry: the caller works with host copies, keep draining them.
     fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
@@ -3748,19 +3819,21 @@ where
         n0,
         blowup_log,
         final_poly_log_degree,
-        true,
+        layout,
+        want_host,
     )
 }
 
 /// [`try_fri_commit_gpu`] entered from a device-resident DEEP codeword
 /// (already in FRI order): no evals H2D at all.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T, B>(
     codeword: math_cuda::deep::GpuDeepCodeword,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     inv_twiddles: &[FieldElement<F>],
     want_host: bool,
 ) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
@@ -3811,15 +3884,23 @@ where
         n0,
         blowup_log,
         final_poly_log_degree,
+        layout,
         want_host,
     )
 }
 
-/// The shared FRI commit loop over an initialized device state: per committed
-/// layer sample ζ, fold + commit on device, D2H root/evals; then the terminal
-/// fold and CPU coefficient extraction. Restores the transcript and returns
-/// `None` on any mid-loop cudarc failure so the CPU path reruns cleanly.
-#[allow(clippy::type_complexity)]
+/// The shared FRI commit loop over an initialized device state, under the
+/// proof format's fold `layout` (the caller's, built for this codeword by
+/// [`crate::fri::terminal::FriFoldLayout::for_options`]): per committed layer
+/// sample ζ, fold + commit on device, D2H root/evals; then the terminal folds
+/// and CPU coefficient extraction. Restores the transcript and returns `None`
+/// on any mid-loop cudarc failure so the CPU path reruns cleanly.
+///
+/// The legacy encoding runs today's loop (one fold and a pair-leaf commit per
+/// layer); the group encoding runs [`fri_commit_gpu_drive_groups`], the device
+/// twin of `commit_phase_with_layout`'s pending-fold loop. One-row layouts are
+/// not implemented on the device and return `None` before any sampling.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn fri_commit_gpu_drive<F, E, T, B>(
     mut state: math_cuda::fri::FriCommitState,
     transcript: &mut T,
@@ -3827,6 +3908,7 @@ fn fri_commit_gpu_drive<F, E, T, B>(
     n0: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     want_host: bool,
 ) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
@@ -3852,12 +3934,18 @@ where
     // produced had this dispatch never been called.
     let transcript_snapshot = transcript.clone();
 
-    // Fold layout, shared with the CPU prover and the verifier — see `FriFoldLayout`.
-    let layout = crate::fri::terminal::FriFoldLayout::new(
-        n0.trailing_zeros(),
-        blowup_log,
-        final_poly_log_degree,
-    );
+    // Fold layout, shared with the CPU prover and the verifier — see
+    // `FriFoldLayout`. It must be this codeword's: a layout built for another
+    // size degrades to the CPU path instead of committing a wrong chain.
+    if layout.one_row
+        || layout.terminal_len == 0
+        || n0
+            .trailing_zeros()
+            .checked_sub(layout.terminal_len.trailing_zeros())
+            != Some(layout.total_folds)
+    {
+        return None;
+    }
     // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
     // the CPU path (which handles both correctly): tiny clamped traces
     // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
@@ -3866,6 +3954,25 @@ where
     if layout.total_folds == 0 || layout.terminal_len < 2 {
         return None;
     }
+    if !layout.is_legacy() {
+        return fri_commit_gpu_drive_groups::<F, E, T, B>(
+            state,
+            transcript,
+            transcript_snapshot,
+            coset_offset,
+            layout,
+            want_host,
+        );
+    }
+    // Today's encoding: the layout is today's (the all-ones schedule).
+    debug_assert_eq!(
+        *layout,
+        crate::fri::terminal::FriFoldLayout::new(
+            n0.trailing_zeros(),
+            blowup_log,
+            final_poly_log_degree
+        )
+    );
     let num_committed = layout.num_committed;
     let mut fri_layer_list: Vec<FriLayer<E, B>> = Vec::with_capacity(num_committed);
 
@@ -3935,6 +4042,106 @@ where
         layout.effective_k,
     );
 
+    // >>>> Send the final polynomial coefficients.
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
+
+    GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((final_poly_coeffs, fri_layer_list))
+}
+
+/// The raw limbs of `ζ, ζ², …, ζ^{2^{n−1}}`: the challenges of `n` successive
+/// binary folds, squared on the host exactly as the CPU loop's `fold_times`
+/// squares them.
+fn zeta_powers_raw<E: IsField>(zeta: &FieldElement<E>, n: u32) -> Vec<[u64; 3]> {
+    let mut out = Vec::with_capacity(n as usize);
+    let mut z = zeta.clone();
+    for level in 0..n {
+        // SAFETY: E == Ext3 (asserted by the drive before any call); its
+        // backing is [u64; 3].
+        let p = &z as *const FieldElement<E> as *const u64;
+        out.push(unsafe { [*p, *p.add(1), *p.add(2)] });
+        if level + 1 < n {
+            z = z.square();
+        }
+    }
+    out
+}
+
+/// The group-encoding (S3) device commit loop: the device twin of
+/// [`crate::fri::commit_phase_with_layout`]'s pending-fold loop. Per committed
+/// layer `j` with exponent `d_j`: sample ζ, fold `d_{j−1}` times on device with
+/// `ζ, ζ², …` (`d_{−1} = 1`, the binary fold 0 of the DEEP pair), commit the
+/// result with leaves of `2^{d_j}` consecutive values, append the root; then
+/// sample the final ζ and fold `d_last` times into the terminal codeword.
+/// Transcript order, ζ powers, fold arithmetic and leaf bytes are the CPU
+/// loop's, so the two produce the same proof (the parity tests pin it).
+#[allow(clippy::type_complexity)]
+fn fri_commit_gpu_drive_groups<F, E, T, B>(
+    mut state: math_cuda::fri::FriCommitState,
+    transcript: &mut T,
+    transcript_snapshot: T,
+    coset_offset: &FieldElement<F>,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    want_host: bool,
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    let mut fri_layer_list: Vec<FriLayer<E, B>> = Vec::with_capacity(layout.num_committed);
+    // Folds owed before the next commit: fold 0 is the binary fold of the DEEP
+    // pair, so one; after committing layer `j`, `d_j`.
+    let mut pending: u32 = 1;
+    for &d in &layout.schedule {
+        // <<<< Receive challenge zeta_j
+        let zeta: FieldElement<E> = transcript.sample_field_element();
+        let powers = zeta_powers_raw(&zeta, pending);
+        let (layer_evals_u64, evals_dev, dev_tree) =
+            match state.fold_and_commit_group(&powers, u32::from(d), want_host) {
+                Ok(v) => v,
+                Err(_) => {
+                    *transcript = transcript_snapshot;
+                    return None;
+                }
+            };
+        let evaluation = layer_evals_u64
+            .map(|v| u64_to_ext3_vec::<E>(&v))
+            .unwrap_or_default();
+        let root = dev_tree.root;
+        fri_layer_list.push(FriLayer {
+            evaluation,
+            merkle_tree: MerkleTree::<B>::from_root(root),
+            gpu_tree: Some(dev_tree),
+            gpu_evals: (!want_host).then_some(evals_dev),
+        });
+        // >>>> Send commitment: [p_j]
+        transcript.append_bytes(&root);
+        pending = u32::from(d);
+    }
+
+    // The final folds into the terminal codeword (total_folds > 0 here).
+    let zeta_final: FieldElement<E> = transcript.sample_field_element();
+    let terminal_evals_u64 = match state.fold_to_host(&zeta_powers_raw(&zeta_final, pending)) {
+        Ok(v) => v,
+        Err(_) => {
+            *transcript = transcript_snapshot;
+            return None;
+        }
+    };
+    debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
+    let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &terminal_codeword,
+        &terminal_offset,
+        layout.effective_k,
+    );
     // >>>> Send the final polynomial coefficients.
     for c in &final_poly_coeffs {
         transcript.append_field_element(c);
@@ -4043,6 +4250,128 @@ where
             FriDecommitment {
                 layers_auth_paths,
                 layers_evaluations_sym,
+            }
+        })
+        .collect();
+    Some(decommits)
+}
+
+/// GPU FRI query phase for the group encoding (S3): the device twin of
+/// [`crate::fri::query_phase_with_layout`]'s group branch. Per committed layer
+/// `j` and query at position `p` the opened leaf is `p >> d_j`, its path is
+/// gathered on device (one batched call per layer), and the opened values are
+/// the whole group `[leaf·2^{d_j}, (leaf+1)·2^{d_j})` — read from the host evals
+/// when the commit drained them, else one batched device gather per layer off
+/// the resident evals; then `p ← p >> d_j`.
+///
+/// Returns `None` when there are no layers or the layers are host trees (CPU
+/// commit), so the caller takes the host walk. Resident layers have root-only
+/// host trees, so a failed gather there is a hard abort, as in
+/// [`try_fri_query_phase_gpu`].
+pub(crate) fn try_fri_query_phase_gpu_groups<E, B>(
+    fri_layers: &[FriLayer<E, B>],
+    iotas: &[usize],
+    layout: &crate::fri::terminal::FriFoldLayout,
+) -> Option<Vec<FriDecommitment<E>>>
+where
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    B: DeviceTreeBackend,
+{
+    if fri_layers.is_empty() {
+        return None;
+    }
+    let first_resident = fri_layers[0].gpu_tree.is_some();
+    debug_assert!(
+        fri_layers
+            .iter()
+            .all(|l| l.gpu_tree.is_some() == first_resident),
+        "FRI layer residency must be all or nothing"
+    );
+    if !first_resident {
+        return None;
+    }
+    assert_eq!(
+        fri_layers.len(),
+        layout.schedule.len(),
+        "one committed FRI layer per schedule entry"
+    );
+    let stream = math_cuda::device::backend()
+        .expect("cuda backend for device-resident FRI query")
+        .next_stream();
+
+    // Per query, the position at each committed layer.
+    let positions: Vec<Vec<usize>> = iotas
+        .iter()
+        .map(|&iota| {
+            let mut p = iota;
+            layout
+                .schedule
+                .iter()
+                .map(|&d| {
+                    let here = p;
+                    p >>= d;
+                    here
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(fri_layers.len());
+    let mut per_layer_groups: Vec<Option<Vec<FieldElement<E>>>> =
+        Vec::with_capacity(fri_layers.len());
+    for (j, (layer, &d)) in fri_layers.iter().zip(&layout.schedule).enumerate() {
+        let tree = layer
+            .gpu_tree
+            .as_ref()
+            .expect("FRI layers are device-resident as a group");
+        let leaves: Vec<usize> = positions.iter().map(|p| p[j] >> d).collect();
+        per_layer_proofs.push(
+            gather_proofs_dev(tree, &leaves, &stream)
+                .expect("device FRI-layer gather failed; resident tree has no host fallback"),
+        );
+        per_layer_groups.push(if layer.evaluation.is_empty() {
+            let evals_dev = layer
+                .gpu_evals
+                .as_ref()
+                .expect("device-only FRI layer without resident evals");
+            let n = 1usize << d;
+            let group_positions: Vec<u32> = leaves
+                .iter()
+                .flat_map(|&leaf| (leaf * n..(leaf + 1) * n).map(|x| x as u32))
+                .collect();
+            let raw = math_cuda::fri::gather_ext3_at(evals_dev, &group_positions, &stream)
+                .expect("device FRI group gather failed; no host fallback");
+            Some(
+                crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
+                    .expect("resident FRI evals are Goldilocks ext3"),
+            )
+        } else {
+            None
+        });
+    }
+
+    let values_per_query = layout.opened_values_per_query();
+    let decommits = positions
+        .iter()
+        .enumerate()
+        .map(|(q, pos)| {
+            let mut values = Vec::with_capacity(values_per_query);
+            let mut paths = Vec::with_capacity(fri_layers.len());
+            for (j, (layer, &d)) in fri_layers.iter().zip(&layout.schedule).enumerate() {
+                let n = 1usize << d;
+                match &per_layer_groups[j] {
+                    Some(g) => values.extend_from_slice(&g[q * n..(q + 1) * n]),
+                    None => {
+                        let leaf = pos[j] >> d;
+                        values.extend_from_slice(&layer.evaluation[leaf * n..(leaf + 1) * n]);
+                    }
+                }
+                paths.push(per_layer_proofs[j][q].clone());
+            }
+            FriDecommitment {
+                layers_auth_paths: paths,
+                layers_evaluations_sym: values,
             }
         })
         .collect();
