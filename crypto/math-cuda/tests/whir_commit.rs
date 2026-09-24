@@ -91,7 +91,7 @@ fn parity<H: WhirHash>(num_vars: usize, log_blowup: usize, log_folding: usize) {
     for index in [0, 1, device.num_leaves() / 3, device.num_leaves() - 1] {
         let opening = device.open(index).expect("open");
         assert!(
-            verify_opening::<_, H>(&device.root(), index, &opening),
+            verify_opening::<_, H>(&device.root(), device.depth(), index, &opening),
             "device opening at {index} does not verify under {}",
             H::NAME
         );

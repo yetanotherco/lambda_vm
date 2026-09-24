@@ -56,9 +56,9 @@ use crate::{
     poly::Composed,
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
-    whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening},
+    whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening_capped},
     whir_hash::{GrindingDigest, WhirHash},
-    whir_round::{self, RoundCommitments, RoundConfig, RoundProof},
+    whir_round::{self, RoundCaps, RoundCommitments, RoundConfig, RoundProof, TreeCheck},
 };
 
 /// `w(x)·f(x)`, the shape every group's sumcheck runs over.
@@ -315,6 +315,34 @@ impl ChainConfig {
             grind,
             format: ChainFormat::DEFAULT,
         }
+    }
+
+    /// The Merkle cap height of each of the chain's `R` commitment trees, tree
+    /// `t` being the one round `t` opens as its current codeword (W1,
+    /// design/CAP.md §5.1).
+    ///
+    /// Tree `t` has depth `D_t − k_t` (its leaves are round `t`'s domain
+    /// folded by that round's `k`) and is opened `Q` times when `t = 0` (round
+    /// 0's current openings) and `2Q` times after (round `t − 1`'s successor
+    /// openings and round `t`'s current ones, the last tree included). The
+    /// height is [`CapPolicy::height`] of those two public numbers, so the
+    /// prover, the host verifier and the in-guest emitter derive the same
+    /// heights from the config alone. All zero at the default.
+    pub fn tree_caps(&self, num_vars: usize) -> Vec<usize> {
+        let mut domain_log = num_vars + self.log_blowup;
+        self.schedule(num_vars)
+            .iter()
+            .enumerate()
+            .map(|(t, &k)| {
+                domain_log -= k;
+                let openings = if t == 0 {
+                    self.num_queries
+                } else {
+                    2 * self.num_queries
+                };
+                self.format.cap.height(openings, domain_log)
+            })
+            .collect()
     }
 
     /// Variables folded in each round: `log_folding` until the remainder.
@@ -798,6 +826,8 @@ where
     // several (`stacked_eval::prove` runs one per commitment).
     crate::whir_split::bump(&crate::whir_split::CHAIN_COUNT);
     let schedule = config.schedule(num_vars);
+    // One cap height per tree; all zero at the default format.
+    let caps = config.tree_caps(num_vars);
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E, H>::Base(commitment);
@@ -901,26 +931,41 @@ where
             log_folding: k,
         };
         let __wc_q = crate::whir_split::mark();
-        let openings = match (&current, &next) {
-            (Current::Base(held), Some(next)) => {
-                RoundOpenings::Base(whir_round::prove(*held, next, &round_config, transcript)?)
-            }
-            (Current::Base(held), None) => RoundOpenings::Base(final_openings::<F, E, T, H>(
-                held,
-                &round_config,
-                transcript,
-            )?),
-            (Current::Extension(held), Some(next)) => {
-                RoundOpenings::Extension(whir_round::prove(held, next, &round_config, transcript)?)
-            }
-            (Current::Extension(held), None) => {
-                RoundOpenings::Extension(final_openings::<E, E, T, H>(
+        // Tree `r` is opened under `caps[r]`, and carries its cap on its first
+        // opening in proof order: round 0's first current opening for tree 0,
+        // round `r − 1`'s first successor opening for every later tree.
+        let round_caps = RoundCaps {
+            current: caps[r],
+            current_owner: r == 0,
+            next: caps.get(r + 1).copied().unwrap_or(0),
+        };
+        let openings =
+            match (&current, &next) {
+                (Current::Base(held), Some(next)) => RoundOpenings::Base(whir_round::prove(
+                    *held,
+                    next,
+                    &round_config,
+                    round_caps,
+                    transcript,
+                )?),
+                (Current::Base(held), None) => RoundOpenings::Base(final_openings::<F, E, T, H>(
                     held,
                     &round_config,
+                    round_caps,
                     transcript,
-                )?)
-            }
-        };
+                )?),
+                (Current::Extension(held), Some(next)) => RoundOpenings::Extension(
+                    whir_round::prove(held, next, &round_config, round_caps, transcript)?,
+                ),
+                (Current::Extension(held), None) => {
+                    RoundOpenings::Extension(final_openings::<E, E, T, H>(
+                        held,
+                        &round_config,
+                        round_caps,
+                        transcript,
+                    )?)
+                }
+            };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
 
         rounds.push(ChainRound {
@@ -1016,6 +1061,7 @@ where
 fn final_openings<C, N, T, H>(
     current: &CodewordCommitment<C, H>,
     config: &RoundConfig,
+    caps: RoundCaps,
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
 where
@@ -1033,7 +1079,7 @@ where
     // ⛔ ONE `open_many` here, not two: the final round has no successor to
     // open. That is the `− 1` in arm F's `2R − 1`.
     Ok(RoundProof {
-        current: current.open_many(&queries)?,
+        current: current.open_many_capped(&queries, caps.current, caps.current_owner)?,
         next: Vec::new(),
     })
 }
@@ -1073,9 +1119,9 @@ where
 /// `weight_at` is the weight's closed form, evaluated at the concatenation of
 /// every round's challenges.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_weighted<F, E, T, W, H>(
-    proof: &ChainProof<F, E>,
-    root: &Commitment,
+pub fn verify_weighted<'a, F, E, T, W, H>(
+    proof: &'a ChainProof<F, E>,
+    root: &'a Commitment,
     weight_at: W,
     y: FieldElement<E>,
     num_vars: usize,
@@ -1102,7 +1148,14 @@ where
 
     let mut claim = y;
     let mut alphas: Vec<FieldElement<E>> = Vec::with_capacity(num_vars);
-    let mut current_root = *root;
+    // Tree 0 is authenticated by the cap round 0's first current opening
+    // carries; every later tree by the check the round that committed it
+    // returned. A verifier constant per tree, derived from the config alone.
+    let caps = config.tree_caps(num_vars);
+    let mut current: TreeCheck<'a> = TreeCheck::Owner {
+        root,
+        cap_height: caps[0],
+    };
     let mut current_domain = domain.clone();
     // Each round's out-of-domain claim, and how many variables were bound when
     // it entered the weight — the challenges after that are where its `eq`
@@ -1159,11 +1212,12 @@ where
 
                 check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
                 let commitments = RoundCommitments {
-                    current_root: &current_root,
+                    current,
                     next_root,
                     next_num_leaves: next_domain.size() >> next_k,
+                    next_cap_height: caps[r + 1],
                 };
-                match &round.openings {
+                let next_check = match &round.openings {
                     RoundOpenings::Base(openings) => whir_round::verify::<F, F, E, T, H>(
                         openings,
                         commitments,
@@ -1180,8 +1234,8 @@ where
                         &round_config,
                         transcript,
                     )?,
-                }
-                current_root = *next_root;
+                };
+                current = TreeCheck::Checked(next_check);
             }
             (None, None, None) => {
                 transcript.append_field_element(&proof.final_value);
@@ -1189,7 +1243,7 @@ where
                 match &round.openings {
                     RoundOpenings::Base(openings) => verify_final::<F, F, E, T, H>(
                         openings,
-                        &current_root,
+                        current,
                         &current_domain,
                         &group.point,
                         &round_config,
@@ -1198,7 +1252,7 @@ where
                     )?,
                     RoundOpenings::Extension(openings) => verify_final::<F, E, E, T, H>(
                         openings,
-                        &current_root,
+                        current,
                         &current_domain,
                         &group.point,
                         &round_config,
@@ -1243,9 +1297,9 @@ where
 }
 
 /// The last round: every queried block must fold to the constant that was sent.
-fn verify_final<F, C, N, T, H>(
-    openings: &RoundProof<C, N>,
-    current_root: &Commitment,
+fn verify_final<'a, F, C, N, T, H>(
+    openings: &'a RoundProof<C, N>,
+    current: TreeCheck<'a>,
     current_domain: &Domain<F>,
     alphas: &[FieldElement<N>],
     config: &RoundConfig,
@@ -1267,10 +1321,22 @@ where
         });
     }
     let num_leaves = current_domain.size() >> config.log_folding;
+    let depth = num_leaves.trailing_zeros() as usize;
+    // The tree's check, built once from its first opening, after the count
+    // guard above (REVIEW-CAP M2). With no openings there is nothing to check.
+    let Some(first) = openings.current.first() else {
+        return Ok(());
+    };
+    let (check, first_siblings) = current.open::<C, H>(depth, first)?;
 
     for (i, opening) in openings.current.iter().enumerate() {
         let q = transcript.sample_u64(num_leaves as u64) as usize;
-        if !verify_opening::<C, H>(current_root, q, opening) {
+        let siblings = if i == 0 {
+            first_siblings
+        } else {
+            opening.proof.merkle_path.as_slice()
+        };
+        if !verify_opening_capped::<C, H>(&check, q, opening, siblings) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != *final_value {

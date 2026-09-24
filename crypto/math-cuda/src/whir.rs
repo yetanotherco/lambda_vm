@@ -729,6 +729,37 @@ impl DeviceCodeword {
         })
     }
 
+    /// [`paths`](Self::paths) and the tree's Merkle cap at `cap_height`, from
+    /// ONE rebuild: the cap is the heap slice `[2^c − 1, 2^{c+1} − 1)` of the
+    /// same node buffer the paths are gathered from (root at node 0, the host
+    /// `MerkleTree` layout), so the two cannot come from different trees.
+    ///
+    /// Returns `(paths, cap)`: the paths exactly as [`paths`](Self::paths)
+    /// returns them (full depth — the caller cuts them to the cap), and
+    /// `2^cap_height` 32-byte nodes, left to right. `cap_height = 0` gives the
+    /// root. No kernel: the cap is a device-to-host copy of `2^c` nodes.
+    pub fn paths_and_cap(
+        &self,
+        log_folding: usize,
+        positions: &[u32],
+        cap_height: usize,
+        hash: crate::DeviceHash,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.with_tree(log_folding, hash, |nodes, num_leaves| {
+            assert!(
+                num_leaves.is_power_of_two() && cap_height <= num_leaves.trailing_zeros() as usize,
+                "a cap of height {cap_height} does not fit a tree of {num_leaves} leaves"
+            );
+            let paths =
+                crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)?;
+            let start = ((1usize << cap_height) - 1) * 32;
+            let end = ((2usize << cap_height) - 1) * 32;
+            let cap = self.stream.clone_dtoh(&nodes.slice(start..end))?;
+            self.stream.synchronize()?;
+            Ok((paths, cap))
+        })
+    }
+
     /// The fold blocks `indices` open — `block` values at stride `num_leaves`
     /// from each — gathered where they lie, one launch and one copy back.
     ///

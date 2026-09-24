@@ -292,7 +292,7 @@ fn the_opening_accepts_what_the_host_accepts() {
         for index in [0usize, 1, num_leaves / 2, num_leaves - 1] {
             let opening = commitment.open(index).expect("the block opens");
             assert!(
-                verify_opening::<F, RpxWhir>(&commitment.root(), index, &opening),
+                verify_opening::<F, RpxWhir>(&commitment.root(), depth, index, &opening),
                 "{}: the host must accept its own opening at {index}",
                 shape.name
             );
@@ -316,7 +316,7 @@ fn the_opening_accepts_what_the_host_accepts() {
         for index in [0usize, 1, num_leaves - 1] {
             let opening = commitment.open(index).expect("the block opens");
             assert!(
-                verify_opening::<E, RpxWhir>(&commitment.root(), index, &opening),
+                verify_opening::<E, RpxWhir>(&commitment.root(), depth, index, &opening),
                 "{}: the host must accept its own opening at {index}",
                 shape.name
             );
@@ -363,7 +363,7 @@ fn a_tampered_opening_cannot_execute() {
     let honest_root = commitment_to_digest(&root);
 
     assert!(
-        verify_opening::<E, RpxWhir>(&root, index, &opening),
+        verify_opening::<E, RpxWhir>(&root, depth, index, &opening),
         "the control opening must authenticate"
     );
     assert!(
@@ -385,7 +385,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut forged = opening.clone();
     forged.values[block / 2] += FEE::one();
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, index, &forged),
+        !verify_opening::<E, RpxWhir>(&root, depth, index, &forged),
         "the host must reject a corrupted value"
     );
     let values: Vec<LfmWord> = forged.values.iter().map(ext_word).collect();
@@ -403,7 +403,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut forged = opening.clone();
     forged.proof.merkle_path[0][0] ^= 1;
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, index, &forged),
+        !verify_opening::<E, RpxWhir>(&root, depth, index, &forged),
         "the host must reject a corrupted sibling"
     );
     assert!(
@@ -425,7 +425,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut wrong_root = root;
     wrong_root[0] ^= 1;
     assert!(
-        !verify_opening::<E, RpxWhir>(&wrong_root, index, &opening),
+        !verify_opening::<E, RpxWhir>(&wrong_root, depth, index, &opening),
         "the host must reject a wrong root"
     );
     assert!(
@@ -448,7 +448,7 @@ fn a_tampered_opening_cannot_execute() {
     // and fail only here.
     let elsewhere = (index + 1) % num_leaves;
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, elsewhere, &opening),
+        !verify_opening::<E, RpxWhir>(&root, depth, elsewhere, &opening),
         "the host must reject an opening claimed at the wrong index"
     );
     assert!(
