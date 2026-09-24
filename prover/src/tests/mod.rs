@@ -130,10 +130,10 @@ pub mod whir_byte_gate;
 pub mod whir_hash_tests;
 #[cfg(test)]
 pub mod whir_identity_tests;
-#[cfg(all(test, feature = "cuda"))]
-pub mod zf_rpx_device_tests;
 #[cfg(test)]
 pub mod zf_air_cache_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod zf_rpx_device_tests;
 #[cfg(test)]
 pub mod zf_rpx_golden_tests;
 #[cfg(test)]
