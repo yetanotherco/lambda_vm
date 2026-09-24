@@ -19,6 +19,8 @@ use math::{
     polynomial::Polynomial,
 };
 
+#[cfg(all(feature = "parallel", not(feature = "cuda")))]
+use rayon::prelude::IntoParallelRefIterator;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -700,17 +702,25 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// Only OS driver threads block here (see `run_admitted`) — never rayon
 /// workers, whose pool the admitted tables use internally and which a
 /// blocked worker would starve.
+///
+/// Device-only mechanism: CPU builds have no device allocation to admit
+/// against, so their `run_admitted` arms take the gate and ignore it. That is
+/// what the `allow(dead_code)` attributes here are for — `multi_prove` still
+/// constructs the gate unconditionally so the three arms share one signature.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct VramGate {
     used: std::sync::Mutex<u64>,
     freed: std::sync::Condvar,
     budget: u64,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct VramPermit<'a> {
     gate: &'a VramGate,
     bytes: u64,
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl VramGate {
     fn new(budget: u64) -> Self {
         Self {
@@ -741,11 +751,32 @@ impl Drop for VramPermit<'_> {
     }
 }
 
+/// Debug-only contract check for `run_admitted`: the result slots are addressed
+/// by `order`'s *values*, so every value must index `estimates` and appear at
+/// most once. Callers pass either a full permutation or one group of one, and a
+/// grouping bug would otherwise surface as a confusing `take()` panic inside a
+/// task rather than here.
+fn debug_check_order(order: &[usize], estimates: &[u64]) {
+    if cfg!(debug_assertions) {
+        let mut seen = vec![false; estimates.len()];
+        for &idx in order {
+            assert!(
+                idx < estimates.len(),
+                "run_admitted: order names table {idx}, estimates has {}",
+                estimates.len()
+            );
+            assert!(!seen[idx], "run_admitted: order names table {idx} twice");
+            seen[idx] = true;
+        }
+    }
+}
+
 /// Run `task` once per table index on `workers` OS driver threads, admitting
 /// each index through `gate` with its estimated bytes. `order` fixes the
 /// start order (heaviest table first, so the long pole starts early and small
 /// tables fill around it — the fixed chunks this replaces made every table
 /// wait for the slowest of its chunk). Returns one slot per original index.
+#[cfg(feature = "cuda")]
 fn run_admitted<T: Send>(
     order: &[usize],
     estimates: &[u64],
@@ -753,6 +784,7 @@ fn run_admitted<T: Send>(
     workers: usize,
     task: impl Fn(usize) -> T + Sync,
 ) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
     let results: Vec<std::sync::Mutex<Option<T>>> = estimates
         .iter()
         .map(|_| std::sync::Mutex::new(None))
@@ -779,6 +811,54 @@ fn run_admitted<T: Send>(
         .into_iter()
         .map(|m| m.into_inner().unwrap())
         .collect()
+}
+
+/// CPU version of the table scheduler. There is no device admission to wait
+/// on here, and the work underneath each table already uses Rayon internally.
+/// Keep the outer scheduling inside the same Rayon pool instead of creating
+/// driver OS threads: otherwise every table task launches nested Rayon work
+/// from outside the pool and loses the work-stealing behavior of the original
+/// phase scheduler.
+#[cfg(all(not(feature = "cuda"), feature = "parallel"))]
+fn run_admitted<T: Send>(
+    order: &[usize],
+    estimates: &[u64],
+    _gate: &VramGate,
+    workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
+    // No interior mutability here, unlike the `cuda` arm: `collect()` joins
+    // each chunk, so every slot is written from this thread.
+    let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
+
+    for chunk in order.chunks(workers.max(1)) {
+        let chunk_results: Vec<(usize, T)> =
+            chunk.par_iter().map(|&idx| (idx, task(idx))).collect();
+        for (idx, result) in chunk_results {
+            results[idx] = Some(result);
+        }
+    }
+
+    results
+}
+
+/// Sequential fallback when the prover is built without its default
+/// `parallel` feature.
+#[cfg(all(not(feature = "cuda"), not(feature = "parallel")))]
+fn run_admitted<T: Send>(
+    order: &[usize],
+    estimates: &[u64],
+    _gate: &VramGate,
+    _workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    debug_check_order(order, estimates);
+    let mut results: Vec<Option<T>> = (0..estimates.len()).map(|_| None).collect();
+    for &idx in order {
+        results[idx] = Some(task(idx));
+    }
+    results
 }
 
 /// Table indices sorted heaviest-first by estimate.
@@ -4483,6 +4563,15 @@ pub trait IsStarkProver<
             &boundary_coefficients,
         )?;
 
+        // Round 2's sub-op timings travel in a thread-local, so take them here
+        // instead of after round 4: this thread re-enters rayon in rounds 3 and
+        // 4, and a worker that blocks there can run another table's whole
+        // scheduler task on top of this frame and consume the slot. Keeping
+        // store and take adjacent is what pins the pair to one thread — see
+        // `instruments::reset_all`.
+        #[cfg(feature = "instruments")]
+        let r2_sub = crate::instruments::take_r2_sub();
+
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
 
@@ -4579,8 +4668,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         {
             let zero = Duration::ZERO;
-            let (r2_constraints, r2_fft, r2_merkle) =
-                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
+            let (r2_constraints, r2_fft, r2_merkle) = r2_sub.unwrap_or((zero, zero, zero));
             let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
                 crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
@@ -4738,5 +4826,75 @@ fn print_bus_balance_report<FieldExtension>(
             let report = tracker.analyze_mismatches();
             report.print_summary();
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Runs `run_admitted` over `order` with `n` tables and returns how many
+    /// times each table's task ran, plus the slots it wrote.
+    fn calls_and_results(
+        order: &[usize],
+        n: usize,
+        workers: usize,
+    ) -> (Vec<usize>, Vec<Option<usize>>) {
+        let estimates = vec![1u64; n];
+        let gate = VramGate::new(u64::MAX);
+        let calls: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let out = run_admitted(order, &estimates, &gate, workers, |idx| {
+            calls[idx].fetch_add(1, Ordering::Relaxed);
+            idx
+        });
+        (
+            calls.iter().map(|c| c.load(Ordering::Relaxed)).collect(),
+            out,
+        )
+    }
+
+    /// The scheduler's contract, independent of how many tables run at once:
+    /// each table's task runs exactly once and its result lands on its own
+    /// index. Nothing else pins this, and a chunking or sizing bug would only
+    /// show up on hosts with a particular core count.
+    #[test]
+    fn every_table_runs_once_and_lands_on_its_own_slot() {
+        for n in [1usize, 2, 5, 21] {
+            // Heaviest-first, which is the order `multi_prove` passes.
+            let estimates: Vec<u64> = (0..n).map(|i| (n - i) as u64).collect();
+            let order = heaviest_first(&estimates);
+            for workers in [1usize, 2, 3, n, n + 5] {
+                let (calls, out) = calls_and_results(&order, n, workers);
+                assert!(
+                    calls.iter().all(|&c| c == 1),
+                    "n={n} workers={workers} calls={calls:?}"
+                );
+                for (idx, slot) in out.iter().enumerate() {
+                    assert_eq!(*slot, Some(idx), "n={n} workers={workers}");
+                }
+            }
+        }
+    }
+
+    /// What the `Staged(depth)` arm passes once the barrier runs over groups:
+    /// a subset of the permutation. The untouched tables must stay empty.
+    #[test]
+    fn a_group_fills_only_its_own_slots() {
+        let n = 9;
+        let group = [7usize, 1, 4];
+        let (calls, out) = calls_and_results(&group, n, 2);
+        for idx in 0..n {
+            let ran = group.contains(&idx);
+            assert_eq!(calls[idx], ran as usize, "table {idx}");
+            assert_eq!(out[idx], ran.then_some(idx), "table {idx}");
+        }
+    }
+
+    #[test]
+    fn an_empty_order_runs_nothing() {
+        let (calls, out) = calls_and_results(&[], 4, 3);
+        assert!(calls.iter().all(|&c| c == 0));
+        assert!(out.iter().all(|s| s.is_none()));
     }
 }
