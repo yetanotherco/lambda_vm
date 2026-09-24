@@ -5,6 +5,7 @@ use super::{
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
 };
+use crate::merkle_caps::{StarkCaps, TableTreeChecks, TreeCheck};
 pub use crate::proof::view::PiDeserializer;
 use crate::{
     config::Commitment,
@@ -18,7 +19,6 @@ use crate::{
     table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::cap::CappedRoot;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 #[cfg(not(feature = "test_fiat_shamir"))]
@@ -473,6 +473,7 @@ pub trait IsStarkVerifier<
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
     /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
+    #[allow(clippy::too_many_arguments)]
     fn step_3_verify_fri(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
@@ -484,6 +485,9 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
+        // The per-tree Merkle checks (`table_tree_checks`); this step reads the
+        // committed FRI layers' ones.
+        checks: &TableTreeChecks<'_>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -536,9 +540,10 @@ pub trait IsStarkVerifier<
             return false;
         }
 
-        // `log2` of the LDE size: every tree's depth is a function of it (a
-        // verifier constant, never read from the proof).
-        let lde_log = domain.lde_length.trailing_zeros() as usize;
+        // One check per committed layer, built with the same layer count.
+        if checks.fri.len() != num_committed {
+            return false;
+        }
 
         let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
         let terminal_codeword =
@@ -571,7 +576,8 @@ pub trait IsStarkVerifier<
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
                     &terminal_codeword,
-                    lde_log,
+                    &checks.fri,
+                    i,
                 )
             })
     }
@@ -594,13 +600,15 @@ pub trait IsStarkVerifier<
     /// so one Merkle path authenticates both `evaluations` (the row) and
     /// `evaluations_sym` (its symmetric). Same layout used for trace and composition.
     ///
-    /// The path must be exactly `depth` siblings long (`log2(lde) − 1`, a
-    /// verifier constant): see [`trace_tree_depth`](Self::trace_tree_depth).
+    /// `check` is the tree's [`TreeCheck`], built once per tree: it fixes the
+    /// exact path length (`log2(lde) − 1 − c`, a verifier constant) and, for a
+    /// capped tree, the authenticated cap the path folds onto. `query` is the
+    /// opening's position in proof order (query 0 is a capped tree's owner).
     fn verify_opening_pair<E>(
         opening: PolynomialOpeningsView<'_, E>,
-        root: &Commitment,
+        check: &TreeCheck<'_>,
+        query: usize,
         iota: usize,
-        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -615,20 +623,16 @@ pub trait IsStarkVerifier<
             opening.evaluations(),
             opening.evaluations_sym(),
         );
-        CappedRoot::uncapped(root, depth).verify::<H::Batched<E>>(
-            opening.merkle_path(),
-            iota,
-            leaf_hash,
-        )
+        check.verify::<H::Batched<E>>(query, opening.merkle_path(), iota, leaf_hash)
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_trace_openings(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
         deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
+        checks: &TableTreeChecks<'_>,
+        query: usize,
         iota: usize,
-        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -637,12 +641,13 @@ pub trait IsStarkVerifier<
         // Main trace (multiplicities for preprocessed, full trace for normal).
         let mut ok = Self::verify_opening_pair::<Field>(
             deep_poly_openings.main_trace_polys(),
-            proof.lde_trace_main_merkle_root(),
+            &checks.main,
+            query,
             iota,
-            depth,
         );
 
-        // Precomputed trace (preprocessed tables only). Mismatched presence:
+        // Precomputed trace (preprocessed tables only). The check exists iff the
+        // proof carries a precomputed root (`table_tree_checks`). Mismatched presence:
         // `(Some(root), None)` and any `(None, Some(opening))` carrying at least
         // one column are rejected upstream by `trace_opening_widths_well_formed`
         // (which pins the precomputed opening width to the AIR — zero for a
@@ -653,11 +658,11 @@ pub trait IsStarkVerifier<
         // only site that rejects that shape, and the check keeps the function
         // self-contained.
         ok &= match (
-            proof.lde_trace_precomputed_merkle_root(),
+            checks.precomputed.as_ref(),
             deep_poly_openings.precomputed_trace_polys(),
         ) {
-            (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<Field>(opening, root, iota, depth)
+            (Some(check), Some(opening)) => {
+                Self::verify_opening_pair::<Field>(opening, check, query, iota)
             }
             (None, None) => true,
             _ => false,
@@ -670,12 +675,9 @@ pub trait IsStarkVerifier<
         // aux tree got to choose them after seeing `z`/`alpha`
         // (`tests::aux_opening_width_tests`). The width is pinned upstream by
         // `trace_opening_widths_well_formed`; do not re-derive it from the proof.
-        ok &= match (
-            proof.lde_trace_aux_merkle_root(),
-            deep_poly_openings.aux_trace_polys(),
-        ) {
-            (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, root, iota, depth)
+        ok &= match (checks.aux.as_ref(), deep_poly_openings.aux_trace_polys()) {
+            (Some(check), Some(opening)) => {
+                Self::verify_opening_pair::<FieldExtension>(opening, check, query, iota)
             }
             (None, None) => true,
             _ => false,
@@ -688,9 +690,9 @@ pub trait IsStarkVerifier<
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_composition_poly_opening(
         deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
-        composition_poly_merkle_root: &Commitment,
-        iota: &usize,
-        depth: usize,
+        check: &TreeCheck<'_>,
+        query: usize,
+        iota: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -705,8 +707,12 @@ pub trait IsStarkVerifier<
             composition_poly.evaluations_sym(),
         );
 
-        CappedRoot::uncapped(composition_poly_merkle_root, depth)
-            .verify::<H::Batched<FieldExtension>>(composition_poly.merkle_path(), *iota, leaf_hash)
+        check.verify::<H::Batched<FieldExtension>>(
+            query,
+            composition_poly.merkle_path(),
+            iota,
+            leaf_hash,
+        )
     }
 
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
@@ -715,7 +721,7 @@ pub trait IsStarkVerifier<
     fn step_4_verify_trace_and_composition_openings(
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
-        domain: &VerifierDomain<Field>,
+        checks: &TableTreeChecks<'_>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -726,40 +732,123 @@ pub trait IsStarkVerifier<
         >();
         // `step_3_verify_fri` (which runs before this) already rejects proofs
         // whose `deep_poly_openings` is shorter than `challenges.iotas`.
-        let depth = Self::trace_tree_depth(domain);
-        challenges.iotas.iter().enumerate().all(|(i, iota_n)| {
+        challenges.iotas.iter().enumerate().all(|(i, &iota_n)| {
             let deep_poly_opening = proof.deep_poly_opening(i);
-            Self::verify_composition_poly_opening(
-                deep_poly_opening,
-                proof.composition_poly_root(),
-                iota_n,
-                depth,
-            ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n, depth)
+            Self::verify_composition_poly_opening(deep_poly_opening, &checks.composition, i, iota_n)
+                && Self::verify_trace_openings(deep_poly_opening, checks, i, iota_n)
         })
     }
 
-    /// Depth of the trace, precomputed, aux and composition trees: a leaf is a
-    /// row PAIR, so `lde / 2` leaves and `log2(lde) − 1` levels (0 for a
-    /// two-point LDE, where the leaf hash is the root). Every authentication
-    /// path into these trees must be exactly this long.
+    /// The per-tree Merkle checks of one table's proof, built ONCE per tree
+    /// before any query is verified (design/CAP.md §4.3).
     ///
-    /// Before this was checked, a path of any length was folded and compared
-    /// with the root; a short one compares an internal node with the root. No
-    /// exploit was shown (it needs a leaf hash equal to an internal node, a
-    /// cross-function collision under the algebraic backend), but the length
-    /// is a verifier constant, so it is now enforced (design/CAP.md §9.4).
-    fn trace_tree_depth(domain: &VerifierDomain<Field>) -> usize {
-        (domain.lde_length.trailing_zeros() as usize).saturating_sub(1)
+    /// Every depth and cap height is a verifier constant ([`StarkCaps`], from
+    /// the AIR's options and the LDE size): the trace, precomputed, aux and
+    /// composition trees are `log2(lde) − 1` deep, committed FRI layer `i` is
+    /// `log2(lde) − i − 2` deep. Every authentication path must be exactly
+    /// `depth − c` long (C1b at `c = 0`: before that a path of any length was
+    /// folded and compared with the root, design/CAP.md §9.4).
+    ///
+    /// A capped tree (`c > 0`) reads its owner opening — query 0's path — here,
+    /// splits off the cap and checks it hashes to the root. That read is safe
+    /// by construction (REVIEW-CAP M2): the caller runs this only after the
+    /// `query_list_len` / `trace_opening_widths_well_formed` count guards, and
+    /// every access below is a length-checked `get`, so a proof with no
+    /// openings, too few FRI layers, or a missing aux/precomputed opening
+    /// rejects (`None`) and never panics. At `c = 0` (the default format) no
+    /// opening is read at all.
+    ///
+    /// The FRI layer count is `fri_termination_params(..).num_committed`; a
+    /// proof with a different number of layer roots is rejected here as in
+    /// `step_3_verify_fri`.
+    fn table_tree_checks<'a>(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'a, Field, FieldExtension, PI>,
+        domain: &VerifierDomain<Field>,
+    ) -> Option<TableTreeChecks<'a>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let options = air.options();
+        let num_committed = Self::fri_termination_params(air, domain).num_committed;
+        let lde_log = domain.lde_length.trailing_zeros() as usize;
+        let caps = StarkCaps::new(
+            options.format.merkle_cap,
+            options.fri_number_of_queries,
+            lde_log,
+            num_committed,
+        );
+        let fri_roots = proof.fri_layers_merkle_roots();
+        if fri_roots.len() != num_committed {
+            return None;
+        }
+        // The owner opening: query 0, read only for a capped tree and only
+        // once it is known to exist.
+        let owner = || (proof.deep_poly_openings_len() > 0).then(|| proof.deep_poly_opening(0));
+        let (d, c) = (caps.trace_depth, caps.trace);
+
+        let main = TreeCheck::build::<H::Batched<Field>>(
+            proof.lde_trace_main_merkle_root(),
+            d,
+            c,
+            || owner().map(|o| o.main_trace_polys().merkle_path()),
+        )?;
+        let precomputed = match proof.lde_trace_precomputed_merkle_root() {
+            Some(root) => Some(TreeCheck::build::<H::Batched<Field>>(root, d, c, || {
+                owner()?.precomputed_trace_polys().map(|p| p.merkle_path())
+            })?),
+            None => None,
+        };
+        let aux = match proof.lde_trace_aux_merkle_root() {
+            Some(root) => Some(TreeCheck::build::<H::Batched<FieldExtension>>(
+                root,
+                d,
+                c,
+                || owner()?.aux_trace_polys().map(|p| p.merkle_path()),
+            )?),
+            None => None,
+        };
+        let composition = TreeCheck::build::<H::Batched<FieldExtension>>(
+            proof.composition_poly_root(),
+            d,
+            c,
+            || owner().map(|o| o.composition_poly().merkle_path()),
+        )?;
+        let fri = fri_roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| {
+                TreeCheck::build::<H::Batched<FieldExtension>>(
+                    root,
+                    caps.fri_depths[i],
+                    caps.fri[i],
+                    || {
+                        (proof.query_list_len() > 0)
+                            .then(|| proof.query(0))
+                            .filter(|q| q.layers_auth_paths_len() > i)
+                            .map(|q| q.layer_auth_path(i))
+                    },
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(TableTreeChecks {
+            main,
+            precomputed,
+            aux,
+            composition,
+            fri,
+        })
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
     fn verify_fri_layer_openings(
-        merkle_root: &Commitment,
+        check: &TreeCheck<'_>,
+        query: usize,
         auth_path_sym: &[Commitment],
         evaluation: &FieldElement<FieldExtension>,
         evaluation_sym: &FieldElement<FieldExtension>,
         iota: usize,
-        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -771,7 +860,8 @@ pub trait IsStarkVerifier<
             vec![evaluation.clone(), evaluation_sym.clone()]
         };
 
-        CappedRoot::uncapped(merkle_root, depth).verify::<H::Batched<FieldExtension>>(
+        check.verify::<H::Batched<FieldExtension>>(
+            query,
             auth_path_sym,
             iota >> 1,
             <H::Batched<FieldExtension> as IsMerkleTreeBackend>::hash_data(&evaluations),
@@ -796,7 +886,10 @@ pub trait IsStarkVerifier<
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
         terminal_codeword: &[FieldElement<FieldExtension>],
-        lde_log: usize,
+        // One per committed layer (`table_tree_checks`), and this query's
+        // position in proof order (query 0 is every capped layer's owner).
+        fri_checks: &[TreeCheck<'_>],
+        query: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -837,26 +930,24 @@ pub trait IsStarkVerifier<
         // previous iteration), then obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)). When there are no
         // committed layers (`total_folds == 1`, a single final fold) this fold is
         // empty and `v`/`index` already hold the terminal-layer value/position.
-        let openings_ok = fri_layers_merkle_roots
+        let openings_ok = fri_checks
             .iter()
             .zip(fri_decommitment.layers_evaluations_sym())
             .zip(evaluation_point_vec)
             .enumerate()
             .fold(
                 true,
-                |result, (i, ((merkle_root, evaluation_sym), evaluation_point_inv))| {
+                |result, (i, ((check, evaluation_sym), evaluation_point_inv))| {
                     // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
                     // `v` is pᵢ(𝜐^(2ⁱ)).
                     // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
                     let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
+                        check,
+                        query,
                         fri_decommitment.layer_auth_path(i),
                         &v,
                         evaluation_sym,
                         index,
-                        // Layer `i` holds `lde / 2^(i+1)` values in pair
-                        // leaves: `log2(lde) − i − 2` levels.
-                        lde_log.saturating_sub(i + 2),
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
@@ -1717,6 +1808,17 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // The per-tree Merkle checks, built once per tree and only now: after
+        // the two count guards above, so a capped tree's owner opening (query
+        // 0) is known to exist before it is read (REVIEW-CAP M2). A capped
+        // tree's cap is authenticated against its root here; at the default
+        // format this reads no opening at all.
+        let Some(tree_checks) = Self::table_tree_checks(air, proof, &domain) else {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Merkle cap or path shape does not match the proof format");
+            return false;
+        };
+
         // The pruned-OOD layout, read from the AIR once and shared by the round-4
         // challenge replay, the block-shape guard, the single grid reconstruction,
         // and both verify steps below — one reconstruction instead of the previous
@@ -1823,6 +1925,7 @@ pub trait IsStarkVerifier<
             &ood_full,
             layout.next_row_cols(),
             layout.step_size(),
+            &tree_checks,
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
@@ -1840,7 +1943,7 @@ pub trait IsStarkVerifier<
         let timer4 = Instant::now();
 
         #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges, &domain) {
+        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges, &tree_checks) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
             return false;

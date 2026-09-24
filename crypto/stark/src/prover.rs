@@ -2755,7 +2755,7 @@ pub trait IsStarkProver<
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-    ) -> Round4<Field, FieldExtension>
+    ) -> Result<Round4<Field, FieldExtension>, ProvingError>
     where
         FieldElement<FieldExtension>: AsBytes,
         FieldElement<Field>: AsBytes,
@@ -2922,15 +2922,36 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase::<FieldExtension, H>(&fri_layers, &iotas);
+        let mut query_list = fri::query_phase::<FieldExtension, H>(&fri_layers, &iotas);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
             .map(|layer| layer.merkle_tree.root)
             .collect();
 
-        let deep_poly_openings =
+        let mut deep_poly_openings =
             Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
+
+        // Merkle caps (design/CAP.md §4.2): a post-pass over the finished
+        // openings. The heights are the verifier's (`StarkCaps`, public shape
+        // only); nothing is absorbed, so the transcript is the uncapped one.
+        // At the default format every height is 0 and this is skipped.
+        let caps = crate::merkle_caps::StarkCaps::new(
+            air.options().format.merkle_cap,
+            number_of_queries,
+            domain_size.trailing_zeros() as usize,
+            fri_layers.len(),
+        );
+        if caps.any() {
+            Self::embed_stark_caps(
+                &caps,
+                round_1_result,
+                round_2_result,
+                &fri_layers,
+                &mut deep_poly_openings,
+                &mut query_list,
+            )?;
+        }
         crate::prove_split::add(&crate::prove_split::R4_QUERIES, __ps_q);
 
         #[cfg(feature = "instruments")]
@@ -2939,12 +2960,215 @@ pub trait IsStarkProver<
             crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
         }
 
-        Round4 {
+        Ok(Round4 {
             fri_final_poly_coeffs,
             fri_layers_merkle_roots,
             deep_poly_openings,
             query_list,
             nonce,
+        })
+    }
+
+    /// Embed every capped tree's cap into its owner path and cut every path of
+    /// that tree to `depth − c` siblings (design/CAP.md §3–§4.2).
+    ///
+    /// Per tree: read the cap (the host tree's heap slice; see
+    /// [`Self::tree_cap`] for a device-resident tree), then
+    /// [`embed_cap`](crypto::merkle_tree::cap::embed_cap) over the tree's
+    /// paths in proof order, so query 0 is the owner. Every path must be the
+    /// full `depth` long (checked), so a tree whose depth disagrees with the
+    /// verifier's constant fails here instead of producing a proof the
+    /// verifier rejects.
+    fn embed_stark_caps(
+        caps: &crate::merkle_caps::StarkCaps,
+        round_1_result: &Round1<Field, FieldExtension, H>,
+        round_2_result: &Round2<FieldExtension, H>,
+        fri_layers: &[crate::fri::fri_commitment::FriLayer<
+            FieldExtension,
+            H::Pair<FieldExtension>,
+        >],
+        deep_poly_openings: &mut [DeepPolynomialOpening<Field, FieldExtension>],
+        query_list: &mut [FriDecommitment<FieldExtension>],
+    ) -> Result<(), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        fn embed<'p>(
+            paths: impl Iterator<Item = Option<&'p mut Vec<Commitment>>>,
+            depth: usize,
+            cap: &[Commitment],
+            what: &str,
+        ) -> Result<(), ProvingError> {
+            let mut paths: Vec<&mut Vec<Commitment>> =
+                paths.collect::<Option<_>>().ok_or_else(|| {
+                    ProvingError::WrongParameter(format!(
+                        "Merkle cap: an opening of the {what} tree is missing"
+                    ))
+                })?;
+            crypto::merkle_tree::cap::embed_cap(&mut paths, depth, cap).map_err(|e| {
+                ProvingError::WrongParameter(format!("Merkle cap of the {what} tree: {e}"))
+            })
+        }
+
+        // The device arm of `tree_cap`: read the cap off the resident tree on
+        // `stream`. `None` when the tree is not device-resident.
+        #[cfg(feature = "cuda")]
+        fn dev<'t>(
+            tree: Option<&'t math_cuda::lde::GpuMerkleTree>,
+            stream: impl FnOnce() -> Option<Arc<math_cuda::CudaStream>> + 't,
+        ) -> impl FnOnce(usize) -> Option<Result<Vec<Commitment>, String>> + 't {
+            move |c| {
+                tree.map(|tree| {
+                    let stream = stream().ok_or("no CUDA stream for the device cap read")?;
+                    crate::gpu_lde::read_cap_dev(tree, c, &stream)
+                })
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let lde_trace = &round_1_result.lde_trace;
+
+        let (depth, c) = (caps.trace_depth, caps.trace);
+        if c > 0 {
+            #[cfg(feature = "cuda")]
+            let main_dev = dev(lde_trace.gpu_main().and_then(|h| h.tree.as_ref()), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let main_dev = |_| None;
+            let main_cap = Self::tree_cap(&round_1_result.main.tree, depth, c, "main", main_dev)?;
+            embed(
+                deep_poly_openings
+                    .iter_mut()
+                    .map(|o| Some(&mut o.main_trace_polys.proof.merkle_path)),
+                depth,
+                &main_cap,
+                "main",
+            )?;
+            if let Some(tree) = round_1_result.main.precomputed_tree.as_ref() {
+                // Always a full host tree (the process-wide cache; its openings
+                // walk it on the host too), so there is no device arm.
+                let cap = Self::tree_cap(tree, depth, c, "precomputed", |_| None)?;
+                embed(
+                    deep_poly_openings.iter_mut().map(|o| {
+                        o.precomputed_trace_polys
+                            .as_mut()
+                            .map(|p| &mut p.proof.merkle_path)
+                    }),
+                    depth,
+                    &cap,
+                    "precomputed",
+                )?;
+            }
+            if let Some(aux) = round_1_result.aux.as_ref() {
+                #[cfg(feature = "cuda")]
+                let aux_dev = dev(lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()), || {
+                    lde_trace.bound_stream()
+                });
+                #[cfg(not(feature = "cuda"))]
+                let aux_dev = |_| None;
+                let cap = Self::tree_cap(&aux.tree, depth, c, "aux", aux_dev)?;
+                embed(
+                    deep_poly_openings
+                        .iter_mut()
+                        .map(|o| o.aux_trace_polys.as_mut().map(|p| &mut p.proof.merkle_path)),
+                    depth,
+                    &cap,
+                    "aux",
+                )?;
+            }
+            #[cfg(feature = "cuda")]
+            let comp_dev = dev(round_2_result.gpu_composition_tree.as_ref(), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let comp_dev = |_| None;
+            let cap = Self::tree_cap(
+                &round_2_result.composition_poly_merkle_tree,
+                depth,
+                c,
+                "composition",
+                comp_dev,
+            )?;
+            embed(
+                deep_poly_openings
+                    .iter_mut()
+                    .map(|o| Some(&mut o.composition_poly.proof.merkle_path)),
+                depth,
+                &cap,
+                "composition",
+            )?;
+        }
+
+        for (i, layer) in fri_layers.iter().enumerate() {
+            let (depth, c) = (caps.fri_depths[i], caps.fri[i]);
+            if c == 0 {
+                continue;
+            }
+            let what = format!("FRI layer {i}");
+            // A fresh backend stream, as the device FRI query phase reads the
+            // same resident layer trees (`try_fri_query_phase_gpu`).
+            #[cfg(feature = "cuda")]
+            let layer_dev = dev(layer.gpu_tree.as_ref(), || {
+                math_cuda::device::backend().ok().map(|b| b.next_stream())
+            });
+            #[cfg(not(feature = "cuda"))]
+            let layer_dev = |_| None;
+            let cap = Self::tree_cap(&layer.merkle_tree, depth, c, &what, layer_dev)?;
+            embed(
+                query_list
+                    .iter_mut()
+                    .map(|q| q.layers_auth_paths.get_mut(i).map(|p| &mut p.merkle_path)),
+                depth,
+                &cap,
+                &what,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The height-`c` cap of one tree of depth `depth`.
+    ///
+    /// A full host tree serves it from its heap (`MerkleTree::cap`, disk-spill
+    /// safe), after checking the tree's depth is the verifier's. A root-only
+    /// host tree means the nodes are device-resident: `device(c)` reads the
+    /// cap off the resident tree, and `None` from it (no resident tree) is a
+    /// hard error naming the tree — never a skipped cap, which would ship
+    /// full-length paths the verifier rejects with no pointer to the cause
+    /// (REVIEW-CAP S6).
+    fn tree_cap<B>(
+        host: &MerkleTree<B>,
+        depth: usize,
+        c: usize,
+        what: &str,
+        device: impl FnOnce(usize) -> Option<Result<Vec<Commitment>, String>>,
+    ) -> Result<Vec<Commitment>, ProvingError>
+    where
+        B: IsMerkleTreeBackend<Node = Commitment>,
+    {
+        if !host.is_root_only() {
+            if host.depth() != Some(depth) {
+                return Err(ProvingError::WrongParameter(format!(
+                    "Merkle cap: the {what} tree has depth {:?}, the format expects {depth}",
+                    host.depth()
+                )));
+            }
+            return host.cap(c).ok_or_else(|| {
+                ProvingError::WrongParameter(format!(
+                    "Merkle cap: height {c} does not fit the {what} tree (depth {depth})"
+                ))
+            });
+        }
+        match device(c) {
+            Some(Ok(cap)) => Ok(cap),
+            Some(Err(e)) => Err(ProvingError::DevicePath(format!(
+                "Merkle cap: reading the height-{c} cap of the device-resident {what} tree \
+                 failed: {e}"
+            ))),
+            None => Err(ProvingError::DevicePath(format!(
+                "Merkle cap: the {what} tree is device-resident (its host tree is root-only) \
+                 and no device cap read is wired for it"
+            ))),
         }
     }
 
@@ -5314,7 +5538,7 @@ pub trait IsStarkProver<
             &round_3_result,
             &z,
             transcript,
-        );
+        )?;
 
         #[cfg(feature = "instruments")]
         {
