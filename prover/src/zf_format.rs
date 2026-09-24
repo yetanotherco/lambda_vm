@@ -455,6 +455,29 @@ mod tests {
     }
 
     #[test]
+    fn the_one_row_knob_is_selectable() {
+        // S2 is implemented on the host CPU paths: `LAMBDA_VM_ZF_ONE_ROW` no
+        // longer aborts, and every spelling reaches the options unchanged.
+        const { assert!(stark::proof::options::ONE_ROW_IMPLEMENTED) };
+        for (v, want) in [
+            ("1", OneRowMode::On),
+            ("auto", OneRowMode::Auto),
+            ("0", OneRowMode::Off),
+        ] {
+            let f = parse(&[(ENV_ONE_ROW, v)]).unwrap();
+            assert!(f.unimplemented_levers().is_empty(), "{v}");
+            let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
+            assert_eq!(f.options(base).format.one_row, want, "{v}");
+        }
+        assert_eq!(
+            parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
+                .unwrap()
+                .banner(),
+            "ZF FORMAT: cap=off whir_cap=off fri=dp one_row=auto whir_folds=uniform4"
+        );
+    }
+
+    #[test]
     fn the_merkle_cap_knob_is_selectable() {
         // C3 + C4 made the STARK cap real, so `LAMBDA_VM_ZF_CAP` no longer
         // aborts; every spelling reaches the options unchanged.

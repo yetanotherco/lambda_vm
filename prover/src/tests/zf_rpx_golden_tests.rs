@@ -285,17 +285,31 @@ fn rpx_group_path_at_all_ones_equals_legacy() {
 /// The production format sites at the PROCESS format (`ZfFormat::global()`):
 /// a small ext3 STARK proved and host-verified under RPX with
 /// `block_base_options()` (STARK base epochs) and `aggregation_wrap_options()`
-/// (every LFM proof). Meant for a knob-on run, `LAMBDA_VM_ZF_FRI=dp` (then it
-/// asserts both sites stamp `Dp` and the proofs use group layers); without the
-/// knob it proves the same at the default format. Either way it proves.
+/// (every LFM proof). Meant for knob-on runs — `LAMBDA_VM_ZF_FRI=dp` (both
+/// sites stamp `Dp` and the proofs use group layers) and
+/// `LAMBDA_VM_ZF_ONE_ROW=1|auto` (both sites stamp the one-row mode; a table
+/// resolved to one row opens no symmetric rows and commits the FRI input);
+/// without a knob it proves the same at the default format. Either way it
+/// proves.
 #[test]
 fn production_sites_prove_at_the_process_format() {
-    let knob = std::env::var(crate::zf_format::ENV_FRI).ok();
-    let want = match knob.as_deref().map(str::trim) {
-        Some("dp") => stark::proof::options::FriMode::Dp,
-        _ => stark::proof::options::FriMode::Pair,
+    use stark::proof::options::{FriMode, OneRowMode};
+    let knob = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+    };
+    let want = match knob(crate::zf_format::ENV_FRI).as_deref() {
+        Some("dp") => FriMode::Dp,
+        _ => FriMode::Pair,
+    };
+    let want_one_row = match knob(crate::zf_format::ENV_ONE_ROW).as_deref() {
+        Some("1") => OneRowMode::On,
+        Some("auto") => OneRowMode::Auto,
+        _ => OneRowMode::Off,
     };
     assert_eq!(crate::zf_format::ZfFormat::global().fri, want);
+    assert_eq!(crate::zf_format::ZfFormat::global().one_row, want_one_row);
     for (site, o) in [
         (
             "block_base_options",
@@ -307,13 +321,27 @@ fn production_sites_prove_at_the_process_format() {
         ),
     ] {
         assert_eq!(o.format.fri_mode, want, "{site}");
+        assert_eq!(o.format.one_row, want_one_row, "{site}");
         // 2^12 rows: LDE 2^14, so both terminals (T = 9, 10) leave committed layers.
         let (air, proof) = prove_logup(1 << 12, &o);
         assert!(verify_logup(&air, &proof), "{site}: must verify");
         let layers = proof.fri_layers_merkle_roots.len();
         assert!(layers > 0, "{site}: committed layers");
         let values = proof.query_list[0].layers_evaluations_sym.len();
-        if want == stark::proof::options::FriMode::Dp {
+        let one_row = stark::leaf_layout::table_leaf_layout(&air, 1 << 12).is_one_row();
+        if want_one_row == OneRowMode::On {
+            assert!(one_row, "{site}: one_row = 1 puts every table on one row");
+        }
+        let sym = &proof.deep_poly_openings[0].main_trace_polys.evaluations_sym;
+        assert_eq!(
+            sym.is_empty(),
+            one_row,
+            "{site}: symmetric rows iff row pairs"
+        );
+        println!(
+            "ZF SITE {site}: fri={want} one_row={want_one_row} resolved_one_row={one_row} layers={layers} values={values}"
+        );
+        if want == FriMode::Dp || one_row {
             assert!(values > layers, "{site}: group encoding");
         } else {
             assert_eq!(values, layers, "{site}: legacy encoding");
