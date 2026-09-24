@@ -447,6 +447,18 @@ mod tests {
     }
 
     #[test]
+    fn the_whir_cap_is_implemented_and_selectable() {
+        const { assert!(multilinear::whir_chain::WHIR_CAP_IMPLEMENTED) };
+        for v in ["auto", "3"] {
+            let f = parse(&[(ENV_WHIR_CAP, v)]).unwrap();
+            assert!(
+                !f.unimplemented_levers().contains(&ENV_WHIR_CAP),
+                "LAMBDA_VM_ZF_WHIR_CAP={v} must be selectable"
+            );
+        }
+    }
+
+    #[test]
     fn apply_stamps_only_the_format_fields() {
         let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
         assert!(base.has_default_format());

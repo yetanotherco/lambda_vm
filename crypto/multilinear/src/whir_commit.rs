@@ -3,7 +3,12 @@
 //! The pre-image of folded index `j` is the stride-`N/2^k` coset
 //! `{ j, j + N/2^k, …, j + (2^k - 1)·N/2^k }`.
 
-use crypto::merkle_tree::{merkle::MerkleTree, proof::Proof, traits::IsMerkleTreeBackend};
+use crypto::merkle_tree::{
+    cap::{CappedRoot, embed_cap},
+    merkle::MerkleTree,
+    proof::Proof,
+    traits::IsMerkleTreeBackend,
+};
 use math::{
     field::{
         element::FieldElement,
@@ -284,6 +289,11 @@ where
         1usize << (self.log_domain_size - self.log_folding)
     }
 
+    /// Siblings on a full authentication path: `log2(num_leaves)`.
+    pub fn depth(&self) -> usize {
+        self.log_domain_size - self.log_folding
+    }
+
     pub fn log_folding(&self) -> usize {
         self.log_folding
     }
@@ -307,6 +317,26 @@ where
     /// in a single pass over the codeword, and a round asks for a hundred of
     /// them.
     pub fn open_many(&self, indices: &[usize]) -> Result<Vec<CosetOpening<F>>, Error> {
+        self.open_many_capped(indices, 0, false)
+    }
+
+    /// [`open_many`](Self::open_many) under a Merkle cap of height
+    /// `cap_height` (the owner-path encoding, `crypto::merkle_tree::cap`).
+    ///
+    /// Every path is cut to `depth − cap_height` siblings. When `owner` is
+    /// set, this call's first opening is the tree's first opening in proof
+    /// order and carries the tree's cap (`2^cap_height` nodes) after its
+    /// siblings. At `cap_height = 0` this is exactly `open_many`, whatever
+    /// `owner` says.
+    ///
+    /// On a device the cap is read from the tree the paths are gathered from,
+    /// inside the same rebuild, so it costs no extra tree build.
+    pub fn open_many_capped(
+        &self,
+        indices: &[usize],
+        cap_height: usize,
+        owner: bool,
+    ) -> Result<Vec<CosetOpening<F>>, Error> {
         let num_leaves = self.num_leaves();
         // ★ ONE CALL, ONE DEVICE TREE REBUILD. Counted rather than inferred:
         // `whir_round::prove` opens the current commitment AND its successor,
@@ -319,7 +349,7 @@ where
         // bookkeeping and read ~100% every time. What competes with the rebuild
         // is the COSET GATHER, which is the next statement, not a nested one.
         let __wq_tree = crate::whir_split::mark();
-        let proofs = self.paths(indices)?;
+        let proofs = self.paths_capped(indices, cap_height, owner)?;
         crate::whir_split::add(&crate::whir_split::TREE_REBUILD, __wq_tree);
 
         let block = 1usize << self.log_folding;
@@ -398,6 +428,76 @@ where
         }
     }
 
+    /// [`paths`](Self::paths), cut to the cap and, for the owner, with the
+    /// cap appended to the first path.
+    fn paths_capped(
+        &self,
+        indices: &[usize],
+        cap_height: usize,
+        owner: bool,
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        if cap_height == 0 {
+            return self.paths(indices);
+        }
+        let depth = self.depth();
+        if cap_height > depth {
+            return Err(Error::CapEmbedFailed {
+                reason: "cap taller than the tree",
+            });
+        }
+        let embed_failed = |_: crypto::merkle_tree::cap::CapError| Error::CapEmbedFailed {
+            reason: "path or cap of the wrong length",
+        };
+        let (mut proofs, cap) = if owner {
+            match &self.codeword {
+                Codeword::Device(device) => {
+                    let num_leaves = self.num_leaves();
+                    if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
+                        return Err(Error::QueryOutOfRange {
+                            index: bad,
+                            bound: num_leaves,
+                        });
+                    }
+                    // ONE rebuild: the cap comes from the tree the paths are
+                    // gathered from.
+                    let (paths, cap) = device
+                        .paths_and_cap(self.log_folding, indices, cap_height, H::DEVICE)
+                        .ok_or(Error::DeviceFailed {
+                            stage: "opening paths and cap",
+                        })?;
+                    let proofs: Vec<Proof<Commitment>> = paths
+                        .into_iter()
+                        .map(|merkle_path| Proof { merkle_path })
+                        .collect();
+                    (proofs, Some(cap))
+                }
+                Codeword::Host(_) => {
+                    let cap = self.tree.cap(cap_height).ok_or(Error::CapEmbedFailed {
+                        reason: "the host tree has no cap at this height",
+                    })?;
+                    (self.paths(indices)?, Some(cap))
+                }
+            }
+        } else {
+            (self.paths(indices)?, None)
+        };
+        match cap {
+            Some(cap) => {
+                let mut refs: Vec<&mut Vec<Commitment>> =
+                    proofs.iter_mut().map(|p| &mut p.merkle_path).collect();
+                embed_cap(&mut refs, depth, &cap).map_err(embed_failed)?;
+            }
+            None => {
+                for proof in &mut proofs {
+                    proof
+                        .truncate_to_cap(depth, cap_height)
+                        .map_err(embed_failed)?;
+                }
+            }
+        }
+        Ok(proofs)
+    }
+
     /// Opens the block that folds onto `index`.
     pub fn open(&self, index: usize) -> Result<CosetOpening<F>, Error> {
         let num_leaves = self.num_leaves();
@@ -431,15 +531,50 @@ where
 /// because "which hash authenticated this path" is the whole content of the
 /// call. A verifier reading a proof under the wrong `H` gets `false` here, not
 /// a different-but-plausible answer.
-pub fn verify_opening<F, H>(root: &Commitment, index: usize, opening: &CosetOpening<F>) -> bool
+///
+/// `depth` is the tree's depth (`log2` of its leaf count), a verifier
+/// constant: the path must be exactly that long and `index < 2^depth`. A path
+/// of any other length is refused before it is folded, so a leaf hash can
+/// never be compared with an internal node (design/CAP.md §9.4).
+pub fn verify_opening<F, H>(
+    root: &Commitment,
+    depth: usize,
+    index: usize,
+    opening: &CosetOpening<F>,
+) -> bool
 where
     F: IsField + 'static,
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    opening
-        .proof
-        .verify::<Backend<F, H>>(root, index, &opening.values)
+    verify_opening_capped::<F, H>(
+        &CappedRoot::uncapped(root, depth),
+        index,
+        opening,
+        &opening.proof.merkle_path,
+    )
+}
+
+/// Checks an opening against one tree's authenticated cap.
+///
+/// `siblings` is the opening's path with any cap split off — the whole
+/// `opening.proof.merkle_path` for every opening but a tree's owner, whose
+/// siblings [`CappedRoot::from_owner`] returns. It must be exactly
+/// `depth − c` long and fold `hash(values)` at `index` onto
+/// `cap[index >> (depth − c)]`. At `c = 0` the cap is the root, and this is
+/// [`verify_opening`].
+pub fn verify_opening_capped<F, H>(
+    check: &CappedRoot<'_, Commitment>,
+    index: usize,
+    opening: &CosetOpening<F>,
+    siblings: &[Commitment],
+) -> bool
+where
+    F: IsField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    check.verify::<Backend<F, H>>(siblings, index, Backend::<F, H>::hash_data(&opening.values))
 }
 
 /// One level of a block's fold.
@@ -584,7 +719,7 @@ mod tests {
             let opening = commitment.open(j).unwrap();
             assert_eq!(opening.values.len(), 2);
             assert!(
-                verify_opening::<F, KeccakWhir>(&root, j, &opening),
+                verify_opening::<F, KeccakWhir>(&root, commitment.depth(), j, &opening),
                 "leaf {j}"
             );
         }
@@ -598,7 +733,12 @@ mod tests {
 
         let mut opening = commitment.open(2).unwrap();
         opening.values[0] += FE::one();
-        assert!(!verify_opening::<F, KeccakWhir>(&root, 2, &opening));
+        assert!(!verify_opening::<F, KeccakWhir>(
+            &root,
+            commitment.depth(),
+            2,
+            &opening
+        ));
     }
 
     #[test]
@@ -607,7 +747,12 @@ mod tests {
         let commitment = CodewordCommitment::<F, KeccakWhir>::new(&cw, 1).unwrap();
         let root = commitment.root();
         let opening = commitment.open(2).unwrap();
-        assert!(!verify_opening::<F, KeccakWhir>(&root, 3, &opening));
+        assert!(!verify_opening::<F, KeccakWhir>(
+            &root,
+            commitment.depth(),
+            3,
+            &opening
+        ));
     }
 
     #[test]

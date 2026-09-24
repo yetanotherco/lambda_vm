@@ -85,6 +85,7 @@ fn the_device_ext3_commit_matches_the_host() {
         assert!(
             multilinear::whir_commit::verify_opening::<_, KeccakWhir>(
                 &device.root(),
+                device.depth(),
                 index,
                 &opening
             ),

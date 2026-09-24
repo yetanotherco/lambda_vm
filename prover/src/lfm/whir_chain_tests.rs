@@ -32,7 +32,7 @@ use math::traits::AsBytes;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    ChainConfig, ChainProof, GrindBits, RoundOpenings, commit, prove, verify,
+    CapPolicy, ChainConfig, ChainProof, GrindBits, RoundOpenings, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
 
@@ -44,9 +44,9 @@ use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_chain::{
-    ChainShape, RoundStorage, chain_grind_perms, chain_hash_schedule, chain_opening_perms,
-    chain_perms, chain_rows, chain_schedule_perms, chain_schedule_rows, chain_shape_rows,
-    emit_verify_weighted, push_round_words, round_words,
+    ChainShape, RoundStorage, chain_cap_perms, chain_grind_perms, chain_hash_schedule,
+    chain_opening_perms, chain_perms, chain_rows, chain_schedule_perms, chain_schedule_rows,
+    chain_shape_rows, emit_verify_weighted, push_round_words, round_words,
 };
 use super::whir_poly::{emit_eq_eval, eq_eval_rows_again};
 use super::whir_transcript::{SpongeEntry, SpongeHash, WhirTranscript};
@@ -260,12 +260,20 @@ fn point(num_vars: usize, seed: u64) -> Vec<FEE> {
 }
 
 fn config(num_queries: usize, grind: u8) -> ChainConfig {
+    config_with(num_queries, grind, CapPolicy::Off)
+}
+
+/// [`config`] under a Merkle cap policy (W1).
+fn config_with(num_queries: usize, grind: u8, cap: CapPolicy) -> ChainConfig {
     ChainConfig {
         log_blowup: 2,
         log_folding: 4,
         num_queries,
         grind: GrindBits::uniform(grind),
-        format: multilinear::whir_chain::ChainFormat::DEFAULT,
+        format: multilinear::whir_chain::ChainFormat {
+            cap,
+            ..multilinear::whir_chain::ChainFormat::DEFAULT
+        },
     }
 }
 
@@ -292,7 +300,12 @@ struct Fixture {
 /// replay reproduces that hash and no other, so a fixture on the default
 /// transcript would be a fixture of a different protocol.
 fn fixture(num_vars: usize, num_queries: usize, grind: u8) -> Fixture {
-    let cfg = config(num_queries, grind);
+    fixture_with(num_vars, num_queries, grind, CapPolicy::Off)
+}
+
+/// [`fixture`] under a Merkle cap policy (W1).
+fn fixture_with(num_vars: usize, num_queries: usize, grind: u8, cap: CapPolicy) -> Fixture {
+    let cfg = config_with(num_queries, grind, cap);
     let f = pseudo_mle(num_vars, 11);
     let z = point(num_vars, 0);
     // `evaluate_in`, not `evaluate`: the claimed point is in the cubic
@@ -1394,4 +1407,267 @@ fn the_single_chain_term_prices_a_stack_of_at_most_sixty_four_pages() {
     );
     // The block carries three.
     assert_eq!(polys_at(3), 1);
+}
+
+// =============================================================================
+// W1: the chain under a Merkle cap
+// =============================================================================
+
+/// The policies the capped gates run under. At `Q = 3` `Auto` caps tree 0 not
+/// at all (3 openings) and every later tree at 2 (6 openings) — a chain with an
+/// uncapped owner round and capped successors, the mixed case.
+const CAP_POLICIES: [CapPolicy; 3] = [CapPolicy::Fixed(1), CapPolicy::Fixed(2), CapPolicy::Auto];
+
+/// ★ The capped chain executes on a proof the host accepts, at every policy,
+/// one- and three-round shapes, and `Q` large enough for `Auto` to cap the
+/// first tree at 3.
+#[test]
+fn a_capped_chain_executes_on_a_proof_the_host_accepts() {
+    for (num_vars, num_queries) in [(6usize, 3usize), (5, 3), (9, 3), (6, 25), (9, 25)] {
+        for cap in CAP_POLICIES {
+            let f = fixture_with(num_vars, num_queries, 0, cap);
+            assert_eq!(
+                f.shape.caps,
+                config_with(num_queries, 0, cap).tree_caps(num_vars),
+                "the shape's caps are the host's"
+            );
+            assert!(
+                f.shape.caps.iter().any(|&c| c > 0),
+                "{cap}: something is capped"
+            );
+            let program = chain_program(&f.shape);
+            let arena = chain_arena(&f, &f.proof);
+            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+                panic!(
+                    "S={num_vars} Q={num_queries} {cap} caps {:?}: the machine refused an \
+                     accepted proof: {e:?}",
+                    f.shape.caps
+                )
+            });
+        }
+    }
+}
+
+/// ★ GATE TWO under the cap: emitted rows and permutations against the closed
+/// forms, which now carry the cap terms.
+#[test]
+fn a_capped_chain_emits_its_closed_form() {
+    for (num_vars, num_queries, grind) in COST_SHAPES.into_iter().chain([(9, 25, 0)]) {
+        for cap in [CapPolicy::Fixed(2), CapPolicy::Fixed(3), CapPolicy::Auto] {
+            let shape = ChainShape::new(&config_with(num_queries, grind, cap), num_vars);
+            let program = chain_program(&shape);
+            let entry = SpongeEntry::fresh();
+            assert_eq!(
+                hint_rows(&program),
+                Layout::new(&shape).total as usize,
+                "every arena word, cap words included, is hinted exactly once"
+            );
+            let measured = program.instrs.len() - const_rows(&program) - chain_plumbing(&shape);
+            let tag = format!(
+                "S={num_vars} Q={num_queries} grind={grind} {cap} {:?}",
+                shape.caps
+            );
+            assert_eq!(measured, chain_rows(&shape, entry), "{tag}: rows");
+            assert_eq!(
+                perm_rows(&program),
+                chain_perms(&shape, entry),
+                "{tag}: permutations"
+            );
+        }
+    }
+}
+
+/// ★ The transcript does not move with the cap: the host's hash schedule on a
+/// capped proof is the same form the default follows.
+#[test]
+fn the_schedule_is_the_host_transcripts_under_the_cap() {
+    for (num_vars, num_queries, grind) in COST_SHAPES {
+        let f = fixture_with(num_vars, num_queries, grind, CapPolicy::Auto);
+        let host = f.recorded.duplex.borrow().hashes.clone();
+        assert_eq!(
+            chain_hash_schedule(&f.shape, SpongeEntry::fresh()),
+            host,
+            "S={num_vars} Q={num_queries} grind={grind}"
+        );
+    }
+}
+
+/// ★ The tamper arm under the cap: a cap node of tree 0 that NO query reaches
+/// (so only the in-guest cap-to-root check can refuse it — REVIEW-CAP M1(b)),
+/// a reached one, and a successor tree's cap node. Each: the host rejects it
+/// and the machine has no execution.
+#[test]
+fn a_tampered_capped_chain_cannot_execute() {
+    // S = 6, k = 4: schedule [4, 2], trees of depth 4 and 2. Fixed(3): caps
+    // [3, 2] — tree 0 has eight cap nodes and three queries, so at least five
+    // are unreached.
+    let cap = CapPolicy::Fixed(3);
+    let f = fixture_with(6, 3, 0, cap);
+    assert_eq!(f.shape.caps, vec![3, 2]);
+    let program = chain_program(&f.shape);
+    assert!(
+        execute(
+            &program,
+            &[chain_arena(&f, &f.proof)],
+            &crate::hash_pin::BLOCK_HASHER
+        )
+        .is_ok(),
+        "the untouched proof must execute, or the arm proves nothing"
+    );
+    let cfg = config_with(3, 0, cap);
+    let host_rejects = |proof: &ChainProof<F, E>| -> bool {
+        verify::<F, E, _, RpxWhir>(
+            proof,
+            &f.root_bytes,
+            &f.z,
+            f.y,
+            &f.domain,
+            &cfg,
+            &mut Recording::new(),
+        )
+        .is_err()
+    };
+
+    // Round 0's query positions, as the host drew them: the leaf is the
+    // position itself, its cap node the top three of its four bits.
+    let reached: Vec<u64> = f.recorded.drawn_u64[..3].iter().map(|q| q >> 1).collect();
+    let unreached = (0..8u64).find(|j| !reached.contains(j)).unwrap() as usize;
+    let reached = reached[0] as usize;
+    let depth0 = f.shape.current_depth(0);
+
+    let mut sites: Vec<(String, ChainProof<F, E>)> = Vec::new();
+    for (name, j) in [("unreached", unreached), ("reached", reached)] {
+        let mut forged = f.proof.clone();
+        match &mut forged.rounds[0].openings {
+            RoundOpenings::Base(p) => p.current[0].proof.merkle_path[depth0 - 3 + j][9] ^= 1,
+            RoundOpenings::Extension(_) => unreachable!("round 0 is base"),
+        }
+        sites.push((format!("tree-0 cap node {j} ({name})"), forged));
+    }
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => {
+            let path = &mut p.next[0].proof.merkle_path;
+            let last = path.len() - 1;
+            path[last][0] ^= 1;
+        }
+        RoundOpenings::Extension(_) => unreachable!("round 0 is base"),
+    }
+    sites.push(("tree-1 cap node 3".to_string(), forged));
+
+    for (name, forged) in &sites {
+        assert!(
+            host_rejects(forged),
+            "{name}: the host must reject the forgery"
+        );
+        assert!(
+            execute(
+                &program,
+                &[chain_arena(&f, forged)],
+                &crate::hash_pin::BLOCK_HASHER
+            )
+            .is_err(),
+            "{name}: the machine must refuse the forgery"
+        );
+    }
+}
+
+/// ★ The production chain under `Auto`, evaluated — the knob-on twin of
+/// [`the_production_chain_costs_what_the_census_quotes`] and
+/// [`the_production_shape_reproduces_the_campaigns_permutation_count`].
+///
+/// Hand derivation (design/CAP.md §10): trees of depth 23, 19, 15, 11, 7, 3, 2
+/// opened 112, then 224 times each, capped 3, 3, 3, 3, 3, 3, 2. Openings save
+/// `112·3 + 5·224·3 + 224·2 = 4,144` parents; the caps cost `6·7 + 3 = 45`:
+/// 22,512 → 18,413 opening permutations, 22,828 → 18,729 in all. Rows: `+2`
+/// an opening at `c = 3` (`7 − 6 + 1`), `0` at `c = 2` (`3 − 4 + 1`), so
+/// `2·(112 + 5·224) = 2,464`, plus the cap checks `6·16 + 12 = 108`:
+/// 184,673 → 187,245 shape rows, 185,509 → 188,081 in all (the schedule does
+/// not move).
+#[test]
+fn the_production_chain_under_the_auto_cap_costs_its_hand_derivation() {
+    let shape = ChainShape::new(&config_with(112, 20, CapPolicy::Auto), 25);
+    assert_eq!(shape.caps, vec![3, 3, 3, 3, 3, 3, 2]);
+    let entry = SpongeEntry::fresh();
+    assert_eq!(chain_cap_perms(&shape), 45, "cap permutations");
+    assert_eq!(chain_opening_perms(&shape), 18_413, "opening permutations");
+    assert_eq!(
+        chain_schedule_rows(&shape, entry),
+        836,
+        "schedule rows unmoved"
+    );
+    assert_eq!(
+        chain_schedule_perms(&shape, entry),
+        276,
+        "schedule perms unmoved"
+    );
+    assert_eq!(chain_grind_perms(&shape), 40);
+    assert_eq!(chain_shape_rows(&shape), 187_245, "shape rows");
+    assert_eq!(chain_rows(&shape, entry), 188_081, "rows a chain");
+    assert_eq!(chain_perms(&shape, entry), 18_729, "permutations a chain");
+    println!(
+        "production chain S=25 k=4 Q=112 grind=20 cap=auto: {} rows, {} permutations",
+        chain_rows(&shape, entry),
+        chain_perms(&shape, entry)
+    );
+}
+
+/// ★ The production chain under `Auto`, EMITTED — the knob-on twin of
+/// [`the_production_chain_emits_its_closed_form`]. Ignored for the same
+/// reason; laptop-safe.
+#[test]
+#[ignore = "builds a production-shape chain program; run it when the census needs the number"]
+fn the_production_chain_emits_its_closed_form_under_the_auto_cap() {
+    let shape = ChainShape::new(&config_with(112, 20, CapPolicy::Auto), 25);
+    let program = chain_program(&shape);
+    let entry = SpongeEntry::fresh();
+    let consts = const_rows(&program);
+    let measured = program.instrs.len() - consts - chain_plumbing(&shape);
+    let selects = count_rows(&program, |i| {
+        matches!(i, super::instr::Instr::Select { .. })
+    });
+    let unpacks = count_rows(&program, |i| {
+        matches!(i, super::instr::Instr::Unpack { .. })
+    });
+    println!(
+        "PRODUCTION chain cap=auto S=25 k=4 Q=112 grind=20: {measured} rows against {} \
+         predicted; {} permutations against {} predicted; {selects} Select, {unpacks} Unpack, \
+         {consts} constants, {} hints, {} instructions whole",
+        chain_rows(&shape, entry),
+        perm_rows(&program),
+        chain_perms(&shape, entry),
+        hint_rows(&program),
+        program.instrs.len(),
+    );
+    assert_eq!(hint_rows(&program), Layout::new(&shape).total as usize);
+    assert_eq!(measured, chain_rows(&shape, entry));
+    assert_eq!(perm_rows(&program), chain_perms(&shape, entry));
+}
+
+/// ⛔ RULINGS 4: `PREPARED_LEG_ROWS` is a ROUTING constant and stays fixed
+/// across formats. Under the `Auto` cap a chain costs slightly more rows (+2 an
+/// opening at `c = 3`, plus the cap checks), so the constant under-states the
+/// 24-variable chain it was read from — by less than 2%, and it still covers
+/// the block's 20-variable stack.
+#[test]
+fn the_genesis_threshold_budget_stays_within_two_percent_under_the_auto_cap() {
+    let auto = |vars| {
+        chain_shape_rows(&ChainShape::new(
+            &config_with(112, 20, CapPolicy::Auto),
+            vars,
+        ))
+    };
+    let (at_20, at_24) = (auto(20), auto(24));
+    let budget = crate::continuation::PREPARED_LEG_ROWS;
+    println!(
+        "GENESIS BUDGET cap=auto: {budget} rows against {at_20} at 20 variables, {at_24} at 24"
+    );
+    assert!(
+        budget >= at_20,
+        "the budget must still cover the 20-variable stack"
+    );
+    assert!(
+        (budget as f64) >= 0.98 * at_24 as f64 && budget <= at_24 + at_24 / 50,
+        "the budget must stay within 2% of the 24-variable chain it stands for"
+    );
 }

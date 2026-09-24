@@ -265,7 +265,7 @@ fn the_openings_verify_against_the_device_commitment() {
         for index in [0, 1, host.num_leaves() / 3, host.num_leaves() - 1] {
             let opening = host.open(index).expect("open");
             assert!(
-                verify_opening::<_, H>(&root, index, &opening),
+                verify_opening::<_, H>(&root, host.depth(), index, &opening),
                 "{name}: opening {index} does not verify against the device root"
             );
         }

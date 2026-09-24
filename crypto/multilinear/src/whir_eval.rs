@@ -246,7 +246,7 @@ where
     let queries = sample_queries(transcript, config.num_queries, num_leaves);
 
     for (i, (&q, opening)) in queries.iter().zip(&proof.openings).enumerate() {
-        if !verify_opening::<E, H>(root, q, opening) {
+        if !verify_opening::<E, H>(root, num_leaves.trailing_zeros() as usize, q, opening) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, E, E>(&opening.values, domain, q, alphas)? != proof.final_value {
