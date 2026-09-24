@@ -251,69 +251,10 @@ pub fn emit_verify_opening(
     edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(root_lanes));
 }
 
-/// ★ One tree's authenticated Merkle cap (W1, design/CAP.md §6.2, §9.2).
-///
-/// The ONLY constructor, [`CapCells::authenticate`], hashes the hinted cap up
-/// to its root and asserts that root equals the tree's root lanes. Every
-/// opening of the tree then reads THESE cells through
-/// [`TreeAuth::verify_opening`] — so the cells checked against the root and
-/// the cells the mux picks from are the same cells, and a tree has one cap
-/// (REVIEW-CAP (e)).
-///
-/// The mux is private to this module and consumes exactly the top `c` of the
-/// index bits it is handed, the rest being walked (REVIEW-CAP (d)): a caller
-/// passes the whole index, never a split of it.
-pub struct CapCells {
-    cap: Vec<WrapDigest>,
-    height: usize,
-}
-
-impl CapCells {
-    /// Authenticate a hinted cap against a tree's root lanes, once per tree.
-    ///
-    /// `cap` must be `2^c` digests, `c ≥ 1`: a tree at `c = 0` has no cap and
-    /// is checked against its root ([`TreeAuth::Root`]).
-    pub fn authenticate(b: &mut LfmBuilder, cap: &[WrapDigest], root_lanes: &[Felt; 4]) -> Self {
-        assert!(
-            cap.len() >= 2 && cap.len().is_power_of_two(),
-            "a cap is 2^c digests with c >= 1, got {}",
-            cap.len()
-        );
-        let root = edsl::wrap_merkle_tree_root(b, cap);
-        edsl::assert_digest_eq_lanes(b, root, std::slice::from_ref(root_lanes));
-        Self {
-            cap: cap.to_vec(),
-            height: cap.len().trailing_zeros() as usize,
-        }
-    }
-
-    pub fn height(&self) -> usize {
-        self.height
-    }
-
-    /// `cap[index >> (depth − c)]` from the index's top `c` bits, LOW first:
-    /// a balanced mux, `2^c − 1` `Select` rows a digest cell. Pairs are
-    /// `(2t, 2t + 1)` because the bits arrive low first (the slot mux's
-    /// reason, `whir_chain::emit_slot_mux`).
-    fn select(&self, b: &mut LfmBuilder, top_bits: &[Bit]) -> WrapDigest {
-        assert_eq!(top_bits.len(), self.height, "one mux level per cap level");
-        let mut level: Vec<WrapDigest> = self.cap.clone();
-        for bit in top_bits {
-            level = level
-                .chunks_exact(2)
-                .map(|pair| {
-                    let cells: Vec<_> = pair[0]
-                        .iter()
-                        .zip(pair[1].iter())
-                        .map(|(l, r)| b.select(*bit, *l, *r).0)
-                        .collect();
-                    WrapDigest::from_cells(&cells)
-                })
-                .collect();
-        }
-        level[0]
-    }
-}
+/// ★ One tree's authenticated Merkle cap — the gadget the STARK verifier
+/// shares ([`super::merkle_cap`]): its only constructor checks the cap against
+/// the tree's root, and its one entry point walks, muxes and compares.
+pub use super::merkle_cap::CapCells;
 
 /// How one tree's openings are authenticated in-guest: against its root
 /// lanes (no cap — today's emission, instruction for instruction), or
@@ -328,7 +269,7 @@ impl TreeAuth {
     pub fn cap_height(&self) -> usize {
         match self {
             TreeAuth::Root(_) => 0,
-            TreeAuth::Cap(cap) => cap.height,
+            TreeAuth::Cap(cap) => cap.height(),
         }
     }
 
@@ -349,17 +290,12 @@ impl TreeAuth {
             TreeAuth::Root(lanes) => emit_verify_opening(b, values, index_bits, siblings, lanes),
             TreeAuth::Cap(cap) => {
                 assert_eq!(
-                    siblings.len() + cap.height,
+                    siblings.len() + cap.height(),
                     index_bits.len(),
                     "a path to the cap: one sibling per level below it"
                 );
-                let (walk_bits, top_bits) = index_bits.split_at(siblings.len());
                 let leaf = emit_block_leaf(b, values);
-                let walked = edsl::wrap_merkle_walk(b, leaf, walk_bits, siblings);
-                let node = cap.select(b, top_bits);
-                for (x, y) in walked.iter().zip(node.iter()) {
-                    edsl::assert_word_eq(b, *x, *y);
-                }
+                cap.verify_path(b, leaf, index_bits, siblings);
             }
         }
     }

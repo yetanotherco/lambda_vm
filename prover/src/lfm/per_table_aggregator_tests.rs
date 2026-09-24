@@ -457,6 +457,7 @@ pub(super) fn global_arena_words(g: &RealGlobal) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }
@@ -1216,6 +1217,7 @@ pub(super) fn child_arena_words(c: &RealChild) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }

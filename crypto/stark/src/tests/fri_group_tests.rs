@@ -21,6 +21,7 @@ use crate::fri::group::{
 };
 use crate::fri::terminal::{FriFoldLayout, terminal_codeword_from_coeffs};
 use crate::fri::{commit_phase_with_layout, fold_times, query_phase_with_layout};
+use crate::merkle_caps::TreeCheck;
 use crate::proof::options::{FriMode, FriScheduleOverride, ProofFormat};
 use crate::traits::AIR;
 
@@ -234,6 +235,16 @@ fn fri_accepts<H: StarkHash>(run: &FriRun, deep: &[Ext], o: &Felt) -> bool {
     let tables: Vec<Vec<Felt>> = (0..=6)
         .map(|d| roots_of_unity_table::<F>(d).unwrap())
         .collect();
+    // One uncapped check per layer tree, at the layout's group-tree depth.
+    let checks: Vec<TreeCheck<'_>> = run
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(j, root)| {
+            let depth = run.layout.layer_depth(run.lde_log, j) as usize;
+            TreeCheck::build::<H::Batched<E>>(root, depth, 0, || None).unwrap()
+        })
+        .collect();
     run.iotas
         .iter()
         .zip(&run.decommitments)
@@ -244,8 +255,8 @@ fn fri_accepts<H: StarkHash>(run: &FriRun, deep: &[Ext], o: &Felt) -> bool {
             let v = (p0 + p0s) + &x_inv * &run.zetas[0] * (p0 - p0s);
             verify_query_groups::<F, E, H::Batched<E>>(
                 &run.layout,
-                run.lde_log,
-                &run.roots,
+                &checks,
+                0,
                 |j| dec.layers_auth_paths[j].merkle_path.as_slice(),
                 &dec.layers_evaluations_sym,
                 &run.zetas,

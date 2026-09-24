@@ -77,10 +77,11 @@ digest of the KAT codeword's first group (values `0 .. 2^d`), and the root of
 the whole KAT codeword committed as a group-leaf layer tree (`2^{7−d}` leaves).
 Digests are the 32-byte node encoding, hex.
 
-**(d) `d_proof_{keccak,blake3,rpx}_{pair,dp,dp_3_1_3}.{json,rkyv}`** — one small
+**(d) `d_proof_{keccak,blake3,rpx}_{pair,dp,dp_3_1_3,cap_pair,cap_dp}.{json,rkyv}`** — one small
 proof per format: `LogReadOnlyRAP<Goldilocks, Goldilocks³>` (one aux column),
 `2^10` rows of reads `(i % 5 + 1, 10·(i % 5 + 1))`, blowup 4 (so `B = 12`),
-`fri_final_poly_log_degree = 2` (`T = 4`), 3 queries, grinding 0, coset
+`fri_final_poly_log_degree = 2` (`T = 4`), 3 queries (20 for the `cap_*`
+formats), grinding 0, coset
 offset 3, proved with `DefaultTranscript::new(&[])` by `GenericProver<…, H>`.
 `.rkyv` is the proof's rkyv bytes (`StarkProof`, the wire format of record).
 The JSON has the layout (`schedule`, `legacy_encoding`, `total_folds`,
@@ -91,10 +92,16 @@ per query `iota`, the DEEP pair (`deep` = p₀(υ), `deep_sym` = p₀(−υ)),
 authentication `path_len`. Formats: `pair` (today, all-ones schedule),
 `dp` (the DP's schedule at `Q = 3`, cap off: `[3, 2, 2]`), `dp_3_1_3` (an
 explicit uneven schedule via the test hook `fri_schedule_override`: unequal
-neighbouring exponents are what catch a fold-count off-by-one).
+neighbouring exponents are what catch a fold-count off-by-one), and the
+Merkle-cap pair (REVIEW-FRI F9): `cap_pair` (`LAMBDA_VM_ZF_CAP=auto`, today's
+FRI) and `cap_dp` (`auto` cap and the DP's schedule), at `Q = 20` so that
+`auto` caps every tree at height 3. Their JSON adds `merkle_cap`,
+`trace_tree_depth`, `trace_cap`, `fri_tree_depths` and `fri_caps` (the
+verifier's `StarkCaps`); each capped tree's `2^c` cap nodes ride at the end of
+query 0's authentication path (the owner path, `D − c + 2^c` nodes; every
+other query carries `D − c`). The cap changes no transcript value: `cap_dp`'s
+roots and `zetas` equal `dp`'s.
 
 ## Not here yet
 
 - (e) S2 one-row leaf digests and the input-tree root (H6, after S2).
-- A vector with a Merkle cap (`Q ≥ 20` so `cap = auto` caps; REVIEW-FRI F9):
-  the cap is not implemented on this branch.

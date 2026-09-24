@@ -241,11 +241,11 @@ impl FromStr for OneRowMode {
 /// could print a non-default format and prove the default one. Each lane
 /// flips its own flag in the commit that makes the lever real.
 ///
-/// The Merkle cap is real on the host and device STARK provers and the host
-/// verifier (design/CAP.md C3 + C4). ⚠ NOT yet in the LFM in-guest verifier
-/// (C5): a recursion run that wraps a capped proof fails closed there, so
-/// `LAMBDA_VM_ZF_CAP` is for STARK-level tests and measurements until C5
-/// lands.
+/// The Merkle cap is real on the host and device STARK provers, the host
+/// verifier (design/CAP.md C3 + C4) and the LFM in-guest STARK verifier (C5:
+/// `lfm::merkle_cap::CapCells`, one caps arena per sub-proof), on pair and on
+/// group-leaf (`Dp`) FRI layers alike. The RV64 recursion guest stays
+/// default-only (RULINGS 11).
 pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
 /// `FriMode::Dp` (S3) is implemented on the HOST paths only:
@@ -255,12 +255,13 @@ pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 ///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
 ///   table runs the CPU FRI loop (DEEP may still run on the device).
 ///
-/// NOT implemented: device group-leaf FRI (lane I-FRI-D), the in-guest (LFM)
-/// verifier of a `Dp` proof (lane I-FRI-G: `lfm::fri::FriShape` still derives
-/// the legacy layout, so an LFM wrap or node over a `Dp` proof fails at emit
-/// time), and the RV64 recursion guest (default-only by RULINGS 11; it refuses
-/// a non-default format). A block run under `LAMBDA_VM_ZF_FRI=dp` therefore
-/// proves and host-verifies its STARK proofs but cannot recurse over them yet.
+/// - the in-guest (LFM) STARK verifier (G1 + G2): `lfm::fri::FriShape` takes
+///   the same schedule, and the emitter verifies group layers (slot check,
+///   group leaf, group fold), so an LFM wrap or node verifies a `Dp` proof.
+///
+/// NOT implemented: device group-leaf FRI (lane I-FRI-D) and the RV64
+/// recursion guest (default-only by RULINGS 11; it refuses a non-default
+/// format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
 /// See [`MERKLE_CAP_IMPLEMENTED`].

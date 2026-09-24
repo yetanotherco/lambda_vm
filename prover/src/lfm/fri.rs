@@ -32,13 +32,15 @@
 //! also mirrors the CPU layout only — `fri/mod.rs` has cuda fast paths that
 //! claim the same layout, unverified here and never run by the machine.
 
-use stark::proof::options::ProofOptions;
+use stark::fri::schedule::FriFormat;
+use stark::proof::options::{FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 use crate::tables::types::FE;
 
-use super::builder::{Bit, Ext, Felt, LfmBuilder};
+use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
 use super::instr::ArenaId;
+use super::merkle_cap::CapCells;
 use super::sub_proof::{self, GroupShape};
 
 /// The compile-time shape of one sub-proof's FRI verification.
@@ -58,6 +60,10 @@ pub struct FriShape {
     pub coset_offset: u64,
     /// Queries the sub-proof carries.
     pub num_queries: usize,
+    /// The inner proof's FORMAT (design/CAP.md, design/FRI.md): its Merkle cap
+    /// policy caps every committed layer tree. A verifier constant, taken from
+    /// the inner proof's options — never from the proof.
+    pub format: ProofFormat,
 }
 
 impl FriShape {
@@ -73,6 +79,7 @@ impl FriShape {
             final_poly_log_degree: options.fri_final_poly_log_degree as u32,
             coset_offset: options.coset_offset,
             num_queries: options.fri_number_of_queries,
+            format: options.format,
         }
     }
 
@@ -87,15 +94,90 @@ impl FriShape {
         self.log2_lde_length - self.terminal_log()
     }
 
-    /// Committed (Merkle-rooted) layers — one root, one auth path per query,
-    /// and one Merkle walk to emit, each.
+    /// Whether the proof uses today's FRI encoding: pair layers, one sibling
+    /// value per committed layer (`fri = pair`). Decided by the FORMAT, never
+    /// by the schedule's values: a `dp` schedule of all ones still uses the
+    /// group encoding (`FriFormat::is_legacy`). Every non-legacy path below is
+    /// the S3 group path; the legacy emission is today's, instruction for
+    /// instruction.
+    pub fn is_legacy(self) -> bool {
+        self.format.fri_mode == FriMode::Pair
+    }
+
+    /// The host's own FRI format for this shape (the fold-schedule DP's
+    /// inputs): the mode, the query count (every FRI tree is opened once per
+    /// query), the cap policy and the test-only schedule override.
+    fn fri_format(self) -> FriFormat {
+        FriFormat {
+            mode: self.format.fri_mode,
+            one_row: false,
+            num_queries: self.num_queries as u64,
+            cap: self.format.merkle_cap,
+            schedule_override: self.format.fri_schedule_override,
+        }
+    }
+
+    /// ★ The committed layers' fold exponents, first committed layer first —
+    /// the SAME function the host prover and verifier lay out with
+    /// (`stark::fri::schedule::FriFormat::schedule`: the all-ones schedule
+    /// under `pair`, the RULINGS-13 cost-law DP under `dp`). A format
+    /// constant: nothing here reads a proof.
     ///
-    /// **`total_folds − 1`, not `total_folds`.** The final fold is performed
-    /// and never committed (`fri/mod.rs:114-118`), so a query folds once more
-    /// than it authenticates. This off-by-one is the readiest way to build a
-    /// verifier that looks right and checks one layer too few.
+    /// ⚠ `num_queries` is a DP input (and a cap-policy input): a program that
+    /// verifies a SUBSET of a proof's queries has a different `dp` schedule
+    /// and `auto` caps than the proof unless the query count is kept.
+    pub fn schedule(self) -> Vec<u8> {
+        self.fri_format()
+            .schedule(self.log2_lde_length, self.terminal_log())
+    }
+
+    /// Committed (Merkle-rooted) layers — one root, one auth path per query,
+    /// and one Merkle walk to emit, each: the schedule's length.
+    ///
+    /// **`total_folds − 1` under `pair`, not `total_folds`.** The final fold is
+    /// performed and never committed (`fri/mod.rs:114-118`), so a query folds
+    /// once more than it authenticates. This off-by-one is the readiest way to
+    /// build a verifier that looks right and checks one layer too few.
     pub fn num_committed(self) -> usize {
-        self.total_folds().saturating_sub(1) as usize
+        self.schedule().len()
+    }
+
+    /// Fold exponent `d_j` of committed layer `j`: a leaf groups `2^{d_j}`
+    /// consecutive values (1 = today's pair).
+    pub fn layer_fold(self, layer: usize) -> u32 {
+        u32::from(self.schedule()[layer])
+    }
+
+    /// Index bits consumed before committed layer `j`: `G_j = Σ_{i<j} d_i`.
+    /// Layer `j`'s slot is `bits[G_j .. G_j + d_j]` and its tree's leaf index
+    /// `bits[G_j + d_j ..]` (FRI.md §3.2).
+    pub fn layer_bit_offset(self, layer: usize) -> usize {
+        self.schedule()[..layer].iter().map(|&d| d as usize).sum()
+    }
+
+    /// Opened values one query's opening of committed layer `j` carries: the
+    /// sibling alone under `pair`, the whole `2^{d_j}` group otherwise
+    /// (FRI.md §3.4 — the query's own value included).
+    pub fn layer_values(self, layer: usize) -> usize {
+        if self.is_legacy() {
+            1
+        } else {
+            1usize << self.layer_fold(layer)
+        }
+    }
+
+    /// Felts committed layer `j`'s leaf hashes: `2^{d_j}` extension values of
+    /// three felts — six (the pair) under `pair`.
+    pub fn layer_leaf_felts(self, layer: usize) -> usize {
+        3 << self.layer_fold(layer)
+    }
+
+    /// Leaf permutations one query costs across every committed layer under
+    /// `hash`'s own block rule (`epoch_verify::blocks_for`).
+    pub fn leaf_permutations_per_query(self, hash: super::edsl::WrapHash) -> usize {
+        (0..self.num_committed())
+            .map(|j| super::epoch_verify::blocks_for(self.layer_leaf_felts(j), hash))
+            .sum()
     }
 
     /// Folds a query performs: `num_committed + 1` whenever anything folds at
@@ -120,13 +202,52 @@ impl FriShape {
         1usize << self.effective_k()
     }
 
-    /// Merkle path length for committed layer `i`: that layer's codeword is
-    /// `2^(n−i−1)` long and its leaves are pairs, so the tree has `2^(n−i−2)`
-    /// leaves.
+    /// Tree depth of committed layer `j`: the layer is `2^(n − 1 − G_j)`
+    /// values long and its leaves group `2^{d_j}`, so the tree has
+    /// `2^(n − 1 − G_j − d_j)` leaves — `n − j − 2` under `pair`.
+    pub fn layer_depth(self, layer: usize) -> usize {
+        let schedule = self.schedule();
+        assert!(
+            layer < schedule.len(),
+            "layer index must be below num_committed"
+        );
+        let consumed: usize = schedule[..=layer].iter().map(|&d| d as usize).sum();
+        self.index_bits() - consumed
+    }
+
+    /// Merkle-cap height of committed layer `i`'s tree under the format's cap
+    /// policy: every layer tree is opened once per query (`0` = uncapped).
+    /// The same function the host prover and verifier use
+    /// (`stark::merkle_caps::StarkCaps`), at the same depth.
+    pub fn layer_cap(self, layer: usize) -> usize {
+        self.format
+            .merkle_cap
+            .height(self.num_queries, self.layer_depth(layer))
+    }
+
+    /// Merkle path length a query's opening of committed layer `i` carries:
+    /// the tree's depth less its cap height (the owner path's cap is split off
+    /// into the caps arena).
     pub fn layer_path_len(self, layer: usize) -> usize {
-        (self.log2_lde_length as usize)
-            .checked_sub(layer + 2)
-            .expect("layer index must be below num_committed")
+        self.layer_depth(layer) - self.layer_cap(layer)
+    }
+
+    /// Arena words the committed layers' caps occupy, once per sub-proof.
+    pub fn cap_words(self, digest_words: usize) -> usize {
+        (0..self.num_committed())
+            .map(|i| match self.layer_cap(i) {
+                0 => 0,
+                c => (1usize << c) * digest_words,
+            })
+            .sum()
+    }
+
+    /// Permutations the committed layers' cap checks cost, once per
+    /// sub-proof: `2^c − 1` parents per capped layer.
+    pub fn cap_permutations(self) -> usize {
+        (0..self.num_committed())
+            .map(|i| super::merkle_cap::cap_root_permutations(self.layer_cap(i)))
+            .sum()
     }
 
     /// Merkle path steps one query walks across every committed layer.
@@ -136,11 +257,13 @@ impl FriShape {
             .sum()
     }
 
-    /// Keccak permutations one query costs: one leaf hash per committed layer
-    /// (a 48-byte pair, one rate block) plus one per path step (64 bytes, one
-    /// rate block).
+    /// Permutations one query costs under the production wrap hash: every
+    /// committed layer's leaf (a 48-byte pair is one block under every hash;
+    /// a `2^d` group is `⌈3·2^d / 8⌉` at the rate-8 algebraic sponge) plus one
+    /// per path step (a parent is one compression under every hash).
     pub fn permutations_per_query(self) -> usize {
-        self.num_committed() + self.path_steps_per_query()
+        self.leaf_permutations_per_query(super::edsl::WrapHash::production())
+            + self.path_steps_per_query()
     }
 
     /// Index bits a query carries — `log2(lde) − 1`, which is both the TRACE
@@ -152,20 +275,26 @@ impl FriShape {
     /// as its leaf-ordering parity and `bits[i+1..]` as its walk, and
     /// `bits[i+1..].len() = n − i − 2 = layer_path_len(i)` exactly — the layer
     /// tree's depth is not a separate fact to keep in sync, it is what is left
-    /// of the index after the folds already performed.
+    /// of the index after the folds already performed. (Under a Merkle cap the
+    /// top `layer_cap(i)` of those bits pick the cap node instead of being
+    /// walked; the split is the cap's own, [`CapCells::verify_path`].)
     pub fn index_bits(self) -> usize {
         self.log2_lde_length as usize - 1
     }
 
-    /// Arena words one query's FRI opening occupies: per committed layer the
-    /// symmetric evaluation (one word) and its path (`digest_words` per level).
+    /// Arena words one query's FRI opening occupies: per committed layer its
+    /// opened values ([`Self::layer_values`]: the symmetric evaluation, or the
+    /// whole group) and its path (`digest_words` per level).
     ///
     /// `digest_words` is the BUILDER's digest width on the machine side
     /// (`edsl::digest_words(b)`) and `proof_arena::words_per_root()` on the
     /// host side — see `SubProofShape::query_words` for why it is an argument.
     pub fn query_words(self, digest_words: usize) -> usize {
         // The path stride is the DIGEST's width, not a literal two.
-        self.num_committed() + digest_words * self.path_steps_per_query()
+        let values: usize = (0..self.num_committed())
+            .map(|j| self.layer_values(j))
+            .sum();
+        values + digest_words * self.path_steps_per_query()
     }
 
     /// Keccak permutations the whole sub-proof's FRI costs.
@@ -175,6 +304,28 @@ impl FriShape {
 
     /// Invariants a caller cannot assemble their way out of.
     pub fn check(self) {
+        assert!(
+            self.format.one_row == OneRowMode::Off,
+            "the in-guest FRI verifier implements row-pair openings only (one-row \
+             openings, S2, are a later in-guest unit): {:?}",
+            self.format.one_row
+        );
+        // The schedule covers exactly the committed folds (`FriFoldLayout`'s
+        // constructor invariant, which refuses a proof otherwise).
+        let schedule = self.schedule();
+        let covered: u32 = schedule.iter().map(|&d| u32::from(d)).sum();
+        assert!(
+            schedule
+                .iter()
+                .all(|&d| (1..=stark::fri::schedule::FRI_SCHEDULE_DMAX).contains(&u32::from(d))),
+            "every fold exponent is in 1..=DMAX: {schedule:?}"
+        );
+        assert_eq!(
+            covered,
+            self.total_folds().saturating_sub(1),
+            "the schedule {schedule:?} must cover the committed folds (fold 0 is binary \
+             and uncommitted)"
+        );
         assert!(
             self.blowup_log >= 1,
             "a blowup of 1 is not a low-degree extension"
@@ -271,6 +422,9 @@ pub struct LayerCommitment {
     /// of four felts. `edsl::assert_digest_eq_lanes` zips a digest against these
     /// and asserts the widths agree, so it works at either width unchanged.
     pub root_lanes: Vec<[Felt; 4]>,
+    /// The layer tree's authenticated Merkle cap, when the format caps it
+    /// (see [`super::sub_proof::GroupCommitment::cap`]). `None` = today.
+    pub cap: Option<CapCells>,
 }
 
 impl LayerCommitment {
@@ -286,7 +440,10 @@ impl LayerCommitment {
                 b.unpack(w)
             })
             .collect();
-        LayerCommitment { root_lanes }
+        LayerCommitment {
+            root_lanes,
+            cap: None,
+        }
     }
 
     /// A layer commitment over lanes the caller already holds.
@@ -297,8 +454,73 @@ impl LayerCommitment {
     /// [`super::sub_proof::GroupCommitment::from_lanes`] for the same argument at
     /// the trace trees.
     pub fn from_lanes(root_lanes: Vec<[Felt; 4]>) -> Self {
-        LayerCommitment { root_lanes }
+        LayerCommitment {
+            root_lanes,
+            cap: None,
+        }
     }
+
+    /// Hint this layer tree's height-`c` cap out of `arena` at `base` and
+    /// authenticate it against the root lanes, once per tree (see
+    /// [`super::sub_proof::GroupCommitment::hint_cap`]). Returns the next free
+    /// word; `c = 0` hints nothing.
+    pub fn hint_cap(&mut self, b: &mut LfmBuilder, arena: ArenaId, base: u32, c: usize) -> u32 {
+        if c == 0 {
+            return base;
+        }
+        let (cap, next) =
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+        self.cap = Some(cap);
+        next
+    }
+
+    /// Authenticate an opened leaf of this layer at the tree's WHOLE leaf
+    /// index: against the cap when capped, else against the root lanes (the
+    /// uncapped emission is today's, instruction for instruction).
+    fn authenticate(
+        &self,
+        b: &mut LfmBuilder,
+        leaf: WrapDigest,
+        index_bits: &[Bit],
+        siblings: &[WrapDigest],
+    ) {
+        match &self.cap {
+            None => {
+                let root = edsl::wrap_merkle_walk(b, leaf, index_bits, siblings);
+                edsl::assert_digest_eq_lanes(b, root, &self.root_lanes);
+            }
+            Some(cap) => cap.verify_path(b, leaf, index_bits, siblings),
+        }
+    }
+
+    fn cap_height(&self) -> usize {
+        self.cap.as_ref().map_or(0, CapCells::height)
+    }
+}
+
+/// Hint and authenticate every capped committed layer's cap, in layer order,
+/// out of `arena` from word 0 — once per sub-proof. The words it reads are
+/// exactly [`FriShape::cap_words`].
+pub fn hint_layer_caps(
+    b: &mut LfmBuilder,
+    shape: FriShape,
+    arena: ArenaId,
+    layers: &mut [LayerCommitment],
+) {
+    assert_eq!(
+        layers.len(),
+        shape.num_committed(),
+        "one commitment per layer"
+    );
+    let mut at = 0u32;
+    for (i, layer) in layers.iter_mut().enumerate() {
+        at = layer.hint_cap(b, arena, at, shape.layer_cap(i));
+    }
+    assert_eq!(
+        at as usize,
+        shape.cap_words(edsl::digest_words(b) as usize),
+        "the FRI caps fill exactly what the shape declares"
+    );
 }
 
 /// A sub-proof's FRI data that does not depend on the query.
@@ -312,6 +534,46 @@ pub struct FriCommitments {
     pub zetas: Vec<Ext>,
     /// The terminal polynomial's `2^effective_k` coefficients, low-to-high.
     pub coeffs: Vec<Ext>,
+    /// Under the group encoding (S3): per committed layer `j`, the challenges
+    /// its `d_j` binary folds use — `ζ_{j+1}, ζ_{j+1}², …, ζ_{j+1}^{2^{d_j−1}}`
+    /// (FRI.md §1.2) — squared ONCE per sub-proof, not per query. Empty under
+    /// `pair`, where each layer folds once with `ζ_{j+1}` itself.
+    pub zeta_powers: Vec<Vec<Ext>>,
+}
+
+impl FriCommitments {
+    /// The commitments of one sub-proof's FRI, with the group encoding's
+    /// challenge powers hoisted ([`Self::zeta_powers`]; nothing is emitted
+    /// under `pair`, so today's program is unchanged).
+    pub fn new(
+        b: &mut LfmBuilder,
+        shape: FriShape,
+        layers: Vec<LayerCommitment>,
+        zetas: Vec<Ext>,
+        coeffs: Vec<Ext>,
+    ) -> Self {
+        let zeta_powers = if shape.is_legacy() || zetas.is_empty() {
+            Vec::new()
+        } else {
+            (0..shape.num_committed())
+                .map(|j| {
+                    let mut z = zetas[j + 1];
+                    let mut powers = vec![z];
+                    for _ in 1..shape.layer_fold(j) {
+                        z = b.emul(z, z);
+                        powers.push(z);
+                    }
+                    powers
+                })
+                .collect()
+        };
+        FriCommitments {
+            layers,
+            zetas,
+            coeffs,
+            zeta_powers,
+        }
+    }
 }
 
 /// One query's opening of one committed layer.
@@ -320,11 +582,16 @@ pub struct FriCommitments {
 /// [`super::sub_proof::GroupOpening`], the values are the caller's, so what the
 /// walk authenticates is what the fold consumes.
 pub struct LayerOpening {
-    /// `pᵢ(−υ^(2ⁱ))` — the conjugate the prover supplies. Its partner
-    /// `pᵢ(υ^(2ⁱ))` is not in the proof at all: the verifier computed it as the
-    /// previous fold's output, which is why a FRI layer opening is one value and
-    /// not two.
-    pub sym: Ext,
+    /// Under `pair`: ONE value, `pᵢ(−υ^(2ⁱ))` — the conjugate the prover
+    /// supplies. Its partner `pᵢ(υ^(2ⁱ))` is not in the proof at all: the
+    /// verifier computed it as the previous fold's output, which is why a pair
+    /// layer opening is one value and not two.
+    ///
+    /// Under the group encoding: the whole group of `2^{d_j}` values in
+    /// position (bit-reversed) order, the query's own value at its slot
+    /// included (FRI.md §3.4) — the leaf is hashed straight from them and the
+    /// slot check `values[slot] == v` ties them to the previous fold.
+    pub values: Vec<Ext>,
     /// Sibling digests, LEAF LEVEL FIRST.
     pub siblings: Vec<WrapDigest>,
 }
@@ -360,6 +627,9 @@ pub struct FriArenas {
     /// Per query, per committed layer: the symmetric evaluation, then the
     /// sibling digests (two words per level).
     pub queries: ArenaId,
+    /// Per capped committed layer, its `2^c` cap digests — declared only when
+    /// the format caps some layer ([`FriShape::cap_words`] `> 0`).
+    pub caps: Option<ArenaId>,
 }
 
 /// Declare the FRI arenas and hoist everything a query does not depend on.
@@ -378,14 +648,19 @@ pub fn declare_fri(
     let coeffs = b.declare_arena(shape.num_terminal_coeffs() as u32);
     let queries =
         b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
+    let cap_words = shape.cap_words(edsl::digest_words(b) as usize);
+    let caps = (cap_words > 0).then(|| b.declare_arena(cap_words as u32));
 
-    let layers = (0..c)
+    let mut layers: Vec<LayerCommitment> = (0..c)
         .map(|i| LayerCommitment::hint(b, roots, edsl::digest_words(b) * i as u32))
         .collect();
-    let zeta_cells = (0..num_zetas as u32)
+    if let Some(caps) = caps {
+        hint_layer_caps(b, shape, caps, &mut layers);
+    }
+    let zeta_cells: Vec<Ext> = (0..num_zetas as u32)
         .map(|i| b.hint_word(zetas, i).as_ext())
         .collect();
-    let coeff_cells = (0..shape.num_terminal_coeffs() as u32)
+    let coeff_cells: Vec<Ext> = (0..shape.num_terminal_coeffs() as u32)
         .map(|i| b.hint_word(coeffs, i).as_ext())
         .collect();
 
@@ -395,12 +670,9 @@ pub fn declare_fri(
             zetas,
             coeffs,
             queries,
+            caps,
         },
-        FriCommitments {
-            layers,
-            zetas: zeta_cells,
-            coeffs: coeff_cells,
-        },
+        FriCommitments::new(b, shape, layers, zeta_cells, coeff_cells),
     )
 }
 
@@ -430,8 +702,13 @@ pub fn hint_layer_openings_from(
     let mut cursor = (query * stride) as u32;
     let openings: Vec<LayerOpening> = (0..shape.num_committed())
         .map(|layer| {
-            let sym = b.hint_word(arena, cursor).as_ext();
-            cursor += 1;
+            let values: Vec<Ext> = (0..shape.layer_values(layer))
+                .map(|_| {
+                    let v = b.hint_word(arena, cursor).as_ext();
+                    cursor += 1;
+                    v
+                })
+                .collect();
             let siblings: Vec<WrapDigest> = (0..shape.layer_path_len(layer))
                 .map(|_| {
                     // The stride follows the DIGEST's width, not a literal.
@@ -440,7 +717,7 @@ pub fn hint_layer_openings_from(
                     d
                 })
                 .collect();
-            LayerOpening { sym, siblings }
+            LayerOpening { values, siblings }
         })
         .collect();
     assert_eq!(
@@ -532,6 +809,13 @@ pub fn emit_query_fri(
     );
     assert_eq!(fri.layers.len(), c, "one commitment per committed layer");
     assert_eq!(openings.len(), c, "one opening per committed layer");
+    for (i, layer) in fri.layers.iter().enumerate() {
+        assert_eq!(
+            layer.cap_height(),
+            shape.layer_cap(i),
+            "layer {i} is capped at the shape's height"
+        );
+    }
     assert_eq!(
         fri.coeffs.len(),
         shape.num_terminal_coeffs(),
@@ -571,20 +855,48 @@ pub fn emit_query_fri(
     // (spec §6). And no parity branch, because the sign the odd slot introduces
     // into `x⁻¹` is the same sign it introduces into `v − sym`, so the two
     // cancel (spec §3). Parity is consulted ONLY for the leaf byte order below.
-    let mut inv_pow = inv;
-    for (i, opening) in openings.iter().enumerate() {
-        // `if index % 2 == 1 { [sym, v] } else { [v, sym] }` (`verifier.rs:637`)
-        // — the even codeword slot leads. `select(bit, l, r)` returns `(l, r)`
-        // at 0 and `(r, l)` at 1, so this IS that conditional.
-        let (first, second) = b.select(q.bits[i], v.as_cell(), opening.sym.as_cell());
-        let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
-        let root = edsl::wrap_merkle_walk(b, leaf, &q.bits[i + 1..], &opening.siblings);
-        edsl::assert_digest_eq_lanes(b, root, &fri.layers[i].root_lanes);
+    if shape.is_legacy() {
+        let mut inv_pow = inv;
+        for (i, opening) in openings.iter().enumerate() {
+            assert_eq!(opening.values.len(), 1, "a pair layer opens its sibling");
+            let sym = opening.values[0];
+            // `if index % 2 == 1 { [sym, v] } else { [v, sym] }` (`verifier.rs:637`)
+            // — the even codeword slot leads. `select(bit, l, r)` returns `(l, r)`
+            // at 0 and `(r, l)` at 1, so this IS that conditional.
+            let (first, second) = b.select(q.bits[i], v.as_cell(), sym.as_cell());
+            let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
+            // `bits[i+1..]` is this layer tree's whole leaf index; a cap walks its
+            // low bits and muxes the top ones.
+            fri.layers[i].authenticate(b, leaf, &q.bits[i + 1..], &opening.siblings);
 
-        // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
-        // squaring per layer (`verifier.rs:692-697`).
-        inv_pow = b.mul(inv_pow, inv_pow);
-        v = edsl::fri_fold(b, v, opening.sym, fri.zetas[i + 1], inv_pow);
+            // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
+            // squaring per layer (`verifier.rs:692-697`).
+            inv_pow = b.mul(inv_pow, inv_pow);
+            v = edsl::fri_fold(b, v, sym, fri.zetas[i + 1], inv_pow);
+        }
+    } else {
+        // The group encoding (S3): committed layer `j` opens a whole coset of
+        // `2^{d_j}` values. `y⁻¹` at committed layer 0 is `υ^{−2}`, and each
+        // layer hands the next its own point (`x_g^{2^d}`, FRI.md §1.1).
+        assert_eq!(
+            fri.zeta_powers.len(),
+            c,
+            "the challenge powers are hoisted once per committed layer"
+        );
+        let mut y_inv = b.mul(inv, inv);
+        for (j, opening) in openings.iter().enumerate() {
+            (v, y_inv) = emit_group_layer(
+                b,
+                shape,
+                j,
+                &fri.layers[j],
+                &fri.zeta_powers[j],
+                v,
+                y_inv,
+                opening,
+                q.bits,
+            );
+        }
     }
 
     // `x = υ^(2^total_folds)`: where the fold chain has arrived, and the
@@ -596,6 +908,192 @@ pub fn emit_query_fri(
     let at = emit_terminal_eval(b, fri, x);
     b.assert_eq_ext(at, v);
     v
+}
+
+/// The program constants of one group fold of exponent `d` (FRI.md §1.3), in
+/// the host verifier's own terms (`fri::group::group_fold`, whose table is
+/// `ω_{2^d}^t` for `ω_{2^d} = get_primitive_root_of_unity(d)`):
+///
+/// - `slot[ℓ] = ω_{2^d}^{2^{d−1−ℓ}}`, so `x_g⁻¹ = y⁻¹·Π_ℓ slot[ℓ]^{s_ℓ}
+///   = y⁻¹·ω_{2^d}^{br_d(s)}` for the slot `s` (bits `s_ℓ`, low first);
+/// - `kappa[ℓ][j] = ω_{2^d}^{−2^ℓ·br_{d−ℓ−1}(j)}`: fold level `ℓ`'s pair `j`
+///   sits at `(X, −X)` with `X⁻¹ = x_g^{−2^ℓ}·kappa[ℓ][j]` (`kappa[ℓ][0] = 1`).
+fn group_fold_constants(d: u32) -> (Vec<FE>, Vec<Vec<FE>>) {
+    use math::fft::bit_reversing::reverse_index;
+    use math::field::traits::IsFFTField;
+
+    let n = 1usize << d;
+    let w = <crate::tables::types::GoldilocksField as IsFFTField>::get_primitive_root_of_unity(
+        u64::from(d),
+    )
+    .expect("2^d divides the two-adicity for d <= DMAX");
+    let pow = |e: usize| w.pow(e as u64);
+    let slot = (0..d as usize)
+        .map(|l| pow(1 << (d as usize - 1 - l)))
+        .collect();
+    let kappa = (0..d as usize)
+        .map(|l| {
+            let half = n >> (l + 1);
+            (0..half)
+                .map(|j| {
+                    let br = if half > 1 {
+                        reverse_index(j, half as u64)
+                    } else {
+                        0
+                    };
+                    pow((n - (br << l)) % n)
+                })
+                .collect()
+        })
+        .collect();
+    (slot, kappa)
+}
+
+// The load-bearing test of the slot check (the in-guest M1): a test build can
+// emit without it and watch a moved `p₀` execute. Production has no switch.
+#[cfg(test)]
+thread_local! {
+    pub(super) static SKIP_SLOT_CHECK: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+#[inline]
+fn skip_slot_check() -> bool {
+    #[cfg(test)]
+    {
+        SKIP_SLOT_CHECK.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// `values[slot]` for the slot's bits, LOW first: a balanced mux of
+/// `2^d − 1` `Select`s over ext cells, pairs `(2t, 2t + 1)` level by level.
+fn emit_value_mux(b: &mut LfmBuilder, values: &[Ext], slot_bits: &[Bit]) -> Ext {
+    assert_eq!(
+        values.len(),
+        1usize << slot_bits.len(),
+        "one mux level per slot bit"
+    );
+    let mut level: Vec<Cell> = values.iter().map(|v| v.as_cell()).collect();
+    for bit in slot_bits {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks_exact(2) {
+            next.push(b.select(*bit, pair[0], pair[1]).0);
+        }
+        level = next;
+    }
+    level[0].as_ext()
+}
+
+/// ★ One committed layer under the group encoding (S3; FRI.md §1.3, §3.2, §6).
+///
+/// With `d = d_j`, `G = G_j`, the query's bits `bits` (low first, all
+/// `index_bits`), its value `v` at this layer (the previous fold's output) and
+/// the inverse `y⁻¹` of its point here:
+///
+/// 1. **slot check** — `values[bits[G..G+d]] == v`, a `2^d − 1`-select mux and
+///    an `assert_eq_ext`: the round-consistency check tying the opened group
+///    to the value the previous fold produced (M1 on the host);
+/// 2. **the group is the leaf** — hashed in full, position order (a
+///    `GroupShape` of `2^{d−1}` ext columns covers `2^d` values; REVIEW-FRI
+///    F6), and authenticated at the tree's leaf index `bits[G+d..]` against the
+///    layer's root or cap;
+/// 3. **the group fold** with `ζ, ζ², …, ζ^{2^{d−1}}`: `x_g⁻¹ = y⁻¹·ω_{2^d}^{br_d(s)}`
+///    (`d` selects of constants and `d` base muls), then `d` levels of
+///    `fri_fold` over the pairs, the level's `x_g^{−2^ℓ}` squared once per
+///    level. A level with more than two pairs folds `ζ^{2^ℓ}·x_g^{−2^ℓ}` into
+///    the challenge once (one `emul_base`) and multiplies each pair by its
+///    constant inside the fold; a level with one or two pairs multiplies the
+///    point instead (at most one base mul). After `d` levels the point is
+///    `x_g^{−2^d}`, the NEXT layer's `y⁻¹`.
+///
+/// Returns `(v, y⁻¹)` at the next layer.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_group_layer(
+    b: &mut LfmBuilder,
+    shape: FriShape,
+    layer: usize,
+    commitment: &LayerCommitment,
+    zeta_powers: &[Ext],
+    v: Ext,
+    y_inv: Felt,
+    opening: &LayerOpening,
+    bits: &[Bit],
+) -> (Ext, Felt) {
+    let d = shape.layer_fold(layer);
+    let g = shape.layer_bit_offset(layer);
+    let n = 1usize << d;
+    assert_eq!(opening.values.len(), n, "a group layer opens 2^d values");
+    assert_eq!(
+        zeta_powers.len(),
+        d as usize,
+        "one challenge power per fold level"
+    );
+    assert_eq!(
+        bits.len() - (g + d as usize),
+        shape.layer_depth(layer),
+        "the tree's leaf index is what is left of the query after the slot"
+    );
+    let slot_bits = &bits[g..g + d as usize];
+
+    // (1) the slot check.
+    let v_slot = emit_value_mux(b, &opening.values, slot_bits);
+    if !skip_slot_check() {
+        b.assert_eq_ext(v_slot, v);
+    }
+
+    // (2) the group is the leaf.
+    let cells: Vec<Cell> = opening.values.iter().map(|x| x.as_cell()).collect();
+    let leaf = sub_proof::emit_leaf_hash(
+        b,
+        GroupShape {
+            num_columns: n / 2,
+            is_ext: true,
+        },
+        &cells,
+    );
+    commitment.authenticate(b, leaf, &bits[g + d as usize..], &opening.siblings);
+
+    // (3) the group fold.
+    let (slot_factors, kappa) = group_fold_constants(d);
+    let mut xinv = y_inv;
+    for (bit, factor) in slot_bits.iter().zip(&slot_factors) {
+        let one = b.felt_const(FE::one());
+        let f = b.felt_const(*factor);
+        let (chosen, _) = b.select(*bit, one.as_cell(), f.as_cell());
+        xinv = b.mul(xinv, Felt(chosen.0));
+    }
+    let mut vals = opening.values.clone();
+    for (l, zeta) in zeta_powers.iter().enumerate() {
+        let half = vals.len() / 2;
+        let scaled = (half > 2).then(|| b.emul_base(*zeta, xinv));
+        let mut next = Vec::with_capacity(half);
+        for j in 0..half {
+            let (lo, hi) = (vals[2 * j], vals[2 * j + 1]);
+            let folded = match scaled {
+                Some(zx) => {
+                    let k = b.felt_const(kappa[l][j]);
+                    edsl::fri_fold(b, lo, hi, zx, k)
+                }
+                None => {
+                    let x = if j == 0 {
+                        xinv
+                    } else {
+                        let k = b.felt_const(kappa[l][j]);
+                        b.mul(xinv, k)
+                    };
+                    edsl::fri_fold(b, lo, hi, *zeta, x)
+                }
+            };
+            next.push(folded);
+        }
+        vals = next;
+        xinv = b.mul(xinv, xinv);
+    }
+    (vals[0], xinv)
 }
 
 /// A whole sub-proof, both legs: every query's openings authenticated and folded

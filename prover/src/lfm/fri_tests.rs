@@ -33,6 +33,7 @@
 //! challenges to a transcript — they arrive as arena values, and tying them to a
 //! replay is assembly's obligation.
 
+use crypto::merkle_tree::cap::CapPolicy;
 use math::field::traits::IsPrimeField;
 use math::polynomial::Polynomial;
 use stark::config::Commitment;
@@ -77,6 +78,17 @@ pub(super) fn folding_fixture(
     num_boundaries: usize,
     blowup: usize,
 ) -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(blowup as u8)
+        .expect("a power-of-two blowup is valid");
+    folding_fixture_with(num_boundaries, opts)
+}
+
+/// [`folding_fixture`] under explicit proof options — the format axis (a
+/// Merkle cap, a FRI fold schedule) and the query count a cap needs.
+pub(super) fn folding_fixture_with(
+    num_boundaries: usize,
+    opts: stark::proof::options::ProofOptions,
+) -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
     use crate::tables::local_to_global::{
         CellBoundary, FiniClaim, InitClaim, generate_local_to_global_trace,
     };
@@ -87,8 +99,6 @@ pub(super) fn folding_fixture(
         "the trace is padded to a power of two, so a non-power-of-two row count \
          would not be the shape asked for"
     );
-    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(blowup as u8)
-        .expect("a power-of-two blowup is valid");
     let air = crate::continuation::l2g_memory_air(&opts, EPOCH_TEST_LABEL);
 
     let boundaries: Vec<CellBoundary> = (0..num_boundaries as u64)
@@ -120,19 +130,24 @@ pub(super) fn folding_fixture(
 }
 
 /// Everything the FRI leg reads about one real sub-proof.
-struct HostFri {
-    shape: FriShape,
+pub(super) struct HostFri {
+    pub(super) shape: FriShape,
     /// The trace-side host fixture over the SAME proof: the openings, the roots,
     /// and production's own DEEP answers, which are this leg's `p₀`.
-    trace: HostSubProof,
+    pub(super) trace: HostSubProof,
     /// One root per committed layer, in fold order.
-    layer_roots: Vec<Commitment>,
+    pub(super) layer_roots: Vec<Commitment>,
     /// `ζ₀ .. ζ_C` from the verifier's replay.
-    zetas: Vec<FEE>,
+    pub(super) zetas: Vec<FEE>,
     /// The terminal polynomial's coefficients, low-to-high.
-    coeffs: Vec<FEE>,
-    /// `[query][layer]` — `(pᵢ(−υ^(2ⁱ)), path)`.
-    openings: Vec<Vec<(FEE, Vec<Commitment>)>>,
+    pub(super) coeffs: Vec<FEE>,
+    /// `[query][layer]` — `(opened values, path)`: the sibling `pᵢ(−υ^(2ⁱ))`
+    /// under `pair`, the whole group under a fold schedule. Paths are cut at
+    /// each layer's cap (query 0's cap split off into [`Self::caps`]).
+    pub(super) openings: Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>,
+    /// Every capped layer's cap, in layer order — the caps arena. Empty at
+    /// the default format.
+    pub(super) caps: Vec<Commitment>,
 }
 
 /// Build the FRI host fixture for a real proof of `num_boundaries` rows.
@@ -143,7 +158,7 @@ fn host_fri(num_boundaries: usize, blowup: usize) -> HostFri {
 
 /// [`host_fri`] for a proof the caller already holds — needed where the test
 /// also wants the AIR's verifier domain.
-fn host_fri_from(
+pub(super) fn host_fri_from(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     proof: &MultiProof<Gl, Ext3, ()>,
 ) -> HostFri {
@@ -155,16 +170,9 @@ fn host_fri_from(
     let shape = FriShape::from_options(opts, trace.shape.log2_lde_length);
     shape.check();
 
-    let openings = (0..view.query_list_len())
-        .map(|q| {
-            let d = view.query(q);
-            d.layers_evaluations_sym()
-                .iter()
-                .enumerate()
-                .map(|(i, sym)| (*sym, d.layer_auth_path(i).to_vec()))
-                .collect()
-        })
-        .collect();
+    // Per layer the opened values (the sibling, or the whole group) and the
+    // path cut at the layer's cap; query 0's caps go to the caps arena.
+    let (openings, caps) = super::epoch_verify_tests::fri_layer_openings(view, shape);
 
     HostFri {
         shape,
@@ -172,27 +180,33 @@ fn host_fri_from(
         zetas: trace.zetas.clone(),
         coeffs: view.fri_final_poly_coeffs().to_vec(),
         openings,
+        caps,
         trace,
     }
 }
 
 impl HostFri {
     /// The arenas the FRI-only program declares, for the given queries.
-    fn fri_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
-        vec![
+    pub(super) fn fri_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
+        let mut out = vec![
             super::proof_arena::commitments_to_arena(&self.layer_roots),
             self.zetas.iter().map(ext_word).collect(),
             self.coeffs.iter().map(ext_word).collect(),
             self.query_arena(queries),
-        ]
+        ];
+        // Declared by `declare_fri` only when the format caps some layer.
+        if self.shape.cap_words(super::proof_arena::words_per_root()) > 0 {
+            out.push(super::proof_arena::commitments_to_arena(&self.caps));
+        }
+        out
     }
 
     /// Per query, per layer: the symmetric evaluation then its path.
-    fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
+    pub(super) fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
-            for (sym, path) in &self.openings[q] {
-                out.push(ext_word(sym));
+            for (values, path) in &self.openings[q] {
+                out.extend(values.iter().map(ext_word));
                 out.extend(super::proof_arena::commitments_to_arena(path));
             }
         }
@@ -209,7 +223,7 @@ impl HostFri {
     /// evaluation against — and the mirror itself is checked, because the same
     /// codeword must reproduce the values the PROVER folded to, which no reading
     /// of these three lines could fake.
-    fn terminal_codeword(&self) -> Vec<FEE> {
+    pub(super) fn terminal_codeword(&self) -> Vec<FEE> {
         use math::fft::bit_reversing::in_place_bit_reverse_permute;
 
         let coset_offset = FE::from(self.shape.coset_offset);
@@ -347,7 +361,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
 ///
 /// Arena order: the per-query `(index, p₀, p₀ˢ)` block, then the four
 /// [`FriArenas`].
-fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
+pub(super) fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let q = b.declare_arena(3 * num_queries as u32);
     let (arenas, fri) = declare_fri(&mut b, shape, num_queries);
@@ -385,7 +399,7 @@ fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
 
 impl HostFri {
     /// The `(index, p₀, p₀ˢ)` arena [`fri_only_program`] reads.
-    fn deep_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
+    pub(super) fn deep_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
             out.push(base_word(FE::from(self.trace.iotas[q] as u64)));
@@ -396,7 +410,7 @@ impl HostFri {
     }
 
     /// Every arena [`fri_only_program`] declares, in order.
-    fn all_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
+    pub(super) fn all_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
         let mut all = vec![self.deep_arena(queries)];
         all.extend(self.fri_arenas(queries));
         all
@@ -736,14 +750,17 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
     );
 }
 
-fn permutations(program: &LfmProgram) -> usize {
+pub(super) fn permutations(program: &LfmProgram) -> usize {
     // The CONFIGURED wrap hash's compressions. Filtering `KeccakF` here read
     // zero the moment production moved to BLAKE3, turning a cost measurement
     // into a failed assertion about a count nobody had re-derived.
     super::machine_tests::wrap_hash_instrs(program)
 }
 
-fn count_matching<F: Fn(&super::instr::Instr) -> bool>(program: &LfmProgram, f: F) -> usize {
+pub(super) fn count_matching<F: Fn(&super::instr::Instr) -> bool>(
+    program: &LfmProgram,
+    f: F,
+) -> usize {
     program.instrs.iter().filter(|i| f(i)).count()
 }
 
@@ -826,6 +843,7 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
             final_poly_log_degree: 7,
             coset_offset: 3,
             num_queries: queries,
+            format: stark::proof::options::ProofFormat::DEFAULT,
         };
         shape.check();
         let per = marginal_fri(shape);
@@ -1272,4 +1290,179 @@ fn the_fri_leg_proves_and_verifies() {
         permutations(&program),
         h.shape.num_committed(),
     );
+}
+
+// =============================================================================
+// Merkle caps in the FRI leg (S1, design/CAP.md §6.1, C5)
+// =============================================================================
+
+/// The folding fixture's options under a cap policy: blowup 2, `queries`
+/// queries (a cap needs openings: `auto` caps at 3 from 20 on), no grinding.
+fn capped_options(policy: CapPolicy, queries: usize) -> stark::proof::options::ProofOptions {
+    let mut o = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup 2 is valid");
+    o.fri_number_of_queries = queries;
+    o.grinding_factor = 0;
+    o.format.merkle_cap = policy;
+    o
+}
+
+/// 2048 rows at blowup 2: LDE 2^12, trace trees 11 deep, three committed FRI
+/// layers 10, 9 and 8 deep — every tree tall enough for a height-3 cap.
+const CAPPED_ROWS: usize = 2048;
+
+fn capped_host(policy: CapPolicy, queries: usize) -> HostFri {
+    let (air, proof) = folding_fixture_with(CAPPED_ROWS, capped_options(policy, queries));
+    host_fri_from(&*air, &proof)
+}
+
+/// ★ The FRI leg verifies every query of a real CAPPED folding proof, and its
+/// permutation count is the capped closed form exactly: per query one leaf and
+/// `depth − c` parents per layer, plus `2^c − 1` parents per capped layer ONCE
+/// (the cap hashed up to its root).
+#[test]
+fn the_fri_emitter_verifies_a_capped_folding_proof() {
+    for policy in [CapPolicy::Fixed(1), CapPolicy::Fixed(2), CapPolicy::Auto] {
+        let h = capped_host(policy, 24);
+        assert_eq!(h.shape.num_committed(), 3);
+        for i in 0..3 {
+            let want = if policy == CapPolicy::Fixed(1) {
+                1
+            } else if policy == CapPolicy::Fixed(2) {
+                2
+            } else {
+                3
+            };
+            assert_eq!(h.shape.layer_cap(i), want, "{policy}: layer {i}");
+        }
+        let all: Vec<usize> = (0..h.trace.iotas.len()).collect();
+        let program = fri_only_program(h.shape, all.len());
+        let exec = execute(
+            &program,
+            &h.all_arenas(&all),
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .expect("an honest capped FRI decommitment must execute");
+
+        let codeword = h.terminal_codeword();
+        let c = h.shape.num_committed();
+        for (k, &q) in all.iter().enumerate() {
+            let v = word_as_ext(&exec.public_words[k].1).expect("ext");
+            assert_eq!(v, codeword[h.trace.iotas[q] >> c], "{policy} query {q}");
+        }
+        let emitted = permutations(&program);
+        let closed = all.len() * h.shape.permutations_per_query() + h.shape.cap_permutations();
+        assert_eq!(
+            emitted, closed,
+            "{policy}: emitted permutations against the capped closed form"
+        );
+        // And the saving against the uncapped shape is the cap's own formula:
+        // per tree `Q·c − (2^c − 1)`.
+        let uncapped = FriShape {
+            format: stark::proof::options::ProofFormat::DEFAULT,
+            ..h.shape
+        };
+        let saved: usize = (0..c)
+            .map(|i| {
+                let cap = h.shape.layer_cap(i);
+                all.len() * cap - ((1usize << cap) - 1)
+            })
+            .sum();
+        assert_eq!(
+            all.len() * uncapped.permutations_per_query() - saved,
+            emitted,
+            "{policy}: the cap saves Q·c − (2^c − 1) per layer tree"
+        );
+        println!(
+            "{policy}: {} queries, caps {:?}: {emitted} permutations (uncapped {})",
+            all.len(),
+            (0..c).map(|i| h.shape.layer_cap(i)).collect::<Vec<_>>(),
+            all.len() * uncapped.permutations_per_query(),
+        );
+    }
+}
+
+/// ★ Every cap word of every capped FRI layer is bound — including the ones no
+/// query reaches, which only the once-per-tree cap-to-root check can reject
+/// (REVIEW-CAP M1(b) in-guest). One query at a height-3 cap reaches one of
+/// eight nodes per layer, so seven words per layer are rejected by that check
+/// alone.
+#[test]
+fn every_fri_cap_word_is_bound_even_the_unreached_ones() {
+    let h = capped_host(CapPolicy::Fixed(3), 24);
+    let queries = vec![0usize];
+    let shape = FriShape {
+        num_queries: 1,
+        ..h.shape
+    };
+    let program = fri_only_program(shape, 1);
+    let honest = h.all_arenas(&queries);
+    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
+    // Arena order: deep, roots, zetas, coeffs, queries, caps.
+    let caps = honest.len() - 1;
+    assert_eq!(
+        honest[caps].len(),
+        3 * 8 * super::proof_arena::words_per_root(),
+        "three layers, eight cap digests each"
+    );
+    for w in 0..honest[caps].len() {
+        let mut bad = honest.clone();
+        bad[caps][w][0] += FE::one();
+        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+            .expect_err(&format!("cap word {w} moved must not execute"));
+    }
+}
+
+/// ★ Both legs as one program over a CAPPED folding proof: the four trace
+/// trees' caps and the three FRI layers' caps authenticated once, every opening
+/// checked against them, and the permutation count the capped closed form.
+#[test]
+fn the_two_legs_verify_one_capped_folding_proof_as_one_program() {
+    use super::epoch_verify::{blocks_for, group_leaf_felts};
+
+    let h = capped_host(CapPolicy::Fixed(3), 24);
+    assert_eq!(h.trace.shape.trace_cap, 3);
+    let queries: Vec<usize> = (0..6).collect();
+    let shape = FriShape {
+        num_queries: queries.len(),
+        ..h.shape
+    };
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let (_, _, terminal) =
+        super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
+    for v in &terminal {
+        b.public(v.as_cell());
+    }
+    let program = compile(b.finish());
+    validate(&program).expect("the joined capped program is admissible");
+
+    let mut arenas = h.trace.arenas(&queries);
+    arenas.extend(h.fri_arenas(&queries));
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the honest capped proof must authenticate, fold and reach the terminal");
+    let codeword = h.terminal_codeword();
+    for (k, &q) in queries.iter().enumerate() {
+        let v = word_as_ext(&exec.public_words[k].1).expect("ext");
+        assert_eq!(v, codeword[h.trace.iotas[q] >> h.shape.num_committed()]);
+    }
+
+    let sub = &h.trace.shape;
+    let hash = super::edsl::WrapHash::production();
+    let leaves: usize = sub
+        .groups()
+        .iter()
+        .map(|g| blocks_for(group_leaf_felts(g), hash))
+        .sum();
+    let closed = queries.len()
+        * (leaves + sub.groups().len() * sub.path_len() + shape.permutations_per_query())
+        + sub.cap_permutations()
+        + shape.cap_permutations();
+    assert_eq!(permutations(&program), closed, "the capped closed form");
+
+    // A trace-tree cap word moved: the caps arena of the TRACE leg is the
+    // sixth arena (uniforms, ood, parts, roots, queries, caps).
+    let mut bad = arenas.clone();
+    bad[5][0][0] += FE::one();
+    execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+        .expect_err("a moved trace-tree cap word must not execute");
 }

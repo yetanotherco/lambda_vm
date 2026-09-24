@@ -2201,6 +2201,7 @@ pub(super) fn epoch_arena_words(e: &RealEpoch, with_legs: bool) -> Vec<Vec<LfmWo
         if with_legs {
             out.push(leg.opening_arena());
             out.push(leg.fri_arena());
+            out.extend(leg.caps_arena());
         }
     }
     out

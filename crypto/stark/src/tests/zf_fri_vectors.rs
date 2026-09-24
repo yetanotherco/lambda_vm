@@ -24,7 +24,7 @@ fn all() -> Vec<VectorFile> {
 #[test]
 fn vectors_are_current() {
     let files = all();
-    assert_eq!(files.len(), 4 + 2 * 3 * 2);
+    assert_eq!(files.len(), 4 + 2 * 5 * 2);
     let bad = check_or_write(&files, false);
     assert!(
         bad.is_empty(),

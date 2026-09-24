@@ -2955,12 +2955,22 @@ pub trait IsStarkProver<
         // openings. The heights are the verifier's (`StarkCaps`, public shape
         // only); nothing is absorbed, so the transcript is the uncapped one.
         // At the default format every height is 0 and this is skipped.
-        let caps = crate::merkle_caps::StarkCaps::new(
+        //
+        // The FRI layer depths are the layout's (a group tree under a fold
+        // schedule), so a capped `fri = dp` proof caps the trees it committed.
+        let caps = crate::merkle_caps::StarkCaps::from_layout(
             air.options().format.merkle_cap,
             number_of_queries,
             domain_size.trailing_zeros() as usize,
-            fri_layers.len(),
+            &fri_layout,
         );
+        if caps.fri.len() != fri_layers.len() {
+            return Err(ProvingError::WrongParameter(format!(
+                "Merkle cap: the FRI layout commits {} layers, the prover built {}",
+                caps.fri.len(),
+                fri_layers.len()
+            )));
+        }
         if caps.any() {
             Self::embed_stark_caps(
                 &caps,

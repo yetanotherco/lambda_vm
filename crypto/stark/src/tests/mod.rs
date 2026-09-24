@@ -4,6 +4,7 @@ pub mod blake3_stark_roundtrip_tests;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug_tests;
 pub mod bus_tests;
+pub mod cap_fri_matrix_tests;
 pub mod commitment_tests;
 pub mod constraint_index_tests;
 pub mod domain_cache_stats;

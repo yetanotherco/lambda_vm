@@ -58,6 +58,7 @@ use crate::tables::types::{FE, GoldilocksField};
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::deep::{DeepInvariants, DeepOpening, DeepShape, emit_deep_point};
 use super::edsl::{self, WrapDigest};
+use super::merkle_cap::CapCells;
 
 /// Rows a Merkle leaf covers — `crypto/stark`'s `ROWS_PER_LEAF`, mirrored here
 /// because it fixes program shape: a leaf holds a row PAIR, which is why one
@@ -112,6 +113,14 @@ pub struct SubProofShape {
     pub log2_lde_length: u32,
     /// The LDE coset offset, `ProofOptions::coset_offset`.
     pub coset_offset: FE,
+    /// The Merkle-cap height of every committed matrix's tree (they share a
+    /// depth and an opening count, so one height): `0` = uncapped, today's
+    /// format. With `c > 0` each tree's `2^c` cap digests are hinted ONCE per
+    /// sub-proof and authenticated against the root ([`CapCells`]), and every
+    /// query's path stops `c` levels short (design/CAP.md §6.1). A verifier
+    /// constant: `CapPolicy::height(num_queries, merkle_depth)` of the inner
+    /// proof's options, never read from the proof.
+    pub trace_cap: usize,
 }
 
 impl SubProofShape {
@@ -154,13 +163,41 @@ impl SubProofShape {
     /// offering the prover a second one.
     pub fn opening_words(&self, digest_words: usize) -> usize {
         let values: usize = self.groups().iter().map(GroupShape::num_values).sum();
-        let siblings = digest_words * self.merkle_depth * self.groups().len();
+        let siblings = digest_words * self.path_len() * self.groups().len();
         values + siblings
+    }
+
+    /// Siblings one query's path carries per group: the tree's depth less its
+    /// cap height (the owner path's cap is split off into the caps arena).
+    pub fn path_len(&self) -> usize {
+        self.merkle_depth - self.trace_cap
+    }
+
+    /// Arena words the committed matrices' caps occupy, once per sub-proof:
+    /// `2^c` digests per group when capped, nothing otherwise.
+    pub fn cap_words(&self, digest_words: usize) -> usize {
+        if self.trace_cap == 0 {
+            0
+        } else {
+            self.groups().len() * (1usize << self.trace_cap) * digest_words
+        }
+    }
+
+    /// Permutations the committed matrices' cap checks cost, once per
+    /// sub-proof: `2^c − 1` parents per group (nothing uncapped).
+    pub fn cap_permutations(&self) -> usize {
+        self.groups().len() * super::merkle_cap::cap_root_permutations(self.trace_cap)
     }
 
     /// Checked invariants of a shape, so a caller cannot assemble one whose
     /// groups do not cover the fold.
     fn check(&self) {
+        assert!(
+            self.trace_cap <= self.merkle_depth,
+            "a cap is at most the tree: height {} over depth {}",
+            self.trace_cap,
+            self.merkle_depth
+        );
         let width: usize = self.trace_groups.iter().map(|g| g.num_columns).sum();
         assert_eq!(
             width, self.deep.num_total_cols,
@@ -209,6 +246,10 @@ pub struct GroupCommitment {
     /// and asserts the widths agree, so it works at either width unchanged.
     pub root_lanes: Vec<[Felt; 4]>,
     pub shape: GroupShape,
+    /// The tree's authenticated Merkle cap, when the format caps it: every
+    /// query's opening is then checked against THESE cells
+    /// ([`CapCells::verify_path`]) instead of the root lanes. `None` = today.
+    pub cap: Option<CapCells>,
 }
 
 impl GroupCommitment {
@@ -229,7 +270,11 @@ impl GroupCommitment {
                 b.unpack(w)
             })
             .collect();
-        GroupCommitment { root_lanes, shape }
+        GroupCommitment {
+            root_lanes,
+            shape,
+            cap: None,
+        }
     }
 
     /// A commitment over lanes the caller already holds — the assembled
@@ -244,7 +289,36 @@ impl GroupCommitment {
     /// join, and it takes lanes rather than words precisely so there is nothing
     /// left to hint.
     pub fn from_lanes(root_lanes: Vec<[Felt; 4]>, shape: GroupShape) -> Self {
-        GroupCommitment { root_lanes, shape }
+        GroupCommitment {
+            root_lanes,
+            shape,
+            cap: None,
+        }
+    }
+
+    /// Hint this tree's height-`c` cap out of `arena` at `base`, authenticate
+    /// it against the root lanes (once per tree), and check every later
+    /// opening against it. Returns the next free word. `c = 0` hints nothing
+    /// and leaves the root check in place.
+    pub fn hint_cap(
+        &mut self,
+        b: &mut LfmBuilder,
+        arena: super::instr::ArenaId,
+        base: u32,
+        c: usize,
+    ) -> u32 {
+        if c == 0 {
+            return base;
+        }
+        let (cap, next) =
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+        self.cap = Some(cap);
+        next
+    }
+
+    /// The cap height openings of this tree are checked at (0 = the root).
+    pub fn cap_height(&self) -> usize {
+        self.cap.as_ref().map_or(0, CapCells::height)
     }
 }
 
@@ -330,13 +404,19 @@ pub fn emit_group_authentication(
     bits: &[Bit],
 ) {
     assert_eq!(
-        opening.siblings.len(),
+        opening.siblings.len() + commitment.cap_height(),
         bits.len(),
-        "one sibling per level, and every group walks the same index"
+        "one sibling per level below the cap, and every group walks the same index"
     );
     let leaf = emit_leaf_hash(b, commitment.shape, &opening.values);
-    let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
-    edsl::assert_digest_eq_lanes(b, root, &commitment.root_lanes);
+    match &commitment.cap {
+        None => {
+            let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
+            edsl::assert_digest_eq_lanes(b, root, &commitment.root_lanes);
+        }
+        // The whole index goes in; the cap splits it (walk low, mux top).
+        Some(cap) => cap.verify_path(b, leaf, bits, &opening.siblings),
+    }
 }
 
 /// The LDE-domain constants the point derivation multiplies together:
@@ -484,6 +564,11 @@ pub fn emit_query_from_bits(
     assert_eq!(openings.len(), groups.len(), "one opening per group");
     for (c, g) in commitments.iter().zip(&groups) {
         assert_eq!(c.shape, *g, "commitment shapes must match the sub-proof");
+        assert_eq!(
+            c.cap_height(),
+            shape.trace_cap,
+            "every committed matrix is capped at the shape's height"
+        );
     }
     assert_eq!(
         bits.len(),
@@ -560,6 +645,9 @@ pub struct SubProofArenas {
     /// Per query, in order: the index, then per group the row-pair values
     /// followed by the sibling digests (two words per level).
     pub queries: super::instr::ArenaId,
+    /// Per group, its `2^c` cap digests — declared only when the shape caps
+    /// the trees ([`SubProofShape::trace_cap`] `> 0`).
+    pub caps: Option<super::instr::ArenaId>,
 }
 
 /// Emit a whole sub-proof's query verification: the invariants once, then every
@@ -596,12 +684,15 @@ pub fn emit_sub_proof_with_bits(
     let roots = b.declare_arena(edsl::digest_words(b) * groups.len() as u32);
     let queries =
         b.declare_arena((num_queries * shape.query_words(edsl::digest_words(b) as usize)) as u32);
+    let cap_words = shape.cap_words(edsl::digest_words(b) as usize);
+    let caps = (cap_words > 0).then(|| b.declare_arena(cap_words as u32));
     let arenas = SubProofArenas {
         uniforms,
         ood,
         parts,
         roots,
         queries,
+        caps,
     };
 
     let gamma = b.hint_word(uniforms, 0).as_ext();
@@ -623,11 +714,18 @@ pub fn emit_sub_proof_with_bits(
         .map(|j| b.hint_word(parts, j).as_ext())
         .collect();
 
-    let commitments: Vec<GroupCommitment> = groups
+    let mut commitments: Vec<GroupCommitment> = groups
         .iter()
         .enumerate()
         .map(|(i, g)| GroupCommitment::hint(b, roots, edsl::digest_words(b) * i as u32, *g))
         .collect();
+    if let Some(caps) = caps {
+        let mut at = 0u32;
+        for c in &mut commitments {
+            at = c.hint_cap(b, caps, at, shape.trace_cap);
+        }
+        assert_eq!(at as usize, cap_words, "the caps arena is filled exactly");
+    }
 
     let inv = emit_deep_invariants(b, &shape.deep, gamma, zeta, &ood_steps, &claimed_parts);
 
@@ -646,7 +744,7 @@ pub fn emit_sub_proof_with_bits(
                         c
                     })
                     .collect();
-                let siblings: Vec<WrapDigest> = (0..shape.merkle_depth)
+                let siblings: Vec<WrapDigest> = (0..shape.path_len())
                     .map(|_| {
                         // The stride follows the DIGEST's width, not a literal.
                         let d = edsl::hint_digest(b, queries, cursor);

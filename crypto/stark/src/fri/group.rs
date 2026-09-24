@@ -31,7 +31,6 @@
 //! Dropping 1 or 2 is a soundness break; `fri_group_tests` has a named test
 //! that turns red for each (M1, M2).
 
-use crypto::merkle_tree::cap::CappedRoot;
 use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
@@ -40,6 +39,7 @@ use math::traits::AsBytes;
 
 use crate::config::Commitment;
 use crate::fri::terminal::FriFoldLayout;
+use crate::merkle_caps::TreeCheck;
 
 /// Verifier mutations for the load-bearing tests (M1, M2). Test builds only;
 /// production has no switch. Thread-local: the host verifier is sequential,
@@ -140,7 +140,9 @@ where
 
 /// The FRI checks of one query under a group-encoded layout (every format but
 /// the legacy one): per committed layer `j`, the group is authenticated at
-/// `leaf = p >> d_j` against `roots[j]` (path `paths(j)`, exact depth), the
+/// `leaf = p >> d_j` by `checks[j]` — the layer tree's check, built once per
+/// tree at the layout's depth with its Merkle cap (`TreeCheck`; exact path
+/// length `depth − c`, query 0 the cap's owner) — with path `paths(j)`, the
 /// slot check `group[p & (2^{d_j} − 1)] == v` holds, and `v` becomes the group
 /// fold with `zetas[j + 1]`; finally `terminal[p] == v`.
 ///
@@ -154,8 +156,8 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_query_groups<'p, F, E, B>(
     layout: &FriFoldLayout,
-    lde_log: u32,
-    roots: &[Commitment],
+    checks: &[TreeCheck<'_>],
+    query: usize,
     paths: impl Fn(usize) -> &'p [Commitment],
     values: &[FieldElement<E>],
     zetas: &[FieldElement<E>],
@@ -171,7 +173,7 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     B: IsStreamingLeafBackend<E, Node = Commitment>,
 {
-    if roots.len() != layout.num_committed
+    if checks.len() != layout.num_committed
         || values.len() != layout.opened_values_per_query()
         || zetas.len() != layout.num_committed + 1
     {
@@ -194,10 +196,7 @@ where
         }
         // (1) the group is the leaf, authenticated with the exact depth.
         let leaf_hash = B::hash_data_from_slices(group, &[]);
-        let depth = layout.layer_depth(lde_log, j) as usize;
-        if !CappedRoot::uncapped(&roots[j], depth).verify::<B>(paths(j), leaf, leaf_hash)
-            && !mutated(2)
-        {
+        if !checks[j].verify::<B>(query, paths(j), leaf, leaf_hash) && !mutated(2) {
             ok = false;
         }
         // (3) fold: x_g⁻¹ = y⁻¹ · ω_{2^d}^{br_d(slot)}.

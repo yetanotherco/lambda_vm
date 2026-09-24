@@ -93,8 +93,7 @@ use super::deep::DeepShape;
 use super::edsl::WrapHash;
 use super::epoch::{RootCells, TableAbsorbs, TableChallengeShape, fork_table};
 use super::epoch_verify::{
-    FRI_LEAF_FELTS, TableVerifyShape, blocks_for, boundary_terms, group_leaf_felts,
-    query_permutations_for,
+    TableVerifyShape, blocks_for, boundary_terms, group_leaf_felts, query_permutations_for,
 };
 use super::fri::FriShape;
 use super::hash::HasherKind;
@@ -409,6 +408,10 @@ fn table_shape(
         merkle_depth: log2_lde_length as usize - 1,
         log2_lde_length,
         coset_offset: FE::from(opts.coset_offset),
+        trace_cap: opts
+            .format
+            .merkle_cap
+            .height(opts.fri_number_of_queries, log2_lde_length as usize - 1),
     };
     let has_aux_trace = air.has_aux_trace();
     let fri = FriShape::from_options(opts, log2_lde_length);
@@ -516,8 +519,9 @@ fn bill(tables: &[TableShape], hash: WrapHash, hash_chip: &str) -> (Bill, usize)
             .iter()
             .map(|g| blocks_for(group_leaf_felts(g), hash))
             .sum();
-        let fri_leaves = t.verify.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
-        let parents = groups.len() * t.verify.sub.merkle_depth;
+        let fri_leaves = t.verify.fri.leaf_permutations_per_query(hash);
+        // Paths stop at the trees' cap (`merkle_depth − trace_cap`).
+        let parents = groups.len() * t.verify.sub.path_len();
         let fri_paths = t.verify.fri.path_steps_per_query();
 
         b.trace_leaves += leaves;

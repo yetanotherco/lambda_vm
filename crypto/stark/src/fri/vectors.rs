@@ -263,13 +263,19 @@ pub fn leaf_digests_json<H: StarkHash>(hash_name: &str) -> VectorFile {
 // ---------------------------------------------------------------------------
 
 /// The (d) proof shape: `LogReadOnlyRAP` (ext3, one aux column), 2^10 rows,
-/// blowup 4 (B = 12), k = 2, Q = 3, grinding 0, coset offset 3.
+/// blowup 4 (B = 12), k = 2, grinding 0, coset offset 3; Q = 3, or
+/// [`CAPPED_QUERIES`] for the capped formats.
 pub const PROOF_ROWS: usize = 1 << 10;
 
-pub fn proof_options(format: ProofFormat) -> ProofOptions {
+/// The query count of the capped (d) formats: the `auto` cap policy caps a
+/// tree opened at least 20 times at height 3 (RULINGS 1), so a Q = 3 proof
+/// carries no cap at all (REVIEW-FRI F9).
+pub const CAPPED_QUERIES: usize = 20;
+
+pub fn proof_options(format: ProofFormat, queries: usize) -> ProofOptions {
     ProofOptions {
         blowup_factor: 4,
-        fri_number_of_queries: 3,
+        fri_number_of_queries: queries,
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 2,
@@ -277,28 +283,46 @@ pub fn proof_options(format: ProofFormat) -> ProofOptions {
     }
 }
 
-/// The formats of (d): `pair` (today), `dp` (the DP's schedule) and
-/// `dp_3_1_3` (an explicit uneven schedule, to catch fold-count bugs).
-pub fn proof_formats() -> Vec<(&'static str, ProofFormat)> {
+/// The formats of (d), with their query counts: `pair` (today), `dp` (the
+/// DP's schedule) and `dp_3_1_3` (an explicit uneven schedule, to catch
+/// fold-count bugs), all at Q = 3; and `cap_pair` / `cap_dp` (the `auto` Merkle
+/// cap on every tree, with today's FRI and with the DP's schedule) at
+/// Q = [`CAPPED_QUERIES`] — the combined S1 × S3 vector of REVIEW-FRI F9.
+pub fn proof_formats() -> Vec<(&'static str, ProofFormat, usize)> {
     let dp = ProofFormat {
         fri_mode: FriMode::Dp,
         ..ProofFormat::DEFAULT
     };
+    let cap = ProofFormat {
+        merkle_cap: CapPolicy::Auto,
+        ..ProofFormat::DEFAULT
+    };
     vec![
-        ("pair", ProofFormat::DEFAULT),
-        ("dp", dp),
+        ("pair", ProofFormat::DEFAULT, 3),
+        ("dp", dp, 3),
         (
             "dp_3_1_3",
             ProofFormat {
                 fri_schedule_override: FriScheduleOverride::new(&[3, 1, 3]),
                 ..dp
             },
+            3,
+        ),
+        ("cap_pair", cap, CAPPED_QUERIES),
+        (
+            "cap_dp",
+            ProofFormat {
+                fri_mode: FriMode::Dp,
+                ..cap
+            },
+            CAPPED_QUERIES,
         ),
     ]
 }
 
 fn logup_case(
     format: ProofFormat,
+    queries: usize,
 ) -> (
     LogReadOnlyRAP<F, E>,
     TraceTable<F, E>,
@@ -319,7 +343,7 @@ fn logup_case(
         m0: cols[4][0],
     };
     (
-        LogReadOnlyRAP::<F, E>::new(&proof_options(format)),
+        LogReadOnlyRAP::<F, E>::new(&proof_options(format, queries)),
         trace,
         pi,
     )
@@ -331,8 +355,8 @@ fn logup_case(
 /// opened values.
 pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
     let mut out = Vec::new();
-    for (fmt_name, format) in proof_formats() {
-        let (air, mut trace, pi) = logup_case(format);
+    for (fmt_name, format, queries) in proof_formats() {
+        let (air, mut trace, pi) = logup_case(format, queries);
         let proof = GenericProver::<F, E, _, H>::prove(
             &air,
             &mut trace,
@@ -362,8 +386,21 @@ pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
         );
         let _ = writeln!(
             s,
-            "  \"air\": \"LogReadOnlyRAP<Goldilocks, Goldilocks^3>, reads (i % 5 + 1, 10·(i % 5 + 1))\",\n  \"trace_rows\": {PROOF_ROWS},\n  \"lde_log\": {lde_log},\n  \"blowup\": 4,\n  \"fri_final_poly_log_degree\": 2,\n  \"queries\": 3,\n  \"grinding_factor\": 0,\n  \"coset_offset\": 3,"
+            "  \"air\": \"LogReadOnlyRAP<Goldilocks, Goldilocks^3>, reads (i % 5 + 1, 10·(i % 5 + 1))\",\n  \"trace_rows\": {PROOF_ROWS},\n  \"lde_log\": {lde_log},\n  \"blowup\": 4,\n  \"fri_final_poly_log_degree\": 2,\n  \"queries\": {queries},\n  \"grinding_factor\": 0,\n  \"coset_offset\": 3,"
         );
+        if !format.merkle_cap.is_off() {
+            // The capped formats only (the Q = 3 files are unchanged): the
+            // policy and every tree's height, from the verifier's own
+            // `StarkCaps`. Each capped tree's cap rides at the end of query
+            // 0's path (the owner path), so that `path_len` is `D − c + 2^c`.
+            let caps = crate::merkle_caps::StarkCaps::for_options(air.options(), lde_log as usize)
+                .expect("caps");
+            let _ = writeln!(
+                s,
+                "  \"merkle_cap\": \"{}\",\n  \"trace_tree_depth\": {},\n  \"trace_cap\": {},\n  \"fri_tree_depths\": {:?},\n  \"fri_caps\": {:?},",
+                format.merkle_cap, caps.trace_depth, caps.trace, caps.fri_depths, caps.fri
+            );
+        }
         let _ = writeln!(
             s,
             "  \"legacy_encoding\": {},\n  \"total_folds\": {},\n  \"terminal_len\": {},\n  \"schedule\": {:?},",
