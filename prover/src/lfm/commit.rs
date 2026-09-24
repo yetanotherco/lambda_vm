@@ -8,8 +8,9 @@
 //! keygen in this framework).
 
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed_with};
+use stark::commitment::commit_bit_reversed_with;
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 
@@ -87,8 +88,15 @@ pub fn lde_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Vec<Vec<FE>> 
     columns.iter().map(expand).collect()
 }
 
-/// Commits an already-expanded LDE column matrix.
+/// Commits an already-expanded LDE column matrix with today's row-pair
+/// leaves.
 pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
+    commit_lde_columns_with(lde_columns, LeafLayout::RowPair)
+}
+
+/// [`commit_lde_columns`] under an explicit trace-tree leaf layout (S2: a
+/// one-row table's preprocessed root is this at [`LeafLayout::Row`]).
+pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> Commitment {
     // ★ Under the block path's PIN, not `stark`'s default aliases. These commit
     // the production tables whose roots `lfm_program_id` names, so the hash that
     // BUILDS them and the hash the program identity CLAIMS have to be the same
@@ -97,7 +105,7 @@ pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
     let (_, root) = commit_bit_reversed_with::<
         GoldilocksField,
         <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-    >(lde_columns, ROWS_PER_LEAF)
+    >(lde_columns, layout.rows_per_leaf())
     .expect("Merkle build failed for LFM column group");
     root
 }
@@ -105,6 +113,15 @@ pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
 /// Commits a column matrix (each inner `Vec` one column, power-of-two height).
 pub fn commit_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Commitment {
     commit_lde_columns(&lde_columns(columns, options))
+}
+
+/// [`commit_columns`] under an explicit leaf layout.
+pub fn commit_columns_with(
+    columns: &[Vec<FE>],
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    commit_lde_columns_with(&lde_columns(columns, options), layout)
 }
 
 /// A [`ColumnGroup`]'s data, column-major (the commit pipeline's input shape).
@@ -197,8 +214,21 @@ pub fn commit_group_device_or_host(
     group: &ColumnGroup,
     options: &ProofOptions,
 ) -> Commitment {
+    commit_group_device_or_host_with(label, group, options, LeafLayout::RowPair)
+}
+
+/// [`commit_group_device_or_host`] under an explicit leaf layout. The device
+/// commit builds row-pair leaves only (`gpu_lde::try_commit_row_major`), so a
+/// one-row root (S2) is always the host pass (REVIEW-FRI F8.1: gated, until
+/// the device lane makes it layout-aware).
+pub fn commit_group_device_or_host_with(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     #[cfg(feature = "cuda")]
-    if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
+    if device_artifacts() && group.padded_rows > 0 && group.width > 0 && !layout.is_one_row() {
         let set = stark::device_set::commit_device_set(
             group.padded_rows,
             group.width,
@@ -240,7 +270,7 @@ pub fn commit_group_device_or_host(
     }
     let _ = label;
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    commit_lde_columns(&lde_columns(&group_columns(group), options))
+    commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
 }
 
 /// Commits one instruction column group.

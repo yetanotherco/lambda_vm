@@ -74,7 +74,7 @@ fn the_in_guest_fri_shape_is_the_hosts_layout() {
                         };
                         let shape = FriShape::from_options(&opts, lde_log);
                         shape.check();
-                        let host = StarkCaps::for_options(&opts, lde_log as usize)
+                        let host = StarkCaps::for_options(&opts, lde_log as usize, false)
                             .expect("a row-pair format lays out");
                         let depths: Vec<usize> = (0..shape.num_committed())
                             .map(|j| shape.layer_depth(j))

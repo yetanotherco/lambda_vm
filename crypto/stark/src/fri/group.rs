@@ -144,10 +144,18 @@ where
 /// tree at the layout's depth with its Merkle cap (`TreeCheck`; exact path
 /// length `depth − c`, query 0 the cap's owner) — with path `paths(j)`, the
 /// slot check `group[p & (2^{d_j} − 1)] == v` holds, and `v` becomes the group
-/// fold with `zetas[j + 1]`; finally `terminal[p] == v`.
+/// fold with layer `j`'s challenge; finally `terminal[p] == v`.
+///
+/// Layer `j`'s challenge is `zetas[j + 1]` for row pairs (`zetas[0]` drove the
+/// uncommitted fold 0) and `zetas[j]` under one row (layer 0 is the committed
+/// DEEP codeword, so no fold precedes it) — [`FriFoldLayout::num_zetas`].
 ///
 /// * `v` / `y_inv`: the query's value at committed layer 0 and the inverse of
-///   its point there (fold 0 already applied by the caller);
+///   its point there (row pairs: fold 0 already applied by the caller; one
+///   row: the DEEP value at `x_r` and `x_r⁻¹` — the layer-0 slot check is then
+///   the input-slot check `group₀[slot] == DEEP(x_r)`);
+/// * `query`: the query's position in proof order (query 0 is every capped
+///   layer's owner opening);
 /// * `iota`: the query's position in committed layer 0;
 /// * `values`: the flat per-query group values (the proof's
 ///   `layers_evaluations_sym` under this encoding), length already checked by
@@ -175,10 +183,11 @@ where
 {
     if checks.len() != layout.num_committed
         || values.len() != layout.opened_values_per_query()
-        || zetas.len() != layout.num_committed + 1
+        || zetas.len() != layout.num_zetas()
     {
         return false;
     }
+    let zeta_offset = usize::from(!layout.one_row);
     let mut index = iota;
     let mut offset = 0usize;
     let mut ok = true;
@@ -212,7 +221,7 @@ where
             0
         };
         let x_g_inv = &y_inv * &table[br_slot];
-        v = group_fold::<F, E>(group, &zetas[j + 1], &x_g_inv, table);
+        v = group_fold::<F, E>(group, &zetas[j + zeta_offset], &x_g_inv, table);
         for _ in 0..d {
             y_inv = y_inv.square();
         }

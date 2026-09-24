@@ -265,8 +265,29 @@ pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 /// refuses a non-default format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
-/// See [`MERKLE_CAP_IMPLEMENTED`].
-pub const ONE_ROW_IMPLEMENTED: bool = false;
+/// `OneRowMode::{On, Auto}` (S2) is implemented on the HOST CPU paths only:
+/// - the CPU prover (one-row trace, precomputed, aux and composition trees;
+///   the DEEP codeword committed as FRI layer 0 before the first challenge;
+///   query indexes over the whole LDE; one-row openings) and the host
+///   verifier (`multi_verify` / `multi_verify_archived`), with the per-table
+///   `Auto` rule (`crate::leaf_layout`, RULINGS 6);
+/// - the preprocessed roots: static one-row twins at blowup 4
+///   (`STATIC_BLOWUP_FACTORS_ONE_ROW` in the prover crate), every computed
+///   root at run time, the LFM artifacts' one-row roots and the registry
+///   policy (a one-row format never reads `LFM_REGISTRY`); a table with no
+///   root for its layout is a proving error and a verifier reject (RULINGS 14)
+///   — e.g. `one_row = 1` at blowup 2, 8 or 16 fails on BITWISE;
+/// - on a `cuda` build a one-row table takes the CPU arm of every commit and
+///   opening (never device-only, host aux build) — correct, not fast.
+///
+/// NOT implemented: device one-row trees, openings and the device input tree
+/// (lane I-FRI-D, D2 — a one-row table on a cuda build runs on the host), the
+/// in-guest (LFM) verifier of a one-row proof (lane I-FRI-G, G3: an emitter
+/// asked for one refuses at emit time, `lfm::fri::FriShape::from_options`),
+/// and the RV64 recursion guest (default-only, RULINGS 11). A block run under
+/// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and
+/// LFM proofs but cannot recurse over one-row STARK proofs yet.
+pub const ONE_ROW_IMPLEMENTED: bool = true;
 
 impl ProofOptions {
     /// True when every format field is at its default: the proof this

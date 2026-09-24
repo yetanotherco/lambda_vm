@@ -77,20 +77,27 @@ impl StarkCaps {
     }
 
     /// The heights of a table proved under `options` over an LDE of
-    /// `2^lde_log` points: the committed FRI layers are the ones the proof
-    /// format's fold layout commits (`FriFoldLayout::for_options`, the same
-    /// call the prover and the verifier make), so under a fold schedule
+    /// `2^lde_log` points, with the table's RESOLVED leaf layout `one_row`
+    /// (the same resolution `FriFoldLayout::for_options` takes): the trace
+    /// trees are the layout's depth and the committed FRI layers are the ones
+    /// the proof format's fold layout commits, so under a fold schedule
     /// (`fri = dp`) layer `j` is `layer_depth(j)` deep, not `log2(lde) − j − 2`.
     ///
     /// This is the one public entry point the in-guest verifier checks its own
-    /// cap heights against. `Err` for a format that cannot be laid out.
+    /// cap heights against (row pairs only there: `one_row = false`). `Err`
+    /// for a format that cannot be laid out.
     pub fn for_options(
         options: &crate::proof::options::ProofOptions,
         lde_log: usize,
+        one_row: bool,
     ) -> Result<Self, crate::fri::schedule::FriFormatError> {
         let blowup_log = (options.blowup_factor as u32).trailing_zeros();
-        let layout =
-            crate::fri::terminal::FriFoldLayout::for_options(lde_log as u32, blowup_log, options)?;
+        let layout = crate::fri::terminal::FriFoldLayout::for_options(
+            lde_log as u32,
+            blowup_log,
+            options,
+            one_row,
+        )?;
         Ok(Self::from_layout(
             options.format.merkle_cap,
             options.fri_number_of_queries,
@@ -101,19 +108,39 @@ impl StarkCaps {
 
     /// The heights over an explicit FRI fold layout (the prover's and the
     /// verifier's route: each holds the layout it built from the options).
-    /// Committed layer `j` is `layout.layer_depth(lde_log, j)` deep: `log2(lde)
-    /// − j − 2` under the all-ones schedule (so this is [`Self::new`] there),
-    /// the group tree's depth under any other.
+    /// The trace trees take the layout's leaf layout (row pairs: `log2(lde) −
+    /// 1`; one row: `log2(lde)`) and committed layer `j` is
+    /// `layout.layer_depth(lde_log, j)` deep: `log2(lde) − j − 2` under the
+    /// all-ones row-pair schedule (so this is [`Self::new`] there), the group
+    /// tree's depth under any other.
     pub(crate) fn from_layout(
         policy: CapPolicy,
         num_queries: usize,
         lde_log: usize,
         layout: &crate::fri::terminal::FriFoldLayout,
     ) -> Self {
-        let trace_depth = Self::trace_tree_depth(lde_log);
-        let fri_depths: Vec<usize> = (0..layout.num_committed)
-            .map(|j| layout.layer_depth(lde_log as u32, j) as usize)
-            .collect();
+        Self::with_depths(
+            policy,
+            num_queries,
+            crate::leaf_layout::LeafLayout::from_one_row(layout.one_row).tree_depth(lde_log),
+            layout.layer_depths(lde_log as u32),
+        )
+    }
+
+    /// The heights for trace trees of depth `trace_depth` and committed FRI
+    /// layers of depths `fri_depths`, every tree opened `num_queries` times.
+    ///
+    /// The general form of [`Self::new`], for any leaf layout and FRI
+    /// schedule: the caller passes the depths its layout implies
+    /// ([`crate::leaf_layout::LeafLayout::tree_depth`] and the FRI layout's
+    /// per-layer depths). At row pairs and the all-ones schedule those are
+    /// exactly [`Self::new`]'s.
+    pub fn with_depths(
+        policy: CapPolicy,
+        num_queries: usize,
+        trace_depth: usize,
+        fri_depths: Vec<usize>,
+    ) -> Self {
         let fri = fri_depths
             .iter()
             .map(|&d| policy.height(num_queries, d))

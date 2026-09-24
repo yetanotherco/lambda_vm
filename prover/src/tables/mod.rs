@@ -61,6 +61,14 @@ pub use types::BusId;
 /// silently skip a test.
 pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 
+/// Blowup factors for which the ONE-ROW (S2) twins of those static
+/// commitments ship (`static_commitment_one_row` and the page twins), emitted
+/// by `compute_static_commitments --layout row` and pinned by the one-row drift
+/// tests. Only the blowup the knob is measured at (design/FRI.md §7.5: 4 for
+/// the base and for the LFM chips): under one row any other blowup is a hard
+/// miss (RULINGS 14), never a recompute.
+pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
+
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).

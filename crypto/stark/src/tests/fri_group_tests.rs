@@ -376,14 +376,15 @@ fn dp_round_trips_at_every_fold_count() {
                 round_trip_simple::<KeccakStarkHash>(rows, blowup, dp_with(None));
             let lde_log = log_rows + blowup.trailing_zeros();
             let o = golden_options(blowup, 1, 9, dp_with(None));
-            let l = FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o).unwrap();
+            let l =
+                FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o, false).unwrap();
             assert_eq!(layers, l.num_committed, "rows {rows}");
             assert_eq!(values, l.opened_values_per_query(), "rows {rows}");
         }
     }
     // A shape where the DP picks a non-trivial schedule is exercised.
     let o = golden_options(4, 1, 9, dp_with(None));
-    let l = FriFoldLayout::for_options(12, 2, &o).unwrap();
+    let l = FriFoldLayout::for_options(12, 2, &o, false).unwrap();
     assert!(
         l.schedule.iter().any(|&d| d > 1),
         "schedule {:?}",

@@ -44,7 +44,7 @@
 
 use crypto::merkle_tree::cap::{AUTO_WEIGHTS, CapPolicy, CapWeights, cap_gain};
 
-use crate::proof::options::{FriMode, FriScheduleOverride, OneRowMode, ProofOptions};
+use crate::proof::options::{FriMode, FriScheduleOverride, ProofOptions};
 
 /// Largest fold exponent the schedule may choose (a 64-value group leaf).
 pub const FRI_SCHEDULE_DMAX: u32 = 6;
@@ -284,9 +284,6 @@ pub fn legacy_fri_schedule(b0: u32, terminal_log: u32) -> Vec<u8> {
 /// Why a proof format cannot be laid out for a table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FriFormatError {
-    /// `one_row` is not `Off`: one-row openings (S2) are not implemented on
-    /// this build. Refused rather than silently proving the row-pair layout.
-    OneRowNotImplemented,
     /// The schedule override does not cover this table's committed folds
     /// exactly, or has an exponent outside `1..=FRI_SCHEDULE_DMAX`.
     ScheduleOverrideMismatch,
@@ -295,9 +292,6 @@ pub enum FriFormatError {
 impl core::fmt::Display for FriFormatError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::OneRowNotImplemented => {
-                f.write_str("one-row openings (LAMBDA_VM_ZF_ONE_ROW) are not implemented")
-            }
             Self::ScheduleOverrideMismatch => {
                 f.write_str("the FRI schedule override does not cover this table's committed folds")
             }
@@ -332,21 +326,18 @@ impl FriFormat {
         schedule_override: None,
     };
 
-    /// The format of a table proved under `options`.
-    ///
-    /// Errors on a one-row mode other than `Off` (not implemented here: the
-    /// per-table `Auto` resolution and the one-row layout arrive with S2).
-    pub fn from_options(options: &ProofOptions) -> Result<Self, FriFormatError> {
-        if options.format.one_row != OneRowMode::Off {
-            return Err(FriFormatError::OneRowNotImplemented);
-        }
-        Ok(Self {
+    /// The format of a table proved under `options` whose trace trees use
+    /// the RESOLVED leaf layout `one_row` (the table's
+    /// [`crate::leaf_layout::table_leaf_layout`]; `options.format.one_row` may
+    /// be `Auto`, which only the caller can resolve, from the AIR's widths).
+    pub fn from_options(options: &ProofOptions, one_row: bool) -> Self {
+        Self {
             mode: options.format.fri_mode,
-            one_row: false,
+            one_row,
             num_queries: options.fri_number_of_queries as u64,
             cap: options.format.merkle_cap,
             schedule_override: options.format.fri_schedule_override,
-        })
+        }
     }
 
     /// Whether the proof uses today's FRI encoding: one sibling value per

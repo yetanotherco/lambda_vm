@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use math::polynomial::Polynomial;
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -307,7 +308,17 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 /// OFFSET encodes the Word address (0..63 for x0-x31, 508 for x254, 510-511 for x255).
 /// INIT holds the initial value (SP=STACK_TOP, PC=entry_point, rest=0).
 pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
-    commit_register_columns(options, preprocessed_columns(init))
+    compute_precomputed_commitment_with(options, init, LeafLayout::RowPair)
+}
+
+/// [`compute_precomputed_commitment`] under an explicit trace-tree leaf
+/// layout (S2; program-dependent, so computed at run time either way).
+pub fn compute_precomputed_commitment_with(
+    options: &ProofOptions,
+    init: &[u32],
+    layout: LeafLayout,
+) -> Commitment {
+    commit_register_columns(options, preprocessed_columns(init), layout)
 }
 
 /// The precomputed columns themselves: OFFSET and INIT, padded to a power of
@@ -401,13 +412,29 @@ pub fn compute_precomputed_commitment_with_fini(
     init: &[u32],
     fini: &[u32],
 ) -> Commitment {
-    commit_register_columns(options, preprocessed_columns_with_fini(init, fini))
+    compute_precomputed_commitment_with_fini_layout(options, init, fini, LeafLayout::RowPair)
+}
+
+/// [`compute_precomputed_commitment_with_fini`] under an explicit leaf layout
+/// (S2) — the host twin of the in-circuit register commitment
+/// (`lfm::programs::emit_register_commitment` at the same `rows_per_leaf`).
+pub fn compute_precomputed_commitment_with_fini_layout(
+    options: &ProofOptions,
+    init: &[u32],
+    fini: &[u32],
+    layout: LeafLayout,
+) -> Commitment {
+    commit_register_columns(options, preprocessed_columns_with_fini(init, fini), layout)
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
 /// order). Shared by the monolithic (OFFSET, INIT) and continuation
 /// (OFFSET, INIT, FINI) preprocessed commitments.
-fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Commitment {
+fn commit_register_columns(
+    options: &ProofOptions,
+    columns: Vec<Vec<FE>>,
+    layout: LeafLayout,
+) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
@@ -432,7 +459,7 @@ fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Com
     // commitment the prover recomputes and compares against, so building it with
     // a different hash than the path commits under fails at prove time with
     // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
-    crate::lfm::commit::commit_lde_columns(&lde_columns)
+    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
 }
 
 /// Returns the preprocessed commitment for the REGISTER table.
@@ -440,6 +467,41 @@ fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Com
 /// Program-dependent (entry_point varies per ELF), so not globally cached.
 pub fn preprocessed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
     compute_precomputed_commitment(options, init)
+}
+
+/// REGISTER's (OFFSET, INIT) commitment source for both leaf layouts, both
+/// computed (program-dependent), the one-row one on first use.
+pub fn lazy_commitment(options: &ProofOptions, init: &[u32]) -> stark::lookup::LazyCommitment {
+    let (o, init) = (options.clone(), init.to_vec());
+    stark::lookup::LazyCommitment::ready(preprocessed_commitment(options, &init)).with_one_row(
+        move || {
+            Some(compute_precomputed_commitment_with(
+                &o,
+                &init,
+                LeafLayout::Row,
+            ))
+        },
+    )
+}
+
+/// The continuation variant (OFFSET, INIT, FINI): the row-pair root the caller
+/// holds, and the one-row root computed from the same `init`/`fini` on first
+/// use.
+pub fn lazy_commitment_with_fini(
+    options: &ProofOptions,
+    row_pair: Commitment,
+    init: &[u32],
+    fini: &[u32],
+) -> stark::lookup::LazyCommitment {
+    let (o, init, fini) = (options.clone(), init.to_vec(), fini.to_vec());
+    stark::lookup::LazyCommitment::ready(row_pair).with_one_row(move || {
+        Some(compute_precomputed_commitment_with_fini_layout(
+            &o,
+            &init,
+            &fini,
+            LeafLayout::Row,
+        ))
+    })
 }
 
 // =========================================================================

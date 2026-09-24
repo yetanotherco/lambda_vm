@@ -250,8 +250,8 @@ pub(crate) fn global_memory_air(
         // `address_lo = page_base_lo + OFFSET` is prover-chosen and the genesis
         // token can name an arbitrary address. GLOBAL_MEMORY's OFFSET column is
         // identical to PAGE's, so the same commitment serves both.
-        return air.with_preprocessed_columns(
-            page::private_page_preprocessed_commitment(opts),
+        return air.with_lazy_preprocessed_columns(
+            page::private_page_lazy_commitment(opts),
             page::NUM_PREPROCESSED_COLS_PRIVATE,
             Arc::new(|| vec![page::offset_column()]),
         );
@@ -261,18 +261,27 @@ pub(crate) fn global_memory_air(
     // compares these instead. They are PAGE's — GLOBAL_MEMORY's preprocessed
     // prefix is the same OFFSET and INIT, which is why the same commitment
     // serves both.
-    let commitment = match preprocessed {
-        Some(commitment) => LazyCommitment::ready(commitment),
-        None => {
-            let config = config.clone();
-            let options = opts.clone();
-            LazyCommitment::deferred(move || {
-                if config.init_values.is_some() {
-                    page::compute_precomputed_commitment(&config, &options)
-                } else {
-                    page::zero_init_preprocessed_commitment(&options)
-                }
-            })
+    // Both leaf layouts (S2): a zero-init page's one-row root is the static
+    // twin, a data page's is computed on first use; a supplied root is a
+    // row-pair root and never stands in for the other layout.
+    let commitment = if config.init_values.is_some() {
+        page::data_page_lazy_commitment(config, opts, preprocessed)
+    } else {
+        match preprocessed {
+            Some(c) => page::zero_init_lazy_commitment_from(c, opts),
+            None => {
+                let options = opts.clone();
+                LazyCommitment::deferred(move || page::zero_init_preprocessed_commitment(&options))
+                    .with_one_row({
+                        let options = opts.clone();
+                        move || {
+                            page::zero_init_preprocessed_commitment_for(
+                                &options,
+                                stark::leaf_layout::LeafLayout::Row,
+                            )
+                        }
+                    })
+            }
         }
     };
     let config = config.clone();

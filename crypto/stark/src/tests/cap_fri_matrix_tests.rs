@@ -108,9 +108,7 @@ fn verifies_archived(air: &SimpleAdditionAIR<F>, proof: &Proof) -> bool {
 /// starts at `lde_log − 1` and layer `j`'s tree is its length over `2^{d_j}`
 /// leaves. Independent of `FriFoldLayout::layer_depth`.
 fn schedule_depths(opts: &ProofOptions) -> (Vec<u8>, Vec<usize>) {
-    let schedule = FriFormat::from_options(opts)
-        .expect("a row-pair format")
-        .schedule(LDE_LOG, TERMINAL_LOG);
+    let schedule = FriFormat::from_options(opts, false).schedule(LDE_LOG, TERMINAL_LOG);
     let mut b = LDE_LOG as usize - 1;
     let depths = schedule
         .iter()
@@ -143,7 +141,7 @@ fn the_cap_and_fri_matrix_round_trips_owned_and_archived() {
             let opts = options(cap, fri, over, QUERIES);
             let (air, proof) = prove(&opts);
             let (schedule, depths) = schedule_depths(&opts);
-            let caps = StarkCaps::for_options(&opts, LDE_LOG as usize).expect("layout");
+            let caps = StarkCaps::for_options(&opts, LDE_LOG as usize, false).expect("layout");
             assert_eq!(
                 caps.fri_depths, depths,
                 "cap={cap} fri={name}: the caps' FRI depths are the layout's"

@@ -154,7 +154,7 @@ pub fn fri_parity<H: StarkHash>(
 ) -> Result<String, String> {
     let blowup_log = options.blowup_factor.trailing_zeros();
     let k = u32::from(options.fri_final_poly_log_degree);
-    let layout = FriFoldLayout::for_options(lde_log, blowup_log, options)
+    let layout = FriFoldLayout::for_options(lde_log, blowup_log, options, false)
         .map_err(|e| format!("layout: {e}"))?;
     let n = 1usize << lde_log;
     let mut rng = seed;

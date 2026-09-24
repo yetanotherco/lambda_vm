@@ -164,6 +164,8 @@ mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
 #[cfg(test)]
+mod one_row_tests;
+#[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]
 mod per_table_census_tests;

@@ -356,7 +356,127 @@ fn logup_case(
 pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
     let mut out = Vec::new();
     for (fmt_name, format, queries) in proof_formats() {
+        out.extend(proof_files::<H>(hash_name, fmt_name, format, queries, "d_proof"));
+    }
+    out
+}
+
+/// The formats of (e) (S2): one-row openings with the pair schedule
+/// (`one_row_pair`: all-ones groups, the input tree committed in pairs) and
+/// with an explicit uneven schedule from the input tree (`one_row_3_2_1_2`,
+/// `Σ = 8 = B − T`).
+pub fn one_row_proof_formats() -> Vec<(&'static str, ProofFormat)> {
+    let on = ProofFormat {
+        one_row: crate::proof::options::OneRowMode::On,
+        ..ProofFormat::DEFAULT
+    };
+    vec![
+        ("one_row_pair", on),
+        (
+            "one_row_3_2_1_2",
+            ProofFormat {
+                fri_mode: FriMode::Dp,
+                fri_schedule_override: FriScheduleOverride::new(&[3, 2, 1, 2]),
+                ..on
+            },
+        ),
+    ]
+}
+
+/// (e) The S2 proofs under hash `H`: the (d) shape (at `Q = 3`) proved with one-row
+/// openings. Per query the JSON adds the trace leaf (`r`, a leaf index over
+/// the whole LDE) and its path length (`log2(lde)`); `deep` is DEEP at the
+/// ONE point `x_r` (there is no `deep_sym`), and layer 0 is the input tree
+/// (the DEEP codeword itself; its root is `fri_roots[0]`, absorbed before the
+/// first ζ, so `zetas` has one entry per layer).
+pub fn one_row_proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
+    let mut out = Vec::new();
+    for (fmt_name, format) in one_row_proof_formats() {
+        out.extend(proof_files::<H>(hash_name, fmt_name, format, 3, "e_proof"));
+    }
+    out
+}
+
+/// (e) One-row trace-leaf digests under hash `H`: a KAT base matrix (16 rows ×
+/// 5 columns) and ext3 matrix (16 rows × 2 columns) from SplitMix64 seed
+/// [`KAT_SEED`] + 100 / + 200, read as bit-reversed LDE columns, committed
+/// with one row per leaf AND with row pairs (today's): every leaf digest and
+/// the root of each. One row: leaf `i` = the row at bit-reversed position `i`
+/// (columns in order, big-endian bytes / the `Batched` felt stream); row pair:
+/// rows `2i`, `2i + 1`.
+pub fn one_row_leaf_digests_json<H: StarkHash>(hash_name: &str) -> VectorFile {
+    const ROWS: usize = 16;
+    let mut st = KAT_SEED + 100;
+    let base: Vec<Vec<Felt>> = (0..5)
+        .map(|_| (0..ROWS).map(|_| Felt::from(splitmix64(&mut st))).collect())
+        .collect();
+    let mut st = KAT_SEED + 200;
+    let ext: Vec<Vec<Ext>> = (0..2)
+        .map(|_| (0..ROWS).map(|_| next_ext(&mut st)).collect())
+        .collect();
+    let mut s = format!(
+        "{{\n  \"generator\": \"stark::fri::vectors::one_row_leaf_digests_json\",\n  \"hash\": \"{hash_name}\",\n  \"rows\": {ROWS},\n"
+    );
+    let base_json: Vec<String> = base
+        .iter()
+        .map(|c| {
+            let v: Vec<String> = c.iter().map(|x| x.canonical().to_string()).collect();
+            format!("[{}]", v.join(","))
+        })
+        .collect();
+    let _ = writeln!(s, "  \"base_columns\": [{}],", base_json.join(","));
+    let ext_cols: Vec<String> = ext.iter().map(|c| exts_json(c)).collect();
+    let _ = writeln!(s, "  \"ext_columns\": [{}],", ext_cols.join(","));
+    let mut items = Vec::new();
+    for (layout_name, rows_per_leaf) in [("row", 1usize), ("row_pair", 2)] {
+        let b = crate::commitment::leaves_bit_reversed_grouped::<F, H::Batched<F>>(
+            &base,
+            rows_per_leaf,
+        );
+        let (_, b_root) =
+            crate::commitment::commit_bit_reversed_with::<F, H::Batched<F>>(&base, rows_per_leaf)
+                .expect("base tree");
+        let e =
+            crate::commitment::leaves_bit_reversed_grouped::<E, H::Batched<E>>(&ext, rows_per_leaf);
+        let (_, e_root) =
+            crate::commitment::commit_bit_reversed_with::<E, H::Batched<E>>(&ext, rows_per_leaf)
+                .expect("ext tree");
+        let hexes = |v: &[crate::config::Commitment]| {
+            let h: Vec<String> = v.iter().map(|x| format!("\"{}\"", hex(x))).collect();
+            format!("[{}]", h.join(","))
+        };
+        items.push(format!(
+            "    {{\"layout\": \"{layout_name}\", \"rows_per_leaf\": {rows_per_leaf}, \"base_leaves\": {}, \"base_root\": \"{}\", \"ext_leaves\": {}, \"ext_root\": \"{}\"}}",
+            hexes(&b),
+            hex(&b_root),
+            hexes(&e),
+            hex(&e_root)
+        ));
+    }
+    s.push_str("  \"layouts\": [\n");
+    s.push_str(&items.join(",\n"));
+    s.push_str("\n  ]\n}\n");
+    VectorFile {
+        name: format!("e_leaf_digests_{hash_name}.json"),
+        bytes: s.into_bytes(),
+    }
+}
+
+/// One proof's `{prefix}_{hash}_{format}.{json,rkyv}` pair (the (d) and (e)
+/// files). The table's leaf layout is resolved as the prover and verifier
+/// resolve it; the JSON keeps the (d) schema for row pairs byte for byte and
+/// adds the one-row fields otherwise.
+fn proof_files<H: StarkHash>(
+    hash_name: &str,
+    fmt_name: &str,
+    format: ProofFormat,
+    queries: usize,
+    prefix: &str,
+) -> Vec<VectorFile> {
+    let mut out = Vec::new();
+    {
         let (air, mut trace, pi) = logup_case(format, queries);
+        let one_row = crate::leaf_layout::table_leaf_layout(&air, PROOF_ROWS).is_one_row();
         let proof = GenericProver::<F, E, _, H>::prove(
             &air,
             &mut trace,
@@ -371,14 +491,15 @@ pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
                 &mut DefaultTranscript::<E>::new(&[]),
             )
         });
-        assert!(ok, "the (d) proof must verify");
+        assert!(ok, "the {prefix} proof must verify");
         let rec = FriCapture::<E>::from_any(records[0].as_ref()).expect("one ext3 record");
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
             .expect("rkyv")
             .to_vec();
         let lde_log = PROOF_ROWS.trailing_zeros() + 2;
-        let layout = FriFoldLayout::for_options(lde_log, 2, air.options()).expect("layout");
-        let stem = format!("d_proof_{hash_name}_{fmt_name}");
+        let layout =
+            FriFoldLayout::for_options(lde_log, 2, air.options(), one_row).expect("layout");
+        let stem = format!("{prefix}_{hash_name}_{fmt_name}");
 
         let mut s = format!(
             "{{\n  \"generator\": \"stark::fri::vectors::proof_vectors\",\n  \"hash\": \"{hash_name}\",\n  \"format\": \"{fmt_name}\",\n  \"proof_rkyv\": \"{stem}.rkyv\",\n  \"proof_rkyv_len\": {},\n",
@@ -393,12 +514,19 @@ pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
             // policy and every tree's height, from the verifier's own
             // `StarkCaps`. Each capped tree's cap rides at the end of query
             // 0's path (the owner path), so that `path_len` is `D − c + 2^c`.
-            let caps = crate::merkle_caps::StarkCaps::for_options(air.options(), lde_log as usize)
+            let caps = crate::merkle_caps::StarkCaps::for_options(air.options(), lde_log as usize, one_row)
                 .expect("caps");
             let _ = writeln!(
                 s,
                 "  \"merkle_cap\": \"{}\",\n  \"trace_tree_depth\": {},\n  \"trace_cap\": {},\n  \"fri_tree_depths\": {:?},\n  \"fri_caps\": {:?},",
                 format.merkle_cap, caps.trace_depth, caps.trace, caps.fri_depths, caps.fri
+            );
+        }
+        if one_row {
+            let _ = writeln!(
+                s,
+                "  \"one_row\": true,\n  \"query_bound\": {},\n  \"trace_tree_depth\": {lde_log},",
+                1u64 << lde_log
             );
         }
         let _ = writeln!(
@@ -446,12 +574,22 @@ pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
                     index >> d
                 };
             }
-            qs.push(format!(
-                "    {{\"iota\": {iota}, \"deep\": {}, \"deep_sym\": {}, \"terminal_position\": {index}, \"layers\": [{}]}}",
-                ext_json(&rec.deep[qi]),
-                ext_json(&rec.deep_sym[qi]),
-                layers.join(", ")
-            ));
+            if one_row {
+                let opening = &proof.deep_poly_openings[qi];
+                qs.push(format!(
+                    "    {{\"iota\": {iota}, \"trace_leaf\": {iota}, \"trace_path_len\": {}, \"deep\": {}, \"terminal_position\": {index}, \"layers\": [{}]}}",
+                    opening.main_trace_polys.proof.merkle_path.len(),
+                    ext_json(&rec.deep[qi]),
+                    layers.join(", ")
+                ));
+            } else {
+                qs.push(format!(
+                    "    {{\"iota\": {iota}, \"deep\": {}, \"deep_sym\": {}, \"terminal_position\": {index}, \"layers\": [{}]}}",
+                    ext_json(&rec.deep[qi]),
+                    ext_json(&rec.deep_sym[qi]),
+                    layers.join(", ")
+                ));
+            }
         }
         s.push_str(&qs.join(",\n"));
         s.push_str("\n  ]\n}\n");
