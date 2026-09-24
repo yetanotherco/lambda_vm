@@ -242,8 +242,20 @@ impl FromStr for OneRowMode {
 /// flips its own flag in the commit that makes the lever real.
 pub const MERKLE_CAP_IMPLEMENTED: bool = false;
 
-/// See [`MERKLE_CAP_IMPLEMENTED`].
-pub const FRI_MODE_IMPLEMENTED: bool = false;
+/// `FriMode::Dp` (S3) is implemented on the HOST paths only:
+/// - the CPU prover (group-leaf layer commits, the scheduled folds, group
+///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
+/// - on a `cuda` build every device FRI arm (DEEP→FRI on device, the device
+///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
+///   table runs the CPU FRI loop (DEEP may still run on the device).
+///
+/// NOT implemented: device group-leaf FRI (lane I-FRI-D), the in-guest (LFM)
+/// verifier of a `Dp` proof (lane I-FRI-G: `lfm::fri::FriShape` still derives
+/// the legacy layout, so an LFM wrap or node over a `Dp` proof fails at emit
+/// time), and the RV64 recursion guest (default-only by RULINGS 11; it refuses
+/// a non-default format). A block run under `LAMBDA_VM_ZF_FRI=dp` therefore
+/// proves and host-verifies its STARK proofs but cannot recurse over them yet.
+pub const FRI_MODE_IMPLEMENTED: bool = true;
 
 /// See [`MERKLE_CAP_IMPLEMENTED`].
 pub const ONE_ROW_IMPLEMENTED: bool = false;

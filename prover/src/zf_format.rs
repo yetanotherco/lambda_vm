@@ -419,6 +419,9 @@ mod tests {
         // Wave A implements none of the levers; the list names each knob set.
         let f = parse(&[(ENV_CAP, "auto"), (ENV_FRI, "dp")]).unwrap();
         let missing = f.unimplemented_levers();
+        // S3 is implemented on the host (stark::proof::options::FRI_MODE_IMPLEMENTED).
+        const { assert!(stark::proof::options::FRI_MODE_IMPLEMENTED) };
+        assert!(!missing.contains(&ENV_FRI), "fri=dp is selectable");
         if !stark::proof::options::MERKLE_CAP_IMPLEMENTED {
             assert!(missing.contains(&ENV_CAP));
         }
