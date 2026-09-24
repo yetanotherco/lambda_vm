@@ -281,3 +281,42 @@ fn rpx_group_path_at_all_ones_equals_legacy() {
         }
     }
 }
+
+/// The production format sites at the PROCESS format (`ZfFormat::global()`):
+/// a small ext3 STARK proved and host-verified under RPX with
+/// `block_base_options()` (STARK base epochs) and `aggregation_wrap_options()`
+/// (every LFM proof). Meant for a knob-on run, `LAMBDA_VM_ZF_FRI=dp` (then it
+/// asserts both sites stamp `Dp` and the proofs use group layers); without the
+/// knob it proves the same at the default format. Either way it proves.
+#[test]
+fn production_sites_prove_at_the_process_format() {
+    let knob = std::env::var(crate::zf_format::ENV_FRI).ok();
+    let want = match knob.as_deref().map(str::trim) {
+        Some("dp") => stark::proof::options::FriMode::Dp,
+        _ => stark::proof::options::FriMode::Pair,
+    };
+    assert_eq!(crate::zf_format::ZfFormat::global().fri, want);
+    for (site, o) in [
+        (
+            "block_base_options",
+            crate::lfm::proof::block_base_options(),
+        ),
+        (
+            "aggregation_wrap_options",
+            crate::lfm::proof::aggregation_wrap_options(),
+        ),
+    ] {
+        assert_eq!(o.format.fri_mode, want, "{site}");
+        // 2^12 rows: LDE 2^14, so both terminals (T = 9, 10) leave committed layers.
+        let (air, proof) = prove_logup(1 << 12, &o);
+        assert!(verify_logup(&air, &proof), "{site}: must verify");
+        let layers = proof.fri_layers_merkle_roots.len();
+        assert!(layers > 0, "{site}: committed layers");
+        let values = proof.query_list[0].layers_evaluations_sym.len();
+        if want == stark::proof::options::FriMode::Dp {
+            assert!(values > layers, "{site}: group encoding");
+        } else {
+            assert_eq!(values, layers, "{site}: legacy encoding");
+        }
+    }
+}
