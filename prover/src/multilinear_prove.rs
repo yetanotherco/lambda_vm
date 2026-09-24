@@ -89,19 +89,30 @@ pub struct MultilinearVmProof {
 /// [`ZfFormat`](crate::zf_format::ZfFormat) WHIR fields (`LAMBDA_VM_ZF_WHIR_CAP`,
 /// `_WHIR_FOLDS`) are stamped on here. Unset knobs give today's config.
 pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
+    chain_config_under(crate::zf_format::ZfFormat::global(), shapes)
+}
+
+/// [`chain_config`] under an explicit format, so a test can build a knob-on
+/// production config without setting the environment.
+///
+/// The query count is charged the fold schedule's worst round count
+/// (`with_security_folds`): the schedule is part of the security accounting,
+/// not a label stamped on afterwards.
+pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> ChainConfig {
     let tallest = shapes
         .iter()
         .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
         .max()
         .unwrap_or(1);
-    let config = ChainConfig::with_security(
+    let config = ChainConfig::with_security_folds(
         2,
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
+        format.whir_folds,
         tallest,
         128,
         GrindBits::uniform(20),
     );
-    crate::zf_format::ZfFormat::global().chain(config)
+    format.chain(config)
 }
 
 /// Binds the statement into the transcript before any challenge is drawn.
@@ -164,14 +175,17 @@ pub(crate) fn absorb(
     // not only in the code.
     let &ChainConfig {
         log_blowup,
-        log_folding,
+        // ★ Absorbed as `fold_word()`: `log_folding` itself (4u64) at the
+        // default fold schedule, a tagged word binding the schedule otherwise.
+        log_folding: _,
         num_queries,
         grind,
-        // ⚠ Format, NOT absorbed: verifier-side constants (see
-        // `lfm::whir_statement::push_config`, the emitter's twin of this).
+        // ⚠ Format, NOT absorbed except the fold schedule, through the word
+        // above: verifier-side constants (see `lfm::whir_statement::push_config`,
+        // the emitter's twin of this).
         format: _,
     } = config;
-    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+    for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
         len += size_of_val(&value);
     }

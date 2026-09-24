@@ -32,7 +32,8 @@ use math::traits::AsBytes;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainProof, GrindBits, RoundOpenings, commit, prove, verify,
+    CapPolicy, ChainConfig, ChainFormat, ChainProof, FirstFold, GrindBits, RoundOpenings,
+    WhirFolds, commit, prove, verify,
 };
 use multilinear::whir_hash::RpxWhir;
 
@@ -277,6 +278,17 @@ fn config_with(num_queries: usize, grind: u8, cap: CapPolicy) -> ChainConfig {
     }
 }
 
+/// [`config`] under a first fold of `k0` (W2's `first5`/`first6` at `k0` = 5, 6).
+fn first_fold_config(num_queries: usize, grind: u8, k0: usize) -> ChainConfig {
+    ChainConfig {
+        format: ChainFormat {
+            folds: WhirFolds::First(FirstFold::new(k0).expect("a tested first fold")),
+            ..ChainFormat::DEFAULT
+        },
+        ..config(num_queries, grind)
+    }
+}
+
 /// Everything one run needs on both sides.
 struct Fixture {
     proof: ChainProof<F, E>,
@@ -300,22 +312,26 @@ struct Fixture {
 /// replay reproduces that hash and no other, so a fixture on the default
 /// transcript would be a fixture of a different protocol.
 fn fixture(num_vars: usize, num_queries: usize, grind: u8) -> Fixture {
-    fixture_with(num_vars, num_queries, grind, CapPolicy::Off)
+    fixture_with(&config(num_queries, grind), num_vars)
 }
 
 /// [`fixture`] under a Merkle cap policy (W1).
-fn fixture_with(num_vars: usize, num_queries: usize, grind: u8, cap: CapPolicy) -> Fixture {
-    let cfg = config_with(num_queries, grind, cap);
+fn fixture_capped(num_vars: usize, num_queries: usize, grind: u8, cap: CapPolicy) -> Fixture {
+    fixture_with(&config_with(num_queries, grind, cap), num_vars)
+}
+
+/// [`fixture`] under any config — the knob-on shapes use it.
+fn fixture_with(cfg: &ChainConfig, num_vars: usize) -> Fixture {
+    let num_queries = cfg.num_queries;
     let f = pseudo_mle(num_vars, 11);
     let z = point(num_vars, 0);
     // `evaluate_in`, not `evaluate`: the claimed point is in the cubic
     // extension, which is where every WHIR challenge lives.
     let y = f.evaluate_in::<E>(&z).expect("f takes its own point");
 
-    let (commitment, domain) =
-        commit::<F, RpxWhir>(&f, &cfg, true).expect("the polynomial commits");
+    let (commitment, domain) = commit::<F, RpxWhir>(&f, cfg, true).expect("the polynomial commits");
     let mut proving = HostTranscript::new(&[]);
-    let proof = prove::<F, E, _, RpxWhir>(&f, &z, &commitment, &domain, &cfg, &mut proving)
+    let proof = prove::<F, E, _, RpxWhir>(&f, &z, &commitment, &domain, cfg, &mut proving)
         .expect("the chain proves");
 
     let mut recorded = Recording::new();
@@ -325,7 +341,7 @@ fn fixture_with(num_vars: usize, num_queries: usize, grind: u8, cap: CapPolicy) 
         &z,
         y,
         &domain,
-        &cfg,
+        cfg,
         &mut recorded,
     )
     .expect("the control proof must verify");
@@ -334,7 +350,7 @@ fn fixture_with(num_vars: usize, num_queries: usize, grind: u8, cap: CapPolicy) 
     // challenge per sumcheck round, `z0` and `gamma` on every round but the
     // last, and `Q` bounded draws a round. Derived from the schedule, not read
     // off the recorder.
-    let shape = ChainShape::new(&cfg, num_vars);
+    let shape = ChainShape::new(cfg, num_vars);
     let rounds = shape.rounds();
     assert_eq!(
         recorded.sampled.len(),
@@ -748,6 +764,36 @@ fn the_refusals_a_real_proof_cannot_reach() {
 const COST_SHAPES: [(usize, usize, u8); 5] =
     [(6, 3, 0), (6, 5, 0), (5, 3, 0), (6, 3, 8), (9, 3, 8)];
 
+/// ★ The knob-on shapes (W2): `(num_vars, num_queries, grind, k0)`.
+///
+/// `S = 9` under `first6` is `[6, 3]` and `S = 11` under `first5` is
+/// `[5, 4, 2]` (design/WHIR.md §4.8), each at grind 0 and 8 for the reason
+/// [`COST_SHAPES`] gives. `S = 6` under `first6` is the one-round chain whose
+/// only block is 64 base values, and `S = 7` is `[6, 1]`, a 64-wide base block
+/// folded into a 2-wide extension tail.
+const KNOB_COST_SHAPES: [(usize, usize, u8, usize); 6] = [
+    (9, 3, 0, 6),
+    (9, 3, 8, 6),
+    (11, 3, 0, 5),
+    (11, 3, 8, 5),
+    (6, 3, 8, 6),
+    (7, 3, 8, 6),
+];
+
+/// Every shape the cost forms are gated at: [`COST_SHAPES`] under today's
+/// schedule, then [`KNOB_COST_SHAPES`] under their first folds.
+fn cost_configs() -> Vec<(ChainConfig, usize)> {
+    COST_SHAPES
+        .iter()
+        .map(|&(n, q, g)| (config(q, g), n))
+        .chain(
+            KNOB_COST_SHAPES
+                .iter()
+                .map(|&(n, q, g, k0)| (first_fold_config(q, g, k0), n)),
+        )
+        .collect()
+}
+
 pub(super) fn count_rows(program: &LfmProgram, want: fn(&super::instr::Instr) -> bool) -> usize {
     program.instrs.iter().filter(|instr| want(instr)).count()
 }
@@ -795,8 +841,9 @@ fn chain_plumbing(shape: &ChainShape) -> usize {
 /// hash, which is a running quantity and not a shape.
 #[test]
 fn the_schedule_is_the_host_transcripts() {
-    for (num_vars, num_queries, grind) in COST_SHAPES {
-        let f = fixture(num_vars, num_queries, grind);
+    for (cfg, num_vars) in cost_configs() {
+        let (num_queries, grind) = (cfg.num_queries, cfg.grind.query);
+        let f = fixture_with(&cfg, num_vars);
         let host = f.recorded.duplex.borrow().hashes.clone();
         let mine = chain_hash_schedule(&f.shape, SpongeEntry::fresh());
 
@@ -806,8 +853,9 @@ fn the_schedule_is_the_host_transcripts() {
             .count();
         let states = mine.len() - squeezes;
         println!(
-            "schedule S={num_vars} Q={num_queries} grind={grind}: {squeezes} squeezes, \
+            "schedule S={num_vars} Q={num_queries} grind={grind} {:?}: {squeezes} squeezes, \
              {states} state reads, {} rows, {} permutations",
+            f.shape.schedule,
             chain_schedule_rows(&f.shape, SpongeEntry::fresh()),
             chain_schedule_perms(&f.shape, SpongeEntry::fresh()),
         );
@@ -853,8 +901,9 @@ fn the_schedule_is_the_host_transcripts() {
 /// own — and only the first of them was pinned before this test.
 #[test]
 fn the_chain_emits_its_closed_form() {
-    for (num_vars, num_queries, grind) in COST_SHAPES {
-        let f = fixture(num_vars, num_queries, grind);
+    for (cfg, num_vars) in cost_configs() {
+        let (num_queries, grind) = (cfg.num_queries, cfg.grind.query);
+        let f = fixture_with(&cfg, num_vars);
         let program = chain_program(&f.shape);
         let entry = SpongeEntry::fresh();
 
@@ -873,10 +922,11 @@ fn the_chain_emits_its_closed_form() {
         let predicted_perms = chain_perms(&f.shape, entry);
 
         println!(
-            "chain S={num_vars} Q={num_queries} grind={grind}: {measured} rows \
+            "chain S={num_vars} Q={num_queries} grind={grind} {:?}: {measured} rows \
              ({} shape + {} schedule predicted {predicted}); {perms} permutations \
              ({} openings + {} grind + {} schedule predicted {predicted_perms}); \
              {consts} constants, {hints} hints, {} instructions",
+            f.shape.schedule,
             chain_shape_rows(&f.shape),
             chain_schedule_rows(&f.shape, entry),
             chain_opening_perms(&f.shape),
@@ -1425,7 +1475,7 @@ const CAP_POLICIES: [CapPolicy; 3] = [CapPolicy::Fixed(1), CapPolicy::Fixed(2), 
 fn a_capped_chain_executes_on_a_proof_the_host_accepts() {
     for (num_vars, num_queries) in [(6usize, 3usize), (5, 3), (9, 3), (6, 25), (9, 25)] {
         for cap in CAP_POLICIES {
-            let f = fixture_with(num_vars, num_queries, 0, cap);
+            let f = fixture_capped(num_vars, num_queries, 0, cap);
             assert_eq!(
                 f.shape.caps,
                 config_with(num_queries, 0, cap).tree_caps(num_vars),
@@ -1482,7 +1532,7 @@ fn a_capped_chain_emits_its_closed_form() {
 #[test]
 fn the_schedule_is_the_host_transcripts_under_the_cap() {
     for (num_vars, num_queries, grind) in COST_SHAPES {
-        let f = fixture_with(num_vars, num_queries, grind, CapPolicy::Auto);
+        let f = fixture_capped(num_vars, num_queries, grind, CapPolicy::Auto);
         let host = f.recorded.duplex.borrow().hashes.clone();
         assert_eq!(
             chain_hash_schedule(&f.shape, SpongeEntry::fresh()),
@@ -1502,7 +1552,7 @@ fn a_tampered_capped_chain_cannot_execute() {
     // [3, 2] — tree 0 has eight cap nodes and three queries, so at least five
     // are unreached.
     let cap = CapPolicy::Fixed(3);
-    let f = fixture_with(6, 3, 0, cap);
+    let f = fixture_capped(6, 3, 0, cap);
     assert_eq!(f.shape.caps, vec![3, 2]);
     let program = chain_program(&f.shape);
     assert!(
@@ -1670,4 +1720,213 @@ fn the_genesis_threshold_budget_stays_within_two_percent_under_the_auto_cap() {
         (budget as f64) >= 0.98 * at_24 as f64 && budget <= at_24 + at_24 / 50,
         "the budget must stay within 2% of the 24-variable chain it stands for"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W2: the first-fold schedules (`LAMBDA_VM_ZF_WHIR_FOLDS=first5 | first6`).
+// ---------------------------------------------------------------------------
+
+/// ★ A first-fold chain executes on a proof the host accepts — the stream
+/// comparison of [`the_chain_executes_on_a_proof_the_host_accepts`], with the
+/// round-0 block 32 or 64 base values wide.
+#[test]
+fn a_first_fold_chain_executes_on_a_proof_the_host_accepts() {
+    for (num_vars, num_queries, grind, k0) in KNOB_COST_SHAPES {
+        let cfg = first_fold_config(num_queries, grind, k0);
+        let f = fixture_with(&cfg, num_vars);
+        assert_eq!(f.shape.schedule, cfg.schedule(num_vars));
+        assert_eq!(f.shape.schedule[0], k0.min(num_vars));
+        assert_eq!(f.shape.current_felts(0), 1 << k0.min(num_vars));
+        let program = chain_program(&f.shape);
+        execute(
+            &program,
+            &[chain_arena(&f, &f.proof)],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "S={num_vars} first{k0} {:?}: the machine refused an accepted proof: {e:?}",
+                f.shape.schedule
+            )
+        });
+    }
+}
+
+/// ★ The tamper arm on the wide base block: the LAST value of round 0's
+/// 64-value block and one of its Merkle siblings. The host must reject each
+/// forgery (so the refusal is of something invalid) and the machine must
+/// refuse it.
+#[test]
+fn a_tampered_first_fold_chain_cannot_execute() {
+    let grind = 8u8;
+    let cfg = first_fold_config(3, grind, 6);
+    let f = fixture_with(&cfg, 9);
+    assert_eq!(f.shape.schedule, vec![6, 3]);
+    let program = chain_program(&f.shape);
+    assert!(
+        execute(
+            &program,
+            &[chain_arena(&f, &f.proof)],
+            &crate::hash_pin::BLOCK_HASHER
+        )
+        .is_ok(),
+        "the untouched proof must execute, or the arm below proves nothing"
+    );
+
+    let host_rejects = |proof: &ChainProof<F, E>| -> bool {
+        let mut t = Recording::new();
+        verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, &cfg, &mut t)
+            .is_err()
+    };
+
+    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => {
+            assert_eq!(p.current[0].values.len(), 64, "round 0 opens 64 values");
+            p.current[0].values[63] += FE::one();
+        }
+        RoundOpenings::Extension(_) => panic!("round 0 is base"),
+    }
+    sites.push(("the last value of a 64-wide base block", forged));
+
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Extension(_) => panic!("round 0 is base"),
+    }
+    sites.push(("a round-0 Merkle sibling", forged));
+
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => p.next[0].values[0] += FEE::one(),
+        RoundOpenings::Extension(_) => panic!("round 0 is base"),
+    }
+    sites.push((
+        "the successor block round 0 checks its fold against",
+        forged,
+    ));
+
+    for (name, forged) in &sites {
+        assert!(
+            host_rejects(forged),
+            "{name}: the host must reject the forgery"
+        );
+        assert!(
+            execute(
+                &program,
+                &[chain_arena(&f, forged)],
+                &crate::hash_pin::BLOCK_HASHER
+            )
+            .is_err(),
+            "{name}: the machine must refuse the forgery"
+        );
+    }
+}
+
+/// ★ The knob-on production pins, at `S = 25, Q = 112`, 20-bit grinds.
+///
+/// Derived by hand first, off `verify_weighted`'s round structure, as
+/// [`the_production_shape_reproduces_the_campaigns_permutation_count`] did:
+///
+/// - `first6` `[6,4,4,4,4,3]`: domains 27/21/17/13/9/5; current depths
+///   21+17+13+9+5+2 = 67, successor depths 17+13+9+5+2 = 46, so 113 parents;
+///   current leaves 8 (64 BASE felts) + 4×6 + 3 (the 24-felt tail) = 35 and
+///   successor leaves 4×6 + 3 = 27, so 62 leaf blocks. 175 a query, 19,600 a
+///   chain.
+/// - `first5` `[5,4,4,4,4,4]`: domains 27/22/18/14/10/6; current depths
+///   22+18+14+10+6+2 = 72, successor 18+14+10+6+2 = 50, so 122 parents; leaves
+///   4 (32 base felts) + 5×6 + 5×6 = 64. 186 a query, 20,832 a chain.
+///
+/// The whole-chain figures (grind + schedule terms) are design/WHIR.md §4.8's,
+/// from D-WHIR's independent Python re-implementation of these forms
+/// (`whir_model.py`), which reproduces today's 22,828 / 185,509: first6
+/// 19,877 permutations and 201,318 rows, first5 21,109 and 189,028. R = 6
+/// under both, so `3R − 1 = 17` grinds, 34 permutations.
+#[test]
+fn the_first_fold_production_chains_cost_what_the_design_derived() {
+    let entry = SpongeEntry::fresh();
+    for (k0, schedule, parents, per_query, perms, rows) in [
+        (6, vec![6, 4, 4, 4, 4, 3], 113, 175, 19_877, 201_318),
+        (5, vec![5, 4, 4, 4, 4, 4], 122, 186, 21_109, 189_028),
+    ] {
+        let shape = ChainShape::new(&first_fold_config(112, 20, k0), 25);
+        assert_eq!(shape.schedule, schedule, "first{k0}");
+        let got_parents: usize = (0..shape.rounds())
+            .map(|r| shape.current_depth(r) + shape.next_depth(r).unwrap_or(0))
+            .sum();
+        assert_eq!(got_parents, parents, "first{k0}: Merkle parents a query");
+        assert_eq!(
+            shape.current_felts(0),
+            1 << k0,
+            "first{k0}: round 0 is base"
+        );
+        let opening = chain_opening_perms(&shape);
+        assert_eq!(opening, per_query * 112, "first{k0}: opening permutations");
+        assert_eq!(chain_grind_perms(&shape), 34, "first{k0}: 17 grinds");
+        println!(
+            "production chain S=25 first{k0} Q=112 grind=20: {opening} opening permutations, \
+             {} permutations, {} rows ({} schedule perms, {} schedule rows)",
+            chain_perms(&shape, entry),
+            chain_rows(&shape, entry),
+            chain_schedule_perms(&shape, entry),
+            chain_schedule_rows(&shape, entry),
+        );
+        assert_eq!(
+            chain_perms(&shape, entry),
+            perms,
+            "first{k0}: permutations a chain"
+        );
+        assert_eq!(chain_rows(&shape, entry), rows, "first{k0}: rows a chain");
+    }
+}
+
+/// ★ The knob-on production chains EMIT their closed forms — the F1 of
+/// [`the_production_chain_emits_its_closed_form`] under `first5` and `first6`.
+/// `#[ignore]`d for the same reason (a production-shape program).
+#[test]
+#[ignore = "builds two production-shape chain programs; run with -- --ignored"]
+fn the_first_fold_production_chains_emit_their_closed_forms() {
+    let entry = SpongeEntry::fresh();
+    for k0 in [5, 6] {
+        let shape = ChainShape::new(&first_fold_config(112, 20, k0), 25);
+        let program = chain_program(&shape);
+        let consts = const_rows(&program);
+        let hints = hint_rows(&program);
+        assert_eq!(hints, Layout::new(&shape).total as usize, "first{k0}");
+        let measured = program.instrs.len() - consts - chain_plumbing(&shape);
+        let perms = perm_rows(&program);
+        println!(
+            "PRODUCTION chain S=25 first{k0} Q=112 grind=20: {measured} rows against {} \
+             predicted; {perms} permutations against {}; {consts} constants, {} instructions",
+            chain_rows(&shape, entry),
+            chain_perms(&shape, entry),
+            program.instrs.len(),
+        );
+        assert_eq!(measured, chain_rows(&shape, entry), "first{k0}: rows");
+        assert_eq!(perms, chain_perms(&shape, entry), "first{k0}: permutations");
+    }
+}
+
+/// ⛔ `PREPARED_LEG_ROWS` stays FIXED under the fold knob (RULINGS 15), and
+/// this is what makes that safe: under each first fold the constant still
+/// covers the block's 20-variable stack, so no page is left sparse that the
+/// opening could carry. The default band above is untouched; its upper side
+/// (the 24-variable chain) is a statement about where the constant was read
+/// from, at the default schedule only.
+#[test]
+fn the_genesis_threshold_budget_still_covers_the_stack_under_each_first_fold() {
+    let budget = crate::continuation::PREPARED_LEG_ROWS;
+    for (k0, at_20_design) in [(5, 137_321), (6, 155_889)] {
+        let at_20 = chain_shape_rows(&ChainShape::new(&first_fold_config(112, 20, k0), 20));
+        println!("GENESIS BUDGET first{k0}: {budget} rows against a chain of {at_20} at 20");
+        assert_eq!(
+            at_20, at_20_design,
+            "first{k0}: the 20-variable stack's rows (design/WHIR.md §4.8)"
+        );
+        assert!(
+            budget >= at_20,
+            "first{k0}: the threshold charges {budget} rows for a stack that costs {at_20}"
+        );
+    }
 }

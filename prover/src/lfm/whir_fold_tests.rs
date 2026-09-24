@@ -85,7 +85,18 @@ fn const_rows(program: &LfmProgram) -> usize {
 /// that moves with the index width, so pinning it needs two widths at the SAME
 /// block: `(8, 4, 4)` and `(8, 4, 6)` are that pair, and a form that folded the
 /// index term into the block term would fit one and miss the other.
-const SHAPES: &[(usize, usize, usize)] = &[(5, 1, 4), (6, 2, 4), (8, 4, 4), (10, 4, 6), (8, 4, 6)];
+///
+/// The last two are W2's first folds (`first5`, `first6`): blocks of 32 and 64,
+/// on the chain relation, the widest folds the stack runs (`MAX_FOLD`).
+const SHAPES: &[(usize, usize, usize)] = &[
+    (5, 1, 4),
+    (6, 2, 4),
+    (8, 4, 4),
+    (10, 4, 6),
+    (8, 4, 6),
+    (12, 5, 7),
+    (13, 6, 7),
+];
 
 /// ★ F1 for the fold: every row named, with the interned constants counted
 /// separately and pinned in their own right.

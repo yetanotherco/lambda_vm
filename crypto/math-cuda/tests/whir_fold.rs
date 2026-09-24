@@ -93,3 +93,50 @@ fn the_device_ext3_commit_matches_the_host() {
         );
     }
 }
+
+/// ★ Six levels in one residency (W2 `first6`: the first round folds 6
+/// variables of the base codeword), against the host arm.
+///
+/// ⚠ Called on the device ENTRY POINT, not through `whir::fold_codeword_k`:
+/// that wrapper returns `None` below its size threshold or under
+/// `LAMBDA_VM_NO_GPU_WHIR_FOLD` and falls back to the host silently, so a
+/// comparison through it can be the host against itself. This one either runs
+/// the kernels or fails.
+#[test]
+fn the_device_folds_six_levels_as_the_host_does() {
+    for (num_vars, log_blowup) in [(14, 2), (12, 2), (7, 1)] {
+        let (cw, domain) = codeword(num_vars, log_blowup);
+        let alphas: Vec<FE3> = (1..=6).map(challenge).collect();
+        let (host, host_domain) =
+            whir::fold_codeword_k_on_host::<Gl, Gl, Ext3>(&cw, &domain, &alphas)
+                .expect("host fold");
+
+        // The arguments `multilinear::gpu::fold_codeword_k` builds.
+        let two_inv = *FE::from(2u64).inv().expect("2 is invertible").value();
+        let mut g_inv = domain.generator().inv().expect("a generator is invertible");
+        let mut g_invs = Vec::with_capacity(alphas.len());
+        for _ in 0..alphas.len() {
+            g_invs.push(*g_inv.value());
+            g_inv = g_inv.square();
+        }
+        let raw_alphas: Vec<u64> = alphas
+            .iter()
+            .flat_map(|a| a.value().iter().map(|c| *c.value()))
+            .collect();
+        let raw: Vec<u64> = cw.iter().map(|v| *v.value()).collect();
+        let device = math_cuda::whir::fold_codeword_base(&raw, two_inv, &g_invs, &raw_alphas)
+            .unwrap_or_else(|e| panic!("device fold at 2^{num_vars} (needs a GPU): {e:?}"));
+        let device: Vec<FE3> = device
+            .chunks_exact(3)
+            .map(|c| FE3::new([FE::from_raw(c[0]), FE::from_raw(c[1]), FE::from_raw(c[2])]))
+            .collect();
+
+        assert_eq!(host.len(), cw.len() >> 6);
+        assert_eq!(device.len(), host.len());
+        assert_eq!(
+            device, host,
+            "the six-level base fold differs at 2^{num_vars}"
+        );
+        assert_eq!(host_domain.log_size(), num_vars + log_blowup - 6);
+    }
+}

@@ -5,7 +5,7 @@
 //! LAMBDA_VM_ZF_WHIR_CAP    off | auto | 0..=16    Merkle cap, every WHIR chain tree (W1)
 //! LAMBDA_VM_ZF_FRI         pair | dp              FRI fold schedule (S3)
 //! LAMBDA_VM_ZF_ONE_ROW     0 | 1 | auto           one-row trace openings (S2)
-//! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | dp | k,k,…  WHIR per-round fold schedule (W2)
+//! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! ```
 //!
 //! Every unset knob is today's format, so an unconfigured run proves exactly
@@ -41,7 +41,7 @@
 
 use std::sync::OnceLock;
 
-use multilinear::whir_chain::{ChainConfig, ChainFormat, FoldList, WhirFolds};
+use multilinear::whir_chain::{ChainConfig, ChainFormat, FirstFold, WhirFolds};
 use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 /// The knob names, in banner order.
@@ -177,6 +177,7 @@ impl ZfFormat {
             }
             // Always, including the default — see the module header.
             println!("{}", format.banner());
+            println!("{}", format.whir_schedule_line());
             format
         })
     }
@@ -191,6 +192,23 @@ impl ZfFormat {
             self.fri,
             self.one_row,
             whir_folds_name(&self.whir_folds)
+        )
+    }
+
+    /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=25:[…]` — the fold
+    /// schedule the WHIR base chains run at the production stack heights, so a
+    /// log states the rounds it proved and not only the knob's name. Printed
+    /// under the banner, on every setting.
+    pub fn whir_schedule_line(&self) -> String {
+        let config = crate::multilinear_prove::chain_config_under(self, &[(1, 25)]);
+        let schedules = (20..=25)
+            .map(|n| format!("n={n}:{:?}", config.schedule(n)).replace(' ', ""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "ZF WHIR SCHEDULES: whir_folds={} q={} {schedules}",
+            whir_folds_name(&self.whir_folds),
+            config.num_queries
         )
     }
 
@@ -238,44 +256,40 @@ fn parse_cap(name: &str, v: &str) -> Result<CapPolicy, String> {
     v.parse().map_err(|e| format!("{name}={v:?}: {e}"))
 }
 
-/// `uniform4` | `dp` | a comma-separated list of folds (`4,4,4,1`).
+/// The first-round folds the knob accepts: the two arms RULINGS 15 builds.
+///
+/// ⚠ Not `first1..=first4`: a first fold narrower than the uniform one adds
+/// rounds at some heights (Q would rise and the arms stop being comparable),
+/// and `first4` IS `uniform4` under another statement word. Not `dp`: RULINGS
+/// 15, no DP. Widening this list is a format decision, not a parser one.
+pub const WHIR_FIRST_FOLDS: [usize; 2] = [5, 6];
+
+/// `uniform4` | `first5` | `first6`.
 fn parse_whir_folds(v: &str) -> Result<WhirFolds, String> {
-    let err = || {
-        format!(
-            "{ENV_WHIR_FOLDS}={v:?}: expected `uniform{PRODUCTION_WHIR_LOG_FOLDING}`, `dp`, or a \
-             comma-separated list of 1..=16, at most {} rounds",
-            multilinear::whir_chain::MAX_FOLD_ROUNDS
-        )
-    };
     if v == format!("uniform{PRODUCTION_WHIR_LOG_FOLDING}") {
         return Ok(WhirFolds::Uniform);
     }
-    if v == "dp" {
-        return Ok(WhirFolds::Dp);
-    }
-    let folds = v
-        .split(',')
-        .map(|k| {
-            let k = k.trim();
-            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(err());
-            }
-            k.parse::<u8>().map_err(|_| err())
+    WHIR_FIRST_FOLDS
+        .iter()
+        .find(|&&k| v == format!("first{k}"))
+        .and_then(|&k| FirstFold::new(k))
+        .map(WhirFolds::First)
+        .ok_or_else(|| {
+            format!(
+                "{ENV_WHIR_FOLDS}={v:?}: expected `uniform{PRODUCTION_WHIR_LOG_FOLDING}`, {}",
+                WHIR_FIRST_FOLDS
+                    .iter()
+                    .map(|k| format!("`first{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )
         })
-        .collect::<Result<Vec<u8>, String>>()?;
-    FoldList::new(&folds).map(WhirFolds::List).ok_or_else(err)
 }
 
 fn whir_folds_name(folds: &WhirFolds) -> String {
     match folds {
         WhirFolds::Uniform => format!("uniform{PRODUCTION_WHIR_LOG_FOLDING}"),
-        WhirFolds::Dp => "dp".to_string(),
-        WhirFolds::List(list) => list
-            .as_slice()
-            .iter()
-            .map(u8::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
+        WhirFolds::First(k0) => format!("first{}", k0.get()),
     }
 }
 
@@ -340,15 +354,17 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto")]).unwrap().one_row,
             OneRowMode::Auto
         );
+        for k in [5, 6] {
+            assert_eq!(
+                parse(&[(ENV_WHIR_FOLDS, &format!("first{k}"))])
+                    .unwrap()
+                    .whir_folds,
+                WhirFolds::First(FirstFold::new(k).unwrap())
+            );
+        }
         assert_eq!(
-            parse(&[(ENV_WHIR_FOLDS, "dp")]).unwrap().whir_folds,
-            WhirFolds::Dp
-        );
-        assert_eq!(
-            parse(&[(ENV_WHIR_FOLDS, "4,4,4,4,4,4,1")])
-                .unwrap()
-                .whir_folds,
-            WhirFolds::List(FoldList::new(&[4, 4, 4, 4, 4, 4, 1]).unwrap())
+            parse(&[(ENV_WHIR_FOLDS, " FIRST6 ")]).unwrap().whir_folds,
+            WhirFolds::First(FirstFold::new(6).unwrap())
         );
     }
 
@@ -368,16 +384,20 @@ mod tests {
             (ENV_WHIR_FOLDS, "uniform"),
             (ENV_WHIR_FOLDS, "uniform3"),
             (ENV_WHIR_FOLDS, ""),
-            (ENV_WHIR_FOLDS, "4,,4"),
-            (ENV_WHIR_FOLDS, "4,0"),
-            (ENV_WHIR_FOLDS, "4,17"),
-            (ENV_WHIR_FOLDS, "+4"),
+            (ENV_WHIR_FOLDS, "4,4,4"),
+            (ENV_WHIR_FOLDS, "dp"),
+            (ENV_WHIR_FOLDS, "first"),
+            (ENV_WHIR_FOLDS, "first4"),
+            (ENV_WHIR_FOLDS, "first3"),
+            (ENV_WHIR_FOLDS, "first7"),
+            (ENV_WHIR_FOLDS, "first0"),
+            (ENV_WHIR_FOLDS, "first 6"),
+            (ENV_WHIR_FOLDS, "first06"),
+            (ENV_WHIR_FOLDS, "list:6,4"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
         }
-        let too_long = vec!["1"; multilinear::whir_chain::MAX_FOLD_ROUNDS + 1].join(",");
-        assert!(parse(&[(ENV_WHIR_FOLDS, &too_long)]).is_err());
     }
 
     #[test]
@@ -387,11 +407,11 @@ mod tests {
             whir_cap: CapPolicy::Fixed(2),
             fri: FriMode::Dp,
             one_row: OneRowMode::Auto,
-            whir_folds: WhirFolds::List(FoldList::new(&[4, 4, 3]).unwrap()),
+            whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
         };
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=4,4,3"
+            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -459,6 +479,15 @@ mod tests {
     }
 
     #[test]
+    fn the_whir_fold_lever_is_selectable() {
+        const { assert!(multilinear::whir_chain::WHIR_FOLDS_IMPLEMENTED) };
+        for v in ["first5", "first6"] {
+            let f = parse(&[(ENV_WHIR_FOLDS, v)]).unwrap();
+            assert!(f.unimplemented_levers().is_empty(), "{v}");
+        }
+    }
+
+    #[test]
     fn apply_stamps_only_the_format_fields() {
         let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
         assert!(base.has_default_format());
@@ -485,12 +514,12 @@ mod tests {
         let chain = crate::multilinear_prove::chain_config(&[(8, 20)]);
         let c = ZfFormat {
             whir_cap: CapPolicy::Fixed(3),
-            whir_folds: WhirFolds::Dp,
+            whir_folds: WhirFolds::First(FirstFold::new(5).unwrap()),
             ..ZfFormat::DEFAULT
         }
         .chain(chain);
         assert_eq!(c.format.cap, CapPolicy::Fixed(3));
-        assert_eq!(c.format.folds, WhirFolds::Dp);
+        assert_eq!(c.format.folds, WhirFolds::First(FirstFold::new(5).unwrap()));
         assert_eq!(
             (c.log_blowup, c.log_folding, c.num_queries, c.grind),
             (
@@ -500,6 +529,48 @@ mod tests {
                 chain.grind
             )
         );
+    }
+
+    #[test]
+    fn the_schedule_line_states_the_rounds() {
+        assert_eq!(
+            ZfFormat::DEFAULT.whir_schedule_line(),
+            "ZF WHIR SCHEDULES: whir_folds=uniform4 q=112 n=20:[4,4,4,4,4] \
+             n=21:[4,4,4,4,4,1] n=22:[4,4,4,4,4,2] n=23:[4,4,4,4,4,3] \
+             n=24:[4,4,4,4,4,4] n=25:[4,4,4,4,4,4,1]"
+        );
+        let first6 = ZfFormat {
+            whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            ..ZfFormat::DEFAULT
+        };
+        assert_eq!(
+            first6.whir_schedule_line(),
+            "ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] \
+             n=21:[6,4,4,4,3] n=22:[6,4,4,4,4] n=23:[6,4,4,4,4,1] \
+             n=24:[6,4,4,4,4,2] n=25:[6,4,4,4,4,3]"
+        );
+    }
+
+    /// The production WHIR config under each accepted knob value: the format
+    /// is carried, Q is charged the schedule's rounds, and at the block's
+    /// tallest stack (25) every arm keeps today's Q = 112.
+    #[test]
+    fn the_production_chain_config_under_each_arm() {
+        use crate::multilinear_prove::chain_config_under;
+        let today = chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)]);
+        assert_eq!(today, crate::multilinear_prove::chain_config(&[(1, 25)]));
+        assert_eq!((today.rounds(25), today.num_queries), (7, 112));
+        for (name, rounds25) in [("first5", 6), ("first6", 6)] {
+            let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
+            let c = chain_config_under(&f, &[(1, 25)]);
+            assert_eq!(c.format.folds, f.whir_folds);
+            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 112), "{name}");
+            assert_eq!(
+                (c.log_blowup, c.log_folding, c.grind),
+                (today.log_blowup, today.log_folding, today.grind)
+            );
+            assert_ne!(c.fold_word(), today.fold_word());
+        }
     }
 
     #[test]
