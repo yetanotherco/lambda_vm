@@ -598,7 +598,8 @@ mod keccak_tests {
     #[test]
     fn test_keccak_bitwise_ops_count() {
         let (kop, _) = make_keccak_ops();
-        let ops = collect_bitwise_from_keccak(&[kop]);
+        let mut ops = Vec::new();
+        for_each_keccak_bitwise_lookup(&[kop], |op| ops.push(op));
 
         let xor = ops
             .iter()
