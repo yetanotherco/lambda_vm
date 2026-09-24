@@ -9,6 +9,8 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
 
+use crate::fri::schedule::{FRI_SCHEDULE_DMAX, FriFormat};
+
 /// The FRI early-termination fold layout.
 ///
 /// Derived identically by the CPU prover (`commit_phase_from_evaluations`), the
@@ -16,11 +18,16 @@ use math::polynomial::Polynomial;
 /// Keeping the arithmetic in one place is load-bearing: the three callers must
 /// agree exactly or proofs fail to verify, and a CPU/GPU disagreement would
 /// surface only on GPU machines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The committed layers follow a fold schedule (`crate::fri::schedule`): layer
+/// `j` folds by `2^{schedule[j]}`. Today's layout ([`Self::new`]) is the
+/// all-ones schedule, built through the same constructor as every other format.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FriFoldLayout {
     /// Folds from the LDE codeword down to the terminal codeword.
     pub(crate) total_folds: u32,
-    /// Committed (Merkle-rooted) FRI layers = `total_folds - 1`, or 0 when there
+    /// Committed (Merkle-rooted) FRI layers = `schedule.len()`. Row-pair
+    /// layout: `total_folds - 1` under the all-ones schedule, or 0 when there
     /// is no fold or only a single final fold.
     pub(crate) num_committed: usize,
     /// Terminal codeword length = `2^(blowup_log + effective_k)`.
@@ -28,10 +35,18 @@ pub(crate) struct FriFoldLayout {
     /// Terminal polynomial log-degree bound actually used, `min(k, trace_bits)`.
     /// This is the verifier's `expected_k` and the prover's `effective_log_degree`.
     pub(crate) effective_k: u32,
+    /// Fold exponent of each committed layer, first committed layer first.
+    /// Invariant (checked by every constructor): `(one_row ? 0 : 1) +
+    /// Σ schedule == total_folds` whenever `total_folds >= 1`, and empty
+    /// otherwise; every entry is in `1..=FRI_SCHEDULE_DMAX`.
+    pub(crate) schedule: Vec<u8>,
+    /// Whether the DEEP codeword itself is committed (one-row openings): then
+    /// the chain starts at the LDE size and there is no uncommitted fold 0.
+    pub(crate) one_row: bool,
 }
 
 impl FriFoldLayout {
-    /// Derive the layout from the LDE codeword size.
+    /// Today's layout, derived from the LDE codeword size.
     ///
     /// * `lde_log`    — log2 of the LDE (deep-composition) codeword length.
     /// * `blowup_log` — log2 of the LDE blowup factor.
@@ -42,15 +57,72 @@ impl FriFoldLayout {
     /// size for traces too small to fold that far (the `.min(lde_log)`).
     /// Computing `blowup_log + k` in `u32` (both small) sidesteps the
     /// `1 << (blowup_log + k)` overflow an out-of-range `k` would otherwise cause.
+    ///
+    /// This is [`Self::for_format`] at [`FriFormat::LEGACY`]: pair layers,
+    /// row-pair openings, the all-ones schedule.
     pub(crate) fn new(lde_log: u32, blowup_log: u32, k: u32) -> Self {
+        Self::for_format(lde_log, blowup_log, k, &FriFormat::LEGACY)
+    }
+
+    /// The layout under an explicit proof format. `total_folds`,
+    /// `terminal_len` and `effective_k` do not depend on the format; only the
+    /// split of the folds into committed layers does.
+    pub(crate) fn for_format(lde_log: u32, blowup_log: u32, k: u32, fmt: &FriFormat<'_>) -> Self {
         let terminal_log = (blowup_log + k).min(lde_log);
+        let schedule = fmt.schedule(lde_log, terminal_log);
+        let layout = Self::assemble(lde_log, blowup_log, terminal_log, fmt.one_row, schedule);
+        // Holds by construction: both schedules land exactly on the terminal.
+        debug_assert!(layout.schedule_is_consistent());
+        layout
+    }
+
+    /// The layout for a caller-supplied schedule, or `None` if the schedule
+    /// does not cover exactly the committed folds (or has an exponent outside
+    /// `1..=FRI_SCHEDULE_DMAX`).
+    #[allow(dead_code)] // first caller arrives with the S3 prover/verifier.
+    pub(crate) fn from_schedule(
+        lde_log: u32,
+        blowup_log: u32,
+        k: u32,
+        one_row: bool,
+        schedule: Vec<u8>,
+    ) -> Option<Self> {
+        let terminal_log = (blowup_log + k).min(lde_log);
+        let layout = Self::assemble(lde_log, blowup_log, terminal_log, one_row, schedule);
+        layout.schedule_is_consistent().then_some(layout)
+    }
+
+    fn assemble(
+        lde_log: u32,
+        blowup_log: u32,
+        terminal_log: u32,
+        one_row: bool,
+        schedule: Vec<u8>,
+    ) -> Self {
         let total_folds = lde_log - terminal_log;
         Self {
             total_folds,
-            num_committed: total_folds.saturating_sub(1) as usize,
+            num_committed: schedule.len(),
             terminal_len: 1usize << terminal_log,
             effective_k: terminal_log - blowup_log,
+            schedule,
+            one_row,
         }
+    }
+
+    /// The constructor invariant (see [`Self::schedule`]).
+    fn schedule_is_consistent(&self) -> bool {
+        let entries_ok = self
+            .schedule
+            .iter()
+            .all(|&d| d >= 1 && u32::from(d) <= FRI_SCHEDULE_DMAX);
+        let covered: u64 = self.schedule.iter().map(|&d| u64::from(d)).sum();
+        let expected = if self.total_folds == 0 {
+            0
+        } else {
+            u64::from(self.total_folds) - u64::from(!self.one_row)
+        };
+        entries_ok && covered == expected
     }
 }
 
