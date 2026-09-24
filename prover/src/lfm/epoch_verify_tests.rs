@@ -67,8 +67,9 @@ pub(super) struct TableLegs {
     pub(super) analysis: Analysis,
     /// `[query][group]` — the row pair in leaf order, then the path.
     openings: Vec<Vec<(Vec<LfmWord>, Vec<Commitment>)>>,
-    /// `[query][layer]` — `(pᵢ(−υ^(2ⁱ)), path)`.
-    fri_openings: Vec<Vec<(FEE, Vec<Commitment>)>>,
+    /// `[query][layer]` — `(opened values, path)`: the sibling `pᵢ(−υ^(2ⁱ))`
+    /// under `pair`, the whole `2^{d_j}` group under a fold schedule.
+    fri_openings: Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>,
     /// Every capped tree's cap, split off query 0's (owner) path, in the caps
     /// arena's order: the committed matrices in group order, then the capped
     /// FRI layers. Empty at the default format.
@@ -286,30 +287,7 @@ pub(super) fn build_table_legs(
         })
         .collect();
 
-    let fri = verify.fri;
-    let mut fri_caps: Vec<Commitment> = Vec::new();
-    let fri_openings = (0..view.query_list_len())
-        .map(|q| {
-            let d = view.query(q);
-            d.layers_evaluations_sym()
-                .iter()
-                .enumerate()
-                .map(|(i, sym)| {
-                    let path = d.layer_auth_path(i);
-                    let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
-                    if c == 0 || q != 0 {
-                        assert_eq!(path.len(), depth - c, "query {q} FRI layer {i}");
-                        return (*sym, path.to_vec());
-                    }
-                    let (siblings, cap) =
-                        crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-                            .expect("the owner path is D − c + 2^c long");
-                    fri_caps.extend_from_slice(cap);
-                    (*sym, siblings.to_vec())
-                })
-                .collect()
-        })
-        .collect();
+    let (fri_openings, fri_caps) = fri_layer_openings(view, verify.fri);
 
     // Production's own boundary list, for the premise check only. It takes the
     // bus public inputs, which are PROOF data — which is exactly why the emitted
@@ -355,6 +333,57 @@ pub(super) fn build_table_legs(
         num_precomputed_cols: num_precomputed,
         precomputed_commitment: air.is_preprocessed().then(|| air.precomputed_commitment()),
     }
+}
+
+/// Every query's FRI layer openings, per layer `(opened values, path)`, and
+/// the capped layers' caps (layer order) split off query 0's owner paths.
+///
+/// The proof's flat `layers_evaluations_sym` is one sibling per layer under
+/// `pair` and every layer's full group (`2^{d_j}` values, position order)
+/// under a fold schedule (FRI.md §3.4); `FriShape::layer_values` says which.
+/// Each path is cut at its layer's cap: query 0 of a capped layer carries
+/// `D − c + 2^c` nodes, every other query `D − c`.
+#[allow(clippy::type_complexity)]
+pub(super) fn fri_layer_openings<PI>(
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    fri: FriShape,
+) -> (Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>, Vec<Commitment>)
+where
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
+    let mut caps: Vec<Commitment> = Vec::new();
+    let openings = (0..view.query_list_len())
+        .map(|q| {
+            let d = view.query(q);
+            let flat = d.layers_evaluations_sym();
+            let per_query: usize = (0..fri.num_committed()).map(|j| fri.layer_values(j)).sum();
+            assert_eq!(
+                flat.len(),
+                per_query,
+                "query {q}: the opened values per query"
+            );
+            let mut offset = 0usize;
+            (0..fri.num_committed())
+                .map(|i| {
+                    let values = flat[offset..offset + fri.layer_values(i)].to_vec();
+                    offset += fri.layer_values(i);
+                    let path = d.layer_auth_path(i);
+                    let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
+                    if c == 0 || q != 0 {
+                        assert_eq!(path.len(), depth - c, "query {q} FRI layer {i}");
+                        return (values, path.to_vec());
+                    }
+                    let (siblings, cap) =
+                        crypto::merkle_tree::cap::split_owner_path(path, depth, c)
+                            .expect("the owner path is D − c + 2^c long");
+                    caps.extend_from_slice(cap);
+                    (values, siblings.to_vec())
+                })
+                .collect()
+        })
+        .collect();
+    (openings, caps)
 }
 
 impl TableLegs {
@@ -403,8 +432,8 @@ impl TableLegs {
     pub(super) fn fri_arena(&self) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for query in &self.fri_openings {
-            for (sym, path) in query {
-                out.push(ext_word(sym));
+            for (values, path) in query {
+                out.extend(values.iter().map(ext_word));
                 out.extend(super::proof_arena::commitments_to_arena(path));
             }
         }
@@ -1563,10 +1592,11 @@ fn the_assembled_epoch_verifier_runs_at_the_process_format() {
     for (i, l) in e.legs.iter().enumerate() {
         let f = l.verify.fri;
         println!(
-            "  leg {i:>2}: log2(lde) {:>2}  trace cap {}  FRI depths {:?} caps {:?}  \
-             {} permutations",
+            "  leg {i:>2}: log2(lde) {:>2}  trace cap {}  FRI schedule {:?} depths {:?} \
+             caps {:?}  {} permutations",
             l.verify.sub.log2_lde_length,
             l.verify.sub.trace_cap,
+            f.schedule(),
             (0..f.num_committed())
                 .map(|j| f.layer_depth(j))
                 .collect::<Vec<_>>(),

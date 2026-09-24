@@ -331,15 +331,18 @@ pub fn emit_table_verification(
     );
 
     // ---- the FRI commitments, likewise from the transcript's own cells.
-    let mut fri = FriCommitments {
-        layers: absorbs
-            .fri_roots
-            .iter()
-            .map(|r| LayerCommitment::from_lanes(r.lanes.clone()))
-            .collect(),
-        zetas: challenges.zetas.clone(),
-        coeffs: absorbs.fri_coeffs.to_vec(),
-    };
+    let layers = absorbs
+        .fri_roots
+        .iter()
+        .map(|r| LayerCommitment::from_lanes(r.lanes.clone()))
+        .collect();
+    let mut fri = FriCommitments::new(
+        b,
+        shape.fri,
+        layers,
+        challenges.zetas.clone(),
+        absorbs.fri_coeffs.to_vec(),
+    );
 
     // ---- the Merkle caps, once per tree, against the SAME root cells the
     // transcript absorbed (design/CAP.md §6.1): the matrices in group order,
@@ -576,7 +579,11 @@ pub fn leaf_permutations_at_rate(shape: &SubProofShape, rate_felts: usize) -> us
 /// take two blocks. The premise is gone rather than re-asserted; this function
 /// is what replaced it.
 pub fn fri_leaf_permutations_at_rate(fri: &FriShape, rate_felts: usize) -> usize {
-    fri.num_committed() * blocks_at_rate(FRI_LEAF_FELTS, rate_felts)
+    // Per layer: the pair's six felts under `pair`, a `2^d`-value group's
+    // `3·2^d` under a fold schedule (`FriShape::layer_leaf_felts`).
+    (0..fri.num_committed())
+        .map(|j| blocks_at_rate(fri.layer_leaf_felts(j), rate_felts))
+        .sum()
 }
 
 /// [`query_permutations`] at an arbitrary sponge rate.
@@ -644,7 +651,8 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
         .iter()
         .map(|g| blocks_for(group_leaf_felts(g), hash))
         .sum();
-    let fri_leaves = shape.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
+    // Per committed layer: a pair leaf (six felts), or a `2^d`-value group.
+    let fri_leaves = shape.fri.leaf_permutations_per_query(hash);
     let per_query =
         leaves + fri_leaves + groups * shape.sub.path_len() + shape.fri.path_steps_per_query();
     shape.num_queries * per_query

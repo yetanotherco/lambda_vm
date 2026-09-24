@@ -130,23 +130,24 @@ pub(super) fn folding_fixture_with(
 }
 
 /// Everything the FRI leg reads about one real sub-proof.
-struct HostFri {
-    shape: FriShape,
+pub(super) struct HostFri {
+    pub(super) shape: FriShape,
     /// The trace-side host fixture over the SAME proof: the openings, the roots,
     /// and production's own DEEP answers, which are this leg's `p₀`.
-    trace: HostSubProof,
+    pub(super) trace: HostSubProof,
     /// One root per committed layer, in fold order.
-    layer_roots: Vec<Commitment>,
+    pub(super) layer_roots: Vec<Commitment>,
     /// `ζ₀ .. ζ_C` from the verifier's replay.
-    zetas: Vec<FEE>,
+    pub(super) zetas: Vec<FEE>,
     /// The terminal polynomial's coefficients, low-to-high.
-    coeffs: Vec<FEE>,
-    /// `[query][layer]` — `(pᵢ(−υ^(2ⁱ)), path)`. Paths are cut at each layer's
-    /// cap (query 0's cap split off into [`Self::caps`]).
-    openings: Vec<Vec<(FEE, Vec<Commitment>)>>,
+    pub(super) coeffs: Vec<FEE>,
+    /// `[query][layer]` — `(opened values, path)`: the sibling `pᵢ(−υ^(2ⁱ))`
+    /// under `pair`, the whole group under a fold schedule. Paths are cut at
+    /// each layer's cap (query 0's cap split off into [`Self::caps`]).
+    pub(super) openings: Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>,
     /// Every capped layer's cap, in layer order — the caps arena. Empty at
     /// the default format.
-    caps: Vec<Commitment>,
+    pub(super) caps: Vec<Commitment>,
 }
 
 /// Build the FRI host fixture for a real proof of `num_boundaries` rows.
@@ -157,7 +158,7 @@ fn host_fri(num_boundaries: usize, blowup: usize) -> HostFri {
 
 /// [`host_fri`] for a proof the caller already holds — needed where the test
 /// also wants the AIR's verifier domain.
-fn host_fri_from(
+pub(super) fn host_fri_from(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     proof: &MultiProof<Gl, Ext3, ()>,
 ) -> HostFri {
@@ -169,31 +170,9 @@ fn host_fri_from(
     let shape = FriShape::from_options(opts, trace.shape.log2_lde_length);
     shape.check();
 
-    // Query 0 of a capped layer is its owner: the cap rides after the
-    // `D − c` siblings and goes to the caps arena.
-    let mut caps = Vec::new();
-    let openings = (0..view.query_list_len())
-        .map(|q| {
-            let d = view.query(q);
-            d.layers_evaluations_sym()
-                .iter()
-                .enumerate()
-                .map(|(i, sym)| {
-                    let path = d.layer_auth_path(i);
-                    let (depth, c) = (shape.layer_depth(i), shape.layer_cap(i));
-                    if c == 0 || q != 0 {
-                        assert_eq!(path.len(), depth - c, "query {q} layer {i}");
-                        return (*sym, path.to_vec());
-                    }
-                    let (siblings, cap) =
-                        crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-                            .expect("the owner path is D − c + 2^c long");
-                    caps.extend_from_slice(cap);
-                    (*sym, siblings.to_vec())
-                })
-                .collect()
-        })
-        .collect();
+    // Per layer the opened values (the sibling, or the whole group) and the
+    // path cut at the layer's cap; query 0's caps go to the caps arena.
+    let (openings, caps) = super::epoch_verify_tests::fri_layer_openings(view, shape);
 
     HostFri {
         shape,
@@ -208,7 +187,7 @@ fn host_fri_from(
 
 impl HostFri {
     /// The arenas the FRI-only program declares, for the given queries.
-    fn fri_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
+    pub(super) fn fri_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
         let mut out = vec![
             super::proof_arena::commitments_to_arena(&self.layer_roots),
             self.zetas.iter().map(ext_word).collect(),
@@ -223,11 +202,11 @@ impl HostFri {
     }
 
     /// Per query, per layer: the symmetric evaluation then its path.
-    fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
+    pub(super) fn query_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
-            for (sym, path) in &self.openings[q] {
-                out.push(ext_word(sym));
+            for (values, path) in &self.openings[q] {
+                out.extend(values.iter().map(ext_word));
                 out.extend(super::proof_arena::commitments_to_arena(path));
             }
         }
@@ -244,7 +223,7 @@ impl HostFri {
     /// evaluation against — and the mirror itself is checked, because the same
     /// codeword must reproduce the values the PROVER folded to, which no reading
     /// of these three lines could fake.
-    fn terminal_codeword(&self) -> Vec<FEE> {
+    pub(super) fn terminal_codeword(&self) -> Vec<FEE> {
         use math::fft::bit_reversing::in_place_bit_reverse_permute;
 
         let coset_offset = FE::from(self.shape.coset_offset);
@@ -382,7 +361,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
 ///
 /// Arena order: the per-query `(index, p₀, p₀ˢ)` block, then the four
 /// [`FriArenas`].
-fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
+pub(super) fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let q = b.declare_arena(3 * num_queries as u32);
     let (arenas, fri) = declare_fri(&mut b, shape, num_queries);
@@ -420,7 +399,7 @@ fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
 
 impl HostFri {
     /// The `(index, p₀, p₀ˢ)` arena [`fri_only_program`] reads.
-    fn deep_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
+    pub(super) fn deep_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
             out.push(base_word(FE::from(self.trace.iotas[q] as u64)));
@@ -431,7 +410,7 @@ impl HostFri {
     }
 
     /// Every arena [`fri_only_program`] declares, in order.
-    fn all_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
+    pub(super) fn all_arenas(&self, queries: &[usize]) -> Vec<Vec<LfmWord>> {
         let mut all = vec![self.deep_arena(queries)];
         all.extend(self.fri_arenas(queries));
         all
@@ -771,14 +750,17 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
     );
 }
 
-fn permutations(program: &LfmProgram) -> usize {
+pub(super) fn permutations(program: &LfmProgram) -> usize {
     // The CONFIGURED wrap hash's compressions. Filtering `KeccakF` here read
     // zero the moment production moved to BLAKE3, turning a cost measurement
     // into a failed assertion about a count nobody had re-derived.
     super::machine_tests::wrap_hash_instrs(program)
 }
 
-fn count_matching<F: Fn(&super::instr::Instr) -> bool>(program: &LfmProgram, f: F) -> usize {
+pub(super) fn count_matching<F: Fn(&super::instr::Instr) -> bool>(
+    program: &LfmProgram,
+    f: F,
+) -> usize {
     program.instrs.iter().filter(|i| f(i)).count()
 }
 
