@@ -212,3 +212,72 @@ fn print_goldens() {
         println!("GOLDEN (\"{name}\", \"{line}\"),");
     }
 }
+
+// ---------------------------------------------------------------------------
+// S3 (fri = dp) round trips under the production RPX pin: group leaves are
+// hashed by the algebraic `Batched` sponge over 3·2^d felts, so the RPX leaf
+// path of the group encoding is exercised here (the stark crate's S3 tests
+// cover Keccak and Blake3).
+// ---------------------------------------------------------------------------
+
+fn dp(schedule: Option<&[u8]>) -> ProofFormat {
+    ProofFormat {
+        fri_mode: stark::proof::options::FriMode::Dp,
+        fri_schedule_override: schedule
+            .map(|s| stark::proof::options::FriScheduleOverride::new(s).expect("fits")),
+        ..ProofFormat::DEFAULT
+    }
+}
+
+#[test]
+fn rpx_dp_round_trips() {
+    // SimpleAddition 2^9 rows, blowup 4, k 1: the chain covers 10 → 3.
+    for sched in [None, Some(&[3u8, 1, 3][..]), Some(&[1, 6][..])] {
+        let o = options(4, 1, 9, dp(sched));
+        let (air, proof) = prove_simple_addition(512, &o);
+        assert!(verify_simple_addition(&air, &proof), "{sched:?}");
+        if let Some(s) = sched {
+            assert_eq!(proof.fri_layers_merkle_roots.len(), s.len());
+            let values: usize = s.iter().map(|&d| 1usize << d).sum();
+            assert_eq!(proof.query_list[0].layers_evaluations_sym.len(), values);
+        }
+    }
+    // LogReadOnlyRAP (ext3 + aux) 2^7 rows, blowup 4, k 1: 8 → 3.
+    for sched in [None, Some(&[2u8, 3][..])] {
+        let o = options(4, 1, 7, dp(sched));
+        let (air, proof) = prove_logup(128, &o);
+        assert!(verify_logup(&air, &proof), "{sched:?}");
+        // A tampered group value is rejected.
+        let mut bad = proof.clone();
+        bad.query_list[0].layers_evaluations_sym[0] += FieldElement::<E>::one();
+        assert!(!verify_logup(&air, &bad));
+    }
+}
+
+/// REVIEW-FRI F1.2 under RPX: the group path at an all-ones schedule commits
+/// the same layer roots, terminal polynomial and paths as the legacy pair path
+/// (the `Batched`/`Pair` two-element invariant, as a tested fact for the
+/// algebraic backend).
+#[test]
+fn rpx_group_path_at_all_ones_equals_legacy() {
+    // LogReadOnlyRAP 2^7 rows, blowup 4, k 1: 5 committed binary layers.
+    let legacy = prove_logup(128, &options(4, 1, 7, ProofFormat::DEFAULT)).1;
+    let group = prove_logup(128, &options(4, 1, 7, dp(Some(&[1, 1, 1, 1, 1])))).1;
+    assert_eq!(legacy.fri_layers_merkle_roots.len(), 5);
+    assert_eq!(
+        legacy.fri_layers_merkle_roots,
+        group.fri_layers_merkle_roots
+    );
+    assert_eq!(legacy.fri_final_poly_coeffs, group.fri_final_poly_coeffs);
+    for (l, g) in legacy.query_list.iter().zip(&group.query_list) {
+        for j in 0..5 {
+            assert_eq!(
+                l.layers_auth_paths[j].merkle_path,
+                g.layers_auth_paths[j].merkle_path
+            );
+            assert!(
+                g.layers_evaluations_sym[2 * j..2 * j + 2].contains(&l.layers_evaluations_sym[j])
+            );
+        }
+    }
+}

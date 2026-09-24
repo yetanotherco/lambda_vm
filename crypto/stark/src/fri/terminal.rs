@@ -52,9 +52,6 @@ pub(crate) struct FriFoldLayout {
     pub(crate) legacy_encoding: bool,
 }
 
-// The format-aware constructors' first callers are the S3 prover and verifier
-// (the next commit); until then only the tests use them.
-#[allow(dead_code)]
 impl FriFoldLayout {
     /// Today's layout, derived from the LDE codeword size.
     ///
@@ -120,6 +117,7 @@ impl FriFoldLayout {
     /// does not cover exactly the committed folds (or has an exponent outside
     /// `1..=FRI_SCHEDULE_DMAX`). The encoding is the group encoding unless
     /// the schedule is today's (row pair, all ones), where it is legacy.
+    #[cfg(test)]
     pub(crate) fn from_schedule(
         lde_log: u32,
         blowup_log: u32,

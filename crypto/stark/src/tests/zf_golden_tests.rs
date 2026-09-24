@@ -105,11 +105,13 @@ macro_rules! fingerprint {
     ($proof:expr) => {{
         let proof = $proof;
         let rk = |bytes: Result<rkyv::util::AlignedVec, rkyv::rancor::Error>| {
-            sha3_hex(&bytes.expect("rkyv"))
+            $crate::tests::zf_golden_tests::sha3_hex(&bytes.expect("rkyv"))
         };
-        Fingerprint {
+        $crate::tests::zf_golden_tests::Fingerprint {
             proof: rk(rkyv::to_bytes::<rkyv::rancor::Error>(proof)),
-            fri_roots: sha3_hex(&proof.fri_layers_merkle_roots.concat()),
+            fri_roots: $crate::tests::zf_golden_tests::sha3_hex(
+                &proof.fri_layers_merkle_roots.concat(),
+            ),
             num_fri_roots: proof.fri_layers_merkle_roots.len(),
             coeffs: rk(rkyv::to_bytes::<rkyv::rancor::Error>(
                 &proof.fri_final_poly_coeffs,
@@ -121,7 +123,6 @@ macro_rules! fingerprint {
         }
     }};
 }
-#[allow(unused_imports)] // for the prover-free S3 tests in this crate
 pub(crate) use fingerprint;
 
 // ---------------------------------------------------------------------------
@@ -169,14 +170,14 @@ fn logup_reads(rows: usize) -> (Vec<Felt>, Vec<Felt>) {
 }
 
 /// `LogReadOnlyRAP` (E = F³, one aux column) under hash `H`.
-pub(crate) fn prove_logup<H: StarkHash>(
-    rows: usize,
-    options: &ProofOptions,
-) -> (
+/// An AIR, its proof and its public inputs.
+pub(crate) type LogupCase = (
     LogReadOnlyRAP<F, E>,
     StarkProof<F, E, LogReadOnlyPublicInputs<F>>,
     LogReadOnlyPublicInputs<F>,
-) {
+);
+
+pub(crate) fn prove_logup<H: StarkHash>(rows: usize, options: &ProofOptions) -> LogupCase {
     let (addr, val) = logup_reads(rows);
     let mut trace: TraceTable<F, E> = read_only_logup_trace(addr, val);
     let cols = trace.columns_main();

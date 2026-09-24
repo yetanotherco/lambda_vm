@@ -7,6 +7,7 @@ pub mod bus_tests;
 pub mod commitment_tests;
 pub mod constraint_index_tests;
 pub mod domain_cache_stats;
+pub mod fri_group_tests;
 pub mod fri_schedule_tests;
 pub mod fri_tests;
 pub mod grinding_tests;
