@@ -1620,6 +1620,14 @@ fn the_assembled_epoch_verifier_runs_at_the_process_format() {
         "the legs' emitted permutations must equal the closed form at the process format"
     );
     println!("  emitted permutations == closed form: {emitted}");
+    // One parseable line for the box wrapper's cross-arm comparison.
+    println!(
+        "ZFTWIN legs_permutations={emitted} cap_root_permutations={cap_perms} \
+         legs_instructions={} legs_selects={} whole_instructions={}",
+        program.instrs.len() - spine.instrs.len(),
+        selects(&program) - selects(&spine),
+        program.instrs.len(),
+    );
 
     // A moved cap word must not execute (only when the format caps a tree).
     // The caps arena is found by content rather than by a hand-counted offset.
