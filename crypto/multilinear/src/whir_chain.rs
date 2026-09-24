@@ -226,7 +226,11 @@ impl ChainFormat {
 /// parsed must not be selectable (see `stark::proof::options::
 /// MERKLE_CAP_IMPLEMENTED`). Each lane flips its own flag in the commit that
 /// makes the lever real.
-pub const WHIR_CAP_IMPLEMENTED: bool = false;
+///
+/// W1 (the Merkle cap) is real: host prover and verifier ([`ChainConfig::
+/// tree_caps`], the owner-path encoding), the device (`paths_and_cap`), and
+/// the in-guest verifier and its cost model (`prover::lfm::whir_chain`).
+pub const WHIR_CAP_IMPLEMENTED: bool = true;
 
 /// The longest explicit fold list [`WhirFolds::List`] holds.
 pub const MAX_FOLD_ROUNDS: usize = 32;
