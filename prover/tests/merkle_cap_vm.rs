@@ -18,10 +18,10 @@
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::zf_format::ZfFormat;
-use stark::merkle_caps::StarkCaps;
 use lambda_vm_prover::{
     GoldilocksCubicProofOptions, MaxRowsConfig, prove_with_options_and_inputs, verify_with_options,
 };
+use stark::merkle_caps::StarkCaps;
 
 /// CPU: a fixture that touches every instruction class (many tables). Device:
 /// the fixture the cuda integration tests use, whose tables cross the GPU LDE
@@ -78,7 +78,13 @@ fn a_vm_proof_round_trips_under_the_process_cap_policy() {
             lde_log as usize,
             p.fri_layers_merkle_roots.len(),
         );
-        let path = |q: usize| p.deep_poly_openings[q].main_trace_polys.proof.merkle_path.len();
+        let path = |q: usize| {
+            p.deep_poly_openings[q]
+                .main_trace_polys
+                .proof
+                .merkle_path
+                .len()
+        };
         assert_eq!(
             path(1),
             caps.trace_depth - caps.trace,

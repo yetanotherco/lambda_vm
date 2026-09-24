@@ -31,7 +31,8 @@ type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
 /// The AIR: no table constraints of its own, the LogUp ones from the framework.
-pub type BusPermutationAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
+pub type BusPermutationAir =
+    AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
 
 const BUS_AB: u64 = 1;
 const BUS_CD: u64 = 2;
@@ -58,7 +59,10 @@ pub fn bus_permutation_air(options: &ProofOptions) -> BusPermutationAir {
 /// A `rows`-row trace (`rows` a power of two, at least 2): `b` is `a`
 /// reversed, `d` is `c` rotated by one row.
 pub fn bus_permutation_trace(rows: usize) -> TraceTable<F, E> {
-    assert!(rows.is_power_of_two() && rows >= 2, "rows must be a power of two ≥ 2");
+    assert!(
+        rows.is_power_of_two() && rows >= 2,
+        "rows must be a power of two ≥ 2"
+    );
     let a: Vec<FE> = (0..rows as u64).map(|i| FE::from(i + 1)).collect();
     let b: Vec<FE> = a.iter().rev().cloned().collect();
     let c: Vec<FE> = (0..rows as u64)
@@ -103,10 +107,11 @@ mod tests {
         let air = bus_permutation_air(&options);
         let mut trace = bus_permutation_trace(64);
         trace.set_main(5, 3, FE::from(999_999u64));
-        let rejected = match Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<E>::new(&[])) {
-            Err(_) => true,
-            Ok(proof) => !Verifier::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[])),
-        };
+        let rejected =
+            match Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<E>::new(&[])) {
+                Err(_) => true,
+                Ok(proof) => !Verifier::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[])),
+            };
         assert!(rejected, "an unbalanced table must not verify");
     }
 }

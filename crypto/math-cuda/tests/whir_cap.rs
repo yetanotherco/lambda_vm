@@ -147,14 +147,30 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
             let host =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_commit).expect("host commit");
             // Same blocking as the commit: the retained layer is served.
-            assert_matches_host(name, &device, &host, k_commit, &positions, |_| {}, |d| d == 0);
+            assert_matches_host(
+                name,
+                &device,
+                &host,
+                k_commit,
+                &positions,
+                |_| {},
+                |d| d == 0,
+            );
             // Another blocking: the layer does not match, the leaves are hashed.
             let k_other = if k_commit == 5 { 3 } else { k_commit + 1 };
             let other =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_other).expect("host commit");
             let leaves = host_codeword.len() >> k_other;
             let positions = [0usize, leaves / 2, leaves - 1];
-            assert_matches_host(name, &device, &other, k_other, &positions, |_| {}, |d| d == 1);
+            assert_matches_host(
+                name,
+                &device,
+                &other,
+                k_other,
+                &positions,
+                |_| {},
+                |d| d == 1,
+            );
         }
     }
     run::<KeccakWhir>("keccak");
@@ -194,7 +210,11 @@ fn paths_and_cap_after_the_retained_layer_is_evicted() {
         let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
         let got = math_cuda::device::reserve(layer_bytes)
             .expect("the reserve must succeed by evicting the retained layer");
-        assert_eq!(device.retained_leaf_bytes(), 0, "c={c}: the layer was evicted");
+        assert_eq!(
+            device.retained_leaf_bytes(),
+            0,
+            "c={c}: the layer was evicted"
+        );
         drop(got);
         drop(hog);
         evictions += 1;
@@ -203,7 +223,9 @@ fn paths_and_cap_after_the_retained_layer_is_evicted() {
     let host = CodewordCommitment::<_, RpxWhir>::new(&host_codeword, k).expect("host commit");
     let leaves = host_codeword.len() >> k;
     let positions = [0usize, 5, leaves / 2, leaves - 1];
-    assert_matches_host("rpx evicted", &device, &host, k, &positions, evict, |d| d == 1);
+    assert_matches_host("rpx evicted", &device, &host, k, &positions, evict, |d| {
+        d == 1
+    });
     assert_eq!(
         evictions,
         host.depth().min(6) + 1,

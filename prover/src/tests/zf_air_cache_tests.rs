@@ -59,10 +59,7 @@ fn formats() -> Vec<ProofFormat> {
 /// and asking again (a cache hit) changes nothing.
 #[test]
 fn the_air_prototype_cache_keys_the_proof_format() {
-    let options = |format: ProofFormat| ProofOptions {
-        format,
-        ..base()
-    };
+    let options = |format: ProofFormat| ProofOptions { format, ..base() };
     // HALT: non-default formats first, the default last.
     for _round in 0..2 {
         for format in formats() {
