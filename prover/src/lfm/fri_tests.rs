@@ -167,7 +167,7 @@ pub(super) fn host_fri_from(
     let trace = build_host_sub_proof(air, proof);
     let view = StarkProofView::Owned(&proof.proofs[0]);
     let opts = air.options();
-    let shape = FriShape::from_options(opts, trace.shape.log2_lde_length);
+    let shape = FriShape::for_layout(opts, trace.shape.log2_lde_length, trace.shape.layout);
     shape.check();
 
     // Per layer the opened values (the sibling, or the whole group) and the
@@ -363,19 +363,32 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
 /// [`FriArenas`].
 pub(super) fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
-    let q = b.declare_arena(3 * num_queries as u32);
+    // Per query `(index, p₀, p₀ˢ)`, or `(r, DEEP(x_r))` under one-row leaves.
+    let per = fri_deep_words(shape) as u32;
+    let q = b.declare_arena(per * num_queries as u32);
     let (arenas, fri) = declare_fri(&mut b, shape, num_queries);
     for i in 0..num_queries {
-        let index = b.hint_felt(q, 3 * i as u32);
-        let p0 = b.hint_word(q, 3 * i as u32 + 1).as_ext();
-        let p0_sym = b.hint_word(q, 3 * i as u32 + 2).as_ext();
+        let index = b.hint_felt(q, per * i as u32);
+        let p0 = b.hint_word(q, per * i as u32 + 1).as_ext();
         let bits = b.bit_dec(index, shape.index_bits());
-        let (point, point_sym) = super::sub_proof::emit_points_from_bits(
-            &mut b,
-            shape.log2_lde_length,
-            FE::from(shape.coset_offset),
-            &bits,
-        );
+        let (p0_sym, point, point_sym) = if shape.one_row() {
+            let point = super::sub_proof::emit_point_from_row_bits(
+                &mut b,
+                shape.log2_lde_length,
+                FE::from(shape.coset_offset),
+                &bits,
+            );
+            (None, point, None)
+        } else {
+            let p0_sym = b.hint_word(q, per * i as u32 + 2).as_ext();
+            let (point, point_sym) = super::sub_proof::emit_points_from_bits(
+                &mut b,
+                shape.log2_lde_length,
+                FE::from(shape.coset_offset),
+                &bits,
+            );
+            (Some(p0_sym), point, Some(point_sym))
+        };
         let openings = hint_layer_openings(&mut b, shape, &arenas, i);
         let v = emit_query_fri(
             &mut b,
@@ -397,14 +410,25 @@ pub(super) fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgra
     program
 }
 
+/// Words per query of [`fri_only_program`]'s DEEP arena: `(index, p₀, p₀ˢ)`
+/// for row pairs, `(r, DEEP(x_r))` under one-row leaves.
+pub(super) fn fri_deep_words(shape: FriShape) -> usize {
+    if shape.one_row() { 2 } else { 3 }
+}
+
 impl HostFri {
-    /// The `(index, p₀, p₀ˢ)` arena [`fri_only_program`] reads.
+    /// The DEEP arena [`fri_only_program`] reads: `(index, p₀, p₀ˢ)` per
+    /// query, or `(r, DEEP(x_r))` under one-row leaves.
     pub(super) fn deep_arena(&self, queries: &[usize]) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for &q in queries {
             out.push(base_word(FE::from(self.trace.iotas[q] as u64)));
-            out.push(ext_word(&self.trace.expected[q].0));
-            out.push(ext_word(&self.trace.expected[q].1));
+            if self.shape.one_row() {
+                out.push(ext_word(&self.trace.expected_at_r[q]));
+            } else {
+                out.push(ext_word(&self.trace.expected[q].0));
+                out.push(ext_word(&self.trace.expected[q].1));
+            }
         }
         out
     }

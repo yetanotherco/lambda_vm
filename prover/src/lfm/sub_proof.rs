@@ -50,19 +50,33 @@
 //! `Mul` per bit against program constants, via [`super::edsl::pow_bits`]. The
 //! symmetric point is `−υ`: `br(2·iota+1) = br(2·iota) + L/2` and `g^{L/2} =
 //! −1`, so it costs one subtraction rather than a second derivation.
+//!
+//! # One-row leaves (S2, design/FRI.md §7)
+//!
+//! Under [`SubProofShape::layout`] = `LeafLayout::Row` every committed matrix
+//! holds ONE row per leaf: a query index `r` has `log2(lde)` bits (uniform over
+//! the whole LDE, not a pair index), every tree is `log2(lde)` deep, a group's
+//! opening is `num_columns` cells (no symmetric row), the point is
+//! `x_r = offset · g^{br(r)}` alone ([`emit_point_from_row_bits`]), and DEEP
+//! is evaluated ONCE. The FRI leg then starts at the committed DEEP codeword
+//! (the input tree) with the input-slot check `group₀[slot] == DEEP(x_r)`
+//! (`super::fri::emit_query_fri`).
 
 use math::field::traits::IsFFTField;
 
 use crate::tables::types::{FE, GoldilocksField};
+
+use stark::leaf_layout::LeafLayout;
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::deep::{DeepInvariants, DeepOpening, DeepShape, emit_deep_point};
 use super::edsl::{self, WrapDigest};
 use super::merkle_cap::CapCells;
 
-/// Rows a Merkle leaf covers — `crypto/stark`'s `ROWS_PER_LEAF`, mirrored here
-/// because it fixes program shape: a leaf holds a row PAIR, which is why one
-/// path authenticates both of a query's two points.
+/// Rows a Merkle leaf covers at today's layout — `crypto/stark`'s
+/// `ROWS_PER_LEAF`, mirrored here because it fixes program shape: a leaf holds
+/// a row PAIR, which is why one path authenticates both of a query's two
+/// points. One-row leaves (S2) are [`SubProofShape::layout`]'s other value.
 pub const ROWS_PER_LEAF: usize = 2;
 
 /// The compile-time shape of one committed matrix of a sub-proof.
@@ -80,14 +94,27 @@ pub struct GroupShape {
 }
 
 impl GroupShape {
-    /// Cells one query's opening of this group occupies — both points.
+    /// Cells one query's opening of this group occupies under row-pair
+    /// leaves — both points. [`Self::values_at`] is the layout-generic form.
     pub fn num_values(&self) -> usize {
-        ROWS_PER_LEAF * self.num_columns
+        self.values_at(ROWS_PER_LEAF)
     }
 
-    /// Bytes the leaf hash covers.
+    /// Cells one query's opening of this group occupies when a leaf holds
+    /// `rows_per_leaf` rows: `2·num_columns` for row pairs, `num_columns`
+    /// under one-row leaves (S2, design/FRI.md §7.4).
+    pub fn values_at(&self, rows_per_leaf: usize) -> usize {
+        rows_per_leaf * self.num_columns
+    }
+
+    /// Bytes the row-pair leaf hash covers.
     pub fn leaf_bytes(&self) -> usize {
-        self.num_values() * if self.is_ext { 24 } else { 8 }
+        self.leaf_bytes_at(ROWS_PER_LEAF)
+    }
+
+    /// Bytes the leaf hash covers at `rows_per_leaf` rows per leaf.
+    pub fn leaf_bytes_at(&self, rows_per_leaf: usize) -> usize {
+        self.values_at(rows_per_leaf) * if self.is_ext { 24 } else { 8 }
     }
 }
 
@@ -105,9 +132,10 @@ pub struct SubProofShape {
     /// aux. Absent groups are omitted, exactly as the proof omits them. Their
     /// widths must sum to `deep.num_total_cols`.
     pub trace_groups: Vec<GroupShape>,
-    /// Merkle depth — `log2(lde_length) − 1`, since a leaf is a row pair. All
-    /// four trees commit over the same LDE domain, so one depth serves them
-    /// all and one index addresses them all.
+    /// Merkle depth — `log2(lde_length) − 1` when a leaf is a row pair,
+    /// `log2(lde_length)` under one-row leaves ([`Self::layout`]). All four
+    /// trees commit over the same LDE domain at the same layout, so one depth
+    /// serves them all and one index addresses them all.
     pub merkle_depth: usize,
     /// `log2` of the LDE domain — `log2_trace_length + log2(blowup)`.
     pub log2_lde_length: u32,
@@ -121,9 +149,26 @@ pub struct SubProofShape {
     /// constant: `CapPolicy::height(num_queries, merkle_depth)` of the inner
     /// proof's options, never read from the proof.
     pub trace_cap: usize,
+    /// The trace trees' leaf layout (S2, design/FRI.md §7): today's row
+    /// pairs, or one row per leaf. A verifier constant — the table's
+    /// `stark::leaf_layout::table_leaf_layout`, resolved from the AIR's
+    /// widths and the trace length, never read from the proof. Under
+    /// [`LeafLayout::Row`] a query opens ONE row per tree, its index ranges
+    /// over the whole LDE, and DEEP is evaluated at the one point `x_r`.
+    pub layout: LeafLayout,
 }
 
 impl SubProofShape {
+    /// Rows one leaf of every committed matrix holds (2, or 1 under S2).
+    pub fn rows_per_leaf(&self) -> usize {
+        self.layout.rows_per_leaf()
+    }
+
+    /// Cells one query's opening of `g` occupies at this shape's layout.
+    pub fn group_values(&self, g: &GroupShape) -> usize {
+        g.values_at(self.rows_per_leaf())
+    }
+
     /// The composition-parts group. Its width is the part count and its
     /// elements are extension, both of which are already DEEP shape.
     pub fn parts_group(&self) -> GroupShape {
@@ -162,7 +207,7 @@ impl SubProofShape {
     /// values and the paths. An arena that still carried an index would be
     /// offering the prover a second one.
     pub fn opening_words(&self, digest_words: usize) -> usize {
-        let values: usize = self.groups().iter().map(GroupShape::num_values).sum();
+        let values: usize = self.groups().iter().map(|g| self.group_values(g)).sum();
         let siblings = digest_words * self.path_len() * self.groups().len();
         values + siblings
     }
@@ -203,12 +248,14 @@ impl SubProofShape {
             width, self.deep.num_total_cols,
             "the trace groups must cover exactly the DEEP column set"
         );
-        assert!(
-            self.merkle_depth + 1 == self.log2_lde_length as usize,
-            "a leaf is a row pair, so the tree is one level shallower than the \
-             LDE domain: depth {} against log2(lde) {}",
+        assert_eq!(
             self.merkle_depth,
-            self.log2_lde_length
+            self.layout.tree_depth(self.log2_lde_length as usize),
+            "a row-pair tree is one level shallower than the LDE domain, a \
+             one-row tree is as deep as it: depth {} against log2(lde) {} at {:?}",
+            self.merkle_depth,
+            self.log2_lde_length,
+            self.layout
         );
         // ⚠ NO `merkle_depth >= 1`. A ONE-PAIR domain — a one-row trace at blowup
         // 2 — has a single leaf, so the tree has no levels and the LEAF HASH IS
@@ -351,13 +398,27 @@ pub struct GroupOpening {
 /// caller that authenticated an extension group WITHOUT folding it would owe
 /// that check itself.
 pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) -> WrapDigest {
+    emit_leaf_hash_rows(b, shape, ROWS_PER_LEAF, values)
+}
+
+/// [`emit_leaf_hash`] for a leaf of `rows_per_leaf` rows: the same stream
+/// (every value's felts in the order given — row-major across the leaf's
+/// rows, `hash_data_from_slices(evaluations, evaluations_sym)` on the host),
+/// sized by the layout. At `rows_per_leaf = 2` it IS [`emit_leaf_hash`],
+/// instruction for instruction.
+pub fn emit_leaf_hash_rows(
+    b: &mut LfmBuilder,
+    shape: GroupShape,
+    rows_per_leaf: usize,
+    values: &[Cell],
+) -> WrapDigest {
     use super::keccak_host::BYTES_PER_HALF;
     use super::transcript_replay::felt_be_halves;
 
     assert_eq!(
         values.len(),
-        shape.num_values(),
-        "a leaf covers the whole row pair"
+        shape.values_at(rows_per_leaf),
+        "a leaf covers the whole row pair (or the one row)"
     );
     if !shape.is_ext {
         let felts: Vec<Felt> = values.iter().map(|c| Felt(c.addr())).collect();
@@ -387,7 +448,7 @@ pub fn emit_leaf_hash(b: &mut LfmBuilder, shape: GroupShape, values: &[Cell]) ->
         }
     }
     let len_bytes = BYTES_PER_HALF * stream.len();
-    debug_assert_eq!(len_bytes, shape.leaf_bytes());
+    debug_assert_eq!(len_bytes, shape.leaf_bytes_at(rows_per_leaf));
     edsl::wrap_hash_bytes(b, byte_hash, &stream, len_bytes)
 }
 
@@ -403,12 +464,24 @@ pub fn emit_group_authentication(
     opening: &GroupOpening,
     bits: &[Bit],
 ) {
+    emit_group_authentication_at(b, commitment, ROWS_PER_LEAF, opening, bits);
+}
+
+/// [`emit_group_authentication`] for a leaf of `rows_per_leaf` rows (the
+/// sub-proof's [`SubProofShape::rows_per_leaf`]).
+pub fn emit_group_authentication_at(
+    b: &mut LfmBuilder,
+    commitment: &GroupCommitment,
+    rows_per_leaf: usize,
+    opening: &GroupOpening,
+    bits: &[Bit],
+) {
     assert_eq!(
         opening.siblings.len() + commitment.cap_height(),
         bits.len(),
         "one sibling per level below the cap, and every group walks the same index"
     );
-    let leaf = emit_leaf_hash(b, commitment.shape, &opening.values);
+    let leaf = emit_leaf_hash_rows(b, commitment.shape, rows_per_leaf, &opening.values);
     match &commitment.cap {
         None => {
             let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
@@ -419,14 +492,42 @@ pub fn emit_group_authentication(
     }
 }
 
-/// The LDE-domain constants the point derivation multiplies together:
-/// `factors[i] = g^{2^{depth-1-i}}`, matching index bit `i`'s weight after the
-/// bit reversal.
-fn point_factors(log2_lde_length: u32) -> Vec<FE> {
+/// The LDE-domain constants the point derivation multiplies together for an
+/// index of `nbits` bits: `factors[i] = g^{2^{nbits-1-i}}`, matching index bit
+/// `i`'s weight after the bit reversal.
+///
+/// Row pairs: the index `ι` has `nbits = log2(lde) − 1` bits and the point is
+/// at bit-reversed position `2ι`, so bit `i` of `ι` is bit `i + 1` of `2ι`,
+/// weight `2^{log2(lde)−2−i} = 2^{nbits−1−i}`. One row: the index `r` has
+/// `nbits = log2(lde)` bits and the point is at position `r` itself, weight
+/// `2^{log2(lde)−1−i} = 2^{nbits−1−i}`. One formula, keyed on the bit count.
+fn point_factors(log2_lde_length: u32, nbits: usize) -> Vec<FE> {
     let g = <GoldilocksField as IsFFTField>::get_primitive_root_of_unity(log2_lde_length as u64)
         .expect("a power-of-two LDE length has a root of unity");
-    let depth = log2_lde_length as usize - 1;
-    (0..depth).map(|i| g.pow(1u64 << (depth - 1 - i))).collect()
+    (0..nbits).map(|i| g.pow(1u64 << (nbits - 1 - i))).collect()
+}
+
+/// `x_r` — the LDE point at bit-reversed position `r` — from the ONE-ROW
+/// query index bits (`log2(lde)` of them, S2; `r` uniform over the whole LDE).
+/// The one-row counterpart of [`emit_points_from_bits`]: no symmetric point,
+/// because a one-row leaf holds one point.
+pub fn emit_point_from_row_bits(
+    b: &mut LfmBuilder,
+    log2_lde_length: u32,
+    coset_offset: FE,
+    bits: &[Bit],
+) -> Felt {
+    assert_eq!(
+        bits.len(),
+        log2_lde_length as usize,
+        "a one-row index ranges over the whole LDE domain"
+    );
+    edsl::pow_bits(
+        b,
+        bits,
+        &point_factors(log2_lde_length, bits.len()),
+        coset_offset,
+    )
 }
 
 /// `(υ, −υ)` from the query index bits, for the LDE domain given by its size and
@@ -450,14 +551,24 @@ pub fn emit_points_from_bits(
         log2_lde_length as usize - 1,
         "a leaf is a row pair, so the index is one bit narrower than the domain"
     );
-    let point = edsl::pow_bits(b, bits, &point_factors(log2_lde_length), coset_offset);
+    let point = edsl::pow_bits(
+        b,
+        bits,
+        &point_factors(log2_lde_length, bits.len()),
+        coset_offset,
+    );
     let zero = b.felt_const(FE::zero());
     (point, b.sub(zero, point))
 }
 
-/// `(υ, −υ)` from the query index bits.
+/// `(υ, −υ)` from the query index bits (row-pair shapes).
 pub fn emit_query_points(b: &mut LfmBuilder, shape: &SubProofShape, bits: &[Bit]) -> (Felt, Felt) {
     assert_eq!(bits.len(), shape.merkle_depth);
+    assert_eq!(
+        shape.layout,
+        LeafLayout::RowPair,
+        "a one-row query has one point (emit_point_from_row_bits)"
+    );
     emit_points_from_bits(b, shape.log2_lde_length, shape.coset_offset, bits)
 }
 
@@ -478,13 +589,22 @@ pub fn emit_query(
     index: Felt,
     openings: &[GroupOpening],
 ) -> (Ext, Ext) {
-    emit_query_with_bits(b, shape, gamma, inv, commitments, index, openings).deep
+    let out = emit_query_with_bits(b, shape, gamma, inv, commitments, index, openings);
+    (
+        out.deep,
+        out.deep_sym
+            .expect("emit_query returns the DEEP pair: a row-pair shape"),
+    )
 }
 
 /// What one query contributes when the caller needs more than the DEEP pair.
 pub struct QueryOutput {
-    /// `(DEEP(υ), DEEP(−υ))`.
-    pub deep: (Ext, Ext),
+    /// `DEEP(υ)` — or, under one-row leaves, `DEEP(x_r)`, the ONE point the
+    /// query opens.
+    pub deep: Ext,
+    /// `DEEP(−υ)` for a row-pair shape; `None` under one-row leaves (S2),
+    /// where the query opens no symmetric row and DEEP runs once.
+    pub deep_sym: Option<Ext>,
     /// The query index decomposed low-to-high — the SAME cells the Merkle walk
     /// consumed and the query points were derived from.
     ///
@@ -512,8 +632,9 @@ pub struct QueryOutput {
     pub point: Felt,
     /// `−υ`, likewise. The zero-fold FRI shape checks the terminal polynomial
     /// at both points (production's `zetas.is_empty()` branch tests
-    /// `terminal[2·iota]` AND `terminal[2·iota+1]`).
-    pub point_sym: Felt,
+    /// `terminal[2·iota]` AND `terminal[2·iota+1]`). `None` under one-row
+    /// leaves: there is no second point.
+    pub point_sym: Option<Felt>,
 }
 
 /// [`emit_query`], additionally returning the index bits — see [`QueryOutput`].
@@ -576,8 +697,13 @@ pub fn emit_query_from_bits(
         "a query index is exactly the tree's depth in bits"
     );
 
+    let rows = shape.rows_per_leaf();
     for (commitment, opening) in commitments.iter().zip(openings) {
-        emit_group_authentication(b, commitment, opening, &bits);
+        emit_group_authentication_at(b, commitment, rows, opening, &bits);
+    }
+
+    if shape.layout.is_one_row() {
+        return emit_one_row_deep(b, shape, gamma, inv, openings, &groups, bits);
     }
 
     let (point, point_sym) = emit_query_points(b, shape, &bits);
@@ -614,13 +740,47 @@ pub fn emit_query_from_bits(
         parts: parts_sym,
     };
     QueryOutput {
-        deep: (
-            emit_deep_point(b, &shape.deep, gamma, inv, &regular),
-            emit_deep_point(b, &shape.deep, gamma, inv, &symmetric),
-        ),
+        deep: emit_deep_point(b, &shape.deep, gamma, inv, &regular),
+        deep_sym: Some(emit_deep_point(b, &shape.deep, gamma, inv, &symmetric)),
         bits,
         point,
-        point_sym,
+        point_sym: Some(point_sym),
+    }
+}
+
+/// The one-row half of [`emit_query_from_bits`] (S2, design/FRI.md §7.4), after
+/// every group was authenticated at leaf `r`: `x_r` from the SAME bits, then
+/// DEEP ONCE, over the authenticated cells — column `c` is `values[c]` (a
+/// one-row leaf holds no symmetric row, so there is no `values[w + c]`).
+fn emit_one_row_deep(
+    b: &mut LfmBuilder,
+    shape: &SubProofShape,
+    gamma: Ext,
+    inv: &DeepInvariants,
+    openings: &[GroupOpening],
+    groups: &[GroupShape],
+    bits: Vec<Bit>,
+) -> QueryOutput {
+    let point = emit_point_from_row_bits(b, shape.log2_lde_length, shape.coset_offset, &bits);
+    let mut trace = Vec::with_capacity(shape.deep.num_total_cols);
+    for (opening, g) in openings.iter().zip(groups).take(shape.trace_groups.len()) {
+        assert_eq!(opening.values.len(), g.num_columns, "one row per leaf");
+        trace.extend(opening.values.iter().map(|v| v.as_ext()));
+    }
+    let parts_opening = openings.last().expect("the parts group is always present");
+    let parts: Vec<Ext> = parts_opening.values.iter().map(|v| v.as_ext()).collect();
+    assert_eq!(parts.len(), shape.deep.num_composition_parts);
+    let at = DeepOpening {
+        point,
+        trace,
+        parts,
+    };
+    QueryOutput {
+        deep: emit_deep_point(b, &shape.deep, gamma, inv, &at),
+        deep_sym: None,
+        bits,
+        point,
+        point_sym: None,
     }
 }
 
@@ -653,16 +813,27 @@ pub struct SubProofArenas {
 /// Emit a whole sub-proof's query verification: the invariants once, then every
 /// query authenticated and folded.
 ///
-/// Returns `(DEEP(υ), DEEP(−υ))` per query. The invariant hoist is the reason a
-/// 219-query proof is affordable, and it is production's own hoist — the OOD
-/// row sums and the block scalars do not depend on the query.
+/// Returns `(DEEP(υ), DEEP(−υ))` per query (a row-pair shape). The invariant
+/// hoist is the reason a 219-query proof is affordable, and it is production's
+/// own hoist — the OOD row sums and the block scalars do not depend on the query.
 pub fn emit_sub_proof(
     b: &mut LfmBuilder,
     shape: &SubProofShape,
     num_queries: usize,
 ) -> (SubProofArenas, Vec<(Ext, Ext)>) {
     let (arenas, out) = emit_sub_proof_with_bits(b, shape, num_queries);
-    (arenas, out.into_iter().map(|q| q.deep).collect())
+    (
+        arenas,
+        out.into_iter()
+            .map(|q| {
+                (
+                    q.deep,
+                    q.deep_sym
+                        .expect("emit_sub_proof returns DEEP pairs: a row-pair shape"),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// [`emit_sub_proof`], additionally returning each query's index bits — see
@@ -737,7 +908,7 @@ pub fn emit_sub_proof_with_bits(
         let openings: Vec<GroupOpening> = groups
             .iter()
             .map(|g| {
-                let values: Vec<Cell> = (0..g.num_values())
+                let values: Vec<Cell> = (0..shape.group_values(g))
                     .map(|_| {
                         let c = b.hint_word(queries, cursor);
                         cursor += 1;

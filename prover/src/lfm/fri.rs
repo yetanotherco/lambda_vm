@@ -33,6 +33,7 @@
 //! claim the same layout, unverified here and never run by the machine.
 
 use stark::fri::schedule::FriFormat;
+use stark::leaf_layout::LeafLayout;
 use stark::proof::options::{FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 use crate::tables::types::FE;
@@ -63,6 +64,11 @@ pub struct FriShape {
     /// The inner proof's FORMAT (design/CAP.md, design/FRI.md): its Merkle cap
     /// policy caps every committed layer tree. A verifier constant, taken from
     /// the inner proof's options — never from the proof.
+    ///
+    /// `format.one_row` is the table's RESOLVED leaf layout (S2): `Off` (row
+    /// pairs) or `On` (one row), never `Auto` — `auto` is resolved per table
+    /// from the AIR's widths ([`Self::for_layout`]) before a shape exists, and
+    /// [`Self::check`] refuses an unresolved one.
     pub format: ProofFormat,
 }
 
@@ -75,26 +81,59 @@ impl FriShape {
     ///
     /// # Panics
     ///
-    /// On a one-row inner format (`LAMBDA_VM_ZF_ONE_ROW` ≠ 0, S2): the
-    /// in-guest verifier of one-row openings and the committed FRI input is
-    /// lane I-FRI-G's G3 and does not exist yet, so an emitter built for the
-    /// row-pair layout must never be handed one — it would emit a verifier of
-    /// the wrong protocol. Emit time, not a proof outcome.
+    /// On `one_row = auto`: the layout of an `auto` table is resolved from its
+    /// AIR's committed widths (`stark::leaf_layout::table_leaf_layout`), which
+    /// the options alone do not carry — use [`Self::for_layout`] with the
+    /// table's resolved layout. `Off` and `On` resolve themselves.
     pub fn from_options(options: &ProofOptions, log2_lde_length: u32) -> Self {
-        assert!(
-            options.format.one_row == stark::proof::options::OneRowMode::Off,
-            "the in-guest STARK verifier does not implement one-row openings (S2, lane G3); \
-             inner format one_row = {}",
-            options.format.one_row
-        );
+        let layout = match options.format.one_row {
+            OneRowMode::Off => LeafLayout::RowPair,
+            OneRowMode::On => LeafLayout::Row,
+            OneRowMode::Auto => panic!(
+                "one_row = auto resolves per table from the AIR's widths: build the \
+                 FRI shape with FriShape::for_layout(options, lde, table_leaf_layout(air, n))"
+            ),
+        };
+        Self::for_layout(options, log2_lde_length, layout)
+    }
+
+    /// The shape of a table proved under `options` whose trace trees use the
+    /// RESOLVED leaf `layout` (the table's `stark::leaf_layout::table_leaf_layout`
+    /// — what the host prover and verifier lay the proof out with). The
+    /// resolved layout is stored in `format.one_row` (`Off` / `On`).
+    pub fn for_layout(options: &ProofOptions, log2_lde_length: u32, layout: LeafLayout) -> Self {
+        let mut format = options.format;
+        format.one_row = if layout.is_one_row() {
+            OneRowMode::On
+        } else {
+            OneRowMode::Off
+        };
         Self {
             log2_lde_length,
             blowup_log: (options.blowup_factor as u32).trailing_zeros(),
             final_poly_log_degree: options.fri_final_poly_log_degree as u32,
             coset_offset: options.coset_offset,
             num_queries: options.fri_number_of_queries,
-            format: options.format,
+            format,
         }
+    }
+
+    /// Whether the table's trace trees hold one row per leaf (S2): the DEEP
+    /// codeword is then committed as FRI layer 0 (the input tree), the query
+    /// index has `log2(lde)` bits and no fold precedes layer 0.
+    pub fn one_row(self) -> bool {
+        match self.format.one_row {
+            OneRowMode::Off => false,
+            OneRowMode::On => true,
+            OneRowMode::Auto => {
+                panic!("a FRI shape carries a RESOLVED layout, never one_row = auto")
+            }
+        }
+    }
+
+    /// The trace trees' leaf layout this shape verifies.
+    pub fn leaf_layout(self) -> LeafLayout {
+        LeafLayout::from_one_row(self.one_row())
     }
 
     /// `log2` of the terminal codeword length, clamped to the full LDE for
@@ -109,13 +148,14 @@ impl FriShape {
     }
 
     /// Whether the proof uses today's FRI encoding: pair layers, one sibling
-    /// value per committed layer (`fri = pair`). Decided by the FORMAT, never
-    /// by the schedule's values: a `dp` schedule of all ones still uses the
-    /// group encoding (`FriFormat::is_legacy`). Every non-legacy path below is
-    /// the S3 group path; the legacy emission is today's, instruction for
-    /// instruction.
+    /// value per committed layer (`fri = pair` with row-pair openings).
+    /// Decided by the FORMAT, never by the schedule's values: a `dp` schedule
+    /// of all ones still uses the group encoding, and so does every one-row
+    /// table (`FriFormat::is_legacy`: its layer 0 is the committed DEEP
+    /// codeword, opened as a full group). Every non-legacy path below is the
+    /// group path; the legacy emission is today's, instruction for instruction.
     pub fn is_legacy(self) -> bool {
-        self.format.fri_mode == FriMode::Pair
+        self.format.fri_mode == FriMode::Pair && !self.one_row()
     }
 
     /// The host's own FRI format for this shape (the fold-schedule DP's
@@ -124,7 +164,7 @@ impl FriShape {
     fn fri_format(self) -> FriFormat {
         FriFormat {
             mode: self.format.fri_mode,
-            one_row: false,
+            one_row: self.one_row(),
             num_queries: self.num_queries as u64,
             cap: self.format.merkle_cap,
             schedule_override: self.format.fri_schedule_override,
@@ -151,9 +191,29 @@ impl FriShape {
     /// **`total_folds − 1` under `pair`, not `total_folds`.** The final fold is
     /// performed and never committed (`fri/mod.rs:114-118`), so a query folds
     /// once more than it authenticates. This off-by-one is the readiest way to
-    /// build a verifier that looks right and checks one layer too few.
+    /// build a verifier that looks right and checks one layer too few. Under
+    /// one-row leaves the chain starts at the DEEP codeword itself (layer 0 =
+    /// the input tree), so the pair schedule is `total_folds` ones.
     pub fn num_committed(self) -> usize {
         self.schedule().len()
+    }
+
+    /// Folding challenges the proof draws (FRI.md §7.3, `FriFoldLayout::num_zetas`):
+    /// one per committed layer plus the final fold's for row pairs (fold 0
+    /// consumes the first), one per committed layer under one row (layer 0 is
+    /// committed before any challenge); none when nothing folds.
+    pub fn num_zetas(self) -> usize {
+        if self.total_folds() == 0 {
+            0
+        } else {
+            self.num_committed() + usize::from(!self.one_row())
+        }
+    }
+
+    /// Index of committed layer `j`'s challenge in the ζ list: `j + 1` for row
+    /// pairs (`ζ₀` drove the uncommitted fold 0), `j` under one row.
+    pub fn layer_zeta_index(self, layer: usize) -> usize {
+        layer + usize::from(!self.one_row())
     }
 
     /// Fold exponent `d_j` of committed layer `j`: a leaf groups `2^{d_j}`
@@ -280,8 +340,10 @@ impl FriShape {
             + self.path_steps_per_query()
     }
 
-    /// Index bits a query carries — `log2(lde) − 1`, which is both the TRACE
-    /// trees' Merkle depth and the bit width of `iota`.
+    /// Index bits a query carries — `log2(lde) − 1` for row pairs (the pair
+    /// index `iota`), `log2(lde)` under one-row leaves (`r` over the whole LDE,
+    /// FRI.md §7.2) — which is both the TRACE trees' Merkle depth and the bit
+    /// width of the index.
     ///
     /// The FRI layers consume SUFFIXES of this one decomposition rather than
     /// decompositions of their own, which is what makes the emitted walks
@@ -293,7 +355,7 @@ impl FriShape {
     /// top `layer_cap(i)` of those bits pick the cap node instead of being
     /// walked; the split is the cap's own, [`CapCells::verify_path`].)
     pub fn index_bits(self) -> usize {
-        self.log2_lde_length as usize - 1
+        self.leaf_layout().tree_depth(self.log2_lde_length as usize)
     }
 
     /// Arena words one query's FRI opening occupies: per committed layer its
@@ -319,10 +381,8 @@ impl FriShape {
     /// Invariants a caller cannot assemble their way out of.
     pub fn check(self) {
         assert!(
-            self.format.one_row == OneRowMode::Off,
-            "the in-guest FRI verifier implements row-pair openings only (one-row \
-             openings, S2, are a later in-guest unit): {:?}",
-            self.format.one_row
+            self.format.one_row != OneRowMode::Auto,
+            "a FRI shape carries a RESOLVED layout (FriShape::for_layout), never one_row = auto"
         );
         // The schedule covers exactly the committed folds (`FriFoldLayout`'s
         // constructor invariant, which refuses a proof otherwise).
@@ -334,11 +394,16 @@ impl FriShape {
                 .all(|&d| (1..=stark::fri::schedule::FRI_SCHEDULE_DMAX).contains(&u32::from(d))),
             "every fold exponent is in 1..=DMAX: {schedule:?}"
         );
+        // Row pairs: fold 0 is binary and uncommitted. One row: every fold is
+        // a committed layer's (layer 0 is the DEEP codeword).
+        let committed_folds = if self.one_row() {
+            self.total_folds()
+        } else {
+            self.total_folds().saturating_sub(1)
+        };
         assert_eq!(
-            covered,
-            self.total_folds().saturating_sub(1),
-            "the schedule {schedule:?} must cover the committed folds (fold 0 is binary \
-             and uncommitted)"
+            covered, committed_folds,
+            "the schedule {schedule:?} must cover the committed folds"
         );
         assert!(
             self.blowup_log >= 1,
@@ -544,14 +609,18 @@ pub struct FriCommitments {
     /// The folding challenges `ζ₀ .. ζ_C` — `num_committed + 1` of them, or
     /// none when nothing folds. The asymmetry is the whole off-by-one of this
     /// leg: the first fold consumes the DEEP pair and is not committed, so
-    /// folds exceed layers by one (`fri/mod.rs:114-118`).
+    /// folds exceed layers by one (`fri/mod.rs:114-118`). Under one-row
+    /// leaves there is no such fold: `num_committed` challenges
+    /// ([`FriShape::num_zetas`]).
     pub zetas: Vec<Ext>,
     /// The terminal polynomial's `2^effective_k` coefficients, low-to-high.
     pub coeffs: Vec<Ext>,
-    /// Under the group encoding (S3): per committed layer `j`, the challenges
-    /// its `d_j` binary folds use — `ζ_{j+1}, ζ_{j+1}², …, ζ_{j+1}^{2^{d_j−1}}`
-    /// (FRI.md §1.2) — squared ONCE per sub-proof, not per query. Empty under
-    /// `pair`, where each layer folds once with `ζ_{j+1}` itself.
+    /// Under the group encoding (S3, and every one-row table): per committed
+    /// layer `j`, the challenges its `d_j` binary folds use — `ζ, ζ², …,
+    /// ζ^{2^{d_j−1}}` for `ζ = ζ_{j+1}` (row pairs) or `ζ_j` (one row,
+    /// [`FriShape::layer_zeta_index`]) (FRI.md §1.2) — squared ONCE per
+    /// sub-proof, not per query. Empty under the legacy encoding, where each
+    /// layer folds once with `ζ_{j+1}` itself.
     pub zeta_powers: Vec<Vec<Ext>>,
 }
 
@@ -571,7 +640,7 @@ impl FriCommitments {
         } else {
             (0..shape.num_committed())
                 .map(|j| {
-                    let mut z = zetas[j + 1];
+                    let mut z = zetas[shape.layer_zeta_index(j)];
                     let mut powers = vec![z];
                     for _ in 1..shape.layer_fold(j) {
                         z = b.emul(z, z);
@@ -616,18 +685,28 @@ pub struct LayerOpening {
 /// re-derivation. [`super::sub_proof::QueryOutput`] is exactly this shape's
 /// supplier.
 pub struct FriQuery<'a> {
-    /// `p₀(υ)` — the DEEP reconstruction at the query point.
+    /// `p₀(υ)` — the DEEP reconstruction at the query point (`DEEP(x_r)` under
+    /// one-row leaves).
     pub p0: Ext,
-    /// `p₀(−υ)`.
-    pub p0_sym: Ext,
-    /// `υ`. Not Merkle-checked here and not hinted: it is the point the
-    /// authenticated opening was folded at.
+    /// `p₀(−υ)` for a row-pair shape; `None` under one-row leaves, which open
+    /// one point.
+    pub p0_sym: Option<Ext>,
+    /// `υ` (or `x_r`). Not Merkle-checked here and not hinted: it is the point
+    /// the authenticated opening was folded at.
     pub point: Felt,
-    /// `−υ`, needed only by the zero-fold shape.
-    pub point_sym: Felt,
+    /// `−υ`, needed only by the row-pair zero-fold shape; `None` under one row.
+    pub point_sym: Option<Felt>,
     /// The query index low-to-high, `shape.index_bits()` of them — the cells
     /// the trace walk consumed.
     pub bits: &'a [Bit],
+}
+
+impl FriQuery<'_> {
+    /// `p₀(−υ)` — a row-pair shape's.
+    fn p0_sym(&self) -> Ext {
+        self.p0_sym
+            .expect("a row-pair FRI query carries the symmetric DEEP value")
+    }
 }
 
 /// The arenas one sub-proof's FRI verification reads, in declaration order.
@@ -655,7 +734,7 @@ pub fn declare_fri(
     shape.check();
     assert!(num_queries > 0, "a proof carries at least one query");
     let c = shape.num_committed();
-    let num_zetas = if shape.total_folds() > 0 { c + 1 } else { 0 };
+    let num_zetas = shape.num_zetas();
 
     let roots = b.declare_arena(edsl::digest_words(b) * c as u32);
     let zetas = b.declare_arena(num_zetas as u32);
@@ -819,7 +898,8 @@ pub fn emit_query_fri(
         q.bits.len(),
         shape.index_bits(),
         "the FRI leg reads suffixes of the trace walk's own decomposition, so \
-         it needs all log2(lde) − 1 index bits"
+         it needs all of its index bits (log2(lde) − 1 for row pairs, log2(lde) \
+         for one row)"
     );
     assert_eq!(fri.layers.len(), c, "one commitment per committed layer");
     assert_eq!(openings.len(), c, "one opening per committed layer");
@@ -836,21 +916,33 @@ pub fn emit_query_fri(
         "the terminal polynomial carries 2^effective_k coefficients"
     );
 
+    assert_eq!(
+        q.p0_sym.is_none(),
+        shape.one_row(),
+        "a one-row query opens ONE point, a row-pair query two"
+    );
+    assert_eq!(q.point_sym.is_none(), shape.one_row());
+
     if shape.total_folds() == 0 {
         assert!(
             fri.zetas.is_empty(),
             "a codeword that never folds draws no folding challenge"
         );
+        // One row: the terminal codeword IS the DEEP codeword and
+        // `terminal[r] == DEEP(x_r)` is the whole check (host
+        // `verify_query_groups`); row pairs check both points.
         let at = emit_terminal_eval(b, fri, q.point);
         b.assert_eq_ext(at, q.p0);
-        let at_sym = emit_terminal_eval(b, fri, q.point_sym);
-        b.assert_eq_ext(at_sym, q.p0_sym);
+        if let (Some(p0_sym), Some(point_sym)) = (q.p0_sym, q.point_sym) {
+            let at_sym = emit_terminal_eval(b, fri, point_sym);
+            b.assert_eq_ext(at_sym, p0_sym);
+        }
         return q.p0;
     }
     assert_eq!(
         fri.zetas.len(),
-        c + 1,
-        "folds exceed committed layers by one"
+        shape.num_zetas(),
+        "folds exceed committed layers by one (row pairs), equal them (one row)"
     );
 
     // `υ⁻¹`, once. Production batch-inverts across queries and REJECTS on a
@@ -860,9 +952,39 @@ pub fn emit_query_fri(
     let one = b.felt_const(FE::one());
     let inv = b.div(one, q.point);
 
+    if shape.one_row() {
+        // ★ S2 (design/FRI.md §7.3-§7.4): layer 0 IS the committed DEEP
+        // codeword, so no fold precedes it. The query's value there is
+        // `DEEP(x_r)` itself and the point's inverse is `x_r⁻¹`; the layer-0
+        // slot check of `emit_group_layer` is then the INPUT-SLOT check
+        // `group₀[slot] == DEEP(x_r)` — the only thing tying the FRI chain to
+        // the authenticated trace openings (host `verify_query_groups`, M1).
+        assert_eq!(
+            fri.zeta_powers.len(),
+            c,
+            "the challenge powers are hoisted once per committed layer"
+        );
+        let mut v = q.p0;
+        let mut y_inv = inv;
+        for (j, opening) in openings.iter().enumerate() {
+            (v, y_inv) = emit_group_layer(
+                b,
+                shape,
+                j,
+                &fri.layers[j],
+                &fri.zeta_powers[j],
+                v,
+                y_inv,
+                opening,
+                q.bits,
+            );
+        }
+        return emit_terminal_check(b, shape, fri, q.point, v);
+    }
+
     // Fold 0 consumes the DEEP pair and authenticates nothing: there is no
     // layer under it, which is why `zetas` is one longer than `layers`.
-    let mut v = edsl::fri_fold(b, q.p0, q.p0_sym, fri.zetas[0], inv);
+    let mut v = edsl::fri_fold(b, q.p0, q.p0_sym(), fri.zetas[0], inv);
 
     // The point chain is one squaring per layer and nothing else — no bit
     // reversal, no domain lookup, no coset offset past the first point
@@ -913,9 +1035,21 @@ pub fn emit_query_fri(
         }
     }
 
-    // `x = υ^(2^total_folds)`: where the fold chain has arrived, and the
-    // terminal codeword's point at position `iota >> C`. See the doc comment.
-    let mut x = q.point;
+    emit_terminal_check(b, shape, fri, q.point, v)
+}
+
+/// `x = υ^(2^total_folds)`: where the fold chain has arrived, and the terminal
+/// codeword's point at position `iota >> C` (`r >> total_folds` under one row
+/// — the same point, since `x_r` IS the query point at layer 0). See
+/// [`emit_query_fri`]'s doc comment. Asserts `P(x) == v` and returns `v`.
+fn emit_terminal_check(
+    b: &mut LfmBuilder,
+    shape: FriShape,
+    fri: &FriCommitments,
+    point: Felt,
+    v: Ext,
+) -> Ext {
+    let mut x = point;
     for _ in 0..shape.total_folds() {
         x = b.mul(x, x);
     }
@@ -1138,6 +1272,11 @@ pub fn emit_sub_proof_with_fri(
         shape.num_queries, num_queries,
         "the query count is one shape, declared once"
     );
+    assert_eq!(
+        sub.layout,
+        shape.leaf_layout(),
+        "both legs verify one table at one leaf layout"
+    );
 
     let (sub_arenas, queries) = super::sub_proof::emit_sub_proof_with_bits(b, sub, num_queries);
     let (fri_arenas, fri) = declare_fri(b, shape, num_queries);
@@ -1152,8 +1291,8 @@ pub fn emit_sub_proof_with_fri(
                 shape,
                 &fri,
                 &FriQuery {
-                    p0: out.deep.0,
-                    p0_sym: out.deep.1,
+                    p0: out.deep,
+                    p0_sym: out.deep_sym,
                     point: out.point,
                     point_sym: out.point_sym,
                     bits: &out.bits,

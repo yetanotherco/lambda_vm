@@ -402,19 +402,23 @@ fn table_shape(
         num_composition_parts: num_parts,
         log2_trace_length,
     };
+    // The table's leaf layout (S2), resolved as the host prover resolves it.
+    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
     let sub = SubProofShape {
         deep,
         trace_groups,
-        merkle_depth: log2_lde_length as usize - 1,
+        merkle_depth,
         log2_lde_length,
         coset_offset: FE::from(opts.coset_offset),
         trace_cap: opts
             .format
             .merkle_cap
-            .height(opts.fri_number_of_queries, log2_lde_length as usize - 1),
+            .height(opts.fri_number_of_queries, merkle_depth),
+        layout: leaf_layout,
     };
     let has_aux_trace = air.has_aux_trace();
-    let fri = FriShape::from_options(opts, log2_lde_length);
+    let fri = FriShape::for_layout(opts, log2_lde_length, leaf_layout);
 
     TableShape {
         name,
