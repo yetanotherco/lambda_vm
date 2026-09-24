@@ -781,6 +781,6 @@ fn widths_of_an_extension_air() {
     let w = TableWidths::of(&air, 64);
     assert_eq!(w.aux, 3 * air.num_auxiliary_rap_columns() as u64);
     assert_eq!(w.main, air.trace_layout().0 as u64);
-    assert!(w.composition % 3 == 0 && w.composition > 0);
+    assert!(w.composition.is_multiple_of(3) && w.composition > 0);
     let _ = <F as IsFFTField>::TWO_ADICITY;
 }
