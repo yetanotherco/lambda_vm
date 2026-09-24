@@ -1,6 +1,6 @@
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(test)))]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 const PREFIX: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xed];
@@ -55,8 +55,24 @@ pub fn generate_nonce(seed: &[u8; 32], grinding_factor: u8) -> Option<u64> {
         is_valid_nonce_for_inner_hash(&inner_hash, candidate_nonce, limit)
     });
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", not(test)))]
     return (0..u64::MAX).into_par_iter().find_any(|&candidate_nonce| {
+        is_valid_nonce_for_inner_hash(&inner_hash, candidate_nonce, limit)
+    });
+
+    // Tests that compare two proofs byte for byte — `retire_lde_proof_is_byte_identical`
+    // is the one — are comparing two grindings as much as two provers, and
+    // `find_any` returns an arbitrary valid nonce of the many that exist. The
+    // nonce reaches the transcript, so a different one moves every challenge and
+    // query index after it: the proofs differ with nothing wrong. The serial
+    // search returns the smallest, which is stable across runs.
+    //
+    // Deliberately not `find_first` in production: which nonce comes back is not
+    // a contract (see `generate_nonce_maybe_gpu`), and this search is the
+    // prover's dominant CPU cost — ordering it would be paying for a property
+    // only the tests want.
+    #[cfg(all(feature = "parallel", test))]
+    return (0..u64::MAX).find(|&candidate_nonce| {
         is_valid_nonce_for_inner_hash(&inner_hash, candidate_nonce, limit)
     });
 }
