@@ -356,7 +356,9 @@ fn logup_case(
 pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
     let mut out = Vec::new();
     for (fmt_name, format, queries) in proof_formats() {
-        out.extend(proof_files::<H>(hash_name, fmt_name, format, queries, "d_proof"));
+        out.extend(proof_files::<H>(
+            hash_name, fmt_name, format, queries, "d_proof",
+        ));
     }
     out
 }
@@ -514,8 +516,12 @@ fn proof_files<H: StarkHash>(
             // policy and every tree's height, from the verifier's own
             // `StarkCaps`. Each capped tree's cap rides at the end of query
             // 0's path (the owner path), so that `path_len` is `D − c + 2^c`.
-            let caps = crate::merkle_caps::StarkCaps::for_options(air.options(), lde_log as usize, one_row)
-                .expect("caps");
+            let caps = crate::merkle_caps::StarkCaps::for_options(
+                air.options(),
+                lde_log as usize,
+                one_row,
+            )
+            .expect("caps");
             let _ = writeln!(
                 s,
                 "  \"merkle_cap\": \"{}\",\n  \"trace_tree_depth\": {},\n  \"trace_cap\": {},\n  \"fri_tree_depths\": {:?},\n  \"fri_caps\": {:?},",

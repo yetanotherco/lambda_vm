@@ -208,8 +208,9 @@ pub(super) fn build_table_legs(
     // ---- the cap heights: the in-guest shapes' against the host's own
     // `StarkCaps` (the prover's and the verifier's), so the two sides derive
     // every tree's height and depth from one function.
-    let host_caps = stark::merkle_caps::StarkCaps::for_options(opts, log2_lde_length as usize, false)
-        .expect("a format the host lays out");
+    let host_caps =
+        stark::merkle_caps::StarkCaps::for_options(opts, log2_lde_length as usize, false)
+            .expect("a format the host lays out");
     assert_eq!(host_caps.trace_depth, verify.sub.merkle_depth);
     assert_eq!(
         host_caps.trace, verify.sub.trace_cap,
