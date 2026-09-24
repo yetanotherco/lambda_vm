@@ -619,7 +619,7 @@ fn m1_the_input_slot_check_is_load_bearing() {
                 &dec.layers_evaluations_sym,
                 &zetas,
                 r,
-                deep[r].clone(),
+                deep[r],
                 x_r.inv().unwrap(),
                 &terminal,
                 &tables,
