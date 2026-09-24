@@ -66,7 +66,9 @@ impl LeafLayout {
         match self {
             Self::RowPair => lde_len >> 1,
             #[cfg(test)]
-            Self::Row if M3_PAIR_BOUND_UNDER_ONE_ROW.load(core::sync::atomic::Ordering::SeqCst) => {
+            Self::Row
+                if M3_PAIR_BOUND_AT_LDE.load(core::sync::atomic::Ordering::SeqCst) == lde_len =>
+            {
                 lde_len >> 1
             }
             Self::Row => lde_len,
@@ -99,14 +101,15 @@ impl LeafLayout {
 }
 
 /// Mutation M3 (FRI.md §10), test builds only: sample one-row query indexes
-/// over the row-pair bound `N / 2`. Prover and verifier both read it, so a
-/// mutated proof still verifies — only `one_row_tests`' bound test sees the
-/// bias, which is what makes that test load-bearing. Process-global (the
-/// prover samples on worker threads); the tests that set it hold
-/// `one_row_tests::M3_LOCK`, and every other proof stays valid while it is set.
+/// over the row-pair bound `N / 2` — for an LDE of exactly this many points
+/// (0 = off). Prover and verifier both read it, so a mutated proof still
+/// verifies; only `one_row_tests`' bound test sees the bias, which is what
+/// makes that test load-bearing. Process-global (the prover samples on worker
+/// threads) and keyed by the LDE size, so it touches only the M3 test's own
+/// shape (an LDE no other one-row test uses), never a concurrent test's proof.
 #[cfg(test)]
-pub(crate) static M3_PAIR_BOUND_UNDER_ONE_ROW: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+pub(crate) static M3_PAIR_BOUND_AT_LDE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// The committed widths of one table, in base-field elements per LDE row, per
 /// tree. `0` = the tree does not exist.

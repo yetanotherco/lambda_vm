@@ -22,7 +22,7 @@ use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::fri::terminal::FriFoldLayout;
 use crate::fri::{commit_phase_with_layout, fold_times};
 use crate::leaf_layout::{
-    LeafLayout, M3_PAIR_BOUND_UNDER_ONE_ROW, TableWidths, resolve_leaf_layout, table_leaf_layout,
+    LeafLayout, M3_PAIR_BOUND_AT_LDE, TableWidths, resolve_leaf_layout, table_leaf_layout,
     table_openings_cost_q,
 };
 use crate::proof::options::{FriMode, FriScheduleOverride, OneRowMode, ProofFormat, ProofOptions};
@@ -43,7 +43,7 @@ type Felt = FieldElement<F>;
 type Ext = FieldElement<E>;
 
 /// Serialises the tests that flip the process-global M3 switch (see
-/// `leaf_layout::M3_PAIR_BOUND_UNDER_ONE_ROW`).
+/// `leaf_layout::M3_PAIR_BOUND_AT_LDE`).
 static M3_LOCK: Mutex<()> = Mutex::new(());
 
 fn fmt(one_row: OneRowMode, fri_mode: FriMode, schedule: Option<&[u8]>) -> ProofFormat {
@@ -432,7 +432,7 @@ fn one_row_zero_fold_case() {
 // ---------------------------------------------------------------------------
 
 /// The query indexes the verifier draws for a one-row SimpleAddition proof of
-/// `rows` rows at blowup 2 with `queries` queries (and the proof verifies).
+/// `rows` rows at blowup 2 with `queries` queries (and whether it verifies).
 fn one_row_iotas(rows: usize, queries: usize) -> (Vec<usize>, bool) {
     let o = golden_options(2, 1, queries, on(FriMode::Pair));
     let (air, proof) = prove_simple_addition::<KeccakStarkHash>(rows, &o);
@@ -441,9 +441,13 @@ fn one_row_iotas(rows: usize, queries: usize) -> (Vec<usize>, bool) {
     (rec.iotas.clone(), ok)
 }
 
-/// With 64 queries over an LDE of 64 points, all 64 indexes below `N / 2`
-/// has probability 2⁻⁶⁴ under the right bound; the pair bound makes it
-/// certain.
+/// The M3 shape: 4096 rows at blowup 2, an LDE of 8192 points no other
+/// one-row test proves at (the mutation is keyed by it), and 64 queries: all
+/// 64 indexes below `N / 2` has probability 2⁻⁶⁴ under the right bound; the
+/// pair bound makes it certain.
+const M3_ROWS: usize = 4096;
+const M3_LDE: usize = 2 * M3_ROWS;
+
 fn upper_half_reached(iotas: &[usize], lde: usize) -> bool {
     iotas.iter().any(|&r| r >= lde / 2) && iotas.iter().all(|&r| r < lde)
 }
@@ -451,9 +455,9 @@ fn upper_half_reached(iotas: &[usize], lde: usize) -> bool {
 #[test]
 fn one_row_query_indexes_cover_the_whole_lde() {
     let _g = M3_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (iotas, ok) = one_row_iotas(32, 64);
+    let (iotas, ok) = one_row_iotas(M3_ROWS, 64);
     assert!(ok);
-    assert!(upper_half_reached(&iotas, 64), "iotas {iotas:?}");
+    assert!(upper_half_reached(&iotas, M3_LDE), "iotas {iotas:?}");
 }
 
 /// M3: sample r over N/2 under one row. Prover and verifier agree on the
@@ -462,12 +466,12 @@ fn one_row_query_indexes_cover_the_whole_lde() {
 #[test]
 fn m3_the_query_bound_test_is_load_bearing() {
     let _g = M3_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    M3_PAIR_BOUND_UNDER_ONE_ROW.store(true, std::sync::atomic::Ordering::SeqCst);
-    let (iotas, ok) = one_row_iotas(32, 64);
-    M3_PAIR_BOUND_UNDER_ONE_ROW.store(false, std::sync::atomic::Ordering::SeqCst);
+    M3_PAIR_BOUND_AT_LDE.store(M3_LDE as u64, std::sync::atomic::Ordering::SeqCst);
+    let (iotas, ok) = one_row_iotas(M3_ROWS, 64);
+    M3_PAIR_BOUND_AT_LDE.store(0, std::sync::atomic::Ordering::SeqCst);
     assert!(ok, "the mutated proof still verifies (both sides mutated)");
     assert!(
-        !upper_half_reached(&iotas, 64),
+        !upper_half_reached(&iotas, M3_LDE),
         "under the mutation the bound test must fail"
     );
 }
