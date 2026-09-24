@@ -1104,7 +1104,7 @@ fn layout_from_options() {
     let o = options_with(ProofFormat::DEFAULT);
     let k = u32::from(o.fri_final_poly_log_degree);
     assert_eq!(
-        FriFoldLayout::for_options(20, 1, &o),
+        FriFoldLayout::for_options(20, 1, &o, false),
         Ok(FriFoldLayout::new(20, 1, k))
     );
     // Dp: the DP's schedule under the options' query count and cap.
@@ -1112,7 +1112,7 @@ fn layout_from_options() {
         fri_mode: FriMode::Dp,
         ..ProofFormat::DEFAULT
     });
-    let l = FriFoldLayout::for_options(20, 1, &o).unwrap();
+    let l = FriFoldLayout::for_options(20, 1, &o, false).unwrap();
     let t = (1 + k).min(20);
     assert_eq!(
         l.schedule,
@@ -1134,14 +1134,19 @@ fn layout_from_options() {
         fri_schedule_override: FriScheduleOverride::new(&fit),
         ..ProofFormat::DEFAULT
     });
-    assert_eq!(FriFoldLayout::for_options(20, 1, &o).unwrap().schedule, fit);
+    assert_eq!(
+        FriFoldLayout::for_options(20, 1, &o, false)
+            .unwrap()
+            .schedule,
+        fit
+    );
     let o = options_with(ProofFormat {
         fri_mode: FriMode::Dp,
         fri_schedule_override: FriScheduleOverride::new(&[3, 1]),
         ..ProofFormat::DEFAULT
     });
     assert_eq!(
-        FriFoldLayout::for_options(20, 1, &o),
+        FriFoldLayout::for_options(20, 1, &o, false),
         Err(FriFormatError::ScheduleOverrideMismatch)
     );
     // An all-ones override under Dp keeps the GROUP encoding.
@@ -1150,18 +1155,31 @@ fn layout_from_options() {
         fri_schedule_override: FriScheduleOverride::new(&vec![1u8; span as usize]),
         ..ProofFormat::DEFAULT
     });
-    let l = FriFoldLayout::for_options(20, 1, &o).unwrap();
+    let l = FriFoldLayout::for_options(20, 1, &o, false).unwrap();
     assert_eq!(l.schedule, vec![1u8; span as usize]);
     assert!(!l.is_legacy());
-    // One-row is refused until S2 exists.
+    // One row (S2): the chain starts at the LDE size, the encoding is the
+    // group one even at fri = pair, and the all-ones schedule covers every
+    // fold (no uncommitted fold 0).
     for one_row in [OneRowMode::On, OneRowMode::Auto] {
         let o = options_with(ProofFormat {
             one_row,
             ..ProofFormat::DEFAULT
         });
+        let l = FriFoldLayout::for_options(20, 1, &o, true).unwrap();
+        assert!(l.one_row && !l.is_legacy());
+        assert_eq!(l.schedule, vec![1u8; (20 - t) as usize]);
+        assert_eq!(l.num_committed as u32, l.total_folds);
+        assert_eq!(l.num_zetas(), l.num_committed);
         assert_eq!(
-            FriFoldLayout::for_options(20, 1, &o),
-            Err(FriFormatError::OneRowNotImplemented)
+            l.layer_depth(20, 0),
+            19,
+            "the input tree: 2^20 values in pairs"
+        );
+        // The same options at a resolved row-pair layout: today's.
+        assert_eq!(
+            FriFoldLayout::for_options(20, 1, &o, false),
+            Ok(FriFoldLayout::new(20, 1, k))
         );
     }
     // An override longer than the fixed capacity is refused at construction.

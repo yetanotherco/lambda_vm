@@ -21,6 +21,7 @@ pub mod gpu_lde;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod leaf_layout;
 #[cfg(feature = "cuda")]
 pub mod logup_gpu;
 pub mod lookup;

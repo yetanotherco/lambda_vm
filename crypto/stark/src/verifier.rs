@@ -5,6 +5,7 @@ use super::{
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
 };
+use crate::leaf_layout::LeafLayout;
 use crate::merkle_caps::{StarkCaps, TableTreeChecks, TreeCheck};
 pub use crate::proof::view::PiDeserializer;
 use crate::{
@@ -148,15 +149,31 @@ pub trait IsStarkVerifier<
     PI: rkyv::Archive + Clone,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    /// The query indexes: leaf indexes of the trace trees, uniform below
+    /// [`LeafLayout::query_bound`] — `lde / 2` (a row PAIR) today, `lde` under
+    /// one-row openings, where each index is one point of `D₀` (FRI.md §7.7 (i):
+    /// sampling a pair and opening one of its points would bias `x₀`).
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &VerifierDomain<Field>,
+        leaf_layout: LeafLayout,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
-        let domain_size = domain.lde_length as u64;
+        let bound = leaf_layout.query_bound(domain.lde_length as u64);
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| (transcript.sample_u64(bound)) as usize)
             .collect::<Vec<usize>>()
+    }
+
+    /// The trace-tree leaf layout of `air`'s proof over `trace_length` rows
+    /// (row pairs, or one row under S2): a verifier-side constant from the
+    /// AIR's options and widths and the trace length the FRI layout already
+    /// trusts ([`crate::leaf_layout::table_leaf_layout`]).
+    fn leaf_layout(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace_length: usize,
+    ) -> LeafLayout {
+        crate::leaf_layout::table_leaf_layout(air, trace_length)
     }
 
     /// The pruned-OOD layout for this AIR — the single place in the verifier that
@@ -254,6 +271,16 @@ pub trait IsStarkVerifier<
             None => return false,
         };
         let expected_aux = air.num_auxiliary_rap_columns();
+        // The symmetric slot exists only for row pairs: a one-row leaf holds
+        // the queried row alone, so every `evaluations_sym` must be EMPTY (a
+        // non-empty one would be hashed into the leaf and read by nothing).
+        let one_row = Self::leaf_layout(air, proof.trace_length()).is_one_row();
+        let sym = |n: usize| if one_row { 0 } else { n };
+        let (sym_precomputed, sym_main, sym_aux) = (
+            sym(expected_precomputed),
+            sym(expected_main),
+            sym(expected_aux),
+        );
 
         if proof.deep_poly_openings_len() < num_queries {
             return false;
@@ -273,11 +300,12 @@ pub trait IsStarkVerifier<
             let main = opening.main_trace_polys();
 
             precomputed == expected_precomputed
-                && precomputed_sym == expected_precomputed
+                && precomputed_sym == sym_precomputed
                 && main.evaluations().len() == expected_main
-                && main.evaluations_sym().len() == expected_main
+                && main.evaluations_sym().len() == sym_main
                 && aux == expected_aux
-                && aux_sym == expected_aux
+                && aux_sym == sym_aux
+                && (!one_row || opening.composition_poly().evaluations_sym().is_empty())
         })
     }
 
@@ -475,6 +503,7 @@ pub trait IsStarkVerifier<
             domain.lde_length.trailing_zeros(),
             blowup_log,
             air.options(),
+            Self::leaf_layout(air, domain.trace_length).is_one_row(),
         )
         .ok()
     }
@@ -503,21 +532,6 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
-        let (deep_poly_evaluations, deep_poly_evaluations_sym) =
-            match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
-                challenges,
-                domain,
-                proof,
-                ood_full,
-                next_row_cols,
-                step_size,
-            ) {
-                Some(pair) => pair,
-                None => return false,
-            };
-        #[cfg(any(test, feature = "test-utils"))]
-        crate::fri::capture::record_deep(&deep_poly_evaluations, &deep_poly_evaluations_sym);
-
         // ---- Reconstruct the FRI terminal codeword from the final-poly coeffs ----
         // The prover folds the deep composition codeword down to a terminal
         // codeword of length `terminal_len = 2^(blowup_log + effective_k)` and sends
@@ -526,6 +540,24 @@ pub trait IsStarkVerifier<
             return false;
         };
         let num_committed = layout.num_committed;
+        // Row pairs: DEEP at `x` and `−x` per query. One row: DEEP at the one
+        // point `x_r` (the sym vector comes back empty).
+        let leaf_layout = LeafLayout::from_one_row(layout.one_row);
+        let (deep_poly_evaluations, deep_poly_evaluations_sym) =
+            match Self::reconstruct_deep_composition_poly_evaluations_for_layout(
+                challenges,
+                domain,
+                proof,
+                ood_full,
+                next_row_cols,
+                step_size,
+                leaf_layout,
+            ) {
+                Some(pair) => pair,
+                None => return false,
+            };
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::fri::capture::record_deep(&deep_poly_evaluations, &deep_poly_evaluations_sym);
 
         // Structural check: number of committed FRI layers must equal
         // `num_committed` (zero when no fold or a single final fold happened).
@@ -577,7 +609,7 @@ pub trait IsStarkVerifier<
         let mut evaluation_point_inverse = challenges
             .iotas
             .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
+            .map(|iota| Self::query_point(leaf_layout, *iota, domain))
             .collect::<Vec<FieldElement<Field>>>();
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
@@ -599,20 +631,21 @@ pub trait IsStarkVerifier<
                     }
                 }
             }
+            let _ = lde_log;
             return (0..challenges.iotas.len())
                 .zip(evaluation_point_inverse)
                 .all(|(i, eval)| {
                     Self::verify_query_groups(
-                        proof,
                         &layout,
                         &challenges.zetas,
                         challenges.iotas[i],
                         proof.query(i),
                         eval,
                         &deep_poly_evaluations[i],
-                        &deep_poly_evaluations_sym[i],
+                        deep_poly_evaluations_sym.get(i),
                         &terminal_codeword,
-                        lde_log as u32,
+                        &checks.fri,
+                        i,
                         &roots_tables,
                     )
                 });
@@ -634,6 +667,17 @@ pub trait IsStarkVerifier<
                     i,
                 )
             })
+    }
+
+    /// The LDE-coset point query `q` opens first under `leaf_layout`: the row
+    /// at bit-reversed position `2q` for row pairs (as
+    /// [`Self::query_challenge_to_evaluation_point`]), `q` for one row.
+    fn query_point(
+        leaf_layout: LeafLayout,
+        q: usize,
+        domain: &VerifierDomain<Field>,
+    ) -> FieldElement<Field> {
+        domain.lde_coset_element(leaf_layout.query_rows(q, domain.lde_length).0)
     }
 
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
@@ -826,13 +870,17 @@ pub trait IsStarkVerifier<
     {
         let options = air.options();
         // A format this verifier cannot lay out rejects here, as in step 3.
-        let num_committed = Self::fri_termination_params(air, domain)?.num_committed;
+        let fri_layout = Self::fri_termination_params(air, domain)?;
+        let num_committed = fri_layout.num_committed;
         let lde_log = domain.lde_length.trailing_zeros() as usize;
-        let caps = StarkCaps::new(
+        // Every depth from the table's layout (row pairs: `log2(lde) − 1`; one
+        // row: `log2(lde)`) and the FRI schedule's per-layer depths — at the
+        // default exactly `StarkCaps::new`'s.
+        let caps = StarkCaps::with_depths(
             options.format.merkle_cap,
             options.fri_number_of_queries,
-            lde_log,
-            num_committed,
+            LeafLayout::from_one_row(fri_layout.one_row).tree_depth(lde_log),
+            fri_layout.layer_depths(lde_log as u32),
         );
         let fri_roots = proof.fri_layers_merkle_roots();
         if fri_roots.len() != num_committed {
@@ -923,51 +971,67 @@ pub trait IsStarkVerifier<
         )
     }
 
-    /// Verify a single FRI query under the group encoding (S3; any format but
-    /// the legacy one): fold 0 from the DEEP pair as today, then
-    /// [`crate::fri::group::verify_query_groups`] for the committed layers and
-    /// the terminal check. The zero-fold case is the legacy one (no layer, no
-    /// challenge).
+    /// Verify a single FRI query under the group encoding (S3 and S2; any
+    /// format but the legacy one), then [`crate::fri::group::verify_query_groups`]
+    /// for the committed layers and the terminal check.
+    ///
+    /// * Row pairs (`p0_eval_sym = Some`): fold 0 from the DEEP pair as today;
+    ///   the zero-fold case is the legacy one (no layer, no challenge, both
+    ///   points checked against the terminal codeword).
+    /// * One row (`p0_eval_sym = None`, S2): layer 0 IS the committed DEEP
+    ///   codeword, so the query's value there is `DEEP(x_r)` itself and the
+    ///   layer-0 slot check is the input-slot check `group₀[slot] == DEEP(x_r)`
+    ///   (FRI.md §7.4). With nothing to fold the terminal codeword is the DEEP
+    ///   codeword and `terminal[r] == DEEP(x_r)` is the whole check.
     // Crate-internal layout type on a default method, as `fri_termination_params`.
     #[allow(clippy::too_many_arguments, private_interfaces)]
     fn verify_query_groups(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
         layout: &crate::fri::terminal::FriFoldLayout,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
         fri_decommitment: FriDecommitmentView<'_, FieldExtension>,
         evaluation_point_inv: FieldElement<Field>,
         p0_eval: &FieldElement<FieldExtension>,
-        p0_eval_sym: &FieldElement<FieldExtension>,
+        p0_eval_sym: Option<&FieldElement<FieldExtension>>,
         terminal_codeword: &[FieldElement<FieldExtension>],
-        lde_log: u32,
+        fri_checks: &[TreeCheck<'_>],
+        query: usize,
         roots_tables: &[Vec<FieldElement<Field>>],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        if zetas.is_empty() {
-            return terminal_codeword
-                .get(iota * 2)
-                .is_some_and(|t| p0_eval == t)
-                && terminal_codeword
-                    .get(iota * 2 + 1)
-                    .is_some_and(|t| p0_eval_sym == t);
-        }
-        // Fold 0 (binary, uncommitted) consumes the DEEP pair: p₁(𝜐²).
-        let v =
-            (p0_eval + p0_eval_sym) + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+        // The encoding of the DEEP value(s) must match the layout: a
+        // one-row layout has no symmetric value, a row-pair one needs it.
+        let (v, y_inv) = match (layout.one_row, p0_eval_sym) {
+            (true, None) => (p0_eval.clone(), evaluation_point_inv),
+            (false, Some(p0_eval_sym)) => {
+                if zetas.is_empty() {
+                    return terminal_codeword
+                        .get(iota * 2)
+                        .is_some_and(|t| p0_eval == t)
+                        && terminal_codeword
+                            .get(iota * 2 + 1)
+                            .is_some_and(|t| p0_eval_sym == t);
+                }
+                // Fold 0 (binary, uncommitted) consumes the DEEP pair: p₁(𝜐²).
+                let v = (p0_eval + p0_eval_sym)
+                    + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+                (v, evaluation_point_inv.square())
+            }
+            _ => return false,
+        };
         crate::fri::group::verify_query_groups::<Field, FieldExtension, H::Batched<FieldExtension>>(
             layout,
-            lde_log,
-            proof.fri_layers_merkle_roots(),
+            fri_checks,
+            query,
             |j| fri_decommitment.layer_auth_path(j),
             fri_decommitment.layers_evaluations_sym(),
             zetas,
             iota,
             v,
-            evaluation_point_inv.square(),
+            y_inv,
             terminal_codeword,
             roots_tables,
         )
@@ -1179,6 +1243,31 @@ pub trait IsStarkVerifier<
         next_row_cols: &[usize],
         step_size: usize,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
+        Self::reconstruct_deep_composition_poly_evaluations_for_layout(
+            challenges,
+            domain,
+            proof,
+            ood_full,
+            next_row_cols,
+            step_size,
+            LeafLayout::RowPair,
+        )
+    }
+
+    /// [`Self::reconstruct_deep_composition_poly_evaluations_for_all_queries`]
+    /// under a leaf layout: for row pairs, DEEP at each query's two points
+    /// (`x`, `−x`); for one row, DEEP at the query's one point `x_r` and an
+    /// EMPTY symmetric vector (the openings carry no symmetric row).
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_deep_composition_poly_evaluations_for_layout(
+        challenges: &Challenges<FieldExtension>,
+        domain: &VerifierDomain<Field>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
+        leaf_layout: LeafLayout,
+    ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
         // `deep_poly_openings` comes straight from the untrusted proof and its
@@ -1208,6 +1297,34 @@ pub trait IsStarkVerifier<
             next_row_cols,
             step_size,
         )?;
+
+        if leaf_layout.is_one_row() {
+            for (i, r) in challenges.iotas.iter().enumerate() {
+                let opening = proof.deep_poly_opening(i);
+                let lde_precomputed: &[FieldElement<Field>] = opening
+                    .precomputed_trace_polys()
+                    .map(|p| p.evaluations())
+                    .unwrap_or(&[]);
+                let lde_aux: &[FieldElement<FieldExtension>] = opening
+                    .aux_trace_polys()
+                    .map(|a| a.evaluations())
+                    .unwrap_or(&[]);
+                let point = Self::query_point(leaf_layout, *r, domain);
+                deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation_at(
+                    &point,
+                    primitive_root,
+                    challenges,
+                    &query_invariant_terms,
+                    next_row_cols,
+                    step_size,
+                    lde_precomputed,
+                    opening.main_trace_polys().evaluations(),
+                    lde_aux,
+                    opening.composition_poly().evaluations(),
+                )?);
+            }
+            return Some((deep_poly_evaluations, deep_poly_evaluations_sym));
+        }
 
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
@@ -1263,6 +1380,88 @@ pub trait IsStarkVerifier<
             deep_poly_evaluations_sym.push(evaluation_sym);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
+    }
+
+    /// The deep composition polynomial at ONE point (one-row openings, S2):
+    /// the same terms as [`Self::reconstruct_deep_composition_poly_evaluation_pair`]
+    /// at `evaluation_point` alone, with the same panic guards (a malformed
+    /// width, a zero denominator → `None`).
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_deep_composition_poly_evaluation_at(
+        evaluation_point: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        challenges: &Challenges<FieldExtension>,
+        query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
+        lde_trace_precomputed_evaluations: &[FieldElement<Field>],
+        lde_trace_main_evaluations: &[FieldElement<Field>],
+        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
+    ) -> Option<FieldElement<FieldExtension>> {
+        let height = query_invariant_terms.ood_row_sum.len();
+        let width = query_invariant_terms.ood_width;
+        let trace_term_coeffs = &challenges.trace_term_coeffs;
+        let num_precomputed = lde_trace_precomputed_evaluations.len();
+        let num_base = num_precomputed + lde_trace_main_evaluations.len();
+        let base_at = |col: usize| -> &FieldElement<Field> {
+            if col < num_precomputed {
+                &lde_trace_precomputed_evaluations[col]
+            } else {
+                &lde_trace_main_evaluations[col - num_precomputed]
+            }
+        };
+        if num_base + lde_trace_aux_evaluations.len() != width {
+            return None;
+        }
+
+        let mut denoms = Vec::with_capacity(height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..height {
+            denoms.push(evaluation_point - &current_z);
+            current_z = primitive_root * &current_z;
+        }
+        FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
+
+        let mut trace_term = FieldElement::<FieldExtension>::zero();
+        for (row_idx, denom) in denoms.iter().enumerate() {
+            let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
+            let mut base_row_sum = FieldElement::<FieldExtension>::zero();
+            let mut add = |col_idx: usize, coeff: &FieldElement<FieldExtension>| {
+                if col_idx < num_base {
+                    base_row_sum += base_at(col_idx) * coeff;
+                } else {
+                    base_row_sum += coeff * &lde_trace_aux_evaluations[col_idx - num_base];
+                }
+            };
+            if row_idx < step_size {
+                for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
+                    add(col_idx, &coeff_col[row_idx]);
+                }
+            } else {
+                for &col_idx in next_row_cols {
+                    add(col_idx, &trace_term_coeffs[col_idx][row_idx]);
+                }
+            }
+            trace_term += denom * &(&base_row_sum - ood_row_sum);
+        }
+
+        let number_of_parts = query_invariant_terms.number_of_parts;
+        if lde_composition_poly_parts_evaluation.len() != number_of_parts {
+            return None;
+        }
+        let denom_composition = (evaluation_point - &query_invariant_terms.z_pow)
+            .inv()
+            .ok()?;
+        let mut h_sum = FieldElement::<FieldExtension>::zero();
+        for (h, gamma) in lde_composition_poly_parts_evaluation
+            .iter()
+            .zip(&challenges.gammas)
+        {
+            h_sum += h * gamma;
+        }
+        let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
+        Some(trace_term + h_terms)
     }
 
     /// Reconstructs the deep composition polynomial evaluation at a query's
@@ -1547,7 +1746,16 @@ pub trait IsStarkVerifier<
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
-                let expected_precomputed = air.precomputed_commitment();
+                // The root of THIS table's leaf layout (a verifier constant);
+                // a layout the AIR has no root for rejects (RULINGS 14).
+                let layout = Self::leaf_layout(*air, trace_length);
+                let Some(expected_precomputed) = air.precomputed_commitment_for(layout) else {
+                    error!(
+                        "Preprocessed table {idx}: no precomputed commitment for the {layout:?} \
+                         leaf layout"
+                    );
+                    return false;
+                };
                 match proof.lde_trace_precomputed_merkle_root() {
                     Some(actual) if *actual == expected_precomputed => {
                         // OK - commitment matches hardcoded
@@ -1821,18 +2029,20 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // FRI commit phase
+        // FRI commit phase. Under one-row openings (S2) the first root is the
+        // input tree (the DEEP codeword itself), absorbed BEFORE any folding
+        // challenge; every other root follows its challenge as today.
+        let leaf_layout = Self::leaf_layout(air, trace_length);
         let merkle_roots = proof.fri_layers_merkle_roots();
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
+        let mut zetas = Vec::with_capacity(merkle_roots.len() + 1);
+        for (j, root) in merkle_roots.iter().enumerate() {
+            if !(leaf_layout.is_one_row() && j == 0) {
                 // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
+                zetas.push(transcript.sample_field_element());
+            }
+            // <<<< Receive commitment: [pₖ] (the first one is [p₀])
+            transcript.append_bytes(root);
+        }
 
         // The prover only samples the final-fold challenge when the codeword
         // actually folds past the committed layers. For tiny traces (the clamp
@@ -1872,7 +2082,7 @@ pub trait IsStarkVerifier<
         // FRI query phase
         // <<<< Send challenges 𝜄ₛ (iota_s)
         let number_of_queries = air.options().fri_number_of_queries;
-        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, leaf_layout, transcript);
 
         Challenges {
             z,

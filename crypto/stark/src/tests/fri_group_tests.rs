@@ -21,6 +21,7 @@ use crate::fri::group::{
 };
 use crate::fri::terminal::{FriFoldLayout, terminal_codeword_from_coeffs};
 use crate::fri::{commit_phase_with_layout, fold_times, query_phase_with_layout};
+use crate::merkle_caps::TreeCheck;
 use crate::proof::options::{FriMode, FriScheduleOverride, ProofFormat};
 use crate::traits::AIR;
 
@@ -242,10 +243,24 @@ fn fri_accepts<H: StarkHash>(run: &FriRun, deep: &[Ext], o: &Felt) -> bool {
             let x_inv = x.inv().unwrap();
             let (p0, p0s) = (&deep[2 * iota], &deep[2 * iota + 1]);
             let v = (p0 + p0s) + &x_inv * &run.zetas[0] * (p0 - p0s);
+            let checks: Vec<TreeCheck<'_>> = run
+                .roots
+                .iter()
+                .enumerate()
+                .map(|(j, root)| {
+                    TreeCheck::build::<H::Batched<E>>(
+                        root,
+                        run.layout.layer_depth(run.lde_log, j) as usize,
+                        0,
+                        || None,
+                    )
+                    .unwrap()
+                })
+                .collect();
             verify_query_groups::<F, E, H::Batched<E>>(
                 &run.layout,
-                run.lde_log,
-                &run.roots,
+                &checks,
+                1,
                 |j| dec.layers_auth_paths[j].merkle_path.as_slice(),
                 &dec.layers_evaluations_sym,
                 &run.zetas,
@@ -365,14 +380,15 @@ fn dp_round_trips_at_every_fold_count() {
                 round_trip_simple::<KeccakStarkHash>(rows, blowup, dp_with(None));
             let lde_log = log_rows + blowup.trailing_zeros();
             let o = golden_options(blowup, 1, 9, dp_with(None));
-            let l = FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o).unwrap();
+            let l =
+                FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o, false).unwrap();
             assert_eq!(layers, l.num_committed, "rows {rows}");
             assert_eq!(values, l.opened_values_per_query(), "rows {rows}");
         }
     }
     // A shape where the DP picks a non-trivial schedule is exercised.
     let o = golden_options(4, 1, 9, dp_with(None));
-    let l = FriFoldLayout::for_options(12, 2, &o).unwrap();
+    let l = FriFoldLayout::for_options(12, 2, &o, false).unwrap();
     assert!(
         l.schedule.iter().any(|&d| d > 1),
         "schedule {:?}",

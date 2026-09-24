@@ -353,7 +353,7 @@ pub fn proof_vectors<H: StarkHash>(hash_name: &str) -> Vec<VectorFile> {
             .expect("rkyv")
             .to_vec();
         let lde_log = PROOF_ROWS.trailing_zeros() + 2;
-        let layout = FriFoldLayout::for_options(lde_log, 2, air.options()).expect("layout");
+        let layout = FriFoldLayout::for_options(lde_log, 2, air.options(), false).expect("layout");
         let stem = format!("d_proof_{hash_name}_{fmt_name}");
 
         let mut s = format!(

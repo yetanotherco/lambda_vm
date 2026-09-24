@@ -74,6 +74,32 @@ impl StarkCaps {
         }
     }
 
+    /// The heights for trace trees of depth `trace_depth` and committed FRI
+    /// layers of depths `fri_depths`, every tree opened `num_queries` times.
+    ///
+    /// The general form of [`Self::new`], for any leaf layout and FRI
+    /// schedule: the caller passes the depths its layout implies
+    /// ([`crate::leaf_layout::LeafLayout::tree_depth`] and the FRI layout's
+    /// per-layer depths). At row pairs and the all-ones schedule those are
+    /// exactly [`Self::new`]'s.
+    pub fn with_depths(
+        policy: CapPolicy,
+        num_queries: usize,
+        trace_depth: usize,
+        fri_depths: Vec<usize>,
+    ) -> Self {
+        let fri = fri_depths
+            .iter()
+            .map(|&d| policy.height(num_queries, d))
+            .collect();
+        Self {
+            trace_depth,
+            trace: policy.height(num_queries, trace_depth),
+            fri_depths,
+            fri,
+        }
+    }
+
     /// True when some tree has a cap (`c > 0`).
     pub fn any(&self) -> bool {
         self.trace > 0 || self.fri.iter().any(|&c| c > 0)

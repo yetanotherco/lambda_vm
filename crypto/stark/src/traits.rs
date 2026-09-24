@@ -210,6 +210,24 @@ pub trait AIR: Send + Sync {
         [0u8; 32]
     }
 
+    /// The hardcoded commitment to the precomputed columns under the trace
+    /// trees' leaf `layout` (S2). The root depends on the layout (a one-row
+    /// leaf hashes different bytes), so each layout has its own trust anchor.
+    ///
+    /// `None` = this AIR has no root for `layout`: the prover refuses to prove
+    /// and the verifier rejects (RULINGS 14 — never a silent recompute, never
+    /// the other layout's root). The default serves today's layout only.
+    /// Only meaningful if `is_preprocessed()` returns true.
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.precomputed_commitment()),
+            crate::leaf_layout::LeafLayout::Row => None,
+        }
+    }
+
     /// The precomputed columns themselves, `0..num_precomputed_columns()`.
     ///
     /// Empty unless `is_preprocessed()`. The univariate path never needs these

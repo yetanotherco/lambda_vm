@@ -88,6 +88,12 @@ where
 /// `d_last` times into the terminal codeword. At the all-ones schedule this is
 /// exactly today's loop (sample, fold once, commit pairs, append).
 ///
+/// One-row layouts (S2): `d_{−1} = 0` — layer 0 is the DEEP codeword itself,
+/// committed with groups of `2^{d_0}` and its root absorbed with NO challenge
+/// before it; every later layer is "sample ζ, fold, commit, append" as above.
+/// So `m` committed layers draw `m` challenges (the last one the final fold's),
+/// against `m + 1` for row pairs.
+///
 /// Leaves: the legacy encoding commits `[a, b]` pairs with `H::Pair`; the
 /// group encoding hashes each `2^d`-value group with `H::Batched` (the two
 /// agree on a two-element leaf, `StarkHash`'s invariant) and builds the tree
@@ -156,9 +162,6 @@ where
         layout.total_folds,
         evals.len().trailing_zeros() - layout.terminal_len.trailing_zeros()
     );
-    // One-row layouts (S2) commit the DEEP codeword itself as layer 0; they are
-    // refused before a layout is built (`FriFormat::from_options`).
-    debug_assert!(!layout.one_row, "one-row FRI layouts are not implemented");
     let num_committed = layout.num_committed;
 
     // Inverse twiddle factors for evaluation-form folding: per-layer working
@@ -167,16 +170,22 @@ where
     let mut fri_layer_list = Vec::with_capacity(num_committed);
 
     // Folds still owed before the next commit: fold 0 is the binary fold of
-    // the DEEP pair, so one; after committing layer `j`, `d_j`.
-    let mut pending: u32 = 1;
+    // the DEEP pair, so one; after committing layer `j`, `d_j`. Under one-row
+    // openings (S2) the DEEP codeword itself is layer 0 (the input tree), so
+    // nothing is owed before it and its root is absorbed BEFORE the first
+    // folding challenge (FRI.md §7.3; a root absorbed after its challenge
+    // would let the prover pick the codeword after seeing it).
+    let mut pending: u32 = if layout.one_row { 0 } else { 1 };
 
     // Commit `num_committed` folded layers to the transcript.
     for &d in &layout.schedule {
-        // <<<< Receive challenge 𝜁ₖ
-        let zeta = transcript.sample_field_element();
+        if pending > 0 {
+            // <<<< Receive challenge 𝜁ₖ
+            let zeta = transcript.sample_field_element();
 
-        // Fold `pending` times with 𝜁, 𝜁², … (evaluation form, no FFT).
-        fold_times(&mut evals, &zeta, pending, &mut inv_twiddles);
+            // Fold `pending` times with 𝜁, 𝜁², … (evaluation form, no FFT).
+            fold_times(&mut evals, &zeta, pending, &mut inv_twiddles);
+        }
 
         let merkle_tree = if layout.is_legacy() {
             // Build the Merkle tree from consecutive pairs.
@@ -199,7 +208,8 @@ where
     }
 
     // The final folds to reach the terminal codeword (size terminal_len),
-    // unless already there (total_folds == 0 means initial_len == terminal_len).
+    // unless already there (total_folds == 0 means initial_len == terminal_len;
+    // then `pending` is 0 under one row too, as the schedule is empty).
     if layout.total_folds > 0 {
         // <<<< Receive challenge: 𝜁_final
         let zeta = transcript.sample_field_element();

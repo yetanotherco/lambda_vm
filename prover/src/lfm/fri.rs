@@ -66,7 +66,21 @@ impl FriShape {
     /// Every FRI-relevant parameter comes from `options` — including the coset
     /// offset, which discharges the plumbing half of the `coset_offset != 3`
     /// deferral recorded in `others/lfm-assembly-obligations.md`.
+    ///
+    /// # Panics
+    ///
+    /// On a one-row inner format (`LAMBDA_VM_ZF_ONE_ROW` ≠ 0, S2): the
+    /// in-guest verifier of one-row openings and the committed FRI input is
+    /// lane I-FRI-G's G3 and does not exist yet, so an emitter built for the
+    /// row-pair layout must never be handed one — it would emit a verifier of
+    /// the wrong protocol. Emit time, not a proof outcome.
     pub fn from_options(options: &ProofOptions, log2_lde_length: u32) -> Self {
+        assert!(
+            options.format.one_row == stark::proof::options::OneRowMode::Off,
+            "the in-guest STARK verifier does not implement one-row openings (S2, lane G3); \
+             inner format one_row = {}",
+            options.format.one_row
+        );
         Self {
             log2_lde_length,
             blowup_log: (options.blowup_factor as u32).trailing_zeros(),
