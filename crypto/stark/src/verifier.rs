@@ -599,7 +599,6 @@ pub trait IsStarkVerifier<
                 .zip(evaluation_point_inverse)
                 .all(|(i, eval)| {
                     Self::verify_query_groups(
-                        proof,
                         &layout,
                         &checks.fri,
                         i,
@@ -931,7 +930,6 @@ pub trait IsStarkVerifier<
     // Crate-internal layout type on a default method, as `fri_termination_params`.
     #[allow(clippy::too_many_arguments, private_interfaces)]
     fn verify_query_groups(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
         layout: &crate::fri::terminal::FriFoldLayout,
         // One per committed layer (`table_tree_checks`, at the layout's group
         // tree depths), and this query's position in proof order (query 0 is
