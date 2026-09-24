@@ -307,3 +307,23 @@ fn deep_parity_medium() {
 fn deep_parity_no_aux() {
     run_parity(8, 2, 5, 0, 2, 2, 5000);
 }
+
+/// Eval-point counts that exercise every block shape of the folded kernel:
+/// one full block of 4, a full block plus a remainder of 1 and of 3, two full
+/// blocks, and no trace terms at all.
+#[test]
+fn deep_parity_eval_point_blocks() {
+    run_parity(6, 2, 7, 3, 2, 4, 7000);
+    run_parity(6, 2, 7, 3, 2, 5, 7001);
+    run_parity(6, 4, 6, 2, 3, 7, 7002);
+    run_parity(5, 2, 4, 2, 2, 8, 7003);
+    run_parity(5, 2, 4, 2, 2, 0, 7004);
+}
+
+/// Production-sized column count (~100 columns, 2 eval points) so the folded
+/// per-point accumulators sum many terms before the OOD subtraction.
+#[test]
+fn deep_parity_wide() {
+    run_parity(8, 2, 80, 24, 2, 2, 9000);
+    run_parity(7, 2, 96, 0, 1, 3, 9001);
+}

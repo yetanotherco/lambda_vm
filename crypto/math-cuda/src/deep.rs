@@ -12,9 +12,56 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+use math::field::goldilocks::GoldilocksField;
+
 use crate::Result;
 use crate::device::backend;
 use crate::lde::{GpuLdeBase, GpuLdeExt3};
+
+type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
+
+fn fp3_from_raw(raw: &[u64]) -> Fp3 {
+    Fp3::new([
+        FieldElement::<GoldilocksField>::from_raw(raw[0]),
+        FieldElement::<GoldilocksField>::from_raw(raw[1]),
+        FieldElement::<GoldilocksField>::from_raw(raw[2]),
+    ])
+}
+
+/// Fold the per-proof OOD constants the kernel subtracts once per eval point
+/// instead of once per column: returns `(1 + num_eval_points) * 3` u64s,
+/// ext3 interleaved, laid out as
+///   `[K_h, ood_compressed[0], ..., ood_compressed[num_eval_points - 1]]`
+/// with `K_h = Σ_j gammas_h[j] * h_ood[j]` and
+/// `ood_compressed[k] = Σ_j gammas_tr[j][k] * trace_ood[j][k]` (the same
+/// compression the CPU R4 loop in `crypto/stark/src/prover.rs` applies).
+fn fold_ood_constants(
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_eval_points: usize,
+) -> Vec<u64> {
+    let mut folded = vec![Fp3::zero(); 1 + num_eval_points];
+    for (g, o) in gammas_h.chunks_exact(3).zip(h_ood.chunks_exact(3)) {
+        folded[0] += fp3_from_raw(g) * fp3_from_raw(o);
+    }
+    if num_eval_points > 0 {
+        for (idx, (g, o)) in gammas_tr
+            .chunks_exact(3)
+            .zip(trace_ood.chunks_exact(3))
+            .enumerate()
+        {
+            folded[1 + idx % num_eval_points] += fp3_from_raw(g) * fp3_from_raw(o);
+        }
+    }
+    folded
+        .iter()
+        .flat_map(|e| e.value().iter().map(|c| *c.value()))
+        .collect()
+}
 
 /// Compute deep-composition evaluations on device.
 ///
@@ -184,9 +231,9 @@ fn deep_fully_resident_launch(
     let be = backend()?;
 
     // H2D only the small scalars on the caller's stream.
-    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev) = (
-        stream.clone_htod(h_ood)?,
-        stream.clone_htod(trace_ood)?,
+    let ood_folded = fold_ood_constants(h_ood, trace_ood, gammas_h, gammas_tr, num_eval_points);
+    let (ood_folded_dev, gammas_h_dev, gammas_tr_dev) = (
+        stream.clone_htod(&ood_folded)?,
         stream.clone_htod(gammas_h)?,
         stream.clone_htod(gammas_tr)?,
     );
@@ -233,8 +280,7 @@ fn deep_fully_resident_launch(
             .arg(&num_eval_points_u)
             .arg(&row_stride_u)
             .arg(&domain_size_u)
-            .arg(&h_ood_dev)
-            .arg(&trace_ood_dev)
+            .arg(&ood_folded_dev)
             .arg(&gammas_h_dev)
             .arg(&gammas_tr_dev)
             .arg(&inv_h_view)
@@ -443,9 +489,9 @@ fn deep_composition_ext3_impl(
 
     let be = backend()?;
 
-    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = (
-        stream.clone_htod(h_ood)?,
-        stream.clone_htod(trace_ood)?,
+    let ood_folded = fold_ood_constants(h_ood, trace_ood, gammas_h, gammas_tr, num_eval_points);
+    let (ood_folded_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = (
+        stream.clone_htod(&ood_folded)?,
         stream.clone_htod(gammas_h)?,
         stream.clone_htod(gammas_tr)?,
         stream.clone_htod(inv_h)?,
@@ -500,8 +546,7 @@ fn deep_composition_ext3_impl(
             .arg(&num_eval_points_u)
             .arg(&row_stride_u)
             .arg(&domain_size_u)
-            .arg(&h_ood_dev)
-            .arg(&trace_ood_dev)
+            .arg(&ood_folded_dev)
             .arg(&gammas_h_dev)
             .arg(&gammas_tr_dev)
             .arg(&inv_h_dev)
@@ -525,4 +570,65 @@ fn deep_composition_ext3_impl(
     let mut out = vec![0u64; domain_size * 3];
     pending.wait_into_u64(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(e: &Fp3) -> [u64; 3] {
+        let v = e.value();
+        [*v[0].value(), *v[1].value(), *v[2].value()]
+    }
+
+    fn flatten(v: &[Fp3]) -> Vec<u64> {
+        v.iter().flat_map(raw).collect()
+    }
+
+    fn fp3(seed: u64) -> Fp3 {
+        // Includes non-canonical limbs (>= p) to match what the kernel may see.
+        let limb = |s: u64| {
+            FieldElement::<GoldilocksField>::from_raw(s.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        };
+        Fp3::new([limb(seed), limb(seed ^ 0xFFFF_FFFF_0000_0001), limb(!seed)])
+    }
+
+    /// `fold_ood_constants` against the direct per-point sums, including the
+    /// `num_eval_points == 0` (H-term only) and empty-parts shapes.
+    #[test]
+    fn fold_ood_constants_matches_direct_sums() {
+        for &(num_parts, num_cols, num_eval_points) in
+            &[(2usize, 5usize, 2usize), (1, 7, 3), (4, 3, 0), (0, 4, 5)]
+        {
+            let s = (num_parts * 100 + num_cols * 10 + num_eval_points) as u64;
+            let h_ood: Vec<Fp3> = (0..num_parts as u64).map(|j| fp3(s + j)).collect();
+            let gammas_h: Vec<Fp3> = (0..num_parts as u64).map(|j| fp3(s + 50 + j)).collect();
+            let n = (num_cols * num_eval_points) as u64;
+            let trace_ood: Vec<Fp3> = (0..n).map(|j| fp3(s + 1000 + j)).collect();
+            let gammas_tr: Vec<Fp3> = (0..n).map(|j| fp3(s + 5000 + j)).collect();
+
+            let mut expected = vec![Fp3::zero(); 1 + num_eval_points];
+            for j in 0..num_parts {
+                expected[0] += &gammas_h[j] * &h_ood[j];
+            }
+            for j in 0..num_cols {
+                for k in 0..num_eval_points {
+                    let idx = j * num_eval_points + k;
+                    expected[1 + k] += &gammas_tr[idx] * &trace_ood[idx];
+                }
+            }
+
+            let got = fold_ood_constants(
+                &flatten(&h_ood),
+                &flatten(&trace_ood),
+                &flatten(&gammas_h),
+                &flatten(&gammas_tr),
+                num_eval_points,
+            );
+            assert_eq!(got.len(), (1 + num_eval_points) * 3);
+            for (k, e) in expected.iter().enumerate() {
+                assert_eq!(fp3_from_raw(&got[k * 3..k * 3 + 3]), *e, "point {k}");
+            }
+        }
+    }
 }
