@@ -10,6 +10,7 @@ pub mod domain_cache_stats;
 pub mod fri_tests;
 pub mod grinding_tests;
 pub mod opening_width_tests;
+pub mod path_length_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;

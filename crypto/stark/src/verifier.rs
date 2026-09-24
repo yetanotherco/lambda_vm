@@ -18,7 +18,8 @@ use crate::{
     table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
+use crypto::merkle_tree::cap::CappedRoot;
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -535,6 +536,10 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // `log2` of the LDE size: every tree's depth is a function of it (a
+        // verifier constant, never read from the proof).
+        let lde_log = domain.lde_length.trailing_zeros() as usize;
+
         let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
         let terminal_codeword =
             crate::fri::terminal::terminal_codeword_from_coeffs::<Field, FieldExtension>(
@@ -566,6 +571,7 @@ pub trait IsStarkVerifier<
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
                     &terminal_codeword,
+                    lde_log,
                 )
             })
     }
@@ -587,10 +593,14 @@ pub trait IsStarkVerifier<
     /// (`2·iota`, `2·iota+1`) is committed as the single leaf at position `iota`,
     /// so one Merkle path authenticates both `evaluations` (the row) and
     /// `evaluations_sym` (its symmetric). Same layout used for trace and composition.
+    ///
+    /// The path must be exactly `depth` siblings long (`log2(lde) − 1`, a
+    /// verifier constant): see [`trace_tree_depth`](Self::trace_tree_depth).
     fn verify_opening_pair<E>(
         opening: PolynomialOpeningsView<'_, E>,
         root: &Commitment,
         iota: usize,
+        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -605,9 +615,8 @@ pub trait IsStarkVerifier<
             opening.evaluations(),
             opening.evaluations_sym(),
         );
-        verify_merkle_path_from_leaf_hash::<H::Batched<E>>(
+        CappedRoot::uncapped(root, depth).verify::<H::Batched<E>>(
             opening.merkle_path(),
-            root,
             iota,
             leaf_hash,
         )
@@ -619,6 +628,7 @@ pub trait IsStarkVerifier<
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
         iota: usize,
+        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -629,6 +639,7 @@ pub trait IsStarkVerifier<
             deep_poly_openings.main_trace_polys(),
             proof.lde_trace_main_merkle_root(),
             iota,
+            depth,
         );
 
         // Precomputed trace (preprocessed tables only). Mismatched presence:
@@ -645,7 +656,9 @@ pub trait IsStarkVerifier<
             proof.lde_trace_precomputed_merkle_root(),
             deep_poly_openings.precomputed_trace_polys(),
         ) {
-            (Some(root), Some(opening)) => Self::verify_opening_pair::<Field>(opening, root, iota),
+            (Some(root), Some(opening)) => {
+                Self::verify_opening_pair::<Field>(opening, root, iota, depth)
+            }
             (None, None) => true,
             _ => false,
         };
@@ -662,7 +675,7 @@ pub trait IsStarkVerifier<
             deep_poly_openings.aux_trace_polys(),
         ) {
             (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, root, iota)
+                Self::verify_opening_pair::<FieldExtension>(opening, root, iota, depth)
             }
             (None, None) => true,
             _ => false,
@@ -677,6 +690,7 @@ pub trait IsStarkVerifier<
         deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
         iota: &usize,
+        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -691,12 +705,8 @@ pub trait IsStarkVerifier<
             composition_poly.evaluations_sym(),
         );
 
-        verify_merkle_path_from_leaf_hash::<H::Batched<FieldExtension>>(
-            composition_poly.merkle_path(),
-            composition_poly_merkle_root,
-            *iota,
-            leaf_hash,
-        )
+        CappedRoot::uncapped(composition_poly_merkle_root, depth)
+            .verify::<H::Batched<FieldExtension>>(composition_poly.merkle_path(), *iota, leaf_hash)
     }
 
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
@@ -705,6 +715,7 @@ pub trait IsStarkVerifier<
     fn step_4_verify_trace_and_composition_openings(
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
+        domain: &VerifierDomain<Field>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -715,14 +726,30 @@ pub trait IsStarkVerifier<
         >();
         // `step_3_verify_fri` (which runs before this) already rejects proofs
         // whose `deep_poly_openings` is shorter than `challenges.iotas`.
+        let depth = Self::trace_tree_depth(domain);
         challenges.iotas.iter().enumerate().all(|(i, iota_n)| {
             let deep_poly_opening = proof.deep_poly_opening(i);
             Self::verify_composition_poly_opening(
                 deep_poly_opening,
                 proof.composition_poly_root(),
                 iota_n,
-            ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
+                depth,
+            ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n, depth)
         })
+    }
+
+    /// Depth of the trace, precomputed, aux and composition trees: a leaf is a
+    /// row PAIR, so `lde / 2` leaves and `log2(lde) − 1` levels (0 for a
+    /// two-point LDE, where the leaf hash is the root). Every authentication
+    /// path into these trees must be exactly this long.
+    ///
+    /// Before this was checked, a path of any length was folded and compared
+    /// with the root; a short one compares an internal node with the root. No
+    /// exploit was shown (it needs a leaf hash equal to an internal node, a
+    /// cross-function collision under the algebraic backend), but the length
+    /// is a verifier constant, so it is now enforced (design/CAP.md §9.4).
+    fn trace_tree_depth(domain: &VerifierDomain<Field>) -> usize {
+        (domain.lde_length.trailing_zeros() as usize).saturating_sub(1)
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
@@ -732,6 +759,7 @@ pub trait IsStarkVerifier<
         evaluation: &FieldElement<FieldExtension>,
         evaluation_sym: &FieldElement<FieldExtension>,
         iota: usize,
+        depth: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -743,11 +771,10 @@ pub trait IsStarkVerifier<
             vec![evaluation.clone(), evaluation_sym.clone()]
         };
 
-        verify_merkle_path::<H::Batched<FieldExtension>>(
+        CappedRoot::uncapped(merkle_root, depth).verify::<H::Batched<FieldExtension>>(
             auth_path_sym,
-            merkle_root,
             iota >> 1,
-            &evaluations,
+            <H::Batched<FieldExtension> as IsMerkleTreeBackend>::hash_data(&evaluations),
         )
     }
 
@@ -769,6 +796,7 @@ pub trait IsStarkVerifier<
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
         terminal_codeword: &[FieldElement<FieldExtension>],
+        lde_log: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -826,6 +854,9 @@ pub trait IsStarkVerifier<
                         &v,
                         evaluation_sym,
                         index,
+                        // Layer `i` holds `lde / 2^(i+1)` values in pair
+                        // leaves: `log2(lde) − i − 2` levels.
+                        lde_log.saturating_sub(i + 2),
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
@@ -1809,7 +1840,7 @@ pub trait IsStarkVerifier<
         let timer4 = Instant::now();
 
         #[allow(clippy::let_and_return)]
-        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges) {
+        if !Self::step_4_verify_trace_and_composition_openings(proof, &challenges, &domain) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("DEEP Composition Polynomial verification failed");
             return false;
