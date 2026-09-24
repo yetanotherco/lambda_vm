@@ -2760,6 +2760,17 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         FieldElement<Field>: AsBytes,
     {
+        // The FRI fold layout of this table's proof format (a verifier-side
+        // constant built from the options, the same call the verifier makes).
+        // A format this build cannot lay out is refused here, before anything
+        // enters the transcript.
+        let fri_layout = crate::fri::terminal::FriFoldLayout::for_options(
+            domain.lde_roots_of_unity_coset.len().trailing_zeros(),
+            domain.blowup_factor.trailing_zeros(),
+            air.options(),
+        )
+        .map_err(|e| ProvingError::WrongParameter(format!("FRI format: {e}")))?;
+
         let coset_offset_u64 = air.context().proof_options.coset_offset;
         let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
 
@@ -2800,33 +2811,39 @@ pub trait IsStarkProver<
         let __ps_df = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        // Device FRI implements the legacy encoding only: any other format
+        // takes the host arm below (which may still compute DEEP on device).
         #[cfg(feature = "cuda")]
-        let precomputed_fri = Self::try_compute_deep_dev(
-            &round_1_result.lde_trace,
-            composition_parts,
-            round_3_result,
-            z,
-            domain,
-            &domain.trace_primitive_root,
-            &gammas,
-            &trace_term_coeffs,
-        )
-        .and_then(|dw| {
-            crate::gpu_lde::try_fri_commit_gpu_from_dev::<
-                Field,
-                FieldExtension,
-                _,
-                H::Pair<FieldExtension>,
-            >(
-                dw,
-                transcript,
-                &coset_offset,
-                domain.blowup_factor.trailing_zeros(),
-                air.options().fri_final_poly_log_degree as u32,
-                domain.fri_inv_twiddles(),
-                !round_1_result.lde_trace.host_trace_empty(),
+        let precomputed_fri = if !fri_layout.is_legacy() {
+            None
+        } else {
+            Self::try_compute_deep_dev(
+                &round_1_result.lde_trace,
+                composition_parts,
+                round_3_result,
+                z,
+                domain,
+                &domain.trace_primitive_root,
+                &gammas,
+                &trace_term_coeffs,
             )
-        });
+            .and_then(|dw| {
+                crate::gpu_lde::try_fri_commit_gpu_from_dev::<
+                    Field,
+                    FieldExtension,
+                    _,
+                    H::Pair<FieldExtension>,
+                >(
+                    dw,
+                    transcript,
+                    &coset_offset,
+                    domain.blowup_factor.trailing_zeros(),
+                    air.options().fri_final_poly_log_degree as u32,
+                    domain.fri_inv_twiddles(),
+                    !round_1_result.lde_trace.host_trace_empty(),
+                )
+            })
+        };
         #[cfg(not(feature = "cuda"))]
         #[allow(clippy::type_complexity)]
         let precomputed_fri: Option<(
@@ -2875,13 +2892,14 @@ pub trait IsStarkProver<
             // FRI commit phase from pre-computed evaluations
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            let res = fri::commit_phase_from_evaluations::<Field, FieldExtension, _, H>(
+            let res = fri::commit_phase_with_layout::<Field, FieldExtension, _, H>(
                 lde_evals,
                 transcript,
                 &coset_offset,
                 domain_size,
                 domain.blowup_factor.trailing_zeros(),
                 air.options().fri_final_poly_log_degree as u32,
+                &fri_layout,
                 domain.fri_inv_twiddles(),
             );
             #[cfg(feature = "instruments")]
@@ -2922,7 +2940,8 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let mut query_list = fri::query_phase::<FieldExtension, H>(&fri_layers, &iotas);
+        let mut query_list =
+            fri::query_phase_with_layout::<FieldExtension, H>(&fri_layers, &iotas, &fri_layout);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()

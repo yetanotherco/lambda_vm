@@ -48,6 +48,9 @@ test-log = { version = "0.2.11", features = ["log"] }
 bincode = "1"
 rand = { version = "0.8.5", features = ["std"] }
 rand_chacha = "0.3.1"
+# Digests of the default-format golden proofs (tests::zf_golden_tests); the
+# version the `crypto` crate already links.
+sha3 = "0.10.8"
 
 [features]
 test-utils = []

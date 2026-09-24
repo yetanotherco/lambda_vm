@@ -130,3 +130,9 @@ pub mod whir_byte_gate;
 pub mod whir_hash_tests;
 #[cfg(test)]
 pub mod whir_identity_tests;
+#[cfg(test)]
+pub mod zf_rpx_golden_tests;
+#[cfg(test)]
+pub mod zf_rpx_vectors;
+#[cfg(test)]
+pub mod zf_vm_dp_tests;

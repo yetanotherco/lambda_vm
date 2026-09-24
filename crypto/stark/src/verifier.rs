@@ -458,16 +458,25 @@ pub trait IsStarkVerifier<
     /// arithmetic as the CPU and GPU provers; drift between them would break all
     /// proofs. `VerifierDomain.lde_length` is the codeword size and
     /// `lde_length / trace_length` the blowup factor.
+    ///
+    /// The proof FORMAT (fold schedule, encoding) comes from `air.options()` —
+    /// a verifier-side constant, never read from the proof. `None` when the
+    /// format cannot be laid out for this table (a one-row mode, or a schedule
+    /// override that does not fit): the proof is then rejected.
     // `FriFoldLayout` is a crate-internal helper type returned from a default method
     // of this public trait; the exposure is intentional (internal helper).
     #[allow(private_interfaces)]
     fn fri_termination_params(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &VerifierDomain<Field>,
-    ) -> crate::fri::terminal::FriFoldLayout {
-        let k = air.options().fri_final_poly_log_degree as u32;
+    ) -> Option<crate::fri::terminal::FriFoldLayout> {
         let blowup_log = (domain.lde_length / domain.trace_length).trailing_zeros();
-        crate::fri::terminal::FriFoldLayout::new(domain.lde_length.trailing_zeros(), blowup_log, k)
+        crate::fri::terminal::FriFoldLayout::for_options(
+            domain.lde_length.trailing_zeros(),
+            blowup_log,
+            air.options(),
+        )
+        .ok()
     }
 
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
@@ -506,12 +515,16 @@ pub trait IsStarkVerifier<
                 Some(pair) => pair,
                 None => return false,
             };
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::fri::capture::record_deep(&deep_poly_evaluations, &deep_poly_evaluations_sym);
 
         // ---- Reconstruct the FRI terminal codeword from the final-poly coeffs ----
         // The prover folds the deep composition codeword down to a terminal
         // codeword of length `terminal_len = 2^(blowup_log + effective_k)` and sends
         // the `2^effective_k` coefficients of the low-degree polynomial it encodes.
-        let layout = Self::fri_termination_params(air, domain);
+        let Some(layout) = Self::fri_termination_params(air, domain) else {
+            return false;
+        };
         let num_committed = layout.num_committed;
 
         // Structural check: number of committed FRI layers must equal
@@ -532,10 +545,13 @@ pub trait IsStarkVerifier<
         // iterations and accept the query vacuously) or padded (making the loop
         // skip the terminal low-degree check), bypassing FRI entirely. This length
         // check is the only thing that pins them, so it must run before the loop.
+        // Opened values per query: one sibling per layer under the legacy
+        // encoding, every layer's full group otherwise (a format constant).
+        let values_per_query = layout.opened_values_per_query();
         if (0..proof.query_list_len()).any(|i| {
             let decommitment = proof.query(i);
             decommitment.layers_auth_paths_len() != num_committed
-                || decommitment.layers_evaluations_sym().len() != num_committed
+                || decommitment.layers_evaluations_sym().len() != values_per_query
         }) {
             return false;
         }
@@ -544,6 +560,10 @@ pub trait IsStarkVerifier<
         if checks.fri.len() != num_committed {
             return false;
         }
+
+        // `log2` of the LDE size: every tree's depth is a function of it (a
+        // verifier constant, never read from the proof).
+        let lde_log = domain.lde_length.trailing_zeros() as usize;
 
         let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
         let terminal_codeword =
@@ -562,6 +582,40 @@ pub trait IsStarkVerifier<
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
+        }
+
+        if !layout.is_legacy() {
+            // Group encoding (S3): the ω_{2^d} tables once, then every query.
+            let mut roots_tables: Vec<Vec<FieldElement<Field>>> = Vec::new();
+            for &d in &layout.schedule {
+                let d = d as usize;
+                if roots_tables.len() <= d {
+                    roots_tables.resize(d + 1, Vec::new());
+                }
+                if roots_tables[d].is_empty() {
+                    match crate::fri::group::roots_of_unity_table::<Field>(d as u32) {
+                        Some(t) => roots_tables[d] = t,
+                        None => return false,
+                    }
+                }
+            }
+            return (0..challenges.iotas.len())
+                .zip(evaluation_point_inverse)
+                .all(|(i, eval)| {
+                    Self::verify_query_groups(
+                        proof,
+                        &layout,
+                        &challenges.zetas,
+                        challenges.iotas[i],
+                        proof.query(i),
+                        eval,
+                        &deep_poly_evaluations[i],
+                        &deep_poly_evaluations_sym[i],
+                        &terminal_codeword,
+                        lde_log as u32,
+                        &roots_tables,
+                    )
+                });
         }
 
         (0..challenges.iotas.len())
@@ -771,7 +825,8 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let options = air.options();
-        let num_committed = Self::fri_termination_params(air, domain).num_committed;
+        // A format this verifier cannot lay out rejects here, as in step 3.
+        let num_committed = Self::fri_termination_params(air, domain)?.num_committed;
         let lde_log = domain.lde_length.trailing_zeros() as usize;
         let caps = StarkCaps::new(
             options.format.merkle_cap,
@@ -865,6 +920,56 @@ pub trait IsStarkVerifier<
             auth_path_sym,
             iota >> 1,
             <H::Batched<FieldExtension> as IsMerkleTreeBackend>::hash_data(&evaluations),
+        )
+    }
+
+    /// Verify a single FRI query under the group encoding (S3; any format but
+    /// the legacy one): fold 0 from the DEEP pair as today, then
+    /// [`crate::fri::group::verify_query_groups`] for the committed layers and
+    /// the terminal check. The zero-fold case is the legacy one (no layer, no
+    /// challenge).
+    // Crate-internal layout type on a default method, as `fri_termination_params`.
+    #[allow(clippy::too_many_arguments, private_interfaces)]
+    fn verify_query_groups(
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        layout: &crate::fri::terminal::FriFoldLayout,
+        zetas: &[FieldElement<FieldExtension>],
+        iota: usize,
+        fri_decommitment: FriDecommitmentView<'_, FieldExtension>,
+        evaluation_point_inv: FieldElement<Field>,
+        p0_eval: &FieldElement<FieldExtension>,
+        p0_eval_sym: &FieldElement<FieldExtension>,
+        terminal_codeword: &[FieldElement<FieldExtension>],
+        lde_log: u32,
+        roots_tables: &[Vec<FieldElement<Field>>],
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        if zetas.is_empty() {
+            return terminal_codeword
+                .get(iota * 2)
+                .is_some_and(|t| p0_eval == t)
+                && terminal_codeword
+                    .get(iota * 2 + 1)
+                    .is_some_and(|t| p0_eval_sym == t);
+        }
+        // Fold 0 (binary, uncommitted) consumes the DEEP pair: p₁(𝜐²).
+        let v =
+            (p0_eval + p0_eval_sym) + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+        crate::fri::group::verify_query_groups::<Field, FieldExtension, H::Batched<FieldExtension>>(
+            layout,
+            lde_log,
+            proof.fri_layers_merkle_roots(),
+            |j| fri_decommitment.layer_auth_path(j),
+            fri_decommitment.layers_evaluations_sym(),
+            zetas,
+            iota,
+            v,
+            evaluation_point_inv.square(),
+            terminal_codeword,
+            roots_tables,
         )
     }
 
@@ -1733,7 +1838,15 @@ pub trait IsStarkVerifier<
         // actually folds past the committed layers. For tiny traces (the clamp
         // case) no fold happens, so no challenge is drawn. This must mirror the
         // prover's `commit_phase_from_evaluations` exactly.
-        let total_folds = Self::fri_termination_params(air, domain).total_folds;
+        // `total_folds` does not depend on the format (only its split into
+        // committed layers does), so the replay reads it from today's layout;
+        // a format the verifier cannot lay out is rejected in step 3.
+        let total_folds = crate::fri::terminal::FriFoldLayout::new(
+            domain.lde_length.trailing_zeros(),
+            (domain.lde_length / domain.trace_length).trailing_zeros(),
+            u32::from(air.options().fri_final_poly_log_degree),
+        )
+        .total_folds;
 
         // >>>> Send final-fold challenge 𝜁_final (only when folding occurs)
         if total_folds > 0 {
@@ -1839,6 +1952,8 @@ pub trait IsStarkVerifier<
             rap_challenges,
             &layout,
         );
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::fri::capture::record_challenges(&challenges.zetas, &challenges.iotas);
 
         // verify grinding
         let grinding_factor = air.context().proof_options.grinding_factor;
