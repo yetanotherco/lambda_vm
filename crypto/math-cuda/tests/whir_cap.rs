@@ -56,19 +56,22 @@ fn nodes(bytes: &[u8]) -> Vec<[u8; 32]> {
 }
 
 /// The device result against the host tree at blocking `k`, every cap height
-/// up to `min(depth, 6)`.
+/// up to `min(depth, 6)`. `before_each(c)` runs before the call at height `c`
+/// (the EVICTED regime evicts there, so every height meets a rebuilt tree).
 fn assert_matches_host<H: WhirHash>(
     name: &str,
     device: &math_cuda::whir::DeviceCodeword,
     host: &CodewordCommitment<F, H>,
     k: usize,
     positions: &[usize],
+    mut before_each: impl FnMut(usize),
     expect_leaf_pass: impl Fn(u64) -> bool,
 ) {
     let depth = host.depth();
     let full = host.open_many(positions).expect("host paths");
     let pos32: Vec<u32> = positions.iter().map(|p| *p as u32).collect();
     for c in 0..=depth.min(6) {
+        before_each(c);
         let builds = device.tree_builds();
         let passes = device.leaf_passes();
         let (paths, cap) = device
@@ -144,14 +147,14 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
             let host =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_commit).expect("host commit");
             // Same blocking as the commit: the retained layer is served.
-            assert_matches_host(name, &device, &host, k_commit, &positions, |d| d == 0);
+            assert_matches_host(name, &device, &host, k_commit, &positions, |_| {}, |d| d == 0);
             // Another blocking: the layer does not match, the leaves are hashed.
             let k_other = if k_commit == 5 { 3 } else { k_commit + 1 };
             let other =
                 CodewordCommitment::<_, H>::new(&host_codeword, k_other).expect("host commit");
             let leaves = host_codeword.len() >> k_other;
             let positions = [0usize, leaves / 2, leaves - 1];
-            assert_matches_host(name, &device, &other, k_other, &positions, |d| d == 1);
+            assert_matches_host(name, &device, &other, k_other, &positions, |_| {}, |d| d == 1);
         }
     }
     run::<KeccakWhir>("keccak");
@@ -160,6 +163,13 @@ fn paths_and_cap_are_the_host_trees_served_or_rehashed() {
 
 /// EVICTED: the retained layer is reclaimed by the allocator's evictor, and
 /// the next opening rebuilds the whole tree — its cap still the host's.
+///
+/// A rebuild RE-CAPTURES the layer (by design: the evictor keeps the codeword's
+/// registry entry because "the mutex lives with the codeword and may refill",
+/// `math-cuda/src/whir.rs`), so a second opening after one eviction is SERVED,
+/// not rebuilt. The eviction therefore runs before EVERY cap height: each
+/// height meets a rebuilt tree and pays exactly one leaf pass, and the layer is
+/// back after each rebuild (the next eviction's precondition says so).
 #[test]
 fn paths_and_cap_after_the_retained_layer_is_evicted() {
     let _exclusive = exclusive();
@@ -169,20 +179,39 @@ fn paths_and_cap_after_the_retained_layer_is_evicted() {
     let layer_bytes = device.retained_leaf_bytes();
     assert!(layer_bytes > 0, "precondition: the commit retained a layer");
 
-    let gap = layer_bytes / 2;
-    let hog_bytes = be
-        .vram_budget_bytes()
-        .saturating_sub(be.reserved_bytes())
-        .saturating_sub(gap);
-    let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
-    let got = math_cuda::device::reserve(layer_bytes)
-        .expect("the reserve must succeed by evicting the retained layer");
-    assert_eq!(device.retained_leaf_bytes(), 0, "the layer was evicted");
-    drop(got);
-    drop(hog);
+    let mut evictions = 0usize;
+    let evict = |c: usize| {
+        assert_eq!(
+            device.retained_leaf_bytes(),
+            layer_bytes,
+            "c={c}: the layer is retained (by the commit, or re-captured by the last rebuild)"
+        );
+        let gap = layer_bytes / 2;
+        let hog_bytes = be
+            .vram_budget_bytes()
+            .saturating_sub(be.reserved_bytes())
+            .saturating_sub(gap);
+        let hog = math_cuda::device::reserve(hog_bytes).expect("the hog reservation cannot fail");
+        let got = math_cuda::device::reserve(layer_bytes)
+            .expect("the reserve must succeed by evicting the retained layer");
+        assert_eq!(device.retained_leaf_bytes(), 0, "c={c}: the layer was evicted");
+        drop(got);
+        drop(hog);
+        evictions += 1;
+    };
 
     let host = CodewordCommitment::<_, RpxWhir>::new(&host_codeword, k).expect("host commit");
     let leaves = host_codeword.len() >> k;
     let positions = [0usize, 5, leaves / 2, leaves - 1];
-    assert_matches_host("rpx evicted", &device, &host, k, &positions, |d| d >= 1);
+    assert_matches_host("rpx evicted", &device, &host, k, &positions, evict, |d| d == 1);
+    assert_eq!(
+        evictions,
+        host.depth().min(6) + 1,
+        "one eviction per cap height"
+    );
+    assert_eq!(
+        device.retained_leaf_bytes(),
+        layer_bytes,
+        "the last rebuild re-captured the layer"
+    );
 }
