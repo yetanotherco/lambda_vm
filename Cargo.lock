@@ -1604,6 +1604,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_cbor",
+ "sha3",
  "tempfile",
  "test-log",
  "thiserror",
