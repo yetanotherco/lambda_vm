@@ -177,6 +177,7 @@ impl ZfFormat {
             }
             // Always, including the default — see the module header.
             println!("{}", format.banner());
+            println!("{}", format.whir_schedule_line());
             format
         })
     }
@@ -191,6 +192,23 @@ impl ZfFormat {
             self.fri,
             self.one_row,
             whir_folds_name(&self.whir_folds)
+        )
+    }
+
+    /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=25:[…]` — the fold
+    /// schedule the WHIR base chains run at the production stack heights, so a
+    /// log states the rounds it proved and not only the knob's name. Printed
+    /// under the banner, on every setting.
+    pub fn whir_schedule_line(&self) -> String {
+        let config = crate::multilinear_prove::chain_config_under(self, &[(1, 25)]);
+        let schedules = (20..=25)
+            .map(|n| format!("n={n}:{:?}", config.schedule(n)).replace(' ', ""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "ZF WHIR SCHEDULES: whir_folds={} q={} {schedules}",
+            whir_folds_name(&self.whir_folds),
+            config.num_queries
         )
     }
 
@@ -473,6 +491,48 @@ mod tests {
                 chain.grind
             )
         );
+    }
+
+    #[test]
+    fn the_schedule_line_states_the_rounds() {
+        assert_eq!(
+            ZfFormat::DEFAULT.whir_schedule_line(),
+            "ZF WHIR SCHEDULES: whir_folds=uniform4 q=112 n=20:[4,4,4,4,4] \
+             n=21:[4,4,4,4,4,1] n=22:[4,4,4,4,4,2] n=23:[4,4,4,4,4,3] \
+             n=24:[4,4,4,4,4,4] n=25:[4,4,4,4,4,4,1]"
+        );
+        let first6 = ZfFormat {
+            whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            ..ZfFormat::DEFAULT
+        };
+        assert_eq!(
+            first6.whir_schedule_line(),
+            "ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] \
+             n=21:[6,4,4,4,3] n=22:[6,4,4,4,4] n=23:[6,4,4,4,4,1] \
+             n=24:[6,4,4,4,4,2] n=25:[6,4,4,4,4,3]"
+        );
+    }
+
+    /// The production WHIR config under each accepted knob value: the format
+    /// is carried, Q is charged the schedule's rounds, and at the block's
+    /// tallest stack (25) every arm keeps today's Q = 112.
+    #[test]
+    fn the_production_chain_config_under_each_arm() {
+        use crate::multilinear_prove::chain_config_under;
+        let today = chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)]);
+        assert_eq!(today, crate::multilinear_prove::chain_config(&[(1, 25)]));
+        assert_eq!((today.rounds(25), today.num_queries), (7, 112));
+        for (name, rounds25) in [("first5", 6), ("first6", 6)] {
+            let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
+            let c = chain_config_under(&f, &[(1, 25)]);
+            assert_eq!(c.format.folds, f.whir_folds);
+            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 112), "{name}");
+            assert_eq!(
+                (c.log_blowup, c.log_folding, c.grind),
+                (today.log_blowup, today.log_folding, today.grind)
+            );
+            assert_ne!(c.fold_word(), today.fold_word());
+        }
     }
 
     #[test]
