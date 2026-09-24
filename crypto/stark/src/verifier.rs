@@ -561,10 +561,6 @@ pub trait IsStarkVerifier<
             return false;
         }
 
-        // `log2` of the LDE size: every tree's depth is a function of it (a
-        // verifier constant, never read from the proof).
-        let lde_log = domain.lde_length.trailing_zeros() as usize;
-
         let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
         let terminal_codeword =
             crate::fri::terminal::terminal_codeword_from_coeffs::<Field, FieldExtension>(
@@ -605,6 +601,8 @@ pub trait IsStarkVerifier<
                     Self::verify_query_groups(
                         proof,
                         &layout,
+                        &checks.fri,
+                        i,
                         &challenges.zetas,
                         challenges.iotas[i],
                         proof.query(i),
@@ -612,7 +610,6 @@ pub trait IsStarkVerifier<
                         &deep_poly_evaluations[i],
                         &deep_poly_evaluations_sym[i],
                         &terminal_codeword,
-                        lde_log as u32,
                         &roots_tables,
                     )
                 });
@@ -799,7 +796,8 @@ pub trait IsStarkVerifier<
     /// Every depth and cap height is a verifier constant ([`StarkCaps`], from
     /// the AIR's options and the LDE size): the trace, precomputed, aux and
     /// composition trees are `log2(lde) − 1` deep, committed FRI layer `i` is
-    /// `log2(lde) − i − 2` deep. Every authentication path must be exactly
+    /// the fold layout's `layer_depth(i)` deep (`log2(lde) − i − 2` under the
+    /// all-ones schedule, the group tree's depth under any other). Every authentication path must be exactly
     /// `depth − c` long (C1b at `c = 0`: before that a path of any length was
     /// folded and compared with the root, design/CAP.md §9.4).
     ///
@@ -826,13 +824,15 @@ pub trait IsStarkVerifier<
     {
         let options = air.options();
         // A format this verifier cannot lay out rejects here, as in step 3.
-        let num_committed = Self::fri_termination_params(air, domain)?.num_committed;
+        let layout = Self::fri_termination_params(air, domain)?;
+        let num_committed = layout.num_committed;
         let lde_log = domain.lde_length.trailing_zeros() as usize;
-        let caps = StarkCaps::new(
+        // FRI layer depths from the layout: a group tree under a fold schedule.
+        let caps = StarkCaps::from_layout(
             options.format.merkle_cap,
             options.fri_number_of_queries,
             lde_log,
-            num_committed,
+            &layout,
         );
         let fri_roots = proof.fri_layers_merkle_roots();
         if fri_roots.len() != num_committed {
@@ -933,6 +933,11 @@ pub trait IsStarkVerifier<
     fn verify_query_groups(
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         layout: &crate::fri::terminal::FriFoldLayout,
+        // One per committed layer (`table_tree_checks`, at the layout's group
+        // tree depths), and this query's position in proof order (query 0 is
+        // every capped layer's owner).
+        fri_checks: &[TreeCheck<'_>],
+        query: usize,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
         fri_decommitment: FriDecommitmentView<'_, FieldExtension>,
@@ -940,7 +945,6 @@ pub trait IsStarkVerifier<
         p0_eval: &FieldElement<FieldExtension>,
         p0_eval_sym: &FieldElement<FieldExtension>,
         terminal_codeword: &[FieldElement<FieldExtension>],
-        lde_log: u32,
         roots_tables: &[Vec<FieldElement<Field>>],
     ) -> bool
     where
@@ -960,8 +964,8 @@ pub trait IsStarkVerifier<
             (p0_eval + p0_eval_sym) + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         crate::fri::group::verify_query_groups::<Field, FieldExtension, H::Batched<FieldExtension>>(
             layout,
-            lde_log,
-            proof.fri_layers_merkle_roots(),
+            fri_checks,
+            query,
             |j| fri_decommitment.layer_auth_path(j),
             fri_decommitment.layers_evaluations_sym(),
             zetas,
