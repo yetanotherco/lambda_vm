@@ -359,7 +359,13 @@ pub const AUTO_WEIGHTS: CapWeights = CapWeights {
 
 /// The in-guest saving (ns, cost-law units) of a height-`c` cap on a tree
 /// opened `openings` times. Integer arithmetic only, so every verifier
-/// reproduces it exactly. `gain(o, 0) = 0`; for `c ≥ 1`:
+/// reproduces it exactly.
+///
+/// Signed and bounded: the gain is negative for few openings, so it is an
+/// `i128`, and every term fits it for any `usize` opening count because
+/// `cap_height` is refused past [`MAX_CAP_HEIGHT`] (the result is then
+/// `i128::MIN`, a height no argmax picks) — no shift or product can overflow on
+/// any target, 32-bit `wasm` included. `gain(o, 0) = 0`; for `c ≥ 1`:
 ///
 /// ```text
 /// o·( c·(compress + select) − (2^c − 1)·select − unpack )
@@ -373,6 +379,9 @@ pub const AUTO_WEIGHTS: CapWeights = CapWeights {
 pub fn cap_gain(weights: &CapWeights, openings: usize, cap_height: usize) -> i128 {
     if cap_height == 0 {
         return 0;
+    }
+    if cap_height > MAX_CAP_HEIGHT {
+        return i128::MIN;
     }
     let o = openings as i128;
     let c = cap_height as i128;
@@ -393,6 +402,14 @@ impl CapPolicy {
 
     /// The cap height of a tree of `depth` levels opened `openings` times.
     /// Always `≤ depth` and `≤ MAX_CAP_HEIGHT`, and 0 for an unopened tree.
+    ///
+    /// `Auto` is RULINGS 1's table, stated directly — 3 for a tree opened at
+    /// least [`AUTO_CAP3_MIN_OPENINGS`] times, 2 from
+    /// [`AUTO_CAP2_MIN_OPENINGS`], 0 below — then clamped to the depth. No
+    /// arithmetic runs at all, so no verifier can disagree on an overflow.
+    /// The table is the argmax of [`cap_gain`] under [`AUTO_WEIGHTS`] for
+    /// every opening count (pinned by a test over all counts up to 10^6 and
+    /// at the `usize` extremes).
     pub fn height(self, openings: usize, depth: usize) -> usize {
         if openings == 0 {
             return 0;
@@ -402,19 +419,26 @@ impl CapPolicy {
             Self::Off => 0,
             Self::Fixed(c) => (c as usize).min(limit),
             Self::Auto => {
-                // argmax, ties to the smaller height; gain(·, 0) = 0.
-                let mut best = (0usize, 0i128);
-                for c in 1..=limit {
-                    let g = cap_gain(&AUTO_WEIGHTS, openings, c);
-                    if g > best.1 {
-                        best = (c, g);
-                    }
-                }
-                best.0
+                let c = if openings >= AUTO_CAP3_MIN_OPENINGS {
+                    3
+                } else if openings >= AUTO_CAP2_MIN_OPENINGS {
+                    2
+                } else {
+                    0
+                };
+                c.min(limit)
             }
         }
     }
 }
+
+/// `Auto` gives a height-3 cap to a tree opened at least this many times
+/// (RULINGS 1). ⚠ A FORMAT CONSTANT, like [`AUTO_WEIGHTS`].
+pub const AUTO_CAP3_MIN_OPENINGS: usize = 20;
+
+/// `Auto` gives a height-2 cap to a tree opened at least this many times and
+/// fewer than [`AUTO_CAP3_MIN_OPENINGS`] (RULINGS 1). ⚠ A FORMAT CONSTANT.
+pub const AUTO_CAP2_MIN_OPENINGS: usize = 4;
 
 impl fmt::Display for CapPolicy {
     /// `off`, `auto`, or the fixed height (`Fixed(0)` prints `off`) — the
@@ -990,6 +1014,96 @@ mod tests {
         assert!(!rejects_forged_cap(mutant));
     }
 
+    // ------------------------------------------- the only-rejecting-check fixtures
+    //
+    // REVIEW-CAP M1: a tamper that some OTHER check also rejects cannot show a
+    // check is load-bearing — removing it leaves the test green. These two
+    // fixtures are built so that exactly one check rejects them, on the real
+    // keccak backend (no toy hash): delete that check and the test fails.
+
+    /// Heap index of the ancestor at `height` levels above leaf `pos` in a tree
+    /// of depth `d` (`height = 0` is the leaf itself).
+    fn ancestor(d: usize, pos: usize, height: usize) -> usize {
+        (1usize << (d - height)) - 1 + (pos >> height)
+    }
+
+    /// M1(a). The real internal node one level above leaf `pos`, presented as a
+    /// "leaf hash" with the path from that node upward — one sibling short.
+    /// At `pos = 0` and `pos = 2^D − 1` the index bits the fold consumes stay
+    /// consistent after the shift (all 0 / all 1), so the length-agnostic fold
+    /// ACCEPTS: only `siblings.len() == D − c` rejects it. Hash-agnostic — the
+    /// node is read out of the tree, not forged — and at `c = 0` it is exactly
+    /// the C1b case.
+    #[test]
+    fn an_internal_node_as_leaf_hash_is_rejected_only_by_the_length_check() {
+        let t = tree(64, 5);
+        let d = t.depth().unwrap();
+        assert_eq!(d, 6);
+        for c in 0..d {
+            let cap = t.cap(c).unwrap();
+            for pos in [0usize, (1 << d) - 1] {
+                let full = t.get_proof_by_pos(pos).unwrap().merkle_path;
+                let node = t.nodes()[ancestor(d, pos, 1)];
+                let forged = &full[1..d - c];
+                // The length-agnostic fold accepts the forgery: no other check
+                // stands between it and acceptance.
+                assert!(
+                    verify_merkle_path_from_leaf_hash::<K>(forged, &cap[pos >> (d - c)], pos, node),
+                    "c={c} pos={pos}: fixture precondition, the fold alone accepts"
+                );
+                // The real check refuses it.
+                assert!(
+                    !verify_merkle_path_to_cap_from_leaf_hash::<K>(forged, &cap, d, pos, node),
+                    "c={c} pos={pos}: an internal node passed for a leaf"
+                );
+                if c == 0 {
+                    assert!(!CappedRoot::uncapped(&t.root, d).verify::<K>(forged, pos, node));
+                }
+            }
+        }
+    }
+
+    /// M1(b). Few openings under a tall cap: with 3 queries and `c = 3`, at
+    /// least 5 of the 8 cap nodes are reached by no query. Flipping one of those
+    /// leaves every per-query check green, so only the cap-to-root check
+    /// (`verify_cap`, run by `from_owner`) rejects it.
+    #[test]
+    fn an_unreached_cap_node_is_rejected_only_by_the_cap_to_root_check() {
+        let f = fixture();
+        let queries = [10usize, 20, 30]; // all under cap node 0 (pos >> 5 == 0)
+        let reached: Vec<usize> = queries.iter().map(|q| q >> (f.d - f.c)).collect();
+        let unreached = (0..1usize << f.c)
+            .find(|k| !reached.contains(k))
+            .expect("some cap node is unreached");
+        let mut owner = f.owner_path(queries[0]);
+        owner[f.d - f.c + unreached][0] ^= 1;
+        let (siblings0, tampered_cap) = split_owner_path(&owner, f.d, f.c).unwrap();
+        // Every query still verifies against the tampered cap: no per-query
+        // check sees the unreached node.
+        assert!(verify_merkle_path_to_cap_from_leaf_hash::<K>(
+            siblings0,
+            tampered_cap,
+            f.d,
+            queries[0],
+            f.leaf(queries[0])
+        ));
+        for &q in &queries[1..] {
+            assert!(
+                verify_merkle_path_to_cap_from_leaf_hash::<K>(
+                    &f.path(q),
+                    tampered_cap,
+                    f.d,
+                    q,
+                    f.leaf(q)
+                ),
+                "q={q}: fixture precondition, per-query checks pass"
+            );
+        }
+        // Only the cap-to-root check rejects it.
+        assert!(!verify_cap::<K>(tampered_cap, &f.t.root, f.c));
+        assert!(CappedRoot::from_owner::<K>(&f.t.root, &owner, f.d, f.c).is_none());
+    }
+
     // ------------------------------------------------------------ policy pins
 
     #[test]
@@ -1018,6 +1132,67 @@ mod tests {
         }
         // c = 4 loses to c = 3 on both the per-opening and the per-tree term.
         assert!(cap_gain(&AUTO_WEIGHTS, 1_000_000, 4) < cap_gain(&AUTO_WEIGHTS, 1_000_000, 3));
+    }
+
+    /// The argmax of the cost law over every height `0..=MAX_CAP_HEIGHT`, ties
+    /// to the smaller height (`gain(·, 0) = 0`).
+    fn cost_law_argmax(openings: usize, limit: usize) -> usize {
+        let mut best = (0usize, 0i128);
+        for c in 1..=limit {
+            let g = cap_gain(&AUTO_WEIGHTS, openings, c);
+            if g > best.1 {
+                best = (c, g);
+            }
+        }
+        best.0
+    }
+
+    /// REVIEW-CAP S5: `Auto` is RULINGS 1's table; this pins that the table is
+    /// the cost-law argmax for every opening count, so the table and the
+    /// weights cannot drift apart.
+    #[test]
+    fn the_auto_table_is_the_cost_law_argmax_at_every_opening_count() {
+        for o in 0..=1_000_000usize {
+            assert_eq!(
+                CapPolicy::Auto.height(o, MAX_CAP_HEIGHT),
+                cost_law_argmax(o, MAX_CAP_HEIGHT),
+                "o={o}"
+            );
+        }
+        for o in [usize::MAX, usize::MAX / 2, 1 << 40, u32::MAX as usize] {
+            assert_eq!(CapPolicy::Auto.height(o, 64), 3, "o={o}");
+            assert_eq!(cost_law_argmax(o, MAX_CAP_HEIGHT), 3, "o={o}");
+        }
+    }
+
+    /// Clamping the table to the depth (RULINGS 1) is not the same function as
+    /// an argmax bounded by the depth, at exactly one point: 4 openings of a
+    /// depth-1 tree, where the table says 1 and the bounded argmax 0 (a c = 1
+    /// cap loses 68 ns there). The table is the rule; this pins the one
+    /// difference so any other one is a failure.
+    #[test]
+    fn the_depth_clamped_table_differs_from_a_bounded_argmax_at_one_point() {
+        let mut diffs = Vec::new();
+        for d in 0..=6usize {
+            for o in 0..5_000usize {
+                if CapPolicy::Auto.height(o, d) != cost_law_argmax(o, d.min(MAX_CAP_HEIGHT)) {
+                    diffs.push((o, d));
+                }
+            }
+        }
+        assert_eq!(diffs, vec![(4, 1)]);
+    }
+
+    #[test]
+    fn the_cost_law_is_bounded_for_every_input() {
+        // No overflow at the `usize` extremes and the tallest height.
+        let top = cap_gain(&AUTO_WEIGHTS, usize::MAX, MAX_CAP_HEIGHT);
+        assert!(top < 0, "a height-16 cap loses at any opening count");
+        assert!(cap_gain(&AUTO_WEIGHTS, usize::MAX, 3) > 0);
+        // A height past the maximum is refused, never shifted.
+        for c in [MAX_CAP_HEIGHT + 1, 127, 128, usize::MAX] {
+            assert_eq!(cap_gain(&AUTO_WEIGHTS, 1_000, c), i128::MIN, "c={c}");
+        }
     }
 
     #[test]
