@@ -103,8 +103,8 @@ fn parity<H: WhirHash>(num_vars: usize, log_blowup: usize, log_folding: usize) {
     }
 }
 
-/// The shapes: both sides of the fused-8-level NTT threshold, a fold width that
-/// is not the whole blowup, and the Möbius windows — below the contiguous
+/// The shapes: both sides of the fused-8-level NTT threshold, fold widths 1 to
+/// 6 (6 = the `first6` schedule's first round), and the Möbius windows — below the contiguous
 /// kernel, exactly one window, one window plus a tiled level, and several full
 /// tiles with a partial one on top.
 fn every_shape<H: WhirHash>() {
@@ -118,6 +118,13 @@ fn every_shape<H: WhirHash>() {
     parity::<H>(9, 1, 2);
     parity::<H>(13, 2, 5);
     parity::<H>(17, 1, 4);
+
+    // ★ k = 6, the widest fold the stack runs (W2 `first6`: tree 0's leaves
+    // are 64 base felts, 512 bytes, one leaf-kernel thread each). A production
+    // height's shape, a smaller one, and four leaves.
+    parity::<H>(14, 2, 6);
+    parity::<H>(12, 2, 6);
+    parity::<H>(7, 1, 6);
 }
 
 #[test]
