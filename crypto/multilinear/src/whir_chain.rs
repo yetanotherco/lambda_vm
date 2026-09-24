@@ -40,6 +40,7 @@
 //! claim chains just as an evaluation does.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
+pub use crypto::merkle_tree::cap::CapPolicy;
 use math::{
     field::{
         element::FieldElement,
@@ -176,6 +177,12 @@ impl GrindBits {
 }
 
 /// Blowup, fold factor, query count and proof of work.
+///
+/// `format` is the proof FORMAT ([`ChainFormat`], the ZF campaign's W1 and W2
+/// levers); its default is today's format. Like the rest of the config it is
+/// a verifier-side constant, never read from a proof. It is NOT absorbed into
+/// the statement (`push_config` binds it as `_`): absorbing it would move
+/// every transcript at the default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainConfig {
     /// `log2` of the code's inverse rate.
@@ -186,6 +193,88 @@ pub struct ChainConfig {
     pub num_queries: usize,
     /// Proof of work before each redrawable challenge.
     pub grind: GrindBits,
+    /// The chain's proof format. [`ChainFormat::DEFAULT`] = today.
+    pub format: ChainFormat,
+}
+
+/// The proof-format levers of a WHIR chain. Grouped so a literal
+/// `ChainConfig` names the format in one line (`format: ChainFormat::DEFAULT`)
+/// and a lever added later touches this struct only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ChainFormat {
+    /// Merkle cap policy for the chain's commitment trees (W1). `Off` = today.
+    pub cap: CapPolicy,
+    /// Per-round fold schedule (W2). `Uniform` = today (`log_folding` every
+    /// round, the remainder last).
+    pub folds: WhirFolds,
+}
+
+impl ChainFormat {
+    /// Today's format: every lever off.
+    pub const DEFAULT: Self = Self {
+        cap: CapPolicy::Off,
+        folds: WhirFolds::Uniform,
+    };
+
+    /// True when this is today's format (`Fixed(0)` counts as `Off`).
+    pub fn is_default(&self) -> bool {
+        self.cap.is_off() && self.folds == WhirFolds::Uniform
+    }
+}
+
+/// Which WHIR format levers THIS build implements. A lever that is only
+/// parsed must not be selectable (see `stark::proof::options::
+/// MERKLE_CAP_IMPLEMENTED`). Each lane flips its own flag in the commit that
+/// makes the lever real.
+pub const WHIR_CAP_IMPLEMENTED: bool = false;
+
+/// The longest explicit fold list [`WhirFolds::List`] holds.
+pub const MAX_FOLD_ROUNDS: usize = 32;
+
+/// The per-round fold schedule of a chain (W2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WhirFolds {
+    /// `log_folding` variables every round, the remainder last. Today's format.
+    #[default]
+    Uniform,
+    /// A schedule chosen per chain by the verifier-side DP.
+    Dp,
+    /// An explicit schedule, round by round.
+    List(FoldList),
+}
+
+/// See [`WHIR_CAP_IMPLEMENTED`].
+pub const WHIR_FOLDS_IMPLEMENTED: bool = false;
+
+/// An explicit fold schedule: `1 ..= MAX_FOLD_ROUNDS` rounds of `1 ..= 16`
+/// variables each. `Copy`, so [`ChainConfig`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FoldList {
+    len: u8,
+    folds: [u8; MAX_FOLD_ROUNDS],
+}
+
+impl FoldList {
+    /// `None` when empty, longer than [`MAX_FOLD_ROUNDS`], or a fold outside
+    /// `1..=16`.
+    pub fn new(folds: &[u8]) -> Option<Self> {
+        if folds.is_empty()
+            || folds.len() > MAX_FOLD_ROUNDS
+            || folds.iter().any(|&k| !(1..=16).contains(&k))
+        {
+            return None;
+        }
+        let mut out = [0u8; MAX_FOLD_ROUNDS];
+        out[..folds.len()].copy_from_slice(folds);
+        Some(Self {
+            len: folds.len() as u8,
+            folds: out,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.folds[..self.len as usize]
+    }
 }
 
 impl ChainConfig {
@@ -224,6 +313,7 @@ impl ChainConfig {
             log_folding,
             num_queries,
             grind,
+            format: ChainFormat::DEFAULT,
         }
     }
 
@@ -1229,6 +1319,7 @@ mod tests {
             log_folding,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: ChainFormat::DEFAULT,
         }
     }
 

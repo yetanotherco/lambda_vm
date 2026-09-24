@@ -1736,6 +1736,7 @@ mod tests {
             log_folding: 2,
             num_queries: 3,
             grind: GrindBits::default(),
+            format: multilinear::whir_chain::ChainFormat::DEFAULT,
         };
         // Domain in the base field, columns in the degree-3 extension.
         let n_stack = constraint_argument::one_stack(num_vars, layout.columns.len());

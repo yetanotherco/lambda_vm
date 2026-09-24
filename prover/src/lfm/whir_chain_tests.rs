@@ -265,6 +265,7 @@ fn config(num_queries: usize, grind: u8) -> ChainConfig {
         log_folding: 4,
         num_queries,
         grind: GrindBits::uniform(grind),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     }
 }
 

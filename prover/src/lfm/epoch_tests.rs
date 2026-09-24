@@ -1332,6 +1332,7 @@ pub(super) fn from_proof_gate_options() -> crate::ProofOptions {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: stark::proof::options::ProofFormat::DEFAULT,
     }
 }
 

@@ -113,6 +113,7 @@ fn a_forged_preprocessed_column_is_rejected() {
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     };
     let air = create_keccak_rc_air(&ProofOptions::default_test_options());
     let width = air.trace_layout().0;

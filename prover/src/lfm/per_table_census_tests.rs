@@ -793,6 +793,7 @@ fn wrap_options() -> ProofOptions {
         coset_offset: 3,
         grinding_factor: 20,
         fri_final_poly_log_degree: 7,
+        format: stark::proof::options::ProofFormat::DEFAULT,
     }
 }
 

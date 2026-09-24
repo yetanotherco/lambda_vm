@@ -34,6 +34,7 @@ pub mod test_utils;
 pub mod tests;
 pub mod whir_hash_knob;
 pub mod whir_identity;
+pub mod zf_format;
 
 // The lib's test harness runs the allocator the shipped binary runs
 // (`bin/cli/src/main.rs` installs the same one), so every host-memory number a
