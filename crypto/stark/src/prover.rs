@@ -3011,9 +3011,32 @@ pub trait IsStarkProver<
             })
         }
 
+        // The device arm of `tree_cap`: read the cap off the resident tree on
+        // `stream`. `None` when the tree is not device-resident.
+        #[cfg(feature = "cuda")]
+        fn dev<'t>(
+            tree: Option<&'t math_cuda::lde::GpuMerkleTree>,
+            stream: impl FnOnce() -> Option<Arc<math_cuda::CudaStream>> + 't,
+        ) -> impl FnOnce(usize) -> Option<Result<Vec<Commitment>, String>> + 't {
+            move |c| {
+                tree.map(|tree| {
+                    let stream = stream().ok_or("no CUDA stream for the device cap read")?;
+                    crate::gpu_lde::read_cap_dev(tree, c, &stream)
+                })
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let lde_trace = &round_1_result.lde_trace;
+
         let (depth, c) = (caps.trace_depth, caps.trace);
         if c > 0 {
-            let main_cap = Self::tree_cap(&round_1_result.main.tree, depth, c, "main", |_| None)?;
+            #[cfg(feature = "cuda")]
+            let main_dev = dev(lde_trace.gpu_main().and_then(|h| h.tree.as_ref()), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let main_dev = |_| None;
+            let main_cap = Self::tree_cap(&round_1_result.main.tree, depth, c, "main", main_dev)?;
             embed(
                 deep_poly_openings
                     .iter_mut()
@@ -3023,6 +3046,8 @@ pub trait IsStarkProver<
                 "main",
             )?;
             if let Some(tree) = round_1_result.main.precomputed_tree.as_ref() {
+                // Always a full host tree (the process-wide cache; its openings
+                // walk it on the host too), so there is no device arm.
                 let cap = Self::tree_cap(tree, depth, c, "precomputed", |_| None)?;
                 embed(
                     deep_poly_openings.iter_mut().map(|o| {
@@ -3036,7 +3061,13 @@ pub trait IsStarkProver<
                 )?;
             }
             if let Some(aux) = round_1_result.aux.as_ref() {
-                let cap = Self::tree_cap(&aux.tree, depth, c, "aux", |_| None)?;
+                #[cfg(feature = "cuda")]
+                let aux_dev = dev(lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()), || {
+                    lde_trace.bound_stream()
+                });
+                #[cfg(not(feature = "cuda"))]
+                let aux_dev = |_| None;
+                let cap = Self::tree_cap(&aux.tree, depth, c, "aux", aux_dev)?;
                 embed(
                     deep_poly_openings
                         .iter_mut()
@@ -3046,12 +3077,18 @@ pub trait IsStarkProver<
                     "aux",
                 )?;
             }
+            #[cfg(feature = "cuda")]
+            let comp_dev = dev(round_2_result.gpu_composition_tree.as_ref(), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let comp_dev = |_| None;
             let cap = Self::tree_cap(
                 &round_2_result.composition_poly_merkle_tree,
                 depth,
                 c,
                 "composition",
-                |_| None,
+                comp_dev,
             )?;
             embed(
                 deep_poly_openings
@@ -3069,7 +3106,15 @@ pub trait IsStarkProver<
                 continue;
             }
             let what = format!("FRI layer {i}");
-            let cap = Self::tree_cap(&layer.merkle_tree, depth, c, &what, |_| None)?;
+            // A fresh backend stream, as the device FRI query phase reads the
+            // same resident layer trees (`try_fri_query_phase_gpu`).
+            #[cfg(feature = "cuda")]
+            let layer_dev = dev(layer.gpu_tree.as_ref(), || {
+                math_cuda::device::backend().ok().map(|b| b.next_stream())
+            });
+            #[cfg(not(feature = "cuda"))]
+            let layer_dev = |_| None;
+            let cap = Self::tree_cap(&layer.merkle_tree, depth, c, &what, layer_dev)?;
             embed(
                 query_list
                     .iter_mut()

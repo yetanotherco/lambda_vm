@@ -430,6 +430,23 @@ mod tests {
     }
 
     #[test]
+    fn the_merkle_cap_knob_is_selectable() {
+        // C3 + C4 made the STARK cap real, so `LAMBDA_VM_ZF_CAP` no longer
+        // aborts; every spelling reaches the options unchanged.
+        const { assert!(stark::proof::options::MERKLE_CAP_IMPLEMENTED) };
+        for (v, want) in [
+            ("auto", CapPolicy::Auto),
+            ("3", CapPolicy::Fixed(3)),
+            ("off", CapPolicy::Off),
+        ] {
+            let f = parse(&[(ENV_CAP, v)]).unwrap();
+            assert!(!f.unimplemented_levers().contains(&ENV_CAP), "{v}");
+            let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
+            assert_eq!(f.options(base).format.merkle_cap, want, "{v}");
+        }
+    }
+
+    #[test]
     fn apply_stamps_only_the_format_fields() {
         let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
         assert!(base.has_default_format());

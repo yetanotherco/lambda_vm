@@ -193,7 +193,13 @@ impl FromStr for OneRowMode {
 /// stable while the campaign lands it — must not be selectable, or a run
 /// could print a non-default format and prove the default one. Each lane
 /// flips its own flag in the commit that makes the lever real.
-pub const MERKLE_CAP_IMPLEMENTED: bool = false;
+///
+/// The Merkle cap is real on the host and device STARK provers and the host
+/// verifier (design/CAP.md C3 + C4). ⚠ NOT yet in the LFM in-guest verifier
+/// (C5): a recursion run that wraps a capped proof fails closed there, so
+/// `LAMBDA_VM_ZF_CAP` is for STARK-level tests and measurements until C5
+/// lands.
+pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
 /// See [`MERKLE_CAP_IMPLEMENTED`].
 pub const FRI_MODE_IMPLEMENTED: bool = false;

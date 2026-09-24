@@ -705,3 +705,138 @@ fn a_device_resident_tree_without_a_cap_read_is_an_error() {
             .expect("a full host tree serves its cap");
     assert!(verify_cap::<Leaf>(&cap, &host.root, 2));
 }
+
+/// C4 on a real device (box only; `--features cuda -- --ignored`): a LogUp
+/// table over the cubic extension, big enough that its main, aux,
+/// composition and FRI trees are committed on the device (host trees
+/// root-only), proved under `Auto` at 30 queries. The caps must come off the
+/// device (`gpu_cap_read_calls` moves), the proof must verify owned and
+/// archived, and against an `Off` proof of the same witness the transcript is
+/// unchanged and every capped path is the full device-gathered path cut to
+/// `D − c` (the cap on the owner).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU; run with --features cuda -- --ignored"]
+fn device_trees_serve_their_caps() {
+    use crate::examples::read_only_memory_logup::{
+        LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
+    };
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
+    type Pi = LogReadOnlyPublicInputs<F>;
+
+    let rows = 1usize << 14;
+    let addresses: Vec<FE> = (0..rows as u64)
+        .map(|i| FE::from((i * 7919) % 4099 + 1))
+        .collect();
+    let values: Vec<FE> = addresses.iter().map(|a| *a * FE::from(10u64)).collect();
+    let prove_at = |policy| {
+        let opts = options(policy, 30, 2);
+        let mut trace = read_only_logup_trace::<F, E>(addresses.clone(), values.clone());
+        let cols = trace.columns_main();
+        let pi = Pi {
+            a0: cols[0][0],
+            v0: cols[1][0],
+            a_sorted_0: cols[2][0],
+            v_sorted_0: cols[3][0],
+            m0: cols[4][0],
+        };
+        let air = LogReadOnlyRAP::<F, E>::new(&opts);
+        let proof = Prover::prove(&air, &mut trace, &pi, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("prove");
+        (air, proof)
+    };
+
+    let (_, off) = prove_at(CapPolicy::Off);
+    let before = crate::gpu_lde::gpu_cap_read_calls();
+    let (air, on) = prove_at(CapPolicy::Auto);
+    let reads = crate::gpu_lde::gpu_cap_read_calls() - before;
+    println!("CAPDEV device cap reads: {reads}");
+    assert!(
+        reads > 0,
+        "no cap came off the device: the trees were host trees, the test proves nothing"
+    );
+    assert!(
+        Verifier::verify(&on, &air, &mut DefaultTranscript::<E>::new(&[])),
+        "a device-proved capped proof must verify"
+    );
+    let multi = MultiProof {
+        proofs: vec![on.clone()],
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&multi).unwrap();
+    let archived = rkyv::access::<
+        crate::proof::stark::ArchivedMultiProof<F, E, Pi>,
+        rkyv::rancor::Error,
+    >(&bytes)
+    .unwrap();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = Pi>> = vec![&air];
+    assert!(Verifier::multi_verify_archived(
+        &airs,
+        archived,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::<E>::zero(),
+    ));
+
+    assert_eq!(
+        off.lde_trace_main_merkle_root,
+        on.lde_trace_main_merkle_root
+    );
+    assert_eq!(off.lde_trace_aux_merkle_root, on.lde_trace_aux_merkle_root);
+    assert_eq!(off.composition_poly_root, on.composition_poly_root);
+    assert_eq!(off.fri_layers_merkle_roots, on.fri_layers_merkle_roots);
+    assert_eq!(off.fri_final_poly_coeffs, on.fri_final_poly_coeffs);
+    let lde_log = (2 * on.trace_length).trailing_zeros() as usize;
+    let caps = StarkCaps::new(
+        CapPolicy::Auto,
+        30,
+        lde_log,
+        on.fri_layers_merkle_roots.len(),
+    );
+    assert_eq!(caps.trace, 3);
+    let check = |full: &Vec<Commitment>, capped: &Vec<Commitment>, q: usize, d: usize, c: usize| {
+        assert_eq!(full.len(), d, "query {q}: full path");
+        assert_eq!(&capped[..d - c], &full[..d - c], "query {q}: siblings");
+        assert_eq!(
+            capped.len(),
+            d - c + if q == 0 { 1 << c } else { 0 },
+            "query {q}"
+        );
+    };
+    let d = caps.trace_depth;
+    for (q, (a, b)) in off
+        .deep_poly_openings
+        .iter()
+        .zip(&on.deep_poly_openings)
+        .enumerate()
+    {
+        check(
+            &a.main_trace_polys.proof.merkle_path,
+            &b.main_trace_polys.proof.merkle_path,
+            q,
+            d,
+            3,
+        );
+        check(
+            &a.composition_poly.proof.merkle_path,
+            &b.composition_poly.proof.merkle_path,
+            q,
+            d,
+            3,
+        );
+        let (aa, bb) = (
+            a.aux_trace_polys.as_ref().unwrap(),
+            b.aux_trace_polys.as_ref().unwrap(),
+        );
+        check(&aa.proof.merkle_path, &bb.proof.merkle_path, q, d, 3);
+    }
+    for (q, (a, b)) in off.query_list.iter().zip(&on.query_list).enumerate() {
+        for i in 0..caps.fri.len() {
+            check(
+                &a.layers_auth_paths[i].merkle_path,
+                &b.layers_auth_paths[i].merkle_path,
+                q,
+                caps.fri_depths[i],
+                caps.fri[i],
+            );
+        }
+    }
+}
