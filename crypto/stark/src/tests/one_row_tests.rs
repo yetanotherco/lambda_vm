@@ -536,6 +536,108 @@ fn input_root_is_absorbed_before_the_first_challenge() {
     let _ = roots_of_unity_table::<F>(1);
 }
 
+/// M1 at the input tree: the input-slot check `group₀[slot] == DEEP(x_r)` is
+/// what ties FRI to the trace openings under one row. A prover commits (and
+/// folds) the input codeword `p₀ + c` — still low degree, so every layer and
+/// the terminal are consistent — while DEEP(x_r) from the openings is `p₀`.
+/// With the check the forgery is rejected; with it skipped (the mutation) it
+/// is ACCEPTED.
+#[test]
+fn m1_the_input_slot_check_is_load_bearing() {
+    use crate::fri::group::{
+        GROUP_MUTATION, GroupMutation, roots_of_unity_table, verify_query_groups,
+    };
+    use crate::fri::query_phase_with_layout;
+    use crate::fri::terminal::terminal_codeword_from_coeffs;
+    use crate::merkle_caps::TreeCheck;
+    use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+    type H = KeccakStarkHash;
+
+    let o = Felt::from(3u64);
+    let lde_log = 10u32;
+    let n = 1usize << lde_log;
+    let coeffs: Vec<Ext> = (0..256u64)
+        .map(|i| Ext::new([Felt::from(i + 5), Felt::from(i * i), Felt::from(11)]))
+        .collect();
+    let poly = math::polynomial::Polynomial::new(&coeffs);
+    let mut p0 =
+        math::polynomial::Polynomial::evaluate_offset_fft::<F>(&poly, 4, Some(256), &o).unwrap();
+    in_place_bit_reverse_permute(&mut p0);
+    let c = Ext::new([Felt::from(5u64), Felt::from(6u64), Felt::from(7u64)]);
+    let shifted: Vec<Ext> = p0.iter().map(|v| v + &c).collect();
+
+    // One row, schedule [3, 2, 3] from 10 to T = 2 + 0.
+    let layout = FriFoldLayout::from_schedule(lde_log, 2, 0, true, vec![3, 2, 3]).unwrap();
+    let tw = compute_coset_twiddles_inv::<F>(&o, n);
+    let mut t = DefaultTranscript::<E>::new(&[5]);
+    let (tcoeffs, layers) =
+        commit_phase_with_layout::<F, E, _, H>(shifted, &mut t, &o, n, 2, 0, &layout, &tw);
+    let roots: Vec<[u8; 32]> = layers.iter().map(|l| l.merkle_tree.root).collect();
+    // Replay: root₀ first, then (ζ, root) per later layer, then the final ζ.
+    let mut replay = DefaultTranscript::<E>::new(&[5]);
+    let mut zetas = Vec::new();
+    for (j, r) in roots.iter().enumerate() {
+        if j > 0 {
+            zetas.push(replay.sample_field_element());
+        }
+        replay.append_bytes(r);
+    }
+    zetas.push(replay.sample_field_element());
+    assert_eq!(zetas.len(), layout.num_zetas());
+    let queries: Vec<usize> = (0..n).step_by(53).collect();
+    let decs = query_phase_with_layout::<E, H>(&layers, &queries, &layout);
+    let terminal = terminal_codeword_from_coeffs::<F, E>(
+        &tcoeffs,
+        &o.pow(1u64 << layout.total_folds),
+        layout.terminal_len,
+    );
+    let tables: Vec<Vec<Felt>> = (0..=6)
+        .map(|d| roots_of_unity_table::<F>(d).unwrap())
+        .collect();
+    let checks: Vec<TreeCheck<'_>> = roots
+        .iter()
+        .enumerate()
+        .map(|(j, root)| {
+            TreeCheck::build::<<H as crate::config::StarkHash>::Batched<E>>(
+                root,
+                layout.layer_depth(lde_log, j) as usize,
+                0,
+                || None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let accepts = |deep: &[Ext]| {
+        queries.iter().zip(&decs).all(|(&r, dec)| {
+            let w = F::get_primitive_root_of_unity(u64::from(lde_log)).unwrap();
+            let x_r = &o * w.pow(reverse_index(r, n as u64) as u64);
+            verify_query_groups::<F, E, <H as crate::config::StarkHash>::Batched<E>>(
+                &layout,
+                &checks,
+                1,
+                |j| dec.layers_auth_paths[j].merkle_path.as_slice(),
+                &dec.layers_evaluations_sym,
+                &zetas,
+                r,
+                deep[r].clone(),
+                x_r.inv().unwrap(),
+                &terminal,
+                &tables,
+            )
+        })
+    };
+    let shifted_again: Vec<Ext> = p0.iter().map(|v| v + &c).collect();
+    assert!(accepts(&shifted_again), "control: honest for p0 + c");
+    assert!(!accepts(&p0), "the input-slot check must reject");
+    GROUP_MUTATION.with(|m| m.set(GroupMutation::SkipSlotCheck));
+    let mutated = accepts(&p0);
+    GROUP_MUTATION.with(|m| m.set(GroupMutation::None));
+    assert!(
+        mutated,
+        "without the input-slot check the forgery is accepted (the check is load-bearing)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Preprocessed tables: one-row roots, and RULINGS 14 (a miss is an error).
 // ---------------------------------------------------------------------------
