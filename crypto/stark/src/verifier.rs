@@ -511,6 +511,8 @@ pub trait IsStarkVerifier<
                 Some(pair) => pair,
                 None => return false,
             };
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::fri::capture::record_deep(&deep_poly_evaluations, &deep_poly_evaluations_sym);
 
         // ---- Reconstruct the FRI terminal codeword from the final-poly coeffs ----
         // The prover folds the deep composition codeword down to a terminal
@@ -1843,6 +1845,8 @@ pub trait IsStarkVerifier<
             rap_challenges,
             &layout,
         );
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::fri::capture::record_challenges(&challenges.zetas, &challenges.iotas);
 
         // verify grinding
         let grinding_factor = air.context().proof_options.grinding_factor;

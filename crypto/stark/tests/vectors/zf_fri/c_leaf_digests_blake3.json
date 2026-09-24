@@ -1,0 +1,13 @@
+{
+  "generator": "stark::fri::vectors::leaf_digests_json",
+  "hash": "blake3",
+  "codeword": "b_group_folds.json codeword",
+  "leaves": [
+    {"d": 1, "first_leaf": "3e94099701015ba4b517b2da241e742be08d6247bc8863a07484aa134dd3c0b2", "layer_root": "ab6a1860afd95f056e99f36162ee961aec77ee8e14c4206b024c02f63a5a7f1e"},
+    {"d": 2, "first_leaf": "8a3a4601f36fa9c390e9d690a87c2c32ca8d039becd87497f2c7e6aeadda7a3f", "layer_root": "c5e6e011fd76656fa059479df53c33122b79894e95471ffab51dd6b6dedeb9a2"},
+    {"d": 3, "first_leaf": "b1ea4061930ffd7af7ea20c263e8c41e3cfc46202480b54945b302759e4fb8a9", "layer_root": "1f638946ead0713ced39f29587cb25f308f43a2db7443fe4fc12ee5574e2e930"},
+    {"d": 4, "first_leaf": "126e67d8deb4860e5a065a64b28319be8db0441a397dc716b2cc63b14dafacdc", "layer_root": "225d49f0dd2fc63dabf168f21825dd49dc08958ee89a3a1841db1dc2ab9e5fd7"},
+    {"d": 5, "first_leaf": "a420dd3555ee2d35e54094b728abb93ef1e441426c0fdac244a88f0e733d7438", "layer_root": "f6c327d2325176f17f157c40f345251b788f37377c65ea3d5eaa3f72e2af68d3"},
+    {"d": 6, "first_leaf": "3a1ad10b88c75a26d86a8898e00519c7bce95870d7d2f7be716d179393a124e7", "layer_root": "0f42251b7c5b0e388e761f3a35b319c455f9539adb59f7e725959b91ad0e3f5a"}
+  ]
+}

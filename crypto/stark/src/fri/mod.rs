@@ -1,9 +1,13 @@
+#[cfg(any(test, feature = "test-utils"))]
+pub mod capture;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
 pub(crate) mod group;
 pub mod schedule;
 pub(crate) mod terminal;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod vectors;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
@@ -250,7 +254,10 @@ pub(crate) fn fold_times<F: IsField + IsSubFieldOf<E>, E: IsField>(
 }
 
 /// A group-leaf layer tree: leaf `g` = `H::Batched` over `evals[g·n .. (g+1)·n]`.
-fn group_tree<E, H>(evals: &[FieldElement<E>], n: usize) -> Option<MerkleTree<H::Pair<E>>>
+pub(crate) fn group_tree<E, H>(
+    evals: &[FieldElement<E>],
+    n: usize,
+) -> Option<MerkleTree<H::Pair<E>>>
 where
     E: IsField + 'static + Send + Sync,
     FieldElement<E>: AsBytes + Sync + Send,
