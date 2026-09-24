@@ -54,7 +54,6 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::lookup::LazyCommitment;
 use stark::prover::IsStarkProver;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -1031,11 +1030,13 @@ impl VmAirs {
             // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
-            Box::new(create_bitwise_air(proof_options).with_preprocessed_columns(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-                Arc::new(bitwise::preprocessed_columns),
-            ))
+            Box::new(
+                create_bitwise_air(proof_options).with_lazy_preprocessed_columns(
+                    bitwise::lazy_commitment(proof_options),
+                    bitwise::NUM_PRECOMPUTED_COLS,
+                    Arc::new(bitwise::preprocessed_columns),
+                ),
+            )
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| {
@@ -1074,16 +1075,10 @@ impl VmAirs {
             // Deferred: the commitment is an LDE and a Merkle tree over the
             // program's whole instruction table, and only the univariate path
             // compares it — the multilinear one checks the columns instead.
-            let decode_root = match decode_commitment {
-                Some(commitment) => LazyCommitment::ready(commitment),
-                None => {
-                    let instructions = instructions.clone();
-                    let options = proof_options.clone();
-                    LazyCommitment::deferred(move || {
-                        decode::compute_precomputed_commitment(&instructions, &options)
-                    })
-                }
-            };
+            // Both leaf layouts (S2): the one-row root is computed on first
+            // use, never taken from a supplied row-pair root.
+            let decode_root =
+                decode::lazy_commitment(instructions.clone(), proof_options, decode_commitment);
             Box::new(
                 create_decode_air(proof_options).with_lazy_preprocessed_columns(
                     decode_root,
@@ -1134,8 +1129,8 @@ impl VmAirs {
         // without the generator it cannot tell a real preprocessed table from a
         // forged one. The univariate path ignores the extra argument.
         let keccak_rc: VmAir = Box::new(
-            create_keccak_rc_air(proof_options).with_preprocessed_columns(
-                tables::keccak_rc::preprocessed_commitment(proof_options),
+            create_keccak_rc_air(proof_options).with_lazy_preprocessed_columns(
+                tables::keccak_rc::lazy_commitment(proof_options),
                 tables::keccak_rc::NUM_PRECOMPUTED_COLS,
                 Arc::new(tables::keccak_rc::preprocessed_columns),
             ),
@@ -1171,11 +1166,12 @@ impl VmAirs {
             // epoch and through `verify_epochs`. The univariate path is
             // unaffected either way — it compares the root and never calls
             // `precomputed_columns()`.
+            let root = register::lazy_commitment_with_fini(proof_options, commitment, init, fini);
             let init = init.to_vec();
             let fini = fini.to_vec();
             Box::new(
-                create_register_air(proof_options).with_preprocessed_columns(
-                    commitment,
+                create_register_air(proof_options).with_lazy_preprocessed_columns(
+                    root,
                     register::NUM_PREPROCESSED_COLS_WITH_FINI,
                     Arc::new(move || register::preprocessed_columns_with_fini(&init, &fini)),
                 ),
@@ -1184,9 +1180,9 @@ impl VmAirs {
             let register_init = register_init
                 .map(<[u32]>::to_vec)
                 .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-            let commitment = register::preprocessed_commitment(proof_options, &register_init);
+            let commitment = register::lazy_commitment(proof_options, &register_init);
             Box::new(
-                create_register_air(proof_options).with_preprocessed_columns(
+                create_register_air(proof_options).with_lazy_preprocessed_columns(
                     commitment,
                     register::NUM_PREPROCESSED_COLS,
                     Arc::new(move || register::preprocessed_columns(&register_init)),
@@ -1220,16 +1216,16 @@ impl VmAirs {
                     // Committing OFFSET alone publishes nothing: it is the dense
                     // `0..page_size-1` enumeration, byte-identical for every page
                     // regardless of program or input.
-                    Box::new(air.with_preprocessed_columns(
-                        page::private_page_preprocessed_commitment(proof_options),
+                    Box::new(air.with_lazy_preprocessed_columns(
+                        page::private_page_lazy_commitment(proof_options),
                         page::NUM_PREPROCESSED_COLS_PRIVATE,
                         Arc::new(|| vec![page::offset_column()]),
                     ))
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
                     let config = config.clone();
-                    Box::new(air.with_preprocessed_columns(
-                        zero_init_commitment,
+                    Box::new(air.with_lazy_preprocessed_columns(
+                        page::zero_init_lazy_commitment_from(zero_init_commitment, proof_options),
                         page::NUM_PREPROCESSED_COLS,
                         Arc::new(move || page::preprocessed_columns(&config)),
                     ))
@@ -1239,18 +1235,13 @@ impl VmAirs {
                     // (recursion guest); otherwise recompute from the ELF.
                     // Deferred when it has to be computed: two dozen pages of
                     // LDE and Merkle that only the univariate path compares.
-                    let commitment = page_commitments
+                    let supplied = page_commitments
                         .unwrap_or(&[])
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
-                        .map(|(_, c)| LazyCommitment::ready(*c))
-                        .unwrap_or_else(|| {
-                            let config = config.clone();
-                            let options = proof_options.clone();
-                            LazyCommitment::deferred(move || {
-                                page::compute_precomputed_commitment(&config, &options)
-                            })
-                        });
+                        .map(|(_, c)| *c);
+                    let commitment =
+                        page::data_page_lazy_commitment(config, proof_options, supplied);
                     let config = config.clone();
                     Box::new(air.with_lazy_preprocessed_columns(
                         commitment,

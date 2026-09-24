@@ -1151,6 +1151,17 @@ impl<
         self
     }
 
+    /// Give this AIR's preprocessed commitment a ONE-ROW (S2) root: `root` is
+    /// what [`AIR::precomputed_commitment_for`](crate::traits::AIR::precomputed_commitment_for)
+    /// returns for [`LeafLayout::Row`](crate::leaf_layout::LeafLayout::Row)
+    /// (`None` = a hard miss). A no-op on an AIR that is not preprocessed.
+    pub fn with_one_row_commitment(mut self, root: Option<crate::config::Commitment>) -> Self {
+        if let Some(c) = self.preprocessed_commitment.take() {
+            self.preprocessed_commitment = Some(c.with_one_row(move || root));
+        }
+        self
+    }
+
     /// Supply a constraint program captured at BUILD time, so this AIR never
     /// has to capture one.
     ///

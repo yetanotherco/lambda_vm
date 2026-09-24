@@ -136,3 +136,5 @@ pub mod zf_rpx_golden_tests;
 pub mod zf_rpx_vectors;
 #[cfg(test)]
 pub mod zf_vm_dp_tests;
+#[cfg(test)]
+pub mod zf_vm_one_row_tests;

@@ -26,7 +26,7 @@ use super::airs::{BLAKE3_SLOT, ChipSet, LfmAirs, NUM_LFM_CHIPS};
 use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, LfmExecution, execute};
 use super::hash::HasherKind;
-use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError, resolve};
+use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError};
 use super::statement::absorb_lfm_statement;
 use super::trace::{LfmTraces, build_traces_with_hasher};
 use super::word::LfmWord;
@@ -285,7 +285,7 @@ pub(crate) fn prove_traces_with_hasher(
     // must be free to overlap another proof's device phase, which is the entire
     // point of the lever.
     let _card = super::device_permit::hold_labeled("multi_prove");
-    let airs = LfmAirs::new_chunked(
+    let mut airs = LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
         options,
@@ -293,6 +293,11 @@ pub(crate) fn prove_traces_with_hasher(
         hasher,
         artifacts.chip_set,
     );
+    // One-row chips (S2) take their roots from the artifacts; without them a
+    // chip resolved to one row is refused by `multi_prove` (RULINGS 14).
+    if let Some(one_row) = &artifacts.one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
     let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
@@ -339,9 +344,9 @@ pub fn lfm_verify(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<bool, LfmRegistryError> {
-    let entry = resolve(kind, options.blowup_factor)?;
+    let artifacts = super::registry::resolve_artifacts(kind, options)?;
     Ok(verify_against_artifacts(
-        &entry.artifacts(),
+        &artifacts,
         proof,
         claimed_public,
         options,
@@ -363,7 +368,8 @@ pub fn verify_against_artifacts(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
-    verify_against_chunked(
+    verify_against_chunked_with(
+        artifacts.one_row_roots.as_ref(),
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
         &artifacts.program_id,
@@ -445,6 +451,36 @@ pub fn verify_against_chunked(
     hasher: HasherKind,
     chip_set: ChipSet,
 ) -> bool {
+    verify_against_chunked_with(
+        None,
+        roots,
+        blake3_roots,
+        program_id,
+        keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        hasher,
+        chip_set,
+    )
+}
+
+/// [`verify_against_chunked`] with the program's one-row (S2) roots, when it
+/// has them (`None` = row-pair roots only: a chip resolved to one row then
+/// rejects, RULINGS 14).
+#[allow(clippy::too_many_arguments)]
+fn verify_against_chunked_with(
+    one_row_roots: Option<&super::registry::LfmOneRowRoots>,
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    blake3_roots: &[Commitment],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> bool {
     // The chunk count and the mask must agree, and BOTH come from the resolved
     // registry entry rather than the proof — so this rejects a malformed entry,
     // not a hostile prover.
@@ -462,7 +498,7 @@ pub fn verify_against_chunked(
         return false;
     }
 
-    let airs = LfmAirs::new_chunked(
+    let mut airs = LfmAirs::new_chunked(
         roots,
         blake3_roots,
         options,
@@ -470,6 +506,9 @@ pub fn verify_against_chunked(
         hasher,
         chip_set,
     );
+    if let Some(one_row) = one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
     let refs = airs.air_refs();
 
     let mut transcript = crate::hash_pin::block_transcript(&[]);

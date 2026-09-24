@@ -1185,6 +1185,7 @@ fn harvest_real_epoch(
         reg_shape: super::programs::RegisterDerivationShape {
             blowup: opts.blowup_factor as usize,
             coset_offset: opts.coset_offset,
+            rows_per_leaf: stark::commitment::ROWS_PER_LEAF,
         },
         expected_program_id: crate::recursion::program_id_from_digest(
             &crate::statement::elf_digest(&elf_bytes),
