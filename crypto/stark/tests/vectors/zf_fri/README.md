@@ -1,4 +1,4 @@
-# S3 FRI vectors (group-leaf FRI layers)
+# S3 and S2 FRI vectors (group-leaf FRI layers, one-row openings)
 
 Test vectors for the S3 proof-format lever (`LAMBDA_VM_ZF_FRI=dp`,
 `ProofFormat.fri_mode = FriMode::Dp`): committed FRI layer `j` folds by
@@ -11,8 +11,8 @@ test that regenerates it in memory and requires it byte-equal to this copy:
 
 | files | test (fails if stale) | regenerate |
 |---|---|---|
-| `a_*`, `b_*`, `c_*_keccak`, `c_*_blake3`, `d_*_keccak_*`, `d_*_blake3_*` | `cargo test -p stark --lib zf_fri_vectors::vectors_are_current` | `cargo test -p stark --lib zf_fri_vectors::write_vectors -- --ignored` |
-| `c_*_rpx`, `d_*_rpx_*` | `cargo test -p lambda-vm-prover --lib tests::zf_rpx_vectors::rpx_vectors_are_current` | `cargo test -p lambda-vm-prover --lib tests::zf_rpx_vectors::write_vectors -- --ignored` |
+| `a_*`, `b_*`, `c_*_keccak`, `c_*_blake3`, `d_*_keccak_*`, `d_*_blake3_*`, `e_*_keccak*`, `e_*_blake3*` | `cargo test -p stark --lib zf_fri_vectors::vectors_are_current` | `cargo test -p stark --lib zf_fri_vectors::write_vectors -- --ignored` |
+| `c_*_rpx`, `d_*_rpx_*`, `e_*_rpx*` | `cargo test -p lambda-vm-prover --lib tests::zf_rpx_vectors::rpx_vectors_are_current` | `cargo test -p lambda-vm-prover --lib tests::zf_rpx_vectors::write_vectors -- --ignored` |
 
 Regenerate only for a deliberate format change (the schedule DP, its weights,
 the fold, the leaf encoding): a stale file means the format moved.
@@ -93,8 +93,42 @@ authentication `path_len`. Formats: `pair` (today, all-ones schedule),
 explicit uneven schedule via the test hook `fri_schedule_override`: unequal
 neighbouring exponents are what catch a fold-count off-by-one).
 
+**(e) S2 — one-row openings with a committed FRI input.**
+
+`e_leaf_digests_{keccak,blake3,rpx}.json` — one-row trace-tree leaves: a KAT
+base matrix (16 rows × 5 columns, SplitMix64 from `KAT_SEED + 100`, one output
+per value, reduced mod p) and an ext3 matrix (16 rows × 2 columns, from
+`KAT_SEED + 200`, three outputs per value), each read as bit-reversed LDE
+columns and committed at `rows_per_leaf = 1` (leaf `i` = the row at
+bit-reversed position `i`) and, for comparison, at `rows_per_leaf = 2` (today:
+rows `2i`, `2i + 1`). Every leaf digest and both roots per layout. A leaf
+hashes the row's values column by column (`leaves_bit_reversed_grouped`, the
+same stream the verifier's `hash_data_from_slices(evaluations, [])` hashes).
+
+`e_proof_{keccak,blake3,rpx}_{one_row_pair,one_row_3_2_1_2}.{json,rkyv}` — the
+(d) proof shape (same AIR, trace, blowup 4, `B = 12`, `T = 4`, `Q = 3`,
+grinding 0) proved with `ProofFormat.one_row = On`:
+- every trace, aux and composition tree commits ONE row per leaf and is
+  `B = 12` deep (`trace_tree_depth`); a query index `r` is uniform over the
+  whole LDE (`query_bound = 4096`, not 2048) and opens leaf `r` of every trace
+  tree (`trace_leaf`, `trace_path_len`); openings carry no symmetric row;
+- `deep` is DEEP at the ONE point `x_r` = the LDE point at bit-reversed
+  position `r` (there is no `deep_sym`);
+- FRI layer 0 is the INPUT tree: the DEEP codeword itself (`2^12` values,
+  bit-reversed), committed with groups of `2^{d_0}` values; its root is
+  `fri_roots[0]` and is absorbed BEFORE the first folding challenge. Transcript:
+  `γ` → append `root_0` → per later layer: sample `ζ`, append its root → sample
+  the final `ζ` → coefficients → nonce → `r`s. So `zetas` has one entry per
+  layer (layer `j` folds with `zetas[j]`), against `layers + 1` for row pairs;
+- per layer `j`: `position = r >> Σ_{i<j} d_i`, `leaf = position >> d_j`,
+  `slot = position & (2^{d_j} − 1)`; layer 0's slot check is the input-slot
+  check `group₀[slot] == deep`; the terminal position is `r >> Σ d_j`.
+- Formats: `one_row_pair` (fri = pair: the all-ones schedule from `B`, eight
+  pair layers, group encoding), `one_row_3_2_1_2` (an explicit uneven schedule,
+  `Σ = 8 = B − T`).
+
 ## Not here yet
 
-- (e) S2 one-row leaf digests and the input-tree root (H6, after S2).
-- A vector with a Merkle cap (`Q ≥ 20` so `cap = auto` caps; REVIEW-FRI F9):
-  the cap is not implemented on this branch.
+- A vector with a Merkle cap (`Q ≥ 20` so `cap = auto` caps; REVIEW-FRI F9).
+  The cap now composes with dp and one_row on the host (`one_row_tests::
+  cap_fri_one_row_matrix_round_trips`), but no capped vector is exported.
