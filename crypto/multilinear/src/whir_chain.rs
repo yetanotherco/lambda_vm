@@ -259,8 +259,10 @@ pub enum WhirFolds {
     First(FirstFold),
 }
 
-/// See [`WHIR_CAP_IMPLEMENTED`].
-pub const WHIR_FOLDS_IMPLEMENTED: bool = false;
+/// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
+/// `agrees_with`, the production config, the GPU parity at k = 6 and the
+/// in-guest gates at k = 5 and 6.
+pub const WHIR_FOLDS_IMPLEMENTED: bool = true;
 
 /// A first-round fold, `1 ..= MAX_FOLD`. Constructed only through
 /// [`FirstFold::new`], so a fold of 0 or wider than the tested stack is not a
