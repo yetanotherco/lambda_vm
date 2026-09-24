@@ -15,6 +15,7 @@ use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use sha2::{Digest, Sha256};
+use stark::examples::bus_permutation::{bus_permutation_air, bus_permutation_trace};
 use stark::examples::read_only_memory_logup::{
     LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
 };
@@ -307,9 +308,28 @@ fn production_sites_prove_at_the_process_format() {
         ),
     ] {
         assert_eq!(o.format.fri_mode, want, "{site}");
-        // 2^12 rows: LDE 2^14, so both terminals (T = 9, 10) leave committed layers.
-        let (air, proof) = prove_logup(1 << 12, &o);
-        assert!(verify_logup(&air, &proof), "{site}: must verify");
+        // 2^12 rows: LDE 2^14, so both terminals (T = 9, 10) leave committed
+        // layers. At that size a `cuda` build commits on the device, whose
+        // composition arm needs the AIR's constraint program — so an
+        // `AirWithBuses` table, as in production (`LogReadOnlyRAP` panicked in
+        // `constraint_program` there).
+        let air = bus_permutation_air(&o);
+        let mut trace = bus_permutation_trace(1 << 12);
+        let proof = GenericProver::<F, E, (), RpxStarkHash>::prove(
+            &air,
+            &mut trace,
+            &(),
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .unwrap_or_else(|e| panic!("{site}: proving must succeed: {e:?}"));
+        assert!(
+            GenericVerifier::<F, E, (), RpxStarkHash>::verify(
+                &proof,
+                &air,
+                &mut DefaultTranscript::<E>::new(&[]),
+            ),
+            "{site}: must verify"
+        );
         let layers = proof.fri_layers_merkle_roots.len();
         assert!(layers > 0, "{site}: committed layers");
         let values = proof.query_list[0].layers_evaluations_sym.len();
