@@ -54,7 +54,7 @@
       ("keccak", [`KECCAK` accelerator], <keccak>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
-      ("memmove", [`MEMMOVE` accelerator], <memmove>),
+      ("copy", [`COPY` accelerator], <copy>),
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),

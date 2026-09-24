@@ -1,5 +1,5 @@
-name = "MEMMOVE"
-code = "MMV"
+name = "COPY"
+code = "CPY"
 
 # Input
 
@@ -139,22 +139,22 @@ pad = 0
 
 [[assumptions]]
 desc = "`IS_WORD[timestamp]`"
-ref = "memmove:a:timestamp"
+ref = "copy:a:timestamp"
 
 [[assumptions]]
 desc = "`IS_WORD[src[i]]`"
 iter = ["i", 0, 1]
-ref = "memmove:a:src"
+ref = "copy:a:src"
 
 [[assumptions]]
 desc = "`IS_WORD[dst[i]]`"
 iter = ["i", 0, 1]
-ref = "memmove:a:dst"
+ref = "copy:a:dst"
 
 [[assumptions]]
 desc = "`IS_WORD[count[i]]`"
 iter = ["i", 0, 1]
-ref = "memmove:a:count"
+ref = "copy:a:count"
 
 # Constraints
 
@@ -166,14 +166,14 @@ kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["arr", ["-", ["^", 2, 32], 30, ["*", 2, "is_set"]], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "first_ecall"]
-ref = "memmove:c:receive_ecall"
+ref = "copy:c:receive_ecall"
 
 [[constraints.incoming]]
 kind = "interaction"
 tag = "COMMIT_DEFER"
 input = ["timestamp", "src", "dst", "count"]
 multiplicity = ["-", "first_commit"]
-ref = "memmove:c:receive_commit_defer"
+ref = "copy:c:receive_commit_defer"
 
 [[constraint_groups]]
 name = "functionality"
@@ -182,19 +182,19 @@ name = "functionality"
 kind = "arith"
 constraint = "$#`is_set` dot #`is_commit` = 0$"
 poly = ["*", "is_set", "is_commit"]
-ref = "memmove:c:one_hot"
+ref = "copy:c:one_hot"
 
 [[constraints.functionality]]
 kind = "arith"
 constraint = "$#`is_set` + #`is_commit` => #`μ` = 1$"
 poly = ["*", ["+", "is_set", "is_commit"], ["not", "μ"]]
-ref = "memmove:c:functionality_implies_mu"
+ref = "copy:c:functionality_implies_mu"
 
 [[constraints.functionality]]
 kind = "arith"
 constraint = "$#`first_ecall` = #`first` dot (1 - #`is_commit`)$"
 poly = ["-", "first_ecall", ["*", "first", ["not", "is_commit"]]]
-ref = "memmove:c:first_ecall"
+ref = "copy:c:first_ecall"
 
 [[constraint_groups]]
 name = "read_input"
@@ -205,7 +205,7 @@ tag = "REG"
 input = [10, "dst", "timestamp"]
 output = "dst"
 cond = "first_ecall"
-ref = "memmove:c:read_dst"
+ref = "copy:c:read_dst"
 
 [[constraints.read_input]]
 kind = "template"
@@ -213,7 +213,7 @@ tag = "REG"
 input = [11, "src", "timestamp"]
 output = "src"
 cond = "first_ecall"
-ref = "memmove:c:read_src"
+ref = "copy:c:read_src"
 
 [[constraints.read_input]]
 kind = "template"
@@ -221,7 +221,7 @@ tag = "REG"
 input = [12, "count", "timestamp"]
 output = "count"
 cond = "first_ecall"
-ref = "memmove:c:read_count"
+ref = "copy:c:read_count"
 
 [[constraint_groups]]
 name = "width"
@@ -232,7 +232,7 @@ tag = "ALU"
 input = ["count", ["cast", 8, "DWordWL"], ["opsel", "LT"]]
 output = ["arr", 0, 0]
 multiplicity = ["-", "μ", "single"]
-ref = "memmove:c:wide_needs_eight"
+ref = "copy:c:wide_needs_eight"
 
 [[constraints.width]]
 kind = "interaction"
@@ -240,7 +240,7 @@ tag = "ALU"
 input = ["count", ["cast", 257, "DWordWL"], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 multiplicity = "first_ecall"
-ref = "memmove:c:bound"
+ref = "copy:c:bound"
 
 [[constraint_groups]]
 name = "copy"
@@ -251,33 +251,33 @@ tag = "MEMW"
 input = [0, "src", "value", ["+", "timestamp", 1, "is_set"], 0, 0, ["not", "single"]]
 output = "value"
 multiplicity = ["-", "μ", "end"]
-ref = "memmove:c:read_value"
+ref = "copy:c:read_value"
 
 [[constraints.copy]]
 kind = "interaction"
 tag = "MEMW"
 input = [["*", 2, "is_commit"], "dst", "value", ["-", ["+", "timestamp", 2], "is_set"], 0, 0, ["not", "single"]]
 multiplicity = ["-", "μ", "end"]
-ref = "memmove:c:write_value"
+ref = "copy:c:write_value"
 
 [[constraints.copy]]
 kind = "arith"
 constraint = "$#`single` => #`value`_i = 0$"
 poly = ["*", "single", ["idx", "value", "i"]]
 iter = ["i", 1, 7]
-ref = "memmove:c:single_lanes"
+ref = "copy:c:single_lanes"
 
 [[constraints.copy]]
 kind = "arith"
 constraint = "$#`is_set` => #`dst`_0 = #`src`_0 + 8$"
 poly = ["*", "is_set", ["-", ["idx", "dst", 0], ["idx", "src", 0], 8]]
-ref = "memmove:c:set_gap_lo"
+ref = "copy:c:set_gap_lo"
 
 [[constraints.copy]]
 kind = "arith"
 constraint = "$#`is_set` => #`dst`_1 = #`src`_1$"
 poly = ["*", "is_set", ["-", ["idx", "dst", 1], ["idx", "src", 1]]]
-ref = "memmove:c:set_gap_hi"
+ref = "copy:c:set_gap_hi"
 
 [[constraint_groups]]
 name = "incr_decr"
@@ -286,7 +286,7 @@ name = "incr_decr"
 kind = "template"
 tag = "IS_BIT"
 input = ["src_carry"]
-ref = "memmove:c:src_incr"
+ref = "copy:c:src_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
@@ -294,20 +294,20 @@ tag = "IS_HALF"
 input = [["idx", "src_incr", "i"]]
 iter = ["i", 0, 2]
 multiplicity = "μ"
-ref = "memmove:c:range_src_incr"
+ref = "copy:c:range_src_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
 tag = "IS_HALF"
 input = ["src_incr_top"]
 multiplicity = "μ"
-ref = "memmove:c:range_src_incr_top"
+ref = "copy:c:range_src_incr_top"
 
 [[constraints.incr_decr]]
 kind = "template"
 tag = "IS_BIT"
 input = ["dst_carry"]
-ref = "memmove:c:dst_incr"
+ref = "copy:c:dst_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
@@ -315,21 +315,21 @@ tag = "IS_HALF"
 input = [["idx", "dst_incr", "i"]]
 iter = ["i", 0, 2]
 multiplicity = "μ"
-ref = "memmove:c:range_dst_incr"
+ref = "copy:c:range_dst_incr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
 tag = "IS_HALF"
 input = ["dst_incr_top"]
 multiplicity = "μ"
-ref = "memmove:c:range_dst_incr_top"
+ref = "copy:c:range_dst_incr_top"
 
 [[constraints.incr_decr]]
 kind = "template"
 tag = "SUB"
 input = ["count", ["arr", "step", 0]]
 output = ["cast", "count_decr", "DWordWL"]
-ref = "memmove:c:count_decr"
+ref = "copy:c:count_decr"
 
 [[constraints.incr_decr]]
 kind = "interaction"
@@ -337,7 +337,7 @@ tag = "IS_HALF"
 input = [["idx", "count_decr", "i"]]
 iter = ["i", 0, 3]
 multiplicity = "μ"
-ref = "memmove:c:range_count_decr"
+ref = "copy:c:range_count_decr"
 
 [[constraint_groups]]
 name = "end"
@@ -348,7 +348,7 @@ tag = "ZERO"
 input = [["+", ["-", 0xFFFF, ["idx", "count_decr", 0]], ["-", 0xFFFF, ["idx", "count_decr", 1]], ["-", 0xFFFF, ["idx", "count_decr", 2]], ["-", 0xFFFF, ["idx", "count_decr", 3]]]]
 output = "end"
 multiplicity = "μ"
-ref = "memmove:c:end"
+ref = "copy:c:end"
 
 [[constraint_groups]]
 name = "bits"
@@ -357,49 +357,49 @@ name = "bits"
 kind = "template"
 tag = "IS_BIT"
 input = ["first"]
-ref = "memmove:c:range_first"
+ref = "copy:c:range_first"
 
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
 input = ["end"]
-ref = "memmove:c:range_end"
+ref = "copy:c:range_end"
 
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
 input = ["single"]
-ref = "memmove:c:range_single"
+ref = "copy:c:range_single"
 
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
 input = ["is_set"]
-ref = "memmove:c:range_is_set"
+ref = "copy:c:range_is_set"
 
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
 input = ["is_commit"]
-ref = "memmove:c:range_is_commit"
+ref = "copy:c:range_is_commit"
 
 [[constraints.bits]]
 kind = "template"
 tag = "IS_BIT"
 input = ["μ"]
-ref = "memmove:c:range_mu"
+ref = "copy:c:range_mu"
 
 [[constraints.bits]]
 kind = "arith"
 constraint = "$#`single` => #`μ` = 1$"
 poly = ["*", "single", ["not", "μ"]]
-ref = "memmove:c:single_implies_mu"
+ref = "copy:c:single_implies_mu"
 
 [[constraints.bits]]
 kind = "arith"
 constraint = "$#`first` + #`end` => #`μ` = 1$"
 poly = ["*", ["+", "first", "end"], ["not", "μ"]]
-ref = "memmove:c:first_or_end_implies_mu"
+ref = "copy:c:first_or_end_implies_mu"
 
 [[constraint_groups]]
 name = "lookups"
@@ -409,11 +409,11 @@ kind = "interaction"
 tag = "MEMMOVE_NEXT"
 input = ["timestamp", ["arr", ["+", ["idx", "src_incr", 0], ["*", ["^", 2, 16], ["idx", "src_incr", 1]]], ["+", ["idx", "src", 1], "src_carry"]], ["arr", ["+", ["idx", "dst_incr", 0], ["*", ["^", 2, 16], ["idx", "dst_incr", 1]]], ["+", ["idx", "dst", 1], "dst_carry"]], ["cast", "count_decr", "DWordWL"], "is_set", "is_commit"]
 multiplicity = ["-", "μ", "end"]
-ref = "memmove:c:send_next_chunk"
+ref = "copy:c:send_next_chunk"
 
 [[constraints.lookups]]
 kind = "interaction"
 tag = "MEMMOVE_NEXT"
 input = ["timestamp", "src", "dst", "count", "is_set", "is_commit"]
 multiplicity = ["-", ["-", "μ", "first"]]
-ref = "memmove:c:receive_next_chunk"
+ref = "copy:c:receive_next_chunk"

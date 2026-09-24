@@ -12,7 +12,7 @@
 #let chip = load_chip("src/commit.toml", config)
 #let commit = raw(chip.name)
 
-The #commit chip handles the `write` system call: it accepts the call, checks the file descriptor, advances the commitment index and hands the bytes themselves to `MEMMOVE` (@memmove).
+The #commit chip handles the `write` system call: it accepts the call, checks the file descriptor, advances the commitment index and hands the bytes themselves to `COPY` (@copy).
 It is one row per system call; the loop over the buffer lives in the other chip.
 
 = Variables
