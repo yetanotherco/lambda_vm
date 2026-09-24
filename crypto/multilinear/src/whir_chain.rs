@@ -180,9 +180,11 @@ impl GrindBits {
 ///
 /// `format` is the proof FORMAT ([`ChainFormat`], the ZF campaign's W1 and W2
 /// levers); its default is today's format. Like the rest of the config it is
-/// a verifier-side constant, never read from a proof. It is NOT absorbed into
-/// the statement (`push_config` binds it as `_`): absorbing it would move
-/// every transcript at the default.
+/// a verifier-side constant, never read from a proof. The fold schedule is
+/// absorbed into the statement through [`ChainConfig::fold_word`], whose value
+/// at the default is `log_folding` itself (today's bytes); the rest of the
+/// format is not absorbed (`push_config` binds it as `_`): absorbing it would
+/// move every transcript at the default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainConfig {
     /// `log2` of the code's inverse rate.

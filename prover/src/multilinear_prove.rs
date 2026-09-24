@@ -164,14 +164,17 @@ pub(crate) fn absorb(
     // not only in the code.
     let &ChainConfig {
         log_blowup,
-        log_folding,
+        // ★ Absorbed as `fold_word()`: `log_folding` itself (4u64) at the
+        // default fold schedule, a tagged word binding the schedule otherwise.
+        log_folding: _,
         num_queries,
         grind,
-        // ⚠ Format, NOT absorbed: verifier-side constants (see
-        // `lfm::whir_statement::push_config`, the emitter's twin of this).
+        // ⚠ Format, NOT absorbed except the fold schedule, through the word
+        // above: verifier-side constants (see `lfm::whir_statement::push_config`,
+        // the emitter's twin of this).
         format: _,
     } = config;
-    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+    for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
         len += size_of_val(&value);
     }
