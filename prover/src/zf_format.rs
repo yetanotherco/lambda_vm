@@ -200,6 +200,8 @@ impl ZfFormat {
             merkle_cap: self.cap,
             fri_mode: self.fri,
             one_row: self.one_row,
+            // A test hook only; no knob sets it.
+            fri_schedule_override: None,
         }
     }
 

@@ -92,6 +92,17 @@ pub struct ProofFormat {
     pub fri_mode: FriMode,
     /// One-row trace openings with a committed FRI input (S2). `Off` = today.
     pub one_row: OneRowMode,
+    /// An explicit committed-layer fold schedule that replaces the DP's under
+    /// [`FriMode::Dp`] (ignored under [`FriMode::Pair`]). `None` = the DP.
+    ///
+    /// A TEST HOOK: it lets round-trip tests prove and verify schedules the DP
+    /// never picks (unequal neighbouring exponents such as `[1, 3]`, the only
+    /// shape that catches a fold-count off-by-one). No knob sets it — the
+    /// `ZF FORMAT` parser always leaves it `None` — and like every format
+    /// field it is a verifier-side constant, never read from a proof. A
+    /// schedule that does not cover the table's committed folds exactly is a
+    /// proving error and a verification failure, never a silent fallback.
+    pub fri_schedule_override: Option<FriScheduleOverride>,
 }
 
 impl ProofFormat {
@@ -100,6 +111,7 @@ impl ProofFormat {
         merkle_cap: CapPolicy::Off,
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
+        fri_schedule_override: None,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -107,6 +119,41 @@ impl ProofFormat {
         self.merkle_cap.is_off()
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
+            && self.fri_schedule_override.is_none()
+    }
+}
+
+/// Longest schedule a [`FriScheduleOverride`] holds.
+pub const FRI_SCHEDULE_OVERRIDE_MAX: usize = 32;
+
+/// An explicit FRI fold schedule (see [`ProofFormat::fri_schedule_override`]):
+/// the fold exponent of each committed layer, first committed layer first.
+/// Fixed capacity so [`ProofFormat`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FriScheduleOverride {
+    len: u8,
+    exponents: [u8; FRI_SCHEDULE_OVERRIDE_MAX],
+}
+
+impl FriScheduleOverride {
+    /// `None` if `schedule` is longer than [`FRI_SCHEDULE_OVERRIDE_MAX`]. The
+    /// exponents themselves are validated where the layout is built (each in
+    /// `1..=FRI_SCHEDULE_DMAX`, summing to the table's committed folds).
+    pub fn new(schedule: &[u8]) -> Option<Self> {
+        if schedule.len() > FRI_SCHEDULE_OVERRIDE_MAX {
+            return None;
+        }
+        let mut exponents = [0u8; FRI_SCHEDULE_OVERRIDE_MAX];
+        exponents[..schedule.len()].copy_from_slice(schedule);
+        Some(Self {
+            len: schedule.len() as u8,
+            exponents,
+        })
+    }
+
+    /// The schedule.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.exponents[..self.len as usize]
     }
 }
 

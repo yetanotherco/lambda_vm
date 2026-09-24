@@ -1,17 +1,36 @@
 //! Tests for the FRI fold schedule (`crate::fri::schedule`) and the generalised
 //! `FriFoldLayout` (FRI.md §10 U1–U3).
+//!
+//! Two objectives appear here. The PRODUCTION one is the cost law (RULINGS 13,
+//! `FRI_COST_WEIGHTS`): U1 pins its schedules as the Rust DP computes them, U2
+//! checks it against brute force. The design model's PERMUTATION objective
+//! (FRI.md §2.1, the §2.2 table) is kept as a second instance of the generic DP
+//! (`fri_schedule_by`), pinned against the design document: it shows the DP
+//! machinery reproduces an independent model exactly, and documents how far
+//! the two objectives' schedules differ.
 
 use crate::fri::schedule::{
-    FRI_SCHEDULE_DMAX, FriFormat, FriMode, fri_chain_start, fri_leaf_blocks, fri_path_cost_q,
-    fri_schedule, fri_schedule_cost_q, fri_schedule_with_cost, legacy_fri_schedule, no_cap,
+    BALU_ROW_NS, FRI_COST_WEIGHTS, FRI_FOLD_XALU_ROWS, FRI_SCHEDULE_DMAX, FriFormat,
+    FriFormatError, XALU_ROW_NS, fri_chain_start, fri_layer_cost_q, fri_leaf_blocks, fri_schedule,
+    fri_schedule_by, fri_schedule_cost_by, fri_schedule_cost_q, fri_schedule_with_cost,
+    legacy_fri_schedule,
 };
 use crate::fri::terminal::FriFoldLayout;
+use crate::proof::options::{
+    CapPolicy, FriMode, FriScheduleOverride, OneRowMode, ProofFormat, ProofOptions,
+};
+use crypto::merkle_tree::cap::{AUTO_WEIGHTS, cap_gain};
 
 const Q: u64 = 110;
 
 // ---------------------------------------------------------------------------
-// Cap-height functions (the DP takes the active cap policy as a parameter).
+// Cap-height functions for the permutation objective.
 // ---------------------------------------------------------------------------
+
+/// A cap-height function that caps nothing.
+fn no_cap(_depth: u32) -> u32 {
+    0
+}
 
 /// The cap rule FRI.md §2.2's table was computed with (PLAN §4):
 /// `c = argmax_{0 ≤ c ≤ depth} (Q·c − (2^c − 1))`, ties to the smaller `c`.
@@ -26,53 +45,49 @@ fn cap_design_model(depth: u32) -> u32 {
     best_c
 }
 
-/// CAP.md §2 `AUTO_WEIGHTS` (ns): compress, select, unpack, hint, compare.
-const AUTO_WEIGHTS: (i64, i64, i64, i64, i64) = (2251, 567, 528, 460, 3789);
-
-/// CAP.md §2 `CapPolicy::Auto.height(openings, depth)`, the policy adopted by
-/// RULINGS.md 1. Implemented locally because the cap primitive commit (lane
-/// I-CAP-S) is not yet on this branch; on rebase this becomes a call to
-/// `CapPolicy::Auto.height` and `cap_auto_heights_match_cap_md` pins that the
-/// two agree.
-fn cap_auto_height(openings: u64, depth: u32) -> u32 {
-    let (wc, ws, wu, wh, wq) = AUTO_WEIGHTS;
-    let o = openings as i64;
-    let gain = |c: u32| -> i64 {
-        if c == 0 {
-            return 0;
-        }
-        let p = 1i64 << c;
-        o * (i64::from(c) * (wc + ws) - (p - 1) * ws - wu) - ((p - 1) * wc + p * wh + wq)
-    };
-    let (mut best, mut best_c) = (0i64, 0u32);
-    for c in 0..=depth.min(16) {
-        let g = gain(c);
-        if g > best {
-            (best, best_c) = (g, c);
-        }
-    }
-    best_c
-}
-
-/// Every FRI tree is opened once per query, so the FRI cap function is
-/// `Auto.height(Q, ·)`.
+/// The adopted policy (RULINGS 1): every FRI tree is opened once per query.
 fn cap_auto(depth: u32) -> u32 {
-    cap_auto_height(Q, depth)
+    CapPolicy::Auto.height(Q as usize, depth as usize) as u32
 }
 
 #[test]
 fn cap_auto_heights_match_cap_md() {
     // CAP.md §11 "CapPolicy pins", at a depth large enough not to clamp.
     for (openings, want) in [(1, 0), (3, 0), (4, 2), (19, 2), (20, 3), (110, 3), (224, 3)] {
-        assert_eq!(cap_auto_height(openings, 20), want, "openings {openings}");
+        assert_eq!(
+            CapPolicy::Auto.height(openings, 20),
+            want,
+            "openings {openings}"
+        );
     }
     // Clamped to depth.
     for depth in 0..8 {
-        assert_eq!(cap_auto_height(110, depth), depth.min(3), "depth {depth}");
+        assert_eq!(cap_auto(depth), depth.min(3), "depth {depth}");
     }
     // The design model's rule reaches 7 at Q = 110 (FRI.md §2.2 used it).
     assert_eq!(cap_design_model(20), 7);
     assert_eq!(cap_design_model(5), 5);
+}
+
+/// FRI.md §2.1's per-layer cost, `Q ×` permutations: `Q·leaf(d) + Q·(depth −
+/// c) + 2^c − 1`.
+fn perm_layer_q(d: u32, depth: u32, q: u64, cap: &dyn Fn(u32) -> u32) -> u64 {
+    let c = cap(depth).min(depth);
+    q * fri_leaf_blocks(d) + q * u64::from(depth - c) + (1u64 << c) - 1
+}
+
+fn perm_schedule(
+    b0: u32,
+    t: u32,
+    cap: &dyn Fn(u32) -> u32,
+) -> crate::fri::schedule::FriScheduleChoice {
+    fri_schedule_by(b0, t, FRI_SCHEDULE_DMAX, &|d, depth| {
+        perm_layer_q(d, depth, Q, cap)
+    })
+}
+
+fn perm_cost(b0: u32, schedule: &[u8], cap: &dyn Fn(u32) -> u32) -> Option<u64> {
+    fri_schedule_cost_by(b0, schedule, &|d, depth| perm_layer_q(d, depth, Q, cap))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,30 +95,78 @@ fn cap_auto_heights_match_cap_md() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn leaf_blocks_and_path_cost() {
+fn leaf_blocks() {
     // ⌈3·2^d / 8⌉, at least 1.
     let want = [1u64, 1, 2, 3, 6, 12, 24];
     for (d, w) in want.iter().enumerate() {
         assert_eq!(fri_leaf_blocks(d as u32), *w, "d = {d}");
     }
-    assert_eq!(fri_path_cost_q(9, Q, &no_cap), 990);
-    // depth 9, c = 7: Q·2 + 127.
-    assert_eq!(fri_path_cost_q(9, Q, &cap_design_model), 347);
-    // A policy asking for more than the tree has is clamped to the depth.
-    assert_eq!(fri_path_cost_q(2, Q, &|_| 40), 3);
-    assert_eq!(fri_path_cost_q(0, Q, &|_| 40), 0);
+}
+
+/// The objective's weights are a format constant (RULINGS 13): the cap
+/// policy's weights plus the in-guest fold and twiddle rows.
+#[test]
+fn cost_weights_are_pinned() {
+    assert_eq!(FRI_COST_WEIGHTS.cap, AUTO_WEIGHTS);
+    assert_eq!(
+        (
+            FRI_COST_WEIGHTS.cap.compress,
+            FRI_COST_WEIGHTS.cap.select,
+            FRI_COST_WEIGHTS.cap.unpack,
+            FRI_COST_WEIGHTS.cap.hint,
+            FRI_COST_WEIGHTS.cap.compare
+        ),
+        (2251, 567, 528, 460, 3789)
+    );
+    assert_eq!(
+        (FRI_FOLD_XALU_ROWS, XALU_ROW_NS, BALU_ROW_NS),
+        (5, 522, 477)
+    );
+    assert_eq!(
+        (FRI_COST_WEIGHTS.fold, FRI_COST_WEIGHTS.twiddle),
+        (2610, 477)
+    );
+    // The node cost law, 421 ns/instruction + 5.63 ns/cell, at the committed
+    // widths (XALU 18, BALU 10 cells), rounded to the nearest ns.
+    assert_eq!(((421.0f64 + 5.63 * 18.0).round()) as u64, XALU_ROW_NS);
+    assert_eq!(((421.0f64 + 5.63 * 10.0).round()) as u64, BALU_ROW_NS);
+}
+
+/// One layer's cost written out by hand.
+#[test]
+fn layer_cost_by_hand() {
+    // d = 3, depth 10, no cap: leaf 3·2251 + 10·(2251+567) + 7·(567+2610) + 3·477.
+    let per_query = 3 * 2251 + 10 * (2251 + 567) + 7 * (567 + 2610) + 3 * 477;
+    assert_eq!(
+        fri_layer_cost_q(&FRI_COST_WEIGHTS, 3, 10, Q, CapPolicy::Off),
+        Q * per_query
+    );
+    // Auto cap at Q = 110 is c = 3 on a 10-deep tree: minus its gain.
+    let gain = cap_gain(&AUTO_WEIGHTS, 110, 3);
+    assert!(gain > 0);
+    assert_eq!(
+        fri_layer_cost_q(&FRI_COST_WEIGHTS, 3, 10, Q, CapPolicy::Auto),
+        Q * per_query - gain as u64
+    );
+    // The legacy layer (d = 1) prices one leaf block, one select, one fold,
+    // one twiddle.
+    assert_eq!(
+        fri_layer_cost_q(&FRI_COST_WEIGHTS, 1, 0, 1, CapPolicy::Off),
+        2251 + 567 + 2610 + 477
+    );
 }
 
 #[test]
 fn schedule_cost_rejects_malformed_schedules() {
-    assert_eq!(fri_schedule_cost_q(10, &[], Q, &no_cap), Some(0));
-    assert_eq!(fri_schedule_cost_q(10, &[0, 1], Q, &no_cap), None);
-    assert_eq!(fri_schedule_cost_q(3, &[2, 2], Q, &no_cap), None);
-    assert!(fri_schedule_cost_q(4, &[2, 2], Q, &no_cap).is_some());
+    let cap = CapPolicy::Off;
+    assert_eq!(fri_schedule_cost_q(10, &[], Q, cap), Some(0));
+    assert_eq!(fri_schedule_cost_q(10, &[0, 1], Q, cap), None);
+    assert_eq!(fri_schedule_cost_q(3, &[2, 2], Q, cap), None);
+    assert!(fri_schedule_cost_q(4, &[2, 2], Q, cap).is_some());
 }
 
 // ---------------------------------------------------------------------------
-// U1: the §2.2 table, pinned. The schedule is a format constant.
+// The design model (permutation objective): the FRI.md §2.2 table, reproduced.
 // ---------------------------------------------------------------------------
 
 /// (B, today, S3 from B−1, S2+S3 from B); each entry = (cost·Q, schedule).
@@ -522,30 +585,22 @@ fn check_pin(name: &str, terminal_log: u32, cap: &dyn Fn(u32) -> u32, rows: &[Ro
         // today: the all-ones chain from B − 1 (no committed layer when B − 1 ≤ T).
         let b0 = fri_chain_start(b, false);
         assert_eq!(legacy_fri_schedule(b0, terminal_log), today, "{ctx} today");
-        assert_eq!(
-            fri_schedule_cost_q(b0, today, Q, cap),
-            Some(today_q),
-            "{ctx} today cost"
-        );
+        assert_eq!(perm_cost(b0, today, cap), Some(today_q), "{ctx} today cost");
         // S3: the DP from B − 1.
-        let got = fri_schedule_with_cost(b0, terminal_log, Q, cap, FRI_SCHEDULE_DMAX);
+        let got = perm_schedule(b0, terminal_log, cap);
         assert_eq!(got.schedule, s3, "{ctx} S3 schedule");
         assert_eq!(got.cost_q, s3_q, "{ctx} S3 cost");
         assert_eq!(got.trees as usize, s3.len(), "{ctx} S3 trees");
         // S2+S3: the DP from B (the DEEP codeword is committed).
         let b0 = fri_chain_start(b, true);
-        let got = fri_schedule_with_cost(b0, terminal_log, Q, cap, FRI_SCHEDULE_DMAX);
+        let got = perm_schedule(b0, terminal_log, cap);
         assert_eq!(got.schedule, s2, "{ctx} S2+S3 schedule");
         assert_eq!(got.cost_q, s2_q, "{ctx} S2+S3 cost");
-        assert_eq!(
-            fri_schedule(b0, terminal_log, Q, cap, FRI_SCHEDULE_DMAX),
-            s2
-        );
     }
 }
 
 #[test]
-fn schedule_pinned_table() {
+fn design_model_reproduces_the_fri_md_table() {
     check_pin("T9 cap off", 9, &no_cap, PIN_T9_CAP_OFF);
     check_pin("T10 cap off", 10, &no_cap, PIN_T10_CAP_OFF);
     check_pin("T9 cap model", 9, &cap_design_model, PIN_T9_CAP_MODEL);
@@ -554,63 +609,246 @@ fn schedule_pinned_table() {
     check_pin("T10 cap auto", 10, &cap_auto, PIN_T10_CAP_AUTO);
 }
 
-/// Spot checks tying the pins to the printed FRI.md §2.2 table (costs there are
-/// per query, i.e. cost·Q / 110, rounded to two decimals).
+/// Spot checks tying the design-model pins to the printed FRI.md §2.2 table
+/// (costs there are per query, i.e. cost·Q / 110, rounded to two decimals).
 #[test]
-fn schedule_pins_match_fri_md_table() {
+fn design_model_pins_match_fri_md_table() {
     let per_query = |cost_q: u64| (cost_q as f64 / Q as f64 * 100.0).round() / 100.0;
-    let s3 = |b0: u32, t: u32, cap: &dyn Fn(u32) -> u32| {
-        fri_schedule_with_cost(b0, t, Q, cap, FRI_SCHEDULE_DMAX)
-    };
-    // Base legs, T = 9, B = 21.
     let today = legacy_fri_schedule(20, 9);
+    assert_eq!(per_query(perm_cost(20, &today, &no_cap).unwrap()), 165.0);
     assert_eq!(
-        per_query(fri_schedule_cost_q(20, &today, Q, &no_cap).unwrap()),
-        165.0
-    );
-    assert_eq!(
-        per_query(fri_schedule_cost_q(20, &today, Q, &cap_design_model).unwrap()),
+        per_query(perm_cost(20, &today, &cap_design_model).unwrap()),
         100.70
     );
-    let c = s3(20, 9, &no_cap);
+    let c = perm_schedule(20, 9, &no_cap);
     assert_eq!((per_query(c.cost_q), c.schedule), (52.0, vec![4, 4, 3]));
-    let c = s3(20, 9, &cap_design_model);
+    let c = perm_schedule(20, 9, &cap_design_model);
     assert_eq!((per_query(c.cost_q), c.schedule), (34.46, vec![4, 4, 3]));
-    let c = s3(21, 9, &cap_design_model);
+    let c = perm_schedule(21, 9, &cap_design_model);
     assert_eq!((per_query(c.cost_q), c.schedule), (39.46, vec![4, 4, 4]));
-    // B = 19, T = 9: the schedule depends on the cap policy (FRI.md §12.2).
-    assert_eq!(s3(18, 9, &no_cap).schedule, vec![5, 4]);
-    assert_eq!(s3(18, 9, &cap_design_model).schedule, vec![3, 3, 3]);
-    // LFM proofs, T = 10: S3+cap at B = 21 is [4,3,3] 33.46, at B = 22 [4,4,3] 37.46.
-    let c = s3(20, 10, &cap_design_model);
+    assert_eq!(perm_schedule(18, 9, &no_cap).schedule, vec![5, 4]);
+    assert_eq!(
+        perm_schedule(18, 9, &cap_design_model).schedule,
+        vec![3, 3, 3]
+    );
+    let c = perm_schedule(20, 10, &cap_design_model);
     assert_eq!((per_query(c.cost_q), c.schedule), (33.46, vec![4, 3, 3]));
-    let c = s3(21, 10, &cap_design_model);
+    let c = perm_schedule(21, 10, &cap_design_model);
     assert_eq!((per_query(c.cost_q), c.schedule), (37.46, vec![4, 4, 3]));
 }
 
 // ---------------------------------------------------------------------------
-// U2: brute-force optimality for b₀ ≤ 16.
+// U1: the PRODUCTION schedules (cost-law objective), pinned from the Rust DP.
+// The schedule is a format constant: a change here is a format change.
 // ---------------------------------------------------------------------------
 
-/// Independent oracle for one layer's cost (FRI.md §2.1, written out again).
-fn oracle_layer_q(d: u32, depth: u32, q: u64, cap: &dyn Fn(u32) -> u32) -> u64 {
-    let leaf = (3u64 << d).div_ceil(8);
-    let c = cap(depth).min(depth);
-    q * leaf.max(1) + q * u64::from(depth - c) + (1u64 << c) - 1
+/// (B, S3 schedule from B − 1, S2+S3 schedule from B) for B = 6..=24.
+type CostRow = (u32, &'static [u8], &'static [u8]);
+
+/// Generated by `print_cost_law_schedule_table` (below, `--ignored`) from the
+/// Rust DP at the commit that introduced the cost-law objective. Independent
+/// cross-check: design/REVIEW-FRI.md F2's cost-law column (its own model,
+/// ASSUMED widths, cap = ruling 1) gives [2,2] / [3,3,3] / [3,3,3,2] /
+/// [3,3,3,3,2] at B = 14 / 19 / 21 / 24, T = 9 — exactly the Auto rows here.
+const PIN_COST_T9_CAP_OFF: &[CostRow] = &[
+    (6, &[], &[]),
+    (7, &[], &[]),
+    (8, &[], &[]),
+    (9, &[], &[]),
+    (10, &[], &[1]),
+    (11, &[1], &[2]),
+    (12, &[2], &[3]),
+    (13, &[3], &[2, 2]),
+    (14, &[2, 2], &[3, 2]),
+    (15, &[3, 2], &[3, 3]),
+    (16, &[3, 3], &[4, 3]),
+    (17, &[4, 3], &[3, 3, 2]),
+    (18, &[3, 3, 2], &[3, 3, 3]),
+    (19, &[3, 3, 3], &[4, 3, 3]),
+    (20, &[4, 3, 3], &[3, 3, 3, 2]),
+    (21, &[3, 3, 3, 2], &[3, 3, 3, 3]),
+    (22, &[3, 3, 3, 3], &[4, 3, 3, 3]),
+    (23, &[4, 3, 3, 3], &[3, 3, 3, 3, 2]),
+    (24, &[3, 3, 3, 3, 2], &[3, 3, 3, 3, 3]),
+];
+const PIN_COST_T10_CAP_OFF: &[CostRow] = &[
+    (6, &[], &[]),
+    (7, &[], &[]),
+    (8, &[], &[]),
+    (9, &[], &[]),
+    (10, &[], &[]),
+    (11, &[], &[1]),
+    (12, &[1], &[2]),
+    (13, &[2], &[3]),
+    (14, &[3], &[4]),
+    (15, &[4], &[3, 2]),
+    (16, &[3, 2], &[3, 3]),
+    (17, &[3, 3], &[4, 3]),
+    (18, &[4, 3], &[3, 3, 2]),
+    (19, &[3, 3, 2], &[3, 3, 3]),
+    (20, &[3, 3, 3], &[4, 3, 3]),
+    (21, &[4, 3, 3], &[3, 3, 3, 2]),
+    (22, &[3, 3, 3, 2], &[3, 3, 3, 3]),
+    (23, &[3, 3, 3, 3], &[4, 3, 3, 3]),
+    (24, &[4, 3, 3, 3], &[3, 3, 3, 3, 2]),
+];
+const PIN_COST_T9_CAP_AUTO: &[CostRow] = &[
+    (6, &[], &[]),
+    (7, &[], &[]),
+    (8, &[], &[]),
+    (9, &[], &[]),
+    (10, &[], &[1]),
+    (11, &[1], &[2]),
+    (12, &[2], &[3]),
+    (13, &[3], &[2, 2]),
+    (14, &[2, 2], &[3, 2]),
+    (15, &[3, 2], &[3, 3]),
+    (16, &[3, 3], &[3, 2, 2]),
+    (17, &[3, 2, 2], &[3, 3, 2]),
+    (18, &[3, 3, 2], &[3, 3, 3]),
+    (19, &[3, 3, 3], &[3, 3, 2, 2]),
+    (20, &[3, 3, 2, 2], &[3, 3, 3, 2]),
+    (21, &[3, 3, 3, 2], &[3, 3, 3, 3]),
+    (22, &[3, 3, 3, 3], &[4, 3, 3, 3]),
+    (23, &[4, 3, 3, 3], &[3, 3, 3, 3, 2]),
+    (24, &[3, 3, 3, 3, 2], &[3, 3, 3, 3, 3]),
+];
+const PIN_COST_T10_CAP_AUTO: &[CostRow] = &[
+    (6, &[], &[]),
+    (7, &[], &[]),
+    (8, &[], &[]),
+    (9, &[], &[]),
+    (10, &[], &[]),
+    (11, &[], &[1]),
+    (12, &[1], &[2]),
+    (13, &[2], &[3]),
+    (14, &[3], &[2, 2]),
+    (15, &[2, 2], &[3, 2]),
+    (16, &[3, 2], &[3, 3]),
+    (17, &[3, 3], &[3, 2, 2]),
+    (18, &[3, 2, 2], &[3, 3, 2]),
+    (19, &[3, 3, 2], &[3, 3, 3]),
+    (20, &[3, 3, 3], &[4, 3, 3]),
+    (21, &[4, 3, 3], &[3, 3, 3, 2]),
+    (22, &[3, 3, 3, 2], &[3, 3, 3, 3]),
+    (23, &[3, 3, 3, 3], &[4, 3, 3, 3]),
+    (24, &[4, 3, 3, 3], &[3, 3, 3, 3, 2]),
+];
+
+fn check_cost_pin(name: &str, terminal_log: u32, cap: CapPolicy, rows: &[CostRow]) {
+    assert_eq!(rows.len(), 19, "{name}: B = 6..=24");
+    for &(b, s3, s2) in rows {
+        let ctx = format!("{name} B={b}");
+        let got = fri_schedule(
+            fri_chain_start(b, false),
+            terminal_log,
+            Q,
+            cap,
+            FRI_SCHEDULE_DMAX,
+        );
+        assert_eq!(got, s3, "{ctx} S3");
+        let got = fri_schedule(
+            fri_chain_start(b, true),
+            terminal_log,
+            Q,
+            cap,
+            FRI_SCHEDULE_DMAX,
+        );
+        assert_eq!(got, s2, "{ctx} S2+S3");
+    }
+}
+
+#[test]
+fn schedule_pinned_table() {
+    check_cost_pin("T9 cap off", 9, CapPolicy::Off, PIN_COST_T9_CAP_OFF);
+    check_cost_pin("T10 cap off", 10, CapPolicy::Off, PIN_COST_T10_CAP_OFF);
+    check_cost_pin("T9 cap auto", 9, CapPolicy::Auto, PIN_COST_T9_CAP_AUTO);
+    check_cost_pin("T10 cap auto", 10, CapPolicy::Auto, PIN_COST_T10_CAP_AUTO);
+}
+
+/// Prints the U1 table in the `fri_schedule_cost_pins.rs` format. Run with
+/// `-- --ignored --nocapture` to regenerate after a DELIBERATE objective change.
+#[test]
+#[ignore = "generator for fri_schedule_cost_pins.rs"]
+fn print_cost_law_schedule_table() {
+    for (name, t, cap) in [
+        ("T9_CAP_OFF", 9, CapPolicy::Off),
+        ("T10_CAP_OFF", 10, CapPolicy::Off),
+        ("T9_CAP_AUTO", 9, CapPolicy::Auto),
+        ("T10_CAP_AUTO", 10, CapPolicy::Auto),
+    ] {
+        println!("const PIN_COST_{name}_DATA: [CostRow; 19] = [");
+        for b in 6..=24u32 {
+            let s3 = fri_schedule(fri_chain_start(b, false), t, Q, cap, FRI_SCHEDULE_DMAX);
+            let s2 = fri_schedule(fri_chain_start(b, true), t, Q, cap, FRI_SCHEDULE_DMAX);
+            println!("    ({b}, &{s3:?}, &{s2:?}),");
+        }
+        println!("];");
+    }
+}
+
+/// B = 21, T = 9, no cap, S3: every candidate schedule's cost by hand, so the
+/// pinned optimum is shown to be one, not merely reproduced.
+#[test]
+fn cost_law_b21_by_hand() {
+    let layer = |d: u64, depth: u64| -> u64 {
+        let leaf = (3u64 << d).div_ceil(8).max(1);
+        let g = (1u64 << d) - 1;
+        Q * (leaf * 2251 + depth * (2251 + 567) + g * (567 + 2610) + d * 477)
+    };
+    let cost = |sched: &[u64]| {
+        let mut b = 20u64;
+        sched
+            .iter()
+            .map(|&d| {
+                b -= d;
+                layer(d, b)
+            })
+            .sum::<u64>()
+    };
+    let got = fri_schedule_with_cost(20, 9, Q, CapPolicy::Off, FRI_SCHEDULE_DMAX);
+    let as_u64: Vec<u64> = got.schedule.iter().map(|&d| u64::from(d)).collect();
+    assert_eq!(got.cost_q, cost(&as_u64));
+    // It beats the permutation objective's choice and today's.
+    assert!(got.cost_q <= cost(&[4, 4, 3]));
+    assert!(got.cost_q < cost(&[1; 11]));
+}
+
+// ---------------------------------------------------------------------------
+// U2: brute-force optimality for b₀ ≤ 16, under the production objective.
+// ---------------------------------------------------------------------------
+
+/// Independent oracle for one layer's cost-law price (the module docs'
+/// formula, written out again with the cap's gain recomputed from its terms).
+fn oracle_layer_q(d: u32, depth: u32, q: u64, cap: CapPolicy) -> u64 {
+    let (wc, ws, wu, wh, wq) = (2251i128, 567i128, 528i128, 460i128, 3789i128);
+    let (fold, tw) = (2610i128, 477i128);
+    let leaf = i128::from((3u64 << d).div_ceil(8).max(1) as u32);
+    let g = (1i128 << d) - 1;
+    let per_query =
+        leaf * wc + i128::from(depth) * (wc + ws) + g * (ws + fold) + i128::from(d) * tw;
+    let c = cap.height(q as usize, depth as usize) as i128;
+    let gain = if c == 0 {
+        0
+    } else {
+        let n = 1i128 << c;
+        q as i128 * (c * (wc + ws) - (n - 1) * ws - wu) - ((n - 1) * wc + n * wh + wq)
+    };
+    (q as i128 * per_query - gain) as u64
 }
 
 /// Every composition of `b0 − t` into parts in `1..=dmax`, with its cost;
 /// returns the minimum under (cost, trees, schedule) lexicographic order.
-fn brute_force(b0: u32, t: u32, q: u64, cap: &dyn Fn(u32) -> u32, dmax: u32) -> (u64, Vec<u8>) {
-    struct Search<'a> {
+fn brute_force(b0: u32, t: u32, q: u64, cap: CapPolicy, dmax: u32) -> (u64, Vec<u8>) {
+    struct Search {
         t: u32,
         q: u64,
-        cap: &'a dyn Fn(u32) -> u32,
+        cap: CapPolicy,
         dmax: u32,
         prefix: Vec<u8>,
         best: Option<(u64, usize, Vec<u8>)>,
     }
-    impl Search<'_> {
+    impl Search {
         fn walk(&mut self, b: u32, cost: u64) {
             if b == self.t {
                 let cand = (cost, self.prefix.len(), self.prefix.clone());
@@ -642,22 +880,21 @@ fn brute_force(b0: u32, t: u32, q: u64, cap: &dyn Fn(u32) -> u32, dmax: u32) -> 
 
 #[test]
 fn dp_is_optimal() {
-    let depth_mod_3 = |depth: u32| depth % 3; // an arbitrary, non-monotone policy
-    let caps: [(&str, &dyn Fn(u32) -> u32); 4] = [
-        ("off", &no_cap),
-        ("model", &cap_design_model),
-        ("auto", &cap_auto),
-        ("depth%3", &depth_mod_3),
+    let caps = [
+        CapPolicy::Off,
+        CapPolicy::Auto,
+        CapPolicy::Fixed(2),
+        CapPolicy::Fixed(5),
     ];
     let mut checked = 0u32;
-    for (cap_name, cap) in caps {
+    for cap in caps {
         for q in [1u64, 3, 110] {
             for dmax in [1u32, 2, 3, FRI_SCHEDULE_DMAX] {
                 for b0 in 0..=16u32 {
                     for t in 0..=b0 {
                         let got = fri_schedule_with_cost(b0, t, q, cap, dmax);
                         let (cost, sched) = brute_force(b0, t, q, cap, dmax);
-                        let ctx = format!("cap={cap_name} q={q} dmax={dmax} b0={b0} t={t}");
+                        let ctx = format!("cap={cap:?} q={q} dmax={dmax} b0={b0} t={t}");
                         assert_eq!(got.cost_q, cost, "{ctx}: cost");
                         // The tie rule makes the optimum unique: the smallest
                         // (trees, schedule) among the cost-optimal ones.
@@ -692,7 +929,7 @@ fn dp_is_optimal() {
 fn dmax_one_is_the_legacy_schedule() {
     for b0 in 0..=30u32 {
         for t in 0..=31u32 {
-            for cap in [&no_cap as &dyn Fn(u32) -> u32, &cap_auto, &cap_design_model] {
+            for cap in [CapPolicy::Off, CapPolicy::Auto] {
                 assert_eq!(fri_schedule(b0, t, Q, cap, 1), legacy_fri_schedule(b0, t));
                 // dmax = 0 is treated as 1.
                 assert_eq!(fri_schedule(b0, t, Q, cap, 0), legacy_fri_schedule(b0, t));
@@ -719,16 +956,26 @@ fn old_layout(lde_log: u32, blowup_log: u32, k: u32) -> (u32, usize, usize, u32)
     )
 }
 
+fn dp_format(cap: CapPolicy) -> FriFormat {
+    FriFormat {
+        mode: FriMode::Dp,
+        one_row: false,
+        num_queries: Q,
+        cap,
+        schedule_override: None,
+    }
+}
+
 #[test]
 fn legacy_layout_equals_old_layout() {
-    let dp_formats: Vec<FriFormat<'static>> = [false, true]
+    // one_row = true is exercised through the schedule arithmetic only (the
+    // layout is still well defined); the prover refuses it (S2 not built).
+    let dp_formats: Vec<FriFormat> = [false, true]
         .into_iter()
         .flat_map(|one_row| {
-            [&no_cap as &'static dyn Fn(u32) -> u32, &cap_auto].map(|cap_height| FriFormat {
-                mode: FriMode::Dp,
+            [CapPolicy::Off, CapPolicy::Auto].map(|cap| FriFormat {
                 one_row,
-                num_queries: Q,
-                cap_height,
+                ..dp_format(cap)
             })
         })
         .collect();
@@ -747,18 +994,20 @@ fn legacy_layout_equals_old_layout() {
                 assert_eq!(new.effective_k, effective_k, "{ctx}");
                 assert_eq!(new.schedule, vec![1u8; num_committed], "{ctx}");
                 assert!(!new.one_row, "{ctx}");
+                assert!(new.is_legacy(), "{ctx}");
+                assert_eq!(new.opened_values_per_query(), num_committed, "{ctx}");
 
-                // Pair mode ignores the query count and the cap policy.
-                for cap_height in [&no_cap as &dyn Fn(u32) -> u32, &cap_auto] {
+                // Pair mode ignores the query count, the cap policy and any
+                // schedule override.
+                for cap in [CapPolicy::Off, CapPolicy::Auto] {
                     let pair = FriFormat {
                         mode: FriMode::Pair,
-                        one_row: false,
-                        num_queries: Q,
-                        cap_height,
+                        schedule_override: FriScheduleOverride::new(&[3, 1]),
+                        ..dp_format(cap)
                     };
                     assert_eq!(
                         FriFoldLayout::for_format(lde_log, blowup_log, k, &pair),
-                        new,
+                        Some(new.clone()),
                         "{ctx}"
                     );
                 }
@@ -774,13 +1023,19 @@ fn legacy_layout_equals_old_layout() {
                     "{ctx}"
                 );
 
-                // Any format moves only the split of the folds into committed layers.
+                // Any format moves only the split of the folds into committed
+                // layers (and, off the legacy format, the encoding).
                 for fmt in &dp_formats {
-                    let l = FriFoldLayout::for_format(lde_log, blowup_log, k, fmt);
+                    let l = FriFoldLayout::for_format(lde_log, blowup_log, k, fmt)
+                        .expect("the DP lands on the terminal");
                     assert_eq!(
                         (l.total_folds, l.terminal_len, l.effective_k, l.one_row),
                         (total_folds, terminal_len, effective_k, fmt.one_row),
                         "{ctx} {fmt:?}"
+                    );
+                    assert!(
+                        !l.is_legacy(),
+                        "{ctx} {fmt:?}: Dp is never the legacy encoding"
                     );
                     assert_eq!(l.num_committed, l.schedule.len(), "{ctx} {fmt:?}");
                     let covered: u32 = l.schedule.iter().map(|&d| u32::from(d)).sum();
@@ -791,16 +1046,18 @@ fn legacy_layout_equals_old_layout() {
                     };
                     assert_eq!(covered, expected, "{ctx} {fmt:?}");
                     assert_eq!(
-                        FriFoldLayout::from_schedule(
-                            lde_log,
-                            blowup_log,
-                            k,
-                            fmt.one_row,
-                            l.schedule.clone()
-                        ),
-                        Some(l),
+                        l.opened_values_per_query(),
+                        l.schedule.iter().map(|&d| 1usize << d).sum::<usize>(),
                         "{ctx} {fmt:?}"
                     );
+                    for j in 0..l.num_committed {
+                        let d = u32::from(l.schedule[j]);
+                        assert_eq!(
+                            l.layer_depth(lde_log, j) + d,
+                            l.layer_log_len(lde_log, j),
+                            "{ctx} {fmt:?} layer {j}"
+                        );
+                    }
                 }
                 checked += 1;
             }
@@ -828,4 +1085,89 @@ fn from_schedule_rejects_a_schedule_that_does_not_cover_the_folds() {
     assert!(FriFoldLayout::from_schedule(10, 2, 7, false, vec![]).is_some());
     assert!(FriFoldLayout::from_schedule(10, 2, 7, false, vec![1]).is_none());
     assert!(FriFoldLayout::from_schedule(10, 2, 7, true, vec![1]).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// The layout from `ProofOptions` (what the prover and verifier build).
+// ---------------------------------------------------------------------------
+
+fn options_with(format: ProofFormat) -> ProofOptions {
+    ProofOptions {
+        format,
+        ..ProofOptions::default_test_options()
+    }
+}
+
+#[test]
+fn layout_from_options() {
+    // Default format: today's layout.
+    let o = options_with(ProofFormat::DEFAULT);
+    let k = u32::from(o.fri_final_poly_log_degree);
+    assert_eq!(
+        FriFoldLayout::for_options(20, 1, &o),
+        Ok(FriFoldLayout::new(20, 1, k))
+    );
+    // Dp: the DP's schedule under the options' query count and cap.
+    let o = options_with(ProofFormat {
+        fri_mode: FriMode::Dp,
+        ..ProofFormat::DEFAULT
+    });
+    let l = FriFoldLayout::for_options(20, 1, &o).unwrap();
+    let t = (1 + k).min(20);
+    assert_eq!(
+        l.schedule,
+        fri_schedule(
+            19,
+            t,
+            o.fri_number_of_queries as u64,
+            CapPolicy::Off,
+            FRI_SCHEDULE_DMAX
+        )
+    );
+    assert!(!l.is_legacy());
+    // An override that fits is taken verbatim; one that does not is an error.
+    let span = 19 - t;
+    let mut fit = vec![1u8; span as usize - 3];
+    fit.insert(0, 3);
+    let o = options_with(ProofFormat {
+        fri_mode: FriMode::Dp,
+        fri_schedule_override: FriScheduleOverride::new(&fit),
+        ..ProofFormat::DEFAULT
+    });
+    assert_eq!(FriFoldLayout::for_options(20, 1, &o).unwrap().schedule, fit);
+    let o = options_with(ProofFormat {
+        fri_mode: FriMode::Dp,
+        fri_schedule_override: FriScheduleOverride::new(&[3, 1]),
+        ..ProofFormat::DEFAULT
+    });
+    assert_eq!(
+        FriFoldLayout::for_options(20, 1, &o),
+        Err(FriFormatError::ScheduleOverrideMismatch)
+    );
+    // An all-ones override under Dp keeps the GROUP encoding.
+    let o = options_with(ProofFormat {
+        fri_mode: FriMode::Dp,
+        fri_schedule_override: FriScheduleOverride::new(&vec![1u8; span as usize]),
+        ..ProofFormat::DEFAULT
+    });
+    let l = FriFoldLayout::for_options(20, 1, &o).unwrap();
+    assert_eq!(l.schedule, vec![1u8; span as usize]);
+    assert!(!l.is_legacy());
+    // One-row is refused until S2 exists.
+    for one_row in [OneRowMode::On, OneRowMode::Auto] {
+        let o = options_with(ProofFormat {
+            one_row,
+            ..ProofFormat::DEFAULT
+        });
+        assert_eq!(
+            FriFoldLayout::for_options(20, 1, &o),
+            Err(FriFormatError::OneRowNotImplemented)
+        );
+    }
+    // An override longer than the fixed capacity is refused at construction.
+    assert!(FriScheduleOverride::new(&[1u8; 33]).is_none());
+    assert_eq!(
+        FriScheduleOverride::new(&[2, 1]).unwrap().as_slice(),
+        &[2, 1]
+    );
 }

@@ -8,29 +8,43 @@
 //!
 //! The schedule is a **format constant**: the prover, the verifier and the
 //! in-guest verifier must derive the same one from public shape parameters
-//! only, never from a proof. So the dynamic program below is integer-only
-//! (`u64`), with a fixed tie rule, and its inputs are all public:
+//! only, never from a proof. So the dynamic program below is integer-only,
+//! with a fixed tie rule, and its inputs are all public:
 //!
 //! * `b0` — log2 length of the first committed layer (`lde_log − 1` when fold 0
 //!   is the uncommitted binary fold of the trace pair, `lde_log` when the DEEP
 //!   codeword itself is committed);
 //! * `terminal_log` — log2 length of the terminal codeword;
-//! * `num_queries` — FRI query count;
-//! * the cap-height function `depth ↦ c` of the active Merkle-cap policy (the
-//!   caller closes over the opening count; `c ≡ 0` when caps are off);
+//! * `num_queries` — FRI query count (every FRI tree is opened once per query);
+//! * the active Merkle-cap policy ([`CapPolicy`]; `Off` caps nothing);
 //! * `dmax` — the largest fold exponent the program may choose.
 //!
-//! Cost model (per query, in units of `1/num_queries` of an in-guest hash
-//! permutation, so every term is an integer): a layer of fold exponent `d`
-//! whose tree has `depth` levels costs
+//! # The objective (RULINGS 13): the cost law, not permutations
+//!
+//! The DP minimises the in-guest verifier's price of the FRI leg under the
+//! SAME cost-law weights the cap policy optimises ([`AUTO_WEIGHTS`], ns per
+//! row from the node law 421 ns/instruction + 5.63 ns/cell and each chip's
+//! committed width), per query per committed layer:
 //!
 //! ```text
-//! Q·leaf(d) + Q·(depth − c) + (2^c − 1),   leaf(d) = max(1, ⌈3·2^d / 8⌉),   c = cap(depth)
+//! leaf(d)·compress                        absorb the 2^d-value group leaf
+//! + depth·(compress + select)             the authentication walk (a Select and a compression per level)
+//! + (2^d − 1)·select                      the slot mux picking the query's value out of the group
+//! + (2^d − 1)·fold                        the group fold: 2^d − 1 binary folds
+//! + d·twiddle                             the twiddle chain: one base mul per fold level
+//! − cap_gain(Q, c(depth)) / Q             what the tree's cap saves, per query (0 without a cap)
 //! ```
 //!
-//! i.e. the leaf absorption of `2^d` cubic-extension values at an 8-felt rate,
-//! the authentication walk down to the cap, and the cap-to-root reduction
-//! amortised over the `Q` queries.
+//! `leaf(d) = max(1, ⌈3·2^d / 8⌉)` (an ext3 group at the RPX rate of 8 felts).
+//! The per-operation row counts are the in-guest emitter's
+//! (`prover/src/lfm/edsl.rs::fri_fold` = 5 `XALU` rows, a `Select` = 1
+//! `SELECT` row, a base `mul` = 1 `BALU` row) — the in-guest lane pins
+//! "emitted rows == these rows" against its emitter. Costs are kept in units of
+//! `1/Q` ns so every term is an integer.
+
+use crypto::merkle_tree::cap::{AUTO_WEIGHTS, CapPolicy, CapWeights, cap_gain};
+
+use crate::proof::options::{FriMode, FriScheduleOverride, OneRowMode, ProofOptions};
 
 /// Largest fold exponent the schedule may choose (a 64-value group leaf).
 pub const FRI_SCHEDULE_DMAX: u32 = 6;
@@ -42,31 +56,45 @@ pub const FRI_LEAF_RATE_FELTS: u64 = 8;
 /// Extension degree of the FRI codeword values.
 pub const FRI_EXTENSION_DEGREE: u64 = 3;
 
-/// The FRI layer format (`LAMBDA_VM_ZF_FRI`). `Pair` is today's all-ones
-/// schedule; `Dp` is the schedule [`fri_schedule`] picks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum FriMode {
-    #[default]
-    Pair,
-    Dp,
+/// `XALU` rows of one binary FRI fold in-guest: `edsl::fri_fold` emits
+/// `eadd, esub, emul, emul_base, eadd`.
+pub const FRI_FOLD_XALU_ROWS: u64 = 5;
+
+/// `BALU` rows of one step of the twiddle chain in-guest (one base `mul`).
+pub const FRI_TWIDDLE_BALU_ROWS: u64 = 1;
+
+/// `SELECT` rows of one two-way select of the slot mux (an ext value is one
+/// cell, so one `Select` instruction).
+pub const FRI_SLOT_SELECT_ROWS: u64 = 1;
+
+/// Cost-law price (ns) of one `XALU` row: 421 + 5.63 × 18 committed cells
+/// (the `LFM_XALU` cliff in the census, `+18874368` cells per `2^20` rows).
+pub const XALU_ROW_NS: u64 = 522;
+
+/// Cost-law price (ns) of one `BALU` row: 421 + 5.63 × 10 committed cells
+/// (the `LFM_BALU` cliff, `+5242880` cells per `2^19` rows).
+pub const BALU_ROW_NS: u64 = 477;
+
+/// The per-row prices the schedule DP weighs. `cap` is the cap policy's own
+/// weights, so the two levers optimise one objective.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FriCostWeights {
+    /// Compression, select, unpack, hint and compare prices (the cap policy's).
+    pub cap: CapWeights,
+    /// One binary fold in-guest.
+    pub fold: u64,
+    /// One step of the twiddle chain in-guest.
+    pub twiddle: u64,
 }
 
-/// The trace-opening layout (`LAMBDA_VM_ZF_ONE_ROW`). `Off` is today's row-pair
-/// leaves with an uncommitted binary fold 0; `On` opens one row and commits the
-/// DEEP codeword as FRI layer 0; `Auto` decides per table. A layout is built
-/// from the RESOLVED per-table choice (a `bool`), never from `Auto`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum OneRowMode {
-    #[default]
-    Off,
-    On,
-    Auto,
-}
-
-/// A cap-height function that caps nothing (`c ≡ 0`).
-pub fn no_cap(_depth: u32) -> u32 {
-    0
-}
+/// The weights the schedule DP optimises. ⚠ A FORMAT CONSTANT: changing any of
+/// them can change the schedule, and so the proofs, of every table under
+/// `LAMBDA_VM_ZF_FRI=dp`. Pinned by `fri_schedule_tests`.
+pub const FRI_COST_WEIGHTS: FriCostWeights = FriCostWeights {
+    cap: AUTO_WEIGHTS,
+    fold: FRI_FOLD_XALU_ROWS * XALU_ROW_NS,
+    twiddle: FRI_TWIDDLE_BALU_ROWS * BALU_ROW_NS,
+};
 
 /// Log2 length of the first committed FRI layer for an LDE of `2^lde_log`.
 ///
@@ -87,33 +115,40 @@ pub fn fri_leaf_blocks(d: u32) -> u64 {
     felts.div_ceil(FRI_LEAF_RATE_FELTS).max(1)
 }
 
-/// `Q ×` the per-query authentication cost of a tree of `depth` levels:
-/// `Q·(depth − c) + 2^c − 1`, `c = cap_height(depth)` clamped to `depth`.
-pub fn fri_path_cost_q(depth: u32, num_queries: u64, cap_height: &dyn Fn(u32) -> u32) -> u64 {
-    // Clamped so that a policy returning more than the tree has can never make
-    // the walk negative (and `2^c` never overflows).
-    let c = cap_height(depth).min(depth).min(63);
-    num_queries
-        .saturating_mul(u64::from(depth - c))
-        .saturating_add((1u64 << c) - 1)
+/// `Q ×` the per-query cost-law price (ns) of one committed layer of fold
+/// exponent `d` whose tree has `depth` levels (the layer is `2^{depth + d}`
+/// values long), under `weights` and the cap policy `cap`. See the module docs.
+pub fn fri_layer_cost_q(
+    weights: &FriCostWeights,
+    d: u32,
+    depth: u32,
+    num_queries: u64,
+    cap: CapPolicy,
+) -> u64 {
+    // i128 throughout, d clamped to 64 so 2^d fits; the result is clamped into
+    // u64 (it is non-negative — a cap never saves more than the walk it
+    // shortens — but the clamp keeps that a non-assumption).
+    let w = |x: u64| x as i128;
+    let d = d.min(64);
+    let q = num_queries as i128;
+    let group = (1i128 << d) - 1;
+    let per_query = w(fri_leaf_blocks(d)) * w(weights.cap.compress)
+        + i128::from(depth) * (w(weights.cap.compress) + w(weights.cap.select))
+        + group * (w(FRI_SLOT_SELECT_ROWS) * w(weights.cap.select) + w(weights.fold))
+        + i128::from(d) * w(weights.twiddle);
+    let queries = usize::try_from(num_queries).unwrap_or(usize::MAX);
+    let c = cap.height(queries, depth as usize);
+    let total = q.saturating_mul(per_query) - cap_gain(&weights.cap, queries, c);
+    u64::try_from(total.max(0)).unwrap_or(u64::MAX)
 }
 
-/// `Q ×` the per-query cost of one committed layer of fold exponent `d` whose
-/// tree has `depth` levels (the layer is `2^{depth + d}` values long).
-fn layer_cost_q(d: u32, depth: u32, num_queries: u64, cap_height: &dyn Fn(u32) -> u32) -> u64 {
-    num_queries
-        .saturating_mul(fri_leaf_blocks(d))
-        .saturating_add(fri_path_cost_q(depth, num_queries, cap_height))
-}
-
-/// `Q ×` the per-query cost of an arbitrary schedule starting at `b0`, or
-/// `None` if a fold exponent is zero or the schedule folds past zero bits.
-/// (The model's own number for "today" is this at the all-ones schedule.)
-pub fn fri_schedule_cost_q(
+/// `Q ×` the per-query cost of an arbitrary schedule starting at `b0` under a
+/// per-layer cost function `layer_cost_q(d, depth)`, or `None` if a fold
+/// exponent is zero or the schedule folds past zero bits.
+pub fn fri_schedule_cost_by(
     b0: u32,
     schedule: &[u8],
-    num_queries: u64,
-    cap_height: &dyn Fn(u32) -> u32,
+    layer_cost_q: &dyn Fn(u32, u32) -> u64,
 ) -> Option<u64> {
     let mut b = b0;
     let mut cost = 0u64;
@@ -123,12 +158,25 @@ pub fn fri_schedule_cost_q(
             return None;
         }
         b = b.checked_sub(d)?;
-        cost = cost.saturating_add(layer_cost_q(d, b, num_queries, cap_height));
+        cost = cost.saturating_add(layer_cost_q(d, b));
     }
     Some(cost)
 }
 
-/// The optimum [`fri_schedule`] picks, with its cost.
+/// [`fri_schedule_cost_by`] under the production objective
+/// ([`FRI_COST_WEIGHTS`], [`fri_layer_cost_q`]).
+pub fn fri_schedule_cost_q(
+    b0: u32,
+    schedule: &[u8],
+    num_queries: u64,
+    cap: CapPolicy,
+) -> Option<u64> {
+    fri_schedule_cost_by(b0, schedule, &|d, depth| {
+        fri_layer_cost_q(&FRI_COST_WEIGHTS, d, depth, num_queries, cap)
+    })
+}
+
+/// The optimum a schedule DP picks, with its cost.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FriScheduleChoice {
     /// `Q ×` the per-query cost (see the module docs).
@@ -139,25 +187,25 @@ pub struct FriScheduleChoice {
     pub schedule: Vec<u8>,
 }
 
-/// The fold schedule and its cost: the dynamic program of FRI.md §2.1.
+/// The schedule DP over an arbitrary per-layer cost `layer_cost_q(d, depth)`:
 ///
 /// ```text
 /// best(T)      = (0, 0, [])
 /// best(b > T)  = min over d ∈ [1, min(dmax, b − T)] of
-///                (Q·leaf(d) + path_q(b − d) + best(b − d).cost, best(b − d).trees + 1, [d] ++ best(b − d).sched)
+///                (layer_cost_q(d, b − d) + best(b − d).cost, best(b − d).trees + 1, [d] ++ best(b − d).sched)
 /// ```
 ///
 /// compared lexicographically on `(cost, trees)`; ties go to the smallest `d`
 /// (the first reached). Equivalently, the result is the lexicographically
 /// smallest schedule among the `(cost, trees)`-optimal ones. It lands exactly
 /// on `terminal_log`: `Σ schedule == b0 − terminal_log`, and the schedule is
-/// empty when `b0 ≤ terminal_log`. A `dmax` of 0 is treated as 1.
-pub fn fri_schedule_with_cost(
+/// empty when `b0 ≤ terminal_log`. A `dmax` of 0 is treated as 1; `dmax` is
+/// capped at 32.
+pub fn fri_schedule_by(
     b0: u32,
     terminal_log: u32,
-    num_queries: u64,
-    cap_height: &dyn Fn(u32) -> u32,
     dmax: u32,
+    layer_cost_q: &dyn Fn(u32, u32) -> u64,
 ) -> FriScheduleChoice {
     if b0 <= terminal_log {
         return FriScheduleChoice {
@@ -166,7 +214,7 @@ pub fn fri_schedule_with_cost(
             schedule: Vec::new(),
         };
     }
-    let dmax = dmax.max(1);
+    let dmax = dmax.clamp(1, 32);
     let span = (b0 - terminal_log) as usize;
     // best[i] = optimum from b = terminal_log + i down to the terminal, stored
     // as (cost, trees, first fold exponent); the schedule is recovered by
@@ -178,7 +226,7 @@ pub fn fri_schedule_with_cost(
         let mut cand: Option<(u64, u32, u32)> = None;
         for d in 1..=dmax.min(i as u32) {
             let (rest_cost, rest_trees, _) = best[i - d as usize];
-            let cost = layer_cost_q(d, b - d, num_queries, cap_height).saturating_add(rest_cost);
+            let cost = layer_cost_q(d, b - d).saturating_add(rest_cost);
             let trees = rest_trees + 1;
             // Strictly better only: ties keep the smaller `d` reached first.
             if cand.is_none_or(|(c, t, _)| (cost, trees) < (c, t)) {
@@ -203,15 +251,29 @@ pub fn fri_schedule_with_cost(
     }
 }
 
-/// The fold schedule of FRI.md §2.1 (see [`fri_schedule_with_cost`]).
+/// The production schedule DP: [`fri_schedule_by`] under the cost-law
+/// objective ([`FRI_COST_WEIGHTS`]) with the cap policy `cap`.
+pub fn fri_schedule_with_cost(
+    b0: u32,
+    terminal_log: u32,
+    num_queries: u64,
+    cap: CapPolicy,
+    dmax: u32,
+) -> FriScheduleChoice {
+    fri_schedule_by(b0, terminal_log, dmax, &|d, depth| {
+        fri_layer_cost_q(&FRI_COST_WEIGHTS, d, depth, num_queries, cap)
+    })
+}
+
+/// The schedule of [`fri_schedule_with_cost`].
 pub fn fri_schedule(
     b0: u32,
     terminal_log: u32,
     num_queries: u64,
-    cap_height: &dyn Fn(u32) -> u32,
+    cap: CapPolicy,
     dmax: u32,
 ) -> Vec<u8> {
-    fri_schedule_with_cost(b0, terminal_log, num_queries, cap_height, dmax).schedule
+    fri_schedule_with_cost(b0, terminal_log, num_queries, cap, dmax).schedule
 }
 
 /// Today's schedule: every committed layer folds by 2.
@@ -219,55 +281,98 @@ pub fn legacy_fri_schedule(b0: u32, terminal_log: u32) -> Vec<u8> {
     vec![1; b0.saturating_sub(terminal_log) as usize]
 }
 
-/// Everything the fold layout needs to know about the proof format.
-///
-/// All fields are verifier-side constants; none is ever read from a proof.
-#[derive(Clone, Copy)]
-pub struct FriFormat<'a> {
-    pub mode: FriMode,
-    /// The resolved one-row choice for this table.
-    pub one_row: bool,
-    /// FRI query count (the DP's opening count per tree).
-    pub num_queries: u64,
-    /// The active cap policy's height function for FRI-layer trees.
-    pub cap_height: &'a dyn Fn(u32) -> u32,
+/// Why a proof format cannot be laid out for a table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FriFormatError {
+    /// `one_row` is not `Off`: one-row openings (S2) are not implemented on
+    /// this build. Refused rather than silently proving the row-pair layout.
+    OneRowNotImplemented,
+    /// The schedule override does not cover this table's committed folds
+    /// exactly, or has an exponent outside `1..=FRI_SCHEDULE_DMAX`.
+    ScheduleOverrideMismatch,
 }
 
-impl FriFormat<'static> {
-    /// Today's format: pair layers, row-pair openings. The query count and cap
-    /// function are unused by the all-ones schedule.
-    pub const LEGACY: Self = Self {
-        mode: FriMode::Pair,
-        one_row: false,
-        num_queries: 0,
-        cap_height: &no_cap,
-    };
-}
-
-impl FriFormat<'_> {
-    /// The committed-layer fold schedule for an LDE of `2^lde_log` folding to a
-    /// terminal of `2^terminal_log`.
-    pub fn schedule(&self, lde_log: u32, terminal_log: u32) -> Vec<u8> {
-        let b0 = fri_chain_start(lde_log, self.one_row);
-        match self.mode {
-            FriMode::Pair => legacy_fri_schedule(b0, terminal_log),
-            FriMode::Dp => fri_schedule(
-                b0,
-                terminal_log,
-                self.num_queries,
-                self.cap_height,
-                FRI_SCHEDULE_DMAX,
-            ),
+impl core::fmt::Display for FriFormatError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OneRowNotImplemented => {
+                f.write_str("one-row openings (LAMBDA_VM_ZF_ONE_ROW) are not implemented")
+            }
+            Self::ScheduleOverrideMismatch => {
+                f.write_str("the FRI schedule override does not cover this table's committed folds")
+            }
         }
     }
 }
 
-impl std::fmt::Debug for FriFormat<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FriFormat")
-            .field("mode", &self.mode)
-            .field("one_row", &self.one_row)
-            .field("num_queries", &self.num_queries)
-            .finish_non_exhaustive()
+/// Everything the fold layout needs to know about the proof format, for one
+/// table. All fields are verifier-side constants; none is ever read from a
+/// proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FriFormat {
+    pub mode: FriMode,
+    /// The RESOLVED one-row choice for this table (never `Auto`).
+    pub one_row: bool,
+    /// FRI query count (the opening count of every FRI tree).
+    pub num_queries: u64,
+    /// The active Merkle-cap policy (an input of the DP, RULINGS 7).
+    pub cap: CapPolicy,
+    /// An explicit schedule that replaces the DP's under [`FriMode::Dp`].
+    pub schedule_override: Option<FriScheduleOverride>,
+}
+
+impl FriFormat {
+    /// Today's format: pair layers, row-pair openings. The query count and cap
+    /// policy are unused by the all-ones schedule.
+    pub const LEGACY: Self = Self {
+        mode: FriMode::Pair,
+        one_row: false,
+        num_queries: 0,
+        cap: CapPolicy::Off,
+        schedule_override: None,
+    };
+
+    /// The format of a table proved under `options`.
+    ///
+    /// Errors on a one-row mode other than `Off` (not implemented here: the
+    /// per-table `Auto` resolution and the one-row layout arrive with S2).
+    pub fn from_options(options: &ProofOptions) -> Result<Self, FriFormatError> {
+        if options.format.one_row != OneRowMode::Off {
+            return Err(FriFormatError::OneRowNotImplemented);
+        }
+        Ok(Self {
+            mode: options.format.fri_mode,
+            one_row: false,
+            num_queries: options.fri_number_of_queries as u64,
+            cap: options.format.merkle_cap,
+            schedule_override: options.format.fri_schedule_override,
+        })
+    }
+
+    /// Whether the proof uses today's FRI encoding: one sibling value per
+    /// committed layer, pair leaves (FRI.md §3.4). True exactly for pair
+    /// layers with row-pair openings; any other format carries every layer's
+    /// full group, even where the schedule is all ones. Decided by the format,
+    /// never by the schedule's values.
+    pub fn is_legacy(&self) -> bool {
+        self.mode == FriMode::Pair && !self.one_row
+    }
+
+    /// The committed-layer fold schedule for an LDE of `2^lde_log` folding to a
+    /// terminal of `2^terminal_log` (the override's, verbatim, when one is
+    /// set under `Dp`; the layout checks that it fits).
+    pub fn schedule(&self, lde_log: u32, terminal_log: u32) -> Vec<u8> {
+        let b0 = fri_chain_start(lde_log, self.one_row);
+        match (self.mode, self.schedule_override) {
+            (FriMode::Pair, _) => legacy_fri_schedule(b0, terminal_log),
+            (FriMode::Dp, Some(o)) => o.as_slice().to_vec(),
+            (FriMode::Dp, None) => fri_schedule(
+                b0,
+                terminal_log,
+                self.num_queries,
+                self.cap,
+                FRI_SCHEDULE_DMAX,
+            ),
+        }
     }
 }

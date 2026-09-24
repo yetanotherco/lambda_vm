@@ -9,7 +9,8 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
 
-use crate::fri::schedule::{FRI_SCHEDULE_DMAX, FriFormat};
+use crate::fri::schedule::{FRI_SCHEDULE_DMAX, FriFormat, FriFormatError};
+use crate::proof::options::ProofOptions;
 
 /// The FRI early-termination fold layout.
 ///
@@ -43,8 +44,17 @@ pub(crate) struct FriFoldLayout {
     /// Whether the DEEP codeword itself is committed (one-row openings): then
     /// the chain starts at the LDE size and there is no uncommitted fold 0.
     pub(crate) one_row: bool,
+    /// Today's FRI encoding ([`FriFormat::is_legacy`]): pair-leaf layer trees
+    /// and one sibling value per committed layer per query. `false` = group
+    /// leaves (`H::Batched` over `2^d` values) and the full group per layer —
+    /// decided by the format, never by the schedule's values, so a `Dp`
+    /// schedule that happens to be all ones still uses the group encoding.
+    pub(crate) legacy_encoding: bool,
 }
 
+// The format-aware constructors' first callers are the S3 prover and verifier
+// (the next commit); until then only the tests use them.
+#[allow(dead_code)]
 impl FriFoldLayout {
     /// Today's layout, derived from the LDE codeword size.
     ///
@@ -61,25 +71,55 @@ impl FriFoldLayout {
     /// This is [`Self::for_format`] at [`FriFormat::LEGACY`]: pair layers,
     /// row-pair openings, the all-ones schedule.
     pub(crate) fn new(lde_log: u32, blowup_log: u32, k: u32) -> Self {
-        Self::for_format(lde_log, blowup_log, k, &FriFormat::LEGACY)
+        let terminal_log = (blowup_log + k).min(lde_log);
+        let schedule = FriFormat::LEGACY.schedule(lde_log, terminal_log);
+        // The all-ones schedule covers the committed folds by construction.
+        Self::assemble(lde_log, blowup_log, terminal_log, false, schedule)
     }
 
     /// The layout under an explicit proof format. `total_folds`,
     /// `terminal_len` and `effective_k` do not depend on the format; only the
     /// split of the folds into committed layers does.
-    pub(crate) fn for_format(lde_log: u32, blowup_log: u32, k: u32, fmt: &FriFormat<'_>) -> Self {
+    ///
+    /// `None` only for a schedule override that does not cover the committed
+    /// folds exactly (the DP and the all-ones schedules land on the terminal
+    /// by construction).
+    pub(crate) fn for_format(
+        lde_log: u32,
+        blowup_log: u32,
+        k: u32,
+        fmt: &FriFormat,
+    ) -> Option<Self> {
         let terminal_log = (blowup_log + k).min(lde_log);
         let schedule = fmt.schedule(lde_log, terminal_log);
-        let layout = Self::assemble(lde_log, blowup_log, terminal_log, fmt.one_row, schedule);
-        // Holds by construction: both schedules land exactly on the terminal.
-        debug_assert!(layout.schedule_is_consistent());
-        layout
+        let mut layout = Self::assemble(lde_log, blowup_log, terminal_log, fmt.one_row, schedule);
+        layout.legacy_encoding = fmt.is_legacy();
+        layout.schedule_is_consistent().then_some(layout)
+    }
+
+    /// The layout of a table proved under `options` over an LDE of
+    /// `2^lde_log` with blowup `2^blowup_log`: what the prover and the host
+    /// verifier both build. The format comes from `options` — a verifier-side
+    /// constant — never from a proof.
+    pub(crate) fn for_options(
+        lde_log: u32,
+        blowup_log: u32,
+        options: &ProofOptions,
+    ) -> Result<Self, FriFormatError> {
+        let fmt = FriFormat::from_options(options)?;
+        Self::for_format(
+            lde_log,
+            blowup_log,
+            u32::from(options.fri_final_poly_log_degree),
+            &fmt,
+        )
+        .ok_or(FriFormatError::ScheduleOverrideMismatch)
     }
 
     /// The layout for a caller-supplied schedule, or `None` if the schedule
     /// does not cover exactly the committed folds (or has an exponent outside
-    /// `1..=FRI_SCHEDULE_DMAX`).
-    #[allow(dead_code)] // first caller arrives with the S3 prover/verifier.
+    /// `1..=FRI_SCHEDULE_DMAX`). The encoding is the group encoding unless
+    /// the schedule is today's (row pair, all ones), where it is legacy.
     pub(crate) fn from_schedule(
         lde_log: u32,
         blowup_log: u32,
@@ -88,8 +128,37 @@ impl FriFoldLayout {
         schedule: Vec<u8>,
     ) -> Option<Self> {
         let terminal_log = (blowup_log + k).min(lde_log);
-        let layout = Self::assemble(lde_log, blowup_log, terminal_log, one_row, schedule);
+        let mut layout = Self::assemble(lde_log, blowup_log, terminal_log, one_row, schedule);
+        layout.legacy_encoding = !one_row && layout.schedule.iter().all(|&d| d == 1);
         layout.schedule_is_consistent().then_some(layout)
+    }
+
+    /// Whether this layout uses today's FRI encoding (see
+    /// [`Self::legacy_encoding`]). Every device FRI arm is gated on this.
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.legacy_encoding
+    }
+
+    /// Log2 length of committed layer `j` (0-based): the chain start minus the
+    /// bits the earlier committed layers consumed.
+    pub(crate) fn layer_log_len(&self, lde_log: u32, j: usize) -> u32 {
+        let consumed: u32 = self.schedule[..j].iter().map(|&d| u32::from(d)).sum();
+        crate::fri::schedule::fri_chain_start(lde_log, self.one_row) - consumed
+    }
+
+    /// Depth of committed layer `j`'s tree: its length over `2^{d_j}` leaves.
+    pub(crate) fn layer_depth(&self, lde_log: u32, j: usize) -> u32 {
+        self.layer_log_len(lde_log, j) - u32::from(self.schedule[j])
+    }
+
+    /// Opened values per query in the flat `layers_evaluations_sym` vector:
+    /// one per layer (legacy) or every layer's full group.
+    pub(crate) fn opened_values_per_query(&self) -> usize {
+        if self.legacy_encoding {
+            self.num_committed
+        } else {
+            self.schedule.iter().map(|&d| 1usize << d).sum()
+        }
     }
 
     fn assemble(
@@ -107,6 +176,7 @@ impl FriFoldLayout {
             effective_k: terminal_log - blowup_log,
             schedule,
             one_row,
+            legacy_encoding: !one_row,
         }
     }
 
