@@ -125,7 +125,8 @@ fn parity_legacy_encoding_blake3() {
     check::<Blake3StarkHash>("blake3", &legacy_cases(), false, 0x5a49_0000);
 }
 
-/// The (d) vector proofs (FRI.md §10 (d): `pair`, `dp`, `dp_3_1_3`) proved on
+/// The (d) vector proofs (FRI.md §10 (d): `pair`, `dp`, `dp_3_1_3`, and the
+/// Merkle-capped `cap_pair`, `cap_dp` at Q = 20) proved on
 /// the device path — LDE 4096, so `LAMBDA_VM_GPU_LDE_THRESHOLD` must be at
 /// most 4096 — are byte-identical to the checked-in CPU-proved files (rkyv
 /// bytes and the verifier-derived JSON), under Keccak and Blake3. The device
@@ -143,9 +144,11 @@ fn proved_vectors_equal_the_cpu_bytes() {
         "FRIDEV vector proofs: {} files, {device_commits} device FRI commits",
         files.len()
     );
-    assert_eq!(files.len(), 2 * 3 * 2);
+    // Five (d) formats (pair, dp, dp_3_1_3 at Q = 3; cap_pair, cap_dp at
+    // Q = 20) x two hashes, two files and one FRI commit per proof.
+    assert_eq!(files.len(), 2 * 5 * 2);
     assert_eq!(
-        device_commits, 6,
+        device_commits, 10,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
     );
     let bad = check_or_write(&files, false);

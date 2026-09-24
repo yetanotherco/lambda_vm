@@ -53,7 +53,8 @@ fn parity_legacy_encoding_rpx() {
     check(&legacy_cases(), false, 0x5a49_0000);
 }
 
-/// The RPX (d) vector proofs (`pair`, `dp`, `dp_3_1_3`, LDE 4096) proved on
+/// The RPX (d) vector proofs (`pair`, `dp`, `dp_3_1_3`, `cap_pair`, `cap_dp`;
+/// LDE 4096) proved on
 /// the device path are byte-identical to the checked-in CPU-proved files. The
 /// device FRI counter must move once per proof. Run alone: the counter is
 /// process-wide.
@@ -68,9 +69,11 @@ fn proved_rpx_vectors_equal_the_cpu_bytes() {
         "FRIDEV rpx vector proofs: {} files, {device_commits} device FRI commits",
         files.len()
     );
-    assert_eq!(files.len(), 3 * 2);
+    // Five (d) formats (pair, dp, dp_3_1_3 at Q = 3; cap_pair, cap_dp at
+    // Q = 20), two files and one FRI commit per proof.
+    assert_eq!(files.len(), 5 * 2);
     assert_eq!(
-        device_commits, 3,
+        device_commits, 5,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
     );
     let bad = check_or_write(&files, false);
