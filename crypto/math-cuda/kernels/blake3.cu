@@ -476,6 +476,29 @@ extern "C" __global__ void blake3_fri_leaves_ext3(
     h.finalize(leaves_out + tid * 32);
 }
 
+// FRI GROUP-leaf hashing (S3): leaf `tid` hashes the `group` consecutive ext3
+// values `evals[tid*group .. (tid+1)*group]` of an interleaved eval vector (the
+// `3*group` contiguous u64s at `evals_interleaved + tid*group*3`), each as its
+// canonical big-endian components. The host `Batched` leaf over the group; at
+// `group = 2` exactly `blake3_fri_leaves_ext3`'s message. A group of 2^d values
+// is 24*2^d bytes, several blocks from d = 2 on — the chain handles any length.
+// Twin of `keccak_fri_group_leaves_ext3`.
+extern "C" __global__ void blake3_fri_group_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_leaves * group u64s
+    uint64_t num_leaves,
+    uint64_t group,                      // ext3 values per leaf (2^d)
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    const uint64_t *g = evals_interleaved + tid * group * 3;
+
+    Blake3Chain h;
+    h.init();
+    for (uint64_t i = 0; i < 3 * group; ++i) h.push_felt(g[i]);
+    h.finalize(leaves_out + tid * 32);
+}
+
 // Row-major ROW-PAIR leaf hashing: the row-major analog of
 // `blake3_leaves_base_row_pair_batched`. Leaf `tid` hashes row
 // `reverse_index(2*tid)` then row `reverse_index(2*tid+1)`, each `m` lanes read
