@@ -664,7 +664,11 @@ fn tree_auth(
         TreeAuth::Root(*root_lanes)
     } else {
         assert_eq!(cap.len(), 1usize << cap_height, "a cap is 2^c digests");
-        TreeAuth::Cap(CapCells::authenticate(b, cap, root_lanes))
+        TreeAuth::Cap(CapCells::authenticate(
+            b,
+            cap,
+            std::slice::from_ref(root_lanes),
+        ))
     }
 }
 
