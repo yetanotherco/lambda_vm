@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn the_whir_fold_lever_is_selectable() {
-        assert!(multilinear::whir_chain::WHIR_FOLDS_IMPLEMENTED);
+        const { assert!(multilinear::whir_chain::WHIR_FOLDS_IMPLEMENTED) };
         for v in ["first5", "first6"] {
             let f = parse(&[(ENV_WHIR_FOLDS, v)]).unwrap();
             assert!(f.unimplemented_levers().is_empty(), "{v}");
