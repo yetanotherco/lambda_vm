@@ -35,7 +35,7 @@ use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::fri::schedule::{FRI_SCHEDULE_DMAX, fri_chain_start, fri_schedule};
 use crate::fri::terminal::FriFoldLayout;
 use crate::fri::vectors::splitmix64;
-use crate::proof::options::{FriMode, FriScheduleOverride, ProofFormat, ProofOptions};
+use crate::proof::options::{FriMode, FriScheduleOverride, OneRowMode, ProofFormat, ProofOptions};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
@@ -147,6 +147,11 @@ fn raw(v: &[Ext]) -> Vec<[u64; 3]> {
 /// `resident` keeps the device layers' evals resident only (the device-only
 /// envelope's shape), so the device query phase gathers them on device.
 ///
+/// `options.format.one_row == On` runs the S2 layout (lane I-S2-D): layer 0 is
+/// the input tree committed from the codeword itself before any challenge,
+/// and the query indexes range over the whole LDE (`Auto` is resolved per
+/// table from an AIR, so it is not a codeword-level case: treated as off).
+///
 /// `Err` names the first mismatch, or the device declining (threshold,
 /// budget, a wiring gate) — never a silent pass.
 pub fn fri_parity<H: StarkHash>(
@@ -157,7 +162,8 @@ pub fn fri_parity<H: StarkHash>(
 ) -> Result<String, String> {
     let blowup_log = options.blowup_factor.trailing_zeros();
     let k = u32::from(options.fri_final_poly_log_degree);
-    let layout = FriFoldLayout::for_options(lde_log, blowup_log, options, false)
+    let one_row = options.format.one_row == OneRowMode::On;
+    let layout = FriFoldLayout::for_options(lde_log, blowup_log, options, one_row)
         .map_err(|e| format!("layout: {e}"))?;
     let n = 1usize << lde_log;
     let mut rng = seed;
@@ -205,7 +211,7 @@ pub fn fri_parity<H: StarkHash>(
     })?;
 
     let what = format!(
-        "LDE 2^{lde_log}, schedule {:?}, legacy {}, resident {resident}",
+        "LDE 2^{lde_log}, schedule {:?}, legacy {}, one_row {one_row}, resident {resident}",
         layout.schedule,
         layout.is_legacy()
     );
@@ -240,13 +246,14 @@ pub fn fri_parity<H: StarkHash>(
         return Err(format!("{what}: the transcripts diverged"));
     }
 
-    // Queries: random pair indices and both ends of the range.
-    let half = n / 2;
+    // Queries: random indices and both ends of the range — pair indices below
+    // `N / 2`, or (one row) trace leaves over the whole LDE.
+    let bound = if one_row { n } else { n / 2 };
     let mut iotas: Vec<usize> = (0..40)
-        .map(|_| (splitmix64(&mut rng) % half as u64) as usize)
+        .map(|_| (splitmix64(&mut rng) % bound as u64) as usize)
         .collect();
     iotas.push(0);
-    iotas.push(half - 1);
+    iotas.push(bound - 1);
     let (cpu_q, gpu_q) = queries::<H>(&cpu_layers, &gpu_layers, &iotas, &layout);
     let gpu_q = gpu_q.ok_or_else(|| format!("{what}: the device query phase declined"))?;
     for (q, (a, b)) in cpu_q.iter().zip(&gpu_q).enumerate() {
@@ -343,6 +350,72 @@ pub fn legacy_cases() -> Vec<Case> {
         .map(|&b| (b, pair_options(1, 1)))
         .collect();
     cases.extend([10u32, 16].iter().map(|&b| (b, pair_options(2, 3))));
+    cases
+}
+
+/// `options` with one-row openings on (S2): the FRI chain starts at the LDE
+/// itself and layer 0 is the input tree.
+pub fn with_one_row(mut options: ProofOptions) -> ProofOptions {
+    options.format.one_row = OneRowMode::On;
+    options
+}
+
+/// The smallest `(lde_log, options)` whose ONE-ROW layout at blowup 2, `k = 1`
+/// (a terminal of 4) has exactly `schedule` as its committed folds (the chain
+/// starts at the LDE, so one bit shorter than [`smallest_case`]).
+pub fn smallest_one_row_case(schedule: &[u8]) -> (u32, ProofOptions) {
+    let sum: u32 = schedule.iter().map(|&d| u32::from(d)).sum();
+    (
+        sum + 2,
+        with_one_row(dp_options(1, 1, 3, CapPolicy::Off, Some(schedule))),
+    )
+}
+
+/// S2 on the device: every [`dp_shapes`] entry at its
+/// [`smallest_one_row_case`] (d_0 = the input tree's group), today's pair
+/// schedule with one-row openings (group encoding at d = 1) at blowup 2 and
+/// 4, and production sizes at the DP's own one-row schedules (base legs at
+/// B = 14, 19, 21, 23, an LFM-shaped B = 22; Q = 110, cap auto).
+pub fn one_row_cases() -> Vec<Case> {
+    let mut cases: Vec<Case> = dp_shapes()
+        .iter()
+        .map(|s| smallest_one_row_case(s))
+        .collect();
+    cases.extend(
+        [4u32, 5, 8, 12]
+            .iter()
+            .map(|&b| (b, with_one_row(pair_options(1, 1)))),
+    );
+    cases.extend(
+        [10u32, 16]
+            .iter()
+            .map(|&b| (b, with_one_row(pair_options(2, 3)))),
+    );
+    cases.extend([14u32, 19, 21, 23].iter().map(|&b| {
+        (
+            b,
+            with_one_row(dp_options(2, 7, 110, CapPolicy::Auto, None)),
+        )
+    }));
+    cases.push((
+        22,
+        with_one_row(dp_options(2, 8, 110, CapPolicy::Auto, None)),
+    ));
+    cases
+}
+
+/// S2 device-only layers: the input tree's evals ARE the resident codeword,
+/// so the query phase gathers layer 0's groups off it.
+pub fn one_row_resident_cases() -> Vec<Case> {
+    let mut cases: Vec<Case> = [&[3u8, 1, 3][..], &[6, 1], &[1, 6]]
+        .iter()
+        .map(|s| smallest_one_row_case(s))
+        .collect();
+    cases.push((
+        16,
+        with_one_row(dp_options(2, 7, 110, CapPolicy::Auto, None)),
+    ));
+    cases.push((14, with_one_row(pair_options(2, 7))));
     cases
 }
 

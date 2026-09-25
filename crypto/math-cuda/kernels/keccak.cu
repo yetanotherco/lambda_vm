@@ -683,3 +683,43 @@ extern "C" __global__ void keccak256_leaves_base_row_major_row_pair_range(
     }
     finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
 }
+
+// ---------------------------------------------------------------------------
+// Row-major ONE-ROW leaf hashing (S2, rows_per_leaf = 1).
+//
+// Leaf `tid` hashes the single row `reverse_index(tid)` (bit reversal over
+// `log_num_rows` bits), columns `[col_start, col_end)` of the contiguous
+// row-major buffer (`data + br * m`, `m` the full row stride), as canonical
+// big-endian lanes. `num_leaves = num_rows`. Byte layout equals the CPU
+// `commit_rows_bit_reversed_subset_with(data, m, col_start, col_end, 1)`; the
+// whole row (`[0, m)`) is `commit_rows_bit_reversed_with(data, m, 1)`.
+//
+// NOT the row-pair kernels at another width: those read rows `brev(2·tid)` and
+// `brev(2·tid + 1)` over `log_num_rows` bits, which is a different row set
+// (I-FRI-D note 1), so one row per leaf needs its own read pattern.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_row_major_row_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    const uint64_t *row = data + br * m;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row[c])));
+    }
+    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+}

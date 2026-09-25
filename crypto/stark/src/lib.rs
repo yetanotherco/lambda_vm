@@ -37,6 +37,8 @@ pub mod prove_split;
 pub mod prover;
 pub mod r4_denoms;
 pub mod residency_mode;
+#[cfg(all(feature = "cuda", any(test, feature = "test-utils")))]
+pub mod s2_device_parity;
 #[cfg(feature = "disk-spill")]
 pub mod storage_mode;
 pub mod table;

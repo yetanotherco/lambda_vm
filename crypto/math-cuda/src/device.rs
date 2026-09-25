@@ -205,6 +205,8 @@ pub struct Backend {
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub keccak256_leaves_base_row_major_row_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_coset: CudaFunction,
     pub keccak256_leaves_ext3_coset: CudaFunction,
@@ -229,6 +231,8 @@ pub struct Backend {
     // yet — they exist so the GPU can follow the CPU's hash switch (PA-PLAN §6.1).
     pub blake3_leaves_base_row_major_row_pair: CudaFunction,
     pub blake3_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub blake3_leaves_base_row_major_row_range: CudaFunction,
     pub blake3_leaves_base_batched: CudaFunction,
     pub blake3_leaves_base_row_pair_batched: CudaFunction,
     pub blake3_leaves_ext3_batched: CudaFunction,
@@ -253,6 +257,8 @@ pub struct Backend {
     // tests check against the host `Rpx256`.
     pub rpx_leaves_base_row_major_row_pair: CudaFunction,
     pub rpx_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub rpx_leaves_base_row_major_row_range: CudaFunction,
     pub rpx_leaves_base_batched: CudaFunction,
     pub rpx_leaves_base_row_pair_batched: CudaFunction,
     pub rpx_leaves_ext3_batched: CudaFunction,
@@ -876,6 +882,8 @@ impl Backend {
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_row_major_row_pair_range: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
+            keccak256_leaves_base_row_major_row_range: keccak
+                .load_function("keccak256_leaves_base_row_major_row_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
             keccak256_leaves_ext3_coset: keccak.load_function("keccak256_leaves_ext3_coset")?,
@@ -893,6 +901,8 @@ impl Backend {
                 .load_function("blake3_leaves_base_row_major_row_pair")?,
             blake3_leaves_base_row_major_row_pair_range: blake3
                 .load_function("blake3_leaves_base_row_major_row_pair_range")?,
+            blake3_leaves_base_row_major_row_range: blake3
+                .load_function("blake3_leaves_base_row_major_row_range")?,
             blake3_leaves_base_batched: blake3.load_function("blake3_leaves_base_batched")?,
             blake3_leaves_base_row_pair_batched: blake3
                 .load_function("blake3_leaves_base_row_pair_batched")?,
@@ -914,6 +924,8 @@ impl Backend {
                 .load_function("rpx_leaves_base_row_major_row_pair")?,
             rpx_leaves_base_row_major_row_pair_range: rpx
                 .load_function("rpx_leaves_base_row_major_row_pair_range")?,
+            rpx_leaves_base_row_major_row_range: rpx
+                .load_function("rpx_leaves_base_row_major_row_range")?,
             rpx_leaves_base_batched: rpx.load_function("rpx_leaves_base_batched")?,
             rpx_leaves_base_row_pair_batched: rpx
                 .load_function("rpx_leaves_base_row_pair_batched")?,

@@ -769,6 +769,33 @@ extern "C" __global__ void rpx_leaves_base_row_major_row_pair_range(
     rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
 }
 
+// Row-major ONE-ROW leaf hashing (S2, rows_per_leaf = 1): leaf `tid` absorbs the
+// single row `reverse_index(tid)`, columns `[col_start, col_end)` of the
+// row-major buffer (`m` the full row stride) — a sponge over
+// `col_end - col_start` felts (the count keys the padding). The CPU
+// `commit_rows_bit_reversed_subset_with(.., 1)`. Twin of
+// `keccak256_leaves_base_row_major_row_range`.
+extern "C" __global__ void rpx_leaves_base_row_major_row_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    const uint64_t *row = data + br * m;
+
+    rpx::Sponge sp;
+    sp.init(col_end - col_start);
+    for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row[c]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
 // ---------------------------------------------------------------------------
 // COSET leaf hashing — the WHIR shape, and the two kernels the per-table branch
 // has no twin for.

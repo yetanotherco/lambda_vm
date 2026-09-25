@@ -12,6 +12,10 @@
 //!     --lib tests::zf_rpx_device_tests::proved_rpx_vectors_equal_the_cpu_bytes \
 //!     -- --ignored --exact --test-threads=1
 //! ```
+//!
+//! S2 on the device (lane I-S2-D, D2): `trees_one_row_rpx` (default threshold),
+//! `fri_one_row_*` (threshold 2), `proved_rpx_one_row_vectors_equal_the_cpu_bytes`
+//! (threshold 1024, alone), the RPX twins of `stark`'s `tests::zf_s2_device_tests`.
 
 use stark::fri::device_parity::{
     Case, legacy_cases, production_cases, resident_cases, run_cases, sweep_cases,
@@ -80,5 +84,77 @@ fn proved_rpx_vectors_equal_the_cpu_bytes() {
     assert!(
         bad.is_empty(),
         "device-proved RPX vectors differ from the checked-in CPU bytes: {bad:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2 on the device (FRI.md §7.6, lane I-S2-D, D2) under the RPX pin.
+// ---------------------------------------------------------------------------
+
+/// One-row main / preprocessed split / aux (host and resident) / composition
+/// trees and their device openings against the host (the RPX twin of
+/// `stark`'s `trees_one_row_*`).
+#[test]
+#[ignore = "requires a GPU; run with --features cuda -- --ignored"]
+fn trees_one_row_rpx() {
+    if let Err(failures) = stark::s2_device_parity::run_tree_parity::<RpxStarkHash>("rpx") {
+        panic!("rpx: {failures:#?}");
+    }
+}
+
+/// The one-row FRI commit (input tree from the codeword, then the group chain)
+/// and query phases against the host CPU loop.
+#[test]
+#[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD=2; run with --features cuda -- --ignored"]
+fn fri_one_row_rpx() {
+    check(
+        &stark::fri::device_parity::one_row_cases(),
+        false,
+        0x5234_0000,
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD=2; run with --features cuda -- --ignored"]
+fn fri_one_row_resident_rpx() {
+    check(
+        &stark::fri::device_parity::one_row_resident_cases(),
+        true,
+        0x5235_0000,
+    );
+}
+
+/// The RPX (e) vector proofs (`one_row_pair`, `one_row_3_2_1_2`; LDE 4096)
+/// proved on the device path are byte-identical to the checked-in CPU-proved
+/// files. Each proof must take the one-row device FRI commit and build at
+/// least its main, aux and composition trees one-row on the device. Run alone:
+/// the counters are process-wide.
+#[test]
+#[ignore = "requires a GPU and LAMBDA_VM_GPU_LDE_THRESHOLD<=4096; run alone with --features cuda -- --ignored --exact --test-threads=1"]
+fn proved_rpx_one_row_vectors_equal_the_cpu_bytes() {
+    use stark::fri::vectors::{check_or_write, one_row_proof_vectors};
+    let fri_before = stark::gpu_lde::gpu_one_row_fri_calls();
+    let trees_before = stark::gpu_lde::gpu_one_row_trees();
+    let files = one_row_proof_vectors::<RpxStarkHash>("rpx");
+    let fri_commits = stark::gpu_lde::gpu_one_row_fri_calls() - fri_before;
+    let trees = stark::gpu_lde::gpu_one_row_trees() - trees_before;
+    println!(
+        "S2DEV rpx vector proofs: {} files, {fri_commits} one-row device FRI commits, {trees} one-row device trees",
+        files.len()
+    );
+    assert_eq!(files.len(), 2 * 2);
+    assert_eq!(
+        fri_commits, 2,
+        "every one-row vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
+    );
+    assert!(
+        trees >= 3 * 2,
+        "every one-row vector proof must build its main, aux and composition trees on the device \
+         ({trees} one-row device trees for 2 proofs)"
+    );
+    let bad = check_or_write(&files, false);
+    assert!(
+        bad.is_empty(),
+        "device-proved one-row RPX vectors differ from the checked-in CPU bytes: {bad:?}"
     );
 }

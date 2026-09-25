@@ -1067,6 +1067,186 @@ fn build_inner_tree_levels_for(
     }
 }
 
+/// Hash the leaves of a row-major commit over `buf` (`num_rows` rows of stride
+/// `m`), columns `[col_start, col_end)`, `rows_per_leaf` rows per leaf, into
+/// `leaves_out` (`num_rows / rows_per_leaf` leaves), with the kernel family
+/// `hash` selects:
+///
+/// - `rows_per_leaf = 2` (today): leaf `i` = rows `reverse_index(2i)`,
+///   `reverse_index(2i + 1)` — the row-pair kernels, the full-row one when the
+///   range is the whole row (so the default launches exactly what it did).
+/// - `rows_per_leaf = 1` (S2): leaf `i` = the row `reverse_index(i)` — the
+///   one-row kernels (`*_leaves_base_row_major_row_range`). The CPU twin is
+///   `commit_rows_bit_reversed_subset_with(.., rows_per_leaf)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_row_major_leaves(
+    hash: DeviceHash,
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    col_start: u64,
+    col_end: u64,
+    num_rows: u64,
+    rows_per_leaf: usize,
+    leaves_out: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    // Every kernel derives rows as `__brevll(..) >> (64 - log_num_rows)`, UB at
+    // `log_num_rows == 0`.
+    assert!(num_rows >= 2 && num_rows.is_power_of_two());
+    assert!(
+        col_start < col_end && col_end <= m,
+        "column range in bounds"
+    );
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    let full = col_start == 0 && col_end == m;
+    if rows_per_leaf == 2 {
+        return match (hash, full) {
+            (DeviceHash::Keccak256, true) => launch_keccak_base_row_major_row_pair(
+                stream,
+                be,
+                buf,
+                m,
+                num_rows,
+                log_num_rows,
+                leaves_out,
+            ),
+            (DeviceHash::Keccak256, false) => launch_keccak_base_row_major_row_pair_range(
+                stream,
+                be,
+                buf,
+                m,
+                col_start,
+                col_end,
+                num_rows,
+                log_num_rows,
+                leaves_out,
+            ),
+            (DeviceHash::Blake3, true) => crate::blake3::launch_leaves_base_row_major_row_pair(
+                stream,
+                be,
+                buf,
+                m,
+                num_rows,
+                log_num_rows,
+                leaves_out,
+            ),
+            (DeviceHash::Blake3, false) => {
+                crate::blake3::launch_leaves_base_row_major_row_pair_range(
+                    stream,
+                    be,
+                    buf,
+                    m,
+                    col_start,
+                    col_end,
+                    num_rows,
+                    log_num_rows,
+                    leaves_out,
+                )
+            }
+            (DeviceHash::Rpx256, true) => crate::rpx::launch_leaves_base_row_major_row_pair(
+                stream,
+                be,
+                buf,
+                m,
+                num_rows,
+                log_num_rows,
+                leaves_out,
+            ),
+            (DeviceHash::Rpx256, false) => crate::rpx::launch_leaves_base_row_major_row_pair_range(
+                stream,
+                be,
+                buf,
+                m,
+                col_start,
+                col_end,
+                num_rows,
+                log_num_rows,
+                leaves_out,
+            ),
+            (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
+                unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
+            }
+        };
+    }
+    // One row per leaf: one thread per row.
+    let (kernel, cfg) = match hash {
+        DeviceHash::Keccak256 => (
+            &be.keccak256_leaves_base_row_major_row_range,
+            keccak_launch_cfg(num_rows),
+        ),
+        DeviceHash::Blake3 => (
+            &be.blake3_leaves_base_row_major_row_range,
+            crate::blake3::blake3_launch_cfg(num_rows),
+        ),
+        DeviceHash::Rpx256 => (
+            &be.rpx_leaves_base_row_major_row_range,
+            crate::rpx::rpx_launch_cfg(num_rows),
+        ),
+        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
+            unimplemented!("{hash:?} device commit not yet ported (row-major one-row leaves)")
+        }
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(buf)
+            .arg(&m)
+            .arg(&col_start)
+            .arg(&col_end)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-major leaf hashing of a HOST row-major matrix under `hash` with
+/// `rows_per_leaf` rows per leaf, columns `[col_start, col_end)`: the leaf
+/// hashes alone (`num_rows / rows_per_leaf` × 32 bytes). A parity harness for
+/// [`launch_row_major_leaves`] against the CPU leaf spec; nothing on a proving
+/// path calls it.
+pub fn row_major_leaves(
+    hash: DeviceHash,
+    data: &[u64],
+    m: usize,
+    col_start: usize,
+    col_end: usize,
+    num_rows: usize,
+    rows_per_leaf: usize,
+) -> Result<Vec<u8>> {
+    assert!(num_rows.is_power_of_two() && num_rows >= 2);
+    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    let total = num_rows
+        .checked_mul(m)
+        .expect("num_rows * m overflows usize");
+    assert!(data.len() >= total);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let data_dev = stream.clone_htod(&data[..total])?;
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
+    launch_row_major_leaves(
+        hash,
+        stream.as_ref(),
+        be,
+        &data_dev,
+        m as u64,
+        col_start as u64,
+        col_end as u64,
+        num_rows as u64,
+        rows_per_leaf,
+        &mut out_dev.as_view_mut(),
+    )?;
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn coset_lde_row_major_inner(
@@ -1079,6 +1259,7 @@ fn coset_lde_row_major_inner(
     what: &str,
     retain_trace_col_major: bool,
     retain_host_lde: bool,
+    rows_per_leaf: usize,
 ) -> Result<(
     GpuMerkleTree,
     CudaSlice<u64>,
@@ -1097,13 +1278,17 @@ fn coset_lde_row_major_inner(
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, what);
 
-    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair (rows 2i,
-    // 2i+1), matching the CPU `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and the
-    // verifier's `verify_opening_pair`. `lde_size` is a power of two >= 2, so it
-    // is always even.
-    let num_leaves = lde_size / 2;
+    // Trace commit with `rows_per_leaf` bit-reversed rows per Merkle leaf: row
+    // pairs (rows 2i, 2i+1) today, matching the CPU `commit_bit_reversed(..,
+    // ROWS_PER_LEAF=2)` and the verifier's `verify_opening_pair`; one row (S2)
+    // under `rows_per_leaf = 1`. `lde_size` is a power of two >= 2, so it is
+    // always a multiple of either.
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    let num_leaves = lde_size / rows_per_leaf;
     let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
-    let log_lde = lde_size.trailing_zeros() as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
 
@@ -1122,45 +1307,25 @@ fn coset_lde_row_major_inner(
     )?;
 
     // Leaf hashing + Merkle on-device, with the kernel family `hash` selects.
-    // Each row-pair leaf reads two bit-reversed rows of `total_cols` consecutive
-    // u64s (`lde_u64` is the bit-reverse modulus; the kernel emits
-    // `lde_size / 2` leaves).
+    // Each leaf reads `rows_per_leaf` bit-reversed rows of `total_cols`
+    // consecutive u64s (`lde_u64` is the bit-reverse modulus; the kernel emits
+    // `lde_size / rows_per_leaf` leaves).
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
     let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
     {
         let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-        match hash {
-            DeviceHash::Keccak256 => launch_keccak_base_row_major_row_pair(
-                stream.as_ref(),
-                be,
-                &buf,
-                cols_u64,
-                lde_u64,
-                log_lde,
-                &mut leaves_view,
-            )?,
-            DeviceHash::Blake3 => crate::blake3::launch_leaves_base_row_major_row_pair(
-                stream.as_ref(),
-                be,
-                &buf,
-                cols_u64,
-                lde_u64,
-                log_lde,
-                &mut leaves_view,
-            )?,
-            DeviceHash::Rpx256 => crate::rpx::launch_leaves_base_row_major_row_pair(
-                stream.as_ref(),
-                be,
-                &buf,
-                cols_u64,
-                lde_u64,
-                log_lde,
-                &mut leaves_view,
-            )?,
-            DeviceHash::Rpo256 | DeviceHash::Poseidon => {
-                unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
-            }
-        }
+        launch_row_major_leaves(
+            hash,
+            stream.as_ref(),
+            be,
+            &buf,
+            cols_u64,
+            0,
+            cols_u64,
+            lde_u64,
+            rows_per_leaf,
+            &mut leaves_view,
+        )?;
     }
     build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
@@ -1282,6 +1447,34 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
+    coset_lde_row_major_with_merkle_tree_keep_rpl(
+        row_major,
+        predev,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        2,
+    )
+}
+
+/// [`coset_lde_row_major_with_merkle_tree_keep`] with `rows_per_leaf` rows per
+/// Merkle leaf: 2 is today's row pair, 1 the S2 one-row tree (twice the
+/// leaves, `(2·lde − 1)·32` node bytes instead of `(lde − 1)·32`).
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_row_major_with_merkle_tree_keep_rpl(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
     let input = match predev {
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
@@ -1296,6 +1489,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         "coset_lde_row_major lde_size",
         true,
         retain_host_lde,
+        rows_per_leaf,
     )?;
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
@@ -1338,6 +1532,39 @@ pub fn coset_lde_row_major_split_trees(
     build_precomputed: bool,
     retain_host_lde: bool,
 ) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
+    coset_lde_row_major_split_trees_rpl(
+        row_major,
+        predev,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        split_col,
+        build_precomputed,
+        retain_host_lde,
+        2,
+    )
+}
+
+/// [`coset_lde_row_major_split_trees`] with `rows_per_leaf` rows per Merkle
+/// leaf in BOTH subset trees (a table has one leaf layout): 2 = row pair,
+/// 1 = S2 one row.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_row_major_split_trees_rpl(
+    row_major: &[u64],
+    predev: Option<&CudaSlice<u64>>,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    split_col: usize,
+    build_precomputed: bool,
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Result<(Option<Vec<u8>>, GpuLdeBase, Vec<u64>)> {
     assert!(split_col > 0 && split_col < m, "split inside the row");
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1348,10 +1575,13 @@ pub fn coset_lde_row_major_split_trees(
     assert_eq!(row_major.len(), n * m, "row-major input shape");
     let lde_size = n * blowup_factor;
     assert_u32_domain(lde_size, "coset_lde_row_major_split lde_size");
-    let num_leaves = lde_size / 2;
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    let num_leaves = lde_size / rows_per_leaf;
     let nodes_bytes = TreeCommit::FullTree.total_nodes_bytes(num_leaves);
     let leaves_offset = TreeCommit::FullTree.leaves_offset_bytes(num_leaves);
-    let log_lde = lde_size.trailing_zeros() as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = m as u64;
 
@@ -1371,44 +1601,18 @@ pub fn coset_lde_row_major_split_trees(
         {
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
-            match hash {
-                DeviceHash::Keccak256 => launch_keccak_base_row_major_row_pair_range(
-                    stream.as_ref(),
-                    be,
-                    &buf,
-                    cols_u64,
-                    col_start,
-                    col_end,
-                    lde_u64,
-                    log_lde,
-                    &mut leaves_view,
-                )?,
-                DeviceHash::Blake3 => crate::blake3::launch_leaves_base_row_major_row_pair_range(
-                    stream.as_ref(),
-                    be,
-                    &buf,
-                    cols_u64,
-                    col_start,
-                    col_end,
-                    lde_u64,
-                    log_lde,
-                    &mut leaves_view,
-                )?,
-                DeviceHash::Rpx256 => crate::rpx::launch_leaves_base_row_major_row_pair_range(
-                    stream.as_ref(),
-                    be,
-                    &buf,
-                    cols_u64,
-                    col_start,
-                    col_end,
-                    lde_u64,
-                    log_lde,
-                    &mut leaves_view,
-                )?,
-                DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
-                    "{hash:?} device commit not yet ported (row-major row-pair leaves, column range)"
-                ),
-            }
+            launch_row_major_leaves(
+                hash,
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                col_start,
+                col_end,
+                lde_u64,
+                rows_per_leaf,
+                &mut leaves_view,
+            )?;
         }
         build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
         Ok(nodes_dev)
@@ -1492,6 +1696,31 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    coset_lde_ext3_row_major_with_merkle_tree_keep_rpl(
+        row_major,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        2,
+    )
+}
+
+/// [`coset_lde_ext3_row_major_with_merkle_tree_keep`] with `rows_per_leaf` rows per Merkle leaf (2 = row pair, 1 = S2
+/// one row).
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_rpl(
+    row_major: &[u64],
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
     let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         hash,
@@ -1502,6 +1731,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         "coset_lde_ext3_row_major lde_size",
         false,
         retain_host_lde,
+        rows_per_leaf,
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),
@@ -1526,6 +1756,31 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    coset_lde_ext3_row_major_with_merkle_tree_keep_dev_rpl(
+        input_dev,
+        hash,
+        n,
+        m,
+        blowup_factor,
+        weights,
+        retain_host_lde,
+        2,
+    )
+}
+
+/// [`coset_lde_ext3_row_major_with_merkle_tree_keep_dev`] with `rows_per_leaf` rows per Merkle leaf (2 = row pair, 1 = S2
+/// one row).
+#[allow(clippy::too_many_arguments)]
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev_rpl(
+    input_dev: &CudaSlice<u64>,
+    hash: DeviceHash,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+    rows_per_leaf: usize,
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
     let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
         hash,
@@ -1536,6 +1791,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         "coset_lde_ext3_row_major_dev lde_size",
         false,
         retain_host_lde,
+        rows_per_leaf,
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),
