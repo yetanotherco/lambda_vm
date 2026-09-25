@@ -122,8 +122,16 @@ pub fn schedules_json() -> VectorFile {
     let w = FRI_COST_WEIGHTS;
     let _ = writeln!(
         s,
-        "  \"weights_ns\": {{\"compress\": {}, \"select\": {}, \"unpack\": {}, \"hint\": {}, \"compare\": {}, \"fold\": {}, \"twiddle\": {}}},",
-        w.cap.compress, w.cap.select, w.cap.unpack, w.cap.hint, w.cap.compare, w.fold, w.twiddle
+        "  \"weights_ns\": {{\"compress\": {}, \"select\": {}, \"unpack\": {}, \"hint\": {}, \"compare\": {}, \"fold\": {}, \"twiddle\": {}, \"xalu\": {}, \"balu\": {}}},",
+        w.cap.compress,
+        w.cap.select,
+        w.cap.unpack,
+        w.cap.hint,
+        w.cap.compare,
+        w.fold,
+        w.twiddle,
+        w.xalu,
+        w.balu
     );
     let _ = writeln!(s, "  \"dmax\": {FRI_SCHEDULE_DMAX},");
     s.push_str("  \"rows\": [\n");

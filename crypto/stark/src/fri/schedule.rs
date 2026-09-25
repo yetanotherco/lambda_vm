@@ -19,28 +19,42 @@
 //! * the active Merkle-cap policy ([`CapPolicy`]; `Off` caps nothing);
 //! * `dmax` — the largest fold exponent the program may choose.
 //!
-//! # The objective (RULINGS 13): the cost law, not permutations
+//! # The objective (RULINGS 13, 22): the cost law of every emitted row
 //!
 //! The DP minimises the in-guest verifier's price of the FRI leg under the
 //! SAME cost-law weights the cap policy optimises ([`AUTO_WEIGHTS`], ns per
 //! row from the node law 421 ns/instruction + 5.63 ns/cell and each chip's
-//! committed width), per query per committed layer:
+//! committed width). Per query per committed layer it prices EVERY row the
+//! in-guest group-layer emitter (`prover/src/lfm/fri.rs::emit_group_layer`)
+//! and its opening's hints emit — [`fri_group_layer_rows`], at a tree of
+//! `depth` levels (uncapped):
 //!
 //! ```text
 //! leaf(d)·compress                        absorb the 2^d-value group leaf
 //! + depth·(compress + select)             the authentication walk (a Select and a compression per level)
 //! + (2^d − 1)·select                      the slot mux picking the query's value out of the group
-//! + (2^d − 1)·fold                        the group fold: 2^d − 1 binary folds
+//! + 2·XALU                                the slot check (assert_eq_ext: esub + ediv)
+//! + (2^d − 1)·fold                        the group fold: 2^d − 1 binary folds (5 XALU each)
 //! + d·twiddle                             the twiddle chain: one base mul per fold level
-//! − cap_gain(Q, c(depth)) / Q             what the tree's cap saves, per query (0 without a cap)
+//! + d·(select + BALU)                     x_g⁻¹ = y⁻¹·ω^{br(slot)}: a constant Select and a base mul per slot bit
+//! + max(0, d − 2)·XALU + [d ≥ 2]·BALU     fold-level scaling (emul_base per level of > 2 pairs; one base mul at 2 pairs)
+//! + 8·BALU + 1·unpack                     the root compare (walked digest unpacked, four lowered asserts)
+//! + 2^d·unpack + 2^d·hint                 the group's values: hinted, unpacked into the leaf
+//! + packs(d)·unpack                       the leaf's 3·2^d felts packed four to a word (LFM_LANES rows)
+//! + depth·hint                            the path's siblings
+//! − cap_gain(Q, c(depth)) / Q − c·hint    what the tree's cap saves, per query (0 without a cap):
+//!                                         the cap policy's own gain, plus the c sibling hints a
+//!                                         capped path does not carry
 //! ```
 //!
-//! `leaf(d) = max(1, ⌈3·2^d / 8⌉)` (an ext3 group at the RPX rate of 8 felts).
-//! The per-operation row counts are the in-guest emitter's
-//! (`prover/src/lfm/edsl.rs::fri_fold` = 5 `XALU` rows, a `Select` = 1
-//! `SELECT` row, a base `mul` = 1 `BALU` row) — the in-guest lane pins
-//! "emitted rows == these rows" against its emitter. Costs are kept in units of
-//! `1/Q` ns so every term is an integer.
+//! `leaf(d) = max(1, ⌈3·2^d / 8⌉)` (an ext3 group at the RPX rate of 8 felts);
+//! the digest is the production one-cell (algebraic) digest. Each row kind is
+//! priced at one weight: `SELECT`, `LFM_HASH` (compress), `Unpack` and hint
+//! at the cap policy's (a `Pack` is an `LFM_LANES` row, as an `Unpack` is,
+//! and is priced like one), `XALU` at [`XALU_ROW_NS`], `BALU` at [`BALU_ROW_NS`].
+//! The in-guest lane pins "emitted rows == [`fri_group_layer_rows`]" kind by
+//! kind against its emitter (`lfm::fri_group_tests`), capped and uncapped.
+//! Costs are kept in units of `1/Q` ns so every term is an integer.
 
 use crypto::merkle_tree::cap::{AUTO_WEIGHTS, CapPolicy, CapWeights, cap_gain};
 
@@ -67,6 +81,28 @@ pub const FRI_TWIDDLE_BALU_ROWS: u64 = 1;
 /// cell, so one `Select` instruction).
 pub const FRI_SLOT_SELECT_ROWS: u64 = 1;
 
+/// `XALU` rows of the slot check: `assert_eq_ext` lowers to an `esub` and an
+/// `ediv` by zero.
+pub const FRI_SLOT_ASSERT_XALU_ROWS: u64 = 2;
+
+/// `SELECT` rows of one slot bit of the `x_g` derivation (`x_g⁻¹ =
+/// y⁻¹·ω_{2^d}^{br(slot)}`): the bit picks `1` or a constant.
+pub const FRI_XG_SELECT_ROWS: u64 = 1;
+
+/// `BALU` rows of one slot bit of the `x_g` derivation (one base `mul`).
+pub const FRI_XG_BALU_ROWS: u64 = 1;
+
+/// `BALU` rows of one opening's root (or cap-node) compare at the production
+/// one-cell digest: four lowered `assert_eq`s, a `sub` and a `div` each.
+pub const FRI_ROOT_COMPARE_BALU_ROWS: u64 = 8;
+
+/// `Unpack` rows of one opening's root compare: the walked digest's lanes (a
+/// capped compare unpacks the muxed cap node too, which the cap's gain prices).
+pub const FRI_ROOT_COMPARE_UNPACK_ROWS: u64 = 1;
+
+/// Felts one `Pack` row assembles into a word for the algebraic leaf sponge.
+pub const FRI_LEAF_PACK_FELTS: u64 = 4;
+
 /// Cost-law price (ns) of one `XALU` row: 421 + 5.63 × 18 committed cells
 /// (the `LFM_XALU` cliff in the census, `+18874368` cells per `2^20` rows).
 pub const XALU_ROW_NS: u64 = 522;
@@ -81,10 +117,14 @@ pub const BALU_ROW_NS: u64 = 477;
 pub struct FriCostWeights {
     /// Compression, select, unpack, hint and compare prices (the cap policy's).
     pub cap: CapWeights,
-    /// One binary fold in-guest.
+    /// One binary fold in-guest ([`FRI_FOLD_XALU_ROWS`] `XALU` rows).
     pub fold: u64,
-    /// One step of the twiddle chain in-guest.
+    /// One step of the twiddle chain in-guest ([`FRI_TWIDDLE_BALU_ROWS`] `BALU` rows).
     pub twiddle: u64,
+    /// One `XALU` row.
+    pub xalu: u64,
+    /// One `BALU` row.
+    pub balu: u64,
 }
 
 /// The weights the schedule DP optimises. ⚠ A FORMAT CONSTANT: changing any of
@@ -94,7 +134,89 @@ pub const FRI_COST_WEIGHTS: FriCostWeights = FriCostWeights {
     cap: AUTO_WEIGHTS,
     fold: FRI_FOLD_XALU_ROWS * XALU_ROW_NS,
     twiddle: FRI_TWIDDLE_BALU_ROWS * BALU_ROW_NS,
+    xalu: XALU_ROW_NS,
+    balu: BALU_ROW_NS,
 };
+
+/// The rows one query's opening of one committed FRI layer emits in-guest, by
+/// chip kind. `hashes` counts two-to-one compressions and leaf-absorption
+/// permutations alike (both are `LFM_HASH` rows, priced `compress`); `packs`
+/// and `unpacks` are both `LFM_LANES` rows, priced `unpack`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FriLayerRows {
+    pub selects: u64,
+    pub xalu: u64,
+    pub balu: u64,
+    pub hashes: u64,
+    pub unpacks: u64,
+    pub packs: u64,
+    pub hints: u64,
+}
+
+impl FriLayerRows {
+    /// The cost-law price (ns) of these rows under `weights`.
+    pub fn price(&self, weights: &FriCostWeights) -> u64 {
+        let w = &weights.cap;
+        [
+            (self.selects, w.select),
+            (self.xalu, weights.xalu),
+            (self.balu, weights.balu),
+            (self.hashes, w.compress),
+            (self.unpacks, w.unpack),
+            (self.packs, w.unpack),
+            (self.hints, w.hint),
+        ]
+        .iter()
+        .fold(0u64, |acc, &(n, p)| acc.saturating_add(n.saturating_mul(p)))
+    }
+}
+
+/// ★ The rows one query's opening of a GROUP layer (fold exponent `d`, tree
+/// `depth` levels deep, cap height `cap_height`, clamped to the depth) emits
+/// in-guest: `emit_group_layer` plus the opening's hints (see the module
+/// docs; `lfm::fri_group_tests` pins these kind by kind against the emitter).
+///
+/// A cap of height `c` walks `depth − c` levels, hints `depth − c` siblings,
+/// muxes the cap node (`2^c − 1` selects) and unpacks it for the compare.
+pub fn fri_group_layer_rows(d: u32, depth: u32, cap_height: u32) -> FriLayerRows {
+    let d = d.min(63);
+    let n = 1u64 << d;
+    let c = cap_height.min(depth).min(63);
+    let walk = u64::from(depth - c);
+    let cap_mux = (1u64 << c) - 1;
+    let d64 = u64::from(d);
+    FriLayerRows {
+        selects: (n - 1) * FRI_SLOT_SELECT_ROWS + walk + cap_mux + d64 * FRI_XG_SELECT_ROWS,
+        xalu: (n - 1) * FRI_FOLD_XALU_ROWS + FRI_SLOT_ASSERT_XALU_ROWS + d64.saturating_sub(2),
+        balu: d64 * FRI_TWIDDLE_BALU_ROWS
+            + d64 * FRI_XG_BALU_ROWS
+            + u64::from(d >= 2)
+            + FRI_ROOT_COMPARE_BALU_ROWS,
+        hashes: fri_leaf_blocks(d) + walk,
+        unpacks: n + FRI_ROOT_COMPARE_UNPACK_ROWS + u64::from(c > 0),
+        packs: fri_leaf_packs(d),
+        hints: n + walk,
+    }
+}
+
+/// The rows one query's opening of a layer under TODAY's pair encoding
+/// (`FriFormat::is_legacy`: one sibling value per layer, no slot check, no
+/// `x_g`) emits in-guest (`prover/src/lfm/fri.rs::emit_pair_layer`): the
+/// parity select, the pair leaf, the walk and compare, one squaring of the
+/// point, one fold; hints: the sibling value and the path.
+pub fn fri_pair_layer_rows(depth: u32, cap_height: u32) -> FriLayerRows {
+    let c = cap_height.min(depth).min(63);
+    let walk = u64::from(depth - c);
+    FriLayerRows {
+        selects: FRI_SLOT_SELECT_ROWS + walk + ((1u64 << c) - 1),
+        xalu: FRI_FOLD_XALU_ROWS,
+        balu: FRI_TWIDDLE_BALU_ROWS + FRI_ROOT_COMPARE_BALU_ROWS,
+        hashes: fri_leaf_blocks(1) + walk,
+        unpacks: 2 + FRI_ROOT_COMPARE_UNPACK_ROWS + u64::from(c > 0),
+        packs: fri_leaf_packs(1),
+        hints: 1 + walk,
+    }
+}
 
 /// Log2 length of the first committed FRI layer for an LDE of `2^lde_log`.
 ///
@@ -109,15 +231,24 @@ pub fn fri_chain_start(lde_log: u32, one_row: bool) -> u32 {
     }
 }
 
+/// `Pack` rows that assemble one group leaf's `3·2^d` felts into words (four
+/// per word, the tail zero-padded) before the sponge absorbs them.
+pub fn fri_leaf_packs(d: u32) -> u64 {
+    let felts = FRI_EXTENSION_DEGREE.saturating_mul(1u64.checked_shl(d).unwrap_or(u64::MAX));
+    felts.div_ceil(FRI_LEAF_PACK_FELTS)
+}
+
 /// Permutations to absorb one group leaf of `2^d` extension values.
 pub fn fri_leaf_blocks(d: u32) -> u64 {
     let felts = FRI_EXTENSION_DEGREE.saturating_mul(1u64.checked_shl(d).unwrap_or(u64::MAX));
     felts.div_ceil(FRI_LEAF_RATE_FELTS).max(1)
 }
 
-/// `Q ×` the per-query cost-law price (ns) of one committed layer of fold
-/// exponent `d` whose tree has `depth` levels (the layer is `2^{depth + d}`
-/// values long), under `weights` and the cap policy `cap`. See the module docs.
+/// `Q ×` the per-query cost-law price (ns) of one committed GROUP layer of
+/// fold exponent `d` whose tree has `depth` levels (the layer is
+/// `2^{depth + d}` values long), under `weights` and the cap policy `cap`:
+/// every emitted row ([`fri_group_layer_rows`]) of the uncapped opening, minus
+/// the cap's gain and the sibling hints the cap removes. See the module docs.
 pub fn fri_layer_cost_q(
     weights: &FriCostWeights,
     d: u32,
@@ -125,20 +256,49 @@ pub fn fri_layer_cost_q(
     num_queries: u64,
     cap: CapPolicy,
 ) -> u64 {
-    // i128 throughout, d clamped to 64 so 2^d fits; the result is clamped into
-    // u64 (it is non-negative — a cap never saves more than the walk it
-    // shortens — but the clamp keeps that a non-assumption).
-    let w = |x: u64| x as i128;
-    let d = d.min(64);
+    layer_cost_q(
+        weights,
+        &fri_group_layer_rows(d, depth, 0),
+        depth,
+        num_queries,
+        cap,
+    )
+}
+
+/// `Q ×` the per-query price of one committed layer under TODAY's pair
+/// encoding ([`fri_pair_layer_rows`]), under `weights` and `cap`.
+pub fn fri_pair_layer_cost_q(
+    weights: &FriCostWeights,
+    depth: u32,
+    num_queries: u64,
+    cap: CapPolicy,
+) -> u64 {
+    layer_cost_q(
+        weights,
+        &fri_pair_layer_rows(depth, 0),
+        depth,
+        num_queries,
+        cap,
+    )
+}
+
+/// `Q × price(uncapped)` minus the cap's gain ([`cap_gain`], the cap policy's
+/// own function) and the `c` sibling hints per query a capped path omits. In
+/// i128, clamped into u64 (non-negative: a cap never saves more than the walk
+/// it shortens, but the clamp keeps that a non-assumption).
+fn layer_cost_q(
+    weights: &FriCostWeights,
+    uncapped: &FriLayerRows,
+    depth: u32,
+    num_queries: u64,
+    cap: CapPolicy,
+) -> u64 {
     let q = num_queries as i128;
-    let group = (1i128 << d) - 1;
-    let per_query = w(fri_leaf_blocks(d)) * w(weights.cap.compress)
-        + i128::from(depth) * (w(weights.cap.compress) + w(weights.cap.select))
-        + group * (w(FRI_SLOT_SELECT_ROWS) * w(weights.cap.select) + w(weights.fold))
-        + i128::from(d) * w(weights.twiddle);
+    let per_query = uncapped.price(weights) as i128;
     let queries = usize::try_from(num_queries).unwrap_or(usize::MAX);
     let c = cap.height(queries, depth as usize);
-    let total = q.saturating_mul(per_query) - cap_gain(&weights.cap, queries, c);
+    let hints_saved = q.saturating_mul(c as i128 * weights.cap.hint as i128);
+    let total = q.saturating_mul(per_query) - cap_gain(&weights.cap, queries, c) - hints_saved;
     u64::try_from(total.max(0)).unwrap_or(u64::MAX)
 }
 
@@ -164,7 +324,7 @@ pub fn fri_schedule_cost_by(
 }
 
 /// [`fri_schedule_cost_by`] under the production objective
-/// ([`FRI_COST_WEIGHTS`], [`fri_layer_cost_q`]).
+/// ([`FRI_COST_WEIGHTS`], [`fri_layer_cost_q`]) — group layers.
 pub fn fri_schedule_cost_q(
     b0: u32,
     schedule: &[u8],
@@ -347,6 +507,39 @@ impl FriFormat {
     /// never by the schedule's values.
     pub fn is_legacy(&self) -> bool {
         self.mode == FriMode::Pair && !self.one_row
+    }
+
+    /// `Q ×` the per-query in-guest price of this table's whole FRI chain for
+    /// an LDE of `2^lde_log` folding to a terminal of `2^terminal_log`: every
+    /// committed layer of [`Self::schedule`] (group layers, or today's pair
+    /// layers when [`Self::is_legacy`]) plus, for row-pair openings, the
+    /// uncommitted fold 0 (one fold; the group encoding also squares the
+    /// point once into the first layer's `y⁻¹`, where the pair encoding
+    /// squares inside each layer).
+    pub fn chain_cost_q(&self, lde_log: u32, terminal_log: u32) -> u64 {
+        let w = &FRI_COST_WEIGHTS;
+        let (q, cap) = (self.num_queries, self.cap);
+        let b0 = fri_chain_start(lde_log, self.one_row);
+        let schedule = self.schedule(lde_log, terminal_log);
+        let layers = if self.is_legacy() {
+            fri_schedule_cost_by(b0, &schedule, &|_, depth| {
+                fri_pair_layer_cost_q(w, depth, q, cap)
+            })
+        } else {
+            fri_schedule_cost_q(b0, &schedule, q, cap)
+        }
+        .unwrap_or(u64::MAX);
+        let fold0 = if !self.one_row && lde_log > terminal_log {
+            let per_query = if self.is_legacy() {
+                w.fold
+            } else {
+                w.fold + w.twiddle
+            };
+            q.saturating_mul(per_query)
+        } else {
+            0
+        };
+        layers.saturating_add(fold0)
     }
 
     /// The committed-layer fold schedule for an LDE of `2^lde_log` folding to a

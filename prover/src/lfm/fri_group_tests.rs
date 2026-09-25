@@ -12,16 +12,18 @@
 //!   load-bearing (a moved `p₀` executes when, and only when, it is skipped);
 //! - the {cap off, auto} × {pair, dp, uneven dp} round-trip matrix on a real
 //!   laptop-scale proof (F9), both legs as one program;
-//! - RULINGS 13: the rows the emitter emits per group layer, against the DP's
-//!   cost-model terms (`stark::fri::schedule`), with every unmodelled row named.
+//! - RULINGS 13 + 22: every row the emitter emits per FRI layer (group and
+//!   pair, capped and uncapped) equals the DP's model (`stark::fri::schedule`),
+//!   and a DEEP point's rows equal the S2 `auto` rule's DEEP term.
 
 use crypto::merkle_tree::cap::CapPolicy;
 use serde_json::Value;
 use stark::examples::read_only_memory_logup::LogReadOnlyPublicInputs;
 use stark::fri::schedule::{
-    FRI_COST_WEIGHTS, FRI_FOLD_XALU_ROWS, FRI_SLOT_SELECT_ROWS, FRI_TWIDDLE_BALU_ROWS,
-    fri_leaf_blocks, fri_schedule_by,
+    FRI_COST_WEIGHTS, FriLayerRows, fri_group_layer_rows, fri_layer_cost_q, fri_pair_layer_cost_q,
+    fri_pair_layer_rows,
 };
+use stark::leaf_layout::deep_point_xalu_rows;
 use stark::merkle_caps::StarkCaps;
 use stark::proof::options::{FriMode, FriScheduleOverride, ProofFormat, ProofOptions};
 use stark::proof::stark::StarkProof;
@@ -29,10 +31,12 @@ use stark::proof::view::StarkProofView;
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
+use super::builder::Felt;
 use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
+use super::deep::{DeepInvariants, DeepOpening, DeepShape, emit_deep_point};
 use super::executor::execute;
-use super::fri::{FriShape, LayerCommitment, LayerOpening, emit_group_layer};
+use super::fri::{FriShape, LayerCommitment, LayerOpening, emit_group_layer, emit_pair_layer};
 use super::fri_tests::{folding_fixture_with, fri_only_program, host_fri_from, permutations};
 use super::instr::Instr;
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
@@ -454,239 +458,310 @@ fn the_cap_and_fri_matrix_round_trips_in_guest() {
 }
 
 // =============================================================================
-// RULINGS 13 — the emitted rows per group layer against the DP's cost terms
+// RULINGS 13 + 22 — every emitted row per FRI layer and per DEEP point, against
+// the host's cost model (`stark::fri::schedule`, `stark::leaf_layout`)
 // =============================================================================
 
-/// Rows one group layer of fold exponent `d` emits, by kind, measured on the
-/// emitter itself: the layer is emitted TWICE in one builder over hinted
-/// inputs and the second emission is counted, so interned program constants
-/// (paid once per program) are out of the figure. The tree is two levels
-/// deep and uncapped, which isolates the model's path term.
-struct LayerRows {
-    selects: usize,
-    xalu: usize,
-    balu: usize,
-    hashes: usize,
-    unpacks: usize,
-    hints: usize,
-    total: usize,
-}
-
-fn measure_group_layer(d: u32) -> LayerRows {
-    let once = group_layer_program(d, 1);
-    let twice = group_layer_program(d, 2);
-    let (a, b) = (count_kinds(&once.instrs), count_kinds(&twice.instrs));
-    LayerRows {
-        selects: b.0 - a.0,
-        xalu: b.1 - a.1,
-        balu: b.2 - a.2,
-        hashes: b.3 - a.3,
-        unpacks: b.4 - a.4,
-        hints: b.5 - a.5,
-        total: twice.instrs.len() - once.instrs.len(),
-    }
-}
-
-/// A program emitting `times` group layers of exponent `d` over hinted
-/// inputs that are all hinted BEFORE the first emission, so the difference
-/// between `times = 2` and `times = 1` is exactly one layer's rows. One
-/// committed layer over a two-level tree: `n − 1 = d + 2` index bits and a
-/// terminal at `2^2` (blowup `2^1`, `k = 1`).
-fn group_layer_program(d: u32, times: usize) -> LfmProgram {
-    let shape = FriShape {
-        log2_lde_length: d + 3,
-        blowup_log: 1,
-        final_poly_log_degree: 1,
-        coset_offset: 3,
-        num_queries: 1,
-        format: ProofFormat {
-            fri_mode: FriMode::Dp,
-            fri_schedule_override: FriScheduleOverride::new(&[d as u8]),
-            ..ProofFormat::DEFAULT
-        },
-    };
-    shape.check();
-    assert_eq!(shape.schedule(), vec![d as u8]);
-    assert_eq!(shape.layer_depth(0), 2);
-
-    let n = 1usize << d;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
-    let arena = b.declare_arena((4 + d as usize + times * (n + 2)) as u32);
-    let root = b.hint_word(arena, 0);
-    let commitment = LayerCommitment::from_lanes(vec![b.unpack(root)]);
-    let v = b.hint_word(arena, 1).as_ext();
-    let y_inv = b.hint_felt(arena, 2);
-    let index = b.hint_felt(arena, 3);
-    let bits = b.bit_dec(index, shape.index_bits());
-    let zetas: Vec<_> = (0..d).map(|i| b.hint_word(arena, 4 + i).as_ext()).collect();
-    let mut at = 4 + d;
-    let openings: Vec<LayerOpening> = (0..times)
-        .map(|_| {
-            let values = (0..n)
-                .map(|_| {
-                    at += 1;
-                    b.hint_word(arena, at - 1).as_ext()
-                })
-                .collect();
-            let siblings = (0..2)
-                .map(|_| {
-                    at += 1;
-                    super::edsl::WrapDigest::from_cell(b.hint_word(arena, at - 1))
-                })
-                .collect();
-            LayerOpening { values, siblings }
-        })
-        .collect();
-    for opening in &openings {
-        emit_group_layer(
-            &mut b,
-            shape,
-            0,
-            &commitment,
-            &zetas,
-            v,
-            y_inv,
-            opening,
-            &bits,
-        );
-    }
-    compile(b.finish())
-}
-
-/// `(selects, XALU, BALU, hashes, unpacks, hints)` over an instruction list.
-fn count_kinds(instrs: &[Instr]) -> (usize, usize, usize, usize, usize, usize) {
-    let mut k = (0, 0, 0, 0, 0, 0);
+/// The kinds of every instruction a program emits: `(selects, XALU, BALU,
+/// hashes, unpacks, packs, hints, other)`.
+fn count_kinds(instrs: &[Instr]) -> [usize; 8] {
+    let mut k = [0usize; 8];
     for i in instrs {
-        match i {
-            Instr::Select { .. } => k.0 += 1,
-            Instr::ExtAlu { .. } => k.1 += 1,
-            Instr::BaseAlu { .. } => k.2 += 1,
-            Instr::Hash { .. } => k.3 += 1,
-            Instr::Unpack { .. } => k.4 += 1,
-            Instr::Hint { .. } => k.5 += 1,
-            _ => {}
-        }
+        let slot = match i {
+            Instr::Select { .. } => 0,
+            Instr::ExtAlu { .. } => 1,
+            Instr::BaseAlu { .. } => 2,
+            Instr::Hash { .. } => 3,
+            Instr::Unpack { .. } => 4,
+            Instr::Pack { .. } => 5,
+            Instr::Hint { .. } => 6,
+            _ => 7,
+        };
+        k[slot] += 1;
     }
     k
 }
 
-/// ★ RULINGS 13: the rows the emitter emits per group layer, against the
-/// DP's cost-model terms (I-FRI-H's weights, `stark::fri::schedule`):
+/// The rows `emit(times)` adds per repetition: the program is built at
+/// `times = 1` and `times = 2` over the same hinted inputs, and the difference
+/// is one repetition's rows — interned program constants and one-time setup
+/// (the index decomposition, the root's unpack, the cap's hints and root
+/// check) fall out of it. Asserts the repetition emits nothing but the priced
+/// row kinds.
+fn rows_of_one(emit: &dyn Fn(usize) -> LfmProgram) -> FriLayerRows {
+    let (once, twice) = (emit(1), emit(2));
+    let (a, b) = (count_kinds(&once.instrs), count_kinds(&twice.instrs));
+    let d: Vec<u64> = (0..8).map(|i| (b[i] - a[i]) as u64).collect();
+    assert_eq!(d[7], 0, "a repetition emits only priced row kinds");
+    assert_eq!(
+        (twice.instrs.len() - once.instrs.len()) as u64,
+        d.iter().sum::<u64>(),
+        "every instruction is counted"
+    );
+    FriLayerRows {
+        selects: d[0],
+        xalu: d[1],
+        balu: d[2],
+        hashes: d[3],
+        unpacks: d[4],
+        packs: d[5],
+        hints: d[6],
+    }
+}
+
+/// Tree depth of the measured layers.
+const MEASURED_DEPTH: usize = 2;
+
+/// A program emitting `times` openings of one committed FRI layer (group
+/// layer of exponent `d`, or today's pair layer when `d == 0`) over a
+/// `MEASURED_DEPTH`-level tree capped at `c`, every shared input hinted before
+/// the first opening. Every opening's values and siblings are hinted in the
+/// loop (as `hint_layer_openings` does), so they count.
+fn fri_layer_program(d: u32, c: usize, times: usize) -> LfmProgram {
+    let pair = d == 0;
+    let fold = if pair { 1 } else { d };
+    let shape = FriShape {
+        log2_lde_length: fold + MEASURED_DEPTH as u32 + 1,
+        blowup_log: 1,
+        final_poly_log_degree: 1,
+        coset_offset: 3,
+        num_queries: 1,
+        format: if pair {
+            ProofFormat::DEFAULT
+        } else {
+            ProofFormat {
+                fri_mode: FriMode::Dp,
+                fri_schedule_override: FriScheduleOverride::new(&[d as u8]),
+                ..ProofFormat::DEFAULT
+            }
+        },
+    };
+    shape.check();
+    assert_eq!(shape.is_legacy(), pair);
+    assert_eq!(shape.schedule(), vec![fold as u8]);
+    assert_eq!(shape.layer_depth(0), MEASURED_DEPTH);
+
+    let n = if pair { 1 } else { 1usize << d };
+    let num_siblings = MEASURED_DEPTH - c;
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    assert_eq!(
+        super::edsl::digest_words(&b),
+        1,
+        "the model prices the production one-cell digest"
+    );
+    let arena = b.declare_arena((4 + fold as usize + (1 << c) + times * (n + num_siblings)) as u32);
+    let root = b.hint_word(arena, 0);
+    let mut commitment = LayerCommitment::from_lanes(vec![b.unpack(root)]);
+    let v = b.hint_word(arena, 1).as_ext();
+    let y_inv = b.hint_felt(arena, 2);
+    let index = b.hint_felt(arena, 3);
+    let bits = b.bit_dec(index, shape.index_bits());
+    let zetas: Vec<_> = (0..fold)
+        .map(|i| b.hint_word(arena, 4 + i).as_ext())
+        .collect();
+    let mut at = commitment.hint_cap(&mut b, arena, 4 + fold, c);
+    for _ in 0..times {
+        let values = (0..n)
+            .map(|_| {
+                at += 1;
+                b.hint_word(arena, at - 1).as_ext()
+            })
+            .collect();
+        let siblings = (0..num_siblings)
+            .map(|_| {
+                at += 1;
+                super::edsl::WrapDigest::from_cell(b.hint_word(arena, at - 1))
+            })
+            .collect();
+        let opening = LayerOpening { values, siblings };
+        if pair {
+            emit_pair_layer(&mut b, 0, &commitment, zetas[0], v, y_inv, &opening, &bits);
+        } else {
+            emit_group_layer(
+                &mut b,
+                shape,
+                0,
+                &commitment,
+                &zetas,
+                v,
+                y_inv,
+                &opening,
+                &bits,
+            );
+        }
+    }
+    compile(b.finish())
+}
+
+/// ★ RULINGS 13 + 22: the rows one query's opening of a committed FRI layer
+/// emits in-guest EQUAL the host model's, kind by kind and in total, for group
+/// layers `d = 1..=6` and today's pair layer, uncapped and capped (`c = 1, 2`
+/// on a two-level tree):
 ///
 /// ```text
-///   model, per query per committed layer of exponent d over a depth-D tree:
-///     leaf(d)·compress + D·(compress + select) + (2^d − 1)·select
-///     + (2^d − 1)·fold(5 XALU) + d·twiddle(1 BALU)
+///   group d, depth D, cap c (stark::fri::schedule::fri_group_layer_rows):
+///     selects  (2^d − 1) slot mux + (D − c) walk + (2^c − 1) cap mux + d x_g
+///     XALU     5·(2^d − 1) folds + 2 slot assert + max(0, d − 2) scaling
+///     BALU     d twiddles + d x_g + [d ≥ 2] scaling + 8 root compare
+///     hashes   leaf(d) + (D − c)
+///     unpacks  2^d values + 1 walked digest + [c ≥ 1] cap node
+///     packs    ⌈3·2^d / 4⌉ leaf words
+///     hints    2^d values + (D − c) siblings
+///   pair, depth D, cap c (fri_pair_layer_rows):
+///     selects 1 + (D − c) + (2^c − 1), XALU 5, BALU 1 + 8, hashes 1 + (D − c),
+///     unpacks 2 + 1 + [c ≥ 1], packs 2, hints 1 + (D − c)
 /// ```
 ///
-/// The three terms the ruling names — the slot mux, the group fold and the
-/// twiddle chain — each MATCH the emitter row for row (and so do the leaf and
-/// the walk). The emitter ALSO emits rows the model does not price, and this
-/// test pins them rather than hiding them, because the schedule is a format
-/// constant and a change of weights is the lead's ruling (RULINGS 13):
-///
-/// - `x_g⁻¹ = y⁻¹·ω^{br(slot)}`: `d` selects of constants and `d` base muls;
-/// - fold-level scaling: one `emul_base` per level with more than two pairs
-///   (`max(0, d − 2)` XALU) and one base mul on the level with two pairs
-///   (`[d ≥ 2]` BALU);
-/// - the slot check's `assert_eq_ext`: 2 XALU;
-/// - the per-opening root (or cap node) compare: 8 BALU rows (four lowered
-///   asserts) and one unpack — which today's pair layer pays as well;
-/// - the group's `2^d` unpacks (the leaf reads three lanes of each value) and
-///   `2^d` value hints, plus the walked root's one unpack and the path hints.
-///
-/// At `d = 1` the model is today's pair layer exactly (1 select, 5 XALU,
-/// 1 BALU); the group encoding at `d = 1` pays the extras on top.
+/// The DP prices exactly these rows: `fri_layer_cost_q` is the uncapped rows
+/// minus the cap's gain and the `c` sibling hints it removes, checked here
+/// against the capped rows priced directly plus the cap's per-tree cost. A
+/// change to the emitter that is not also a change to the model fails here.
 #[test]
-fn the_group_layer_rows_against_the_dp_cost_model() {
+fn every_emitted_fri_row_is_priced() {
     let w = FRI_COST_WEIGHTS;
-    let depth = 2usize;
-    println!(
-        "\n  d | model sel/XALU/BALU/hash | emitted sel/XALU/BALU/hash | unmodelled \
-         sel/XALU/BALU  unpack hint | model ns  unmodelled ns"
-    );
-    for d in 1..=6u32 {
-        let r = measure_group_layer(d);
-        let n = 1usize << d;
-        // The model's rows (the ruling's terms plus the leaf and the walk).
-        let m_sel = (n - 1) * FRI_SLOT_SELECT_ROWS as usize + depth;
-        let m_xalu = (n - 1) * FRI_FOLD_XALU_ROWS as usize;
-        let m_balu = d as usize * FRI_TWIDDLE_BALU_ROWS as usize;
-        let m_hash = fri_leaf_blocks(d) as usize + depth;
-        // What the emitter adds on top, by construction (see the doc).
-        let x_sel = d as usize;
-        let x_xalu = 2 + (d as usize).saturating_sub(2);
-        // + the per-opening root compare: four lowered base asserts (a `sub`
-        // and a `div` each), today's pair layer pays it too.
-        let x_balu = d as usize + usize::from(d >= 2) + 8;
-        assert_eq!(
-            r.hashes, m_hash,
-            "d={d}: leaf blocks + one compression per level"
-        );
-        assert_eq!(r.selects, m_sel + x_sel, "d={d}: selects");
-        assert_eq!(r.xalu, m_xalu + x_xalu, "d={d}: XALU rows");
-        assert_eq!(r.balu, m_balu + x_balu, "d={d}: BALU rows");
-        assert_eq!(
-            r.unpacks,
-            n + 1,
-            "d={d}: the group's unpacks and the walked root's"
-        );
-        assert_eq!(r.hints, n + depth, "d={d}: the group's values and its path");
-        let model_ns = m_sel as u64 * w.cap.select
-            + (n as u64 - 1) * w.fold
-            + d as u64 * w.twiddle
-            + m_hash as u64 * w.cap.compress;
-        let unmodelled_ns = x_sel as u64 * w.cap.select
-            + x_xalu as u64 * XALU_NS
-            + x_balu as u64 * BALU_NS
-            + (n as u64 + 1) * w.cap.unpack
-            + n as u64 * w.cap.hint;
-        println!(
-            "  {d} | {m_sel:>3}/{m_xalu:>4}/{m_balu:>2}/{m_hash:>2}          | \
-             {:>3}/{:>4}/{:>2}/{:>2}            | {x_sel:>3}/{x_xalu:>4}/{x_balu:>2}     \
-             {:>4} {:>4} | {model_ns:>8} {unmodelled_ns:>8}  ({} instructions)",
-            r.selects,
-            r.xalu,
-            r.balu,
-            r.hashes,
-            n + 1,
-            n,
-            r.total,
-        );
+    println!("\n  layer c | sel XALU BALU hash unpack pack hint | ns/query");
+    for c in 0..=2usize {
+        for d in 0..=6u32 {
+            let got = rows_of_one(&|times| fri_layer_program(d, c, times));
+            let (label, model) = if d == 0 {
+                (
+                    "pair".to_string(),
+                    fri_pair_layer_rows(MEASURED_DEPTH as u32, c as u32),
+                )
+            } else {
+                (
+                    format!("d={d}"),
+                    fri_group_layer_rows(d, MEASURED_DEPTH as u32, c as u32),
+                )
+            };
+            assert_eq!(got, model, "{label} c={c}: emitted rows == model rows");
+            println!(
+                "  {label:>5} {c} | {:>3} {:>4} {:>4} {:>4} {:>6} {:>4} {:>4} | {:>8}",
+                got.selects,
+                got.xalu,
+                got.balu,
+                got.hashes,
+                got.unpacks,
+                got.packs,
+                got.hints,
+                got.price(&w)
+            );
+        }
     }
 
-    // What the unmodelled rows would do to the schedule, for the lead: the DP
-    // re-run with them priced (hint words priced at the cap policy's hint
-    // weight), at the production terminals and Q = 110 under cap = auto.
-    // Printed, not asserted: changing the objective is a format change.
-    let cap = CapPolicy::Auto;
-    let q = 110u64;
-    let with_extras = |d: u32, depth: u32| -> u64 {
-        let base = stark::fri::schedule::fri_layer_cost_q(&w, d, depth, q, cap);
-        let n = 1u64 << d;
-        let extra = u64::from(d) * w.cap.select
-            + (2 + u64::from(d.saturating_sub(2))) * XALU_NS
-            + (u64::from(d) + u64::from(d >= 2) + 8) * BALU_NS
-            + (n + 1) * w.cap.unpack
-            + n * w.cap.hint;
-        base + q * extra
-    };
-    println!("\n  schedules at Q = 110, cap = auto: the ruled objective vs the emitted rows");
-    for t in [9u32, 10] {
-        for b0 in [13u32, 18, 20, 21, 23] {
-            let ruled = fri_schedule_by(b0, t, 6, &|d, depth| {
-                stark::fri::schedule::fri_layer_cost_q(&w, d, depth, q, cap)
-            });
-            let emitted = fri_schedule_by(b0, t, 6, &with_extras);
-            println!(
-                "    T={t} b0={b0}: ruled {:?} (ns·Q {})  |  with the emitted rows {:?} \
-                 (ns·Q {})",
-                ruled.schedule, ruled.cost_q, emitted.schedule, emitted.cost_q
+    // The DP's per-layer price is these rows: uncapped exactly; capped, the
+    // capped rows plus the cap's once-per-tree cost (`cap_gain`'s per-tree
+    // term: 2^c − 1 compressions, 2^c hints, one compare).
+    let depth = 10u32;
+    for q in [1u64, 20, 110] {
+        for cap in [
+            CapPolicy::Off,
+            CapPolicy::Fixed(1),
+            CapPolicy::Fixed(3),
+            CapPolicy::Auto,
+        ] {
+            let c = cap.height(q as usize, depth as usize) as u32;
+            let per_tree = if c == 0 {
+                0
+            } else {
+                ((1u64 << c) - 1) * w.cap.compress + (1u64 << c) * w.cap.hint + w.cap.compare
+            };
+            for d in 1..=6u32 {
+                let direct = q * fri_group_layer_rows(d, depth, c).price(&w) + per_tree;
+                assert_eq!(
+                    fri_layer_cost_q(&w, d, depth, q, cap),
+                    direct,
+                    "group d={d} q={q} cap={cap:?}"
+                );
+            }
+            let direct = q * fri_pair_layer_rows(depth, c).price(&w) + per_tree;
+            assert_eq!(
+                fri_pair_layer_cost_q(&w, depth, q, cap),
+                direct,
+                "pair q={q} cap={cap:?}"
             );
         }
     }
 }
 
-/// Cost-law prices of an `XALU` and a `BALU` row, the schedule module's.
-const XALU_NS: u64 = stark::fri::schedule::XALU_ROW_NS;
-const BALU_NS: u64 = stark::fri::schedule::BALU_ROW_NS;
+/// A program emitting `times` DEEP points of `shape` over hinted openings and
+/// hinted invariants (the invariants hinted before the first point).
+fn deep_point_program(shape: &DeepShape, times: usize) -> LfmProgram {
+    let e = shape.num_eval_points;
+    let cols = shape.num_total_cols;
+    let parts = shape.num_composition_parts;
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena((4 * e + 4 + times * (1 + cols + parts)) as u32);
+    let mut at = 0u32;
+    let mut next = |b: &mut LfmBuilder| {
+        at += 1;
+        b.hint_word(arena, at - 1).as_ext()
+    };
+    let gamma = next(&mut b);
+    let inv = DeepInvariants {
+        ood_row_sum: (0..e).map(|_| next(&mut b)).collect(),
+        h_sum_zpow: next(&mut b),
+        z_pow: next(&mut b),
+        row_points: (0..e).map(|_| next(&mut b)).collect(),
+        gamma_pow_surviving: next(&mut b),
+        gamma_pow_block: (0..e).map(|_| next(&mut b)).collect(),
+        gamma_stride: (0..e).map(|_| next(&mut b)).collect(),
+    };
+    for _ in 0..times {
+        let point = Felt(next(&mut b).as_cell().0);
+        let opening = DeepOpening {
+            point,
+            trace: (0..cols).map(|_| next(&mut b)).collect(),
+            parts: (0..parts).map(|_| next(&mut b)).collect(),
+        };
+        emit_deep_point(&mut b, shape, gamma, &inv, &opening);
+    }
+    compile(b.finish())
+}
+
+/// ★ RULINGS 22: the XALU rows of ONE in-guest DEEP point EQUAL the S2 `auto`
+/// rule's DEEP term (`stark::leaf_layout::deep_point_xalu_rows`:
+/// `num_surviving + 4·E + P + 3`), over shapes with and without a next row,
+/// a widened step, and one or many composition parts. DEEP emits no other
+/// row kind; the point's hinted inputs here stand in for the cells the trace
+/// walk already authenticated.
+#[test]
+fn the_deep_point_rows_are_the_auto_rules_deep_term() {
+    let shapes = [
+        // (step, offsets, cols, next-row cols, parts)
+        (1usize, 1usize, 7usize, vec![], 1usize),
+        (1, 2, 5, vec![1, 3], 2),
+        (1, 2, 40, vec![0, 5, 39], 3),
+        (2, 2, 6, vec![2], 2),
+        (1, 3, 9, vec![0, 8], 4),
+    ];
+    for (step, offsets, cols, next_cols, parts) in shapes {
+        let shape = DeepShape {
+            step_size: step,
+            num_eval_points: offsets * step,
+            num_total_cols: cols,
+            next_row_cols: next_cols.clone(),
+            num_composition_parts: parts,
+            log2_trace_length: 8,
+        };
+        let got = rows_of_one(&|times| deep_point_program(&shape, times));
+        let want = deep_point_xalu_rows(
+            shape.num_surviving() as u64,
+            shape.num_eval_points as u64,
+            parts as u64,
+        );
+        let ctx =
+            format!("step {step} offsets {offsets} cols {cols} next {next_cols:?} parts {parts}");
+        assert_eq!(got.xalu, want, "{ctx}: DEEP XALU rows");
+        assert_eq!(
+            (got.selects, got.balu, got.hashes, got.unpacks, got.packs),
+            (0, 0, 0, 0, 0),
+            "{ctx}: DEEP emits only XALU rows"
+        );
+        assert_eq!(
+            got.hints as usize,
+            1 + cols + parts,
+            "{ctx}: the stand-in hints"
+        );
+    }
+}
