@@ -43,6 +43,52 @@ pub enum LfmProgramKind {
     StatementReplayV0,
 }
 
+impl LfmProgramKind {
+    /// The fixture program this kind names, built from code — what
+    /// `compute_lfm_registry` blesses into the row.
+    pub fn program(self) -> LfmProgram {
+        use super::programs::{
+            KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
+            statement_replay_program, transcript_replay_program, trivial_program,
+        };
+        match self {
+            Self::TrivialV0 => trivial_program(),
+            Self::FriToyV0 => fri_toy_program(),
+            Self::KeccakChainV0 => keccak_chain_program(),
+            Self::KeccakSpongeV0 => keccak_sponge_program(KECCAK_SPONGE_LEN),
+            Self::TranscriptReplayV0 => transcript_replay_program(),
+            Self::StatementReplayV0 => statement_replay_program(),
+        }
+    }
+}
+
+/// ★ The artifacts a fixture program is verified against under `options`.
+///
+/// The registry policy: `LFM_REGISTRY` is blessed at
+/// today's leaf layout and STAYS row-pair only. At the default format this is
+/// [`resolve`] — the registry row, no fallback. Under a one-row format (`On`
+/// or `Auto`) the registry is NOT read: the program is rebuilt from code and
+/// its artifacts computed at run time (row-pair AND one-row roots, as
+/// `compute_lfm_registry` would), which is what the registry pins anyway —
+/// `registry_drift_*` hold the two equal at the default.
+pub fn resolve_artifacts(
+    kind: LfmProgramKind,
+    options: &ProofOptions,
+) -> Result<LfmArtifacts, LfmRegistryError> {
+    if options.format.one_row == stark::proof::options::OneRowMode::Off {
+        return Ok(resolve(kind, options.blowup_factor)?.artifacts());
+    }
+    Ok(build_artifacts(&kind.program(), options))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Reads of `LFM_REGISTRY` on this thread (test builds only), for the
+    /// registry-policy test.
+    pub(crate) static REGISTRY_READS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LfmRegistryError {
     UnknownProgram {
@@ -113,6 +159,9 @@ impl LfmRegistryEntry {
             hasher: self.hasher,
             chip_set: self.chip_set,
             program_id: self.program_id,
+            // The registry is ROW-PAIR ONLY: a one-row
+            // format never reads it — `resolve_artifacts` builds at run time.
+            one_row_roots: None,
         }
     }
 }
@@ -151,6 +200,27 @@ pub struct LfmArtifacts {
     /// compiled groups at bless time. See [`ChipSet`].
     pub chip_set: ChipSet,
     pub program_id: Commitment,
+    /// The ONE-ROW (S2) preprocessed roots of the same groups, built only when
+    /// the options' format has one-row openings on (`On` or `Auto`: which chips
+    /// `Auto` resolves to one row is decided later, per chip, by the STARK
+    /// prover and verifier, so every chip gets one). `None` at the default.
+    ///
+    /// NOT folded into `program_id`: the identity stays the row-pair roots'
+    /// (the one-row roots are a deterministic function of the same columns),
+    /// so a program keeps one id across layouts on the LFM side.
+    pub one_row_roots: Option<LfmOneRowRoots>,
+}
+
+/// The one-row preprocessed roots of an [`LfmArtifacts`] (see its field).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LfmOneRowRoots {
+    /// Per chip slot, as `LfmArtifacts::roots`; `None` = no one-row root (a
+    /// static table with no one-row twin at this blowup — a hard miss if the
+    /// chip resolves to one row). Slot 12 (`KECCAK_RND`) has no
+    /// preprocessed columns and stays `None`.
+    pub roots: [Option<Commitment>; NUM_LFM_CHIPS],
+    /// One per `LFM_BLAKE3` chunk, as `LfmArtifacts::blake3_chunk_roots`.
+    pub blake3_chunk_roots: Vec<Commitment>,
 }
 
 impl LfmArtifacts {
@@ -515,6 +585,8 @@ pub fn build_artifacts_with_hasher(
         &blake3_chunk_roots,
         &blake3_chunk_log_heights,
     );
+    let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
+        .then(|| build_one_row_roots(program, options, &groups));
     LfmArtifacts {
         roots,
         log_heights,
@@ -524,6 +596,36 @@ pub fn build_artifacts_with_hasher(
         hasher,
         chip_set,
         program_id,
+        one_row_roots,
+    }
+}
+
+/// The one-row roots of every committed group (host pass: the device commit
+/// builds row-pair leaves only), plus the static tables' one-row twins.
+fn build_one_row_roots(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    groups: &[&ColumnGroup; 11],
+) -> LfmOneRowRoots {
+    use stark::leaf_layout::LeafLayout::Row;
+    let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
+    let commits = map_maybe_parallel(groups, |g| {
+        super::commit::commit_group_device_or_host_with(PREP_GROUP_LABEL, g, options, Row)
+    });
+    for (slot, root) in commits.into_iter().enumerate() {
+        roots[slot] = Some(root);
+    }
+    let chunks: Vec<usize> = (0..blake3_chunk_rows(program).len()).collect();
+    let blake3_chunk_roots = map_maybe_parallel(&chunks, |c| {
+        let group = program.blake3_chunk_group(*c);
+        super::commit::commit_group_device_or_host_with(BLAKE3_CHUNK_LABEL, &group, options, Row)
+    });
+    roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
+    roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
+    roots[14] = bitwise::preprocessed_commitment_for(options, Row);
+    LfmOneRowRoots {
+        roots,
+        blake3_chunk_roots,
     }
 }
 
@@ -547,6 +649,8 @@ pub fn resolve(
     kind: LfmProgramKind,
     blowup_factor: u8,
 ) -> Result<&'static LfmRegistryEntry, LfmRegistryError> {
+    #[cfg(test)]
+    REGISTRY_READS.with(|c| c.set(c.get() + 1));
     let mut matches = LFM_REGISTRY
         .iter()
         .filter(|e| e.kind == kind && e.blowup_factor == blowup_factor);

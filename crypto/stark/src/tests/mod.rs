@@ -4,6 +4,7 @@ pub mod blake3_stark_roundtrip_tests;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug_tests;
 pub mod bus_tests;
+pub mod cap_fri_matrix_tests;
 pub mod commitment_tests;
 pub mod constraint_index_tests;
 pub mod domain_cache_stats;
@@ -11,7 +12,9 @@ pub mod fri_group_tests;
 pub mod fri_schedule_tests;
 pub mod fri_tests;
 pub mod grinding_tests;
+pub mod log_read_only_program_tests;
 pub mod merkle_cap_tests;
+pub mod one_row_tests;
 pub mod opening_width_tests;
 pub mod path_length_tests;
 pub mod proof_options_tests;
@@ -24,5 +27,9 @@ pub mod small_trace_tests;
 pub mod table_disk_spill_tests;
 pub mod terminal_tests;
 pub mod trace_test_helpers;
+#[cfg(feature = "cuda")]
+pub mod zf_fri_device_tests;
 pub mod zf_fri_vectors;
 pub mod zf_golden_tests;
+#[cfg(feature = "cuda")]
+pub mod zf_s2_device_tests;

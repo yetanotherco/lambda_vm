@@ -42,8 +42,8 @@ impl fmt::Display for ProofOptionsError {
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
-/// - `format`: the proof FORMAT ([`ProofFormat`], the ZF campaign's levers).
-///   Its default is today's format, byte for byte.
+/// - `format`: the proof FORMAT ([`ProofFormat`], the ZF proof-format levers).
+///   Its default is the legacy format (every lever off), byte for byte.
 ///
 /// # The format is not serialized
 ///
@@ -74,7 +74,8 @@ pub struct ProofOptions {
     /// polynomial has degree < 2^fri_final_poly_log_degree; the prover sends those
     /// 2^k coefficients instead of folding to a constant.
     pub fri_final_poly_log_degree: u8,
-    /// The proof format. [`ProofFormat::DEFAULT`] = today. Not serialized.
+    /// The proof format. [`ProofFormat::DEFAULT`] = the legacy format (the
+    /// production format is stamped on by the prover crate). Not serialized.
     #[serde(skip)]
     #[rkyv(with = rkyv::with::Skip)]
     #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
@@ -106,16 +107,33 @@ pub struct ProofFormat {
 }
 
 impl ProofFormat {
-    /// Today's format: every lever off.
-    pub const DEFAULT: Self = Self {
+    /// This crate's default: every lever off, i.e. [`Self::LEGACY`].
+    ///
+    /// ⚠ NOT the production format. The prover crate's
+    /// `zf_format::ZfFormat::DEFAULT` (the measured configuration) is stamped
+    /// onto the options at the production sites; a `ProofOptions` built here
+    /// without a format, or deserialized (the format is not serialized), is
+    /// the legacy format.
+    pub const DEFAULT: Self = Self::LEGACY;
+
+    /// The legacy format: every lever off. The only format the RV64
+    /// recursion guest verifies.
+    pub const LEGACY: Self = Self {
         merkle_cap: CapPolicy::Off,
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
     };
 
-    /// True when this is today's format (`Fixed(0)` counts as `Off`).
+    /// True when this is this crate's default format, [`Self::LEGACY`]
+    /// (`Fixed(0)` counts as `Off`).
     pub fn is_default(&self) -> bool {
+        self.is_legacy()
+    }
+
+    /// True when every lever is off (`Fixed(0)` counts as `Off`): the proof
+    /// this produces is the legacy format, byte for byte.
+    pub fn is_legacy(&self) -> bool {
         self.merkle_cap.is_off()
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
@@ -237,40 +255,73 @@ impl FromStr for OneRowMode {
 
 /// Which format levers THIS build implements. A lever that is only parsed —
 /// its field exists so the option structs and the `ZF FORMAT` banner stay
-/// stable while the campaign lands it — must not be selectable, or a run
-/// could print a non-default format and prove the default one. Each lane
-/// flips its own flag in the commit that makes the lever real.
+/// stable before the lever lands — must not be selectable, or a run
+/// could print a non-default format and prove the default one. Each flag
+/// is flipped in the commit that makes the lever real.
 ///
-/// The Merkle cap is real on the host and device STARK provers and the host
-/// verifier (design/CAP.md C3 + C4). ⚠ NOT yet in the LFM in-guest verifier
-/// (C5): a recursion run that wraps a capped proof fails closed there, so
-/// `LAMBDA_VM_ZF_CAP` is for STARK-level tests and measurements until C5
-/// lands.
+/// The Merkle cap is real on the host and device STARK provers, the host
+/// verifier and the LFM in-guest STARK verifier
+/// (`lfm::merkle_cap::CapCells`, one caps arena per sub-proof), on pair and on
+/// group-leaf (`Dp`) FRI layers alike. The RV64 recursion guest stays
+/// legacy-only: its archived verifier refuses any other format.
 pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
-/// `FriMode::Dp` (S3) is implemented on the HOST paths only:
+/// `FriMode::Dp` (S3) is implemented on the prover paths and the host verifier:
 /// - the CPU prover (group-leaf layer commits, the scheduled folds, group
 ///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
-/// - on a `cuda` build every device FRI arm (DEEP→FRI on device, the device
-///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
-///   table runs the CPU FRI loop (DEEP may still run on the device).
+/// - on a `cuda` build the device FRI arms (DEEP→FRI on device, the device
+///   layer commit, the device query gather) run both encodings: the group
+///   loop (`gpu_lde::fri_commit_gpu_drive_groups`,
+///   `math_cuda::fri::FriCommitState::fold_and_commit_group`) is the CPU
+///   loop's device twin, byte for byte (`tests::zf_fri_device_tests`).
 ///
-/// NOT implemented: device group-leaf FRI (lane I-FRI-D), the in-guest (LFM)
-/// verifier of a `Dp` proof (lane I-FRI-G: `lfm::fri::FriShape` still derives
-/// the legacy layout, so an LFM wrap or node over a `Dp` proof fails at emit
-/// time), and the RV64 recursion guest (default-only by RULINGS 11; it refuses
-/// a non-default format). A block run under `LAMBDA_VM_ZF_FRI=dp` therefore
-/// proves and host-verifies its STARK proofs but cannot recurse over them yet.
+/// - the in-guest (LFM) STARK verifier (G1 + G2): `lfm::fri::FriShape` takes
+///   the same schedule, and the emitter verifies group layers (slot check,
+///   group leaf, group fold), so an LFM wrap or node verifies a `Dp` proof.
+///
+/// NOT implemented: the RV64 recursion guest (legacy-only; it
+/// refuses a non-legacy format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
-/// See [`MERKLE_CAP_IMPLEMENTED`].
-pub const ONE_ROW_IMPLEMENTED: bool = false;
+/// `OneRowMode::{On, Auto}` (S2) is implemented on the prover (CPU and
+/// device) and the host verifier:
+/// - the CPU prover (one-row trace, precomputed, aux and composition trees;
+///   the DEEP codeword committed as FRI layer 0 before the first challenge;
+///   query indexes over the whole LDE; one-row openings) and the host
+///   verifier (`multi_verify` / `multi_verify_archived`), with the per-table
+///   `Auto` rule (`crate::leaf_layout`);
+/// - the preprocessed roots: static one-row twins at blowup 4
+///   (`STATIC_BLOWUP_FACTORS_ONE_ROW` in the prover crate), every computed
+///   root at run time, the LFM artifacts' one-row roots and the registry
+///   policy (a one-row format never reads `LFM_REGISTRY`); a table with no
+///   root for its layout is a proving error and a verifier reject, never a recompute
+///   — e.g. `one_row = 1` at blowup 2, 8 or 16 fails on BITWISE;
+/// - the device: one-row trees for the fused main commit,
+///   the preprocessed split, the aux commits (host input and resident) and the
+///   composition tree, device openings at row `r`, the LFM artifact commit,
+///   and the input tree committed from the resident DEEP codeword before the
+///   first challenge — each proof byte-identical to the CPU one; a one-row
+///   table may be device-only like a row-pair one, and under `Auto` one proof
+///   mixes both layouts on the device.
+///
+/// NOT implemented: the in-guest (LFM) verifier of a one-row proof (an emitter
+/// asked for one refuses at emit time, `lfm::fri::FriShape::from_options`),
+/// and the RV64 recursion guest (legacy-only). A block run under
+/// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and
+/// LFM proofs but cannot recurse over one-row STARK proofs yet.
+pub const ONE_ROW_IMPLEMENTED: bool = true;
 
 impl ProofOptions {
-    /// True when every format field is at its default: the proof this
-    /// produces is today's format, byte for byte.
+    /// True when every format field is at this crate's default (the legacy
+    /// format): the proof this produces is the legacy format, byte for
+    /// byte.
     pub fn has_default_format(&self) -> bool {
         self.format.is_default()
+    }
+
+    /// True when every lever is off: [`ProofFormat::LEGACY`].
+    pub fn has_legacy_format(&self) -> bool {
+        self.format.is_legacy()
     }
 
     /// Default proof options used for testing purposes.

@@ -108,7 +108,7 @@ fn push_config(bytes: &mut Vec<u8>, config: &ChainConfig) {
         // ⚠ NOT absorbed: the rest of the format (the cap policy) is a set of
         // verifier-side constants, like the STARK cap. Absorbing it would move
         // this statement's bytes, and every WHIR transcript KAT, at the
-        // default. A lane that changes a lever's effect on the statement
+        // default. A change to a lever's effect on the statement
         // decides that here, explicitly. The fold schedule is absorbed through
         // the word above, whose default value is today's.
         format: _,

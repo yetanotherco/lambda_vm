@@ -847,17 +847,34 @@ impl BusValue {
 /// tree each, and there are two dozen of them.
 ///
 /// [`precomputed_columns`]: crate::traits::AIR::precomputed_columns
+///
+/// # One root per leaf layout (S2)
+///
+/// The root depends on the trace trees' leaf layout
+/// ([`crate::leaf_layout::LeafLayout`]), so a commitment carries a separate,
+/// separately cached source for the one-row layout. [`get`](Self::get) is
+/// today's (row-pair) root, unchanged; [`get_for`](Self::get_for) serves
+/// either and returns `None` for a layout this commitment has no source for
+/// (the prover then refuses and the verifier rejects; never a silent recompute).
 #[derive(Clone)]
 pub struct LazyCommitment {
     value: std::sync::Arc<std::sync::OnceLock<crate::config::Commitment>>,
     #[allow(clippy::type_complexity)]
     build: std::sync::Arc<dyn Fn() -> crate::config::Commitment + Send + Sync>,
+    /// The one-row root: `None` = no source (every constructor but
+    /// [`with_one_row`](Self::with_one_row)).
+    #[allow(clippy::type_complexity)]
+    one_row: Option<(
+        std::sync::Arc<std::sync::OnceLock<Option<crate::config::Commitment>>>,
+        std::sync::Arc<dyn Fn() -> Option<crate::config::Commitment> + Send + Sync>,
+    )>,
 }
 
 impl std::fmt::Debug for LazyCommitment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyCommitment")
             .field("computed", &self.value.get().is_some())
+            .field("one_row_source", &self.one_row.is_some())
             .finish()
     }
 }
@@ -870,6 +887,7 @@ impl LazyCommitment {
         Self {
             value: std::sync::Arc::new(cell),
             build: std::sync::Arc::new(|| [0u8; 32]),
+            one_row: None,
         }
     }
 
@@ -879,11 +897,44 @@ impl LazyCommitment {
         Self {
             value: std::sync::Arc::new(std::sync::OnceLock::new()),
             build: std::sync::Arc::new(build),
+            one_row: None,
         }
     }
 
+    /// This commitment plus a source for the ONE-ROW layout's root, computed
+    /// on the first [`get_for`](Self::get_for)`(Row)` and cached like the
+    /// row-pair one. The source returns `None` when it has no root for that
+    /// layout (e.g. a static table with no one-row entry): a hard miss, never
+    /// a fallback to the row-pair root.
+    pub fn with_one_row(
+        mut self,
+        build: impl Fn() -> Option<crate::config::Commitment> + Send + Sync + 'static,
+    ) -> Self {
+        self.one_row = Some((
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            std::sync::Arc::new(build),
+        ));
+        self
+    }
+
+    /// Today's (row-pair) root.
     pub fn get(&self) -> crate::config::Commitment {
         *self.value.get_or_init(|| (self.build)())
+    }
+
+    /// The root under `layout`; `None` when this commitment has no source for
+    /// it.
+    pub fn get_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<crate::config::Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.get()),
+            crate::leaf_layout::LeafLayout::Row => {
+                let (cell, build) = self.one_row.as_ref()?;
+                *cell.get_or_init(|| build())
+            }
+        }
     }
 }
 
@@ -1097,6 +1148,17 @@ impl<
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
+    }
+
+    /// Give this AIR's preprocessed commitment a ONE-ROW (S2) root: `root` is
+    /// what [`AIR::precomputed_commitment_for`](crate::traits::AIR::precomputed_commitment_for)
+    /// returns for [`LeafLayout::Row`](crate::leaf_layout::LeafLayout::Row)
+    /// (`None` = a hard miss). A no-op on an AIR that is not preprocessed.
+    pub fn with_one_row_commitment(mut self, root: Option<crate::config::Commitment>) -> Self {
+        if let Some(c) = self.preprocessed_commitment.take() {
+            self.preprocessed_commitment = Some(c.with_one_row(move || root));
+        }
         self
     }
 
@@ -1550,6 +1612,18 @@ where
             .as_ref()
             .map(LazyCommitment::get)
             .unwrap_or([0u8; 32])
+    }
+
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<crate::config::Commitment> {
+        match &self.preprocessed_commitment {
+            Some(c) => c.get_for(layout),
+            // Not preprocessed: the row-pair answer is the trait's zero root
+            // (never compared); there is no one-row root to give.
+            None => (!layout.is_one_row()).then_some([0u8; 32]),
+        }
     }
 
     fn precomputed_columns(&self) -> Vec<Vec<FieldElement<F>>> {

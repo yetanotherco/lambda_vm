@@ -95,15 +95,17 @@ impl FriFoldLayout {
     }
 
     /// The layout of a table proved under `options` over an LDE of
-    /// `2^lde_log` with blowup `2^blowup_log`: what the prover and the host
-    /// verifier both build. The format comes from `options` — a verifier-side
-    /// constant — never from a proof.
+    /// `2^lde_log` with blowup `2^blowup_log`, whose trace trees use the
+    /// resolved leaf layout `one_row`: what the prover and the host verifier
+    /// both build. The format comes from `options` and the table's AIR — a
+    /// verifier-side constant — never from a proof.
     pub(crate) fn for_options(
         lde_log: u32,
         blowup_log: u32,
         options: &ProofOptions,
+        one_row: bool,
     ) -> Result<Self, FriFormatError> {
-        let fmt = FriFormat::from_options(options)?;
+        let fmt = FriFormat::from_options(options, one_row);
         Self::for_format(
             lde_log,
             blowup_log,
@@ -132,7 +134,8 @@ impl FriFoldLayout {
     }
 
     /// Whether this layout uses today's FRI encoding (see
-    /// [`Self::legacy_encoding`]). Every device FRI arm is gated on this.
+    /// [`Self::legacy_encoding`]). The device FRI arms branch on this: today's
+    /// pair loop, or its group-leaf twin.
     pub(crate) fn is_legacy(&self) -> bool {
         self.legacy_encoding
     }
@@ -147,6 +150,25 @@ impl FriFoldLayout {
     /// Depth of committed layer `j`'s tree: its length over `2^{d_j}` leaves.
     pub(crate) fn layer_depth(&self, lde_log: u32, j: usize) -> u32 {
         self.layer_log_len(lde_log, j) - u32::from(self.schedule[j])
+    }
+
+    /// Folding challenges a proof of this layout draws: one per committed
+    /// layer plus the final fold's for row pairs (fold 0 consumes the first),
+    /// one per committed layer for one row (layer 0, the input tree, is
+    /// committed before any challenge); none when nothing folds.
+    pub(crate) fn num_zetas(&self) -> usize {
+        if self.total_folds == 0 {
+            0
+        } else {
+            self.num_committed + usize::from(!self.one_row)
+        }
+    }
+
+    /// Depth of every committed layer's tree, in layer order.
+    pub(crate) fn layer_depths(&self, lde_log: u32) -> Vec<usize> {
+        (0..self.num_committed)
+            .map(|j| self.layer_depth(lde_log, j) as usize)
+            .collect()
     }
 
     /// Opened values per query in the flat `layers_evaluations_sym` vector:

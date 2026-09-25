@@ -138,7 +138,10 @@ pub(super) fn real_global(
     for (idx, air) in refs.iter().enumerate() {
         let v = view.get(idx);
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
+                *air,
+                v.trace_length(),
+            ));
         }
         transcript.append_bytes(v.lde_trace_main_merkle_root());
     }
@@ -457,6 +460,7 @@ pub(super) fn global_arena_words(g: &RealGlobal) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }
@@ -1085,7 +1089,7 @@ pub(super) fn real_child_timed(
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    let airs = super::airs::LfmAirs::new_chunked(
+    let mut airs = super::airs::LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
         &opts,
@@ -1093,6 +1097,11 @@ pub(super) fn real_child_timed(
         artifacts.hasher,
         artifacts.chip_set,
     );
+    // S2: the one-row preprocessed roots, exactly as `verify_against_artifacts`
+    // attaches them — a one-row chip's Phase A root and leg compare use them.
+    if let Some(one_row) = &artifacts.one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&proved.proof);
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
@@ -1114,7 +1123,10 @@ pub(super) fn real_child_timed(
     for (idx, air) in refs.iter().enumerate() {
         let v = view.get(idx);
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
+                *air,
+                v.trace_length(),
+            ));
         }
         transcript.append_bytes(v.lde_trace_main_merkle_root());
     }
@@ -1216,6 +1228,7 @@ pub(super) fn child_arena_words(c: &RealChild) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }
@@ -1443,6 +1456,21 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     }
     let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
     let label_range = (labels[0][0], labels[FAN_IN - 1][0]);
+    // S2: how many of each wrap's sub-proofs the node verifies at one-row
+    // leaves (0 at the default format, all at `one_row = 1`, the AIR widths'
+    // choice at `auto`). One parseable line per child for the box wrapper.
+    for (k, c) in children.iter().enumerate() {
+        let one_row = c
+            .legs
+            .iter()
+            .filter(|l| l.verify.sub.layout.is_one_row())
+            .count();
+        println!(
+            "ZFS2NODE child={k} {} sub_proofs={} one_row_legs={one_row}",
+            crate::zf_format::ZfFormat::global().banner(),
+            c.legs.len()
+        );
+    }
     println!(
         "   {FAN_IN} epoch wraps proved in {:.1}s, {} published words each, \
          {} sub-proofs each\n   RSS high-water AFTER the wrap proves: {:?} GiB",

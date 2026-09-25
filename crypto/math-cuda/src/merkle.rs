@@ -445,7 +445,7 @@ pub fn gather_merkle_paths_dev(
 ///
 /// No kernel: the device heap has the host layout (root at node 0, the level
 /// with `2^c` nodes at `[2^c - 1, 2^{c+1} - 1)`), so the cap is one D2H of the
-/// heap slice `[(2^c - 1) * 32, (2^{c+1} - 1) * 32)` (design/CAP.md §1.3). The
+/// heap slice `[(2^c - 1) * 32, (2^{c+1} - 1) * 32)`. The
 /// same nodes `MerkleTree::cap` returns on the host tree, byte for byte.
 /// `cap_height = 0` is the root. Runs on the caller's `stream`, after the work
 /// already queued on it, and waits for the copy.
@@ -488,7 +488,12 @@ pub fn read_cap_dev(
 /// and the stream it was built on. Used by the device keep wrapper below.
 fn build_comp_poly_tree_nodes_dev(
     parts_interleaved: &[&[u64]],
+    rows_per_leaf: usize,
 ) -> Result<(CudaSlice<u8>, usize, Arc<CudaStream>)> {
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
     assert!(!parts_interleaved.is_empty());
     let m = parts_interleaved.len();
     let ext3_elems = parts_interleaved[0].len() / 3;
@@ -502,7 +507,7 @@ fn build_comp_poly_tree_nodes_dev(
     }
     let lde_size = ext3_elems;
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
-    let num_leaves = lde_size / 2;
+    let num_leaves = lde_size / rows_per_leaf;
     let tight_total_nodes = 2 * num_leaves - 1;
 
     let be = backend()?;
@@ -536,9 +541,16 @@ fn build_comp_poly_tree_nodes_dev(
         let num_rows_u64 = lde_size as u64;
         let log_num_rows = lde_size.trailing_zeros() as u64;
         let cfg = keccak_launch_cfg(num_leaves as u64);
+        // Row pairs: rows `2i`, `2i+1` of every part; one row (S2): the row
+        // `reverse_index(i)` alone — the one-row ext3 kernel, same arguments.
+        let kernel = if rows_per_leaf == 2 {
+            &be.keccak_comp_poly_leaves_ext3
+        } else {
+            &be.keccak256_leaves_ext3_batched
+        };
         unsafe {
             stream
-                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .launch_builder(kernel)
                 .arg(&buf)
                 .arg(&col_stride_u64)
                 .arg(&num_parts_u64)
@@ -569,12 +581,28 @@ pub fn build_comp_poly_tree_from_slabs_dev(
     m: usize,
     lde_size: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
+    build_comp_poly_tree_from_slabs_dev_rpl(stream, buf, m, lde_size, 2)
+}
+
+/// [`build_comp_poly_tree_from_slabs_dev`] with `rows_per_leaf` rows per leaf
+/// (2 = row pair, 1 = S2 one row: `lde_size` leaves).
+pub fn build_comp_poly_tree_from_slabs_dev_rpl(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u64>,
+    m: usize,
+    lde_size: usize,
+    rows_per_leaf: usize,
+) -> Result<crate::lde::GpuMerkleTree> {
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
     assert!(m > 0);
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
     assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
-    let num_leaves = lde_size / 2;
+    let num_leaves = lde_size / rows_per_leaf;
     let tight_total_nodes = 2 * num_leaves - 1;
     let be = backend()?;
 
@@ -588,9 +616,16 @@ pub fn build_comp_poly_tree_from_slabs_dev(
         let num_rows_u64 = lde_size as u64;
         let log_num_rows = lde_size.trailing_zeros() as u64;
         let cfg = keccak_launch_cfg(num_leaves as u64);
+        // Row pairs: rows `2i`, `2i+1` of every part; one row (S2): the row
+        // `reverse_index(i)` alone — the one-row ext3 kernel, same arguments.
+        let kernel = if rows_per_leaf == 2 {
+            &be.keccak_comp_poly_leaves_ext3
+        } else {
+            &be.keccak256_leaves_ext3_batched
+        };
         unsafe {
             stream
-                .launch_builder(&be.keccak_comp_poly_leaves_ext3)
+                .launch_builder(kernel)
                 .arg(buf)
                 .arg(&col_stride_u64)
                 .arg(&num_parts_u64)
@@ -624,9 +659,19 @@ pub fn build_comp_poly_tree_from_slabs_dev(
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
 ) -> Result<crate::lde::GpuMerkleTree> {
+    build_comp_poly_tree_from_evals_ext3_keep_rpl(parts_interleaved, 2)
+}
+
+/// [`build_comp_poly_tree_from_evals_ext3_keep`] with `rows_per_leaf` rows per
+/// leaf (2 = row pair, 1 = S2 one row: `lde_size` leaves).
+pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
+    parts_interleaved: &[&[u64]],
+    rows_per_leaf: usize,
+) -> Result<crate::lde::GpuMerkleTree> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
-    let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
+    let (nodes_dev, num_leaves, stream) =
+        build_comp_poly_tree_nodes_dev(parts_interleaved, rows_per_leaf)?;
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;

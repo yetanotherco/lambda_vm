@@ -205,6 +205,8 @@ pub struct Backend {
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub keccak256_leaves_base_row_major_row_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_coset: CudaFunction,
     pub keccak256_leaves_ext3_coset: CudaFunction,
@@ -213,6 +215,8 @@ pub struct Backend {
     pub grind_search: CudaFunction,
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub keccak_fri_group_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
@@ -227,11 +231,15 @@ pub struct Backend {
     // yet — they exist so the GPU can follow the CPU's hash switch (PA-PLAN §6.1).
     pub blake3_leaves_base_row_major_row_pair: CudaFunction,
     pub blake3_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub blake3_leaves_base_row_major_row_range: CudaFunction,
     pub blake3_leaves_base_batched: CudaFunction,
     pub blake3_leaves_base_row_pair_batched: CudaFunction,
     pub blake3_leaves_ext3_batched: CudaFunction,
     pub blake3_comp_poly_leaves_ext3: CudaFunction,
     pub blake3_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub blake3_fri_group_leaves_ext3: CudaFunction,
     pub blake3_merkle_level: CudaFunction,
     pub blake3_merkle_tail: CudaFunction,
     pub blake3_compress_probe_6r: CudaFunction,
@@ -249,11 +257,15 @@ pub struct Backend {
     // tests check against the host `Rpx256`.
     pub rpx_leaves_base_row_major_row_pair: CudaFunction,
     pub rpx_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub rpx_leaves_base_row_major_row_range: CudaFunction,
     pub rpx_leaves_base_batched: CudaFunction,
     pub rpx_leaves_base_row_pair_batched: CudaFunction,
     pub rpx_leaves_ext3_batched: CudaFunction,
     pub rpx_comp_poly_leaves_ext3: CudaFunction,
     pub rpx_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub rpx_fri_group_leaves_ext3: CudaFunction,
     pub rpx_merkle_level: CudaFunction,
     pub rpx_merkle_tail: CudaFunction,
     pub rpx_permute_probe: CudaFunction,
@@ -870,6 +882,8 @@ impl Backend {
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_row_major_row_pair_range: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
+            keccak256_leaves_base_row_major_row_range: keccak
+                .load_function("keccak256_leaves_base_row_major_row_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
             keccak256_leaves_ext3_coset: keccak.load_function("keccak256_leaves_ext3_coset")?,
@@ -879,6 +893,7 @@ impl Backend {
             grind_search: keccak.load_function("grind_search")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
+            keccak_fri_group_leaves_ext3: keccak.load_function("keccak_fri_group_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
@@ -886,12 +901,15 @@ impl Backend {
                 .load_function("blake3_leaves_base_row_major_row_pair")?,
             blake3_leaves_base_row_major_row_pair_range: blake3
                 .load_function("blake3_leaves_base_row_major_row_pair_range")?,
+            blake3_leaves_base_row_major_row_range: blake3
+                .load_function("blake3_leaves_base_row_major_row_range")?,
             blake3_leaves_base_batched: blake3.load_function("blake3_leaves_base_batched")?,
             blake3_leaves_base_row_pair_batched: blake3
                 .load_function("blake3_leaves_base_row_pair_batched")?,
             blake3_leaves_ext3_batched: blake3.load_function("blake3_leaves_ext3_batched")?,
             blake3_comp_poly_leaves_ext3: blake3.load_function("blake3_comp_poly_leaves_ext3")?,
             blake3_fri_leaves_ext3: blake3.load_function("blake3_fri_leaves_ext3")?,
+            blake3_fri_group_leaves_ext3: blake3.load_function("blake3_fri_group_leaves_ext3")?,
             blake3_merkle_level: blake3.load_function("blake3_merkle_level")?,
             blake3_merkle_tail: blake3.load_function("blake3_merkle_tail")?,
             blake3_compress_probe_6r: blake3.load_function("blake3_compress_probe_6r")?,
@@ -906,12 +924,15 @@ impl Backend {
                 .load_function("rpx_leaves_base_row_major_row_pair")?,
             rpx_leaves_base_row_major_row_pair_range: rpx
                 .load_function("rpx_leaves_base_row_major_row_pair_range")?,
+            rpx_leaves_base_row_major_row_range: rpx
+                .load_function("rpx_leaves_base_row_major_row_range")?,
             rpx_leaves_base_batched: rpx.load_function("rpx_leaves_base_batched")?,
             rpx_leaves_base_row_pair_batched: rpx
                 .load_function("rpx_leaves_base_row_pair_batched")?,
             rpx_leaves_ext3_batched: rpx.load_function("rpx_leaves_ext3_batched")?,
             rpx_comp_poly_leaves_ext3: rpx.load_function("rpx_comp_poly_leaves_ext3")?,
             rpx_fri_leaves_ext3: rpx.load_function("rpx_fri_leaves_ext3")?,
+            rpx_fri_group_leaves_ext3: rpx.load_function("rpx_fri_group_leaves_ext3")?,
             rpx_merkle_level: rpx.load_function("rpx_merkle_level")?,
             rpx_merkle_tail: rpx.load_function("rpx_merkle_tail")?,
             rpx_permute_probe: rpx.load_function("rpx_permute_probe")?,

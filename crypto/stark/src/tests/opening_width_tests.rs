@@ -71,6 +71,9 @@ pub struct FibonacciSplitAIR<F: IsFFTField> {
     out: Option<FieldElement<F>>,
     precomputed_columns: usize,
     precomputed_commitment: Commitment,
+    /// The one-row (S2) root of the same precomputed columns; `None` = the
+    /// AIR has none (the one-row prover must refuse, never recompute).
+    precomputed_commitment_row: Option<Commitment>,
     phantom: PhantomData<F>,
 }
 
@@ -107,6 +110,12 @@ impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
         air.precomputed_commitment = commitment;
         air
     }
+
+    /// This AIR with a one-row (S2) precomputed root as well.
+    pub(crate) fn with_one_row_commitment(mut self, commitment: Commitment) -> Self {
+        self.precomputed_commitment_row = Some(commitment);
+        self
+    }
 }
 
 impl<F> AIR for FibonacciSplitAIR<F>
@@ -135,6 +144,7 @@ where
             out: None,
             precomputed_columns: 0,
             precomputed_commitment: [0u8; 32],
+            precomputed_commitment_row: None,
             phantom: PhantomData,
         }
     }
@@ -212,6 +222,16 @@ where
 
     fn precomputed_commitment(&self) -> Commitment {
         self.precomputed_commitment
+    }
+
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.precomputed_commitment),
+            crate::leaf_layout::LeafLayout::Row => self.precomputed_commitment_row,
+        }
     }
 }
 

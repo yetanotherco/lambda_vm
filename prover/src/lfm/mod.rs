@@ -46,6 +46,7 @@ pub mod keccak_host;
 pub mod layout;
 pub mod lde;
 pub mod logup;
+pub mod merkle_cap;
 pub mod per_table_aggregator;
 pub mod poseidon;
 pub mod preprocessed;
@@ -147,6 +148,8 @@ mod exec_identity_tests;
 #[cfg(test)]
 mod framework_probe;
 #[cfg(test)]
+mod fri_group_tests;
+#[cfg(test)]
 mod fri_tests;
 #[cfg(test)]
 mod join_tests;
@@ -160,6 +163,10 @@ mod leaf_tests;
 mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
+#[cfg(test)]
+mod one_row_guest_tests;
+#[cfg(test)]
+mod one_row_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]

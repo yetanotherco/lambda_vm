@@ -1,5 +1,7 @@
 #[cfg(any(test, feature = "test-utils"))]
 pub mod capture;
+#[cfg(all(feature = "cuda", any(test, feature = "test-utils")))]
+pub mod device_parity;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
@@ -88,6 +90,12 @@ where
 /// `d_last` times into the terminal codeword. At the all-ones schedule this is
 /// exactly today's loop (sample, fold once, commit pairs, append).
 ///
+/// One-row layouts (S2): `d_{−1} = 0` — layer 0 is the DEEP codeword itself,
+/// committed with groups of `2^{d_0}` and its root absorbed with NO challenge
+/// before it; every later layer is "sample ζ, fold, commit, append" as above.
+/// So `m` committed layers draw `m` challenges (the last one the final fold's),
+/// against `m + 1` for row pairs.
+///
 /// Leaves: the legacy encoding commits `[a, b]` pairs with `H::Pair`; the
 /// group encoding hashes each `2^d`-value group with `H::Batched` (the two
 /// agree on a two-element leaf, `StarkHash`'s invariant) and builds the tree
@@ -95,8 +103,11 @@ where
 /// families share, which today's layer trees already rely on (built with
 /// `H::Pair`, verified with `H::Batched`).
 ///
-/// Every device FRI arm is taken only for the legacy encoding: a group-encoded
-/// layout always runs this CPU loop.
+/// The device arm (`try_fri_commit_gpu`) runs both encodings: today's loop for
+/// the legacy one and its group twin otherwise — one-row layouts included,
+/// whose input tree the device commits from the codeword before any
+/// challenge. When it declines, the CPU loop
+/// ([`commit_phase_cpu_with_layout`]) runs.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn commit_phase_with_layout<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
@@ -104,7 +115,7 @@ pub(crate) fn commit_phase_with_layout<
     T: IsStarkTranscript<E, F> + Clone,
     H: StarkHash,
 >(
-    mut evals: Vec<FieldElement<E>>,
+    evals: Vec<FieldElement<E>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
@@ -124,27 +135,60 @@ where
     // snapshots the transcript before mutating it so a mid-loop cudarc
     // error restores state and lets the CPU loop below run as if the GPU
     // had never been tried.
+    // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
+    // drives the same commit phase on-device (Goldilocks + Ext3, above the
+    // LDE size threshold, and only when folding actually happens) and returns
+    // `Some` with the final-polynomial coefficients. It returns `None` on any
+    // precondition miss or cudarc error — restoring the transcript first — so
+    // the CPU path below then runs as if the GPU had never been tried.
     #[cfg(feature = "cuda")]
-    if layout.is_legacy() {
-        // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
-        // drives the same commit phase on-device (Goldilocks + Ext3, above the
-        // LDE size threshold, and only when folding actually happens) and returns
-        // `Some` with the final-polynomial coefficients. It returns `None` on any
-        // precondition miss or cudarc error — restoring the transcript first — so
-        // the CPU path below then runs as if the GPU had never been tried.
-        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T, H::Pair<E>>(
-            &evals,
-            transcript,
-            coset_offset,
-            domain_size,
-            blowup_log,
-            final_poly_log_degree,
-            inv_twiddles,
-        ) {
-            return result;
-        }
+    if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T, H::Pair<E>>(
+        &evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+    ) {
+        return result;
     }
+    commit_phase_cpu_with_layout::<F, E, T, H>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+    )
+}
 
+/// The CPU loop of [`commit_phase_with_layout`], with no device arm: what every
+/// build runs when the device declines, and the host reference the device
+/// parity tests compare against.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn commit_phase_cpu_with_layout<
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    T: IsStarkTranscript<E, F> + Clone,
+    H: StarkHash,
+>(
+    mut evals: Vec<FieldElement<E>>,
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+) -> (Vec<FieldElement<E>>, Vec<FriLayer<E, H::Pair<E>>>)
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
     debug_assert_eq!(evals.len(), domain_size);
     // Caller-enforced twiddle sizing (Domain::fri_inv_twiddles): the folding
     // loop below indexes `inv_twiddles[..len/2]` per layer.
@@ -156,9 +200,6 @@ where
         layout.total_folds,
         evals.len().trailing_zeros() - layout.terminal_len.trailing_zeros()
     );
-    // One-row layouts (S2) commit the DEEP codeword itself as layer 0; they are
-    // refused before a layout is built (`FriFormat::from_options`).
-    debug_assert!(!layout.one_row, "one-row FRI layouts are not implemented");
     let num_committed = layout.num_committed;
 
     // Inverse twiddle factors for evaluation-form folding: per-layer working
@@ -167,16 +208,22 @@ where
     let mut fri_layer_list = Vec::with_capacity(num_committed);
 
     // Folds still owed before the next commit: fold 0 is the binary fold of
-    // the DEEP pair, so one; after committing layer `j`, `d_j`.
-    let mut pending: u32 = 1;
+    // the DEEP pair, so one; after committing layer `j`, `d_j`. Under one-row
+    // openings (S2) the DEEP codeword itself is layer 0 (the input tree), so
+    // nothing is owed before it and its root is absorbed BEFORE the first
+    // folding challenge (a root absorbed after its challenge
+    // would let the prover pick the codeword after seeing it).
+    let mut pending: u32 = if layout.one_row { 0 } else { 1 };
 
     // Commit `num_committed` folded layers to the transcript.
     for &d in &layout.schedule {
-        // <<<< Receive challenge 𝜁ₖ
-        let zeta = transcript.sample_field_element();
+        if pending > 0 {
+            // <<<< Receive challenge 𝜁ₖ
+            let zeta = transcript.sample_field_element();
 
-        // Fold `pending` times with 𝜁, 𝜁², … (evaluation form, no FFT).
-        fold_times(&mut evals, &zeta, pending, &mut inv_twiddles);
+            // Fold `pending` times with 𝜁, 𝜁², … (evaluation form, no FFT).
+            fold_times(&mut evals, &zeta, pending, &mut inv_twiddles);
+        }
 
         let merkle_tree = if layout.is_legacy() {
             // Build the Merkle tree from consecutive pairs.
@@ -199,7 +246,8 @@ where
     }
 
     // The final folds to reach the terminal codeword (size terminal_len),
-    // unless already there (total_folds == 0 means initial_len == terminal_len).
+    // unless already there (total_folds == 0 means initial_len == terminal_len;
+    // then `pending` is 0 under one row too, as the schedule is empty).
     if layout.total_folds > 0 {
         // <<<< Receive challenge: 𝜁_final
         let zeta = transcript.sample_field_element();
@@ -339,9 +387,10 @@ where
 /// [`query_phase`] under an explicit fold layout. The legacy encoding is
 /// [`query_phase`] itself (device arm included); the group encoding opens, per
 /// committed layer `j`, the whole group `evaluation[leaf·2^{d_j} ..][..2^{d_j}]`
-/// (the query's own value included, FRI.md §3.4) and the path of
-/// `leaf = p >> d_j`, then moves to `p >> d_j`. Host layers only: a group
-/// layout never takes the device commit.
+/// (the query's own value included) and the path of
+/// `leaf = p >> d_j`, then moves to `p >> d_j` — on the device when the layers
+/// are device-resident (`try_fri_query_phase_gpu_groups`), else by the host
+/// walk ([`query_phase_groups_host`]).
 pub(crate) fn query_phase_with_layout<F: IsField + 'static, H: StarkHash>(
     fri_layers: &[FriLayer<F, H::Pair<F>>],
     iotas: &[usize],
@@ -353,6 +402,25 @@ where
     if layout.is_legacy() {
         return query_phase::<F, H>(fri_layers, iotas);
     }
+    #[cfg(feature = "cuda")]
+    if let Some(decommits) =
+        crate::gpu_lde::try_fri_query_phase_gpu_groups::<F, H::Pair<F>>(fri_layers, iotas, layout)
+    {
+        return decommits;
+    }
+    query_phase_groups_host::<F, H>(fri_layers, iotas, layout)
+}
+
+/// The host walk of [`query_phase_with_layout`]'s group encoding over host
+/// layer trees (the device parity tests' reference).
+pub(crate) fn query_phase_groups_host<F: IsField + 'static, H: StarkHash>(
+    fri_layers: &[FriLayer<F, H::Pair<F>>],
+    iotas: &[usize],
+    layout: &FriFoldLayout,
+) -> Vec<FriDecommitment<F>>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
     debug_assert_eq!(fri_layers.len(), layout.num_committed);
     iotas
         .iter()

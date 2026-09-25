@@ -1,7 +1,7 @@
-//! S3 (group-leaf FRI layers) on the CPU prover and host verifier: FRI.md §10
-//! U4–U6, the tamper tests T1–T3, the load-bearing mutations M1–M2 and the
+//! S3 (group-leaf FRI layers) on the CPU prover and host verifier: the
+//! round trips U4–U6, the tamper tests T1–T3, the load-bearing mutations M1–M2 and the
 //! differential of the group path at the all-ones schedule against the legacy
-//! path (REVIEW-FRI F1.2).
+//! path.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -21,6 +21,7 @@ use crate::fri::group::{
 };
 use crate::fri::terminal::{FriFoldLayout, terminal_codeword_from_coeffs};
 use crate::fri::{commit_phase_with_layout, fold_times, query_phase_with_layout};
+use crate::merkle_caps::TreeCheck;
 use crate::proof::options::{FriMode, FriScheduleOverride, ProofFormat};
 use crate::traits::AIR;
 
@@ -234,6 +235,16 @@ fn fri_accepts<H: StarkHash>(run: &FriRun, deep: &[Ext], o: &Felt) -> bool {
     let tables: Vec<Vec<Felt>> = (0..=6)
         .map(|d| roots_of_unity_table::<F>(d).unwrap())
         .collect();
+    // One uncapped check per layer tree, at the layout's group-tree depth.
+    let checks: Vec<TreeCheck<'_>> = run
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(j, root)| {
+            let depth = run.layout.layer_depth(run.lde_log, j) as usize;
+            TreeCheck::build::<H::Batched<E>>(root, depth, 0, || None).unwrap()
+        })
+        .collect();
     run.iotas
         .iter()
         .zip(&run.decommitments)
@@ -244,8 +255,8 @@ fn fri_accepts<H: StarkHash>(run: &FriRun, deep: &[Ext], o: &Felt) -> bool {
             let v = (p0 + p0s) + &x_inv * &run.zetas[0] * (p0 - p0s);
             verify_query_groups::<F, E, H::Batched<E>>(
                 &run.layout,
-                run.lde_log,
-                &run.roots,
+                &checks,
+                0,
                 |j| dec.layers_auth_paths[j].merkle_path.as_slice(),
                 &dec.layers_evaluations_sym,
                 &run.zetas,
@@ -365,14 +376,15 @@ fn dp_round_trips_at_every_fold_count() {
                 round_trip_simple::<KeccakStarkHash>(rows, blowup, dp_with(None));
             let lde_log = log_rows + blowup.trailing_zeros();
             let o = golden_options(blowup, 1, 9, dp_with(None));
-            let l = FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o).unwrap();
+            let l =
+                FriFoldLayout::for_options(lde_log, blowup.trailing_zeros(), &o, false).unwrap();
             assert_eq!(layers, l.num_committed, "rows {rows}");
             assert_eq!(values, l.opened_values_per_query(), "rows {rows}");
         }
     }
     // A shape where the DP picks a non-trivial schedule is exercised.
     let o = golden_options(4, 1, 9, dp_with(None));
-    let l = FriFoldLayout::for_options(12, 2, &o).unwrap();
+    let l = FriFoldLayout::for_options(12, 2, &o, false).unwrap();
     assert!(
         l.schedule.iter().any(|&d| d > 1),
         "schedule {:?}",
@@ -491,7 +503,7 @@ fn the_format_is_a_verifier_constant() {
 }
 
 // ---------------------------------------------------------------------------
-// F1.2: the group path at the all-ones schedule vs the legacy path.
+// The group path at the all-ones schedule vs the legacy path.
 // ---------------------------------------------------------------------------
 
 /// Proving under `dp` with an all-ones schedule runs the GROUP code path (group

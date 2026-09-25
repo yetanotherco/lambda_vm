@@ -4222,6 +4222,7 @@ fn derivation_shape(blowup: usize) -> RegisterDerivationShape {
     RegisterDerivationShape {
         blowup,
         coset_offset: PRODUCTION_COSET_OFFSET,
+        rows_per_leaf: stark::commitment::ROWS_PER_LEAF,
     }
 }
 
@@ -4615,6 +4616,7 @@ fn the_register_derivation_proves_and_verifies() {
     let shape = RegisterDerivationShape {
         blowup: inner.blowup_factor as usize,
         coset_offset: inner.coset_offset,
+        rows_per_leaf: stark::commitment::ROWS_PER_LEAF,
     };
     assert_eq!(
         shape,

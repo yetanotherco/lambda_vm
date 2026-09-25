@@ -1,5 +1,5 @@
 //! Group-leaf FRI layers (S3): a committed layer of fold exponent `d` groups
-//! `2^d` consecutive bit-reversed evaluations per leaf (FRI.md §1).
+//! `2^d` consecutive bit-reversed evaluations per leaf.
 //!
 //! # Why a group is a coset, and how it folds
 //!
@@ -31,7 +31,6 @@
 //! Dropping 1 or 2 is a soundness break; `fri_group_tests` has a named test
 //! that turns red for each (M1, M2).
 
-use crypto::merkle_tree::cap::CappedRoot;
 use crypto::merkle_tree::traits::IsStreamingLeafBackend;
 use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
@@ -40,6 +39,7 @@ use math::traits::AsBytes;
 
 use crate::config::Commitment;
 use crate::fri::terminal::FriFoldLayout;
+use crate::merkle_caps::TreeCheck;
 
 /// Verifier mutations for the load-bearing tests (M1, M2). Test builds only;
 /// production has no switch. Thread-local: the host verifier is sequential,
@@ -140,12 +140,22 @@ where
 
 /// The FRI checks of one query under a group-encoded layout (every format but
 /// the legacy one): per committed layer `j`, the group is authenticated at
-/// `leaf = p >> d_j` against `roots[j]` (path `paths(j)`, exact depth), the
+/// `leaf = p >> d_j` by `checks[j]` — the layer tree's check, built once per
+/// tree at the layout's depth with its Merkle cap (`TreeCheck`; exact path
+/// length `depth − c`, query 0 the cap's owner) — with path `paths(j)`, the
 /// slot check `group[p & (2^{d_j} − 1)] == v` holds, and `v` becomes the group
-/// fold with `zetas[j + 1]`; finally `terminal[p] == v`.
+/// fold with layer `j`'s challenge; finally `terminal[p] == v`.
+///
+/// Layer `j`'s challenge is `zetas[j + 1]` for row pairs (`zetas[0]` drove the
+/// uncommitted fold 0) and `zetas[j]` under one row (layer 0 is the committed
+/// DEEP codeword, so no fold precedes it) — [`FriFoldLayout::num_zetas`].
 ///
 /// * `v` / `y_inv`: the query's value at committed layer 0 and the inverse of
-///   its point there (fold 0 already applied by the caller);
+///   its point there (row pairs: fold 0 already applied by the caller; one
+///   row: the DEEP value at `x_r` and `x_r⁻¹` — the layer-0 slot check is then
+///   the input-slot check `group₀[slot] == DEEP(x_r)`);
+/// * `query`: the query's position in proof order (query 0 is every capped
+///   layer's owner opening);
 /// * `iota`: the query's position in committed layer 0;
 /// * `values`: the flat per-query group values (the proof's
 ///   `layers_evaluations_sym` under this encoding), length already checked by
@@ -154,8 +164,8 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_query_groups<'p, F, E, B>(
     layout: &FriFoldLayout,
-    lde_log: u32,
-    roots: &[Commitment],
+    checks: &[TreeCheck<'_>],
+    query: usize,
     paths: impl Fn(usize) -> &'p [Commitment],
     values: &[FieldElement<E>],
     zetas: &[FieldElement<E>],
@@ -171,12 +181,13 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     B: IsStreamingLeafBackend<E, Node = Commitment>,
 {
-    if roots.len() != layout.num_committed
+    if checks.len() != layout.num_committed
         || values.len() != layout.opened_values_per_query()
-        || zetas.len() != layout.num_committed + 1
+        || zetas.len() != layout.num_zetas()
     {
         return false;
     }
+    let zeta_offset = usize::from(!layout.one_row);
     let mut index = iota;
     let mut offset = 0usize;
     let mut ok = true;
@@ -194,10 +205,7 @@ where
         }
         // (1) the group is the leaf, authenticated with the exact depth.
         let leaf_hash = B::hash_data_from_slices(group, &[]);
-        let depth = layout.layer_depth(lde_log, j) as usize;
-        if !CappedRoot::uncapped(&roots[j], depth).verify::<B>(paths(j), leaf, leaf_hash)
-            && !mutated(2)
-        {
+        if !checks[j].verify::<B>(query, paths(j), leaf, leaf_hash) && !mutated(2) {
             ok = false;
         }
         // (3) fold: x_g⁻¹ = y⁻¹ · ω_{2^d}^{br_d(slot)}.
@@ -213,7 +221,7 @@ where
             0
         };
         let x_g_inv = &y_inv * &table[br_slot];
-        v = group_fold::<F, E>(group, &zetas[j + 1], &x_g_inv, table);
+        v = group_fold::<F, E>(group, &zetas[j + zeta_offset], &x_g_inv, table);
         for _ in 0..d {
             y_inv = y_inv.square();
         }

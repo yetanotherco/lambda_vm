@@ -148,7 +148,25 @@ fn the_production_epoch_recount() {
     assert_eq!(shapes.len(), 34, "epoch 0 is 34 tables (sh1)");
     let sizes = epoch_groups(shapes.len());
     assert_eq!(sizes, vec![33, 1], "the bookend is committed alone");
-    let config = chain_config(&shapes);
+    // ⚠ AT THE LEGACY WHIR FORMAT, named. This recount is of sh1's measured
+    // epoch, and sh1 ran before the default flip (uniform folds, no cap): its
+    // "rounds 56" is 8 chains x 7 rounds. The production default (first6, cap
+    // auto) proves this epoch in 8 x 6 = 48 rounds — asserted
+    // below so the flip is a stated fact here, not a silent re-pin of a record.
+    let config =
+        crate::multilinear_prove::chain_config_under(&crate::zf_format::ZfFormat::LEGACY, &shapes);
+    {
+        let production = crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat::DEFAULT,
+            &shapes,
+        );
+        assert_eq!(
+            production.format,
+            crate::zf_format::ZfFormat::DEFAULT.chain_format()
+        );
+        assert_eq!(production.num_queries, 112, "the flip keeps Q");
+        assert_eq!(ChainShape::new(&production, 25).rounds(), 6, "first6 at 25");
+    }
     let (layouts, _domains) = stacks(&shapes, &sizes, &config).expect("the epoch's stacks build");
 
     // ⚠ ASSERTED BEFORE ANYTHING IS COUNTED. These four are sh1's own printed

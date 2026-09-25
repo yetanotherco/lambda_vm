@@ -37,6 +37,21 @@ pub const fn full_tree_bytes(lde_size: u64) -> u64 {
     lde_size.saturating_sub(1).saturating_mul(MERKLE_NODE_BYTES)
 }
 
+/// `(2 · leaves − 1) · 32` for the tree over `lde_size` rows with
+/// `rows_per_leaf` rows per leaf: [`full_tree_bytes`] at 2 (today's row pair),
+/// `(2 · lde − 1) · 32` — twice the leaves, about twice the bytes — at 1 (the
+/// S2 one-row tree).
+pub const fn tree_bytes_for(lde_size: u64, rows_per_leaf: u64) -> u64 {
+    if rows_per_leaf <= 1 {
+        lde_size
+            .saturating_mul(2)
+            .saturating_sub(1)
+            .saturating_mul(MERKLE_NODE_BYTES)
+    } else {
+        full_tree_bytes(lde_size)
+    }
+}
+
 /// Bytes of `cols` ext3 columns over `rows` rows.
 pub const fn ext3_bytes(rows: u64, cols: u64) -> u64 {
     rows.saturating_mul(cols).saturating_mul(EXT3_BYTES)
@@ -87,13 +102,25 @@ pub fn commit_device_set(
     blowup: usize,
     snapshot: bool,
 ) -> CommitDeviceSet {
+    commit_device_set_rpl(n, base_cols, blowup, snapshot, 2)
+}
+
+/// [`commit_device_set`] for a tree with `rows_per_leaf` rows per leaf (2 =
+/// row pair, 1 = the S2 one-row tree, whose node buffer is twice as large).
+pub fn commit_device_set_rpl(
+    n: usize,
+    base_cols: usize,
+    blowup: usize,
+    snapshot: bool,
+    rows_per_leaf: usize,
+) -> CommitDeviceSet {
     let n = n as u64;
     let cols = base_cols as u64;
     let lde = n.saturating_mul(blowup as u64);
     CommitDeviceSet {
         lde_bytes: base_bytes(lde, cols),
         snapshot_bytes: if snapshot { base_bytes(n, cols) } else { 0 },
-        tree_bytes: full_tree_bytes(lde),
+        tree_bytes: tree_bytes_for(lde, rows_per_leaf as u64),
         scratch_bytes: n
             .saturating_mul(BASE_BYTES)
             .saturating_add(INPLACE_TRANSPOSE_SCRATCH_CAP_BYTES),
@@ -156,6 +183,17 @@ impl TableDeviceSet {
 
 /// Size one table's rounds-2–4 device set for `shape`.
 pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
+    table_device_set_rpl(shape, 2)
+}
+
+/// [`table_device_set`] for a table whose trace trees (main, aux,
+/// composition) carry `rows_per_leaf` rows per leaf: at 1 (S2) every trace
+/// tree is the one-row tree, about twice the node bytes. The FRI trees double
+/// their bound too: under one row the chain starts at the LDE itself (the
+/// input tree over the DEEP codeword, `lde / 2^{d_0}` leaves), so the layer
+/// trees together hold fewer than `2 · lde` nodes, which is
+/// [`tree_bytes_for`]`(lde, 1)`.
+pub fn table_device_set_rpl(shape: TableShape, rows_per_leaf: usize) -> TableDeviceSet {
     let TableShape {
         n,
         blowup,
@@ -164,7 +202,8 @@ pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
         num_parts,
         num_eval_points,
     } = shape;
-    let main = commit_device_set(n, main_cols, blowup, true);
+    let main = commit_device_set_rpl(n, main_cols, blowup, true, rows_per_leaf);
+    let rpl = rows_per_leaf as u64;
     let (n, k, aux, parts) = (
         n as u64,
         num_eval_points as u64,
@@ -177,17 +216,17 @@ pub fn table_device_set(shape: TableShape) -> TableDeviceSet {
     } else {
         ext3_bytes(lde, aux)
             .saturating_add(ext3_bytes(n, aux + 1))
-            .saturating_add(full_tree_bytes(lde))
+            .saturating_add(tree_bytes_for(lde, rpl))
     };
     let composition_bytes = if parts == 0 {
         0
     } else {
-        ext3_bytes(lde, 1 + parts).saturating_add(full_tree_bytes(lde))
+        ext3_bytes(lde, 1 + parts).saturating_add(tree_bytes_for(lde, rpl))
     };
     let deep_fri_bytes = ext3_bytes(n, k)
         .saturating_add(ext3_bytes(lde, 1 + k))
         .saturating_add(ext3_bytes(lde, 2))
-        .saturating_add(full_tree_bytes(lde));
+        .saturating_add(tree_bytes_for(lde, rpl));
     TableDeviceSet {
         main,
         aux_bytes,
@@ -248,6 +287,48 @@ mod tests {
     const CARD_32_GIB_BUDGET: u64 = 32 * GIB / 5 * 4;
     /// The dispatch layer's row floor (`gpu_lde::DEFAULT_GPU_LDE_THRESHOLD`).
     const FLOOR: usize = 1 << 14;
+
+    /// S2: a one-row tree has twice the leaves, so its node
+    /// buffer is `(2·lde − 1)·32` against the row pair's `(lde − 1)·32` —
+    /// +`lde·32` bytes per tree (128 MiB at an LDE of 2^22) — and
+    /// the table device set grows by that per trace tree plus the FRI bound;
+    /// the default (`rows_per_leaf = 2`) is the old model exactly.
+    #[test]
+    fn a_one_row_tree_doubles_the_node_buffer_and_the_default_is_unchanged() {
+        let lde: u64 = 1 << 22;
+        assert_eq!(tree_bytes_for(lde, 2), full_tree_bytes(lde));
+        assert_eq!(tree_bytes_for(lde, 1), (2 * lde - 1) * MERKLE_NODE_BYTES);
+        assert_eq!(tree_bytes_for(lde, 1) - tree_bytes_for(lde, 2), lde * 32);
+        assert_eq!(tree_bytes_for(lde, 1) - tree_bytes_for(lde, 2), 128 << 20);
+
+        let n = 1usize << 20;
+        assert_eq!(
+            commit_device_set_rpl(n, 49, 4, true, 2),
+            commit_device_set(n, 49, 4, true)
+        );
+        let one = commit_device_set_rpl(n, 49, 4, true, 1);
+        assert_eq!(one.tree_bytes, tree_bytes_for(lde, 1));
+        assert_eq!(
+            one.total() - commit_device_set(n, 49, 4, true).total(),
+            lde * 32
+        );
+
+        let shape = TableShape {
+            n,
+            blowup: 4,
+            main_cols: 49,
+            aux_cols: 13,
+            num_parts: 2,
+            num_eval_points: 2,
+        };
+        assert_eq!(table_device_set_rpl(shape, 2), table_device_set(shape));
+        // Main, aux and composition trees, and the FRI tree bound: four
+        // node buffers, each `lde · 32` larger.
+        assert_eq!(
+            table_device_set_rpl(shape, 1).total() - table_device_set(shape).total(),
+            4 * lde * 32
+        );
+    }
 
     /// The synthetic over-budget table: 2^22 rows x 612 columns at blowup 2.
     /// Its LDE alone is 38.25 GiB; with the snapshot and the tree the commit's

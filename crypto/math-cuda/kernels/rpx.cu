@@ -687,6 +687,29 @@ extern "C" __global__ void rpx_fri_leaves_ext3(
     rpx::store_digest_be(digest, leaves_out + tid * 32);
 }
 
+// FRI GROUP-leaf hashing (S3): leaf `tid` absorbs the `group` consecutive ext3
+// values `evals[tid*group .. (tid+1)*group]` of an interleaved eval vector — the
+// `3*group` contiguous felts at `evals_interleaved + tid*group*3` — in order, a
+// sponge over `3*group` felts (the count keys the padding). The host
+// `AlgebraicBatchBackend` leaf over the group; at `group = 2` exactly
+// `rpx_fri_leaves_ext3`'s six felts. Twin of `keccak_fri_group_leaves_ext3`.
+extern "C" __global__ void rpx_fri_group_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_leaves * group u64s
+    uint64_t num_leaves,
+    uint64_t group,                      // ext3 values per leaf (2^d)
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t *g = evals_interleaved + tid * group * 3;
+
+    rpx::Sponge sp;
+    sp.init(3 * group);
+    for (uint64_t i = 0; i < 3 * group; ++i) sp.absorb(g[i]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, leaves_out + tid * 32);
+}
+
 // Row-major ROW-PAIR leaf hashing: leaf `tid` absorbs row `reverse_index(2*tid)`
 // then row `reverse_index(2*tid+1)`, each `m` lanes read contiguously from
 // `data + br * m`. `m` is the row stride in u64s: base trace = column count,
@@ -741,6 +764,33 @@ extern "C" __global__ void rpx_leaves_base_row_major_row_pair_range(
     sp.init(2 * (col_end - col_start));
     for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row_0[c]);
     for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row_1[c]);
+    uint64_t digest[rpx::DIGEST_FELTS];
+    sp.finalize(digest);
+    rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);
+}
+
+// Row-major ONE-ROW leaf hashing (S2, rows_per_leaf = 1): leaf `tid` absorbs the
+// single row `reverse_index(tid)`, columns `[col_start, col_end)` of the
+// row-major buffer (`m` the full row stride) — a sponge over
+// `col_end - col_start` felts (the count keys the padding). The CPU
+// `commit_rows_bit_reversed_subset_with(.., 1)`. Twin of
+// `keccak256_leaves_base_row_major_row_range`.
+extern "C" __global__ void rpx_leaves_base_row_major_row_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    const uint64_t *row = data + br * m;
+
+    rpx::Sponge sp;
+    sp.init(col_end - col_start);
+    for (uint64_t c = col_start; c < col_end; ++c) sp.absorb(row[c]);
     uint64_t digest[rpx::DIGEST_FELTS];
     sp.finalize(digest);
     rpx::store_digest_be(digest, hashed_leaves_out + tid * 32);

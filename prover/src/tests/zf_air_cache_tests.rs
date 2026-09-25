@@ -2,20 +2,19 @@
 //! FORMAT: an AIR built for one format and asked for under another is a
 //! different verifier.
 //!
-//! Before this test the key was `(name, blowup, queries, coset, grinding,
-//! final degree)` — every `ProofOptions` field except `format`, which the ZF
-//! campaign added later. The first AIR built in a process then fixed the
-//! format of every later AIR with the same name and parameters, whatever
-//! format the caller asked for. Two gate reds on candidate-b were this and
-//! nothing else:
+//! A key of `(name, blowup, queries, coset, grinding, final degree)` alone —
+//! every `ProofOptions` field except `format` — lets the first AIR built in a
+//! process fix the format of every later AIR with the same name and
+//! parameters, whatever format the caller asks for. Two test failures come
+//! from exactly that:
 //!
-//! - `merkle_cap_vm` (`LAMBDA_VM_ZF_CAP=auto`): the capped prove cached capped
-//!   AIRs, so `verify_with_options(.., &default, ..)` verified the capped proof
-//!   with those capped AIRs and accepted it.
-//! - `zf_vm_dp_tests`: in a fresh process the dp prove cached dp AIRs and the
-//!   "default" verifier accepted the dp proof; in the lib suite an earlier test
-//!   had cached default AIRs, so the dp prove proved at `pair` and the
-//!   non-vacuity assertion fired.
+//! - `merkle_cap_vm` (`LAMBDA_VM_ZF_CAP=auto`): the capped prove caches capped
+//!   AIRs, so `verify_with_options(.., &default, ..)` verifies the capped proof
+//!   with those capped AIRs and accepts it.
+//! - `zf_vm_dp_tests`: in a fresh process the dp prove caches dp AIRs and the
+//!   "default" verifier accepts the dp proof; in the lib suite an earlier test
+//!   has cached default AIRs, so the dp prove proves at `pair` and the
+//!   non-vacuity assertion fires.
 //!
 //! The options used here carry a query count no other test uses, so these
 //! keys are this test's alone however the suite interleaves.

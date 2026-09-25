@@ -178,7 +178,7 @@ impl GrindBits {
 
 /// Blowup, fold factor, query count and proof of work.
 ///
-/// `format` is the proof FORMAT ([`ChainFormat`], the ZF campaign's W1 and W2
+/// `format` is the proof FORMAT ([`ChainFormat`]: the W1 cap and W2 fold
 /// levers); its default is today's format. Like the rest of the config it is
 /// a verifier-side constant, never read from a proof. The fold schedule is
 /// absorbed into the statement through [`ChainConfig::fold_word`], whose value
@@ -226,7 +226,7 @@ impl ChainFormat {
 
 /// Which WHIR format levers THIS build implements. A lever that is only
 /// parsed must not be selectable (see `stark::proof::options::
-/// MERKLE_CAP_IMPLEMENTED`). Each lane flips its own flag in the commit that
+/// MERKLE_CAP_IMPLEMENTED`). Each flag is flipped in the commit that
 /// makes the lever real.
 ///
 /// W1 (the Merkle cap) is real: host prover and verifier ([`ChainConfig::
@@ -239,7 +239,7 @@ pub const WHIR_CAP_IMPLEMENTED: bool = true;
 /// The stack is tested up to it and no further: the GPU commit/fold parity
 /// (`math-cuda` `whir_commit`/`whir_fold`, k = 6) and the in-guest fold
 /// emitter (`lfm::whir_fold_tests`, k = 5 and 6). `k0 = 7` loses on in-guest
-/// instructions (design/WHIR.md §3.2), so nothing above 6 is opened.
+/// instructions, so nothing above 6 is opened.
 pub const MAX_FOLD: usize = 6;
 
 /// The per-round fold schedule of a chain (W2).
@@ -247,11 +247,11 @@ pub const MAX_FOLD: usize = 6;
 /// ★ Why a FIRST fold and not a list. A config serves chains of every height
 /// (`chain_config` takes the tallest stack, and each chain folds its own
 /// `num_vars`), so a per-round list would have to say what a shorter chain
-/// does with it. The lever design/WHIR.md measured is the first fold alone —
+/// does with it. The lever is the first fold alone —
 /// tree 0 is the only base-field tree, opened `Q` times rather than `2Q`, and
 /// every variable it takes shortens every later tree — so the schedule is
 /// "`k0`, then today's uniform walk", a function of `(k0, log_folding,
-/// num_vars)` at every height. There is no DP (RULINGS 15).
+/// num_vars)` at every height. There is no DP.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WhirFolds {
     /// `log_folding` variables every round, the remainder last. Today's format.
@@ -381,7 +381,7 @@ impl ChainConfig {
     ///
     /// - `Uniform` → `log_folding`: `4u64` at the default, today's bytes.
     /// - `First(k0)` → `FOLD_WORD_TAG | log_folding << 52 | 1 << 48 | k0`:
-    ///   design/WHIR.md §4.3's prefix encoding with a one-entry prefix (tail
+    ///   a prefix encoding with a one-entry prefix (tail
     ///   `log_folding`, length 1, the fold in the low nibble).
     ///
     /// Every chain's schedule is a function of this word and its own
@@ -402,8 +402,7 @@ impl ChainConfig {
     }
 
     /// The Merkle cap height of each of the chain's `R` commitment trees, tree
-    /// `t` being the one round `t` opens as its current codeword (W1,
-    /// design/CAP.md §5.1).
+    /// `t` being the one round `t` opens as its current codeword (W1).
     ///
     /// Tree `t` has depth `D_t − k_t` (its leaves are round `t`'s domain
     /// folded by that round's `k`) and is opened `Q` times when `t = 0` (round
@@ -1417,7 +1416,7 @@ where
     let num_leaves = current_domain.size() >> config.log_folding;
     let depth = num_leaves.trailing_zeros() as usize;
     // The tree's check, built once from its first opening, after the count
-    // guard above (REVIEW-CAP M2). With no openings there is nothing to check.
+    // guard above, so indexing it never panics. With no openings there is nothing to check.
     let Some(first) = openings.current.first() else {
         return Ok(());
     };
@@ -1659,7 +1658,7 @@ mod tests {
         assert_eq!(config(4).fold_word().to_le_bytes(), 4u64.to_le_bytes());
     }
 
-    /// design/WHIR.md §3.2's schedules, by hand, and the clamp at small heights.
+    /// The first-fold schedules, by hand, and the clamp at small heights.
     #[test]
     fn the_first_fold_schedules() {
         let (f5, f6) = (first(5, 4), first(6, 4));

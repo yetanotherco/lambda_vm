@@ -93,8 +93,7 @@ use super::deep::DeepShape;
 use super::edsl::WrapHash;
 use super::epoch::{RootCells, TableAbsorbs, TableChallengeShape, fork_table};
 use super::epoch_verify::{
-    FRI_LEAF_FELTS, TableVerifyShape, blocks_for, boundary_terms, group_leaf_felts,
-    query_permutations_for,
+    TableVerifyShape, blocks_for, boundary_terms, group_leaf_felts, query_permutations_for,
 };
 use super::fri::FriShape;
 use super::hash::HasherKind;
@@ -403,15 +402,23 @@ fn table_shape(
         num_composition_parts: num_parts,
         log2_trace_length,
     };
+    // The table's leaf layout (S2), resolved as the host prover resolves it.
+    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
     let sub = SubProofShape {
         deep,
         trace_groups,
-        merkle_depth: log2_lde_length as usize - 1,
+        merkle_depth,
         log2_lde_length,
         coset_offset: FE::from(opts.coset_offset),
+        trace_cap: opts
+            .format
+            .merkle_cap
+            .height(opts.fri_number_of_queries, merkle_depth),
+        layout: leaf_layout,
     };
     let has_aux_trace = air.has_aux_trace();
-    let fri = FriShape::from_options(opts, log2_lde_length);
+    let fri = FriShape::for_layout(opts, log2_lde_length, leaf_layout);
 
     TableShape {
         name,
@@ -516,8 +523,9 @@ fn bill(tables: &[TableShape], hash: WrapHash, hash_chip: &str) -> (Bill, usize)
             .iter()
             .map(|g| blocks_for(group_leaf_felts(g), hash))
             .sum();
-        let fri_leaves = t.verify.fri.num_committed() * blocks_for(FRI_LEAF_FELTS, hash);
-        let parents = groups.len() * t.verify.sub.merkle_depth;
+        let fri_leaves = t.verify.fri.leaf_permutations_per_query(hash);
+        // Paths stop at the trees' cap (`merkle_depth − trace_cap`).
+        let parents = groups.len() * t.verify.sub.path_len();
         let fri_paths = t.verify.fri.path_steps_per_query();
 
         b.trace_leaves += leaves;

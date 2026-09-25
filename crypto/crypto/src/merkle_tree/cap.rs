@@ -403,7 +403,7 @@ impl CapPolicy {
     /// The cap height of a tree of `depth` levels opened `openings` times.
     /// Always `≤ depth` and `≤ MAX_CAP_HEIGHT`, and 0 for an unopened tree.
     ///
-    /// `Auto` is RULINGS 1's table, stated directly — 3 for a tree opened at
+    /// `Auto` is a fixed table, stated directly — 3 for a tree opened at
     /// least [`AUTO_CAP3_MIN_OPENINGS`] times, 2 from
     /// [`AUTO_CAP2_MIN_OPENINGS`], 0 below — then clamped to the depth. No
     /// arithmetic runs at all, so no verifier can disagree on an overflow.
@@ -433,11 +433,11 @@ impl CapPolicy {
 }
 
 /// `Auto` gives a height-3 cap to a tree opened at least this many times
-/// (RULINGS 1). ⚠ A FORMAT CONSTANT, like [`AUTO_WEIGHTS`].
+/// ⚠ A FORMAT CONSTANT, like [`AUTO_WEIGHTS`].
 pub const AUTO_CAP3_MIN_OPENINGS: usize = 20;
 
 /// `Auto` gives a height-2 cap to a tree opened at least this many times and
-/// fewer than [`AUTO_CAP3_MIN_OPENINGS`] (RULINGS 1). ⚠ A FORMAT CONSTANT.
+/// fewer than [`AUTO_CAP3_MIN_OPENINGS`]. ⚠ A FORMAT CONSTANT.
 pub const AUTO_CAP2_MIN_OPENINGS: usize = 4;
 
 impl fmt::Display for CapPolicy {
@@ -1016,7 +1016,7 @@ mod tests {
 
     // ------------------------------------------- the only-rejecting-check fixtures
     //
-    // REVIEW-CAP M1: a tamper that some OTHER check also rejects cannot show a
+    // A tamper that some OTHER check also rejects cannot show a
     // check is load-bearing — removing it leaves the test green. These two
     // fixtures are built so that exactly one check rejects them, on the real
     // keccak backend (no toy hash): delete that check and the test fails.
@@ -1033,7 +1033,7 @@ mod tests {
     /// consistent after the shift (all 0 / all 1), so the length-agnostic fold
     /// ACCEPTS: only `siblings.len() == D − c` rejects it. Hash-agnostic — the
     /// node is read out of the tree, not forged — and at `c = 0` it is exactly
-    /// the C1b case.
+    /// the uncapped exact-length case.
     #[test]
     fn an_internal_node_as_leaf_hash_is_rejected_only_by_the_length_check() {
         let t = tree(64, 5);
@@ -1147,7 +1147,7 @@ mod tests {
         best.0
     }
 
-    /// REVIEW-CAP S5: `Auto` is RULINGS 1's table; this pins that the table is
+    /// `Auto` is a fixed table; this pins that the table is
     /// the cost-law argmax for every opening count, so the table and the
     /// weights cannot drift apart.
     #[test]
@@ -1165,7 +1165,7 @@ mod tests {
         }
     }
 
-    /// Clamping the table to the depth (RULINGS 1) is not the same function as
+    /// Clamping the table to the depth is not the same function as
     /// an argmax bounded by the depth, at exactly one point: 4 openings of a
     /// depth-1 tree, where the table says 1 and the bounded argmax 0 (a c = 1
     /// cap loses 68 ns there). The table is the rule; this pins the one
@@ -1238,7 +1238,7 @@ mod tests {
                 compare: 3789,
             }
         );
-        // The gains the pinned heights rest on (CAP.md §2).
+        // The gains the pinned heights rest on.
         assert_eq!(cap_gain(&AUTO_WEIGHTS, 20, 2), 55_758);
         assert_eq!(cap_gain(&AUTO_WEIGHTS, 20, 3), 55_914);
         assert_eq!(cap_gain(&AUTO_WEIGHTS, 19, 2), 52_351);

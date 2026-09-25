@@ -585,7 +585,11 @@ fn capped_program(depth: usize, c: usize, n: usize) -> LfmProgram {
         .collect();
     let root = b.hint_word(arena, 1 << c);
     let root_lanes = b.unpack(root);
-    let tree = TreeAuth::Cap(CapCells::authenticate(&mut b, &cap, &root_lanes));
+    let tree = TreeAuth::Cap(CapCells::authenticate(
+        &mut b,
+        &cap,
+        std::slice::from_ref(&root_lanes),
+    ));
     for q in 0..n {
         let at = ((1 << c) + 1 + q * per) as u32;
         let values: Vec<Ext> = (0..block)
@@ -676,7 +680,7 @@ fn the_cap_mux_selects_every_index() {
     }
 }
 
-/// ★ REVIEW-CAP M1(b) in-guest: a cap word NO opening reaches, tampered. The
+/// ★ In-guest: a cap word NO opening reaches, tampered. The
 /// walk and the mux of every opening are unaffected, so only the cap-to-root
 /// check can refuse it — and it does. A cap word an opening does reach is
 /// refused too.

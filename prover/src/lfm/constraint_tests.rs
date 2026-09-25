@@ -939,7 +939,10 @@ pub(super) fn open_sub_proof(
     // single-table case (no per-table domain separator).
     let mut transcript = crate::hash_pin::block_transcript(&[]);
     if air.is_preprocessed() {
-        transcript.append_bytes(&air.precomputed_commitment());
+        transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
+            air,
+            view.trace_length(),
+        ));
     }
     transcript.append_bytes(view.lde_trace_main_merkle_root());
     let rap_challenges: Vec<FEE> = if air.has_aux_trace() {
