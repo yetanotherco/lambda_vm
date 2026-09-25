@@ -156,7 +156,10 @@ fn the_production_epoch_recount() {
     let config =
         crate::multilinear_prove::chain_config_under(&crate::zf_format::ZfFormat::LEGACY, &shapes);
     {
-        let production = chain_config(&shapes);
+        let production = crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat::DEFAULT,
+            &shapes,
+        );
         assert_eq!(
             production.format,
             crate::zf_format::ZfFormat::DEFAULT.chain_format()
