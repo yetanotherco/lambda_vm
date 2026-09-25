@@ -101,28 +101,17 @@ extern "C" __global__ void ntt_dit_level_batched(uint64_t *data,
     x[i1] = sub(u, v);
 }
 
-extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
-                                                    const uint64_t *tw,
-                                                    uint64_t n,
-                                                    uint64_t log_n,
-                                                    uint64_t base_step,
-                                                    uint64_t col_stride) {
-    __shared__ uint64_t tile[256];
-    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
-
+// The butterfly rounds of `ntt_dit_8_levels_batched` on one loaded 256-slot
+// tile: levels base_step..base_step+7, `blk` being the tile's block index
+// within its column. Shared by the plain and the spread-loading kernels so
+// both run the exact same butterflies (and thus produce identical bits).
+__device__ __forceinline__ void dit_8_levels_tile(uint64_t *tile,
+                                                  const uint64_t *tw,
+                                                  uint64_t n,
+                                                  uint64_t log_n,
+                                                  uint64_t base_step,
+                                                  uint32_t blk) {
     uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n - base_step);
-
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-
-    uint64_t group_size = 1ULL << base_step;
-    uint64_t n_groups   = n >> base_step;
-    uint64_t low_bits   = tid / n_groups;
-    uint64_t high_bits  = tid & (n_groups - 1);
-    uint64_t row        = high_bits * group_size + low_bits;
-
-    tile[threadIdx.x] = x[row];
-    __syncthreads();
-
     uint32_t remaining_high_bits = (uint32_t)(log_n - base_step - 1);
     uint32_t high_mask = (1u << remaining_high_bits) - 1u;
 
@@ -136,7 +125,7 @@ extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
             uint32_t idx2 = idx1 + half;
 
             uint32_t gs  = (uint32_t)base_step + loc_step;
-            uint32_t ggp = (blockIdx.x << 7) + i;
+            uint32_t ggp = (blk << 7) + i;
             ggp = ((ggp & high_mask) << (uint32_t)base_step) + (ggp >> remaining_high_bits);
             ggp = ggp & ((1u << gs) - 1u);
             uint64_t factor = tw[(uint64_t)ggp * (n >> (gs + 1))];
@@ -148,6 +137,67 @@ extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
+                                                    const uint64_t *tw,
+                                                    uint64_t n,
+                                                    uint64_t log_n,
+                                                    uint64_t base_step,
+                                                    uint64_t col_stride) {
+    __shared__ uint64_t tile[256];
+    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
+
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+
+    uint64_t group_size = 1ULL << base_step;
+    uint64_t n_groups   = n >> base_step;
+    uint64_t low_bits   = tid / n_groups;
+    uint64_t high_bits  = tid & (n_groups - 1);
+    uint64_t row        = high_bits * group_size + low_bits;
+
+    tile[threadIdx.x] = x[row];
+    __syncthreads();
+
+    dit_8_levels_tile(tile, tw, n, log_n, base_step, blockIdx.x);
+
+    x[row] = tile[threadIdx.x];
+}
+
+// Levels 0..7 of a size-n forward DIT NTT whose input is the zero-padded,
+// bit-reversed expansion of a compact prefix, loaded on the fly instead of
+// being materialised in DRAM. The first n >> log_spread slots of each column
+// must hold the coefficients ALREADY bit-reversed at that size (one
+// `bit_reverse_permute_batched` over the prefix); slot `r` of the expansion
+// is then prefix[r >> log_spread] when the low `log_spread` bits of r are
+// zero, and 0 otherwise — exactly what `bit_reverse_permute_batched` over the
+// zero-tailed buffer used to produce, so the butterflies see the same tile.
+// The tail [n >> log_spread, n) is never read and need not be zeroed.
+//
+// In place: block `blk` reads prefix slots [blk*256, blk*256+256) >> log_spread
+// and writes slots [blk*256, blk*256+256). The host launches the blocks in
+// descending waves [block_lo, block_hi) with block_hi <= block_lo << log_spread,
+// so no wave reads a slot another block of the same wave writes (block 0,
+// which overlaps itself, runs alone and loads before it stores).
+// Grid: x = block_hi - block_lo, y = column. Requires 1 <= log_spread <= 8.
+extern "C" __global__ void ntt_dit_8_levels_batched_spread(uint64_t *data,
+                                                           const uint64_t *tw,
+                                                           uint64_t n,
+                                                           uint64_t log_n,
+                                                           uint64_t log_spread,
+                                                           uint64_t block_lo,
+                                                           uint64_t col_stride) {
+    __shared__ uint64_t tile[256];
+    uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
+
+    uint64_t blk = block_lo + blockIdx.x;
+    uint64_t row = blk * 256 + threadIdx.x;
+    uint64_t spread_mask = (1ULL << log_spread) - 1;
+
+    tile[threadIdx.x] = (row & spread_mask) ? 0ULL : x[row >> log_spread];
+    __syncthreads();
+
+    dit_8_levels_tile(tile, tw, n, log_n, 0, (uint32_t)blk);
 
     x[row] = tile[threadIdx.x];
 }
@@ -316,6 +366,25 @@ extern "C" __global__ void bit_reverse_row_major(uint64_t *data,
     }
 }
 
+// Out-of-place row bit-reverse: dst row `row` = src row `br(row)` for the
+// first n rows. One read + one write per row, replacing a D2D copy into
+// `dst` followed by the in-place `bit_reverse_row_major`. `src` and `dst`
+// must not overlap. Same grid as `bit_reverse_row_major`.
+extern "C" __global__ void bit_reverse_row_major_oop(uint64_t *__restrict__ dst,
+                                                     const uint64_t *__restrict__ src,
+                                                     uint64_t n,
+                                                     uint64_t log_n,
+                                                     uint64_t m)
+{
+    uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= m) return;
+    for (uint64_t row = blockIdx.y; row < n; row += gridDim.y) {
+        // A 64-bit shift is UB at log_n == 0 (n == 1, the identity).
+        uint64_t rev = log_n ? (__brevll(row) >> (64 - log_n)) : 0;
+        dst[row * m + col] = src[rev * m + col];
+    }
+}
+
 // One DIT butterfly level on row-major data.
 // Grid: gridDim.x = ceil(m / blockDim.x), gridDim.y = min(ceil(n/2 / blockDim.y), 65535).
 // blockDim.x covers columns (coalescing), blockDim.y covers butterfly pairs.
@@ -418,17 +487,25 @@ extern "C" __global__ void matrix_transpose_strided(
 // with base_step == 0, whose twiddle math this reuses verbatim). Grid:
 // x = column tiles, y = n/256 row blocks. Requires n >= 256. Shmem tile is
 // padded (pitch = T+1) to break bank conflicts on the butterfly accesses.
-extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
-                                                      const uint64_t *tw,
-                                                      uint64_t n,
-                                                      uint64_t log_n,
-                                                      uint64_t m)
+// Body of the row-major 8-level kernels over the 256-row blocks
+// [rb_lo, rb_hi). With log_spread == 0 each tile row is loaded from the same
+// row (the plain kernel); with log_spread > 0 it is the spread load described
+// at `ntt_dit_8_levels_row_major_spread`.
+__device__ __forceinline__ void dit_8_levels_row_major_blocks(uint64_t *data,
+                                                              const uint64_t *tw,
+                                                              uint64_t n,
+                                                              uint64_t log_n,
+                                                              uint64_t m,
+                                                              uint64_t log_spread,
+                                                              uint64_t rb_lo,
+                                                              uint64_t rb_hi)
 {
     extern __shared__ uint64_t tile[];
     uint32_t T = blockDim.x;
     uint32_t pitch = T + 1;
     uint64_t col = (uint64_t)blockIdx.x * T + threadIdx.x;
     bool live = col < m;
+    uint64_t spread_mask = (1ULL << log_spread) - 1;
 
     uint32_t n_loc_steps = (uint32_t)min((uint64_t)8, log_n);
     uint32_t remaining_high_bits = (uint32_t)(log_n - 1);
@@ -437,11 +514,14 @@ extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
     // Grid-stride over 256-row blocks: gridDim.y caps at 65535, so lde sizes
     // >= 2^24 need more than one row block per y-slot. The trip count is
     // uniform across the block, keeping every __syncthreads converged.
-    for (uint64_t rb = blockIdx.y; rb < (n >> 8); rb += gridDim.y) {
+    for (uint64_t rb = rb_lo + blockIdx.y; rb < rb_hi; rb += gridDim.y) {
         uint64_t row_base = rb * 256;
 
         for (uint32_t r = threadIdx.y; r < 256; r += blockDim.y) {
-            if (live) tile[r * pitch + threadIdx.x] = data[(row_base + r) * m + col];
+            uint64_t row = row_base + r;
+            if (live)
+                tile[r * pitch + threadIdx.x] =
+                    (row & spread_mask) ? 0ULL : data[(row >> log_spread) * m + col];
         }
         __syncthreads();
 
@@ -474,4 +554,34 @@ extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
+                                                      const uint64_t *tw,
+                                                      uint64_t n,
+                                                      uint64_t log_n,
+                                                      uint64_t m)
+{
+    dit_8_levels_row_major_blocks(data, tw, n, log_n, m, 0, 0, n >> 8);
+}
+
+// Row-major analog of `ntt_dit_8_levels_batched_spread`: levels 0..7 of a
+// size-n forward NTT whose zero-padded, bit-reversed input is loaded from the
+// compact first n >> log_spread rows (already row-bit-reversed at that size)
+// instead of being materialised. Row `r` of the expansion is compact row
+// r >> log_spread when the low `log_spread` bits of r are zero, else 0; rows
+// past the compact prefix are never read. In place, launched in descending
+// waves of row blocks [rb_lo, rb_hi) with rb_hi <= rb_lo << log_spread (block
+// 0 alone last) so no wave reads a row it also writes. Same grid shape as
+// `ntt_dit_8_levels_row_major`, with y covering the wave. 1 <= log_spread <= 8.
+extern "C" __global__ void ntt_dit_8_levels_row_major_spread(uint64_t *data,
+                                                             const uint64_t *tw,
+                                                             uint64_t n,
+                                                             uint64_t log_n,
+                                                             uint64_t m,
+                                                             uint64_t log_spread,
+                                                             uint64_t rb_lo,
+                                                             uint64_t rb_hi)
+{
+    dit_8_levels_row_major_blocks(data, tw, n, log_n, m, log_spread, rb_lo, rb_hi);
 }

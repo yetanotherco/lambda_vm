@@ -463,8 +463,9 @@ pub fn download_comp_h(h: &GpuCompH) -> Result<Vec<u64>> {
 }
 
 /// Degree-2 quotient decomposition on device: splits a resident `H` (2n rows)
-/// into the two halves `H0/H1`, written in zero-padded slab layout (6 slabs of
-/// `lde_size = 2n` u64, first `n` filled) ready for the batched slab LDE.
+/// into the two halves `H0/H1`, written in slab layout (6 slabs of
+/// `lde_size = 2n` u64, first `n` filled, the padding tail left unwritten)
+/// ready for the batched slab LDE, which ignores the tail.
 /// Returns the slab buffer, the producing stream, and `n`.
 pub fn decompose_d2_into_slabs(
     h: &GpuCompH,
@@ -477,7 +478,9 @@ pub fn decompose_d2_into_slabs(
     let lde_size = h.num_rows;
     let be = backend()?;
     let stream = h.stream.clone();
-    let mut out = stream.alloc_zeros::<u64>(6 * lde_size)?;
+    // SAFETY: the kernel writes rows 0..n of all 6 slabs; rows n.. are the LDE
+    // padding, never read by `coset_lde_batch_ext3_slabs_keep`.
+    let mut out = unsafe { stream.alloc::<u64>(6 * lde_size) }?;
 
     let grid = (n as u32)
         .div_ceil(BLOCK_DIM)

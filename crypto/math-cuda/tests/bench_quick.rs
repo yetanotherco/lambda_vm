@@ -353,3 +353,71 @@ fn bench_lde_multi_column_gpu_limited_threads() {
         gpu_serial_ns as f64 / gpu_ns as f64,
     );
 }
+
+/// Median of `iters` timings (ms), each returned by `run` itself so setup
+/// (e.g. re-uploading an input it consumes) stays outside the measurement.
+fn median_ms(iters: usize, mut run: impl FnMut() -> f64) -> f64 {
+    run(); // warm-up: twiddle caches, allocator pool
+    let mut ms: Vec<f64> = (0..iters).map(|_| run()).collect();
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ms[iters / 2]
+}
+
+/// Device-resident LDE shapes at prover scale (blowup 2, the real config),
+/// for comparing the forward NTT's input handling across builds: run on each
+/// ref, or under `nsys profile --trace=cuda` for the per-kernel split. The
+/// row-major case takes a device input (the `predev` path); the ext3 case is
+/// the composition-parts slab LDE.
+#[test]
+#[ignore = "informal perf probe; run with --ignored --nocapture"]
+fn bench_lde_device_resident_forward_input() {
+    let be = math_cuda::device::backend().unwrap();
+    let blowup = 2usize;
+    const ITERS: usize = 9;
+    for log_n in [20u32, 21, 22] {
+        let n = 1usize << log_n;
+        let lde = n * blowup;
+        let weights = coset_weights(n, 7);
+        let mut rng = ChaCha8Rng::seed_from_u64(log_n as u64);
+
+        let m = 64usize;
+        let row_major: Vec<u64> = (0..n * m).map(|_| rng.r#gen::<u64>()).collect();
+        let predev = be.next_stream().clone_htod(&row_major).unwrap();
+        let row_ms = median_ms(ITERS, || {
+            let t0 = Instant::now();
+            let (handle, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+                &row_major,
+                Some(&predev),
+                n,
+                m,
+                blowup,
+                &weights,
+                false,
+            )
+            .unwrap();
+            let s = be.next_stream();
+            handle.wait_ready_on(&s).unwrap();
+            s.synchronize().unwrap();
+            t0.elapsed().as_secs_f64() * 1e3
+        });
+
+        let parts = 2usize;
+        let slabs: Vec<u64> = (0..3 * parts * lde).map(|_| rng.r#gen::<u64>()).collect();
+        let stream = be.next_stream();
+        let slab_ms = median_ms(ITERS, || {
+            let buf = stream.clone_htod(&slabs).unwrap();
+            stream.synchronize().unwrap();
+            let t0 = Instant::now();
+            let handle = math_cuda::lde::coset_lde_batch_ext3_slabs_keep(
+                &stream, buf, parts, n, blowup, &weights, None,
+            )
+            .unwrap();
+            handle.wait_ready_on(&stream).unwrap();
+            stream.synchronize().unwrap();
+            t0.elapsed().as_secs_f64() * 1e3
+        });
+        println!(
+            "log_n={log_n}: row-major m={m} device input {row_ms:.2} ms | ext3 slabs x{parts} {slab_ms:.2} ms"
+        );
+    }
+}

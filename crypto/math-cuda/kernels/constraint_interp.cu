@@ -473,7 +473,7 @@ extern "C" __global__ void constraint_composition_kernel(
 //   H1[i] = inv_2x[i] * (h[i] - h[i+n])
 // Reads the interleaved ext3 composition evals `h` (2n rows); writes the two
 // halves in slab layout (3 base slabs per half, `slab_stride` u64 each; rows
-// n.. stay zero as the LDE zero-pad).
+// n.. are the LDE padding, left unwritten — the slab LDE never reads them).
 extern "C" __global__ void decompose_d2_ext3(
     const uint64_t *__restrict__ h,
     const uint64_t *__restrict__ inv_2x,

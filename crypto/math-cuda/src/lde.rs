@@ -228,6 +228,35 @@ fn launch_bit_reverse_row_major(
     Ok(())
 }
 
+/// `dst` rows `0..n` = `src` rows bit-reversed at size `n` (`m` lanes per
+/// row); `src` is only read.
+fn launch_bit_reverse_row_major_oop(
+    stream: &CudaStream,
+    be: &Backend,
+    dst: &mut CudaSlice<u64>,
+    src: &CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    m: u64,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_row_major_oop)
+            .arg(dst)
+            .arg(src)
+            .arg(&n)
+            .arg(&log_n)
+            .arg(&m)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 fn launch_pointwise_mul_row_major(
     stream: &CudaStream,
     be: &Backend,
@@ -266,12 +295,6 @@ fn run_row_major_ntt_body(
     // remaining high-stride levels keep one kernel per level.
     let mut first_level = 0u64;
     if n >= 256 {
-        let t: u32 = 8.min(m as u32).max(1);
-        let cfg = LaunchConfig {
-            grid_dim: ((m as u32).div_ceil(t), ((n / 256) as u32).min(65535), 1),
-            block_dim: (t, 128, 1),
-            shared_mem_bytes: 256 * (t + 1) * 8,
-        };
         unsafe {
             stream
                 .launch_builder(&be.ntt_dit_8_levels_row_major)
@@ -280,11 +303,77 @@ fn run_row_major_ntt_body(
                 .arg(&n)
                 .arg(&log_n)
                 .arg(&m)
-                .launch(cfg)?;
+                .launch(row_major_8_levels_cfg(m, n / 256))?;
         }
         first_level = 8.min(log_n);
     }
+    run_row_major_ntt_levels(stream, be, buf, tw, n, log_n, first_level, m)
+}
 
+/// Row-major block shape shared by the 8-level kernels: `t` columns x 128
+/// threads per block, staging 256 rows x `t` columns (pitch `t + 1`) in shmem.
+fn row_major_8_levels_cfg(m: u64, row_blocks: u64) -> LaunchConfig {
+    let t: u32 = 8.min(m as u32).max(1);
+    LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(t), (row_blocks as u32).min(65535), 1),
+        block_dim: (t, 128, 1),
+        shared_mem_bytes: 256 * (t + 1) * 8,
+    }
+}
+
+/// Row-major analog of [`run_batched_forward_ntt_from_prefix`]: forward NTT
+/// at `lde_size` of the zero-padded first `n` rows, in place. When
+/// [`spread_load_applies`], the prefix rows are bit-reversed at size `n` and
+/// levels 0..8 load the expansion straight from them.
+fn run_row_major_forward_ntt_from_prefix(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    fwd_tw: &CudaSlice<u64>,
+    n: u64,
+    lde_size: u64,
+    m: u64,
+) -> Result<()> {
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    if !spread_load_applies(n as usize, lde_size as usize) {
+        launch_bit_reverse_row_major(stream, be, buf, lde_size, log_lde, m)?;
+        return run_row_major_ntt_body(stream, be, buf, fwd_tw, lde_size, log_lde, m);
+    }
+    let log_spread = log_lde - log_n;
+    if n > 1 {
+        launch_bit_reverse_row_major(stream, be, buf, n, log_n, m)?;
+    }
+    for (lo, hi) in spread_waves(lde_size / 256, log_spread) {
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_8_levels_row_major_spread)
+                .arg(&mut *buf)
+                .arg(fwd_tw)
+                .arg(&lde_size)
+                .arg(&log_lde)
+                .arg(&m)
+                .arg(&log_spread)
+                .arg(&lo)
+                .arg(&hi)
+                .launch(row_major_8_levels_cfg(m, hi - lo))?;
+        }
+    }
+    run_row_major_ntt_levels(stream, be, buf, fwd_tw, lde_size, log_lde, 8, m)
+}
+
+/// Row-major DIT levels `first_level..log_n`, one kernel per level.
+#[allow(clippy::too_many_arguments)]
+fn run_row_major_ntt_levels(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    tw: &CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    first_level: u64,
+    m: u64,
+) -> Result<()> {
     let col_tile: u32 = 32.min(m as u32);
     let row_tile: u32 = (256 / col_tile).max(1);
     for level in first_level..log_n {
@@ -404,7 +493,9 @@ fn launch_row_to_col_major(
     cols: usize,
     lde_u64: u64,
 ) -> Result<CudaSlice<u64>> {
-    let mut dst = stream.alloc_zeros::<u64>(lde_size * cols)?;
+    // SAFETY: the transpose writes every `(row, col)` of the `lde_size × cols`
+    // output (x tiles cover all columns, y grid-strides over all rows).
+    let mut dst = unsafe { stream.alloc::<u64>(lde_size * cols) }?;
     let cfg = LaunchConfig {
         grid_dim: (
             (cols as u32).div_ceil(32),
@@ -428,17 +519,18 @@ fn launch_row_to_col_major(
 }
 
 /// Row-major LDE input: either a host slice (uploaded) or an already-resident
-/// device buffer (copied device-to-device, no PCIe upload).
+/// device buffer (read in place by the iNTT bit-reverse, no PCIe upload).
+#[derive(Clone, Copy)]
 enum InnerInput<'a> {
     Host(&'a [u64]),
     Dev(&'a CudaSlice<u64>),
 }
 
-/// The expansion stage shared by the row-major commit pipelines: upload (or
-/// D2D-copy) the row-major trace into a zero-padded `lde_size × total_cols`
-/// buffer, optionally snapshot the trace-domain input column-major (for the
-/// LogUp fingerprint kernel), then iNTT → coset weights → forward NTT in
-/// place. Returns the row-major LDE buffer and the optional snapshot.
+/// The expansion stage shared by the row-major commit pipelines: upload the
+/// row-major trace into (or, for a device input, bit-reverse it straight into)
+/// the prefix of an `lde_size × total_cols` buffer, optionally snapshot the
+/// trace-domain input column-major (for the LogUp fingerprint kernel), then
+/// iNTT → coset weights → forward NTT in place. Returns the row-major LDE buffer and the optional snapshot.
 #[allow(clippy::too_many_arguments)]
 fn expand_row_major_on_stream(
     stream: &Arc<CudaStream>,
@@ -454,33 +546,39 @@ fn expand_row_major_on_stream(
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
     let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
 
-    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
-    // carry data, the remainder are already zero (zero-padding for LDE). Host
-    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
-    // Big host traces go through the pinned staging slot: the driver's
-    // internal pageable staging is 2-3x slower and convoys across threads.
+    // lde_size*total_cols scratch; only the first n*total_cols rows carry data,
+    // the forward NTT either loads the zero padding on the fly or (small shapes)
+    // reads a zeroed tail — see `alloc_lde_scratch`. Host input uploads (H2D)
+    // into the prefix; device input is not copied at all: the iNTT bit-reverse
+    // below reads it in place. Big host traces go through the pinned staging
+    // slot: the driver's internal pageable staging is 2-3x slower and convoys
+    // across threads.
     const PINNED_H2D_MIN_U64: usize = 1 << 20;
-    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
+    let mut buf = alloc_lde_scratch(stream, lde_size * total_cols, n, lde_size)?;
     match input {
         InnerInput::Host(h) if h.len() >= PINNED_H2D_MIN_U64 => {
             let mut dst = buf.slice_mut(0..n * total_cols);
             crate::device::htod_via(stream, be.pinned_staging(), &be.ctx, h, &mut dst)?;
         }
         InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
-        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Dev(_) => {}
     }
 
     // Snapshot the trace-domain input (column-major) before the iNTT overwrites
     // it in place. The LogUp aux fingerprint kernel reads the main trace in
     // place from this buffer, so R1 aux build skips the ~3 GB main re-upload.
-    // Transpose is a plain row->col transpose on the first n rows (not yet
-    // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
+    // Transpose is a plain row->col transpose of the natural-order input (the
+    // device input itself, or the uploaded prefix of `buf`):
+    // dst[col*n + row] = input[row*total_cols + col].
     let trace_col_major = if retain_trace_col_major {
+        let src = match input {
+            InnerInput::Dev(d) => d,
+            InnerInput::Host(_) => &buf,
+        };
         Some(launch_row_to_col_major(
-            stream, be, &buf, n, total_cols, n as u64,
+            stream, be, src, n, total_cols, n as u64,
         )?)
     } else {
         None
@@ -490,8 +588,22 @@ fn expand_row_major_on_stream(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    // iNTT: bit-reverse rows → per-level DIT.
-    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
+    // iNTT: bit-reverse rows (straight out of the device input when there is
+    // one, in place on the uploaded prefix otherwise) → per-level DIT.
+    match input {
+        InnerInput::Dev(d) => launch_bit_reverse_row_major_oop(
+            stream.as_ref(),
+            be,
+            &mut buf,
+            d,
+            n_u64,
+            log_n,
+            cols_u64,
+        )?,
+        InnerInput::Host(_) => {
+            launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?
+        }
+    }
     run_row_major_ntt_body(
         stream.as_ref(),
         be,
@@ -506,14 +618,13 @@ fn expand_row_major_on_stream(
     launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
 
     // Forward NTT at lde_size.
-    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
-    run_row_major_ntt_body(
+    run_row_major_forward_ntt_from_prefix(
         stream.as_ref(),
         be,
         &mut buf,
         fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
+        n_u64,
+        lde_size as u64,
         cols_u64,
     )?;
 
@@ -1118,9 +1229,9 @@ pub fn coset_lde_batch_base(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
-    // tail of each column is already the zero-pad the CPU path does.
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    // Column layout: `buf[c * lde_size + r]`; the [n, lde_size) tail of each
+    // column is the zero-pad (see `alloc_lde_scratch`).
+    let mut buf = alloc_lde_scratch(&stream, m * lde_size, n, lde_size)?;
     // Any `?` between the first upload below and `sync_event` would release
     // the slot with async H2D reads of the slab still in flight; this guard
     // (declared after `staging`, so it drops first) drains the stream on
@@ -1144,64 +1255,17 @@ pub fn coset_lde_batch_base(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // === 1. Bit-reverse first N of every column ===
-    launch_bit_reverse_batched(
+    run_batched_coset_lde(
         stream.as_ref(),
         be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 2. iNTT body over all columns ===
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 3. Pointwise multiply by coset weights (includes 1/N) ===
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 4. Bit-reverse full LDE of every column ===
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-
-    // === 5. Forward NTT on full LDE of every column ===
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
         fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
+        &weights_dev,
+        n as u64,
+        lde_size as u64,
+        lde_size as u64,
+        m as u32,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -1295,7 +1359,7 @@ pub fn coset_lde_batch_base_into(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    let mut buf = alloc_lde_scratch(&stream, m * lde_size, n, lde_size)?;
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
@@ -1308,56 +1372,17 @@ pub fn coset_lde_batch_base_into(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
-
-    // iNTT bit-reverse + body, pointwise mul, forward bit-reverse + body.
-    launch_bit_reverse_batched(
+    run_batched_coset_lde(
         stream.as_ref(),
         be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
         fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
+        &weights_dev,
+        n as u64,
+        lde_size as u64,
+        lde_size as u64,
+        m as u32,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -1471,7 +1496,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         pinned[c * n..c * n + n].copy_from_slice(col);
     }
 
-    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    let mut buf = alloc_lde_scratch(&stream, m * lde_size, n, lde_size)?;
     for c in 0..m {
         let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
         stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
@@ -1484,57 +1509,20 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let col_stride_u64 = lde_size as u64;
-    let m_u32 = m as u32;
 
-    // iNTT
-    launch_bit_reverse_batched(
+    run_batched_coset_lde(
         stream.as_ref(),
         be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        m_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        m_u32,
-    )?;
-    // forward NTT at LDE size
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        m_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
         fwd_tw.as_ref(),
+        &weights_dev,
+        n as u64,
         lde_u64,
-        log_lde,
         col_stride_u64,
-        m_u32,
+        m as u32,
     )?;
 
     // Allocate the device output buffer. In `LeavesOnly` mode this is just
@@ -1714,7 +1702,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
 
     pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    let mut buf = alloc_lde_scratch(&stream, mb * lde_size, n, lde_size)?;
     for s in 0..mb {
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
         stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
@@ -1726,40 +1714,21 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
 
-    // Apply coset scaling: x[k] *= weights[k] for k in 0..n (no iFFT first).
-    launch_pointwise_mul_batched(
+    // Input is already coefficients (no iFFT): coset scaling, then the forward
+    // NTT at lde_size.
+    run_batched_coset_eval(
         stream.as_ref(),
         be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-
-    // Bit-reverse full lde_size slab, then forward DIT NTT.
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         fwd_tw.as_ref(),
+        &weights_dev,
+        n as u64,
         lde_u64,
-        log_lde,
         col_stride_u64,
-        mb_u32,
+        mb as u32,
     )?;
 
     // Optional R2-style row-pair Merkle tree build on the LDE buffer, queued
@@ -1925,8 +1894,8 @@ pub fn coset_lde_batch_ext3_into(
 
     pack_ext3_to_pinned_slabs(columns, pinned, n);
 
-    // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
+    // Device buffer holding 3M slabs of `lde_size` (see `alloc_lde_scratch`).
+    let mut buf = alloc_lde_scratch(&stream, mb * lde_size, n, lde_size)?;
     // H2D: slab by slab into the first N slots of each `lde_size`-slab.
     for s in 0..mb {
         let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
@@ -1940,57 +1909,19 @@ pub fn coset_lde_batch_ext3_into(
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    // === Butterflies: identical to the base-field batched path, but with
-    // grid.y = 3M instead of M. ===
-    launch_bit_reverse_batched(
+    // Butterflies: identical to the base-field batched path, but over 3M
+    // slabs instead of M columns.
+    run_batched_coset_lde(
         stream.as_ref(),
         be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
         fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
+        &weights_dev,
+        n as u64,
+        lde_size as u64,
+        lde_size as u64,
+        mb as u32,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -2017,8 +1948,9 @@ pub fn coset_lde_batch_ext3_into(
 }
 
 /// Batched ext3 coset LDE over columns ALREADY resident on device in slab
-/// layout (`3m` slabs of `lde_size` u64, first `n` of each filled, rest
-/// zero-padded), e.g. from the on-device degree-2 decomposition. Runs the
+/// layout (`3m` slabs of `lde_size` u64, first `n` of each filled; the rest is
+/// the padding, whose contents are ignored), e.g. from the on-device degree-2
+/// decomposition. Runs the
 /// same butterfly pipeline as [`coset_lde_batch_ext3_into`] and keeps the
 /// device buffer as a [`GpuLdeExt3`] handle. With `outputs = Some(..)` the
 /// evaluations are also drained to host (interleaved ext3, `3*lde_size` u64
@@ -2051,61 +1983,30 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
+    // The forward NTT reads the padding only on the small shapes the spread
+    // load does not cover; zero it there so callers never have to.
+    if lde_size > n && !spread_load_applies(n, lde_size) {
+        for s in 0..mb {
+            stream.memset_zeros(&mut buf.slice_mut(s * lde_size + n..(s + 1) * lde_size))?;
+        }
+    }
 
     let be = backend()?;
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
 
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    launch_bit_reverse_batched(
+    run_batched_coset_lde(
         stream.as_ref(),
         be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
         &mut buf,
         inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
         fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
+        &weights_dev,
+        n as u64,
+        lde_size as u64,
+        lde_size as u64,
+        mb as u32,
     )?;
 
     let ready = match outputs {
@@ -2141,6 +2042,151 @@ pub fn coset_lde_batch_ext3_slabs_keep(
         tree: None,
         ready,
     })
+}
+
+/// The coset-LDE butterfly pipeline over `m` column-major columns of `buf`
+/// (column `c` at `c * col_stride`), in place: iNTT of the first `n`
+/// natural-order evaluations, coset weights (which carry the `1/N`), then
+/// the forward NTT at `lde_size`. Every batched LDE entry point runs exactly
+/// this sequence. The `[n, lde_size)` tail of each column must be zero unless
+/// [`spread_load_applies`], in which case it is never read.
+#[allow(clippy::too_many_arguments)]
+fn run_batched_coset_lde(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    inv_tw: &CudaSlice<u64>,
+    fwd_tw: &CudaSlice<u64>,
+    weights: &CudaSlice<u64>,
+    n: u64,
+    lde_size: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    let log_n = n.trailing_zeros() as u64;
+    launch_bit_reverse_batched(stream, be, buf, n, log_n, col_stride, m)?;
+    run_batched_ntt_body(stream, buf, inv_tw, n, log_n, col_stride, m)?;
+    run_batched_coset_eval(stream, be, buf, fwd_tw, weights, n, lde_size, col_stride, m)
+}
+
+/// Second half of [`run_batched_coset_lde`]: the first `n` entries of each
+/// column hold natural-order coefficients; scale them by the coset weights
+/// and evaluate at `lde_size` points with the forward NTT, in place.
+#[allow(clippy::too_many_arguments)]
+fn run_batched_coset_eval(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    fwd_tw: &CudaSlice<u64>,
+    weights: &CudaSlice<u64>,
+    n: u64,
+    lde_size: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    launch_pointwise_mul_batched(stream, be, buf, weights, n, col_stride, m)?;
+    run_batched_forward_ntt_from_prefix(stream, be, buf, fwd_tw, n, lde_size, col_stride, m)
+}
+
+/// Forward NTT at `lde_size` of the zero-padded `n`-prefix of each column, in
+/// place. When [`spread_load_applies`], the prefix is bit-reversed at size `n`
+/// and the first 8 levels load the zero-padded expansion straight from it, so
+/// neither the `lde_size` bit-reverse pass nor the zero tail touch DRAM;
+/// otherwise the zero-tailed buffer is bit-reversed at `lde_size` as before.
+#[allow(clippy::too_many_arguments)]
+fn run_batched_forward_ntt_from_prefix(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    fwd_tw: &CudaSlice<u64>,
+    n: u64,
+    lde_size: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    if !spread_load_applies(n as usize, lde_size as usize) {
+        launch_bit_reverse_batched(stream, be, buf, lde_size, log_lde, col_stride, m)?;
+        return run_batched_ntt_body(stream, buf, fwd_tw, lde_size, log_lde, col_stride, m);
+    }
+    let log_spread = log_lde - log_n;
+    // n == 1 is its own bit-reversal (and the kernel's shift is UB at log 0).
+    if n > 1 {
+        launch_bit_reverse_batched(stream, be, buf, n, log_n, col_stride, m)?;
+    }
+    for (lo, hi) in spread_waves(lde_size / 256, log_spread) {
+        let cfg = LaunchConfig {
+            grid_dim: ((hi - lo) as u32, m, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_8_levels_batched_spread)
+                .arg(&mut *buf)
+                .arg(fwd_tw)
+                .arg(&lde_size)
+                .arg(&log_lde)
+                .arg(&log_spread)
+                .arg(&lo)
+                .arg(&col_stride)
+                .launch(cfg)?;
+        }
+    }
+    run_batched_ntt_levels(stream, buf, fwd_tw, lde_size, log_lde, 8, col_stride, m)
+}
+
+/// Whether the forward LDE NTT loads its zero-padded input from the `n`-prefix
+/// (the spread kernels): it needs the fused 8-level kernel (`lde_size >= 256`),
+/// an actual padding (`lde_size > n`), and at least one prefix slot per
+/// 256-slot block (`lde_size / n <= 256`). When it applies, the `[n, lde_size)`
+/// tail is never read.
+fn spread_load_applies(n: usize, lde_size: usize) -> bool {
+    lde_size >= 256 && lde_size > n && lde_size / n <= 256
+}
+
+/// Allocate `len` u64s of LDE scratch whose columns (or rows) hold `n` input
+/// entries padded to `lde_size`. Zeroed only when the forward NTT will read
+/// the padding tail (see [`spread_load_applies`]); otherwise every slot is
+/// written before it is read and the memset is wasted DRAM traffic.
+fn alloc_lde_scratch(
+    stream: &Arc<CudaStream>,
+    len: usize,
+    n: usize,
+    lde_size: usize,
+) -> Result<CudaSlice<u64>> {
+    if lde_size > n && !spread_load_applies(n, lde_size) {
+        Ok(stream.alloc_zeros::<u64>(len)?)
+    } else {
+        // SAFETY: the inputs land in the first `n` slots of each column/row,
+        // every kernel before the forward NTT touches only those, and the
+        // spread load writes all `lde_size` slots without reading the tail.
+        Ok(unsafe { stream.alloc::<u64>(len) }?)
+    }
+}
+
+/// Block waves for the in-place spread kernels, highest first. Block `b`
+/// reads prefix slots `[b*256, (b+1)*256) >> log_spread` and writes
+/// `[b*256, (b+1)*256)`. A wave `[lo, hi)` with `hi <= lo << log_spread` only
+/// reads below `lo*256`, so it never reads a slot it writes; the earlier waves
+/// wrote only above `hi*256`, past every slot it reads; the later ones write
+/// below `lo*256`, after it has read. Block 0 overlaps itself (a block loads
+/// its whole tile before storing it, so that is safe) and runs alone, last.
+fn spread_waves(num_blocks: u64, log_spread: u64) -> Vec<(u64, u64)> {
+    debug_assert!((1..=8).contains(&log_spread));
+    let mut waves = Vec::new();
+    let mut hi = num_blocks;
+    while hi > 0 {
+        let lo = if hi == 1 {
+            0
+        } else {
+            hi.div_ceil(1 << log_spread)
+        };
+        waves.push((lo, hi));
+        hi = lo;
+    }
+    waves
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched
@@ -2197,14 +2243,30 @@ fn run_batched_ntt_body(
             }
         }
     }
+    run_batched_ntt_levels(stream, x_dev, tw_dev, n, log_n, fused, col_stride, m)
+}
 
+/// The per-level (above the shmem-fusion window) DIT levels
+/// `first_level..log_n` over `m` batched columns, one kernel per level.
+#[allow(clippy::too_many_arguments)]
+fn run_batched_ntt_levels(
+    stream: &cudarc::driver::CudaStream,
+    x_dev: &mut cudarc::driver::CudaSlice<u64>,
+    tw_dev: &cudarc::driver::CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    first_level: u64,
+    col_stride: u64,
+    m: u32,
+) -> Result<()> {
+    let be = backend()?;
     let grid_x = ((n / 2) as u32).div_ceil(256).max(1);
     let cfg = LaunchConfig {
         grid_dim: (grid_x, m, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    for level in fused..log_n {
+    for level in first_level..log_n {
         unsafe {
             stream
                 .launch_builder(&be.ntt_dit_level_batched)
@@ -2218,4 +2280,128 @@ fn run_batched_ntt_body(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{spread_load_applies, spread_waves};
+
+    fn rev(i: usize, bits: u32) -> usize {
+        if bits == 0 {
+            0
+        } else {
+            i.reverse_bits() >> (usize::BITS - bits)
+        }
+    }
+
+    /// Replays the spread kernels' data movement on the host: the prefix is
+    /// bit-reversed at size `n`, then each wave loads every block's tile
+    /// (slot `r` <- prefix[r >> log_spread] when its low bits are zero, else
+    /// 0) and stores it back. Checks that no block reads a slot written by an
+    /// earlier wave or by another block of its own wave, that every slot is
+    /// written exactly once, and that the tiles equal the old path's input:
+    /// the zero-padded buffer bit-reversed at `lde_size`.
+    fn replay_spread(log_n: u32, log_spread: u32) {
+        let n = 1usize << log_n;
+        let lde = n << log_spread;
+        let log_lde = log_n + log_spread;
+        let coeffs: Vec<u64> = (0..n as u64).map(|i| i + 1).collect();
+
+        let mut expected = vec![0u64; lde];
+        for (i, e) in expected.iter_mut().enumerate() {
+            let j = rev(i, log_lde);
+            if j < n {
+                *e = coeffs[j];
+            }
+        }
+
+        // Prefix bit-reversed at size n; the tail is garbage the kernels must
+        // never read.
+        let mut buf = vec![u64::MAX; lde];
+        for h in 0..n {
+            buf[h] = coeffs[rev(h, log_n)];
+        }
+        let mut written = vec![false; lde];
+        let mask = (1usize << log_spread) - 1;
+
+        let waves = spread_waves((lde / 256) as u64, log_spread as u64);
+        assert_eq!(waves.last(), Some(&(0, 1)), "block 0 must run alone, last");
+        for &(lo, hi) in &waves {
+            let (lo, hi) = (lo as usize, hi as usize);
+            assert!(lo < hi);
+            let own = lo * 256..hi * 256;
+            let mut tiles = Vec::new();
+            for blk in lo..hi {
+                let tile: Vec<u64> = (0..256)
+                    .map(|t| {
+                        let row = blk * 256 + t;
+                        if row & mask != 0 {
+                            return 0;
+                        }
+                        let src = row >> log_spread;
+                        assert!(src < n, "read past the prefix");
+                        assert!(!written[src], "read a slot an earlier wave wrote");
+                        let same_block = src / 256 == blk;
+                        assert!(
+                            !own.contains(&src) || (same_block && (lo, hi) == (0, 1)),
+                            "wave {lo}..{hi} reads slot {src} it also writes"
+                        );
+                        buf[src]
+                    })
+                    .collect();
+                tiles.push((blk, tile));
+            }
+            for (blk, tile) in tiles {
+                for (t, v) in tile.into_iter().enumerate() {
+                    let row = blk * 256 + t;
+                    assert!(!written[row], "slot {row} written twice");
+                    written[row] = true;
+                    buf[row] = v;
+                }
+            }
+        }
+        assert!(written.iter().all(|&w| w), "some slot never written");
+        assert_eq!(buf, expected, "log_n={log_n} log_spread={log_spread}");
+    }
+
+    #[test]
+    fn spread_load_reproduces_the_bit_reversed_padded_input() {
+        for log_spread in 1..=8u32 {
+            // lde_size from the 256 minimum up to several waves' worth.
+            for log_lde in 8..=16u32 {
+                if log_lde > log_spread {
+                    replay_spread(log_lde - log_spread, log_spread);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spread_waves_cover_every_block_once_highest_first() {
+        for log_spread in 1..=8u64 {
+            for num_blocks in 1..=300u64 {
+                let waves = spread_waves(num_blocks, log_spread);
+                let mut next_hi = num_blocks;
+                for &(lo, hi) in &waves {
+                    assert_eq!(hi, next_hi, "waves must tile [0, num_blocks) downward");
+                    assert!(lo < hi);
+                    assert!(
+                        (lo, hi) == (0, 1) || hi <= lo << log_spread,
+                        "wave {lo}..{hi} would read its own writes"
+                    );
+                    next_hi = lo;
+                }
+                assert_eq!(next_hi, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn spread_load_applies_only_with_padding_the_fused_kernel_can_load() {
+        assert!(spread_load_applies(128, 256)); // smallest fused size
+        assert!(!spread_load_applies(64, 128)); // below the 8-level kernel
+        assert!(!spread_load_applies(1 << 10, 1 << 10)); // blowup 1: no padding
+        assert!(spread_load_applies(2, 512)); // blowup 256: one slot per block
+        assert!(!spread_load_applies(2, 1024)); // blowup 512: blocks with no slot
+    }
 }

@@ -181,12 +181,15 @@ pub struct Backend {
     pub bit_reverse_permute_batched: CudaFunction,
     pub ntt_dit_level_batched: CudaFunction,
     pub ntt_dit_8_levels_batched: CudaFunction,
+    pub ntt_dit_8_levels_batched_spread: CudaFunction,
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
     // row-major NTT kernels
     pub bit_reverse_row_major: CudaFunction,
+    pub bit_reverse_row_major_oop: CudaFunction,
     pub ntt_dit_level_row_major: CudaFunction,
     pub ntt_dit_8_levels_row_major: CudaFunction,
+    pub ntt_dit_8_levels_row_major_spread: CudaFunction,
     pub pointwise_mul_row_major: CudaFunction,
     pub matrix_transpose_strided: CudaFunction,
 
@@ -417,11 +420,16 @@ impl Backend {
             bit_reverse_permute_batched: ntt.load_function("bit_reverse_permute_batched")?,
             ntt_dit_level_batched: ntt.load_function("ntt_dit_level_batched")?,
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
+            ntt_dit_8_levels_batched_spread: ntt
+                .load_function("ntt_dit_8_levels_batched_spread")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
+            bit_reverse_row_major_oop: ntt.load_function("bit_reverse_row_major_oop")?,
             ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
             ntt_dit_8_levels_row_major: ntt.load_function("ntt_dit_8_levels_row_major")?,
+            ntt_dit_8_levels_row_major_spread: ntt
+                .load_function("ntt_dit_8_levels_row_major_spread")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major_row_pair: keccak
