@@ -1,0 +1,238 @@
+//! LFM — the Lambda Field Machine.
+//!
+//! A fixed, straight-line, field-native recursion machine for verifying
+//! Lambda VM STARK proofs: the SP1 v4 mechanism (the program is the machine's
+//! preprocessed columns; write-once memory closed by pure LogUp balance; no
+//! pc, no branches, no fetch/decode) with on-demand registration instead of
+//! exhaustive shape enumeration — our framework has no keygen, so a program
+//! is nothing but a vector of supplied preprocessed roots plus a registry
+//! entry.
+//!
+//! Design authority: `others/lfm-design.md` (v0). This module is the
+//! software layer (Milestone A): word model, instruction set, eDSL builder,
+//! straight-line compiler, executor/witness generator, admission validator,
+//! and the hash interface with a placeholder permutation. The chips and prover
+//! integration follow (Milestone B); the fixed AIR set is 14 chips, the last
+//! three being the production keccak family hosted unchanged (see `airs`).
+
+pub mod airs;
+pub mod algebraic_commit;
+pub mod algebraic_transcript;
+pub mod blake3;
+pub mod blake3_chip;
+pub mod blake3_socket;
+pub mod block_root;
+pub mod builder;
+pub mod chips;
+pub mod chunking;
+pub mod commit;
+pub mod compiler;
+pub mod constraints;
+pub mod deep;
+pub mod device_permit;
+pub mod edsl;
+pub mod epoch;
+pub mod epoch_verify;
+pub mod exec_schedule;
+pub mod executor;
+pub mod fixture;
+pub mod fri;
+pub mod global_parent;
+pub mod global_split;
+pub mod hash;
+pub mod instr;
+pub mod keccak_adapter;
+pub mod keccak_host;
+pub mod layout;
+pub mod lde;
+pub mod logup;
+pub mod merkle_cap;
+pub mod per_table_aggregator;
+pub mod poseidon;
+pub mod preprocessed;
+pub mod program_census;
+pub mod programs;
+pub mod proof;
+pub mod proof_arena;
+pub mod proof_fixture;
+pub mod registry;
+pub mod rpo;
+pub mod rpx;
+pub mod statement;
+pub mod statement_replay;
+pub mod sub_proof;
+pub mod trace;
+pub mod transcript_replay;
+/// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — a diagnostic, OFF by default.
+pub mod tree_probe;
+pub mod validator;
+pub mod whir_air;
+pub mod whir_bus;
+pub mod whir_chain;
+pub mod whir_epoch;
+pub mod whir_fold;
+pub mod whir_gkr;
+/// The CROSS-EPOCH program builder, beside `whir_epoch`'s level-0 one.
+pub mod whir_global;
+pub mod whir_open;
+pub mod whir_poly;
+pub mod whir_program;
+/// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
+///
+/// ⚠ NOT `#[cfg(test)]`: `WhirRealEpoch` is the input type of V1's level-0
+/// program builder, and a production builder cannot take its input from a test
+/// module.
+pub(crate) mod whir_real_epoch;
+/// The WHIR cross-epoch driver, beside the level-0 one above.
+///
+/// ⚠ NOT `whir_global`: that name belongs to the emitter, exactly as
+/// `whir_real_epoch` is not `whir_epoch`.
+///
+/// ★ `pub`, AND THAT IS THE REMEDY FOR A `dead_code` CLASS, NOT AN OVERSIGHT.
+/// The module above is `pub(crate)` and gets away with it because
+/// `whir_epoch::whir_epoch_program` names `WhirRealEpoch` in a public
+/// signature; nothing public names the cross-epoch driver's type yet, so under
+/// `pub(crate)` the lib target reports every item in it unreachable and
+/// `make lint`'s first arm turns that into hard errors. A module-scoped
+/// `#![allow(dead_code)]` would silence the class AND everything added to it
+/// later, so the surface is published instead of the reports suppressed.
+pub mod whir_real_global;
+pub mod whir_reduce;
+pub mod whir_stacked;
+pub mod whir_statement;
+pub mod whir_table;
+pub mod whir_transcript;
+pub mod whir_transcript_kats;
+pub mod word;
+
+pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
+pub use builder::{ArenaSchema, LfmBuilder, LfmProgramSource};
+pub use chunking::{KECCAK_RND_MAX_CHUNK_ROWS, KeccakChunking};
+pub use commit::{commit_columns, commit_group, commit_lde_columns, lde_columns};
+pub use compiler::{ColumnGroup, LfmColumnGroups, LfmProgram, compile};
+pub use executor::{LfmExecError, LfmExecution, LfmRecords, execute};
+pub use hash::{HasherKind, LfmHasher, TestPermutation};
+pub use instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr};
+pub use program_census::build_artifacts_counted;
+pub use proof::{LfmProof, LfmProveError, lfm_prove, lfm_verify, verify_against_artifacts};
+pub use registry::{
+    LFM_REGISTRY, LfmArtifacts, LfmProgramKind, LfmRegistryEntry, LfmRegistryError,
+    build_artifacts, build_artifacts_with_hasher, resolve,
+};
+pub use statement::{LFM_MACHINE_VERSION, lfm_program_id};
+pub use transcript_replay::{Candidate, TranscriptReplay};
+pub use validator::{LfmViolation, validate};
+pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
+
+// The algebraic `StarkHash` configurations this differential drives the host
+// with are `#[cfg(not(feature = "cuda"))]` — inexpressible under cuda, by
+// design — so the gate follows them rather than failing to compile there.
+#[cfg(test)]
+mod blake3_chip_tests;
+#[cfg(test)]
+mod blake3_probe;
+#[cfg(test)]
+mod blake3_socket_kats;
+#[cfg(test)]
+mod blake3_socket_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod c5_probe;
+#[cfg(test)]
+mod constraint_tests;
+#[cfg(test)]
+mod epoch_tests;
+#[cfg(test)]
+mod epoch_verify_tests;
+#[cfg(test)]
+mod exec_identity_tests;
+#[cfg(test)]
+mod framework_probe;
+#[cfg(test)]
+mod fri_group_tests;
+#[cfg(test)]
+mod fri_tests;
+#[cfg(test)]
+mod join_tests;
+#[cfg(test)]
+mod keccak_probe;
+#[cfg(test)]
+mod leaf_kats;
+#[cfg(test)]
+mod leaf_tests;
+#[cfg(test)]
+mod logup_tests;
+#[cfg(test)]
+mod machine_tests;
+#[cfg(test)]
+mod one_row_guest_tests;
+#[cfg(test)]
+mod one_row_tests;
+#[cfg(test)]
+mod per_table_aggregator_tests;
+#[cfg(test)]
+mod per_table_census_tests;
+#[cfg(test)]
+mod poseidon_chip_tests;
+#[cfg(test)]
+mod preprocessed_tests;
+#[cfg(test)]
+mod whir_air_tests;
+#[cfg(test)]
+mod whir_bus_tests;
+#[cfg(test)]
+mod whir_chain_tests;
+#[cfg(test)]
+mod whir_epoch_program_tests;
+/// Its tests, which stayed behind when the driver moved out.
+#[cfg(test)]
+mod whir_epoch_tests;
+#[cfg(test)]
+mod whir_fold_tests;
+#[cfg(test)]
+mod whir_gkr_tests;
+/// The cross-epoch program builder's tests.
+#[cfg(test)]
+mod whir_global_tests;
+#[cfg(test)]
+mod whir_open_tests;
+#[cfg(test)]
+mod whir_poly_tests;
+#[cfg(test)]
+mod whir_program_tests;
+/// The cross-epoch driver's tests, beside the level-0 driver's.
+#[cfg(test)]
+mod whir_real_global_tests;
+#[cfg(test)]
+mod whir_reduce_tests;
+#[cfg(test)]
+mod whir_stacked_tests;
+#[cfg(test)]
+mod whir_statement_tests;
+#[cfg(test)]
+mod whir_table_tests;
+#[cfg(test)]
+mod whir_transcript_kat_tests;
+#[cfg(test)]
+mod whir_transcript_replay_tests;
+// ★ Test-only: the dependency-structure measurement that prices a parallel
+// executor before one is written (lane E). No production path reaches it.
+#[cfg(test)]
+mod reach_profile;
+#[cfg(test)]
+mod rpo_chip_tests;
+#[cfg(test)]
+mod rpx_chip_tests;
+#[cfg(test)]
+mod step_size_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod trace_identity_tests;
+#[cfg(all(test, not(feature = "cuda")))]
+mod transcript_diff_tests;
+#[cfg(test)]
+mod transcript_kats;
+#[cfg(test)]
+mod transcript_tests;
+#[cfg(test)]
+mod wrap_tests;

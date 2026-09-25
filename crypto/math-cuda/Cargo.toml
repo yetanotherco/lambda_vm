@@ -34,6 +34,12 @@ rayon = "1.7"
 libloading = { version = "0.8", optional = true }
 
 [features]
+# `blake3-6round` is on by default so the cubin's round count matches the host
+# tree's, which P-a Stage 6 moved to 6 by default for the same reason. These are
+# separate crates' features and the lockstep between them is what makes the
+# device and host hashes one hash; defaulting only one of them is precisely the
+# mismatch the parity tests would report as a wrong root.
+default = ["blake3-6round"]
 # Test-only fault injection in FriCommitState. Production builds leave this
 # off so the fault check is fully elided at compile time.
 test-faults = []
@@ -41,9 +47,22 @@ test-faults = []
 # stark/prover layers). Zero-cost when disabled; when enabled but
 # libnvToolsExt is absent at runtime, every call is a cheap no-op.
 nvtx = ["dep:libloading"]
+# Compile `kernels/blake3.cu` for the 6-round internal BLAKE3 variant instead of
+# the 7-round standard one. Same polarity as the host tree's `blake3-6round`
+# (on = 6 rounds), and it has to be set in lockstep with it: they are separate
+# crates' features and a mismatch is a GPU tree committing under a different hash
+# than the CPU one. `blake3::device_rounds` reads the cubin's round count back so
+# that is assertable rather than discoverable — see
+# `tests/blake3_compress_parity.rs`.
+blake3-6round = []
 
 [dev-dependencies]
+# 7-round-only, so it can anchor the standard arm of the BLAKE3 kernels and
+# nothing else — the same dev-only role it has in `prover/Cargo.toml`.
+blake3 = { version = "1.8.5", default-features = false, features = ["std", "pure"] }
 crypto = { path = "../crypto" }
+# The host pipeline the WHIR commit parity test compares against.
+multilinear = { path = "../multilinear" }
 rand = { version = "0.8.5", features = ["std"] }
 rand_chacha = "0.3.1"
 rayon = "1.7"

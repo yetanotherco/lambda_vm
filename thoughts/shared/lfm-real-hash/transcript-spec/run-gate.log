@@ -1,0 +1,30 @@
+==============================================================================
+TRANSCRIPT GATE — executable now (tag = LFMT on the frozen socket)
+==============================================================================
+  [PASS    ] G1  message schedule @LFMT, 7 rounds, symbolic       -> unsat  (want unsat)
+  [PASS    ] G2  full 7-round pipeline == transcript KAT          -> sat    (want sat)  2.9s
+  [PASS    ] G3  same pipeline EXCLUDES a wrong digest            -> unsat  (want unsat)  3.0s
+  [PASS    ] G4a Merkle tag (LFMC) used for a transcript step     -> sat    (want sat)  3.1s
+  [PASS    ] G4b transcript tag (LFMT) used for a Merkle parent   -> sat    (want sat)  3.1s
+  [PASS    ] G5  squeeze counter i=1 cannot produce squeeze i=0   -> sat    (want sat)  2.8s
+
+------------------------------------------------------------------------------
+TRANSCRIPT GATE: PASS  (6/6)
+
+==============================================================================
+PRE-COMMITTED CONTROLS (need MODE_T; the build agent must run these)
+==============================================================================
+  M1: m[8] pinned to TAG_LFMC while MODE_T = 1
+      expect: SAT — a transcript row computing the Merkle tag is a live confusion bug
+  M2: m[8] pinned to TAG_LFMT while MODE_C = 1
+      expect: SAT — the mirror image; a Merkle parent computing the transcript tag
+  M3: MODE_C and MODE_T both 1 on one row
+      expect: UNSAT — excluded by the generalised mode-sum booleanity (idx 4)
+  M4: MODE_C = MODE_T = 0 on a row with MU = 1
+      expect: UNSAT — MU is defined as MODE_C + MODE_T, so this is not a real row
+  M5: drop the mode-sum booleanity
+      expect: SAT — modes become arbitrary felts, so m[8] becomes a prover-chosen linear combination of the two tags: the domain separation evaporates
+  M6: MODE_T treated as a MAIN (prover-chosen) column instead of preprocessed
+      expect: SAT — the whole soundness argument for the tag rests on MODE_* being preprocessed; this control is what proves that dependency is real
+  M7: capacity prefix idx 0-3 still pins S_k with the generalised form S_k = MODE_P*IN + (MODE_C + MODE_T)*IV_k
+      expect: UNSAT with the form present; SAT with it dropped

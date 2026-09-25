@@ -1,6 +1,8 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
+use crate::fiat_shamir::transcript_hash::{
+    Blake3TranscriptHash, KeccakTranscriptHash, TranscriptHash,
+};
 
-use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use core::marker::PhantomData;
 use digest::Digest;
 use math::{
@@ -16,8 +18,12 @@ use math::{
 /// per squeeze).
 const SQUEEZE_LEN: usize = 32;
 
-/// Keccak-sponge Fiat-Shamir transcript with a Plonky3-style duplex output
-/// buffer.
+/// Bytes in a field element, for the window alignment the counter reports.
+#[cfg(feature = "hash-metrics")]
+const FELT_BYTES: usize = 8;
+
+/// Sponge Fiat-Shamir transcript with a Plonky3-style duplex output buffer,
+/// over the hash `T` names.
 ///
 /// Challenges are derived by squeezing the sponge and rejection-sampling field
 /// coordinates directly from those bytes — there is **no CSPRNG**. Earlier this
@@ -28,8 +34,13 @@ const SQUEEZE_LEN: usize = 32;
 /// free. The output buffer amortizes one squeeze across up to `SQUEEZE_LEN / 8`
 /// 64-bit candidates, so a cubic-extension element (3 coordinates) usually costs
 /// a single squeeze.
-pub struct DefaultTranscript<F: HasDefaultTranscript> {
-    hasher: Keccak256,
+///
+/// `T` defaults to [`KeccakTranscriptHash`], so `DefaultTranscript::<F>::new(..)`
+/// still names exactly the transcript this system has always produced — every
+/// method body below is hash-agnostic, and the keccak configuration selects the
+/// unbounded rejection schedule, so its bytes do not move.
+pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = KeccakTranscriptHash> {
+    hasher: T::Digest,
     /// Duplex output buffer: bytes squeezed from the sponge, consumed 8 at a
     /// time by field/`u64` sampling. Positions `[out_pos, SQUEEZE_LEN)` are the
     /// bytes not yet handed out; `out_pos == SQUEEZE_LEN` means "empty, squeeze
@@ -37,52 +48,138 @@ pub struct DefaultTranscript<F: HasDefaultTranscript> {
     /// squeeze can never reflect input appended after it was produced.
     out_buf: [u8; SQUEEZE_LEN],
     out_pos: usize,
-    phantom: PhantomData<F>,
+    /// ★ Bytes absorbed since the sponge was last reset by a squeeze — the
+    /// WINDOW an in-guest verifier re-slices into field elements every 8 bytes.
+    /// A value absorbed at an offset that is not a multiple of 8 straddles two
+    /// of them, which is what the statement padding exists to prevent and what
+    /// `Counts::transcript_misaligned_absorbs_after_statement` counts — from the
+    /// statement's end, because only past that boundary is the padding making a
+    /// promise. See `counting` below.
+    ///
+    /// The definition is `WindowRecorder`'s, not a second one: opens at 0,
+    /// becomes `SQUEEZE_LEN` after a squeeze (which finalize-resets and
+    /// re-absorbs its own 32-byte output, so a window never opens empty), and
+    /// does not move on `state()`, which finalizes a clone.
+    ///
+    /// ⚠ Gated, because this module promises a normal build compiles every
+    /// counter call to nothing and is provably unchanged. An unconditional
+    /// field and an add per absorb would make that sentence false to save a few
+    /// `cfg` lines.
+    #[cfg(feature = "hash-metrics")]
+    window: usize,
+    /// ★ Whether this transcript is PAST a statement, and therefore whether a
+    /// misaligned absorb is a finding.
+    ///
+    /// False until `mark_statement_end`. A statement's own fields are
+    /// misaligned by nature and counting them made the counter a number nobody
+    /// could pre-register — the EQ fixture read 25 at `public_output = 0` and 24
+    /// at two bytes, of which 22 and 21 were felt-sized, and ZERO fell after the
+    /// statement. Counting only past the mark is what makes zero the reading a
+    /// correct pad produces.
+    ///
+    /// ⚠ A transcript that never marks counts nothing, which is right: it has
+    /// no "after a statement". The byte gate's raw fixture is one.
+    #[cfg(feature = "hash-metrics")]
+    counting: bool,
+    phantom: PhantomData<(F, T)>,
 }
 
-impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
+impl<F: HasDefaultTranscript, T: TranscriptHash> Clone for DefaultTranscript<F, T> {
     fn clone(&self) -> Self {
         Self {
             hasher: self.hasher.clone(),
             out_buf: self.out_buf,
             out_pos: self.out_pos,
+            // The window travels with the clone: a fork replays the same stream
+            // from the same offset, so its absorbs are aligned exactly when the
+            // original's are.
+            #[cfg(feature = "hash-metrics")]
+            window: self.window,
+            // …and so does the mark. A replay of a stream that is past its
+            // statement is past it too — the `owed` fork is exactly that.
+            #[cfg(feature = "hash-metrics")]
+            counting: self.counting,
             phantom: PhantomData,
         }
     }
 }
 
-impl<F> DefaultTranscript<F>
+impl<F, T> DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
-            hasher: Keccak256::new(),
+            hasher: T::Digest::new(),
             out_buf: [0u8; SQUEEZE_LEN],
             // Empty: the first sample forces a squeeze.
             out_pos: SQUEEZE_LEN,
+            #[cfg(feature = "hash-metrics")]
+            window: 0,
+            #[cfg(feature = "hash-metrics")]
+            counting: false,
             phantom: PhantomData,
         };
+        // The seed goes through `append_bytes`, so a non-empty one advances the
+        // window like any other absorb — which is why the WHIR byte gate's own
+        // first window, 13 seed bytes then a root, is NOT aligned.
         res.append_bytes(data);
         res
     }
 
     /// Raw squeeze: finalize the current sponge state, advance the hash chain by
-    /// absorbing the (reversed) output, and return it. Also invalidates the
-    /// duplex output buffer, so interleaving raw `sample()` calls with buffered
-    /// field/`u64` sampling can never reuse stale squeeze bytes.
+    /// absorbing the output, and return it. Also invalidates the duplex output
+    /// buffer, so interleaving raw `sample()` calls with buffered field/`u64`
+    /// sampling can never reuse stale squeeze bytes.
+    ///
+    /// ★ The byte order is the configuration's, via
+    /// [`TranscriptHash::REVERSES_SQUEEZE`] — `true` for keccak, which is the
+    /// convention every proof on this branch has been produced under, and
+    /// `false` for an algebraic sponge, whose squeeze is already four canonical
+    /// felts and whose consumer is a field-native verifier that would otherwise
+    /// spend rows undoing the reversal.
+    ///
+    /// ⚠ The returned bytes and the chained bytes are the SAME value, and that
+    /// is deliberate: a replaying verifier reproducing this chain would
+    /// otherwise have two byte conventions to carry instead of none. Whichever
+    /// order the constant selects applies to both.
+    ///
+    /// The constant is associated, so each configuration monomorphises to
+    /// straight-line code — the keccak arm keeps the instruction sequence it
+    /// had before this became a choice.
     pub fn sample(&mut self) -> [u8; 32] {
+        // ★ Hash-agnostic, and deliberately here rather than inside a digest:
+        // a counter that lives in keccak reads ZERO for an algebraic
+        // transcript, which is indistinguishable from "no transcript ran".
+        crate::hash_metrics::count_transcript_squeeze::<T::Digest>();
         let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
-        result_hash.reverse();
+        if T::REVERSES_SQUEEZE {
+            result_hash.reverse();
+        }
         self.hasher.update(result_hash);
         self.out_pos = SQUEEZE_LEN;
+        // A new window, holding the 32 bytes just re-absorbed.
+        #[cfg(feature = "hash-metrics")]
+        {
+            self.window = SQUEEZE_LEN;
+        }
         result_hash
     }
 
     /// Next 64-bit candidate from the duplex output buffer, refilling with one
     /// squeeze when fewer than 8 bytes remain. Big-endian, matching the byte
     /// order `sample_u64` used when it read directly from `sample()`.
+    ///
+    /// ★ `SQUEEZE_LEN` is 32 and every read is 8, so `out_pos` only ever takes
+    /// the values `0, 8, 16, 24, 32` and a candidate is always a whole 8-byte
+    /// group — never two halves of adjacent ones. That is what lets a
+    /// configuration whose squeeze is four canonical felts promise
+    /// `CANDIDATES_PER_COORDINATE = Some(1)`: the felt boundaries and the read
+    /// boundaries are the same boundaries. `append_bytes` invalidates the
+    /// buffer wholesale rather than partially, so the alignment survives
+    /// interleaved absorbs.
     fn next_sample_u64(&mut self) -> u64 {
         if self.out_pos + 8 > SQUEEZE_LEN {
             self.out_buf = self.sample();
@@ -93,11 +190,63 @@ where
         self.out_pos += 8;
         u64::from_be_bytes(bytes)
     }
+
+    /// One base coordinate's worth of candidates under a FIXED schedule: draw
+    /// exactly `n`, hand back the first that `F` would accept.
+    ///
+    /// All `n` are drawn whichever one lands in range — that is the entire
+    /// point. Returning early on the first hit would restore the data-dependent
+    /// schedule this exists to remove.
+    ///
+    /// The value handed back is one `F::sample_field_element_from` accepts, so
+    /// its own rejection loop exits after a single call and consumption is
+    /// exactly `n` per coordinate. When every candidate misses (≈ 2⁻³²ⁿ) the
+    /// last one is returned, `F` rejects it, and the loop draws another `n` —
+    /// the schedule stays a multiple of `n` and the distribution stays exactly
+    /// uniform, because nothing is ever reduced into range.
+    fn next_candidate_fixed(&mut self, n: usize) -> u64 {
+        candidate_under_fixed_schedule::<F>(n, || self.next_sample_u64())
+    }
 }
 
-impl<F> Default for DefaultTranscript<F>
+/// One base coordinate's worth of candidates under a FIXED schedule: pull
+/// exactly `n` from `next`, hand back the first that `F` would accept.
+///
+/// Free-standing rather than a method so the schedule can be driven by a
+/// counting closure in a test — "consumes exactly `n`" is the whole property,
+/// and it is not observable from the transcript's outputs.
+pub(crate) fn candidate_under_fixed_schedule<F: HasDefaultTranscript>(
+    n: usize,
+    mut next: impl FnMut() -> u64,
+) -> u64 {
+    let mut chosen: Option<u64> = None;
+    let mut last = 0u64;
+    for _ in 0..n {
+        let candidate = next();
+        last = candidate;
+        if chosen.is_none() && F::candidate_in_range(candidate) {
+            chosen = Some(candidate);
+        }
+    }
+    chosen.unwrap_or(last)
+}
+
+/// The BLAKE3 Fiat-Shamir transcript: `Blake3Chain` in the sponge, and rider
+/// 1's constant-consumption sampling.
+pub type Blake3Transcript<F> = DefaultTranscript<F, Blake3TranscriptHash>;
+
+impl<F, T> crate::fiat_shamir::transcript_hash::HasTranscriptHash for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
+{
+    type Hash = T;
+}
+
+impl<F, T> Default for DefaultTranscript<F, T>
+where
+    F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     fn default() -> Self {
@@ -105,9 +254,10 @@ where
     }
 }
 
-impl<F> IsTranscript<F> for DefaultTranscript<F>
+impl<F, T> IsTranscript<F> for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
 {
     fn append_bytes(&mut self, new_bytes: &[u8]) {
@@ -115,24 +265,81 @@ where
         // subsequent challenge must depend on this input, so drop the bytes
         // squeezed before it.
         self.out_pos = SQUEEZE_LEN;
+        crate::hash_metrics::count_transcript_absorb::<T::Digest>();
+        #[cfg(feature = "hash-metrics")]
+        {
+            if self.counting && !self.window.is_multiple_of(FELT_BYTES) {
+                crate::hash_metrics::count_transcript_misaligned_absorb();
+            }
+            self.window += new_bytes.len();
+        }
         self.hasher.update(new_bytes);
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
         // Absorb, same invalidation as `append_bytes` (the field element's bytes
         // are streamed straight into the sponge with no intermediate `Vec`).
+        //
+        // ⚠ Counted PER `update` rather than once per call, because that is the
+        // unit `absorb_calls` has always used and the dimension a block-
+        // absorption change moves. Today the degree-3 extension writes one
+        // 24-byte buffer and calls the sink once, so the two happen to agree —
+        // a field or a serialisation that streams in pieces would not, and the
+        // counter should follow the sponge rather than the argument list.
         self.out_pos = SQUEEZE_LEN;
-        element.stream_bytes(&mut |b| self.hasher.update(b));
+        // ⚠ Per `update`, the unit the absorb counter already uses and the one
+        // `WindowRecorder` mirrors: an element streamed in pieces is several
+        // absorbs in both instruments or in neither.
+        #[cfg(feature = "hash-metrics")]
+        let window = &mut self.window;
+        #[cfg(feature = "hash-metrics")]
+        let counting = self.counting;
+        let hasher = &mut self.hasher;
+        element.stream_bytes(&mut |b| {
+            crate::hash_metrics::count_transcript_absorb::<T::Digest>();
+            #[cfg(feature = "hash-metrics")]
+            {
+                if counting && !window.is_multiple_of(FELT_BYTES) {
+                    crate::hash_metrics::count_transcript_misaligned_absorb();
+                }
+                *window += b.len();
+            }
+            hasher.update(b);
+        });
+    }
+
+    fn mark_statement_end(&mut self) {
+        // The window is DELIBERATELY untouched: see the trait's documentation.
+        // If the statement ended off a boundary the next absorb is counted, and
+        // that is the whole point of the mark existing at all.
+        #[cfg(feature = "hash-metrics")]
+        {
+            self.counting = true;
+        }
     }
 
     fn state(&self) -> [u8; 32] {
+        // ★ Counted, and NOT as a squeeze. This finalizes a CLONE: no reset and
+        // no re-absorb, so the chain does not advance and a counter hooked to
+        // `sample` cannot see it. There is one per grind check — 2,996 on a
+        // block proof against 182,734 squeezes — so a counter that reported
+        // only their sum could be checked against neither.
+        crate::hash_metrics::count_transcript_state::<T::Digest>();
         self.hasher.clone().finalize().into()
     }
 
     fn sample_field_element(&mut self) -> FieldElement<F> {
-        F::sample_field_element_from(|| self.next_sample_u64())
+        match T::CANDIDATES_PER_COORDINATE {
+            None => F::sample_field_element_from(|| self.next_sample_u64()),
+            Some(n) => F::sample_field_element_from(|| self.next_candidate_fixed(n.get())),
+        }
     }
 
+    /// Note this loop is already fixed-consumption where it matters. Its only
+    /// production caller samples query indices against `domain_size >> 1`, a
+    /// power of two, and for `upper_bound = 2^k` the threshold is
+    /// `(-2^k) mod 2^k = 0` — so no candidate is ever rejected. The loop is here
+    /// for non-power-of-two bounds, which the protocol does not use.
     fn sample_u64(&mut self, upper_bound: u64) -> u64 {
         assert!(upper_bound > 0, "upper_bound must be greater than 0");
         let threshold = upper_bound.wrapping_neg() % upper_bound;
@@ -145,9 +352,10 @@ where
     }
 }
 
-impl<F, S> IsStarkTranscript<F, S> for DefaultTranscript<F>
+impl<F, T, S> IsStarkTranscript<F, S> for DefaultTranscript<F, T>
 where
     F: HasDefaultTranscript,
+    T: TranscriptHash,
     FieldElement<F>: AsBytes,
     S: IsField + IsSubFieldOf<F>,
 {

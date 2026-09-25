@@ -1,0 +1,48 @@
+--- upstream/blake3_portable.c	2026-08-10 17:15:50
++++ blake3_portable_paramrounds.c	2026-08-10 17:16:06
+@@ -1,6 +1,17 @@
+ #include "blake3_impl.h"
+ #include <string.h>
+ 
++/* ---- LAMBDA VM PARAMETERISATION: round-count knob (added) -------------
++ * 7 = standard BLAKE3 (bit-compatible with published vectors).
++ * 6 = the internal variant this repo's LFM chip prices (assumption A6R).
++ * --------------------------------------------------------------------- */
++#ifndef BLAKE3_ROUNDS_PARAM
++#define BLAKE3_ROUNDS_PARAM 7
++#endif
++#if BLAKE3_ROUNDS_PARAM > 7 || BLAKE3_ROUNDS_PARAM < 1
++#error "BLAKE3_ROUNDS_PARAM must be in 1..7 (MSG_SCHEDULE has 7 rows)"
++#endif
++
+ INLINE uint32_t rotr32(uint32_t w, uint32_t c) {
+   return (w >> c) | (w << (32 - c));
+ }
+@@ -72,13 +83,20 @@
+   state[14] = (uint32_t)block_len;
+   state[15] = (uint32_t)flags;
+ 
+-  round_fn(state, &block_words[0], 0);
+-  round_fn(state, &block_words[0], 1);
+-  round_fn(state, &block_words[0], 2);
+-  round_fn(state, &block_words[0], 3);
+-  round_fn(state, &block_words[0], 4);
+-  round_fn(state, &block_words[0], 5);
+-  round_fn(state, &block_words[0], 6);
++  /* ---- LAMBDA VM PARAMETERISATION (the ONLY edit to this file) ----------
++   * Upstream unrolls exactly seven calls here:
++   *     round_fn(state, &block_words[0], 0);
++   *     ... (rounds 1..5) ...
++   *     round_fn(state, &block_words[0], 6);
++   * They are replaced by a loop whose bound is BLAKE3_ROUNDS_PARAM, which
++   * defaults to 7. At the default the loop executes the identical seven calls
++   * in the identical order, so the parameterisation is inert by inspection --
++   * and that is re-checked empirically against the official test vectors.
++   * MSG_SCHEDULE has exactly 7 rows, so the bound may not exceed 7.
++   * -------------------------------------------------------------------- */
++  for (size_t r = 0; r < BLAKE3_ROUNDS_PARAM; r++) {
++    round_fn(state, &block_words[0], r);
++  }
+ }
+ 
+ void blake3_compress_in_place_portable(uint32_t cv[8],

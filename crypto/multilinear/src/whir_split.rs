@@ -1,0 +1,1508 @@
+//! The WHIR base's stage breakdown, behind `LAMBDA_VM_BASE_SPLIT=1`.
+//!
+//! # Why this exists, and why the knob is not a new name
+//!
+//! The WHIR base proves the block's epochs and prints **one number** for all of
+//! them — `base (WHIR): 15 epochs in 84.5s`, 57% of the block's wall with
+//! nothing under it. There is not one timer, span or print between
+//! `multilinear_continuation::prove_continuation` and the bottom of the chain,
+//! so every optimisation round so far has moved that number without anyone
+//! being able to say which part of it moved.
+//!
+//! The STARK base has had a breakdown for months, under `LAMBDA_VM_BASE_SPLIT`.
+//! The LFM tree launcher exports that knob on the **WHIR** arm too — "byte
+//! identical to the D-S exports" — and it reached nothing at all, because the
+//! WHIR base does not go through `continuation::prove_continuation`. An inert
+//! knob printed as if it mattered is worse than a missing one: the export is
+//! the evidence a reader uses to believe the breakdown was taken.
+//!
+//! ⇒ this module reuses **the same knob name and the same line format**, so one
+//! name means one thing on both pipelines.
+//!
+//! # Why it lives in `multilinear` and not beside the STARK instrument
+//!
+//! Not taste — reachability. The stages span four places: the producer
+//! (`prover::continuation`), the epoch prover and the global stage
+//! (`prover::multilinear_continuation`), the argument and the openings
+//! (`stark::multilinear_table`), and the harness that reads them back. `prover`
+//! depends on `stark`, `stark` depends on `multilinear`, and `multilinear`
+//! depends on neither. This crate is the only one all four can reach, so the
+//! helpers the STARK instrument keeps private to `prover::continuation` are not
+//! an option for the two lower layers, whatever their visibility.
+//!
+//! # Phase walls and per-epoch records
+//!
+//! Two kinds of number, and mixing them is the way to misread the table:
+//!
+//! - **Stage walls** are measured on the thread that runs the stage, at stage
+//!   boundaries. Within one thread they do not overlap and they **partition**
+//!   that thread's epoch wall.
+//! - **The producer and the prover run concurrently**, so their two sums do
+//!   NOT add up to the base wall and must never be added. What the pair says is
+//!   which of the two set the wall — see `handoff` in
+//!   `prover::continuation::for_each_epoch`.
+//!
+//! # Cost when disabled
+//!
+//! [`enabled`] is a `OnceLock<bool>` load and a predictable branch; [`mark`]
+//! returns `None` and **no clock is read**, so a disabled run pays no
+//! `Instant::now` at all. Every call site is at stage granularity — about a
+//! dozen per epoch against a ~5.6 s epoch — so even enabled it is far below the
+//! noise of what it measures.
+//!
+//! # ⚠ One prove at a time
+//!
+//! The inner slots are process-global, because they are written inside
+//! `multi_prove` and read one layer up. Two `multi_prove` calls in flight would
+//! mix their numbers. In the base that cannot happen — there is a single prover
+//! thread — but the **same process** later proves the LFM tree with several
+//! workers at once, so rather than assume the base is the only writer,
+//! [`begin_prove`] counts concurrent proves and a record that saw one carries
+//! `OVERLAPPED`. A mixed reading says so instead of looking clean.
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// `LAMBDA_VM_BASE_SPLIT=1` (any non-empty value other than `0`) turns the
+/// lines and the records on.
+///
+/// The same spelling as `prover::continuation`'s own gate, deliberately: the
+/// two are read in different crates and must not be able to disagree about what
+/// the knob means.
+pub fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAMBDA_VM_BASE_SPLIT") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
+/// Unix epoch seconds, for aligning a stage with an external GPU sampler.
+///
+/// A duplicate of `stark::prove_split::epoch_secs` by necessity, not by
+/// oversight: `multilinear` cannot reach `stark`. Kept byte-identical in
+/// behaviour so a stamp from either instrument lands on the same timeline.
+pub fn epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
+}
+
+/// Start a timed stage — `None`, and no clock read, when the knob is off.
+#[inline]
+pub fn mark() -> Option<(Instant, f64)> {
+    enabled().then(|| (Instant::now(), epoch_secs()))
+}
+
+/// Close a stage opened by [`mark`], print its line, and return its seconds.
+///
+/// The line is the STARK base's format, unchanged:
+/// `BASE EPOCH {index}: {stage} {secs:.2}s t=[{t0:.3},{t1:.3}]`.
+///
+/// The two wall-clock stamps are what let an external GPU sampler be sliced by
+/// stage; the duration alone cannot place the stage on the sampler's timeline.
+#[inline]
+pub fn stage_done(index: u64, stage: &str, open: Option<(Instant, f64)>) -> f64 {
+    match open {
+        Some((start, t0)) => {
+            let secs = start.elapsed().as_secs_f64();
+            // ⛔ The cross-epoch stage's index is `u64::MAX`, and printing it
+            // raw put `BASE EPOCH 18446744073709551615` in the log — read back
+            // from a real run, not imagined. It is unreadable and it defeats a
+            // parse that expects a small integer, so the sentinel is rendered
+            // by NAME. The record keeps the sentinel; only the line differs.
+            let who = if index == GLOBAL_INDEX {
+                "global".to_string()
+            } else {
+                index.to_string()
+            };
+            println!(
+                "BASE EPOCH {who}: {stage} {secs:.2}s t=[{t0:.3},{:.3}]",
+                epoch_secs()
+            );
+            secs
+        }
+        None => 0.0,
+    }
+}
+
+// ── the inner slots: written inside `multi_prove`, read one layer up ────────
+
+/// A nanosecond accumulator. Public so call sites name their slot as a constant
+/// rather than passing an index.
+#[derive(Debug)]
+pub struct Slot(AtomicU64);
+
+impl Slot {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    /// Read and CLEAR. Reading a slot clears it, so a caller that drops the
+    /// value silently would hand this epoch's time to the next one.
+    fn take(&self) -> f64 {
+        self.0.swap(0, Ordering::Relaxed) as f64 / 1e9
+    }
+}
+
+/// An occurrence counter. Same discipline as [`Slot`] — process-global, and
+/// cleared when read — but it counts CALLS, not nanoseconds.
+///
+/// ★ It exists because a count survives a shape where a duration does not. On
+/// the card-free fixture the query openings read `0.00` s, so no bound on a
+/// TIME could ever see one of the four windows go missing there; the calls
+/// still happen, so a count still can. That is what makes the gate's
+/// real-wiring mutation able to fire at the shape the gate actually runs.
+#[derive(Debug)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    /// Read and CLEAR, for the reason [`Slot::take`] does.
+    fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Count one occurrence. Inert when the instrument is off, like [`mark`].
+#[inline]
+pub fn bump(counter: &Counter) {
+    if enabled() {
+        counter.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `absorb_roots_and_challenge`: the roots into the transcript and the
+/// challenge out. Host.
+pub static CHALLENGE: Slot = Slot::new();
+/// The per-table argument: LogUp, the GKR input layer, the GKR prove, the
+/// zerocheck and the constraint core. **Serial over the epoch's tables** — the
+/// loop has no rayon and no `k` — so this is both a sum and a wall.
+pub static ARGUE: Slot = Slot::new();
+/// The per-GROUP WHIR openings. Two per epoch: `epoch_groups(n)` is
+/// `[n - 1, 1]`, so every epoch pays two full chains.
+pub static OPEN_GROUPS: Slot = Slot::new();
+/// The out-of-band DECODE opening, one more chain on top of the two.
+pub static OPEN_PREPARED: Slot = Slot::new();
+
+// ── inside an opening: the WHIR chain's round loop ──────────────────────────
+//
+// `open_groups` is 43.8% of the base and 24.9% of the block's whole wall, and
+// it was one number. These six PARTITION the round (`whir_chain.rs:715-795`),
+// so `open_groups - Σ(six)` is loop overhead and nothing else.
+//
+// ⛔ They are taken at the END OF THE GROUP LOOP, before the prepared opening
+// runs. The prepared chain writes the same slots, so a take placed after it
+// would fold DECODE's chain into `open_groups` and arm E would close on a
+// number that is not what it claims.
+
+/// All THREE 20-bit grinds a round pays: folding, out-of-domain, query.
+pub static GRIND: Slot = Slot::new();
+/// `factors.rounds` — the opening sumcheck.
+pub static SUMCHECK: Slot = Slot::new();
+/// `fold_held` — the codeword folded in place where it lies.
+pub static FOLD: Slot = Slot::new();
+/// The FRESH Merkle commit of the successor, once per round, plus its root
+/// absorb; or the final-value path on the last round.
+pub static COMMIT_FOLDED: Slot = Slot::new();
+/// Out-of-domain: the sampled point, `evaluate_message`, `add_scaled_eq`.
+/// Its grind is in [`GRIND`], not here.
+pub static OOD: Slot = Slot::new();
+/// The query openings — `whir_round::prove` / `final_openings`, which REBUILD
+/// the Merkle tree on device per query batch.
+pub static QUERIES: Slot = Slot::new();
+
+// ── inside the query openings: what `open_many` does, twice per round ───────
+//
+// QUERIES is the largest slot in the chain and, like `open_groups` before it,
+// one number. These four PARTITION it, and they are counted on EVERY
+// `open_many` call — `whir_round::prove` opens the CURRENT commitment and the
+// NEXT one (`whir_round.rs:104-105`), so a non-final round calls it twice and
+// the final round once through `final_openings`.
+//
+// ⛔ THE BOUNDARY IS `open_many`, NOT `paths()`. On the device arm `paths()` is
+// a range check, ONE device call, and a `map` that wraps each path in a
+// `Proof`; splitting INSIDE it would put the rebuild against host bookkeeping
+// over a hundred kilobyte-sized paths and read ~100% every time. The term that
+// competes with the rebuild is the COSET GATHER, which sits beside `paths()` in
+// `open_many` and would otherwise stay inside QUERIES as an unnamed remainder —
+// the same shape as the setup gap the seventh slot was added to name.
+
+/// `sample_queries` / the `sample_u64` loop — the transcript squeezes that
+/// choose the indices, and the `leaf_and_slot` map onto the successor.
+pub static QUERY_SAMPLE: Slot = Slot::new();
+/// ★ `paths()` — where a device codeword's Merkle tree is REBUILT, because the
+/// commitment kept only its root. This is round 3's whole question.
+pub static TREE_REBUILD: Slot = Slot::new();
+/// `cosets()` — the query blocks gathered off the codeword where it lies.
+pub static COSET_GATHER: Slot = Slot::new();
+/// The zip/map/collect that pairs each block with its path.
+pub static OPEN_ASSEMBLE: Slot = Slot::new();
+
+/// The ROUND LOOP's own wall, summed over rounds — the six measured against
+/// their container rather than against `open_groups` directly.
+///
+/// ★ WHY A SEVENTH NUMBER RATHER THAN A WIDER TOLERANCE. The six closed to
+/// +1.4% on the laptop and +5.1% on the box, because what they leave out is
+/// roughly FIXED per epoch while the window they sit in shrinks on a faster
+/// machine. Widening the tolerance to admit 5% would have been the move that
+/// makes a check unable to fail — and it would have been wrong about the cause,
+/// because the gap is NOT round bookkeeping:
+///
+/// `Factors::from_shares` runs in `prove_shared`, and `stacked_eval::prove`
+/// builds the weights and the stacked polys — all inside `open_groups` and
+/// OUTSIDE the round loop entirely. That is a setup phase, the same class of
+/// miss as the out-of-domain grind, not a scattering of small gaps.
+///
+/// So the round's wall is measured, and the two remainders are NAMED and
+/// reported separately: `round_other` is the loop's own bookkeeping between
+/// windows, `setup_tail` is everything outside the loop. The reading says which
+/// of the two owns the gap; neither is inferred.
+pub static ROUND: Slot = Slot::new();
+
+/// Rounds the chain ran, summed over the group openings.
+pub static ROUND_COUNT: Counter = Counter::new();
+
+/// ★ CHAINS run in the group openings — NOT groups.
+///
+/// ⛔ A group is not a chain. `stacked_eval::prove` runs one chain per
+/// COMMITMENT in the stacked commitment (`stacked_eval.rs:367`, a loop over
+/// `stacked.commitments`), so a single group can open several. Arm F's identity
+/// is per chain, so it counts chains; deriving it from `groups` would have made
+/// the arm red on the honest path the first time a group carried two
+/// commitments — and a check that reddens honestly gets widened until it cannot
+/// fail at all.
+pub static CHAIN_COUNT: Counter = Counter::new();
+
+/// ★ `open_many` calls — and therefore device tree REBUILDS, one per call.
+///
+/// Pre-registered as an identity the record can check itself against: a chain
+/// of `R` rounds calls `open_many` twice per non-final round and once in the
+/// final one, so `2R − 1`. Summed over `g` chains that is
+/// `2·Σ R − g = 2·round_count − groups`, which is [`check_closure`]'s arm F.
+pub static REBUILD_CALLS: Counter = Counter::new();
+
+/// Everything the chain parked at the group-loop boundary, awaiting the record.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChainSlots {
+    /// grind, sumcheck, fold, commit_folded, ood, queries.
+    pub six: [f64; 6],
+    /// The round loop's own wall, summed over rounds.
+    pub round_wall: f64,
+    /// query_sample, tree_rebuild, coset_gather, open_assemble.
+    pub queries: [f64; 4],
+    /// Chains run, rounds run, and `open_many` calls made, in the group
+    /// openings.
+    pub chain_count: u64,
+    pub round_count: u64,
+    pub rebuild_calls: u64,
+}
+
+/// The chain's slots, as taken at the group-loop boundary.
+static CHAIN_AT_GROUPS: Mutex<ChainSlots> = Mutex::new(ChainSlots {
+    six: [0.0; 6],
+    round_wall: 0.0,
+    queries: [0.0; 4],
+    chain_count: 0,
+    round_count: 0,
+    rebuild_calls: 0,
+});
+
+/// Park the chain's slots for the record being built one layer up.
+pub fn note_chain(chain: ChainSlots) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = CHAIN_AT_GROUPS.lock() {
+        *held = chain;
+    }
+}
+
+/// Read and clear every chain slot and counter, in record order.
+pub fn take_chain() -> ChainSlots {
+    ChainSlots {
+        six: [
+            GRIND.take(),
+            SUMCHECK.take(),
+            FOLD.take(),
+            COMMIT_FOLDED.take(),
+            OOD.take(),
+            QUERIES.take(),
+        ],
+        round_wall: ROUND.take(),
+        queries: [
+            QUERY_SAMPLE.take(),
+            TREE_REBUILD.take(),
+            COSET_GATHER.take(),
+            OPEN_ASSEMBLE.take(),
+        ],
+        chain_count: CHAIN_COUNT.take(),
+        round_count: ROUND_COUNT.take(),
+        rebuild_calls: REBUILD_CALLS.take(),
+    }
+}
+
+/// Close a region opened by [`mark`] into `slot`, returning its seconds.
+///
+/// It returns the value rather than making the caller read the clock again:
+/// a second `elapsed()` for the same region measures a longer one, and the two
+/// numbers would then disagree by the cost of the instrument itself.
+#[inline]
+pub fn add(slot: &Slot, start: Option<(Instant, f64)>) -> f64 {
+    match start {
+        Some((t, _)) => {
+            let nanos = t.elapsed().as_nanos() as u64;
+            slot.0.fetch_add(nanos, Ordering::Relaxed);
+            nanos as f64 / 1e9
+        }
+        None => 0.0,
+    }
+}
+
+/// How many groups the last argument opened, so the record carries the count
+/// rather than a reader assuming `epoch_groups`' shape held.
+static GROUPS: AtomicUsize = AtomicUsize::new(0);
+/// The slowest single table of the current argument, by INDEX into the epoch's
+/// table order.
+static MAX_TABLE: Mutex<Option<(usize, f64)>> = Mutex::new(None);
+/// The epoch's table names, in that same order.
+///
+/// ⓘ Set one layer up, because the committed table does not carry a name — it
+/// is a layout and a trace. The index is what the argument can observe; the
+/// name is what a reader can act on, and only the caller holding the AIRs has
+/// it.
+static TABLE_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Note one table's argument time, keeping the maximum by index.
+///
+/// ⛔ The SUM alone cannot choose a lever here. `argue` being large is
+/// consistent with fifty even tables (where parallelism is the answer) and with
+/// one dominating table (where it is not), and those want opposite fixes.
+#[inline]
+pub fn note_table(index: usize, secs: f64) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = MAX_TABLE.lock()
+        && held.as_ref().is_none_or(|(_, best)| secs > *best)
+    {
+        *held = Some((index, secs));
+    }
+}
+
+/// Name the epoch's tables, in the order the argument walks them.
+pub fn set_table_names(names: Vec<String>) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = TABLE_NAMES.lock() {
+        *held = names;
+    }
+}
+
+/// Note how many groups this argument opened.
+#[inline]
+pub fn note_groups(n: usize) {
+    if enabled() {
+        GROUPS.store(n, Ordering::Relaxed);
+    }
+}
+
+// ── the overlap falsifier ───────────────────────────────────────────────────
+
+/// Proves inside `multi_prove` right now.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Set once if two proves were ever concurrent. Never cleared: one mixed
+/// reading taints every later record, because a slot it polluted is only zeroed
+/// by the take that reports it.
+static OVERLAPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// What [`begin_prove`] hands back.
+///
+/// ⛔ It releases the count on DROP, not on the success path. `multi_prove` has
+/// `?` early-returns, and a release that only ran when the prove succeeded
+/// would leave the count stuck at one forever — every later record would then
+/// be stamped `OVERLAPPED` by a prove that FAILED rather than by two that
+/// overlapped. A false alarm on a falsifier is worse than no falsifier, because
+/// it reads as evidence.
+#[derive(Debug)]
+pub struct ProveGuard(());
+
+impl Drop for ProveGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Open a prove. Cheap and inert when the knob is off.
+pub fn begin_prove() -> Option<ProveGuard> {
+    if !enabled() {
+        return None;
+    }
+    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1 > 1 {
+        OVERLAPPED.store(1, Ordering::Relaxed);
+    }
+    Some(ProveGuard(()))
+}
+
+// ── the per-epoch records ───────────────────────────────────────────────────
+
+/// One epoch's producer-side stages. The four **partition** `wall`, so the only
+/// thing that can break `execute + collect + build + handoff == wall` is a
+/// stage whose timer is missing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProducerSplit {
+    pub index: u64,
+    pub execute: f64,
+    pub collect: f64,
+    pub build: f64,
+    /// The blocking hand-off to the prover over an unbuffered channel. **This
+    /// is the backpressure**: large means the prover is the bottleneck, ~0
+    /// means the producer is.
+    pub handoff: f64,
+    pub wall: f64,
+}
+
+impl ProducerSplit {
+    /// What the four stages leave over. Named rather than left implicit — an
+    /// unattributed remainder is how a phase hides.
+    pub fn other(&self) -> f64 {
+        self.wall - self.execute - self.collect - self.build - self.handoff
+    }
+}
+
+/// One epoch's prover-side stages, and the argument's own split inside `prove`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProverSplit {
+    /// The epoch index, or [`GLOBAL_INDEX`] for the cross-epoch stage.
+    pub index: u64,
+    pub prep: f64,
+    pub absorb: f64,
+    pub commit: f64,
+    pub prove: f64,
+    pub wall: f64,
+    pub challenge: f64,
+    pub argue: f64,
+    pub open_groups: f64,
+    pub open_prepared: f64,
+    pub groups: usize,
+    pub max_table: Option<(String, f64)>,
+    pub airs: usize,
+    pub overlapped: bool,
+    /// The chain's six, for the GROUP openings only, in the order
+    /// [`take_chain`] returns them: grind, sumcheck, fold, commit_folded, ood,
+    /// queries. The prepared opening keeps its wall and no breakdown — it is
+    /// 2.5% of the base, and six more fields would not move a ranking.
+    pub chain: [f64; 6],
+    /// The round loop's own wall, summed over rounds. The six live inside it;
+    /// everything else in `open_groups` lives outside it.
+    pub chain_round_wall: f64,
+    /// The four inside the QUERIES slot, in the order [`take_chain`] returns
+    /// them: query_sample, tree_rebuild, coset_gather, open_assemble.
+    pub queries: [f64; 4],
+    /// Chains and rounds the group openings ran, and `open_many` calls they
+    /// made — the three numbers arm F's identity is written over.
+    pub chain_count: u64,
+    pub round_count: u64,
+    pub rebuild_calls: u64,
+}
+
+/// The six chain slots' names, in record order — so a message can name the one
+/// that went missing instead of printing an index.
+pub const CHAIN_NAMES: [&str; 6] = [
+    "grind",
+    "sumcheck",
+    "fold",
+    "commit_folded",
+    "ood",
+    "queries",
+];
+
+/// The four query slots' names, in record order — same reason as
+/// [`CHAIN_NAMES`]: a message names the slot that went missing.
+pub const QUERY_NAMES: [&str; 4] = [
+    "query_sample",
+    "tree_rebuild",
+    "coset_gather",
+    "open_assemble",
+];
+
+/// ★ The ABSOLUTE allowance arm E gives the four query slots, beside its
+/// relative one.
+///
+/// A purely relative bound cannot work at both shapes the gate runs. Card-free,
+/// the fixture's query openings read `0.00` s — a couple of milliseconds — and
+/// 3% of that is tens of microseconds, below the glue between the four windows
+/// and below the clock's own resolution, so the bound would fire on the honest
+/// path. At the block, QUERIES is about a second per epoch and this slack is
+/// 0.2%, so any of the four going missing still trips it.
+///
+/// ⇒ At the fixture the bound is inert BY DESIGN, and that is exactly why the
+/// fixture's real-wiring mutation targets arm F's COUNT rather than a duration.
+const QUERY_SLACK: f64 = 0.002;
+
+/// The index the cross-epoch global stage records under. It is the last thing
+/// the base does and it is INSIDE the base's wall, so it belongs in the table —
+/// but it is not an epoch and must not be averaged with them.
+pub const GLOBAL_INDEX: u64 = u64::MAX;
+
+impl ProverSplit {
+    /// What the four stages leave over.
+    pub fn other(&self) -> f64 {
+        self.wall - self.prep - self.absorb - self.commit - self.prove
+    }
+    /// What the four inner slots leave over inside `prove`.
+    pub fn prove_other(&self) -> f64 {
+        self.prove - self.challenge - self.argue - self.open_groups - self.open_prepared
+    }
+    /// The round loop's own bookkeeping: its wall, less the six windows inside
+    /// it. Must be ≥ 0 — a negative value means the six overlap or reach
+    /// outside the loop.
+    pub fn round_other(&self) -> f64 {
+        self.chain_round_wall - self.chain.iter().sum::<f64>()
+    }
+    /// Everything inside `open_groups` that is NOT the round loop: the factors
+    /// built from the weight shares, the stacked polys, the domain clone, the
+    /// proof assembled after the last round. Must be ≥ 0.
+    pub fn setup_tail(&self) -> f64 {
+        self.open_groups - self.chain_round_wall
+    }
+    /// What the six leave over inside `open_groups`, whatever its cause. Kept
+    /// because it is the number the first two defects showed up in.
+    pub fn chain_other(&self) -> f64 {
+        self.open_groups - self.chain.iter().sum::<f64>()
+    }
+    /// What the four leave over inside the QUERIES slot: the glue between the
+    /// windows `open_many` opens, plus `whir_round::prove`'s own frame.
+    pub fn queries_other(&self) -> f64 {
+        self.chain[5] - self.queries.iter().sum::<f64>()
+    }
+    /// ★ The `open_many` calls the group openings SHOULD have made, from the
+    /// chains and rounds they ran: `2R − 1` per chain, summed over the chains,
+    /// which is `2·ΣR − chains`.
+    ///
+    /// ⛔ CHAINS, not groups: `stacked_eval::prove` runs one chain per
+    /// commitment, so a group can open several. Both numbers are counted by the
+    /// run, so this is a claim about the call structure that the run can refute
+    /// — not a constant retyped from a reading of the source.
+    pub fn derived_rebuild_calls(&self) -> i128 {
+        2 * self.round_count as i128 - self.chain_count as i128
+    }
+    pub fn is_global(&self) -> bool {
+        self.index == GLOBAL_INDEX
+    }
+}
+
+static PRODUCER: Mutex<Vec<ProducerSplit>> = Mutex::new(Vec::new());
+static PROVER: Mutex<Vec<ProverSplit>> = Mutex::new(Vec::new());
+
+/// Record one epoch's producer stages.
+pub fn push_producer(rec: ProducerSplit) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut held) = PRODUCER.lock() {
+        held.push(rec);
+    }
+}
+
+/// Close the prover's stages into a record: take the inner slots, print the
+/// line, and store it.
+///
+/// The line and the record come from the SAME values, so the shell's parse and
+/// the harness's table cannot disagree about a number they both report.
+pub fn push_prover(mut rec: ProverSplit) {
+    if !enabled() {
+        return;
+    }
+    rec.challenge = CHALLENGE.take();
+    rec.argue = ARGUE.take();
+    rec.open_groups = OPEN_GROUPS.take();
+    rec.open_prepared = OPEN_PREPARED.take();
+    rec.groups = GROUPS.swap(0, Ordering::Relaxed);
+    // ⓘ THE SLOTS ARE DISCARDED HERE, NOT READ. By this point they hold the
+    // PREPARED opening's chain — the group openings' were taken and parked at
+    // the end of the group loop, before DECODE's ran. Reading them now would
+    // put DECODE's chain under `open_groups`'s name. So: drop what they hold
+    // (which also keeps it out of the next epoch), then take the parked pair.
+    let _ = take_chain();
+    let parked = CHAIN_AT_GROUPS
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    rec.chain = parked.six;
+    rec.chain_round_wall = parked.round_wall;
+    rec.queries = parked.queries;
+    rec.chain_count = parked.chain_count;
+    rec.round_count = parked.round_count;
+    rec.rebuild_calls = parked.rebuild_calls;
+    let names = TABLE_NAMES
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    rec.max_table = MAX_TABLE
+        .lock()
+        .ok()
+        .and_then(|mut h| h.take())
+        .map(|(at, secs)| {
+            let name = names
+                .get(at)
+                .cloned()
+                .unwrap_or_else(|| format!("table#{at}"));
+            (name, secs)
+        });
+    rec.overlapped = OVERLAPPED.load(Ordering::Relaxed) != 0;
+
+    let who = if rec.is_global() {
+        "GLOBAL (in base)".to_string()
+    } else {
+        format!("#{}", rec.index)
+    };
+    let (max_name, max_secs) = rec
+        .max_table
+        .clone()
+        .unwrap_or_else(|| ("-".to_string(), 0.0));
+    println!(
+        "WHIR PROVE SPLIT {who}{tainted}: airs {airs} · wall {wall:.2}s · \
+         prep {prep:.2} · absorb {absorb:.3} · commit {commit:.2} · \
+         prove {prove:.2} · other {other:.2} || inside[Σ] challenge {challenge:.3} · \
+         argue {argue:.2} (max {max_name} {max_secs:.2}) · \
+         open_groups {open_groups:.2} ({groups} groups) · \
+         open_prepared {open_prepared:.2} · other {prove_other:.2} || \
+         chain[Σ groups] grind {c0:.2} · sumcheck {c1:.2} · fold {c2:.2} · \
+         commit_folded {c3:.2} · ood {c4:.2} · queries {c5:.2} || \
+         round_wall {cw:.2} · round_other {c6:.2} · setup_tail {cst:.2} || \
+         queries[Σ groups] query_sample {q0:.2} · tree_rebuild {q1:.2} · \
+         coset_gather {q2:.2} · open_assemble {q3:.2} · queries_other {qo:.2} \
+         || chains {chains} · rounds {rounds} · rebuild_calls {rebuilds} \
+         (derived {rderiv})",
+        tainted = if rec.overlapped { " ⛔OVERLAPPED" } else { "" },
+        airs = rec.airs,
+        wall = rec.wall,
+        prep = rec.prep,
+        absorb = rec.absorb,
+        commit = rec.commit,
+        prove = rec.prove,
+        other = rec.other(),
+        challenge = rec.challenge,
+        argue = rec.argue,
+        open_groups = rec.open_groups,
+        groups = rec.groups,
+        open_prepared = rec.open_prepared,
+        prove_other = rec.prove_other(),
+        c0 = rec.chain[0],
+        c1 = rec.chain[1],
+        c2 = rec.chain[2],
+        c3 = rec.chain[3],
+        c4 = rec.chain[4],
+        c5 = rec.chain[5],
+        cw = rec.chain_round_wall,
+        c6 = rec.round_other(),
+        cst = rec.setup_tail(),
+        q0 = rec.queries[0],
+        q1 = rec.queries[1],
+        q2 = rec.queries[2],
+        q3 = rec.queries[3],
+        qo = rec.queries_other(),
+        chains = rec.chain_count,
+        rounds = rec.round_count,
+        rebuilds = rec.rebuild_calls,
+        rderiv = rec.derived_rebuild_calls(),
+    );
+
+    if let Ok(mut held) = PROVER.lock() {
+        held.push(rec);
+    }
+}
+
+/// Take every record collected so far, clearing the stores.
+///
+/// Clearing is what keeps a later phase — the LFM tree proves in the same
+/// process — from being read as part of the base.
+pub fn drain() -> (Vec<ProducerSplit>, Vec<ProverSplit>) {
+    let producer = PRODUCER
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    let prover = PROVER
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    (producer, prover)
+}
+
+/// Does the breakdown close? `Ok(())`, or the first failure spelled out.
+///
+/// ★ A PURE FUNCTION OVER THE RECORDS, deliberately. The arms it runs are the
+/// only reason the table can be quoted, so they have to be testable against
+/// MANUFACTURED states — a state they must accept and states they must refuse —
+/// rather than only against whatever a real run happens to produce. A check
+/// that has never been seen to fail is not evidence.
+///
+/// ⛔ IT DOES NOT CHECK `Σ producer + Σ prover == base`. The two run on
+/// different threads at once, so that identity is false on a CORRECT
+/// instrument: the base wall is epoch 0's preparation plus the proofs plus the
+/// pipeline's waiting, while the sum double-counts every overlap. Asserting it
+/// would redden the honest path, and a check that reddens honestly gets its
+/// tolerance widened until it cannot fail at all. Arm D asserts the two
+/// INEQUALITIES that are actually true of a two-thread pipeline.
+pub fn check_closure(
+    producer: &[ProducerSplit],
+    prover: &[ProverSplit],
+    base_secs: f64,
+    tol: f64,
+) -> Result<(), String> {
+    for r in prover {
+        let who = if r.is_global() {
+            "global".to_string()
+        } else {
+            format!("epoch {}", r.index)
+        };
+        // Arm A: prep + absorb + commit + prove partition the prover's wall.
+        if r.other().abs() > tol * r.wall.max(1e-9) {
+            return Err(format!(
+                "arm A: {who}'s prover stages do not close — wall {:.3}s but \
+                 prep+absorb+commit+prove = {:.3}s, leaving {:.3}s ({:.1}%) \
+                 unattributed. A stage's timer is missing.",
+                r.wall,
+                r.wall - r.other(),
+                r.other(),
+                100.0 * r.other() / r.wall.max(1e-9),
+            ));
+        }
+        // Arm B: the four inner slots partition `prove`.
+        if r.prove_other().abs() > tol * r.prove.max(1e-9) {
+            return Err(format!(
+                "arm B: {who}'s argument does not close — prove {:.3}s but \
+                 challenge+argue+open_groups+open_prepared = {:.3}s, leaving \
+                 {:.3}s ({:.1}%) unattributed inside `prove`.",
+                r.prove,
+                r.prove - r.prove_other(),
+                r.prove_other(),
+                100.0 * r.prove_other() / r.prove.max(1e-9),
+            ));
+        }
+        // Arm E: the chain's two remainders must be NON-NEGATIVE.
+        //
+        // ⛔ NOT "the six sum to `open_groups`". With the round wall measured,
+        // `Σ(six) + round_other + setup_tail = open_groups` is an IDENTITY —
+        // the two remainders are defined as the differences — so asserting it
+        // would be a check that cannot fail, which is worse than no check.
+        //
+        // What can fail, and did twice: a remainder going NEGATIVE. That is not
+        // drift. It means the parts are not parts, and it has two causes — a
+        // window reaching outside what contains it, and windows that overlap
+        // and double-count. `round_other < 0` says the six overlap or escape
+        // the loop; `setup_tail < 0` says the loop's wall escapes
+        // `open_groups`. Both are structural errors in the instrument, and
+        // neither is reachable by construction.
+        let slots = || -> String {
+            CHAIN_NAMES
+                .iter()
+                .zip(r.chain.iter())
+                .map(|(n, v)| format!("{n} {v:.3}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        // ⛔ ORDER MATTERS, and the first draft had it wrong. CONTAINMENT
+        // failures are checked before the ACCOUNTING one: a loop wall that
+        // escapes its opening also leaves a huge positive `round_other`, so
+        // with the accounting check first it was reported as "a slot is not
+        // being added" — the wrong defect, named confidently. Structure first,
+        // then arithmetic.
+        if r.setup_tail() < -tol * r.open_groups.max(1e-9) {
+            return Err(format!(
+                "arm E: {who}'s round loop does not fit its opening — \
+                 open_groups is {:.3}s but the loop's wall is {:.3}s, leaving \
+                 {:.3}s. NEGATIVE, so the loop's window reaches outside the \
+                 opening that contains it. Slots: {}.",
+                r.open_groups,
+                r.chain_round_wall,
+                r.setup_tail(),
+                slots(),
+            ));
+        }
+        if r.round_other() < -tol * r.open_groups.max(1e-9) {
+            return Err(format!(
+                "arm E: {who}'s six do not fit the round loop — the loop's wall \
+                 is {:.3}s but the six inside it sum to {:.3}s, leaving \
+                 {:.3}s. NEGATIVE, so the six overlap each other or reach \
+                 outside the loop: they are not a partition of it. Slots: {}.",
+                r.chain_round_wall,
+                r.chain.iter().sum::<f64>(),
+                r.round_other(),
+                slots(),
+            ));
+        }
+        // ⛔⛔ AND AN UPPER BOUND, because dropping it cost the arm its power.
+        // Asserting only `>= 0` made a MISSING slot invisible: omit one of the
+        // six and Σ(six) shrinks, so `round_other = round_wall − Σ(six)` GROWS
+        // — positive, allowed, unseen. The gate proved it: the same mutation
+        // arm E caught before the round wall existed sailed through after it.
+        //
+        // The identity was not the thing to remove; asserting the identity was.
+        // `round_other` is the loop's own bookkeeping between windows and reads
+        // **0.00 on every record** on a correct instrument, so a few percent of
+        // the loop's wall is enormous headroom on the honest path AND trips on
+        // any omitted slot bigger than that. `setup_tail` keeps only `>= 0`:
+        // it is legitimately un-slotted work outside the loop, and bounding it
+        // would be asserting a size nobody measured.
+        if r.round_other() > tol * r.chain_round_wall.max(1e-9) {
+            let named: Vec<String> = CHAIN_NAMES
+                .iter()
+                .zip(r.chain.iter())
+                .map(|(n, v)| format!("{n} {v:.3}"))
+                .collect();
+            return Err(format!(
+                "arm E: {who}'s six do not account for the round loop — the \
+                 loop's wall is {:.3}s but the six inside it sum to only \
+                 {:.3}s, leaving {:.3}s ({:.1}%) unattributed. The loop's own \
+                 bookkeeping is ~0 on a correct instrument, so a gap this size \
+                 is a SLOT THAT IS NOT BEING ADDED. Slots: {}.",
+                r.chain_round_wall,
+                r.chain.iter().sum::<f64>(),
+                r.round_other(),
+                100.0 * r.round_other() / r.chain_round_wall.max(1e-9),
+                named.join(" · "),
+            ));
+        }
+        // Arm E, the query half: the four inside QUERIES, containment first.
+        let queries_secs = r.chain[5];
+        let query_bound = tol * queries_secs.max(0.0) + QUERY_SLACK;
+        let query_slots = || -> String {
+            QUERY_NAMES
+                .iter()
+                .zip(r.queries.iter())
+                .map(|(n, v)| format!("{n} {v:.4}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        if r.queries_other() < -query_bound {
+            return Err(format!(
+                "arm E: {who}'s four query slots OVERRUN the openings that \
+                 contain them — QUERIES is {queries_secs:.3}s but the four sum \
+                 to {:.3}s, a NEGATIVE remainder of {:.3}s. A sum of parts \
+                 cannot exceed the whole that contains it: either a window \
+                 reaches outside `open_many` or two of them nest. Slots: {}.",
+                r.queries.iter().sum::<f64>(),
+                r.queries_other(),
+                query_slots(),
+            ));
+        }
+        if r.queries_other() > query_bound {
+            return Err(format!(
+                "arm E: {who}'s four do not account for the query openings — \
+                 QUERIES is {queries_secs:.3}s but the four inside it sum to \
+                 only {:.3}s, leaving {:.3}s ({:.1}%) unattributed. The glue \
+                 between the windows is ~0 on a correct instrument, so a gap \
+                 this size is A SLOT THAT IS NOT BEING ADDED. Slots: {}.",
+                r.queries.iter().sum::<f64>(),
+                r.queries_other(),
+                100.0 * r.queries_other() / queries_secs.max(1e-9),
+                query_slots(),
+            ));
+        }
+        // Arm F: the rebuild count, against the rounds that produced it.
+        //
+        // `whir_round::prove` opens the CURRENT commitment and the NEXT one,
+        // and the last round opens only the current through `final_openings`,
+        // so a chain of R rounds makes `2R − 1` `open_many` calls — one device
+        // tree rebuild each — and g chains make `2·ΣR − g`. BOTH SIDES ARE
+        // COUNTED BY THE RUN; neither is a constant read off the source, so
+        // this is a claim about the call structure that the run can refute.
+        //
+        // ⭐ It is also the only arm here that can fire on the card-free
+        // fixture, where every duration in the chain's query half reads 0.00.
+        // ⛔ THE GUARD IS "EITHER SIDE IS NONZERO", NOT "THE ROUNDS ARE".
+        // Guarding on the rounds alone would make the arm blind to exactly one
+        // of the two omissions it exists to catch: drop the ROUND count and
+        // `round_count` is 0, the guard skips, and the missing counter is
+        // invisible. A record that genuinely ran no chain has BOTH at zero, and
+        // that is the only state this arm may pass over.
+        if (r.chain_count > 0 || r.round_count > 0 || r.rebuild_calls > 0)
+            && r.rebuild_calls as i128 != r.derived_rebuild_calls()
+        {
+            return Err(format!(
+                "arm F: {who}'s query openings made {} `open_many` calls, but \
+                 {} round(s) over {} chain(s) derive {} (2R − 1 per chain). \
+                 Either a call is not being counted, or the chain no longer \
+                 opens the current commitment and its successor once each per \
+                 round.",
+                r.rebuild_calls,
+                r.round_count,
+                r.chain_count,
+                r.derived_rebuild_calls(),
+            ));
+        }
+    }
+    // Arm C: execute + collect + build + handoff partition the producer's wall.
+    for r in producer {
+        if r.other().abs() > tol * r.wall.max(1e-9) {
+            return Err(format!(
+                "arm C: epoch {}'s producer stages do not close — wall {:.3}s \
+                 but execute+collect+build+handoff = {:.3}s, leaving {:.3}s \
+                 ({:.1}%) unattributed. A stage's timer is missing.",
+                r.index,
+                r.wall,
+                r.wall - r.other(),
+                r.other(),
+                100.0 * r.other() / r.wall.max(1e-9),
+            ));
+        }
+    }
+    // Arm D: the two inequalities a two-thread pipeline really satisfies.
+    let p_wall: f64 = producer.iter().map(|r| r.wall).sum();
+    let v_wall: f64 = prover.iter().map(|r| r.wall).sum();
+    let busiest = p_wall.max(v_wall);
+    if busiest > base_secs * (1.0 + tol) {
+        return Err(format!(
+            "arm D: the busiest thread ({busiest:.2}s) exceeds the base wall \
+             ({base_secs:.2}s) — a thread cannot take longer than the pipeline \
+             that contains it.",
+        ));
+    }
+    if base_secs > (p_wall + v_wall) * (1.0 + tol) {
+        return Err(format!(
+            "arm D: the base wall ({base_secs:.2}s) exceeds the serial bound \
+             ({:.2}s) — the pipeline took longer than running every stage one \
+             after another, so time is being spent outside every stage.",
+            p_wall + v_wall,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⛔ The disabled path must read no clock. Asserted through the only
+    /// observable it has: [`mark`] returns `None`, so [`add`] cannot move a
+    /// slot and [`stage_done`] cannot print.
+    ///
+    /// The knob is a process-wide `OnceLock` and the test binary does not set
+    /// it, so this is the state every other test in the crate runs under.
+    #[test]
+    fn disabled_is_inert() {
+        assert!(
+            !enabled(),
+            "the test binary must not set LAMBDA_VM_BASE_SPLIT"
+        );
+        assert!(mark().is_none(), "a disabled mark must read no clock");
+        assert_eq!(
+            add(&ARGUE, mark()),
+            0.0,
+            "a disabled add must not move a slot"
+        );
+        assert_eq!(ARGUE.take(), 0.0, "a disabled add must not move a slot");
+        // ★ And the COUNTERS, which are the one thing here that is not a clock
+        // read: `bump` has to check the knob itself, because unlike `add` it
+        // takes no `Option` that a disabled `mark` could have emptied.
+        bump(&REBUILD_CALLS);
+        bump(&ROUND_COUNT);
+        bump(&CHAIN_COUNT);
+        assert_eq!(
+            (REBUILD_CALLS.take(), ROUND_COUNT.take(), CHAIN_COUNT.take()),
+            (0, 0, 0),
+            "a disabled bump must not move a counter"
+        );
+        assert_eq!(stage_done(0, "execute", mark()), 0.0);
+        note_table(3, 9.0);
+        set_table_names(vec!["KECCAK".to_string()]);
+        note_groups(7);
+        push_producer(ProducerSplit {
+            index: 0,
+            wall: 1.0,
+            ..Default::default()
+        });
+        push_prover(ProverSplit {
+            index: 0,
+            wall: 1.0,
+            ..Default::default()
+        });
+        let (producer, prover) = drain();
+        assert!(
+            producer.is_empty() && prover.is_empty(),
+            "disabled records nothing"
+        );
+    }
+
+    /// The remainders are what catch a missing timer, so they must be the
+    /// arithmetic they claim and not a restatement of it.
+    #[test]
+    fn a_missing_stage_shows_up_in_the_remainder() {
+        let whole = ProducerSplit {
+            index: 0,
+            execute: 1.0,
+            collect: 2.0,
+            build: 3.0,
+            handoff: 4.0,
+            wall: 10.0,
+        };
+        assert!(
+            whole.other().abs() < 1e-9,
+            "a complete partition leaves nothing over"
+        );
+
+        // The mutation the gate runs: one stage's timer omitted. The stage
+        // reads 0 and its time lands in the remainder, where the check sees it.
+        let missing = ProducerSplit {
+            build: 0.0,
+            ..whole.clone()
+        };
+        assert!(
+            (missing.other() - 3.0).abs() < 1e-9,
+            "an omitted `build` must surface as 3.0s of remainder, got {}",
+            missing.other()
+        );
+
+        let p = ProverSplit {
+            index: 0,
+            prep: 1.0,
+            absorb: 0.5,
+            commit: 2.0,
+            prove: 6.5,
+            wall: 10.0,
+            challenge: 0.5,
+            argue: 4.0,
+            open_groups: 1.5,
+            open_prepared: 0.5,
+            ..Default::default()
+        };
+        assert!(p.other().abs() < 1e-9);
+        assert!(p.prove_other().abs() < 1e-9);
+        assert!(!p.is_global());
+        assert!(
+            ProverSplit {
+                index: GLOBAL_INDEX,
+                ..Default::default()
+            }
+            .is_global()
+        );
+    }
+
+    /// ⛔ The cross-epoch stage's index is `u64::MAX`. A real run printed
+    /// `BASE EPOCH 18446744073709551615` before this was fixed, so the
+    /// rendering is pinned rather than left to a reader to notice again.
+    #[test]
+    fn the_global_sentinel_is_rendered_by_name() {
+        assert_eq!(GLOBAL_INDEX, u64::MAX);
+        assert!(
+            !format!("{GLOBAL_INDEX}").contains("global"),
+            "the raw sentinel is what the line must NOT carry",
+        );
+        assert!(
+            ProverSplit {
+                index: GLOBAL_INDEX,
+                ..Default::default()
+            }
+            .is_global()
+        );
+        assert!(
+            !ProverSplit {
+                index: 0,
+                ..Default::default()
+            }
+            .is_global()
+        );
+    }
+
+    /// A realistic pair of records: the producer and the prover each close, and
+    /// the two threads overlap, so `Σ producer + Σ prover` is well above the
+    /// base wall and arm D's inequalities are the only true statements about it.
+    fn honest() -> (Vec<ProducerSplit>, Vec<ProverSplit>, f64) {
+        let producer: Vec<_> = (0..3)
+            .map(|i| ProducerSplit {
+                index: i,
+                execute: 1.0,
+                collect: 0.5,
+                build: 1.5,
+                handoff: 2.0,
+                wall: 5.0,
+            })
+            .collect();
+        let prover: Vec<_> = (0..3)
+            .map(|i| ProverSplit {
+                index: i,
+                prep: 0.5,
+                absorb: 0.1,
+                commit: 1.4,
+                prove: 3.0,
+                wall: 5.0,
+                challenge: 0.1,
+                argue: 1.9,
+                open_groups: 0.9,
+                open_prepared: 0.1,
+                // The six partition `open_groups`: 0.3 + 0.2 + 0.1 + 0.1 +
+                // 0.05 + 0.05 = 0.8.
+                chain: [0.3, 0.2, 0.1, 0.1, 0.05, 0.05],
+                // ⛔ THE WALL MUST MODEL A CORRECT INSTRUMENT. The six sum to
+                // 0.80 and the loop's own bookkeeping reads ~0 on every real
+                // record, so the wall is 0.81 — 1.2% of remainder, inside the
+                // 3% bound. The first draft used 0.85 (5.9%) and the fixture
+                // itself tripped the bound it was written to test: a fixture
+                // that is not a correct instrument makes every arm meaningless.
+                // `open_groups` 0.90 leaves setup_tail 0.09, positive, which is
+                // where the un-slotted setup legitimately lives.
+                chain_round_wall: 0.81,
+                // The four partition the QUERIES slot (chain[5] = 0.05):
+                // 0.005 + 0.030 + 0.010 + 0.004 = 0.049, leaving 0.001 of
+                // glue — the same "~0 on a correct instrument" the round
+                // loop's own remainder reads. Same lesson as the round wall
+                // above: a fixture that is not a correct instrument makes
+                // every arm written against it meaningless.
+                queries: [0.005, 0.030, 0.010, 0.004],
+                // Two chains of six rounds: 2·12 − 2 = 22 `open_many` calls,
+                // which is arm F's identity satisfied rather than asserted.
+                // `groups` is carried too, and deliberately DIFFERENT from the
+                // chain count: a group can open several chains, and an identity
+                // written over groups would pass here by coincidence.
+                groups: 1,
+                chain_count: 2,
+                round_count: 12,
+                rebuild_calls: 22,
+                ..Default::default()
+            })
+            .collect();
+        // Two threads over three epochs: ~one epoch of preparation, then the
+        // proofs. Not 30s.
+        (producer, prover, 17.0)
+    }
+
+    /// ⛔ THE STATE THE CHECK EXISTS TO ACCEPT. Run first, because an arm that
+    /// cannot pass is the failure mode that costs a box launch.
+    #[test]
+    fn closure_accepts_an_honest_run() {
+        let (producer, prover, base) = honest();
+        assert_eq!(check_closure(&producer, &prover, base, 0.03), Ok(()));
+    }
+
+    /// ★ AND THE STATES IT MUST REFUSE, one per arm, each a MANUFACTURED
+    /// omission of exactly the kind the box mutation will make. Each assertion
+    /// reads the arm's NAME out of the message: an arm that reddened for some
+    /// other reason would not be evidence that this arm works.
+    #[test]
+    fn closure_refuses_every_manufactured_omission() {
+        // Arm A: one prover stage's timer omitted. Its time becomes remainder.
+        let (producer, mut prover, base) = honest();
+        prover[1].commit = 0.0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm A:"), "expected arm A, got: {err}");
+        assert!(err.contains("epoch 1"), "arm A must name the epoch: {err}");
+
+        // Arm A must name the GLOBAL stage as `global`, not as an epoch index.
+        let (producer, mut prover, base) = honest();
+        prover.push(ProverSplit {
+            index: GLOBAL_INDEX,
+            prep: 0.1,
+            prove: 0.4,
+            wall: 2.0,
+            ..Default::default()
+        });
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm A:"), "expected arm A, got: {err}");
+        assert!(
+            err.contains("global"),
+            "arm A must name the global stage: {err}"
+        );
+
+        // Arm B: one INNER slot omitted. The four stages still close, so only
+        // arm B can catch it — which is why arm B exists.
+        let (producer, mut prover, base) = honest();
+        prover[2].argue = 0.0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm B:"), "expected arm B, got: {err}");
+        assert!(err.contains("epoch 2"), "arm B must name the epoch: {err}");
+
+        // Arm C: one producer stage's timer omitted.
+        let (mut producer, prover, base) = honest();
+        producer[0].handoff = 0.0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm C:"), "expected arm C, got: {err}");
+        assert!(err.contains("epoch 0"), "arm C must name the epoch: {err}");
+
+        // Arm E, failure 1: the six OVERLAP or escape the loop, so they sum to
+        // more than the loop's own wall. This is the shape both real defects
+        // took — a window secured at one edge, then two windows nesting around
+        // the same grind — and it is NEGATIVE, not drift.
+        let (producer, mut prover, base) = honest();
+        prover[1].chain[0] = 0.60; // grind 0.30 -> 0.60: the six now exceed 0.85
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 1"), "arm E must name the epoch: {err}");
+        assert!(
+            err.contains("NEGATIVE"),
+            "arm E must say what a negative remainder means: {err}"
+        );
+        assert!(
+            err.contains("grind 0.600"),
+            "arm E must print the six by NAME so the culprit is visible: {err}",
+        );
+
+        // Arm E, failure 2: the loop's wall escapes the opening that contains
+        // it. A different structural error, and only the second bound sees it.
+        let (producer, mut prover, base) = honest();
+        prover[2].chain_round_wall = 1.50; // > open_groups 0.90
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 2"), "{err}");
+        assert!(
+            err.contains("reaches outside the opening"),
+            "the second bound must name its own failure: {err}",
+        );
+
+        // ⛔⛔ Arm E, failure 3: ONE OF THE SIX ZEROED, the round wall
+        // UNCHANGED — a slot whose timer is gone. This is the case the first
+        // version of the seventh slot could not see: Σ(six) shrinks, the
+        // remainder grows, and `>= 0` alone calls that fine. It is the whole
+        // reason `round_other` carries an upper bound.
+        let (producer, mut prover, base) = honest();
+        prover[0].chain[0] = 0.0; // grind 0.30 gone; round_wall still 0.85
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 0"), "{err}");
+        assert!(
+            err.contains("SLOT THAT IS NOT BEING ADDED"),
+            "arm E must name the cause, not just the gap: {err}",
+        );
+        assert!(err.contains("grind 0.000"), "and print the six: {err}");
+
+        // ⛔ AND THE CASE THAT MUST **NOT** REDDEN: a slot legitimately SMALL
+        // rather than missing. `queries` reads 0.00 on a card-free fixture
+        // because the codewords are tiny — a reading, not an error — and the
+        // round wall shrinks with it, so the remainder does not grow.
+        let (producer, mut prover, base) = honest();
+        prover[0].chain[5] = 0.0;
+        prover[0].chain_round_wall = 0.76; // the wall loses it too
+        // ⛔ AND THE FOUR INSIDE IT GO WITH IT. This line was added when the
+        // query half of arm E reddened here on its first run: leaving the four
+        // at their honest values while zeroing the slot that CONTAINS them
+        // models four parts summing to more than their whole — an impossible
+        // instrument, and the very shape arm E exists to reject. The fixture
+        // was wrong, not the bound. Same lesson as `honest()`'s round wall.
+        prover[0].queries = [0.0; 4];
+        assert_eq!(
+            check_closure(&producer, &prover, base, 0.03),
+            Ok(()),
+            "a slot that is genuinely small is a reading, not a missing timer",
+        );
+
+        // Arm D, first inequality: a thread claiming more than the pipeline.
+        let (producer, prover, _) = honest();
+        let err = check_closure(&producer, &prover, 5.0, 0.03).unwrap_err();
+        assert!(err.starts_with("arm D:"), "expected arm D, got: {err}");
+        assert!(err.contains("busiest thread"), "{err}");
+
+        // Arm D, second: a base wall beyond the serial bound — time spent
+        // outside every stage.
+        let (producer, prover, _) = honest();
+        let err = check_closure(&producer, &prover, 100.0, 0.03).unwrap_err();
+        assert!(err.starts_with("arm D:"), "expected arm D, got: {err}");
+        assert!(err.contains("serial bound"), "{err}");
+    }
+
+    /// ⛔ THE SECOND MUTATION THE GATE RUNS: the tolerance zeroed must redden a
+    /// run that is merely REALISTIC rather than exact. A real stage sum is
+    /// strictly below its wall — the wall's own clock reads bracket the stage
+    /// reads — so a check that still passed at tolerance zero would be reading
+    /// numbers that cannot have come from a measurement.
+    #[test]
+    fn a_zero_tolerance_refuses_a_realistic_run() {
+        let (mut producer, prover, base) = honest();
+        // The instrument's own cost: a real wall is a hair longer than the sum
+        // of its parts, because the wall's clock reads bracket the stages'.
+        producer[0].wall += 0.002;
+        assert_eq!(check_closure(&producer, &prover, base, 0.03), Ok(()));
+
+        // Arm C alone, with no prover records to reach first: the 2 ms of
+        // instrument cost is what a zeroed tolerance refuses.
+        let err = check_closure(&producer, &[], base, 0.0).unwrap_err();
+        assert!(
+            err.starts_with("arm C:"),
+            "expected arm C at tol 0, got: {err}"
+        );
+        assert!(err.contains("epoch 0"), "{err}");
+
+        // And on the WHOLE record set a zeroed tolerance still reddens — the
+        // arm that fires first is whichever record is walked first, which is
+        // why the isolated check above is the one that names arm C.
+        assert!(
+            check_closure(&producer, &prover, base, 0.0).is_err(),
+            "a zeroed tolerance must refuse a run carrying real timer cost",
+        );
+    }
+
+    /// ⛔ EVERY ONE OF THE FOUR, OMITTED IN TURN, IS SEEN — and named.
+    ///
+    /// The same discipline as the six: `check_closure` is a pure function over
+    /// records, so an omission can be FED to it rather than waited for. That
+    /// matters more here than it did for the six, because the shape the gate
+    /// runs card-free has every one of these durations at 0.00 and no bound on
+    /// a time could see anything there (see `QUERY_SLACK`).
+    #[test]
+    fn closure_refuses_every_omitted_query_slot() {
+        for (i, name) in QUERY_NAMES.iter().enumerate() {
+            let (producer, mut prover, base) = honest();
+            let dropped = prover[1].queries[i];
+            assert!(
+                dropped > 0.0,
+                "{name} must be nonzero in the fixture or \
+                     this case cannot fail"
+            );
+            prover[1].queries[i] = 0.0;
+            let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+            assert!(
+                err.starts_with("arm E:"),
+                "expected arm E for {name}, got: {err}"
+            );
+            assert!(err.contains("epoch 1"), "arm E must name the epoch: {err}");
+            assert!(
+                err.contains("A SLOT THAT IS NOT BEING ADDED"),
+                "arm E must say what the gap means: {err}"
+            );
+            assert!(
+                err.contains(&format!("{name} 0.0000")),
+                "arm E must print the four BY NAME so the culprit is visible: {err}"
+            );
+        }
+    }
+
+    /// ⛔ AND ITS TWIN, WHICH MUST NOT REDDEN: a genuinely tiny QUERIES with
+    /// the four tiny alongside it — the card-free fixture's own shape.
+    ///
+    /// Without this case the next lane meets a gate that reds on every
+    /// card-free run and widens the bound until it cannot fail at all. That is
+    /// the failure this pair exists to make impossible.
+    #[test]
+    fn closure_accepts_query_slots_that_are_small_because_the_work_was() {
+        let (producer, mut prover, base) = honest();
+        for rec in prover.iter_mut() {
+            // QUERIES shrinks from 0.05 to 0.002, and the four shrink with it.
+            rec.chain[5] = 0.002;
+            rec.queries = [0.0002, 0.0012, 0.0004, 0.0001];
+            // The six and the walls move together so the outer arms still hold.
+            rec.chain_round_wall = rec.chain.iter().sum::<f64>() + 0.001;
+            rec.open_groups = rec.chain_round_wall + 0.09;
+            rec.prove = rec.challenge + rec.argue + rec.open_groups + rec.open_prepared;
+            rec.wall = rec.prep + rec.absorb + rec.commit + rec.prove;
+        }
+        assert_eq!(
+            check_closure(&producer, &prover, base, 0.03),
+            Ok(()),
+            "a small QUERIES with small parts is an honest run, not a defect"
+        );
+    }
+
+    /// ⛔ A NEGATIVE remainder in the query half: the four cannot exceed the
+    /// slot that contains them, and it means nesting or a window reaching
+    /// outside `open_many` — the two defects arm E caught in the six.
+    #[test]
+    fn closure_refuses_query_slots_that_overrun_their_opening() {
+        let (producer, mut prover, base) = honest();
+        // tree_rebuild alone made larger than the whole QUERIES slot.
+        prover[2].queries[1] = 0.09;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm E:"), "expected arm E, got: {err}");
+        assert!(err.contains("epoch 2"), "arm E must name the epoch: {err}");
+        assert!(
+            err.contains("NEGATIVE"),
+            "arm E must say what a negative remainder means: {err}"
+        );
+        assert!(
+            err.contains("tree_rebuild 0.0900"),
+            "arm E must print the culprit by name: {err}"
+        );
+    }
+
+    /// ★ ARM F — the rebuild count against the rounds that produced it, and
+    /// the ONE arm that can fire where every duration reads 0.00.
+    #[test]
+    fn closure_refuses_a_rebuild_call_that_is_not_counted() {
+        let (producer, mut prover, base) = honest();
+        prover[0].rebuild_calls -= 1;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm F:"), "expected arm F, got: {err}");
+        assert!(err.contains("epoch 0"), "arm F must name the epoch: {err}");
+        assert!(
+            err.contains("21") && err.contains("22"),
+            "arm F must print BOTH the counted and the derived number: {err}"
+        );
+        assert!(
+            err.contains("2R − 1 per chain"),
+            "arm F must state the identity it is checking: {err}"
+        );
+    }
+
+    /// And arm F fires on the other side too — a chain that stopped opening
+    /// its successor would make FEWER calls per round, not more.
+    #[test]
+    fn closure_refuses_a_round_that_stopped_opening_its_successor() {
+        let (producer, mut prover, base) = honest();
+        // 12 rounds over 2 groups that made only one call per round.
+        prover[1].rebuild_calls = 12;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm F:"), "expected arm F, got: {err}");
+        assert!(
+            err.contains("opens the current commitment and its successor"),
+            "arm F must name the structure it assumes: {err}"
+        );
+    }
+
+    /// ★ AND THE OTHER OMISSION: the ROUND counter dropped while the calls
+    /// are still counted. Guarding arm F on `round_count > 0` alone would skip
+    /// this record entirely and the missing counter would be invisible — the
+    /// same blind spot the seventh slot opened in arm E, in a new place.
+    #[test]
+    fn closure_refuses_a_round_that_was_not_counted() {
+        let (producer, mut prover, base) = honest();
+        prover[2].round_count = 0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm F:"), "expected arm F, got: {err}");
+        assert!(err.contains("epoch 2"), "arm F must name the epoch: {err}");
+        assert!(
+            err.contains("22") && err.contains("0 round(s)"),
+            "arm F must print both counted numbers: {err}"
+        );
+    }
+
+    /// ★ AND THE THIRD OMISSION: the CHAIN counter dropped. The identity is
+    /// written over all three numbers, so each of them going missing is a
+    /// different wrong answer and each must be seen.
+    #[test]
+    fn closure_refuses_a_chain_that_was_not_counted() {
+        let (producer, mut prover, base) = honest();
+        prover[1].chain_count = 0;
+        let err = check_closure(&producer, &prover, base, 0.03).unwrap_err();
+        assert!(err.starts_with("arm F:"), "expected arm F, got: {err}");
+        assert!(
+            err.contains("0 chain(s)") && err.contains("24"),
+            "arm F must print the chains it counted and what they derive: {err}"
+        );
+    }
+
+    /// ⛔ AND ARM F MUST NOT FIRE ON A RECORD THAT RAN NO CHAIN. An epoch that
+    /// opened no groups has no rounds and no calls, and `2·0 − 0 = 0` would
+    /// hold anyway — but a record with `groups` set and no chain at all would
+    /// read a derived `-groups`, which is not a defect in the run.
+    #[test]
+    fn closure_accepts_a_record_that_ran_no_chain() {
+        let (producer, mut prover, base) = honest();
+        for rec in prover.iter_mut() {
+            rec.chain_count = 0;
+            rec.round_count = 0;
+            rec.rebuild_calls = 0;
+            rec.chain = [0.0; 6];
+            rec.queries = [0.0; 4];
+            rec.chain_round_wall = 0.0;
+            rec.open_groups = 0.9;
+        }
+        assert_eq!(
+            check_closure(&producer, &prover, base, 0.03),
+            Ok(()),
+            "no chain is not a broken chain"
+        );
+    }
+}

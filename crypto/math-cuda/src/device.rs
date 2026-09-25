@@ -4,7 +4,7 @@
 //! on a single CUDA context; a pool of streams lets rayon-parallel callers
 //! overlap H2D / compute / D2H.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream};
@@ -128,6 +128,7 @@ impl Drop for PinnedStaging {
 const ARITH_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arith.cubin"));
 const NTT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
 const KECCAK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keccak.cubin"));
+const RPX_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpx.cubin"));
 const BARY_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/barycentric.cubin"));
 const DEEP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deep.cubin"));
 const FRI_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fri.cubin"));
@@ -135,6 +136,9 @@ const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.c
 const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
 const CONSTRAINT_INTERP_CUBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
+const BLAKE3_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blake3.cubin"));
+const SUMCHECK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sumcheck.cubin"));
+const WHIR_FOLD_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whir_fold.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -158,9 +162,12 @@ pub struct Backend {
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     next: AtomicUsize,
-    /// VRAM budget (bytes) for table-session admission control. See
+    /// VRAM budget (bytes) for admission control. See
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
+    /// Device bytes promised to structures that are still alive. See
+    /// [`Backend::reserve`].
+    reserved: AtomicU64,
 
     // arith.cubin
     pub vector_add_u64: CudaFunction,
@@ -174,8 +181,13 @@ pub struct Backend {
 
     // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
+    pub lift_spread: CudaFunction,
+    pub mobius_level: CudaFunction,
+    pub mobius_low_levels: CudaFunction,
+    pub mobius_tile: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
+    pub ntt_dit_tile: CudaFunction,
     pub pointwise_mul: CudaFunction,
     pub scalar_mul: CudaFunction,
     pub bit_reverse_permute_batched: CudaFunction,
@@ -193,15 +205,85 @@ pub struct Backend {
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub keccak256_leaves_base_row_major_row_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_base_coset: CudaFunction,
+    pub keccak256_leaves_ext3_coset: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub grind_search: CudaFunction,
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub keccak_fri_group_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
     pub keccak_merkle_tail: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
+    // blake3.cubin — the leaf kernels, the Merkle level/tail compressors, and
+    // the parity-harness probes that are the only host-visible handle on the
+    // device compression function, byte serialization and chain construction
+    // (see `kernels/blake3.cu`). Twin for twin with the keccak set above, and in
+    // the same order. `merkle_gather_paths` has no twin: path gathering copies
+    // nodes and never hashes, so it is hash-agnostic and both trees share it.
+    //
+    // Keccak stays the prover's default, so no production dispatch reaches these
+    // yet — they exist so the GPU can follow the CPU's hash switch (PA-PLAN §6.1).
+    pub blake3_leaves_base_row_major_row_pair: CudaFunction,
+    pub blake3_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub blake3_leaves_base_row_major_row_range: CudaFunction,
+    pub blake3_leaves_base_batched: CudaFunction,
+    pub blake3_leaves_base_row_pair_batched: CudaFunction,
+    pub blake3_leaves_ext3_batched: CudaFunction,
+    pub blake3_comp_poly_leaves_ext3: CudaFunction,
+    pub blake3_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub blake3_fri_group_leaves_ext3: CudaFunction,
+    pub blake3_merkle_level: CudaFunction,
+    pub blake3_merkle_tail: CudaFunction,
+    pub blake3_compress_probe_6r: CudaFunction,
+    pub blake3_compress_probe_7r: CudaFunction,
+    pub blake3_compress_probe_default: CudaFunction,
+    pub blake3_rounds_probe: CudaFunction,
+    pub blake3_serialize_felts_probe: CudaFunction,
+    pub blake3_blocks_of_felts_probe: CudaFunction,
+    pub blake3_chain_probe: CudaFunction,
+
+    // rpx.cubin — the RPX256 (XHash12) leaf kernels, Merkle level/tail
+    // compressors and the permutation probe (see `kernels/rpx.cu`). Twin for
+    // twin with the blake3 set above and in the same order; the probe is the
+    // only host-visible handle on the bare device permutation, which the parity
+    // tests check against the host `Rpx256`.
+    pub rpx_leaves_base_row_major_row_pair: CudaFunction,
+    pub rpx_leaves_base_row_major_row_pair_range: CudaFunction,
+    /// S2 one-row leaves (`rows_per_leaf = 1`): row `reverse_index(i)`, a column range.
+    pub rpx_leaves_base_row_major_row_range: CudaFunction,
+    pub rpx_leaves_base_batched: CudaFunction,
+    pub rpx_leaves_base_row_pair_batched: CudaFunction,
+    pub rpx_leaves_ext3_batched: CudaFunction,
+    pub rpx_comp_poly_leaves_ext3: CudaFunction,
+    pub rpx_fri_leaves_ext3: CudaFunction,
+    /// S3 group-leaf FRI layers: `group` consecutive ext3 values per leaf.
+    pub rpx_fri_group_leaves_ext3: CudaFunction,
+    pub rpx_merkle_level: CudaFunction,
+    pub rpx_merkle_tail: CudaFunction,
+    pub rpx_permute_probe: CudaFunction,
+    pub rpx_grind_search: CudaFunction,
+    /// ⛔ DIAGNOSTIC ONLY — the grind search with its executed-permutation
+    /// counters. Nothing on a proving path launches it; its one caller is
+    /// [`crate::grinding::search_counted`], which reads whether a slow launch
+    /// does MORE work or the same work more slowly.
+    pub rpx_grind_search_counted: CudaFunction,
+
+    // rpx.cubin — the algebraic hash's twins of the keccak entries above.
+    // Only the ones the WHIR path reaches are bound: the coset leaves, the two
+    // tree compressors and the grind. The row-group leaf kernels the per-table
+    // branch uses are in the cubin but are not loaded here, because nothing on
+    // this path launches them and an unused handle is a claim that something
+    // does.
+    pub rpx_leaves_base_coset: CudaFunction,
+    pub rpx_leaves_ext3_coset: CudaFunction,
 
     // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
@@ -239,6 +321,28 @@ pub struct Backend {
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
 
+    // sumcheck.cubin
+    pub sumcheck_round_ext3: CudaFunction,
+    pub sum_partials_ext3: CudaFunction,
+    pub sumcheck_fold_ext3: CudaFunction,
+    pub mle_fold_base_ext3: CudaFunction,
+    pub eq_expand_level_ext3: CudaFunction,
+    pub eq_seed_shares_ext3: CudaFunction,
+    pub eq_expand_level_shares_ext3: CudaFunction,
+    pub program_map_ext3: CudaFunction,
+    pub factors_from_columns_ext3: CudaFunction,
+    pub mle_lift_base_ext3: CudaFunction,
+    pub add_scaled_ext3: CudaFunction,
+    pub fill_ext3: CudaFunction,
+    pub fraction_fold_ext3: CudaFunction,
+    pub fraction_fold_padded_ext3: CudaFunction,
+    pub mle_fold_base_ext3_many: CudaFunction,
+
+    // whir_fold.cubin
+    pub whir_fold_base_ext3: CudaFunction,
+    pub whir_fold_ext3: CudaFunction,
+    pub gather_cosets: CudaFunction,
+
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
@@ -250,17 +354,186 @@ pub struct Backend {
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
 }
 
-/// Raise the device default memory pool's release threshold so freed
-/// stream-ordered allocations are kept for reuse instead of returned to the OS
-/// at each sync. Best-effort: any failure (e.g. a device/driver without
-/// stream-ordered allocator support) leaves the default behaviour untouched.
+/// The environment knob for the device default memory pool's release
+/// threshold, in MiB: the bytes of freed stream-ordered memory the pool keeps
+/// before handing memory back to the OS at the next sync. Unset means
+/// [`DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES`]. The VRAM sampler runs set it
+/// to `0`, so `total - free` reads the live working set and not the retained
+/// pool.
+pub const MEMPOOL_RELEASE_ENV: &str = "LAMBDA_VM_MEMPOOL_RELEASE_MB";
+
+/// Retain every freed block (`u64::MAX`): a same-shape allocation skips the
+/// driver and reuses the block, which is what the per-table pipeline's
+/// repeated LDE/FRI buffers want.
+///
+/// Measured, not guessed (RTX 5090, 2026-09-07, `one_lde_buffer::vram_arm`
+/// at 2^21 × 316 @ blowup 2, five commits, in-process 1 kHz peak): retain-all
+/// 1176.9 / 1057.9 / 1055.3 / 1056.2 / 1055.6 ms against release-0
+/// 1178.5 / 1057.2 / 1077.5 / 1081.2 / 1079.3 ms — retention ≈2% faster once
+/// the first commit has populated the pool — and a peak of 15.67 GiB under
+/// both: a same-shape allocation reuses the retained block, so retention adds
+/// nothing to the peak. The unequal-shape case is covered at block scale by
+/// the multi-table q=41 wrap rung under this default (VRAM peak 28,976 MiB, no
+/// device decline): the stream-ordered allocator serves a new request from the
+/// physical chunks it retains, and the release threshold governs only what a
+/// sync hands back to the OS. The explicit release for a moment reuse cannot
+/// serve is [`Backend::trim_mempool_to`]; the sampler runs set the knob to `0`
+/// so `total - free` reads the live set rather than the pool.
+pub const DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES: u64 = u64::MAX;
+
+/// The effective release threshold in bytes: the knob when set and parseable,
+/// the default otherwise. Read once per process; the prover's diagnostics
+/// print it so every box log states the posture its run had.
+pub fn mempool_release_threshold_bytes() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var(MEMPOOL_RELEASE_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES)
+    })
+}
+
+/// The device default memory pool, or `None` on a device/driver without
+/// stream-ordered allocator support.
+///
+/// # Safety
+///
+/// `ctx` must be a live context; its device is queried directly.
+unsafe fn default_mempool(ctx: &CudaContext) -> Option<cudarc::driver::sys::CUmemoryPool> {
+    use cudarc::driver::sys;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    // SAFETY: the out-pointer is a valid stack slot; the device is the
+    // context's own.
+    unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, ctx.cu_device())
+            .result()
+            .ok()
+            .map(|()| pool)
+    }
+}
+
+/// Set the device default memory pool's release threshold
+/// ([`mempool_release_threshold_bytes`]) so freed stream-ordered allocations
+/// are kept for reuse instead of returned to the OS at each sync. Best-effort:
+/// any failure leaves the driver default (release everything) untouched, and
+/// the one-line report says so.
 fn retain_default_mempool(ctx: &CudaContext) {
     use cudarc::driver::sys;
-    // SAFETY: raw CUDA driver calls. `ctx.cu_device()` is a valid device for
-    // the just-created context; the out-pointers are valid stack slots; the
+    let threshold = mempool_release_threshold_bytes();
+    // SAFETY: raw CUDA driver calls on the just-created context's device; the
     // threshold is read as a u64 by the driver. Errors are swallowed.
+    let set = unsafe {
+        default_mempool(ctx).is_some_and(|pool| {
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &threshold as *const u64 as *mut core::ffi::c_void,
+            )
+            .result()
+            .is_ok()
+        })
+    };
+    // One line per process, so the box log states the posture the run had.
+    eprintln!(
+        "[gpu] mempool release threshold: {}{}",
+        match threshold {
+            u64::MAX => "retain all freed blocks".to_string(),
+            t => format!("{} MiB", t >> 20),
+        },
+        if set {
+            ""
+        } else {
+            " (driver refused; the release-on-sync default stays)"
+        }
+    );
+}
+
+/// Device bytes held for as long as this lives. See [`Backend::reserve`].
+///
+/// ★ The count is atomic and the reservation is GROWABLE, because a chain
+/// promises its room once and then discovers more of it: the tree a commitment
+/// caches is not known when the codeword reserves, and it is shared through an
+/// `Arc` by the time it is. Growing this rather than taking a second
+/// reservation is what keeps ONE number answering "what does this chain hold" —
+/// two accountings for one working set is a shape this codebase has paid for
+/// before.
+#[derive(Debug)]
+pub struct DeviceReservation {
+    bytes: AtomicU64,
+}
+
+impl DeviceReservation {
+    /// Bytes this reservation currently accounts for.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Promise `extra` more against the same budget, under this reservation.
+    ///
+    /// Returns false and changes nothing if the budget will not take it — the
+    /// caller then does without whatever it wanted the bytes for, rather than
+    /// holding memory the accounting cannot see.
+    pub fn grow(&self, extra: u64) -> bool {
+        let Ok(be) = backend() else { return false };
+        let mut held = be.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(extra) > be.vram_budget_bytes {
+                return false;
+            }
+            match be.reserved.compare_exchange_weak(
+                held,
+                held + extra,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.bytes.fetch_add(extra, Ordering::Relaxed);
+                    note_reserved(held + extra);
+                    return true;
+                }
+                Err(seen) => held = seen,
+            }
+        }
+    }
+
+    /// Give `given` of them back, when what they were promised for is dropped
+    /// before the reservation is.
+    pub fn shrink(&self, given: u64) {
+        let given = given.min(self.bytes.load(Ordering::Relaxed));
+        if given == 0 {
+            return;
+        }
+        self.bytes.fetch_sub(given, Ordering::Relaxed);
+        if let Ok(be) = backend() {
+            be.reserved.fetch_sub(given, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for DeviceReservation {
+    fn drop(&mut self) {
+        if let Ok(be) = backend() {
+            be.reserved
+                .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Hands the device default memory pool's retained blocks back to the OS.
+///
+/// The pool keeps freed stream-ordered allocations forever by design (see
+/// [`retain_default_mempool`]), which is what makes repeated allocations cheap
+/// — and also what makes a *new* shape of allocation fail while the pool sits
+/// on memory it is not using. Best-effort: a failure leaves things as they are.
+fn trim_default_mempool() {
+    use cudarc::driver::sys;
+    let Ok(be) = backend() else { return };
+    // SAFETY: raw driver calls. The device is the backend's, the out-pointer a
+    // stack slot, and the target size is read as a u64. Errors are swallowed.
     unsafe {
-        let dev = ctx.cu_device();
+        let dev = be.ctx.cu_device();
         let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
         if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
             .result()
@@ -268,21 +541,193 @@ fn retain_default_mempool(ctx: &CudaContext) {
         {
             return;
         }
-        // Default: retain freed stream-ordered blocks indefinitely (u64::MAX)
-        // for reuse. `LAMBDA_VM_MEMPOOL_RELEASE_MB` overrides the cap (bytes the
-        // pool keeps before returning memory to the OS) when retained-pool
-        // growth needs bounding.
-        let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(u64::MAX);
-        let _ = sys::cuMemPoolSetAttribute(
-            pool,
-            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            &threshold as *const u64 as *mut core::ffi::c_void,
-        )
-        .result();
+        let _ = sys::cuMemPoolTrimTo(pool, 0).result();
+    }
+}
+
+/// Lands every stream's pending frees and hands the pool's retained blocks
+/// back.
+///
+/// The frees are stream-ordered, so a buffer dropped on another stream is not
+/// free until that stream reaches the drop — and the pool cannot return what
+/// it has not been given yet. Draining the whole context first is what makes
+/// the trim worth doing.
+///
+/// Public because a test that asks the driver how much memory this process has
+/// taken needs the pool empty first, or it is measuring the pool's retention
+/// instead of the caller's — see `a_group_holds_only_its_codewords_before_any_open`.
+pub fn drain_and_trim() -> Result<()> {
+    let be = backend()?;
+    be.ctx.synchronize()?;
+    trim_default_mempool();
+    Ok(())
+}
+
+/// Promises `bytes` against the budget for a caller whose structure outlives
+/// the type that spends them.
+pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
+    backend().ok()?.reserve(bytes)
+}
+
+/// Argue-surface device fallbacks: the reservation refusals in math-cuda's
+/// `sumcheck`, `gkr` and `columns`, counted where each one's `reserve` returns
+/// `None` and its work moves to the host.
+///
+/// ⛔ WHY THIS EXISTS. Until this counter the only fallback number the campaign
+/// read was `multilinear::gpu::host_fallbacks()`, which has ONE caller — the
+/// COMMIT path (`multilinear/src/whir_chain.rs`) — so every `host fallbacks 0`
+/// certified that no COMMITMENT fell back and said NOTHING about the per-table
+/// ARGUMENT. wt16 was net-negative for exactly that blind spot: the leaf-layer
+/// retention grew `be.reserved`, argue's `reserve` then refused and moved to
+/// the host UNCOUNTED, and the slot-level reading looked like a clean win.
+/// Read beside `host_fallbacks()`, this makes "the device did the work"
+/// distinguishable from "it quietly did not" on the argue surface.
+///
+/// SCOPE, stated precisely. The FIVE argue-side `reserve`→`None` sites in
+/// `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1), `columns.rs`
+/// (×1). This is NOT the whole device surface, and it does not claim to be:
+/// `multilinear/src/gpu.rs` holds two further argue-side sites — `:177`
+/// (`reserve_room`) and `:1572` (the GKR tree) — whose `None` still falls to
+/// the host uncounted. Those are a documented FOLLOW-UP, out of this counter's
+/// scope, because each needs its caller traced before it can honestly be
+/// labelled a fallback. A THIRD site there, `:1551`, is a SPECULATIVE reserve
+/// whose `None` selects a lazy path that is STILL on the device — NOT a
+/// fallback, and it must never be counted. Putting a wrong site into the very
+/// counter meant to end false numbers is the one thing to avoid.
+static DEVICE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Argue-surface device fallbacks this process has taken — see
+/// [`DEVICE_FALLBACKS`] for the enumerated sites and the scope it does not
+/// cover. Read alongside `multilinear::gpu::host_fallbacks()` (the commit-side
+/// count) for both surfaces.
+pub fn device_fallbacks() -> u64 {
+    DEVICE_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Zero the process-wide counter. For a test that wants to assert a delta, and
+/// for a harness that reads one prove's worth from a reused process.
+pub fn reset_device_fallbacks() {
+    DEVICE_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+/// Record one argue-side reservation refusal — bumped at each of the five
+/// sites [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
+pub(crate) fn note_device_fallback() {
+    DEVICE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ★ The high-water mark of `be.reserved` — the PEAK simultaneous device
+/// reservation this process reached, updated wherever the total rises
+/// ([`Backend::reserve`] and [`DeviceReservation::grow`]).
+///
+/// This is the reservation quantity argue's `reserve` is checked against, which
+/// the raw device trace cannot report: the raw peak includes the never-purge
+/// pool's retained blocks and sits above the reservation budget, while THIS is
+/// exactly what the budget gates. A control run reads argue's peak reservation
+/// demand here; and while the evictable retention holds only spare bytes, this
+/// stays below the budget by construction.
+static RESERVED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `be.reserved` just rose to `now`, keeping the peak.
+fn note_reserved(now: u64) {
+    RESERVED_HIGH_WATER.fetch_max(now, Ordering::Relaxed);
+}
+
+/// The peak simultaneous device reservation this process reached — see
+/// [`RESERVED_HIGH_WATER`].
+pub fn reserved_high_water() -> u64 {
+    RESERVED_HIGH_WATER.load(Ordering::Relaxed)
+}
+
+/// Zero the reservation high-water. For a test asserting a delta.
+pub fn reset_reserved_high_water() {
+    RESERVED_HIGH_WATER.store(0, Ordering::Relaxed);
+}
+
+/// ★ THE RETENTION EVICTOR — the callback the WHIR leaf-layer retention installs
+/// so the allocator can reclaim spare retained bytes UNDER PRESSURE, on a real
+/// caller's behalf, without `device.rs` depending on `whir.rs`.
+///
+/// This is what makes the retention a PRIORITY scheme, not a byte race
+/// ([[gpu-two-vramgates-overlap]]): it holds only genuinely-spare bytes, and the
+/// instant a real caller (argue) cannot get its reservation, the layers are
+/// given back. A plain `fn` pointer — Send + Sync, no allocation — installed once
+/// via `OnceLock`; it takes a byte TARGET and returns how many it actually freed.
+///
+/// ⛔ CONTRACT the evictor MUST honour (see `whir::evict_retained_layers`): it
+/// frees by dropping retained layers and calling `DeviceReservation::shrink`, and
+/// it MUST NOT call `reserve` or `grow` — those would re-enter the allocator that
+/// called it and deadlock.
+static EVICTOR: OnceLock<fn(u64) -> u64> = OnceLock::new();
+
+/// Install the retention evictor. Idempotent — only the first install sticks.
+pub fn set_retention_evictor(evictor: fn(u64) -> u64) {
+    let _ = EVICTOR.set(evictor);
+}
+
+/// Ask the retention to give back at least `target` bytes of budget; returns how
+/// many it freed (0 if none is installed or nothing was reclaimable).
+fn try_evict_retained(target: u64) -> u64 {
+    match EVICTOR.get() {
+        Some(evict) => evict(target),
+        None => 0,
+    }
+}
+
+/// Allocates on `stream`, and if the device says no, gives the pool's retained
+/// blocks back and asks once more.
+///
+/// "Out of memory" from the stream-ordered allocator usually means the pool is
+/// holding blocks of the wrong shape, not that the device is full — a second
+/// prover on the same card is enough. It is worth one retry: a prove whose
+/// tables are already on the device has nowhere to fall back to, so a failure
+/// here is a failed proof.
+///
+/// # Safety
+/// The caller must write every element before reading it, as with
+/// `CudaStream::alloc`.
+pub unsafe fn alloc_or_trim<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    // SAFETY: the caller's, forwarded.
+    match unsafe { stream.alloc::<T>(len) } {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            // SAFETY: the caller's, forwarded.
+            unsafe { stream.alloc::<T>(len) }
+        }
+    }
+}
+
+/// Uploads on `stream`, with the same one retry as [`alloc_or_trim`]: a copy
+/// to the device allocates too, and the small ones are no less fatal for being
+/// small.
+pub fn htod_or_trim<T: cudarc::driver::DeviceRepr + Unpin>(
+    stream: &Arc<CudaStream>,
+    src: &[T],
+) -> Result<CudaSlice<T>> {
+    match stream.clone_htod(src) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.clone_htod(src)
+        }
+    }
+}
+
+/// The same, zeroed.
+pub fn alloc_zeros_or_trim<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    len: usize,
+) -> Result<CudaSlice<T>> {
+    match stream.alloc_zeros::<T>(len) {
+        Ok(slice) => Ok(slice),
+        Err(_) => {
+            drain_and_trim()?;
+            stream.alloc_zeros::<T>(len)
+        }
     }
 }
 
@@ -345,6 +790,7 @@ impl Backend {
         let arith = ctx.load_module(Ptx::from_binary(ARITH_CUBIN.to_vec()))?;
         let ntt = ctx.load_module(Ptx::from_binary(NTT_CUBIN.to_vec()))?;
         let keccak = ctx.load_module(Ptx::from_binary(KECCAK_CUBIN.to_vec()))?;
+        let rpx = ctx.load_module(Ptx::from_binary(RPX_CUBIN.to_vec()))?;
         let bary = ctx.load_module(Ptx::from_binary(BARY_CUBIN.to_vec()))?;
         let deep = ctx.load_module(Ptx::from_binary(DEEP_CUBIN.to_vec()))?;
         let fri = ctx.load_module(Ptx::from_binary(FRI_CUBIN.to_vec()))?;
@@ -352,6 +798,9 @@ impl Backend {
         let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
         let constraint_interp =
             ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
+        let blake3 = ctx.load_module(Ptx::from_binary(BLAKE3_CUBIN.to_vec()))?;
+        let sumcheck = ctx.load_module(Ptx::from_binary(SUMCHECK_CUBIN.to_vec()))?;
+        let whir_fold = ctx.load_module(Ptx::from_binary(WHIR_FOLD_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -410,8 +859,13 @@ impl Backend {
             ext3_add: arith.load_function("ext3_add_kernel")?,
             ext3_sub: arith.load_function("ext3_sub_kernel")?,
             bit_reverse_permute: ntt.load_function("bit_reverse_permute")?,
+            lift_spread: ntt.load_function("lift_spread")?,
+            mobius_level: ntt.load_function("mobius_level")?,
+            mobius_low_levels: ntt.load_function("mobius_low_levels")?,
+            mobius_tile: ntt.load_function("mobius_tile")?,
             ntt_dit_level: ntt.load_function("ntt_dit_level")?,
             ntt_dit_8_levels: ntt.load_function("ntt_dit_8_levels")?,
+            ntt_dit_tile: ntt.load_function("ntt_dit_tile")?,
             pointwise_mul: ntt.load_function("pointwise_mul")?,
             scalar_mul: ntt.load_function("scalar_mul")?,
             bit_reverse_permute_batched: ntt.load_function("bit_reverse_permute_batched")?,
@@ -428,16 +882,67 @@ impl Backend {
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_row_major_row_pair_range: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
+            keccak256_leaves_base_row_major_row_range: keccak
+                .load_function("keccak256_leaves_base_row_major_row_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_base_coset: keccak.load_function("keccak256_leaves_base_coset")?,
+            keccak256_leaves_ext3_coset: keccak.load_function("keccak256_leaves_ext3_coset")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
             grind_search: keccak.load_function("grind_search")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
+            keccak_fri_group_leaves_ext3: keccak.load_function("keccak_fri_group_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
             keccak_merkle_tail: keccak.load_function("keccak_merkle_tail")?,
             merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
+            blake3_leaves_base_row_major_row_pair: blake3
+                .load_function("blake3_leaves_base_row_major_row_pair")?,
+            blake3_leaves_base_row_major_row_pair_range: blake3
+                .load_function("blake3_leaves_base_row_major_row_pair_range")?,
+            blake3_leaves_base_row_major_row_range: blake3
+                .load_function("blake3_leaves_base_row_major_row_range")?,
+            blake3_leaves_base_batched: blake3.load_function("blake3_leaves_base_batched")?,
+            blake3_leaves_base_row_pair_batched: blake3
+                .load_function("blake3_leaves_base_row_pair_batched")?,
+            blake3_leaves_ext3_batched: blake3.load_function("blake3_leaves_ext3_batched")?,
+            blake3_comp_poly_leaves_ext3: blake3.load_function("blake3_comp_poly_leaves_ext3")?,
+            blake3_fri_leaves_ext3: blake3.load_function("blake3_fri_leaves_ext3")?,
+            blake3_fri_group_leaves_ext3: blake3.load_function("blake3_fri_group_leaves_ext3")?,
+            blake3_merkle_level: blake3.load_function("blake3_merkle_level")?,
+            blake3_merkle_tail: blake3.load_function("blake3_merkle_tail")?,
+            blake3_compress_probe_6r: blake3.load_function("blake3_compress_probe_6r")?,
+            blake3_compress_probe_7r: blake3.load_function("blake3_compress_probe_7r")?,
+            blake3_compress_probe_default: blake3.load_function("blake3_compress_probe_default")?,
+            blake3_rounds_probe: blake3.load_function("blake3_rounds_probe")?,
+            blake3_serialize_felts_probe: blake3.load_function("blake3_serialize_felts_probe")?,
+            blake3_blocks_of_felts_probe: blake3.load_function("blake3_blocks_of_felts_probe")?,
+            blake3_chain_probe: blake3.load_function("blake3_chain_probe")?,
+
+            rpx_leaves_base_row_major_row_pair: rpx
+                .load_function("rpx_leaves_base_row_major_row_pair")?,
+            rpx_leaves_base_row_major_row_pair_range: rpx
+                .load_function("rpx_leaves_base_row_major_row_pair_range")?,
+            rpx_leaves_base_row_major_row_range: rpx
+                .load_function("rpx_leaves_base_row_major_row_range")?,
+            rpx_leaves_base_batched: rpx.load_function("rpx_leaves_base_batched")?,
+            rpx_leaves_base_row_pair_batched: rpx
+                .load_function("rpx_leaves_base_row_pair_batched")?,
+            rpx_leaves_ext3_batched: rpx.load_function("rpx_leaves_ext3_batched")?,
+            rpx_comp_poly_leaves_ext3: rpx.load_function("rpx_comp_poly_leaves_ext3")?,
+            rpx_fri_leaves_ext3: rpx.load_function("rpx_fri_leaves_ext3")?,
+            rpx_fri_group_leaves_ext3: rpx.load_function("rpx_fri_group_leaves_ext3")?,
+            rpx_merkle_level: rpx.load_function("rpx_merkle_level")?,
+            rpx_merkle_tail: rpx.load_function("rpx_merkle_tail")?,
+            rpx_permute_probe: rpx.load_function("rpx_permute_probe")?,
+            // The WHIR path's leaves are a fold COSET, not a row group, so these
+            // two are additional kernels rather than alternatives to the seven
+            // above. `rpx_merkle_level` / `rpx_merkle_tail` are shared.
+            rpx_leaves_base_coset: rpx.load_function("rpx_leaves_base_coset")?,
+            rpx_leaves_ext3_coset: rpx.load_function("rpx_leaves_ext3_coset")?,
+            rpx_grind_search: rpx.load_function("rpx_grind_search")?,
+            rpx_grind_search_counted: rpx.load_function("rpx_grind_search_counted")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
@@ -470,6 +975,24 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            whir_fold_base_ext3: whir_fold.load_function("whir_fold_base_ext3")?,
+            whir_fold_ext3: whir_fold.load_function("whir_fold_ext3")?,
+            gather_cosets: whir_fold.load_function("gather_cosets")?,
+            sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,
+            sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
+            sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
+            mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
+            eq_expand_level_ext3: sumcheck.load_function("eq_expand_level_ext3")?,
+            eq_seed_shares_ext3: sumcheck.load_function("eq_seed_shares_ext3")?,
+            eq_expand_level_shares_ext3: sumcheck.load_function("eq_expand_level_shares_ext3")?,
+            program_map_ext3: sumcheck.load_function("program_map_ext3")?,
+            factors_from_columns_ext3: sumcheck.load_function("factors_from_columns_ext3")?,
+            mle_lift_base_ext3: sumcheck.load_function("mle_lift_base_ext3")?,
+            add_scaled_ext3: sumcheck.load_function("add_scaled_ext3")?,
+            fill_ext3: sumcheck.load_function("fill_ext3")?,
+            fraction_fold_ext3: sumcheck.load_function("fraction_fold_ext3")?,
+            fraction_fold_padded_ext3: sumcheck.load_function("fraction_fold_padded_ext3")?,
+            mle_fold_base_ext3_many: sumcheck.load_function("mle_fold_base_ext3_many")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp
@@ -486,13 +1009,127 @@ impl Backend {
             util_stream,
             next: AtomicUsize::new(0),
             vram_budget_bytes,
+            reserved: AtomicU64::new(0),
         })
     }
 
-    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// VRAM budget in bytes for admission control. `u64::MAX`
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
         self.vram_budget_bytes
+    }
+
+    /// Live `(free, total)` device memory in bytes, for diagnostics — the
+    /// admission gates never read it (they must answer the same at R1 and at
+    /// R4). `None` when the query fails.
+    pub fn device_mem_info(&self) -> Option<(u64, u64)> {
+        self.ctx
+            .mem_get_info()
+            .ok()
+            .map(|(free, total)| (free as u64, total as u64))
+    }
+
+    /// Hand the default memory pool's unused reserved memory back to the OS,
+    /// keeping at most `keep_bytes` (`cuMemPoolTrimTo`). Under the retained
+    /// posture ([`mempool_release_threshold_bytes`]) a sync never releases;
+    /// this is the explicit release for the moments reuse cannot serve — a
+    /// differently-shaped table after a large one, or a sampler that must read
+    /// the live working set. Best effort: `false` when the pool cannot be
+    /// queried or the trim fails.
+    pub fn trim_mempool_to(&self, keep_bytes: u64) -> bool {
+        use cudarc::driver::sys;
+        // SAFETY: raw driver calls on this backend's live context; the trim
+        // takes a plain byte count.
+        unsafe {
+            default_mempool(&self.ctx).is_some_and(|pool| {
+                sys::cuMemPoolTrimTo(pool, keep_bytes as usize)
+                    .result()
+                    .is_ok()
+            })
+        }
+    }
+
+    /// Bytes the device reports free, right now.
+    ///
+    /// The driver's own accounting rather than this module's: [`reserve`]
+    /// counts what callers PROMISED, which is silent about anything allocated
+    /// without a reservation. A test that wants to know whether a structure is
+    /// holding device memory it never declared has to ask the device, and this
+    /// is how — see `a_group_holds_only_its_codewords_before_any_open`.
+    ///
+    /// ⚠ The stream-ordered pool retains freed blocks, so this falls as memory
+    /// is used and does not always rise as it is released. It answers "how
+    /// much has this process taken from the device", not "how much is live",
+    /// which is the question a retention test is asking.
+    pub fn free_vram_bytes(&self) -> Result<u64> {
+        use cudarc::driver::sys;
+        self.ctx.bind_to_thread()?;
+        // SAFETY: a raw driver query writing into two stack slots, with the
+        // context bound to this thread on the line above.
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize).result()?;
+            Ok(free as u64)
+        }
+    }
+
+    /// Promises `bytes` of the device to something about to be built there, or
+    /// refuses.
+    ///
+    /// Asking the driver how much is free does not answer this: two callers
+    /// can both be told yes and both be right at the moment they ask. What a
+    /// structure needs is that the room stays its own until it is done — a
+    /// codeword that is admitted and then cannot fold has nowhere to go, since
+    /// there is no copy on the host by then.
+    ///
+    /// Refusing is cheap wherever it is asked, because everything that asks
+    /// has a host path. The budget binds only when several proofs share a
+    /// card: one of them is enough to fill it.
+    pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
+        let mut evicted = false;
+        let mut held = self.reserved.load(Ordering::Relaxed);
+        loop {
+            if held.saturating_add(bytes) > self.vram_budget_bytes {
+                // ★ Before giving up, ask the retention for spare bytes ONCE. The
+                // retention holds only genuinely-spare leaf layers and gives them
+                // back here, so a real caller (argue) is never displaced by a
+                // cache — the fix for wt16, where the retention won the shared
+                // budget and argue fell to the host. Bounded to one pass by
+                // `evicted`, so a persistent miss returns None (and the call
+                // site's `note_device_fallback` counts it) rather than spinning.
+                if !evicted {
+                    evicted = true;
+                    let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;
+                    if try_evict_retained(deficit) > 0 {
+                        held = self.reserved.load(Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                return None;
+            }
+            match self.reserved.compare_exchange_weak(
+                held,
+                held + bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    note_reserved(held + bytes);
+                    return Some(DeviceReservation {
+                        bytes: AtomicU64::new(bytes),
+                    });
+                }
+                Err(seen) => held = seen,
+            }
+        }
+    }
+
+    /// Bytes promised across every live reservation — what `reserve` checks
+    /// the budget against. Exposed so a test can assert the number rather than
+    /// assert that nothing crashed.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved.load(Ordering::Relaxed)
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
@@ -895,5 +1532,84 @@ impl Backend {
             None => self.ctx.new_event(None)?,
         };
         Ok(PooledEvent { event: Some(ev) })
+    }
+}
+
+#[cfg(test)]
+mod device_fallback_counter_tests {
+    use super::{
+        device_fallbacks, note_device_fallback, note_reserved, reserved_high_water,
+        reset_device_fallbacks, reset_reserved_high_water,
+    };
+    use std::sync::Mutex;
+
+    /// The counter is process-wide, so a test asserting an absolute value
+    /// serialises against anything else in this binary that might move it.
+    static COUNTER: Mutex<()> = Mutex::new(());
+
+    /// The plumbing, card-free: a bump reads as one, bumps accumulate, and a
+    /// reset reads as zero. This is the CONTROL for the box test — if
+    /// `note`/`device_fallbacks`/`reset` did not agree here, no site test could
+    /// be trusted.
+    #[test]
+    fn note_bumps_read_and_reset_zeroes() {
+        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        reset_device_fallbacks();
+        assert_eq!(device_fallbacks(), 0, "reset must zero the counter");
+        note_device_fallback();
+        assert_eq!(device_fallbacks(), 1, "one note reads one");
+        note_device_fallback();
+        assert_eq!(device_fallbacks(), 2, "notes accumulate");
+        reset_device_fallbacks();
+        assert_eq!(device_fallbacks(), 0, "reset must zero it again");
+    }
+
+    /// ⛔ THE FOUR UNDRIVEN SITES' FALSIFIER. The box test drives ONE site
+    /// (`DeviceColumns::upload`); this arm is what lets the other four fail
+    /// without four card fixtures. `note_device_fallback` must be CALLED at
+    /// exactly the five argue-surface sites the counter's doc enumerates —
+    /// three in `sumcheck.rs`, one in `gkr.rs`, one in `columns.rs`. Removing
+    /// the call at ANY site changes the tuple and reddens this test by name,
+    /// which localises the loss to the file it happened in.
+    ///
+    /// The pattern carries the `crate::device::` prefix so it counts CALLS and
+    /// never the definition (`pub(crate) fn note_device_fallback`).
+    #[test]
+    fn note_device_fallback_is_called_at_exactly_the_five_argue_sites() {
+        const PATTERN: &str = "crate::device::note_device_fallback()";
+        let sumcheck = include_str!("sumcheck.rs").matches(PATTERN).count();
+        let gkr = include_str!("gkr.rs").matches(PATTERN).count();
+        let columns = include_str!("columns.rs").matches(PATTERN).count();
+        assert_eq!(
+            (sumcheck, gkr, columns),
+            (3, 1, 1),
+            "the argue-surface device-fallback counter must be bumped at exactly \
+             the five sites the counter's doc names: sumcheck ×3, gkr ×1, \
+             columns ×1 (found sumcheck {sumcheck}, gkr {gkr}, columns {columns})"
+        );
+    }
+
+    /// The reservation high-water is a MONOTONE peak: it takes the max, so a
+    /// smaller rise never lowers it and a larger one raises it. Card-free — it
+    /// exercises `note_reserved` directly (the same call `reserve`/`grow` make on
+    /// every successful rise of `be.reserved`), so a peak that failed to track
+    /// would show here before any card run relied on the number.
+    #[test]
+    fn reserved_high_water_keeps_the_max() {
+        let _g = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero the high-water");
+        note_reserved(100);
+        assert_eq!(reserved_high_water(), 100, "the first rise sets the peak");
+        note_reserved(50);
+        assert_eq!(
+            reserved_high_water(),
+            100,
+            "a smaller rise must not lower it"
+        );
+        note_reserved(200);
+        assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
+        reset_reserved_high_water();
+        assert_eq!(reserved_high_water(), 0, "reset must zero it again");
     }
 }

@@ -16,29 +16,49 @@ pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+pub mod hash_pin;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+pub mod lfm;
+pub mod multilinear_continuation;
+pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
+#[cfg(feature = "shape-profile")]
+pub mod shape_profile;
 mod statement;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
+pub mod whir_hash_knob;
+pub mod whir_identity;
+pub mod zf_format;
+
+// The lib's test harness runs the allocator the shipped binary runs
+// (`bin/cli/src/main.rs` installs the same one), so every host-memory number a
+// `cargo test --lib` measurement produces is a production-allocator number.
+// Under the platform allocator the same proves read up to 13 GiB higher at the
+// wrap's q=41 rung: glibc kept freed arena chunks resident, and the run
+// measured the allocator, not the prover. Integration tests are separate
+// crates and install their own (`tests/calibration.rs` already does).
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::fmt;
+use std::sync::Arc;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
@@ -51,12 +71,12 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    E, F, VmAir, create_bitwise_air, create_blake3_air, create_branch_air, create_bytewise_air,
+    create_commit_air, create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_hint_air,
+    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -89,6 +109,15 @@ pub struct RuntimePageRange {
 /// continuation epoch carries it only when it is the final one, so `verify_epoch`
 /// sizes non-final epochs with `FIXED_TABLE_COUNT - 1`. Any caller computing an
 /// expected sub-proof count for a continuation epoch must do the same.
+///
+/// ⚠ Every always-on table costs every proof a near-empty AIR even when the
+/// workload never touches it (the EC-campaign lesson, PR #871). BLAKE3 was
+/// always-on for one release and that bill came due: on a real block it cost
+/// the recursion wrap +31.2% of its trace cells and +44% of its peak memory,
+/// out of a table carrying 0.035% of the epoch's own cells. It left this count
+/// for [`TableCounts::blake3`], and the six accelerator chips followed it for
+/// the same reason — see that field for why omitting such a table is sound
+/// (`thoughts/shared/block-compression/WRAP-GROWTH-BISECT.md`).
 pub const FIXED_TABLE_COUNT: usize = 5;
 
 /// How many sub-proofs each counted table contributes. Chunked chips report
@@ -120,6 +149,55 @@ pub struct TableCounts {
     pub ecdas: usize,
     pub hint: usize,
     pub commit: usize,
+    /// ★ BLAKE3 tables: **0 or 1**, not a chunk count — 1 iff the workload
+    /// executed at least one BLAKE3 syscall.
+    ///
+    /// ## Why a zero here is sound, when a zero anywhere else is not
+    ///
+    /// Every other field in this struct is rejected at zero by
+    /// [`TableCounts::validate`], because dropping (say) the LT table would
+    /// delete its constraints while the CPU rows that depend on them stay in
+    /// the proof — the classic remove-the-checker forgery. BLAKE3 is different,
+    /// and the difference is a bus argument, not a convention:
+    ///
+    /// - CPU is the sole SENDER on [`tables::types::BusId::Ecall`], with
+    ///   multiplicity `Column(cols::ECALL)` and tuple
+    ///   `[timestamp, 0, rv1]`, where `rv1` is the syscall number read out of
+    ///   the guest's register — **trace data**, not a constant
+    ///   (`tables/cpu.rs`, the ECALL sender).
+    /// - Each syscall table RECEIVES on that same bus with its own syscall
+    ///   number as a hardcoded constant in the tuple. The BLAKE3 table has TWO
+    ///   such receivers, one per mode: the single-compression receive carries
+    ///   `BLAKE3_SYSCALL_NUMBER` (`tables/blake3.rs`, interaction 1) and the
+    ///   absorb receive carries `BLAKE3_ABSORB_SYSCALL_NUMBER` (gated on the
+    ///   group's FIRST row). No other receiver in the machine carries either
+    ///   constant, so the argument covers both syscalls: omitting the table
+    ///   strands compress sends and absorb sends alike.
+    ///
+    /// So a workload that executes a BLAKE3 syscall — either mode — necessarily
+    /// puts a send on the Ecall bus whose tuple only the BLAKE3 table can match. Omit the
+    /// table and that send has no receiver: the global LogUp sum is non-zero,
+    /// and `multi_verify` rejects on bus balance before any constraint is
+    /// evaluated. A prover claiming `blake3: 0` for an epoch that used BLAKE3
+    /// is therefore not saving work — it is producing a proof that cannot
+    /// verify. The count is a size hint the bus already enforces, not a
+    /// permission the verifier grants.
+    ///
+    /// ## Why it must still be bound into the statement
+    ///
+    /// `include_halt` is NOT a precedent for leaving this unbound: `is_final`
+    /// is known to the verifier a priori, whereas "this epoch used BLAKE3" is
+    /// asserted by the prover. Unbound, prover and verifier could build
+    /// different AIR sets from the same bytes. It is bound the same way every
+    /// other count is — absorbed into the Fiat-Shamir transcript by
+    /// `statement::absorb_statement_with_digest`, so a disagreement diverges
+    /// every derived challenge — and cross-checked against the sub-proof count
+    /// in `verify_proof_parts`.
+    ///
+    /// Bounded above by 1 in [`TableCounts::validate`]: extra BLAKE3 tables buy
+    /// an attacker nothing, but an unbounded count would let a malformed proof
+    /// make the verifier build arbitrarily many AIRs before any other check.
+    pub blake3: usize,
 }
 
 impl TableCounts {
@@ -152,6 +230,7 @@ impl TableCounts {
             self.ecdas,
             self.hint,
             self.commit,
+            self.blake3,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -168,12 +247,14 @@ impl TableCounts {
     ///
     /// What keeps a zero count honest is the LogUp bus, not this check. A chip
     /// influences the run only through its bus interactions, and none of the
-    /// eighteen optional chips carries boundary constraints of its own, so one
-    /// with no rows contributes zero to the bus and removing it changes nothing.
-    /// (The mandatory tables do constrain boundaries — that is part of why they
-    /// are mandatory.) A prover that omits a table whose operations *did*
-    /// execute leaves its counterparty's sends unmatched, and the bus-balance
-    /// check — summed over the tables that are present — rejects the proof.
+    /// optional chips carries boundary constraints of its own, so one with no
+    /// rows contributes zero to the bus and removing it changes nothing. (The
+    /// mandatory tables do constrain boundaries — that is part of why they are
+    /// mandatory.) A prover that omits a table whose operations *did* execute
+    /// leaves its counterparty's sends unmatched, and the bus-balance check —
+    /// summed over the tables that are present — rejects the proof. For BLAKE3
+    /// the same argument is spelled out end to end on [`TableCounts::blake3`],
+    /// down to the two Ecall receivers that make it airtight.
     ///
     /// Two things that argument needs, both pinned by tests. Each omitted table
     /// must be a bus participant (`every_table_participates_in_the_bus`), and
@@ -205,6 +286,11 @@ impl TableCounts {
         // load-bearing for memory safety — both verifiers run the cross-check
         // before any count sizes an AIR set — and if one of them ever becomes
         // chunked, this list is what changes.
+        //
+        // BLAKE3 belongs to the same list for the same reason, and had its own
+        // bound before these six existed: nothing is gained by claiming more
+        // than one BLAKE3 table, and an unbounded count would have the verifier
+        // allocate AIRs off a number the proof has not been checked against.
         let at_most_one = [
             ("keccak", self.keccak),
             ("keccak_rnd", self.keccak_rnd),
@@ -212,11 +298,12 @@ impl TableCounts {
             ("ecdas", self.ecdas),
             ("hint", self.hint),
             ("commit", self.commit),
+            ("blake3", self.blake3),
         ];
         for (name, count) in at_most_one {
             if count > 1 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is {count} — accelerator tables are not chunked"
+                    "{name} count is {count} — this table is not chunked"
                 )));
             }
         }
@@ -276,12 +363,31 @@ pub struct GuestInput {
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
-/// Wire-format version of the recursion input blob. v3: `TableCounts` gained the
-/// six accelerator fields, which moves every field after it in the archive. v2:
-/// rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives use 32-bit offsets.
-/// Any change to a type reachable from `GuestInput` belongs here: the guest
-/// reads the archive in place, so a stale blob is misread rather than rejected.
-pub const RECURSION_INPUT_VERSION: u32 = 3;
+/// Wire-format version of the recursion input blob.
+///
+/// Any change to a type reachable from `GuestInput` belongs here. The prefix IS
+/// checked — `recursion_archive_bytes` rejects a version it does not recognise
+/// before the guest's in-place read — so a blob carrying an OLD number is
+/// refused legibly. The hazard this constant exists for is the other one: a
+/// layout change that does NOT bump it passes that check and is then read in
+/// place at offsets the reader does not expect.
+///
+/// - v1: rkyv 32-bit rel-ptrs.
+/// - v2: rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives are incompatible.
+/// - v3: one epoch proof format. `EpochProof::proof` is a `MultiProof` where v2
+///   had an `EpochProofBody` enum, so every v2 archive carries a discriminant at
+///   an offset a v3 reader does not expect.
+/// - v4: `TableCounts` gained the six accelerator fields, which moves every
+///   field after it in the archive.
+///
+/// ⚠ v4 EXISTS BECAUSE TWO BRANCHES BOTH CALLED THEIR CHANGE v3, which is the
+/// unbumped case in disguise. The per-table lineage's v3 is the epoch proof
+/// format; main's v3 is the accelerator fields. Both are reachable from
+/// `GuestInput` and neither is a superset of the other, so two mutually
+/// unreadable archives carried one number — and a prefix check cannot tell them
+/// apart. Keeping either suffix would have been a silent misread; the merged
+/// format carries both changes and is v4.
+pub const RECURSION_INPUT_VERSION: u32 = 4;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
@@ -566,7 +672,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Type alias for AIR-trace-public-inputs triples used in multi-table proving.
-type AirTracePair<'a> = (
+pub type AirTracePair<'a> = (
     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     &'a mut stark::trace::TraceTable<F, E>,
     &'a (),
@@ -590,6 +696,7 @@ pub(crate) struct VmAirs {
     pub keccaks: Vec<VmAir>,
     pub keccak_rnds: Vec<VmAir>,
     pub keccak_rc: VmAir,
+    pub blake3: VmAir,
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
@@ -599,11 +706,44 @@ pub(crate) struct VmAirs {
     /// Whether the HALT table participates in this proof. False for intermediate
     /// continuation epochs, which do not terminate the program.
     pub include_halt: bool,
+    /// Whether the BLAKE3 table participates in this proof — `table_counts
+    /// .blake3 == 1`, i.e. the workload executed a BLAKE3 syscall.
+    ///
+    /// Unlike `include_halt`, this is NOT verifier-known a priori: `is_final`
+    /// follows from the epoch's position, while "did this workload use BLAKE3"
+    /// is asserted by the prover. Honouring that assertion is safe only because
+    /// a false one cannot verify — see [`TableCounts::blake3`] for the
+    /// Ecall-bus argument. Both sides derive this from the same bound count, so
+    /// they cannot silently build different AIR sets.
+    pub include_blake3: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
     pub stores: Vec<VmAir>,
     pub cpu32s: Vec<VmAir>,
+}
+
+/// What a continuation epoch preprocesses REGISTER against: the commitment
+/// **and** the two public vectors it commits, INIT = `R_i` and FINI = `R_{i+1}`.
+///
+/// ★ THE VECTORS TRAVEL WITH THE COMMITMENT BECAUSE THE TWO VERIFIERS BIND
+/// DIFFERENT THINGS. The univariate verifier recomputes the root and compares
+/// it; the multilinear one has no precomputed tree and instead checks the
+/// proof's claimed openings of columns `0..n` against the values the program
+/// implies, which it obtains from
+/// [`stark::traits::AIR::precomputed_columns`]. Handing an AIR a commitment
+/// with no columns closure therefore binds the first path and nothing at all on
+/// the second. Carrying both here makes "preprocessed" mean the same thing on
+/// both, and makes the omission a missing field rather than a silent `None`.
+pub struct RegisterPreprocessed<'a> {
+    /// The root, for the univariate verifier.
+    pub commitment: Commitment,
+    /// `R_i`, the epoch's starting register file — the verifier's own value:
+    /// the ELF's entry point for epoch 0, the previous epoch's proved `reg_fini`
+    /// after that.
+    pub init: &'a [u32],
+    /// `R_{i+1}`, the epoch's final register file as the proof states it.
+    pub fini: &'a [u32],
 }
 
 impl VmAirs {
@@ -688,6 +828,16 @@ impl VmAirs {
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
+        }
+        // ★ BLAKE3 closes the accelerator group rather than keeping the slot it
+        // held between KECCAK_RC and ECSM. That slot no longer exists: the six
+        // accelerators stopped being always-on tables in the leading block and
+        // became counted ones here, and BLAKE3 is the same kind of chip — 0 or 1
+        // by `TableCounts::blake3`. Its position is a layout choice, and the only
+        // obligation is that `air_refs` below makes the identical one: those two
+        // orders ARE the proof's sub-proof layout.
+        if self.include_blake3 {
+            pairs.push((self.blake3.as_ref(), &mut traces.blake3, &()));
         }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
@@ -776,6 +926,11 @@ impl VmAirs {
         for air in &self.hints {
             refs.push(air.as_ref());
         }
+        // The same slot as `air_trace_pairs`: these two orders ARE the proof's
+        // layout, and must move together.
+        if self.include_blake3 {
+            refs.push(self.blake3.as_ref());
+        }
 
         for air in &self.cpus {
             refs.push(air.as_ref());
@@ -851,7 +1006,7 @@ impl VmAirs {
         include_halt: bool,
         register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
-        register_preprocessed: Option<(Commitment, usize)>,
+        register_preprocessed: Option<RegisterPreprocessed<'_>>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
@@ -875,10 +1030,13 @@ impl VmAirs {
             // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
-            Box::new(create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-            ))
+            Box::new(
+                create_bitwise_air(proof_options).with_lazy_preprocessed_columns(
+                    bitwise::lazy_commitment(proof_options),
+                    bitwise::NUM_PRECOMPUTED_COLS,
+                    Arc::new(bitwise::preprocessed_columns),
+                ),
+            )
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| {
@@ -908,14 +1066,27 @@ impl VmAirs {
                 Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
             })
             .collect();
-        let decode_root = decode_commitment.unwrap_or_else(|| {
-            decode::commitment_from_elf(elf, proof_options)
-                .expect("Failed to compute decode commitment")
-        });
-        let decode: VmAir = Box::new(
-            create_decode_air(proof_options)
-                .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS),
-        );
+        let decode: VmAir = {
+            // The instruction map, decoded once here rather than on every call:
+            // only the multilinear verifier asks, but it asks per proof.
+            let instructions = Arc::new(
+                decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
+            );
+            // Deferred: the commitment is an LDE and a Merkle tree over the
+            // program's whole instruction table, and only the univariate path
+            // compares it — the multilinear one checks the columns instead.
+            // Both leaf layouts (S2): the one-row root is computed on first
+            // use, never taken from a supplied row-pair root.
+            let decode_root =
+                decode::lazy_commitment(instructions.clone(), proof_options, decode_commitment);
+            Box::new(
+                create_decode_air(proof_options).with_lazy_preprocessed_columns(
+                    decode_root,
+                    decode::NUM_PRECOMPUTED_COLS,
+                    Arc::new(move || decode::preprocessed_columns(&instructions)),
+                ),
+            )
+        };
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| {
                 Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
@@ -952,10 +1123,18 @@ impl VmAirs {
                 ) as VmAir
             })
             .collect();
-        let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
-            tables::keccak_rc::NUM_PRECOMPUTED_COLS,
-        ));
+        let blake3: VmAir = Box::new(create_blake3_air(proof_options));
+        // The columns, not just the commitment: the multilinear path checks the
+        // precomputed columns' claimed openings rather than comparing a root, so
+        // without the generator it cannot tell a real preprocessed table from a
+        // forged one. The univariate path ignores the extra argument.
+        let keccak_rc: VmAir = Box::new(
+            create_keccak_rc_air(proof_options).with_lazy_preprocessed_columns(
+                tables::keccak_rc::lazy_commitment(proof_options),
+                tables::keccak_rc::NUM_PRECOMPUTED_COLS,
+                Arc::new(tables::keccak_rc::preprocessed_columns),
+            ),
+        );
         let ecsms: Vec<_> = (0..table_counts.ecsm)
             .map(|i| {
                 Box::new(create_ecsm_air(proof_options).with_name(&format!("ECSM[{i}]"))) as VmAir
@@ -971,21 +1150,45 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
-        let register: VmAir =
-            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
-                Box::new(
-                    create_register_air(proof_options)
-                        .with_preprocessed(commitment, num_preprocessed_cols),
-                )
-            } else {
-                let register_init = register_init
-                    .map(<[u32]>::to_vec)
-                    .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-                Box::new(create_register_air(proof_options).with_preprocessed(
-                    register::preprocessed_commitment(proof_options, &register_init),
+        let register: VmAir = if let Some(RegisterPreprocessed {
+            commitment,
+            init,
+            fini,
+        }) = register_preprocessed
+        {
+            // ⚠ THE COLUMNS, NOT ONLY THE COMMITMENT. `with_preprocessed`
+            // alone leaves `precomputed_columns()` empty, and the
+            // multilinear verifier checks exactly that list — an empty one
+            // in zero iterations. REGISTER was the only preprocessed AIR
+            // here built that way, so on the multilinear continuation path
+            // INIT and FINI were prover-chosen main trace: a bundle whose
+            // epoch 0 `reg_fini` had one bit flipped verified, on every
+            // epoch and through `verify_epochs`. The univariate path is
+            // unaffected either way — it compares the root and never calls
+            // `precomputed_columns()`.
+            let root = register::lazy_commitment_with_fini(proof_options, commitment, init, fini);
+            let init = init.to_vec();
+            let fini = fini.to_vec();
+            Box::new(
+                create_register_air(proof_options).with_lazy_preprocessed_columns(
+                    root,
+                    register::NUM_PREPROCESSED_COLS_WITH_FINI,
+                    Arc::new(move || register::preprocessed_columns_with_fini(&init, &fini)),
+                ),
+            )
+        } else {
+            let register_init = register_init
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+            let commitment = register::lazy_commitment(proof_options, &register_init);
+            Box::new(
+                create_register_air(proof_options).with_lazy_preprocessed_columns(
+                    commitment,
                     register::NUM_PREPROCESSED_COLS,
-                ))
-            };
+                    Arc::new(move || register::preprocessed_columns(&register_init)),
+                ),
+            )
+        };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -1013,28 +1216,38 @@ impl VmAirs {
                     // Committing OFFSET alone publishes nothing: it is the dense
                     // `0..page_size-1` enumeration, byte-identical for every page
                     // regardless of program or input.
-                    Box::new(air.with_preprocessed(
-                        page::private_page_preprocessed_commitment(proof_options),
+                    Box::new(air.with_lazy_preprocessed_columns(
+                        page::private_page_lazy_commitment(proof_options),
                         page::NUM_PREPROCESSED_COLS_PRIVATE,
+                        Arc::new(|| vec![page::offset_column()]),
                     ))
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
-                    Box::new(
-                        air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS),
-                    )
+                    let config = config.clone();
+                    Box::new(air.with_lazy_preprocessed_columns(
+                        page::zero_init_lazy_commitment_from(zero_init_commitment, proof_options),
+                        page::NUM_PREPROCESSED_COLS,
+                        Arc::new(move || page::preprocessed_columns(&config)),
+                    ))
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
                     // (recursion guest); otherwise recompute from the ELF.
-                    let commitment = page_commitments
+                    // Deferred when it has to be computed: two dozen pages of
+                    // LDE and Merkle that only the univariate path compares.
+                    let supplied = page_commitments
                         .unwrap_or(&[])
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
-                        .map(|(_, c)| *c)
-                        .unwrap_or_else(|| {
-                            page::compute_precomputed_commitment(config, proof_options)
-                        });
-                    Box::new(air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS))
+                        .map(|(_, c)| *c);
+                    let commitment =
+                        page::data_page_lazy_commitment(config, proof_options, supplied);
+                    let config = config.clone();
+                    Box::new(air.with_lazy_preprocessed_columns(
+                        commitment,
+                        page::NUM_PREPROCESSED_COLS,
+                        Arc::new(move || page::preprocessed_columns(&config)),
+                    ))
                 }
             })
             .collect();
@@ -1089,6 +1302,7 @@ impl VmAirs {
             keccaks,
             keccak_rnds,
             keccak_rc,
+            blake3,
             ecsms,
             ecdases,
             hints,
@@ -1096,6 +1310,7 @@ impl VmAirs {
             pages,
             memw_registers,
             include_halt,
+            include_blake3: table_counts.blake3 == 1,
             eqs,
             bytewises,
             stores,
@@ -1160,20 +1375,39 @@ pub(crate) fn compute_commit_bus_offset(
 /// Replay the prover's Phase A (main trace commitments) to recover the shared
 /// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
 /// — no `MultiProof` deserialization required either way.
+///
+/// Generic over the transcript for the same reason as `absorb_lfm_statement`:
+/// the replay is `append_bytes` plus `sample_field_element`, both on
+/// `IsTranscript`, so it is the same replay under any sponge.
+///
+/// ★ The preprocessed root absorbed is the one of the table's LEAF LAYOUT
+/// (S2), resolved exactly as the STARK prover and verifier resolve it —
+/// `stark::leaf_layout::table_leaf_layout(air, proof.trace_length())`, then
+/// `air.precomputed_commitment_for(layout)` — because that is the root the
+/// prover absorbed before sampling `z` and `α`. Absorbing the row-pair root
+/// for a one-row table replays a different transcript: the recovered `z`, `α`
+/// differ from the prover's, so every expected bus balance that depends on
+/// them (the LFM public words, the VM commit bus) is wrong and an honest proof
+/// is rejected. At the default format every layout is row pairs and this is
+/// the row-pair root, byte for byte what was absorbed before.
+///
+/// `None` = a preprocessed table has no root for its layout (never recomputed): the
+/// caller rejects, exactly as the STARK verifier would.
 pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: impl ProofViewSource<'p, F, E, ()>,
-    transcript: &mut DefaultTranscript<E>,
-) -> (FieldElement<E>, FieldElement<E>) {
+    transcript: &mut impl IsTranscript<E>,
+) -> Option<(FieldElement<E>, FieldElement<E>)> {
     for (air, proof) in airs.iter().zip(proofs.view_iter()) {
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            let layout = stark::leaf_layout::table_leaf_layout(*air, proof.trace_length());
+            transcript.append_bytes(&air.precomputed_commitment_for(layout)?);
         }
         transcript.append_bytes(proof.lde_trace_main_merkle_root());
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
-    (z, alpha)
+    Some((z, alpha))
 }
 
 /// Computes the expected COMMIT bus balance for a proof view slice (owned or
@@ -1183,9 +1417,12 @@ pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     proofs: impl ProofViewSource<'p, F, E, ()>,
     public_output_bytes: &[u8],
     start_index: u64,
-    transcript: &mut DefaultTranscript<E>,
+    // Any transcript, not the byte one by name: the block path's transcript is
+    // whatever `hash_pin` pins, and on an algebraic branch that is a different
+    // TYPE rather than the same type over a different digest.
+    transcript: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
+    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript)?;
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
@@ -1377,7 +1614,7 @@ pub fn prove_with_options_and_inputs(
 
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1392,11 +1629,17 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
+    let pairs = airs.air_trace_pairs(&mut traces);
+    #[cfg(feature = "shape-profile")]
+    shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
+    // ★ The block path's PIN, not `stark`'s default alias — the monolithic
+    // production prove, the twin of the batched one in `continuation.rs`.
+    let proof = crate::hash_pin::BlockProver::multi_prove(
+        pairs,
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         storage_mode,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
     #[cfg(feature = "instruments")]
@@ -1608,7 +1851,7 @@ fn verify_proof_parts(
     // Bind the statement into the verifier's transcript. A tampered statement
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1639,7 +1882,7 @@ fn verify_proof_parts(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(Verifier::multi_verify_views(
+    Ok(crate::hash_pin::BlockVerifier::multi_verify_views(
         &air_refs,
         proofs,
         &mut transcript,

@@ -5,13 +5,17 @@
 //! Everything else (`ntt`, element-wise arith) is either internal to those
 //! pipelines or used by the parity test suite.
 
+pub mod argue_probe;
 pub mod barycentric;
+pub mod blake3;
+pub mod columns;
 pub mod constraint_interp;
 pub mod deep;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
@@ -19,6 +23,10 @@ pub mod logup;
 pub mod merkle;
 pub mod ntt;
 pub mod nvtx;
+pub mod rpx;
+pub mod sumcheck;
+pub mod whir;
+pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.
@@ -29,6 +37,61 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use crate::device::{Backend, backend};
 
 pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
+
+/// Which hash family a device tree build launches.
+///
+/// The fused LDE+commit pipelines ([`lde`]), the composition-poly tree
+/// builders ([`merkle`] / [`blake3`]) and the FRI layer commits ([`fri`])
+/// each exist kernel-for-kernel in both BYTE families; this enum is the
+/// dispatch key callers pass down. It deliberately carries no round counts or
+/// parameters: within one build each family is a single concrete hash
+/// (keccak-256, or `Blake3Chain` at the compiled round count), exactly as on
+/// the host.
+///
+/// ★ Of the three ALGEBRAIC keys, [`DeviceHash::Rpx256`] is ported
+/// ([`rpx`]); RPO256 and Poseidon name hashes whose device kernels are not.
+/// Every dispatch site in this crate carries an arm for the unported keys that
+/// aborts with `unimplemented!` naming the hash — never an arm that launches a
+/// byte-hash kernel in its place. The keys exist ahead of their kernels so the
+/// host side (`stark::config::DeviceTreeBackend`) can name every commitment
+/// hash under `cuda`: a tree labelled RPO is then built by RPO kernels or not
+/// built at all. Porting a family means replacing those arms with launches,
+/// and the set of arms is the checklist.
+///
+/// ★ **Why the key travels with the request at all.** On the host a Merkle
+/// backend both NAMES a hash and computes it, so a tree cannot wear a name its
+/// own code did not produce. On the device the backend only names it — the
+/// kernels hash — so without a key travelling alongside, a tree labelled RPX
+/// could be built by keccak's kernels and nothing would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceHash {
+    /// Keccak-256 leaves and parents.
+    Keccak256,
+    /// `Blake3Chain` leaves and parents at the compiled round count.
+    Blake3,
+    /// RPO256 leaves and parents. No device kernels yet: every dispatch site
+    /// aborts loudly on this key.
+    Rpo256,
+    /// RPX256 (XHash12) leaves and parents — [`rpx`]'s kernels, the
+    /// algebraic family's first device port.
+    Rpx256,
+    /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
+    /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
+    Poseidon,
+}
+
+impl DeviceHash {
+    /// The name a tree built under this key may be called by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Keccak256 => "keccak256",
+            Self::Blake3 => "blake3-chain",
+            Self::Rpo256 => "rpo256",
+            Self::Rpx256 => "rpx256",
+            Self::Poseidon => "poseidon-goldilocks",
+        }
+    }
+}
 
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.
 pub fn vector_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
