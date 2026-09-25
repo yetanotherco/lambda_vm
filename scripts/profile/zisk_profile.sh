@@ -24,7 +24,7 @@
 #   and input are in that repo, so no guest build; AIR shapes are fixed per AIR, so the kernel
 #   launches are the ones of any block) once plainly and once under ncu, filtered to the
 #   expression kernels of the largest AIR (gen_basic_a0_0_b22_*), computeFRIExpressionFolded,
-#   fold_reg, computeEvals_v2, transposeFRI and the NTT/Merkle kernels at the block's own shapes.
+#   fold_reg, computeEvals_v2 and transposeFRI (NTT and Merkle are stage 1's).
 #   Emulator mode (no --asm): the GPU kernels are the same, and no ASM services are spawned.
 #
 # USAGE (repo checkout of whir/profile-rpx; needs CUDA with nvcc, Nsight Compute, curl, git)
@@ -221,7 +221,8 @@ if [ "$ZP_PROVE" = 1 ]; then
   run_plain prove "${PROVE[@]}" -o "$BIG/proof-plain.bin" || pf_die "plain prove failed (see $BIG/prove.plain.log)"
   { grep -E 'Proof generated|steps' "$BIG/prove.plain.log" || true; } > "$SMALL/prove_plain.txt"
   if [ "$ZP_NO_NCU" != 1 ]; then
-    PROVE_RE='^(gen_basic_a0_0_b22_.*|computeFRIExpressionFolded|fold_reg|computeEvals_v2|transposeFRI|nttDitColMajorKernel|nttDifColMajorKernel|linearHashTiledKernel_pos1|merkleNodeKernel_pos1|merkleNodeWarpKernel_pos1)$'
+    # NTT and Merkle are stage 1's (same kernels, the same shapes); this pass takes what only a prove has
+    PROVE_RE='^(gen_basic_a0_0_b22_.*|computeFRIExpressionFolded|fold_reg|computeEvals_v2|transposeFRI)$'
     ncu_pass prove "$PROVE_RE" "${PROVE[@]}" -o "$BIG/proof-ncu.bin"
     { grep -E 'Proof generated|steps' "$BIG/prove.stdout" || true; } > "$SMALL/prove_ncu.txt"
   fi
