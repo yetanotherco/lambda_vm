@@ -251,6 +251,7 @@ pub fn emit_table_verification(
     );
 
     // ---- the OOD grid, from the two blocks the transcript absorbed.
+    let g = super::phase::enter("ood_logup_uniforms");
     let grid = emit_reconstruct_ood(b, &shape.sub.deep, absorbs.ood_current, absorbs.ood_next);
 
     // ---- the LogUp uniforms, DERIVED (never hinted): the α powers from the one
@@ -292,7 +293,11 @@ pub fn emit_table_verification(
     };
 
     // ---- (1) the constraint evaluation and (2) the quotient check.
+    drop(g);
+    let g = super::phase::enter("constraints");
     let evals = emit_analyzed(b, analysis, &ood);
+    drop(g);
+    let g = super::phase::enter("quotient");
     let q = emit_quotient(
         b,
         &shape.quotient,
@@ -305,6 +310,8 @@ pub fn emit_table_verification(
     b.assert_eq_ext(q.claimed, q.composition);
 
     // ---- (3) DEEP, over the same grid and the same parts.
+    drop(g);
+    let g = super::phase::enter("deep_inv");
     let inv = emit_deep_invariants(
         b,
         &shape.sub.deep,
@@ -315,6 +322,8 @@ pub fn emit_table_verification(
     );
 
     // ---- the committed matrices, in DEEP column order then the parts.
+    drop(g);
+    let g = super::phase::enter("caps");
     let groups = shape.sub.groups();
     let mut commitments: Vec<GroupCommitment> = Vec::with_capacity(groups.len());
     let push = |root: &RootCells, out: &mut Vec<GroupCommitment>| {
@@ -377,12 +386,14 @@ pub fn emit_table_verification(
     }
 
     // ---- (4) per query: authenticate, fold DEEP, then fold FRI.
+    drop(g);
     let stride = shape
         .sub
         .opening_words(super::edsl::digest_words(b) as usize);
     let mut fri_terminal = Vec::with_capacity(shape.num_queries);
     for (qi, bits) in challenges.iota_bits.iter().enumerate() {
         let mut cursor = (qi * stride) as u32;
+        let hints = super::phase::enter("q_hints");
         let openings: Vec<GroupOpening> = groups
             .iter()
             .map(|g| {
@@ -410,6 +421,8 @@ pub fn emit_table_verification(
             "the emitter's cursor must agree with the declared query stride"
         );
 
+        drop(hints);
+        let g = super::phase::enter("trace_query");
         let out = emit_query_from_bits(
             b,
             &shape.sub,
@@ -419,7 +432,11 @@ pub fn emit_table_verification(
             bits.clone(),
             &openings,
         );
+        drop(g);
+        let hints = super::phase::enter("q_hints");
         let layers = hint_layer_openings_from(b, shape.fri, arenas.fri, qi);
+        drop(hints);
+        let _g = super::phase::enter("fri_query");
         fri_terminal.push(emit_query_fri(
             b,
             shape.fri,

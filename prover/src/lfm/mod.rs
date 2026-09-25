@@ -48,6 +48,7 @@ pub mod lde;
 pub mod logup;
 pub mod merkle_cap;
 pub mod per_table_aggregator;
+pub mod phase;
 pub mod poseidon;
 pub mod preprocessed;
 pub mod program_census;

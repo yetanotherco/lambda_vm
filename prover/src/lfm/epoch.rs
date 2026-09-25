@@ -776,6 +776,7 @@ pub fn emit_table_challenges(
         "a nonce exists exactly when grinding is on"
     );
 
+    let g = super::phase::enter("challenges");
     // ---- Phase C and the contribution bind, inside the fork.
     if let Some(root) = absorbs.aux_root {
         root.absorb(b, t);
@@ -831,6 +832,8 @@ pub fn emit_table_challenges(
         append_ext_cell(b, t, *c);
     }
 
+    drop(g);
+    let g = super::phase::enter("grind");
     if let Some(nonce) = absorbs.nonce {
         let seed = t.state(b);
         emit_grinding_check(b, seed, nonce, shape.grinding_factor);
@@ -840,9 +843,12 @@ pub fn emit_table_challenges(
         t.append_felt(b, nonce);
     }
 
+    drop(g);
+    let g = super::phase::enter("query_idx");
     let iota_bits = (0..shape.num_queries)
         .map(|_| t.sample_u64_pow2(b, shape.index_bits()))
         .collect();
+    drop(g);
 
     TableChallenges {
         beta,

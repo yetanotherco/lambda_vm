@@ -326,6 +326,7 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     let per_root = RootCells::words_per_root(b);
 
     // ---- the statement, over the child's claimed published words ----
+    let g = super::phase::enter("n_stmt");
     let publics = hint_public_words(b, a.publics, child.num_public_words);
     let mut t = TranscriptReplay::new(&[]);
     emit_lfm_statement(
@@ -335,6 +336,8 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
         child.fri_final_poly_log_degree,
     );
 
+    drop(g);
+    let g = super::phase::enter("n_phase_a");
     // ---- Phase A: preprocessed roots as AIR-set constants, main roots hinted.
     let main_cells: Vec<RootCells> = (0..n)
         .map(|i| RootCells::hint(b, a.main_roots, per_root * i as u32))
@@ -362,9 +365,12 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
         .collect();
     let (z, alpha) = replay_phase_a(&mut t, b, &phase_a);
 
+    drop(g);
     // ---- one fork per sub-proof, with the full verification legs ----
     let mut contributions: Vec<Ext> = Vec::new();
     for (i, table) in child.tables.iter().enumerate() {
+        let _table = super::phase::enter("table");
+        let hints = super::phase::enter("hints");
         let c = table.challenge;
         let arenas = &a.per_table[i];
         let aux = arenas.aux_root.map(|id| RootCells::hint(b, id, 0));
@@ -386,6 +392,7 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
             .map(|k| b.hint_word(arenas.fri_coeffs, k).as_ext())
             .collect();
         let nonce = arenas.nonce.map(|id| b.hint_felt(id, 0));
+        drop(hints);
         if let Some(l) = contribution {
             contributions.push(l);
         }
@@ -426,12 +433,14 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     // Every other LFM bus balances to zero internally; `LfmPublic` is the one
     // whose target is the claimed words, which is what makes this the binding
     // between "the proof verifies" and "it published THESE words".
+    let g = super::phase::enter("n_closure");
     let target = emit_public_balance(b, &publics, z, alpha);
     let shape = super::logup::LogUpShape {
         num_contributing_tables: contributions.len(),
         num_output_bytes: 0,
     };
     super::logup::emit_bus_closure(b, &shape, &contributions, target);
+    drop(g);
 
     LegCells {
         publics,
@@ -921,7 +930,10 @@ pub fn emit_node(b: &mut LfmBuilder, inputs: &NodeInputs<'_>) {
         .zip(&arenas)
         .map(|(child, a)| emit_leg(b, child, a))
         .collect();
+    let g = super::phase::enter("n_bindings");
     emit_chain_bindings(b, &legs, layouts, labels);
+    drop(g);
+    let _g = super::phase::enter("n_publish");
     emit_node_publishes(
         b,
         &NodePublishes {

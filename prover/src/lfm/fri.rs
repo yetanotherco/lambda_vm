@@ -1044,6 +1044,7 @@ fn emit_terminal_check(
     point: Felt,
     v: Ext,
 ) -> Ext {
+    let _g = super::phase::enter("terminal");
     let mut x = point;
     for _ in 0..shape.total_folds() {
         x = b.mul(x, x);
@@ -1077,10 +1078,15 @@ pub fn emit_pair_layer(
     // — the even codeword slot leads. `select(bit, l, r)` returns `(l, r)`
     // at 0 and `(r, l)` at 1, so this IS that conditional.
     let (first, second) = b.select(bits[layer], v.as_cell(), sym.as_cell());
+    let leaf_scope = super::phase::enter("leaf");
     let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
+    drop(leaf_scope);
     // `bits[layer+1..]` is this layer tree's whole leaf index; a cap walks its
     // low bits and muxes the top ones.
+    let merkle_scope = super::phase::enter("merkle");
     commitment.authenticate(b, leaf, &bits[layer + 1..], &opening.siblings);
+    drop(merkle_scope);
+    let _fold = super::phase::enter("fold");
 
     // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
     // squaring per layer (`verifier.rs:692-697`).
@@ -1218,12 +1224,15 @@ pub fn emit_group_layer(
     let slot_bits = &bits[g..g + d as usize];
 
     // (1) the slot check.
+    let slot_scope = super::phase::enter("slot_mux");
     let v_slot = emit_value_mux(b, &opening.values, slot_bits);
     if !skip_slot_check() {
         b.assert_eq_ext(v_slot, v);
     }
 
     // (2) the group is the leaf.
+    drop(slot_scope);
+    let leaf_scope = super::phase::enter("leaf");
     let cells: Vec<Cell> = opening.values.iter().map(|x| x.as_cell()).collect();
     let leaf = sub_proof::emit_leaf_hash(
         b,
@@ -1233,9 +1242,13 @@ pub fn emit_group_layer(
         },
         &cells,
     );
+    drop(leaf_scope);
+    let merkle_scope = super::phase::enter("merkle");
     commitment.authenticate(b, leaf, &bits[g + d as usize..], &opening.siblings);
+    drop(merkle_scope);
 
     // (3) the group fold.
+    let _fold = super::phase::enter("fold");
     let (slot_factors, kappa) = group_fold_constants(d);
     let mut xinv = y_inv;
     for (bit, factor) in slot_bits.iter().zip(&slot_factors) {

@@ -123,6 +123,9 @@ pub struct LfmBuilder {
     /// R1c instruments), so a grep for the pinned hash in `lfm/` returns
     /// exactly the deliberate exceptions.
     wrap_hash: WrapHash,
+    /// Per instruction, the emission-phase id open when it was emitted; filled
+    /// only under `LAMBDA_VM_GAP_PHASES` (see [`super::phase`]).
+    phase_ids: Vec<u32>,
 }
 
 impl LfmBuilder {
@@ -151,6 +154,13 @@ impl LfmBuilder {
         self.wrap_hash
     }
 
+    fn push_instr(&mut self, instr: Instr) {
+        if super::phase::enabled() {
+            self.phase_ids.push(super::phase::current());
+        }
+        self.instrs.push(instr);
+    }
+
     fn alloc(&mut self) -> Addr {
         let addr = Addr(self.next_addr);
         self.next_addr += 1;
@@ -172,7 +182,7 @@ impl LfmBuilder {
             return addr;
         }
         let out = self.alloc();
-        self.instrs.push(Instr::Const {
+        self.push_instr(Instr::Const {
             out,
             value,
             mult: 0,
@@ -206,7 +216,7 @@ impl LfmBuilder {
             self.read(c.0);
         }
         let out = self.alloc();
-        self.instrs.push(Instr::BaseAlu {
+        self.push_instr(Instr::BaseAlu {
             op,
             out,
             a: a.0,
@@ -244,7 +254,7 @@ impl LfmBuilder {
             self.read(c);
         }
         let out = self.alloc();
-        self.instrs.push(Instr::ExtAlu {
+        self.push_instr(Instr::ExtAlu {
             op,
             out,
             a,
@@ -301,7 +311,7 @@ impl LfmBuilder {
         self.read(r.0);
         let out_l = self.alloc();
         let out_r = self.alloc();
-        self.instrs.push(Instr::Select {
+        self.push_instr(Instr::Select {
             bit: bit.0,
             out_l,
             out_r,
@@ -321,7 +331,7 @@ impl LfmBuilder {
         self.read(x.0);
         let bits: Vec<(Addr, u64)> = (0..nbits).map(|_| (self.alloc(), 0)).collect();
         let handles = bits.iter().map(|(a, _)| Bit(*a)).collect();
-        self.instrs.push(Instr::BitDec {
+        self.push_instr(Instr::BitDec {
             input: x.0,
             bits,
             halves: None,
@@ -338,7 +348,7 @@ impl LfmBuilder {
     pub fn bit_dec_be_halves(&mut self, x: Felt) -> [Felt; 2] {
         self.read(x.0);
         let halves = [(self.alloc(), 0), (self.alloc(), 0)];
-        self.instrs.push(Instr::BitDec {
+        self.push_instr(Instr::BitDec {
             input: x.0,
             bits: Vec::new(),
             halves: Some(halves),
@@ -371,7 +381,7 @@ impl LfmBuilder {
         self.read(acc.0);
         self.read(felts.0);
         let out = self.alloc();
-        self.instrs.push(Instr::Hash {
+        self.push_instr(Instr::Hash {
             mode: HashMode::Leaf,
             ins: [acc.0, felts.0, Addr(0)],
             outs: [out, Addr(0), Addr(0)],
@@ -398,7 +408,7 @@ impl LfmBuilder {
         self.read(a.0);
         self.read(b.0);
         let out = self.alloc();
-        self.instrs.push(Instr::Hash {
+        self.push_instr(Instr::Hash {
             mode,
             ins: [a.0, b.0, Addr(0)],
             outs: [out, Addr(0), Addr(0)],
@@ -413,7 +423,7 @@ impl LfmBuilder {
             self.read(c.0);
         }
         let outs = [self.alloc(), self.alloc(), self.alloc()];
-        self.instrs.push(Instr::Hash {
+        self.push_instr(Instr::Hash {
             mode: HashMode::Permute,
             ins: [state[0].0, state[1].0, state[2].0],
             outs,
@@ -429,7 +439,7 @@ impl LfmBuilder {
     pub fn unpack(&mut self, c: Cell) -> [Felt; 4] {
         self.read(c.0);
         let outs = [self.alloc(), self.alloc(), self.alloc(), self.alloc()];
-        self.instrs.push(Instr::Unpack {
+        self.push_instr(Instr::Unpack {
             input: c.0,
             outs,
             mults: [0; 4],
@@ -443,7 +453,7 @@ impl LfmBuilder {
             self.read(l.0);
         }
         let out = self.alloc();
-        self.instrs.push(Instr::Pack {
+        self.push_instr(Instr::Pack {
             lanes: lanes.map(|f| f.0),
             out,
             mult: 0,
@@ -514,8 +524,7 @@ impl LfmBuilder {
         }
         let outs: [Addr; 13] = core::array::from_fn(|_| self.alloc());
         let rev_outs: Option<[Addr; 2]> = want_rev.then(|| core::array::from_fn(|_| self.alloc()));
-        self.instrs
-            .push(Instr::KeccakF(Box::new(super::instr::KeccakOperands {
+        self.push_instr(Instr::KeccakF(Box::new(super::instr::KeccakOperands {
                 mode,
                 ins: state.map(|c| c.0),
                 block: block.map(|c| c.0),
@@ -594,8 +603,7 @@ impl LfmBuilder {
         let outs: [Addr; layout::blake3::OUT_WORDS] = core::array::from_fn(|_| self.alloc());
         let rev_outs: Option<[Addr; layout::blake3::DIGEST_WORDS]> =
             want_rev.then(|| core::array::from_fn(|_| self.alloc()));
-        self.instrs
-            .push(Instr::Blake3(Box::new(super::instr::Blake3Operands {
+        self.push_instr(Instr::Blake3(Box::new(super::instr::Blake3Operands {
                 ins,
                 outs,
                 mults: [0; layout::blake3::OUT_WORDS],
@@ -620,7 +628,7 @@ impl LfmBuilder {
     /// this sound.
     pub fn hint_word(&mut self, arena: ArenaId, index: u32) -> Cell {
         let out = self.alloc();
-        self.instrs.push(Instr::Hint {
+        self.push_instr(Instr::Hint {
             arena,
             index,
             out,
@@ -638,10 +646,13 @@ impl LfmBuilder {
         self.read(c.0);
         let index = self.public_len;
         self.public_len += 1;
-        self.instrs.push(Instr::Public { addr: c.0, index });
+        self.push_instr(Instr::Public { addr: c.0, index });
     }
 
     pub fn finish(self) -> LfmProgramSource {
+        if super::phase::enabled() {
+            super::phase::report(&self.instrs, &self.phase_ids);
+        }
         LfmProgramSource {
             instrs: self.instrs,
             num_addrs: self.next_addr,

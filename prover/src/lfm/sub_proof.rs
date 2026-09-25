@@ -481,7 +481,10 @@ pub fn emit_group_authentication_at(
         bits.len(),
         "one sibling per level below the cap, and every group walks the same index"
     );
+    let g = super::phase::enter("leaf");
     let leaf = emit_leaf_hash_rows(b, commitment.shape, rows_per_leaf, &opening.values);
+    drop(g);
+    let _g = super::phase::enter("merkle");
     match &commitment.cap {
         None => {
             let root = edsl::wrap_merkle_walk(b, leaf, bits, &opening.siblings);
@@ -522,6 +525,7 @@ pub fn emit_point_from_row_bits(
         log2_lde_length as usize,
         "a one-row index ranges over the whole LDE domain"
     );
+    let _g = super::phase::enter("points");
     edsl::pow_bits(
         b,
         bits,
@@ -551,6 +555,7 @@ pub fn emit_points_from_bits(
         log2_lde_length as usize - 1,
         "a leaf is a row pair, so the index is one bit narrower than the domain"
     );
+    let _g = super::phase::enter("points");
     let point = edsl::pow_bits(
         b,
         bits,
@@ -702,6 +707,7 @@ pub fn emit_query_from_bits(
         emit_group_authentication_at(b, commitment, rows, opening, &bits);
     }
 
+    let _g = super::phase::enter("deep_fold");
     if shape.layout.is_one_row() {
         return emit_one_row_deep(b, shape, gamma, inv, openings, &groups, bits);
     }

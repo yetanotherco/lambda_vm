@@ -1849,6 +1849,7 @@ fn epoch_program_with(
     let a_split_decode = split_decode.then(|| b.declare_arena(root_words));
 
     // ---- the statement ----
+    let g = super::phase::enter("w_stmt");
     let stmt: Vec<_> = (0..stmt_halves as u32)
         .map(|i| b.hint_felt(a_stmt, i))
         .collect();
@@ -1867,6 +1868,8 @@ fn epoch_program_with(
         },
     );
 
+    drop(g);
+    let g = super::phase::enter("w_prep_roots");
     // ---- ★ the preprocessed roots, each from the source its provenance admits
     //
     // Ledger entry 7, and entry 2 closes with it. `PrepSource` was decided
@@ -1925,6 +1928,8 @@ fn epoch_program_with(
         "every declared preprocessed arena word must be read"
     );
 
+    drop(g);
+    let g = super::phase::enter("w_phase_a");
     // ---- Phase A ----
     let main_cells: Vec<RootCells> = (0..n)
         .map(|i| {
@@ -1982,6 +1987,8 @@ fn epoch_program_with(
     b.public(z.as_cell());
     b.public(alpha.as_cell());
 
+    drop(g);
+    let g = super::phase::enter("w_program_id");
     // ---- ★ the attestation join: the DECODE cell Phase A absorbed, folded
     //
     // One cell, two consumers. Without this the DECODE root would be a free arena
@@ -2033,6 +2040,8 @@ fn epoch_program_with(
         b.public(id[1]);
     }
 
+    drop(g);
+    let g = super::phase::enter("w_publish");
     // ---- ★ THE BLOCK-BINDING SCHEMA, published right after the attestation id
     //
     // An aggregation node over these wraps sees exactly two things about a child:
@@ -2078,9 +2087,12 @@ fn epoch_program_with(
         b.public(half.as_cell());
     }
 
+    drop(g);
     // ---- one fork per table ----
     let mut contributions: Vec<super::builder::Ext> = Vec::new();
     for (i, h) in e.tables.iter().enumerate() {
+        let _table = super::phase::enter("table");
+        let hints = super::phase::enter("hints");
         let a = &per_table[i];
         let aux = a.aux_root.map(|id| RootCells::hint(&mut b, id, 0));
         let contribution = a.contribution.map(|id| b.hint_word(id, 0).as_ext());
@@ -2108,6 +2120,7 @@ fn epoch_program_with(
             .map(|k| b.hint_word(a.fri_coeffs, k).as_ext())
             .collect();
         let nonce = a.nonce.map(|id| b.hint_felt(id, 0));
+        drop(hints);
 
         if let Some(c) = contribution {
             contributions.push(c);
@@ -2173,6 +2186,7 @@ fn epoch_program_with(
     }
 
     // ---- the LogUp closure, on the cells the forks already absorbed ----
+    let g = super::phase::enter("w_closure");
     //
     // Every `L` here is the cell its own fork bound into the transcript, and
     // the output bytes are derived from the halves the statement absorbed — so
@@ -2194,6 +2208,7 @@ fn epoch_program_with(
     let target = super::logup::emit_commit_bus_target(&mut b, &shape, z, alpha, start, &bytes);
     let total = super::logup::emit_bus_closure(&mut b, &shape, &contributions, target);
     b.public(total.as_cell());
+    drop(g);
 
     let program = compile(b.finish());
     validate(&program).expect("the epoch challenge program must be admissible");
