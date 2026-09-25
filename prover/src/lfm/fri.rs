@@ -872,21 +872,16 @@ pub fn emit_query_fri(
     if shape.is_legacy() {
         let mut inv_pow = inv;
         for (i, opening) in openings.iter().enumerate() {
-            assert_eq!(opening.values.len(), 1, "a pair layer opens its sibling");
-            let sym = opening.values[0];
-            // `if index % 2 == 1 { [sym, v] } else { [v, sym] }` (`verifier.rs:637`)
-            // — the even codeword slot leads. `select(bit, l, r)` returns `(l, r)`
-            // at 0 and `(r, l)` at 1, so this IS that conditional.
-            let (first, second) = b.select(q.bits[i], v.as_cell(), sym.as_cell());
-            let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
-            // `bits[i+1..]` is this layer tree's whole leaf index; a cap walks its
-            // low bits and muxes the top ones.
-            fri.layers[i].authenticate(b, leaf, &q.bits[i + 1..], &opening.siblings);
-
-            // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
-            // squaring per layer (`verifier.rs:692-697`).
-            inv_pow = b.mul(inv_pow, inv_pow);
-            v = edsl::fri_fold(b, v, sym, fri.zetas[i + 1], inv_pow);
+            (v, inv_pow) = emit_pair_layer(
+                b,
+                i,
+                &fri.layers[i],
+                fri.zetas[i + 1],
+                v,
+                inv_pow,
+                opening,
+                q.bits,
+            );
         }
     } else {
         // The group encoding (S3): committed layer `j` opens a whole coset of
@@ -922,6 +917,41 @@ pub fn emit_query_fri(
     let at = emit_terminal_eval(b, fri, x);
     b.assert_eq_ext(at, v);
     v
+}
+
+/// One committed layer under TODAY's pair encoding (`FriShape::is_legacy`):
+/// the opening carries the sibling value only. With the query's value `v` at
+/// this layer and `x⁻¹` of its point one layer up (`inv_pow`), order the pair
+/// by the parity bit `bits[layer]`, hash it as the leaf, authenticate it at the
+/// tree's leaf index `bits[layer + 1..]`, square the point and fold with
+/// `zeta`. Returns `(v, inv_pow)` at the next layer. The rows it emits are
+/// `stark::fri::schedule::fri_pair_layer_rows` (pinned in `fri_group_tests`).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_pair_layer(
+    b: &mut LfmBuilder,
+    layer: usize,
+    commitment: &LayerCommitment,
+    zeta: Ext,
+    v: Ext,
+    inv_pow: Felt,
+    opening: &LayerOpening,
+    bits: &[Bit],
+) -> (Ext, Felt) {
+    assert_eq!(opening.values.len(), 1, "a pair layer opens its sibling");
+    let sym = opening.values[0];
+    // `if index % 2 == 1 { [sym, v] } else { [v, sym] }` (`verifier.rs:637`)
+    // — the even codeword slot leads. `select(bit, l, r)` returns `(l, r)`
+    // at 0 and `(r, l)` at 1, so this IS that conditional.
+    let (first, second) = b.select(bits[layer], v.as_cell(), sym.as_cell());
+    let leaf = sub_proof::emit_leaf_hash(b, FRI_LEAF_GROUP, &[first, second]);
+    // `bits[layer+1..]` is this layer tree's whole leaf index; a cap walks its
+    // low bits and muxes the top ones.
+    commitment.authenticate(b, leaf, &bits[layer + 1..], &opening.siblings);
+
+    // `evaluation_point_vec[i] = υ^(−2^(i+1))` — `inv.square()` then one
+    // squaring per layer (`verifier.rs:692-697`).
+    let inv_pow = b.mul(inv_pow, inv_pow);
+    (edsl::fri_fold(b, v, sym, zeta, inv_pow), inv_pow)
 }
 
 /// The program constants of one group fold of exponent `d` (FRI.md §1.3), in

@@ -47,6 +47,9 @@ type Ext = FieldElement<E>;
 /// leaf under every hash), and unequal neighbours (a fold-count off-by-one
 /// between the commit and the pending folds shows only there).
 pub const EXTRA_SHAPES: &[&[u8]] = &[
+    // A lone 16-group layer: a DP schedule until RULINGS 22 re-priced the
+    // objective, kept so the sweep's coverage does not shrink.
+    &[4],
     &[6],
     &[1, 6],
     &[6, 1],

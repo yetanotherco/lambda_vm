@@ -26,7 +26,7 @@ use crypto::merkle_tree::cap::{CapPolicy, cap_gain};
 use math::fft::bit_reversing::reverse_index;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 
-use crate::fri::schedule::{FRI_COST_WEIGHTS, FriFormat, fri_schedule_cost_q};
+use crate::fri::schedule::{FRI_COST_WEIGHTS, FriFormat};
 use crate::proof::options::{OneRowMode, ProofOptions};
 use crate::traits::AIR;
 
@@ -124,6 +124,29 @@ pub struct TableWidths {
     pub aux: u64,
     /// The composition tree (every part).
     pub composition: u64,
+    /// `XALU` rows of ONE in-guest DEEP point for this table
+    /// ([`deep_point_xalu_rows`]); row pairs evaluate DEEP at two points, one
+    /// row at one.
+    pub deep_point_rows: u64,
+}
+
+/// `XALU` rows the in-guest verifier emits for DEEP at ONE query point
+/// (`prover/src/lfm/deep.rs::emit_deep_point`), for a table whose DEEP
+/// reconstruction folds `num_surviving` trace openings (the pruned OOD grid,
+/// [`crate::ood::OodLayout::num_surviving`]) over `num_eval_points` OOD rows
+/// and `num_parts` composition parts:
+///
+/// ```text
+/// per OOD row r:  (|cols_r| − 1) Horner steps + [r ≥ 1] block scale
+///                 + numerator esub + denominator esub + ediv + (emul | emul_add)
+/// parts:          (P − 1) Horner steps + emul + esub + esub + ediv + emul_add
+/// total:          num_surviving + 4·E + P + 3
+/// ```
+///
+/// One `XALU` row per opened value plus a per-point constant; the prover
+/// crate's `lfm::fri_group_tests` pins it against the emitter.
+pub const fn deep_point_xalu_rows(num_surviving: u64, num_eval_points: u64, num_parts: u64) -> u64 {
+    num_surviving + 4 * num_eval_points + num_parts + 3
 }
 
 impl TableWidths {
@@ -152,11 +175,24 @@ impl TableWidths {
             air.composition_poly_degree_bound(trace_length) / trace_length
         };
         let ext = ext_degree::<F, E>();
+        let ctx = air.context();
+        let num_eval_points = ctx.transition_offsets.len() * air.step_size();
+        let ood = crate::ood::OodLayout::new(
+            ctx.trace_columns,
+            num_eval_points,
+            air.step_size(),
+            air.trace_ood_next_row_columns(),
+        );
         Self {
             precomputed: precomputed as u64,
             main: main as u64,
             aux: (aux as u64).saturating_mul(ext),
             composition: (parts as u64).saturating_mul(ext),
+            deep_point_rows: deep_point_xalu_rows(
+                ood.num_surviving() as u64,
+                num_eval_points as u64,
+                parts as u64,
+            ),
         }
     }
 }
@@ -196,12 +232,12 @@ pub fn trace_tree_cost_q(felts: u64, depth: u32, num_queries: u64, cap: CapPolic
 /// policy and query count.
 ///
 /// Row pairs: every tree's leaf holds two rows and is `lde_log − 1` deep, the
-/// FRI chain starts at `lde_log − 1`, and the uncommitted fold 0 costs one fold
-/// and one twiddle step. One row: every leaf holds one row and is `lde_log`
-/// deep, and the FRI chain (layer 0 = the committed DEEP codeword) starts at
-/// `lde_log`. The in-guest DEEP arithmetic (two points vs one) is NOT priced:
-/// it is not a term of the shared objective, and leaving it out only ever
-/// favours today's layout.
+/// FRI chain starts at `lde_log − 1` with the uncommitted fold 0
+/// ([`FriFormat::chain_cost_q`]), and DEEP is evaluated at TWO points (`υ`,
+/// `−υ`). One row: every leaf holds one row and is `lde_log` deep, the FRI
+/// chain (layer 0 = the committed DEEP codeword) starts at `lde_log`, and DEEP
+/// is evaluated at ONE point (RULINGS 22). A DEEP point costs
+/// [`TableWidths::deep_point_rows`] `XALU` rows.
 pub fn table_openings_cost_q(
     widths: &TableWidths,
     options: &ProofOptions,
@@ -232,15 +268,13 @@ pub fn table_openings_cost_q(
         cap,
         schedule_override: options.format.fri_schedule_override,
     };
-    let b0 = crate::fri::schedule::fri_chain_start(lde_log, one_row);
-    let schedule = fmt.schedule(lde_log, terminal_log);
-    let chain = fri_schedule_cost_q(b0, &schedule, q, cap).unwrap_or(u64::MAX);
-    let fold0 = if !one_row && lde_log > terminal_log {
-        q.saturating_mul(FRI_COST_WEIGHTS.fold + FRI_COST_WEIGHTS.twiddle)
-    } else {
-        0
-    };
-    trees.saturating_add(chain).saturating_add(fold0)
+    let chain = fmt.chain_cost_q(lde_log, terminal_log);
+    let deep_points: u64 = if one_row { 1 } else { 2 };
+    let deep = q
+        .saturating_mul(deep_points)
+        .saturating_mul(widths.deep_point_rows)
+        .saturating_mul(FRI_COST_WEIGHTS.xalu);
+    trees.saturating_add(chain).saturating_add(deep)
 }
 
 /// RULINGS 6's `auto` rule: one row iff it is STRICTLY cheaper than row pairs

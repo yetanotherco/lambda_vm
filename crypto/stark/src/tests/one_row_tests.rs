@@ -19,11 +19,12 @@ use crate::examples::fibonacci_2_columns::compute_trace;
 use crate::examples::simple_fibonacci::FibonacciPublicInputs;
 use crate::fri::capture::{FriCapture, capture};
 use crate::fri::fri_functions::compute_coset_twiddles_inv;
+use crate::fri::schedule::FRI_COST_WEIGHTS;
 use crate::fri::terminal::FriFoldLayout;
 use crate::fri::{commit_phase_with_layout, fold_times};
 use crate::leaf_layout::{
-    LeafLayout, M3_PAIR_BOUND_AT_LDE, TableWidths, resolve_leaf_layout, table_leaf_layout,
-    table_openings_cost_q,
+    LeafLayout, M3_PAIR_BOUND_AT_LDE, TableWidths, deep_point_xalu_rows, resolve_leaf_layout,
+    table_leaf_layout, table_openings_cost_q,
 };
 use crate::proof::options::{FriMode, FriScheduleOverride, OneRowMode, ProofFormat, ProofOptions};
 use crate::proof::stark::MultiProof;
@@ -738,6 +739,7 @@ fn auto_is_the_strict_cost_comparison() {
                             main,
                             aux,
                             composition: 6,
+                            deep_point_rows: deep_point_xalu_rows(main + 2 * aux, 2, 2),
                         };
                         let row = table_openings_cost_q(&w, &o, lde_log, 2, true);
                         let pair = table_openings_cost_q(&w, &o, lde_log, 2, false);
@@ -757,6 +759,7 @@ fn auto_is_the_strict_cost_comparison() {
         main: 1,
         aux: 0,
         composition: 3,
+        deep_point_rows: deep_point_xalu_rows(1, 1, 1),
     };
     for lde_log in 4..=24 {
         let off = opts_q(110, OneRowMode::Off, FriMode::Pair, CapPolicy::Off);
@@ -769,14 +772,26 @@ fn auto_is_the_strict_cost_comparison() {
     }
 }
 
+/// The DEEP term of the pinned cases: `E = 2` OOD rows (a current and a next
+/// row; every case has aux columns, whose LogUp accumulators read the next
+/// row), every column opened at the current row and the aux columns at the
+/// next (an ASSUMED window: the real one is each AIR's
+/// `trace_ood_next_row_columns`), `parts` composition parts.
+fn pinned_deep_rows(pre: u64, main: u64, aux: u64, parts: u64) -> u64 {
+    deep_point_xalu_rows(pre + main + aux + aux, 2, parts)
+}
+
 /// ⚠ A FORMAT PIN: `auto`'s choice for a set of production-like shapes (Q =
 /// 110, blowup 4, k = 7, cap auto, fri dp). Wide tables go one-row, narrow
 /// tall ones stay row pairs. Any change to the cost function or its weights
 /// that moves one of these is a format change. The widths are illustrative
 /// (MEMW 49 main / 13 aux as REVIEW-FRI §C reads them; the others are round
-/// numbers), not a census: at generation the MEMW-like and CPU-like cases sat
-/// within 0.5% and 2% of the threshold (row 49,988,402 vs pair 49,741,452;
-/// row 51,474,062 vs pair 52,465,162, ×Q ns), so they pin the rule's edge.
+/// numbers), not a census. Re-pinned for RULINGS 22 (every emitted FRI row
+/// priced, DEEP at two points vs one): two choices moved to one row — the
+/// MEMW-like case (row pairs by 0.5% before; one row by 5.5% now, and only
+/// because of the DEEP term, see `auto_choices_margins`) and the narrow short
+/// preprocessed one (its LDE is already terminal, so no FRI layer separates
+/// the layouts and the second DEEP point decides).
 #[test]
 fn auto_choices_are_pinned() {
     let o = opts_q(110, OneRowMode::Auto, FriMode::Dp, CapPolicy::Auto);
@@ -785,22 +800,88 @@ fn auto_choices_are_pinned() {
         ("wide keccak-like", 16, 0, 2600, 40, 2, true),
         ("wide, short", 12, 0, 400, 20, 2, true),
         ("narrow tall, preprocessed", 22, 12, 4, 2, 2, false),
-        ("narrow short, preprocessed", 7, 8, 1, 1, 2, false),
-        ("memw-like", 21, 0, 49, 13, 2, false),
+        ("narrow short, preprocessed", 7, 8, 1, 1, 2, true),
+        ("memw-like", 21, 0, 49, 13, 2, MEMW_LIKE_ONE_ROW),
         ("cpu-like", 21, 0, 74, 20, 2, true),
     ];
     let mut got = Vec::new();
     for &(name, b, pre, main, aux, parts, _) in cases {
-        let w = TableWidths {
-            precomputed: pre,
-            main,
-            aux: aux * 3,
-            composition: parts * 3,
-        };
-        got.push((name, resolve_leaf_layout(&w, &o, b, 2).is_one_row()));
+        got.push((
+            name,
+            resolve_leaf_layout(&pinned_widths(pre, main, aux, parts), &o, b, 2).is_one_row(),
+        ));
     }
     let want: Vec<_> = cases.iter().map(|c| (c.0, c.6)).collect();
     assert_eq!(got, want);
+}
+
+/// The MEMW-like case's pinned choice (see `auto_choices_are_pinned`).
+const MEMW_LIKE_ONE_ROW: bool = true;
+
+fn pinned_widths(pre: u64, main: u64, aux: u64, parts: u64) -> TableWidths {
+    TableWidths {
+        precomputed: pre,
+        main,
+        aux: aux * 3,
+        composition: parts * 3,
+        deep_point_rows: pinned_deep_rows(pre, main, aux, parts),
+    }
+}
+
+/// Prints each pinned case's two prices (`-- --nocapture`), and pins how much
+/// of the one-row saving the DEEP term is at the two edge cases.
+#[test]
+fn auto_choices_margins() {
+    let o = opts_q(110, OneRowMode::Auto, FriMode::Dp, CapPolicy::Auto);
+    for (name, pre, main, aux, parts) in [
+        ("memw-like", 0u64, 49u64, 13u64, 2u64),
+        ("cpu-like", 0, 74, 20, 2),
+    ] {
+        let w = pinned_widths(pre, main, aux, parts);
+        let row = table_openings_cost_q(&w, &o, 21, 2, true);
+        let pair = table_openings_cost_q(&w, &o, 21, 2, false);
+        let deep_point = 110 * w.deep_point_rows * FRI_COST_WEIGHTS.xalu;
+        println!(
+            "  {name}: row {row} pair {pair} (x Q ns; one DEEP point {deep_point}; row/pair {:.4})",
+            row as f64 / pair as f64
+        );
+        assert!(row < pair, "{name} goes one row");
+        // Without the DEEP point one row saves, the MEMW-like case would stay
+        // row pairs: the term decides it.
+        if name == "memw-like" {
+            assert!(row + deep_point >= pair, "{name}: the DEEP term decides");
+        }
+    }
+}
+
+/// RULINGS 22: DEEP costs two points under row pairs and one under one row,
+/// each [`TableWidths::deep_point_rows`] XALU rows per query — and nothing
+/// else in the price depends on it.
+#[test]
+fn the_deep_term_is_two_points_vs_one() {
+    for fri in [FriMode::Pair, FriMode::Dp] {
+        for cap in [CapPolicy::Off, CapPolicy::Auto] {
+            let o = opts_q(110, OneRowMode::Auto, fri, cap);
+            let base = pinned_widths(0, 49, 13, 2);
+            let none = TableWidths {
+                deep_point_rows: 0,
+                ..base
+            };
+            let point = 110 * base.deep_point_rows * FRI_COST_WEIGHTS.xalu;
+            for lde_log in 8..=22u32 {
+                for (one_row, points) in [(true, 1u64), (false, 2)] {
+                    assert_eq!(
+                        table_openings_cost_q(&base, &o, lde_log, 2, one_row),
+                        table_openings_cost_q(&none, &o, lde_log, 2, one_row) + points * point,
+                        "fri {fri:?} cap {cap:?} B {lde_log} one_row {one_row}"
+                    );
+                }
+            }
+        }
+    }
+    // The formula: one XALU row per surviving opening, plus 4 per OOD row,
+    // one per part and 3.
+    assert_eq!(deep_point_xalu_rows(100, 2, 2), 100 + 8 + 2 + 3);
 }
 
 /// `auto` resolves per table from the AIR, and the prover and the verifier
@@ -884,5 +965,18 @@ fn widths_of_an_extension_air() {
     assert_eq!(w.aux, 3 * air.num_auxiliary_rap_columns() as u64);
     assert_eq!(w.main, air.trace_layout().0 as u64);
     assert!(w.composition.is_multiple_of(3) && w.composition > 0);
+    // The DEEP term from the AIR's own OOD layout (the verifier's reading).
+    let e = air.context().transition_offsets.len() * air.step_size();
+    let ood = crate::ood::OodLayout::new(
+        air.context().trace_columns,
+        e,
+        air.step_size(),
+        air.trace_ood_next_row_columns(),
+    );
+    assert_eq!(
+        w.deep_point_rows,
+        deep_point_xalu_rows(ood.num_surviving() as u64, e as u64, w.composition / 3)
+    );
+    assert!(w.deep_point_rows > ood.num_surviving() as u64);
     let _ = <F as IsFFTField>::TWO_ADICITY;
 }

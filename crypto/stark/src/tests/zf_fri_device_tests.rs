@@ -38,7 +38,8 @@ fn dp_shapes_are_pinned() {
 }
 
 const PINNED_SHAPES: &[&[u8]] = &[
-    // The DP's own (22).
+    // The DP's own (21; RULINGS 22 dropped [4] and moved [4, 3] after
+    // [4, 3, 3, 3] in first-appearance order).
     &[1],
     &[2],
     &[3],
@@ -57,11 +58,11 @@ const PINNED_SHAPES: &[&[u8]] = &[
     &[3, 3, 3, 3, 2, 2],
     &[3, 3, 3, 3, 3, 2],
     &[3, 3, 3, 3, 3, 3],
-    &[4, 3],
     &[4, 3, 3],
     &[4, 3, 3, 3],
+    &[4, 3],
+    // EXTRA_SHAPES (8).
     &[4],
-    // EXTRA_SHAPES (7).
     &[6],
     &[1, 6],
     &[6, 1],
