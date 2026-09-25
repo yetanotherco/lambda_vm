@@ -151,7 +151,7 @@ pub trait IsStarkVerifier<
 {
     /// The query indexes: leaf indexes of the trace trees, uniform below
     /// [`LeafLayout::query_bound`] — `lde / 2` (a row PAIR) today, `lde` under
-    /// one-row openings, where each index is one point of `D₀` (FRI.md §7.7 (i):
+    /// one-row openings, where each index is one point of `D₀` (soundness:
     /// sampling a pair and opening one of its points would bias `x₀`).
     fn sample_query_indexes(
         number_of_queries: usize,
@@ -833,19 +833,19 @@ pub trait IsStarkVerifier<
     }
 
     /// The per-tree Merkle checks of one table's proof, built ONCE per tree
-    /// before any query is verified (design/CAP.md §4.3).
+    /// before any query is verified.
     ///
     /// Every depth and cap height is a verifier constant ([`StarkCaps`], from
     /// the AIR's options and the LDE size): the trace, precomputed, aux and
     /// composition trees are `log2(lde) − 1` deep, committed FRI layer `i` is
     /// the fold layout's `layer_depth(i)` deep (`log2(lde) − i − 2` under the
     /// all-ones schedule, the group tree's depth under any other). Every authentication path must be exactly
-    /// `depth − c` long (C1b at `c = 0`: before that a path of any length was
-    /// folded and compared with the root, design/CAP.md §9.4).
+    /// `depth − c` long, at `c = 0` too: a path of any other length would be
+    /// folded and compared with the root, letting an internal node pass as a leaf.
     ///
     /// A capped tree (`c > 0`) reads its owner opening — query 0's path — here,
     /// splits off the cap and checks it hashes to the root. That read is safe
-    /// by construction (REVIEW-CAP M2): the caller runs this only after the
+    /// by construction: the caller runs this only after the
     /// `query_list_len` / `trace_opening_widths_well_formed` count guards, and
     /// every access below is a length-checked `get`, so a proof with no
     /// openings, too few FRI layers, or a missing aux/precomputed opening
@@ -976,8 +976,8 @@ pub trait IsStarkVerifier<
     ///   points checked against the terminal codeword).
     /// * One row (`p0_eval_sym = None`, S2): layer 0 IS the committed DEEP
     ///   codeword, so the query's value there is `DEEP(x_r)` itself and the
-    ///   layer-0 slot check is the input-slot check `group₀[slot] == DEEP(x_r)`
-    ///   (FRI.md §7.4). With nothing to fold the terminal codeword is the DEEP
+    ///   layer-0 slot check is the input-slot check `group₀[slot] == DEEP(x_r)`.
+    ///   With nothing to fold the terminal codeword is the DEEP
     ///   codeword and `terminal[r] == DEEP(x_r)` is the whole check.
     // Crate-internal layout type on a default method, as `fri_termination_params`.
     #[allow(clippy::too_many_arguments, private_interfaces)]
@@ -1746,7 +1746,7 @@ pub trait IsStarkVerifier<
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
                 // The root of THIS table's leaf layout (a verifier constant);
-                // a layout the AIR has no root for rejects (RULINGS 14).
+                // a layout the AIR has no root for rejects (never a recompute).
                 let layout = Self::leaf_layout(*air, trace_length);
                 let Some(expected_precomputed) = air.precomputed_commitment_for(layout) else {
                     error!(
@@ -2132,7 +2132,7 @@ pub trait IsStarkVerifier<
 
         // The per-tree Merkle checks, built once per tree and only now: after
         // the two count guards above, so a capped tree's owner opening (query
-        // 0) is known to exist before it is read (REVIEW-CAP M2). A capped
+        // 0) is known to exist before it is read. A capped
         // tree's cap is authenticated against its root here; at the default
         // format this reads no opening at all.
         let Some(tree_checks) = Self::table_tree_checks(air, proof, &domain) else {

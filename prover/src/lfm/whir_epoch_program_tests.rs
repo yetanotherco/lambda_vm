@@ -151,7 +151,7 @@ fn the_production_epoch_recount() {
     // ⚠ AT THE LEGACY WHIR FORMAT, named. This recount is of sh1's measured
     // epoch, and sh1 ran before the default flip (uniform folds, no cap): its
     // "rounds 56" is 8 chains x 7 rounds. The production default (first6, cap
-    // auto; RULINGS 26) proves this epoch in 8 x 6 = 48 rounds — asserted
+    // auto) proves this epoch in 8 x 6 = 48 rounds — asserted
     // below so the flip is a stated fact here, not a silent re-pin of a record.
     let config =
         crate::multilinear_prove::chain_config_under(&crate::zf_format::ZfFormat::LEGACY, &shapes);

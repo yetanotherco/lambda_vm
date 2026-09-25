@@ -1,9 +1,9 @@
-//! W1 — the Merkle cap on WHIR chains (design/CAP.md §5), end to end on the
+//! W1 — the Merkle cap on WHIR chains, end to end on the
 //! host: every tree's paths stop `c` levels below its root, and the tree's cap
 //! rides on its first opening in proof order (the owner path).
 //!
 //! Round-level fixtures that need the query positions (the unreached cap node
-//! and the internal-node leaf of REVIEW-CAP M1) live in `whir_round::tests`,
+//! and the leaf forged from an internal node) live in `whir_round::tests`,
 //! where the query draw is reachable.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -239,7 +239,7 @@ fn the_default_format_is_byte_identical_to_a_zero_cap() {
     }
 }
 
-/// REVIEW-CAP S2: the cap changes no transcript value. The same witness under
+/// The cap changes no transcript value. The same witness under
 /// `Off`, `Fixed(3)` and `Auto` (no grinding, so the nonces are fixed) gives
 /// the same sumchecks, roots, out-of-domain values, nonces and final value;
 /// only the paths differ.

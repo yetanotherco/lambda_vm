@@ -1,4 +1,4 @@
-//! `LogReadOnlyRAP` carries a constraint program (I-FIX-D2).
+//! `LogReadOnlyRAP` carries a constraint program.
 //!
 //! The CUDA composition arm evaluates `AIR::constraint_program()` once main
 //! and aux are device-resident; `LogReadOnlyRAP` (the AIR of the checked-in

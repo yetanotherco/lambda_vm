@@ -1165,7 +1165,7 @@ fn check_transcript_pins(
     // variable: `MaxRowsConfig::default` is what chunked the epochs whose
     // transcript this is, and it reaches the posture through this function.
     let max_rows_log2 = crate::tables::max_rows_log2_override();
-    // ★ RULINGS 26: the bases were MEASURED at the legacy WHIR format (uniform
+    // ★ The bases were MEASURED at the legacy WHIR format (uniform
     // folds, no cap). A run at any other WHIR format — the production default
     // included — is a different measurement: it SKIPS and says so, like a run
     // at another table cap. Re-pinning at the default needs a box measurement.
@@ -1449,7 +1449,7 @@ fn the_pinned_pair_is_the_measurement() {
     // tallest stacked polynomial exactly — and the query count is 112 for every
     // height the block's cross-epoch tables can reach. The RUNTIME pin does not
     // rely on that: it evaluates the terms at the run's own config.
-    // ⚠ AT THE LEGACY WHIR FORMAT, named (RULINGS 26): the bases and lb17/lb18
+    // ⚠ AT THE LEGACY WHIR FORMAT, named: the bases and lb17/lb18
     // were measured before the default flip, and the runtime pin skips any
     // other format.
     let config = crate::multilinear_prove::chain_config_under(
@@ -1559,7 +1559,7 @@ fn the_genesis_stack_is_the_schedule_the_shape_implies() {
     // polynomial exactly. Stated here because the literal triple at the end of
     // this test is only the block's numbers at THIS posture; the runtime pin
     // evaluates the same form at the run's own config and does not rely on it.
-    // ⚠ THE LEGACY WHIR FORMAT (RULINGS 26): lb17/lb18 ran before the flip;
+    // ⚠ THE LEGACY WHIR FORMAT: lb17/lb18 ran before the flip;
     // under first6 the 21-variable stack is five rounds, not six.
     let config = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat::LEGACY,
@@ -1710,7 +1710,7 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
         columns,
         "one placement per column, which is what the opening's wrapper absorbs"
     );
-    // ★ RULINGS 26: the DECODE group is committed under the PROCESS format
+    // ★ The DECODE group is committed under the PROCESS format
     // (`decode_prepared_config` → `chain_config`), so with no knob set this is
     // the production default's first6 schedule, [6,4,4,4,4,1] — pre-flip it was
     // uniform4's [4,4,4,4,4,3]. Both are six rounds over 23 folded variables,

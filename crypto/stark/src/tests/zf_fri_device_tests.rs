@@ -1,4 +1,4 @@
-//! S3 on the device (FRI.md §5, lane I-FRI-D, D1): the device FRI commit and
+//! S3 on the device: the device FRI commit and
 //! query phases against the host CPU loop, under Keccak and Blake3 (the RPX
 //! twins live in the prover crate's `tests::zf_rpx_device_tests`).
 //!
@@ -38,8 +38,7 @@ fn dp_shapes_are_pinned() {
 }
 
 const PINNED_SHAPES: &[&[u8]] = &[
-    // The DP's own (21; RULINGS 22 dropped [4] and moved [4, 3] after
-    // [4, 3, 3, 3] in first-appearance order).
+    // The DP's own (21, in first-appearance order).
     &[1],
     &[2],
     &[3],
@@ -126,7 +125,7 @@ fn parity_legacy_encoding_blake3() {
     check::<Blake3StarkHash>("blake3", &legacy_cases(), false, 0x5a49_0000);
 }
 
-/// The (d) vector proofs (FRI.md §10 (d): `pair`, `dp`, `dp_3_1_3`, and the
+/// The (d) vector proofs (the README's (d): `pair`, `dp`, `dp_3_1_3`, and the
 /// Merkle-capped `cap_pair`, `cap_dp` at Q = 20) proved on
 /// the device path — LDE 4096, so `LAMBDA_VM_GPU_LDE_THRESHOLD` must be at
 /// most 4096 — are byte-identical to the checked-in CPU-proved files (rkyv
@@ -154,8 +153,8 @@ fn proved_vectors_equal_the_cpu_bytes() {
         device_commits, 10,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
     );
-    // Every proof composes on the device (the AIR's constraint program,
-    // I-FIX-D2); a host composition would not be counted here.
+    // Every proof composes on the device (the AIR's constraint program); a
+    // host composition would not be counted here.
     assert_eq!(
         compositions, 10,
         "every vector proof must compose on the device ({compositions} device compositions)"

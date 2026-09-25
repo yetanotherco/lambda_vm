@@ -903,7 +903,7 @@ impl LfmAirs {
     /// This set with every preprocessed chip's ONE-ROW (S2) root attached:
     /// what `precomputed_commitment_for(Row)` returns when the STARK prover or
     /// verifier resolves that chip to one row. Without it a one-row chip is a
-    /// hard miss (RULINGS 14). `KECCAK_RND` has no preprocessed columns.
+    /// hard miss, never a recompute. `KECCAK_RND` has no preprocessed columns.
     pub fn with_one_row_roots(mut self, one_row: &super::registry::LfmOneRowRoots) -> Self {
         let r = &one_row.roots;
         self.const_ = self.const_.with_one_row_commitment(r[0]);

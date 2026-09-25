@@ -215,7 +215,7 @@ pub trait AIR: Send + Sync {
     /// leaf hashes different bytes), so each layout has its own trust anchor.
     ///
     /// `None` = this AIR has no root for `layout`: the prover refuses to prove
-    /// and the verifier rejects (RULINGS 14 — never a silent recompute, never
+    /// and the verifier rejects (never a silent recompute, never
     /// the other layout's root). The default serves today's layout only.
     /// Only meaningful if `is_preprocessed()` returns true.
     fn precomputed_commitment_for(

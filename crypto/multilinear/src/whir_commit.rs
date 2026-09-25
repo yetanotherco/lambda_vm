@@ -535,7 +535,7 @@ where
 /// `depth` is the tree's depth (`log2` of its leaf count), a verifier
 /// constant: the path must be exactly that long and `index < 2^depth`. A path
 /// of any other length is refused before it is folded, so a leaf hash can
-/// never be compared with an internal node (design/CAP.md §9.4).
+/// never be compared with an internal node.
 pub fn verify_opening<F, H>(
     root: &Commitment,
     depth: usize,

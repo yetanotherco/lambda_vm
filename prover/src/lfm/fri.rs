@@ -61,7 +61,7 @@ pub struct FriShape {
     pub coset_offset: u64,
     /// Queries the sub-proof carries.
     pub num_queries: usize,
-    /// The inner proof's FORMAT (design/CAP.md, design/FRI.md): its Merkle cap
+    /// The inner proof's FORMAT: its Merkle cap
     /// policy caps every committed layer tree. A verifier constant, taken from
     /// the inner proof's options — never from the proof.
     ///
@@ -174,7 +174,7 @@ impl FriShape {
     /// ★ The committed layers' fold exponents, first committed layer first —
     /// the SAME function the host prover and verifier lay out with
     /// (`stark::fri::schedule::FriFormat::schedule`: the all-ones schedule
-    /// under `pair`, the RULINGS-13 cost-law DP under `dp`). A format
+    /// under `pair`, the cost-law DP under `dp`). A format
     /// constant: nothing here reads a proof.
     ///
     /// ⚠ `num_queries` is a DP input (and a cap-policy input): a program that
@@ -198,7 +198,7 @@ impl FriShape {
         self.schedule().len()
     }
 
-    /// Folding challenges the proof draws (FRI.md §7.3, `FriFoldLayout::num_zetas`):
+    /// Folding challenges the proof draws (`FriFoldLayout::num_zetas`):
     /// one per committed layer plus the final fold's for row pairs (fold 0
     /// consumes the first), one per committed layer under one row (layer 0 is
     /// committed before any challenge); none when nothing folds.
@@ -224,14 +224,14 @@ impl FriShape {
 
     /// Index bits consumed before committed layer `j`: `G_j = Σ_{i<j} d_i`.
     /// Layer `j`'s slot is `bits[G_j .. G_j + d_j]` and its tree's leaf index
-    /// `bits[G_j + d_j ..]` (FRI.md §3.2).
+    /// `bits[G_j + d_j ..]`.
     pub fn layer_bit_offset(self, layer: usize) -> usize {
         self.schedule()[..layer].iter().map(|&d| d as usize).sum()
     }
 
     /// Opened values one query's opening of committed layer `j` carries: the
     /// sibling alone under `pair`, the whole `2^{d_j}` group otherwise
-    /// (FRI.md §3.4 — the query's own value included).
+    /// (the query's own value included).
     pub fn layer_values(self, layer: usize) -> usize {
         if self.is_legacy() {
             1
@@ -341,8 +341,8 @@ impl FriShape {
     }
 
     /// Index bits a query carries — `log2(lde) − 1` for row pairs (the pair
-    /// index `iota`), `log2(lde)` under one-row leaves (`r` over the whole LDE,
-    /// FRI.md §7.2) — which is both the TRACE trees' Merkle depth and the bit
+    /// index `iota`), `log2(lde)` under one-row leaves (`r` over the whole
+    /// LDE) — which is both the TRACE trees' Merkle depth and the bit
     /// width of the index.
     ///
     /// The FRI layers consume SUFFIXES of this one decomposition rather than
@@ -618,7 +618,7 @@ pub struct FriCommitments {
     /// Under the group encoding (S3, and every one-row table): per committed
     /// layer `j`, the challenges its `d_j` binary folds use — `ζ, ζ², …,
     /// ζ^{2^{d_j−1}}` for `ζ = ζ_{j+1}` (row pairs) or `ζ_j` (one row,
-    /// [`FriShape::layer_zeta_index`]) (FRI.md §1.2) — squared ONCE per
+    /// [`FriShape::layer_zeta_index`]) — squared ONCE per
     /// sub-proof, not per query. Empty under the legacy encoding, where each
     /// layer folds once with `ζ_{j+1}` itself.
     pub zeta_powers: Vec<Vec<Ext>>,
@@ -672,7 +672,7 @@ pub struct LayerOpening {
     ///
     /// Under the group encoding: the whole group of `2^{d_j}` values in
     /// position (bit-reversed) order, the query's own value at its slot
-    /// included (FRI.md §3.4) — the leaf is hashed straight from them and the
+    /// included — the leaf is hashed straight from them and the
     /// slot check `values[slot] == v` ties them to the previous fold.
     pub values: Vec<Ext>,
     /// Sibling digests, LEAF LEVEL FIRST.
@@ -953,7 +953,7 @@ pub fn emit_query_fri(
     let inv = b.div(one, q.point);
 
     if shape.one_row() {
-        // ★ S2 (design/FRI.md §7.3-§7.4): layer 0 IS the committed DEEP
+        // ★ S2: layer 0 IS the committed DEEP
         // codeword, so no fold precedes it. The query's value there is
         // `DEEP(x_r)` itself and the point's inverse is `x_r⁻¹`; the layer-0
         // slot check of `emit_group_layer` is then the INPUT-SLOT check
@@ -1008,7 +1008,7 @@ pub fn emit_query_fri(
     } else {
         // The group encoding (S3): committed layer `j` opens a whole coset of
         // `2^{d_j}` values. `y⁻¹` at committed layer 0 is `υ^{−2}`, and each
-        // layer hands the next its own point (`x_g^{2^d}`, FRI.md §1.1).
+        // layer hands the next its own point (`x_g^{2^d}`).
         assert_eq!(
             fri.zeta_powers.len(),
             c,
@@ -1088,7 +1088,7 @@ pub fn emit_pair_layer(
     (edsl::fri_fold(b, v, sym, zeta, inv_pow), inv_pow)
 }
 
-/// The program constants of one group fold of exponent `d` (FRI.md §1.3), in
+/// The program constants of one group fold of exponent `d`, in
 /// the host verifier's own terms (`fri::group::group_fold`, whose table is
 /// `ω_{2^d}^t` for `ω_{2^d} = get_primitive_root_of_unity(d)`):
 ///
@@ -1166,7 +1166,7 @@ fn emit_value_mux(b: &mut LfmBuilder, values: &[Ext], slot_bits: &[Bit]) -> Ext 
     level[0].as_ext()
 }
 
-/// ★ One committed layer under the group encoding (S3; FRI.md §1.3, §3.2, §6).
+/// ★ One committed layer under the group encoding (S3).
 ///
 /// With `d = d_j`, `G = G_j`, the query's bits `bits` (low first, all
 /// `index_bits`), its value `v` at this layer (the previous fold's output) and
@@ -1176,8 +1176,8 @@ fn emit_value_mux(b: &mut LfmBuilder, values: &[Ext], slot_bits: &[Bit]) -> Ext 
 ///    an `assert_eq_ext`: the round-consistency check tying the opened group
 ///    to the value the previous fold produced (M1 on the host);
 /// 2. **the group is the leaf** — hashed in full, position order (a
-///    `GroupShape` of `2^{d−1}` ext columns covers `2^d` values; REVIEW-FRI
-///    F6), and authenticated at the tree's leaf index `bits[G+d..]` against the
+///    `GroupShape` of `2^{d−1}` ext columns covers `2^d` values), and
+///    authenticated at the tree's leaf index `bits[G+d..]` against the
 ///    layer's root or cap;
 /// 3. **the group fold** with `ζ, ζ², …, ζ^{2^{d−1}}`: `x_g⁻¹ = y⁻¹·ω_{2^d}^{br_d(s)}`
 ///    (`d` selects of constants and `d` base muls), then `d` levels of

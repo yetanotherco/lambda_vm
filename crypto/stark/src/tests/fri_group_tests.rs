@@ -1,7 +1,7 @@
-//! S3 (group-leaf FRI layers) on the CPU prover and host verifier: FRI.md §10
-//! U4–U6, the tamper tests T1–T3, the load-bearing mutations M1–M2 and the
+//! S3 (group-leaf FRI layers) on the CPU prover and host verifier: the
+//! round trips U4–U6, the tamper tests T1–T3, the load-bearing mutations M1–M2 and the
 //! differential of the group path at the all-ones schedule against the legacy
-//! path (REVIEW-FRI F1.2).
+//! path.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -503,7 +503,7 @@ fn the_format_is_a_verifier_constant() {
 }
 
 // ---------------------------------------------------------------------------
-// F1.2: the group path at the all-ones schedule vs the legacy path.
+// The group path at the all-ones schedule vs the legacy path.
 // ---------------------------------------------------------------------------
 
 /// Proving under `dp` with an all-ones schedule runs the GROUP code path (group

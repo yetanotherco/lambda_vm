@@ -767,7 +767,7 @@ const COST_SHAPES: [(usize, usize, u8); 5] =
 /// ★ The knob-on shapes (W2): `(num_vars, num_queries, grind, k0)`.
 ///
 /// `S = 9` under `first6` is `[6, 3]` and `S = 11` under `first5` is
-/// `[5, 4, 2]` (design/WHIR.md §4.8), each at grind 0 and 8 for the reason
+/// `[5, 4, 2]`, each at grind 0 and 8 for the reason
 /// [`COST_SHAPES`] gives. `S = 6` under `first6` is the one-round chain whose
 /// only block is 64 base values, and `S = 7` is `[6, 1]`, a 64-wide base block
 /// folded into a 2-wide extension tail.
@@ -1543,7 +1543,7 @@ fn the_schedule_is_the_host_transcripts_under_the_cap() {
 }
 
 /// ★ The tamper arm under the cap: a cap node of tree 0 that NO query reaches
-/// (so only the in-guest cap-to-root check can refuse it — REVIEW-CAP M1(b)),
+/// (so only the in-guest cap-to-root check can refuse it),
 /// a reached one, and a successor tree's cap node. Each: the host rejects it
 /// and the machine has no execution.
 #[test]
@@ -1626,7 +1626,7 @@ fn a_tampered_capped_chain_cannot_execute() {
 /// [`the_production_chain_costs_what_the_census_quotes`] and
 /// [`the_production_shape_reproduces_the_campaigns_permutation_count`].
 ///
-/// Hand derivation (design/CAP.md §10): trees of depth 23, 19, 15, 11, 7, 3, 2
+/// Hand derivation: trees of depth 23, 19, 15, 11, 7, 3, 2
 /// opened 112, then 224 times each, capped 3, 3, 3, 3, 3, 3, 2. Openings save
 /// `112·3 + 5·224·3 + 224·2 = 4,144` parents; the caps cost `6·7 + 3 = 45`:
 /// 22,512 → 18,413 opening permutations, 22,828 → 18,729 in all. Rows: `+2`
@@ -1694,7 +1694,7 @@ fn the_production_chain_emits_its_closed_form_under_the_auto_cap() {
     assert_eq!(perm_rows(&program), chain_perms(&shape, entry));
 }
 
-/// ⛔ RULINGS 4: `PREPARED_LEG_ROWS` is a ROUTING constant and stays fixed
+/// ⛔ `PREPARED_LEG_ROWS` is a ROUTING constant and stays fixed
 /// across formats. Under the `Auto` cap a chain costs slightly more rows (+2 an
 /// opening at `c = 3`, plus the cap checks), so the constant under-states the
 /// 24-variable chain it was read from — by less than 2%, and it still covers
@@ -1838,9 +1838,9 @@ fn a_tampered_first_fold_chain_cannot_execute() {
 ///   22+18+14+10+6+2 = 72, successor 18+14+10+6+2 = 50, so 122 parents; leaves
 ///   4 (32 base felts) + 5×6 + 5×6 = 64. 186 a query, 20,832 a chain.
 ///
-/// The whole-chain figures (grind + schedule terms) are design/WHIR.md §4.8's,
-/// from D-WHIR's independent Python re-implementation of these forms
-/// (`whir_model.py`), which reproduces today's 22,828 / 185,509: first6
+/// The whole-chain figures (grind + schedule terms) come from an independent
+/// Python re-implementation of these forms, which reproduces today's
+/// 22,828 / 185,509: first6
 /// 19,877 permutations and 201,318 rows, first5 21,109 and 189,028. R = 6
 /// under both, so `3R − 1 = 17` grinds, 34 permutations.
 #[test]
@@ -1881,12 +1881,12 @@ fn the_first_fold_production_chains_cost_what_the_design_derived() {
     }
 }
 
-/// ★ RULINGS 26: THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with
+/// ★ THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with
 /// no knob set — is `first6` under the `Auto` cap, at the legacy security
 /// parameters (blowup 2^2, Q = 112, 20-bit grinds). The legacy chain keeps its
 /// own pins above (`the_production_chain_costs…`, 185,509 / 22,828); these are
-/// the default's, the two levers the WHIR block measured together
-/// (wt54–wt57, −9.10 s): W2's six rounds and W1's cap.
+/// the default's, the two levers measured together on the WHIR pipeline's
+/// block (−9.10 s, ABBA): W2's six rounds and W1's cap.
 #[test]
 fn the_production_default_chain_is_first6_under_the_auto_cap() {
     let production = crate::multilinear_prove::chain_config_under(
@@ -1935,7 +1935,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
     const { assert!(DEFAULT_CHAIN_PERMS < 18_729 && DEFAULT_CHAIN_PERMS < 19_877) };
 }
 
-/// The production default chain's pins (RULINGS 26), derived by the closed
+/// The production default chain's pins, derived by the closed
 /// forms and checked against the EMITTED program by
 /// [`the_production_default_chain_emits_its_closed_form`].
 const DEFAULT_CHAIN_CAPS: &[usize] = &[3, 3, 3, 3, 3, 2];
@@ -2004,7 +2004,7 @@ fn the_first_fold_production_chains_emit_their_closed_forms() {
     }
 }
 
-/// ⛔ `PREPARED_LEG_ROWS` stays FIXED under the fold knob (RULINGS 15), and
+/// ⛔ `PREPARED_LEG_ROWS` stays FIXED under the fold knob, and
 /// this is what makes that safe: under each first fold the constant still
 /// covers the block's 20-variable stack, so no page is left sparse that the
 /// opening could carry. The default band above is untouched; its upper side

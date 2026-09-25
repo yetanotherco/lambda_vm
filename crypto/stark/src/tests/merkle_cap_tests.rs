@@ -1,4 +1,4 @@
-//! Merkle caps on univariate STARK proofs (design/CAP.md §4, lever S1, commit C3).
+//! Merkle caps on univariate STARK proofs (lever S1).
 //!
 //! Every tree of a proof — main, precomputed, aux, composition, each committed
 //! FRI layer — gets a height-`c` cap under a cap policy. The cap rides at the
@@ -7,9 +7,9 @@
 //! - round trips at every policy, over the owned and the archived (rkyv) path;
 //! - the default (`Off`) is byte-identical to a zero-height policy;
 //! - the transcript does not move: an `Off` and an `Auto` proof of one witness
-//!   differ only in their Merkle paths (REVIEW-CAP S2);
+//!   differ only in their Merkle paths;
 //! - tampers of every tree class, of the owner split, and of the policy;
-//! - REVIEW-CAP M1 at the verifier level: an unreached cap node that only the
+//! - load-bearing checks at the verifier level: an unreached cap node that only the
 //!   cap-to-root check rejects, and an internal node passed off as a leaf that
 //!   only the exact-length check rejects.
 
@@ -298,7 +298,7 @@ fn a_zero_height_policy_is_byte_identical_to_off() {
     assert_eq!(off, bytes(CapPolicy::Auto));
 }
 
-/// REVIEW-CAP S2: the transcript does not change under a cap. One witness
+/// The transcript does not change under a cap. One witness
 /// proved at `Off` and at `Auto` (grinding off) gives equal roots, OOD values,
 /// FRI final coefficients, nonces and opened values; only the Merkle paths
 /// differ, and each capped path is exactly its full path cut to `D − c`, with
@@ -587,7 +587,7 @@ fn an_unreached_cap_node_is_rejected_by_the_cap_to_root_check_alone() {
 /// real internal node one level above a queried leaf, presented as a leaf hash
 /// with the path from that node up — which the length-agnostic fold accepts.
 /// Only the exact-length check stands between the two; deleting it from the
-/// cap primitive makes this test fail. Run at the default (`c = 0`, C1b) and
+/// cap primitive makes this test fail. Run at the default (`c = 0`) and
 /// under a cap.
 #[test]
 fn an_internal_node_passed_as_a_leaf_is_rejected_by_the_length_check_alone() {
@@ -651,7 +651,7 @@ fn an_internal_node_passed_as_a_leaf_is_rejected_by_the_length_check_alone() {
 
 // ------------------------------------------------------------- device trees
 
-/// REVIEW-CAP S6: a device-resident tree (a root-only host tree) whose cap has
+/// A device-resident tree (a root-only host tree) whose cap has
 /// no device read is a hard `Err` naming the tree — never a skipped cap, which
 /// would ship full-length paths the verifier rejects with no pointer to the
 /// cause. And a device read that fails is an `Err` too, not a panic.
@@ -706,7 +706,7 @@ fn a_device_resident_tree_without_a_cap_read_is_an_error() {
     assert!(verify_cap::<Leaf>(&cap, &host.root, 2));
 }
 
-/// C4 on a real device (box only; `--features cuda -- --ignored`): a LogUp
+/// The device cap read on a real device (box only; `--features cuda -- --ignored`): a LogUp
 /// table over the cubic extension, big enough that its main, aux,
 /// composition and FRI trees are committed on the device (host trees
 /// root-only), proved under `Auto` at 30 queries. The caps must come off the

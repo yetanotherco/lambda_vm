@@ -707,7 +707,7 @@ pub(super) fn nonce_halves(b: &mut LfmBuilder, nonce: Felt) -> [Felt; 2] {
     super::transcript_replay::felt_be_halves(b, nonce)
 }
 
-// The transcript-order mutation (FRI.md §10 T6 in-guest): a test build can
+// The transcript-order mutation (tamper T6, in-guest): a test build can
 // replay a one-row table with a ζ drawn BEFORE the input root and watch the
 // challenge differential go red. Production has no switch.
 #[cfg(test)]
@@ -813,11 +813,11 @@ pub fn emit_table_challenges(
         // Sample FIRST, absorb SECOND — a ζ drawn after its own layer root is a
         // challenge the prover answers rather than one that binds them.
         //
-        // ★ Except the one-row INPUT tree (S2, design/FRI.md §7.3): root 0 is
+        // ★ Except the one-row INPUT tree (S2): root 0 is
         // the DEEP codeword itself, committed BEFORE any folding challenge —
         // absorbed right after γ, with no ζ ahead of it. A ζ drawn before it
-        // would let the prover pick the codeword after seeing λ₁ (FRI.md §7.7
-        // (ii)); the host replay (`verifier.rs`, `replay_rounds_after_round_1`)
+        // would let the prover pick the codeword after seeing λ₁; the host
+        // replay (`verifier.rs`, `replay_rounds_after_round_1`)
         // is the same loop.
         if !(shape.fri.one_row() && j == 0) || zeta_before_input_root() {
             zetas.push(t.sample_ext(b));

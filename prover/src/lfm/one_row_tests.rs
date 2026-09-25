@@ -1,5 +1,5 @@
-//! S2 (one-row openings) on the LFM side, host only (design/FRI.md §7.5.2–4,
-//! REVIEW-FRI F8): the commit helpers at both leaf layouts, the registry
+//! S2 (one-row openings) on the LFM side, host only: the commit helpers at
+//! both leaf layouts, the registry
 //! policy (a one-row format never reads `LFM_REGISTRY`), the one-row roots of
 //! a program's artifacts, and the in-circuit register commitment against its
 //! host twin at BOTH layouts. Execute-only and artifact builds; nothing here
@@ -59,7 +59,7 @@ fn the_commit_helpers_follow_the_layout() {
     assert_ne!(row, pair);
 }
 
-/// ★ The registry policy (FRI.md §7.5.4): `LFM_REGISTRY` stays row-pair only.
+/// ★ The registry policy: `LFM_REGISTRY` stays row-pair only.
 /// At the default format `resolve_artifacts` IS the registry row; under a
 /// one-row format (`On` or `Auto`) it never reads the registry and builds the
 /// program's artifacts at run time — with the SAME row-pair roots and program
@@ -93,7 +93,7 @@ fn a_one_row_format_never_reads_the_registry() {
             assert_ne!(root, built.roots[slot], "slot {slot}: layouts differ");
         }
         // Blowup 2 has no one-row static twin: the hosted KECCAK_RC and
-        // BITWISE roots are hard misses (RULINGS 14), not recomputes.
+        // BITWISE roots are hard misses, not recomputes.
         assert_eq!(one_row.roots[13], None);
         assert_eq!(one_row.roots[14], None);
     }
@@ -166,7 +166,7 @@ fn digest_bytes(public: &[(u32, LfmWord)]) -> [u8; 32] {
 }
 
 /// ★ The in-circuit register commitment against its host twin at BOTH leaf
-/// layouts (FRI.md §7.5.3). A mismatch would show only as a runtime
+/// layouts. A mismatch would show only as a runtime
 /// `DivByZero` deep in a node, so each layout gets its own root equality. One
 /// emitter, two constants (`RegisterDerivationShape::rows_per_leaf`).
 #[test]

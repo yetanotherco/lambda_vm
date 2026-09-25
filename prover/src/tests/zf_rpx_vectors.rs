@@ -1,4 +1,4 @@
-//! The exported S3 and S2 vectors (FRI.md §10 (c), (d), (e)) under the production RPX pin,
+//! The exported S3 and S2 vectors ((c), (d), (e) in the README) under the production RPX pin,
 //! written next to the Keccak/Blake3 ones in
 //! `crypto/stark/tests/vectors/zf_fri/` (the stark crate cannot name
 //! `RpxStarkHash`). Regenerated in memory and required byte-equal to the

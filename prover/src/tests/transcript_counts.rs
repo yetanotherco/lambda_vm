@@ -177,7 +177,7 @@ fn schedule(num_vars: usize, k: usize) -> Vec<usize> {
 
 /// One chain's transcript over the fold schedule `sch` — the config's own
 /// (`ChainConfig::schedule`), so a non-uniform first fold (`whir_folds=first6`,
-/// the production default since RULINGS 26) is priced as it is proved.
+/// the production default) is priced as it is proved.
 fn drive_chain(s: &mut Sim, sch: &[usize], queries: usize) {
     let rounds = sch.len();
     for (r, &kr) in sch.iter().enumerate() {

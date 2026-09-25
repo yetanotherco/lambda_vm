@@ -1,8 +1,8 @@
 //! S2 (one-row trace openings with a committed FRI input) on the CPU prover
-//! and host verifier: design/FRI.md §7 and §10 — U6 at one_row, the tamper
+//! and host verifier: the round trip U6 at one_row, the tamper
 //! tests T4–T6, the load-bearing mutation M3, the transcript-order KAT, the
-//! per-table `auto` rule (RULINGS 6, REVIEW-FRI F5), the preprocessed-root
-//! miss (RULINGS 14) and the cap × FRI × one-row matrix (REVIEW-FRI F9).
+//! per-table `auto` rule, the preprocessed-root
+//! miss (a hard error, never a recompute) and the cap × FRI × one-row matrix.
 
 use std::sync::Mutex;
 
@@ -61,7 +61,7 @@ fn on(fri_mode: FriMode) -> ProofFormat {
 }
 
 // ---------------------------------------------------------------------------
-// The layout helper (REVIEW-FRI F7): one place a query becomes rows.
+// The layout helper: one place a query becomes rows.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -97,7 +97,7 @@ fn query_rows_bounds_and_depths() {
     }
 }
 
-/// REVIEW-FRI F7: no stray `2·iota(+1)` row arithmetic outside the helper in
+/// No stray `2·iota(+1)` row arithmetic outside the helper in
 /// the opening code of the prover and the verifier (the legacy FRI
 /// zero-fold terminal check, which indexes the TERMINAL codeword by the pair,
 /// is the one named exception).
@@ -428,7 +428,7 @@ fn one_row_zero_fold_case() {
 }
 
 // ---------------------------------------------------------------------------
-// FRI.md §7.7 (i): r is uniform over ALL of D₀. M3 shows the test that says so
+// Soundness: r is uniform over ALL of D₀. M3 shows the test that says so
 // is load-bearing.
 // ---------------------------------------------------------------------------
 
@@ -478,7 +478,7 @@ fn m3_the_query_bound_test_is_load_bearing() {
 }
 
 // ---------------------------------------------------------------------------
-// FRI.md §7.7 (ii): the input root is absorbed before ζ₀ (transcript KAT).
+// Soundness: the input root is absorbed before ζ₀ (transcript KAT).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -640,7 +640,7 @@ fn m1_the_input_slot_check_is_load_bearing() {
 }
 
 // ---------------------------------------------------------------------------
-// Preprocessed tables: one-row roots, and RULINGS 14 (a miss is an error).
+// Preprocessed tables: one-row roots, and a miss is an error (never a recompute).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -716,7 +716,7 @@ fn one_row_preprocessed_table_and_a_missing_root() {
 }
 
 // ---------------------------------------------------------------------------
-// RULINGS 6 / REVIEW-FRI F5: the per-table `auto` rule.
+// The per-table `auto` rule.
 // ---------------------------------------------------------------------------
 
 fn opts_q(q: usize, one_row: OneRowMode, fri: FriMode, cap: CapPolicy) -> ProofOptions {
@@ -785,11 +785,10 @@ fn pinned_deep_rows(pre: u64, main: u64, aux: u64, parts: u64) -> u64 {
 /// 110, blowup 4, k = 7, cap auto, fri dp). Wide tables go one-row, narrow
 /// tall ones stay row pairs. Any change to the cost function or its weights
 /// that moves one of these is a format change. The widths are illustrative
-/// (MEMW 49 main / 13 aux as REVIEW-FRI §C reads them; the others are round
-/// numbers), not a census. Re-pinned for RULINGS 22 (every emitted FRI row
-/// priced, DEEP at two points vs one): two choices moved to one row — the
-/// MEMW-like case (row pairs by 0.5% before; one row by 5.5% now, and only
-/// because of the DEEP term, see `auto_choices_margins`) and the narrow short
+/// (MEMW 49 main / 13 aux; the others are round
+/// numbers), not a census. With every emitted FRI row priced and DEEP at two
+/// points vs one, two choices are one row only because of the DEEP term: the
+/// MEMW-like case (one row by 5.5%, see `auto_choices_margins`) and the narrow short
 /// preprocessed one (its LDE is already terminal, so no FRI layer separates
 /// the layouts and the second DEEP point decides).
 #[test]
@@ -854,7 +853,7 @@ fn auto_choices_margins() {
     }
 }
 
-/// RULINGS 22: DEEP costs two points under row pairs and one under one row,
+/// DEEP costs two points under row pairs and one under one row,
 /// each [`TableWidths::deep_point_rows`] XALU rows per query — and nothing
 /// else in the price depends on it.
 #[test]
@@ -907,7 +906,7 @@ fn auto_resolves_per_table_from_the_air() {
 }
 
 // ---------------------------------------------------------------------------
-// REVIEW-FRI F9: {cap off, auto} × {pair, dp} × {0, 1, auto}, Q ≥ 20.
+// The format matrix: {cap off, auto} × {pair, dp} × {0, 1, auto}, Q ≥ 20.
 // ---------------------------------------------------------------------------
 
 #[test]

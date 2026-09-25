@@ -1,6 +1,5 @@
 //! ★ One tree's authenticated Merkle cap, in-guest — the one gadget the WHIR
-//! chain verifier (W1) and the STARK sub-proof verifier (S1) share
-//! (design/CAP.md §6.1, §6.2, §9.2; REVIEW-CAP S1).
+//! chain verifier (W1) and the STARK sub-proof verifier (S1) share.
 //!
 //! A tree of depth `D` committed with a height-`c` cap is authenticated in two
 //! places, and the in-guest verifier makes the dangerous state of each
@@ -10,18 +9,18 @@
 //!   digests up to their root and asserts it equals the tree's root lanes. It
 //!   is the ONLY constructor, so every [`CapCells`] value is a cap that hashes
 //!   to its root — and a tree has exactly one: the cells checked against the
-//!   root and the cells the mux reads are the same cells (REVIEW-CAP (e)).
+//!   root and the cells the mux reads are the same cells.
 //! - **Per opening**, [`CapCells::verify_path`] is the ONE entry point. It takes
 //!   the opened leaf, the tree's WHOLE leaf index (low bit first, one bit per
 //!   level) and the path to the cap, walks the low `D − c` bits, picks
 //!   `cap[index >> (D − c)]` with the top `c` bits and asserts the two digests
 //!   equal. The split point is computed here from the index's own length and
 //!   the cap's height; the mux is private, so no caller can feed it a constant,
-//!   a hinted bit or a sub-slice of its own choosing (REVIEW-CAP (d)).
+//!   a hinted bit or a sub-slice of its own choosing.
 //!
 //! The mux is a balanced tree of `2^c − 1` `Select`s per digest cell: the LFM
 //! has no load at a computed address, which is why the cap height is priced by
-//! the cost law and stays at most 3 (RULINGS 1).
+//! the cost law and stays at most 3.
 //!
 //! ⚠ What a caller still owes: `index_bits` must be the tree's own leaf index
 //! as the TRANSCRIPT produced it — the query's bits, or a suffix of them for a

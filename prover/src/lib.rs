@@ -1391,7 +1391,7 @@ pub(crate) fn compute_commit_bus_offset(
 /// is rejected. At the default format every layout is row pairs and this is
 /// the row-pair root, byte for byte what was absorbed before.
 ///
-/// `None` = a preprocessed table has no root for its layout (RULINGS 14): the
+/// `None` = a preprocessed table has no root for its layout (never recomputed): the
 /// caller rejects, exactly as the STARK verifier would.
 pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],

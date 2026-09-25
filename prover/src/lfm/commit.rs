@@ -220,7 +220,7 @@ pub fn commit_group_device_or_host(
 /// [`commit_group_device_or_host`] under an explicit leaf layout. The device
 /// commit (`gpu_lde::try_commit_row_major_with`) builds the tree with
 /// `layout.rows_per_leaf()` rows per leaf, so a one-row root (S2) takes the
-/// device like a row-pair one (REVIEW-FRI F8.1).
+/// device like a row-pair one.
 pub fn commit_group_device_or_host_with(
     label: &str,
     group: &ColumnGroup,
@@ -346,7 +346,7 @@ mod device_parity {
         }
     }
 
-    /// S2 (REVIEW-FRI F8.1): the one-row artifact root on the device equals the
+    /// S2: the one-row artifact root on the device equals the
     /// host one-row root at the same production shapes, and differs from the
     /// row-pair root (a device that ignored the layout would equal it). The
     /// device one-row tree counter must move once per group, so a host

@@ -1317,7 +1317,7 @@ fn the_fri_leg_proves_and_verifies() {
 }
 
 // =============================================================================
-// Merkle caps in the FRI leg (S1, design/CAP.md §6.1, C5)
+// Merkle caps in the FRI leg (S1)
 // =============================================================================
 
 /// The folding fixture's options under a cap policy: blowup 2, `queries`
@@ -1408,7 +1408,7 @@ fn the_fri_emitter_verifies_a_capped_folding_proof() {
 
 /// ★ Every cap word of every capped FRI layer is bound — including the ones no
 /// query reaches, which only the once-per-tree cap-to-root check can reject
-/// (REVIEW-CAP M1(b) in-guest). One query at a height-3 cap reaches one of
+/// (in-guest). One query at a height-3 cap reaches one of
 /// eight nodes per layer, so seven words per layer are rejected by that check
 /// alone.
 #[test]

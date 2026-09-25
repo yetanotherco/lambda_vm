@@ -1,4 +1,4 @@
-//! ★ The proof FORMAT this process proves under — the ZF campaign's levers.
+//! ★ The proof FORMAT this process proves under — the ZF proof-format levers.
 //!
 //! ```text
 //! LAMBDA_VM_ZF_CAP         off | auto | 0..=16    Merkle cap, every univariate STARK tree (S1)
@@ -8,12 +8,12 @@
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! ```
 //!
-//! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration
-//! (RULINGS 26): `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
+//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
 //! Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`), so setting all five to off
-//! reproduces [`ZfFormat::LEGACY`] — the pre-campaign format, byte for byte —
+//! reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for byte —
 //! for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
@@ -40,9 +40,9 @@
 //!
 //! **A lever this build does not implement ABORTS too.** The fields exist
 //! before the levers do (so the option structs and this banner are stable
-//! while the campaign lands them), and a knob set on a build that only parses
-//! it would print a non-default format and prove the default one. Each lane
-//! flips its `*_IMPLEMENTED` constant when its lever is real.
+//! before the levers land), and a knob set on a build that only parses
+//! it would print a non-default format and prove the default one. Each
+//! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
 //! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
@@ -95,10 +95,14 @@ impl Default for ZfFormat {
 
 impl ZfFormat {
     /// ★ The production format when no knob is set: the MEASURED
-    /// configuration (RULINGS 26). S1 `cap=auto` (STARK block −15.35 s),
+    /// configuration. S1 `cap=auto` (STARK block −15.35 s),
     /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
     /// (WHIR block −9.10 s together), each measured net positive in an ABBA
-    /// block run. Security parameters (queries, grinding, blowup) are the
+    /// block run. `one_row` stays off: in ABBA block runs it costs +3.2 s on
+    /// the WHIR pipeline (the prover-side cost of one-row LFM proofs) and saves
+    /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
+    /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
+    /// Security parameters (queries, grinding, blowup) are the
     /// legacy ones: no lever touches them.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
@@ -108,9 +112,9 @@ impl ZfFormat {
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
     };
 
-    /// The pre-campaign format: every lever off. What all five knobs at their
+    /// The legacy format: every lever off. What all five knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
-    /// only format the RV64 recursion guest verifies (RULINGS 26).
+    /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
         cap: CapPolicy::Off,
         whir_cap: CapPolicy::Off,
@@ -120,7 +124,7 @@ impl ZfFormat {
     };
 
     /// True when every lever is off: the format proves exactly what the
-    /// pre-campaign prover proved.
+    /// prover proved before any lever existed.
     pub fn is_legacy(&self) -> bool {
         self.cap.is_off()
             && self.whir_cap.is_off()
@@ -306,12 +310,12 @@ fn parse_cap(name: &str, v: &str) -> Result<CapPolicy, String> {
     v.parse().map_err(|e| format!("{name}={v:?}: {e}"))
 }
 
-/// The first-round folds the knob accepts: the two arms RULINGS 15 builds.
+/// The first-round folds the knob accepts: the two arms that are built.
 ///
 /// ⚠ Not `first1..=first4`: a first fold narrower than the uniform one adds
 /// rounds at some heights (Q would rise and the arms stop being comparable),
-/// and `first4` IS `uniform4` under another statement word. Not `dp`: RULINGS
-/// 15, no DP. Widening this list is a format decision, not a parser one.
+/// and `first4` IS `uniform4` under another statement word. Not `dp`: only
+/// the first fold is a lever. Widening this list is a format decision, not a parser one.
 pub const WHIR_FIRST_FOLDS: [usize; 2] = [5, 6];
 
 /// `uniform4` | `first5` | `first6`.
@@ -356,7 +360,7 @@ mod tests {
         ZfFormat::from_lookup(|k| map.get(k).cloned())
     }
 
-    /// ★ RULINGS 26: with no knob set the process proves the MEASURED
+    /// ★ With no knob set the process proves the MEASURED
     /// configuration.
     #[test]
     fn nothing_set_is_the_measured_default() {
@@ -382,7 +386,7 @@ mod tests {
     }
 
     /// Every knob keeps its OFF spelling, and all five at off are the legacy
-    /// (pre-campaign) format: the rollback and A/B arm.
+    /// format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
         let f = parse(&[
@@ -594,8 +598,8 @@ mod tests {
 
     #[test]
     fn the_merkle_cap_knob_is_selectable() {
-        // C3 + C4 made the STARK cap real, so `LAMBDA_VM_ZF_CAP` no longer
-        // aborts; every spelling reaches the options unchanged.
+        // The STARK cap is real on host and device, so `LAMBDA_VM_ZF_CAP` does
+        // not abort; every spelling reaches the options unchanged.
         const { assert!(stark::proof::options::MERKLE_CAP_IMPLEMENTED) };
         for (v, want) in [
             ("auto", CapPolicy::Auto),
@@ -784,7 +788,7 @@ mod tests {
             assert_eq!(o.format, want, "{site}");
             assert!(!o.has_legacy_format(), "{site}");
         }
-        // Security parameters are the legacy presets' (RULINGS 26).
+        // Security parameters are the legacy presets'.
         let base = crate::lfm::proof::block_base_options();
         let preset = crate::recursion::Preset::Blowup4.options();
         assert_eq!(
@@ -808,7 +812,7 @@ mod tests {
         assert_eq!(chain.log_folding, PRODUCTION_WHIR_LOG_FOLDING);
     }
 
-    /// ★ RULINGS 26 (RULINGS 11 amended): the RV64 guest verifier stays on
+    /// ★ The RV64 guest verifier stays on
     /// the LEGACY format after the default flip. Its presets NAME the legacy
     /// format (not the process default), and both guest entries refuse every
     /// other format — the production default included.
@@ -879,7 +883,7 @@ mod tests {
 
     #[test]
     fn the_serialized_options_bytes_ignore_the_format_fields() {
-        // RULINGS 10: the format fields are skipped by serde and rkyv, so a
+        // The format fields are skipped by serde and rkyv, so a
         // serialized `ProofOptions` has the same bytes whatever the format,
         // and deserializes to the default format.
         let base = crate::GoldilocksCubicProofOptions::with_blowup(4).unwrap();

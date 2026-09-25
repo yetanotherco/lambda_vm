@@ -1,5 +1,5 @@
-//! The S3 test vectors the host lane exports (FRI.md §10, "Vectors the host
-//! lane exports" (a)–(d)) for the device and in-guest lanes, checked in under
+//! The S3 test vectors the host prover exports ((a)–(d) in the README) for the
+//! device prover and the in-guest verifier, checked in under
 //! `crypto/stark/tests/vectors/zf_fri/` (see the README there).
 //!
 //! Compiled only for tests and the `test-utils` feature. Everything here is
@@ -72,7 +72,7 @@ pub fn check_or_write(files: &[VectorFile], write: bool) -> Vec<String> {
     bad
 }
 
-/// SplitMix64: the KAT input generator (stated in the README so any lane can
+/// SplitMix64: the KAT input generator (stated in the README so any consumer can
 /// regenerate the inputs without this crate).
 pub fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -276,8 +276,8 @@ pub fn leaf_digests_json<H: StarkHash>(hash_name: &str) -> VectorFile {
 pub const PROOF_ROWS: usize = 1 << 10;
 
 /// The query count of the capped (d) formats: the `auto` cap policy caps a
-/// tree opened at least 20 times at height 3 (RULINGS 1), so a Q = 3 proof
-/// carries no cap at all (REVIEW-FRI F9).
+/// tree opened at least 20 times at height 3, so a Q = 3 proof
+/// carries no cap at all.
 pub const CAPPED_QUERIES: usize = 20;
 
 pub fn proof_options(format: ProofFormat, queries: usize) -> ProofOptions {
@@ -295,7 +295,7 @@ pub fn proof_options(format: ProofFormat, queries: usize) -> ProofOptions {
 /// DP's schedule) and `dp_3_1_3` (an explicit uneven schedule, to catch
 /// fold-count bugs), all at Q = 3; and `cap_pair` / `cap_dp` (the `auto` Merkle
 /// cap on every tree, with today's FRI and with the DP's schedule) at
-/// Q = [`CAPPED_QUERIES`] — the combined S1 × S3 vector of REVIEW-FRI F9.
+/// Q = [`CAPPED_QUERIES`] — the combined S1 × S3 vector.
 pub fn proof_formats() -> Vec<(&'static str, ProofFormat, usize)> {
     let dp = ProofFormat {
         fri_mode: FriMode::Dp,

@@ -51,7 +51,7 @@
 //! symmetric point is `−υ`: `br(2·iota+1) = br(2·iota) + L/2` and `g^{L/2} =
 //! −1`, so it costs one subtraction rather than a second derivation.
 //!
-//! # One-row leaves (S2, design/FRI.md §7)
+//! # One-row leaves (S2)
 //!
 //! Under [`SubProofShape::layout`] = `LeafLayout::Row` every committed matrix
 //! holds ONE row per leaf: a query index `r` has `log2(lde)` bits (uniform over
@@ -102,7 +102,7 @@ impl GroupShape {
 
     /// Cells one query's opening of this group occupies when a leaf holds
     /// `rows_per_leaf` rows: `2·num_columns` for row pairs, `num_columns`
-    /// under one-row leaves (S2, design/FRI.md §7.4).
+    /// under one-row leaves (S2).
     pub fn values_at(&self, rows_per_leaf: usize) -> usize {
         rows_per_leaf * self.num_columns
     }
@@ -145,11 +145,11 @@ pub struct SubProofShape {
     /// depth and an opening count, so one height): `0` = uncapped, today's
     /// format. With `c > 0` each tree's `2^c` cap digests are hinted ONCE per
     /// sub-proof and authenticated against the root ([`CapCells`]), and every
-    /// query's path stops `c` levels short (design/CAP.md §6.1). A verifier
+    /// query's path stops `c` levels short. A verifier
     /// constant: `CapPolicy::height(num_queries, merkle_depth)` of the inner
     /// proof's options, never read from the proof.
     pub trace_cap: usize,
-    /// The trace trees' leaf layout (S2, design/FRI.md §7): today's row
+    /// The trace trees' leaf layout (S2): today's row
     /// pairs, or one row per leaf. A verifier constant — the table's
     /// `stark::leaf_layout::table_leaf_layout`, resolved from the AIR's
     /// widths and the trace length, never read from the proof. Under
@@ -748,7 +748,7 @@ pub fn emit_query_from_bits(
     }
 }
 
-/// The one-row half of [`emit_query_from_bits`] (S2, design/FRI.md §7.4), after
+/// The one-row half of [`emit_query_from_bits`] (S2), after
 /// every group was authenticated at leaf `r`: `x_r` from the SAME bits, then
 /// DEEP ONCE, over the authenticated cells — column `c` is `values[c]` (a
 /// one-row leaf holds no symmetric row, so there is no `values[w + c]`).

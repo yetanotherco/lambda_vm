@@ -1,4 +1,4 @@
-//! The trace-tree leaf layout of one table's proof (S2, design/FRI.md §7).
+//! The trace-tree leaf layout of one table's proof (S2).
 //!
 //! Today every trace, precomputed, aux and composition tree commits one LDE
 //! row PAIR per leaf (`commitment::ROWS_PER_LEAF = 2`): leaf `i` hashes the
@@ -19,8 +19,8 @@
 //! the proof's bytes. A proof may therefore mix layouts across tables, and
 //! each table's layout is a verifier-side constant.
 //!
-//! [`LeafLayout::query_rows`] is the ONE place a query index becomes LDE rows
-//! (REVIEW-FRI F7): every opening site, prover and verifier, goes through it.
+//! [`LeafLayout::query_rows`] is the ONE place a query index becomes LDE rows:
+//! every opening site, prover and verifier, goes through it.
 
 use crypto::merkle_tree::cap::{CapPolicy, cap_gain};
 use math::fft::bit_reversing::reverse_index;
@@ -61,7 +61,7 @@ impl LeafLayout {
 
     /// The exclusive bound of a query index over an LDE of `lde_len` points:
     /// a leaf index, so `lde / 2` for row pairs and `lde` for one row
-    /// (FRI.md §7.7 (i): under one row `r` must be uniform over ALL of `D₀`).
+    /// (under one row `r` must be uniform over ALL of `D₀`).
     pub fn query_bound(self, lde_len: u64) -> u64 {
         match self {
             Self::RowPair => lde_len >> 1,
@@ -90,7 +90,7 @@ impl LeafLayout {
     /// bit-reversed positions `2q` and `2q + 1`, the points `x` and `−x` —
     /// and `(row, None)` for one row, the row at bit-reversed position `q`.
     ///
-    /// The single site where a query index becomes rows (REVIEW-FRI F7).
+    /// The single site where a query index becomes rows.
     pub fn query_rows(self, q: usize, lde_len: usize) -> (usize, Option<usize>) {
         let n = lde_len as u64;
         match self {
@@ -100,7 +100,7 @@ impl LeafLayout {
     }
 }
 
-/// Mutation M3 (FRI.md §10), test builds only: sample one-row query indexes
+/// Mutation M3, test builds only: sample one-row query indexes
 /// over the row-pair bound `N / 2` — for an LDE of exactly this many points
 /// (0 = off). Prover and verifier both read it, so a mutated proof still
 /// verifies; only `one_row_tests`' bound test sees the bias, which is what
@@ -236,7 +236,7 @@ pub fn trace_tree_cost_q(felts: u64, depth: u32, num_queries: u64, cap: CapPolic
 /// ([`FriFormat::chain_cost_q`]), and DEEP is evaluated at TWO points (`υ`,
 /// `−υ`). One row: every leaf holds one row and is `lde_log` deep, the FRI
 /// chain (layer 0 = the committed DEEP codeword) starts at `lde_log`, and DEEP
-/// is evaluated at ONE point (RULINGS 22). A DEEP point costs
+/// is evaluated at ONE point. A DEEP point costs
 /// [`TableWidths::deep_point_rows`] `XALU` rows.
 pub fn table_openings_cost_q(
     widths: &TableWidths,
@@ -277,7 +277,7 @@ pub fn table_openings_cost_q(
     trees.saturating_add(chain).saturating_add(deep)
 }
 
-/// RULINGS 6's `auto` rule: one row iff it is STRICTLY cheaper than row pairs
+/// The per-table `auto` rule: one row iff it is STRICTLY cheaper than row pairs
 /// under [`table_openings_cost_q`] (a tie keeps today's layout).
 pub fn one_row_is_cheaper(
     widths: &TableWidths,

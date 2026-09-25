@@ -298,7 +298,7 @@ fn bitwise_non_three_coset_recomputes_and_differs_from_static() {
 }
 
 // =========================================================================
-// One-row (S2) twins: design/FRI.md §7.5.1, RULINGS 14
+// One-row (S2) twins: a missing twin is a hard miss, never a recompute
 // =========================================================================
 //
 // Each static table ships a SECOND match table for the one-row leaf layout
@@ -382,7 +382,7 @@ fn pages_one_row_static_match_recompute() {
     }
 }
 
-/// RULINGS 14: under one row, a blowup with no twin and a non-3 coset are
+/// Under one row, a blowup with no twin and a non-3 coset are
 /// HARD MISSES — `None`, never the recompute the row-pair wrappers fall back
 /// to (which would silently rebuild a 2^20-row BITWISE LDE and tree). The
 /// row-pair layout keeps today's answers.

@@ -211,7 +211,7 @@ where
     // the DEEP pair, so one; after committing layer `j`, `d_j`. Under one-row
     // openings (S2) the DEEP codeword itself is layer 0 (the input tree), so
     // nothing is owed before it and its root is absorbed BEFORE the first
-    // folding challenge (FRI.md §7.3; a root absorbed after its challenge
+    // folding challenge (a root absorbed after its challenge
     // would let the prover pick the codeword after seeing it).
     let mut pending: u32 = if layout.one_row { 0 } else { 1 };
 
@@ -387,7 +387,7 @@ where
 /// [`query_phase`] under an explicit fold layout. The legacy encoding is
 /// [`query_phase`] itself (device arm included); the group encoding opens, per
 /// committed layer `j`, the whole group `evaluation[leaf·2^{d_j} ..][..2^{d_j}]`
-/// (the query's own value included, FRI.md §3.4) and the path of
+/// (the query's own value included) and the path of
 /// `leaf = p >> d_j`, then moves to `p >> d_j` — on the device when the layers
 /// are device-resident (`try_fri_query_phase_gpu_groups`), else by the host
 /// walk ([`query_phase_groups_host`]).

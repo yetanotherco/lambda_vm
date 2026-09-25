@@ -1,5 +1,5 @@
 //! A real VM proof under the Merkle cap policy the PROCESS FORMAT names
-//! (`LAMBDA_VM_ZF_CAP`, design/CAP.md §4): every production table — the
+//! (`LAMBDA_VM_ZF_CAP`): every production table — the
 //! preprocessed ones (precomputed + main trees), the LogUp aux trees, the
 //! composition trees and every committed FRI layer — capped, proved and
 //! verified through the public `prove_with_options_and_inputs` /

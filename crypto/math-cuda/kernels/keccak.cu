@@ -695,8 +695,8 @@ extern "C" __global__ void keccak256_leaves_base_row_major_row_pair_range(
 // whole row (`[0, m)`) is `commit_rows_bit_reversed_with(data, m, 1)`.
 //
 // NOT the row-pair kernels at another width: those read rows `brev(2·tid)` and
-// `brev(2·tid + 1)` over `log_num_rows` bits, which is a different row set
-// (I-FRI-D note 1), so one row per leaf needs its own read pattern.
+// `brev(2·tid + 1)` over `log_num_rows` bits, which is a different row set,
+// so one row per leaf needs its own read pattern.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void keccak256_leaves_base_row_major_row_range(
     const uint64_t *data,

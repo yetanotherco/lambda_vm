@@ -1,5 +1,5 @@
 //! Merkle caps (S1) composed with group-leaf FRI layers (S3) on the host path:
-//! REVIEW-FRI F9's round-trip matrix {cap off, fixed, auto} × {pair, dp,
+//! a round-trip matrix {cap off, fixed, auto} × {pair, dp,
 //! dp with an uneven override}, at a query count where `auto` caps (Q ≥ 20).
 //!
 //! Under a fold schedule a committed FRI layer is a GROUP tree whose depth is
@@ -11,8 +11,7 @@
 //! - every FRI layer's paths have the capped shape at the LAYOUT's depth,
 //!   computed here independently from the schedule;
 //! - every cap node of a capped group layer is bound, and an unreached one is
-//!   rejected by the cap-to-root check alone (REVIEW-CAP M1(b) on a group
-//!   tree);
+//!   rejected by the cap-to-root check alone (on a group tree);
 //! - a proof made under one (cap, fri) format fails under the others.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -46,7 +45,7 @@ type Leaf = <DefaultStarkHash as StarkHash>::Batched<F>;
 const ROWS: usize = 1024;
 const LDE_LOG: u32 = 11;
 const TERMINAL_LOG: u32 = 3;
-/// `auto` caps at height 3 from 20 openings on (RULINGS 1).
+/// `auto` caps at height 3 from 20 openings on.
 const QUERIES: usize = 24;
 
 fn options(cap: CapPolicy, fri: FriMode, over: Option<&[u8]>, queries: usize) -> ProofOptions {
@@ -214,7 +213,7 @@ fn every_cap_node_of_a_capped_group_layer_is_bound() {
     }
 }
 
-/// REVIEW-CAP M1(b) on a group tree: with three queries and a height-3 cap on
+/// An unreached cap node on a group tree: with three queries and a height-3 cap on
 /// FRI layer 0, at least five of its eight cap nodes are reached by no query.
 /// Flipping one leaves every per-query fold untouched (each still lands on its
 /// own cap node), so only the cap-to-root check of the group layer's

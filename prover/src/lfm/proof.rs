@@ -294,7 +294,7 @@ pub(crate) fn prove_traces_with_hasher(
         artifacts.chip_set,
     );
     // One-row chips (S2) take their roots from the artifacts; without them a
-    // chip resolved to one row is refused by `multi_prove` (RULINGS 14).
+    // chip resolved to one row is refused by `multi_prove`, never recomputed.
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
@@ -467,7 +467,7 @@ pub fn verify_against_chunked(
 
 /// [`verify_against_chunked`] with the program's one-row (S2) roots, when it
 /// has them (`None` = row-pair roots only: a chip resolved to one row then
-/// rejects, RULINGS 14).
+/// rejects).
 #[allow(clippy::too_many_arguments)]
 fn verify_against_chunked_with(
     one_row_roots: Option<&super::registry::LfmOneRowRoots>,
@@ -608,7 +608,7 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 ///
 /// Not [`crate::recursion::Preset::options`] itself: that value also fixes
 /// the RV64 recursion guest's verifier, which stays on the LEGACY format
-/// (its presets name it; RULINGS 26).
+/// (its presets name it).
 pub fn block_base_options() -> ProofOptions {
     crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
 }

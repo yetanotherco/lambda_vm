@@ -1,14 +1,14 @@
-//! Golden proofs under the production RPX pin (REVIEW-FRI F1), in TWO formats:
+//! Golden proofs under the production RPX pin, in TWO formats:
 //!
 //! - the LEGACY format (every ZF lever off; `ProofFormat::LEGACY`, the stark
 //!   crate's default): the RPX half of `stark::tests::zf_golden_tests` (which
 //!   covers Keccak and Blake3 and cannot name `RpxStarkHash`, a prover-crate
-//!   type). It keeps the pre-campaign bytes pinned after the default flip, so
+//!   type). It keeps the legacy bytes pinned after the default flip, so
 //!   the rollback arm (every knob off) is still checked against bytes, not
 //!   against a round trip;
-//! - the PRODUCTION default (`ZfFormat::DEFAULT.proof_format()`, RULINGS 26):
-//!   the bytes every production site now stamps. Pinned at the default flip
-//!   (lane I-FLIP); regenerate only for a deliberate format change.
+//! - the PRODUCTION default (`ZfFormat::DEFAULT.proof_format()`):
+//!   the bytes every production site stamps. Regenerate only for a
+//!   deliberate format change.
 //!
 //! Each case proves a small in-repo AIR at `grinding_factor = 0` (so the bytes
 //! are reproducible) and pins the SHA-256 of the proof's rkyv bytes plus, so a
@@ -230,7 +230,7 @@ const GOLDENS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The LEGACY-format RPX goldens: the pre-campaign bytes, unmoved by the
+/// The LEGACY-format RPX goldens: the legacy bytes, unmoved by the
 /// default flip.
 #[test]
 fn legacy_format_rpx_goldens_are_byte_identical() {
@@ -245,7 +245,7 @@ fn legacy_format_rpx_goldens_are_byte_identical() {
     }
 }
 
-/// The PRODUCTION-default RPX goldens (RULINGS 26: cap auto, `fri=dp`, and
+/// The PRODUCTION-default RPX goldens (cap auto, `fri=dp`, and
 /// whatever `ZfFormat::DEFAULT` stamps). A move here is a production format
 /// change.
 #[test]
@@ -324,7 +324,7 @@ fn rpx_dp_round_trips() {
     }
 }
 
-/// REVIEW-FRI F1.2 under RPX: the group path at an all-ones schedule commits
+/// Under RPX, the group path at an all-ones schedule commits
 /// the same layer roots, terminal polynomial and paths as the legacy pair path
 /// (the `Batched`/`Pair` two-element invariant, as a tested fact for the
 /// algebraic backend).
@@ -369,7 +369,7 @@ fn production_sites_prove_at_the_process_format() {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
     };
-    // An unset knob is the production default's value (RULINGS 26).
+    // An unset knob is the production default's value.
     let default = crate::zf_format::ZfFormat::DEFAULT;
     let want = match knob(crate::zf_format::ENV_FRI).as_deref() {
         Some("dp") => FriMode::Dp,

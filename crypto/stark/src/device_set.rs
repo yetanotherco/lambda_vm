@@ -288,9 +288,9 @@ mod tests {
     /// The dispatch layer's row floor (`gpu_lde::DEFAULT_GPU_LDE_THRESHOLD`).
     const FLOOR: usize = 1 << 14;
 
-    /// S2 (lane I-S2-D): a one-row tree has twice the leaves, so its node
+    /// S2: a one-row tree has twice the leaves, so its node
     /// buffer is `(2·lde − 1)·32` against the row pair's `(lde − 1)·32` —
-    /// +`lde·32` bytes per tree (128 MiB at an LDE of 2^22, FRI.md §7.6) — and
+    /// +`lde·32` bytes per tree (128 MiB at an LDE of 2^22) — and
     /// the table device set grows by that per trace tree plus the FRI bound;
     /// the default (`rows_per_leaf = 2`) is the old model exactly.
     #[test]

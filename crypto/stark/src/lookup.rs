@@ -855,7 +855,7 @@ impl BusValue {
 /// separately cached source for the one-row layout. [`get`](Self::get) is
 /// today's (row-pair) root, unchanged; [`get_for`](Self::get_for) serves
 /// either and returns `None` for a layout this commitment has no source for
-/// (the prover then refuses and the verifier rejects, RULINGS 14).
+/// (the prover then refuses and the verifier rejects; never a silent recompute).
 #[derive(Clone)]
 pub struct LazyCommitment {
     value: std::sync::Arc<std::sync::OnceLock<crate::config::Commitment>>,

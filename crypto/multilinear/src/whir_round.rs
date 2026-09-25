@@ -37,7 +37,7 @@ pub struct RoundConfig {
 
 /// How a tree's openings are authenticated in a round.
 ///
-/// A tree is authenticated ONCE (design/CAP.md §5.3, §9.3): tree 0 by the
+/// A tree is authenticated ONCE: tree 0 by the
 /// cap its first opening in round 0 carries, and tree `t ≥ 1` by the cap its
 /// first opening as round `t − 1`'s SUCCESSOR carries. Round `t` then opens
 /// tree `t` as its current tree against that stored check, and never re-reads
@@ -205,7 +205,7 @@ where
 ///
 /// ⚠ ORDER. The opening counts are checked before any opening is indexed or
 /// any cap is read, so a proof with too few openings is refused and never
-/// panics (design/REVIEW-CAP.md M2).
+/// panics.
 pub fn verify<'a, F, C, N, T, H>(
     proof: &'a RoundProof<C, N>,
     commitments: RoundCommitments<'a>,
@@ -638,7 +638,7 @@ mod tests {
         }
     }
 
-    /// REVIEW-CAP M1(b): a cap node no query reaches, flipped. Every
+    /// A cap node no query reaches, flipped. Every
     /// per-query check still accepts against the forged cap — shown below —
     /// so ONLY the cap-to-root check can refuse it. The error names it.
     #[test]
@@ -705,7 +705,7 @@ mod tests {
         ));
     }
 
-    /// REVIEW-CAP M1(a), the WHIR analogue of C1b: a leaf forged from an
+    /// The WHIR analogue of the STARK's exact path-length check: a leaf forged from an
     /// INTERNAL node. Under keccak a 64-byte block (eight base values at
     /// `k = 3`) is a valid parent input, so values whose bytes are the level-1
     /// node's two children hash to that node, and a path one sibling short

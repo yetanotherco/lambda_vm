@@ -42,8 +42,8 @@ impl fmt::Display for ProofOptionsError {
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
-/// - `format`: the proof FORMAT ([`ProofFormat`], the ZF campaign's levers).
-///   Its default is the legacy (pre-campaign) format, byte for byte.
+/// - `format`: the proof FORMAT ([`ProofFormat`], the ZF proof-format levers).
+///   Its default is the legacy format (every lever off), byte for byte.
 ///
 /// # The format is not serialized
 ///
@@ -116,7 +116,7 @@ impl ProofFormat {
     /// the legacy format.
     pub const DEFAULT: Self = Self::LEGACY;
 
-    /// The pre-campaign format: every lever off. The only format the RV64
+    /// The legacy format: every lever off. The only format the RV64
     /// recursion guest verifies.
     pub const LEGACY: Self = Self {
         merkle_cap: CapPolicy::Off,
@@ -132,7 +132,7 @@ impl ProofFormat {
     }
 
     /// True when every lever is off (`Fixed(0)` counts as `Off`): the proof
-    /// this produces is the pre-campaign format, byte for byte.
+    /// this produces is the legacy format, byte for byte.
     pub fn is_legacy(&self) -> bool {
         self.merkle_cap.is_off()
             && self.fri_mode == FriMode::Pair
@@ -255,15 +255,15 @@ impl FromStr for OneRowMode {
 
 /// Which format levers THIS build implements. A lever that is only parsed —
 /// its field exists so the option structs and the `ZF FORMAT` banner stay
-/// stable while the campaign lands it — must not be selectable, or a run
-/// could print a non-default format and prove the default one. Each lane
-/// flips its own flag in the commit that makes the lever real.
+/// stable before the lever lands — must not be selectable, or a run
+/// could print a non-default format and prove the default one. Each flag
+/// is flipped in the commit that makes the lever real.
 ///
 /// The Merkle cap is real on the host and device STARK provers, the host
-/// verifier (design/CAP.md C3 + C4) and the LFM in-guest STARK verifier (C5:
-/// `lfm::merkle_cap::CapCells`, one caps arena per sub-proof), on pair and on
+/// verifier and the LFM in-guest STARK verifier
+/// (`lfm::merkle_cap::CapCells`, one caps arena per sub-proof), on pair and on
 /// group-leaf (`Dp`) FRI layers alike. The RV64 recursion guest stays
-/// default-only (RULINGS 11).
+/// legacy-only: its archived verifier refuses any other format.
 pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
 /// `FriMode::Dp` (S3) is implemented on the prover paths and the host verifier:
@@ -279,8 +279,8 @@ pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 ///   the same schedule, and the emitter verifies group layers (slot check,
 ///   group leaf, group fold), so an LFM wrap or node verifies a `Dp` proof.
 ///
-/// NOT implemented: the RV64 recursion guest (default-only by RULINGS 11; it
-/// refuses a non-default format).
+/// NOT implemented: the RV64 recursion guest (legacy-only; it
+/// refuses a non-legacy format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
 /// `OneRowMode::{On, Auto}` (S2) is implemented on the prover (CPU and
@@ -289,14 +289,14 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 ///   the DEEP codeword committed as FRI layer 0 before the first challenge;
 ///   query indexes over the whole LDE; one-row openings) and the host
 ///   verifier (`multi_verify` / `multi_verify_archived`), with the per-table
-///   `Auto` rule (`crate::leaf_layout`, RULINGS 6);
+///   `Auto` rule (`crate::leaf_layout`);
 /// - the preprocessed roots: static one-row twins at blowup 4
 ///   (`STATIC_BLOWUP_FACTORS_ONE_ROW` in the prover crate), every computed
 ///   root at run time, the LFM artifacts' one-row roots and the registry
 ///   policy (a one-row format never reads `LFM_REGISTRY`); a table with no
-///   root for its layout is a proving error and a verifier reject (RULINGS 14)
+///   root for its layout is a proving error and a verifier reject, never a recompute
 ///   — e.g. `one_row = 1` at blowup 2, 8 or 16 fails on BITWISE;
-/// - the device (lane I-S2-D, D2): one-row trees for the fused main commit,
+/// - the device: one-row trees for the fused main commit,
 ///   the preprocessed split, the aux commits (host input and resident) and the
 ///   composition tree, device openings at row `r`, the LFM artifact commit,
 ///   and the input tree committed from the resident DEEP codeword before the
@@ -304,16 +304,16 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 ///   table may be device-only like a row-pair one, and under `Auto` one proof
 ///   mixes both layouts on the device.
 ///
-/// NOT implemented: the in-guest (LFM) verifier of a one-row proof (lane I-FRI-G, G3: an emitter
+/// NOT implemented: the in-guest (LFM) verifier of a one-row proof (an emitter
 /// asked for one refuses at emit time, `lfm::fri::FriShape::from_options`),
-/// and the RV64 recursion guest (default-only, RULINGS 11). A block run under
+/// and the RV64 recursion guest (legacy-only). A block run under
 /// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and
 /// LFM proofs but cannot recurse over one-row STARK proofs yet.
 pub const ONE_ROW_IMPLEMENTED: bool = true;
 
 impl ProofOptions {
     /// True when every format field is at this crate's default (the legacy
-    /// format): the proof this produces is the pre-campaign format, byte for
+    /// format): the proof this produces is the legacy format, byte for
     /// byte.
     pub fn has_default_format(&self) -> bool {
         self.format.is_default()

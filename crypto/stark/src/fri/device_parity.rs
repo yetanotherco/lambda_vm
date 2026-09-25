@@ -47,8 +47,8 @@ type Ext = FieldElement<E>;
 /// leaf under every hash), and unequal neighbours (a fold-count off-by-one
 /// between the commit and the pending folds shows only there).
 pub const EXTRA_SHAPES: &[&[u8]] = &[
-    // A lone 16-group layer: a DP schedule until RULINGS 22 re-priced the
-    // objective, kept so the sweep's coverage does not shrink.
+    // A lone 16-group layer: a DP schedule until the objective priced every
+    // emitted row, kept so the sweep's coverage does not shrink.
     &[4],
     &[6],
     &[1, 6],
@@ -147,7 +147,7 @@ fn raw(v: &[Ext]) -> Vec<[u64; 3]> {
 /// `resident` keeps the device layers' evals resident only (the device-only
 /// envelope's shape), so the device query phase gathers them on device.
 ///
-/// `options.format.one_row == On` runs the S2 layout (lane I-S2-D): layer 0 is
+/// `options.format.one_row == On` runs the S2 layout: layer 0 is
 /// the input tree committed from the codeword itself before any challenge,
 /// and the query indexes range over the whole LDE (`Auto` is resolved per
 /// table from an AIR, so it is not a codeword-level case: treated as off).

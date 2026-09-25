@@ -1,11 +1,11 @@
-//! S2 in the in-guest (LFM) STARK verifier (G3, design/FRI.md §7.2–§7.4,
-//! §11): one-row trace leaves, DEEP at ONE point, the committed FRI input and
+//! S2 in the in-guest (LFM) STARK verifier (G3): one-row trace leaves, DEEP
+//! at ONE point, the committed FRI input and
 //! its input-slot check, index bits over the whole LDE, no `−υ` point.
 //!
 //! Checked against the host's own artefacts, never against a second model:
 //! - the in-guest one-row shape (index bits, schedule, layer depths, caps,
 //!   challenge count) against the host's `StarkCaps::for_options(.., true)`;
-//! - the emitted FRI verifier against I-S2-H's checked-in RPX (e) proofs
+//! - the emitted FRI verifier against the host's checked-in RPX (e) proofs
 //!   (`crypto/stark/tests/vectors/zf_fri/e_proof_rpx_*`), executed, with its
 //!   permutation count equal to the closed form;
 //! - the in-guest one-row (and row-pair) trace leaf against the (e) leaf
@@ -129,7 +129,7 @@ fn an_unresolved_auto_layout_is_refused() {
 }
 
 // =============================================================================
-// (e) — the emitted FRI verifier on I-S2-H's one-row RPX proofs
+// (e) — the emitted FRI verifier on the host's one-row RPX proofs
 // =============================================================================
 
 fn ext_of(v: &Value) -> FEE {
@@ -366,8 +366,8 @@ fn no_tampered_input_tree_value_can_pass() {
     }
 }
 
-/// ★ The INPUT-SLOT check is LOAD-BEARING (the in-guest M1 at the input tree,
-/// FRI.md §7.7). Under one-row leaves `DEEP(x_r)` meets the committed FRI
+/// ★ The INPUT-SLOT check is LOAD-BEARING (the in-guest M1 at the input
+/// tree). Under one-row leaves `DEEP(x_r)` meets the committed FRI
 /// chain ONLY at `group₀[slot] == DEEP(x_r)`: the input leaf hashes the group,
 /// the walk authenticates it, the group fold reads it — none reads `DEEP(x_r)`.
 /// So a moved `DEEP(x_r)` is refused with the check and ACCEPTED without it,
@@ -403,7 +403,7 @@ fn the_input_slot_check_is_load_bearing() {
 // =============================================================================
 
 /// ★ The in-guest trace leaf at `rows_per_leaf = 1` (and at 2, today's) is
-/// the host's: every leaf of I-S2-H's (e) KAT matrices (16 rows × 5 base
+/// the host's: every leaf of the (e) KAT matrices (16 rows × 5 base
 /// columns, 16 rows × 2 ext3 columns, read as bit-reversed LDE columns) under
 /// the production hash. One row: leaf `i` = the row at bit-reversed position
 /// `i`, columns in order. Row pair: rows `2i` then `2i + 1`.
@@ -692,7 +692,7 @@ fn a_one_row_and_a_row_pair_table_verify_in_one_program() {
 
 /// The one-row query index needs a schedule override that the DP never
 /// picks to exercise unequal neighbouring exponents from the INPUT tree
-/// (REVIEW-FRI F6 at layer 0): `[3, 1, 3, 2]` over the 9 committed folds of a
+/// (the fold-count off-by-one check at layer 0): `[3, 1, 3, 2]` over the 9 committed folds of a
 /// 2048-row, blowup-2, `k = 2` one-row table (`12 → 3`, every fold committed)
 /// — both legs, executed.
 #[test]

@@ -3,9 +3,8 @@
 //! Every tree's depth is a verifier constant: `log2(lde) − 1` for the trace,
 //! precomputed, aux and composition trees (a leaf is a row pair), and
 //! `log2(lde) − i − 2` for committed FRI layer `i` (pair leaves over
-//! `lde / 2^(i+1)` values). The verifier used to fold a path of any length and
-//! compare the result with the root; it now requires the exact length
-//! (design/CAP.md §9.4, commit C1b). These tests pin that honest proofs meet
+//! `lde / 2^(i+1)` values). The verifier requires the exact length, so a leaf
+//! hash is never compared with an internal node. These tests pin that honest proofs meet
 //! the lengths exactly and that a path one node short or long is rejected, for
 //! each tree class the verifier walks.
 

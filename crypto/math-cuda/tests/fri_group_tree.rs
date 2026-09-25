@@ -1,4 +1,4 @@
-//! S3 group-leaf FRI layers on the device (FRI.md §5, lane I-FRI-D).
+//! S3 group-leaf FRI layers on the device.
 //!
 //! - The group-leaf trees (`build_fri_group_tree_from_evals_ext3`, the kernels
 //!   `FriCommitState::fold_and_commit_group` commits with) equal the host tree

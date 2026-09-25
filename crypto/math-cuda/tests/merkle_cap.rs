@@ -2,7 +2,7 @@
 //! the host `MerkleTree::cap` returns — the `2^c` nodes `c` levels below the
 //! root, left to right, byte for byte. This is the gate for reading a
 //! device-resident tree's Merkle cap in the STARK R4 cap post-pass
-//! (design/CAP.md §4.2) instead of copying the whole tree.
+//! instead of copying the whole tree.
 
 use crypto::merkle_tree::backends::field_element_vector::FieldElementVectorBackend;
 use crypto::merkle_tree::merkle::MerkleTree;

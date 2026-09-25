@@ -375,7 +375,7 @@ impl FriCommitState {
     ///
     /// The fold count and the group size are separate on purpose: committed
     /// layer `j` is reached by the PREVIOUS layer's `d_{j−1}` folds and grouped
-    /// by its own `d_j` (FRI.md §3.1). Only the last fold's output is kept; the
+    /// by its own `d_j`. Only the last fold's output is kept; the
     /// intermediate codewords are released as the chain advances.
     ///
     /// Returns what [`Self::fold_and_commit_layer`] returns: the layer's evals

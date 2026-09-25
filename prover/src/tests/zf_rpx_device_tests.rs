@@ -1,4 +1,4 @@
-//! S3 on the device under the production RPX pin (lane I-FRI-D, D1): the RPX
+//! S3 on the device under the production RPX pin: the RPX
 //! twins of the stark crate's `tests::zf_fri_device_tests` (which cover Keccak
 //! and Blake3; the stark crate cannot name `RpxStarkHash`).
 //!
@@ -13,7 +13,7 @@
 //!     -- --ignored --exact --test-threads=1
 //! ```
 //!
-//! S2 on the device (lane I-S2-D, D2): `trees_one_row_rpx` (default threshold),
+//! S2 on the device: `trees_one_row_rpx` (default threshold),
 //! `fri_one_row_*` (threshold 2), `proved_rpx_one_row_vectors_equal_the_cpu_bytes`
 //! (threshold 1024, alone), the RPX twins of `stark`'s `tests::zf_s2_device_tests`.
 
@@ -82,8 +82,8 @@ fn proved_rpx_vectors_equal_the_cpu_bytes() {
         device_commits, 5,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
     );
-    // Every proof composes on the device (the AIR's constraint program,
-    // I-FIX-D2); a host composition would not be counted here.
+    // Every proof composes on the device (the AIR's constraint program); a
+    // host composition would not be counted here.
     assert_eq!(
         compositions, 5,
         "every RPX vector proof must compose on the device ({compositions} device compositions)"
@@ -96,7 +96,7 @@ fn proved_rpx_vectors_equal_the_cpu_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// S2 on the device (FRI.md §7.6, lane I-S2-D, D2) under the RPX pin.
+// S2 on the device under the RPX pin.
 // ---------------------------------------------------------------------------
 
 /// One-row main / preprocessed split / aux (host and resident) / composition
@@ -162,8 +162,8 @@ fn proved_rpx_one_row_vectors_equal_the_cpu_bytes() {
         "every one-row vector proof must build its main, aux and composition trees on the device \
          ({trees} one-row device trees for 2 proofs)"
     );
-    // Every proof composes on the device (the AIR's constraint program,
-    // I-FIX-D2); a host composition would not be counted here.
+    // Every proof composes on the device (the AIR's constraint program); a
+    // host composition would not be counted here.
     assert_eq!(
         compositions, 2,
         "every one-row RPX vector proof must compose on the device ({compositions} device compositions)"

@@ -1,4 +1,4 @@
-//! S2 on the device (FRI.md §7.6, lane I-S2-D, D2): one-row trees and
+//! S2 on the device: one-row trees and
 //! openings, and the committed input tree from the DEEP codeword, against the
 //! host CPU paths, under Keccak and Blake3 (the RPX twins live in the prover
 //! crate's `tests::zf_rpx_device_tests`).
@@ -85,7 +85,7 @@ fn fri_one_row_resident_blake3() {
     fri::<Blake3StarkHash>("blake3", &one_row_resident_cases(), true, 0x5235_0000);
 }
 
-/// The (e) vector proofs (FRI.md §10 (e): `one_row_pair` and
+/// The (e) vector proofs (the README's (e): `one_row_pair` and
 /// `one_row_3_2_1_2`, LDE 4096, Q = 3, grinding 0) proved on the device path
 /// are byte-identical to the checked-in CPU-proved files (rkyv bytes and the
 /// verifier-derived JSON), under Keccak and Blake3. Each proof must take the
@@ -120,8 +120,8 @@ fn proved_one_row_vectors_equal_the_cpu_bytes() {
         "every one-row vector proof must build its main, aux and composition trees on the device \
          ({trees} one-row device trees for 4 proofs)"
     );
-    // Every proof composes on the device (the AIR's constraint program,
-    // I-FIX-D2); a host composition would not be counted here.
+    // Every proof composes on the device (the AIR's constraint program); a
+    // host composition would not be counted here.
     assert_eq!(
         compositions, 4,
         "every one-row vector proof must compose on the device ({compositions} device compositions)"

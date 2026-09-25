@@ -344,7 +344,7 @@ fn the_challenge_replay_matches_production() {
     }
 }
 
-/// ★ S2 (one-row leaves, design/FRI.md §7.2–§7.3): the in-machine replay of a
+/// ★ S2 (one-row leaves): the in-machine replay of a
 /// one-row table reproduces production's challenges — the input root absorbed
 /// right after `γ` with NO challenge ahead of it, one `ζ` per committed layer
 /// (layer `j` folds with `ζ_j`), and the query indices sampled over the WHOLE
@@ -1308,7 +1308,7 @@ fn harvest_real_epoch(
         // The attestation folds the DECODE root Phase A absorbed — the
         // row-pair `decode_root` at the default format (asserted below), the
         // DECODE table's one-row root when S2 resolves it to one row (the
-        // attestation id moves with the knob, FRI.md §7.5.2).
+        // attestation id moves with the knob).
         expected_program_id: crate::recursion::program_id_from_digest(
             &crate::statement::elf_digest(&elf_bytes),
             elf.entry_point,

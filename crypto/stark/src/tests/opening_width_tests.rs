@@ -72,7 +72,7 @@ pub struct FibonacciSplitAIR<F: IsFFTField> {
     precomputed_columns: usize,
     precomputed_commitment: Commitment,
     /// The one-row (S2) root of the same precomputed columns; `None` = the
-    /// AIR has none (the one-row prover must refuse, RULINGS 14).
+    /// AIR has none (the one-row prover must refuse, never recompute).
     precomputed_commitment_row: Option<Commitment>,
     phantom: PhantomData<F>,
 }

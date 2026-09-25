@@ -347,7 +347,7 @@ pub(super) fn build_table_legs(
 
 /// The precomputed-columns commitment the host verifier takes for `air` over
 /// a trace of `trace_length` rows: `precomputed_commitment_for` the table's
-/// resolved leaf layout (S2, RULINGS 14 — a layout with no root is a hard
+/// resolved leaf layout (S2 — a layout with no root is a hard
 /// error, never the other layout's root). At row pairs it IS
 /// `air.precomputed_commitment()`.
 pub(super) fn layout_precomputed_commitment<PI>(
@@ -364,7 +364,7 @@ pub(super) fn layout_precomputed_commitment<PI>(
 ///
 /// The proof's flat `layers_evaluations_sym` is one sibling per layer under
 /// `pair` and every layer's full group (`2^{d_j}` values, position order)
-/// under a fold schedule (FRI.md §3.4); `FriShape::layer_values` says which.
+/// under a fold schedule; `FriShape::layer_values` says which.
 /// Each path is cut at its layer's cap: query 0 of a capped layer carries
 /// `D − c + 2^c` nodes, every other query `D − c`.
 #[allow(clippy::type_complexity)]
@@ -1546,7 +1546,7 @@ fn the_candidate_rate_model_is_derived_not_remembered() {
 }
 
 /// Queries the knob-on twin proves at: enough openings that `auto` caps every
-/// tall tree at height 3 (RULINGS 1: from 20 openings on).
+/// tall tree at height 3 (from 20 openings on).
 const PROCESS_FORMAT_QUERIES: usize = 24;
 
 /// ★ The KNOB-ON TWIN of [`the_assembled_epoch_verifier_runs`] (box only): a
@@ -1559,8 +1559,8 @@ const PROCESS_FORMAT_QUERIES: usize = 24;
 /// terminal); the legs' emitted permutations equal the closed form
 /// `Σ table_permutations_for` (per-query paths cut at each tree's cap plus
 /// `2^c − 1` once per capped tree; group leaves and group paths under
-/// `fri = dp`); a moved cap word does not execute. Prints the census the lead
-/// compares across arms (instructions, permutations, `Select`s, cells per
+/// `fri = dp`); a moved cap word does not execute. Prints the census to
+/// compare across arms (instructions, permutations, `Select`s, cells per
 /// chip). At the default format it is the MIN-preset run at 24 queries.
 #[test]
 #[ignore = "a real epoch proof at 24 queries and its assembled verifier: box only"]
@@ -1572,7 +1572,7 @@ fn the_assembled_epoch_verifier_runs_at_the_process_format() {
 
 /// ★ [`the_assembled_epoch_verifier_runs_at_the_process_format`] at BLOWUP 4
 /// — the S2 (one-row) twin, box only. One-row static roots exist at blowup 4
-/// only (`STATIC_BLOWUP_FACTORS_ONE_ROW`, RULINGS 14: a missing twin is a
+/// only (`STATIC_BLOWUP_FACTORS_ONE_ROW`; a missing twin is a
 /// proving error), so the MIN preset's blowup 2 cannot prove a one-row
 /// BITWISE; this arm keeps every other MIN-preset option and lifts the blowup
 /// to 4 for every format, so its knob-off and knob-on runs are one A/B. Under

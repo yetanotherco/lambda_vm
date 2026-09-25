@@ -3623,8 +3623,8 @@ pub(crate) fn gather_proofs_dev(
     Some(proofs)
 }
 
-/// Read the height-`cap_height` Merkle cap of a device-resident tree
-/// (design/CAP.md §4.2): the nodes `MerkleTree::cap` returns on the host tree,
+/// Read the height-`cap_height` Merkle cap of a device-resident tree: the
+/// nodes `MerkleTree::cap` returns on the host tree,
 /// byte for byte, since the device heap has the host layout. The R4 cap
 /// post-pass calls it for every capped tree whose host tree is root-only.
 ///
@@ -4186,8 +4186,8 @@ fn zeta_powers_raw<E: IsField>(zeta: &FieldElement<E>, n: u32) -> Vec<[u64; 3]> 
 ///
 /// One-row layouts (S2): `d_{−1} = 0` — layer 0 is the INPUT TREE, the resident
 /// DEEP codeword itself committed with groups of `2^{d_0}` (a zero-fold group
-/// commit, I-FRI-D's group kernels), its root appended with NO challenge
-/// sampled before it (FRI.md §7.3, the CPU loop's `pending = 0`); every later
+/// commit, the group kernels), its root appended with NO challenge
+/// sampled before it (the CPU loop's `pending = 0`); every later
 /// layer is as above.
 /// Transcript order, ζ powers, fold arithmetic and leaf bytes are the CPU
 /// loop's, so the two produce the same proof (the parity tests pin it).

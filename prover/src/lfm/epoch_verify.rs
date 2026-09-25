@@ -351,7 +351,7 @@ pub fn emit_table_verification(
     );
 
     // ---- the Merkle caps, once per tree, against the SAME root cells the
-    // transcript absorbed (design/CAP.md §6.1): the matrices in group order,
+    // transcript absorbed: the matrices in group order,
     // then the FRI layers. Every opening below is checked against these cells.
     let digest_words = super::edsl::digest_words(b) as usize;
     assert_eq!(
@@ -673,7 +673,7 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
 
 /// Permutations one sub-proof's Merkle cap checks cost, ONCE per sub-proof
 /// (not per query): every capped tree hashes its `2^c` cap up to its root,
-/// `2^c − 1` parents (design/CAP.md §6.1 `cap_permutations`). Zero at the
+/// `2^c − 1` parents. Zero at the
 /// default format.
 pub fn cap_permutations(shape: &TableVerifyShape) -> usize {
     shape.sub.cap_permutations() + shape.fri.cap_permutations()

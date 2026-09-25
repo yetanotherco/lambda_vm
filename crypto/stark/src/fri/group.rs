@@ -1,5 +1,5 @@
 //! Group-leaf FRI layers (S3): a committed layer of fold exponent `d` groups
-//! `2^d` consecutive bit-reversed evaluations per leaf (FRI.md §1).
+//! `2^d` consecutive bit-reversed evaluations per leaf.
 //!
 //! # Why a group is a coset, and how it folds
 //!

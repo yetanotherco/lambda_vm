@@ -445,7 +445,7 @@ pub fn gather_merkle_paths_dev(
 ///
 /// No kernel: the device heap has the host layout (root at node 0, the level
 /// with `2^c` nodes at `[2^c - 1, 2^{c+1} - 1)`), so the cap is one D2H of the
-/// heap slice `[(2^c - 1) * 32, (2^{c+1} - 1) * 32)` (design/CAP.md §1.3). The
+/// heap slice `[(2^c - 1) * 32, (2^{c+1} - 1) * 32)`. The
 /// same nodes `MerkleTree::cap` returns on the host tree, byte for byte.
 /// `cap_height = 0` is the root. Runs on the caller's `stream`, after the work
 /// already queued on it, and waits for the copy.

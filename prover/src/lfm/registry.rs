@@ -64,7 +64,7 @@ impl LfmProgramKind {
 
 /// ★ The artifacts a fixture program is verified against under `options`.
 ///
-/// The registry policy (design/FRI.md §7.5.4): `LFM_REGISTRY` is blessed at
+/// The registry policy: `LFM_REGISTRY` is blessed at
 /// today's leaf layout and STAYS row-pair only. At the default format this is
 /// [`resolve`] — the registry row, no fallback. Under a one-row format (`On`
 /// or `Auto`) the registry is NOT read: the program is rebuilt from code and
@@ -159,7 +159,7 @@ impl LfmRegistryEntry {
             hasher: self.hasher,
             chip_set: self.chip_set,
             program_id: self.program_id,
-            // The registry is ROW-PAIR ONLY (design/FRI.md §7.5.4): a one-row
+            // The registry is ROW-PAIR ONLY: a one-row
             // format never reads it — `resolve_artifacts` builds at run time.
             one_row_roots: None,
         }
@@ -216,7 +216,7 @@ pub struct LfmArtifacts {
 pub struct LfmOneRowRoots {
     /// Per chip slot, as `LfmArtifacts::roots`; `None` = no one-row root (a
     /// static table with no one-row twin at this blowup — a hard miss if the
-    /// chip resolves to one row, RULINGS 14). Slot 12 (`KECCAK_RND`) has no
+    /// chip resolves to one row). Slot 12 (`KECCAK_RND`) has no
     /// preprocessed columns and stays `None`.
     pub roots: [Option<Commitment>; NUM_LFM_CHIPS],
     /// One per `LFM_BLAKE3` chunk, as `LfmArtifacts::blake3_chunk_roots`.

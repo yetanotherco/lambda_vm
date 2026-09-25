@@ -1,4 +1,4 @@
-//! Merkle caps of a univariate STARK proof (design/CAP.md §4, lever S1).
+//! Merkle caps of a univariate STARK proof (lever S1).
 //!
 //! Every tree of a proof is opened once per query: the trace trees (main,
 //! precomputed, aux), the composition tree and each committed FRI layer. Under
@@ -14,8 +14,8 @@
 //!
 //! [`TreeCheck`] is the verifier's per-tree check: built ONCE per tree (the
 //! owner path's length and its cap-to-root check), then used for every query.
-//! At `c = 0` it never touches the owner opening and is exactly the C1b
-//! exact-length check, so the default format verifies the bytes it did.
+//! At `c = 0` it never touches the owner opening and is exactly the uncapped
+//! exact-length check, so the legacy format verifies the same bytes.
 
 use crypto::merkle_tree::cap::{CapPolicy, CappedRoot};
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;

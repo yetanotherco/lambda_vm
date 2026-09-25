@@ -1,18 +1,18 @@
 //! S3 in the in-guest FRI verifier: the shape from the shared schedule (G1)
-//! and the group-layer emitter (G2), design/FRI.md §6, §11.
+//! and the group-layer emitter (G2).
 //!
 //! Checked against the host's own artefacts, never against a second model:
 //! - the in-guest shape (schedule, layer depths, caps) against the host's
 //!   `StarkCaps::for_options` / `FriFormat::schedule` over a sweep of shapes;
-//! - the emitted verifier against I-FRI-H's checked-in RPX vectors
+//! - the emitted verifier against the host's checked-in RPX vectors
 //!   (`crypto/stark/tests/vectors/zf_fri/d_proof_rpx_*`: pair, dp, the uneven
-//!   `[3, 1, 3]` override, and the two capped Q = 20 formats of REVIEW-FRI F9),
+//!   `[3, 1, 3]` override, and the two capped Q = 20 formats),
 //!   executed, with its permutation count equal to the closed form;
 //! - tampers of every value a group opening carries, and the slot check shown
 //!   load-bearing (a moved `p₀` executes when, and only when, it is skipped);
 //! - the {cap off, auto} × {pair, dp, uneven dp} round-trip matrix on a real
-//!   laptop-scale proof (F9), both legs as one program;
-//! - RULINGS 13 + 22: every row the emitter emits per FRI layer (group and
+//!   laptop-scale proof, both legs as one program;
+//! - every row the emitter emits per FRI layer (group and
 //!   pair, capped and uncapped) equals the DP's model (`stark::fri::schedule`),
 //!   and a DEEP point's rows equal the S2 `auto` rule's DEEP term.
 
@@ -100,7 +100,7 @@ fn the_in_guest_fri_shape_is_the_hosts_layout() {
 }
 
 // =============================================================================
-// G2 — the emitted verifier on I-FRI-H's RPX vectors
+// G2 — the emitted verifier on the host's RPX vectors
 // =============================================================================
 
 fn ext_of(v: &Value) -> FEE {
@@ -201,8 +201,8 @@ impl Vector {
 
 /// ★ The emitted FRI verifier accepts every RPX (d) vector — today's pair
 /// proof, the DP schedule, the uneven `[3, 1, 3]` override (the only shape
-/// that catches a fold-count off-by-one, REVIEW-FRI F6) and both capped Q = 20
-/// formats (F9) — with the vector's schedule, depths and caps derived by the
+/// that catches a fold-count off-by-one) and both capped Q = 20
+/// formats — with the vector's schedule, depths and caps derived by the
 /// emitter's own shape, and the permutation count exactly the closed form.
 #[test]
 fn the_emitted_fri_verifier_accepts_every_rpx_vector() {
@@ -351,10 +351,10 @@ fn the_slot_check_is_load_bearing() {
 }
 
 // =============================================================================
-// F9 — the {cap} × {fri} round-trip matrix, both legs, on a real proof
+// The {cap} × {fri} round-trip matrix, both legs, on a real proof
 // =============================================================================
 
-/// ★ REVIEW-FRI F9's matrix on a real laptop-scale proof (L2G_MEMORY, 2048
+/// ★ The cap × FRI matrix on a real laptop-scale proof (L2G_MEMORY, 2048
 /// rows, blowup 2, `k = 2` so the committed chain covers 11 → 3, Q = 24):
 /// {cap off, auto} × {pair, dp, dp `[3, 1, 4]`}. Per cell the FRI leg alone
 /// and both legs as one program execute over every query, reach the terminal
@@ -458,7 +458,7 @@ fn the_cap_and_fri_matrix_round_trips_in_guest() {
 }
 
 // =============================================================================
-// RULINGS 13 + 22 — every emitted row per FRI layer and per DEEP point, against
+// Every emitted row per FRI layer and per DEEP point, against
 // the host's cost model (`stark::fri::schedule`, `stark::leaf_layout`)
 // =============================================================================
 
@@ -593,7 +593,7 @@ fn fri_layer_program(d: u32, c: usize, times: usize) -> LfmProgram {
     compile(b.finish())
 }
 
-/// ★ RULINGS 13 + 22: the rows one query's opening of a committed FRI layer
+/// ★ The rows one query's opening of a committed FRI layer
 /// emits in-guest EQUAL the host model's, kind by kind and in total, for group
 /// layers `d = 1..=6` and today's pair layer, uncapped and capped (`c = 1, 2`
 /// on a two-level tree):
@@ -719,7 +719,7 @@ fn deep_point_program(shape: &DeepShape, times: usize) -> LfmProgram {
     compile(b.finish())
 }
 
-/// ★ RULINGS 22: the XALU rows of ONE in-guest DEEP point EQUAL the S2 `auto`
+/// ★ The XALU rows of ONE in-guest DEEP point EQUAL the S2 `auto`
 /// rule's DEEP term (`stark::leaf_layout::deep_point_xalu_rows`:
 /// `num_surviving + 4·E + P + 3`), over shapes with and without a next row,
 /// a widened step, and one or many composition parts. DEEP emits no other

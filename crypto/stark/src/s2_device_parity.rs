@@ -1,5 +1,4 @@
-//! Device-vs-host parity for S2's one-row trees and openings (FRI.md §7.6,
-//! lane I-S2-D, D2).
+//! Device-vs-host parity for S2's one-row trees and openings.
 //!
 //! Compiled for `cuda` builds with tests or `test-utils`; every entry needs a
 //! GPU, so the callers are `#[ignore]`d box tests. The stark crate instantiates

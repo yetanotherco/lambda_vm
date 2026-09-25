@@ -104,7 +104,7 @@ pub enum ProvingError {
     PrecomputedCommitmentMismatch,
     /// The AIR has no preprocessed commitment for the table's leaf layout
     /// (S2: a one-row layout whose static root was never generated). A hard
-    /// error, never a silent recompute (RULINGS 14): proving on would either
+    /// error, never a silent recompute: proving on would either
     /// take the other layout's root — a proof every verifier rejects — or
     /// rebuild a whole preprocessed LDE and tree behind the operator's back.
     PrecomputedCommitmentMissing(String),
@@ -238,7 +238,7 @@ type PrecomputedTreeMap =
 /// The cache key: the root AND the trees' rows per leaf (S2). The root alone
 /// already differs between leaf layouts (a one-row leaf hashes other bytes),
 /// so two layouts cannot alias; the layout is in the key anyway so that
-/// argument is not a hash-collision argument (FRI.md §7.5.5).
+/// argument is not a hash-collision argument.
 type PrecomputedTreeKey = (Commitment, usize);
 
 fn precomputed_tree_cache() -> &'static Mutex<PrecomputedTreeMap> {
@@ -3060,7 +3060,7 @@ pub trait IsStarkProver<
             leaf_layout,
         );
 
-        // Merkle caps (design/CAP.md §4.2): a post-pass over the finished
+        // Merkle caps: a post-pass over the finished
         // openings. The heights are the verifier's (`StarkCaps`, public shape
         // only); nothing is absorbed, so the transcript is the uncapped one.
         // At the default format every height is 0 and this is skipped.
@@ -3110,7 +3110,7 @@ pub trait IsStarkProver<
     }
 
     /// Embed every capped tree's cap into its owner path and cut every path of
-    /// that tree to `depth − c` siblings (design/CAP.md §3–§4.2).
+    /// that tree to `depth − c` siblings.
     ///
     /// Per tree: read the cap (the host tree's heap slice; see
     /// [`Self::tree_cap`] for a device-resident tree), then
@@ -3274,8 +3274,7 @@ pub trait IsStarkProver<
     /// host tree means the nodes are device-resident: `device(c)` reads the
     /// cap off the resident tree, and `None` from it (no resident tree) is a
     /// hard error naming the tree — never a skipped cap, which would ship
-    /// full-length paths the verifier rejects with no pointer to the cause
-    /// (REVIEW-CAP S6).
+    /// full-length paths the verifier rejects with no pointer to the cause.
     fn tree_cap<B>(
         host: &MerkleTree<B>,
         depth: usize,
@@ -4549,7 +4548,7 @@ pub trait IsStarkProver<
 
                 let layout = leaf_layouts[idx];
                 // The root of THIS layout; a layout the AIR has no root for is
-                // refused here, before anything is committed (RULINGS 14).
+                // refused here, before anything is committed.
                 let precomputed = if air.is_preprocessed() {
                     let root = air.precomputed_commitment_for(layout).ok_or_else(|| {
                         ProvingError::PrecomputedCommitmentMissing(format!(

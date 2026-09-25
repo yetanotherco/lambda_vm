@@ -1,7 +1,7 @@
 //! Test-only capture of the verifier's FRI challenges and DEEP values, for the
-//! exported test vectors (`tests/vectors/zf_fri`, FRI.md §10 (d)): a vector
+//! exported test vectors (`tests/vectors/zf_fri`, the README's (d)): a vector
 //! carries a proof AND the ζ, ι and DEEP values a correct verifier derives
-//! from it, so the device and in-guest lanes can check each stage separately.
+//! from it, so the device prover and the in-guest verifier can check each stage separately.
 //!
 //! Compiled only for tests and the `test-utils` feature. Thread-local: the
 //! host verifier is sequential on the calling thread, so [`capture`] sees

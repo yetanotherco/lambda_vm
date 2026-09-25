@@ -1,4 +1,4 @@
-//! The exported S3 and S2 vectors (FRI.md §10 (a)–(e)) under Keccak and Blake3 are
+//! The exported S3 and S2 vectors ((a)–(e) in the README) under Keccak and Blake3 are
 //! current: regenerated in memory and byte-equal to the checked-in files in
 //! `crypto/stark/tests/vectors/zf_fri/` (the RPX files: the prover crate's
 //! `tests::zf_rpx_vectors`). Regenerate after a deliberate format change:

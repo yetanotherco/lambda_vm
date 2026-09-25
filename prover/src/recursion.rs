@@ -42,7 +42,7 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
     coset_offset: 3,
     grinding_factor: 1,
     fri_final_poly_log_degree: 7,
-    // RULINGS 26: the RV64 guest verifies the LEGACY format, named here rather
+    // The RV64 guest verifies the LEGACY format, named here rather
     // than inherited from a default.
     format: stark::proof::options::ProofFormat::LEGACY,
 };
@@ -78,7 +78,7 @@ impl Preset {
     /// The fixed `ProofOptions` this preset's guest verifies with.
     ///
     /// ★ Always the LEGACY proof format ([`ProofFormat::LEGACY`](stark::proof::options::ProofFormat::LEGACY)),
-    /// stamped explicitly (RULINGS 26): the RV64 guest's archived verifier is
+    /// stamped explicitly: the RV64 guest's archived verifier is
     /// not threaded with the ZF format levers, so its presets name the format
     /// it was built for instead of inheriting the process's production format
     /// ([`crate::zf_format::ZfFormat::DEFAULT`]).
@@ -276,8 +276,8 @@ pub fn program_id_from_elf(
     ))
 }
 
-/// The RV64 recursion guest verifies the LEGACY proof format only (RULINGS 11,
-/// as amended by RULINGS 26): its presets fix the options at build time and
+/// The RV64 recursion guest verifies the LEGACY proof format only: its
+/// presets fix the options at build time and
 /// name the legacy format, and the archived verifier it runs is not threaded
 /// with the ZF format levers. Any other format — including the production
 /// default [`crate::zf_format::ZfFormat::DEFAULT`] — must never reach it, so

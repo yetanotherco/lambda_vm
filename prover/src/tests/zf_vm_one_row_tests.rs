@@ -4,13 +4,13 @@
 //! - A real multi-table VM proof (RPX block pin, host CPU paths) at
 //!   `one_row = 1` and at `one_row = auto` with `fri = dp`, blowup 4 (the
 //!   blowup the one-row static twins ship for).
-//! - RULINGS 14 at the VM level: at blowup 2 there is no one-row twin, so
+//! - The hard miss at the VM level: at blowup 2 there is no one-row twin, so
 //!   `one_row = 1` is a proving ERROR naming the missing root — never a silent
 //!   recompute, never a proof.
 //! - An LFM machine proof (`TrivialV0`) at `one_row = 1`, blowup 4, verified
 //!   through `lfm_verify`, i.e. through the registry policy (built at run time,
 //!   `LFM_REGISTRY` not read).
-//! - Lane I-FIX-S2's regression: the Phase-A replay that recovers `z`, `α` for
+//! - A regression: the Phase-A replay that recovers `z`, `α` for
 //!   the expected bus balances absorbs each preprocessed table's root AT ITS
 //!   LEAF LAYOUT — an LFM proof at the wrap's options under `one_row = auto`
 //!   (mixed layouts, one-row preprocessed chips, published words) and a VM
@@ -110,7 +110,7 @@ fn a_vm_proof_round_trips_at_one_row_auto_with_dp() {
     );
 }
 
-/// RULINGS 14: no one-row static twin at blowup 2 ⇒ a proving error naming
+/// No one-row static twin at blowup 2 ⇒ a proving error naming
 /// the missing root.
 #[test]
 fn a_missing_one_row_twin_is_a_vm_proving_error() {
@@ -161,7 +161,7 @@ fn an_lfm_proof_round_trips_at_one_row() {
     );
 }
 
-/// ★ REGRESSION (lane I-FIX-S2): one-row PREPROCESSED tables and the Phase-A
+/// ★ REGRESSION: one-row PREPROCESSED tables and the Phase-A
 /// replay. The prover absorbs each preprocessed table's root OF ITS LEAF
 /// LAYOUT before sampling the shared LogUp `z`, `α`; the verify paths recover
 /// `z`, `α` with `crate::replay_transcript_phase_a_view`, which absorbed the

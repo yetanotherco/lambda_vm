@@ -19,7 +19,7 @@
 //! * the active Merkle-cap policy ([`CapPolicy`]; `Off` caps nothing);
 //! * `dmax` — the largest fold exponent the program may choose.
 //!
-//! # The objective (RULINGS 13, 22): the cost law of every emitted row
+//! # The objective: the cost law of every emitted row
 //!
 //! The DP minimises the in-guest verifier's price of the FRI leg under the
 //! SAME cost-law weights the cap policy optimises ([`AUTO_WEIGHTS`], ns per
@@ -52,7 +52,7 @@
 //! priced at one weight: `SELECT`, `LFM_HASH` (compress), `Unpack` and hint
 //! at the cap policy's (a `Pack` is an `LFM_LANES` row, as an `Unpack` is,
 //! and is priced like one), `XALU` at [`XALU_ROW_NS`], `BALU` at [`BALU_ROW_NS`].
-//! The in-guest lane pins "emitted rows == [`fri_group_layer_rows`]" kind by
+//! The in-guest emitter's tests pin "emitted rows == [`fri_group_layer_rows`]" kind by
 //! kind against its emitter (`lfm::fri_group_tests`), capped and uncapped.
 //! Costs are kept in units of `1/Q` ns so every term is an integer.
 
@@ -469,7 +469,7 @@ pub struct FriFormat {
     pub one_row: bool,
     /// FRI query count (the opening count of every FRI tree).
     pub num_queries: u64,
-    /// The active Merkle-cap policy (an input of the DP, RULINGS 7).
+    /// The active Merkle-cap policy (an input of the DP: the cap changes each layer's path cost).
     pub cap: CapPolicy,
     /// An explicit schedule that replaces the DP's under [`FriMode::Dp`].
     pub schedule_override: Option<FriScheduleOverride>,
@@ -501,7 +501,7 @@ impl FriFormat {
     }
 
     /// Whether the proof uses today's FRI encoding: one sibling value per
-    /// committed layer, pair leaves (FRI.md §3.4). True exactly for pair
+    /// committed layer, pair leaves. True exactly for pair
     /// layers with row-pair openings; any other format carries every layer's
     /// full group, even where the schedule is all ones. Decided by the format,
     /// never by the schedule's values.

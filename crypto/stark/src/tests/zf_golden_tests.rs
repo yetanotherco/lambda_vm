@@ -1,4 +1,4 @@
-//! Default-format golden proofs (REVIEW-FRI F1): the bytes today's prover emits,
+//! Default-format golden proofs: the bytes today's prover emits,
 //! pinned, so a format lever that claims "the default is byte-identical" is
 //! checked against the prover's own output rather than against a round trip
 //! (a drifted prover still accepts its own proofs).
@@ -18,9 +18,8 @@
 //! an aux trace (`LogReadOnlyRAP`, E = F³), `total_folds` ∈ {0, 1, 2, ≥ 3}, and
 //! one multi-table bus proof (CPU/ADD/MUL, `multi_prove`).
 //!
-//! Generated at the default format BEFORE any S3 prover code existed (commit
-//! "H0" of lane I-FRI-H, on `zf/cap-stark` @ 77ea1ab89 + the schedule DP, which
-//! changes no prover path). Regenerate only for a deliberate format change:
+//! Generated at the default format BEFORE any S3 prover code existed (the
+//! schedule DP alone changes no prover path). Regenerate only for a deliberate format change:
 //! `cargo test -p stark --lib zf_golden_tests::print_goldens -- --ignored --nocapture`.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
