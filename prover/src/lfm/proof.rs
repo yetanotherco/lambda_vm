@@ -523,7 +523,9 @@ fn verify_against_chunked_with(
     // LogUp challenges; the expected balance is the LfmPublic sum recomputed
     // from the claimed words (all other LFM buses balance to zero internally).
     let mut replay = transcript.clone();
-    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut replay);
+    let Some((z, alpha)) = crate::replay_transcript_phase_a_view(&refs, view, &mut replay) else {
+        return false;
+    };
     let Some(expected) = expected_public_balance(claimed_public, &z, &alpha) else {
         return false;
     };

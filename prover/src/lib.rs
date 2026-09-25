@@ -1379,20 +1379,35 @@ pub(crate) fn compute_commit_bus_offset(
 /// Generic over the transcript for the same reason as `absorb_lfm_statement`:
 /// the replay is `append_bytes` plus `sample_field_element`, both on
 /// `IsTranscript`, so it is the same replay under any sponge.
+///
+/// ★ The preprocessed root absorbed is the one of the table's LEAF LAYOUT
+/// (S2), resolved exactly as the STARK prover and verifier resolve it —
+/// `stark::leaf_layout::table_leaf_layout(air, proof.trace_length())`, then
+/// `air.precomputed_commitment_for(layout)` — because that is the root the
+/// prover absorbed before sampling `z` and `α`. Absorbing the row-pair root
+/// for a one-row table replays a different transcript: the recovered `z`, `α`
+/// differ from the prover's, so every expected bus balance that depends on
+/// them (the LFM public words, the VM commit bus) is wrong and an honest proof
+/// is rejected. At the default format every layout is row pairs and this is
+/// the row-pair root, byte for byte what was absorbed before.
+///
+/// `None` = a preprocessed table has no root for its layout (RULINGS 14): the
+/// caller rejects, exactly as the STARK verifier would.
 pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: impl ProofViewSource<'p, F, E, ()>,
     transcript: &mut impl IsTranscript<E>,
-) -> (FieldElement<E>, FieldElement<E>) {
+) -> Option<(FieldElement<E>, FieldElement<E>)> {
     for (air, proof) in airs.iter().zip(proofs.view_iter()) {
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            let layout = stark::leaf_layout::table_leaf_layout(*air, proof.trace_length());
+            transcript.append_bytes(&air.precomputed_commitment_for(layout)?);
         }
         transcript.append_bytes(proof.lde_trace_main_merkle_root());
     }
     let z: FieldElement<E> = transcript.sample_field_element();
     let alpha: FieldElement<E> = transcript.sample_field_element();
-    (z, alpha)
+    Some((z, alpha))
 }
 
 /// Computes the expected COMMIT bus balance for a proof view slice (owned or
@@ -1407,7 +1422,7 @@ pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     // TYPE rather than the same type over a different digest.
     transcript: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
+    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript)?;
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 

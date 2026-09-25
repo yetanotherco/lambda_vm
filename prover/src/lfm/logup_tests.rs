@@ -1393,7 +1393,8 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         num_contributing_tables: contributions.len(),
         num_output_bytes: public_output.len(),
     };
-    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut seed());
+    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut seed())
+        .expect("every preprocessed table has a root for its layout");
 
     let n_tables = contributions.len() as u32;
     let n_bytes = public_output.len() as u32;

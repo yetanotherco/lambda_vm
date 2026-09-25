@@ -10,6 +10,11 @@
 //! - An LFM machine proof (`TrivialV0`) at `one_row = 1`, blowup 4, verified
 //!   through `lfm_verify`, i.e. through the registry policy (built at run time,
 //!   `LFM_REGISTRY` not read).
+//! - Lane I-FIX-S2's regression: the Phase-A replay that recovers `z`, `α` for
+//!   the expected bus balances absorbs each preprocessed table's root AT ITS
+//!   LEAF LAYOUT — an LFM proof at the wrap's options under `one_row = auto`
+//!   (mixed layouts, one-row preprocessed chips, published words) and a VM
+//!   proof with public output at `one_row = 1`.
 //! - D2 (lane I-S2-D): the one-row VM proof's BYTES at grinding 0, written to
 //!   `ZF_S2_PROOF_DIR` by a CPU build and by a cuda build; the box compares the
 //!   two files byte for byte (the device-proved one-row VM proof equals the CPU
@@ -158,6 +163,126 @@ fn an_lfm_proof_round_trips_at_one_row() {
         )
         .expect("built at run time under one row"),
         "an honest one-row LFM proof must verify"
+    );
+}
+
+/// ★ REGRESSION (lane I-FIX-S2): one-row PREPROCESSED tables and the Phase-A
+/// replay. The prover absorbs each preprocessed table's root OF ITS LEAF
+/// LAYOUT before sampling the shared LogUp `z`, `α`; the verify paths recover
+/// `z`, `α` with `crate::replay_transcript_phase_a_view`, which absorbed the
+/// ROW-PAIR root unconditionally. For a one-row preprocessed table the replay
+/// then diverges, and every expected balance that depends on `z`, `α` is
+/// wrong: an honest proof is rejected. The balance depends on them only when
+/// something is published — the LFM public words, the VM commit bus — which
+/// is why a VM proof without public output (`test_mul_8`) verified anyway.
+///
+/// At the wrap's options (blowup 4, terminal 2^8, 128-bit queries) under
+/// `one_row = auto`, as the block tree proves its LFM wraps: layouts MIX
+/// within one proof and at least one preprocessed chip goes one-row (asserted,
+/// so this keeps exercising the bug). Verified through
+/// `verify_against_artifacts` — the call the tree harness makes before
+/// harvesting a child (`per_table_aggregator_tests::real_child_timed`) — and
+/// through `lfm_verify`.
+#[test]
+fn an_lfm_proof_at_the_wrap_options_round_trips_at_one_row_auto() {
+    use crate::lfm::proof::{lfm_prove, lfm_verify, verify_against_artifacts};
+    use crate::lfm::registry::{LfmProgramKind, build_artifacts};
+    use crate::tables::types::FE;
+    use stark::leaf_layout::table_leaf_layout;
+    let mut o = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
+    o.fri_final_poly_log_degree = 8;
+    o.format.one_row = OneRowMode::Auto;
+    let program = LfmProgramKind::TrivialV0.program();
+    let artifacts = build_artifacts(&program, &o);
+    let arenas: Vec<Vec<crate::lfm::word::LfmWord>> = vec![
+        (0..4u64)
+            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
+            .collect(),
+    ];
+    let proved = lfm_prove(&program, &artifacts, &arenas, &o).expect("auto LFM prove");
+    assert!(
+        !proved.public_words.is_empty(),
+        "the balance must depend on z and alpha: the program publishes"
+    );
+
+    let mut airs = crate::lfm::airs::LfmAirs::new_chunked(
+        &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
+        &o,
+        artifacts.keccak_rnd_chunks,
+        artifacts.hasher,
+        artifacts.chip_set,
+    );
+    airs = airs.with_one_row_roots(artifacts.one_row_roots.as_ref().expect("built"));
+    let refs = airs.air_refs();
+    let (mut prep_rows, mut rows, mut pairs) = (0usize, 0usize, 0usize);
+    for (air, p) in refs.iter().zip(&proved.proof.proofs) {
+        let layout = table_leaf_layout(*air, p.trace_length);
+        println!(
+            "ZF FIX-S2 layout {:<12} 2^{:<2} {layout:?}",
+            air.name(),
+            p.trace_length.trailing_zeros()
+        );
+        if layout.is_one_row() {
+            rows += 1;
+            prep_rows += usize::from(air.is_preprocessed());
+        } else {
+            pairs += 1;
+        }
+    }
+    println!(
+        "ZF FIX-S2 LFM one_row=auto: {rows} one-row, {pairs} row-pair, {prep_rows} one-row preprocessed"
+    );
+    assert!(
+        prep_rows >= 1 && pairs >= 1,
+        "the fixture must mix layouts with a one-row preprocessed chip \
+         ({prep_rows} one-row preprocessed, {pairs} row-pair)"
+    );
+
+    assert!(
+        verify_against_artifacts(&artifacts, &proved.proof, &proved.public_words, &o),
+        "an honest one-row-auto LFM proof must verify (the tree harness's call)"
+    );
+    assert!(
+        lfm_verify(
+            LfmProgramKind::TrivialV0,
+            &proved.proof,
+            &proved.public_words,
+            &o
+        )
+        .expect("built at run time under one row"),
+        "an honest one-row-auto LFM proof must verify through lfm_verify"
+    );
+    // Still bound to the claimed words: one moved public word rejects.
+    let mut wrong = proved.public_words.clone();
+    wrong[0].1[0] += FE::from(1u64);
+    assert!(
+        !verify_against_artifacts(&artifacts, &proved.proof, &wrong, &o),
+        "a moved public word must be rejected"
+    );
+}
+
+/// The VM half of the same regression: a VM proof WITH public output (the
+/// commit bus's expected balance depends on the replayed `z`, `α`) at
+/// `one_row = 1`, where every preprocessed VM table (BITWISE, DECODE, the
+/// pages, REGISTER) is one-row.
+#[test]
+fn a_vm_proof_with_public_output_round_trips_at_one_row() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let one_row = opts(4, OneRowMode::On, FriMode::Pair);
+    let vm_proof = crate::prove_with_options(&elf_bytes, &one_row, &Default::default())
+        .expect("test_commit_4 must prove at one_row = 1");
+    assert_eq!(vm_proof.public_output, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    assert!(
+        crate::verify_with_options(&vm_proof, &elf_bytes, &one_row, None, None)
+            .expect("honest verify must not error"),
+        "an honest one-row VM proof with public output must verify"
+    );
+    let mut wrong = vm_proof.clone();
+    wrong.public_output[0] ^= 1;
+    assert!(
+        !crate::verify_with_options(&wrong, &elf_bytes, &one_row, None, None).unwrap_or(false),
+        "a moved public output byte must be rejected"
     );
 }
 
