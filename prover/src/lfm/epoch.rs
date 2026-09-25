@@ -299,10 +299,12 @@ impl TableChallengeShape {
     }
 
     /// Bits one query index carries — `sample_u64(lde_length >> 1)`
-    /// (`verifier.rs:138-141`), so one bit narrower than the domain, which is
-    /// exactly the Merkle depth the walk consumes.
+    /// (`verifier.rs:138-141`), so one bit narrower than the domain, for row
+    /// pairs; `sample_u64(lde_length)`, the whole domain, under one-row leaves
+    /// (S2, `LeafLayout::query_bound`). Either way exactly the Merkle depth the
+    /// walk consumes — the FRI shape's [`FriShape::index_bits`], one definition.
     pub fn index_bits(&self) -> usize {
-        self.log2_lde_length() as usize - 1
+        self.fri.index_bits()
     }
 
     fn check(&self) {
@@ -705,6 +707,27 @@ pub(super) fn nonce_halves(b: &mut LfmBuilder, nonce: Felt) -> [Felt; 2] {
     super::transcript_replay::felt_be_halves(b, nonce)
 }
 
+// The transcript-order mutation (FRI.md §10 T6 in-guest): a test build can
+// replay a one-row table with a ζ drawn BEFORE the input root and watch the
+// challenge differential go red. Production has no switch.
+#[cfg(test)]
+thread_local! {
+    pub(super) static ZETA_BEFORE_INPUT_ROOT: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+#[inline]
+fn zeta_before_input_root() -> bool {
+    #[cfg(test)]
+    {
+        ZETA_BEFORE_INPUT_ROOT.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Replay one table's rounds 2 to 4 against a FORKED transcript.
 ///
 /// `t` must be the fork ([`fork_table`]), not the shared transcript. Returns
@@ -785,11 +808,20 @@ pub fn emit_table_challenges(
     // ---- Round 4: γ, the interleaved FRI commit phase, then the queries.
     let gamma = t.sample_ext(b);
 
-    let mut zetas = Vec::with_capacity(shape.fri.num_committed() + 1);
-    for root in absorbs.fri_roots {
+    let mut zetas = Vec::with_capacity(shape.fri.num_zetas());
+    for (j, root) in absorbs.fri_roots.iter().enumerate() {
         // Sample FIRST, absorb SECOND — a ζ drawn after its own layer root is a
         // challenge the prover answers rather than one that binds them.
-        zetas.push(t.sample_ext(b));
+        //
+        // ★ Except the one-row INPUT tree (S2, design/FRI.md §7.3): root 0 is
+        // the DEEP codeword itself, committed BEFORE any folding challenge —
+        // absorbed right after γ, with no ζ ahead of it. A ζ drawn before it
+        // would let the prover pick the codeword after seeing λ₁ (FRI.md §7.7
+        // (ii)); the host replay (`verifier.rs`, `replay_rounds_after_round_1`)
+        // is the same loop.
+        if !(shape.fri.one_row() && j == 0) || zeta_before_input_root() {
+            zetas.push(t.sample_ext(b));
+        }
         root.absorb(b, t);
     }
     if shape.fri.total_folds() > 0 {

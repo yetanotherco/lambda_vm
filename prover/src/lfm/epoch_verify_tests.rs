@@ -175,7 +175,10 @@ pub(super) fn build_table_legs(
         "the next-row block covers every evaluation point past the first step"
     );
 
-    let merkle_depth = log2_lde_length as usize - 1;
+    // The table's leaf layout (S2): the host prover's and verifier's own
+    // per-table resolution, so `auto` mixes layouts across a proof's tables.
+    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
     let sub = SubProofShape {
         deep,
         trace_groups,
@@ -186,6 +189,7 @@ pub(super) fn build_table_legs(
             .format
             .merkle_cap
             .height(opts.fri_number_of_queries, merkle_depth),
+        layout: leaf_layout,
     };
     let has_aux_trace = air.has_aux_trace();
     let verify = TableVerifyShape {
@@ -194,7 +198,7 @@ pub(super) fn build_table_legs(
             num_composition_parts: claimed_parts.len(),
             boundary: boundary_terms(has_aux_trace, num_total_cols),
         },
-        fri: FriShape::from_options(opts, log2_lde_length),
+        fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout),
         main_width,
         num_alpha_powers: if has_aux_trace {
             artifact.shape.max_bus_elements as usize
@@ -208,9 +212,12 @@ pub(super) fn build_table_legs(
     // ---- the cap heights: the in-guest shapes' against the host's own
     // `StarkCaps` (the prover's and the verifier's), so the two sides derive
     // every tree's height and depth from one function.
-    let host_caps =
-        stark::merkle_caps::StarkCaps::for_options(opts, log2_lde_length as usize, false)
-            .expect("a format the host lays out");
+    let host_caps = stark::merkle_caps::StarkCaps::for_options(
+        opts,
+        log2_lde_length as usize,
+        leaf_layout.is_one_row(),
+    )
+    .expect("a format the host lays out");
     assert_eq!(host_caps.trace_depth, verify.sub.merkle_depth);
     assert_eq!(
         host_caps.trace, verify.sub.trace_cap,
@@ -332,8 +339,24 @@ pub(super) fn build_table_legs(
         production_boundary,
         has_aux_trace,
         num_precomputed_cols: num_precomputed,
-        precomputed_commitment: air.is_preprocessed().then(|| air.precomputed_commitment()),
+        precomputed_commitment: air
+            .is_preprocessed()
+            .then(|| layout_precomputed_commitment(air, trace_length)),
     }
+}
+
+/// The precomputed-columns commitment the host verifier takes for `air` over
+/// a trace of `trace_length` rows: `precomputed_commitment_for` the table's
+/// resolved leaf layout (S2, RULINGS 14 — a layout with no root is a hard
+/// error, never the other layout's root). At row pairs it IS
+/// `air.precomputed_commitment()`.
+pub(super) fn layout_precomputed_commitment<PI>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
+    trace_length: usize,
+) -> Commitment {
+    let layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    air.precomputed_commitment_for(layout)
+        .unwrap_or_else(|| panic!("no precomputed commitment at {layout:?}"))
 }
 
 /// Every query's FRI layer openings, per layer `(opened values, path)`, and
@@ -1542,10 +1565,34 @@ const PROCESS_FORMAT_QUERIES: usize = 24;
 #[test]
 #[ignore = "a real epoch proof at 24 queries and its assembled verifier: box only"]
 fn the_assembled_epoch_verifier_runs_at_the_process_format() {
-    let format = crate::zf_format::ZfFormat::global();
     let mut opts = super::proof_fixture::fixture_options();
     opts.fri_number_of_queries = PROCESS_FORMAT_QUERIES;
-    let opts = format.options(opts);
+    assembled_twin_at_the_process_format(opts);
+}
+
+/// ★ [`the_assembled_epoch_verifier_runs_at_the_process_format`] at BLOWUP 4
+/// — the S2 (one-row) twin, box only. One-row static roots exist at blowup 4
+/// only (`STATIC_BLOWUP_FACTORS_ONE_ROW`, RULINGS 14: a missing twin is a
+/// proving error), so the MIN preset's blowup 2 cannot prove a one-row
+/// BITWISE; this arm keeps every other MIN-preset option and lifts the blowup
+/// to 4 for every format, so its knob-off and knob-on runs are one A/B. Under
+/// `one_row = auto` the epoch's tables resolve their layouts one by one
+/// (printed per leg), so the assembled machine verifies a MIXED-layout proof;
+/// the REGISTER root is derived in-machine at that table's own layout.
+#[test]
+#[ignore = "a real epoch proof at blowup 4, 24 queries, and its assembled verifier: box only"]
+fn the_assembled_epoch_verifier_runs_at_blowup_4_at_the_process_format() {
+    let mut opts = super::proof_fixture::fixture_options();
+    opts.fri_number_of_queries = PROCESS_FORMAT_QUERIES;
+    opts.blowup_factor = 4;
+    assembled_twin_at_the_process_format(opts);
+}
+
+/// The body of the assembled-verifier twins: `base` with the process format
+/// stamped on, proved, harvested and verified by the assembled machine.
+fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
+    let format = crate::zf_format::ZfFormat::global();
+    let opts = format.options(base);
     let e = super::epoch_tests::real_epoch_with(opts.clone());
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
@@ -1593,9 +1640,10 @@ fn the_assembled_epoch_verifier_runs_at_the_process_format() {
     for (i, l) in e.legs.iter().enumerate() {
         let f = l.verify.fri;
         println!(
-            "  leg {i:>2}: log2(lde) {:>2}  trace cap {}  FRI schedule {:?} depths {:?} \
-             caps {:?}  {} permutations",
+            "  leg {i:>2}: log2(lde) {:>2}  layout {:?}  trace cap {}  FRI schedule {:?} \
+             depths {:?} caps {:?}  {} permutations",
             l.verify.sub.log2_lde_length,
+            l.verify.sub.layout,
             l.verify.sub.trace_cap,
             f.schedule(),
             (0..f.num_committed())
@@ -1629,6 +1677,44 @@ fn the_assembled_epoch_verifier_runs_at_the_process_format() {
         selects(&program) - selects(&spine),
         program.instrs.len(),
     );
+    // S2: how many legs verify one-row tables (0 at `one_row = 0`, every leg
+    // at `1`, the AIR widths' choice at `auto`), and the blowup of the arm.
+    let one_row_legs = e
+        .legs
+        .iter()
+        .filter(|l| l.verify.sub.layout.is_one_row())
+        .count();
+    println!(
+        "ZFS2TWIN blowup={} legs={} one_row_legs={one_row_legs} row_pair_legs={}",
+        opts.blowup_factor,
+        e.legs.len(),
+        e.legs.len() - one_row_legs,
+    );
+    match opts.format.one_row {
+        stark::proof::options::OneRowMode::Off => assert_eq!(one_row_legs, 0),
+        stark::proof::options::OneRowMode::On => assert_eq!(one_row_legs, e.legs.len()),
+        stark::proof::options::OneRowMode::Auto => {}
+    }
+    // A one-row leg's input-tree group value (query 0, layer 0, value 0) moved
+    // must not execute — the input group is authenticated and slot-checked.
+    // The FRI arena is found by content rather than by a hand-counted offset.
+    if let Some((k, words)) = e
+        .legs
+        .iter()
+        .enumerate()
+        .find(|(_, l)| l.verify.sub.layout.is_one_row() && l.verify.fri.num_committed() > 0)
+        .map(|(k, l)| (k, l.fri_arena()))
+    {
+        let at = arenas
+            .iter()
+            .position(|a| *a == words)
+            .expect("the one-row leg's FRI arena is among the program's arenas");
+        let mut bad = arenas.clone();
+        bad[at][0][0] += FE::one();
+        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+            .expect_err("a moved input-tree value must not execute");
+        println!("  leg {k}: a moved one-row input-tree value is refused");
+    }
 
     // A moved cap word must not execute (only when the format caps a tree).
     // The caps arena is found by content rather than by a hand-counted offset.

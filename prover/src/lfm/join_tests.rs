@@ -82,7 +82,12 @@ pub(super) struct HostSubProof {
     /// trace leg does not.
     pub(super) zetas: Vec<FEE>,
     /// The production reconstruction's answer per query, `(regular, sym)`.
+    /// Row-pair shapes only (empty under one-row leaves).
     pub(super) expected: Vec<(FEE, FEE)>,
+    /// Under one-row leaves (S2): production's DEEP at the ONE point `x_r`
+    /// per query (`reconstruct_deep_composition_poly_evaluation_at`). Empty
+    /// for row pairs.
+    pub(super) expected_at_r: Vec<FEE>,
     /// The same, asked of production with the PRECOMPUTED and MAIN slices
     /// swapped — the alternative column order a fixture without a precomputed
     /// group cannot distinguish. Empty when there is no precomputed group, or
@@ -90,8 +95,9 @@ pub(super) struct HostSubProof {
     /// well-formed reading).
     expected_base_swapped: Vec<(FEE, FEE)>,
     /// Production's query points, kept so the machine's derivation can be
-    /// checked against them rather than against a local formula.
-    points: Vec<(FE, FE)>,
+    /// checked against them rather than against a local formula: `(υ, −υ)`
+    /// for row pairs, `(x_r, None)` under one-row leaves.
+    pub(super) points: Vec<(FE, Option<FE>)>,
 }
 
 fn host_sub_proof() -> &'static HostSubProof {
@@ -137,7 +143,10 @@ pub(super) fn build_host_sub_proof(
 
     let blowup = air.options().blowup_factor as usize;
     let lde_length = view.trace_length() * blowup;
-    let merkle_depth = lde_length.trailing_zeros() as usize - 1;
+    // The table's leaf layout — the host prover's and verifier's own
+    // resolution (S2: `auto` per table from the AIR's widths).
+    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, view.trace_length());
+    let merkle_depth = leaf_layout.tree_depth(lde_length.trailing_zeros() as usize);
     let opts = air.options();
     let trace_cap = opts
         .format
@@ -150,6 +159,7 @@ pub(super) fn build_host_sub_proof(
         log2_lde_length: lde_length.trailing_zeros(),
         coset_offset: FE::from(air.options().coset_offset),
         trace_cap,
+        layout: leaf_layout,
     };
     // Query 0 of a capped tree is its owner: its path carries the cap after
     // the `D − c` siblings. The query arena takes the siblings, the caps
@@ -202,6 +212,7 @@ pub(super) fn build_host_sub_proof(
         num_precomputed > 0 && main_width - num_precomputed == num_precomputed;
     let mut openings = Vec::new();
     let mut expected = Vec::new();
+    let mut expected_at_r = Vec::new();
     let mut expected_base_swapped = Vec::new();
     let mut points = Vec::new();
     for (q, iota) in sp.challenges.iotas.iter().enumerate() {
@@ -252,6 +263,31 @@ pub(super) fn build_host_sub_proof(
             siblings: split(q, c.merkle_path()),
         });
         openings.push(groups);
+
+        if leaf_layout.is_one_row() {
+            // S2: one point, `x_r`, and DEEP there alone — production's own
+            // one-row functions (`query_point`, `…_evaluation_at`).
+            let point = V::query_point(leaf_layout, *iota, &domain);
+            let empty_base: &[FE] = &[];
+            let want = V::reconstruct_deep_composition_poly_evaluation_at(
+                &point,
+                &generator,
+                &sp.challenges,
+                &invariants,
+                layout.next_row_cols(),
+                layout.step_size(),
+                o.precomputed_trace_polys()
+                    .map(|p| p.evaluations())
+                    .unwrap_or(empty_base),
+                m.evaluations(),
+                o.aux_trace_polys().map(|a| a.evaluations()).unwrap_or(&[]),
+                c.evaluations(),
+            )
+            .expect("a real one-row proof reconstructs");
+            expected_at_r.push(want);
+            points.push((point, None));
+            continue;
+        }
 
         let point = V::query_challenge_to_evaluation_point(*iota, false, &domain);
         let point_sym = V::query_challenge_to_evaluation_point(*iota, true, &domain);
@@ -305,7 +341,7 @@ pub(super) fn build_host_sub_proof(
             .expect("the swapped reading is well formed, so it reconstructs");
             expected_base_swapped.push(swapped);
         }
-        points.push((point, point_sym));
+        points.push((point, Some(point_sym)));
     }
 
     let ood: Vec<FEE> = (0..deep.num_eval_points)
@@ -324,6 +360,7 @@ pub(super) fn build_host_sub_proof(
         iotas: sp.challenges.iotas.clone(),
         zetas: sp.challenges.zetas.clone(),
         expected,
+        expected_at_r,
         expected_base_swapped,
         points,
     }
@@ -441,7 +478,8 @@ fn the_join_premises_hold_on_a_real_proof() {
              query_challenge_to_evaluation_point(iota, false)"
         );
         assert_eq!(
-            exec.public_words[1].1[0], h.points[q].1,
+            exec.public_words[1].1[0],
+            h.points[q].1.expect("a row-pair fixture"),
             "query {q}: the machine's symmetric point must be \
              query_challenge_to_evaluation_point(iota, true)"
         );
@@ -601,6 +639,7 @@ fn shape_for(
         log2_lde_length: log2_trace_length + log2_blowup,
         coset_offset: FE::from(3u64),
         trace_cap: 0,
+        layout: stark::leaf_layout::LeafLayout::RowPair,
     }
 }
 
@@ -1349,7 +1388,10 @@ fn the_controls_show_what_the_join_denies() {
     let program = compile(control_program_source(&h.shape, Control::HintedPoint));
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
-    arenas.push(vec![base_word(h.points[q].0), base_word(h.points[q].1)]);
+    arenas.push(vec![
+        base_word(h.points[q].0),
+        base_word(h.points[q].1.expect("a row-pair fixture")),
+    ]);
     let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("honest");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
@@ -1357,7 +1399,10 @@ fn the_controls_show_what_the_join_denies() {
     );
 
     let mut attacked = arenas.clone();
-    attacked[5] = vec![base_word(h.points[other].0), base_word(h.points[other].1)];
+    attacked[5] = vec![
+        base_word(h.points[other].0),
+        base_word(h.points[other].1.expect("a row-pair fixture")),
+    ];
     let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
         "HintedPoint: a hinted point is not tied to the authenticated index, \
          which is what this control permits",

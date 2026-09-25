@@ -104,6 +104,11 @@ impl TableVerifyShape {
             "the FRI layers consume suffixes of the trace walk's decomposition"
         );
         assert_eq!(
+            self.sub.layout,
+            self.fri.leaf_layout(),
+            "the trace trees and the FRI chain verify one table at one leaf layout"
+        );
+        assert_eq!(
             self.fri.num_queries, self.num_queries,
             "the query count is one shape, declared once"
         );
@@ -380,7 +385,7 @@ pub fn emit_table_verification(
         let openings: Vec<GroupOpening> = groups
             .iter()
             .map(|g| {
-                let values = (0..g.num_values())
+                let values = (0..shape.sub.group_values(g))
                     .map(|_| {
                         let c = b.hint_word(arenas.openings, cursor);
                         cursor += 1;
@@ -419,8 +424,8 @@ pub fn emit_table_verification(
             shape.fri,
             &fri,
             &FriQuery {
-                p0: out.deep.0,
-                p0_sym: out.deep.1,
+                p0: out.deep,
+                p0_sym: out.deep_sym,
                 point: out.point,
                 point_sym: out.point_sym,
                 bits: &out.bits,
@@ -478,7 +483,7 @@ pub fn leaf_permutations(shape: &SubProofShape) -> usize {
     shape
         .groups()
         .iter()
-        .map(|g| super::keccak_host::num_blocks(g.leaf_bytes()))
+        .map(|g| super::keccak_host::num_blocks(g.leaf_bytes_at(shape.rows_per_leaf())))
         .sum()
 }
 
@@ -527,10 +532,16 @@ pub const LFM_HASH_RATE_FELTS: usize = super::hash::HASH_DIGEST_FELTS;
 /// block at the candidate's rate 4.
 pub const FRI_LEAF_FELTS: usize = 6;
 
-/// Felts one query's opening of a group covers, the felt-side counterpart of
-/// [`super::sub_proof::GroupShape::leaf_bytes`].
+/// Felts one query's row-pair opening of a group covers, the felt-side
+/// counterpart of [`super::sub_proof::GroupShape::leaf_bytes`].
 pub fn group_leaf_felts(g: &super::sub_proof::GroupShape) -> usize {
-    g.num_values() * if g.is_ext { 3 } else { 1 }
+    group_leaf_felts_at(g, super::sub_proof::ROWS_PER_LEAF)
+}
+
+/// [`group_leaf_felts`] at `rows_per_leaf` rows per leaf (1 under S2's
+/// one-row leaves) — what the closed forms price, at the sub-proof's layout.
+pub fn group_leaf_felts_at(g: &super::sub_proof::GroupShape, rows_per_leaf: usize) -> usize {
+    g.values_at(rows_per_leaf) * if g.is_ext { 3 } else { 1 }
 }
 
 /// Permutations a sponge of `rate_felts` spends absorbing `felts`, under keccak's
@@ -560,7 +571,7 @@ pub fn leaf_permutations_at_rate(shape: &SubProofShape, rate_felts: usize) -> us
     shape
         .groups()
         .iter()
-        .map(|g| blocks_at_rate(group_leaf_felts(g), rate_felts))
+        .map(|g| blocks_at_rate(group_leaf_felts_at(g, shape.rows_per_leaf()), rate_felts))
         .sum()
 }
 
@@ -645,11 +656,12 @@ pub fn blocks_for(felts: usize, hash: WrapHash) -> usize {
 /// absorptions move.
 pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize {
     let groups = shape.sub.groups().len();
+    let rows = shape.sub.rows_per_leaf();
     let leaves: usize = shape
         .sub
         .groups()
         .iter()
-        .map(|g| blocks_for(group_leaf_felts(g), hash))
+        .map(|g| blocks_for(group_leaf_felts_at(g, rows), hash))
         .sum();
     // Per committed layer: a pair leaf (six felts), or a `2^d`-value group.
     let fri_leaves = shape.fri.leaf_permutations_per_query(hash);
