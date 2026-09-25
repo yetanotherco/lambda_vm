@@ -265,7 +265,8 @@ pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 /// refuses a non-default format).
 pub const FRI_MODE_IMPLEMENTED: bool = true;
 
-/// `OneRowMode::{On, Auto}` (S2) is implemented on the HOST CPU paths only:
+/// `OneRowMode::{On, Auto}` (S2) is implemented on the prover (CPU and
+/// device) and the host verifier:
 /// - the CPU prover (one-row trace, precomputed, aux and composition trees;
 ///   the DEEP codeword committed as FRI layer 0 before the first challenge;
 ///   query indexes over the whole LDE; one-row openings) and the host
@@ -277,12 +278,15 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 ///   policy (a one-row format never reads `LFM_REGISTRY`); a table with no
 ///   root for its layout is a proving error and a verifier reject (RULINGS 14)
 ///   — e.g. `one_row = 1` at blowup 2, 8 or 16 fails on BITWISE;
-/// - on a `cuda` build a one-row table takes the CPU arm of every commit and
-///   opening (never device-only, host aux build) — correct, not fast.
+/// - the device (lane I-S2-D, D2): one-row trees for the fused main commit,
+///   the preprocessed split, the aux commits (host input and resident) and the
+///   composition tree, device openings at row `r`, the LFM artifact commit,
+///   and the input tree committed from the resident DEEP codeword before the
+///   first challenge — each proof byte-identical to the CPU one; a one-row
+///   table may be device-only like a row-pair one, and under `Auto` one proof
+///   mixes both layouts on the device.
 ///
-/// NOT implemented: device one-row trees, openings and the device input tree
-/// (lane I-FRI-D, D2 — a one-row table on a cuda build runs on the host), the
-/// in-guest (LFM) verifier of a one-row proof (lane I-FRI-G, G3: an emitter
+/// NOT implemented: the in-guest (LFM) verifier of a one-row proof (lane I-FRI-G, G3: an emitter
 /// asked for one refuses at emit time, `lfm::fri::FriShape::from_options`),
 /// and the RV64 recursion guest (default-only, RULINGS 11). A block run under
 /// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and

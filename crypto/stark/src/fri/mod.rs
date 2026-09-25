@@ -104,9 +104,10 @@ where
 /// `H::Pair`, verified with `H::Batched`).
 ///
 /// The device arm (`try_fri_commit_gpu`) runs both encodings: today's loop for
-/// the legacy one and its group twin otherwise. One-row layouts are not
-/// implemented on the device and always take the CPU loop
-/// ([`commit_phase_cpu_with_layout`]).
+/// the legacy one and its group twin otherwise — one-row layouts included,
+/// whose input tree the device commits from the codeword before any
+/// challenge. When it declines, the CPU loop
+/// ([`commit_phase_cpu_with_layout`]) runs.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn commit_phase_with_layout<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
@@ -134,26 +135,24 @@ where
     // snapshots the transcript before mutating it so a mid-loop cudarc
     // error restores state and lets the CPU loop below run as if the GPU
     // had never been tried.
+    // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
+    // drives the same commit phase on-device (Goldilocks + Ext3, above the
+    // LDE size threshold, and only when folding actually happens) and returns
+    // `Some` with the final-polynomial coefficients. It returns `None` on any
+    // precondition miss or cudarc error — restoring the transcript first — so
+    // the CPU path below then runs as if the GPU had never been tried.
     #[cfg(feature = "cuda")]
-    if !layout.one_row {
-        // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
-        // drives the same commit phase on-device (Goldilocks + Ext3, above the
-        // LDE size threshold, and only when folding actually happens) and returns
-        // `Some` with the final-polynomial coefficients. It returns `None` on any
-        // precondition miss or cudarc error — restoring the transcript first — so
-        // the CPU path below then runs as if the GPU had never been tried.
-        if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T, H::Pair<E>>(
-            &evals,
-            transcript,
-            coset_offset,
-            domain_size,
-            blowup_log,
-            final_poly_log_degree,
-            layout,
-            inv_twiddles,
-        ) {
-            return result;
-        }
+    if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T, H::Pair<E>>(
+        &evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+    ) {
+        return result;
     }
     commit_phase_cpu_with_layout::<F, E, T, H>(
         evals,

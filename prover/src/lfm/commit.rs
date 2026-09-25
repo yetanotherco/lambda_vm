@@ -218,9 +218,9 @@ pub fn commit_group_device_or_host(
 }
 
 /// [`commit_group_device_or_host`] under an explicit leaf layout. The device
-/// commit builds row-pair leaves only (`gpu_lde::try_commit_row_major`), so a
-/// one-row root (S2) is always the host pass (REVIEW-FRI F8.1: gated, until
-/// the device lane makes it layout-aware).
+/// commit (`gpu_lde::try_commit_row_major_with`) builds the tree with
+/// `layout.rows_per_leaf()` rows per leaf, so a one-row root (S2) takes the
+/// device like a row-pair one (REVIEW-FRI F8.1).
 pub fn commit_group_device_or_host_with(
     label: &str,
     group: &ColumnGroup,
@@ -228,12 +228,13 @@ pub fn commit_group_device_or_host_with(
     layout: LeafLayout,
 ) -> Commitment {
     #[cfg(feature = "cuda")]
-    if device_artifacts() && group.padded_rows > 0 && group.width > 0 && !layout.is_one_row() {
-        let set = stark::device_set::commit_device_set(
+    if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
+        let set = stark::device_set::commit_device_set_rpl(
             group.padded_rows,
             group.width,
             options.blowup_factor as usize,
             true,
+            layout.rows_per_leaf(),
         );
         DEVICE_PEAK_BYTES.fetch_max(set.total(), std::sync::atomic::Ordering::Relaxed);
         // ⛔ ROUND-3 TREE PROBE (diagnostic, OFF by default). The card permit is
@@ -249,7 +250,7 @@ pub fn commit_group_device_or_host_with(
         // would otherwise not have. The measurement cannot perturb what it
         // measures.
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
-        let committed = stark::gpu_lde::try_commit_row_major::<
+        let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
         >(
@@ -259,6 +260,7 @@ pub fn commit_group_device_or_host_with(
             group.width,
             options.blowup_factor as usize,
             &FE::from(options.coset_offset),
+            layout.rows_per_leaf(),
         );
         if let Some(t) = probe_t {
             super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
@@ -342,6 +344,48 @@ mod device_parity {
                  and gpu_lde's single-tree path"
             );
         }
+    }
+
+    /// S2 (REVIEW-FRI F8.1): the one-row artifact root on the device equals the
+    /// host one-row root at the same production shapes, and differs from the
+    /// row-pair root (a device that ignored the layout would equal it). The
+    /// device one-row tree counter must move once per group, so a host
+    /// fallback fails this test instead of comparing host with host.
+    #[test]
+    fn the_one_row_device_commit_matches_the_host_commit_above_the_floor() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        assert!(
+            device_artifacts(),
+            "LFM_DEVICE_ARTIFACTS=0: this test would compare a host root with a host root"
+        );
+        let before = stark::gpu_lde::gpu_one_row_trees();
+        let shapes = [(4_096usize, 1usize), (8_192, 20), (4_096, 134)];
+        for (rows, width) in shapes {
+            let g = group(rows, width);
+            let lde = lde_columns(&group_columns(&g), &options);
+            let host = commit_lde_columns_with(&lde, LeafLayout::Row);
+            let pair = commit_lde_columns_with(&lde, LeafLayout::RowPair);
+            let device = commit_group_device_or_host_with(
+                "device_parity_one_row",
+                &g,
+                &options,
+                LeafLayout::Row,
+            );
+            assert_eq!(
+                device, host,
+                "{rows}x{width}: the one-row device root differs from the host one-row root"
+            );
+            assert_ne!(
+                device, pair,
+                "{rows}x{width}: the one-row root equals the row-pair root"
+            );
+        }
+        let moved = stark::gpu_lde::gpu_one_row_trees() - before;
+        assert!(
+            moved >= shapes.len() as u64,
+            "only {moved} one-row device trees for {} groups: the device declined (host fallback)",
+            shapes.len()
+        );
     }
 
     /// And the control: `LFM_DEVICE_ARTIFACTS=0` must reach the host pass. Read

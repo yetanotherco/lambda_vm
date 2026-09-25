@@ -1615,9 +1615,10 @@ pub trait IsStarkProver<
     /// tables) and the root is checked against the AIR-hardcoded commitment
     /// OF `layout`. `table` is the AIR's name, for the device diagnostics.
     ///
-    /// `layout` is the table's trace-tree leaf layout. The device arms build
-    /// row-pair leaves only, so a one-row table (S2) always takes the CPU arm
-    /// (device one-row trees are lane I-FRI-D's D2).
+    /// `layout` is the table's trace-tree leaf layout: every arm (the fused
+    /// and split device commits and the CPU one) builds its trees with
+    /// `layout.rows_per_leaf()` rows per leaf, so a one-row table (S2) commits
+    /// on the device like a row-pair one.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn commit_main_trace(
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] table: &str,
@@ -1644,7 +1645,7 @@ pub trait IsStarkProver<
         // for CPU proving and forces the host path per table.
         let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
-        if precomputed.is_none() && !residency.recomputes_main_lde() && !layout.is_one_row() {
+        if precomputed.is_none() && !residency.recomputes_main_lde() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
                 trace_slice.len() / num_cols
@@ -1668,6 +1669,7 @@ pub trait IsStarkProver<
                     domain.blowup_factor,
                     &twiddles.coset_weights,
                     !device_only,
+                    rows_per_leaf,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -1702,7 +1704,6 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         if let Some((expected_precomputed_root, num_precomputed)) = precomputed
             && !residency.recomputes_main_lde()
-            && !layout.is_one_row()
         {
             let (trace_slice, num_cols) = trace.main_data_row_major();
             let n = if num_cols > 0 {
@@ -1740,6 +1741,7 @@ pub trait IsStarkProver<
                     num_precomputed,
                     cached_pre.is_none(),
                     !device_only,
+                    rows_per_leaf,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -2614,8 +2616,8 @@ pub trait IsStarkProver<
         let __ps_r2c = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        // The table's leaf layout (S2): the device composition trees are
-        // row-pair only, so a one-row table commits on the host.
+        // The table's leaf layout (S2): the composition tree, device or host,
+        // carries `leaf_layout.rows_per_leaf()` rows per leaf.
         let leaf_layout =
             crate::leaf_layout::table_leaf_layout(air, domain.interpolation_domain_size);
         // GPU fast path for the comp-poly Merkle commit: hash straight from
@@ -2629,22 +2631,20 @@ pub trait IsStarkProver<
             match round_1_result
                 .lde_trace
                 .gpu_composition_parts()
-                .filter(|_| !leaf_layout.is_one_row())
                 .and_then(|h| {
                     crate::gpu_lde::try_build_comp_poly_tree_gpu_from_dev::<
                         FieldExtension,
                         H::Batched<FieldExtension>,
-                    >(h)
+                    >(h, leaf_layout.rows_per_leaf())
                 })
                 .or_else(|| {
-                    (!leaf_layout.is_one_row())
-                        .then(|| {
-                            crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-                                FieldExtension,
-                                H::Batched<FieldExtension>,
-                            >(&lde_composition_poly_parts_evaluations)
-                        })
-                        .flatten()
+                    crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                        FieldExtension,
+                        H::Batched<FieldExtension>,
+                    >(
+                        &lde_composition_poly_parts_evaluations,
+                        leaf_layout.rows_per_leaf(),
+                    )
                 }) {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
@@ -2915,13 +2915,11 @@ pub trait IsStarkProver<
         let __ps_df = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        // Device FRI implements the pair and group (S3) encodings; a one-row
-        // layout (not implemented on the device) takes the host arm below
-        // (which may still compute DEEP on device).
+        // Device FRI implements the pair and group (S3) encodings and the
+        // one-row layout (S2), whose input tree is committed from the resident
+        // codeword before the first challenge.
         #[cfg(feature = "cuda")]
-        let precomputed_fri = if fri_layout.one_row {
-            None
-        } else {
+        let precomputed_fri = {
             Self::try_compute_deep_dev(
                 &round_1_result.lde_trace,
                 composition_parts,
@@ -3656,23 +3654,24 @@ pub trait IsStarkProver<
     /// Like [`Self::open_composition_poly`] but uses a Merkle proof already
     /// gathered from the resident device composition tree
     /// ([`crate::gpu_lde::gather_proofs_dev`]) instead of walking a host tree.
-    /// Row-pair leaf: one proof at position `index` authenticates both rows.
+    /// One proof at position `index` authenticates the leaf: both rows of a
+    /// row pair, or the one row (S2).
     #[cfg(feature = "cuda")]
     fn open_composition_poly_with_proof(
         proof: Proof<Commitment>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
+        leaf_layout: LeafLayout,
     ) -> PolynomialOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Device composition trees exist for row-pair tables only.
         Self::composition_opening_from_proof(
             proof,
             lde_composition_poly_evaluations,
             index,
-            LeafLayout::RowPair,
+            leaf_layout,
         )
     }
 
@@ -3709,14 +3708,16 @@ pub trait IsStarkProver<
 
     /// Like [`Self::open_polys_with`], but uses a Merkle proof already gathered
     /// from the resident device tree (see [`crate::gpu_lde::gather_proofs_dev`])
-    /// instead of walking a host tree. Row-pair leaf: one proof at position
-    /// `challenge` authenticates both the queried row and its symmetric
-    /// counterpart. Evaluations still come from the host LDE columns via `gather`.
+    /// instead of walking a host tree. One proof at position `challenge`
+    /// authenticates the leaf: the queried row and its symmetric counterpart
+    /// (row pair), or the one row (S2). Evaluations still come from the host
+    /// LDE columns via `gather`.
     #[cfg(feature = "cuda")]
     fn open_polys_with_proofs<C, G>(
         domain: &Domain<Field>,
         proof: Proof<Commitment>,
         challenge: usize,
+        leaf_layout: LeafLayout,
         gather: G,
     ) -> PolynomialOpenings<C>
     where
@@ -3724,9 +3725,7 @@ pub trait IsStarkProver<
         FieldElement<C>: AsBytes + Sync + Send,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        // Device trees exist for row-pair tables only.
-        let (row, sym) =
-            LeafLayout::RowPair.query_rows(challenge, domain.lde_roots_of_unity_coset.len());
+        let (row, sym) = leaf_layout.query_rows(challenge, domain.lde_roots_of_unity_coset.len());
         PolynomialOpenings {
             proof,
             evaluations: gather(row),
@@ -3751,17 +3750,37 @@ pub trait IsStarkProver<
         }
     }
 
-    /// Slice out query `qi`'s even/odd row (each `ncols` field elements) from the
-    /// row-major device gather `[even(q0), odd(q0), even(q1), odd(q1), ...]`.
+    /// The LDE rows the device gathers for `queries`, in query order: per
+    /// query the rows [`LeafLayout::query_rows`] names — `[row, sym]` for a
+    /// row pair, `[row]` for one row (S2). [`Self::device_rows`] slices the
+    /// gather back per query.
     #[cfg(feature = "cuda")]
-    fn device_row_pair<C: IsField>(
+    fn device_query_rows(queries: &[usize], lde_len: usize, leaf_layout: LeafLayout) -> Vec<u32> {
+        queries
+            .iter()
+            .flat_map(|&c| {
+                let (row, sym) = leaf_layout.query_rows(c, lde_len);
+                core::iter::once(row as u32).chain(sym.map(|r| r as u32))
+            })
+            .collect()
+    }
+
+    /// Slice out query `qi`'s rows (each `ncols` field elements) from the
+    /// row-major device gather of [`Self::device_query_rows`]: `(row, sym)`
+    /// for a row pair (`[row(q0), sym(q0), row(q1), sym(q1), ...]`), `(row,
+    /// [])` for one row (`[row(q0), row(q1), ...]`).
+    #[cfg(feature = "cuda")]
+    fn device_rows<C: IsField>(
         vals: &[FieldElement<C>],
         qi: usize,
         ncols: usize,
+        leaf_layout: LeafLayout,
     ) -> (Vec<FieldElement<C>>, Vec<FieldElement<C>>) {
-        let even = vals[(2 * qi) * ncols..(2 * qi + 1) * ncols].to_vec();
-        let odd = vals[(2 * qi + 1) * ncols..(2 * qi + 2) * ncols].to_vec();
-        (even, odd)
+        let per = leaf_layout.rows_per_leaf();
+        let at = |k: usize| vals[(per * qi + k) * ncols..(per * qi + k + 1) * ncols].to_vec();
+        let row = at(0);
+        let sym = if per == 2 { at(1) } else { Vec::new() };
+        (row, sym)
     }
 
     /// Gather every query's row-pair off a device-resident LDE (a small D2H of
@@ -3831,12 +3850,6 @@ pub trait IsStarkProver<
         FieldElement<C>: AsBytes + Sync + Send,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        // Device trees and gathers are row-pair only: a one-row table never
-        // has them (its commits took the CPU arms), so this is the host walk.
-        assert!(
-            !leaf_layout.is_one_row() || dev_proofs.is_none(),
-            "R4 {what} opening: a one-row table has a device-resident tree"
-        );
         let Some(proofs) = dev_proofs else {
             assert!(
                 !lde_trace.host_trace_empty(),
@@ -3861,10 +3874,16 @@ pub trait IsStarkProver<
                 !lde_trace.host_trace_empty(),
                 "R4 {what} opening fell back to the host gather, but it is device-only (empty)"
             );
-            return Self::open_polys_with_proofs(domain, proof, challenge, gather);
+            return Self::open_polys_with_proofs(domain, proof, challenge, leaf_layout, gather);
         };
-        let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
-        let (even, odd) = (even[col_range.clone()].to_vec(), odd[col_range].to_vec());
+        let (even, odd) = Self::device_rows(dev_vals, qi, ncols, leaf_layout);
+        // `odd` is empty for one row (no symmetric row).
+        let odd = if odd.is_empty() {
+            odd
+        } else {
+            odd[col_range.clone()].to_vec()
+        };
+        let even = even[col_range].to_vec();
         // Cross-check the device gather against the host LDE. Skipped under
         // device-only (host trace empty): the gather was proven bit-identical
         // while the host copy was resident, and there is nothing to check
@@ -3872,9 +3891,8 @@ pub trait IsStarkProver<
         // --release, and gather failure modes — stride/offset/layout — are
         // systematic, so one query catches them); debug checks every query.
         if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty() {
-            let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
-            let (r_even, r_odd) = LeafLayout::RowPair.query_rows(challenge, domain_size as usize);
-            let r_odd = r_odd.expect("a row pair has a symmetric row");
+            let domain_size = domain.lde_roots_of_unity_coset.len();
+            let (r_even, r_odd) = leaf_layout.query_rows(challenge, domain_size);
             assert_eq!(
                 even,
                 gather(r_even),
@@ -3882,7 +3900,7 @@ pub trait IsStarkProver<
             );
             assert_eq!(
                 odd,
-                gather(r_odd),
+                r_odd.map(&gather).unwrap_or_default(),
                 "device {what}-row gather mismatch (odd), query {qi}"
             );
         }
@@ -3911,25 +3929,17 @@ pub trait IsStarkProver<
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        // Row-pair LDE positions for every query, `[even(q0), odd(q0), ...]`.
-        // Each query opens the leaf at `challenge`, which pairs LDE rows
+        // The LDE rows of every query's leaf: `[row(q0), sym(q0), ...]` for
+        // row pairs — the leaf at `challenge` pairs LDE rows
         // `reverse_index(2·challenge)` (the queried point) and
-        // `reverse_index(2·challenge+1)` (its symmetric `-x` point).
+        // `reverse_index(2·challenge+1)` (its symmetric `-x` point) — and
+        // `[row(q0), row(q1), ...]` for one row (S2), the leaf at `challenge`
+        // being the row `reverse_index(challenge)` alone.
         #[cfg(feature = "cuda")]
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
         #[cfg(feature = "cuda")]
-        let query_rows: Vec<u32> = indexes_to_open
-            .iter()
-            .flat_map(|&c| {
-                let (row, sym) = LeafLayout::RowPair.query_rows(c, domain_size as usize);
-                [row as u32, sym.unwrap_or(row) as u32]
-            })
-            .collect();
-        // Every device arm below is row-pair only: a one-row table (S2) has no
-        // device-resident tree (its commits took the CPU arms) and opens on
-        // the host. Filtering here keeps it that way even if one appeared.
-        #[cfg(feature = "cuda")]
-        let device_ok = !leaf_layout.is_one_row();
+        let query_rows: Vec<u32> =
+            Self::device_query_rows(indexes_to_open, domain_size as usize, leaf_layout);
 
         // R4 trace proofs from the resident device trees, gathered in one batch
         // over all query positions instead of walking the host trees (byte
@@ -3945,13 +3955,12 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let main_dev_proofs: Option<Vec<Proof<Commitment>>> = lde_trace
             .gpu_main()
-            .filter(|_| device_ok)
             .and_then(|h| h.tree.as_ref())
             .map(|tree| {
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident main-tree opening");
-                // Row-pair leaves: one proof per query at position `challenge`.
+                // One proof per query at leaf `challenge` (either layout).
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
                     .expect("device main-tree gather failed; resident tree has no host fallback")
             });
@@ -3961,25 +3970,22 @@ pub trait IsStarkProver<
         let aux_dev_proofs: Option<Vec<Proof<Commitment>>> = round_1_result
             .aux
             .as_ref()
-            .filter(|_| device_ok)
             .and_then(|_aux| lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()))
             .map(|tree| {
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident aux-tree opening");
-                // Row-pair leaves: one proof per query at position `challenge`.
+                // One proof per query at leaf `challenge` (either layout).
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
                     .expect("device aux-tree gather failed; resident tree has no host fallback")
             });
 
-        // Composition tree: openings open a single position `index` (row pair
-        // leaf), so gather one proof per query challenge from the device tree.
+        // Composition tree: openings open a single position `index` (a row
+        // pair or one-row leaf), so gather one proof per query challenge from
+        // the device tree.
         #[cfg(feature = "cuda")]
-        let comp_dev_proofs: Option<Vec<Proof<Commitment>>> = round_2_result
-            .gpu_composition_tree
-            .as_ref()
-            .filter(|_| device_ok)
-            .map(|tree| {
+        let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
+            round_2_result.gpu_composition_tree.as_ref().map(|tree| {
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident composition-tree opening");
@@ -4138,18 +4144,20 @@ pub trait IsStarkProver<
                 {
                     match main_dev_values.as_ref() {
                         Some(vals) => {
-                            let (even, odd) = Self::device_row_pair(vals, qi, total_cols);
-                            let (even, odd) = (
-                                even[..num_precomputed_cols].to_vec(),
-                                odd[..num_precomputed_cols].to_vec(),
-                            );
+                            let (even, odd) = Self::device_rows(vals, qi, total_cols, leaf_layout);
+                            let even = even[..num_precomputed_cols].to_vec();
+                            // Empty for one row (no symmetric row).
+                            let odd = if odd.is_empty() {
+                                odd
+                            } else {
+                                odd[..num_precomputed_cols].to_vec()
+                            };
                             // Query 0 stays a release canary, same rationale
                             // as `open_trace_polys_device`.
                             if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty()
                             {
                                 let (r_even, r_odd) =
-                                    LeafLayout::RowPair.query_rows(*index, domain_size as usize);
-                                let r_odd = r_odd.expect("a row pair has a symmetric row");
+                                    leaf_layout.query_rows(*index, domain_size as usize);
                                 assert_eq!(
                                     even,
                                     lde_trace.gather_main_row_range(
@@ -4161,7 +4169,13 @@ pub trait IsStarkProver<
                                 );
                                 assert_eq!(
                                     odd,
-                                    lde_trace.gather_main_row_range(r_odd, 0, num_precomputed_cols),
+                                    r_odd
+                                        .map(|r| lde_trace.gather_main_row_range(
+                                            r,
+                                            0,
+                                            num_precomputed_cols
+                                        ))
+                                        .unwrap_or_default(),
                                     "device precomputed-row gather mismatch (odd), query {qi}"
                                 );
                             }
@@ -4195,7 +4209,8 @@ pub trait IsStarkProver<
                 {
                     match (&comp_dev_proofs, &comp_dev_values) {
                         (Some(proofs), Some(vals)) => {
-                            let (even, odd) = Self::device_row_pair(vals, qi, comp_num_parts);
+                            let (even, odd) =
+                                Self::device_rows(vals, qi, comp_num_parts, leaf_layout);
                             // Cross-check against the host part evals while
                             // they are still resident (absent under full
                             // residency, where the gather is the only source).
@@ -4211,6 +4226,7 @@ pub trait IsStarkProver<
                                     proofs[qi].clone(),
                                     composition_parts,
                                     *index,
+                                    leaf_layout,
                                 );
                                 assert_eq!(
                                     even, expected.evaluations,
@@ -4240,6 +4256,7 @@ pub trait IsStarkProver<
                                 proofs[qi].clone(),
                                 composition_parts,
                                 *index,
+                                leaf_layout,
                             )
                         }
                         _ => Self::open_composition_poly(
@@ -4435,7 +4452,17 @@ pub trait IsStarkProver<
         // dispatch layer admits the commit against.
         let main_estimates: Vec<u64> = table_shapes
             .iter()
-            .map(|s| crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, true).total())
+            .zip(&leaf_layouts)
+            .map(|(s, l)| {
+                crate::device_set::commit_device_set_rpl(
+                    s.n,
+                    s.main_cols,
+                    s.blowup,
+                    true,
+                    l.rows_per_leaf(),
+                )
+                .total()
+            })
             .collect();
 
         // The AIR names, for the driver threads' panic payloads: a device abort
@@ -4537,10 +4564,10 @@ pub trait IsStarkProver<
 
                 // Stage-3 device-only gate: when it holds, `commit_main_trace`
                 // keeps the R1 LDE device-resident and skips the host D2H. A
-                // one-row table never goes device-only: its trees are host
-                // trees (the device arms build row pairs only).
+                // one-row table (S2) is no exception: its device trees and
+                // openings follow its leaf layout.
                 #[cfg(feature = "cuda")]
-                let device_only = Self::device_only_for(*air, domain) && !layout.is_one_row();
+                let device_only = Self::device_only_for(*air, domain);
 
                 Self::commit_main_trace(
                     air.name(),
@@ -4626,16 +4653,6 @@ pub trait IsStarkProver<
             }
         }
 
-        // One-row tables (S2) commit every tree on the host (the device arms
-        // build row-pair leaves only), so their aux build stays host-side too:
-        // a resident aux would leave no host aux trace for the CPU commit.
-        #[cfg(feature = "cuda")]
-        for ((_, trace, _), layout) in air_trace_pairs.iter_mut().zip(&leaf_layouts) {
-            if layout.is_one_row() {
-                trace.set_resident_aux_ok(false);
-            }
-        }
-
         // `RecomputeLde` already forced the main commit onto the host path;
         // keeping the aux build there too makes the mode wholly host-side, which
         // is what its aux release at the end of each fused task acts on.
@@ -4690,7 +4707,13 @@ pub trait IsStarkProver<
         let peak_estimates: Vec<u64> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
+            .map(|(idx, _)| {
+                crate::device_set::table_device_set_rpl(
+                    table_shapes[idx],
+                    leaf_layouts[idx].rows_per_leaf(),
+                )
+                .total()
+            })
             .collect();
 
         // The fused phase's own walk, separate from R1's because the aux
@@ -4796,8 +4819,7 @@ pub trait IsStarkProver<
                         let layout = leaf_layouts[idx];
                         #[cfg(feature = "cuda")]
                         let device_only = Self::device_only_for(*air, domain)
-                            && gpu_main_cells[idx].lock().unwrap().is_some()
-                            && !layout.is_one_row();
+                            && gpu_main_cells[idx].lock().unwrap().is_some();
 
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
@@ -4807,7 +4829,7 @@ pub trait IsStarkProver<
                         // a clean error (falling through as-is would commit a
                         // zero aux trace).
                         #[cfg(feature = "cuda")]
-                        if trace.aux_resident().is_some() && !layout.is_one_row() {
+                        if trace.aux_resident().is_some() {
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
                             let num_cols = trace.aux_resident().map_or(0, |ra| ra.num_aux_cols);
@@ -4822,6 +4844,7 @@ pub trait IsStarkProver<
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
                                     !device_only,
+                                    layout.rows_per_leaf(),
                                 )
                             };
                             let mut expanded = expand(trace.aux_resident().expect("checked above"));
@@ -4869,10 +4892,10 @@ pub trait IsStarkProver<
                         }
 
                         // Fused GPU path (cuda only): row-major ext3 NTT — single
-                        // H2D, no column extraction, no CPU transpose. Row-pair
-                        // leaves only, so never for a one-row table.
+                        // H2D, no column extraction, no CPU transpose. The tree
+                        // follows the table's leaf layout.
                         #[cfg(feature = "cuda")]
-                        if !layout.is_one_row() {
+                        {
                             let (trace_slice, num_cols) = trace.aux_data_row_major();
                             let n = if num_cols > 0 {
                                 trace_slice.len() / num_cols
@@ -4894,6 +4917,7 @@ pub trait IsStarkProver<
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
                                     !device_only,
+                                    layout.rows_per_leaf(),
                                 )
                             {
                                 #[cfg(feature = "instruments")]
