@@ -205,33 +205,33 @@ when both algorithm-halves accept the same record for this input.
 ]
 
 More formally, we define
-$v_0, v_1: commitmentSpace times proofSpace to recordSpace$ as a valid _split_ of 
-verifier $v in verifierSpace$ if
+$verify_0, verify_1: commitmentSpace times proofSpace to recordSpace$ as a valid _split_ of 
+verifier $verify in verifierSpace$ if
 $
-  forall (instance, proof) in instanceSpace times proofSpace: v(comm(instance), proof) = 1 iff v_0(comm(instance), proof) = v_1(comm(instance), proof),
+  forall (instance, proof) in instanceSpace times proofSpace: verify(comm(instance), proof) = 1 iff verify_0(comm(instance), proof) = verify_(comm(instance), proof),
 $
 where $recordSpace$ denotes the communication record space.
 That is, the two halves agree if and only if the instance-proof verifies succesfully.
 By applying the Kronecker delta function $delta$ #footnote("https://en.wikipedia.org/wiki/Kronecker_delta"),
 we can transform both halves into members of $programSpace$:
 $
-  tilde(v)_0(comm(instance), [proof, record]) := delta_(v_0(comm(instance), proof),record), #h(3em)
-  tilde(v)_1(comm(instance), [proof, record]) := delta_(v_1(comm(instance), proof),record).
+  tilde(verify)_0(comm(instance), [proof, record]) := delta_(verify_0(comm(instance), proof),record), #h(3em)
+  tilde(verify)_1(comm(instance), [proof, record]) := delta_(verify_1(comm(instance), proof),record).
 $
-That is, $tilde(v)_0, tilde(v)_1$ indicate whether the provided record $record in recordSpace$
-would indeed be produced by $v_0$ respectively $v_1$ when provided $instance$ and $proof$.
+That is, $tilde(verify)_0, tilde(verify)_1$ indicate whether the provided record $record in recordSpace$
+would indeed be produced by $verify_0$ respectively $verify_1$ when provided $instance$ and $proof$.
 With this transformation in place, one can express 
 $
-	v(comm(instance), proof) 
-	= tilde(v)_0(comm(instance), [proof, d(comm(instance), proof)]) 
-		dot tilde(v)_1(comm(instance), [proof, d(comm(instance), proof)]).
+	verify(comm(instance), proof) 
+	= tilde(verify)_0(comm(instance), [proof, d(comm(instance), proof)]) 
+		dot tilde(verify)_1(comm(instance), [proof, d(comm(instance), proof)]).
 $
 where $d(comm(instance), proof)$ denotes the record deriviation function.
 We introduce the function product $(product(f, g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
 This then allows us to express
 $
 	prove(verify(comm(instance), dot); proof)
-	&= prove(product(tilde(v)_0, tilde(v)_1)(comm(instance), dot); [proof, record])
+	&= prove(product(tilde(verify)_0, tilde(verify)_1)(comm(instance), dot); [proof, record])
 	&= proof',
 $
 with $record := d(comm(instance), proof)$.
@@ -240,7 +240,7 @@ Summarizing, we have now expressed recursive verification in terms of a
 split verifier, where the same instance-proof-record triple was provided to 
 both verification halves.
 The produced proof $proof'$ now attests to $instance in language$ when
-$verify(comm(product(tilde(v)_0, tilde(v)_1)(comm(instance), dot)), proof') = 1$.
+$verify(comm(product(tilde(verify)_0, tilde(verify)_1)(comm(instance), dot)), proof') = 1$.
 
 = Split proving
 #et("todo")
@@ -277,9 +277,9 @@ has the proof include a bit $b$ indicating whether it is verifying a base proof 
 We now observe that
 $
 	tilde(verify)^*_0([comm(x), comm(y)], [[proof, b], r]) 
-	&:= tilde(v)_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+	&:= tilde(verify)_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
 	tilde(verify)^*_1([comm(x), comm(y)], [[proof, b], r]) 
-	&:= tilde(v)_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
+	&:= tilde(verify)_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
 $
 jointly form a valid split of $verify^*$, since
 $
@@ -290,7 +290,7 @@ $
 $
 when
 $r = d([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
-By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(tilde(v)^*_0, tilde(v)^*_1)))$, 
+By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1)))$, 
 we now obtain
 $
 	product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], [[proof, b], r])
@@ -319,18 +319,18 @@ We now discuss how the split-recursion system is integrated in practice.
 
 == The split
 Let $v$ denote the verification algorithm performing all steps outlined in @verification.
-We split $v$ into halves $tilde(v)_f$ and $tilde(v)_b$ such that an efficient
+We split $v$ into halves $tilde(verify)_f$ and $tilde(verify)_b$ such that an efficient
 arithmetization is achieved when the former is executed in the _field-VM_ (@field-VM)
 and the latter on the _RiscV-VM_ (@decode through @ecall).
-Practically speaking, $tilde(v)_f$ is put in charge of all verification steps
+Practically speaking, $tilde(verify)_f$ is put in charge of all verification steps
 involving _field_ arithmetic --- e.g., verifying `FRI` folding, 
-while $tilde(v)_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
+while $tilde(verify)_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
 by means of the Fiat-Shamir transformation.
 
 The communication record primarily exists of the various Fiat-Shamir-derived
-challenges required by $tilde(v)_f$ to complete verification.
-During execution, $tilde(v)_b$ is in charge of validating these record values,
-while $tilde(v)_f$ assumes them to be correct.
+challenges required by $tilde(verify)_f$ to complete verification.
+During execution, $tilde(verify)_b$ is in charge of validating these record values,
+while $tilde(verify)_f$ assumes them to be correct.
 
 #et([update the communication record overview once @verification is complete.])
 
@@ -373,12 +373,12 @@ guest program.
 Since the guest program is publically known during recursive verification, 
 this limitation does not apply here
 
-Hence, by having $tilde(v)_b ([comm(x), comm(y)], [[proof, b], record])$ `COMMIT` 
+Hence, by having $tilde(verify)_b ([comm(x), comm(y)], [[proof, b], record])$ `COMMIT` 
 to the commitments $comm(x)$ and $comm(y)$ it is provided, and using the same commitments
 to balance the proof's interaction logic when $b=1$, the ultimate verifier of the
 final proof can be confident that the same verification algorithm was used
 at every recursion step when verifying 
-$(comm(x), comm(y)) = (comm(instance), comm(product(tilde(v)_b, tilde(v)_f)))$.
+$(comm(x), comm(y)) = (comm(instance), comm(product(tilde(verify)_b, tilde(verify)_f)))$.
 
 == Summary
 
@@ -387,7 +387,7 @@ The communication record contains all challenges derived from the proof by
 means of the Fiat-Shamir transformation.
 
 *`RiscV-VM` subalgorithm*
-$tilde(v)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
+$tilde(verify)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
 - `COMMIT`s to $comm(instance), comm(instance2)$ by sending both halves to `stdout`.
 - derives challenges from $proof$ by means of Fiat-Shamir, and assert that they 
   match those located in $record$ at the expected location.
@@ -396,7 +396,7 @@ $tilde(v)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
   given the derived challenges.
 
 *`Field-VM` subalgorithm*
-$tilde(v)_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
+$tilde(verify)_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
 - Performs the field arithmetic steps required to verify that $proof$ attests
   to $instance$ (when $b=0$) or $instance2$ (when $b != 0$),
   given the challenges stated on the $record$.
