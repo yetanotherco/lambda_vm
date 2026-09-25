@@ -7951,6 +7951,10 @@ fn the_whir_production_tree_composes_to_a_root() {
     mark("AFTER the WHIR base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the WHIR base"));
     whir_base_split_readback(base_secs);
+    if multilinear::whir_split::gap_census() {
+        println!("GAPB HASH_METRICS base {:?}", crypto::hash_metrics::snapshot());
+        crypto::hash_metrics::reset();
+    }
     // ⛔ ROUND-3 TREE PROBE, ARMED AT THE BASE BOUNDARY (diagnostic, OFF by
     // default — `LAMBDA_VM_TREE_BUSY_PROBE`). Everything below this line is the
     // tree/wrap phase, and the probe prices each of its four stages against the
@@ -8439,6 +8443,9 @@ fn the_whir_production_tree_composes_to_a_root() {
         }
     }
 
+    if multilinear::whir_split::gap_census() {
+        println!("GAPB HASH_METRICS tree {:?}", crypto::hash_metrics::snapshot());
+    }
     let (run_peak, run_at) = whole_run.stop();
     println!(
         "\n★★★ WHOLE RUN: host peak {run_peak:.3} GiB at t={run_at:.1}, {:.1}s total",

@@ -76,6 +76,22 @@ where
         resident: Option<(&crate::gpu::ResidentColumns, usize)>,
         config: &ChainConfig,
     ) -> Result<Self, Error> {
+        if crate::whir_split::gap_census() {
+            let real: usize = layout
+                .placements()
+                .iter()
+                .map(|p| 1usize << p.num_vars)
+                .sum();
+            eprintln!(
+                "GAPB STACK n_stack={} num_polys={} columns={} column_cells={} stacked_cells={} lde_cells={}",
+                layout.n_stack(),
+                layout.num_polys(),
+                columns.len(),
+                real,
+                layout.num_polys() << layout.n_stack(),
+                layout.num_polys() << (layout.n_stack() + config.log_blowup),
+            );
+        }
         // The stacked polynomials are not built here: each is its columns at
         // their offsets, and both the commit and the opening write those
         // straight into the device's buffer. Assembling a copy on the way is a
