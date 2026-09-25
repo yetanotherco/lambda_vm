@@ -78,6 +78,17 @@ pub fn enabled() -> bool {
     })
 }
 
+/// `LAMBDA_VM_GAP_CENSUS=1` prints `GAPB` shape lines: every table, stack and
+/// WHIR chain the base commits, so a work census can be read off one run.
+/// Prints only; no proof byte depends on it.
+pub fn gap_census() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LAMBDA_VM_GAP_CENSUS") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 /// Unix epoch seconds, for aligning a stage with an external GPU sampler.
 ///
 /// A duplicate of `stark::prove_split::epoch_secs` by necessity, not by

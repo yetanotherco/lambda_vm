@@ -4400,6 +4400,29 @@ pub trait IsStarkProver<
             .map(|(air, trace, _)| crate::leaf_layout::table_leaf_layout(*air, trace.num_rows()))
             .collect();
 
+        if multilinear::whir_split::gap_census() {
+            for (air, trace, _) in &*air_trace_pairs {
+                let (main, aux) = air.trace_layout();
+                let o = air.options();
+                eprintln!(
+                    "GAPB STARK_TABLE name={} rows={} main={main} aux={aux} precomputed={} max_degree={} comp_degree_bound={} constraints={} ir_nodes={} bus_interactions={} blowup={} queries={} grind={} fri_final_log={} format={:?}",
+                    air.name(),
+                    trace.num_rows(),
+                    air.num_precomputed_columns(),
+                    air.max_constraint_degree(),
+                    air.composition_poly_degree_bound(trace.num_rows()),
+                    air.num_transition_constraints(),
+                    air.constraint_program().nodes.len(),
+                    air.bus_interactions().len(),
+                    o.blowup_factor,
+                    o.fri_number_of_queries,
+                    o.grinding_factor,
+                    o.fri_final_poly_log_degree,
+                    o.format,
+                );
+            }
+        }
+
         let k = table_parallelism(num_airs);
 
         // VRAM budgeted admission. The budget caps the summed device working set

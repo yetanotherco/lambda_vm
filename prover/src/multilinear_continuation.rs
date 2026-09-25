@@ -834,6 +834,27 @@ pub(crate) fn epoch_groups(num_tables: usize) -> Vec<usize> {
 }
 
 /// A table's layout, from the AIR and the shape the verifier states.
+/// One `GAPB TABLE` line for the work census (`LAMBDA_VM_GAP_CENSUS=1`).
+fn gap_table_line(
+    stage: &str,
+    air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    width: usize,
+    num_vars: usize,
+    committed: Option<&CommittedTable<'_, F, E>>,
+) {
+    let program = air.constraint_program();
+    eprintln!(
+        "GAPB TABLE {stage} name={} width={width} num_vars={num_vars} committed_cols={} precomputed_cols={} constraints={} base_constraints={} ir_nodes={} bus_interactions={}",
+        air.name(),
+        committed.map_or(0, |t| t.num_committed_columns()),
+        air.num_precomputed_columns(),
+        program.roots.len(),
+        program.num_base,
+        program.nodes.len(),
+        air.bus_interactions().len(),
+    );
+}
+
 fn layout_of<'a>(
     air: &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     width: usize,
@@ -1125,6 +1146,9 @@ where
             CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
+        if multilinear::whir_split::gap_census() {
+            gap_table_line("global", *air, width, num_vars, committed.last());
+        }
     }
     let sizes = global_groups(boundaries.len(), gm_configs.len());
     let __ws_airs = committed.len();
@@ -1683,6 +1707,9 @@ where
             CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
+        if multilinear::whir_split::gap_census() {
+            gap_table_line(&format!("epoch{label}"), *air, width, num_vars, committed.last());
+        }
     }
     let sizes = epoch_groups(committed.len());
     prepared.agrees_with(&config)?;

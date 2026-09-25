@@ -1196,6 +1196,12 @@ pub(crate) fn for_each_epoch(
             None => break,
         };
         let is_final = executor.pc() == 0;
+        if multilinear::whir_split::gap_census() {
+            eprintln!(
+                "GAPB EPOCH index={index} cycles={} is_final={is_final}",
+                logs.len()
+            );
+        }
         if !is_final && logs.len() != epoch_size {
             return Err(Error::ContinuationInvariant(format!(
                 "intermediate epoch ran {} cycles, expected {epoch_size}",

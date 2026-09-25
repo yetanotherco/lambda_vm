@@ -921,6 +921,17 @@ where
     let schedule = config.schedule(num_vars);
     // One cap height per tree; all zero at the default format.
     let caps = config.tree_caps(num_vars);
+    if crate::whir_split::gap_census() {
+        eprintln!(
+            "GAPB CHAIN num_vars={num_vars} log_domain={} blowup_log={} schedule={schedule:?} caps={caps:?} queries={} grind={}/{}/{}",
+            commitment.log_domain_size(),
+            config.log_blowup,
+            config.num_queries,
+            config.grind.folding,
+            config.grind.ood,
+            config.grind.query,
+        );
+    }
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E, H>::Base(commitment);
