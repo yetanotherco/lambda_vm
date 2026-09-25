@@ -83,7 +83,7 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 }
 
 /// An ext3 element from three SplitMix64 outputs, each reduced mod p.
-fn next_ext(state: &mut u64) -> Ext {
+pub(crate) fn next_ext(state: &mut u64) -> Ext {
     Ext::new([
         Felt::from(splitmix64(state)),
         Felt::from(splitmix64(state)),

@@ -30,3 +30,5 @@ pub mod trace_test_helpers;
 pub mod zf_fri_device_tests;
 pub mod zf_fri_vectors;
 pub mod zf_golden_tests;
+#[cfg(feature = "cuda")]
+pub mod zf_s2_device_tests;
