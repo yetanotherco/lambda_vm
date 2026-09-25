@@ -185,6 +185,15 @@ pub struct CpuOperation {
     pub ecall_keccak: bool,
     /// For KeccakPermute ECALLs: state address from x10.
     pub keccak_state_addr: u64,
+    /// Whether this ECALL is a Blake3Compress syscall.
+    pub ecall_blake3: bool,
+    /// For Blake3Compress ECALLs: state address from x10.
+    pub blake3_state_addr: u64,
+    /// Whether this ECALL is a Blake3Absorb (chained-absorb) syscall. Its four
+    /// operands (x10..x13) are recovered from the register state in the trace
+    /// builder, exactly like ECSM and HINT — one ecall expands to a whole group
+    /// of BLAKE3 rows, so there is nothing useful to carry on this row.
+    pub ecall_blake3_absorb: bool,
 
     /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
     pub ecall_ecsm: bool,
@@ -236,6 +245,11 @@ impl CpuOperation {
         let ecall_keccak =
             f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
+        let ecall_blake3 =
+            f.ecall && log.src1_val == executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER;
+        let blake3_state_addr = if ecall_blake3 { log.src2_val } else { 0 };
+        let ecall_blake3_absorb = f.ecall
+            && log.src1_val == executor::vm::instruction::execution::BLAKE3_ABSORB_SYSCALL_NUMBER;
         // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
         // in the trace builder.
         let ecall_ecsm =
@@ -259,6 +273,9 @@ impl CpuOperation {
                 commit_count,
                 ecall_keccak,
                 keccak_state_addr,
+                ecall_blake3,
+                blake3_state_addr,
+                ecall_blake3_absorb,
                 decode,
                 timestamp,
                 ..Default::default()
@@ -359,6 +376,9 @@ impl CpuOperation {
             commit_count,
             ecall_keccak,
             keccak_state_addr,
+            ecall_blake3,
+            blake3_state_addr,
+            ecall_blake3_absorb,
             ecall_ecsm,
             ecall_hint,
         }

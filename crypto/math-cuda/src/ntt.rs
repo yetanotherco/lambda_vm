@@ -121,6 +121,14 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
 
 /// Run the butterfly body of a bit-reversed-input DIT NTT. Split out so the
 /// LDE orchestrator can reuse it on the same device buffer.
+/// Columns a fused tile spans — one warp, which is what keeps it coalesced.
+/// Mirrors `NTT_TILE_COLS` in `kernels/ntt.cu`.
+const TILE_COLS: u32 = 32;
+
+/// Levels a fused tile takes at once. `32 × 32` threads is a full block and
+/// `32 × 33 × 8` bytes of shared memory, which is room to spare.
+const TILE_LEVELS: u64 = 5;
+
 pub(crate) fn run_ntt_body(
     stream: &cudarc::driver::CudaStream,
     x_dev: &mut cudarc::driver::CudaSlice<u64>,
@@ -168,11 +176,44 @@ pub(crate) fn run_ntt_body(
         }
     }
 
-    // Levels 8..log_n: per-level kernels. Loads are fully coalesced in the
-    // per-level path; switching to fused-with-row-remap at base_step>0 tanks
-    // DRAM throughput enough to wipe out the launch savings.
+    // Levels 8..log_n, five at a time through a 2D tile: `threadIdx.x` walks
+    // the contiguous low bits and `threadIdx.y` the stride the butterflies
+    // move, so both the load and the store stay coalesced. The older
+    // fused-with-row-remap path gathered along the stride instead and lost
+    // more bandwidth than it saved in passes — that is why the per-level
+    // fallback is still here for what does not tile.
     let half_cfg = LaunchConfig::for_num_elems((n / 2) as u32);
-    for level in fused..log_n {
+    let mut level = fused;
+    while level < log_n {
+        let k = core::cmp::min(TILE_LEVELS, log_n - level);
+        // A tile needs a warp of contiguous indices below it, and is only
+        // worth its idle half when it fuses more than a level.
+        if k >= 2 && (1u64 << level) >= TILE_COLS as u64 {
+            let rows = 1u32 << k;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    ((1u64 << level) / TILE_COLS as u64) as u32,
+                    (n >> (level + k)) as u32,
+                    1,
+                ),
+                block_dim: (TILE_COLS, rows, 1),
+                shared_mem_bytes: rows * (TILE_COLS + 1) * 8,
+            };
+            let k_u32 = k as u32;
+            unsafe {
+                stream
+                    .launch_builder(&be.ntt_dit_tile)
+                    .arg(&mut *x_dev)
+                    .arg(tw_dev)
+                    .arg(&n)
+                    .arg(&log_n)
+                    .arg(&level)
+                    .arg(&k_u32)
+                    .launch(cfg)?;
+            }
+            level += k;
+            continue;
+        }
         unsafe {
             stream
                 .launch_builder(&be.ntt_dit_level)
@@ -183,6 +224,7 @@ pub(crate) fn run_ntt_body(
                 .arg(&level)
                 .launch(half_cfg)?;
         }
+        level += 1;
     }
     Ok(())
 }

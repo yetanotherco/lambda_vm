@@ -84,8 +84,10 @@ mod imp {
     impl Update for PlatformKeccak256 {
         #[inline(always)]
         fn update(&mut self, data: &[u8]) {
-            // Track absorbed bytes (for the finalize permutation count) and the
-            // host-side absorption stats.
+            // Absorption — the guest's dominant keccak cost (many small
+            // `stream_bytes` absorbs), which no finalize counter would see. The
+            // running byte total is what lets `finalize` report a permutation
+            // count as well.
             self.1 += data.len();
             crate::hash_metrics::count_absorb(data.len());
             Update::update(&mut self.0, data);

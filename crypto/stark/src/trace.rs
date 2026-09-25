@@ -314,6 +314,22 @@ where
         self.main_rowmajor_dev = None;
     }
 
+    /// Free the auxiliary columns, keeping the declared aux width.
+    ///
+    /// Called by `multi_prove` under `ResidencyMode::RecomputeLde` once a
+    /// table's proof exists: `allocate_aux_table` writes the LogUp columns into
+    /// this caller-owned trace and nothing reads them afterwards, so under that
+    /// mode they are released rather than carried to the end of the prove.
+    /// Callers that do read a trace's aux columns after proving must use
+    /// `ResidencyMode::Retain`.
+    pub fn release_aux_columns(&mut self) {
+        self.aux_table = Table::new(Vec::new(), self.aux_table.width);
+        #[cfg(feature = "cuda")]
+        {
+            self.aux_resident = None;
+        }
+    }
+
     pub fn num_steps(&self) -> usize {
         debug_assert!(self.main_table.height.is_multiple_of(self.step_size));
         self.main_table.height / self.step_size
@@ -841,7 +857,11 @@ where
     E: IsField + 'static,
 {
     let n = domain.interpolation_domain_size;
-    let bf = domain.blowup_factor;
+    // The read stride is the TABLE's own blowup, not the domain's: for every
+    // existing caller the two coincide (the table was expanded at the
+    // domain's blowup), and the batched phase 4 hands a blowup-1 table that
+    // IS the stride subsample already — same values, a quarter the buffer.
+    let bf = lde_trace.blowup_factor;
     let num_main_cols = lde_trace.num_main_cols();
     let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;

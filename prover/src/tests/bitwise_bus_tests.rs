@@ -4,11 +4,9 @@
 //! - Completeness: Valid lookups to BITWISE are accepted
 //! - Soundness: Invalid lookups to BITWISE are rejected
 
+use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
-
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use math::field::element::FieldElement;
 
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
@@ -17,7 +15,7 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::verifier::IsStarkVerifier;
 
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::test_utils::multi_prove_ram;
@@ -195,15 +193,15 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -305,15 +303,15 @@ fn prove_and_verify_custom(
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    crate::hash_pin::BlockVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut crate::hash_pin::block_transcript(&[]),
         &FieldElement::zero(),
     )
 }

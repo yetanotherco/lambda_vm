@@ -1,0 +1,614 @@
+//! LFM prove / verify entry points.
+//!
+//! Prove: execute → traces → statement-bound transcript → the same generic
+//! `multi_prove` the RV64 VM uses. Verify: registry-resolve the program's
+//! roots (hard error on a miss — no fallback), rebuild the AIR set, replay
+//! Phase A on a forked transcript to recover the shared LogUp challenges,
+//! compute the expected `LfmPublic` balance from the *claimed* public words
+//! (the COMMIT-bus pattern), and run `multi_verify_views`.
+
+use std::cell::Cell;
+use std::time::Instant;
+
+use math::field::element::FieldElement;
+use math::field::traits::IsPrimeField;
+use stark::config::Commitment;
+use stark::proof::options::ProofOptions;
+use stark::proof::stark::MultiProof;
+use stark::proof::view::MultiProofView;
+use stark::prover::{IsStarkProver, ProvingError};
+use stark::residency_mode::ResidencyMode;
+use stark::verifier::IsStarkVerifier;
+
+use crate::tables::types::{BusId, GoldilocksExtension, GoldilocksField};
+
+use super::airs::{BLAKE3_SLOT, ChipSet, LfmAirs, NUM_LFM_CHIPS};
+use super::compiler::LfmProgram;
+use super::executor::{LfmExecError, LfmExecution, execute};
+use super::hash::HasherKind;
+use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError};
+use super::statement::absorb_lfm_statement;
+use super::trace::{LfmTraces, build_traces_with_hasher};
+use super::word::LfmWord;
+
+type F = GoldilocksField;
+type E = GoldilocksExtension;
+
+pub struct LfmProof {
+    pub proof: MultiProof<F, E, ()>,
+    /// The public output the execution produced, in emission order.
+    pub public_words: Vec<(u32, LfmWord)>,
+}
+
+/// The three phases of a prove, in seconds: the LFM interpreter, the chip
+/// trace fill, and `multi_prove`.
+///
+/// ★ RECORDED, NOT PRINTED. This file is a production path — every shipped
+/// prove goes through [`lfm_prove`] — so a `println!` beside the three
+/// statements would put a timing line on the stdout of everything that proves,
+/// which the rest of the module deliberately does not do (its one diagnostic is
+/// a `log::info!`). The driver that wants the split takes it and prints it
+/// beside the stage label it already holds.
+///
+/// ⇒ Two things fall out of recording instead of printing, and both are why it
+/// is worth the extra type. A stage LOADED from cache did not prove, so
+/// [`take_prove_split`] returns `None` and the driver prints nothing rather
+/// than reprinting the previous stage's numbers. And the cell is PER-THREAD,
+/// so when sibling proofs run concurrently each worker fills and reads its own
+/// — a shared print would emit unattributable lines the moment a second proof
+/// is in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProveSplit {
+    /// `execute` — the LFM interpreter's walk over the program.
+    pub execute: f64,
+    /// `build_traces_with_hasher` — the chip trace fill.
+    pub fill: f64,
+    /// `prove_traces_with_hasher` — AIR construction, the transcript and
+    /// `multi_prove` itself, NET of any wait for the card.
+    ///
+    /// ⛔ Net on purpose. Gross, this field absorbs however long a sibling held
+    /// the card, so the same work reads differently at one worker and at two
+    /// and the arms stop being comparable — which is exactly what a scheduling
+    /// A/B needs them to be.
+    pub multi_prove: f64,
+    /// Seconds spent BLOCKED waiting for the card before `multi_prove` began.
+    /// Zero whenever the permit is inert, so a serial line is unchanged.
+    pub permit_wait: f64,
+    /// The phases INSIDE `execute`. Carried beside it rather than folded into
+    /// it: a lever that moves one phase and not another cannot be read off their
+    /// sum, which is the lesson the three fields above were split out for in the
+    /// first place.
+    pub exec: super::executor::ExecSplit,
+}
+
+thread_local! {
+    static LAST_PROVE_SPLIT: Cell<Option<ProveSplit>> = const { Cell::new(None) };
+}
+
+/// Take the split of the most recent prove ON THIS THREAD, clearing it.
+///
+/// `None` when nothing has proved on this thread since the last take. A caller
+/// that prints on `Some` therefore stays silent for a cached stage, which is
+/// the reading it wants: a line that appears is a prove that happened.
+pub fn take_prove_split() -> Option<ProveSplit> {
+    LAST_PROVE_SPLIT.with(|c| c.take())
+}
+
+#[derive(Debug)]
+pub enum LfmProveError {
+    Exec(LfmExecError),
+    Prover(ProvingError),
+}
+
+/// Proves under the permutation `artifacts` was built for.
+///
+/// The hasher comes from the artifacts rather than from a default, because
+/// `artifacts.program_id` is derived from it: taking it from anywhere else
+/// would let the statement claim one permutation while the AIRs prove another.
+pub fn lfm_prove(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+) -> Result<LfmProof, LfmProveError> {
+    lfm_prove_with_hasher(program, artifacts, arenas, options, artifacts.hasher)
+}
+
+/// [`lfm_prove`] with the `LFM_HASH` permutation named explicitly at the call
+/// site instead of read off `artifacts`.
+///
+/// The chips bake their hasher's constants into their constraints, so execution
+/// must use the same hasher — this function is the single place that holds them
+/// together, passing one `hasher` to the executor, the trace filler and the AIR
+/// set. Verification needs the same value ([`verify_against`]).
+///
+/// # Panics
+///
+/// If `hasher` is not the one `artifacts` was built for. The two are not
+/// independent: `artifacts.program_id` binds the hasher, so a mismatch would
+/// produce a proof whose statement names a permutation the trace does not use —
+/// unverifiable everywhere, and confusing at exactly the point (registry
+/// regeneration) where it would be introduced. The agreement is a caller bug,
+/// not a proof outcome, so it is asserted rather than returned.
+pub fn lfm_prove_with_hasher(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> Result<LfmProof, LfmProveError> {
+    assert_eq!(
+        artifacts.hasher, hasher,
+        "artifacts were built for {:?} but proving was asked for {hasher:?}; \
+         program_id binds the hasher, so the two must agree",
+        artifacts.hasher
+    );
+    lfm_prove_with_residency(
+        program,
+        artifacts,
+        arenas,
+        options,
+        hasher,
+        decide_lfm_residency(),
+    )
+}
+
+/// [`lfm_prove_with_hasher`] with the residency mode supplied instead of read
+/// from the environment, so a test can prove the same program under both modes
+/// in one process without touching global state.
+pub(crate) fn lfm_prove_with_residency(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<LfmProof, LfmProveError> {
+    // ★ THE SPLIT OF THE `prove` FIELD. The driver's per-node TIMING line prints
+    // this whole function as one number, and the three statements below are
+    // three different machines: `execute` is a single-threaded interpreter,
+    // `build_traces_with_hasher` is a parallel fill, and only the third reaches
+    // the card. Timing them separately is what lets a lever be aimed at one.
+    //
+    // ⚠ Recorded on the SUCCESS path only. The `?`s below return to a caller
+    // that panics, so a partial split would describe a run that produced no
+    // proof — and the cell would then hand it to the NEXT stage on this thread
+    // as if it were that stage's own.
+    //
+    // ⚠ The two `drop`s below are the other half of that reasoning: this
+    // function's PEAK, not its clock, is what fences a third concurrent sibling
+    // on a 57.5 GiB host. Both are placed AFTER the elapsed-time read, so
+    // `execute` and `fill` keep measuring exactly what they measured before and
+    // stay comparable across the change; only the wall absorbs the free, which
+    // is a handful of `munmap`s.
+    let t = Instant::now();
+    let LfmExecution {
+        records,
+        public_words,
+        memory,
+        split: exec_split,
+    } = execute(program, arenas, &hasher).map_err(LfmProveError::Exec)?;
+    let execute_secs = t.elapsed().as_secs_f64();
+    // The final write-once array: 32 bytes per address, a few hundred MB for a
+    // wrap. It is a diagnostic surface for tests — nothing on the proving path
+    // reads it — so held to the end of this scope it would stay live through the
+    // fill AND the whole device phase, on every worker at once, for nothing.
+    drop(memory);
+
+    let t = Instant::now();
+    let mut traces = build_traces_with_hasher(program, &records, hasher);
+    let fill_secs = t.elapsed().as_secs_f64();
+    // Same reason, larger: the records are what the fill consumes, and they are
+    // dead the moment it returns. The traces it produced are the live set from
+    // here on; holding the records as well doubles the values through the card
+    // phase.
+    drop(records);
+
+    let t = Instant::now();
+    let waited_before = super::device_permit::waited_secs();
+    let proof = prove_traces_with_hasher(
+        artifacts,
+        &mut traces,
+        &public_words,
+        options,
+        hasher,
+        residency,
+    )
+    .map_err(LfmProveError::Prover)?;
+    // The wait is SUBTRACTED rather than left inside, so `multi_prove` means
+    // the same thing at one worker and at two.
+    let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
+    let multi_prove_secs = (t.elapsed().as_secs_f64() - permit_wait).max(0.0);
+
+    LAST_PROVE_SPLIT.with(|c| {
+        c.set(Some(ProveSplit {
+            execute: execute_secs,
+            fill: fill_secs,
+            multi_prove: multi_prove_secs,
+            permit_wait,
+            exec: exec_split,
+        }))
+    });
+
+    Ok(LfmProof {
+        proof,
+        public_words,
+    })
+}
+
+/// Proves an already-built trace set against `artifacts`.
+///
+/// Split out of [`lfm_prove`] so callers that need to inspect or corrupt a
+/// trace between generation and proving (the tamper tests) share this
+/// transcript setup instead of reimplementing it. `lfm_prove` itself goes
+/// through [`prove_traces_with_hasher`], so this artifacts-hasher form has only
+/// test callers.
+#[cfg(test)]
+pub(crate) fn prove_traces(
+    artifacts: &LfmArtifacts,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    prove_traces_with_hasher(
+        artifacts,
+        traces,
+        public_words,
+        options,
+        artifacts.hasher,
+        decide_lfm_residency(),
+    )
+}
+
+/// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
+/// been built with the same one.
+///
+/// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
+/// mode from [`decide_lfm_residency`] rather than parameters: both are resource
+/// decisions, invisible to the proof — spilling changes where a trace lives and
+/// recompute changes how long an LDE lives, never a byte the transcript absorbs
+/// — so threading them through the prove signature would put knobs with no wire
+/// meaning in front of every caller.
+pub(crate) fn prove_traces_with_hasher(
+    artifacts: &LfmArtifacts,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
+    // a driver has armed it, and then exclusive: `multi_prove` builds its own
+    // full-budget `VramGate`, so two of them in flight would budget the card
+    // twice over. Held here rather than around the whole of `lfm_prove`
+    // deliberately — the executor and the trace fill run BEFORE this call and
+    // must be free to overlap another proof's device phase, which is the entire
+    // point of the lever.
+    let _card = super::device_permit::hold_labeled("multi_prove");
+    let mut airs = LfmAirs::new_chunked(
+        &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
+        options,
+        artifacts.keccak_rnd_chunks,
+        hasher,
+        artifacts.chip_set,
+    );
+    // One-row chips (S2) take their roots from the artifacts; without them a
+    // chip resolved to one row is refused by `multi_prove`, never recomputed.
+    if let Some(one_row) = &artifacts.one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    absorb_lfm_statement(
+        &mut transcript,
+        &artifacts.program_id,
+        public_words,
+        options.fri_final_poly_log_degree,
+    );
+    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
+        airs.air_trace_pairs(traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        crate::auto_storage::decide_lfm(),
+        residency,
+    )
+}
+
+/// The LFM wrap's [`ResidencyMode`]: `RecomputeLde` when `LAMBDA_VM_RESIDENCY`
+/// is set to `recompute`, else `Retain`.
+///
+/// An explicit knob for the same reason the storage mode is one: the wrap has
+/// no calibrated peak estimate to decide from, and the trade this mode makes —
+/// one extra forward NTT per table against dropping the `O(N)` main-LDE
+/// retention — is only worth taking when `N` is large. The fixture wrap has one
+/// or two `KECCAK_RND` chunks and would just pay the NTT.
+///
+/// `RecomputeLde` also releases each table's aux columns once its proof exists,
+/// so callers that read the traces after proving must leave this unset. Nothing
+/// on the wrap path does.
+pub(crate) fn decide_lfm_residency() -> ResidencyMode {
+    match std::env::var("LAMBDA_VM_RESIDENCY").as_deref() {
+        Ok("recompute") => {
+            log::info!("lfm residency_mode: RecomputeLde (LAMBDA_VM_RESIDENCY=recompute)");
+            ResidencyMode::RecomputeLde
+        }
+        _ => ResidencyMode::Retain,
+    }
+}
+
+/// `Err` = registry miss (the hard, no-fallback path). `Ok(false)` = invalid
+/// proof or claimed-public mismatch.
+pub fn lfm_verify(
+    kind: LfmProgramKind,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> Result<bool, LfmRegistryError> {
+    let artifacts = super::registry::resolve_artifacts(kind, options)?;
+    Ok(verify_against_artifacts(
+        &artifacts,
+        proof,
+        claimed_public,
+        options,
+    ))
+}
+
+/// [`verify_against`] driven by a whole [`LfmArtifacts`].
+///
+/// # Why this exists
+///
+/// `verify_against` takes seven separate pieces of program shape, so every new
+/// thing the registry pins would change its signature and every call site with
+/// it. Taking the struct means a field added to `LfmArtifacts` reaches the
+/// verifier without moving anyone, and `prover/tests/d0_king_gate.rs` compiles
+/// unchanged across such an arrival because of it.
+pub fn verify_against_artifacts(
+    artifacts: &LfmArtifacts,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> bool {
+    verify_against_chunked_with(
+        artifacts.one_row_roots.as_ref(),
+        &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
+        &artifacts.program_id,
+        artifacts.keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        artifacts.hasher,
+        artifacts.chip_set,
+    )
+}
+
+/// Verifies against a supplied root vector, program digest, `KECCAK_RND` chunk
+/// count and hasher instead of a registry entry.
+///
+/// The registry lookup in [`lfm_verify`] is the soundness argument's first
+/// premise and has no off-switch; this is not one. It exists for callers that
+/// legitimately hold freshly built artifacts — the registry regeneration path,
+/// and tests covering program shapes that are not (and need not be) registered,
+/// such as the per-length keccak256 programs.
+///
+/// ⚠ This is the SINGLE-`LFM_BLAKE3` door: it builds one instance, from slot
+/// 11's root. A program whose `LFM_BLAKE3` is chunked has extra roots that the
+/// fifteen-wide array cannot hold, so its callers go through
+/// [`verify_against_artifacts`] (or [`verify_against_chunked`]); handing a
+/// chunked proof to this function rejects it on the AIR count rather than
+/// verifying it against the wrong shape.
+///
+/// Every piece is supplied for the same reason: it is program shape the
+/// verifier must know to build the AIR set, and none of it is ever read off the
+/// proof. That includes the hasher — which a caller holding artifacts should
+/// pass as `artifacts.hasher`, since the digest it is paired with was derived
+/// from exactly that value. There is deliberately no defaulting form: a
+/// verifier that silently assumed a permutation would be assuming the one thing
+/// the roots cannot tell it.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_against(
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> bool {
+    // Slot 11's root IS chunk 0's, so a one-element window over the array is the
+    // whole `LFM_BLAKE3` shape a single-table program has. A CHUNKED program's
+    // extra roots live only in `LfmArtifacts`, which is why chunked callers go
+    // through `verify_against_artifacts` — this door would build one instance
+    // against a proof carrying several and reject on the AIR count.
+    verify_against_chunked(
+        roots,
+        &roots[BLAKE3_SLOT..=BLAKE3_SLOT],
+        program_id,
+        keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        hasher,
+        chip_set,
+    )
+}
+
+/// [`verify_against`] with `LFM_BLAKE3` split over `blake3_roots` instances.
+///
+/// The general form. Chunk roots are supplied rather than derived for the same
+/// reason every other piece here is: they are program shape the verifier must
+/// know to build the AIR set, and none of it is ever read off the proof.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_against_chunked(
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    blake3_roots: &[Commitment],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> bool {
+    verify_against_chunked_with(
+        None,
+        roots,
+        blake3_roots,
+        program_id,
+        keccak_rnd_chunks,
+        proof,
+        claimed_public,
+        options,
+        hasher,
+        chip_set,
+    )
+}
+
+/// [`verify_against_chunked`] with the program's one-row (S2) roots, when it
+/// has them (`None` = row-pair roots only: a chip resolved to one row then
+/// rejects).
+#[allow(clippy::too_many_arguments)]
+fn verify_against_chunked_with(
+    one_row_roots: Option<&super::registry::LfmOneRowRoots>,
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    blake3_roots: &[Commitment],
+    program_id: &Commitment,
+    keccak_rnd_chunks: usize,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+) -> bool {
+    // The chunk count and the mask must agree, and BOTH come from the resolved
+    // registry entry rather than the proof — so this rejects a malformed entry,
+    // not a hostile prover.
+    //
+    // With the keccak family present a zero chunk count would drop KECCAK_RND —
+    // and its constraints — from a set that still contains LFM_KECCAK's sends,
+    // which is the shape the old unconditional guard existed to refuse. With
+    // the family absent, zero is the only correct count: the chip has no work,
+    // no sends and no reason to exist.
+    if chip_set.keccak != (keccak_rnd_chunks > 0) {
+        return false;
+    }
+    let view = MultiProofView::Owned(proof);
+    if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) {
+        return false;
+    }
+
+    let mut airs = LfmAirs::new_chunked(
+        roots,
+        blake3_roots,
+        options,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+    );
+    if let Some(one_row) = one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
+    let refs = airs.air_refs();
+
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    absorb_lfm_statement(
+        &mut transcript,
+        program_id,
+        claimed_public,
+        options.fri_final_poly_log_degree,
+    );
+
+    // Fork the statement-bound state and replay Phase A to recover the shared
+    // LogUp challenges; the expected balance is the LfmPublic sum recomputed
+    // from the claimed words (all other LFM buses balance to zero internally).
+    let mut replay = transcript.clone();
+    let Some((z, alpha)) = crate::replay_transcript_phase_a_view(&refs, view, &mut replay) else {
+        return false;
+    };
+    let Some(expected) = expected_public_balance(claimed_public, &z, &alpha) else {
+        return false;
+    };
+
+    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+        &refs,
+        view,
+        &mut transcript,
+        &expected,
+    )
+}
+
+/// `Σ_i 1/(z − (LfmPublic + index_i·α + Σ_l v_l·α^{2+l}))` — the fingerprint
+/// layout matches the `LFM_PUBLIC` sender token `(index, v0..v3)`.
+fn expected_public_balance(
+    words: &[(u32, LfmWord)],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> Option<FieldElement<E>> {
+    let bus = FieldElement::<E>::from(BusId::LfmPublic as u64);
+    let mut powers = [FieldElement::<E>::zero(); 5];
+    powers[0] = *alpha;
+    for i in 1..5 {
+        powers[i] = &powers[i - 1] * alpha;
+    }
+    let mut fingerprints: Vec<FieldElement<E>> = words
+        .iter()
+        .map(|(index, word)| {
+            let mut acc = &bus + FieldElement::<E>::from(*index as u64) * &powers[0];
+            for (l, lane) in word.iter().enumerate() {
+                let v = GoldilocksField::canonical(lane.value());
+                acc += FieldElement::<E>::from(v) * &powers[1 + l];
+            }
+            z - acc
+        })
+        .collect();
+    // A zero fingerprint (a collision with z) is a failure, like COMMIT's.
+    FieldElement::inplace_batch_inverse(&mut fingerprints).ok()?;
+    Some(
+        fingerprints
+            .iter()
+            .fold(FieldElement::<E>::zero(), |acc, t| acc + t),
+    )
+}
+
+// ===========================================================================
+// Presets
+// ===========================================================================
+
+/// The wrap layer's options when the wrap feeds the AGGREGATOR: blowup 4
+/// (110 queries at the 128-bit Johnson-bound target) with the FRI terminal at
+/// degree 2^8.
+///
+/// The choice optimizes the wrap's VERIFIER — the aggregation program pays
+/// per query per wrap, and 110 queries against blowup-4 trees nearly halve
+/// its Merkle-walk volume versus the 219-query blowup-2 wrap (the priced
+/// A-decision point). The terminal at 2^8 trades one committed FRI layer —
+/// 110 more openings the aggregator would walk — for 128 more terminal
+/// coefficients it merely absorbs. Inner epochs are NOT touched by this
+/// choice: the wrap PROGRAM is a function of the inner proof's options, so
+/// this constructor moves no program identity.
+///
+/// ★ A PRODUCTION FORMAT SITE: the process's [`ZfFormat`](crate::zf_format::ZfFormat)
+/// is stamped on here (`LAMBDA_VM_ZF_CAP`, `_FRI`, `_ONE_ROW`), so every LFM
+/// proof — wraps, nodes, the root — and every emitter that derives its shape
+/// from these options sees one format. Unset knobs give
+/// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT), the measured
+/// configuration; every knob at its off spelling gives the legacy options.
+pub fn aggregation_wrap_options() -> ProofOptions {
+    let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
+        .expect("blowup=4 is valid");
+    opts.fri_final_poly_log_degree = 8;
+    crate::zf_format::ZfFormat::global().options(opts)
+}
+
+/// The STARK block's base-epoch options: the blowup-4 preset the production
+/// tree proves its epochs under, with the process's
+/// [`ZfFormat`](crate::zf_format::ZfFormat) stamped on — a PRODUCTION FORMAT
+/// SITE, like [`aggregation_wrap_options`].
+///
+/// Not [`crate::recursion::Preset::options`] itself: that value also fixes
+/// the RV64 recursion guest's verifier, which stays on the LEGACY format
+/// (its presets name it).
+pub fn block_base_options() -> ProofOptions {
+    crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
+}

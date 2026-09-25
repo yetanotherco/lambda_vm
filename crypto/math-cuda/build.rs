@@ -74,12 +74,12 @@ fn to_real_arch(arch: &str) -> String {
 
 /// Single source for the barycentric multi-kernel eval-point cap. The CUDA
 /// side sizes a per-thread accumulator array with it (`BARY_MAX_K`, passed via
-/// `-D` below) and the Rust dispatch asserts against it (generated into
-/// `bary_consts.rs`) — defining it twice invites stack corruption in the
-/// kernel the day one side moves without the other.
+/// `-D` at the barycentric.cu call site below) and the Rust dispatch asserts
+/// against it (generated into `bary_consts.rs`) — defining it twice invites
+/// stack corruption in the kernel the day one side moves without the other.
 const BARY_MAX_EVAL_POINTS: usize = 8;
 
-fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
+fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = manifest_dir.join("kernels").join(src);
@@ -90,6 +90,7 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
     println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_LINEINFO");
+    println!("cargo:rerun-if-env-changed=LAMBDA_VM_RPX_MAXRREGCOUNT");
 
     // When nvcc is missing from PATH, emit an empty cubin stub so the crate
     // still compiles. include_bytes! in src/device.rs needs the file to exist
@@ -125,11 +126,24 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
 
     let mut cmd = Command::new(nvcc_path());
     cmd.args(["--cubin", "-O3", "-std=c++17", "-arch", &arch]);
-    cmd.arg(format!("-DBARY_MAX_K={BARY_MAX_EVAL_POINTS}"));
+    cmd.args(defines);
     // SASS→source line mapping for Nsight Compute. Unlike -G this does not
     // change codegen, but keep it opt-in so production cubins stay byte-stable.
     if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
         cmd.arg("-lineinfo");
+    }
+    // Opt-in per-thread register cap for the round-3 occupancy discriminator.
+    // Capping registers lets more blocks reside per SM, tracing the RPX
+    // permutation's throughput-vs-occupancy curve across separate builds (the
+    // production grind kernel cannot carry a per-kernel `__launch_bounds__`, and
+    // it is what this sweep must move). Empty/unset/"0" ⇒ no cap ⇒ production
+    // cubins stay byte-stable, exactly like `-lineinfo` above. Diagnostic only;
+    // never set in a production or bench build.
+    if let Ok(r) = env::var("LAMBDA_VM_RPX_MAXRREGCOUNT")
+        && !r.is_empty()
+        && r != "0"
+    {
+        cmd.arg(format!("-maxrregcount={r}"));
     }
     let status = cmd
         .arg("-o")
@@ -178,13 +192,45 @@ fn main() {
         );
     }
 
-    compile_kernel("arith.cu", "arith.cubin", have_nvcc);
-    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc);
-    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc);
-    compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc);
-    compile_kernel("deep.cu", "deep.cubin", have_nvcc);
-    compile_kernel("fri.cu", "fri.cubin", have_nvcc);
-    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc);
-    compile_kernel("logup.cu", "logup.cubin", have_nvcc);
-    compile_kernel("constraint_interp.cu", "constraint_interp.cubin", have_nvcc);
+    compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
+    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
+    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc, &[]);
+    let bary_define = format!("-DBARY_MAX_K={BARY_MAX_EVAL_POINTS}");
+    compile_kernel(
+        "barycentric.cu",
+        "barycentric.cubin",
+        have_nvcc,
+        &[&bary_define],
+    );
+    compile_kernel("deep.cu", "deep.cubin", have_nvcc, &[]);
+    compile_kernel("fri.cu", "fri.cubin", have_nvcc, &[]);
+    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);
+    // RPX256 (XHash12) leaves and parents — the algebraic hash's device
+    // kernels. Pinned on the host by `tests/host_kat/rpx_host_kat.cpp`; the
+    // cubin needs no `-D`: RPX has no compile-time knob.
+    compile_kernel("rpx.cu", "rpx.cubin", have_nvcc, &[]);
+    compile_kernel("logup.cu", "logup.cubin", have_nvcc, &[]);
+    compile_kernel(
+        "constraint_interp.cu",
+        "constraint_interp.cubin",
+        have_nvcc,
+        &[],
+    );
+    // The BLAKE3 kernels' round count is a compile-time knob with the same
+    // polarity as the host tree's `blake3-6round` feature: 7 rounds (standard
+    // BLAKE3) unless the feature selects the 6-round variant. The `.cu` defaults
+    // to 7 on its own, so a stale `-D` can never silently pick 6.
+    // `CARGO_FEATURE_*`, not `cfg!(feature = ..)`: cargo passes a build script
+    // the active features as environment variables and does NOT cfg them into
+    // its compilation, so the `cfg!` form here would silently always be false.
+    let blake3_defines: &[&str] = if env::var_os("CARGO_FEATURE_BLAKE3_6ROUND").is_some() {
+        &["-DBLAKE3_ROUNDS=6"]
+    } else {
+        &[]
+    };
+    compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
+    // The WHIR path's own kernels. They carry no compile-time knob, so they
+    // take the empty define list rather than gaining a second signature.
+    compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
+    compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
 }

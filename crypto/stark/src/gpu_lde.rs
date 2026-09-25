@@ -4,6 +4,21 @@
 //! back to CPU for extension-field columns and small columns where kernel
 //! launch overhead dominates. Produces the same natural-order, non-canonical
 //! LDE evaluations as the CPU path.
+//!
+//! Admission is bytes-aware and the device path, once admitted, is the ONLY
+//! path: see the "Bytes-aware admission" section. A table the device admits
+//! proves on the device or the prove aborts with a diagnostic; host RAM is a
+//! cache, not a compute path, and the one way back to a host commit is the
+//! test-only switch [`TEST_ONLY_HOST_FALLBACK_ENV`].
+//!
+//! The tree-building entries here are generic over a Merkle backend `B` that
+//! they never call: the leaf and parent hashing happens in the `math-cuda`
+//! kernels, and `B` only types the host `MerkleTree` the root is wrapped in.
+//! `B` is therefore bound to [`DeviceTreeBackend`] rather than
+//! `IsMerkleTreeBackend`: its `COMMITMENT_HASH` constant is the dispatch key
+//! handed to `math-cuda` (selecting the keccak or the BLAKE3 kernel family at
+//! every leaf, level and FRI-layer launch), so the label cannot disagree with
+//! the kernel that produced the bytes.
 
 use core::mem::transmute_copy;
 use std::any::TypeId;
@@ -20,7 +35,6 @@ use math_cuda::{CudaSlice, CudaStream};
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::proof::Proof;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
@@ -29,11 +43,76 @@ use math::traits::AsBytes;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-use crate::config::{Commitment, FriLayerMerkleTreeBackend};
+use crate::config::{Commitment, CommitmentHash, DeviceTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
 use crate::trace::LDETraceTable;
+
+/// The `math_cuda` dispatch key for a commitment hash.
+///
+/// Total over [`CommitmentHash`], so a variant added there without a
+/// [`math_cuda::DeviceHash`] twin fails to compile HERE, naming the gap, rather
+/// than at whatever `match` first meets it. Every tree entry point below
+/// dispatches on the result, and `math-cuda` either has kernels for the key or
+/// aborts loudly at the first launch — a build must never quietly commit under
+/// a hash the configuration did not name (HASH-PINNING.md), so there is no
+/// byte-hash fallback anywhere on this path.
+const fn device_hash_for(hash: CommitmentHash) -> math_cuda::DeviceHash {
+    match hash {
+        CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
+        CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
+        CommitmentHash::Rpo256 => math_cuda::DeviceHash::Rpo256,
+        CommitmentHash::Rpx256 => math_cuda::DeviceHash::Rpx256,
+        CommitmentHash::Poseidon => math_cuda::DeviceHash::Poseidon,
+    }
+}
+
+/// The inverse of [`device_hash_for`] — total over [`math_cuda::DeviceHash`],
+/// so a device key no commitment hash names fails to compile here too.
+const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
+    match hash {
+        math_cuda::DeviceHash::Keccak256 => CommitmentHash::Keccak256,
+        math_cuda::DeviceHash::Blake3 => CommitmentHash::Blake3,
+        math_cuda::DeviceHash::Rpo256 => CommitmentHash::Rpo256,
+        math_cuda::DeviceHash::Rpx256 => CommitmentHash::Rpx256,
+        math_cuda::DeviceHash::Poseidon => CommitmentHash::Poseidon,
+    }
+}
+
+/// ★ Every [`CommitmentHash`] variant has exactly one [`math_cuda::DeviceHash`]
+/// twin, and the pairing is not crossed.
+///
+/// The two `match`es above being total already proves each side maps
+/// somewhere; this proves the two maps are inverse to each other, which is what
+/// rules out a mis-paired arm (`Rpx256 => DeviceHash::Rpo256`) — the one
+/// editing error that would hand a tree a name its kernels do not deserve once
+/// the algebraic kernels exist. A sixth variant fails `device_hash_for` first
+/// and is added to this list with its arm. Discriminants are compared because
+/// `PartialEq` is not `const`.
+const _: () = {
+    const ALL: [CommitmentHash; 5] = [
+        CommitmentHash::Keccak256,
+        CommitmentHash::Blake3,
+        CommitmentHash::Rpo256,
+        CommitmentHash::Rpx256,
+        CommitmentHash::Poseidon,
+    ];
+    let mut i = 0;
+    while i < ALL.len() {
+        let back = commitment_hash_for(device_hash_for(ALL[i]));
+        assert!(
+            back as u8 == ALL[i] as u8,
+            "a CommitmentHash must round-trip through its DeviceHash twin"
+        );
+        i += 1;
+    }
+};
+
+/// The `math_cuda` dispatch key for `B`'s hash.
+pub(crate) fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
+    device_hash_for(B::COMMITMENT_HASH)
+}
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
 /// `coset_lde_full_expand` completes in a few hundred microseconds and the
@@ -81,6 +160,10 @@ fn gpu_lde_threshold() -> usize {
 /// nothing to fall back to and aborts regardless of the host LDE. Lowering
 /// the commit threshold therefore widens that one abort site even though it
 /// leaves this envelope alone.
+///
+/// Inside the envelope the contract is stricter still: a device-only table's
+/// host recovery is refused in production ([`refuse_host_recovery`]), so a
+/// runtime decline there is an abort with a diagnostic, never a slow prove.
 const DEFAULT_DEVICE_ONLY_MIN_LDE: usize = 1 << 19;
 
 fn gpu_device_only_threshold() -> usize {
@@ -93,8 +176,294 @@ fn gpu_device_only_threshold() -> usize {
     })
 }
 
+// ============================================================================
+// Bytes-aware admission — the ONE predicate every dispatch site consults
+// ============================================================================
+//
+// Two rules decide whether a dispatch may ask the device for anything, and
+// both live here so no site carries a private copy of either:
+//
+// - the row FLOOR (`gpu_lde_threshold`): below it the host path is the faster
+//   one — launch overhead dominates — and taking it is policy, not a fallback;
+// - the bytes CEILING (the card's admission budget): what the site is about to
+//   allocate must fit the card. Width enters here and only here: a `2^21 × 449`
+//   table clears the floor at any width, and used to sail into an allocation
+//   failure that quietly became a host commit.
+//
+// What happens past admission is the other half of the contract. Host RAM is a
+// cache, not a compute path: a table the device ADMITS proves on the device or
+// the prove stops, loudly, with the shape, the bytes and the live VRAM in the
+// message ([`abort_or_test_fallback`]). The only way back to a host commit is
+// the test-only switch [`TEST_ONLY_HOST_FALLBACK_ENV`].
+//
+// LOCKSTEP: [`admit`] is a pure function of `(lde_size, bytes)` and two
+// process constants (the floor, the card's budget). R1 sizes its commit and
+// asks; every handle-bearing site re-derives admission later from the same
+// `lde_size` and its own, smaller, transient, and gets the same answer. Live
+// free memory is deliberately NOT an input: it would let a table admitted at
+// R1 be declined at R4, which for a device-only table is an abort with the
+// work already done. FRI re-derives at width 1 (one ext3 column); the ceiling
+// is an upper bound, so a narrow transient always clears it — a cells FLOOR
+// would degenerate there, which is why the floor stays a row count.
+
+// The arithmetic — the device-set model and the pure predicate — lives in
+// `crate::device_set`, free of the `cuda` gate, because the per-table
+// scheduler's throttle reads the same model on every build. Re-exported here
+// so the dispatch layer's callers keep one path.
+use crate::device_set::BASE_BYTES;
+pub use crate::device_set::{
+    Admission, CommitDeviceSet, admit_bytes, commit_device_set, commit_device_set_rpl, ext3_bytes,
+    full_tree_bytes, tree_bytes_for,
+};
+
+/// The process predicate: `gpu_lde_threshold()` as the floor and the card's
+/// admission budget ([`device_vram_budget_bytes`]: 80% of device memory, or
+/// `LAMBDA_VM_VRAM_BUDGET_MB`) as the ceiling. Both are fixed for the life of
+/// the process, so the same `(lde_size, bytes)` gets the same answer at R1 and
+/// at every later re-derivation.
+pub(crate) fn admit(lde_size: usize, bytes: u64) -> Admission {
+    match device_vram_budget_bytes() {
+        None => Admission::NoDevice,
+        Some(budget) => admit_bytes(lde_size, bytes, gpu_lde_threshold(), budget),
+    }
+}
+
+/// One dispatch's identity for the diagnostics: which device stage, and the
+/// shape it was sized for. The table's NAME is not known at this layer; the
+/// prover's driver re-raises the panic payload with the message intact, and
+/// its own `[gpu]` lines name the table.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DispatchShape<'a> {
+    /// The AIR's name — the prover passes it down so the diagnostic names the
+    /// table at the site, not only in the re-raised payload.
+    pub table: &'a str,
+    pub what: &'static str,
+    pub n: usize,
+    pub base_cols: usize,
+    pub blowup: usize,
+}
+
+/// Why a stage that must run on the device could not.
+#[derive(Debug)]
+pub(crate) enum DevicePathFailure {
+    OverBudget { bytes: u64, budget: u64 },
+    DeviceError(String),
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Live `free / total` device memory for the diagnostics — the one place the
+/// live number is read; admission itself never looks at it (LOCKSTEP).
+fn live_vram_line() -> String {
+    match math_cuda::device::backend()
+        .ok()
+        .and_then(|be| be.device_mem_info())
+    {
+        Some((free, total)) => format!(
+            "live VRAM free {:.2} GiB of {:.2} GiB",
+            gib(free),
+            gib(total)
+        ),
+        None => "live VRAM unavailable".to_string(),
+    }
+}
+
+/// The live device posture every device-path failure reports: free/total VRAM
+/// and the mempool release threshold. Shared by the dispatch layer's aborts and
+/// the prover's clean errors so the two read the same line.
+pub(crate) fn device_path_status() -> String {
+    format!("{}; {}", live_vram_line(), mempool_line())
+}
+
+fn mempool_line() -> String {
+    match math_cuda::device::mempool_release_threshold_bytes() {
+        u64::MAX => "mempool retains freed blocks (release threshold unset)".to_string(),
+        t => format!("mempool release threshold {} MiB", t >> 20),
+    }
+}
+
+/// The diagnostic every abort and every test-only fallback prints: the stage
+/// and shape, the device set term by term, the admission budget, the live
+/// free/total VRAM and the mempool posture.
+fn device_path_diagnostic(
+    shape: &DispatchShape<'_>,
+    set: Option<&CommitDeviceSet>,
+    failure: &DevicePathFailure,
+) -> String {
+    let DispatchShape {
+        table,
+        what,
+        n,
+        base_cols,
+        blowup,
+    } = shape;
+    let reason = match failure {
+        DevicePathFailure::OverBudget { bytes, budget } => format!(
+            "over the VRAM admission budget: needs {bytes} B ({:.2} GiB), budget {budget} B ({:.2} GiB)",
+            gib(*bytes),
+            gib(*budget)
+        ),
+        DevicePathFailure::DeviceError(e) => format!("device error after admission: {e}"),
+    };
+    let set_line = match set {
+        Some(s) => format!(
+            "; device set LDE {:.2} GiB + snapshot {:.2} GiB + tree {:.3} GiB + scratch {:.3} GiB = {:.2} GiB",
+            gib(s.lde_bytes),
+            gib(s.snapshot_bytes),
+            gib(s.tree_bytes),
+            gib(s.scratch_bytes),
+            gib(s.total())
+        ),
+        None => String::new(),
+    };
+    format!(
+        "table {table}: {what}: rows {n} x {base_cols} base cols @ blowup {blowup} (LDE {}); {reason}{set_line}; {}",
+        n.saturating_mul(*blowup),
+        device_path_status()
+    )
+}
+
+/// The test-only switch that turns the loud abort back into the old host
+/// commit. Named so it cannot be read as a production knob; a banner is
+/// printed when it is honoured. Production runs never set it.
+pub const TEST_ONLY_HOST_FALLBACK_ENV: &str = "LAMBDA_VM_TEST_ONLY_HOST_FALLBACK";
+
+/// Whether a device failure may fall back to host compute in this process.
+/// `true` under [`TEST_ONLY_HOST_FALLBACK_ENV`], under the
+/// [`gpu_force_downgrade`] test hook (whose whole purpose is to exercise the
+/// host recovery), and in a `test-cuda-faults` build (the fault-injection
+/// suite asserts on the recoveries). None of the three is a production
+/// configuration; the banner says so once.
+pub(crate) fn test_only_host_fallback() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let by_env = std::env::var(TEST_ONLY_HOST_FALLBACK_ENV).is_ok_and(|v| v != "0");
+        let by_hook = gpu_force_downgrade();
+        let by_feature = cfg!(feature = "test-cuda-faults");
+        let on = by_env || by_hook || by_feature;
+        if on {
+            let why = if by_env {
+                TEST_ONLY_HOST_FALLBACK_ENV
+            } else if by_hook {
+                "LAMBDA_VM_GPU_FORCE_DOWNGRADE"
+            } else {
+                "feature test-cuda-faults"
+            };
+            eprintln!(
+                "[gpu] TEST-ONLY host fallback ENABLED ({why}): a device failure falls back to \
+                 host compute instead of aborting the prove. Never a production configuration."
+            );
+        }
+        on
+    })
+}
+
+/// Refuse the host path — or take it under the test-only switch.
+///
+/// Returns only when [`test_only_host_fallback`] is set, after printing the
+/// diagnostic tagged TEST-ONLY; the caller then returns `None` and its host
+/// arm runs. Otherwise panics with the diagnostic: the prover's driver threads
+/// catch and re-raise it on the calling thread (`run_admitted`), so the prove
+/// stops with the reason instead of finishing hours later on the CPU.
+pub(crate) fn abort_or_test_fallback(
+    shape: &DispatchShape<'_>,
+    set: Option<&CommitDeviceSet>,
+    failure: DevicePathFailure,
+) {
+    let msg = device_path_diagnostic(shape, set, &failure);
+    if test_only_host_fallback() {
+        eprintln!("[gpu] TEST-ONLY host fallback: {msg}");
+        return;
+    }
+    panic!("[gpu] ABORT: the device path is the production path and it is unavailable — {msg}");
+}
+
+/// R1 commit admission: `None` when the device is absent or the table is
+/// below the floor (the host commit is the right one), `Some(())` when
+/// admitted. Over budget is an abort — or, under the test-only switch, a
+/// reported host commit.
+fn admit_commit(lde_size: usize, shape: &DispatchShape<'_>, set: &CommitDeviceSet) -> Option<()> {
+    match admit(lde_size, set.total()) {
+        Admission::NoDevice | Admission::BelowFloor { .. } => None,
+        Admission::Admitted { .. } => Some(()),
+        Admission::OverBudget { bytes, budget } => {
+            abort_or_test_fallback(
+                shape,
+                Some(set),
+                DevicePathFailure::OverBudget { bytes, budget },
+            );
+            None
+        }
+    }
+}
+
+/// [`admit_commit`] for an input that is ALREADY resident on device (the
+/// LogUp aux build's `ResidentAux`): no row floor — the data is there, and a
+/// decline would not be "take the faster host path" but "download it to
+/// commit on the host" — only the bytes ceiling.
+fn admit_resident_commit(shape: &DispatchShape<'_>, set: &CommitDeviceSet) -> Option<()> {
+    let budget = device_vram_budget_bytes()?;
+    match admit_bytes(usize::MAX, set.total(), 0, budget) {
+        Admission::OverBudget { bytes, budget } => {
+            abort_or_test_fallback(
+                shape,
+                Some(set),
+                DevicePathFailure::OverBudget { bytes, budget },
+            );
+            None
+        }
+        _ => Some(()),
+    }
+}
+
+/// Admission for the R2–R4 transients (parts LDE, trees, DEEP, FRI, the
+/// inverted denominators): `true` when admitted. A decline is the caller's
+/// documented host arm; over budget is reported so it is never a silent one.
+/// Whether that arm may run at all is decided downstream, where a device-only
+/// table's recovery goes through [`refuse_host_recovery`].
+fn admit_transient(lde_size: usize, bytes: u64, what: &str) -> bool {
+    match admit(lde_size, bytes) {
+        Admission::Admitted { .. } => true,
+        Admission::NoDevice | Admission::BelowFloor { .. } => false,
+        Admission::OverBudget { bytes, budget } => {
+            eprintln!(
+                "[gpu] {what} declined at LDE {lde_size}: over the VRAM admission budget \
+                 (needs {bytes} B = {:.2} GiB, budget {budget} B = {:.2} GiB); the host arm runs",
+                gib(bytes),
+                gib(budget)
+            );
+            false
+        }
+    }
+}
+
+/// The gate on every "download the resident data and continue on the host"
+/// recovery of a device-only table. In production that recovery IS the
+/// failure to report: it aborts here with the shape and the live VRAM. Under
+/// the test-only switch it prints the same line tagged TEST-ONLY and returns,
+/// and the recovery proceeds.
+fn refuse_host_recovery(what: &str, rows: usize, main_cols: usize, aux_cols: usize) {
+    let msg = format!(
+        "{what}: rows {rows} main cols {main_cols} aux cols {aux_cols}; {}",
+        device_path_status()
+    );
+    if test_only_host_fallback() {
+        eprintln!("[gpu] TEST-ONLY host recovery: {msg}");
+        return;
+    }
+    panic!(
+        "[gpu] ABORT: a device-only table would continue on the HOST (host RAM is a cache, \
+         not a compute path) — {msg}"
+    );
+}
+
 /// Test hook: decline the device R2 path unconditionally so device-only
 /// tables exercise the [`materialize_lde_trace_host`] recovery end to end.
+/// Setting it also enables the test-only host fallback
+/// ([`test_only_host_fallback`]) — the recovery it exists to exercise would
+/// otherwise abort.
 pub(crate) fn gpu_force_downgrade() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LAMBDA_VM_GPU_FORCE_DOWNGRADE").is_ok_and(|v| v != "0"))
@@ -166,21 +535,43 @@ pub fn reset_all_gpu_call_counters() {
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
+    GPU_CAP_READ_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_COMPOSITION_PARTS_DOWNLOADS.store(0, Ordering::Relaxed);
-    GPU_GRIND_CALLS.store(0, Ordering::Relaxed);
+    GPU_ONE_ROW_TREES.store(0, Ordering::Relaxed);
+    GPU_ONE_ROW_TREE_PEAK_BYTES.store(0, Ordering::Relaxed);
+    GPU_ONE_ROW_FRI_CALLS.store(0, Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    crypto::grinding::reset_gpu_grind_calls();
 }
 
-/// Successful GPU proof-of-work grind dispatches — one per table whose round-4
-/// nonce search ran on device and produced a nonce that passed the host
-/// validity check (a device miss or an invalid kernel result falls back to the
-/// CPU search and is not counted).
-pub(crate) static GPU_GRIND_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Successful GPU proof-of-work grind dispatches on the KECCAK kernel. Counted
+/// by [`crypto::grinding`], which owns the dispatch both provers share.
+///
+/// ⚠ Keccak only. A proof under an algebraic pin increments
+/// [`gpu_grind_calls_rpx`] instead, and reading this one alone would report
+/// ZERO for a run whose every grind reached the device.
 pub fn gpu_grind_calls() -> u64 {
-    GPU_GRIND_CALLS.load(Ordering::Relaxed)
+    #[cfg(feature = "cuda")]
+    return crypto::grinding::gpu_grind_calls();
+    #[cfg(not(feature = "cuda"))]
+    return 0;
+}
+
+/// Successful GPU proof-of-work grind dispatches on the RPX kernel.
+///
+/// ★ This is the falsifier for the whole algebraic grind path. Both arms return
+/// a valid nonce whether or not the device ran, so a zero here on a block proved
+/// under the RPX pin means every grind fell to the host rayon search — ~2^20 RPX
+/// permutations per table per epoch — with nothing failing and no other signal.
+pub fn gpu_grind_calls_rpx() -> u64 {
+    #[cfg(feature = "cuda")]
+    return crypto::grinding::gpu_grind_calls_rpx();
+    #[cfg(not(feature = "cuda"))]
+    return 0;
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -222,6 +613,15 @@ pub fn gpu_composition_calls() -> u64 {
 pub(crate) static GPU_OPENING_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_opening_gather_calls() -> u64 {
     GPU_OPENING_GATHER_CALLS.load(Ordering::Relaxed)
+}
+
+/// Merkle caps read off a device-resident tree ([`read_cap_dev`]) — one per
+/// capped tree whose nodes live on the device (main, aux, composition, FRI
+/// layer). Zero under the default format, where no tree is capped; under a
+/// cap policy a device prove with this at zero never took the device arm.
+pub(crate) static GPU_CAP_READ_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_cap_read_calls() -> u64 {
+    GPU_CAP_READ_CALLS.load(Ordering::Relaxed)
 }
 
 /// Tables whose round-1 LDE was kept device-only (host trace D2H skipped) — the
@@ -288,15 +688,14 @@ pub(crate) fn device_only_disabled() -> bool {
 /// requires.
 ///
 /// If a precondition is nonetheless violated at runtime (mis-gate or
-/// transient GPU error), what happens depends on the round. R2 and the R1
-/// resident-aux commit recover: they download what the host arms need (the
-/// resident LDEs at R2, the resident aux trace plus the main LDE at R1), bump
-/// their site's counter ([`GPU_DEVICE_ONLY_DOWNGRADES`] at R2,
-/// [`GPU_RESIDENT_AUX_DOWNGRADES`] at R1) and continue host-backed — slower,
-/// never wrong — aborting only when the resident handles cannot serve the
-/// data. R3 and R4 have no such recovery: the R3 barycentric arms assert on
-/// the buffer they are about to read and the R4 guards on `host_trace_empty`,
-/// both failing loudly rather than reading an empty host trace.
+/// transient GPU error), the table's recovery reaches
+/// [`refuse_host_recovery`]: in production that is a loud abort with the shape
+/// and the live VRAM — host RAM is a cache, not a compute path. Under the
+/// test-only fallback ([`test_only_host_fallback`]) R2 downloads what the host
+/// arms need (the resident LDEs), bumps [`GPU_DEVICE_ONLY_DOWNGRADES`] and
+/// continues host-backed; the R1 resident-aux commit has no host recovery at
+/// all (a decline after the drain-and-retry is a `ProvingError::DevicePath`),
+/// and R3 and R4 assert on the buffer they are about to read.
 ///
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
@@ -381,7 +780,11 @@ where
     }
     let n = columns[0].len();
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
+    // One fresh LDE output per column on device.
+    let bytes = (lde_size as u64)
+        .saturating_mul(columns.len() as u64)
+        .saturating_mul(BASE_BYTES);
+    if !admit(lde_size, bytes).is_admitted() {
         return LayoutDispatch::Skip;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
@@ -409,7 +812,8 @@ where
     }
     let n = columns[0].len();
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
+    // One fresh ext3 LDE output per column on device.
+    if !admit(lde_size, ext3_bytes(lde_size as u64, columns.len() as u64)).is_admitted() {
         return LayoutDispatch::Skip;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
@@ -626,13 +1030,15 @@ where
     let n = h0.len();
     let blowup = 2; // extend_half_to_lde extends N → 2N always
     let lde_size = n * blowup;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    // Two ext3 inputs staged and two ext3 LDE outputs allocated on device.
+    let bytes = ext3_bytes(lde_size as u64, 2).saturating_add(ext3_bytes(n as u64, 2));
+    if !admit_transient(lde_size, bytes, "R2 extend-halves") {
         return None;
     }
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -693,10 +1099,11 @@ where
 }
 
 /// Shared admission gate for the device composition-parts producers: the tower
-/// must be the Goldilocks/ext3 pair the kernels are written for, and the LDE must
-/// be a power of two at or above the commit threshold. Returns the validated LDE
-/// size so callers can derive from it. Kept in one place so a future condition
-/// (a VRAM check, a tower widening) cannot land on only one of the d=1/d=2 arms.
+/// must be the Goldilocks/ext3 pair the kernels are written for, the LDE must
+/// be a power of two, and the two ext3 part slabs the decompose allocates must
+/// clear [`admit`]. Returns the validated LDE size so callers can derive from
+/// it. Kept in one place so a future condition (a tower widening) cannot land
+/// on only one of the d=1/d=2 arms.
 fn dev_comp_parts_gate<F, E>(num_rows: usize) -> Option<usize>
 where
     F: IsField + 'static,
@@ -708,7 +1115,10 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if num_rows < gpu_lde_threshold() || !num_rows.is_power_of_two() {
+    if !num_rows.is_power_of_two() {
+        return None;
+    }
+    if !admit_transient(num_rows, ext3_bytes(num_rows as u64, 2), "R2 decompose") {
         return None;
     }
     Some(num_rows)
@@ -863,7 +1273,110 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 /// Merkle → single D2H. Keeps the Merkle tree resident on device (in the
 /// handle's `.tree`); the returned host `MerkleTree` is root only, so query
 /// openings gather paths from the device tree via [`gather_proofs_dev`].
+#[allow(clippy::too_many_arguments)]
+/// Commit ONE preprocessed column group on the device: coset LDE, leaf hash and
+/// Merkle tree in a single fused call, returning only the root.
+///
+/// # Why this exists
+///
+/// `prover::lfm::registry::build_artifacts_with_hasher` commits every program's
+/// instruction column groups on the HOST — interpolate, coset-expand, Merkle —
+/// and lane P measured that at 12.6 s per epoch wrap and 22.0 s per interior
+/// node, the largest phase of the recursion pipeline, while the card sat at
+/// 1 MiB and 0%. The identical operation on the main trace already runs on the
+/// device inside `r1_main_commit`. This is the entry point that lets the
+/// artifact build reach it, and it is a `pub` wrapper rather than a visibility
+/// change because the caller lives in another crate and should see one named
+/// function, not the dispatch layer's internals.
+///
+/// # What it returns, and what it does NOT
+///
+/// The ROOT, and nothing else. The Merkle tree stays resident on the device
+/// inside the handle, which is dropped here — the artifact build wants the root
+/// (it goes into `lfm_program_id` and the AIR's declared commitment) and has no
+/// use for the nodes.
+///
+/// ⚠ That means this does NOT feed the process-wide precomputed-tree cache, and
+/// deliberately so: `precomputed_tree_cache_put` takes a FULL host tree because
+/// `multi_prove` opens against it, and a root-only tree in that cache would be a
+/// tree that cannot answer a query. `multi_prove` builds and caches its own
+/// precomputed tree on the device already (`try_expand_split_trees_row_major_keep`
+/// with `build_precomputed`), so nothing here is lost by staying out of it.
+///
+/// # The roots must match the host's, and a production invariant already says
+/// they do
+///
+/// The host commits with `commit_bit_reversed_with::<_, H::Batched<F>>(evals,
+/// ROWS_PER_LEAF)`. The device builds its leaves from the row-major LDE. These
+/// are already required to agree: `multi_prove` rebuilds the precomputed tree on
+/// the device from the row-major main trace and REFUSES the proof when its root
+/// differs from the one the AIR declares (`ProvingError::PrecomputedCommitmentMismatch`),
+/// and for an LFM proof the declared root is exactly what the host artifact build
+/// produced. Every GPU recursion proof passes that check today. The six
+/// `registry_drift_*` tests are the gate that keeps it true for this caller.
+///
+/// `None` means the device declined — admission said no, the field is not
+/// Goldilocks, or the shape is degenerate — and the caller must commit on the
+/// host. That is the same contract every other entry point in this module has.
+pub fn try_commit_row_major<F, B>(
+    table: &str,
+    row_major: &[FieldElement<F>],
+    rows: usize,
+    cols: usize,
+    blowup_factor: usize,
+    coset_offset: &FieldElement<F>,
+) -> Option<Commitment>
+where
+    F: IsFFTField + 'static,
+    B: DeviceTreeBackend,
+{
+    try_commit_row_major_with::<F, B>(table, row_major, rows, cols, blowup_factor, coset_offset, 2)
+}
+
+/// [`try_commit_row_major`] with `rows_per_leaf` rows per Merkle leaf: 2 is
+/// today's row pair, 1 the S2 one-row root (the host twin is
+/// `commit_bit_reversed_with(.., rows_per_leaf)`).
+pub fn try_commit_row_major_with<F, B>(
+    table: &str,
+    row_major: &[FieldElement<F>],
+    rows: usize,
+    cols: usize,
+    blowup_factor: usize,
+    coset_offset: &FieldElement<F>,
+    rows_per_leaf: usize,
+) -> Option<Commitment>
+where
+    F: IsFFTField + 'static,
+    B: DeviceTreeBackend,
+{
+    if rows == 0 || cols == 0 || row_major.len() != rows * cols {
+        return None;
+    }
+    // ⛔ The weights come from the prover's own derivation, not a second copy —
+    // they carry the iFFT normalization, so a divergence here is a divergence in
+    // the roots.
+    let weights = crate::prover::coset_weights::<F>(rows, coset_offset);
+    let (tree, _handle, _lde) = try_expand_leaf_and_tree_row_major_keep::<F, F, B>(
+        table,
+        "LFM artifact prep commit",
+        row_major,
+        None,
+        rows,
+        cols,
+        blowup_factor,
+        &weights,
+        // The artifact build never reads the evaluations — only the root — so
+        // the row-major D2H is skipped entirely.
+        false,
+        rows_per_leaf,
+    )?;
+    Some(tree.root)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
+    table: &str,
+    what: &'static str,
     row_major: &[FieldElement<E>],
     predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
@@ -871,6 +1384,7 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     retain_host_lde: bool,
+    rows_per_leaf: usize,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeBase,
@@ -879,12 +1393,8 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -894,6 +1404,20 @@ where
     if row_major.len() != n * m || m == 0 || n == 0 {
         return None;
     }
+    let lde_size = n.saturating_mul(blowup_factor);
+    // ⛔ `what` is a PARAMETER because this call now has two callers with two
+    // different stories. An abort diagnostic naming "R1 main commit" for an
+    // artifact-prep commit would send the reader to the prove, which is not
+    // where the failure is.
+    let shape = DispatchShape {
+        table,
+        what,
+        n,
+        base_cols: m,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set_rpl(n, m, blowup_factor, true, rows_per_leaf);
+    admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
@@ -901,19 +1425,32 @@ where
     GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1, set.tree_bytes);
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
-    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_rpl(
         raw,
         predev,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
         &weights_u64,
         retain_host_lde,
-    )
-    .ok()?;
+        rows_per_leaf,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -937,7 +1474,7 @@ where
 /// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
 fn tree_from_node_bytes<B>(nodes: Vec<u8>) -> Option<MerkleTree<B>>
 where
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
     debug_assert_eq!(nodes.len() % 32, 0);
     let nodes: Vec<[u8; 32]> = nodes
@@ -968,6 +1505,7 @@ where
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
+    table: &str,
     row_major: &[FieldElement<E>],
     predev: Option<&math_cuda::CudaSlice<u64>>,
     n: usize,
@@ -977,6 +1515,7 @@ pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
     split_col: usize,
     build_precomputed: bool,
     want_host: bool,
+    rows_per_leaf: usize,
 ) -> Option<(
     Option<MerkleTree<B>>,
     MerkleTree<B>,
@@ -986,12 +1525,8 @@ pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1004,6 +1539,16 @@ where
     if split_col == 0 || split_col >= m {
         return None;
     }
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        table,
+        what: "R1 main commit (preprocessed split)",
+        n,
+        base_cols: m,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set_rpl(n, m, blowup_factor, true, rows_per_leaf);
+    admit_commit(lde_size, &shape, &set)?;
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
@@ -1011,10 +1556,13 @@ where
     GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1 + build_precomputed as u64, set.tree_bytes);
 
-    let (pre_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (pre_nodes, handle, lde_u64) = match math_cuda::lde::coset_lde_row_major_split_trees_rpl(
         raw,
         predev,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
@@ -1022,8 +1570,18 @@ where
         split_col,
         build_precomputed,
         want_host,
-    )
-    .ok()?;
+        rows_per_leaf,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     let pre_tree = match pre_nodes {
         Some(nodes) => Some(tree_from_node_bytes::<B>(nodes)?),
@@ -1055,13 +1613,16 @@ where
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
+    table: &str,
     row_major: &[FieldElement<E>],
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     retain_host_lde: bool,
+    rows_per_leaf: usize,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeExt3,
@@ -1070,12 +1631,8 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
-    let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1085,27 +1642,50 @@ where
     if row_major.len() != n * m || m == 0 || n == 0 {
         return None;
     }
-
     // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
     let m3 = m * 3;
+    let lde_size = n.saturating_mul(blowup_factor);
+    let shape = DispatchShape {
+        table,
+        what: "R1 aux commit",
+        n,
+        base_cols: m3,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set_rpl(n, m3, blowup_factor, false, rows_per_leaf);
+    admit_commit(lde_size, &shape, &set)?;
+
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m3) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
     GPU_LDE_CALLS.fetch_add((m * 3) as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1, set.tree_bytes);
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
     // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
-    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
+    // Admitted means the device path is the only path: a failure here aborts.
+    let (handle, lde_u64) = match math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_rpl(
         raw,
+        device_hash_of::<B>(),
         n,
         m,
         blowup_factor,
         &weights_u64,
         retain_host_lde,
-    )
-    .ok()?;
+        rows_per_leaf,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_or_test_fallback(
+                &shape,
+                Some(&set),
+                DevicePathFailure::DeviceError(format!("{e:?}")),
+            );
+            return None;
+        }
+    };
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1180,6 +1760,41 @@ where
 static GPU_MERKLE_TREE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_merkle_tree_calls() -> u64 {
     GPU_MERKLE_TREE_CALLS.load(Ordering::Relaxed)
+}
+
+/// S2 one-row trees (`rows_per_leaf = 1`) the device built: trace trees (main,
+/// the preprocessed split's subsets, aux plain and resident), composition
+/// trees, and FRI input trees over the resident DEEP codeword. A one-row table
+/// that fell back to the host leaves this unmoved, so the device-parity tests
+/// assert on it (a fallback is a FAIL, never a pass).
+static GPU_ONE_ROW_TREES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_one_row_trees() -> u64 {
+    GPU_ONE_ROW_TREES.load(Ordering::Relaxed)
+}
+
+/// The largest single one-row tree's node buffer the device was asked for,
+/// in bytes (the admission's own term, `(2 · lde − 1) · 32`) — what a
+/// one-row table adds over its row-pair twin, per tree, for the 0-fallback
+/// gate.
+static GPU_ONE_ROW_TREE_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_one_row_tree_peak_bytes() -> u64 {
+    GPU_ONE_ROW_TREE_PEAK_BYTES.load(Ordering::Relaxed)
+}
+
+/// Device FRI commits under a one-row layout (S2): the input tree committed
+/// from the DEEP codeword on device, then the group chain.
+static GPU_ONE_ROW_FRI_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_one_row_fri_calls() -> u64 {
+    GPU_ONE_ROW_FRI_CALLS.load(Ordering::Relaxed)
+}
+
+/// Count `trees` one-row trees of `tree_bytes` node bytes each (no-op for
+/// row pairs).
+fn note_one_row_trees(rows_per_leaf: usize, trees: u64, tree_bytes: u64) {
+    if rows_per_leaf == 1 {
+        GPU_ONE_ROW_TREES.fetch_add(trees, Ordering::Relaxed);
+        GPU_ONE_ROW_TREE_PEAK_BYTES.fetch_max(tree_bytes, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -1303,10 +1918,11 @@ where
 /// recomputes on CPU.
 pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
     lde_parts: &[Vec<FieldElement<E>>],
+    rows_per_leaf: usize,
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
     if lde_parts.is_empty() {
         return None;
@@ -1315,10 +1931,14 @@ where
     if !lde_size.is_power_of_two() || lde_size < 2 {
         return None;
     }
-    if lde_size < gpu_lde_threshold() {
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+    // The parts are re-uploaded (`m` ext3 columns over the LDE) and one full
+    // tree (`rows_per_leaf` rows per leaf) is built.
+    let tree_bytes = tree_bytes_for(lde_size as u64, rows_per_leaf as u64);
+    let bytes = ext3_bytes(lde_size as u64, lde_parts.len() as u64).saturating_add(tree_bytes);
+    if !admit_transient(lde_size, bytes, "R2 composition tree") {
         return None;
     }
     // All parts must have the same LDE length.
@@ -1339,12 +1959,33 @@ where
     // Keep the composition tree resident on device, so the whole tree copy to
     // host is eliminated. R4 composition openings gather paths from the device
     // tree (`gather_proofs_dev`); the returned host tree is root only.
-    let dev_tree = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts) {
+    let dev_tree = match match device_hash_of::<B>() {
+        math_cuda::DeviceHash::Keccak256 => {
+            math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep_rpl(
+                &raw_parts,
+                rows_per_leaf,
+            )
+        }
+        math_cuda::DeviceHash::Blake3 => {
+            math_cuda::blake3::build_comp_poly_tree_from_evals_ext3_keep_rpl(
+                &raw_parts,
+                rows_per_leaf,
+            )
+        }
+        math_cuda::DeviceHash::Rpx256 => {
+            math_cuda::rpx::build_comp_poly_tree_from_evals_ext3_keep_rpl(&raw_parts, rows_per_leaf)
+        }
+        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
+            "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
+            B::COMMITMENT_HASH
+        ),
+    } {
         Ok(t) => t,
         Err(_) => return None,
     };
-    debug_assert_eq!(dev_tree.leaves_len, lde_size / 2);
+    debug_assert_eq!(dev_tree.leaves_len, lde_size / rows_per_leaf);
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1, tree_bytes);
     let host = MerkleTree::<B>::from_root(dev_tree.root);
     Some((host, dev_tree))
 }
@@ -1354,29 +1995,64 @@ where
 /// host pack + H2D re-upload of data that is already on device.
 pub(crate) fn try_build_comp_poly_tree_gpu_from_dev<E, B>(
     handle: &math_cuda::lde::GpuLdeExt3,
+    rows_per_leaf: usize,
 ) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    if handle.m == 0 || !handle.lde_size.is_power_of_two() || handle.lde_size < gpu_lde_threshold()
-    {
+    if handle.m == 0 || !handle.lde_size.is_power_of_two() {
+        return None;
+    }
+    // Only the tree is fresh: the parts are already resident.
+    let tree_bytes = tree_bytes_for(handle.lde_size as u64, rows_per_leaf as u64);
+    if !admit_transient(
+        handle.lde_size,
+        tree_bytes,
+        "R2 composition tree (resident parts)",
+    ) {
         return None;
     }
     let be = math_cuda::device::backend().ok()?;
     let stream = be.next_stream();
     handle.wait_ready_on(&stream).ok()?;
-    let dev_tree = math_cuda::merkle::build_comp_poly_tree_from_slabs_dev(
-        &stream,
-        handle.buf.as_ref(),
-        handle.m,
-        handle.lde_size,
-    )
+    let dev_tree = match device_hash_of::<B>() {
+        math_cuda::DeviceHash::Keccak256 => {
+            math_cuda::merkle::build_comp_poly_tree_from_slabs_dev_rpl(
+                &stream,
+                handle.buf.as_ref(),
+                handle.m,
+                handle.lde_size,
+                rows_per_leaf,
+            )
+        }
+        math_cuda::DeviceHash::Blake3 => {
+            math_cuda::blake3::build_comp_poly_tree_from_slabs_dev_rpl(
+                &stream,
+                handle.buf.as_ref(),
+                handle.m,
+                handle.lde_size,
+                rows_per_leaf,
+            )
+        }
+        math_cuda::DeviceHash::Rpx256 => math_cuda::rpx::build_comp_poly_tree_from_slabs_dev_rpl(
+            &stream,
+            handle.buf.as_ref(),
+            handle.m,
+            handle.lde_size,
+            rows_per_leaf,
+        ),
+        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
+            "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
+            B::COMMITMENT_HASH
+        ),
+    }
     .ok()?;
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1, tree_bytes);
     let host = MerkleTree::<B>::from_root(dev_tree.root);
     Some((host, dev_tree))
 }
@@ -1753,28 +2429,25 @@ pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// ([`materialize_lde_trace_host`], the sole function that bumps this —
 /// entered from the R2 host evaluator, the R3 barycentric arms and the R4
 /// DEEP host loop). Nonzero means the device-only gate cleared a table whose
-/// downstream dispatch then declined at runtime — the table continued
-/// host-backed, correct but slower. A count is either a gate miss (a static
-/// condition worth mirroring into the gate) or a transient device decline
-/// (VRAM pressure), which by definition cannot be gated out — see
-/// [`materialize_lde_trace_host`]'s own note. The R1 resident-aux downgrade
-/// is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires on tables
-/// the gate never marked device-only, so summing the two would blame the gate
-/// for declines it never made.
+/// downstream dispatch then declined at runtime. Only reachable under the
+/// test-only host fallback ([`test_only_host_fallback`]): in production the
+/// recovery aborts instead. A count is either a gate miss (a static condition
+/// worth mirroring into the gate) or a transient device decline (VRAM
+/// pressure), which by definition cannot be gated out. The R1 resident-aux
+/// downgrade is counted by [`GPU_RESIDENT_AUX_DOWNGRADES`] instead: it fires
+/// on tables the gate never marked device-only, so summing the two would
+/// blame the gate for declines it never made.
 pub(crate) static GPU_DEVICE_ONLY_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_downgrades() -> u64 {
     GPU_DEVICE_ONLY_DOWNGRADES.load(Ordering::Relaxed)
 }
 
-/// R1 downgrades, and only those: times the resident aux trace was downloaded
-/// so the aux commit could continue on the host arms, after the device aux LDE
-/// declined and the drain-and-retry either did not run or declined again
-/// ([`materialize_aux_trace_host`], the sole site that bumps this). Independent
-/// of the device-only gate — the site is entered whenever `aux_resident()` is
-/// set, whatever the gate said — so a table that was never device-only can land
-/// here, and a nonzero value points at sustained VRAM pressure rather than a
-/// gate miss. Read it against [`GPU_RESIDENT_AUX_RETRIES`]: retries alone mean
-/// the drain absorbed the pressure, retries plus downgrades mean it did not.
+/// R1 resident-aux downgrades. Retired: a resident aux LDE that declines after
+/// the drain-and-retry is now a clean `ProvingError::DevicePath` in the prover
+/// (host RAM is a cache, not a compute path), so nothing bumps this and it
+/// reads zero. The accessor stays for the integration suite's assertion that
+/// it IS zero. Read [`GPU_RESIDENT_AUX_RETRIES`] for the pressure signal:
+/// retries mean the drain absorbed a transient decline.
 pub(crate) static GPU_RESIDENT_AUX_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_resident_aux_downgrades() -> u64 {
     GPU_RESIDENT_AUX_DOWNGRADES.load(Ordering::Relaxed)
@@ -1806,15 +2479,20 @@ pub fn gpu_resident_aux_retries() -> u64 {
 /// Recover a device-only table for the host path: download the resident main
 /// and aux LDEs from their device handles into the host buffers and clear the
 /// device-only flag. A side whose host buffer is already populated (a mixed
-/// state: one commit fell back to CPU while the other stayed device-only) is
-/// kept as is — only the missing side is downloaded. The class-level safety
-/// net under the device-only gate — a static predicate can never mirror every
-/// reason a dynamic dispatch might decline (kernel eligibility, transient
-/// errors, shapes a new workload brings), so any miss lands here and degrades
-/// to a slower-but-correct CPU round instead of a hard abort. Returns false
-/// (→ the caller's abort) when the resident handles cannot serve the data: a
-/// missing handle or bound stream, a handle whose shape disagrees with the
-/// trace, a failed download or sync, or a field tower with no CUDA lowering.
+/// state: one side's dispatch declined below the device-only envelope while
+/// the other stayed device-only) is kept as is — only the missing side is
+/// downloaded.
+///
+/// In production this recovery does not run: host RAM is a cache, not a
+/// compute path, so a device-only table whose downstream dispatch declined is
+/// a failure to report, and [`refuse_host_recovery`] aborts here with the
+/// shape and the live VRAM. Under the test-only switch
+/// ([`test_only_host_fallback`]) the download proceeds and the table continues
+/// on the host arms — the fault-injection suites assert on exactly that.
+/// Returns false (→ the caller's abort) when the resident handles cannot serve
+/// the data: a missing handle or bound stream, a handle whose shape disagrees
+/// with the trace, a failed download or sync, or a field tower with no CUDA
+/// lowering.
 pub(crate) fn materialize_lde_trace_host<F, E>(
     lde_trace: &mut crate::trace::LDETraceTable<F, E>,
 ) -> bool
@@ -1825,6 +2503,12 @@ where
     if !lde_trace.host_trace_empty() {
         return true;
     }
+    refuse_host_recovery(
+        "R2/R3/R4 host arm on a device-only trace",
+        lde_trace.num_rows(),
+        lde_trace.num_main_cols(),
+        lde_trace.num_aux_cols(),
+    );
     if !is_goldilocks_ext3_tower::<F, E>() {
         return false;
     }
@@ -1872,7 +2556,7 @@ where
             }
             let (m, lde) = (h.m, h.lde_size);
             // Short download: degrade like the sibling paths
-            // (`download_main_lde_row_major`, `materialize_aux_trace_host`)
+            // (`download_main_lde_row_major`, `download_composition_parts_host`)
             // rather than panic on the slab slicing below.
             if slabs.len() != m * lde * 3 {
                 return false;
@@ -1979,49 +2663,6 @@ where
             v.capacity(),
         )
     })
-}
-
-/// R1 counterpart of [`materialize_lde_trace_host`]: download the resident
-/// aux trace (already row-major ext3, matching the host layout) into the
-/// trace's aux table, so the aux commit continues on the host arms when the
-/// device aux LDE declines at runtime.
-pub(crate) fn materialize_aux_trace_host<F, E>(trace: &mut crate::trace::TraceTable<F, E>) -> bool
-where
-    F: IsField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
-{
-    if !is_goldilocks_ext3_tower::<F, E>() {
-        return false;
-    }
-    let (buf, rows, cols) = match trace.aux_resident.as_ref() {
-        Some(ra) => (ra.buf.clone(), ra.num_rows, ra.num_aux_cols),
-        None => return false,
-    };
-    let Ok(be) = math_cuda::device::backend() else {
-        return false;
-    };
-    let stream = be.next_stream();
-    let Ok(raw) = stream.clone_dtoh(buf.as_ref()) else {
-        return false;
-    };
-    if stream.synchronize().is_err() || raw.len() != rows * cols * 3 {
-        return false;
-    }
-    let data = u64_to_ext3_vec::<E>(&raw);
-    trace.aux_table = crate::table::Table::new(data, cols);
-    trace.num_aux_columns = cols;
-    // The declined device LDE attempt can leave kernels enqueued on another
-    // stream still reading this buffer; its owning stream is long idle, so
-    // dropping here would complete the stream-ordered free immediately and
-    // the pool could hand the memory to a concurrent table's allocation
-    // while those kernels run. Drain the device before the drop — this is a
-    // rare recovery path.
-    if be.ctx.synchronize().is_err() {
-        return false;
-    }
-    trace.aux_resident = None;
-    GPU_RESIDENT_AUX_DOWNGRADES.fetch_add(1, Ordering::Relaxed);
-    true
 }
 
 /// Diagnostic: download a resident ext3 handle (3-slab layout) as per-column
@@ -2157,6 +2798,12 @@ where
     let Some(h) = lde_trace.gpu_composition_parts() else {
         return false;
     };
+    refuse_host_recovery(
+        "host consumer of the composition parts on a device-only table",
+        h.lde_size,
+        lde_trace.num_main_cols(),
+        lde_trace.num_aux_cols(),
+    );
     let Some(stream) = lde_trace.bound_stream() else {
         return false;
     };
@@ -2276,9 +2923,6 @@ where
         return None;
     }
     let lde_size = domain_size.checked_mul(blowup_factor)?;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
@@ -2286,6 +2930,12 @@ where
         return None;
     }
     let m = parts_coefs.len();
+    // `m` ext3 coefficient inputs staged and `m` ext3 LDE parts kept resident.
+    let bytes = ext3_bytes(lde_size as u64, m as u64)
+        .saturating_add(ext3_bytes(domain_size as u64, m as u64));
+    if !admit_transient(lde_size, bytes, "R2 parts LDE") {
+        return None;
+    }
 
     let mut weights_u64 = Vec::with_capacity(domain_size);
     let mut w = FieldElement::<F>::one();
@@ -2354,10 +3004,12 @@ unsafe fn ext3_slice_to_u64<E: IsField>(col: &[FieldElement<E>]) -> &[u64] {
 /// The resident buffer is only borrowed: the device-input LDE copies it
 /// device-to-device into its own scratch, so `ra` stays valid afterwards.
 pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
+    table: &str,
     ra: &math_cuda::logup::ResidentAux,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
     retain_host_lde: bool,
+    rows_per_leaf: usize,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeExt3,
@@ -2366,30 +3018,53 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
 where
     F: IsField + 'static,
     E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
     {
         return None;
     }
+    // No row floor: the aux trace is already on device. Only the bytes
+    // ceiling — a resident input that will not fit its own LDE is an abort.
+    let shape = DispatchShape {
+        table,
+        what: "R1 aux commit (resident)",
+        n: ra.num_rows,
+        base_cols: ra.num_aux_cols * 3,
+        blowup: blowup_factor,
+    };
+    let set = commit_device_set_rpl(
+        ra.num_rows,
+        ra.num_aux_cols * 3,
+        blowup_factor,
+        false,
+        rows_per_leaf,
+    );
+    admit_resident_commit(&shape, &set)?;
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
     GPU_LDE_CALLS.fetch_add((ra.num_aux_cols * 3) as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    note_one_row_trees(rows_per_leaf, 1, set.tree_bytes);
 
-    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev_rpl(
         &ra.buf,
+        device_hash_of::<B>(),
         ra.num_rows,
         ra.num_aux_cols,
         blowup_factor,
         &weights_u64,
         retain_host_lde,
+        rows_per_leaf,
     )
     .inspect_err(|e| {
-        // Surface the swallowed driver error (e.g. OOM): the caller drains
-        // the device and retries, then downgrades the table to the host path.
+        // Surface the swallowed driver error (e.g. OOM): the caller drains the
+        // device and retries — a device-side recovery, which is why this is a
+        // decline and not an abort. If the retry declines too, the caller
+        // reports the failure (`ProvingError::DevicePath`); there is no host
+        // downgrade any more.
         eprintln!(
             "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
             ra.num_rows, ra.num_aux_cols, blowup_factor
@@ -2474,9 +3149,6 @@ where
     }
     let main = lde_trace.gpu_main()?;
     let lde_size = main.lde_size;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
     if !lde_size.is_power_of_two() {
         return None;
     }
@@ -2486,6 +3158,12 @@ where
     let num_total_cols = num_main + num_aux;
     let num_parts = composition_poly_gammas.len();
     if h_ood.len() != num_parts {
+        return None;
+    }
+    // The DEEP codeword, plus — on the host arms — the parts and the inverted
+    // denominators staged onto the device (an upper bound over the three arms).
+    let bytes = ext3_bytes(lde_size as u64, (2 + num_parts + num_eval_points) as u64);
+    if !admit_transient(lde_size, bytes, "R4 DEEP") {
         return None;
     }
     if trace_ood_columns.len() != num_total_cols
@@ -2680,7 +3358,15 @@ where
     }
     let main = lde_trace.gpu_main()?;
     let lde_size = main.lde_size;
-    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
+    if !lde_size.is_power_of_two() {
+        return None;
+    }
+    // Everything is resident but the DEEP codeword itself.
+    if !admit_transient(
+        lde_size,
+        ext3_bytes(lde_size as u64, 1),
+        "R4 DEEP (resident)",
+    ) {
         return None;
     }
     let num_main = main.m;
@@ -2774,7 +3460,9 @@ where
         return None;
     }
     let total = n.checked_mul(k_scalars)?;
-    if total < gpu_lde_threshold() {
+    // The inverted denominators (`total` ext3) plus the coset points.
+    let bytes = ext3_bytes(total as u64, 1).saturating_add((n as u64).saturating_mul(BASE_BYTES));
+    if !admit_transient(total, bytes, "batch invert") {
         return None;
     }
 
@@ -2935,6 +3623,60 @@ pub(crate) fn gather_proofs_dev(
     Some(proofs)
 }
 
+/// Read the height-`cap_height` Merkle cap of a device-resident tree: the
+/// nodes `MerkleTree::cap` returns on the host tree,
+/// byte for byte, since the device heap has the host layout. The R4 cap
+/// post-pass calls it for every capped tree whose host tree is root-only.
+///
+/// Fails closed with a message, never a panic: a cap taller than the tree or a
+/// cudarc error is an `Err` the caller turns into a `ProvingError`. `stream`
+/// is the stream the tree's own openings were gathered on (the table's bound
+/// stream; a fresh backend stream for the FRI layers, as the FRI query phase
+/// uses).
+pub(crate) fn read_cap_dev(
+    tree: &math_cuda::lde::GpuMerkleTree,
+    cap_height: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<Commitment>, String> {
+    if !tree.leaves_len.is_power_of_two() {
+        return Err(format!(
+            "device tree has {} leaves, not a power of two",
+            tree.leaves_len
+        ));
+    }
+    let depth = tree.leaves_len.trailing_zeros() as usize;
+    if cap_height > depth {
+        return Err(format!(
+            "cap height {cap_height} exceeds the device tree depth {depth}"
+        ));
+    }
+    if tree.nodes.len() < ((2usize << cap_height) - 1) * 32 {
+        return Err(format!(
+            "device node buffer of {} bytes is too short for a height-{cap_height} cap",
+            tree.nodes.len()
+        ));
+    }
+    let bytes = math_cuda::merkle::read_cap_dev(&tree.nodes, tree.leaves_len, cap_height, stream)
+        .map_err(|e| format!("cudarc: {e:?}"))?;
+    let cap: Vec<Commitment> = bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut node: Commitment = [0u8; 32];
+            node.copy_from_slice(c);
+            node
+        })
+        .collect();
+    if cap.len() != 1 << cap_height {
+        return Err(format!(
+            "device cap read returned {} nodes, expected {}",
+            cap.len(),
+            1usize << cap_height
+        ));
+    }
+    GPU_CAP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    Ok(cap)
+}
+
 /// R3 OOD device-side context: bundles the inverted denominators, the
 /// coset_points upload (used by every barycentric kernel for this batch),
 /// and the stream so producer + consumers serialize naturally. Hoisting
@@ -2976,7 +3718,9 @@ where
         return None;
     }
     let total = n.checked_mul(k_scalars)?;
-    if total < gpu_lde_threshold() {
+    // The inverted denominators (`total` ext3) plus the coset points.
+    let bytes = ext3_bytes(total as u64, 1).saturating_add((n as u64).saturating_mul(BASE_BYTES));
+    if !admit_transient(total, bytes, "R3 context") {
         return None;
     }
 
@@ -3024,25 +3768,95 @@ where
 /// a byte-identical pre-GPU transcript state and produces the same proof
 /// it would have produced had the GPU never been tried. This requires the
 /// concrete transcript type to support snapshot semantics via `Clone`.
-#[allow(clippy::type_complexity)]
-pub(crate) fn try_fri_commit_gpu<F, E, T>(
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn try_fri_commit_gpu<F, E, T, B>(
     evals: &[FieldElement<E>],
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     inv_twiddles: &[FieldElement<F>],
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    // Host-evals entry: the caller works with host copies, keep draining them.
+    try_fri_commit_gpu_evals::<F, E, T, B>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+        true,
+    )
+}
+
+/// [`try_fri_commit_gpu`] with the layers' host copies optional: `want_host =
+/// false` keeps each committed layer's evals resident only (`gpu_evals`), the
+/// shape the device-only envelope produces — so the device query phase's
+/// resident gathers can be tested from host evals.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn try_fri_commit_gpu_resident<F, E, T, B>(
+    evals: &[FieldElement<E>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    try_fri_commit_gpu_evals::<F, E, T, B>(
+        evals,
+        transcript,
+        coset_offset,
+        domain_size,
+        blowup_log,
+        final_poly_log_degree,
+        layout,
+        inv_twiddles,
+        false,
+    )
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn try_fri_commit_gpu_evals<F, E, T, B>(
+    evals: &[FieldElement<E>],
+    transcript: &mut T,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    inv_twiddles: &[FieldElement<F>],
+    want_host: bool,
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
 {
     // GPU drives the early-termination FRI commit phase, mirroring
     // `commit_phase_from_evaluations`: for each committed layer (sample zeta,
@@ -3058,7 +3872,14 @@ where
     if n0 != domain_size || !n0.is_power_of_two() || n0 < 2 {
         return None;
     }
-    if n0 < gpu_lde_threshold() {
+    // The evals upload, the geometric layer chain (bounded by one more
+    // codeword) and the layer trees (bounded by one full tree; under one row
+    // the chain starts at the codeword itself, so by the one-row bound).
+    let bytes = ext3_bytes(n0 as u64, 2).saturating_add(tree_bytes_for(
+        n0 as u64,
+        if layout.one_row { 1 } else { 2 },
+    ));
+    if !admit_transient(n0, bytes, "R4 FRI commit") {
         return None;
     }
     // Mismatched twiddles would panic inside `FriCommitState::new`; gate here
@@ -3082,43 +3903,47 @@ where
     // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
     let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
 
-    let state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
+    let state = match math_cuda::fri::FriCommitState::new(
+        evals_u64,
+        &inv_tw_u64,
+        n0,
+        device_hash_of::<B>(),
+    ) {
         Ok(s) => s,
         Err(_) => return None,
     };
-    // Host-evals entry: the caller works with host copies, keep draining them.
-    fri_commit_gpu_drive(
+    fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
         coset_offset,
         n0,
         blowup_log,
         final_poly_log_degree,
-        true,
+        layout,
+        want_host,
     )
 }
 
 /// [`try_fri_commit_gpu`] entered from a device-resident DEEP codeword
 /// (already in FRI order): no evals H2D at all.
-#[allow(clippy::type_complexity)]
-pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T>(
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(crate) fn try_fri_commit_gpu_from_dev<F, E, T, B>(
     codeword: math_cuda::deep::GpuDeepCodeword,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     inv_twiddles: &[FieldElement<F>],
     want_host: bool,
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
 {
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
@@ -3127,7 +3952,17 @@ where
         return None;
     }
     let n0 = codeword.n;
-    if !n0.is_power_of_two() || n0 < 2 || n0 < gpu_lde_threshold() {
+    if !n0.is_power_of_two() || n0 < 2 {
+        return None;
+    }
+    // The layer chain and its trees; the codeword is already resident. Under
+    // one row the input tree is built over the codeword itself (the one-row
+    // tree bound covers it and every later layer).
+    let bytes = ext3_bytes(n0 as u64, 1).saturating_add(tree_bytes_for(
+        n0 as u64,
+        if layout.one_row { 1 } else { 2 },
+    ));
+    if !admit_transient(n0, bytes, "R4 FRI commit (resident)") {
         return None;
     }
     // Mismatched twiddles would panic inside `FriCommitState::new_dev`;
@@ -3141,44 +3976,54 @@ where
         let v: u64 = unsafe { *(t.value() as *const _ as *const u64) };
         inv_tw_u64.push(v);
     }
-    let state = match math_cuda::fri::FriCommitState::new_dev(codeword, &inv_tw_u64) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    fri_commit_gpu_drive(
+    let state =
+        match math_cuda::fri::FriCommitState::new_dev(codeword, &inv_tw_u64, device_hash_of::<B>())
+        {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+    fri_commit_gpu_drive::<F, E, T, B>(
         state,
         transcript,
         coset_offset,
         n0,
         blowup_log,
         final_poly_log_degree,
+        layout,
         want_host,
     )
 }
 
-/// The shared FRI commit loop over an initialized device state: per committed
-/// layer sample ζ, fold + commit on device, D2H root/evals; then the terminal
-/// fold and CPU coefficient extraction. Restores the transcript and returns
-/// `None` on any mid-loop cudarc failure so the CPU path reruns cleanly.
-#[allow(clippy::type_complexity)]
-fn fri_commit_gpu_drive<F, E, T>(
+/// The shared FRI commit loop over an initialized device state, under the
+/// proof format's fold `layout` (the caller's, built for this codeword by
+/// [`crate::fri::terminal::FriFoldLayout::for_options`]): per committed layer
+/// sample ζ, fold + commit on device, D2H root/evals; then the terminal folds
+/// and CPU coefficient extraction. Restores the transcript and returns `None`
+/// on any mid-loop cudarc failure so the CPU path reruns cleanly.
+///
+/// The legacy encoding runs today's loop (one fold and a pair-leaf commit per
+/// layer); the group encoding runs [`fri_commit_gpu_drive_groups`], the device
+/// twin of `commit_phase_with_layout`'s pending-fold loop — one-row layouts
+/// (S2) included, whose layer 0 is the input tree committed from the codeword
+/// itself with no challenge before it.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn fri_commit_gpu_drive<F, E, T, B>(
     mut state: math_cuda::fri::FriCommitState,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     n0: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    layout: &crate::fri::terminal::FriFoldLayout,
     want_host: bool,
-) -> Option<(
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)>
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
 {
     // The unsafe zeta reads below reinterpret `FieldElement<E>` as 3 u64:
     // every caller gates the tower, but assert here so a future caller with
@@ -3195,12 +4040,17 @@ where
     // produced had this dispatch never been called.
     let transcript_snapshot = transcript.clone();
 
-    // Fold layout, shared with the CPU prover and the verifier — see `FriFoldLayout`.
-    let layout = crate::fri::terminal::FriFoldLayout::new(
-        n0.trailing_zeros(),
-        blowup_log,
-        final_poly_log_degree,
-    );
+    // Fold layout, shared with the CPU prover and the verifier — see
+    // `FriFoldLayout`. It must be this codeword's: a layout built for another
+    // size degrades to the CPU path instead of committing a wrong chain.
+    if layout.terminal_len == 0
+        || n0
+            .trailing_zeros()
+            .checked_sub(layout.terminal_len.trailing_zeros())
+            != Some(layout.total_folds)
+    {
+        return None;
+    }
     // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
     // the CPU path (which handles both correctly): tiny clamped traces
     // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
@@ -3209,9 +4059,30 @@ where
     if layout.total_folds == 0 || layout.terminal_len < 2 {
         return None;
     }
+    // One-row layouts are never the legacy encoding (FriFoldLayout: one row ⇒
+    // group encoding), so they always take the group drive below.
+    debug_assert!(!layout.one_row || !layout.is_legacy());
+    if !layout.is_legacy() {
+        return fri_commit_gpu_drive_groups::<F, E, T, B>(
+            state,
+            transcript,
+            transcript_snapshot,
+            coset_offset,
+            layout,
+            want_host,
+        );
+    }
+    // Today's encoding: the layout is today's (the all-ones schedule).
+    debug_assert_eq!(
+        *layout,
+        crate::fri::terminal::FriFoldLayout::new(
+            n0.trailing_zeros(),
+            blowup_log,
+            final_poly_log_degree
+        )
+    );
     let num_committed = layout.num_committed;
-    let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
-        Vec::with_capacity(num_committed);
+    let mut fri_layer_list: Vec<FriLayer<E, B>> = Vec::with_capacity(num_committed);
 
     for _layer_idx in 0..num_committed {
         // <<<< Receive challenge zeta_k
@@ -3236,7 +4107,7 @@ where
             .map(|v| u64_to_ext3_vec::<E>(&v))
             .unwrap_or_default();
         let root = dev_tree.root;
-        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+        let merkle_tree = MerkleTree::<B>::from_root(root);
         // Retain the device evals only when no host copy exists (device-only):
         // with a host copy the query phase reads it, and the retained buffer
         // would be ~24 bytes/LDE-row of dead VRAM per table.
@@ -3288,6 +4159,120 @@ where
     Some((final_poly_coeffs, fri_layer_list))
 }
 
+/// The raw limbs of `ζ, ζ², …, ζ^{2^{n−1}}`: the challenges of `n` successive
+/// binary folds, squared on the host exactly as the CPU loop's `fold_times`
+/// squares them.
+fn zeta_powers_raw<E: IsField>(zeta: &FieldElement<E>, n: u32) -> Vec<[u64; 3]> {
+    let mut out = Vec::with_capacity(n as usize);
+    let mut z = zeta.clone();
+    for level in 0..n {
+        // SAFETY: E == Ext3 (asserted by the drive before any call); its
+        // backing is [u64; 3].
+        let p = &z as *const FieldElement<E> as *const u64;
+        out.push(unsafe { [*p, *p.add(1), *p.add(2)] });
+        if level + 1 < n {
+            z = z.square();
+        }
+    }
+    out
+}
+
+/// The group-encoding (S3) device commit loop: the device twin of
+/// [`crate::fri::commit_phase_with_layout`]'s pending-fold loop. Per committed
+/// layer `j` with exponent `d_j`: sample ζ, fold `d_{j−1}` times on device with
+/// `ζ, ζ², …` (`d_{−1} = 1`, the binary fold 0 of the DEEP pair), commit the
+/// result with leaves of `2^{d_j}` consecutive values, append the root; then
+/// sample the final ζ and fold `d_last` times into the terminal codeword.
+///
+/// One-row layouts (S2): `d_{−1} = 0` — layer 0 is the INPUT TREE, the resident
+/// DEEP codeword itself committed with groups of `2^{d_0}` (a zero-fold group
+/// commit, the group kernels), its root appended with NO challenge
+/// sampled before it (the CPU loop's `pending = 0`); every later
+/// layer is as above.
+/// Transcript order, ζ powers, fold arithmetic and leaf bytes are the CPU
+/// loop's, so the two produce the same proof (the parity tests pin it).
+#[allow(clippy::type_complexity)]
+fn fri_commit_gpu_drive_groups<F, E, T, B>(
+    mut state: math_cuda::fri::FriCommitState,
+    transcript: &mut T,
+    transcript_snapshot: T,
+    coset_offset: &FieldElement<F>,
+    layout: &crate::fri::terminal::FriFoldLayout,
+    want_host: bool,
+) -> Option<(Vec<FieldElement<E>>, Vec<FriLayer<E, B>>)>
+where
+    F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static + Send + Sync,
+    FieldElement<F>: AsBytes,
+    FieldElement<E>: AsBytes,
+    T: IsStarkTranscript<E, F> + Clone,
+    B: DeviceTreeBackend,
+{
+    let mut fri_layer_list: Vec<FriLayer<E, B>> = Vec::with_capacity(layout.num_committed);
+    // Folds owed before the next commit: fold 0 is the binary fold of the DEEP
+    // pair, so one; after committing layer `j`, `d_j`. Under one row nothing
+    // is owed before the input tree, and no challenge is drawn for it.
+    let mut pending: u32 = if layout.one_row { 0 } else { 1 };
+    for &d in &layout.schedule {
+        let powers = if pending > 0 {
+            // <<<< Receive challenge zeta_j
+            let zeta: FieldElement<E> = transcript.sample_field_element();
+            zeta_powers_raw(&zeta, pending)
+        } else {
+            Vec::new()
+        };
+        let (layer_evals_u64, evals_dev, dev_tree) =
+            match state.fold_and_commit_group(&powers, u32::from(d), want_host) {
+                Ok(v) => v,
+                Err(_) => {
+                    *transcript = transcript_snapshot;
+                    return None;
+                }
+            };
+        let evaluation = layer_evals_u64
+            .map(|v| u64_to_ext3_vec::<E>(&v))
+            .unwrap_or_default();
+        let root = dev_tree.root;
+        fri_layer_list.push(FriLayer {
+            evaluation,
+            merkle_tree: MerkleTree::<B>::from_root(root),
+            gpu_tree: Some(dev_tree),
+            gpu_evals: (!want_host).then_some(evals_dev),
+        });
+        // >>>> Send commitment: [p_j]
+        transcript.append_bytes(&root);
+        pending = u32::from(d);
+    }
+
+    // The final folds into the terminal codeword (total_folds > 0 here).
+    let zeta_final: FieldElement<E> = transcript.sample_field_element();
+    let terminal_evals_u64 = match state.fold_to_host(&zeta_powers_raw(&zeta_final, pending)) {
+        Ok(v) => v,
+        Err(_) => {
+            *transcript = transcript_snapshot;
+            return None;
+        }
+    };
+    debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
+    let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &terminal_codeword,
+        &terminal_offset,
+        layout.effective_k,
+    );
+    // >>>> Send the final polynomial coefficients.
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
+
+    GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+    if layout.one_row {
+        GPU_ONE_ROW_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    Some((final_poly_coeffs, fri_layer_list))
+}
+
 /// GPU FRI query phase: gather each layer's paths on device instead of walking
 /// host trees. For layer `l` and query `iota` the opened position is
 /// `(iota >> l) >> 1`, matching [`crate::fri::query_phase`]. Paths for all
@@ -3296,13 +4281,14 @@ where
 ///
 /// Returns None when there are no layers or the layers are host trees (CPU
 /// commit), so the caller falls back to the host walk.
-pub(crate) fn try_fri_query_phase_gpu<E>(
-    fri_layers: &[FriLayer<E, FriLayerMerkleTreeBackend<E>>],
+pub(crate) fn try_fri_query_phase_gpu<E, B>(
+    fri_layers: &[FriLayer<E, B>],
     iotas: &[usize],
 ) -> Option<Vec<FriDecommitment<E>>>
 where
     E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
+    B: DeviceTreeBackend,
 {
     if fri_layers.is_empty() {
         return None;
@@ -3392,6 +4378,186 @@ where
     Some(decommits)
 }
 
+/// GPU FRI query phase for the group encoding (S3): the device twin of
+/// [`crate::fri::query_phase_with_layout`]'s group branch. Per committed layer
+/// `j` and query at position `p` the opened leaf is `p >> d_j`, its path is
+/// gathered on device (one batched call per layer), and the opened values are
+/// the whole group `[leaf·2^{d_j}, (leaf+1)·2^{d_j})` — read from the host evals
+/// when the commit drained them, else one batched device gather per layer off
+/// the resident evals; then `p ← p >> d_j`.
+///
+/// Returns `None` when there are no layers or the layers are host trees (CPU
+/// commit), so the caller takes the host walk. Resident layers have root-only
+/// host trees, so a failed gather there is a hard abort, as in
+/// [`try_fri_query_phase_gpu`].
+pub(crate) fn try_fri_query_phase_gpu_groups<E, B>(
+    fri_layers: &[FriLayer<E, B>],
+    iotas: &[usize],
+    layout: &crate::fri::terminal::FriFoldLayout,
+) -> Option<Vec<FriDecommitment<E>>>
+where
+    E: IsField + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    B: DeviceTreeBackend,
+{
+    if fri_layers.is_empty() {
+        return None;
+    }
+    let first_resident = fri_layers[0].gpu_tree.is_some();
+    debug_assert!(
+        fri_layers
+            .iter()
+            .all(|l| l.gpu_tree.is_some() == first_resident),
+        "FRI layer residency must be all or nothing"
+    );
+    if !first_resident {
+        return None;
+    }
+    assert_eq!(
+        fri_layers.len(),
+        layout.schedule.len(),
+        "one committed FRI layer per schedule entry"
+    );
+    let stream = math_cuda::device::backend()
+        .expect("cuda backend for device-resident FRI query")
+        .next_stream();
+
+    // Per query, the position at each committed layer.
+    let positions: Vec<Vec<usize>> = iotas
+        .iter()
+        .map(|&iota| {
+            let mut p = iota;
+            layout
+                .schedule
+                .iter()
+                .map(|&d| {
+                    let here = p;
+                    p >>= d;
+                    here
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(fri_layers.len());
+    let mut per_layer_groups: Vec<Option<Vec<FieldElement<E>>>> =
+        Vec::with_capacity(fri_layers.len());
+    for (j, (layer, &d)) in fri_layers.iter().zip(&layout.schedule).enumerate() {
+        let tree = layer
+            .gpu_tree
+            .as_ref()
+            .expect("FRI layers are device-resident as a group");
+        let leaves: Vec<usize> = positions.iter().map(|p| p[j] >> d).collect();
+        per_layer_proofs.push(
+            gather_proofs_dev(tree, &leaves, &stream)
+                .expect("device FRI-layer gather failed; resident tree has no host fallback"),
+        );
+        per_layer_groups.push(if layer.evaluation.is_empty() {
+            let evals_dev = layer
+                .gpu_evals
+                .as_ref()
+                .expect("device-only FRI layer without resident evals");
+            let n = 1usize << d;
+            let group_positions: Vec<u32> = leaves
+                .iter()
+                .flat_map(|&leaf| (leaf * n..(leaf + 1) * n).map(|x| x as u32))
+                .collect();
+            let raw = math_cuda::fri::gather_ext3_at(evals_dev, &group_positions, &stream)
+                .expect("device FRI group gather failed; no host fallback");
+            Some(
+                crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
+                    .expect("resident FRI evals are Goldilocks ext3"),
+            )
+        } else {
+            None
+        });
+    }
+
+    let values_per_query = layout.opened_values_per_query();
+    let decommits = positions
+        .iter()
+        .enumerate()
+        .map(|(q, pos)| {
+            let mut values = Vec::with_capacity(values_per_query);
+            let mut paths = Vec::with_capacity(fri_layers.len());
+            for (j, (layer, &d)) in fri_layers.iter().zip(&layout.schedule).enumerate() {
+                let n = 1usize << d;
+                match &per_layer_groups[j] {
+                    Some(g) => values.extend_from_slice(&g[q * n..(q + 1) * n]),
+                    None => {
+                        let leaf = pos[j] >> d;
+                        values.extend_from_slice(&layer.evaluation[leaf * n..(leaf + 1) * n]);
+                    }
+                }
+                paths.push(per_layer_proofs[j][q].clone());
+            }
+            FriDecommitment {
+                layers_auth_paths: paths,
+                layers_evaluations_sym: values,
+            }
+        })
+        .collect();
+    Some(decommits)
+}
+
+/// The abort itself, on a real device. `LAMBDA_VM_VRAM_BUDGET_MB` is read once
+/// at backend init, so this test runs in its own process with the budget
+/// lowered to 1 GiB — the shape is then over budget on any card while its host
+/// input stays at 1.2 GiB:
+///
+/// ```text
+/// LAMBDA_VM_VRAM_BUDGET_MB=1024 cargo test -p stark --release --features cuda \
+///     --lib gpu_lde::admission_box_tests -- --ignored --nocapture
+/// ```
+#[cfg(all(test, feature = "cuda"))]
+mod admission_box_tests {
+    use super::*;
+    use crate::config::BatchedMerkleTreeBackend;
+
+    type F = GoldilocksField;
+    type Fp = FieldElement<F>;
+
+    /// 2^18 rows x 612 columns at blowup 2: a 2.4 GiB LDE, 3.7 GiB device set
+    /// against the 1 GiB budget the command line sets. Must abort with the
+    /// over-budget diagnostic, never commit on the host.
+    #[test]
+    #[ignore = "requires GPU and LAMBDA_VM_VRAM_BUDGET_MB=1024 in its own process"]
+    #[should_panic(expected = "over the VRAM admission budget")]
+    fn an_over_budget_commit_aborts_instead_of_committing_on_the_host() {
+        let n: usize = 1 << 18;
+        let m: usize = 612;
+        let blowup: usize = 2;
+        let budget = device_vram_budget_bytes().expect("cuda backend");
+        assert!(
+            budget <= 2 << 30,
+            "this test needs LAMBDA_VM_VRAM_BUDGET_MB=1024 set before the backend initialises \
+             (budget is {budget} B)"
+        );
+        let data: Vec<Fp> = (0..n * m).map(|i| Fp::from(i as u64)).collect();
+        let weights: Vec<Fp> = (0..n).map(|i| Fp::from(i as u64 + 1)).collect();
+        let committed = try_expand_leaf_and_tree_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
+            "admission_box_test",
+            "admission box",
+            &data,
+            None,
+            n,
+            m,
+            blowup,
+            &weights,
+            true,
+            2,
+        );
+        panic!(
+            "the over-budget commit returned {} instead of aborting",
+            if committed.is_some() {
+                "a device handle"
+            } else {
+                "None (a silent host commit)"
+            }
+        );
+    }
+}
+
 /// GPU↔CPU parity for the preprocessed split-tree commit path. Requires the
 /// `cuda` feature and a visible GPU (skipped otherwise via the dispatch gate
 /// returning `None` — asserted here, so a silent skip fails the test).
@@ -3437,7 +4603,17 @@ mod split_tree_tests {
 
         let (pre_tree, mult_tree, handle, lde) =
             try_expand_split_trees_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
-                &data, None, n, m, blowup, &weights, split, true, true,
+                "split_tree_test",
+                &data,
+                None,
+                n,
+                m,
+                blowup,
+                &weights,
+                split,
+                true,
+                true,
+                2,
             )
             .expect("GPU split path must engage above the threshold");
         let pre_tree = pre_tree.expect("precomputed tree was requested");

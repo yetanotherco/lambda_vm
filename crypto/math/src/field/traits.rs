@@ -305,4 +305,19 @@ pub trait HasDefaultTranscript: IsField {
     /// straight from the Fiat-Shamir sponge, so no separate CSPRNG keystream is
     /// generated (see `DefaultTranscript`).
     fn sample_field_element_from(next_u64: impl FnMut() -> u64) -> FieldElement<Self>;
+
+    /// Would [`Self::sample_field_element_from`] accept `candidate` as one
+    /// coordinate, or reject it and pull another?
+    ///
+    /// This exposes the acceptance predicate so a caller can pre-filter the
+    /// candidate stream and thereby control *how many* candidates a draw
+    /// consumes — see `DefaultTranscript`'s constant-consumption mode. It has to
+    /// agree with what `sample_field_element_from` actually does: a pre-filtering
+    /// caller that disagreed would hand the sampler values it rejects, and the
+    /// consumption schedule the caller believes it is enforcing would not be the
+    /// real one.
+    ///
+    /// For an extension field this is the predicate for a single *base*
+    /// coordinate, because that is the granularity the rejection loop runs at.
+    fn candidate_in_range(candidate: u64) -> bool;
 }
