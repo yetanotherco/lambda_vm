@@ -211,3 +211,45 @@ pf_metrics_flag() {
     *) echo "" ;;
   esac
 }
+
+# ---- the bundle guard ---------------------------------------------------------------------
+# OUT/small is the part of a run that leaves the box (committed, or sent as a tarball); OUT/big
+# holds the .nsys-rep / .ncu-rep / .sqlite, which embed the machine's environment verbatim (a
+# FAST trace carried the box's tokens and a base64 SSH private key) and never leave it.
+# A bundle is declared safe only when every file in it is plain text (a compressed or binary file
+# could carry anything past a text search), none is an Nsight report, database or capture
+# stream, and no file holds any of these case-sensitive markers: credential names and prefixes, a PEM private-key block,
+# the same block base64-encoded ("LS0tLS1CRUdJT" is base64 of "-----BEGIN", which is how the
+# key sat in that trace), and an AWS access-key id.
+PF_SECRET_MARKERS='TOKEN|KEY|SECRET|PASSWORD|BEGIN .*PRIVATE|ssh-|ghp_|github_pat_|LS0tLS1CRUdJT|AKIA[0-9A-Z]{16}'
+
+# pf_scan_bundle DIR REPORT — returns 0 when DIR is clean. Findings go to REPORT (keep it OUTSIDE
+# DIR) as file:line:matched-marker. Stdout gets counts and file names only: never a matched
+# line (it could be the secret) and never a marker word (it would plant a hit in whatever log
+# stdout lands in).
+pf_scan_bundle() {
+  local dir="$1" report="$2" f magic nfiles nbad nhits files
+  : > "$report"
+  nfiles=0
+  while IFS= read -r -d '' f; do
+    nfiles=$((nfiles + 1))
+    case "$f" in
+      *.nsys-rep|*.qdrep|*.qdstrm|*.ncu-rep|*.sqlite|*.sqlite3|*.db|*.arrow|*.parquet)
+        printf 'forbidden file type: %s\n' "${f#"$dir"/}" >> "$report"; continue ;;
+    esac
+    magic="$(head -c 15 "$f" 2>/dev/null | LC_ALL=C tr -d '\0' || true)"
+    if [ "$magic" = "SQLite format 3" ]; then printf 'forbidden file type: %s (a sqlite database)\n' "${f#"$dir"/}" >> "$report"
+    elif [ -s "$f" ] && ! LC_ALL=C grep -qI . "$f"; then printf 'forbidden file type: %s (not plain text)\n' "${f#"$dir"/}" >> "$report"; fi
+    if [ "$(wc -c < "$f" | tr -d ' ')" -gt 52428800 ]; then printf 'forbidden file type: %s (over 50 MB)\n' "${f#"$dir"/}" >> "$report"; fi
+  done < <(find "$dir" -type f -print0)
+  { LC_ALL=C grep -rnoaE -- "$PF_SECRET_MARKERS" "$dir" 2>/dev/null || true; } | sed "s#^$dir/##" >> "$report"
+  nbad="$(awk '/^forbidden file type: / { n++ } END { print n + 0 }' "$report")"
+  nhits="$(awk '!/^forbidden file type: / { n++ } END { print n + 0 }' "$report")"
+  files="$(awk -F': ' '/^forbidden file type: / { print $2; next } { split($0, a, ":"); print a[1] }' "$report" | awk '{ print $1 }' | sort -u | tr '\n' ' ')"
+  if [ "$nbad" -eq 0 ] && [ "$nhits" -eq 0 ]; then
+    echo "bundle scan: clean ($nfiles plain-text files: no credential marker, no Nsight report or database)"
+    return 0
+  fi
+  echo "bundle scan: REFUSED: $nhits marker hit(s) and $nbad forbidden file(s) in: $files(details in $report)"
+  return 1
+}

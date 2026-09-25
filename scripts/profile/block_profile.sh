@@ -33,6 +33,8 @@
 #   --out DIR         output directory (default scripts/profile/out/block-<UTC>); never reused
 #   --gpu N           GPU index as nvidia-smi numbers it (default 0)
 #   --allow-busy-gpu  run although the card is not idle (the numbers then describe a shared card)
+#   --no-cpu-sampling no nsys CPU sampling. It is otherwise on where the box allows it, and a box
+#                     that refuses it (a container without perf events) runs without: never a failure
 #   --preflight-only  stop after the checks
 #
 # ENV KNOBS (all optional)
@@ -46,8 +48,11 @@
 #   NSYS NCU           explicit tool paths
 #
 # OUTPUT
-#   OUT/small/  CSVs, text summaries, logs, the exact environment: a few MB, safe to commit
-#   OUT/big/    blockA.nsys-rep, blockA.sqlite, ncu/*.ncu-rep, raw exports, full build logs
+#   OUT/small/  CSVs, text summaries, logs and an allowlist of run facts, a few MB. The only part
+#               that leaves the box, and only after the final bundle scan passes (plain text, no
+#               credential marker, no Nsight report or database); otherwise no tarball is written.
+#   OUT/big/    blockA.nsys-rep, blockA.sqlite, ncu/*.ncu-rep, raw exports, full build logs. These
+#               EMBED THE MACHINE'S ENVIRONMENT: never commit, share or upload them.
 #   The last lines printed say exactly what to send back; scripts/profile/README.md has more.
 set -euo pipefail
 
@@ -96,7 +101,8 @@ constraint_composition_kernel:0:3:71.1
 
 usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
-COUNTERS=1 SKIP_BUILD=0 SKIP_NSYS=0 SKIP_NCU=0 ALLOW_BUSY=0 PREFLIGHT_ONLY=0 GPU=0 OUT=""
+COUNTERS=1 SKIP_BUILD=0 SKIP_NSYS=0 SKIP_NCU=0 ALLOW_BUSY=0 PREFLIGHT_ONLY=0 CPU_SAMPLING=1 GPU=0 OUT=""
+NO_SAMPLING="--sample=none --cpuctxsw=none"
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -105,6 +111,7 @@ parse_args() {
       --skip-nsys) SKIP_NSYS=1 ;;
       --skip-ncu) SKIP_NCU=1 ;;
       --allow-busy-gpu) ALLOW_BUSY=1 ;;
+      --no-cpu-sampling) CPU_SAMPLING=0 ;;
       --preflight-only) PREFLIGHT_ONLY=1 ;;
       --gpu) GPU="${2:?--gpu needs an index}"; shift ;;
       --out) OUT="${2:?--out needs a directory}"; shift ;;
@@ -175,7 +182,8 @@ cgroup_limit_gib() { # this process's cgroup memory limit in GiB, when one is se
 }
 free_gib() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 / 1048576 }'; }
 
-NSYS_BIN="" NCU_BIN="" SAMPLE_FLAGS="--sample=none --cpuctxsw=none" METRICS_FLAG="" NCU_HAS_KILL=0 GPU_NAME="gpu" GPU_CC=""
+NSYS_BIN="" NCU_BIN="" SAMPLE_FLAGS="$NO_SAMPLING" METRICS_FLAG="" NCU_HAS_KILL=0 GPU_NAME="gpu" GPU_CC=""
+DRIVER_CUDA="" NVCC_REL=""
 preflight() {
   local sev_build v t got what path want pair reading n tl comps chan nightly probe res mt cg eff fr
 
@@ -221,6 +229,7 @@ preflight() {
       vram="$(pf_gpu_field "$GPU" memory.total)"; case "$vram" in ''|*[!0-9]*) vram=0 ;; esac
       GPU_CC="$(pf_gpu_field "$GPU" compute_cap)"; drv="$(pf_gpu_field "$GPU" driver_version)"
       cudadrv="$({ nvidia-smi 2>/dev/null || true; } | pf_first_match 'CUDA Version: [0-9]+[.][0-9]+' | awk '{ print $3 }')"
+      DRIVER_CUDA="$cudadrv"
       chk PASS "gpu $GPU of $n: $GPU_NAME · $vram MiB · compute $GPU_CC · driver $drv"
       if [ -n "$cudadrv" ] && pf_ver_ge "$cudadrv" "$MIN_CUDA"; then chk PASS "driver: CUDA $cudadrv >= $MIN_CUDA"
       else chk FAIL "driver: CUDA '${cudadrv:-?}' < $MIN_CUDA (cudarc is pinned to the 12.8 driver API)"; fi
@@ -238,6 +247,7 @@ preflight() {
   v="$(pf_cuda_home)/bin/nvcc"
   if [ -x "$v" ]; then
     got="$({ "$v" --version 2>/dev/null || true; } | pf_first_match 'release [0-9]+[.][0-9]+' | awk '{ print $2 }')"
+    NVCC_REL="$got"
     if [ -n "$got" ] && pf_ver_ge "$got" "$MIN_CUDA"; then chk PASS "nvcc: $v (release $got)"
     else chk FAIL "nvcc: $v is release '${got:-?}', < $MIN_CUDA"; fi
   else
@@ -249,9 +259,9 @@ preflight() {
   if [ -n "$NSYS_BIN" ]; then
     v="$(pf_tool_version "$NSYS_BIN")"
     if [ -n "$v" ] && pf_ver_ge "$v" "$MIN_NSIGHT"; then chk PASS "nsys: $NSYS_BIN ($v)"; else chk FAIL "nsys: $NSYS_BIN is ${v:-?}, < $MIN_NSIGHT"; fi
-    SAMPLE_FLAGS="$(pf_sampling_flags "$NSYS_BIN")"
+    if [ "$CPU_SAMPLING" = 1 ]; then SAMPLE_FLAGS="$(pf_sampling_flags "$NSYS_BIN")"; else SAMPLE_FLAGS="$NO_SAMPLING"; fi
     METRICS_FLAG="$(pf_metrics_flag "$NSYS_BIN")"
-    chk INFO "nsys: CPU sampling on this box: $SAMPLE_FLAGS · GPU-metrics option: ${METRICS_FLAG:-<none>}"
+    chk INFO "nsys: CPU sampling: $SAMPLE_FLAGS$([ "$CPU_SAMPLING" = 0 ] && echo ' (--no-cpu-sampling)') · GPU-metrics option: ${METRICS_FLAG:-<none>}"
   elif [ "$SKIP_NSYS" = 1 ]; then chk INFO "nsys: not found (run A skipped)"
   else chk FAIL "nsys (Nsight Systems) not found on PATH, in \$CUDA_HOME/bin or /opt/nvidia/nsight-systems/*; set NSYS=/path/to/nsys"; fi
   NCU_BIN="$(pf_find_tool ncu || true)"
@@ -289,7 +299,14 @@ preflight() {
     else
       nsys_args "$TMP/probe/pf_probe_nsys"
       res="$(pf_nsys_probe "$NSYS_BIN" "$probe" "$TMP/probe/pf_probe_nsys" "$COUNTERS" "${NSYS_ARGS[@]}")"
-      case "$res" in "NSYS ok"*) chk PASS "nsys probe (run A's flags): $res" ;; *) chk FAIL "nsys probe (run A's flags): $res" ;; esac
+      if [ "${res#NSYS ok}" = "$res" ] && [ "$SAMPLE_FLAGS" != "$NO_SAMPLING" ]; then
+        # CPU sampling is optional: a box that refuses it runs without it, it is never a failure
+        chk INFO "nsys: the probe failed with CPU sampling on ($res); retrying without it"
+        SAMPLE_FLAGS="$NO_SAMPLING"
+        nsys_args "$TMP/probe/pf_probe_nsys_nosample"
+        res="$(pf_nsys_probe "$NSYS_BIN" "$probe" "$TMP/probe/pf_probe_nsys_nosample" "$COUNTERS" "${NSYS_ARGS[@]}")"
+      fi
+      case "$res" in "NSYS ok"*) chk PASS "nsys probe (run A's flags, $SAMPLE_FLAGS): $res" ;; *) chk FAIL "nsys probe (run A's flags): $res" ;; esac
     fi
   fi
 
@@ -404,30 +421,45 @@ record_env() {
     "_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1")
 }
 
-write_env_capture() {
-  local f="$SMALL/env.txt" e
+write_env_capture() { # an ALLOWLIST of run facts, never the environment (this file leaves the box)
+  local f="$SMALL/env.txt" e name
   {
-    echo "# The profiled process ran under env -i with exactly these variables:"
-    for e in "${RUN_ENV[@]}"; do printf '%s\n' "$e"; done
-    echo "# Deliberately NOT set (the record's choices): LAMBDA_VM_VRAM_BUDGET_MB (VRAM_BUDGET_MB=query:"
-    echo "#   the device layer asks the driver), LFM_TREE_LEVELS (refused under PROVE_ROOT), LFM_TREE_TOP_OVERLAP"
-    echo "#   (left at its default), every LAMBDA_VM_ZF_* (the default proof format), LFM_WHIR_PREFETCH,"
-    echo "#   LAMBDA_VM_TREE_BUSY_PROBE, LFM_CENSUS_FAN_IN, A_BUNDLE*, A_CACHE_DIR."
-    echo "# Run: (cd $REPO/prover && <bin> $TEST --ignored --exact --nocapture --test-threads=1)"
-    echo "repo_head=$(git -C "$REPO" rev-parse HEAD)"
+    echo "# Run facts, an allowlist. The environment itself is never recorded in OUT/small: nsys and"
+    echo "# ncu store it in their reports, which is why those stay in OUT/big."
+    echo "repo_sha=$(git -C "$REPO" rev-parse HEAD)"
     echo "repo_branch=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
     echo "tracked_files_modified=$(git -C "$REPO" status --porcelain --untracked-files=no | awk 'END { print NR }')"
-    echo "test_binary=$BIN"
     echo "test_binary_sha256=$(pf_sha256 "$BIN" || echo '?')"
-    echo "cubin_dir=$CUBIN_DIR"
-    echo "gpu=$GPU $GPU_NAME (compute $GPU_CC)"
-    echo "gpu_query=$(nvidia-smi -i "$GPU" --query-gpu=name,memory.total,driver_version,pci.bus_id,clocks.max.sm,power.limit --format=csv,noheader 2>/dev/null || echo '?')"
-    echo "nvcc=$({ "$(pf_cuda_home)/bin/nvcc" --version 2>/dev/null || true; } | awk 'END { print }')"
-    echo "nsys=${NSYS_BIN:-none} $( [ -n "$NSYS_BIN" ] && pf_tool_version "$NSYS_BIN" )"
-    echo "ncu=${NCU_BIN:-none} $( [ -n "$NCU_BIN" ] && pf_tool_version "$NCU_BIN" )"
+    echo "gpu_index=$GPU"
+    echo "gpu_name=$GPU_NAME"
+    echo "gpu_compute_cap=$GPU_CC"
+    echo "gpu_memory_total_mib=$(pf_gpu_field "$GPU" memory.total)"
+    echo "gpu_clocks_max_sm_mhz=$(pf_gpu_field "$GPU" clocks.max.sm)"
+    echo "gpu_clocks_max_mem_mhz=$(pf_gpu_field "$GPU" clocks.max.mem)"
+    echo "gpu_power_limit_w=$(pf_gpu_field "$GPU" power.limit)"
+    echo "driver_version=$(pf_gpu_field "$GPU" driver_version)"
+    echo "driver_cuda_version=${DRIVER_CUDA:-?}"
+    echo "nvcc_release=${NVCC_REL:-?}"
+    echo "nsys_version=$(if [ -n "$NSYS_BIN" ]; then pf_tool_version "$NSYS_BIN"; else echo none; fi)"
+    echo "ncu_version=$(if [ -n "$NCU_BIN" ]; then pf_tool_version "$NCU_BIN"; else echo none; fi)"
     echo "rustc=$(cd "$REPO" && rustc --version 2>/dev/null || echo '?')"
-    echo "host=$(uname -srm) cpu=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true) threads=$(nproc 2>/dev/null || echo '?')"
-    echo "options: counters=$COUNTERS skip_build=$SKIP_BUILD skip_nsys=$SKIP_NSYS skip_ncu=$SKIP_NCU gpu_metrics_freq=$GPU_METRICS_FREQ sampling='$SAMPLE_FLAGS'"
+    echo "cpu=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true) · $(nproc 2>/dev/null || echo '?') threads"
+    echo "options=counters:$COUNTERS skip_build:$SKIP_BUILD skip_nsys:$SKIP_NSYS skip_ncu:$SKIP_NCU gpu_metrics_hz:$GPU_METRICS_FREQ cpu_sampling:'$SAMPLE_FLAGS'"
+    echo "# The knob variables the profiled process ran with. It runs under env -i with these and the"
+    echo "# system basics PATH HOME USER LOGNAME LANG LC_ALL TERM TMPDIR XDG_RUNTIME_DIR LD_LIBRARY_PATH"
+    echo "# CUDA_HOME CUDA_PATH (each only when set), CUDA_DEVICE_ORDER, CUDA_VISIBLE_DEVICES and"
+    echo "# CARGO_MANIFEST_DIR, whose values are not recorded. <repo> = this checkout."
+    for e in "${RUN_ENV[@]}"; do
+      name="${e%%=*}"
+      case "$name" in
+        LAMBDA_VM_*|LFM_*|TABLE_PARALLELISM|_RJEM_MALLOC_CONF|ZF_*) printf '%s\n' "${e//"$REPO"/<repo>}" ;;
+      esac
+    done
+    echo "# LAMBDA_VM_ZF_* (the proof-format knobs): none set, i.e. the default format."
+    echo "# Deliberately not set, as in the record: LAMBDA_VM_VRAM_BUDGET_MB (VRAM_BUDGET_MB=query: the"
+    echo "# device layer asks the driver), LFM_TREE_LEVELS (refused under PROVE_ROOT), LFM_TREE_TOP_OVERLAP"
+    echo "# (its default), LFM_WHIR_PREFETCH, LAMBDA_VM_TREE_BUSY_PROBE, LFM_CENSUS_FAN_IN, A_BUNDLE*, A_CACHE_DIR."
+    echo "# Run: (cd <repo>/prover && <test binary> $TEST --ignored --exact --nocapture --test-threads=1)"
   } > "$f"
 }
 
@@ -538,6 +570,12 @@ stop_sampler() {
   if [ -n "$SAMPLER" ]; then kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true; SAMPLER=""; fi
 }
 
+nsys_block_run() { # the traced run itself, into big/runA.raw.log
+  (cd "$REPO/prover" && exec timeout --signal=INT --kill-after=300 "$RUN_A_TIMEOUT" \
+     env -i "${RUN_ENV[@]}" "$NSYS_BIN" "${NSYS_ARGS[@]}" \
+     "$BIN" "$TEST" --ignored --exact --nocapture --test-threads=1) > "$BIG/runA.raw.log" 2>&1
+}
+
 nsys_args() { # nsys_args REP_BASE — NSYS_ARGS=(profile ...): run A's flags, shared with the preflight probe
   local -a sflags
   NSYS_ARGS=(profile --trace="cuda,osrt,nvtx")
@@ -596,10 +634,20 @@ run_a() {
   pf_log "nsys ${NSYS_ARGS[*]} $BIN $TEST --ignored --exact --nocapture --test-threads=1"
   start_sampler
   rc=0
-  (cd "$REPO/prover" && exec timeout --signal=INT --kill-after=300 "$RUN_A_TIMEOUT" \
-     env -i "${RUN_ENV[@]}" "$NSYS_BIN" "${NSYS_ARGS[@]}" \
-     "$BIN" "$TEST" --ignored --exact --nocapture --test-threads=1) > "$BIG/runA.raw.log" 2>&1 || rc=$?
+  nsys_block_run || rc=$?
   stop_sampler
+  if [ ! -s "$BIG/blockA.nsys-rep" ] && [ "$SAMPLE_FLAGS" != "$NO_SAMPLING" ]; then
+    # CPU sampling is optional: a refusal the preflight did not catch costs one retry, not the run
+    pf_log "run A wrote no report with CPU sampling on (rc=$rc); retrying once without it"
+    mv "$BIG/runA.raw.log" "$BIG/runA.raw.try1.log"
+    SAMPLE_FLAGS="$NO_SAMPLING"
+    write_env_capture
+    nsys_args "$BIG/blockA"
+    start_sampler
+    rc=0
+    nsys_block_run || rc=$?
+    stop_sampler
+  fi
   { tr '\r' '\n' < "$BIG/runA.raw.log" | grep -vE '^\[[0-9]+/[0-9]+\] +\[' || true; } > "$SMALL/runA.test.log"
   step_end "$rc"
   readback_a "$SMALL/runA.test.log" "$rc"
@@ -706,13 +754,42 @@ estimate() {
   pf_log "  TOTAL           ~$(( g + p + a + b / 60 )) min"
 }
 
-finish() {
-  local slug verdict rc=0 f
+send_back() { # send_back SAFE(0|1) VERDICT SCAN_LINE — SEND-BACK.txt, marker-free by construction
+  local safe="$1" verdict="$2" scan="$3" slug day
   slug="$(printf '%s' "$GPU_NAME" | tr '[:upper:]' '[:lower:]' | sed -e 's/nvidia//; s/geforce//; s/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//')"
+  day="$(date -u +%Y%m%d)"
   {
-    echo "OUT/small: what each file is"
+    if [ "$safe" = 1 ]; then
+      echo "==================== SEND BACK ===================="
+      echo "1. $SMALL ($(du -sh "$SMALL" | awk '{ print $1 }'); packed as $OUT/small.tar.gz)"
+      echo "   passed the bundle scan: plain text only, no credential marker, no Nsight report or database."
+      echo "   Commit it on this branch:"
+      echo "     cd $REPO"
+      echo "     mkdir -p scripts/profile/results/$day-$slug"
+      echo "     cp -R $SMALL/. scripts/profile/results/$day-$slug/"
+      echo "     git add scripts/profile/results/$day-$slug"
+      echo "     git commit -m 'profile: WHIR block run on $GPU_NAME ($(date -u +%Y-%m-%d))'"
+      echo "     git push origin HEAD:whir/profile-rpx"
+      echo "   or send $OUT/small.tar.gz."
+    else
+      echo "==================== NOTHING TO SEND: THE BUNDLE SCAN REFUSED ===================="
+      echo "1. $scan"
+      echo "   Nothing in $OUT may be committed or sent until those lines are read and removed; the"
+      echo "   findings list is in OUT/big and is not to be shared either. No small.tar.gz was written."
+    fi
+    echo "2. NEVER commit, share or upload $BIG: the .nsys-rep, .ncu-rep and .sqlite embed this"
+    echo "   machine's environment (nsys and ncu store it verbatim). They stay on this box."
+    echo "RESULT: run A $RUN_A_VERDICT · run B $RUN_B_VERDICT · bundle $([ "$safe" = 1 ] && echo clean || echo refused)"
+    echo "BLOCK_PROFILE VERDICT: $verdict"
+  } > "$SMALL/SEND-BACK.txt"
+}
+
+finish() {
+  local verdict safe=0 scan
+  {
+    echo "OUT/small: what each file is (the only part of a run that leaves the box)"
     echo "  preflight.txt         every check, PASS/WARN/FAIL/INFO"
-    echo "  env.txt               the exact environment of the profiled process, tools, HEAD, binary sha256"
+    echo "  env.txt               run facts, an allowlist: versions, GPU, repo sha, the knob variables set"
     echo "  steps.tsv             every step: start, seconds, rc"
     echo "  driver.log            this script's own output"
     echo "  build-*.tail.txt      the last lines of each build (full logs in OUT/big)"
@@ -728,39 +805,34 @@ finish() {
     echo "  ncu/ncu_summary.txt   (counters only) one line per profiled launch: SOL, issue, occupancy, stalls, pipes"
     echo "  ncu/<kernel>.details.txt|csv   ncu's own per-launch report (the authority, with its rule messages)"
     echo "  ncu/passes.tsv, ncu/<kernel>.prof.txt   each pass's outcome and ncu's own messages"
+    echo "  SEND-BACK.txt         what to send back, and the bundle scan's verdict"
     echo
     echo "files present:"
     (cd "$SMALL" && find . -type f | sort | sed 's/^\.\//  /')
   } > "$SMALL/INDEX.txt"
   {
-    echo "OUT/big (NOT for git):"
+    echo "OUT/big (never committed, shared or uploaded: it embeds this machine's environment):"
     (cd "$BIG" && find . -type f -size +0 ! -path './tmp/*' -exec ls -l {} + 2>/dev/null | awk '{ printf "  %12d  %s\n", $5, $NF }')
   } > "$SMALL/manifest.txt"
 
   verdict="PASS"
   if [ "$SKIP_NSYS" = 0 ] && [ "$RUN_A_VERDICT" != ok ]; then verdict="PARTIAL"; fi
   if [ "$SKIP_NCU" = 0 ] && [ "${RUN_B_VERDICT%% *}" != ok ]; then verdict="PARTIAL"; fi
-  {
-    echo "==================== SEND BACK ===================="
-    echo "1. ALWAYS: $SMALL  ($(du -sh "$SMALL" | awk '{ print $1 }'); also packed as $OUT/small.tar.gz)"
-    echo "   It holds no secret: the only environment in it is env.txt's explicit list."
-    echo "   Either commit it on this branch:"
-    echo "     cd $REPO"
-    echo "     mkdir -p scripts/profile/results/$(date -u +%Y%m%d)-$slug"
-    echo "     cp -R $SMALL/. scripts/profile/results/$(date -u +%Y%m%d)-$slug/"
-    echo "     git add scripts/profile/results/$(date -u +%Y%m%d)-$slug"
-    echo "     git commit -m 'profile: WHIR block run on $GPU_NAME ($(date -u +%Y-%m-%d))'"
-    echo "     git push origin HEAD:whir/profile-rpx"
-    echo "   or send $OUT/small.tar.gz."
-    echo "2. ONLY IF ASKED (large; never into git): $BIG/blockA.nsys-rep (Nsight Systems GUI),"
-    echo "   $BIG/ncu/*.ncu-rep (Nsight Compute GUI). Sizes in small/manifest.txt."
-    echo "RESULT: run A $RUN_A_VERDICT · run B $RUN_B_VERDICT"
-    echo "BLOCK_PROFILE VERDICT: $verdict"
-  } > "$SMALL/SEND-BACK.txt"
-  tar -czf "$OUT/small.tar.gz" -C "$OUT" small || rc=$?
+  # Scan, write SEND-BACK, and scan again: the second scan is the authority, over the final files.
+  rm -f "$OUT/small.tar.gz"
+  if scan="$(pf_scan_bundle "$SMALL" "$BIG/bundle_scan.txt")"; then safe=1; fi
+  send_back "$safe" "$([ "$safe" = 1 ] && echo "$verdict" || echo 'REFUSED (bundle scan)')" "$scan"
+  if scan="$(pf_scan_bundle "$SMALL" "$BIG/bundle_scan.txt")"; then safe=1; else safe=0; fi
+  if [ "$safe" = 1 ]; then
+    tar -czf "$OUT/small.tar.gz" -C "$OUT" small
+  else
+    send_back 0 'REFUSED (bundle scan)' "$scan"
+  fi
+  pf_log "$scan"
   cat "$SMALL/SEND-BACK.txt"
+  if [ "$safe" != 1 ]; then return 4; fi
   if [ "$verdict" != PASS ]; then return 3; fi
-  return "$rc"
+  return 0
 }
 
 # ======================================================================================

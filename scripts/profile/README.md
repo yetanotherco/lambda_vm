@@ -14,10 +14,42 @@ The run is the record's, not an approximation of it. The test is
 `lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root`, from
 `cargo test --release -p lambda-vm-prover --features cuda --lib`, with exactly the record
 launcher's environment (`A-tree-whir.v10.sh` as `whir_tree17.sh` ran it). The profiled
-process gets only that environment plus a few system variables (`env -i`). Nothing else
-from your shell reaches the run, and nothing from it (tokens, keys) lands in the reports:
-nsys and ncu store the target's environment verbatim. The inputs are the record's guest ELF
-and block, in `fixtures/`, verified by sha256.
+process gets only that environment plus a few system variables (`env -i`), so nothing else
+from your shell reaches the run. The inputs are the record's guest ELF and block, in
+`fixtures/`, verified by sha256.
+
+## Secrets: what may leave the box
+
+**`OUT/big` never leaves the box.** Its `.nsys-rep`, `.ncu-rep` and `.sqlite` files embed the
+machine's environment: nsys and ncu store the process environment verbatim. A trace of
+this run on our rented box carried that box's Jupyter token, container API key and a base64
+SSH private key.
+Never commit `OUT/big`, never share it, never upload it. Running under `env -i` narrows what
+gets recorded, but that does not change the rule.
+
+**Only `OUT/small` leaves the box, and only after the final bundle scan passes.** The scan
+refuses the bundle in three cases:
+- any file that is not plain text;
+- any `.nsys-rep`, `.ncu-rep`, `.sqlite` or other Nsight capture, whatever its name;
+- any line matching a credential marker: `TOKEN`, `KEY`, `SECRET`, `PASSWORD`,
+  `BEGIN ...PRIVATE`, `ssh-`, `ghp_`, `github_pat_`, a base64-encoded PEM header, or an AWS
+  key id.
+
+On a hit the script writes no tarball, says there is nothing to send, and exits 4. The hits
+(file, line, marker) are listed in `OUT/big/bundle_scan.txt`, which is not to be shared
+either. Read those lines and remove them, then re-scan; the tarball is written only if the
+scan passes:
+
+```bash
+bash -c '. scripts/profile/lib/common.sh && pf_scan_bundle OUT/small OUT/big/bundle_scan.txt && tar -czf OUT/small.tar.gz -C OUT small'
+```
+
+`OUT/small/env.txt` is an allowlist of run facts, never the environment:
+- driver, CUDA, nvcc, nsys and ncu versions;
+- the GPU's name, clocks and memory;
+- the repo sha and the test binary's sha256;
+- the knob variables the run sets (`LAMBDA_VM_*`, `LFM_*`, `TABLE_PARALLELISM`,
+  `_RJEM_MALLOC_CONF`), with the checkout's path written as `<repo>`.
 
 ## For Mauro: the commands
 
@@ -42,8 +74,8 @@ Run it inside `tmux` or `screen`: a dropped ssh session would otherwise end it.
 
 Useful options: `--gpu N` (another GPU); `--skip-build` (reuse this checkout's last build,
 same HEAD); `--skip-nsys` / `--skip-ncu` (one run only, for example to redo run B:
-`--skip-build --skip-nsys`); `--out DIR`. `--help` lists everything, including the env knobs
-(`NCU_KERNELS`, `NCU_COUNT`, `GPU_METRICS_FREQ`, the timeouts).
+`--skip-build --skip-nsys`); `--no-cpu-sampling`; `--out DIR`. `--help` lists everything,
+including the env knobs (`NCU_KERNELS`, `NCU_COUNT`, `GPU_METRICS_FREQ`, the timeouts).
 
 ## Expected runtime (block_profile.sh)
 
@@ -65,13 +97,15 @@ sections), saving and restoring the device memory the kernel can reach. The esti
 
 `block_profile.sh` writes `scripts/profile/out/block-<UTC>/` (git-ignored):
 
-- `small/`: a few MB, safe to commit, no secrets. `small/INDEX.txt` says what each file is.
-  Read `small/nsys/summary.txt` first (stages, busy/idle per 5 s, top kernels, copies,
-  GPU metrics), then `small/ncu/ncu_summary.txt` and `small/ncu/<kernel>.details.txt`.
-- `big/`: `blockA.nsys-rep`, `blockA.sqlite`, `ncu/*.ncu-rep`, the raw exports and full
-  build logs. These are large and never go into git.
+- `small/`: a few MB of plain text, packed as `small.tar.gz` once the bundle scan passes.
+  `small/INDEX.txt` says what each file is. Read `small/nsys/summary.txt` first (stages,
+  busy/idle per 5 s, top kernels, copies, GPU metrics), then `small/ncu/ncu_summary.txt`
+  and `small/ncu/<kernel>.details.txt`.
+- `big/`: `blockA.nsys-rep`, `blockA.sqlite`, `ncu/*.ncu-rep`, the raw exports and the full
+  build logs. It embeds the machine's environment: never commit, share or upload it.
 
-The last lines the script prints say exactly what to send back. Either commit `small/`:
+The last lines the script prints say exactly what to send back. Once the scan passes, either
+commit `small/`:
 
 ```bash
 mkdir -p scripts/profile/results/<YYYYMMDD>-<gpu>
@@ -81,9 +115,9 @@ git commit -m 'profile: WHIR block run on <gpu> (<date>)'
 git push origin HEAD:whir/profile-rpx
 ```
 
-or send `scripts/profile/out/block-<UTC>/small.tar.gz`. The `.nsys-rep` / `.ncu-rep` files
-only if asked (a file transfer, not git). `whir_ncu.sh` leaves one tarball next to its
-output directory; send that.
+or send `scripts/profile/out/block-<UTC>/small.tar.gz`. `whir_ncu.sh` writes the same way:
+`OUT/small` (text, `small.tar.gz` once its scan passes) and `OUT/big` (its `.ncu-rep`,
+`.nsys-rep` and `.sqlite`, which stay on the box).
 
 ## How to read the results
 
@@ -135,9 +169,14 @@ launches that carry each kernel's time:
   npm-check-updates. The scripts check every `ncu` on PATH by its banner, then
   `$CUDA_HOME/bin` and `/opt/nvidia/nsight-compute/*`, or `NCU=/path/to/ncu`. The same
   applies to `NSYS`.
-- **CPU sampling off** (`--sample=none` in the preflight): `nsys status --environment`
-  says process-tree sampling is not available (a container without perf events, or
-  `perf_event_paranoid` > 2 as non-root). Run A still traces CUDA and the OS runtime.
+- **CPU sampling off** (`--sample=none` in the preflight): nsys CPU sampling is optional
+  and never fails a run. It is used where `nsys status --environment` offers it and the
+  preflight probe succeeds with it. When a box refuses it (FAST's container does), the
+  probe, and if need be run A itself, retry once without it. Run A still traces CUDA and the
+  OS runtime. `--no-cpu-sampling` turns it off from the start.
+- **`BLOCK_PROFILE VERDICT: REFUSED (bundle scan)`**: something in `small/` looks like a
+  credential or is not plain text. See "Secrets" above. Nothing may be sent until the flagged
+  lines are gone and the scan passes.
 - **run B ends `partial`**: `small/ncu/passes.tsv` and `small/ncu/<kernel>.prof.txt` say
   which kernel got no profile. The usual causes are running out of host memory in ncu's
   replay (the preflight warns below 64 GiB) or a pass timeout (`NCU_PASS_TIMEOUT`,
@@ -154,9 +193,10 @@ bash scripts/profile/block_profile.sh --no-counters
 ```
 
 This runs the preflight (the counter probe reports `locked`, as INFO), the build and run A
-without GPU metrics, and skips run B. The last lines read `RESULT: run A ok · run B skipped`
-and `BLOCK_PROFILE VERDICT: PASS`.
+without GPU metrics, and skips run B. The last lines read
+`RESULT: run A ok · run B skipped · bundle clean` and `BLOCK_PROFILE VERDICT: PASS`.
 
-`lib/` holds the shared pieces: `common.sh` (tool discovery, probes, the clean environment),
+`lib/` holds the shared pieces: `common.sh` (tool discovery, probes, the clean environment,
+the bundle scan),
 `nsys_block_summary.py` and `ncu_summary.py` (post-processing, stdlib only, each with
 `--selftest`), and `cargo_test_bin.py` (test binaries by cargo's own JSON).
