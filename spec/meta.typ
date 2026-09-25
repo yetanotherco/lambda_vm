@@ -18,6 +18,7 @@
     ("TEMPLATES", (
       ("is_bit", [`IS_BIT` template], <isbit>),
       ("is_byte", [`IS_BYTE` template], <isbyte>),
+      ("is_whh", [`IS_WHH` template], <iswhh>),
       ("sign", [`SIGN` template], <sign>),
       ("add", [`ADD`/`SUB` template], <add>),
       ("neg", [`NEG` template], <neg>),
