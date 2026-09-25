@@ -749,7 +749,9 @@ except sqlite3.Error:
     print(0)
 PY
 )"
-  v="NVTX ranges in the trace: $n$([ "${n:-0}" -eq 0 ] && echo ' (none: no libnvToolsExt reached, see the preflight)')"
+  # `|| true`: under set -e an assignment takes its substitution's status, so a trace WITH ranges
+  # (the test fails) would end the script here without a word
+  v="NVTX ranges in the trace: $n$([ "${n:-0}" -eq 0 ] && echo ' (none: no libnvToolsExt reached, see the preflight)' || true)"
   pf_log "$v"
   # just above the verdict line, which stays the file's last
   awk -v ins="$v" 'NR > 1 { print prev } { prev = $0 } END { print ins; print prev }' "$SMALL/runA.verdict.txt" > "$TMP/verdict.txt" \
