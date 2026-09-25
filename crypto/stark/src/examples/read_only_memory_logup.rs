@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use crate::{
+    constraint_ir::ConstraintProgram,
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
@@ -13,7 +14,6 @@ use crate::{
             num_base_from_meta, run_transition_prover, run_transition_verifier,
         },
     },
-    constraint_ir::ConstraintProgram,
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,

@@ -107,7 +107,11 @@ fn the_log_read_only_program_equals_the_prover_folder_and_the_device_model() {
         let mut interp_ext = vec![Ext::zero(); n];
         eval_program(prog, &ctx, &mut interp_base, &mut interp_ext);
         assert_eq!(folder_base, interp_base, "base constraints, trial {trial}");
-        assert_eq!(folder_ext[nb..], interp_ext[nb..], "ext constraints, trial {trial}");
+        assert_eq!(
+            folder_ext[nb..],
+            interp_ext[nb..],
+            "ext constraints, trial {trial}"
+        );
 
         // The lowered device program, host model of the GPU kernel.
         let main_raw: Vec<Vec<u64>> = main
@@ -130,10 +134,18 @@ fn the_log_read_only_program_equals_the_prover_folder_and_the_device_model() {
             &mut ext_dev,
         );
         for c in 0..nb {
-            assert_eq!(Felt::from(base_dev[c]), folder_base[c], "device base {c}, trial {trial}");
+            assert_eq!(
+                Felt::from(base_dev[c]),
+                folder_base[c],
+                "device base {c}, trial {trial}"
+            );
         }
         for c in nb..n {
-            assert_eq!(from_limbs(ext_dev[c]), folder_ext[c], "device ext {c}, trial {trial}");
+            assert_eq!(
+                from_limbs(ext_dev[c]),
+                folder_ext[c],
+                "device ext {c}, trial {trial}"
+            );
         }
     }
 }
