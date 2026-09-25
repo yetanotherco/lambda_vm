@@ -151,6 +151,13 @@ pf_counter_probe() {
   if [ $# -eq 0 ]; then set -- --section SpeedOfLight -c 1; fi
   pf_base_env
   out="$(env -i "${PF_ENV[@]}" timeout 300 "$ncu" "$@" "$bin" 2>&1)" || rc=$?
+  # With `-o REP` (run B's flags) ncu writes the profile to REP.ncu-rep and prints no table, so
+  # the kernel's metrics are read back from the report instead of from stdout.
+  local rep="" prev=""
+  for a in "$@"; do if [ "$prev" = "-o" ]; then rep="$a"; fi; prev="$a"; done
+  if [ -n "$rep" ] && [ -s "$rep.ncu-rep" ]; then
+    out="$out"$'\n'"$(timeout 300 "$ncu" --import "$rep.ncu-rep" --page details 2>&1 || true)"
+  fi
   printf '%s\n' "$out" > "$log"
   case "$out" in
     *ERR_NVGPUCTRPERM*) echo "COUNTERS locked (ERR_NVGPUCTRPERM)" ;;
