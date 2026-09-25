@@ -900,6 +900,33 @@ impl LfmAirs {
         }
     }
 
+    /// This set with every preprocessed chip's ONE-ROW (S2) root attached:
+    /// what `precomputed_commitment_for(Row)` returns when the STARK prover or
+    /// verifier resolves that chip to one row. Without it a one-row chip is a
+    /// hard miss, never a recompute. `KECCAK_RND` has no preprocessed columns.
+    pub fn with_one_row_roots(mut self, one_row: &super::registry::LfmOneRowRoots) -> Self {
+        let r = &one_row.roots;
+        self.const_ = self.const_.with_one_row_commitment(r[0]);
+        self.balu = self.balu.with_one_row_commitment(r[1]);
+        self.xalu = self.xalu.with_one_row_commitment(r[2]);
+        self.select = self.select.with_one_row_commitment(r[3]);
+        self.bitdec = self.bitdec.with_one_row_commitment(r[4]);
+        self.hash = self.hash.with_one_row_commitment(r[5]);
+        self.keccak = self.keccak.with_one_row_commitment(r[6]);
+        self.lanes = self.lanes.with_one_row_commitment(r[7]);
+        self.hint = self.hint.with_one_row_commitment(r[8]);
+        self.public = self.public.with_one_row_commitment(r[9]);
+        self.range = self.range.with_one_row_commitment(r[10]);
+        self.blake3 = std::mem::take(&mut self.blake3)
+            .into_iter()
+            .enumerate()
+            .map(|(i, air)| air.with_one_row_commitment(one_row.blake3_chunk_roots.get(i).copied()))
+            .collect();
+        self.keccak_rc = self.keccak_rc.with_one_row_commitment(r[13]);
+        self.bitwise = self.bitwise.with_one_row_commitment(r[14]);
+        self
+    }
+
     /// Number of `KECCAK_RND` instances this set was built with.
     pub fn keccak_rnd_chunks(&self) -> usize {
         self.keccak_rnd.len()

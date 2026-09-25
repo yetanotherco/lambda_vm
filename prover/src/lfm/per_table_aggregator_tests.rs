@@ -138,7 +138,10 @@ pub(super) fn real_global(
     for (idx, air) in refs.iter().enumerate() {
         let v = view.get(idx);
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
+                *air,
+                v.trace_length(),
+            ));
         }
         transcript.append_bytes(v.lde_trace_main_merkle_root());
     }
@@ -457,6 +460,7 @@ pub(super) fn global_arena_words(g: &RealGlobal) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }
@@ -1085,7 +1089,7 @@ pub(super) fn real_child_timed(
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    let airs = super::airs::LfmAirs::new_chunked(
+    let mut airs = super::airs::LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
         &opts,
@@ -1093,6 +1097,11 @@ pub(super) fn real_child_timed(
         artifacts.hasher,
         artifacts.chip_set,
     );
+    // S2: the one-row preprocessed roots, exactly as `verify_against_artifacts`
+    // attaches them — a one-row chip's Phase A root and leg compare use them.
+    if let Some(one_row) = &artifacts.one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&proved.proof);
     assert_eq!(refs.len(), view.len(), "one AIR per sub-proof");
@@ -1114,7 +1123,10 @@ pub(super) fn real_child_timed(
     for (idx, air) in refs.iter().enumerate() {
         let v = view.get(idx);
         if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
+                *air,
+                v.trace_length(),
+            ));
         }
         transcript.append_bytes(v.lde_trace_main_merkle_root());
     }
@@ -1216,6 +1228,7 @@ pub(super) fn child_arena_words(c: &RealChild) -> Vec<Vec<LfmWord>> {
         }
         arenas.push(leg.opening_arena());
         arenas.push(leg.fri_arena());
+        arenas.extend(leg.caps_arena());
     }
     arenas
 }
@@ -1443,6 +1456,21 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     }
     let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
     let label_range = (labels[0][0], labels[FAN_IN - 1][0]);
+    // S2: how many of each wrap's sub-proofs the node verifies at one-row
+    // leaves (0 at the default format, all at `one_row = 1`, the AIR widths'
+    // choice at `auto`). One parseable line per child for the box wrapper.
+    for (k, c) in children.iter().enumerate() {
+        let one_row = c
+            .legs
+            .iter()
+            .filter(|l| l.verify.sub.layout.is_one_row())
+            .count();
+        println!(
+            "ZFS2NODE child={k} {} sub_proofs={} one_row_legs={one_row}",
+            crate::zf_format::ZfFormat::global().banner(),
+            c.legs.len()
+        );
+    }
     println!(
         "   {FAN_IN} epoch wraps proved in {:.1}s, {} published words each, \
          {} sub-proofs each\n   RSS high-water AFTER the wrap proves: {:?} GiB",
@@ -2563,6 +2591,30 @@ fn mark(label: &str) {
     println!("   MARK {label}: live {rss:?} GiB / high-water {hwm:?} GiB / t={t:.1}");
 }
 
+/// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — one line per tree stage, and NOTHING at
+/// all unless `LAMBDA_VM_TREE_BUSY_PROBE` is set.
+///
+/// ★ WHAT IT IS FOR. The tree phase's serialising resource is
+/// [`super::device_permit`] — mutual exclusion over a proof's two device phases,
+/// because two proofs in flight can budget the card twice over. So the ceiling
+/// on every concurrency lever in this phase is `Σ held`, and `held / stage wall`
+/// is the reading that separates "the card is the wall" (a floor: the only
+/// remaining lever is the permutation, already at its arithmetic floor) from
+/// "the host is the wall" (a lever: overlap independent stages).
+///
+/// ⚠ `take` CLEARS, so the stages must be priced IN ORDER and each call must
+/// bracket exactly one stage. Reading two stages against one set of counters is
+/// how a late stage comes to look card-bound because an early one was.
+fn tree_probe_line(stage: &str, wall_secs: f64) {
+    if !super::tree_probe::enabled() {
+        return;
+    }
+    println!(
+        "   {}",
+        super::tree_probe::take().describe(stage, wall_secs),
+    );
+}
+
 /// ★★★ THE PRODUCTION-SCALE LEAF NODE — the run that answers whether a tree fits.
 ///
 /// Everything measured so far is FIXTURE scale, where a node's children are
@@ -2654,7 +2706,8 @@ fn the_production_leaf_node_measures() {
     );
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     println!(
         "★ PRODUCTION LEAF NODE: FAN-IN {fan_in} · guest {}, {} input bytes, \
@@ -3468,9 +3521,17 @@ fn tree_siblings() -> usize {
 /// a TASK INSIDE level 0's pool instead of as a `K=1` stage between level 0 and
 /// level 1.
 ///
-/// Unset is today's shape, so the control arm and the candidate arm are the same
-/// binary. `LFM_TREE_TOP_OVERLAP=1` turns it on; an empty value reads as unset,
-/// for `resolve_siblings`' reason.
+/// ★ **THE DEFAULT IS PER DRIVER, and only the default.** The WHIR tree runs the
+/// overlap unset, because it is measured there: −3.85 s alone and −11.85 s with
+/// fan-in 3 (wt33-38, A/B/B/A, the bit-exactness gates held). The STARK tree
+/// keeps it off unset, so every STARK number on record stays comparable and an
+/// arm that changes only the interior is still the same experiment it was.
+///
+/// ⛔ `LFM_TREE_TOP_OVERLAP` still decides it on BOTH drivers and means the same
+/// thing on both: `1` on, `0` off, and an empty value reads as unset — for
+/// `resolve_siblings`' reason — so neither default can be reached only by
+/// unsetting. `0` is the way back on the WHIR path and the only way to name the
+/// control arm explicitly.
 /// One slot of a pool whose tasks are not all the same kind.
 ///
 /// Level 0's pool proves epoch wraps; under `LFM_TREE_TOP_OVERLAP` one of its
@@ -3558,9 +3619,17 @@ fn parse_positive(var: &str, default: usize) -> usize {
     }
 }
 
-fn tree_top_overlap() -> bool {
+/// `LFM_TREE_TOP_OVERLAP`, resolved against the CALLER'S default — see the knob's
+/// own doc above [`PoolOut`] for what it selects and why the two trees differ.
+///
+/// ⛔ THE DEFAULT IS A PARAMETER RATHER THAN A SECOND FUNCTION so the parse, the
+/// explicit `0`, the explicit `1` and the panic on anything else are written
+/// ONCE. A driver may choose which arm an unset knob lands on; it may not
+/// acquire its own spelling of the knob.
+fn tree_top_overlap(default: bool) -> bool {
     match std::env::var("LFM_TREE_TOP_OVERLAP").ok().as_deref() {
-        None | Some("") | Some("0") => false,
+        None | Some("") => default,
+        Some("0") => false,
         Some("1") => true,
         Some(other) => panic!("LFM_TREE_TOP_OVERLAP must be `0` or `1`, got `{other}`"),
     }
@@ -5886,7 +5955,8 @@ fn the_production_tree_composes_to_a_root() {
     };
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(
@@ -6210,7 +6280,11 @@ fn the_production_tree_composes_to_a_root() {
     // ⛔ INDEX 0 so a free worker picks it up immediately. It is ~10 s against a
     // wrap's ~14.6 worker-seconds; queued last it would BE the tail and the
     // lever would pay for itself twice.
-    let top_overlap = tree_top_overlap();
+    //
+    // ⛔ `false` IS THE STARK TREE'S DEFAULT AND STAYS ONE. The WHIR driver runs
+    // the overlap unset; this one does not, so an unset knob here selects exactly
+    // the shape every STARK number on record was taken at.
+    let top_overlap = tree_top_overlap(false);
     let l0_offset = usize::from(top_overlap);
     if top_overlap {
         println!(
@@ -6746,6 +6820,18 @@ use super::whir_epoch::{whir_epoch_arena, whir_epoch_program};
 /// `verify_epoch_bookend`. Handing one in does nothing for the other, so both
 /// are taken once per bundle here. The STARK harness hoists the same pair for
 /// the same reason and says so where it does it.
+///
+/// ★★★ AND UNDER `top_overlap` IT ALSO PROVES THE GLOBAL CHILD, as task 0 of
+/// its own pool — the shape the STARK level 0 already runs. That is why
+/// `fan_in` is a parameter here at all: the wraps do not read it (a wrap has no
+/// arity), [`prove_whir_global_child`] does.
+///
+/// ⛔ THE GLOBAL TASK IS CALLED FROM INSIDE THIS FUNCTION AND NOT HANDED IN AS A
+/// CLOSURE, and the reason is the same `H` that makes this a function at all:
+/// `prove_whir_global_child` is generic in `H` too, so calling it here reuses
+/// this function's own `H` — a caller-supplied closure would have to name `H` in
+/// its type and could not leave `with_whir_hash!`. ✓ The return type still names
+/// no `H`: [`WhirGlobalChild`] is a `RealChild` plus a `GlobalLayout`.
 #[allow(clippy::too_many_arguments)]
 fn whir_level_zero<H>(
     bundle: &crate::multilinear_continuation::ContinuationProof,
@@ -6755,10 +6841,13 @@ fn whir_level_zero<H>(
     wrap_opts: &crate::ProofOptions,
     ceiling: &Result<f64, String>,
     siblings: usize,
+    fan_in: usize,
+    top_overlap: bool,
 ) -> (
     Vec<RealChild>,
     Vec<super::per_table_aggregator::SchemaLayout>,
     Vec<Vec<u64>>,
+    Option<WhirGlobalChild>,
 )
 where
     H: multilinear::whir_hash::WhirHash,
@@ -7057,11 +7146,74 @@ where
     // from the STARK tree's BY CONSTRUCTION. Diffing the two families reports a
     // difference that was designed in. The comparison this gate makes is one WHIR
     // run against another.
-    for (k, (child, layout, lbl, cells, instrs)) in
-        in_index_order(bundle.num_epochs(), siblings, prove_one_wrap)
-            .into_iter()
-            .enumerate()
-    {
+    //
+    // ★★★ THE ROOT'S EXTRA CHILD, AS ONE MORE TASK IN THIS POOL — the STARK
+    // level 0's own shape, in its own words: "ONE MORE TASK, NOT ONE MORE
+    // WORKER". A thread beside the level would put `siblings + 1` host working
+    // sets on the box; as an item in the SAME pool at most `siblings` are ever
+    // live and one of them is the global child INSTEAD of a wrap. The card is
+    // unaffected either way — the global task takes the same permit every wrap
+    // takes, so `max holders 1` still holds and still asserts.
+    //
+    // ⛔ INDEX 0, so a free worker picks it up immediately. Queued last it would
+    // BE the tail and the lever would pay for itself twice.
+    // ⓘ PRINTED ON BOTH ARMS, because on this tree the overlap is the DEFAULT.
+    // A banner that appeared only when the lever was on named the arm precisely
+    // while an unset knob selected the other one; now that unset selects the
+    // overlap, silence would name the arm a reader is least likely to expect.
+    // ⛔ The on-arm line still begins `★ TOP OVERLAP:` exactly, so the gate that
+    // greps for it across a run is unchanged; the off-arm line is deliberately a
+    // different prefix and cannot be mistaken for it.
+    let l0_offset = usize::from(top_overlap);
+    if top_overlap {
+        println!(
+            "   ★ TOP OVERLAP: the WHIR GLOBAL child runs as task 0 of level 0's \
+             pool (the default; LFM_TREE_TOP_OVERLAP=0 puts it back as the K=1 \
+             stage after level 0)"
+        );
+    } else {
+        println!(
+            "   ★ TOP OVERLAP OFF: the WHIR GLOBAL child runs as the K=1 stage \
+             after level 0 (LFM_TREE_TOP_OVERLAP=0; unset = task 0 of level 0's \
+             pool)"
+        );
+    }
+    // ⓘ Boxed for the same reason the STARK level boxes its slots: the two
+    // variants are very different sizes and the pool holds one slot per task.
+    type L0Out = PoolOut<Box<WhirWrapSlot>, Box<WhirGlobalChild>>;
+    let l0_out = in_index_order(bundle.num_epochs() + l0_offset, siblings, |j| -> L0Out {
+        if top_overlap && j == 0 {
+            // ⛔ A REFUSAL, NEVER A `None` THE CALLER TURNS INTO A `return` —
+            // the property the serial call site was written to have, kept here.
+            // `in_index_order` re-raises the FIRST worker panic with its payload
+            // intact, so the stage's own reason still travels.
+            PoolOut::Global(Box::new(
+                prove_whir_global_child::<H>(bundle, elf_bytes, inner, wrap_opts, ceiling, fan_in)
+                    .unwrap_or_else(|why| {
+                        panic!(
+                            "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no \
+                         extra child for a root and no block artifact to compose: {why}"
+                        )
+                    }),
+            ))
+        } else {
+            PoolOut::Wrap(Box::new(prove_one_wrap(j - l0_offset)))
+        }
+    });
+    // ⓘ Drained in INDEX order, so the wraps arrive exactly as the serial loop
+    // built them and the global — if it ran here — is lifted out of slot 0. The
+    // IDENTITY lines below are therefore byte-identical in content AND in order
+    // to a run with the knob unset; that is the gate this lever is measured
+    // under. `split_pool_out` ASSERTS the global ran exactly when the knob is on,
+    // so a knob that silently stopped scheduling the task fails here rather than
+    // at a root with no child to give it.
+    let (l0_wraps, overlapped_global) = split_pool_out(l0_out, top_overlap);
+    assert_eq!(
+        l0_wraps.len(),
+        bundle.num_epochs(),
+        "level 0's pool must yield one slot per epoch; the global task is not a wrap"
+    );
+    for (k, (child, layout, lbl, cells, instrs)) in l0_wraps.into_iter().map(|w| *w).enumerate() {
         println!(
             "   whir wrap {k} IDENTITY: program_id {} · heights {:?} · blake3 chunk heights \
              {:?} · published {} words · {cells} cells ({instrs} instructions)",
@@ -7085,8 +7237,15 @@ where
     // main thread's counter still reads the hoist's 1 no matter what the workers
     // did, so an equality on it would pass in exactly the case worth catching.
     // The two asserts above are the ones that can fail.
+    //
+    // ⚠ AND THE GLOBAL TASK DOES NOT DISTURB THEM. Each wrap calls
+    // `reset_decode_derivations()` as its FIRST act, on its own worker, so a
+    // worker that previously ran the global task starts its next wrap at zero
+    // whatever the global derived. The global task carries no such assert of its
+    // own, which is correct: the hoist is level 0's claim, not the cross-epoch
+    // stage's.
 
-    (children, layouts, labels)
+    (children, layouts, labels, overlapped_global.map(|g| *g))
 }
 
 /// What the WHIR global stage hands the root: the child, and the layout that
@@ -7543,7 +7702,7 @@ coset_gather {:.2}s ({:.0}%) · open_assemble {:.2}s ({:.0}%) · rebuild_calls {
 #[ignore = "box tier, production scale: the WHIR base, its level 0 and the interior"]
 fn the_whir_production_tree_composes_to_a_root() {
     use super::epoch_tests::EpochInputs;
-    use super::per_table_aggregator::{FAN_IN, tree_node_count, tree_shape};
+    use super::per_table_aggregator::{WHIR_FAN_IN, tree_node_count, tree_shape};
     use super::program_census::build_artifacts_counted;
     use super::proof::lfm_prove;
     use std::time::Instant;
@@ -7613,13 +7772,6 @@ fn the_whir_production_tree_composes_to_a_root() {
             "it selects prove-or-load for the PARENT of k slices, and there are \
              no slices",
         ),
-        (
-            "LFM_TREE_TOP_OVERLAP",
-            "it makes the global stage task 0 of level 0's own pool. Here the \
-             stage runs AFTER level 0 so a level-0 wall from this binary stays \
-             comparable to every earlier WHIR run; overlapping it is an \
-             optimisation round's item, not an unset knob's",
-        ),
     ] {
         assert!(
             std::env::var(var).is_err(),
@@ -7634,11 +7786,21 @@ fn the_whir_production_tree_composes_to_a_root() {
          — no WHIR tree has been proved. Unset it"
     );
 
+    // ★ THREE UNSET, AND FROM THIS TREE'S OWN CONSTANT. `WHIR_FAN_IN` is not
+    // `FAN_IN`: the STARK tree keeps two because its arity-3 node does not fit
+    // the card (ds15/ds16), and this tree takes three because the host peak the
+    // shared constant's doc was waiting on now exists — 31.1-31.5 GiB of a 33.5
+    // gate, `device fallbacks 0` and `commit fallbacks 0` on every arm — and it
+    // is worth −8.05 s of interior card time (wt29-32).
+    //
+    // ⛔ `LFM_CENSUS_FAN_IN` STILL OVERRIDES, with the same parse and the same
+    // 2..=4 bound as the STARK driver. What changed is which value an unset
+    // variable selects, and nothing else.
     let fan_in: usize = match std::env::var("LFM_CENSUS_FAN_IN") {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|e| panic!("LFM_CENSUS_FAN_IN must be an integer: {e}")),
-        Err(_) => FAN_IN,
+        Err(_) => WHIR_FAN_IN,
     };
     assert!(
         (2..=4).contains(&fan_in),
@@ -7703,7 +7865,8 @@ fn the_whir_production_tree_composes_to_a_root() {
     );
 
     let inputs = EpochInputs::from_env();
-    let inner = crate::recursion::Preset::Blowup4.options();
+    // ★ The production format sites (the process's `ZfFormat` stamped on).
+    let inner = super::proof::block_base_options();
     let wrap_opts = super::proof::aggregation_wrap_options();
     let ceiling = cgroup_limit_gib();
     println!(
@@ -7779,6 +7942,43 @@ fn the_whir_production_tree_composes_to_a_root() {
     mark("AFTER the WHIR base (this live figure is L_bundle)");
     println!("{}", jemalloc_line("AFTER the WHIR base"));
     whir_base_split_readback(base_secs);
+    // ⛔ ROUND-3 TREE PROBE, ARMED AT THE BASE BOUNDARY (diagnostic, OFF by
+    // default — `LAMBDA_VM_TREE_BUSY_PROBE`). Everything below this line is the
+    // tree/wrap phase, and the probe prices each of its four stages against the
+    // permit that serialises them. The base's own holds are discarded here so
+    // level 0 reports its own, and the device reservation high-water is cut at
+    // the same boundary for the same reason — the base's reservation dominates
+    // the run and would otherwise be the only number any stage could report.
+    if super::tree_probe::enabled() {
+        let _ = super::tree_probe::take();
+        println!(
+            "   TREE PROBE armed at the base boundary: the base's own card holds are \
+             discarded here, so every figure below is the TREE phase's own"
+        );
+        // ⛔ THE KNOBS THE DISPATCH TOTAL DEPENDS ON, SHOWN READ ON THE PATH.
+        // Both artifact-commit walks go through `map_maybe_parallel`, so the
+        // `device commit dispatch` figure below is WORKER-SECONDS with up to
+        // `groups_in_flight` overlapping — quoting it as a fraction of a wall
+        // without these two numbers beside it is how a reader turns concurrency
+        // into a bug report.
+        println!(
+            "   TREE PROBE knobs READ: LFM_ARTIFACT_PARALLEL={} · \
+             LFM_ARTIFACT_GROUPS_IN_FLIGHT={} ⇒ up to {} device commits overlap \
+             inside ONE build_artifacts hold",
+            u8::from(super::commit::parallel_build()),
+            super::registry::groups_in_flight(),
+            // ⚠ THE `parallel` FEATURE IS PART OF THE ANSWER, not a detail:
+            // `map_maybe_parallel`'s rayon arm is `#[cfg(feature = "parallel")]`,
+            // so on a build without it the knob can read 1 and nothing overlaps.
+            // A banner that quoted the knob alone would name a concurrency the
+            // binary cannot have.
+            if cfg!(feature = "parallel") && super::commit::parallel_build() {
+                super::registry::groups_in_flight()
+            } else {
+                1
+            },
+        );
+    }
 
     let elf = executor::elf::Elf::load(&inputs.elf_bytes).expect("the inner ELF must load");
     let shape = tree_shape(bundle.num_epochs(), fan_in);
@@ -7818,9 +8018,28 @@ fn the_whir_production_tree_composes_to_a_root() {
     super::device_permit::arm(l0_siblings);
     let level0_sampler = HostSampler::start();
 
+    // ★ ROUND 3's KNOB, RESOLVED BEFORE THE LEVEL AND PRINTED BY IT — AND ON
+    // THIS TREE IT IS THE DEFAULT. Unset, the global child is task 0 of level
+    // 0's pool; `0` puts it back as the `K = 1` stage after level 0, which is the
+    // control arm and is still ONE binary away.
+    //
+    // ⛔ WHY THIS STOPPED BEING A REFUSAL. The refusal that used to sit in the
+    // list above said, in as many words, "overlapping it is an optimisation
+    // round's item, not an unset knob's". This is that round: the global child's
+    // own stage is 6.5 s of which 4.4 s is host work performed with NO other
+    // proof on the card (measured, wt27/wt28 `CARD HOLD` brackets), because the
+    // stage runs alone between level 0 and the interior.
+    //
+    // ⛔ AND WHY IT STOPPED BEING AN UNSET KNOB. The lever was A/B/B/A'd on this
+    // driver — −3.85 s alone (wt33-36) and −11.85 s beside fan-in 3 (wt37-38,
+    // 128.3 s against 140.2) — with the 15 wrap `program_id`s and the `whir
+    // global IDENTITY` unmoved on both arms. A default that reproduces the
+    // landed number is the point: a run with no knobs set must be the measured
+    // configuration, not the configuration the launcher happened to remember.
+    let top_overlap = tree_top_overlap(true);
     // ⓘ ONE LINE PER ARM, which is the whole reason level 0 is a function: the
     // macro duplicates whatever is written here.
-    let (mut children, mut layouts, mut labels) = crate::with_whir_hash!(|H| {
+    let (mut children, mut layouts, mut labels, overlapped_global) = crate::with_whir_hash!(|H| {
         whir_level_zero::<H>(
             &bundle,
             &inputs.elf_bytes,
@@ -7829,6 +8048,8 @@ fn the_whir_production_tree_composes_to_a_root() {
             &wrap_opts,
             &ceiling,
             l0_siblings,
+            fan_in,
+            top_overlap,
         )
     });
 
@@ -7854,40 +8075,76 @@ fn the_whir_production_tree_composes_to_a_root() {
     if let Some(stats) = super::program_census::end_level() {
         println!("   {}", stats.describe("level 0"));
     }
+    tree_probe_line("level 0", level0_wall);
 
     // ---- level 0's OTHER child: the WHIR GLOBAL WRAP.
     //
-    // ⓘ WHERE THE STARK HARNESS RUNS `prove_global_child`, and AFTER level 0 for
-    // a reason. ✓ The stage reads only the base bundle — its signature says so —
-    // so it COULD run beside the level; placing it after keeps a level-0 wall
-    // from this binary comparable to every earlier WHIR run. Overlapping it is
-    // an optimisation round's item, and `LFM_TREE_TOP_OVERLAP` is refused above
-    // until it is one.
+    // ⓘ ITS WORK IS NORMALLY ALREADY DONE. Unset, and under
+    // `LFM_TREE_TOP_OVERLAP=1`, this value was produced by a task inside level
+    // 0's own pool; under `LFM_TREE_TOP_OVERLAP=0` it is proved right here, where
+    // the stage ran before the lever landed. ★ EITHER WAY IT IS CONSUMED AT THIS
+    // POINT IN THE PROGRAM, so nothing downstream can tell which — the root reads
+    // `global.child` and `global.published` from the same place in the same
+    // order.
+    //
+    // ⓘ WHERE THE STARK HARNESS RUNS `prove_global_child`, and where this driver
+    // runs it on the `0` arm. ✓ The stage reads only the base bundle — its
+    // signature says so, and its own doc adds "it reads NOTHING any level-0 wrap
+    // produced" — so it CAN run beside the level, which is why unset now does.
+    // ⛔ Keeping the code path here is what makes `0` a real control rather than
+    // a removed option: a level-0 wall from this binary is still comparable to
+    // every WHIR run taken before the lever, by naming one variable.
     //
     // ⛔ AND A REFUSAL, NEVER A `return`. `prove_whir_global_child` hands back
     // the reason it could not build, and a run with no global child has no extra
     // child for a root and no block artifact to compose: it must be RED, not
     // green over a stage nobody ran. That is the shape the STARK caller's
     // `let Some(..) else { return; }` does NOT have, and inheriting it was the
-    // named hazard this stage was written against.
-    let global = crate::with_whir_hash!(|H| {
-        prove_whir_global_child::<H>(
-            &bundle,
-            &inputs.elf_bytes,
-            &inner,
-            &wrap_opts,
-            &ceiling,
-            fan_in,
-        )
-    })
-    .unwrap_or_else(|why| {
-        panic!(
-            "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no extra \
-             child for a root and no block artifact to compose: {why}"
-        )
-    });
+    // named hazard this stage was written against. ✓ The overlap keeps it: the
+    // pool task panics with the stage's own reason and `in_index_order` re-raises
+    // that payload intact.
+    let t_global_stage = Instant::now();
+    let global = match overlapped_global {
+        Some(done) => done,
+        None => crate::with_whir_hash!(|H| {
+            prove_whir_global_child::<H>(
+                &bundle,
+                &inputs.elf_bytes,
+                &inner,
+                &wrap_opts,
+                &ceiling,
+                fan_in,
+            )
+        })
+        .unwrap_or_else(|why| {
+            panic!(
+                "★ THE WHIR GLOBAL WRAP COULD NOT BE BUILT, so this run has no extra \
+                 child for a root and no block artifact to compose: {why}"
+            )
+        }),
+    };
+    // ⭐ THE STAGE THIS LANE EXISTS FOR — and the label says which arm produced
+    // it, because a stage line reading 0.0 s would otherwise look like a stage
+    // that vanished rather than one that ran inside level 0.
+    //
+    // ⚠ UNDER THE OVERLAP THIS LINE IS NOT THE STAGE'S COST. The work happened
+    // inside level 0's window, so this wall is only the `match` above and the
+    // stage's cost is already inside level 0's numbers. The same applies to
+    // `MARK AFTER the WHIR global child`, which under the overlap is printed by
+    // a worker DURING level 0: a reader slicing phases by that MARK gets level 0
+    // and the global child as one window on the `=1` arm, exactly as the
+    // pre-round-3 briefs mistakenly read them on the unset arm.
+    tree_probe_line(
+        if top_overlap {
+            "the WHIR GLOBAL child (OVERLAPPED — its cost is inside level 0)"
+        } else {
+            "the WHIR GLOBAL child (runs ALONE)"
+        },
+        t_global_stage.elapsed().as_secs_f64(),
+    );
 
     // ---- levels 1..=hi, in the one interior both production trees share.
+    let t_interior = Instant::now();
     let interior = compose_interior_levels(
         InteriorInputs {
             shape: &shape,
@@ -7915,6 +8172,31 @@ fn the_whir_production_tree_composes_to_a_root() {
     assert!(
         interior.top_level.is_none(),
         "the sizing arm is off, so no level may be held back"
+    );
+    // ⭐ THE INTERIOR'S OWN PERMIT LINE, AND THE REASON IT IS TAKEN HERE.
+    //
+    // ⛔ `compose_interior_levels` prints `PermitStats` only from its BARRIER
+    // loop. The production harness runs `LFM_TREE_LEVEL_POOL=1` with
+    // `LFM_TREE_LEVEL_POOL_FROM` at its default 1, so `barrier_levels` is 0, the
+    // barrier loop runs ZERO levels and the whole interior goes through the
+    // POOLED span — which calls no `take_stats`. ⇒ on the configuration that
+    // actually runs, the one reading that says whether the card or the host
+    // bound the interior is not printed at all.
+    //
+    // ✓ Taken in the CALLER, so `compose_interior_levels` stays byte-identical
+    // and the STARK driver is untouched. The counters hold exactly the
+    // interior's own: level 0 cleared them above, and the global child between
+    // them ran unarmed, where `Drop` accumulates nothing into `HELD_NANOS`.
+    // ⓘ The interior's line stays because the four stage lines PARTITION the tree
+    // phase and `take` clears — a stage that printed nothing would fold its holds
+    // into the next one's. It is not here to decide anything: the interior's
+    // permit-held fraction is already settled at 0.92 from the `CARD HOLD` lines
+    // of wt27 and wt28, which is a FLOOR under the mutual-exclusion permit.
+    // ⛔ And NO `device_permit::take_stats()` call beside it: that counter belongs
+    // to the lines the drivers already print, and reading it CLEARS it.
+    tree_probe_line(
+        &format!("the interior (levels 1..={hi})"),
+        t_interior.elapsed().as_secs_f64(),
     );
     // The interior is done, and the reset is the CALLER's — the same line the
     // STARK harness carries immediately after its own call to
@@ -7947,6 +8229,7 @@ fn the_whir_production_tree_composes_to_a_root() {
              LFM_TREE_PROVE_ROOT=1 with LFM_TREE_ROOT_OPTION=A|B composes one\n"
         ),
         Some(option) => {
+            let t_root_stage = Instant::now();
             // ⛔ THE ROOT COUNTS ITS CHILDREN, HERE, WHERE THE LEVELS ARE STILL IN
             // VIEW. ✓ `child_level` is the same named rule `hi` was set from
             // above, so the two cannot drift; what this compares is the number of
@@ -8136,6 +8419,14 @@ fn the_whir_production_tree_composes_to_a_root() {
                 Some(why) => println!("\n   ⚠ {why}"),
                 None => super::block_root::assert_artifact_is_posture_independent(&runs),
             }
+            // ⓘ The last tree stage, and it runs alone like the global child —
+            // with nothing after it to overlap with. It is priced for the same
+            // reason the others are: a stage nobody measured is a stage nobody
+            // can rule out.
+            tree_probe_line(
+                "the BLOCK-ARTIFACT ROOT (runs ALONE)",
+                t_root_stage.elapsed().as_secs_f64(),
+            );
         }
     }
 
@@ -8310,12 +8601,22 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
         tree_node_count(&shape),
     );
 
-    // ⓘ ONE WRAP AT A TIME. The serial arm is the control everywhere else in
-    // this file, and a fixture run has nothing to learn from concurrency.
+    // ⓘ ONE WRAP AT A TIME, AND THE OVERLAP OFF. The serial arm is the control
+    // everywhere else in this file, and a fixture run has nothing to learn from
+    // concurrency — so this stays the shape it had: level 0, then the global
+    // stage below it. ⛔ `false` is written out rather than read from the knob,
+    // because a fixture run that silently followed `LFM_TREE_TOP_OVERLAP` would
+    // change what the card-free test covers depending on the caller's shell.
     super::device_permit::arm(1);
-    let (children, layouts, labels) = crate::with_whir_hash!(|H| {
-        whir_level_zero::<H>(&bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1)
+    let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
+        whir_level_zero::<H>(
+            &bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1, fan_in, false,
+        )
     });
+    assert!(
+        no_overlapped_global.is_none(),
+        "the overlap is off on this arm, so level 0 must not have produced a global child"
+    );
     assert_eq!(
         children.len(),
         bundle.num_epochs(),

@@ -2309,26 +2309,46 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
 /// Phase A is spliced and at what shift.
 ///
 /// CORRECTION to an earlier claim of mine: the statement is NOT unconditionally
-/// 3 bytes past a boundary. Its length is `215 + L + 16R`, so the shift Phase A
-/// inherits is `(3 + L) mod 4` — it is 3 only when the public output happens to
-/// be a multiple of four, and it is ZERO (Phase A entirely unspliced) whenever
-/// `L ≡ 1 (mod 4)`. Since `L` is one byte per COMMIT op and therefore workload-
-/// determined, the Phase-A splice cost is workload-dependent and free for about
-/// one workload in four.
+/// 3 bytes past a boundary. Its length is `264 + L + 16R`, so the shift Phase A
+/// inherits is `L mod 4` — since `L` is one byte per COMMIT op and therefore
+/// workload-determined, the Phase-A splice cost is workload-dependent, and free
+/// (Phase A entirely unspliced) for about one workload in four.
+///
+/// ★ THE CONSTANT TERM'S OWN SHIFT IS GONE, and this test is where that is
+/// pinned. It was `215 + L + 16R`, giving `(3 + L) mod 4` — free only at
+/// `L ≡ 1` — and `statement_replay`'s module doc said a single pad byte at the
+/// end of the encoding would make all of Phase A free. The main-sync port
+/// supplied it without aiming at it.
+///
+/// MOVER: `892c7d1bc` (main's `c2ac5d546`, #977) — arm (ii), the STATEMENT
+/// ENCODING. That merge's two arms are (i) the table set shrank, empty tables
+/// now being elided rather than padded, and (ii) this one. `epoch_verify_tests`'
+/// SUB_PROOFS is the pin on (i).
+///
+/// #977 took the six accelerator chips out of
+/// `FIXED_TABLE_COUNT` (11 → 5) and made them counted, so `NUM_TABLE_COUNTS`
+/// went 15 → 21 (`+48 ≡ 0 mod 4`, which moves no shift), and the same PR
+/// appended `is_final` as the statement's last byte (`+1`). `215 + 49 = 264`,
+/// and `264 ≡ 0 (mod 4)`.
+///
+/// The acceptance shape is still spliced, which is what keeps the splice path
+/// under test: `L = 14 ≢ 0 (mod 4)`, so the cursor lands at shift 2 where it
+/// used to land at 3.
 #[test]
-fn epoch_statement_cursor_is_three_plus_output_len() {
+fn epoch_statement_cursor_is_the_output_len_alone() {
     let shape = epoch_statement_shape();
     let r = shape.page_ranges.len();
-    // 215, not the 207 of the fourteen-count era: `TableCounts::blake3` added
-    // one absorbed u64. Eight bytes is a whole number of halves, so the shift
-    // Phase A inherits is unchanged.
-    assert_eq!(shape.byte_len(), 215 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
+    // 264, not the 215 of the fifteen-count era and not the 207 of the
+    // fourteen-count one: six accelerator counts (+48) and the trailing
+    // `is_final` byte (+1). Both terms are named in the doc above, because 264
+    // is the sum of a change that moves NO shift and one that moves it by one.
+    assert_eq!(shape.byte_len(), 264 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
     for l in 0..8usize {
-        let total = 215 + l + 16 * r;
+        let total = 264 + l + 16 * r;
         assert_eq!(
             total % keccak_host::BYTES_PER_HALF,
-            (3 + l) % keccak_host::BYTES_PER_HALF,
-            "Phase A inherits shift (3 + L) mod 4"
+            l % keccak_host::BYTES_PER_HALF,
+            "Phase A inherits shift L mod 4"
         );
     }
     // The acceptance shape is chosen to exercise BOTH new paths at once: an
@@ -4202,6 +4222,7 @@ fn derivation_shape(blowup: usize) -> RegisterDerivationShape {
     RegisterDerivationShape {
         blowup,
         coset_offset: PRODUCTION_COSET_OFFSET,
+        rows_per_leaf: stark::commitment::ROWS_PER_LEAF,
     }
 }
 
@@ -4595,6 +4616,7 @@ fn the_register_derivation_proves_and_verifies() {
     let shape = RegisterDerivationShape {
         blowup: inner.blowup_factor as usize,
         coset_offset: inner.coset_offset,
+        rows_per_leaf: stark::commitment::ROWS_PER_LEAF,
     };
     assert_eq!(
         shape,

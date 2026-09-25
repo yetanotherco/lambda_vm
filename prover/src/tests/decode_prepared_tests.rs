@@ -40,6 +40,7 @@ fn config() -> ChainConfig {
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     }
 }
 
@@ -226,5 +227,53 @@ fn decode_is_found_by_name_and_only_once() {
         decode_table_index(&two).is_err(),
         "a table set with two DECODEs was accepted, so the index it returns is \
          a choice rather than a fact"
+    );
+}
+
+/// ★ W2: a commitment reused across epochs must have been built under the
+/// epoch's fold schedule. At `first6` tree 0's leaves are 64 values wide, so a
+/// `uniform4` epoch would open them as 16-wide ones: `agrees_with` refuses
+/// before any opening is attempted, and the roots differ besides.
+#[test]
+fn a_decode_commitment_refuses_another_fold_schedule() {
+    use multilinear::whir_chain::{FirstFold, WhirFolds};
+
+    let first6 = ChainConfig {
+        format: multilinear::whir_chain::ChainFormat {
+            folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            ..multilinear::whir_chain::ChainFormat::DEFAULT
+        },
+        ..config()
+    };
+    let instrs = program(200, 7);
+    let at_first6 =
+        decode_prepared_from_columns::<KeccakWhir>([1; 32], preprocessed_columns(&instrs), &first6)
+            .expect("prepared at first6");
+    let at_uniform = prepared::<KeccakWhir>(&instrs, 1);
+
+    at_first6
+        .agrees_with(&first6)
+        .expect("same schedule: accepted");
+    at_uniform
+        .agrees_with(&config())
+        .expect("same schedule: accepted");
+    let err = at_first6
+        .agrees_with(&config())
+        .expect_err("a first6 commitment under a uniform epoch must be refused");
+    assert!(format!("{err:?}").contains("folds"), "{err:?}");
+    at_uniform
+        .agrees_with(&first6)
+        .expect_err("a uniform commitment under a first6 epoch must be refused");
+    // Q does not enter: a config differing only in num_queries still agrees.
+    at_first6
+        .agrees_with(&ChainConfig {
+            num_queries: first6.num_queries + 1,
+            ..first6
+        })
+        .expect("num_queries is not part of a commitment");
+
+    assert_ne!(
+        at_first6.roots, at_uniform.roots,
+        "the leaf width moves the roots"
     );
 }

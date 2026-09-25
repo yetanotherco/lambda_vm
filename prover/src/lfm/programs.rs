@@ -1189,6 +1189,11 @@ pub struct RegisterDerivationShape {
     pub blowup: usize,
     /// The inner proof's coset offset (`ProofOptions::coset_offset`).
     pub coset_offset: u64,
+    /// Rows per Merkle leaf of the inner REGISTER tree: the inner table's leaf
+    /// layout (`stark::leaf_layout::LeafLayout::rows_per_leaf`) — 2 today, 1
+    /// under one-row openings (S2). One emitter, two constants; the host twin
+    /// is `register::compute_precomputed_commitment_with_fini_layout`.
+    pub rows_per_leaf: usize,
 }
 
 impl RegisterDerivationShape {
@@ -1202,9 +1207,9 @@ impl RegisterDerivationShape {
         self.num_rows() * self.blowup
     }
 
-    /// Merkle leaves — one per row PAIR (`ROWS_PER_LEAF = 2`).
+    /// Merkle leaves — one per `rows_per_leaf` rows (a row PAIR today).
     pub fn leaves(self) -> usize {
-        self.lde_rows() / stark::commitment::ROWS_PER_LEAF
+        self.lde_rows() / self.rows_per_leaf
     }
 
     /// Permutations the tree costs: one per leaf plus one per internal node.
@@ -1329,7 +1334,6 @@ pub fn emit_register_commitment(
     use super::lde::coset_lde;
     use crate::tables::register::{NUM_PREPROCESSED_COLS_WITH_FINI, NUM_REGISTER_ADDRESSES};
     use math::fft::bit_reversing::reverse_index;
-    use stark::commitment::ROWS_PER_LEAF;
 
     assert_eq!(
         NUM_PREPROCESSED_COLS_WITH_FINI, 3,
@@ -1384,14 +1388,20 @@ pub fn emit_register_commitment(
     let init_lde = coset_lde(b, &init_col, shape.blowup, coset_offset);
     let fini_lde = coset_lde(b, &fini_col, shape.blowup, coset_offset);
 
-    // Leaf `i` hashes the bit-reversed rows `2i` and `2i+1`, each written
-    // column by column in big-endian — `keccak_leaves_bit_reversed_grouped`.
+    // Leaf `i` hashes the bit-reversed rows `R·i .. R·i + R − 1` (`R` =
+    // `shape.rows_per_leaf`: the pair `2i`, `2i+1` today), each written column
+    // by column in big-endian — `keccak_leaves_bit_reversed_grouped`.
+    let rows_per_leaf = shape.rows_per_leaf;
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "a REGISTER leaf holds one row or a row pair"
+    );
     let lde_rows = shape.lde_rows();
     let leaves: Vec<_> = (0..shape.leaves())
         .map(|leaf| {
-            let mut values = Vec::with_capacity(ROWS_PER_LEAF * NUM_PREPROCESSED_COLS_WITH_FINI);
-            for k in 0..ROWS_PER_LEAF {
-                let row = reverse_index(ROWS_PER_LEAF * leaf + k, lde_rows as u64);
+            let mut values = Vec::with_capacity(rows_per_leaf * NUM_PREPROCESSED_COLS_WITH_FINI);
+            for k in 0..rows_per_leaf {
+                let row = reverse_index(rows_per_leaf * leaf + k, lde_rows as u64);
                 values.extend([offset_lde[row], init_lde[row], fini_lde[row]]);
             }
             edsl::wrap_leaf_hash(b, &values)

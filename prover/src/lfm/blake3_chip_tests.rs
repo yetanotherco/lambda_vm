@@ -1215,8 +1215,29 @@ fn the_flip_inventory_of_registered_programs_is_pinned() {
     /// takes a 64-byte block where the keccak sponge takes a 136-byte rate, so
     /// the same message divides into more compressions — which is the in-machine
     /// half of the cost the campaign priced, visible here as a row count.
+    ///
+    /// ★ StatementReplayV0 moved 9 → 10 on the main-sync port, and the mover is
+    /// NAMED rather than absorbed.
+    ///
+    /// MOVER: `892c7d1bc` (main's `c2ac5d546`, #977) — arm (ii), the STATEMENT
+    /// ENCODING. That merge's two arms are (i) the table set shrank, empty
+    /// tables now being elided rather than padded, and (ii) the absorbed epoch
+    /// statement grew. This pin is on (ii); `epoch_verify_tests`' SUB_PROOFS is
+    /// on (i).
+    ///
+    /// #977 took the six accelerator chips out of
+    /// `FIXED_TABLE_COUNT` (11 → 5) and made them counted, so the epoch
+    /// statement absorbs six more `u64` counts, and the same PR appended
+    /// `is_final` as the statement's last byte. `NUM_TABLE_COUNTS` went 15 → 21
+    /// and `EpochStatementShape::byte_len` gained a trailing `+ 1`: the
+    /// statement is **+49 bytes**, which is under one 64-byte `Blake3Chain`
+    /// block and therefore worth exactly one more compression.
+    ///
+    /// TranscriptReplayV0 stays at 8, and that is what keeps this a pair rather
+    /// than two literals: it replays no statement, so a change that moved BOTH
+    /// counts would not be this one and would have to name itself.
     const TRANSCRIPT_REPLAY_BLAKE3_ROWS: usize = 8;
-    const STATEMENT_REPLAY_BLAKE3_ROWS: usize = 9;
+    const STATEMENT_REPLAY_BLAKE3_ROWS: usize = 10;
 
     use super::instr::Instr;
     use super::programs::{

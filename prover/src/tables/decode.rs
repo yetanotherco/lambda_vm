@@ -36,6 +36,7 @@ use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
 use math::polynomial::Polynomial;
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -313,6 +314,17 @@ pub fn compute_precomputed_commitment(
     instructions: &U64HashMap<Instruction>,
     options: &ProofOptions,
 ) -> Commitment {
+    compute_precomputed_commitment_with(instructions, options, LeafLayout::RowPair)
+}
+
+/// [`compute_precomputed_commitment`] under an explicit trace-tree leaf layout
+/// (S2). DECODE is program-dependent, so a one-row DECODE root is computed at
+/// run time, like the row-pair one.
+pub fn compute_precomputed_commitment_with(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     let columns = preprocessed_columns(instructions);
     let num_rows = columns[0].len();
 
@@ -341,7 +353,35 @@ pub fn compute_precomputed_commitment(
     // commitment the prover recomputes and compares against, so building it with
     // a different hash than the path commits under fails at prove time with
     // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
-    crate::lfm::commit::commit_lde_columns(&lde_columns)
+    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+}
+
+/// DECODE's commitment source for both leaf layouts: the row-pair root
+/// `supplied` by the caller (the recursion guest's) or computed on first use,
+/// and the one-row root computed on first use (program-dependent: no static
+/// twin; a supplied root never stands in for the other layout).
+pub fn lazy_commitment(
+    instructions: std::sync::Arc<U64HashMap<Instruction>>,
+    options: &ProofOptions,
+    supplied: Option<Commitment>,
+) -> stark::lookup::LazyCommitment {
+    let base = match supplied {
+        Some(c) => stark::lookup::LazyCommitment::ready(c),
+        None => {
+            let (instructions, options) = (instructions.clone(), options.clone());
+            stark::lookup::LazyCommitment::deferred(move || {
+                compute_precomputed_commitment(&instructions, &options)
+            })
+        }
+    };
+    let options = options.clone();
+    base.with_one_row(move || {
+        Some(compute_precomputed_commitment_with(
+            &instructions,
+            &options,
+            LeafLayout::Row,
+        ))
+    })
 }
 
 // =========================================================================

@@ -34,7 +34,7 @@ type FE = FieldElement<F>;
 /// The bus-balanced CPU/ADD/MUL instance from the completeness tests. Rebuilt
 /// per prove because `multi_prove` writes the LogUp aux columns into the caller's
 /// traces — and under `RecomputeLde` frees them again.
-fn traces() -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
+pub(super) fn traces() -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
     let cpu = TraceTable::from_columns_main(
         vec![
             vec![

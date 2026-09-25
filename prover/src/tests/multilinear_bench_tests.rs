@@ -1165,6 +1165,21 @@ fn check_transcript_pins(
     // variable: `MaxRowsConfig::default` is what chunked the epochs whose
     // transcript this is, and it reaches the posture through this function.
     let max_rows_log2 = crate::tables::max_rows_log2_override();
+    // ★ The bases were MEASURED at the legacy WHIR format (uniform
+    // folds, no cap). A run at any other WHIR format — the production default
+    // included — is a different measurement: it SKIPS and says so, like a run
+    // at another table cap. Re-pinning at the default needs a box measurement.
+    let whir_format = crate::zf_format::ZfFormat::global().chain_format();
+    if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT {
+        println!(
+            "{:<12} transcript pin SKIPPED - WHIR format {:?} (the bases were measured at the \
+             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4)",
+            "WHIR",
+            whir_format,
+            multilinear::whir_chain::ChainFormat::DEFAULT,
+        );
+        return;
+    }
     if !pin_applies(&sha, elf.len(), epoch_size_log2, max_rows_log2) {
         // Never silent. A skipped assert that prints nothing is
         // indistinguishable from one that passed, which is the failure this
@@ -1434,7 +1449,13 @@ fn the_pinned_pair_is_the_measurement() {
     // tallest stacked polynomial exactly — and the query count is 112 for every
     // height the block's cross-epoch tables can reach. The RUNTIME pin does not
     // rely on that: it evaluates the terms at the run's own config.
-    let config = crate::multilinear_prove::chain_config(&[(1, 21)]);
+    // ⚠ AT THE LEGACY WHIR FORMAT, named: the bases and lb17/lb18
+    // were measured before the default flip, and the runtime pin skips any
+    // other format.
+    let config = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::LEGACY,
+        &[(1, 21)],
+    );
     assert_eq!(
         (config.log_folding, config.num_queries),
         (4, 112),
@@ -1538,7 +1559,12 @@ fn the_genesis_stack_is_the_schedule_the_shape_implies() {
     // polynomial exactly. Stated here because the literal triple at the end of
     // this test is only the block's numbers at THIS posture; the runtime pin
     // evaluates the same form at the run's own config and does not rely on it.
-    let config = crate::multilinear_prove::chain_config(&[(1, 21)]);
+    // ⚠ THE LEGACY WHIR FORMAT: lb17/lb18 ran before the flip;
+    // under first6 the 21-variable stack is five rounds, not six.
+    let config = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::LEGACY,
+        &[(1, 21)],
+    );
     assert_eq!(
         (config.log_blowup, config.log_folding, config.num_queries),
         (2, 4, 112),
@@ -1684,9 +1710,25 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
         columns,
         "one placement per column, which is what the opening's wrapper absorbs"
     );
+    // ★ The DECODE group is committed under the PROCESS format
+    // (`decode_prepared_config` → `chain_config`), so with no knob set this is
+    // the production default's first6 schedule, [6,4,4,4,4,1] — pre-flip it was
+    // uniform4's [4,4,4,4,4,3]. Both are six rounds over 23 folded variables,
+    // so every count below is the same at either format.
+    assert_eq!(
+        config.format,
+        crate::zf_format::ZfFormat::global().chain_format()
+    );
+    let want: Vec<usize> = if crate::zf_format::ZfFormat::global().whir_folds
+        == multilinear::whir_chain::WhirFolds::Uniform
+    {
+        vec![4, 4, 4, 4, 4, 3]
+    } else {
+        vec![6, 4, 4, 4, 4, 1]
+    };
     assert_eq!(
         config.schedule(layout.n_stack()),
-        vec![4, 4, 4, 4, 4, 3],
+        want,
         "the fold schedule the chain runs"
     );
     assert_eq!(
@@ -1725,7 +1767,10 @@ fn pinned_stack() -> transcript_pin::Stack {
             columns: 6,
             num_vars: crate::continuation::PAGE_NUM_VARS,
         }),
-        config: crate::multilinear_prove::chain_config(&[(1, 21)]),
+        config: crate::multilinear_prove::chain_config_under(
+            &crate::zf_format::ZfFormat::LEGACY,
+            &[(1, 21)],
+        ),
     }
 }
 
@@ -1859,7 +1904,10 @@ fn the_pinned_constants_differ_by_owed() {
         pinned_stack(),
         transcript_pin::Stack {
             shape: None,
-            config: crate::multilinear_prove::chain_config(&[(1, 21)]),
+            config: crate::multilinear_prove::chain_config_under(
+                &crate::zf_format::ZfFormat::LEGACY,
+                &[(1, 21)],
+            ),
         },
     ] {
         let (pa, ps, pt) = transcript_pin::prove(shape, &stack);
@@ -2348,12 +2396,15 @@ fn check_device_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if !pin_applies(
-        &sha,
-        elf.len(),
-        epoch_size_log2,
-        crate::tables::max_rows_log2_override(),
-    ) {
+    if crate::zf_format::ZfFormat::global().chain_format()
+        != multilinear::whir_chain::ChainFormat::DEFAULT
+        || !pin_applies(
+            &sha,
+            elf.len(),
+            epoch_size_log2,
+            crate::tables::max_rows_log2_override(),
+        )
+    {
         println!(
             "{:<12} device pin SKIPPED - see the transcript pin's line",
             "WHIR"

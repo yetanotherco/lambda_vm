@@ -1,4 +1,7 @@
 use core::fmt;
+use core::str::FromStr;
+
+pub use crypto::merkle_tree::cap::CapPolicy;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -39,6 +42,19 @@ impl fmt::Display for ProofOptionsError {
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
+/// - `format`: the proof FORMAT ([`ProofFormat`], the ZF proof-format levers).
+///   Its default is the legacy format (every lever off), byte for byte.
+///
+/// # The format is not serialized
+///
+/// `format` is skipped by serde and rkyv (and restored to its default on
+/// deserialize), so a serialized `ProofOptions` has exactly the bytes it had
+/// before the field existed. Nothing repo-wide was found to serialize a
+/// `ProofOptions` into pinned bytes (the one by-value holder, `AirContext`,
+/// derives neither), and skipping it makes that true by construction rather
+/// than by search. The format is a verifier-side constant: it comes from the
+/// code that builds the options, never from bytes a prover supplied — a
+/// proof never carries it.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(
     Clone,
@@ -58,9 +74,256 @@ pub struct ProofOptions {
     /// polynomial has degree < 2^fri_final_poly_log_degree; the prover sends those
     /// 2^k coefficients instead of folding to a constant.
     pub fri_final_poly_log_degree: u8,
+    /// The proof format. [`ProofFormat::DEFAULT`] = the legacy format (the
+    /// production format is stamped on by the prover crate). Not serialized.
+    #[serde(skip)]
+    #[rkyv(with = rkyv::with::Skip)]
+    #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
+    pub format: ProofFormat,
 }
 
+/// The proof-format levers of a univariate STARK proof. Grouped so a literal
+/// `ProofOptions` names the format in one line (`format: ProofFormat::DEFAULT`)
+/// and a lever added later touches this struct only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ProofFormat {
+    /// Merkle cap policy for every tree of the proof (S1). `Off` = today.
+    pub merkle_cap: CapPolicy,
+    /// FRI fold schedule of the committed layers (S3). `Pair` = today.
+    pub fri_mode: FriMode,
+    /// One-row trace openings with a committed FRI input (S2). `Off` = today.
+    pub one_row: OneRowMode,
+    /// An explicit committed-layer fold schedule that replaces the DP's under
+    /// [`FriMode::Dp`] (ignored under [`FriMode::Pair`]). `None` = the DP.
+    ///
+    /// A TEST HOOK: it lets round-trip tests prove and verify schedules the DP
+    /// never picks (unequal neighbouring exponents such as `[1, 3]`, the only
+    /// shape that catches a fold-count off-by-one). No knob sets it — the
+    /// `ZF FORMAT` parser always leaves it `None` — and like every format
+    /// field it is a verifier-side constant, never read from a proof. A
+    /// schedule that does not cover the table's committed folds exactly is a
+    /// proving error and a verification failure, never a silent fallback.
+    pub fri_schedule_override: Option<FriScheduleOverride>,
+}
+
+impl ProofFormat {
+    /// This crate's default: every lever off, i.e. [`Self::LEGACY`].
+    ///
+    /// ⚠ NOT the production format. The prover crate's
+    /// `zf_format::ZfFormat::DEFAULT` (the measured configuration) is stamped
+    /// onto the options at the production sites; a `ProofOptions` built here
+    /// without a format, or deserialized (the format is not serialized), is
+    /// the legacy format.
+    pub const DEFAULT: Self = Self::LEGACY;
+
+    /// The legacy format: every lever off. The only format the RV64
+    /// recursion guest verifies.
+    pub const LEGACY: Self = Self {
+        merkle_cap: CapPolicy::Off,
+        fri_mode: FriMode::Pair,
+        one_row: OneRowMode::Off,
+        fri_schedule_override: None,
+    };
+
+    /// True when this is this crate's default format, [`Self::LEGACY`]
+    /// (`Fixed(0)` counts as `Off`).
+    pub fn is_default(&self) -> bool {
+        self.is_legacy()
+    }
+
+    /// True when every lever is off (`Fixed(0)` counts as `Off`): the proof
+    /// this produces is the legacy format, byte for byte.
+    pub fn is_legacy(&self) -> bool {
+        self.merkle_cap.is_off()
+            && self.fri_mode == FriMode::Pair
+            && self.one_row == OneRowMode::Off
+            && self.fri_schedule_override.is_none()
+    }
+}
+
+/// Longest schedule a [`FriScheduleOverride`] holds.
+pub const FRI_SCHEDULE_OVERRIDE_MAX: usize = 32;
+
+/// An explicit FRI fold schedule (see [`ProofFormat::fri_schedule_override`]):
+/// the fold exponent of each committed layer, first committed layer first.
+/// Fixed capacity so [`ProofFormat`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FriScheduleOverride {
+    len: u8,
+    exponents: [u8; FRI_SCHEDULE_OVERRIDE_MAX],
+}
+
+impl FriScheduleOverride {
+    /// `None` if `schedule` is longer than [`FRI_SCHEDULE_OVERRIDE_MAX`]. The
+    /// exponents themselves are validated where the layout is built (each in
+    /// `1..=FRI_SCHEDULE_DMAX`, summing to the table's committed folds).
+    pub fn new(schedule: &[u8]) -> Option<Self> {
+        if schedule.len() > FRI_SCHEDULE_OVERRIDE_MAX {
+            return None;
+        }
+        let mut exponents = [0u8; FRI_SCHEDULE_OVERRIDE_MAX];
+        exponents[..schedule.len()].copy_from_slice(schedule);
+        Some(Self {
+            len: schedule.len() as u8,
+            exponents,
+        })
+    }
+
+    /// The schedule.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.exponents[..self.len as usize]
+    }
+}
+
+/// How the committed FRI layers fold (S3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FriMode {
+    /// One binary fold per committed layer, pair leaves. Today's format.
+    #[default]
+    Pair,
+    /// Folds of `2^d` per committed layer, `d` chosen by the verifier-side DP.
+    Dp,
+}
+
+impl FriMode {
+    /// The knob spelling (`LAMBDA_VM_ZF_FRI`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pair => "pair",
+            Self::Dp => "dp",
+        }
+    }
+}
+
+impl fmt::Display for FriMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for FriMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "pair" => Ok(Self::Pair),
+            "dp" => Ok(Self::Dp),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Whether the trace trees commit one LDE row per leaf (S2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OneRowMode {
+    /// Row-pair leaves, the DEEP pair rebuilt from trace openings. Today's format.
+    #[default]
+    Off,
+    /// One-row leaves and a committed FRI-input tree for every table.
+    On,
+    /// Per table, whichever the cost model prefers from the AIR's widths.
+    Auto,
+}
+
+impl OneRowMode {
+    /// The knob spelling (`LAMBDA_VM_ZF_ONE_ROW`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "0",
+            Self::On => "1",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for OneRowMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for OneRowMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "0" => Ok(Self::Off),
+            "1" => Ok(Self::On),
+            "auto" => Ok(Self::Auto),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which format levers THIS build implements. A lever that is only parsed —
+/// its field exists so the option structs and the `ZF FORMAT` banner stay
+/// stable before the lever lands — must not be selectable, or a run
+/// could print a non-default format and prove the default one. Each flag
+/// is flipped in the commit that makes the lever real.
+///
+/// The Merkle cap is real on the host and device STARK provers, the host
+/// verifier and the LFM in-guest STARK verifier
+/// (`lfm::merkle_cap::CapCells`, one caps arena per sub-proof), on pair and on
+/// group-leaf (`Dp`) FRI layers alike. The RV64 recursion guest stays
+/// legacy-only: its archived verifier refuses any other format.
+pub const MERKLE_CAP_IMPLEMENTED: bool = true;
+
+/// `FriMode::Dp` (S3) is implemented on the prover paths and the host verifier:
+/// - the CPU prover (group-leaf layer commits, the scheduled folds, group
+///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
+/// - on a `cuda` build the device FRI arms (DEEP→FRI on device, the device
+///   layer commit, the device query gather) run both encodings: the group
+///   loop (`gpu_lde::fri_commit_gpu_drive_groups`,
+///   `math_cuda::fri::FriCommitState::fold_and_commit_group`) is the CPU
+///   loop's device twin, byte for byte (`tests::zf_fri_device_tests`).
+///
+/// - the in-guest (LFM) STARK verifier (G1 + G2): `lfm::fri::FriShape` takes
+///   the same schedule, and the emitter verifies group layers (slot check,
+///   group leaf, group fold), so an LFM wrap or node verifies a `Dp` proof.
+///
+/// NOT implemented: the RV64 recursion guest (legacy-only; it
+/// refuses a non-legacy format).
+pub const FRI_MODE_IMPLEMENTED: bool = true;
+
+/// `OneRowMode::{On, Auto}` (S2) is implemented on the prover (CPU and
+/// device) and the host verifier:
+/// - the CPU prover (one-row trace, precomputed, aux and composition trees;
+///   the DEEP codeword committed as FRI layer 0 before the first challenge;
+///   query indexes over the whole LDE; one-row openings) and the host
+///   verifier (`multi_verify` / `multi_verify_archived`), with the per-table
+///   `Auto` rule (`crate::leaf_layout`);
+/// - the preprocessed roots: static one-row twins at blowup 4
+///   (`STATIC_BLOWUP_FACTORS_ONE_ROW` in the prover crate), every computed
+///   root at run time, the LFM artifacts' one-row roots and the registry
+///   policy (a one-row format never reads `LFM_REGISTRY`); a table with no
+///   root for its layout is a proving error and a verifier reject, never a recompute
+///   — e.g. `one_row = 1` at blowup 2, 8 or 16 fails on BITWISE;
+/// - the device: one-row trees for the fused main commit,
+///   the preprocessed split, the aux commits (host input and resident) and the
+///   composition tree, device openings at row `r`, the LFM artifact commit,
+///   and the input tree committed from the resident DEEP codeword before the
+///   first challenge — each proof byte-identical to the CPU one; a one-row
+///   table may be device-only like a row-pair one, and under `Auto` one proof
+///   mixes both layouts on the device.
+///
+/// NOT implemented: the in-guest (LFM) verifier of a one-row proof (an emitter
+/// asked for one refuses at emit time, `lfm::fri::FriShape::from_options`),
+/// and the RV64 recursion guest (legacy-only). A block run under
+/// `LAMBDA_VM_ZF_ONE_ROW` therefore proves and host-verifies its STARK and
+/// LFM proofs but cannot recurse over one-row STARK proofs yet.
+pub const ONE_ROW_IMPLEMENTED: bool = true;
+
 impl ProofOptions {
+    /// True when every format field is at this crate's default (the legacy
+    /// format): the proof this produces is the legacy format, byte for
+    /// byte.
+    pub fn has_default_format(&self) -> bool {
+        self.format.is_default()
+    }
+
+    /// True when every lever is off: [`ProofFormat::LEGACY`].
+    pub fn has_legacy_format(&self) -> bool {
+        self.format.is_legacy()
+    }
+
     /// Default proof options used for testing purposes.
     /// These options should never be used in production.
     pub fn default_test_options() -> Self {
@@ -70,6 +333,7 @@ impl ProofOptions {
             coset_offset: 3,
             grinding_factor: 1,
             fri_final_poly_log_degree: DEFAULT_FRI_FINAL_POLY_LOG_DEGREE,
+            format: ProofFormat::DEFAULT,
         }
     }
 }
@@ -130,6 +394,7 @@ impl GoldilocksCubicProofOptions {
             coset_offset: 3,
             grinding_factor,
             fri_final_poly_log_degree: DEFAULT_FRI_FINAL_POLY_LOG_DEGREE,
+            format: ProofFormat::DEFAULT,
         })
     }
 }

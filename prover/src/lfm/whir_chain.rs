@@ -82,7 +82,8 @@ use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
 use super::whir_fold::{emit_fold_coset, fold_coset_rows};
 use super::whir_open::{
-    BlockValues, emit_verify_opening, verify_opening_perms, verify_opening_rows,
+    BlockValues, CapCells, TreeAuth, cap_check_perms, cap_check_rows, verify_opening_perms_capped,
+    verify_opening_rows_capped,
 };
 use super::whir_poly::{
     emit_eq_eval, emit_sumcheck_round, eq_eval_rows_again, sumcheck_round_rows,
@@ -127,6 +128,12 @@ pub struct ChainRoundWires<'a> {
     /// Per query: the successor block holding the folded value. Empty on the
     /// last round.
     pub next: &'a [QueryOpening<'a>],
+    /// The current tree's Merkle cap, when this round OWNS it: round 0 with
+    /// `caps[0] > 0`. Empty otherwise (W1; a later round's current tree was
+    /// authenticated as the round before's successor).
+    pub current_cap: &'a [WrapDigest],
+    /// The successor tree's Merkle cap, when it has one (`caps[r + 1] > 0`).
+    pub next_cap: &'a [WrapDigest],
 }
 
 /// The shape of one chain: everything the closed forms below are a function of.
@@ -143,6 +150,10 @@ pub struct ChainShape {
     pub num_vars: usize,
     pub num_queries: usize,
     pub grind: (usize, usize, usize),
+    /// Each tree's Merkle cap height (W1): tree `r` is round `r`'s current
+    /// tree. From the same `ChainConfig::tree_caps` the host prover and
+    /// verifier use; all zero at the default format.
+    pub caps: Vec<usize>,
 }
 
 impl ChainShape {
@@ -154,11 +165,14 @@ impl ChainShape {
             domain_log.push(d);
             d -= k;
         }
+        let caps = config.tree_caps(num_vars);
+        debug_assert_eq!(caps.len(), schedule.len(), "one cap height per tree");
         Self {
             schedule,
             domain_log,
             num_vars,
             num_queries: config.num_queries,
+            caps,
             grind: (
                 config.grind.folding as usize,
                 config.grind.ood as usize,
@@ -181,6 +195,23 @@ impl ChainShape {
     /// current depth. Only rounds before the last have one.
     pub fn next_depth(&self, r: usize) -> Option<usize> {
         (r + 1 < self.rounds()).then(|| self.current_depth(r + 1))
+    }
+
+    /// Round `r`'s current tree's cap height. ⚠ [`current_depth`](Self::current_depth)
+    /// stays the index-bit count; the sibling count is
+    /// [`current_path`](Self::current_path).
+    pub fn current_cap(&self, r: usize) -> usize {
+        self.caps[r]
+    }
+
+    /// Siblings on a path to round `r`'s current tree's cap.
+    pub fn current_path(&self, r: usize) -> usize {
+        self.current_depth(r) - self.caps[r]
+    }
+
+    /// The successor tree's cap height at round `r`.
+    pub fn next_cap(&self, r: usize) -> Option<usize> {
+        (r + 1 < self.rounds()).then(|| self.caps[r + 1])
     }
 
     /// Felts in round `r`'s current block: one per value in round 0, where the
@@ -208,12 +239,24 @@ impl ChainShape {
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
     for r in 0..shape.rounds() {
-        per_query += verify_opening_perms(shape.current_felts(r), shape.current_depth(r));
+        per_query += verify_opening_perms_capped(
+            shape.current_felts(r),
+            shape.current_depth(r),
+            shape.caps[r],
+        );
         if let Some(depth) = shape.next_depth(r) {
-            per_query += verify_opening_perms(3 << shape.schedule[r + 1], depth);
+            per_query +=
+                verify_opening_perms_capped(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }
     }
-    shape.num_queries * per_query
+    shape.num_queries * per_query + chain_cap_perms(shape)
+}
+
+/// PERMUTATIONS the chain's cap checks cost: each capped tree's cap hashed up
+/// to its root once, `2^c − 1` parents. Zero at the default. Part of
+/// [`chain_opening_perms`], stated apart so the per-tree term is visible.
+pub fn chain_cap_perms(shape: &ChainShape) -> usize {
+    shape.caps.iter().map(|&c| cap_check_perms(c)).sum()
 }
 
 /// INSTRUCTIONS one chain's query phase costs: per round, per query, the two
@@ -230,14 +273,18 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
         let depth = shape.current_depth(r);
         // The index draw, the current opening, and the fold.
         let mut q = 1
-            + verify_opening_rows(felts, unpacks, depth)
+            + verify_opening_rows_capped(felts, unpacks, depth, shape.caps[r])
             + fold_coset_rows(1usize << shape.schedule[r], depth);
         match shape.next_depth(r) {
             Some(next_depth) => {
                 let next_block = 1usize << shape.schedule[r + 1];
                 // The successor opening, the slot mux, and `folded == claimed`.
-                q += verify_opening_rows(3 * next_block, next_block, next_depth)
-                    + (next_block - 1)
+                q += verify_opening_rows_capped(
+                    3 * next_block,
+                    next_block,
+                    next_depth,
+                    shape.caps[r + 1],
+                ) + (next_block - 1)
                     + 2;
             }
             // `folded == final_value`.
@@ -291,6 +338,9 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
         rows += eq_eval_rows_again(shape.num_vars - shape.bound(r)) + 1;
     }
     rows += 1 + 1 + 2;
+    // W1: each capped tree's cap check, once (its hinted words are arena
+    // words, counted with the arena like every other hint).
+    rows += shape.caps.iter().map(|&c| cap_check_rows(c)).sum::<usize>();
     rows
 }
 
@@ -490,7 +540,9 @@ pub fn emit_verify_weighted(
 
     let mut claim = y;
     let mut alphas: Vec<Ext> = Vec::with_capacity(shape.num_vars);
-    let mut current_root = *root_lanes;
+    // Tree 0: its cap (when it has one) is authenticated against the root
+    // here, once; every later tree where its root is absorbed.
+    let mut current_tree = tree_auth(b, shape.caps[0], rounds[0].current_cap, root_lanes);
     let mut current_domain = domain.clone();
     // Each out-of-domain claim: its batching weight, its point, and how many
     // variables were bound when it entered.
@@ -525,7 +577,7 @@ pub fn emit_verify_weighted(
         }
         let bound = alphas.len() + k;
 
-        let next_root_lanes = match (round.next_root, round.ood_value, shape.next_depth(r)) {
+        let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
                 let lanes = b.unpack(next_root);
                 transcript.absorb_felts(b, &lanes);
@@ -552,9 +604,10 @@ pub fn emit_verify_weighted(
                 ood.push((gamma, ood_point, bound));
 
                 emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
-                Some(lanes)
+                Some(tree_auth(b, shape.caps[r + 1], round.next_cap, &lanes))
             }
             (None, None, None) => {
+                assert!(round.next_cap.is_empty(), "the last round has no successor");
                 transcript.absorb_ext(b, final_value);
                 emit_grind_check(b, transcript, grind_query as u8, round.nonces.query);
                 None
@@ -573,13 +626,13 @@ pub fn emit_verify_weighted(
             r,
             &current_domain,
             &point,
-            &current_root,
-            next_root_lanes.as_ref(),
+            &current_tree,
+            next_tree.as_ref(),
             final_value,
         );
 
-        if let Some(lanes) = next_root_lanes {
-            current_root = lanes;
+        if let Some(tree) = next_tree {
+            current_tree = tree;
         }
         alphas.extend(point);
         current_domain = next_domain;
@@ -594,6 +647,29 @@ pub fn emit_verify_weighted(
     }
 
     emit_final_check(b, claim, weight, final_value, one);
+}
+
+/// How a tree's openings are checked: against its root lanes when its cap
+/// height is 0 (today's emission, unchanged), else against its cap, hinted as
+/// `cap` and authenticated against the root lanes HERE — the one place a
+/// tree's [`CapCells`] are made.
+fn tree_auth(
+    b: &mut LfmBuilder,
+    cap_height: usize,
+    cap: &[WrapDigest],
+    root_lanes: &[Felt; 4],
+) -> TreeAuth {
+    if cap_height == 0 {
+        assert!(cap.is_empty(), "an uncapped tree carries no cap wires");
+        TreeAuth::Root(*root_lanes)
+    } else {
+        assert_eq!(cap.len(), 1usize << cap_height, "a cap is 2^c digests");
+        TreeAuth::Cap(CapCells::authenticate(
+            b,
+            cap,
+            std::slice::from_ref(root_lanes),
+        ))
+    }
 }
 
 /// ★ `require_out_of_domain` (`whir_chain.rs:88-101`), emitted as a REFUSAL.
@@ -647,29 +723,30 @@ fn emit_query_phase(
     r: usize,
     current_domain: &Domain<GoldilocksField>,
     alphas: &[Ext],
-    current_root: &[Felt; 4],
-    next_root: Option<&[Felt; 4]>,
+    current_tree: &TreeAuth,
+    next_tree: Option<&TreeAuth>,
     final_value: Ext,
 ) {
     let depth = shape.current_depth(r);
+    debug_assert_eq!(current_tree.cap_height(), shape.caps[r]);
     assert_eq!(round.current.len(), shape.num_queries);
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
 
-    match (next_root, shape.next_depth(r)) {
-        (Some(next_lanes), Some(next_depth)) => {
+    match (next_tree, shape.next_depth(r)) {
+        (Some(next_tree), Some(next_depth)) => {
             let next_block = 1usize << shape.schedule[r + 1];
             assert_eq!(round.next.len(), shape.num_queries);
             for (q, bits) in queries.iter().enumerate() {
                 let current = &round.current[q];
                 let next = &round.next[q];
-                emit_verify_opening(b, current.values, bits, current.siblings, current_root);
+                current_tree.verify_opening(b, current.values, bits, current.siblings);
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
                 // leaf and the high ones choose the slot inside it. Both bounds
                 // are powers of two, so this is a partition of the bits.
                 let (leaf_bits, slot_bits) = bits.split_at(next_depth);
-                emit_verify_opening(b, next.values, leaf_bits, next.siblings, next_lanes);
+                next_tree.verify_opening(b, next.values, leaf_bits, next.siblings);
 
                 let folded =
                     emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
@@ -681,7 +758,7 @@ fn emit_query_phase(
         _ => {
             for (q, bits) in queries.iter().enumerate() {
                 let current = &round.current[q];
-                emit_verify_opening(b, current.values, bits, current.siblings, current_root);
+                current_tree.verify_opening(b, current.values, bits, current.siblings);
                 let folded =
                     emit_fold_coset(b, &block_ext(current.values), current_domain, bits, alphas);
                 b.assert_eq_ext(folded, final_value);
@@ -783,6 +860,10 @@ pub struct RoundStorage {
     roots: Vec<Option<super::builder::Cell>>,
     oods: Vec<Option<Ext>>,
     nonces: Vec<RoundNonces>,
+    /// Per round: the current tree's cap when the round owns it (round 0),
+    /// and the successor's cap. Empty where the tree is uncapped.
+    current_caps: Vec<Vec<WrapDigest>>,
+    next_caps: Vec<Vec<WrapDigest>>,
 }
 
 impl RoundStorage {
@@ -806,6 +887,8 @@ impl RoundStorage {
         let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
         let mut oods: Vec<Option<Ext>> = Vec::new();
         let mut nonces: Vec<RoundNonces> = Vec::new();
+        let mut current_caps: Vec<Vec<WrapDigest>> = Vec::new();
+        let mut next_caps: Vec<Vec<WrapDigest>> = Vec::new();
 
         let mut at = base;
         for r in 0..shape.rounds() {
@@ -825,7 +908,16 @@ impl RoundStorage {
             let query = b.hint_felt(arena, at + 2);
             at += 3;
 
-            let depth = shape.current_depth(r);
+            // W1: tree 0's cap, right after round 0's nonces (the words the
+            // owner path carried after its siblings).
+            let current_cap: Vec<WrapDigest> = if r == 0 {
+                (0..cap_words(shape.caps[0]))
+                    .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let depth = shape.current_path(r);
             let block = 1usize << k;
             // ★ ROUND 0's current codeword is BASE on the host
             // (`whir_chain.rs:983`), so its block hashes ONE felt a value and
@@ -855,10 +947,15 @@ impl RoundStorage {
                 })
                 .collect();
 
-            let (next_root, ood_value, next) = match shape.next_depth(r) {
+            let (next_root, ood_value, next, next_cap) = match shape.next_depth(r) {
                 Some(next_depth) => {
                     let nr = next_word(b, &mut at);
                     let ov = next_word(b, &mut at).as_ext();
+                    // W1: the successor's cap, after its root and ood value.
+                    let next_cap: Vec<WrapDigest> = (0..cap_words(shape.caps[r + 1]))
+                        .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                        .collect();
+                    let next_depth = next_depth - shape.caps[r + 1];
                     let next_block = 1usize << shape.schedule[r + 1];
                     let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
                         .map(|_| {
@@ -871,9 +968,9 @@ impl RoundStorage {
                             (values, path)
                         })
                         .collect();
-                    (Some(nr), Some(ov), next)
+                    (Some(nr), Some(ov), next, next_cap)
                 }
-                None => (None, None, Vec::new()),
+                None => (None, None, Vec::new(), Vec::new()),
             };
 
             sumchecks.push(sumcheck);
@@ -886,6 +983,8 @@ impl RoundStorage {
                 ood: ood_nonce,
                 query,
             });
+            current_caps.push(current_cap);
+            next_caps.push(next_cap);
         }
         assert_eq!(
             at - base,
@@ -901,6 +1000,8 @@ impl RoundStorage {
             roots,
             oods,
             nonces,
+            current_caps,
+            next_caps,
         }
     }
 
@@ -951,6 +1052,8 @@ impl RoundStorage {
                 nonces: self.nonces[r],
                 current: &current[r],
                 next: &next[r],
+                current_cap: &self.current_caps[r],
+                next_cap: &self.next_caps[r],
             })
             .collect()
     }
@@ -959,19 +1062,29 @@ impl RoundStorage {
 pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     let k = shape.schedule[r];
     // The sumcheck's two evaluations a round, three nonces, and per query
-    // the current block plus its path.
+    // the current block plus its path (to the cap, when the tree has one).
     let mut n = (2 * k + 3) as u32;
-    let depth = shape.current_depth(r);
+    let depth = shape.current_path(r);
     let block = 1usize << k;
     n += (shape.num_queries * (block + depth)) as u32;
+    if r == 0 {
+        // W1: tree 0's cap words.
+        n += cap_words(shape.caps[0]) as u32;
+    }
     if let Some(next_depth) = shape.next_depth(r) {
-        // The successor root, its out-of-domain value, and per query its
-        // block and path.
-        n += 2;
+        // The successor root, its out-of-domain value, its cap, and per query
+        // its block and path.
+        n += 2 + cap_words(shape.caps[r + 1]) as u32;
         let next_block = 1usize << shape.schedule[r + 1];
-        n += (shape.num_queries * (next_block + next_depth)) as u32;
+        n += (shape.num_queries * (next_block + next_depth - shape.caps[r + 1])) as u32;
     }
     n
+}
+
+/// Words a tree's cap occupies in the arena: `2^c` one-word digests, none at
+/// `c = 0` (an uncapped tree is checked against its root).
+fn cap_words(cap: usize) -> usize {
+    if cap == 0 { 0 } else { 1usize << cap }
 }
 
 /// One chain's round wires, in the order [`RoundStorage::hint`] reads them.
@@ -994,7 +1107,10 @@ pub fn push_round_words(
         for nonce in [round.nonces.folding, round.nonces.ood, round.nonces.query] {
             words.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
         }
-        push_openings(words, round, true);
+        // W1: round 0 owns tree 0, whose cap rides at the end of its first
+        // current path; it goes to the arena here and the path goes without it.
+        let current_cap = if r == 0 { cap_words(shape.caps[0]) } else { 0 };
+        push_openings(words, round, true, current_cap);
         if shape.next_depth(r).is_some() {
             words.push(commitment_to_digest(
                 round.next_root.as_ref().expect("a successor root"),
@@ -1002,50 +1118,68 @@ pub fn push_round_words(
             words.push(ext_word(
                 round.ood_value.as_ref().expect("an out-of-domain value"),
             ));
-            push_openings(words, round, false);
+            push_openings(words, round, false, cap_words(shape.caps[r + 1]));
         }
     }
 }
 
 /// One round's query openings, current or successor, block then path.
+///
+/// `owner_cap` is the number of cap words the side's FIRST opening carries at
+/// the end of its path (the owner-path encoding, W1): they are written first,
+/// ahead of every block, and the path is written without them. Zero at the
+/// default. A malformed path is not repaired here: its words are written as
+/// they are, and the arena's length (a verifier constant) refuses it.
 fn push_openings(
     words: &mut Vec<LfmWord>,
     round: &ChainRound<GoldilocksField, GoldilocksExtension>,
     current: bool,
+    owner_cap: usize,
 ) {
+    fn side<V>(
+        words: &mut Vec<LfmWord>,
+        openings: &[multilinear::whir_commit::CosetOpening<V>],
+        owner_cap: usize,
+        value_word: impl Fn(&math::field::element::FieldElement<V>) -> LfmWord,
+    ) where
+        V: math::field::traits::IsField,
+    {
+        let owner_split = openings
+            .first()
+            .map_or(0, |o| o.proof.merkle_path.len().saturating_sub(owner_cap));
+        if let Some(owner) = openings.first() {
+            for node in &owner.proof.merkle_path[owner_split..] {
+                words.push(commitment_to_digest(node));
+            }
+        }
+        for (i, opening) in openings.iter().enumerate() {
+            for v in &opening.values {
+                words.push(value_word(v));
+            }
+            let path = if i == 0 {
+                &opening.proof.merkle_path[..owner_split]
+            } else {
+                &opening.proof.merkle_path[..]
+            };
+            for node in path {
+                words.push(commitment_to_digest(node));
+            }
+        }
+    }
     match &round.openings {
         RoundOpenings::Base(p) => {
             if current {
-                for opening in &p.current {
-                    // A base value arrives as `(v, 0, 0, 0)`.
-                    for v in &opening.values {
-                        words.push([*v, FE::zero(), FE::zero(), FE::zero()]);
-                    }
-                    for node in &opening.proof.merkle_path {
-                        words.push(commitment_to_digest(node));
-                    }
-                }
+                // A base value arrives as `(v, 0, 0, 0)`.
+                side(words, &p.current, owner_cap, |v| {
+                    [*v, FE::zero(), FE::zero(), FE::zero()]
+                });
             } else {
-                for opening in &p.next {
-                    for v in &opening.values {
-                        words.push(ext_word(v));
-                    }
-                    for node in &opening.proof.merkle_path {
-                        words.push(commitment_to_digest(node));
-                    }
-                }
+                side(words, &p.next, owner_cap, ext_word);
             }
         }
         RoundOpenings::Extension(p) => {
-            let side = if current { &p.current } else { &p.next };
-            for opening in side {
-                for v in &opening.values {
-                    words.push(ext_word(v));
-                }
-                for node in &opening.proof.merkle_path {
-                    words.push(commitment_to_digest(node));
-                }
-            }
+            let openings = if current { &p.current } else { &p.next };
+            side(words, openings, owner_cap, ext_word);
         }
     }
 }

@@ -25,7 +25,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::ChainConfig;
+use multilinear::whir_chain::{ChainConfig, WhirFolds};
 use stark::config::Commitment;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -171,6 +171,9 @@ where
     /// The parameters it was committed under — see [`Self::agrees_with`].
     log_blowup: usize,
     log_folding: usize,
+    /// The fold schedule (W2): its first round sets the leaf width tree 0 was
+    /// built at.
+    folds: WhirFolds,
 }
 
 impl<H> DecodePrepared<H>
@@ -219,15 +222,20 @@ where
     /// exactly as long as that holds, and it is ASSERTED per epoch rather than
     /// assumed, because the day a blowup becomes shape-dependent this is the
     /// line that says so instead of a proof nobody can verify.
+    ///
+    /// ★ AND THE FOLD SCHEDULE (W2). `commit_stacked` blocks tree 0's leaves at
+    /// `config.schedule(n)[0]`, which under a first fold is `k0`, not
+    /// `log_folding`. The schedule is a function of `(log_folding, folds, n)`
+    /// and `n` is the commitment's own, so equal policies mean an equal first
+    /// fold; a commitment built at `first6` has 64-wide leaves that a
+    /// `uniform4` epoch would open as 16-wide ones.
     pub(crate) fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
-        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
-            return Err(Error::Prover(format!(
-                "the pinned DECODE commitment was built at blowup {} / folding {}, \
-                 and this epoch argues at blowup {} / folding {}",
-                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
-            )));
-        }
-        Ok(())
+        committed_under(
+            "the pinned DECODE commitment was built",
+            "this epoch argues",
+            (self.log_blowup, self.log_folding, self.folds),
+            config,
+        )
     }
 
     /// What the verifier settles the opening against.
@@ -299,6 +307,9 @@ where
     /// The parameters it was committed under — see [`Self::agrees_with`].
     log_blowup: usize,
     log_folding: usize,
+    /// The fold schedule (W2): its first round sets the leaf width tree 0 was
+    /// built at.
+    folds: WhirFolds,
 }
 
 impl<H> GenesisPrepared<H>
@@ -349,15 +360,15 @@ where
     /// [`DecodePrepared::agrees_with`] stops being vacuous for DECODE too.
     /// `StackedCommitment::commit` reads these two and never `num_queries`, so
     /// they are the whole of what a cached commitment must agree on.
+    /// The fold schedule is part of it for the reason
+    /// [`DecodePrepared::agrees_with`] gives.
     pub(crate) fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
-        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
-            return Err(Error::Prover(format!(
-                "the genesis stack was committed at blowup {} / folding {}, and this \
-                 cross-epoch proof argues at blowup {} / folding {}",
-                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
-            )));
-        }
-        Ok(())
+        committed_under(
+            "the genesis stack was committed",
+            "this cross-epoch proof argues",
+            (self.log_blowup, self.log_folding, self.folds),
+            config,
+        )
     }
 
     /// What an EMITTER needs to build the prepared leg, taken from the very
@@ -379,6 +390,7 @@ where
             domain: self.commitment.domain().clone(),
             log_blowup: self.log_blowup,
             log_folding: self.log_folding,
+            folds: self.folds,
         }
     }
 }
@@ -418,6 +430,8 @@ pub struct GlobalPrepared {
     pub domain: multilinear::whir::Domain<F>,
     pub log_blowup: usize,
     pub log_folding: usize,
+    /// The fold schedule it was committed under (W2).
+    pub folds: WhirFolds,
 }
 
 impl GlobalPrepared {
@@ -435,15 +449,35 @@ impl GlobalPrepared {
     /// The same assertion [`GenesisPrepared::agrees_with`] makes, for a consumer
     /// that holds the published form rather than the commitment.
     pub fn agrees_with(&self, config: &ChainConfig) -> Result<(), Error> {
-        if (config.log_blowup, config.log_folding) != (self.log_blowup, self.log_folding) {
-            return Err(Error::Prover(format!(
-                "the genesis stack was committed at blowup {} / folding {}, and this \
-                 program is emitted against blowup {} / folding {}",
-                self.log_blowup, self.log_folding, config.log_blowup, config.log_folding,
-            )));
-        }
-        Ok(())
+        committed_under(
+            "the genesis stack was committed",
+            "this program is emitted against",
+            (self.log_blowup, self.log_folding, self.folds),
+            config,
+        )
     }
+}
+
+/// The one comparison every `agrees_with` makes: a commitment built once and
+/// reused must have been built under the blowup, the fold width AND the fold
+/// schedule the proof argues at — the three things `StackedCommitment::commit`
+/// reads (it never reads `num_queries`).
+fn committed_under(
+    built: &str,
+    argues: &str,
+    (log_blowup, log_folding, folds): (usize, usize, WhirFolds),
+    config: &ChainConfig,
+) -> Result<(), Error> {
+    if (config.log_blowup, config.log_folding, config.format.folds)
+        != (log_blowup, log_folding, folds)
+    {
+        return Err(Error::Prover(format!(
+            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?}, and \
+             {argues} at blowup {} / folding {} / folds {:?}",
+            config.log_blowup, config.log_folding, config.format.folds,
+        )));
+    }
+    Ok(())
 }
 
 /// The genesis stack for a page family, or `None` when nothing is dense enough
@@ -547,6 +581,7 @@ where
         commitment,
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
+        folds: config.format.folds,
     }))
 }
 
@@ -641,6 +676,7 @@ where
         commitment,
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
+        folds: config.format.folds,
     })
 }
 
@@ -757,11 +793,17 @@ pub(crate) fn absorb_epoch(
 
     let &ChainConfig {
         log_blowup,
-        log_folding,
+        // ★ Absorbed as `fold_word()`: `log_folding` itself (4u64) at the
+        // default fold schedule, a tagged word binding the schedule otherwise.
+        log_folding: _,
         num_queries,
         grind,
+        // ⚠ Format, NOT absorbed except the fold schedule, through the word
+        // above: verifier-side constants (see `lfm::whir_statement::push_config`,
+        // the emitter's twin of this).
+        format: _,
     } = config;
-    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+    for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
         len += size_of_val(&value);
     }
@@ -919,11 +961,17 @@ pub(crate) fn absorb_global(
     len += table_num_vars.len();
     let &ChainConfig {
         log_blowup,
-        log_folding,
+        // ★ Absorbed as `fold_word()`: `log_folding` itself (4u64) at the
+        // default fold schedule, a tagged word binding the schedule otherwise.
+        log_folding: _,
         num_queries,
         grind,
+        // ⚠ Format, NOT absorbed except the fold schedule, through the word
+        // above: verifier-side constants (see `lfm::whir_statement::push_config`,
+        // the emitter's twin of this).
+        format: _,
     } = config;
-    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+    for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
         t.append_bytes(&value.to_le_bytes());
         len += size_of_val(&value);
     }

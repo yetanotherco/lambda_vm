@@ -193,10 +193,28 @@ is what keeps `E` small. At `T = 24` with tables at their row cap (`L_t = 12`), 
 `3E = 1,092` base candidates and `P ≈ 2.5·10^−7`. At a larger `T ≈ 60`, `E = 904` and
 `P ≈ 6.3·10^−7`.
 
-`T = 24` is **measured, not assumed**: reading a real two-epoch continuation proof
-(`machine_tests::arena_filler_reads_real_committed_roots`) gives 24 sub-proofs for an
-intermediate epoch and 25 for the final one, the extra being HALT. It was an honest hedge when
-this section was written; it no longer needs to be.
+`T = 24` was the epoch shape when this section was written: a real two-epoch continuation proof
+gave 24 sub-proofs for an intermediate epoch and 25 for the final one, the extra being HALT.
+
+⚠ TWO CORRECTIONS, and the bound survives both.
+
+**`T` is now SMALLER, and the bound is monotone in `T`.** #977 (`892c7d1bc` on this lineage) took
+`FIXED_TABLE_COUNT` 11 → 5 and made COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS and HINT counted, so
+an epoch that never reaches one carries no sub-proof for it — `epoch_verify_tests`'
+`SUB_PROOFS` measures 16 on the fibonacci fixture, down from 25. `E = 4 + Σ_t (3 + L_t)` is
+increasing in `T`, and `P ≤ 3E · 2^−32` is increasing in `E`, so a smaller `T` only lowers `P`:
+the `P ≈ 2.5·10^−7` quoted at `T = 24` remains a valid upper bound, now a conservative one. The
+`T ≈ 60` figure is the side that matters for a real block and is untouched.
+
+**The cited test does not pin the number.** `machine_tests::arena_filler_reads_real_committed_roots`
+asserts `tables > 0`, one main root per sub-proof, and that no root is all-zero — never a count.
+So "measured, not assumed" was true of the run that was done and false of the suite: nothing
+would have failed when `T` moved, and nothing did. The count that IS asserted is
+`epoch_verify_tests`' `SUB_PROOFS`, on a different fixture (`epoch_tests::real_epoch`) than the
+two-epoch continuation this paragraph describes. `T` for THAT fixture is unmeasured since #977;
+it is bounded above by the 25/26 ceiling in
+`tests::constraint_artifact_tests::continuation_epoch_constraint_leg`, which is what the bound
+above should be read against until someone runs it.
 
 **State it as `< 10^−6` per proof at production shapes**, growing by `≈ 1.05·10^−8` per additional
 table — each table contributes `3 + L_t ≈ 15` extension draws, so the per-table increment is 15×

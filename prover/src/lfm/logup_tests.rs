@@ -949,8 +949,9 @@ enum RowWitness {
 ///
 /// ## Why this had to be measured
 ///
-/// `FIXED_TABLE_COUNT` forces a sub-proof for all ten fixed tables whatever the
-/// workload, so a real epoch always carries tables with no real rows. The
+/// `FIXED_TABLE_COUNT` forces a sub-proof for its five tables whatever the
+/// workload — ten before #977 moved the six accelerators into `TableCounts` —
+/// so a real epoch always carries tables with no real rows. The
 /// closure's [`LogUpShape::num_contributing_tables`] is a program CONSTANT, so
 /// if such a table reported `None` the count would be workload-dependent and the
 /// constant wrong. The LogUp leg closed with this labelled INFERENCE: production
@@ -978,8 +979,11 @@ enum RowWitness {
 /// "No rows" is read off the TRACE, not inferred from the workload, and not read
 /// back off the contribution being measured — see [`RowWitness`] for the two
 /// forms it takes and why one would not do. `FIXED_TABLE_COUNT` keeps the
-/// sub-proof either way: `generate_keccak_trace` pads a zero-operation table to
-/// four rows rather than dropping it.
+/// sub-proof either way, and KECCAK_RC is the example since #977: it is one of
+/// the five always-on tables, and its trace is padded with `MU` gated off
+/// rather than dropped. KECCAK itself is no longer such a table — it is
+/// `TableCounts::keccak`, and an epoch that calls no keccak carries no KECCAK
+/// sub-proof to measure.
 ///
 /// ## Which sub-proof is which table
 ///
@@ -1350,8 +1354,11 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // None would make every real epoch unverifiable. That is now a run: strip
     // the bus public inputs off a zero-row sub-proof and watch this very proof
     // stop verifying. Only the `is_some` direction can be tested on an epoch —
-    // all 25 sub-proofs declare interactions, so :1244's converse has no
-    // subject here.
+    // every sub-proof this epoch carries declares interactions, so :1244's
+    // converse has no subject here. It reads "all 16" since #977 (`892c7d1bc`)
+    // rather than all 25, and the count is deliberately not spelled: the loop
+    // walks `census`, so a literal here would be a second, driftable copy of a
+    // length the loop already has.
     for (i, (name, _, no_rows)) in census.iter().enumerate() {
         if !no_rows {
             continue;
@@ -1386,7 +1393,8 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         num_contributing_tables: contributions.len(),
         num_output_bytes: public_output.len(),
     };
-    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut seed());
+    let (z, alpha) = crate::replay_transcript_phase_a_view(&refs, view, &mut seed())
+        .expect("every preprocessed table has a root for its layout");
 
     let n_tables = contributions.len() as u32;
     let n_bytes = public_output.len() as u32;

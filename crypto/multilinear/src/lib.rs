@@ -24,6 +24,8 @@ pub mod uneven;
 pub mod uni_skip;
 pub mod virtual_poly;
 pub mod whir;
+#[cfg(test)]
+mod whir_cap_tests;
 pub mod whir_chain;
 pub mod whir_commit;
 pub mod whir_eval;
@@ -107,6 +109,14 @@ pub enum Error {
     QueryCountMismatch { expected: usize, got: usize },
     #[error("query {query}: the Merkle opening does not match the commitment")]
     OpeningRejected { query: usize },
+    /// A tree's Merkle cap, carried by its first opening, is the wrong length
+    /// or does not hash to the tree's root.
+    #[error("a Merkle cap does not authenticate against its root")]
+    CapRejected,
+    /// The prover could not cut its paths to the cap: a policy asked for a cap
+    /// taller than the tree, or a path had the wrong length.
+    #[error("could not embed the Merkle cap: {reason}")]
+    CapEmbedFailed { reason: &'static str },
     #[error("query {query}: the folded block does not match the committed successor")]
     FoldInconsistent { query: usize },
     #[error("the folded codeword and the sumcheck disagree on the evaluation")]

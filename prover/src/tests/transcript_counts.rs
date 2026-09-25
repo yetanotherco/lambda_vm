@@ -159,6 +159,11 @@ fn drive_table(s: &mut Sim, t: &TableTranscriptShape) {
     }
 }
 
+/// Today's uniform fold schedule, spelled independently of `ChainConfig`: `k`
+/// per round, the remainder last. The LEGACY format's schedule; the closed
+/// form below drives the config's own schedule, and
+/// `the_uniform_schedule_is_the_legacy_configs` ties the two at the legacy
+/// format.
 fn schedule(num_vars: usize, k: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut left = num_vars;
@@ -170,8 +175,10 @@ fn schedule(num_vars: usize, k: usize) -> Vec<usize> {
     out
 }
 
-fn drive_chain(s: &mut Sim, n_stack: usize, k: usize, queries: usize) {
-    let sch = schedule(n_stack, k);
+/// One chain's transcript over the fold schedule `sch` — the config's own
+/// (`ChainConfig::schedule`), so a non-uniform first fold (`whir_folds=first6`,
+/// the production default) is priced as it is proved.
+fn drive_chain(s: &mut Sim, sch: &[usize], queries: usize) {
     let rounds = sch.len();
     for (r, &kr) in sch.iter().enumerate() {
         s.state(); // check_grind(folding)
@@ -208,7 +215,7 @@ pub fn transcript_counts(
     statement_absorbs: &[u64],
     tables: &[TableTranscriptShape],
     groups: &[GroupTranscriptShape],
-    log_folding: usize,
+    chain: &multilinear::whir_chain::ChainConfig,
     queries: usize,
     owed_probe: bool,
 ) -> TranscriptCounts {
@@ -251,7 +258,7 @@ pub fn transcript_counts(
         }
         s.sample_ext(); // the batching challenge
         for _ in 0..g.num_polys {
-            drive_chain(&mut s, g.n_stack, log_folding, queries);
+            drive_chain(&mut s, &chain.schedule(g.n_stack), queries);
         }
     }
     s.c
@@ -423,7 +430,7 @@ fn continuation_transcript_counts(
                 &epoch_statement_absorbs(EPOCH_TAG, public_output.len(), shapes.len()),
                 &tables,
                 &groups,
-                config.log_folding,
+                &config,
                 config.num_queries,
                 true,
             );
@@ -437,7 +444,7 @@ fn continuation_transcript_counts(
                 let roots: usize = groups.iter().map(|g| g.num_polys).sum();
                 let chain_rounds: usize = groups
                     .iter()
-                    .map(|g| g.num_polys * g.n_stack.div_ceil(config.log_folding))
+                    .map(|g| g.num_polys * config.rounds(g.n_stack))
                     .sum();
                 println!(
                     "epoch {:>2}: transcript_absorbs {:>8} transcript_squeezes {:>7} | absorb_calls {:>9} bytes {:>11} states {:>6}",
@@ -530,7 +537,7 @@ fn continuation_transcript_counts(
         &global_statement_absorbs(page_bases.len(), gshapes.len()),
         &gtables,
         &ggroups,
-        gconfig.log_folding,
+        &gconfig,
         gconfig.num_queries,
         false,
     );
@@ -556,7 +563,7 @@ fn continuation_transcript_counts(
         let groots: usize = ggroups.iter().map(|g| g.num_polys).sum();
         let chain_rounds: usize = ggroups
             .iter()
-            .map(|g| g.num_polys * g.n_stack.div_ceil(gconfig.log_folding))
+            .map(|g| g.num_polys * gconfig.rounds(g.n_stack))
             .sum();
         println!(
             "          tables {} sum_m {} gkr_rounds {} sum_n {} cols {} factors {} n*deg {} roots {} chain_rounds {} Q {}",
@@ -726,5 +733,33 @@ fn whir_transcript_counts_for_the_block() {
     println!(
         "transcript finalizes (squeezes + states) = {}",
         c.finalizes()
+    );
+}
+
+/// The closed form drives `ChainConfig::schedule`; at the LEGACY format that
+/// is exactly the uniform schedule spelled independently above, at every
+/// height a chain reaches. Under the production default (first6) the two
+/// differ, which is why the form no longer takes a fold width.
+#[test]
+fn the_uniform_schedule_is_the_legacy_configs() {
+    let legacy = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::LEGACY,
+        &[(1, 25)],
+    );
+    for n in 1..=32 {
+        assert_eq!(
+            schedule(n, legacy.log_folding),
+            legacy.schedule(n),
+            "n = {n}"
+        );
+    }
+    let production = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    assert_ne!(
+        schedule(25, production.log_folding),
+        production.schedule(25),
+        "first6 is not the uniform walk"
     );
 }

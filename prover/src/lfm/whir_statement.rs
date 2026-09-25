@@ -99,11 +99,21 @@ pub struct GlobalStatement<'a> {
 fn push_config(bytes: &mut Vec<u8>, config: &ChainConfig) {
     let &ChainConfig {
         log_blowup,
-        log_folding,
+        // ★ Written as `fold_word()`: `log_folding` itself (4u64) under the
+        // default schedule — today's bytes — and a tagged word that binds the
+        // fold schedule otherwise (W2). Same length either way: 245 bytes.
+        log_folding: _,
         num_queries,
         grind,
+        // ⚠ NOT absorbed: the rest of the format (the cap policy) is a set of
+        // verifier-side constants, like the STARK cap. Absorbing it would move
+        // this statement's bytes, and every WHIR transcript KAT, at the
+        // default. A change to a lever's effect on the statement
+        // decides that here, explicitly. The fold schedule is absorbed through
+        // the word above, whose default value is today's.
+        format: _,
     } = config;
-    for value in [log_blowup as u64, log_folding as u64, num_queries as u64] {
+    for value in [log_blowup as u64, config.fold_word(), num_queries as u64] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes.extend_from_slice(&[grind.folding, grind.ood, grind.query]);

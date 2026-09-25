@@ -143,10 +143,28 @@ pub const fn block_leaf_rows(felts: usize, unpacks: usize) -> usize {
 /// once by the caller and shared across every query against that root, so they
 /// are not charged here.
 pub const fn verify_opening_rows(felts: usize, unpacks: usize, depth: usize) -> usize {
+    verify_opening_rows_capped(felts, unpacks, depth, 0)
+}
+
+/// [`verify_opening_rows`] against a tree capped at height `cap`
+/// ([`CapCells`]): the walk stops `cap` levels short (`2·cap` rows fewer),
+/// the cap mux picks the node with `2^cap − 1` `Select` rows, and the
+/// comparison is of two VARIABLE cells, so it unpacks both (one `Unpack` more
+/// than against the hoisted root lanes). At `cap = 0` it is the root form.
+pub const fn verify_opening_rows_capped(
+    felts: usize,
+    unpacks: usize,
+    depth: usize,
+    cap: usize,
+) -> usize {
     let leaf = block_leaf_rows(felts, unpacks);
-    let walk = 2 * depth;
+    let walk = 2 * (depth - cap);
     let compare = 1 + 2 * FELTS_PER_WORD;
-    leaf + walk + compare
+    if cap == 0 {
+        leaf + walk + compare
+    } else {
+        leaf + walk + ((1usize << cap) - 1) + 1 + compare
+    }
 }
 
 /// PERMUTATIONS one query's opening costs: the leaf's blocks plus one parent a
@@ -154,7 +172,32 @@ pub const fn verify_opening_rows(felts: usize, unpacks: usize, depth: usize) -> 
 /// function of the block's felts and the tree's depth alone — no row
 /// bookkeeping enters it.
 pub const fn verify_opening_perms(felts: usize, depth: usize) -> usize {
-    felts.div_ceil(RATE_FELTS) + depth
+    verify_opening_perms_capped(felts, depth, 0)
+}
+
+/// [`verify_opening_perms`] against a tree capped at height `cap`: `cap`
+/// parents fewer. The cap's own `2^cap − 1` parents are paid once per TREE,
+/// by [`cap_check_perms`].
+pub const fn verify_opening_perms_capped(felts: usize, depth: usize, cap: usize) -> usize {
+    felts.div_ceil(RATE_FELTS) + depth - cap
+}
+
+/// PERMUTATIONS one tree's cap check costs: the cap hashed up to its root,
+/// `2^cap − 1` parents. Nothing at `cap = 0`.
+pub const fn cap_check_perms(cap: usize) -> usize {
+    (1usize << cap) - 1
+}
+
+/// INSTRUCTIONS one tree's cap check costs beyond its hinted words: the
+/// `2^cap − 1` parents (one `compress` each) and the root comparison (one
+/// `Unpack` and four lowered asserts). Nothing at `cap = 0`: an uncapped tree
+/// is compared against its root lanes query by query.
+pub const fn cap_check_rows(cap: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        cap_check_perms(cap) + 1 + 2 * FELTS_PER_WORD
+    }
 }
 
 /// ★ The block's Merkle leaf: `sponge_leaf` over its felts.
@@ -206,4 +249,54 @@ pub fn emit_verify_opening(
     let leaf = emit_block_leaf(b, values);
     let walked = edsl::wrap_merkle_walk(b, leaf, index_bits, siblings);
     edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(root_lanes));
+}
+
+/// ★ One tree's authenticated Merkle cap — the gadget the STARK verifier
+/// shares ([`super::merkle_cap`]): its only constructor checks the cap against
+/// the tree's root, and its one entry point walks, muxes and compares.
+pub use super::merkle_cap::CapCells;
+
+/// How one tree's openings are authenticated in-guest: against its root
+/// lanes (no cap — today's emission, instruction for instruction), or
+/// against its authenticated [`CapCells`].
+pub enum TreeAuth {
+    Root([Felt; 4]),
+    Cap(CapCells),
+}
+
+impl TreeAuth {
+    /// The cap height the openings are cut to (0 for a root).
+    pub fn cap_height(&self) -> usize {
+        match self {
+            TreeAuth::Root(_) => 0,
+            TreeAuth::Cap(cap) => cap.height(),
+        }
+    }
+
+    /// ★ `whir_commit::verify_opening_capped`, emitted as a refusal.
+    ///
+    /// `index_bits` is the WHOLE leaf index, low first, one bit per tree
+    /// level; `siblings` is the path to the cap, `index_bits.len() − c` long.
+    /// The low bits are walked and the top `c` pick the cap node. With a
+    /// [`TreeAuth::Root`] this is [`emit_verify_opening`] exactly.
+    pub fn verify_opening(
+        &self,
+        b: &mut LfmBuilder,
+        values: BlockValues<'_>,
+        index_bits: &[Bit],
+        siblings: &[WrapDigest],
+    ) {
+        match self {
+            TreeAuth::Root(lanes) => emit_verify_opening(b, values, index_bits, siblings, lanes),
+            TreeAuth::Cap(cap) => {
+                assert_eq!(
+                    siblings.len() + cap.height(),
+                    index_bits.len(),
+                    "a path to the cap: one sibling per level below it"
+                );
+                let leaf = emit_block_leaf(b, values);
+                cap.verify_path(b, leaf, index_bits, siblings);
+            }
+        }
+    }
 }

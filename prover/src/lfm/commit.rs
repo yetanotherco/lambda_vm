@@ -8,8 +8,9 @@
 //! keygen in this framework).
 
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed_with};
+use stark::commitment::commit_bit_reversed_with;
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 
@@ -87,8 +88,15 @@ pub fn lde_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Vec<Vec<FE>> 
     columns.iter().map(expand).collect()
 }
 
-/// Commits an already-expanded LDE column matrix.
+/// Commits an already-expanded LDE column matrix with today's row-pair
+/// leaves.
 pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
+    commit_lde_columns_with(lde_columns, LeafLayout::RowPair)
+}
+
+/// [`commit_lde_columns`] under an explicit trace-tree leaf layout (S2: a
+/// one-row table's preprocessed root is this at [`LeafLayout::Row`]).
+pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> Commitment {
     // ★ Under the block path's PIN, not `stark`'s default aliases. These commit
     // the production tables whose roots `lfm_program_id` names, so the hash that
     // BUILDS them and the hash the program identity CLAIMS have to be the same
@@ -97,7 +105,7 @@ pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
     let (_, root) = commit_bit_reversed_with::<
         GoldilocksField,
         <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-    >(lde_columns, ROWS_PER_LEAF)
+    >(lde_columns, layout.rows_per_leaf())
     .expect("Merkle build failed for LFM column group");
     root
 }
@@ -105,6 +113,15 @@ pub fn commit_lde_columns(lde_columns: &[Vec<FE>]) -> Commitment {
 /// Commits a column matrix (each inner `Vec` one column, power-of-two height).
 pub fn commit_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Commitment {
     commit_lde_columns(&lde_columns(columns, options))
+}
+
+/// [`commit_columns`] under an explicit leaf layout.
+pub fn commit_columns_with(
+    columns: &[Vec<FE>],
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
+    commit_lde_columns_with(&lde_columns(columns, options), layout)
 }
 
 /// A [`ColumnGroup`]'s data, column-major (the commit pipeline's input shape).
@@ -197,16 +214,43 @@ pub fn commit_group_device_or_host(
     group: &ColumnGroup,
     options: &ProofOptions,
 ) -> Commitment {
+    commit_group_device_or_host_with(label, group, options, LeafLayout::RowPair)
+}
+
+/// [`commit_group_device_or_host`] under an explicit leaf layout. The device
+/// commit (`gpu_lde::try_commit_row_major_with`) builds the tree with
+/// `layout.rows_per_leaf()` rows per leaf, so a one-row root (S2) takes the
+/// device like a row-pair one.
+pub fn commit_group_device_or_host_with(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     #[cfg(feature = "cuda")]
     if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
-        let set = stark::device_set::commit_device_set(
+        let set = stark::device_set::commit_device_set_rpl(
             group.padded_rows,
             group.width,
             options.blowup_factor as usize,
             true,
+            layout.rows_per_leaf(),
         );
         DEVICE_PEAK_BYTES.fetch_max(set.total(), std::sync::atomic::Ordering::Relaxed);
-        if let Some(root) = stark::gpu_lde::try_commit_row_major::<
+        // ⛔ ROUND-3 TREE PROBE (diagnostic, OFF by default). The card permit is
+        // held across the WHOLE of `build_artifacts_with_hasher`, and THIS call
+        // is the only device work inside it. So `Σ dispatch` against that hold
+        // says how much of an exclusive card hold is actually spent on the card:
+        // far below it and the permit is held over HOST work, which is a lever
+        // with a mechanism rather than a floor.
+        //
+        // ⚠ A HOST STOPWATCH, NOT A CUDA EVENT, and that is the point:
+        // `try_commit_row_major` blocks until it has a root, so the wall around
+        // it brackets the dispatch without adding a synchronize the device path
+        // would otherwise not have. The measurement cannot perturb what it
+        // measures.
+        let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
+        let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
         >(
@@ -216,14 +260,19 @@ pub fn commit_group_device_or_host(
             group.width,
             options.blowup_factor as usize,
             &FE::from(options.coset_offset),
-        ) {
+            layout.rows_per_leaf(),
+        );
+        if let Some(t) = probe_t {
+            super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
+        }
+        if let Some(root) = committed {
             DEVICE_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return root;
         }
     }
     let _ = label;
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    commit_lde_columns(&lde_columns(&group_columns(group), options))
+    commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
 }
 
 /// Commits one instruction column group.
@@ -295,6 +344,48 @@ mod device_parity {
                  and gpu_lde's single-tree path"
             );
         }
+    }
+
+    /// S2: the one-row artifact root on the device equals the
+    /// host one-row root at the same production shapes, and differs from the
+    /// row-pair root (a device that ignored the layout would equal it). The
+    /// device one-row tree counter must move once per group, so a host
+    /// fallback fails this test instead of comparing host with host.
+    #[test]
+    fn the_one_row_device_commit_matches_the_host_commit_above_the_floor() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        assert!(
+            device_artifacts(),
+            "LFM_DEVICE_ARTIFACTS=0: this test would compare a host root with a host root"
+        );
+        let before = stark::gpu_lde::gpu_one_row_trees();
+        let shapes = [(4_096usize, 1usize), (8_192, 20), (4_096, 134)];
+        for (rows, width) in shapes {
+            let g = group(rows, width);
+            let lde = lde_columns(&group_columns(&g), &options);
+            let host = commit_lde_columns_with(&lde, LeafLayout::Row);
+            let pair = commit_lde_columns_with(&lde, LeafLayout::RowPair);
+            let device = commit_group_device_or_host_with(
+                "device_parity_one_row",
+                &g,
+                &options,
+                LeafLayout::Row,
+            );
+            assert_eq!(
+                device, host,
+                "{rows}x{width}: the one-row device root differs from the host one-row root"
+            );
+            assert_ne!(
+                device, pair,
+                "{rows}x{width}: the one-row root equals the row-pair root"
+            );
+        }
+        let moved = stark::gpu_lde::gpu_one_row_trees() - before;
+        assert!(
+            moved >= shapes.len() as u64,
+            "only {moved} one-row device trees for {} groups: the device declined (host fallback)",
+            shapes.len()
+        );
     }
 
     /// And the control: `LFM_DEVICE_ARTIFACTS=0` must reach the host pass. Read

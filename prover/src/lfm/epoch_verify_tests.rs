@@ -1,8 +1,8 @@
 //! ★ The assembled epoch verifier — spine plus legs — run on a real
 //! continuation epoch proof.
 //!
-//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 115 of a
-//! real 25-sub-proof epoch's challenges against production's own replay. Every
+//! [`super::epoch_tests`] built the Fiat-Shamir spine and checked all 79 of a
+//! real 16-sub-proof epoch's challenges against production's own replay. Every
 //! verification leg, meanwhile, was driven by its own isolation program with
 //! HINTED challenges. This module hangs the legs off the spine: per sub-proof the
 //! OOD grid is rebuilt from the two pruned blocks the transcript absorbed, the
@@ -19,7 +19,7 @@
 //! `assert_word_eq_lanes` against a root the transcript absorbed, and the FRI
 //! chain ends in `assert_eq_ext` against the terminal polynomial. A program that
 //! executes at all has passed them. So the differential that remains is the
-//! spine's — the 115 challenges, still checked — plus the fact of execution, and
+//! spine's — the 79 challenges, still checked — plus the fact of execution, and
 //! the falsification tests below are what turn "it executed" into evidence, by
 //! showing what does NOT execute.
 //!
@@ -27,7 +27,7 @@
 //!
 //! The preset. The fixture epoch is proved at the MIN preset (blowup 2, one
 //! query per table, grinding factor 1), because that is what
-//! `proof_fixture::fixture_options` gives and what keeps a 25-sub-proof epoch
+//! `proof_fixture::fixture_options` gives and what keeps a 16-sub-proof epoch
 //! provable in a unit test. Every per-query cost here is therefore ONE query's,
 //! and the blowup-8 predictions the phase pinned (73 queries, 14,454 FRI
 //! permutations per sub-proof) are reached by scaling, not by measurement — the
@@ -67,8 +67,13 @@ pub(super) struct TableLegs {
     pub(super) analysis: Analysis,
     /// `[query][group]` — the row pair in leaf order, then the path.
     openings: Vec<Vec<(Vec<LfmWord>, Vec<Commitment>)>>,
-    /// `[query][layer]` — `(pᵢ(−υ^(2ⁱ)), path)`.
-    fri_openings: Vec<Vec<(FEE, Vec<Commitment>)>>,
+    /// `[query][layer]` — `(opened values, path)`: the sibling `pᵢ(−υ^(2ⁱ))`
+    /// under `pair`, the whole `2^{d_j}` group under a fold schedule.
+    fri_openings: Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>,
+    /// Every capped tree's cap, split off query 0's (owner) path, in the caps
+    /// arena's order: the committed matrices in group order, then the capped
+    /// FRI layers. Empty at the default format.
+    caps: Vec<Commitment>,
     /// Production's OWN boundary-constraint list for this AIR, kept so
     /// [`the_boundary_terms_are_program_shape`] can compare the program-shape
     /// rule against the call rather than against a belief about it.
@@ -170,12 +175,21 @@ pub(super) fn build_table_legs(
         "the next-row block covers every evaluation point past the first step"
     );
 
+    // The table's leaf layout (S2): the host prover's and verifier's own
+    // per-table resolution, so `auto` mixes layouts across a proof's tables.
+    let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    let merkle_depth = leaf_layout.tree_depth(log2_lde_length as usize);
     let sub = SubProofShape {
         deep,
         trace_groups,
-        merkle_depth: log2_lde_length as usize - 1,
+        merkle_depth,
         log2_lde_length,
         coset_offset: FE::from(opts.coset_offset),
+        trace_cap: opts
+            .format
+            .merkle_cap
+            .height(opts.fri_number_of_queries, merkle_depth),
+        layout: leaf_layout,
     };
     let has_aux_trace = air.has_aux_trace();
     let verify = TableVerifyShape {
@@ -184,7 +198,7 @@ pub(super) fn build_table_legs(
             num_composition_parts: claimed_parts.len(),
             boundary: boundary_terms(has_aux_trace, num_total_cols),
         },
-        fri: FriShape::from_options(opts, log2_lde_length),
+        fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout),
         main_width,
         num_alpha_powers: if has_aux_trace {
             artifact.shape.max_bus_elements as usize
@@ -194,6 +208,41 @@ pub(super) fn build_table_legs(
         num_queries: opts.fri_number_of_queries,
         sub,
     };
+
+    // ---- the cap heights: the in-guest shapes' against the host's own
+    // `StarkCaps` (the prover's and the verifier's), so the two sides derive
+    // every tree's height and depth from one function.
+    let host_caps = stark::merkle_caps::StarkCaps::for_options(
+        opts,
+        log2_lde_length as usize,
+        leaf_layout.is_one_row(),
+    )
+    .expect("a format the host lays out");
+    assert_eq!(host_caps.trace_depth, verify.sub.merkle_depth);
+    assert_eq!(
+        host_caps.trace, verify.sub.trace_cap,
+        "the trace trees' cap"
+    );
+    assert_eq!(host_caps.fri.len(), verify.fri.num_committed());
+    for (i, (&d, &c)) in host_caps.fri_depths.iter().zip(&host_caps.fri).enumerate() {
+        assert_eq!(d, verify.fri.layer_depth(i), "FRI layer {i}'s tree depth");
+        assert_eq!(c, verify.fri.layer_cap(i), "FRI layer {i}'s cap");
+    }
+
+    // ---- the owner split: query 0 of a capped tree carries the cap at the end
+    // of its path; the arenas take the `D − c` siblings, the caps arena the cap.
+    let mut trace_caps: Vec<Vec<Commitment>> = Vec::new();
+    let mut split = |q: usize, path: &[Commitment], depth: usize, c: usize| -> Vec<Commitment> {
+        if c == 0 || q != 0 {
+            assert_eq!(path.len(), depth - c, "query {q}: a path to the cap");
+            return path.to_vec();
+        }
+        let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
+            .expect("the owner path is D − c + 2^c long");
+        trace_caps.push(cap.to_vec());
+        siblings.to_vec()
+    };
+    let (depth, c_trace) = (verify.sub.merkle_depth, verify.sub.trace_cap);
 
     // ---- the openings, per query, in the emitter's group order.
     let openings = (0..view.deep_poly_openings_len())
@@ -210,7 +259,7 @@ pub(super) fn build_table_legs(
                         .chain(p.evaluations_sym())
                         .map(|v| base_word(*v))
                         .collect(),
-                    p.merkle_path().to_vec(),
+                    split(q, p.merkle_path(), depth, c_trace),
                 ));
             }
             let m = o.main_trace_polys();
@@ -220,7 +269,7 @@ pub(super) fn build_table_legs(
                     .chain(m.evaluations_sym())
                     .map(|v| base_word(*v))
                     .collect(),
-                m.merkle_path().to_vec(),
+                split(q, m.merkle_path(), depth, c_trace),
             ));
             if aux_width > 0 {
                 let a = o.aux_trace_polys().expect("an aux opening");
@@ -230,7 +279,7 @@ pub(super) fn build_table_legs(
                         .chain(a.evaluations_sym())
                         .map(ext_word)
                         .collect(),
-                    a.merkle_path().to_vec(),
+                    split(q, a.merkle_path(), depth, c_trace),
                 ));
             }
             let c = o.composition_poly();
@@ -240,22 +289,13 @@ pub(super) fn build_table_legs(
                     .chain(c.evaluations_sym())
                     .map(ext_word)
                     .collect(),
-                c.merkle_path().to_vec(),
+                split(q, c.merkle_path(), depth, c_trace),
             ));
             groups
         })
         .collect();
 
-    let fri_openings = (0..view.query_list_len())
-        .map(|q| {
-            let d = view.query(q);
-            d.layers_evaluations_sym()
-                .iter()
-                .enumerate()
-                .map(|(i, sym)| (*sym, d.layer_auth_path(i).to_vec()))
-                .collect()
-        })
-        .collect();
+    let (fri_openings, fri_caps) = fri_layer_openings(view, verify.fri);
 
     // Production's own boundary list, for the premise check only. It takes the
     // bus public inputs, which are PROOF data — which is exactly why the emitted
@@ -283,16 +323,91 @@ pub(super) fn build_table_legs(
         })
         .collect();
 
+    let caps: Vec<Commitment> = trace_caps.into_iter().flatten().chain(fri_caps).collect();
+    assert_eq!(
+        caps.len() * super::proof_arena::words_per_root(),
+        verify.cap_words(super::proof_arena::words_per_root()),
+        "every capped tree's cap, and nothing else"
+    );
+
     TableLegs {
         verify,
         analysis: analyze(&artifact),
         openings,
         fri_openings,
+        caps,
         production_boundary,
         has_aux_trace,
         num_precomputed_cols: num_precomputed,
-        precomputed_commitment: air.is_preprocessed().then(|| air.precomputed_commitment()),
+        precomputed_commitment: air
+            .is_preprocessed()
+            .then(|| layout_precomputed_commitment(air, trace_length)),
     }
+}
+
+/// The precomputed-columns commitment the host verifier takes for `air` over
+/// a trace of `trace_length` rows: `precomputed_commitment_for` the table's
+/// resolved leaf layout (S2 — a layout with no root is a hard
+/// error, never the other layout's root). At row pairs it IS
+/// `air.precomputed_commitment()`.
+pub(super) fn layout_precomputed_commitment<PI>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
+    trace_length: usize,
+) -> Commitment {
+    let layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
+    air.precomputed_commitment_for(layout)
+        .unwrap_or_else(|| panic!("no precomputed commitment at {layout:?}"))
+}
+
+/// Every query's FRI layer openings, per layer `(opened values, path)`, and
+/// the capped layers' caps (layer order) split off query 0's owner paths.
+///
+/// The proof's flat `layers_evaluations_sym` is one sibling per layer under
+/// `pair` and every layer's full group (`2^{d_j}` values, position order)
+/// under a fold schedule; `FriShape::layer_values` says which.
+/// Each path is cut at its layer's cap: query 0 of a capped layer carries
+/// `D − c + 2^c` nodes, every other query `D − c`.
+#[allow(clippy::type_complexity)]
+pub(super) fn fri_layer_openings<PI>(
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    fri: FriShape,
+) -> (Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>, Vec<Commitment>)
+where
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
+    let mut caps: Vec<Commitment> = Vec::new();
+    let openings = (0..view.query_list_len())
+        .map(|q| {
+            let d = view.query(q);
+            let flat = d.layers_evaluations_sym();
+            let per_query: usize = (0..fri.num_committed()).map(|j| fri.layer_values(j)).sum();
+            assert_eq!(
+                flat.len(),
+                per_query,
+                "query {q}: the opened values per query"
+            );
+            let mut offset = 0usize;
+            (0..fri.num_committed())
+                .map(|i| {
+                    let values = flat[offset..offset + fri.layer_values(i)].to_vec();
+                    offset += fri.layer_values(i);
+                    let path = d.layer_auth_path(i);
+                    let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
+                    if c == 0 || q != 0 {
+                        assert_eq!(path.len(), depth - c, "query {q} FRI layer {i}");
+                        return (values, path.to_vec());
+                    }
+                    let (siblings, cap) =
+                        crypto::merkle_tree::cap::split_owner_path(path, depth, c)
+                            .expect("the owner path is D − c + 2^c long");
+                    caps.extend_from_slice(cap);
+                    (values, siblings.to_vec())
+                })
+                .collect()
+        })
+        .collect();
+    (openings, caps)
 }
 
 impl TableLegs {
@@ -319,12 +434,30 @@ impl TableLegs {
         out
     }
 
+    /// The sub-proof's Merkle caps, once — `None` at the default format, where
+    /// the emitter declares no caps arena
+    /// (`epoch_verify::declare_table_arenas`).
+    pub(super) fn caps_arena(&self) -> Option<Vec<LfmWord>> {
+        let words = self.verify.cap_words(super::proof_arena::words_per_root());
+        if words == 0 {
+            assert!(self.caps.is_empty());
+            return None;
+        }
+        let out = super::proof_arena::commitments_to_arena(&self.caps);
+        assert_eq!(
+            out.len(),
+            words,
+            "the caps arena is what the shape declares"
+        );
+        Some(out)
+    }
+
     /// Per query, per committed layer: the symmetric evaluation then its path.
     pub(super) fn fri_arena(&self) -> Vec<LfmWord> {
         let mut out = Vec::new();
         for query in &self.fri_openings {
-            for (sym, path) in query {
-                out.push(ext_word(sym));
+            for (values, path) in query {
+                out.extend(values.iter().map(ext_word));
                 out.extend(super::proof_arena::commitments_to_arena(path));
             }
         }
@@ -341,12 +474,12 @@ impl TableLegs {
 /// continuation epoch proof that production accepts.
 ///
 /// What executing proves, stated precisely. Every check is an assert inside the
-/// program, so reaching the end means: all 25 quotient identities held at the
-/// spine's own `z` and `β`; every one of the 25 sub-proofs' opened row pairs
+/// program, so reaching the end means: all 16 quotient identities held at the
+/// spine's own `z` and `β`; every one of the 16 sub-proofs' opened row pairs
 /// hashed to a leaf that walked to the root the transcript absorbed, at the index
 /// the transcript sampled; every DEEP reconstruction fed a FRI chain that folded
 /// to the terminal polynomial the transcript absorbed; and the LogUp closure
-/// reached production's COMMIT-bus target. The 115 published challenges are
+/// reached production's COMMIT-bus target. The 79 published challenges are
 /// checked against production's replay on top, so the Fiat-Shamir the whole thing
 /// hangs from is still differentialled.
 #[test]
@@ -425,11 +558,44 @@ fn the_assembled_epoch_verifier_runs() {
     // bisect priced — a near-empty always-on table is four challenges here and
     // +31.2% of the wrap's cells at the secure preset.
     //
+    // ★ And then FURTHER the same way, for the same reason at six times the
+    // size.
+    //
+    // MOVER: `892c7d1bc` (main's `c2ac5d546`, #977) — arm (i), the TABLE SET.
+    // That merge's two arms are (i) the table set shrank, empty tables now
+    // being elided rather than padded, and (ii) the absorbed epoch statement
+    // grew 49 bytes. This pin is on (i); `blake3_chip_tests`'
+    // STATEMENT_REPLAY_BLAKE3_ROWS and `machine_tests`' statement byte length
+    // are on (ii).
+    //
+    // #977 did to the six accelerator
+    // chips what #903's revert did to BLAKE3: `FIXED_TABLE_COUNT` 11 → 5, with
+    // `commit`, `keccak`, `keccak_rnd`, `ecsm`, `ecdas` and `hint` becoming
+    // `TableCounts` fields that a run which never reaches them reports as zero.
+    // This fixture epoch reaches none of the six, so 25 → 16 and 115 → 79.
+    // Six of the nine are those accelerators: the pre-#977 25 was 14 split
+    // families + 10 intermediate fixed (11 less HALT) + 1 L2G_MEMORY, and the
+    // fixed term is now 4, which lands at 19. The remaining three are split
+    // families this fixture leaves empty, and they are NOT named here because
+    // the measurement does not name them — only `e.tables.len()` is read.
+    //
+    // The accounting below is what says the whole move is empty tables at four
+    // challenges each: every one of them opens nothing, so it contributes a
+    // (β, z, γ) triple and one query index and no DEEP zeta, exactly as an
+    // always-on table did. If that model is wrong for any of the nine, the
+    // `checked` assertion two below fails and says so.
+    //
+    // The identity is spelled with both sides positive because `SUB_PROOFS` is
+    // now BELOW the 24 it used to be measured against, and `SUB_PROOFS - 24` on
+    // a `usize` is an underflow rather than a failed assertion. Moved this way
+    // it still fails — in either direction — if the four-challenge model stops
+    // describing the move.
+    //
     // `LFM_BLAKE3` (P-a Stage 5) does NOT appear in either number: it is a chip
     // of the LFM machine, counted by `NUM_LFM_CHIPS`, and this is the RV64
     // epoch the LFM machine verifies.
-    const SUB_PROOFS: usize = 25;
-    const CHALLENGES_AT_MIN_PRESET: usize = 115;
+    const SUB_PROOFS: usize = 16;
+    const CHALLENGES_AT_MIN_PRESET: usize = 79;
     const CHALLENGES_PER_ALWAYS_ON_TABLE: usize = 4;
     assert_eq!(
         e.tables.len(),
@@ -438,9 +604,10 @@ fn the_assembled_epoch_verifier_runs() {
          function of"
     );
     assert_eq!(
-        CHALLENGES_AT_MIN_PRESET,
-        111 + CHALLENGES_PER_ALWAYS_ON_TABLE * (SUB_PROOFS - 24),
-        "the always-on tables account for the whole move from the original 111"
+        CHALLENGES_AT_MIN_PRESET + CHALLENGES_PER_ALWAYS_ON_TABLE * 24,
+        111 + CHALLENGES_PER_ALWAYS_ON_TABLE * SUB_PROOFS,
+        "the tables that left the proof account for the whole move from the \
+         original 111"
     );
     assert_eq!(
         checked, CHALLENGES_AT_MIN_PRESET,
@@ -581,7 +748,7 @@ fn the_assembled_epoch_verifier_runs() {
     println!(
         "\x20 constraint leg inside the assembled verifier: {constraint_alu} ALU \
          rows lowering ({constraint_unfused} unfused) + {recombination} \
-         recombination = {} over 25 sub-proofs  [pinned: see the run output]\
+         recombination = {} over 16 sub-proofs  [pinned: see the run output]\
          \n\x20 that is {:.1}% of the legs' {} instructions",
         constraint_alu + recombination,
         100.0 * (constraint_alu + recombination) as f64
@@ -665,7 +832,7 @@ fn the_assembled_epoch_verifier_runs() {
     // The pinned 213,744 came from `join_tests::join_leg_cost`, whose stated
     // assumptions are: all 28 PRODUCTION AIRs, every trace at a UNIFORM
     // 2^20, blowup 8, 73 queries, and NO FRI (the joined leg has none). The
-    // measurement above is: this epoch's 25 sub-proofs, at their REAL trace
+    // measurement above is: this epoch's 16 sub-proofs, at their REAL trace
     // lengths, blowup 2, one query, FRI included. Three parameters differ, so
     // the two numbers cannot be compared directly — they are projected onto each
     // other one parameter at a time instead, which is also what says which
@@ -801,7 +968,7 @@ fn the_assembled_epoch_verifier_runs() {
         "\n  RECONCILIATION against the pinned blowup-8 predictions (projections \
          from shapes — this run is at the min preset and measures none of them):\n\
          \x20 openings only, 73 queries, UNIFORM 2^20 (deep-join's own \
-         assumption, over this epoch's 25 sub-proofs): {}   [pinned: see the run output \
+         assumption, over this epoch's 16 sub-proofs): {}   [pinned: see the run output \
          over all 28 production AIRs]\n\
          \x20 openings only, 73 queries, this epoch's REAL trace lengths: {}\n\
          \x20 openings + FRI, 73 queries, real lengths: {}\n\
@@ -1350,6 +1517,7 @@ fn the_candidate_rate_model_is_derived_not_remembered() {
         final_poly_log_degree: 3,
         coset_offset: 3,
         num_queries: 73,
+        format: stark::proof::options::ProofFormat::DEFAULT,
     };
     assert!(fri.num_committed() > 0, "the shape must exercise the term");
 
@@ -1374,5 +1542,196 @@ fn the_candidate_rate_model_is_derived_not_remembered() {
     assert_eq!(terminal.num_committed(), 0);
     for rate in [KECCAK_RATE_FELTS, LFM_HASH_RATE_FELTS] {
         assert_eq!(fri_leaf_permutations_at_rate(&terminal, rate), 0);
+    }
+}
+
+/// Queries the knob-on twin proves at: enough openings that `auto` caps every
+/// tall tree at height 3 (from 20 openings on).
+const PROCESS_FORMAT_QUERIES: usize = 24;
+
+/// ★ The KNOB-ON TWIN of [`the_assembled_epoch_verifier_runs`] (box only): a
+/// real continuation epoch proved at the PROCESS format — `ZfFormat::global()`,
+/// i.e. `LAMBDA_VM_ZF_CAP` / `LAMBDA_VM_ZF_FRI` — at the MIN preset with
+/// [`PROCESS_FORMAT_QUERIES`] queries, verified by the assembled machine.
+///
+/// Asserts, per format: the program executes (every cap authenticated once per
+/// tree, every opening checked against it, every FRI group folded to the
+/// terminal); the legs' emitted permutations equal the closed form
+/// `Σ table_permutations_for` (per-query paths cut at each tree's cap plus
+/// `2^c − 1` once per capped tree; group leaves and group paths under
+/// `fri = dp`); a moved cap word does not execute. Prints the census to
+/// compare across arms (instructions, permutations, `Select`s, cells per
+/// chip). At the default format it is the MIN-preset run at 24 queries.
+#[test]
+#[ignore = "a real epoch proof at 24 queries and its assembled verifier: box only"]
+fn the_assembled_epoch_verifier_runs_at_the_process_format() {
+    let mut opts = super::proof_fixture::fixture_options();
+    opts.fri_number_of_queries = PROCESS_FORMAT_QUERIES;
+    assembled_twin_at_the_process_format(opts);
+}
+
+/// ★ [`the_assembled_epoch_verifier_runs_at_the_process_format`] at BLOWUP 4
+/// — the S2 (one-row) twin, box only. One-row static roots exist at blowup 4
+/// only (`STATIC_BLOWUP_FACTORS_ONE_ROW`; a missing twin is a
+/// proving error), so the MIN preset's blowup 2 cannot prove a one-row
+/// BITWISE; this arm keeps every other MIN-preset option and lifts the blowup
+/// to 4 for every format, so its knob-off and knob-on runs are one A/B. Under
+/// `one_row = auto` the epoch's tables resolve their layouts one by one
+/// (printed per leg), so the assembled machine verifies a MIXED-layout proof;
+/// the REGISTER root is derived in-machine at that table's own layout.
+#[test]
+#[ignore = "a real epoch proof at blowup 4, 24 queries, and its assembled verifier: box only"]
+fn the_assembled_epoch_verifier_runs_at_blowup_4_at_the_process_format() {
+    let mut opts = super::proof_fixture::fixture_options();
+    opts.fri_number_of_queries = PROCESS_FORMAT_QUERIES;
+    opts.blowup_factor = 4;
+    assembled_twin_at_the_process_format(opts);
+}
+
+/// The body of the assembled-verifier twins: `base` with the process format
+/// stamped on, proved, harvested and verified by the assembled machine.
+fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
+    let format = crate::zf_format::ZfFormat::global();
+    let opts = format.options(base);
+    let e = super::epoch_tests::real_epoch_with(opts.clone());
+    let program = super::epoch_tests::epoch_program(&e, true);
+    let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the assembled verifier must execute at the process format");
+
+    let spine = super::epoch_tests::epoch_program(&e, false);
+    let perms = |p: &_| super::machine_tests::wrap_hash_instrs(p);
+    let selects = |p: &super::compiler::LfmProgram| {
+        p.instrs
+            .iter()
+            .filter(|i| matches!(i, super::instr::Instr::Select { .. }))
+            .count()
+    };
+    let hash = super::edsl::WrapHash::production();
+    let emitted = perms(&program) - perms(&spine);
+    let predicted: usize = e
+        .legs
+        .iter()
+        .map(|l| super::epoch_verify::table_permutations_for(&l.verify, hash))
+        .sum();
+    let cap_perms: usize = e
+        .legs
+        .iter()
+        .map(|l| super::epoch_verify::cap_permutations(&l.verify))
+        .sum();
+    println!(
+        "\n★ ASSEMBLED EPOCH VERIFIER AT THE PROCESS FORMAT\n  {}\n  opts: blowup {}, \
+         {} queries, grinding {}, k {}\n  sub-proofs {}  |  legs: {} instructions, \
+         {} permutations ({} of them cap roots), {} selects  |  whole: {} instructions, \
+         {} permutations",
+        format.banner(),
+        opts.blowup_factor,
+        opts.fri_number_of_queries,
+        opts.grinding_factor,
+        opts.fri_final_poly_log_degree,
+        e.legs.len(),
+        program.instrs.len() - spine.instrs.len(),
+        emitted,
+        cap_perms,
+        selects(&program) - selects(&spine),
+        program.instrs.len(),
+        perms(&program),
+    );
+    for (i, l) in e.legs.iter().enumerate() {
+        let f = l.verify.fri;
+        println!(
+            "  leg {i:>2}: log2(lde) {:>2}  layout {:?}  trace cap {}  FRI schedule {:?} \
+             depths {:?} caps {:?}  {} permutations",
+            l.verify.sub.log2_lde_length,
+            l.verify.sub.layout,
+            l.verify.sub.trace_cap,
+            f.schedule(),
+            (0..f.num_committed())
+                .map(|j| f.layer_depth(j))
+                .collect::<Vec<_>>(),
+            (0..f.num_committed())
+                .map(|j| f.layer_cap(j))
+                .collect::<Vec<_>>(),
+            super::epoch_verify::table_permutations_for(&l.verify, hash),
+        );
+    }
+    for c in super::airs::lfm_chip_census(&program) {
+        println!(
+            "  CENSUS {:<14} real {:>10} padded {:>10} cells {:>12}",
+            c.name,
+            c.real_rows,
+            c.rows,
+            c.main_cells()
+        );
+    }
+    assert_eq!(
+        emitted, predicted,
+        "the legs' emitted permutations must equal the closed form at the process format"
+    );
+    println!("  emitted permutations == closed form: {emitted}");
+    // One parseable line for the box wrapper's cross-arm comparison.
+    println!(
+        "ZFTWIN legs_permutations={emitted} cap_root_permutations={cap_perms} \
+         legs_instructions={} legs_selects={} whole_instructions={}",
+        program.instrs.len() - spine.instrs.len(),
+        selects(&program) - selects(&spine),
+        program.instrs.len(),
+    );
+    // S2: how many legs verify one-row tables (0 at `one_row = 0`, every leg
+    // at `1`, the AIR widths' choice at `auto`), and the blowup of the arm.
+    let one_row_legs = e
+        .legs
+        .iter()
+        .filter(|l| l.verify.sub.layout.is_one_row())
+        .count();
+    println!(
+        "ZFS2TWIN blowup={} legs={} one_row_legs={one_row_legs} row_pair_legs={}",
+        opts.blowup_factor,
+        e.legs.len(),
+        e.legs.len() - one_row_legs,
+    );
+    match opts.format.one_row {
+        stark::proof::options::OneRowMode::Off => assert_eq!(one_row_legs, 0),
+        stark::proof::options::OneRowMode::On => assert_eq!(one_row_legs, e.legs.len()),
+        stark::proof::options::OneRowMode::Auto => {}
+    }
+    // A one-row leg's input-tree group value (query 0, layer 0, value 0) moved
+    // must not execute — the input group is authenticated and slot-checked.
+    // The FRI arena is found by content rather than by a hand-counted offset.
+    if let Some((k, words)) = e
+        .legs
+        .iter()
+        .enumerate()
+        .find(|(_, l)| l.verify.sub.layout.is_one_row() && l.verify.fri.num_committed() > 0)
+        .map(|(k, l)| (k, l.fri_arena()))
+    {
+        let at = arenas
+            .iter()
+            .position(|a| *a == words)
+            .expect("the one-row leg's FRI arena is among the program's arenas");
+        let mut bad = arenas.clone();
+        bad[at][0][0] += FE::one();
+        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+            .expect_err("a moved input-tree value must not execute");
+        println!("  leg {k}: a moved one-row input-tree value is refused");
+    }
+
+    // A moved cap word must not execute (only when the format caps a tree).
+    // The caps arena is found by content rather than by a hand-counted offset.
+    if let Some((k, words)) = e
+        .legs
+        .iter()
+        .enumerate()
+        .find_map(|(k, l)| l.caps_arena().map(|w| (k, w)))
+    {
+        let at = arenas
+            .iter()
+            .position(|a| *a == words)
+            .expect("the caps arena is among the program's arenas");
+        let mut bad = arenas.clone();
+        bad[at][0][0] += FE::one();
+        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+            .expect_err("a moved cap word must not execute");
+        println!("  leg {k}: a moved cap word is refused");
     }
 }

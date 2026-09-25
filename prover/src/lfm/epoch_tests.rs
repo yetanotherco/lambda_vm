@@ -23,7 +23,8 @@
 //!
 //! It stops at the challenges. That the legs then CONSUME these cells is
 //! [`the_legs_consume_the_replayed_challenges`]'s job, and the whole-epoch
-//! composition (25 sub-proofs behind one statement) is not built here.
+//! composition (16 sub-proofs behind one statement on this fixture, 25 at the
+//! post-#977 ceiling) is not built here.
 
 use stark::config::Commitment;
 use stark::proof::stark::MultiProof;
@@ -91,7 +92,11 @@ fn host_table(
     let trace_length = view.trace_length();
     let log2_trace_length = trace_length.trailing_zeros();
     let log2_blowup = (opts.blowup_factor as usize).trailing_zeros();
-    let fri = FriShape::from_options(opts, log2_trace_length + log2_blowup);
+    let fri = FriShape::for_layout(
+        opts,
+        log2_trace_length + log2_blowup,
+        stark::leaf_layout::table_leaf_layout(air, trace_length),
+    );
 
     let ood_c = view.trace_ood_evaluations();
     let ood_n = view.trace_ood_next_evaluations();
@@ -118,7 +123,9 @@ fn host_table(
 
     HostTable {
         shape,
-        precomputed_root: air.is_preprocessed().then(|| air.precomputed_commitment()),
+        precomputed_root: air.is_preprocessed().then(|| {
+            super::epoch_verify_tests::layout_precomputed_commitment(air, view.trace_length())
+        }),
         main_root: *view.lde_trace_main_merkle_root(),
         aux_root: view.lde_trace_aux_merkle_root().copied(),
         contribution: view.bus_table_contribution(),
@@ -334,6 +341,84 @@ fn the_challenge_replay_matches_production() {
         assert_eq!(zetas, h.zetas, "the FRI zetas at {boundaries} boundaries");
         let want: Vec<u64> = h.iotas.iter().map(|i| *i as u64).collect();
         assert_eq!(iotas, want, "the query indices at {boundaries} boundaries");
+    }
+}
+
+/// ★ S2 (one-row leaves): the in-machine replay of a
+/// one-row table reproduces production's challenges — the input root absorbed
+/// right after `γ` with NO challenge ahead of it, one `ζ` per committed layer
+/// (layer `j` folds with `ζ_j`), and the query indices sampled over the WHOLE
+/// LDE (`log2(lde)` bits, the upper half reached). Swept over folding counts 0
+/// (the zero-fold case: no input tree at all), 1+ layers. The transcript order
+/// is load-bearing: the replay with a `ζ` drawn BEFORE the input root (the test
+/// mutation) diverges from production wherever an input tree exists.
+#[test]
+fn the_one_row_challenge_replay_matches_production() {
+    for (boundaries, fri) in [
+        (4usize, stark::proof::options::FriMode::Pair),
+        (512, stark::proof::options::FriMode::Pair),
+        (2048, stark::proof::options::FriMode::Pair),
+        (2048, stark::proof::options::FriMode::Dp),
+    ] {
+        let mut opts =
+            stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup 2");
+        opts.format.one_row = stark::proof::options::OneRowMode::On;
+        opts.format.fri_mode = fri;
+        let (air, proof) = super::fri_tests::folding_fixture_with(boundaries, opts);
+        let h = host_table(&*air, &proof);
+        let label = format!("{boundaries} boundaries, fri={fri:?}");
+        assert!(h.shape.fri.one_row(), "{label}");
+        assert_eq!(h.shape.index_bits(), h.shape.log2_lde_length() as usize);
+        assert_eq!(
+            h.zetas.len(),
+            h.shape.fri.num_committed(),
+            "{label}: one challenge per committed layer (the input tree has none)"
+        );
+        assert_eq!(h.zetas.len(), h.shape.fri.num_zetas());
+
+        let (beta, z, gamma, zetas, iotas) = run(&h);
+        assert_eq!(beta, h.beta, "{label}: beta");
+        assert_eq!(z, h.z, "{label}: z");
+        assert_eq!(gamma, h.gamma, "{label}: gamma");
+        assert_eq!(zetas, h.zetas, "{label}: the FRI zetas");
+        let want: Vec<u64> = h.iotas.iter().map(|i| *i as u64).collect();
+        assert_eq!(iotas, want, "{label}: the query indices");
+        let lde = 1u64 << h.shape.log2_lde_length();
+        if h.iotas.len() >= 8 {
+            assert!(
+                want.iter().any(|&r| r >= lde / 2),
+                "{label}: one-row indices range over the whole LDE"
+            );
+        }
+
+        if h.shape.fri.num_committed() > 0 {
+            super::epoch::ZETA_BEFORE_INPUT_ROOT.with(|c| c.set(true));
+            let mutated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let program = challenge_program(&h);
+                let arenas = challenge_arenas(&h);
+                execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                    .ok()
+                    .map(|exec| {
+                        (0..h.zetas.len())
+                            .map(|k| word_as_ext(&exec.public_words[3 + k].1).expect("ext"))
+                            .collect::<Vec<FEE>>()
+                    })
+            }));
+            super::epoch::ZETA_BEFORE_INPUT_ROOT.with(|c| c.set(false));
+            let mutated = mutated.expect("the mutated replay still emits");
+            assert_ne!(
+                mutated.as_ref(),
+                Some(&h.zetas),
+                "{label}: a ζ drawn before the input root must move the challenges"
+            );
+        }
+        println!(
+            "{label}: {} layers, {} zetas, {} queries over 2^{} — replay == production",
+            h.shape.fri.num_committed(),
+            h.zetas.len(),
+            h.iotas.len(),
+            h.shape.log2_lde_length()
+        );
     }
 }
 
@@ -570,25 +655,39 @@ pub(super) fn prep_source_census(e: &RealEpoch) -> (usize, usize, usize) {
 /// really buys is the failure mode — a preprocessed AIR whose root matches
 /// nothing known is a root the machine has no binding for, and this panics
 /// rather than hinting it.
+///
+/// `layout` is the table's resolved trace-tree leaf layout (S2): every
+/// candidate is recomputed AT that layout, so a one-row table's root is matched
+/// against the one-row candidates only (a row-pair root never stands in).
 fn prep_source(
     root: Commitment,
     opts: &crate::ProofOptions,
     elf: &executor::elf::Elf,
     register_init: &[u32],
     reg_fini: &[u32],
+    layout: stark::leaf_layout::LeafLayout,
 ) -> PrepSource {
     use crate::tables::{bitwise, decode, keccak_rc, page, register};
 
-    if root == bitwise::preprocessed_commitment(opts)
-        || root == keccak_rc::preprocessed_commitment(opts)
-        || root == page::zero_init_preprocessed_commitment(opts)
+    if Some(root) == bitwise::preprocessed_commitment_for(opts, layout)
+        || Some(root) == keccak_rc::preprocessed_commitment_for(opts, layout)
+        || Some(root) == page::zero_init_preprocessed_commitment_for(opts, layout)
     {
         return PrepSource::Constant(root);
     }
-    if root == register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini) {
+    if root
+        == register::compute_precomputed_commitment_with_fini_layout(
+            opts,
+            register_init,
+            reg_fini,
+            layout,
+        )
+    {
         return PrepSource::Register(root);
     }
-    if root == decode::commitment_from_elf(elf, opts).expect("the DECODE commitment must compute") {
+    let instructions =
+        decode::instructions_from_elf(elf).expect("the DECODE commitment must compute");
+    if root == decode::compute_precomputed_commitment_with(&instructions, opts, layout) {
         return PrepSource::ElfDependent(root);
     }
     panic!(
@@ -1086,20 +1185,39 @@ fn harvest_real_epoch(
     // ---- Phase A, transcribed from `multi_verify_views:1160-1227`.
     let mut transcript = seed();
     let mut phase_a = Vec::new();
+    // S2: the REGISTER table's leaf layout (the in-circuit register commitment
+    // is emitted at its `rows_per_leaf`) and the DECODE root Phase A absorbs
+    // (the attestation folds that very root) — both at the table's resolved
+    // layout, which is today's row pair at the default format.
+    let mut register_layout = stark::leaf_layout::LeafLayout::RowPair;
+    let mut absorbed_decode_root = decode_root;
     for (idx, air) in refs.iter().enumerate() {
         let v = view.get(idx);
         if air.is_preprocessed() {
-            let prep = air.precomputed_commitment();
+            let layout = stark::leaf_layout::table_leaf_layout(*air, v.trace_length());
+            let prep = air
+                .precomputed_commitment_for(layout)
+                .unwrap_or_else(|| panic!("table {idx}: no precomputed root at {layout:?}"));
             transcript.append_bytes(&prep);
             transcript.append_bytes(v.lde_trace_main_merkle_root());
-            phase_a.push((
-                Some(prep_source(prep, opts, elf, &register_init, &reg_fini)),
-                *v.lde_trace_main_merkle_root(),
-            ));
+            let source = prep_source(prep, opts, elf, &register_init, &reg_fini, layout);
+            match source {
+                PrepSource::Register(_) => register_layout = layout,
+                PrepSource::ElfDependent(root) => absorbed_decode_root = root,
+                PrepSource::Constant(_) => {}
+            }
+            phase_a.push((Some(source), *v.lde_trace_main_merkle_root()));
         } else {
             transcript.append_bytes(v.lde_trace_main_merkle_root());
             phase_a.push((None, *v.lde_trace_main_merkle_root()));
         }
+    }
+    if opts.format.one_row == stark::proof::options::OneRowMode::Off {
+        assert_eq!(
+            absorbed_decode_root, decode_root,
+            "at the default format Phase A absorbs today's DECODE root"
+        );
+        assert_eq!(register_layout, stark::leaf_layout::LeafLayout::RowPair);
     }
     let needs_lookup_challenges = refs.iter().any(|a| a.has_aux_trace());
     assert!(needs_lookup_challenges, "an epoch uses LogUp");
@@ -1184,11 +1302,17 @@ fn harvest_real_epoch(
         reg_shape: super::programs::RegisterDerivationShape {
             blowup: opts.blowup_factor as usize,
             coset_offset: opts.coset_offset,
+            // The REGISTER table's own leaf layout: 2 at the default format.
+            rows_per_leaf: register_layout.rows_per_leaf(),
         },
+        // The attestation folds the DECODE root Phase A absorbed — the
+        // row-pair `decode_root` at the default format (asserted below), the
+        // DECODE table's one-row root when S2 resolves it to one row (the
+        // attestation id moves with the knob).
         expected_program_id: crate::recursion::program_id_from_digest(
             &crate::statement::elf_digest(&elf_bytes),
             elf.entry_point,
-            &decode_root,
+            &absorbed_decode_root,
             &[],
         ),
         tables,
@@ -1331,6 +1455,7 @@ pub(super) fn from_proof_gate_options() -> crate::ProofOptions {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: stark::proof::options::ProofFormat::DEFAULT,
     }
 }
 
@@ -1529,14 +1654,20 @@ pub(super) fn host_table_forked(
         ood_current_dims: (ood_c.width(), ood_c.height()),
         ood_next_dims: (ood_n.width(), ood_n.height()),
         num_parts: view.composition_poly_parts_ood_evaluation().len(),
-        fri: FriShape::from_options(opts, log2_trace_length + log2_blowup),
+        fri: FriShape::for_layout(
+            opts,
+            log2_trace_length + log2_blowup,
+            stark::leaf_layout::table_leaf_layout(air, view.trace_length()),
+        ),
         grinding_factor: opts.grinding_factor,
         num_queries: opts.fri_number_of_queries,
     };
 
     HostTable {
         shape,
-        precomputed_root: air.is_preprocessed().then(|| air.precomputed_commitment()),
+        precomputed_root: air.is_preprocessed().then(|| {
+            super::epoch_verify_tests::layout_precomputed_commitment(air, view.trace_length())
+        }),
         main_root: *view.lde_trace_main_merkle_root(),
         aux_root: view.lde_trace_aux_merkle_root().copied(),
         contribution: view.bus_table_contribution(),
@@ -2199,6 +2330,7 @@ pub(super) fn epoch_arena_words(e: &RealEpoch, with_legs: bool) -> Vec<Vec<LfmWo
         if with_legs {
             out.push(leg.opening_arena());
             out.push(leg.fri_arena());
+            out.extend(leg.caps_arena());
         }
     }
     out

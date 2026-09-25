@@ -18,7 +18,9 @@ use super::edsl::WrapDigest;
 use super::executor::execute;
 use super::validator::validate;
 use super::whir_open::{
-    BlockValues, emit_verify_opening, verify_opening_perms, verify_opening_rows,
+    BlockValues, CapCells, TreeAuth, cap_check_perms, cap_check_rows, emit_verify_opening,
+    verify_opening_perms, verify_opening_perms_capped, verify_opening_rows,
+    verify_opening_rows_capped,
 };
 use super::word::{LfmWord, ext_word};
 
@@ -292,7 +294,7 @@ fn the_opening_accepts_what_the_host_accepts() {
         for index in [0usize, 1, num_leaves / 2, num_leaves - 1] {
             let opening = commitment.open(index).expect("the block opens");
             assert!(
-                verify_opening::<F, RpxWhir>(&commitment.root(), index, &opening),
+                verify_opening::<F, RpxWhir>(&commitment.root(), depth, index, &opening),
                 "{}: the host must accept its own opening at {index}",
                 shape.name
             );
@@ -316,7 +318,7 @@ fn the_opening_accepts_what_the_host_accepts() {
         for index in [0usize, 1, num_leaves - 1] {
             let opening = commitment.open(index).expect("the block opens");
             assert!(
-                verify_opening::<E, RpxWhir>(&commitment.root(), index, &opening),
+                verify_opening::<E, RpxWhir>(&commitment.root(), depth, index, &opening),
                 "{}: the host must accept its own opening at {index}",
                 shape.name
             );
@@ -363,7 +365,7 @@ fn a_tampered_opening_cannot_execute() {
     let honest_root = commitment_to_digest(&root);
 
     assert!(
-        verify_opening::<E, RpxWhir>(&root, index, &opening),
+        verify_opening::<E, RpxWhir>(&root, depth, index, &opening),
         "the control opening must authenticate"
     );
     assert!(
@@ -385,7 +387,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut forged = opening.clone();
     forged.values[block / 2] += FEE::one();
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, index, &forged),
+        !verify_opening::<E, RpxWhir>(&root, depth, index, &forged),
         "the host must reject a corrupted value"
     );
     let values: Vec<LfmWord> = forged.values.iter().map(ext_word).collect();
@@ -403,7 +405,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut forged = opening.clone();
     forged.proof.merkle_path[0][0] ^= 1;
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, index, &forged),
+        !verify_opening::<E, RpxWhir>(&root, depth, index, &forged),
         "the host must reject a corrupted sibling"
     );
     assert!(
@@ -425,7 +427,7 @@ fn a_tampered_opening_cannot_execute() {
     let mut wrong_root = root;
     wrong_root[0] ^= 1;
     assert!(
-        !verify_opening::<E, RpxWhir>(&wrong_root, index, &opening),
+        !verify_opening::<E, RpxWhir>(&wrong_root, depth, index, &opening),
         "the host must reject a wrong root"
     );
     assert!(
@@ -448,7 +450,7 @@ fn a_tampered_opening_cannot_execute() {
     // and fail only here.
     let elsewhere = (index + 1) % num_leaves;
     assert!(
-        !verify_opening::<E, RpxWhir>(&root, elsewhere, &opening),
+        !verify_opening::<E, RpxWhir>(&root, depth, elsewhere, &opening),
         "the host must reject an opening claimed at the wrong index"
     );
     assert!(
@@ -529,4 +531,237 @@ fn the_leaf_pins_a_hinted_base_value_to_its_low_lane() {
         "the refusal must be the base-word check at the leaf's Pack, not some other \
          failure that happens to also stop the program: got {refusal:?}"
     );
+}
+
+// =============================================================================
+// W1: openings against a Merkle cap
+// =============================================================================
+
+/// A tree of 64 leaves (depth 6) over ext blocks of two, capped at `c`.
+fn capped_commitment() -> CodewordCommitment<E, RpxWhir> {
+    ext_commitment(
+        &Shape {
+            log_domain: 7,
+            log_folding: 1,
+            name: "block 2, 6 levels",
+        },
+        0xCA9,
+    )
+}
+
+/// Arena: the cap (`2^c` words), the root, then per opening its block, its
+/// `depth − c` siblings and its index.
+fn capped_arena(
+    commitment: &CodewordCommitment<E, RpxWhir>,
+    c: usize,
+    openings: &[(usize, CosetOpening<E>)],
+    cap: &[[u8; 32]],
+) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = cap.iter().map(commitment_to_digest).collect();
+    words.push(commitment_to_digest(&commitment.root()));
+    let depth = commitment.depth();
+    for (index, opening) in openings {
+        words.extend(opening.values.iter().map(ext_word));
+        words.extend(
+            opening.proof.merkle_path[..depth - c]
+                .iter()
+                .map(commitment_to_digest),
+        );
+        words.push([FE::from(*index as u64), FE::zero(), FE::zero(), FE::zero()]);
+    }
+    words
+}
+
+/// The program [`capped_arena`] feeds: one cap check, then `n` openings through
+/// [`TreeAuth::verify_opening`]. Returns the program and the rows of its cap
+/// check alone (measured by building the same prefix twice).
+fn capped_program(depth: usize, c: usize, n: usize) -> LfmProgram {
+    let block = 2usize;
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let per = block + (depth - c) + 1;
+    let arena = b.declare_arena(((1 << c) + 1 + n * per) as u32);
+    let cap: Vec<WrapDigest> = (0..1u32 << c)
+        .map(|i| WrapDigest::from_cell(b.hint_word(arena, i)))
+        .collect();
+    let root = b.hint_word(arena, 1 << c);
+    let root_lanes = b.unpack(root);
+    let tree = TreeAuth::Cap(CapCells::authenticate(
+        &mut b,
+        &cap,
+        std::slice::from_ref(&root_lanes),
+    ));
+    for q in 0..n {
+        let at = ((1 << c) + 1 + q * per) as u32;
+        let values: Vec<Ext> = (0..block)
+            .map(|i| b.hint_word(arena, at + i as u32).as_ext())
+            .collect();
+        let siblings: Vec<WrapDigest> = (0..depth - c)
+            .map(|i| WrapDigest::from_cell(b.hint_word(arena, at + (block + i) as u32)))
+            .collect();
+        let index = b.hint_felt(arena, at + (block + depth - c) as u32);
+        let bits = b.bit_dec(index, depth);
+        tree.verify_opening(&mut b, BlockValues::Ext(&values), &bits, &siblings);
+    }
+    b.public(root);
+    let program = compile(b.finish());
+    validate(&program).expect("the capped opening leg must be admissible");
+    program
+}
+
+/// The host's owner encoding: every path cut to `depth − c`, the first one
+/// carrying the cap. Returns the openings and the cap.
+#[allow(clippy::type_complexity)]
+fn open_capped(
+    commitment: &CodewordCommitment<E, RpxWhir>,
+    c: usize,
+    indices: &[usize],
+) -> (Vec<(usize, CosetOpening<E>)>, Vec<[u8; 32]>) {
+    let depth = commitment.depth();
+    let openings = commitment
+        .open_many_capped(indices, c, true)
+        .expect("the blocks open");
+    let cap = openings[0].proof.merkle_path[depth - c..].to_vec();
+    (indices.iter().copied().zip(openings).collect(), cap)
+}
+
+/// ★ The cap mux selects the right node for EVERY index: all 64 leaves of a
+/// depth-6 tree opened against a height-3 cap, so all eight top-bit patterns
+/// are exercised. A mux level fed a constant (or the wrong bit) picks the
+/// wrong node for half the indices and this refuses to execute. And an
+/// opening claimed under another top-bit pattern — right leaf, right path,
+/// wrong subtree — is refused, host and machine.
+#[test]
+fn the_cap_mux_selects_every_index() {
+    let commitment = capped_commitment();
+    let depth = commitment.depth();
+    assert_eq!(depth, 6);
+    for c in 1..=3usize {
+        let all: Vec<usize> = (0..64).collect();
+        let (openings, cap) = open_capped(&commitment, c, &all);
+        let program = capped_program(depth, c, all.len());
+        execute(
+            &program,
+            &[capped_arena(&commitment, c, &openings, &cap)],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .unwrap_or_else(|e| panic!("c={c}: the machine refused honest capped openings: {e:?}"));
+
+        // Right leaf and path, claimed in another subtree.
+        let (index, opening) = &openings[5];
+        let elsewhere = index ^ (1 << (depth - 1));
+        let root = commitment.root();
+        let (check, _) = crypto::merkle_tree::cap::CappedRoot::from_owner::<
+            <RpxWhir as multilinear::whir_hash::WhirHash>::Backend<E>,
+        >(&root, &openings[0].1.proof.merkle_path, depth, c)
+        .expect("the owner's cap authenticates");
+        let siblings = &opening.proof.merkle_path[..depth - c];
+        assert!(
+            multilinear::whir_commit::verify_opening_capped::<E, RpxWhir>(
+                &check, *index, opening, siblings
+            )
+        );
+        assert!(
+            !multilinear::whir_commit::verify_opening_capped::<E, RpxWhir>(
+                &check, elsewhere, opening, siblings
+            ),
+            "c={c}: the host must refuse the wrong subtree"
+        );
+        let program = capped_program(depth, c, 1);
+        let forged = vec![(elsewhere, opening.clone())];
+        assert!(
+            execute(
+                &program,
+                &[capped_arena(&commitment, c, &forged, &cap)],
+                &crate::hash_pin::BLOCK_HASHER
+            )
+            .is_err(),
+            "c={c}: the machine must refuse the wrong subtree"
+        );
+    }
+}
+
+/// ★ In-guest: a cap word NO opening reaches, tampered. The
+/// walk and the mux of every opening are unaffected, so only the cap-to-root
+/// check can refuse it — and it does. A cap word an opening does reach is
+/// refused too.
+#[test]
+fn a_tampered_cap_word_cannot_execute() {
+    let commitment = capped_commitment();
+    let depth = commitment.depth();
+    let c = 3;
+    // Two openings, both under cap node 0 (indices < 8).
+    let (openings, cap) = open_capped(&commitment, c, &[1, 6]);
+    let program = capped_program(depth, c, 2);
+    let honest = capped_arena(&commitment, c, &openings, &cap);
+    assert!(
+        execute(
+            &program,
+            std::slice::from_ref(&honest),
+            &crate::hash_pin::BLOCK_HASHER
+        )
+        .is_ok(),
+        "the untouched arena must execute, or the arm proves nothing"
+    );
+    for node in [5usize, 0] {
+        let mut forged = honest.clone();
+        forged[node][1] += FE::one();
+        assert!(
+            execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "cap word {node} tampered: the machine must refuse"
+        );
+    }
+}
+
+/// ★ F1 for the capped opening and the cap check: the emitted rows and
+/// permutations against [`verify_opening_rows_capped`],
+/// [`verify_opening_perms_capped`], [`cap_check_rows`] and
+/// [`cap_check_perms`], at every cap height of a depth-6 tree.
+#[test]
+fn the_capped_opening_emits_its_closed_form() {
+    let depth = 6;
+    let (block, felts, unpacks) = (2usize, 6usize, 2usize);
+    for c in 1..=depth {
+        let one = capped_program(depth, c, 1);
+        let two = capped_program(depth, c, 2);
+        // The second opening's own rows: the difference, less its plumbing
+        // (its hints and its `BitDec`).
+        let per_opening_plumbing = block + (depth - c) + 1 + 1;
+        let opening_rows = (two.instrs.len() - const_rows(&two))
+            - (one.instrs.len() - const_rows(&one))
+            - per_opening_plumbing;
+        assert_eq!(
+            opening_rows,
+            verify_opening_rows_capped(felts, unpacks, depth, c),
+            "c={c}: rows a capped opening"
+        );
+        assert_eq!(
+            perm_rows(&two) - perm_rows(&one),
+            verify_opening_perms_capped(felts, depth, c),
+            "c={c}: permutations a capped opening"
+        );
+        // The one-opening program: plumbing (cap hints, root hint, its
+        // `Unpack`, the public) + the cap check + one opening.
+        let fixed_plumbing = (1 << c) + 1 + 1 + 1;
+        let check_rows = one.instrs.len()
+            - const_rows(&one)
+            - fixed_plumbing
+            - per_opening_plumbing
+            - opening_rows;
+        assert_eq!(check_rows, cap_check_rows(c), "c={c}: rows the cap check");
+        assert_eq!(
+            perm_rows(&one) - verify_opening_perms_capped(felts, depth, c),
+            cap_check_perms(c),
+            "c={c}: permutations the cap check"
+        );
+    }
+    // At c = 0 the capped forms are the root forms.
+    assert_eq!(
+        verify_opening_rows_capped(felts, unpacks, depth, 0),
+        verify_opening_rows(felts, unpacks, depth)
+    );
+    assert_eq!(
+        verify_opening_perms_capped(felts, depth, 0),
+        verify_opening_perms(felts, depth)
+    );
+    assert_eq!((cap_check_rows(0), cap_check_perms(0)), (0, 0));
 }

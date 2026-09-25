@@ -107,6 +107,9 @@ type SumcheckRounds<E> = (
 #[cfg(feature = "cuda")]
 const COMMIT_THRESHOLD: usize = 1 << 16;
 
+/// Per query an authentication path, and the tree's Merkle cap.
+pub(crate) type PathsAndCap = (Vec<Vec<[u8; 32]>>, Vec<[u8; 32]>);
+
 /// A byte buffer of Merkle nodes, relabelled as nodes without copying.
 ///
 /// A tree over a stacked polynomial is hundreds of megabytes; chunking it into
@@ -2199,6 +2202,44 @@ impl DeviceCodeword {
         Some(nodes.chunks_exact(depth).map(<[_]>::to_vec).collect())
     }
 
+    /// [`paths`](Self::paths) and the tree's Merkle cap at `cap_height` (its
+    /// `2^cap_height` nodes that height below the root, left to right), both
+    /// from ONE rebuild of the tree — so the cap and the paths are of the same
+    /// tree, whether its leaf layer was hashed or served from retention.
+    pub(crate) fn paths_and_cap(
+        &self,
+        log_folding: usize,
+        indices: &[usize],
+        cap_height: usize,
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<PathsAndCap> {
+        let leaves = self.0.elements() >> log_folding;
+        let depth = leaves.trailing_zeros() as usize;
+        if indices.iter().any(|index| *index >= leaves) || cap_height > depth {
+            return None;
+        }
+        let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
+        let (bytes, cap_bytes) = self
+            .0
+            .paths_and_cap(log_folding, &positions, cap_height, hash.into_math_cuda())
+            .ok()?;
+        let nodes = nodes_in_place(bytes)?;
+        // `2^c` nodes: copied rather than reinterpreted in place, because a
+        // cap is a few hundred bytes and its allocation's capacity is not ours
+        // to vouch for.
+        if cap_bytes.len() != 32usize << cap_height {
+            return None;
+        }
+        let cap: Vec<[u8; 32]> = cap_bytes
+            .chunks_exact(32)
+            .map(|node| <[u8; 32]>::try_from(node).ok())
+            .collect::<Option<_>>()?;
+        if cap.len() != 1usize << cap_height {
+            return None;
+        }
+        Some((nodes.chunks_exact(depth).map(<[_]>::to_vec).collect(), cap))
+    }
+
     /// The blocks `indices` open, gathered where they lie — one launch and one
     /// copy back for the whole round.
     pub(crate) fn cosets<F>(
@@ -2330,6 +2371,16 @@ impl DeviceCodeword {
         _indices: &[usize],
         _hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn paths_and_cap(
+        &self,
+        _log_folding: usize,
+        _indices: &[usize],
+        _cap_height: usize,
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<PathsAndCap> {
         match self.0 {}
     }
 

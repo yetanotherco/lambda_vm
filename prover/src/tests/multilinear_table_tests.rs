@@ -52,6 +52,7 @@ fn config() -> ChainConfig {
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     }
 }
 
@@ -260,7 +261,13 @@ fn layout_dyn<'a>(
 /// counterparty is not another table but the statement, so the tables only sum
 /// to zero for a program that outputs nothing. `compute_commit_bus_offset` is
 /// the same quantity the univariate verifier demands.
-fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
+///
+/// ★ Returns the argued tables BY NAME, in `air_trace_pairs` order, because a
+/// count cannot say which. Since #977 the set is workload-dependent — an empty
+/// table is elided rather than padded — so "how many" stopped being the
+/// question and "which ones" became it: a count cannot tell a table that
+/// vanished from one that gained a chunk while another vanished.
+fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> Vec<String> {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, logs, &Default::default(), &[]).unwrap();
     let public_output = traces.public_output_bytes.clone();
@@ -298,6 +305,13 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         })
         .collect();
 
+    // Captured before `tables` is moved into the commitment, and from `pairs`
+    // rather than from the AIR set, so it is the proof's own sub-proof order.
+    let names: Vec<String> = pairs
+        .iter()
+        .map(|(air, _, _)| air.name().to_string())
+        .collect();
+
     let mut tables = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter().zip(&shapes) {
         let columns = trace.columns_main();
@@ -309,6 +323,11 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
         );
     }
     let count = tables.len();
+    assert_eq!(
+        names.len(),
+        count,
+        "one name per argued table, or the census below describes another proof"
+    );
     // Every table's columns in one commitment: 55 of them still open once.
     let committed =
         CommittedTables::<_, _, KeccakWhir>::commit(tables, &config()).expect("commit every table");
@@ -362,7 +381,38 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
     )
     .expect("the whole table set verifies");
 
-    count
+    names
+}
+
+/// The `FIXED_TABLE_COUNT` always-on tables, in `air_trace_pairs` order — the
+/// prefix EVERY argued set opens with, whatever the workload runs.
+///
+/// One copy, shared by the cases below, because it is the half of each census
+/// that is machine shape rather than program shape: a workload cannot add to it
+/// or take from it. The counted tables that follow are the program's own.
+const ALWAYS_ON_TABLES: [&str; 5] = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
+
+/// The shared prefix of `argued`, as `&str` so it compares against the literal
+/// censuses below.
+fn always_on_prefix(argued: &[String]) -> Vec<&str> {
+    argued
+        .iter()
+        .take(ALWAYS_ON_TABLES.len())
+        .map(String::as_str)
+        .collect()
+}
+
+/// [`ALWAYS_ON_TABLES`] is a census OF `FIXED_TABLE_COUNT`, so it must not be
+/// able to drift from it silently — the failure the sibling list in
+/// `constraint_artifact_tests` actually had, where it named eleven while the
+/// constant said five.
+#[test]
+fn the_always_on_prefix_is_the_constants_own() {
+    assert_eq!(
+        ALWAYS_ON_TABLES.len(),
+        crate::FIXED_TABLE_COUNT,
+        "the always-on prefix must name every FIXED_TABLE_COUNT table"
+    );
 }
 
 /// **The whole VM through the multilinear path**: every live table of a real
@@ -371,39 +421,253 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> usize {
 /// The traces come from the executor, not from hand-written operations, so the
 /// widths, the interaction counts, the packings and the multiplicity patterns
 /// are whatever the VM actually produces.
+///
+/// ★ THE SET BY NAME, NOT A COUNT, and the reason is #977. This asserted
+/// `>= 20` until the main-sync merge `892c7d1bc` (main's `c2ac5d546`, #977)
+/// took `FIXED_TABLE_COUNT` 11 -> 5 and made COMMIT, KECCAK, KECCAK_RND, ECSM,
+/// ECDAS and HINT counted: an empty table is now ELIDED from the proof rather
+/// than padded into it, so the argued set is workload-dependent and "the full
+/// table set" stopped being a thing a bound could describe. It read 10 here.
+///
+/// A count is the wrong instrument for that move twice over. It cannot tell a
+/// table that VANISHED from one that gained a chunk while another vanished, and
+/// it says nothing about ORDER — which `air_trace_pairs` calls the proof's
+/// sub-proof layout in as many words, since `air_refs` must reproduce it. The
+/// ordered census fails on any of the three and names which.
+///
+/// MEASURED at `788f36a19`, box, CPU-only, no campaign env. `[0]` is a chunk
+/// index and `PAGE:0x0` a page base, both as `AIR::name` renders them.
 #[test]
 fn every_live_table_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("sub");
     let argued = prove_and_verify_all_tables(elf, &logs);
-    assert!(argued >= 20, "expected the full table set, argued {argued}");
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
+        argued.join(" ")
+    );
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "CPU[0]",
+            "LT[0]",
+            "MEMW_A[0]",
+            "PAGE:0x0",
+            "MEMW_R[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed"
+    );
 }
 
-/// The same over the whole 64-bit instruction set, which lights up the tables a
-/// two-instruction program never reaches.
+/// The same over the whole 64-bit instruction set, which lights up tables a
+/// two-instruction program never reaches: SHIFT, MUL, DVRM, BYTEWISE and CPU32,
+/// five more than `sub`'s ten.
+///
+/// ⚠ AND IT IS NOT THE FULL TABLE SET, which is what the old `>= 20` bound and
+/// its "expected the full table set" message both claimed. Fifteen tables are
+/// argued, and six counted families are absent: MEMW (the unaligned one; only
+/// MEMW_A and MEMW_R appear), LOAD, STORE, BRANCH, EQ and COMMIT — plus every
+/// accelerator. Since #977 an absent table means a table with NO ROWS, so this
+/// says the `all_instructions_64` fixture executes no branch, no load, no store
+/// and no `eq`, which is a narrower program than its name suggests.
+///
+/// That gap is PINNED rather than fixed here: widening the fixture is a change
+/// to `executor/programs/asm`, and this census is what would notice it. A
+/// family arriving fails this test saying which, which is the outcome to want.
+///
+/// MEASURED at `788f36a19`, box, CPU-only, no campaign env.
 #[test]
 fn the_whole_instruction_set_is_proved_and_verified() {
     let (elf, logs, _) = run_asm_elf("all_instructions_64");
-    assert!(prove_and_verify_all_tables(elf, &logs) >= 20);
+    let argued = prove_and_verify_all_tables(elf, &logs);
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
+        argued.join(" ")
+    );
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "CPU[0]",
+            "LT[0]",
+            "SHIFT[0]",
+            "MEMW_A[0]",
+            "MUL[0]",
+            "DVRM[0]",
+            "PAGE:0x0",
+            "MEMW_R[0]",
+            "BYTEWISE[0]",
+            "CPU32[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed"
+    );
+    // NON-VACUITY against the case above: this fixture must actually reach
+    // further than `sub` did, or the two censuses are one test written twice.
+    for wider in ["SHIFT[0]", "MUL[0]", "DVRM[0]", "BYTEWISE[0]", "CPU32[0]"] {
+        assert!(
+            argued.iter().any(|n| n == wider),
+            "{wider} is what this case adds over `sub`; argued: {}",
+            argued.join(" ")
+        );
+    }
 }
 
-/// And over a Rust program that calls the keccak precompile — which brings
-/// KECCAK, KECCAK_RND and KECCAK_RC in, **and** writes public output, so the
-/// statement's share of the bus is load-bearing here and nowhere else.
-#[test]
-fn a_program_using_a_precompile_is_proved_and_verified() {
+/// Proves and verifies the guest at `executor/program_artifacts/rust/<name>.elf`,
+/// returning the argued tables by name.
+fn prove_and_verify_rust_guest(name: &str) -> Vec<String> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
-        .join("executor/program_artifacts/rust/keccak.elf");
+        .join("executor/program_artifacts/rust")
+        .join(format!("{name}.elf"));
     let bytes = std::fs::read(&root).unwrap_or_else(|_| panic!("read {}", root.display()));
-    let elf = Elf::load(&bytes).expect("load keccak.elf");
+    let elf = Elf::load(&bytes).unwrap_or_else(|e| panic!("load {name}.elf: {e:?}"));
     let logs = Executor::new(&elf, vec![])
         .expect("executor")
         .run()
         .expect("run")
         .logs;
+    prove_and_verify_all_tables(elf, &logs)
+}
 
-    assert!(prove_and_verify_all_tables(elf, &logs) >= 20);
+/// Is `family`, or `family` plus a chunk index, among the argued tables?
+///
+/// "Equal, or followed by `[`" — never a bare prefix, which would let
+/// `KECCAK_RC` answer for `KECCAK`.
+fn argues(argued: &[String], family: &str) -> bool {
+    argued.iter().any(|n| {
+        let s = n.as_str();
+        s == family || (s.starts_with(family) && s[family.len()..].starts_with('['))
+    })
+}
+
+/// And over a Rust program that calls the keccak PRECOMPILE — the
+/// `keccak_permute` ecall — so KECCAK and KECCAK_RND are argued, **and** which
+/// writes public output, so the statement's share of the bus is load-bearing.
+///
+/// ⛔ THIS CASE PROVED THE WRONG GUEST UNTIL NOW, and the bound is what hid it.
+/// It loaded `keccak.elf`, which is `executor/programs/rust/keccak` — a guest
+/// whose `Cargo.toml` depends on `tiny-keccak` and whose `main` hashes in
+/// SOFTWARE, issuing no syscall but `commit`. It has never touched a precompile.
+/// The measured census at `413b3a3b7` carries COMMIT[0] and no keccak table at
+/// all, which is what finally said so.
+///
+/// ★ And the claim was false BEFORE #977 too — it was merely unfalsifiable.
+/// KECCAK and KECCAK_RND were always-on then, so they appeared in the table set
+/// of every workload, reached or not, and a doc sentence about which tables the
+/// program "brings in" described MACHINE shape while reading like program
+/// behaviour. `892c7d1bc` (main's `c2ac5d546`, #977) made them counted, which
+/// turned a latent falsehood into a visible one. Another instance of the
+/// pattern in `SOUNDNESS.md`: a claim no assertion defended.
+///
+/// The accelerator guest it should have used is `keccak_precompile`, whose
+/// `main` calls `lambda_vm_syscalls::keccak::keccak256` over five padding edge
+/// cases. It is built by the Makefile's `RUST_PROGRAM_DIRS` wildcard like every
+/// other guest, and before this commit **nothing in the prover proved it** — its
+/// only reference in the tree is `executor/tests/rust.rs`, which runs it in the
+/// executor and never proves it. So the suite had no precompile coverage on the
+/// multilinear path at all.
+///
+/// ⚠ The census here is by PRESENCE, not an ordered list: this guest has never
+/// been proved on this path, so there is no measured set to pin, and inventing
+/// one would repeat the mistake above. Its cost is likewise unmeasured — five
+/// `keccak256` calls including a multi-block input.
+///
+/// ✓ The ELF resolves on a CI prover shard exactly as `keccak.elf` does, and
+/// this is written down so the next reader does not re-ask: the lineage's
+/// prover-tests job runs `make compile-programs-asm`, `make compile-programs-rust`
+/// and `make compile-recursion-elfs` before `cargo nextest run`, and
+/// `compile-programs-rust` builds every directory under
+/// `executor/programs/rust/` through the `RUST_PROGRAM_DIRS` wildcard — this
+/// guest included, with no per-program list to extend.
+#[test]
+fn a_program_using_a_precompile_is_proved_and_verified() {
+    let argued = prove_and_verify_rust_guest("keccak_precompile");
+    assert_eq!(
+        always_on_prefix(&argued),
+        ALWAYS_ON_TABLES,
+        "every argued set opens with the always-on tables; argued: {}",
+        argued.join(" ")
+    );
+    // KECCAK_RC is deliberately NOT in this list: it is always-on and asserted
+    // in the prefix above, so matching it here would let a run that reaches no
+    // precompile satisfy a check named for one — which is exactly how the
+    // software guest passed as a precompile test for as long as it did.
+    for family in ["KECCAK", "KECCAK_RND", "COMMIT"] {
+        assert!(
+            argues(&argued, family),
+            "{family} must be argued — it is what this case exists for, and \
+             since #977 it is a counted table that an unreached workload drops \
+             silently; argued: {}",
+            argued.join(" ")
+        );
+    }
+}
+
+/// The SOFTWARE-hash guest, kept because it is the widest live table set in the
+/// suite — and it is the one the precompile case above used to prove.
+///
+/// `executor/programs/rust/keccak` hashes with `tiny-keccak` in guest code, so
+/// it reaches no accelerator and argues the RV64 core broadly instead: 21
+/// tables, including MEMW, LOAD, STORE, BRANCH and EQ — the five families
+/// `the_whole_instruction_set_is_proved_and_verified` does NOT reach despite its
+/// name. A Rust guest doing ordinary work exercises more of the VM than the asm
+/// fixture named for the instruction set, which is worth keeping a case for.
+///
+/// It also carries public output (COMMIT[0]) and two PAGE tables, one of them
+/// the stack page — the only case here that does either.
+///
+/// MEASURED at `413b3a3b7`, box, CPU-only, no campaign env.
+#[test]
+fn a_software_hash_guest_argues_the_widest_table_set() {
+    let argued = prove_and_verify_rust_guest("keccak");
+    assert_eq!(
+        argued,
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "COMMIT[0]",
+            "CPU[0]",
+            "LT[0]",
+            "SHIFT[0]",
+            "MEMW[0]",
+            "MEMW_A[0]",
+            "LOAD[0]",
+            "MUL[0]",
+            "BRANCH[0]",
+            "PAGE:0x0",
+            "PAGE:0xfffffffffffc0000",
+            "MEMW_R[0]",
+            "EQ[0]",
+            "BYTEWISE[0]",
+            "STORE[0]",
+            "CPU32[0]",
+        ],
+        "the argued table set moved — a table appeared, vanished, or the \
+         sub-proof order changed. NOTE what is absent and must stay absent: \
+         KECCAK, KECCAK_RND, ECSM, ECDAS and HINT. This guest hashes in \
+         software, and an accelerator appearing here means it is proving \
+         something else — which is precisely the confusion the precompile case \
+         above lived in. A separate `!argues(..)` loop would restate the list \
+         and could only fire after this assertion already had."
+    );
 }
 
 /// A proof is only a proof if it can leave the process. Round-trips a real

@@ -43,6 +43,52 @@ pub enum LfmProgramKind {
     StatementReplayV0,
 }
 
+impl LfmProgramKind {
+    /// The fixture program this kind names, built from code — what
+    /// `compute_lfm_registry` blesses into the row.
+    pub fn program(self) -> LfmProgram {
+        use super::programs::{
+            KECCAK_SPONGE_LEN, fri_toy_program, keccak_chain_program, keccak_sponge_program,
+            statement_replay_program, transcript_replay_program, trivial_program,
+        };
+        match self {
+            Self::TrivialV0 => trivial_program(),
+            Self::FriToyV0 => fri_toy_program(),
+            Self::KeccakChainV0 => keccak_chain_program(),
+            Self::KeccakSpongeV0 => keccak_sponge_program(KECCAK_SPONGE_LEN),
+            Self::TranscriptReplayV0 => transcript_replay_program(),
+            Self::StatementReplayV0 => statement_replay_program(),
+        }
+    }
+}
+
+/// ★ The artifacts a fixture program is verified against under `options`.
+///
+/// The registry policy: `LFM_REGISTRY` is blessed at
+/// today's leaf layout and STAYS row-pair only. At the default format this is
+/// [`resolve`] — the registry row, no fallback. Under a one-row format (`On`
+/// or `Auto`) the registry is NOT read: the program is rebuilt from code and
+/// its artifacts computed at run time (row-pair AND one-row roots, as
+/// `compute_lfm_registry` would), which is what the registry pins anyway —
+/// `registry_drift_*` hold the two equal at the default.
+pub fn resolve_artifacts(
+    kind: LfmProgramKind,
+    options: &ProofOptions,
+) -> Result<LfmArtifacts, LfmRegistryError> {
+    if options.format.one_row == stark::proof::options::OneRowMode::Off {
+        return Ok(resolve(kind, options.blowup_factor)?.artifacts());
+    }
+    Ok(build_artifacts(&kind.program(), options))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Reads of `LFM_REGISTRY` on this thread (test builds only), for the
+    /// registry-policy test.
+    pub(crate) static REGISTRY_READS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LfmRegistryError {
     UnknownProgram {
@@ -113,6 +159,9 @@ impl LfmRegistryEntry {
             hasher: self.hasher,
             chip_set: self.chip_set,
             program_id: self.program_id,
+            // The registry is ROW-PAIR ONLY: a one-row
+            // format never reads it — `resolve_artifacts` builds at run time.
+            one_row_roots: None,
         }
     }
 }
@@ -151,6 +200,27 @@ pub struct LfmArtifacts {
     /// compiled groups at bless time. See [`ChipSet`].
     pub chip_set: ChipSet,
     pub program_id: Commitment,
+    /// The ONE-ROW (S2) preprocessed roots of the same groups, built only when
+    /// the options' format has one-row openings on (`On` or `Auto`: which chips
+    /// `Auto` resolves to one row is decided later, per chip, by the STARK
+    /// prover and verifier, so every chip gets one). `None` at the default.
+    ///
+    /// NOT folded into `program_id`: the identity stays the row-pair roots'
+    /// (the one-row roots are a deterministic function of the same columns),
+    /// so a program keeps one id across layouts on the LFM side.
+    pub one_row_roots: Option<LfmOneRowRoots>,
+}
+
+/// The one-row preprocessed roots of an [`LfmArtifacts`] (see its field).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LfmOneRowRoots {
+    /// Per chip slot, as `LfmArtifacts::roots`; `None` = no one-row root (a
+    /// static table with no one-row twin at this blowup — a hard miss if the
+    /// chip resolves to one row). Slot 12 (`KECCAK_RND`) has no
+    /// preprocessed columns and stays `None`.
+    pub roots: [Option<Commitment>; NUM_LFM_CHIPS],
+    /// One per `LFM_BLAKE3` chunk, as `LfmArtifacts::blake3_chunk_roots`.
+    pub blake3_chunk_roots: Vec<Commitment>,
 }
 
 impl LfmArtifacts {
@@ -515,6 +585,8 @@ pub fn build_artifacts_with_hasher(
         &blake3_chunk_roots,
         &blake3_chunk_log_heights,
     );
+    let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
+        .then(|| build_one_row_roots(program, options, &groups));
     LfmArtifacts {
         roots,
         log_heights,
@@ -524,6 +596,36 @@ pub fn build_artifacts_with_hasher(
         hasher,
         chip_set,
         program_id,
+        one_row_roots,
+    }
+}
+
+/// The one-row roots of every committed group (host pass: the device commit
+/// builds row-pair leaves only), plus the static tables' one-row twins.
+fn build_one_row_roots(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    groups: &[&ColumnGroup; 11],
+) -> LfmOneRowRoots {
+    use stark::leaf_layout::LeafLayout::Row;
+    let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
+    let commits = map_maybe_parallel(groups, |g| {
+        super::commit::commit_group_device_or_host_with(PREP_GROUP_LABEL, g, options, Row)
+    });
+    for (slot, root) in commits.into_iter().enumerate() {
+        roots[slot] = Some(root);
+    }
+    let chunks: Vec<usize> = (0..blake3_chunk_rows(program).len()).collect();
+    let blake3_chunk_roots = map_maybe_parallel(&chunks, |c| {
+        let group = program.blake3_chunk_group(*c);
+        super::commit::commit_group_device_or_host_with(BLAKE3_CHUNK_LABEL, &group, options, Row)
+    });
+    roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
+    roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
+    roots[14] = bitwise::preprocessed_commitment_for(options, Row);
+    LfmOneRowRoots {
+        roots,
+        blake3_chunk_roots,
     }
 }
 
@@ -547,6 +649,8 @@ pub fn resolve(
     kind: LfmProgramKind,
     blowup_factor: u8,
 ) -> Result<&'static LfmRegistryEntry, LfmRegistryError> {
+    #[cfg(test)]
+    REGISTRY_READS.with(|c| c.set(c.get() + 1));
     let mut matches = LFM_REGISTRY
         .iter()
         .filter(|e| e.kind == kind && e.blowup_factor == blowup_factor);
@@ -569,6 +673,28 @@ pub fn resolve(
 // GENERATED — do not edit by hand. Regenerate with:
 //   cargo run --bin compute_lfm_registry --release
 // and paste the output below. Drift tests recompute and compare on every PR.
+//
+// ★ LAST REGENERATION, and what forced it: the main-sync merge `892c7d1bc`
+// (main's `c2ac5d546`, #977) grew the absorbed continuation-epoch statement by
+// 49 bytes — six accelerator counts joined it when `FIXED_TABLE_COUNT` went
+// 11 -> 5 (`NUM_TABLE_COUNTS` 15 -> 21, +48) and `is_final` was appended as its
+// last byte (+1). StatementReplayV0 is the one registered program that replays
+// that statement, so its script gained one `Blake3Chain` compression and seven
+// of its fifteen roots moved with `program_id`.
+//
+// ⚠ EXACTLY ONE ENTRY MOVED, and that was checked rather than assumed: the
+// other five programs build no epoch statement, and all fifteen roots, the
+// log-heights, `keccak_rnd_chunks`, `hasher` and `chip_set` of each came back
+// byte-identical. `log_heights[11]` did NOT move even for StatementReplayV0 —
+// 9 and 10 compressions both pad to the 16-row group. The regenerated
+// `roots[11]` also equals the value `machine_tests::
+// every_registry_entry_is_a_single_blake3_table` computes from the program
+// (`7a 3b 86 1b ...`), which is what says the paste closes the gap the pin
+// found rather than moving the pin to meet the paste.
+//
+// `compute_static_commitments` was NOT re-run and did not need to be: this is
+// not a hash-pin change, so slots 13 and 14 (KECCAK_RC's and BITWISE's static
+// preprocessed commitments) are untouched — and they came back identical.
 //
 // ★ WHICH CONFIGURATION THIS TABLE ASSUMES, and what would move it.
 //
@@ -1083,14 +1209,14 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         blowup_factor: 2,
         roots: [
             [
-                0x8e, 0x12, 0x29, 0x48, 0x9e, 0xac, 0x16, 0x2c, 0x45, 0x9a, 0x99, 0xbf, 0xde, 0x4a,
-                0x9a, 0xd5, 0x57, 0x3c, 0xff, 0x61, 0xee, 0x7a, 0xd5, 0x20, 0xa0, 0x1d, 0x7a, 0x27,
-                0x4c, 0x93, 0xef, 0xb4,
+                0xc0, 0x80, 0x4f, 0xab, 0xb9, 0xa1, 0x41, 0xe8, 0xcf, 0xda, 0x76, 0xea, 0xca, 0x45,
+                0x0d, 0xdc, 0x21, 0xf1, 0xb3, 0x32, 0xe0, 0x91, 0xc8, 0xce, 0xa5, 0x96, 0x96, 0xa3,
+                0x30, 0x36, 0x09, 0x97,
             ],
             [
-                0x79, 0x6f, 0x6d, 0xe6, 0xb0, 0x27, 0x4a, 0x4f, 0x35, 0x50, 0x4f, 0x02, 0x76, 0x26,
-                0x3c, 0x73, 0x2b, 0xbe, 0xa6, 0xdd, 0xab, 0xb3, 0x9e, 0xf7, 0x4a, 0xce, 0x51, 0xc1,
-                0x12, 0xa2, 0x80, 0x40,
+                0xfb, 0xca, 0xf1, 0x74, 0xa1, 0xad, 0xf6, 0x3d, 0x24, 0x92, 0x44, 0x80, 0xc8, 0x64,
+                0x4d, 0xb2, 0xdc, 0x8a, 0x33, 0xc0, 0x98, 0x7a, 0x9f, 0xba, 0xbd, 0xe4, 0x8e, 0xa6,
+                0xa9, 0x43, 0x5c, 0x5a,
             ],
             [
                 0x07, 0xdb, 0x70, 0x37, 0x6d, 0xff, 0x1c, 0x50, 0x7f, 0x82, 0xf7, 0x83, 0x73, 0x7c,
@@ -1098,14 +1224,14 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xae, 0x17, 0x71, 0x37,
             ],
             [
-                0x06, 0xfe, 0x81, 0xac, 0x1e, 0xd6, 0x2e, 0x90, 0xec, 0xd5, 0x9a, 0x03, 0x33, 0xe2,
-                0xdf, 0xeb, 0xa5, 0xa5, 0x42, 0xe4, 0x7a, 0xec, 0x27, 0x4c, 0xda, 0x74, 0x87, 0x31,
-                0xe1, 0x40, 0xe0, 0x58,
+                0x36, 0xb7, 0x63, 0x4d, 0x83, 0x5b, 0xfc, 0x7e, 0x23, 0x62, 0xfe, 0x2c, 0xf1, 0xc4,
+                0xf6, 0x2f, 0x2f, 0x8d, 0x45, 0x5c, 0x21, 0xaf, 0x24, 0xd8, 0x01, 0xfe, 0x3a, 0x68,
+                0x64, 0x9e, 0xdd, 0x38,
             ],
             [
-                0x60, 0xdf, 0x05, 0x40, 0x1e, 0x94, 0x4d, 0x5a, 0x43, 0xd7, 0x0b, 0xe9, 0x8e, 0x38,
-                0x1e, 0x3d, 0x22, 0xa5, 0x91, 0xeb, 0xa4, 0x1f, 0xf8, 0xff, 0x1f, 0x96, 0x8b, 0x53,
-                0xb6, 0x48, 0x97, 0xd7,
+                0x5c, 0x51, 0x64, 0x8c, 0xad, 0x71, 0x1f, 0x07, 0x17, 0x09, 0x71, 0x74, 0x03, 0x60,
+                0x90, 0x87, 0x6e, 0x7b, 0x9d, 0xe6, 0xd0, 0x59, 0x6e, 0xf4, 0x2c, 0x1b, 0xb5, 0x83,
+                0x58, 0xf2, 0x98, 0x1f,
             ],
             [
                 0x7d, 0x25, 0xc1, 0xee, 0x40, 0x2b, 0x03, 0x6b, 0xf9, 0x14, 0x9a, 0xa3, 0x50, 0x04,
@@ -1118,9 +1244,9 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xff, 0x31, 0xec, 0xb2,
             ],
             [
-                0x92, 0x13, 0x7a, 0xa0, 0xb8, 0xe0, 0xe3, 0xb7, 0xb0, 0x4e, 0x49, 0x3d, 0x2b, 0x8f,
-                0x7d, 0x1a, 0xef, 0x0b, 0x47, 0x68, 0x28, 0xd7, 0x23, 0x8c, 0xa4, 0x4c, 0x10, 0x2c,
-                0x2e, 0x1c, 0x6d, 0x0c,
+                0x8f, 0xad, 0x35, 0x4f, 0xa7, 0x06, 0x90, 0xd9, 0x49, 0x80, 0x19, 0xcc, 0x81, 0xfd,
+                0xaf, 0xdd, 0x5f, 0x32, 0x13, 0xc8, 0xfc, 0xf9, 0xae, 0xcc, 0x0f, 0xfa, 0x67, 0x16,
+                0xd8, 0x6e, 0x06, 0x20,
             ],
             [
                 0x8a, 0xc9, 0x0a, 0xc6, 0x8d, 0x5c, 0x71, 0xf7, 0x0d, 0x60, 0x13, 0x14, 0x21, 0xcc,
@@ -1128,9 +1254,9 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xc5, 0xb2, 0x5e, 0x21,
             ],
             [
-                0xe5, 0x6d, 0x6f, 0x2a, 0x3b, 0x38, 0x2f, 0xd0, 0xcf, 0x6f, 0xcb, 0x53, 0xb3, 0xfa,
-                0x03, 0x1b, 0x4e, 0x99, 0xda, 0x4a, 0xa2, 0xf7, 0x82, 0x23, 0x9f, 0x03, 0x59, 0x06,
-                0x51, 0xec, 0x4d, 0x4f,
+                0x99, 0x86, 0x5e, 0xbf, 0x36, 0xe0, 0xaa, 0xf0, 0x3a, 0xed, 0x45, 0x21, 0xb9, 0xca,
+                0x8c, 0x4f, 0x9e, 0x5a, 0x16, 0x37, 0x1d, 0xea, 0xd9, 0x84, 0xae, 0x56, 0x93, 0xf8,
+                0x7f, 0xcb, 0x4a, 0x18,
             ],
             [
                 0xa3, 0xd2, 0x1d, 0x58, 0xbf, 0x0c, 0x09, 0xb2, 0x14, 0xce, 0xe6, 0x4f, 0x94, 0xf8,
@@ -1138,9 +1264,9 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
                 0xe8, 0xc4, 0x17, 0x99,
             ],
             [
-                0x6a, 0xc2, 0xa2, 0x99, 0xe6, 0x48, 0x90, 0x8b, 0xe6, 0xa1, 0xca, 0xbf, 0x87, 0x9c,
-                0x70, 0x73, 0xe2, 0x70, 0x50, 0x82, 0xf9, 0xeb, 0xdf, 0xeb, 0x61, 0x21, 0x06, 0x7f,
-                0x37, 0x78, 0x2a, 0x1d,
+                0x7a, 0x3b, 0x86, 0x1b, 0xc0, 0x56, 0x74, 0x90, 0x30, 0x0f, 0x37, 0x0b, 0x20, 0x41,
+                0x27, 0x22, 0x29, 0x0d, 0xa4, 0x4d, 0xa1, 0xeb, 0x68, 0xed, 0x82, 0x13, 0x1e, 0xa6,
+                0xfd, 0x6f, 0x02, 0x41,
             ],
             [
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1166,9 +1292,9 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
             blake3: true,
         },
         program_id: [
-            0xd9, 0x80, 0x4c, 0xab, 0xc9, 0xa2, 0xbb, 0x15, 0xb2, 0x36, 0xe3, 0x4b, 0x50, 0x05,
-            0x97, 0x07, 0x99, 0xf6, 0x54, 0xa3, 0x87, 0x07, 0x34, 0xa5, 0x14, 0x8a, 0xd5, 0x63,
-            0x21, 0xd6, 0xa6, 0x4d,
+            0x5f, 0x89, 0x18, 0xf9, 0x16, 0xd3, 0xc5, 0xb8, 0x38, 0xfe, 0x73, 0x6e, 0x5f, 0xc0,
+            0x30, 0x62, 0xf6, 0x4a, 0x72, 0xa4, 0xd6, 0x12, 0x27, 0x98, 0x8b, 0x2c, 0x24, 0xa4,
+            0xcf, 0x6e, 0x28, 0x21,
         ],
     },
 ];

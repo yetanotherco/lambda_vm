@@ -26,6 +26,7 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::fri;
+use crate::leaf_layout::LeafLayout;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::residency_mode::ResidencyMode;
@@ -44,7 +45,6 @@ use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 use crypto::merkle_tree::merkle::MerkleTree;
-#[cfg(feature = "cuda")]
 use crypto::merkle_tree::proof::Proof;
 use crypto::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
 
@@ -102,6 +102,12 @@ pub enum ProvingError {
     /// proof an honest verifier always rejects — fail fast on the prover side
     /// with a localized error instead.
     PrecomputedCommitmentMismatch,
+    /// The AIR has no preprocessed commitment for the table's leaf layout
+    /// (S2: a one-row layout whose static root was never generated). A hard
+    /// error, never a silent recompute: proving on would either
+    /// take the other layout's root — a proof every verifier rejects — or
+    /// rebuild a whole preprocessed LDE and tree behind the operator's back.
+    PrecomputedCommitmentMissing(String),
     /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
     /// out of disk space, fd exhaustion, or mmap failure.
     #[cfg(feature = "disk-spill")]
@@ -227,7 +233,13 @@ where
 /// the O(n) scan for the least-recently-used entry costs less than any ordering
 /// structure would.
 type PrecomputedTreeMap =
-    std::collections::HashMap<Commitment, (u64, Arc<dyn std::any::Any + Send + Sync>)>;
+    std::collections::HashMap<PrecomputedTreeKey, (u64, Arc<dyn std::any::Any + Send + Sync>)>;
+
+/// The cache key: the root AND the trees' rows per leaf (S2). The root alone
+/// already differs between leaf layouts (a one-row leaf hashes other bytes),
+/// so two layouts cannot alias; the layout is in the key anyway so that
+/// argument is not a hash-collision argument.
+type PrecomputedTreeKey = (Commitment, usize);
 
 fn precomputed_tree_cache() -> &'static Mutex<PrecomputedTreeMap> {
     static CACHE: OnceLock<Mutex<PrecomputedTreeMap>> = OnceLock::new();
@@ -284,7 +296,7 @@ pub fn precomputed_tree_cache_stats() -> (usize, u64, u64, u64) {
 /// a check that cannot fail.
 fn precomputed_tree_insert_capped(
     map: &mut PrecomputedTreeMap,
-    root: Commitment,
+    root: PrecomputedTreeKey,
     tree: Arc<dyn std::any::Any + Send + Sync>,
     cap: Option<usize>,
 ) {
@@ -365,7 +377,9 @@ pub fn precomputed_tree_cache_hit_miss() -> (u64, u64) {
 
 pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
     root: &Commitment,
+    rows_per_leaf: usize,
 ) -> Option<Arc<MerkleTree<B>>> {
+    let root = &(*root, rows_per_leaf);
     let mut cache = precomputed_tree_cache().lock().unwrap();
     let out = cache
         .get(root)
@@ -392,11 +406,12 @@ pub(crate) fn precomputed_tree_cache_get<B: IsMerkleTreeBackend + 'static>(
 
 pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     root: Commitment,
+    rows_per_leaf: usize,
     tree: Arc<MerkleTree<B>>,
 ) {
     precomputed_tree_insert_capped(
         &mut precomputed_tree_cache().lock().unwrap(),
-        root,
+        (root, rows_per_leaf),
         tree as Arc<dyn std::any::Any + Send + Sync>,
         precomputed_tree_cache_cap(),
     );
@@ -1311,6 +1326,42 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
+        Self::commit_rows_bit_reversed_subset_with(
+            data,
+            num_cols,
+            col_start,
+            col_end,
+            crate::commitment::ROWS_PER_LEAF,
+        )
+    }
+
+    /// [`Self::commit_rows_bit_reversed`] with `rows_per_leaf` rows per leaf
+    /// (the table's [`LeafLayout`]): 2 = today's row pairs, 1 = one row (S2).
+    fn commit_rows_bit_reversed_with<E>(
+        data: &[FieldElement<E>],
+        num_cols: usize,
+        rows_per_leaf: usize,
+    ) -> Option<(MerkleTree<H::Batched<E>>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+        E: IsField,
+    {
+        Self::commit_rows_bit_reversed_subset_with(data, num_cols, 0, num_cols, rows_per_leaf)
+    }
+
+    /// [`Self::commit_rows_bit_reversed_subset`] with `rows_per_leaf` rows per
+    /// leaf: leaf `i` hashes the bit-reversed rows `R·i .. R·i + R − 1`.
+    fn commit_rows_bit_reversed_subset_with<E>(
+        data: &[FieldElement<E>],
+        num_cols: usize,
+        col_start: usize,
+        col_end: usize,
+        rows_per_leaf: usize,
+    ) -> Option<(MerkleTree<H::Batched<E>>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
+        E: IsField,
+    {
         use math::traits::ByteConversion;
 
         if num_cols == 0 || data.is_empty() || col_end <= col_start {
@@ -1327,17 +1378,19 @@ pub trait IsStarkProver<
             "num_rows must be a power of two for reverse_index"
         );
 
-        // Local alias for the canonical constant, used several times below.
-        const ROWS_PER_LEAF: usize = crate::commitment::ROWS_PER_LEAF;
-        let num_leaves = num_rows / ROWS_PER_LEAF;
+        debug_assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+        if rows_per_leaf == 0 || !num_rows.is_multiple_of(rows_per_leaf) {
+            return None;
+        }
+        let num_leaves = num_rows / rows_per_leaf;
         let subset_cols = col_end - col_start;
         let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-        let leaf_bytes = ROWS_PER_LEAF * subset_cols * byte_len;
+        let leaf_bytes = rows_per_leaf * subset_cols * byte_len;
 
         let hash_leaf = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
             let mut offset = 0;
-            for k in 0..ROWS_PER_LEAF {
-                let br_idx = reverse_index(ROWS_PER_LEAF * leaf_idx + k, num_rows as u64);
+            for k in 0..rows_per_leaf {
+                let br_idx = reverse_index(rows_per_leaf * leaf_idx + k, num_rows as u64);
                 let row_start = br_idx * num_cols;
                 let row = &data[row_start + col_start..row_start + col_end];
                 for elem in row.iter() {
@@ -1385,6 +1438,27 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        Self::compute_precomputed_commitment_for_testing_with(
+            trace,
+            air,
+            num_precomputed_cols,
+            LeafLayout::RowPair,
+        )
+    }
+
+    /// [`Self::compute_precomputed_commitment_for_testing`] under an explicit
+    /// leaf layout (S2's one-row root of the same columns).
+    #[cfg(any(test, feature = "test-utils"))]
+    fn compute_precomputed_commitment_for_testing_with(
+        trace: &TraceTable<Field, FieldExtension>,
+        air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        num_precomputed_cols: usize,
+        layout: LeafLayout,
+    ) -> Option<Commitment>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
         let domain = Domain::new(air, trace.num_rows());
         let columns = trace.columns_main();
         let precomputed: Vec<_> = columns.into_iter().take(num_precomputed_cols).collect();
@@ -1394,7 +1468,7 @@ pub trait IsStarkProver<
         let (_, commitment) = crate::commitment::commit_bit_reversed_with::<
             Field,
             H::Batched<Field>,
-        >(&evals, crate::commitment::ROWS_PER_LEAF)?;
+        >(&evals, layout.rows_per_leaf())?;
         Some(commitment)
     }
 
@@ -1538,15 +1612,21 @@ pub trait IsStarkProver<
     ///
     /// `precomputed`: if present, the leading `num_cols` columns are committed
     /// as a separate Merkle tree (the precomputed split for preprocessed
-    /// tables) and the root is checked against the AIR-hardcoded commitment.
-    /// `table` is the AIR's name, for the device diagnostics.
-    #[allow(clippy::type_complexity)]
+    /// tables) and the root is checked against the AIR-hardcoded commitment
+    /// OF `layout`. `table` is the AIR's name, for the device diagnostics.
+    ///
+    /// `layout` is the table's trace-tree leaf layout: every arm (the fused
+    /// and split device commits and the CPU one) builds its trees with
+    /// `layout.rows_per_leaf()` rows per leaf, so a one-row table (S2) commits
+    /// on the device like a row-pair one.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn commit_main_trace(
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] table: &str,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
+        layout: LeafLayout,
         #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] residency: ResidencyMode,
@@ -1563,6 +1643,7 @@ pub trait IsStarkProver<
         // commit is recomputed on the host, so the buffer the tree was built
         // from must be the host one. Same posture as disk-spill — the mode is
         // for CPU proving and forces the host path per table.
+        let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
         if precomputed.is_none() && !residency.recomputes_main_lde() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -1588,6 +1669,7 @@ pub trait IsStarkProver<
                     domain.blowup_factor,
                     &twiddles.coset_weights,
                     !device_only,
+                    rows_per_leaf,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -1635,7 +1717,10 @@ pub trait IsStarkProver<
             let cache_ok = true;
             let cached_pre = cache_ok
                 .then(|| {
-                    precomputed_tree_cache_get::<H::Batched<Field>>(&expected_precomputed_root)
+                    precomputed_tree_cache_get::<H::Batched<Field>>(
+                        &expected_precomputed_root,
+                        rows_per_leaf,
+                    )
                 })
                 .flatten();
             #[cfg(feature = "instruments")]
@@ -1656,6 +1741,7 @@ pub trait IsStarkProver<
                     num_precomputed,
                     cached_pre.is_none(),
                     !device_only,
+                    rows_per_leaf,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -1680,6 +1766,7 @@ pub trait IsStarkProver<
                         if cache_ok {
                             precomputed_tree_cache_put::<H::Batched<Field>>(
                                 expected_precomputed_root,
+                                rows_per_leaf,
                                 Arc::clone(&tree),
                             );
                         }
@@ -1727,8 +1814,9 @@ pub trait IsStarkProver<
         let commit = match precomputed {
             None => {
                 #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_rows_bit_reversed(&main_data, total_cols)
-                    .ok_or(ProvingError::EmptyCommitment)?;
+                let (mut tree, root) =
+                    Self::commit_rows_bit_reversed_with(&main_data, total_cols, rows_per_leaf)
+                        .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
                 Self::spill_tree(&mut tree, storage_mode, "main Merkle tree")?;
                 TableCommit::plain(tree, root)
@@ -1746,7 +1834,10 @@ pub trait IsStarkProver<
                 let cache_ok = true;
                 let precomputed_tree = match cache_ok
                     .then(|| {
-                        precomputed_tree_cache_get::<H::Batched<Field>>(&expected_precomputed_root)
+                        precomputed_tree_cache_get::<H::Batched<Field>>(
+                            &expected_precomputed_root,
+                            rows_per_leaf,
+                        )
                     })
                     .flatten()
                 {
@@ -1755,11 +1846,12 @@ pub trait IsStarkProver<
                     Some(tree) => tree,
                     None => {
                         #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_rows_bit_reversed_subset(
+                        let (mut tree, root) = Self::commit_rows_bit_reversed_subset_with(
                             &main_data,
                             total_cols,
                             0,
                             num_precomputed,
+                            rows_per_leaf,
                         )
                         .ok_or(ProvingError::EmptyCommitment)?;
                         if root != expected_precomputed_root {
@@ -1771,6 +1863,7 @@ pub trait IsStarkProver<
                         if cache_ok {
                             precomputed_tree_cache_put::<H::Batched<Field>>(
                                 expected_precomputed_root,
+                                rows_per_leaf,
                                 Arc::clone(&tree),
                             );
                         }
@@ -1778,11 +1871,12 @@ pub trait IsStarkProver<
                     }
                 };
                 #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
+                let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset_with(
                     &main_data,
                     total_cols,
                     num_precomputed,
                     total_cols,
+                    rows_per_leaf,
                 )
                 .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
@@ -2522,6 +2616,10 @@ pub trait IsStarkProver<
         let __ps_r2c = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        // The table's leaf layout (S2): the composition tree, device or host,
+        // carries `leaf_layout.rows_per_leaf()` rows per leaf.
+        let leaf_layout =
+            crate::leaf_layout::table_leaf_layout(air, domain.interpolation_domain_size);
         // GPU fast path for the comp-poly Merkle commit: hash straight from
         // the resident parts handle when R2 kept one (no host pack + H2D
         // re-upload); otherwise wrap the host eval Vecs. Either way the tree
@@ -2537,13 +2635,16 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_build_comp_poly_tree_gpu_from_dev::<
                         FieldExtension,
                         H::Batched<FieldExtension>,
-                    >(h)
+                    >(h, leaf_layout.rows_per_leaf())
                 })
                 .or_else(|| {
                     crate::gpu_lde::try_build_comp_poly_tree_gpu::<
                         FieldExtension,
                         H::Batched<FieldExtension>,
-                    >(&lde_composition_poly_parts_evaluations)
+                    >(
+                        &lde_composition_poly_parts_evaluations,
+                        leaf_layout.rows_per_leaf(),
+                    )
                 }) {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
@@ -2574,7 +2675,7 @@ pub trait IsStarkProver<
                         H::Batched<FieldExtension>,
                     >(
                         &lde_composition_poly_parts_evaluations,
-                        crate::commitment::ROWS_PER_LEAF,
+                        leaf_layout.rows_per_leaf(),
                     )
                     .ok_or(ProvingError::EmptyCommitment)?;
                     (tree, root, None)
@@ -2584,7 +2685,7 @@ pub trait IsStarkProver<
         let (composition_poly_merkle_tree, composition_poly_root) =
             crate::commitment::commit_bit_reversed_with::<FieldExtension, H::Batched<FieldExtension>>(
                 &lde_composition_poly_parts_evaluations,
-                crate::commitment::ROWS_PER_LEAF,
+                leaf_layout.rows_per_leaf(),
             )
             .ok_or(ProvingError::EmptyCommitment)?;
         crate::prove_split::add(&crate::prove_split::R2_COMMIT, __ps_r2c);
@@ -2755,11 +2856,25 @@ pub trait IsStarkProver<
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-    ) -> Round4<Field, FieldExtension>
+    ) -> Result<Round4<Field, FieldExtension>, ProvingError>
     where
         FieldElement<FieldExtension>: AsBytes,
         FieldElement<Field>: AsBytes,
     {
+        // The FRI fold layout of this table's proof format (a verifier-side
+        // constant built from the options, the same call the verifier makes).
+        // A format this build cannot lay out is refused here, before anything
+        // enters the transcript.
+        let leaf_layout =
+            crate::leaf_layout::table_leaf_layout(air, domain.interpolation_domain_size);
+        let fri_layout = crate::fri::terminal::FriFoldLayout::for_options(
+            domain.lde_roots_of_unity_coset.len().trailing_zeros(),
+            domain.blowup_factor.trailing_zeros(),
+            air.options(),
+            leaf_layout.is_one_row(),
+        )
+        .map_err(|e| ProvingError::WrongParameter(format!("FRI format: {e}")))?;
+
         let coset_offset_u64 = air.context().proof_options.coset_offset;
         let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
 
@@ -2800,33 +2915,39 @@ pub trait IsStarkProver<
         let __ps_df = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        // Device FRI implements the pair and group (S3) encodings and the
+        // one-row layout (S2), whose input tree is committed from the resident
+        // codeword before the first challenge.
         #[cfg(feature = "cuda")]
-        let precomputed_fri = Self::try_compute_deep_dev(
-            &round_1_result.lde_trace,
-            composition_parts,
-            round_3_result,
-            z,
-            domain,
-            &domain.trace_primitive_root,
-            &gammas,
-            &trace_term_coeffs,
-        )
-        .and_then(|dw| {
-            crate::gpu_lde::try_fri_commit_gpu_from_dev::<
-                Field,
-                FieldExtension,
-                _,
-                H::Pair<FieldExtension>,
-            >(
-                dw,
-                transcript,
-                &coset_offset,
-                domain.blowup_factor.trailing_zeros(),
-                air.options().fri_final_poly_log_degree as u32,
-                domain.fri_inv_twiddles(),
-                !round_1_result.lde_trace.host_trace_empty(),
+        let precomputed_fri = {
+            Self::try_compute_deep_dev(
+                &round_1_result.lde_trace,
+                composition_parts,
+                round_3_result,
+                z,
+                domain,
+                &domain.trace_primitive_root,
+                &gammas,
+                &trace_term_coeffs,
             )
-        });
+            .and_then(|dw| {
+                crate::gpu_lde::try_fri_commit_gpu_from_dev::<
+                    Field,
+                    FieldExtension,
+                    _,
+                    H::Pair<FieldExtension>,
+                >(
+                    dw,
+                    transcript,
+                    &coset_offset,
+                    domain.blowup_factor.trailing_zeros(),
+                    air.options().fri_final_poly_log_degree as u32,
+                    &fri_layout,
+                    domain.fri_inv_twiddles(),
+                    !round_1_result.lde_trace.host_trace_empty(),
+                )
+            })
+        };
         #[cfg(not(feature = "cuda"))]
         #[allow(clippy::type_complexity)]
         let precomputed_fri: Option<(
@@ -2875,13 +2996,14 @@ pub trait IsStarkProver<
             // FRI commit phase from pre-computed evaluations
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            let res = fri::commit_phase_from_evaluations::<Field, FieldExtension, _, H>(
+            let res = fri::commit_phase_with_layout::<Field, FieldExtension, _, H>(
                 lde_evals,
                 transcript,
                 &coset_offset,
                 domain_size,
                 domain.blowup_factor.trailing_zeros(),
                 air.options().fri_final_poly_log_degree as u32,
+                &fri_layout,
                 domain.fri_inv_twiddles(),
             );
             #[cfg(feature = "instruments")]
@@ -2920,17 +3042,56 @@ pub trait IsStarkProver<
         crate::prove_split::add(&crate::prove_split::R4_GRIND, __ps_g);
         let __ps_q = crate::prove_split::mark();
         let number_of_queries = air.options().fri_number_of_queries;
-        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, leaf_layout, transcript);
 
-        let query_list = fri::query_phase::<FieldExtension, H>(&fri_layers, &iotas);
+        let mut query_list =
+            fri::query_phase_with_layout::<FieldExtension, H>(&fri_layers, &iotas, &fri_layout);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
             .map(|layer| layer.merkle_tree.root)
             .collect();
 
-        let deep_poly_openings =
-            Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
+        let mut deep_poly_openings = Self::open_deep_composition_poly(
+            domain,
+            round_1_result,
+            round_2_result,
+            &iotas,
+            leaf_layout,
+        );
+
+        // Merkle caps: a post-pass over the finished
+        // openings. The heights are the verifier's (`StarkCaps`, public shape
+        // only); nothing is absorbed, so the transcript is the uncapped one.
+        // At the default format every height is 0 and this is skipped.
+        //
+        // Every depth is the layout's: the trace trees' from the table's leaf
+        // layout (row pairs `log2(lde) − 1`, one row `log2(lde)`) and each FRI
+        // layer's from the fold layout (a group tree under a fold schedule),
+        // so a capped `fri = dp` or one-row proof caps the trees it committed.
+        let caps = crate::merkle_caps::StarkCaps::from_layout(
+            air.options().format.merkle_cap,
+            number_of_queries,
+            domain_size.trailing_zeros() as usize,
+            &fri_layout,
+        );
+        if caps.fri.len() != fri_layers.len() {
+            return Err(ProvingError::WrongParameter(format!(
+                "Merkle cap: the FRI layout commits {} layers, the prover built {}",
+                caps.fri.len(),
+                fri_layers.len()
+            )));
+        }
+        if caps.any() {
+            Self::embed_stark_caps(
+                &caps,
+                round_1_result,
+                round_2_result,
+                &fri_layers,
+                &mut deep_poly_openings,
+                &mut query_list,
+            )?;
+        }
         crate::prove_split::add(&crate::prove_split::R4_QUERIES, __ps_q);
 
         #[cfg(feature = "instruments")]
@@ -2939,23 +3100,228 @@ pub trait IsStarkProver<
             crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
         }
 
-        Round4 {
+        Ok(Round4 {
             fri_final_poly_coeffs,
             fri_layers_merkle_roots,
             deep_poly_openings,
             query_list,
             nonce,
+        })
+    }
+
+    /// Embed every capped tree's cap into its owner path and cut every path of
+    /// that tree to `depth − c` siblings.
+    ///
+    /// Per tree: read the cap (the host tree's heap slice; see
+    /// [`Self::tree_cap`] for a device-resident tree), then
+    /// [`embed_cap`](crypto::merkle_tree::cap::embed_cap) over the tree's
+    /// paths in proof order, so query 0 is the owner. Every path must be the
+    /// full `depth` long (checked), so a tree whose depth disagrees with the
+    /// verifier's constant fails here instead of producing a proof the
+    /// verifier rejects.
+    fn embed_stark_caps(
+        caps: &crate::merkle_caps::StarkCaps,
+        round_1_result: &Round1<Field, FieldExtension, H>,
+        round_2_result: &Round2<FieldExtension, H>,
+        fri_layers: &[crate::fri::fri_commitment::FriLayer<
+            FieldExtension,
+            H::Pair<FieldExtension>,
+        >],
+        deep_poly_openings: &mut [DeepPolynomialOpening<Field, FieldExtension>],
+        query_list: &mut [FriDecommitment<FieldExtension>],
+    ) -> Result<(), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        fn embed<'p>(
+            paths: impl Iterator<Item = Option<&'p mut Vec<Commitment>>>,
+            depth: usize,
+            cap: &[Commitment],
+            what: &str,
+        ) -> Result<(), ProvingError> {
+            let mut paths: Vec<&mut Vec<Commitment>> =
+                paths.collect::<Option<_>>().ok_or_else(|| {
+                    ProvingError::WrongParameter(format!(
+                        "Merkle cap: an opening of the {what} tree is missing"
+                    ))
+                })?;
+            crypto::merkle_tree::cap::embed_cap(&mut paths, depth, cap).map_err(|e| {
+                ProvingError::WrongParameter(format!("Merkle cap of the {what} tree: {e}"))
+            })
+        }
+
+        // The device arm of `tree_cap`: read the cap off the resident tree on
+        // `stream`. `None` when the tree is not device-resident.
+        #[cfg(feature = "cuda")]
+        fn dev<'t>(
+            tree: Option<&'t math_cuda::lde::GpuMerkleTree>,
+            stream: impl FnOnce() -> Option<Arc<math_cuda::CudaStream>> + 't,
+        ) -> impl FnOnce(usize) -> Option<Result<Vec<Commitment>, String>> + 't {
+            move |c| {
+                tree.map(|tree| {
+                    let stream = stream().ok_or("no CUDA stream for the device cap read")?;
+                    crate::gpu_lde::read_cap_dev(tree, c, &stream)
+                })
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let lde_trace = &round_1_result.lde_trace;
+
+        let (depth, c) = (caps.trace_depth, caps.trace);
+        if c > 0 {
+            #[cfg(feature = "cuda")]
+            let main_dev = dev(lde_trace.gpu_main().and_then(|h| h.tree.as_ref()), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let main_dev = |_| None;
+            let main_cap = Self::tree_cap(&round_1_result.main.tree, depth, c, "main", main_dev)?;
+            embed(
+                deep_poly_openings
+                    .iter_mut()
+                    .map(|o| Some(&mut o.main_trace_polys.proof.merkle_path)),
+                depth,
+                &main_cap,
+                "main",
+            )?;
+            if let Some(tree) = round_1_result.main.precomputed_tree.as_ref() {
+                // Always a full host tree (the process-wide cache; its openings
+                // walk it on the host too), so there is no device arm.
+                let cap = Self::tree_cap(tree, depth, c, "precomputed", |_| None)?;
+                embed(
+                    deep_poly_openings.iter_mut().map(|o| {
+                        o.precomputed_trace_polys
+                            .as_mut()
+                            .map(|p| &mut p.proof.merkle_path)
+                    }),
+                    depth,
+                    &cap,
+                    "precomputed",
+                )?;
+            }
+            if let Some(aux) = round_1_result.aux.as_ref() {
+                #[cfg(feature = "cuda")]
+                let aux_dev = dev(lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()), || {
+                    lde_trace.bound_stream()
+                });
+                #[cfg(not(feature = "cuda"))]
+                let aux_dev = |_| None;
+                let cap = Self::tree_cap(&aux.tree, depth, c, "aux", aux_dev)?;
+                embed(
+                    deep_poly_openings
+                        .iter_mut()
+                        .map(|o| o.aux_trace_polys.as_mut().map(|p| &mut p.proof.merkle_path)),
+                    depth,
+                    &cap,
+                    "aux",
+                )?;
+            }
+            #[cfg(feature = "cuda")]
+            let comp_dev = dev(round_2_result.gpu_composition_tree.as_ref(), || {
+                lde_trace.bound_stream()
+            });
+            #[cfg(not(feature = "cuda"))]
+            let comp_dev = |_| None;
+            let cap = Self::tree_cap(
+                &round_2_result.composition_poly_merkle_tree,
+                depth,
+                c,
+                "composition",
+                comp_dev,
+            )?;
+            embed(
+                deep_poly_openings
+                    .iter_mut()
+                    .map(|o| Some(&mut o.composition_poly.proof.merkle_path)),
+                depth,
+                &cap,
+                "composition",
+            )?;
+        }
+
+        for (i, layer) in fri_layers.iter().enumerate() {
+            let (depth, c) = (caps.fri_depths[i], caps.fri[i]);
+            if c == 0 {
+                continue;
+            }
+            let what = format!("FRI layer {i}");
+            // A fresh backend stream, as the device FRI query phase reads the
+            // same resident layer trees (`try_fri_query_phase_gpu`).
+            #[cfg(feature = "cuda")]
+            let layer_dev = dev(layer.gpu_tree.as_ref(), || {
+                math_cuda::device::backend().ok().map(|b| b.next_stream())
+            });
+            #[cfg(not(feature = "cuda"))]
+            let layer_dev = |_| None;
+            let cap = Self::tree_cap(&layer.merkle_tree, depth, c, &what, layer_dev)?;
+            embed(
+                query_list
+                    .iter_mut()
+                    .map(|q| q.layers_auth_paths.get_mut(i).map(|p| &mut p.merkle_path)),
+                depth,
+                &cap,
+                &what,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The height-`c` cap of one tree of depth `depth`.
+    ///
+    /// A full host tree serves it from its heap (`MerkleTree::cap`, disk-spill
+    /// safe), after checking the tree's depth is the verifier's. A root-only
+    /// host tree means the nodes are device-resident: `device(c)` reads the
+    /// cap off the resident tree, and `None` from it (no resident tree) is a
+    /// hard error naming the tree — never a skipped cap, which would ship
+    /// full-length paths the verifier rejects with no pointer to the cause.
+    fn tree_cap<B>(
+        host: &MerkleTree<B>,
+        depth: usize,
+        c: usize,
+        what: &str,
+        device: impl FnOnce(usize) -> Option<Result<Vec<Commitment>, String>>,
+    ) -> Result<Vec<Commitment>, ProvingError>
+    where
+        B: IsMerkleTreeBackend<Node = Commitment>,
+    {
+        if !host.is_root_only() {
+            if host.depth() != Some(depth) {
+                return Err(ProvingError::WrongParameter(format!(
+                    "Merkle cap: the {what} tree has depth {:?}, the format expects {depth}",
+                    host.depth()
+                )));
+            }
+            return host.cap(c).ok_or_else(|| {
+                ProvingError::WrongParameter(format!(
+                    "Merkle cap: height {c} does not fit the {what} tree (depth {depth})"
+                ))
+            });
+        }
+        match device(c) {
+            Some(Ok(cap)) => Ok(cap),
+            Some(Err(e)) => Err(ProvingError::DevicePath(format!(
+                "Merkle cap: reading the height-{c} cap of the device-resident {what} tree \
+                 failed: {e}"
+            ))),
+            None => Err(ProvingError::DevicePath(format!(
+                "Merkle cap: the {what} tree is device-resident (its host tree is root-only) \
+                 and no device cap read is wired for it"
+            ))),
         }
     }
 
+    /// The query indexes: trace-tree leaf indexes, uniform below
+    /// [`LeafLayout::query_bound`] (`lde / 2` today, `lde` under one row).
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &Domain<Field>,
+        leaf_layout: LeafLayout,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let bound = leaf_layout.query_bound(domain.lde_roots_of_unity_coset.len() as u64);
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| (transcript.sample_u64(bound)) as usize)
             .collect::<Vec<usize>>()
     }
 
@@ -3238,6 +3604,7 @@ pub trait IsStarkProver<
         composition_poly_merkle_tree: &MerkleTree<H::Batched<FieldExtension>>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
+        leaf_layout: LeafLayout,
     ) -> PolynomialOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -3246,28 +3613,39 @@ pub trait IsStarkProver<
         let proof = composition_poly_merkle_tree
             .get_proof_by_pos(index)
             .expect("FRI query index in bounds");
+        Self::composition_opening_from_proof(
+            proof,
+            lde_composition_poly_evaluations,
+            index,
+            leaf_layout,
+        )
+    }
 
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
-            .iter()
-            .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
-            })
-            .collect();
-
+    /// The composition parts' values at query `index` (the rows
+    /// [`LeafLayout::query_rows`] names) with an already-built Merkle proof:
+    /// both rows for a row pair, the one row (and an empty `evaluations_sym`)
+    /// for one row.
+    fn composition_opening_from_proof(
+        proof: Proof<Commitment>,
+        lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
+        index: usize,
+        leaf_layout: LeafLayout,
+    ) -> PolynomialOpenings<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let rows =
+            |part: &Vec<FieldElement<FieldExtension>>| leaf_layout.query_rows(index, part.len());
         PolynomialOpenings {
             proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
+            evaluations: lde_composition_poly_evaluations
+                .iter()
+                .map(|part| part[rows(part).0].clone())
                 .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
+            evaluations_sym: lde_composition_poly_evaluations
+                .iter()
+                .filter_map(|part| rows(part).1.map(|r| part[r].clone()))
                 .collect(),
         }
     }
@@ -3275,40 +3653,25 @@ pub trait IsStarkProver<
     /// Like [`Self::open_composition_poly`] but uses a Merkle proof already
     /// gathered from the resident device composition tree
     /// ([`crate::gpu_lde::gather_proofs_dev`]) instead of walking a host tree.
-    /// Row-pair leaf: one proof at position `index` authenticates both rows.
+    /// One proof at position `index` authenticates the leaf: both rows of a
+    /// row pair, or the one row (S2).
     #[cfg(feature = "cuda")]
     fn open_composition_poly_with_proof(
         proof: Proof<Commitment>,
         lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
         index: usize,
+        leaf_layout: LeafLayout,
     ) -> PolynomialOpenings<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
-            .iter()
-            .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
-            })
-            .collect();
-
-        PolynomialOpenings {
+        Self::composition_opening_from_proof(
             proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
-                .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
-                .collect(),
-        }
+            lde_composition_poly_evaluations,
+            index,
+            leaf_layout,
+        )
     }
 
     /// Computes values and validity proofs of the evaluations of trace polynomials at
@@ -3319,6 +3682,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         tree: &MerkleTree<H::Batched<C>>,
         challenge: usize,
+        leaf_layout: LeafLayout,
         gather: G,
     ) -> PolynomialOpenings<C>
     where
@@ -3326,29 +3690,33 @@ pub trait IsStarkProver<
         FieldElement<C>: AsBytes + Sync + Send,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
-        // Rows `2·challenge` and `2·challenge+1` are committed together as the
-        // single leaf at position `challenge`; one Merkle path authenticates both
-        // the queried row and its symmetric counterpart.
+        // Row pairs: rows `2·challenge` and `2·challenge+1` are committed
+        // together as the single leaf at position `challenge`; one Merkle path
+        // authenticates both the queried row and its symmetric counterpart.
+        // One row: the leaf at `challenge` is the row alone, and there is no
+        // symmetric row.
+        let (row, sym) = leaf_layout.query_rows(challenge, domain.lde_roots_of_unity_coset.len());
         PolynomialOpenings {
             proof: tree
                 .get_proof_by_pos(challenge)
                 .expect("FRI query index in bounds"),
-            evaluations: gather(reverse_index(challenge * 2, domain_size)),
-            evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),
+            evaluations: gather(row),
+            evaluations_sym: sym.map(&gather).unwrap_or_default(),
         }
     }
 
     /// Like [`Self::open_polys_with`], but uses a Merkle proof already gathered
     /// from the resident device tree (see [`crate::gpu_lde::gather_proofs_dev`])
-    /// instead of walking a host tree. Row-pair leaf: one proof at position
-    /// `challenge` authenticates both the queried row and its symmetric
-    /// counterpart. Evaluations still come from the host LDE columns via `gather`.
+    /// instead of walking a host tree. One proof at position `challenge`
+    /// authenticates the leaf: the queried row and its symmetric counterpart
+    /// (row pair), or the one row (S2). Evaluations still come from the host
+    /// LDE columns via `gather`.
     #[cfg(feature = "cuda")]
     fn open_polys_with_proofs<C, G>(
         domain: &Domain<Field>,
         proof: Proof<Commitment>,
         challenge: usize,
+        leaf_layout: LeafLayout,
         gather: G,
     ) -> PolynomialOpenings<C>
     where
@@ -3356,11 +3724,11 @@ pub trait IsStarkProver<
         FieldElement<C>: AsBytes + Sync + Send,
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let (row, sym) = leaf_layout.query_rows(challenge, domain.lde_roots_of_unity_coset.len());
         PolynomialOpenings {
             proof,
-            evaluations: gather(reverse_index(challenge * 2, domain_size)),
-            evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),
+            evaluations: gather(row),
+            evaluations_sym: sym.map(&gather).unwrap_or_default(),
         }
     }
 
@@ -3381,17 +3749,37 @@ pub trait IsStarkProver<
         }
     }
 
-    /// Slice out query `qi`'s even/odd row (each `ncols` field elements) from the
-    /// row-major device gather `[even(q0), odd(q0), even(q1), odd(q1), ...]`.
+    /// The LDE rows the device gathers for `queries`, in query order: per
+    /// query the rows [`LeafLayout::query_rows`] names — `[row, sym]` for a
+    /// row pair, `[row]` for one row (S2). [`Self::device_rows`] slices the
+    /// gather back per query.
     #[cfg(feature = "cuda")]
-    fn device_row_pair<C: IsField>(
+    fn device_query_rows(queries: &[usize], lde_len: usize, leaf_layout: LeafLayout) -> Vec<u32> {
+        queries
+            .iter()
+            .flat_map(|&c| {
+                let (row, sym) = leaf_layout.query_rows(c, lde_len);
+                core::iter::once(row as u32).chain(sym.map(|r| r as u32))
+            })
+            .collect()
+    }
+
+    /// Slice out query `qi`'s rows (each `ncols` field elements) from the
+    /// row-major device gather of [`Self::device_query_rows`]: `(row, sym)`
+    /// for a row pair (`[row(q0), sym(q0), row(q1), sym(q1), ...]`), `(row,
+    /// [])` for one row (`[row(q0), row(q1), ...]`).
+    #[cfg(feature = "cuda")]
+    fn device_rows<C: IsField>(
         vals: &[FieldElement<C>],
         qi: usize,
         ncols: usize,
+        leaf_layout: LeafLayout,
     ) -> (Vec<FieldElement<C>>, Vec<FieldElement<C>>) {
-        let even = vals[(2 * qi) * ncols..(2 * qi + 1) * ncols].to_vec();
-        let odd = vals[(2 * qi + 1) * ncols..(2 * qi + 2) * ncols].to_vec();
-        (even, odd)
+        let per = leaf_layout.rows_per_leaf();
+        let at = |k: usize| vals[(per * qi + k) * ncols..(per * qi + k + 1) * ncols].to_vec();
+        let row = at(0);
+        let sym = if per == 2 { at(1) } else { Vec::new() };
+        (row, sym)
     }
 
     /// Gather every query's row-pair off a device-resident LDE (a small D2H of
@@ -3453,6 +3841,7 @@ pub trait IsStarkProver<
         ncols: usize,
         col_range: std::ops::Range<usize>,
         what: &str,
+        leaf_layout: LeafLayout,
         gather: G,
     ) -> PolynomialOpenings<C>
     where
@@ -3474,7 +3863,7 @@ pub trait IsStarkProver<
                 !tree.is_root_only(),
                 "R4 {what} opening fell back to a root-only host tree (nodes device-resident)"
             );
-            return Self::open_polys_with(domain, tree, challenge, gather);
+            return Self::open_polys_with(domain, tree, challenge, leaf_layout, gather);
         };
         let proof = proofs[qi].clone();
         let Some(dev_vals) = dev_values else {
@@ -3484,10 +3873,16 @@ pub trait IsStarkProver<
                 !lde_trace.host_trace_empty(),
                 "R4 {what} opening fell back to the host gather, but it is device-only (empty)"
             );
-            return Self::open_polys_with_proofs(domain, proof, challenge, gather);
+            return Self::open_polys_with_proofs(domain, proof, challenge, leaf_layout, gather);
         };
-        let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
-        let (even, odd) = (even[col_range.clone()].to_vec(), odd[col_range].to_vec());
+        let (even, odd) = Self::device_rows(dev_vals, qi, ncols, leaf_layout);
+        // `odd` is empty for one row (no symmetric row).
+        let odd = if odd.is_empty() {
+            odd
+        } else {
+            odd[col_range.clone()].to_vec()
+        };
+        let even = even[col_range].to_vec();
         // Cross-check the device gather against the host LDE. Skipped under
         // device-only (host trace empty): the gather was proven bit-identical
         // while the host copy was resident, and there is nothing to check
@@ -3495,9 +3890,8 @@ pub trait IsStarkProver<
         // --release, and gather failure modes — stride/offset/layout — are
         // systematic, so one query catches them); debug checks every query.
         if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty() {
-            let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
-            let r_even = reverse_index(challenge * 2, domain_size);
-            let r_odd = reverse_index(challenge * 2 + 1, domain_size);
+            let domain_size = domain.lde_roots_of_unity_coset.len();
+            let (r_even, r_odd) = leaf_layout.query_rows(challenge, domain_size);
             assert_eq!(
                 even,
                 gather(r_even),
@@ -3505,19 +3899,21 @@ pub trait IsStarkProver<
             );
             assert_eq!(
                 odd,
-                gather(r_odd),
+                r_odd.map(&gather).unwrap_or_default(),
                 "device {what}-row gather mismatch (odd), query {qi}"
             );
         }
         Self::open_polys_from_values(proof, even, odd)
     }
 
-    /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
+    /// Open the deep composition polynomial on a list of indexes and their
+    /// symmetric elements (row pairs) or at the indexes alone (one row, S2).
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension, H>,
         round_2_result: &Round2<FieldExtension, H>,
         indexes_to_open: &[usize],
+        leaf_layout: LeafLayout,
     ) -> DeepPolynomialOpenings<Field, FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -3532,22 +3928,17 @@ pub trait IsStarkProver<
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        // Row-pair LDE positions for every query, `[even(q0), odd(q0), ...]`.
-        // Each query opens the leaf at `challenge`, which pairs LDE rows
+        // The LDE rows of every query's leaf: `[row(q0), sym(q0), ...]` for
+        // row pairs — the leaf at `challenge` pairs LDE rows
         // `reverse_index(2·challenge)` (the queried point) and
-        // `reverse_index(2·challenge+1)` (its symmetric `-x` point).
+        // `reverse_index(2·challenge+1)` (its symmetric `-x` point) — and
+        // `[row(q0), row(q1), ...]` for one row (S2), the leaf at `challenge`
+        // being the row `reverse_index(challenge)` alone.
         #[cfg(feature = "cuda")]
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
         #[cfg(feature = "cuda")]
-        let query_rows: Vec<u32> = indexes_to_open
-            .iter()
-            .flat_map(|&c| {
-                [
-                    reverse_index(c * 2, domain_size) as u32,
-                    reverse_index(c * 2 + 1, domain_size) as u32,
-                ]
-            })
-            .collect();
+        let query_rows: Vec<u32> =
+            Self::device_query_rows(indexes_to_open, domain_size as usize, leaf_layout);
 
         // R4 trace proofs from the resident device trees, gathered in one batch
         // over all query positions instead of walking the host trees (byte
@@ -3568,7 +3959,7 @@ pub trait IsStarkProver<
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident main-tree opening");
-                // Row-pair leaves: one proof per query at position `challenge`.
+                // One proof per query at leaf `challenge` (either layout).
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
                     .expect("device main-tree gather failed; resident tree has no host fallback")
             });
@@ -3583,13 +3974,14 @@ pub trait IsStarkProver<
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident aux-tree opening");
-                // Row-pair leaves: one proof per query at position `challenge`.
+                // One proof per query at leaf `challenge` (either layout).
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
                     .expect("device aux-tree gather failed; resident tree has no host fallback")
             });
 
-        // Composition tree: openings open a single position `index` (row pair
-        // leaf), so gather one proof per query challenge from the device tree.
+        // Composition tree: openings open a single position `index` (a row
+        // pair or one-row leaf), so gather one proof per query challenge from
+        // the device tree.
         #[cfg(feature = "cuda")]
         let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
             round_2_result.gpu_composition_tree.as_ref().map(|tree| {
@@ -3705,13 +4097,14 @@ pub trait IsStarkProver<
                         total_cols,
                         num_precomputed_cols..total_cols,
                         "multiplicity",
+                        leaf_layout,
                         |row| {
                             lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                         },
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                Self::open_polys_with(domain, &main_commit.tree, *index, leaf_layout, |row| {
                     lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                 })
             } else {
@@ -3728,12 +4121,13 @@ pub trait IsStarkProver<
                         total_cols,
                         0..total_cols,
                         "main",
+                        leaf_layout,
                         |row| lde_trace.gather_main_row(row),
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                    Self::open_polys_with(domain, &main_commit.tree, *index, leaf_layout, |row| {
                         lde_trace.gather_main_row(row)
                     })
                 }
@@ -3749,17 +4143,20 @@ pub trait IsStarkProver<
                 {
                     match main_dev_values.as_ref() {
                         Some(vals) => {
-                            let (even, odd) = Self::device_row_pair(vals, qi, total_cols);
-                            let (even, odd) = (
-                                even[..num_precomputed_cols].to_vec(),
-                                odd[..num_precomputed_cols].to_vec(),
-                            );
+                            let (even, odd) = Self::device_rows(vals, qi, total_cols, leaf_layout);
+                            let even = even[..num_precomputed_cols].to_vec();
+                            // Empty for one row (no symmetric row).
+                            let odd = if odd.is_empty() {
+                                odd
+                            } else {
+                                odd[..num_precomputed_cols].to_vec()
+                            };
                             // Query 0 stays a release canary, same rationale
                             // as `open_trace_polys_device`.
                             if (cfg!(debug_assertions) || qi == 0) && !lde_trace.host_trace_empty()
                             {
-                                let r_even = reverse_index(*index * 2, domain_size);
-                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                                let (r_even, r_odd) =
+                                    leaf_layout.query_rows(*index, domain_size as usize);
                                 assert_eq!(
                                     even,
                                     lde_trace.gather_main_row_range(
@@ -3771,7 +4168,13 @@ pub trait IsStarkProver<
                                 );
                                 assert_eq!(
                                     odd,
-                                    lde_trace.gather_main_row_range(r_odd, 0, num_precomputed_cols),
+                                    r_odd
+                                        .map(|r| lde_trace.gather_main_row_range(
+                                            r,
+                                            0,
+                                            num_precomputed_cols
+                                        ))
+                                        .unwrap_or_default(),
                                     "device precomputed-row gather mismatch (odd), query {qi}"
                                 );
                             }
@@ -3788,14 +4191,14 @@ pub trait IsStarkProver<
                                 "R4 precomputed opening fell back to the host gather, \
                                  but it is device-only (empty)"
                             );
-                            Self::open_polys_with(domain, tree, *index, |row| {
+                            Self::open_polys_with(domain, tree, *index, leaf_layout, |row| {
                                 lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
                             })
                         }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
-                Self::open_polys_with(domain, tree, *index, |row| {
+                Self::open_polys_with(domain, tree, *index, leaf_layout, |row| {
                     lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
                 })
             });
@@ -3805,7 +4208,8 @@ pub trait IsStarkProver<
                 {
                     match (&comp_dev_proofs, &comp_dev_values) {
                         (Some(proofs), Some(vals)) => {
-                            let (even, odd) = Self::device_row_pair(vals, qi, comp_num_parts);
+                            let (even, odd) =
+                                Self::device_rows(vals, qi, comp_num_parts, leaf_layout);
                             // Cross-check against the host part evals while
                             // they are still resident (absent under full
                             // residency, where the gather is the only source).
@@ -3821,6 +4225,7 @@ pub trait IsStarkProver<
                                     proofs[qi].clone(),
                                     composition_parts,
                                     *index,
+                                    leaf_layout,
                                 );
                                 assert_eq!(
                                     even, expected.evaluations,
@@ -3850,12 +4255,14 @@ pub trait IsStarkProver<
                                 proofs[qi].clone(),
                                 composition_parts,
                                 *index,
+                                leaf_layout,
                             )
                         }
                         _ => Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
                             composition_parts,
                             *index,
+                            leaf_layout,
                         ),
                     }
                 }
@@ -3865,6 +4272,7 @@ pub trait IsStarkProver<
                         &round_2_result.composition_poly_merkle_tree,
                         composition_parts,
                         *index,
+                        leaf_layout,
                     )
                 }
             };
@@ -3883,12 +4291,13 @@ pub trait IsStarkProver<
                         lde_trace.num_aux_cols(),
                         0..lde_trace.num_aux_cols(),
                         "aux",
+                        leaf_layout,
                         |row| lde_trace.gather_aux_row(row),
                     )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                    Self::open_polys_with(domain, &aux.tree, *index, leaf_layout, |row| {
                         lde_trace.gather_aux_row(row)
                     })
                 }
@@ -3983,6 +4392,13 @@ pub trait IsStarkProver<
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
+        // Each table's trace-tree leaf layout (S2): a verifier-side constant
+        // from the AIR's format and widths and the trace length — the call
+        // the verifier makes with the proof's trace length.
+        let leaf_layouts: Vec<LeafLayout> = air_trace_pairs
+            .iter()
+            .map(|(air, trace, _)| crate::leaf_layout::table_leaf_layout(*air, trace.num_rows()))
+            .collect();
 
         let k = table_parallelism(num_airs);
 
@@ -4035,7 +4451,17 @@ pub trait IsStarkProver<
         // dispatch layer admits the commit against.
         let main_estimates: Vec<u64> = table_shapes
             .iter()
-            .map(|s| crate::device_set::commit_device_set(s.n, s.main_cols, s.blowup, true).total())
+            .zip(&leaf_layouts)
+            .map(|(s, l)| {
+                crate::device_set::commit_device_set_rpl(
+                    s.n,
+                    s.main_cols,
+                    s.blowup,
+                    true,
+                    l.rows_per_leaf(),
+                )
+                .total()
+            })
             .collect();
 
         // The AIR names, for the driver threads' panic payloads: a device abort
@@ -4120,12 +4546,25 @@ pub trait IsStarkProver<
                 let domain = &domains[idx];
                 let twiddles = &twiddle_caches[idx];
 
-                let precomputed = air
-                    .is_preprocessed()
-                    .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+                let layout = leaf_layouts[idx];
+                // The root of THIS layout; a layout the AIR has no root for is
+                // refused here, before anything is committed.
+                let precomputed = if air.is_preprocessed() {
+                    let root = air.precomputed_commitment_for(layout).ok_or_else(|| {
+                        ProvingError::PrecomputedCommitmentMissing(format!(
+                            "table {}: no precomputed commitment for the {layout:?} leaf layout",
+                            air.name()
+                        ))
+                    })?;
+                    Some((root, air.num_precomputed_columns()))
+                } else {
+                    None
+                };
 
                 // Stage-3 device-only gate: when it holds, `commit_main_trace`
-                // keeps the R1 LDE device-resident and skips the host D2H.
+                // keeps the R1 LDE device-resident and skips the host D2H. A
+                // one-row table (S2) is no exception: its device trees and
+                // openings follow its leaf layout.
                 #[cfg(feature = "cuda")]
                 let device_only = Self::device_only_for(*air, domain);
 
@@ -4135,6 +4574,7 @@ pub trait IsStarkProver<
                     domain,
                     twiddles,
                     precomputed,
+                    layout,
                     #[cfg(feature = "cuda")]
                     device_only,
                     #[cfg(feature = "disk-spill")]
@@ -4266,7 +4706,13 @@ pub trait IsStarkProver<
         let peak_estimates: Vec<u64> = air_trace_pairs
             .iter()
             .enumerate()
-            .map(|(idx, _)| crate::device_set::table_device_set(table_shapes[idx]).total())
+            .map(|(idx, _)| {
+                crate::device_set::table_device_set_rpl(
+                    table_shapes[idx],
+                    leaf_layouts[idx].rows_per_leaf(),
+                )
+                .total()
+            })
             .collect();
 
         // The fused phase's own walk, separate from R1's because the aux
@@ -4369,6 +4815,7 @@ pub trait IsStarkProver<
                         // committed on the host, skipping the aux D2H here would
                         // leave a device-only trace with no main handle to serve
                         // it.
+                        let layout = leaf_layouts[idx];
                         #[cfg(feature = "cuda")]
                         let device_only = Self::device_only_for(*air, domain)
                             && gpu_main_cells[idx].lock().unwrap().is_some();
@@ -4396,6 +4843,7 @@ pub trait IsStarkProver<
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
                                     !device_only,
+                                    layout.rows_per_leaf(),
                                 )
                             };
                             let mut expanded = expand(trace.aux_resident().expect("checked above"));
@@ -4443,7 +4891,8 @@ pub trait IsStarkProver<
                         }
 
                         // Fused GPU path (cuda only): row-major ext3 NTT — single
-                        // H2D, no column extraction, no CPU transpose.
+                        // H2D, no column extraction, no CPU transpose. The tree
+                        // follows the table's leaf layout.
                         #[cfg(feature = "cuda")]
                         {
                             let (trace_slice, num_cols) = trace.aux_data_row_major();
@@ -4467,6 +4916,7 @@ pub trait IsStarkProver<
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
                                     !device_only,
+                                    layout.rows_per_leaf(),
                                 )
                             {
                                 #[cfg(feature = "instruments")]
@@ -4504,9 +4954,12 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) =
-                            Self::commit_rows_bit_reversed(&aux_data, total_cols)
-                                .ok_or(ProvingError::EmptyCommitment)?;
+                        let (mut tree, root) = Self::commit_rows_bit_reversed_with(
+                            &aux_data,
+                            total_cols,
+                            layout.rows_per_leaf(),
+                        )
+                        .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "disk-spill")]
                         Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
                         let commit = TableCommit::plain(tree, root);
@@ -5314,7 +5767,7 @@ pub trait IsStarkProver<
             &round_3_result,
             &z,
             transcript,
-        );
+        )?;
 
         #[cfg(feature = "instruments")]
         {
@@ -5553,10 +6006,10 @@ mod precomputed_tree_cache_tests {
         }
     }
 
-    fn root(n: u8) -> Commitment {
+    fn root(n: u8) -> PrecomputedTreeKey {
         let mut c = [0u8; COMMITMENT_SIZE];
         c[0] = n;
-        c
+        (c, crate::commitment::ROWS_PER_LEAF)
     }
     fn tree(n: u64) -> Arc<MerkleTree<TestBackend>> {
         Arc::new(MerkleTree::<TestBackend>::build(&[n, n + 1]).expect("two leaves build a tree"))
@@ -5565,7 +6018,7 @@ mod precomputed_tree_cache_tests {
         tree(n) as Arc<dyn std::any::Any + Send + Sync>
     }
     fn keys(m: &PrecomputedTreeMap) -> Vec<u8> {
-        let mut k: Vec<u8> = m.keys().map(|c| c[0]).collect();
+        let mut k: Vec<u8> = m.keys().map(|(c, _)| c[0]).collect();
         k.sort_unstable();
         k
     }
@@ -5652,6 +6105,23 @@ mod precomputed_tree_cache_tests {
             precomputed_tree_insert_capped(&mut m, root(n), erased(n as u64), None);
         }
         assert_eq!(m.len(), 201, "an unset cap must not evict anything");
+    }
+
+    /// The leaf layout is part of the key (S2): one root under two layouts is
+    /// two entries, never a hit on the other layout's tree.
+    #[test]
+    fn the_leaf_layout_is_part_of_the_key() {
+        let mut m = PrecomputedTreeMap::new();
+        let (c, _) = root(5);
+        precomputed_tree_insert_capped(&mut m, (c, 2), erased(1), None);
+        precomputed_tree_insert_capped(&mut m, (c, 1), erased(2), None);
+        assert_eq!(m.len(), 2);
+        let got = |k: &PrecomputedTreeKey| {
+            m.get(k)
+                .and_then(|(_, any)| Arc::clone(any).downcast::<MerkleTree<TestBackend>>().ok())
+                .map(|t| t.root)
+        };
+        assert_ne!(got(&(c, 2)), got(&(c, 1)));
     }
 
     /// ⓘ `0` is read as UNSET, not as "cache nothing" — a zero-size cache would

@@ -58,6 +58,7 @@ fn every_commit_is_counted_on_exactly_one_side() {
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
+        format: multilinear::whir_chain::ChainFormat::DEFAULT,
     };
 
     multilinear::gpu::reset_call_counters();
