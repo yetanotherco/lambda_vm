@@ -138,11 +138,13 @@ fn parity_legacy_encoding_blake3() {
 fn proved_vectors_equal_the_cpu_bytes() {
     use crate::fri::vectors::{check_or_write, proof_vectors};
     let before = crate::gpu_lde::gpu_fri_calls();
+    let comp_before = crate::gpu_lde::gpu_composition_calls();
     let mut files = proof_vectors::<KeccakStarkHash>("keccak");
     files.extend(proof_vectors::<Blake3StarkHash>("blake3"));
     let device_commits = crate::gpu_lde::gpu_fri_calls() - before;
+    let compositions = crate::gpu_lde::gpu_composition_calls() - comp_before;
     println!(
-        "FRIDEV vector proofs: {} files, {device_commits} device FRI commits",
+        "FRIDEV vector proofs: {} files, {device_commits} device FRI commits, {compositions} device compositions",
         files.len()
     );
     // Five (d) formats (pair, dp, dp_3_1_3 at Q = 3; cap_pair, cap_dp at
@@ -151,6 +153,12 @@ fn proved_vectors_equal_the_cpu_bytes() {
     assert_eq!(
         device_commits, 10,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
+    );
+    // Every proof composes on the device (the AIR's constraint program,
+    // I-FIX-D2); a host composition would not be counted here.
+    assert_eq!(
+        compositions, 10,
+        "every vector proof must compose on the device ({compositions} device compositions)"
     );
     let bad = check_or_write(&files, false);
     assert!(
