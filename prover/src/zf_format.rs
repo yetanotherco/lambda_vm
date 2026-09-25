@@ -9,9 +9,10 @@
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! `cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6`.
 //! Each lever was measured net positive on block runs before it became the
-//! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
+//! default (`one_row=auto` on the STARK pipeline: see [`ZfFormat::DEFAULT`]).
+//! Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`), so setting all five to off
 //! reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for byte —
 //! for rollback and for A/B arms. The crypto crates' own defaults
@@ -45,7 +46,7 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -98,17 +99,23 @@ impl ZfFormat {
     /// configuration. S1 `cap=auto` (STARK block −15.35 s),
     /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
     /// (WHIR block −9.10 s together), each measured net positive in an ABBA
-    /// block run. `one_row` stays off: in ABBA block runs it costs +3.2 s on
-    /// the WHIR pipeline (the prover-side cost of one-row LFM proofs) and saves
-    /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
-    /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
+    /// block run. S2 `one_row=auto` is on because it is the STARK pipeline's
+    /// best setting: on top of the other levers it takes about 8 s and
+    /// 7–8 GiB of host memory off the STARK block (ABBA block runs). It costs
+    /// +3.2 s on the WHIR pipeline (the prover-side cost of one-row LFM
+    /// proofs), where `LAMBDA_VM_ZF_ONE_ROW=0` is the faster setting. The
+    /// one-row roots of the static preprocessed tables ship at blowup 4 only
+    /// ([`crate::tables::STATIC_BLOWUP_FACTORS_ONE_ROW`]), the blowup both
+    /// production sites prove at. At another blowup a static table that `auto`
+    /// puts on one row (KECCAK_RC) has no root, and proving is an error, never
+    /// a recompute.
     /// Security parameters (queries, grinding, blowup) are the
     /// legacy ones: no lever touches them.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
         fri: FriMode::Dp,
-        one_row: OneRowMode::Off,
+        one_row: OneRowMode::Auto,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
     };
 
@@ -373,13 +380,13 @@ mod tests {
                 cap: CapPolicy::Auto,
                 whir_cap: CapPolicy::Auto,
                 fri: FriMode::Dp,
-                one_row: OneRowMode::Off,
+                one_row: OneRowMode::Auto,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             }
         );
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
@@ -435,6 +442,14 @@ mod tests {
                 "pair",
                 ZfFormat {
                     fri: FriMode::Pair,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_ONE_ROW,
+                "0",
+                ZfFormat {
+                    one_row: OneRowMode::Off,
                     ..ZfFormat::DEFAULT
                 },
             ),
@@ -658,11 +673,12 @@ mod tests {
         let d = ZfFormat::LEGACY.options(base.clone());
         assert!(d.has_default_format());
         assert!(d.has_legacy_format());
-        // The production default stamps cap=auto and fri=dp, nothing else.
+        // The production default stamps cap=auto, fri=dp and one_row=auto,
+        // nothing else.
         let p = ZfFormat::DEFAULT.options(base.clone());
         assert_eq!(p.format.merkle_cap, CapPolicy::Auto);
         assert_eq!(p.format.fri_mode, FriMode::Dp);
-        assert_eq!(p.format.one_row, ZfFormat::DEFAULT.one_row);
+        assert_eq!(p.format.one_row, OneRowMode::Auto);
         assert_eq!(p.format.fri_schedule_override, None);
         assert!(!p.has_legacy_format());
         assert_eq!(

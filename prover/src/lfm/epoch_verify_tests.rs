@@ -1561,7 +1561,11 @@ const PROCESS_FORMAT_QUERIES: usize = 24;
 /// `2^c − 1` once per capped tree; group leaves and group paths under
 /// `fri = dp`); a moved cap word does not execute. Prints the census to
 /// compare across arms (instructions, permutations, `Select`s, cells per
-/// chip). At the default format it is the MIN-preset run at 24 queries.
+/// chip). It proves the row-pair formats (`LAMBDA_VM_ZF_ONE_ROW=0`): at the MIN
+/// preset's blowup 2 no one-row static root ships, so a format that puts
+/// KECCAK_RC on one row — `one_row=1`, and `one_row=auto`, the default — is a
+/// proving error there (a hard miss, never a recompute). The one-row twin is
+/// [`the_assembled_epoch_verifier_runs_at_blowup_4_at_the_process_format`].
 #[test]
 #[ignore = "a real epoch proof at 24 queries and its assembled verifier: box only"]
 fn the_assembled_epoch_verifier_runs_at_the_process_format() {
