@@ -9,9 +9,11 @@
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration
-//! (RULINGS 26): `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
-//! Each lever was measured net positive on block runs before it became the
-//! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
+//! (RULINGS 26): `cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6`.
+//! Each lever but `one_row=auto` was measured net positive on block runs
+//! before it became the default; `one_row=auto` is the default PROVISIONALLY
+//! (pre-registered net positive on STARK, neutral on WHIR; its own commit, so
+//! it reverts cleanly if the ds30–35 / wt72–77 arms disagree). Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`), so setting all five to off
 //! reproduces [`ZfFormat::LEGACY`] — the pre-campaign format, byte for byte —
 //! for rollback and for A/B arms. The crypto crates' own defaults
@@ -45,7 +47,7 @@
 //! flips its `*_IMPLEMENTED` constant when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -98,13 +100,15 @@ impl ZfFormat {
     /// configuration (RULINGS 26). S1 `cap=auto` (STARK block −15.35 s),
     /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
     /// (WHIR block −9.10 s together), each measured net positive in an ABBA
-    /// block run. Security parameters (queries, grinding, blowup) are the
-    /// legacy ones: no lever touches them.
+    /// block run. S2 `one_row=auto` is the default PROVISIONALLY (RULINGS 26:
+    /// pre-registered net positive on STARK, neutral on WHIR, pending the
+    /// ds30–35 / wt72–77 arms). Security parameters (queries, grinding,
+    /// blowup) are the legacy ones: no lever touches them.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
         fri: FriMode::Dp,
-        one_row: OneRowMode::Off,
+        one_row: OneRowMode::Auto,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
     };
 
@@ -369,13 +373,13 @@ mod tests {
                 cap: CapPolicy::Auto,
                 whir_cap: CapPolicy::Auto,
                 fri: FriMode::Dp,
-                one_row: OneRowMode::Off,
+                one_row: OneRowMode::Auto,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             }
         );
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
@@ -431,6 +435,14 @@ mod tests {
                 "pair",
                 ZfFormat {
                     fri: FriMode::Pair,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_ONE_ROW,
+                "0",
+                ZfFormat {
+                    one_row: OneRowMode::Off,
                     ..ZfFormat::DEFAULT
                 },
             ),
