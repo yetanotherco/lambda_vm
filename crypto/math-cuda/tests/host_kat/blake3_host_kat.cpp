@@ -694,6 +694,55 @@ void row_major_leaf_kernels_read_the_specified_bytes() {
     printf("row-major leaf kernels: read pattern matches the CPU leaf spec, all column ranges\n");
 }
 
+// The row-major ONE-ROW kernel (S2, rows_per_leaf = 1): leaf `i` is the single
+// row `reverse_index(i)` over `log_n` bits, every non-empty column range. Also
+// the control that it is NOT the row-pair kernel's first row: at n >= 4 the
+// one-row leaf 1 is row brev(1) = n/2, the row-pair leaf 0's second row, never
+// row brev(2) (the pair kernel's leaf 1 first row).
+void row_major_one_row_kernel_reads_the_specified_bytes() {
+    for (uint32_t log_n : {1u, 2u, 4u, 6u}) {
+        for (uint64_t m : {1ull, 5ull, 13ull}) {
+            uint64_t n = 1ull << log_n;
+            std::vector<uint64_t> data(n * m);
+            for (size_t i = 0; i < data.size(); ++i) data[i] = sample(log_n * 11 + m, i);
+            for (uint64_t cs = 0; cs < m; ++cs) {
+                for (uint64_t ce = cs + 1; ce <= m; ++ce) {
+                    std::vector<uint8_t> out(n * 32, 0);
+                    CUDA_HOST_FOR_EACH_THREAD(t, n) {
+                        blake3_leaves_base_row_major_row_range(data.data(), m, cs, ce, n, log_n,
+                                                               out.data());
+                    }
+                    std::vector<std::vector<uint8_t>> want(n);
+                    for (uint64_t leaf = 0; leaf < n; ++leaf) {
+                        uint64_t br = reverse_index(leaf, log_n);
+                        for (uint64_t c = cs; c < ce; ++c) push_be(want[leaf], data[br * m + c]);
+                    }
+                    check_leaves(out, want, "blake3_leaves_base_row_major_row_range");
+                }
+            }
+        }
+    }
+    // The one-row tree has TWICE the leaves of the row-pair tree over the same
+    // rows, and its leaves are not the pair tree's: a one-row kernel that read
+    // row pairs would match neither the spec above nor differ here.
+    {
+        const uint32_t log_n = 4;
+        const uint64_t n = 1ull << log_n, m = 3;
+        std::vector<uint64_t> data(n * m);
+        for (size_t i = 0; i < data.size(); ++i) data[i] = sample(0x0E, i);
+        std::vector<uint8_t> one(n * 32, 0), pair((n / 2) * 32, 0);
+        CUDA_HOST_FOR_EACH_THREAD(t, n) {
+            blake3_leaves_base_row_major_row_range(data.data(), m, 0, m, n, log_n, one.data());
+        }
+        CUDA_HOST_FOR_EACH_THREAD(t, n / 2) {
+            blake3_leaves_base_row_major_row_pair(data.data(), m, n, log_n, pair.data());
+        }
+        check(memcmp(one.data(), pair.data(), 32) != 0,
+              "a one-row leaf must not equal the row-pair leaf over the same first row");
+    }
+    printf("row-major one-row kernel: read pattern matches the CPU one-row leaf spec, all column ranges\n");
+}
+
 // The full-range ranged kernel must be the unranged one — the same bytes by two
 // code paths. A cheap check that the range arithmetic has no off-by-one at the
 // boundary it is most likely to have one at.
@@ -767,6 +816,7 @@ int main() {
     fri_leaf_kernel_reads_the_specified_bytes();
     row_major_leaf_kernels_read_the_specified_bytes();
     the_full_range_variant_equals_the_plain_one();
+    row_major_one_row_kernel_reads_the_specified_bytes();
     leaves_depend_on_data_and_row();
     if (failures != 0) {
         printf("\n*** %d FAILURE(S) ***\n", failures);

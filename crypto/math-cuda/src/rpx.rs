@@ -582,6 +582,22 @@ pub fn build_comp_poly_tree_from_slabs_dev(
     m: usize,
     lde_size: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
+    build_comp_poly_tree_from_slabs_dev_rpl(stream, buf, m, lde_size, 2)
+}
+
+/// [`build_comp_poly_tree_from_slabs_dev`] with `rows_per_leaf` rows per leaf
+/// (2 = row pair, 1 = S2 one row: `lde_size` leaves, the one-row ext3 kernel).
+pub fn build_comp_poly_tree_from_slabs_dev_rpl(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u64>,
+    m: usize,
+    lde_size: usize,
+    rows_per_leaf: usize,
+) -> Result<crate::lde::GpuMerkleTree> {
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
     // Same sticky hook as the keccak and BLAKE3 twins: the comp-tree cliff test
     // arms one counter and must reach it under whichever hash the build pins.
     #[cfg(feature = "test-faults")]
@@ -589,7 +605,7 @@ pub fn build_comp_poly_tree_from_slabs_dev(
     assert!(m > 0);
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
     assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
-    let num_leaves = lde_size / 2;
+    let num_leaves = lde_size / rows_per_leaf;
     let tight_total_nodes = 2 * num_leaves - 1;
     let be = backend()?;
 
@@ -600,7 +616,12 @@ pub fn build_comp_poly_tree_from_slabs_dev(
     {
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
-        launch_ext3_row_pair(
+        let launch = if rows_per_leaf == 2 {
+            launch_ext3_row_pair
+        } else {
+            launch_leaves_ext3
+        };
+        launch(
             stream.as_ref(),
             buf,
             lde_size as u64,
@@ -629,6 +650,15 @@ pub fn build_comp_poly_tree_from_slabs_dev(
 /// stages through the same pinned de-interleave buffer for the same reason.
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
+) -> Result<crate::lde::GpuMerkleTree> {
+    build_comp_poly_tree_from_evals_ext3_keep_rpl(parts_interleaved, 2)
+}
+
+/// [`build_comp_poly_tree_from_evals_ext3_keep`] with `rows_per_leaf` rows per
+/// leaf (2 = row pair, 1 = S2 one row).
+pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
+    parts_interleaved: &[&[u64]],
+    rows_per_leaf: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
@@ -666,7 +696,7 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep(
     stream.synchronize()?;
     drop(staging);
 
-    build_comp_poly_tree_from_slabs_dev(&stream, &buf, m, lde_size)
+    build_comp_poly_tree_from_slabs_dev_rpl(&stream, &buf, m, lde_size, rows_per_leaf)
 }
 
 /// Build a FRI-layer Merkle tree on device under RPX from an interleaved ext3

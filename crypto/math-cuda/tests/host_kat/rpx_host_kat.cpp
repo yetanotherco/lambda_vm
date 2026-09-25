@@ -999,6 +999,35 @@ void row_major_leaf_kernels_read_the_specified_felts() {
     printf("row-major leaf kernels: read pattern + node encoding match the CPU leaf spec, all column ranges\n");
 }
 
+// The row-major ONE-ROW kernel (S2, rows_per_leaf = 1): leaf `i` absorbs the
+// single row `reverse_index(i)` over `log_n` bits, every non-empty column range
+// (the felt count keys the padding, so each range length is its own sponge).
+void row_major_one_row_kernel_reads_the_specified_felts() {
+    for (uint32_t log_n : {1u, 2u, 4u, 6u}) {
+        for (uint64_t m : {1ull, 5ull, 13ull}) {
+            const uint64_t n = 1ull << log_n;
+            std::vector<uint64_t> data(n * m);
+            uint64_t seed = log_n * 11 + m;
+            for (size_t i = 0; i < data.size(); ++i) data[i] = sample(seed, i);
+            for (uint64_t cs = 0; cs < m; ++cs) {
+                for (uint64_t ce = cs + 1; ce <= m; ++ce) {
+                    std::vector<uint8_t> out(n * 32, 0);
+                    CUDA_HOST_FOR_EACH_THREAD(t, n) {
+                        rpx_leaves_base_row_major_row_range(data.data(), m, cs, ce, n, log_n, out.data());
+                    }
+                    std::vector<std::vector<uint64_t>> want(n);
+                    for (uint64_t leaf = 0; leaf < n; ++leaf) {
+                        const uint64_t br = reverse_index(leaf, log_n);
+                        for (uint64_t c = cs; c < ce; ++c) want[leaf].push_back(data[br * m + c]);
+                    }
+                    check_leaves(out, want, "rpx_leaves_base_row_major_row_range");
+                }
+            }
+        }
+    }
+    printf("row-major one-row kernel: read pattern + node encoding match the CPU one-row leaf spec, all column ranges\n");
+}
+
 // The host parent over two nodes: decode big-endian, compress, encode.
 void expected_parent(const uint8_t *left, const uint8_t *right, uint8_t out[32]) {
     uint64_t l[4], r[4], d[4];
@@ -1207,6 +1236,7 @@ int main() {
     fri_leaf_kernel_reads_the_specified_felts();
     coset_leaf_kernels_read_the_specified_felts();
     row_major_leaf_kernels_read_the_specified_felts();
+    row_major_one_row_kernel_reads_the_specified_felts();
     merkle_compressors_match_the_host_parent();
     permute_probe_matches_the_oracle_table();
     printf("\n-- layer 8: the proof-of-work grind kernel against the host predicate --\n");
