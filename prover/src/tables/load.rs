@@ -179,6 +179,7 @@ pub fn generate_load_trace(
     operations: &[LoadOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+    crate::record_real_rows("load", operations.len(), num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

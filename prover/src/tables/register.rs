@@ -220,6 +220,7 @@ pub fn generate_register_trace(
     init: &[u32],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    crate::record_real_rows("register", NUM_REGISTER_ADDRESSES, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -311,6 +312,7 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> C
 /// This is where the **entry point** enters the statement: `x255`'s INIT is it.
 pub fn preprocessed_columns(init: &[u32]) -> Vec<Vec<FE>> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    crate::record_real_rows("register", NUM_REGISTER_ADDRESSES, num_rows);
     let addr_list = register_word_address_list();
 
     let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
@@ -347,6 +349,7 @@ pub fn compute_precomputed_commitment_with_fini(
 pub fn preprocessed_columns_with_fini(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    crate::record_real_rows("register", NUM_REGISTER_ADDRESSES, num_rows);
     let addr_list = register_word_address_list();
 
     let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
@@ -367,6 +370,7 @@ pub fn preprocessed_columns_with_fini(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>
 /// (OFFSET, INIT, FINI) preprocessed commitments.
 fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    crate::record_real_rows("register", NUM_REGISTER_ADDRESSES, num_rows);
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {

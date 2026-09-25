@@ -23,9 +23,44 @@ const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 /// into the transcript. The recursion attestation folds the same digest into
 /// `program_id` (see the `recursion` module), sharing one pass over the ELF.
 pub(crate) fn elf_digest(elf: &[u8]) -> [u8; 32] {
+    if let Some(digest) = DIGEST_SCOPE.with(|scope| {
+        scope
+            .get()
+            .filter(|(address, len, _)| *address == elf.as_ptr() as usize && *len == elf.len())
+            .map(|(_, _, digest)| digest)
+    }) {
+        return digest;
+    }
     let mut h = Keccak256::new();
     h.update(elf);
     h.finalize().into()
+}
+
+std::thread_local! {
+    /// The ELF bytes a [`DigestScope`] hashed, by address and length, and their digest.
+    static DIGEST_SCOPE: std::cell::Cell<Option<(usize, usize, [u8; 32])>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Hashes an ELF once for every statement bound while the scope lives.
+///
+/// Each epoch of a run binds the same ELF digest, a keccak over the whole
+/// program; a verifier in a guest paid it per epoch. The bytes are borrowed for
+/// the scope, so the same address and length are the same bytes.
+pub(crate) struct DigestScope;
+
+impl DigestScope {
+    pub(crate) fn enter(elf: &[u8]) -> Self {
+        let digest = elf_digest(elf);
+        DIGEST_SCOPE.with(|scope| scope.set(Some((elf.as_ptr() as usize, elf.len(), digest))));
+        DigestScope
+    }
+}
+
+impl Drop for DigestScope {
+    fn drop(&mut self) {
+        DIGEST_SCOPE.with(|scope| scope.set(None));
+    }
 }
 
 /// Which statement is being bound. Selects the leading domain tag and whether an

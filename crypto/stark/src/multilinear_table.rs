@@ -30,6 +30,7 @@ use multilinear::{
     gkr::{self, FractionTree, GkrProof},
     logup,
     mle::Mle,
+    jagged::{self, JaggedCommitment, JaggedProof},
     stacked_eval::{self, Claimed, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
@@ -149,6 +150,7 @@ where
             interactions: self.interactions,
             slot_of: &self.slot_of,
             preprocessed,
+            preprocessed_at: None,
             kinds: &self.kinds,
             num_vars: self.num_vars,
         }
@@ -339,9 +341,20 @@ where
     /// which is what binds the same table across two proofs, since a table has
     /// no root of its own when it shares a stack.
     groups: Vec<StackedCommitment<F>>,
+    /// The groups committed jagged instead, by group index. Their tables are
+    /// not in `groups`, which holds the stacked ones in order.
+    jagged: Vec<(usize, JaggedCommitment<F>)>,
     /// How many tables each group holds, in order.
     sizes: Vec<usize>,
     roots: Vec<Commitment>,
+}
+
+/// Whether multi-table groups are committed jagged — the prover's choice, read
+/// once. The verifier follows the proof: both openings are sound, and a group
+/// says which one settles it.
+pub fn jagged_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_JAGGED").is_ok_and(|v| v == "1"))
 }
 
 /// Where each table's columns start in the global column order.
@@ -467,15 +480,41 @@ where
         drop(all);
 
         let mut groups = Vec::with_capacity(sizes.len());
+        let mut jagged = Vec::new();
         let mut roots = Vec::new();
         let mut at = 0usize;
-        for &size in sizes {
+        for (index, &size) in sizes.iter().enumerate() {
             let group = &tables[at..at + size];
+            // A group of one is a table with a root of its own, compared across
+            // proofs against a stacked commitment of it: that one stays stacked.
+            if size > 1 && jagged_enabled() {
+                let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
+                let widths: Vec<usize> = group.iter().map(|t| t.num_committed_columns()).collect();
+                let committed =
+                    JaggedCommitment::<F>::commit(&columns, &widths, MAX_STACK_VARS, config)?;
+                eprintln!(
+                    "ML_JAGGED_LAYOUT n={} polys={} cells={} real={}",
+                    committed.layout().num_vars(),
+                    committed.layout().num_polys(),
+                    committed.layout().cells(),
+                    committed.tails().iter().map(|t| t.rows as u64).sum::<u64>(),
+                );
+                roots.extend(committed.roots());
+                jagged.push((index, committed));
+                at += size;
+                continue;
+            }
             let shapes: Vec<(usize, usize)> = group
                 .iter()
                 .map(|t| (t.num_committed_columns(), t.num_vars()))
                 .collect();
             let layout = global_layout(&shapes)?;
+            eprintln!(
+                "ML_STACKED_LAYOUT n={} polys={} cells={}",
+                layout.n_stack(),
+                layout.num_polys(),
+                layout.num_polys() << layout.n_stack(),
+            );
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
@@ -500,6 +539,7 @@ where
             tables,
             store,
             groups,
+            jagged,
             sizes: sizes.to_vec(),
             roots,
         })
@@ -538,6 +578,10 @@ pub struct TableStatement<'a, F: IsFFTField + IsPrimeField, E: IsField> {
     /// commitment only says the prover stayed consistent with what it
     /// committed; these are what say it committed the right thing.
     pub preprocessed: &'a [Mle<F>],
+    /// The same columns' extensions in closed form, for a table that has one;
+    /// `preprocessed` is then empty and this is what is checked.
+    #[allow(clippy::type_complexity)]
+    pub preprocessed_at: Option<&'a dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>>>,
     pub kinds: &'a [FactorKind],
     pub num_vars: usize,
 }
@@ -596,6 +640,9 @@ pub struct MultiProof<F: IsField, E: IsField> {
     /// Every table's columns, at each one's own point — one opening per
     /// commitment group, in group order.
     pub columns: Vec<StackedProof<F, E>>,
+    /// The groups settled jagged instead, by group index, in group order.
+    /// `columns` holds the rest.
+    pub jagged: Vec<(u32, JaggedProof<F, E>)>,
 }
 
 /// The table's share of the bus, `p/q`.
@@ -800,7 +847,18 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
-    for (col, column) in statement.preprocessed.iter().enumerate() {
+    // Every preprocessed column is claimed at the same point, so the columns a
+    // closed form does not answer for are evaluated together.
+    let closed = match statement.preprocessed_at {
+        Some(at) => Some(at(&reduced.point).ok_or(MlError::EvaluationMismatch)?),
+        None if statement.preprocessed.len() > 1 => {
+            let columns: Vec<&Mle<F>> = statement.preprocessed.iter().collect();
+            Some(Mle::evaluate_many_in(&columns, &reduced.point)?)
+        }
+        None => None,
+    };
+    let count = closed.as_ref().map_or(statement.preprocessed.len(), Vec::len);
+    for col in 0..count {
         let factor = slot(statement.slot_of, col)?;
         // A preprocessed column is read unshifted by construction: `TableLayout`
         // registers every main column that way. Anything else means the two
@@ -822,7 +880,11 @@ where
                     index: source.column,
                     len: reduced.column_values.len(),
                 })?;
-        if column.evaluate_in(&reduced.point)? != *claimed {
+        let expected = match &closed {
+            Some(values) => values[col].clone(),
+            None => statement.preprocessed[col].evaluate_in(&reduced.point)?,
+        };
+        if expected != *claimed {
             return Err(MlError::EvaluationMismatch);
         }
     }
@@ -862,6 +924,7 @@ where
     // order the stack was built in.
     let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
     let mut values: Vec<FieldElement<E>> = Vec::new();
+    let t_tables = std::time::Instant::now();
     for table in committed.tables() {
         let (proof, point) = prove(table, &z, &alpha, &beta, transcript)?;
         for _ in 0..table.num_committed_columns() {
@@ -874,10 +937,15 @@ where
     // One opening per group, over that group's columns. The points and values
     // are in the global column order, so a group takes the slice its tables
     // span.
+    let tables_s = t_tables.elapsed().as_secs_f64();
+    let t_open = std::time::Instant::now();
     let mut columns = Vec::with_capacity(committed.groups().len());
+    let mut jagged_proofs = Vec::with_capacity(committed.jagged.len());
+    let mut stacked = committed.groups().iter();
+    let mut jagged_groups = committed.jagged.iter().peekable();
     let mut table_at = 0usize;
     let mut column_at = 0usize;
-    for (group, &size) in committed.groups().iter().zip(committed.sizes()) {
+    for (index, &size) in committed.sizes().iter().enumerate() {
         let width: usize = committed.tables()[table_at..table_at + size]
             .iter()
             .map(|t| t.num_committed_columns())
@@ -887,6 +955,26 @@ where
             .iter()
             .flat_map(|t| t.trace.columns())
             .collect();
+        if let Some((_, group)) = jagged_groups.next_if(|(i, _)| *i == index) {
+            jagged_proofs.push((
+                index as u32,
+                jagged::prove::<F, E, T>(
+                    group,
+                    &group_columns,
+                    &points[column_at..column_at + width],
+                    &values[column_at..column_at + width],
+                    config,
+                    transcript,
+                )?,
+            ));
+            table_at += size;
+            column_at += width;
+            continue;
+        }
+        let group = stacked.next().ok_or(MlError::QueryCountMismatch {
+            expected: index + 1,
+            got: committed.groups().len(),
+        })?;
         columns.push(stacked_eval::prove::<F, E, T>(
             group,
             &group_columns,
@@ -900,10 +988,15 @@ where
         column_at += width;
     }
 
+    eprintln!(
+        "ML_MULTI_PROVE tables_s={tables_s:.3} open_s={:.3}",
+        t_open.elapsed().as_secs_f64()
+    );
     Ok(MultiProof {
         roots: committed.roots().to_vec(),
         tables,
         columns,
+        jagged: jagged_proofs,
     })
 }
 
@@ -941,7 +1034,7 @@ where
     }
     if layouts.len() != sizes.len()
         || domains.len() != sizes.len()
-        || proof.columns.len() != sizes.len()
+        || proof.columns.len() + proof.jagged.len() != sizes.len()
         || sizes.iter().sum::<usize>() != statements.len()
     {
         return Err(MlError::QueryCountMismatch {
@@ -976,13 +1069,53 @@ where
     let mut statement_at = 0usize;
     let mut column_at = 0usize;
     let mut root_at = 0usize;
-    for (((opening, layout), domain), &size) in
-        proof.columns.iter().zip(layouts).zip(domains).zip(sizes)
-    {
+    let mut stacked = proof.columns.iter();
+    let mut jagged_groups = proof.jagged.iter().peekable();
+    for (index, ((layout, domain), &size)) in layouts.iter().zip(domains).zip(sizes).enumerate() {
         let width: usize = statements[statement_at..statement_at + size]
             .iter()
             .map(|s| s.slot_of.len())
             .sum();
+        if let Some((_, opening)) = jagged_groups.next_if(|(i, _)| *i as usize == index) {
+            // Same rule as the prover: a group of one stays stacked, so its
+            // root is comparable across proofs.
+            if size < 2 {
+                return Err(MlError::QueryCountMismatch {
+                    expected: 2,
+                    got: size,
+                });
+            }
+            let widths: Vec<usize> = statements[statement_at..statement_at + size]
+                .iter()
+                .map(|s| s.slot_of.len())
+                .collect();
+            let num_roots = jagged::num_roots(opening, &widths, MAX_STACK_VARS)?;
+            let roots = proof
+                .roots
+                .get(root_at..root_at + num_roots)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: root_at + num_roots,
+                    got: proof.roots.len(),
+                })?;
+            jagged::verify::<F, E, T>(
+                opening,
+                roots,
+                &widths,
+                &points[column_at..column_at + width],
+                &values[column_at..column_at + width],
+                MAX_STACK_VARS,
+                config,
+                transcript,
+            )?;
+            statement_at += size;
+            column_at += width;
+            root_at += num_roots;
+            continue;
+        }
+        let opening = stacked.next().ok_or(MlError::QueryCountMismatch {
+            expected: index + 1,
+            got: proof.columns.len(),
+        })?;
         let roots = proof
             .roots
             .get(root_at..root_at + layout.num_polys())
@@ -1003,6 +1136,12 @@ where
         statement_at += size;
         column_at += width;
         root_at += layout.num_polys();
+    }
+    if jagged_groups.next().is_some() || root_at != proof.roots.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: root_at,
+            got: proof.roots.len(),
+        });
     }
     Ok(())
 }

@@ -437,10 +437,26 @@ pub fn verify_with_options(
         .iter()
         .map(|air| preprocessed_mles(*air))
         .collect::<Result<_, _>>()?;
+    #[allow(clippy::type_complexity)]
+    let closed_forms: Vec<Option<Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>>> =
+        air_refs
+            .iter()
+            .map(|air| {
+                air.has_precomputed_closed_form().then(|| {
+                    Box::new(move |point: &[FieldElement<E>]| air.precomputed_closed_form(point))
+                        as Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>
+                })
+            })
+            .collect();
     let statements: Vec<TableStatement<'_, F, E>> = layouts
         .iter()
         .zip(&preprocessed)
-        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .zip(&closed_forms)
+        .map(|((layout, cols), closed)| {
+            let mut statement = layout.statement_with_preprocessed(cols);
+            statement.preprocessed_at = closed.as_deref();
+            statement
+        })
         .collect();
 
     // What the tables owe: the COMMIT bus's counterparty is the statement, and

@@ -84,7 +84,7 @@ pub fn ood_point<E: IsField>(z0: &FieldElement<E>, num_vars: usize) -> Vec<Field
 ///
 /// Sampling from the transcript makes this negligible; it is checked rather
 /// than assumed.
-fn require_out_of_domain<F, E>(z0: &FieldElement<E>, domain: &Domain<F>) -> Result<(), Error>
+pub(crate) fn require_out_of_domain<F, E>(z0: &FieldElement<E>, domain: &Domain<F>) -> Result<(), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + Send + Sync + 'static,
@@ -103,7 +103,7 @@ where
 ///
 /// Retrying that challenge then costs `2^bits` hashes. Zero bits is a no-op, so
 /// a caller that has not chosen its parameters yet pays nothing.
-fn grind<E, T>(transcript: &mut T, bits: u8) -> Result<u64, Error>
+pub(crate) fn grind<E, T>(transcript: &mut T, bits: u8) -> Result<u64, Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
@@ -119,7 +119,7 @@ where
 
 /// The verifier's half: the nonce must pass against the same state, and it is
 /// absorbed the same way.
-fn check_grind<E, T>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
+pub(crate) fn check_grind<E, T>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,

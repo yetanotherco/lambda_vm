@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "recursion-ml"
+version = "0.1.0"
+edition = "2024"
+
+# Verifies multilinear (WHIR) continuation epochs in the guest, to count what a
+# recursive verifier of them costs. Measurement only.
+[dependencies]
+lambda-vm-prover = { path = "../../../prover", default-features = false }
+lambda-vm-syscalls = { path = "../../../syscalls" }
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned", "pointer_width_64"] }
+
+[profile.release]
+debug = 2

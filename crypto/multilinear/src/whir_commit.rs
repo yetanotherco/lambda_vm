@@ -22,8 +22,8 @@ use crate::{Error, whir::Domain};
 
 /// 32-byte Keccak commitments, matching the rest of the prover.
 pub type Commitment = [u8; 32];
-type Backend<F> = BatchKeccak256Backend<F>;
-type Tree<F> = MerkleTree<Backend<F>>;
+pub(crate) type Backend<F> = BatchKeccak256Backend<F>;
+pub(crate) type Tree<F> = MerkleTree<Backend<F>>;
 
 /// A committed codeword and the tree needed to open it.
 pub struct CodewordCommitment<F: IsField>
@@ -437,15 +437,22 @@ where
         .pow((domain.size() / values.len()) as u64);
 
     let mut out = Vec::with_capacity(half);
-    let mut x = domain.generator().pow(position as u64);
+    // The slots sit at x·η^t, so their inverses are x⁻¹·η^(−t): two inversions
+    // for the whole level instead of one per slot — an inversion is an
+    // exponentiation, which a verifier running in a guest pays in full.
+    let mut x_inv = domain
+        .generator()
+        .pow(position as u64)
+        .inv()
+        .expect("domain elements are nonzero");
+    let eta_inv = eta.inv().expect("domain elements are nonzero");
     for t in 0..half {
         let (a, b) = (&values[t], &values[t + half]);
         let even = &two_inv * (a + b);
-        let x_inv = x.inv().expect("domain elements are nonzero");
-        let odd = (&two_inv * x_inv) * (a - b);
+        let odd = (&two_inv * &x_inv) * (a - b);
         // The base element on the left: the only direction the tower gives.
         out.push(even + odd * alpha);
-        x *= &eta;
+        x_inv *= &eta_inv;
     }
     out
 }

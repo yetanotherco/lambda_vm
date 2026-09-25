@@ -31,7 +31,70 @@ pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
 
+/// Real (pre-padding) rows of every table built, recorded for the jagged-waste measurement.
+#[cfg(test)]
+pub(crate) static REAL_ROWS: std::sync::Mutex<Vec<(&str, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[inline]
+pub(crate) fn record_real_rows(_kind: &'static str, _real: usize, _padded: usize) {
+    #[cfg(test)]
+    REAL_ROWS.lock().unwrap().push((_kind, _real, _padded));
+}
+
 use std::fmt;
+
+type DecodedInstructions = Arc<
+    executor::vm::memory::U64HashMap<executor::vm::instruction::decoding::Instruction>,
+>;
+
+std::thread_local! {
+    /// The ELF a [`DecodeScope`] decoded, by address, and its instructions.
+    static DECODE_SCOPE: std::cell::RefCell<Option<(usize, DecodedInstructions)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Decodes an ELF once for everything built from it while the scope lives.
+///
+/// A verifier of a run of epochs builds every epoch's AIRs from the same ELF,
+/// and each build decoded its instruction table again — a hash map of every
+/// instruction, which a verifier in a guest pays per epoch. Within the scope
+/// the ELF is borrowed, so the same address is the same program; outside it,
+/// nothing changes.
+pub(crate) struct DecodeScope;
+
+impl DecodeScope {
+    pub(crate) fn enter(elf: &Elf) -> Self {
+        let instructions = Arc::new(
+            decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
+        );
+        DECODE_SCOPE.with(|scope| {
+            *scope.borrow_mut() = Some((elf as *const Elf as usize, instructions));
+        });
+        DecodeScope
+    }
+}
+
+impl Drop for DecodeScope {
+    fn drop(&mut self) {
+        DECODE_SCOPE.with(|scope| *scope.borrow_mut() = None);
+    }
+}
+
+/// `elf`'s instruction table: the scope's when it decoded this very ELF, a
+/// fresh decode otherwise.
+fn decoded_instructions(elf: &Elf) -> DecodedInstructions {
+    let cached = DECODE_SCOPE.with(|scope| {
+        scope
+            .borrow()
+            .as_ref()
+            .filter(|(address, _)| *address == elf as *const Elf as usize)
+            .map(|(_, instructions)| instructions.clone())
+    });
+    cached.unwrap_or_else(|| {
+        Arc::new(decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"))
+    })
+}
 use std::sync::Arc;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -728,7 +791,7 @@ impl VmAirs {
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
-                Box::new(create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i))) as VmAir
+                Box::new(create_cpu_air(proof_options).with_program_key("CPU").with_name(&format!("CPU[{}]", i))) as VmAir
             })
             .collect();
         let bitwise: VmAir = if minimal_bitwise {
@@ -748,46 +811,48 @@ impl VmAirs {
             // own preprocessed commitment first.
             Box::new(create_bitwise_air(proof_options))
         } else {
-            Box::new(create_bitwise_air(proof_options).with_preprocessed_columns(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-                Arc::new(bitwise::preprocessed_columns),
-            ))
+            Box::new(
+                create_bitwise_air(proof_options)
+                    .with_preprocessed_columns(
+                        bitwise::preprocessed_commitment(proof_options),
+                        bitwise::NUM_PRECOMPUTED_COLS,
+                        Arc::new(bitwise::preprocessed_columns),
+                    )
+                    .with_precomputed_closed_form(Arc::new(bitwise::precomputed_closed_form)),
+            )
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| {
-                Box::new(create_lt_air(proof_options).with_name(&format!("LT[{}]", i))) as VmAir
+                Box::new(create_lt_air(proof_options).with_program_key("LT").with_name(&format!("LT[{}]", i))) as VmAir
             })
             .collect();
         let shifts: Vec<_> = (0..table_counts.shift)
             .map(|i| {
-                Box::new(create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+                Box::new(create_shift_air(proof_options).with_program_key("SHIFT").with_name(&format!("SHIFT[{}]", i)))
                     as VmAir
             })
             .collect();
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| {
-                Box::new(create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i))) as VmAir
+                Box::new(create_memw_air(proof_options).with_program_key("MEMW").with_name(&format!("MEMW[{}]", i))) as VmAir
             })
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
             .map(|i| {
                 Box::new(
-                    create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)),
+                    create_memw_aligned_air(proof_options).with_program_key("MEMW_A").with_name(&format!("MEMW_A[{}]", i)),
                 ) as VmAir
             })
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| {
-                Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
+                Box::new(create_load_air(proof_options).with_program_key("LOAD").with_name(&format!("LOAD[{}]", i))) as VmAir
             })
             .collect();
         let decode: VmAir = {
             // The instruction map, decoded once here rather than on every call:
             // only the multilinear verifier asks, but it asks per proof.
-            let instructions = Arc::new(
-                decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
-            );
+            let instructions = decoded_instructions(elf);
             // Deferred: the commitment is an LDE and a Merkle tree over the
             // program's whole instruction table, and only the univariate path
             // compares it — the multilinear one checks the columns instead.
@@ -805,30 +870,36 @@ impl VmAirs {
                 create_decode_air(proof_options).with_lazy_preprocessed_columns(
                     decode_root,
                     decode::NUM_PRECOMPUTED_COLS,
-                    Arc::new(move || decode::preprocessed_columns(&instructions)),
-                ),
+                    Arc::new({
+                        let instructions = instructions.clone();
+                        move || decode::preprocessed_columns(&instructions)
+                    }),
+                )
+                .with_precomputed_closed_form(Arc::new(move |point| {
+                    decode::evaluate_preprocessed(&instructions, point)
+                })),
             )
         };
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| {
-                Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
+                Box::new(create_mul_air(proof_options).with_program_key("MUL").with_name(&format!("MUL[{}]", i))) as VmAir
             })
             .collect();
         let dvrms: Vec<_> = (0..table_counts.dvrm)
             .map(|i| {
-                Box::new(create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i))) as VmAir
+                Box::new(create_dvrm_air(proof_options).with_program_key("DVRM").with_name(&format!("DVRM[{}]", i))) as VmAir
             })
             .collect();
         let branches: Vec<_> = (0..table_counts.branch)
             .map(|i| {
-                Box::new(create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+                Box::new(create_branch_air(proof_options).with_program_key("BRANCH").with_name(&format!("BRANCH[{}]", i)))
                     as VmAir
             })
             .collect();
-        let halt: VmAir = Box::new(create_halt_air(proof_options));
-        let commit: VmAir = Box::new(create_commit_air(proof_options));
-        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let halt: VmAir = Box::new(create_halt_air(proof_options).with_program_key("HALT"));
+        let commit: VmAir = Box::new(create_commit_air(proof_options).with_program_key("COMMIT"));
+        let keccak: VmAir = Box::new(create_keccak_air(proof_options).with_program_key("KECCAK"));
+        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options).with_program_key("KECCAK_RND"));
         let keccak_rc: VmAir = Box::new(
             create_keccak_rc_air(proof_options).with_preprocessed_columns(
                 tables::keccak_rc::preprocessed_commitment(proof_options),
@@ -836,9 +907,9 @@ impl VmAirs {
                 Arc::new(tables::keccak_rc::preprocessed_columns),
             ),
         );
-        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
-        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
-        let hint: VmAir = Box::new(create_hint_air(proof_options));
+        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options).with_program_key("ECSM"));
+        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options).with_program_key("ECDAS"));
+        let hint: VmAir = Box::new(create_hint_air(proof_options).with_program_key("HINT"));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols, columns)) = register_preprocessed {
                 Box::new(
@@ -931,30 +1002,30 @@ impl VmAirs {
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
             .map(|i| {
                 Box::new(
-                    create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)),
+                    create_memw_register_air(proof_options).with_program_key("MEMW_R").with_name(&format!("MEMW_R[{}]", i)),
                 ) as VmAir
             })
             .collect();
         let eqs: Vec<_> = (0..table_counts.eq)
             .map(|i| {
-                Box::new(create_eq_air(proof_options).with_name(&format!("EQ[{}]", i))) as VmAir
+                Box::new(create_eq_air(proof_options).with_program_key("EQ").with_name(&format!("EQ[{}]", i))) as VmAir
             })
             .collect();
         let bytewises: Vec<_> = (0..table_counts.bytewise)
             .map(|i| {
-                Box::new(create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+                Box::new(create_bytewise_air(proof_options).with_program_key("BYTEWISE").with_name(&format!("BYTEWISE[{}]", i)))
                     as VmAir
             })
             .collect();
         let stores: Vec<_> = (0..table_counts.store)
             .map(|i| {
-                Box::new(create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+                Box::new(create_store_air(proof_options).with_program_key("STORE").with_name(&format!("STORE[{}]", i)))
                     as VmAir
             })
             .collect();
         let cpu32s: Vec<_> = (0..table_counts.cpu32)
             .map(|i| {
-                Box::new(create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+                Box::new(create_cpu32_air(proof_options).with_program_key("CPU32").with_name(&format!("CPU32[{}]", i)))
                     as VmAir
             })
             .collect();

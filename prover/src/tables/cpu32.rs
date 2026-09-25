@@ -196,6 +196,7 @@ pub fn generate_cpu32_trace(
     operations: &[Cpu32Operation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+    crate::record_real_rows("cpu32", operations.len(), num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

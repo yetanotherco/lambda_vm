@@ -70,6 +70,7 @@ pub mod memw_tests;
 pub mod mul_tests;
 #[cfg(test)]
 pub mod multilinear_bench_tests;
+pub mod jagged_waste_tests;
 #[cfg(test)]
 pub mod multilinear_continuation_tests;
 pub mod multilinear_prove_tests;

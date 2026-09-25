@@ -221,6 +221,27 @@ pub trait AIR: Send + Sync {
         Vec::new()
     }
 
+    /// Whether [`precomputed_closed_form`](Self::precomputed_closed_form)
+    /// answers, so a verifier can skip generating the columns.
+    fn has_precomputed_closed_form(&self) -> bool {
+        false
+    }
+
+    /// The precomputed columns' multilinear extensions at `point`, in closed
+    /// form, when the table is structured enough to have one.
+    ///
+    /// The multilinear verifier checks each preprocessed column's claimed value
+    /// by evaluating it at the point the proof settled on — a pass over every
+    /// cell, `2^20` of them per BITWISE column. A table whose entries are simple
+    /// functions of the row index's bits has an extension that costs a handful
+    /// of operations instead, and gives the same value.
+    fn precomputed_closed_form(
+        &self,
+        _point: &[FieldElement<Self::FieldExtension>],
+    ) -> Option<Vec<FieldElement<Self::FieldExtension>>> {
+        None
+    }
+
     fn num_auxiliary_rap_columns(&self) -> usize {
         self.trace_layout().1
     }

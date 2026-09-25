@@ -244,6 +244,69 @@ pub fn preprocessed_columns() -> Vec<Vec<FE>> {
     }
 }
 
+/// Every precomputed column's multilinear extension at `point`, in closed form.
+///
+/// Row `x + 256·y + 65536·z` holds functions of the bits of `x`, `y` and `z`
+/// that are each multilinear in distinct bits — sums of `2^k·bit_k`, products
+/// of an `x` bit and a `y` bit, or an `eq` over `z` times a linear form in the
+/// halfword's bits — so those expressions, read over the point's coordinates,
+/// *are* the extensions: the same values [`preprocessed_columns`] gives at any
+/// point, for a few hundred operations instead of `2^20` per column.
+pub fn precomputed_closed_form(
+    point: &[math::field::element::FieldElement<GoldilocksExtension>],
+) -> Vec<math::field::element::FieldElement<GoldilocksExtension>> {
+    type X = math::field::element::FieldElement<GoldilocksExtension>;
+    let bits = NUM_ROWS.trailing_zeros() as usize;
+    assert_eq!(point.len(), bits, "BITWISE is claimed on its own cube");
+    // Bit `i` of the row index, least significant first; `point[0]` is the most
+    // significant variable.
+    let bit = |i: usize| point[bits - 1 - i].clone();
+    let one = X::one();
+    let pow = |k: usize| X::from(1u64 << k);
+    let x: Vec<X> = (0..8).map(bit).collect();
+    let y: Vec<X> = (8..16).map(bit).collect();
+    let z: Vec<X> = (16..20).map(bit).collect();
+    let h: Vec<X> = x.iter().chain(&y).cloned().collect();
+
+    let linear = |v: &[X]| v.iter().enumerate().fold(X::zero(), |acc, (k, b)| acc + pow(k) * b);
+    let and = (0..8).fold(X::zero(), |acc, k| acc + pow(k) * &x[k] * &y[k]);
+    let or = (0..8).fold(X::zero(), |acc, k| {
+        acc + pow(k) * (&x[k] + &y[k] - &x[k] * &y[k])
+    });
+    let xor = (0..8).fold(X::zero(), |acc, k| {
+        acc + pow(k) * (&x[k] + &y[k] - X::from(2u64) * &x[k] * &y[k])
+    });
+    let zero = (0..bits).fold(one.clone(), |acc, i| acc * (&one - bit(i)));
+    // eq(z, s) for every shift amount.
+    let eq_z: Vec<X> = (0..16usize)
+        .map(|s| {
+            (0..4).fold(one.clone(), |acc, k| {
+                acc * if (s >> k) & 1 == 1 { z[k].clone() } else { &one - &z[k] }
+            })
+        })
+        .collect();
+    let sll = (0..16usize).fold(X::zero(), |acc, s| {
+        acc + &eq_z[s] * (0..16 - s).fold(X::zero(), |a, j| a + pow(j + s) * &h[j])
+    });
+    let sllc = (1..16usize).fold(X::zero(), |acc, s| {
+        acc + &eq_z[s] * (16 - s..16).fold(X::zero(), |a, j| a + pow(j + s - 16) * &h[j])
+    });
+
+    vec![
+        linear(&x),
+        linear(&y),
+        linear(&z),
+        and,
+        or,
+        xor,
+        x[7].clone(),
+        y[7].clone(),
+        zero,
+        sll,
+        sllc,
+    ]
+}
+
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed

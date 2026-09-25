@@ -127,6 +127,7 @@ pub fn generate_decode_trace(
     // +1 for the CPU padding entry
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
+    crate::record_real_rows("decode", num_entries, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -246,6 +247,61 @@ pub fn preprocessed_columns(instructions: &U64HashMap<Instruction>) -> Vec<Vec<F
                 .collect()
         })
         .collect()
+}
+
+/// The precomputed columns' multilinear extensions at `point`, without
+/// building them.
+///
+/// The multilinear verifier checks DECODE's claimed openings against its own
+/// evaluation of the instruction table — [`preprocessed_columns`] and then a
+/// fold per column, five tables of `2^20` cells built only to be folded away.
+/// This walks the instructions in the order [`generate_decode_trace`] lays them
+/// out and accumulates each row's values against one `eq(point, ·)` table; the
+/// padding rows are all the same row, so they are that row's values times
+/// `1 − Σ_{r<h} eq(point, r)`, which is closed-form. Same values, no table.
+pub fn evaluate_preprocessed(
+    instructions: &U64HashMap<Instruction>,
+    point: &[math::field::element::FieldElement<GoldilocksExtension>],
+) -> Vec<math::field::element::FieldElement<GoldilocksExtension>> {
+    type X = math::field::element::FieldElement<GoldilocksExtension>;
+    let num_entries = instructions.len() + 1;
+    let num_rows = num_entries.next_power_of_two().max(2);
+    assert_eq!(
+        point.len(),
+        num_rows.trailing_zeros() as usize,
+        "DECODE is claimed on its own cube"
+    );
+    let values = |entry: &DecodeEntry| -> [FE; NUM_PRECOMPUTED_COLS] {
+        let [pc_0, pc_1] = super::types::dword_wl(entry.pc);
+        let [imm_0, imm_1] = super::types::dword_wl(entry.imm);
+        [pc_0, pc_1, FE::from(entry.packed_decode()), imm_0, imm_1]
+    };
+    let eq = multilinear::eq::eq_evals(point);
+    let zero = FE::zero();
+    let mut acc: Vec<X> = vec![X::zero(); NUM_PRECOMPUTED_COLS];
+    let mut add_row = |row: usize, row_values: [FE; NUM_PRECOMPUTED_COLS]| {
+        for (a, v) in acc.iter_mut().zip(&row_values) {
+            if *v != zero {
+                *a += v * &eq[row];
+            }
+        }
+    };
+    for (row, (&pc, &instr)) in instructions.iter().enumerate() {
+        add_row(row, values(&DecodeEntry::from_instruction(pc, instr, 4)));
+    }
+    add_row(
+        instructions.len(),
+        values(&DecodeEntry {
+            pc: super::cpu::CPU_PADDING_PC,
+            ..Default::default()
+        }),
+    );
+    let padding = values(&DecodeEntry::padding_entry());
+    let rest = X::one() - multilinear::jagged::lt_eval(point, num_entries);
+    for (a, v) in acc.iter_mut().zip(&padding) {
+        *a += v * &rest;
+    }
+    acc
 }
 
 /// Computes the LDE commitment for DECODE precomputed columns.
@@ -401,6 +457,7 @@ fn build_decode_table(
     // Pad to next power of 2, minimum 2
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
+    crate::record_real_rows("decode", num_entries, num_rows);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,

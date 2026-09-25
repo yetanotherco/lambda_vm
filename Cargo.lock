@@ -947,6 +947,7 @@ dependencies = [
  "rayon",
  "rkyv",
  "serde",
+ "sha3",
  "thiserror",
 ]
 

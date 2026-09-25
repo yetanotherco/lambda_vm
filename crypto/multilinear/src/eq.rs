@@ -48,16 +48,16 @@ where
     }
     dst[0] = by.clone();
     for (level, r_i) in r.iter().rev().enumerate() {
-        let one_minus = FieldElement::<F>::one() - r_i;
         // Each half of the doubled table is an independent scaling of the
         // current one, and the halves are disjoint — so this is one pass over
         // the level, and the last levels are the whole cube, which is where the
         // pool is worth it.
         let half = 1usize << level;
         let (lo, hi) = dst[..half * 2].split_at_mut(half);
+        // l·(1 − r) = l − l·r: one multiplication per pair, not two.
         let scale = |(l, h): (&mut FieldElement<F>, &mut FieldElement<F>)| {
             *h = &*l * r_i;
-            *l = &*l * &one_minus;
+            *l = &*l - &*h;
         };
         #[cfg(feature = "parallel")]
         if half >= crate::SERIAL_BELOW {

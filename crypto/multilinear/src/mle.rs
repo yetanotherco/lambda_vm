@@ -238,6 +238,43 @@ impl<F: IsField + 'static> Mle<F> {
         Ok(current.into_iter().next().expect("one value remains"))
     }
 
+    /// Several columns' extensions at one point in a larger field.
+    ///
+    /// [`evaluate_in`](Self::evaluate_in) folds each column on its own — half
+    /// the cube lifted and then folded down, per column. Sharing the point,
+    /// the `eq(point, ·)` table is built **once** and each column is a dot
+    /// product against it, a base-by-extension multiplication per nonzero
+    /// cell; a preprocessed table is mostly zeros, and those cost nothing.
+    pub fn evaluate_many_in<E>(
+        columns: &[&Mle<F>],
+        point: &[FieldElement<E>],
+    ) -> Result<Vec<FieldElement<E>>, Error>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField + 'static,
+        FieldElement<E>: Send + Sync,
+    {
+        if let Some(column) = columns.iter().find(|c| c.num_vars != point.len()) {
+            return Err(Error::VariableCountMismatch {
+                expected: column.num_vars,
+                got: point.len(),
+            });
+        }
+        let eq = crate::eq::eq_evals(point);
+        let zero = FieldElement::<F>::zero();
+        Ok(columns
+            .iter()
+            .map(|column| {
+                column
+                    .evals
+                    .iter()
+                    .zip(&eq)
+                    .filter(|(v, _)| **v != zero)
+                    .fold(FieldElement::<E>::zero(), |acc, (v, e)| acc + v * e)
+            })
+            .collect())
+    }
+
     /// The single remaining evaluation, once every variable has been fixed.
     pub fn as_constant(&self) -> Option<&FieldElement<F>> {
         (self.num_vars == 0).then(|| &self.evals[0])

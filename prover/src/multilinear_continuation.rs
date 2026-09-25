@@ -489,16 +489,35 @@ fn verify_global_bookends(
     let preprocessed: Vec<Vec<Mle<F>>> = air_refs
         .iter()
         .map(|air| {
+            if air.has_precomputed_closed_form() {
+                return Ok(Vec::new());
+            }
             air.precomputed_columns()
                 .into_iter()
                 .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("{e:?}"))))
                 .collect::<Result<_, _>>()
         })
         .collect::<Result<_, _>>()?;
+    #[allow(clippy::type_complexity)]
+    let closed_forms: Vec<Option<Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>>> =
+        air_refs
+            .iter()
+            .map(|air| {
+                air.has_precomputed_closed_form().then(|| {
+                    Box::new(move |point: &[FieldElement<E>]| air.precomputed_closed_form(point))
+                        as Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>
+                })
+            })
+            .collect();
     let statements: Vec<TableStatement<'_, F, E>> = layouts
         .iter()
         .zip(&preprocessed)
-        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .zip(&closed_forms)
+        .map(|((layout, cols), closed)| {
+            let mut statement = layout.statement_with_preprocessed(cols);
+            statement.preprocessed_at = closed.as_deref();
+            statement
+        })
         .collect();
 
     let sizes = global_groups(num_epochs, gm_configs.len());
@@ -596,6 +615,7 @@ pub fn prove_epoch(
         &config,
     );
 
+    let t_layout = std::time::Instant::now();
     let mut committed = Vec::with_capacity(pairs.len());
     for ((air, trace, _), &(width, num_vars)) in pairs.iter_mut().zip(&shapes) {
         let layout = layout_of(*air, width, num_vars)
@@ -616,11 +636,19 @@ pub fn prove_epoch(
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
     }
+    let layout_s = t_layout.elapsed().as_secs_f64();
     let sizes = epoch_groups(committed.len());
+    let t_commit = std::time::Instant::now();
     let committed = CommittedTables::commit_grouped(committed, &sizes, &config)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let commit_s = t_commit.elapsed().as_secs_f64();
+    let t_prove = std::time::Instant::now();
     let proof = multilinear_table::multi_prove(&committed, &config, &mut transcript)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    eprintln!(
+        "ML_EPOCH_TIMING label={label} layout_s={layout_s:.3} commit_s={commit_s:.3} multi_prove_s={:.3}",
+        t_prove.elapsed().as_secs_f64()
+    );
 
     Ok(EpochProof {
         proof,
@@ -832,6 +860,10 @@ fn verify_epochs_bookends(
         return Ok(None);
     }
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    // Every epoch's AIRs come from this ELF: decode it once for all of them.
+    let _decoded = crate::DecodeScope::enter(&elf);
+    let _hashed = statement::DigestScope::enter(elf_bytes);
+    let _programs = stark::lookup::ProgramScope::enter();
     let mut carried = register::register_init_from_entry_point(elf.entry_point);
     let mut bookends = Vec::with_capacity(epochs.len());
     for (index, epoch) in epochs.iter().enumerate() {
@@ -934,16 +966,35 @@ fn verify_epoch_bookend(
     let preprocessed: Vec<Vec<Mle<F>>> = air_refs
         .iter()
         .map(|air| {
+            if air.has_precomputed_closed_form() {
+                return Ok(Vec::new());
+            }
             air.precomputed_columns()
                 .into_iter()
                 .map(|values| Mle::new(values).map_err(|e| Error::Prover(format!("{e:?}"))))
                 .collect::<Result<_, _>>()
         })
         .collect::<Result<_, _>>()?;
+    #[allow(clippy::type_complexity)]
+    let closed_forms: Vec<Option<Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>>> =
+        air_refs
+            .iter()
+            .map(|air| {
+                air.has_precomputed_closed_form().then(|| {
+                    Box::new(move |point: &[FieldElement<E>]| air.precomputed_closed_form(point))
+                        as Box<dyn Fn(&[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> + '_>
+                })
+            })
+            .collect();
     let statements: Vec<TableStatement<'_, F, E>> = layouts
         .iter()
         .zip(&preprocessed)
-        .map(|(layout, cols)| layout.statement_with_preprocessed(cols))
+        .zip(&closed_forms)
+        .map(|((layout, cols), closed)| {
+            let mut statement = layout.statement_with_preprocessed(cols);
+            statement.preprocessed_at = closed.as_deref();
+            statement
+        })
         .collect();
 
     let Some(owed) = owed(

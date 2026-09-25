@@ -616,6 +616,7 @@ fn phases() {
         roots: committed.roots().to_vec(),
         tables: table_proofs,
         columns: vec![columns],
+        jagged: Vec::new(),
     };
     let total = total.elapsed();
 

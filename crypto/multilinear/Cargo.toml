@@ -15,6 +15,7 @@ math = { path = "../math", features = [
 ] }
 crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
 thiserror = "1.0.38"
+sha3 = { version = "0.10.8", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 # pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
 rkyv = { version = "0.8.10", default-features = false, features = [

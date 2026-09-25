@@ -58,7 +58,69 @@ mod imp {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+// Host, `hash-metrics` feature ON: `sha3::Keccak256` plus a finalize counter for
+// [`crate::hash_metrics`]. The counter is a PURE SIDE EFFECT — every method
+// forwards to the inner hasher (byte-identical digest) and is `#[inline(always)]`,
+// so no cross-crate call is added over the bare alias.
+#[cfg(all(not(target_arch = "riscv64"), feature = "hash-metrics"))]
+mod imp {
+    use digest::{
+        FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update,
+    };
+
+    /// The `usize` accumulates bytes absorbed for the CURRENT hash, so
+    /// `finalize` can report the permutation count (`bytes / 136 + 1`). It resets
+    /// to zero on `reset` / `finalize_into_reset`, and `finalize_into` consumes
+    /// `self`.
+    #[derive(Clone, Default)]
+    pub struct PlatformKeccak256(sha3::Keccak256, usize);
+
+    impl HashMarker for PlatformKeccak256 {}
+
+    impl OutputSizeUser for PlatformKeccak256 {
+        type OutputSize = digest::typenum::U32;
+    }
+
+    impl Update for PlatformKeccak256 {
+        #[inline(always)]
+        fn update(&mut self, data: &[u8]) {
+            // Track absorbed bytes (for the finalize permutation count) and the
+            // host-side absorption stats.
+            self.1 += data.len();
+            crate::hash_metrics::count_absorb(data.len());
+            Update::update(&mut self.0, data);
+        }
+    }
+
+    impl FixedOutput for PlatformKeccak256 {
+        #[inline(always)]
+        fn finalize_into(self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_finalize(self.1);
+            FixedOutput::finalize_into(self.0, out);
+        }
+    }
+
+    impl Reset for PlatformKeccak256 {
+        #[inline(always)]
+        fn reset(&mut self) {
+            self.1 = 0;
+            Reset::reset(&mut self.0);
+        }
+    }
+
+    impl FixedOutputReset for PlatformKeccak256 {
+        #[inline(always)]
+        fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
+            crate::hash_metrics::count_finalize(self.1);
+            self.1 = 0;
+            FixedOutputReset::finalize_into_reset(&mut self.0, out);
+        }
+    }
+}
+
+// Default host build (no `hash-metrics` feature): the plain alias, provably
+// unchanged from upstream.
+#[cfg(all(not(target_arch = "riscv64"), not(feature = "hash-metrics")))]
 mod imp {
     pub type PlatformKeccak256 = sha3::Keccak256;
 }

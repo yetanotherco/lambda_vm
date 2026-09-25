@@ -928,8 +928,17 @@ pub struct AirWithBuses<
     #[allow(clippy::type_complexity)]
     precomputed_columns:
         Option<std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>>,
+    /// The precomputed columns' extensions in closed form, for a table that
+    /// has one — see [`AIR::precomputed_closed_form`](crate::traits::AIR::precomputed_closed_form).
+    #[allow(clippy::type_complexity)]
+    precomputed_closed_form:
+        Option<std::sync::Arc<dyn Fn(&[FieldElement<E>]) -> Vec<FieldElement<E>> + Send + Sync>>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
+    /// What makes this table's constraint program the same as another's, for
+    /// a table whose constraints depend on nothing but its kind — see
+    /// [`ProgramScope`]. `None` for a table built from its own parameters.
+    program_key: Option<&'static str>,
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
@@ -963,7 +972,9 @@ impl<
             preprocessed_commitment: self.preprocessed_commitment.clone(),
             num_precomputed_cols: self.num_precomputed_cols,
             precomputed_columns: self.precomputed_columns.clone(),
+            precomputed_closed_form: self.precomputed_closed_form.clone(),
             name: self.name.clone(),
+            program_key: self.program_key,
             max_bus_elements: self.max_bus_elements,
         }
     }
@@ -1050,7 +1061,9 @@ impl<
             preprocessed_commitment: None,
             num_precomputed_cols: None,
             precomputed_columns: None,
+            precomputed_closed_form: None,
             name: None,
+            program_key: None,
             max_bus_elements,
         }
     }
@@ -1108,6 +1121,18 @@ impl<
         )
     }
 
+    /// Adds the precomputed columns' closed form.
+    #[allow(clippy::type_complexity)]
+    pub fn with_precomputed_closed_form(
+        mut self,
+        closed_form: std::sync::Arc<
+            dyn Fn(&[FieldElement<E>]) -> Vec<FieldElement<E>> + Send + Sync,
+        >,
+    ) -> Self {
+        self.precomputed_closed_form = Some(closed_form);
+        self
+    }
+
     /// The same with the commitment deferred: the multilinear path checks the
     /// columns and never forces it.
     pub fn with_lazy_preprocessed_columns(
@@ -1128,6 +1153,48 @@ impl<
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self
+    }
+
+    /// Declares this table's constraints a function of its kind alone, so a
+    /// [`ProgramScope`] may hand it the program another table of the kind
+    /// captured. Only for tables built from the proof options and nothing else.
+    pub fn with_program_key(mut self, key: &'static str) -> Self {
+        self.program_key = Some(key);
+        self
+    }
+}
+
+type ProgramKey = (&'static str, &'static str, (usize, usize), usize);
+
+std::thread_local! {
+    #[allow(clippy::type_complexity)]
+    static PROGRAM_SCOPE: std::cell::RefCell<
+        Option<std::collections::HashMap<ProgramKey, std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Shares constraint programs between tables of the same kind while it lives.
+///
+/// A table's program is captured by running its constraints symbolically,
+/// which on the wide tables is most of what building a verifier's statement
+/// costs — and a verifier of a run of epochs builds the same kinds again for
+/// every epoch. Within the scope a table that declared a
+/// [`program_key`](AirWithBuses::with_program_key) takes the program the first
+/// table of its key captured; the key also carries the constraint set's type,
+/// the trace layout and the number of interactions, so tables that differ in
+/// any of those never share. Outside a scope every table captures its own.
+pub struct ProgramScope;
+
+impl ProgramScope {
+    pub fn enter() -> Self {
+        PROGRAM_SCOPE.with(|scope| *scope.borrow_mut() = Some(Default::default()));
+        ProgramScope
+    }
+}
+
+impl Drop for ProgramScope {
+    fn drop(&mut self) {
+        PROGRAM_SCOPE.with(|scope| *scope.borrow_mut() = None);
     }
 }
 
@@ -1261,11 +1328,35 @@ where
         // CaptureBuilder, matching the folder emission order/indexing exactly.
         self.constraint_program
             .get_or_init(|| {
-                let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
-                self.constraint_set.eval(&mut cb);
-                emit_logup_constraints(&mut cb, &self.logup, self.num_base);
-                let (prog, _degrees) = cb.finish(self.num_base);
-                std::sync::Arc::new(prog)
+                let capture = || {
+                    let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
+                    self.constraint_set.eval(&mut cb);
+                    emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+                    let (prog, _degrees) = cb.finish(self.num_base);
+                    std::sync::Arc::new(prog)
+                };
+                let Some(kind) = self.program_key else {
+                    return capture();
+                };
+                let key: ProgramKey = (
+                    kind,
+                    std::any::type_name::<CS>(),
+                    self.trace_layout,
+                    self.auxiliary_trace_build_data.interactions.len(),
+                );
+                let shared = PROGRAM_SCOPE.with(|scope| {
+                    scope.borrow().as_ref().and_then(|programs| programs.get(&key).cloned())
+                });
+                if let Some(program) = shared.and_then(|p| p.downcast::<crate::constraint_ir::ConstraintProgram<F, E>>().ok()) {
+                    return program;
+                }
+                let program = capture();
+                PROGRAM_SCOPE.with(|scope| {
+                    if let Some(programs) = scope.borrow_mut().as_mut() {
+                        programs.insert(key, program.clone());
+                    }
+                });
+                program
             })
             .as_ref()
     }
@@ -1496,6 +1587,14 @@ where
             .as_ref()
             .map(|build| build())
             .unwrap_or_default()
+    }
+
+    fn has_precomputed_closed_form(&self) -> bool {
+        self.precomputed_closed_form.is_some()
+    }
+
+    fn precomputed_closed_form(&self, point: &[FieldElement<E>]) -> Option<Vec<FieldElement<E>>> {
+        self.precomputed_closed_form.as_ref().map(|f| f(point))
     }
 }
 
