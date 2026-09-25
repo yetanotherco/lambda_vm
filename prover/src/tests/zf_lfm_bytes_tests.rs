@@ -100,13 +100,17 @@ fn lfm_proof_bytes_for_the_device_comparison() {
         let artifacts = build_artifacts(&program, &o);
         match format.one_row {
             OneRowMode::On => assert!(artifacts.one_row_roots.is_some(), "{name}: one-row roots"),
-            OneRowMode::Off => assert!(artifacts.one_row_roots.is_none(), "{name}: no one-row roots"),
+            OneRowMode::Off => assert!(
+                artifacts.one_row_roots.is_none(),
+                "{name}: no one-row roots"
+            ),
             _ => {}
         }
         #[cfg(feature = "cuda")]
-        let (trees0, fri0) = (
+        let (trees0, fri0, all_fri0) = (
             stark::gpu_lde::gpu_one_row_trees(),
             stark::gpu_lde::gpu_one_row_fri_calls(),
+            stark::gpu_lde::gpu_fri_calls(),
         );
         let mut runs: Vec<Vec<u8>> = Vec::with_capacity(2);
         let mut last = None;
@@ -125,9 +129,10 @@ fn lfm_proof_bytes_for_the_device_comparison() {
             last = Some(proved);
         }
         #[cfg(feature = "cuda")]
-        let (trees, fri) = (
+        let (trees, fri, all_fri) = (
             stark::gpu_lde::gpu_one_row_trees() - trees0,
             stark::gpu_lde::gpu_one_row_fri_calls() - fri0,
+            stark::gpu_lde::gpu_fri_calls() - all_fri0,
         );
         let proved = last.expect("proved twice");
         assert_eq!(
@@ -176,8 +181,14 @@ fn lfm_proof_bytes_for_the_device_comparison() {
         #[cfg(feature = "cuda")]
         {
             println!(
-                "ZF LFM DEVICE {name}: {trees} one-row device trees, {fri} one-row device FRI \
-                 commits (two proofs)"
+                "ZF LFM DEVICE {name}: {all_fri} device FRI commits, {trees} one-row device trees, \
+                 {fri} one-row device FRI commits (two proofs)"
+            );
+            // The two large chips (2^16 and 2^20 rows, LDE >= 2^18) are above
+            // the default device floor in every format.
+            assert!(
+                all_fri > 0,
+                "{name}: no FRI commit reached the device: the proof would be a host proof"
             );
             if format.one_row == OneRowMode::On {
                 assert!(
@@ -188,7 +199,11 @@ fn lfm_proof_bytes_for_the_device_comparison() {
                 );
             }
             if format.one_row == OneRowMode::Off {
-                assert_eq!(trees + fri, 0, "{name}: no one-row device work without one row");
+                assert_eq!(
+                    trees + fri,
+                    0,
+                    "{name}: no one-row device work without one row"
+                );
             }
             println!(
                 "ZF LFM DEVMEM {name}: largest one-row tree {} B; device fallbacks {}; \
