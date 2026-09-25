@@ -99,12 +99,14 @@ fn proved_one_row_vectors_equal_the_cpu_bytes() {
     use crate::fri::vectors::{check_or_write, one_row_proof_vectors};
     let fri_before = crate::gpu_lde::gpu_one_row_fri_calls();
     let trees_before = crate::gpu_lde::gpu_one_row_trees();
+    let comp_before = crate::gpu_lde::gpu_composition_calls();
     let mut files = one_row_proof_vectors::<KeccakStarkHash>("keccak");
     files.extend(one_row_proof_vectors::<Blake3StarkHash>("blake3"));
     let fri_commits = crate::gpu_lde::gpu_one_row_fri_calls() - fri_before;
     let trees = crate::gpu_lde::gpu_one_row_trees() - trees_before;
+    let compositions = crate::gpu_lde::gpu_composition_calls() - comp_before;
     println!(
-        "S2DEV vector proofs: {} files, {fri_commits} one-row device FRI commits, {trees} one-row device trees",
+        "S2DEV vector proofs: {} files, {fri_commits} one-row device FRI commits, {trees} one-row device trees, {compositions} device compositions",
         files.len()
     );
     // Two (e) formats x two hashes, two files per proof.
@@ -117,6 +119,12 @@ fn proved_one_row_vectors_equal_the_cpu_bytes() {
         trees >= 3 * 4,
         "every one-row vector proof must build its main, aux and composition trees on the device \
          ({trees} one-row device trees for 4 proofs)"
+    );
+    // Every proof composes on the device (the AIR's constraint program,
+    // I-FIX-D2); a host composition would not be counted here.
+    assert_eq!(
+        compositions, 4,
+        "every one-row vector proof must compose on the device ({compositions} device compositions)"
     );
     let bad = check_or_write(&files, false);
     assert!(

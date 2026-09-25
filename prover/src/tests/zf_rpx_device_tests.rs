@@ -67,10 +67,12 @@ fn parity_legacy_encoding_rpx() {
 fn proved_rpx_vectors_equal_the_cpu_bytes() {
     use stark::fri::vectors::{check_or_write, proof_vectors};
     let before = stark::gpu_lde::gpu_fri_calls();
+    let comp_before = stark::gpu_lde::gpu_composition_calls();
     let files = proof_vectors::<RpxStarkHash>("rpx");
     let device_commits = stark::gpu_lde::gpu_fri_calls() - before;
+    let compositions = stark::gpu_lde::gpu_composition_calls() - comp_before;
     println!(
-        "FRIDEV rpx vector proofs: {} files, {device_commits} device FRI commits",
+        "FRIDEV rpx vector proofs: {} files, {device_commits} device FRI commits, {compositions} device compositions",
         files.len()
     );
     // Five (d) formats (pair, dp, dp_3_1_3 at Q = 3; cap_pair, cap_dp at
@@ -79,6 +81,12 @@ fn proved_rpx_vectors_equal_the_cpu_bytes() {
     assert_eq!(
         device_commits, 5,
         "every vector proof must take the device FRI commit (lower LAMBDA_VM_GPU_LDE_THRESHOLD)"
+    );
+    // Every proof composes on the device (the AIR's constraint program,
+    // I-FIX-D2); a host composition would not be counted here.
+    assert_eq!(
+        compositions, 5,
+        "every RPX vector proof must compose on the device ({compositions} device compositions)"
     );
     let bad = check_or_write(&files, false);
     assert!(
@@ -135,11 +143,13 @@ fn proved_rpx_one_row_vectors_equal_the_cpu_bytes() {
     use stark::fri::vectors::{check_or_write, one_row_proof_vectors};
     let fri_before = stark::gpu_lde::gpu_one_row_fri_calls();
     let trees_before = stark::gpu_lde::gpu_one_row_trees();
+    let comp_before = stark::gpu_lde::gpu_composition_calls();
     let files = one_row_proof_vectors::<RpxStarkHash>("rpx");
     let fri_commits = stark::gpu_lde::gpu_one_row_fri_calls() - fri_before;
     let trees = stark::gpu_lde::gpu_one_row_trees() - trees_before;
+    let compositions = stark::gpu_lde::gpu_composition_calls() - comp_before;
     println!(
-        "S2DEV rpx vector proofs: {} files, {fri_commits} one-row device FRI commits, {trees} one-row device trees",
+        "S2DEV rpx vector proofs: {} files, {fri_commits} one-row device FRI commits, {trees} one-row device trees, {compositions} device compositions",
         files.len()
     );
     assert_eq!(files.len(), 2 * 2);
@@ -151,6 +161,12 @@ fn proved_rpx_one_row_vectors_equal_the_cpu_bytes() {
         trees >= 3 * 2,
         "every one-row vector proof must build its main, aux and composition trees on the device \
          ({trees} one-row device trees for 2 proofs)"
+    );
+    // Every proof composes on the device (the AIR's constraint program,
+    // I-FIX-D2); a host composition would not be counted here.
+    assert_eq!(
+        compositions, 2,
+        "every one-row RPX vector proof must compose on the device ({compositions} device compositions)"
     );
     let bad = check_or_write(&files, false);
     assert!(
