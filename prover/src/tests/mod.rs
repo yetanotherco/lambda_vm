@@ -135,6 +135,8 @@ pub mod zf_air_cache_tests;
 #[cfg(all(test, feature = "cuda"))]
 pub mod zf_rpx_device_tests;
 #[cfg(test)]
+pub mod zf_lfm_bytes_tests;
+#[cfg(test)]
 pub mod zf_rpx_golden_tests;
 #[cfg(test)]
 pub mod zf_rpx_vectors;
