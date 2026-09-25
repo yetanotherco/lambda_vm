@@ -162,13 +162,28 @@ box:
 - After each pass, `verify` compares what ncu profiled with the plan and writes
   `small/ncu/verify.tsv`: `ok`, `partial` or `MISMATCH`.
 
+Ordinals do not survive the tree stages, where sibling proofs launch concurrently: on 09-25
+`merkle_wide`, re-anchored to launch 12044, profiled grids 32 and 16. A shape that lives there
+is therefore a SELECT pass, whose shapes field is a predicate (`select:gridx>=8192,min=2`):
+- ncu runs it with `--filter-mode per-launch-config`, so `-s`/`-c` apply to each launch
+  configuration separately and every configuration of the kernel gets its launches, the wide
+  ones included. There is no `--kill`, so the block runs to its end.
+- The pass's exports are then filtered to the launches with gridDim.x ≥ N (the unfiltered ones
+  stay in `big/ncu/<pass>.*.all`).
+- `verify` passes it only with at least M of them. Otherwise run B logs `ERROR: SELECT PASS
+  MISSED ITS SHAPES` and the run's verdict is FAIL.
+- The preflight profiles the probe kernel with the select flags, so an ncu without
+  per-launch-config fails there, not an hour in.
+
+One pass alone, without run A: `NCU_PASSES=merkle_wide bash scripts/profile/block_profile.sh --skip-nsys`.
+
 | pass | kernel | launches (shape in the trace) | what it settles |
 |---|---|---|---|
 | grind | rpx_grind_search | 5 from the base (1024 × 128, 64 regs) | why 4.46 ns per permutation against 2.77 in the leaf kernel |
 | grind_pair | rpx_grind_search + rpx_grind_search_counted | the `rpx_grind_counted` test: warm-up and seed 0 at poll period 1, shipped then counted | the same, with a counted twin; the warm-up line prints the nonce (executed ≈ nonce + 131,072) |
 | coset | rpx_leaves_base_coset | 2 at 16384 × 128 | the permutation's full-card ceiling |
 | merkle_narrow | rpx_merkle_level | one tree's levels 512 → 2 (incl. grids 512, 32, 2) | latency |
-| merkle_wide | rpx_merkle_level | 16384 and 8192 × 128, the two widest levels of one wrap tree | throughput |
+| merkle_wide | rpx_merkle_level | SELECT: 2 launches of each configuration, kept if gridDim.x ≥ 8192 (base coset trees' 8192, the wraps' 16384) | throughput |
 | tail | rpx_merkle_tail | 3 at 1 × 128 | per-level latency; barrier and local-memory stalls |
 | sumcheck_2p21 | sumcheck_round_ext3 | one 2^21 sumcheck's rounds from 4096 × 256 (98 regs) down, then the two 1181 × 256 | slot-buffer traffic against capped occupancy |
 | sumcheck_slow | sumcheck_round_ext3 | the slow 253 × 32 launches (162, 94, 59 ms) | the same, where it costs most |

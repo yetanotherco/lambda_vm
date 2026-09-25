@@ -47,7 +47,8 @@
 #   SYSROOT_DIR        guest C sysroot (default $HOME/.lambda-vm-sysroot; provisioned when missing)
 #   GPU_METRICS_FREQ   nsys GPU-metrics sampling rate in Hz (default 2000)
 #   NCU_PLAN           run B's plan, a TSV in lib/ncu_plan.py's format (default: default_plan below)
-#   NCU_PASSES         run only these passes of the plan, e.g. "grind merkle_wide"
+#   NCU_PASSES         run only these passes of the plan, e.g. "grind merkle_wide". One pass alone,
+#                      without run A:  NCU_PASSES=merkle_wide bash scripts/profile/block_profile.sh --skip-nsys
 #   NCU_SECTIONS       ncu section identifiers (default: the eight below)
 #   NCU_METRICS        explicit ncu metrics (default: lib/common.sh PF_NCU_METRICS, the analysis's
 #                      list), narrowed by the preflight to what this ncu and GPU can collect
@@ -87,13 +88,18 @@ RECORD_VRAM_MIB=30000 # the record's card: RTX 5090, 32 GB (31.4 GiB usable)
 # the trace analysis asks for (ANALYSIS-1GPU.md §7). ncu has no grid-size filter, so run B
 # re-anchors each window on this box's own run A trace (the nearest index with exactly these
 # shapes) and verifies after each pass that the launches it profiled have them.
+# A row whose shapes field is `select:gridx>=N,min=M` is a SELECT pass instead (lib/ncu_plan.py):
+# ncu runs it with --filter-mode per-launch-config, so skip/count apply to each launch
+# configuration of the kernel; its exports then keep only launches with gridDim.x >= N, and the
+# pass FAILS the run unless at least M of those were profiled. Ordinals do not reproduce in the
+# tree stages (concurrent sibling proofs), so a shape that lives only there is selected this way.
 default_plan() {
   cat <<'PLAN'
 pass	kernel	skip	count	t_ref_s	shapes	note	target
 grind	rpx_grind_search	16	5	4.7	1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1	5 grinds from the base: why 4.46 ns per permutation against 2.77 in the leaf kernel (with grind_pair)	block
 coset	rpx_leaves_base_coset	1	2	3.2	16384,1,1/128,1,1;16384,1,1/128,1,1	the permutation's full-card ceiling	block
 merkle_narrow	rpx_merkle_level	2	9	1.6	512,1,1/128,1,1;256,1,1/128,1,1;128,1,1/128,1,1;64,1,1/128,1,1;32,1,1/128,1,1;16,1,1/128,1,1;8,1,1/128,1,1;4,1,1/128,1,1;2,1,1/128,1,1	one tree's narrow levels, 512 down to 2: latency	block
-merkle_wide	rpx_merkle_level	12493	2	71.5	16384,1,1/128,1,1;8192,1,1/128,1,1	the two widest levels of one wrap tree: throughput	block
+merkle_wide	rpx_merkle_level	0	2	110	select:gridx>=8192,min=2	wide levels (gridDim.x >= 8192): throughput. Selected by SHAPE (per launch configuration), not by ordinal: 09-25's ordinal 12044 landed on a narrow level	block
 tail	rpx_merkle_tail	1	3	3.4	1,1,1/128,1,1;1,1,1/128,1,1;1,1,1/128,1,1	per-level latency; barrier and local-memory stalls	block
 sumcheck_2p21	sumcheck_round_ext3	340	18	3.9	4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;2048,2,1/256,1,1;1024,3,1/256,1,1;512,3,1/256,1,1;512,3,1/128,1,1;512,3,1/64,1,1;512,3,1/32,1,1;256,3,1/32,1,1;128,3,1/32,1,1;64,3,1/32,1,1;32,3,1/32,1,1;16,3,1/32,1,1;1181,1,1/256,1,1;1181,1,1/256,1,1	one 2^21 sumcheck's rounds from 4096x256 down, then the two 1181x256	block
 sumcheck_slow	sumcheck_round_ext3	6929	3	15.3	253,1,1/32,1,1;253,1,1/32,1,1;253,1,1/32,1,1	the slow 253x32 launches: slot-buffer traffic against capped occupancy	block
@@ -320,6 +326,13 @@ preflight() {
         res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe_runb.ncu.log" "${NCU_ARGS[@]}")"
         if [ "$res" = "COUNTERS unlocked" ]; then chk PASS "counters: unlocked; ncu profiled the probe kernel with run B's exact flags"
         else chk FAIL "counters are unlocked but ncu refused run B's flags on the probe kernel: $res"; fi
+        v="$(planned_select_passes)"
+        if [ -n "$v" ]; then
+          ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu_select" select
+          res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe_select.ncu.log" "${NCU_ARGS[@]}")"
+          if [ "$res" = "COUNTERS unlocked" ]; then chk PASS "ncu select passes ($v): this ncu profiled the probe kernel with --filter-mode per-launch-config"
+          else chk FAIL "ncu select passes ($v): ncu refused --filter-mode per-launch-config on the probe kernel: $res (see $TMP/probe/pf_probe_select.ncu.log)"; fi
+        fi
       fi
     fi
   elif [ "$COUNTERS" = 1 ]; then
@@ -649,10 +662,20 @@ nsys_args() { # nsys_args REP_BASE — NSYS_ARGS=(profile ...): run A's flags, s
   NSYS_ARGS+=(--stats=false -f true -o "$1")
 }
 
-ncu_args() { # ncu_args KERNEL SKIP COUNT REP_BASE — NCU_ARGS=(...): run B's flags, shared with the probe
+plan_source() { if [ -n "${NCU_PLAN:-}" ]; then cat "$NCU_PLAN"; else default_plan; fi; }
+planned_select_passes() { # the select passes run B will run (after NCU_PASSES), space-separated
+  plan_source | awk -F'\t' -v keep="${NCU_PASSES:-}" \
+    'NR > 1 && $6 ~ /^select:/ && (keep == "" || index(" " keep " ", " " $1 " ")) { printf "%s%s", (n++ ? " " : ""), $1 }'
+}
+
+ncu_args() { # ncu_args KERNEL SKIP COUNT REP_BASE [select] — NCU_ARGS=(...): run B's flags, shared with the probe
   local s
   NCU_ARGS=(--target-processes all -k "regex:^${1}\$" -s "$2" -c "$3")
-  if [ "$NCU_HAS_KILL" = 1 ]; then NCU_ARGS+=(--kill yes); fi
+  if [ "${5:-}" = select ]; then
+    # skip/count per launch configuration; no --kill: its count is never "reached" as a whole,
+    # so the run goes to its end and every configuration gets its launches
+    NCU_ARGS+=(--filter-mode per-launch-config)
+  elif [ "$NCU_HAS_KILL" = 1 ]; then NCU_ARGS+=(--kill yes); fi
   for s in $NCU_SECTIONS; do NCU_ARGS+=(--section "$s"); done
   if [ -n "$NCU_METRICS_OK" ]; then NCU_ARGS+=(--metrics "$NCU_METRICS_OK"); fi
   NCU_ARGS+=(-f -o "$4")
@@ -765,7 +788,7 @@ PY
 # ======================================================================================
 # run B: Nsight Compute, one pass per kernel
 # ======================================================================================
-RUN_B_VERDICT="skipped"
+RUN_B_VERDICT="skipped" RUN_B_SELECT_FAIL=""
 wait_idle() { # a killed pass must have released the card before the next one starts
   local reading=""
   for _ in $(seq 1 30); do
@@ -777,11 +800,11 @@ wait_idle() { # a killed pass must have released the card before the next one st
 }
 
 run_b() {
-  local pass kernel skip count target bin test rc profiled t0 nbad=0 nshape=0 total=0
+  local pass kernel skip count shapes target bin test rc profiled t0 mode what f nbad=0 nshape=0 total=0
   record_env
   if [ ! -s "$SMALL/env.txt" ]; then write_env_capture; fi
   mkdir -p "$BIG/ncu" "$SMALL/ncu"
-  if [ -n "${NCU_PLAN:-}" ]; then cp "$NCU_PLAN" "$TMP/ncu_plan.in.tsv"; else default_plan > "$TMP/ncu_plan.in.tsv"; fi
+  plan_source > "$TMP/ncu_plan.in.tsv"
   if [ -s "$BIG/blockA.sqlite" ]; then
     python3 "$HERE/lib/ncu_plan.py" anchor "$TMP/ncu_plan.in.tsv" "$BIG/blockA.sqlite" > "$SMALL/ncu/plan.tsv" 2> "$BIG/ncu/anchor.log" \
       || cp "$TMP/ncu_plan.in.tsv" "$SMALL/ncu/plan.tsv"
@@ -791,9 +814,12 @@ run_b() {
     pf_log "run B: no run A trace in this OUT, so the windows are the reference trace's (verified after each pass)"
   fi
   printf 'pass\tkernel\tskip\tcount\trc\tprofiled\tseconds\n' > "$SMALL/ncu/passes.tsv"
-  while IFS=$'\t' read -r pass kernel skip count _ _ _ target; do
+  # shellcheck disable=SC2094 # `ncu_plan.py keep` only READS plan.tsv (it filters the pass's exports)
+  while IFS=$'\t' read -r pass kernel skip count _ shapes _ target; do
     if [ "$pass" = pass ]; then continue; fi
     if [ -n "${NCU_PASSES:-}" ] && [[ " $NCU_PASSES " != *" $pass "* ]]; then continue; fi
+    mode=window what="its launches $skip..$((skip + count - 1))"
+    case "$shapes" in select:*) mode=select what="launches $skip..$((skip + count - 1)) of EACH launch configuration, keeping ${shapes#select:}" ;; esac
     case "$target" in
       block) bin="$BIN"; test="$TEST" ;;
       grind_counted) bin="$GRIND_BIN"; test="$GRIND_TEST" ;;
@@ -801,8 +827,8 @@ run_b() {
     esac
     total=$((total + 1))
     wait_idle
-    step_begin "run B: ncu $pass ($kernel, its launches $skip..$((skip + count - 1)))"
-    ncu_args "$kernel" "$skip" "$count" "$BIG/ncu/$pass"
+    step_begin "run B: ncu $pass ($kernel, $what)"
+    ncu_args "$kernel" "$skip" "$count" "$BIG/ncu/$pass" "$mode"
     t0="$(date +%s)"
     rc=0
     (cd "$REPO/prover" && exec timeout --signal=INT --kill-after=120 "$NCU_PASS_TIMEOUT" \
@@ -817,6 +843,15 @@ run_b() {
       timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page details > "$SMALL/ncu/$pass.details.txt" 2>&1 || true
       timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page details --csv > "$SMALL/ncu/$pass.details.csv" 2>/dev/null || true
       timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page raw --csv > "$BIG/ncu/$pass.raw.csv" 2>/dev/null || true
+      if [ "$mode" = select ]; then # every configuration was profiled; keep the shapes asked for
+        for f in "$SMALL/ncu/$pass.details.txt" "$SMALL/ncu/$pass.details.csv" "$BIG/ncu/$pass.raw.csv"; do
+          if [ -s "$f" ]; then cp "$f" "$BIG/ncu/$(basename "$f").all"; fi
+        done
+        python3 "$HERE/lib/ncu_plan.py" keep "$SMALL/ncu/plan.tsv" "$pass" \
+          "$SMALL/ncu/$pass.details.txt" "$SMALL/ncu/$pass.details.csv" "$BIG/ncu/$pass.raw.csv" \
+          < /dev/null > "$BIG/ncu/$pass.keep.log" 2>&1 || pf_log "ncu $pass: keep failed: see $BIG/ncu/$pass.keep.log"
+        pf_log "ncu $pass: $(head -1 "$BIG/ncu/$pass.keep.log" | sed 's/^.*: kept/kept/') (unfiltered exports: big/ncu/$pass.*.all)"
+      fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pass" "$kernel" "$skip" "$count" "$rc" "$profiled" "$(( $(date +%s) - t0 ))" >> "$SMALL/ncu/passes.tsv"
     # with --kill ncu ends the run itself once the launches are in, so rc alone says little
@@ -829,6 +864,12 @@ run_b() {
     awk -F'\t' -v keep=" $NCU_PASSES " 'NR == 1 || index(keep, " " $1 " ")' "$SMALL/ncu/verify.tsv" > "$TMP/verify.tsv" && mv "$TMP/verify.tsv" "$SMALL/ncu/verify.tsv"
   fi
   nshape="$(awk -F'\t' 'NR > 1 && $3 != "ok" { n++ } END { print n + 0 }' "$SMALL/ncu/verify.tsv")"
+  # a select pass that missed its shapes is a FAILED run, loudly: its whole point is those shapes
+  RUN_B_SELECT_FAIL="$(awk -F'\t' -v sel=" $(planned_select_passes) " \
+    'NR > 1 && $3 != "ok" && index(sel, " " $1 " ") { printf "%s%s: %s", (n++ ? "; " : ""), $1, $3 }' "$SMALL/ncu/verify.tsv")"
+  if [ -n "$RUN_B_SELECT_FAIL" ]; then
+    pf_log "ERROR: SELECT PASS MISSED ITS SHAPES: $RUN_B_SELECT_FAIL (small/ncu/verify.tsv; unfiltered exports in big/ncu/*.all). The run's verdict is FAIL."
+  fi
   pf_log "run B: shape check: $(awk -F'\t' 'NR > 1 && $3 == "ok" { n++ } END { print n + 0 }' "$SMALL/ncu/verify.tsv") pass(es) profiled exactly the planned shapes, $nshape did not (small/ncu/verify.tsv)"
   if compgen -G "$BIG/ncu/*.raw.csv" > /dev/null; then
     python3 "$HERE/lib/ncu_summary.py" --out "$SMALL/ncu" "$BIG"/ncu/*.raw.csv > "$BIG/ncu/summary.log" 2>&1 || true
@@ -852,13 +893,15 @@ estimate() {
   pf_log "  prover builds   ~${p} min   (fresh release CUDA build + the grind test ~25; incremental less)"
   pf_log "  run A           ~${a} min   (~2-4 min of block run under nsys, then export + stats + summary)"
   if [ "$SKIP_NCU" = 0 ]; then
-    while IFS=$'\t' read -r pass kernel skip count tref rest; do
+    while IFS=$'\t' read -r pass kernel skip count tref shapes rest; do
       if [ "$pass" = pass ]; then continue; fi
       if [ -n "${NCU_PASSES:-}" ] && [[ " $NCU_PASSES " != *" $pass "* ]]; then continue; fi
       case "$tref" in ''|-|*[!0-9.]*) tref=110 ;; esac
+      # a select pass runs the whole block and profiles `count` launches of each of ~16 configurations
+      case "$shapes" in select:*) tref=110; count=$((count * 16)) ;; esac
       b="$(awk -v b="$b" -v t="$tref" -v c="$count" 'BEGIN { printf "%.0f", b + 60 + 2.5 * t + 20 * c }')"
       pf_log "  run B  $(printf '%-14s' "$pass") ~$(awk -v t="$tref" -v c="$count" 'BEGIN { printf "%.1f", (60 + 2.5 * t + 20 * c) / 60 }') min"
-    done < <(if [ -n "${NCU_PLAN:-}" ]; then cat "$NCU_PLAN"; else default_plan; fi)
+    done < <(plan_source)
     pf_log "  run B total     ~$((b / 60)) min   (per pass: 60 s start + 2.5 x the window's time into the run + 20 s per launch)"
   fi
   pf_log "  TOTAL           ~$(( g + p + a + b / 60 )) min"
@@ -934,6 +977,7 @@ finish() {
   verdict="PASS"
   if [ "$SKIP_NSYS" = 0 ] && [ "$RUN_A_VERDICT" != ok ]; then verdict="PARTIAL"; fi
   if [ "$SKIP_NCU" = 0 ] && [ "${RUN_B_VERDICT%% *}" != ok ]; then verdict="PARTIAL"; fi
+  if [ -n "$RUN_B_SELECT_FAIL" ]; then verdict="FAIL (select pass: $RUN_B_SELECT_FAIL)"; fi
   # Scan, write SEND-BACK, and scan again: the second scan is the authority, over the final files.
   rm -f "$OUT/small.tar.gz"
   if scan="$(pf_scan_bundle "$SMALL" "$BIG/bundle_scan.txt")"; then safe=1; fi
