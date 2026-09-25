@@ -187,7 +187,7 @@ All values that are to be communicated from one part to another, are stated on t
 For each value on the record, the "sending" half _verifies_ that it is as expected, 
 whilst the "receiving" half _assumes_ its correctness and resumes verification under this assumption.
 One can now conclude that the proof satisfies the instance
-when both algorithm-halves produce the same record for this input.
+when both algorithm-halves accept the same record for this input.
 
 #aside("Coupling")[
   As observed, both verification halves must be synchronized to correctly verify a proof.
@@ -205,7 +205,7 @@ when both algorithm-halves produce the same record for this input.
 ]
 
 More formally, we define
-$v_0, v_1: instanceSpace times proofSpace to recordSpace$ as a valid _split_ of 
+$v_0, v_1: commitmentSpace times proofSpace to recordSpace$ as a valid _split_ of 
 verifier $v in verifierSpace$ if
 $
   forall (instance, proof) in instanceSpace times proofSpace: v(comm(instance), proof) = 1 iff v_0(comm(instance), proof) = v_1(comm(instance), proof),
