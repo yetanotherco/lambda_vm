@@ -20,9 +20,10 @@
 //! - `legacy`: every lever off;
 //! - `one_row_1`: legacy + one row on every chip;
 //! - `production`: the STARK levers of the prover's default format
-//!   ([`crate::zf_format::ZfFormat::DEFAULT`]: cap auto, fri dp, one row off),
+//!   ([`crate::zf_format::ZfFormat::DEFAULT`]: cap auto, fri dp, one_row auto),
 //!   asserted equal to what that default stamps so the two cannot drift;
-//! - `all_levers`: every STARK lever on (cap auto, fri dp, one_row auto).
+//! - `no_one_row`: the default without one-row openings (cap auto, fri dp,
+//!   one_row 0).
 //!
 //! Under cuda the `one_row_1` proof must build one-row trees on the device and
 //! take the one-row device FRI commit (a silent host fallback would still give
@@ -48,7 +49,7 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
     let production = ProofFormat {
         merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
         fri_mode: FriMode::Dp,
-        one_row: OneRowMode::Off,
+        one_row: OneRowMode::Auto,
         fri_schedule_override: None,
     };
     assert_eq!(
@@ -67,9 +68,9 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         ),
         ("production", production),
         (
-            "all_levers",
+            "no_one_row",
             ProofFormat {
-                one_row: OneRowMode::Auto,
+                one_row: OneRowMode::Off,
                 ..production
             },
         ),
