@@ -1456,6 +1456,21 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     }
     let label_refs: Vec<&[u64]> = labels.iter().map(|l| &l[..]).collect();
     let label_range = (labels[0][0], labels[FAN_IN - 1][0]);
+    // S2: how many of each wrap's sub-proofs the node verifies at one-row
+    // leaves (0 at the default format, all at `one_row = 1`, the AIR widths'
+    // choice at `auto`). One parseable line per child for the box wrapper.
+    for (k, c) in children.iter().enumerate() {
+        let one_row = c
+            .legs
+            .iter()
+            .filter(|l| l.verify.sub.layout.is_one_row())
+            .count();
+        println!(
+            "ZFS2NODE child={k} {} sub_proofs={} one_row_legs={one_row}",
+            crate::zf_format::ZfFormat::global().banner(),
+            c.legs.len()
+        );
+    }
     println!(
         "   {FAN_IN} epoch wraps proved in {:.1}s, {} published words each, \
          {} sub-proofs each\n   RSS high-water AFTER the wrap proves: {:?} GiB",
