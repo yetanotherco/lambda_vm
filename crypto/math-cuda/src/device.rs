@@ -182,6 +182,7 @@ pub struct Backend {
     pub ntt_dit_level_batched: CudaFunction,
     pub ntt_dit_8_levels_batched: CudaFunction,
     pub ntt_dit_8_levels_batched_spread: CudaFunction,
+    pub copy_prefix_batched: CudaFunction,
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
     // row-major NTT kernels
@@ -422,6 +423,7 @@ impl Backend {
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
             ntt_dit_8_levels_batched_spread: ntt
                 .load_function("ntt_dit_8_levels_batched_spread")?,
+            copy_prefix_batched: ntt.load_function("copy_prefix_batched")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
             bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,

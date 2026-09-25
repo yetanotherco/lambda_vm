@@ -326,7 +326,7 @@ fn row_major_8_levels_cfg(m: u64, row_blocks: u64) -> LaunchConfig {
 /// [`spread_load_applies`], the prefix rows are bit-reversed at size `n` and
 /// levels 0..8 load the expansion straight from them.
 fn run_row_major_forward_ntt_from_prefix(
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     be: &Backend,
     buf: &mut CudaSlice<u64>,
     fwd_tw: &CudaSlice<u64>,
@@ -344,21 +344,40 @@ fn run_row_major_forward_ntt_from_prefix(
     if n > 1 {
         launch_bit_reverse_row_major(stream, be, buf, n, log_n, m)?;
     }
-    for (lo, hi) in spread_waves(lde_size / 256, log_spread) {
-        unsafe {
-            stream
-                .launch_builder(&be.ntt_dit_8_levels_row_major_spread)
-                .arg(&mut *buf)
-                .arg(fwd_tw)
-                .arg(&lde_size)
-                .arg(&log_lde)
-                .arg(&m)
-                .arg(&log_spread)
-                .arg(&lo)
-                .arg(&hi)
-                .launch(row_major_8_levels_cfg(m, hi - lo))?;
-        }
+    let spread = |buf: &mut CudaSlice<u64>,
+                  src: Option<&CudaSlice<u64>>,
+                  rb_lo: u64,
+                  rb_hi: u64|
+     -> Result<()> {
+        let null_src = 0u64; // nullptr: read the prefix rows in place
+        let mut launch = stream.launch_builder(&be.ntt_dit_8_levels_row_major_spread);
+        launch.arg(&mut *buf);
+        match src {
+            Some(src) => launch.arg(src),
+            None => launch.arg(&null_src),
+        };
+        launch
+            .arg(fwd_tw)
+            .arg(&lde_size)
+            .arg(&log_lde)
+            .arg(&m)
+            .arg(&log_spread)
+            .arg(&rb_lo)
+            .arg(&rb_hi);
+        unsafe { launch.launch(row_major_8_levels_cfg(m, rb_hi - rb_lo)) }?;
+        Ok(())
+    };
+    let (waves, tail) = spread_schedule(lde_size / 256, log_spread);
+    for (lo, hi) in waves {
+        spread(buf, None, lo, hi)?;
     }
+    // The last `tail` row blocks: copy their (contiguous) prefix rows aside
+    // and expand them in one launch.
+    let tail_len = (((tail * 256) >> log_spread) * m) as usize;
+    // SAFETY: the D2D copy fills all of it before the spread launch reads it.
+    let mut tail_src = unsafe { stream.alloc::<u64>(tail_len) }?;
+    stream.memcpy_dtod(&buf.slice(0..tail_len), &mut tail_src)?;
+    spread(buf, Some(&tail_src), 0, tail)?;
     run_row_major_ntt_levels(stream, be, buf, fwd_tw, lde_size, log_lde, 8, m)
 }
 
@@ -619,7 +638,7 @@ fn expand_row_major_on_stream(
 
     // Forward NTT at lde_size.
     run_row_major_forward_ntt_from_prefix(
-        stream.as_ref(),
+        stream,
         be,
         &mut buf,
         fwd_tw.as_ref(),
@@ -1256,7 +1275,7 @@ pub fn coset_lde_batch_base(
     let weights_dev = stream.clone_htod(weights)?;
 
     run_batched_coset_lde(
-        stream.as_ref(),
+        &stream,
         be,
         &mut buf,
         inv_tw.as_ref(),
@@ -1373,7 +1392,7 @@ pub fn coset_lde_batch_base_into(
     let weights_dev = stream.clone_htod(weights)?;
 
     run_batched_coset_lde(
-        stream.as_ref(),
+        &stream,
         be,
         &mut buf,
         inv_tw.as_ref(),
@@ -1513,7 +1532,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     let col_stride_u64 = lde_size as u64;
 
     run_batched_coset_lde(
-        stream.as_ref(),
+        &stream,
         be,
         &mut buf,
         inv_tw.as_ref(),
@@ -1720,7 +1739,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     // Input is already coefficients (no iFFT): coset scaling, then the forward
     // NTT at lde_size.
     run_batched_coset_eval(
-        stream.as_ref(),
+        &stream,
         be,
         &mut buf,
         fwd_tw.as_ref(),
@@ -1912,7 +1931,7 @@ pub fn coset_lde_batch_ext3_into(
     // Butterflies: identical to the base-field batched path, but over 3M
     // slabs instead of M columns.
     run_batched_coset_lde(
-        stream.as_ref(),
+        &stream,
         be,
         &mut buf,
         inv_tw.as_ref(),
@@ -1997,7 +2016,7 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     let weights_dev = stream.clone_htod(weights)?;
 
     run_batched_coset_lde(
-        stream.as_ref(),
+        stream,
         be,
         &mut buf,
         inv_tw.as_ref(),
@@ -2052,7 +2071,7 @@ pub fn coset_lde_batch_ext3_slabs_keep(
 /// [`spread_load_applies`], in which case it is never read.
 #[allow(clippy::too_many_arguments)]
 fn run_batched_coset_lde(
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     be: &Backend,
     buf: &mut CudaSlice<u64>,
     inv_tw: &CudaSlice<u64>,
@@ -2074,7 +2093,7 @@ fn run_batched_coset_lde(
 /// and evaluate at `lde_size` points with the forward NTT, in place.
 #[allow(clippy::too_many_arguments)]
 fn run_batched_coset_eval(
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     be: &Backend,
     buf: &mut CudaSlice<u64>,
     fwd_tw: &CudaSlice<u64>,
@@ -2095,7 +2114,7 @@ fn run_batched_coset_eval(
 /// otherwise the zero-tailed buffer is bit-reversed at `lde_size` as before.
 #[allow(clippy::too_many_arguments)]
 fn run_batched_forward_ntt_from_prefix(
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     be: &Backend,
     buf: &mut CudaSlice<u64>,
     fwd_tw: &CudaSlice<u64>,
@@ -2115,25 +2134,59 @@ fn run_batched_forward_ntt_from_prefix(
     if n > 1 {
         launch_bit_reverse_batched(stream, be, buf, n, log_n, col_stride, m)?;
     }
-    for (lo, hi) in spread_waves(lde_size / 256, log_spread) {
+    let spread = |buf: &mut CudaSlice<u64>,
+                  src: Option<&CudaSlice<u64>>,
+                  lo: u64,
+                  blocks: u64,
+                  src_stride: u64|
+     -> Result<()> {
+        let null_src = 0u64; // nullptr: read the prefix in place
+        let mut launch = stream.launch_builder(&be.ntt_dit_8_levels_batched_spread);
+        launch.arg(&mut *buf);
+        match src {
+            Some(src) => launch.arg(src),
+            None => launch.arg(&null_src),
+        };
+        launch
+            .arg(fwd_tw)
+            .arg(&lde_size)
+            .arg(&log_lde)
+            .arg(&log_spread)
+            .arg(&lo)
+            .arg(&col_stride)
+            .arg(&src_stride);
         let cfg = LaunchConfig {
-            grid_dim: ((hi - lo) as u32, m, 1),
+            grid_dim: (blocks as u32, m, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
-            stream
-                .launch_builder(&be.ntt_dit_8_levels_batched_spread)
-                .arg(&mut *buf)
-                .arg(fwd_tw)
-                .arg(&lde_size)
-                .arg(&log_lde)
-                .arg(&log_spread)
-                .arg(&lo)
-                .arg(&col_stride)
-                .launch(cfg)?;
-        }
+        unsafe { launch.launch(cfg) }?;
+        Ok(())
+    };
+    let (waves, tail) = spread_schedule(lde_size / 256, log_spread);
+    for (lo, hi) in waves {
+        spread(buf, None, lo, hi - lo, 0)?;
     }
+    // The last `tail` blocks: set their prefix slots aside, expand in one go.
+    let tail_len = (tail * 256) >> log_spread;
+    // SAFETY: `copy_prefix_batched` writes all `tail_len` slots of all `m`
+    // columns before the spread launch reads them (same stream).
+    let mut tail_src = unsafe { stream.alloc::<u64>(tail_len as usize * m as usize) }?;
+    let copy_cfg = LaunchConfig {
+        grid_dim: ((tail_len as u32).div_ceil(256), m, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.copy_prefix_batched)
+            .arg(&mut tail_src)
+            .arg(&*buf)
+            .arg(&tail_len)
+            .arg(&col_stride)
+            .launch(copy_cfg)?;
+    }
+    spread(buf, Some(&tail_src), 0, tail, tail_len)?;
     run_batched_ntt_levels(stream, buf, fwd_tw, lde_size, log_lde, 8, col_stride, m)
 }
 
@@ -2166,27 +2219,32 @@ fn alloc_lde_scratch(
     }
 }
 
-/// Block waves for the in-place spread kernels, highest first. Block `b`
+/// Row blocks (per column) at or below which the spread load stops running
+/// in-place waves. Each further wave would be a tiny launch paying the ~15 µs
+/// latency floor of an 8-level kernel (on the real block: ~6k such launches,
+/// ~27% of the spread time); instead the remaining blocks read a copy of their
+/// prefix slots and expand in a single launch.
+const SPREAD_TAIL_BLOCKS: u64 = 256;
+
+/// Launch plan for the spread kernels: in-place waves, highest first, then a
+/// tail of blocks `[0, tail)` that read a copy of their prefix slots. Block `b`
 /// reads prefix slots `[b*256, (b+1)*256) >> log_spread` and writes
 /// `[b*256, (b+1)*256)`. A wave `[lo, hi)` with `hi <= lo << log_spread` only
-/// reads below `lo*256`, so it never reads a slot it writes; the earlier waves
-/// wrote only above `hi*256`, past every slot it reads; the later ones write
-/// below `lo*256`, after it has read. Block 0 overlaps itself (a block loads
-/// its whole tile before storing it, so that is safe) and runs alone, last.
-fn spread_waves(num_blocks: u64, log_spread: u64) -> Vec<(u64, u64)> {
+/// reads below `lo*256`, so never a slot it writes; the earlier waves wrote
+/// only at or above `hi*256`, past every slot it reads; the later ones write
+/// below `lo*256`, after it has read. The tail's sources lie below
+/// `tail*256 >> log_spread`, which no wave writes, so copying them after the
+/// waves still captures the prefix.
+fn spread_schedule(num_blocks: u64, log_spread: u64) -> (Vec<(u64, u64)>, u64) {
     debug_assert!((1..=8).contains(&log_spread));
     let mut waves = Vec::new();
     let mut hi = num_blocks;
-    while hi > 0 {
-        let lo = if hi == 1 {
-            0
-        } else {
-            hi.div_ceil(1 << log_spread)
-        };
+    while hi > SPREAD_TAIL_BLOCKS {
+        let lo = hi.div_ceil(1 << log_spread);
         waves.push((lo, hi));
         hi = lo;
     }
-    waves
+    (waves, hi)
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched
@@ -2284,7 +2342,7 @@ fn run_batched_ntt_levels(
 
 #[cfg(test)]
 mod tests {
-    use super::{spread_load_applies, spread_waves};
+    use super::{SPREAD_TAIL_BLOCKS, spread_load_applies, spread_schedule};
 
     fn rev(i: usize, bits: u32) -> usize {
         if bits == 0 {
@@ -2295,10 +2353,12 @@ mod tests {
     }
 
     /// Replays the spread kernels' data movement on the host: the prefix is
-    /// bit-reversed at size `n`, then each wave loads every block's tile
+    /// bit-reversed at size `n`; each in-place wave loads every block's tile
     /// (slot `r` <- prefix[r >> log_spread] when its low bits are zero, else
-    /// 0) and stores it back. Checks that no block reads a slot written by an
-    /// earlier wave or by another block of its own wave, that every slot is
+    /// 0) and stores it back; then the tail's prefix slots are copied aside
+    /// and the tail blocks load from the copy. Checks that no wave reads a
+    /// slot written by an earlier wave or by a block of its own wave, that the
+    /// copy happens before any of its slots is overwritten, that every slot is
     /// written exactly once, and that the tiles equal the old path's input:
     /// the zero-padded buffer bit-reversed at `lde_size`.
     fn replay_spread(log_n: u32, log_spread: u32) {
@@ -2315,51 +2375,71 @@ mod tests {
             }
         }
 
-        // Prefix bit-reversed at size n; the tail is garbage the kernels must
-        // never read.
+        // Prefix bit-reversed at size n; the padding is garbage the kernels
+        // must never read.
         let mut buf = vec![u64::MAX; lde];
         for h in 0..n {
             buf[h] = coeffs[rev(h, log_n)];
         }
         let mut written = vec![false; lde];
         let mask = (1usize << log_spread) - 1;
-
-        let waves = spread_waves((lde / 256) as u64, log_spread as u64);
-        assert_eq!(waves.last(), Some(&(0, 1)), "block 0 must run alone, last");
-        for &(lo, hi) in &waves {
-            let (lo, hi) = (lo as usize, hi as usize);
-            assert!(lo < hi);
-            let own = lo * 256..hi * 256;
-            let mut tiles = Vec::new();
-            for blk in lo..hi {
-                let tile: Vec<u64> = (0..256)
-                    .map(|t| {
-                        let row = blk * 256 + t;
-                        if row & mask != 0 {
-                            return 0;
-                        }
-                        let src = row >> log_spread;
-                        assert!(src < n, "read past the prefix");
-                        assert!(!written[src], "read a slot an earlier wave wrote");
-                        let same_block = src / 256 == blk;
-                        assert!(
-                            !own.contains(&src) || (same_block && (lo, hi) == (0, 1)),
-                            "wave {lo}..{hi} reads slot {src} it also writes"
-                        );
-                        buf[src]
-                    })
-                    .collect();
-                tiles.push((blk, tile));
-            }
-            for (blk, tile) in tiles {
-                for (t, v) in tile.into_iter().enumerate() {
+        let tile = |blk: usize, src: &dyn Fn(usize) -> u64| -> Vec<u64> {
+            (0..256)
+                .map(|t| {
                     let row = blk * 256 + t;
-                    assert!(!written[row], "slot {row} written twice");
-                    written[row] = true;
-                    buf[row] = v;
-                }
+                    if row & mask != 0 {
+                        0
+                    } else {
+                        src(row >> log_spread)
+                    }
+                })
+                .collect()
+        };
+        fn store(blk: usize, tile: Vec<u64>, buf: &mut [u64], written: &mut [bool]) {
+            for (t, v) in tile.into_iter().enumerate() {
+                let row = blk * 256 + t;
+                assert!(!written[row], "slot {row} written twice");
+                written[row] = true;
+                buf[row] = v;
             }
         }
+
+        let (waves, tail) = spread_schedule((lde / 256) as u64, log_spread as u64);
+        for &(lo, hi) in &waves {
+            let (lo, hi) = (lo as usize, hi as usize);
+            let own = lo * 256..hi * 256;
+            let tiles: Vec<(usize, Vec<u64>)> = (lo..hi)
+                .map(|blk| {
+                    let t = tile(blk, &|src| {
+                        assert!(src < n, "read past the prefix");
+                        assert!(!written[src], "read a slot an earlier wave wrote");
+                        assert!(
+                            !own.contains(&src),
+                            "wave {lo}..{hi} reads slot {src} it writes"
+                        );
+                        buf[src]
+                    });
+                    (blk, t)
+                })
+                .collect();
+            for (blk, t) in tiles {
+                store(blk, t, &mut buf, &mut written);
+            }
+        }
+
+        let tail = tail as usize;
+        let tail_len = (tail * 256) >> log_spread;
+        assert!(tail_len <= n);
+        assert!(
+            written[..tail_len].iter().all(|&w| !w),
+            "a wave overwrote the tail's sources before the copy"
+        );
+        let copy = buf[..tail_len].to_vec();
+        for blk in 0..tail {
+            let t = tile(blk, &|src| copy[src]);
+            store(blk, t, &mut buf, &mut written);
+        }
+
         assert!(written.iter().all(|&w| w), "some slot never written");
         assert_eq!(buf, expected, "log_n={log_n} log_spread={log_spread}");
     }
@@ -2367,8 +2447,8 @@ mod tests {
     #[test]
     fn spread_load_reproduces_the_bit_reversed_padded_input() {
         for log_spread in 1..=8u32 {
-            // lde_size from the 256 minimum up to several waves' worth.
-            for log_lde in 8..=16u32 {
+            // lde_size from the 256 minimum (tail only) to several waves.
+            for log_lde in 8..=19u32 {
                 if log_lde > log_spread {
                     replay_spread(log_lde - log_spread, log_spread);
                 }
@@ -2377,21 +2457,22 @@ mod tests {
     }
 
     #[test]
-    fn spread_waves_cover_every_block_once_highest_first() {
+    fn spread_schedule_tiles_blocks_downward_and_stops_at_the_tail() {
         for log_spread in 1..=8u64 {
-            for num_blocks in 1..=300u64 {
-                let waves = spread_waves(num_blocks, log_spread);
+            for num_blocks in (1..=2000u64).chain([1 << 15, (1 << 16) + 3]) {
+                let (waves, tail) = spread_schedule(num_blocks, log_spread);
                 let mut next_hi = num_blocks;
                 for &(lo, hi) in &waves {
-                    assert_eq!(hi, next_hi, "waves must tile [0, num_blocks) downward");
+                    assert_eq!(hi, next_hi, "waves must tile the blocks downward");
                     assert!(lo < hi);
                     assert!(
-                        (lo, hi) == (0, 1) || hi <= lo << log_spread,
-                        "wave {lo}..{hi} would read its own writes"
+                        hi <= lo << log_spread,
+                        "wave {lo}..{hi} reads its own writes"
                     );
                     next_hi = lo;
                 }
-                assert_eq!(next_hi, 0);
+                assert_eq!(tail, next_hi, "the tail starts where the waves stop");
+                assert!(tail >= 1 && tail <= SPREAD_TAIL_BLOCKS.min(num_blocks));
             }
         }
     }

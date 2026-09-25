@@ -171,35 +171,51 @@ extern "C" __global__ void ntt_dit_8_levels_batched(uint64_t *data,
 // `bit_reverse_permute_batched` over the prefix); slot `r` of the expansion
 // is then prefix[r >> log_spread] when the low `log_spread` bits of r are
 // zero, and 0 otherwise — exactly what `bit_reverse_permute_batched` over the
-// zero-tailed buffer used to produce, so the butterflies see the same tile.
-// The tail [n >> log_spread, n) is never read and need not be zeroed.
+// zero-padded buffer used to produce, so the butterflies see the same tile.
+// The padding [n >> log_spread, n) is never read and need not be zeroed.
 //
-// In place: block `blk` reads prefix slots [blk*256, blk*256+256) >> log_spread
-// and writes slots [blk*256, blk*256+256). The host launches the blocks in
-// descending waves [block_lo, block_hi) with block_hi <= block_lo << log_spread,
-// so no wave reads a slot another block of the same wave writes (block 0,
-// which overlaps itself, runs alone and loads before it stores).
-// Grid: x = block_hi - block_lo, y = column. Requires 1 <= log_spread <= 8.
+// Block `blk` reads prefix slots [blk*256, blk*256+256) >> log_spread and
+// writes slots [blk*256, blk*256+256). With `src == nullptr` the prefix is
+// read in place from `data`, and the host launches descending waves
+// [block_lo, block_hi) with block_hi <= block_lo << log_spread so no wave reads
+// a slot a block of the same wave writes. The last, small blocks instead read
+// a copy of their prefix slots from `src` (column c at c * src_stride), all in
+// one launch. Grid: x = blocks in the launch, y = column. 1 <= log_spread <= 8.
 extern "C" __global__ void ntt_dit_8_levels_batched_spread(uint64_t *data,
+                                                           const uint64_t *src,
                                                            const uint64_t *tw,
                                                            uint64_t n,
                                                            uint64_t log_n,
                                                            uint64_t log_spread,
                                                            uint64_t block_lo,
-                                                           uint64_t col_stride) {
+                                                           uint64_t col_stride,
+                                                           uint64_t src_stride) {
     __shared__ uint64_t tile[256];
     uint64_t *x = data + (uint64_t)blockIdx.y * col_stride;
+    const uint64_t *s = src ? src + (uint64_t)blockIdx.y * src_stride : x;
 
     uint64_t blk = block_lo + blockIdx.x;
     uint64_t row = blk * 256 + threadIdx.x;
     uint64_t spread_mask = (1ULL << log_spread) - 1;
 
-    tile[threadIdx.x] = (row & spread_mask) ? 0ULL : x[row >> log_spread];
+    tile[threadIdx.x] = (row & spread_mask) ? 0ULL : s[row >> log_spread];
     __syncthreads();
 
     dit_8_levels_tile(tile, tw, n, log_n, 0, (uint32_t)blk);
 
     x[row] = tile[threadIdx.x];
+}
+
+// dst[c * len + i] = src[c * src_stride + i] for i < len: sets aside the
+// prefix slots the spread kernel's last blocks read, so they can expand out of
+// place in one launch. Grid: x = ceil(len / 256), y = column.
+extern "C" __global__ void copy_prefix_batched(uint64_t *__restrict__ dst,
+                                               const uint64_t *__restrict__ src,
+                                               uint64_t len,
+                                               uint64_t src_stride) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    dst[(uint64_t)blockIdx.y * len + i] = src[(uint64_t)blockIdx.y * src_stride + i];
 }
 
 
@@ -489,9 +505,10 @@ extern "C" __global__ void matrix_transpose_strided(
 // padded (pitch = T+1) to break bank conflicts on the butterfly accesses.
 // Body of the row-major 8-level kernels over the 256-row blocks
 // [rb_lo, rb_hi). With log_spread == 0 each tile row is loaded from the same
-// row (the plain kernel); with log_spread > 0 it is the spread load described
-// at `ntt_dit_8_levels_row_major_spread`.
+// row of `src` (the plain kernel passes src == data); with log_spread > 0 it
+// is the spread load described at `ntt_dit_8_levels_row_major_spread`.
 __device__ __forceinline__ void dit_8_levels_row_major_blocks(uint64_t *data,
+                                                              const uint64_t *src,
                                                               const uint64_t *tw,
                                                               uint64_t n,
                                                               uint64_t log_n,
@@ -521,7 +538,7 @@ __device__ __forceinline__ void dit_8_levels_row_major_blocks(uint64_t *data,
             uint64_t row = row_base + r;
             if (live)
                 tile[r * pitch + threadIdx.x] =
-                    (row & spread_mask) ? 0ULL : data[(row >> log_spread) * m + col];
+                    (row & spread_mask) ? 0ULL : src[(row >> log_spread) * m + col];
         }
         __syncthreads();
 
@@ -562,7 +579,7 @@ extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
                                                       uint64_t log_n,
                                                       uint64_t m)
 {
-    dit_8_levels_row_major_blocks(data, tw, n, log_n, m, 0, 0, n >> 8);
+    dit_8_levels_row_major_blocks(data, data, tw, n, log_n, m, 0, 0, n >> 8);
 }
 
 // Row-major analog of `ntt_dit_8_levels_batched_spread`: levels 0..7 of a
@@ -570,11 +587,14 @@ extern "C" __global__ void ntt_dit_8_levels_row_major(uint64_t *data,
 // compact first n >> log_spread rows (already row-bit-reversed at that size)
 // instead of being materialised. Row `r` of the expansion is compact row
 // r >> log_spread when the low `log_spread` bits of r are zero, else 0; rows
-// past the compact prefix are never read. In place, launched in descending
-// waves of row blocks [rb_lo, rb_hi) with rb_hi <= rb_lo << log_spread (block
-// 0 alone last) so no wave reads a row it also writes. Same grid shape as
-// `ntt_dit_8_levels_row_major`, with y covering the wave. 1 <= log_spread <= 8.
+// past the compact prefix are never read. With `src == nullptr` the prefix is
+// read in place from `data`, launched in descending waves of row blocks
+// [rb_lo, rb_hi) with rb_hi <= rb_lo << log_spread so no wave reads a row it
+// also writes; the last, small blocks read a copy of their prefix rows from
+// `src` (same row stride m) in one launch. Same grid shape as
+// `ntt_dit_8_levels_row_major`, with y covering the launch. 1 <= log_spread <= 8.
 extern "C" __global__ void ntt_dit_8_levels_row_major_spread(uint64_t *data,
+                                                             const uint64_t *src,
                                                              const uint64_t *tw,
                                                              uint64_t n,
                                                              uint64_t log_n,
@@ -583,5 +603,6 @@ extern "C" __global__ void ntt_dit_8_levels_row_major_spread(uint64_t *data,
                                                              uint64_t rb_lo,
                                                              uint64_t rb_hi)
 {
-    dit_8_levels_row_major_blocks(data, tw, n, log_n, m, log_spread, rb_lo, rb_hi);
+    dit_8_levels_row_major_blocks(data, src ? src : data, tw, n, log_n, m, log_spread,
+                                  rb_lo, rb_hi);
 }

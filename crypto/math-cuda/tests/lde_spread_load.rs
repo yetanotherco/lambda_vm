@@ -9,7 +9,8 @@
 //! a single output bit, so every comparison here is on raw (non-canonical)
 //! u64s. The shapes straddle the fused-load thresholds: below the 8-level
 //! kernel (lde < 256), exactly one block, one prefix slot per block (blowup
-//! 256), past it (blowup 512), and blowup 1 (no padding at all).
+//! 256), past it (blowup 512), blowup 1 (no padding at all), and both sides
+//! of the switch from in-place waves to the single copied-tail launch.
 
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
@@ -32,7 +33,10 @@ const SHAPES: &[(u32, usize)] = &[
     (9, 4),
     (11, 8),
     (13, 2),
-    (12, 16),
+    (12, 16), // 256 blocks: the largest tail-only shape
+    (16, 2),  // 512 blocks: one in-place wave, then the tail
+    (15, 8),  // log_spread 3 with waves
+    (17, 4),  // several waves
 ];
 
 fn coset_weights(n: usize, g: u64) -> Vec<u64> {
