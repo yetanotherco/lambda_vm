@@ -272,12 +272,11 @@ preflight() {
     if [ -z "$probe" ]; then chk FAIL "probe: could not build the one-kernel CUDA probe: see $TMP/probe/pf_probe.build.log"; fi
   fi
   if [ -n "$probe" ] && [ -n "$NCU_BIN" ]; then
-    if [ "$SKIP_NCU" = 1 ]; then res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log")"
-    else
-      ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu"
-      res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log" "${NCU_ARGS[@]}")"
-    fi
-    if [ "$SKIP_NCU" = 1 ] && [ "$COUNTERS" = 0 ]; then chk INFO "counters: $res (not needed with --no-counters)"
+    # with run B's own flags in every mode: ncu parses them before it touches the counters, so
+    # even a locked box shows whether this ncu accepts them ('locked' = accepted, then refused)
+    ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu"
+    res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log" "${NCU_ARGS[@]}")"
+    if [ "$SKIP_NCU" = 1 ] && [ "$COUNTERS" = 0 ]; then chk INFO "counters: $res (not needed with --no-counters; 'locked' also means ncu accepted run B's flags)"
     elif [ "$res" = "COUNTERS unlocked" ]; then chk PASS "counters: $res (ncu profiled the probe kernel)"
     else
       chk FAIL "counters: $res. Unlock (as root: echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' > /etc/modprobe.d/nvidia-profiling.conf, update-initramfs -u, reboot), or run as root, or pass --no-counters"
