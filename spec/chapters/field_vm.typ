@@ -71,7 +71,10 @@ The `d` argument to the instruction obtains its register value from the future s
 
 == Register hinting
 
-Each general-purpose register in the current state can be marked as _hinted_ by the acting instruction.
+By default, a general-purpose register will have the same value the future state
+as it does in the current state.
+To change register values, each general-purpose register in the current state
+can be marked as _hinted_ by the acting instruction.
 This means that from the current state onwards,#footnote[Until it is hinted again.]
 the register can take a value that is independent from the previous value,
 except as constrained by the instruction.
@@ -159,9 +162,9 @@ as experience may point out further useful abstractions.
   `MUL d, a, b`][`FMA d == a * b + (0 * X), hint out`][Multiplication][
   `INV d, a`][`FMA d == (a + 1) * d - 1, hint <register of d>`][Extension field inversion. Note: `d` and `a` cannot use the same register here, and `d` should not be input-hinted in the next instruction.][
   `J a`][`FMA PC == a, hint out`][Jump. Can be to a register, memory content, or absolute address, depending on the addressing mode of `a`, even relative to PC][
-  `JZA imm`][`FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`][Jump if ZERO, absolute target address][
+  `JZA imm`][`FMA PC == (ZERO)*(-1*PC+(imm-1))+(1*PC+1), hint out`][Jump if ZERO, absolute target address. The immediate in the translated instruction is different from, but based on, the immediate in the pseudoinstruction.][
   `JZR a`][`FMA PC == (ZERO) * (a - 1) + (PC + 1), hint out`][Jump if ZERO, PC-relative target address][
-  `JNZA imm`][`FMA PC == ZERO * (PC - imm) + (ZERO + imm), hint out`][Jump if not ZERO, absolute target address][
+  `JNZA imm`][`FMA PC == ZERO * (PC + (-imm)) + (ZERO + imm), hint out`][Jump if not ZERO, absolute target address. The immediate in the translated instruction is different from, but based on, the immediate in the pseudoinstruction.][
   `JNZR a`][`FMA PC == (a - 1) * (-1 * ZERO + 1) + (PC + 1), hint out`][Jump if not ZERO, PC-relative target address]
 
 Eventually, usage may inform a set of common pseudoinstructions,
@@ -173,15 +176,16 @@ along with informing potential optimizations that remove unused capabilities
 Since the VM makes use of read-only memory, traditional usage of a program stack does not work.
 We assume that each function invocation (unless other optimizations apply) will have an associated _frame_,
 pointed to by a _frame pointer_ `fp`.
-We assume here that `fp` is one of the general purpose registers.
-Observe that we let `fp` point into the middle of the frame, such that the information relevant to the callee
-starts at offset 0.
+We assume here that one of the general-purpose registers takes the role of `fp`.
 In this frame, the following data is stored:
 
 / `MEM[fp - k]...MEM[fp - 1]`: `k` saved registers from the calling function
 / `MEM[fp + 0]`: The stored parent frame pointer
 / `MEM[fp + 1]`: The return address
 / `MEM[fp + 2]...MEM[fp + l]`: Additional information required by the function
+
+Observe that we let `fp` point into the middle of the frame, such that the information relevant to the callee
+starts at offset 0.
 
 Then, to facilitate function calls, we describe a possible implementation of the `CALL` and `RET` pseudoinstructions, that, respectively, perform a new function call and return back to the caller.
 
@@ -229,7 +233,7 @@ for $i = j in [0, N + 1]$ and $f_(i)(j) = 0$ for $i != j in [0, N + 1]$.#footnot
 Since the degree of these $f_(i)(x)$ can grow too large to express in a single polynomial constraint,
 we perform a _"degree split"_:
 $ f_(i)(x) &= f_(i, 0)(x) + x^(d - 1) (f_(i, 1)(x) + x^(d - 2) (f_(i, 2) + x^(d - 2) (f_(i, 3) + ...)))\
-           &= 1 dot f_(i,0)(x) + x^(d - 1) f_(i,1)(x) + ... + x^(d - 1 + (t - 1) dot (d - 2)) f(i, t)(x), $
+           &= 1 dot f_(i,0)(x) + x^(d - 1) f_(i,1)(x) + ... + x^(d - 1 + (t - 1) dot (d - 2)) f_(i, t)(x), $
 for a maximal constraint degree $d$.
 Here, $deg(f_(i, 0)) <= d - 2$ and $deg(f_(i, k)) <= d - 3$.
 We denote by $t + 1$ the number of non-zero $f_(i, k)$ for fixed $i$.
