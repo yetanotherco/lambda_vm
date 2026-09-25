@@ -302,8 +302,7 @@ fn row_major_host_and_device_input_match_reference_bits() {
                 .unwrap();
             assert_eq!(host_lde, expected, "row-major host input {ctx}");
 
-            let be = backend().expect("cuda backend");
-            let predev = be.next_stream().clone_htod(&row_major).unwrap();
+            let predev = upload_synced(&row_major);
             let (dev_handle, dev_lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
                 &row_major,
                 Some(&predev),
@@ -341,6 +340,17 @@ fn row_major_host_and_device_input_match_reference_bits() {
     }
 }
 
+/// A device input as the prover hands one over: uploaded on its own stream
+/// and host-synchronized before it escapes. The backend disables cudarc's
+/// cross-stream event tracking (see `Backend::init`), so the LDE stream does
+/// not wait on the upload by itself.
+fn upload_synced(data: &[u64]) -> math_cuda::CudaSlice<u64> {
+    let stream = backend().expect("cuda backend").next_stream();
+    let dev = stream.clone_htod(data).unwrap();
+    stream.synchronize().unwrap();
+    dev
+}
+
 fn n_times(log_n: u32, blowup: usize) -> usize {
     (1usize << log_n) * blowup
 }
@@ -364,11 +374,7 @@ fn row_major_split_trees_device_input_matches_host_input() {
         .unwrap();
         assert_eq!(host_lde, expected, "split trees host input {ctx}");
 
-        let predev = backend()
-            .unwrap()
-            .next_stream()
-            .clone_htod(&row_major)
-            .unwrap();
+        let predev = upload_synced(&row_major);
         let (dev_nodes, dev_handle, dev_lde) = math_cuda::lde::coset_lde_row_major_split_trees(
             &row_major,
             Some(&predev),
@@ -412,11 +418,7 @@ fn row_major_ext3_host_and_device_input_match_reference_bits() {
             .unwrap();
         assert_eq!(host_lde, expected, "ext3 row-major host input {ctx}");
 
-        let dev_in = backend()
-            .unwrap()
-            .next_stream()
-            .clone_htod(&row_major)
-            .unwrap();
+        let dev_in = upload_synced(&row_major);
         let (dev_handle, dev_lde) =
             math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
                 &dev_in, n, m, blowup, &weights, true,

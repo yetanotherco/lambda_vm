@@ -382,7 +382,11 @@ fn bench_lde_device_resident_forward_input() {
 
         let m = 64usize;
         let row_major: Vec<u64> = (0..n * m).map(|_| rng.r#gen::<u64>()).collect();
-        let predev = be.next_stream().clone_htod(&row_major).unwrap();
+        // Host-synchronized before use: the backend orders cross-stream reads
+        // explicitly (no cudarc event tracking).
+        let upload = be.next_stream();
+        let predev = upload.clone_htod(&row_major).unwrap();
+        upload.synchronize().unwrap();
         let row_ms = median_ms(ITERS, || {
             let t0 = Instant::now();
             let (handle, _) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
