@@ -42,6 +42,15 @@ SCALAR = [  # (column, [metric names, first present wins])
     ("limit_blocks", ["launch__occupancy_limit_blocks"]),
     ("l1_hit_pct", ["l1tex__t_sector_hit_rate.pct"]),
     ("l2_hit_pct", ["lts__t_sector_hit_rate.pct"]),
+    ("inst_executed", ["smsp__inst_executed.sum"]),
+    ("thread_inst_executed", ["smsp__thread_inst_executed.sum"]),
+    ("local_ld_sectors", ["l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum"]),
+    ("local_st_sectors", ["l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum"]),
+]
+# coalescing: global sectors per request, as (column, sectors metric, requests metric)
+RATIOS = [
+    ("global_ld_sectors_per_req", "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum", "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"),
+    ("global_st_sectors_per_req", "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum", "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum"),
 ]
 STALL = [re.compile(r"^smsp__average_warps?_issue_stalled_(\w+?)_per_issue_active\.ratio$"),
          re.compile(r"^smsp__average_warp_latency_issue_stalled_(\w+?)\.ratio$")]
@@ -91,6 +100,10 @@ def summarise(row, units):
                     v *= TIME_UNIT.get(units.get(n, "nsecond").strip(), 1e-6)
                 out[col] = v
                 break
+    for col, num_m, den_m in RATIOS:
+        n, d = num(row.get(num_m)), num(row.get(den_m))
+        if n is not None and d:
+            out[col] = n / d
     stalls, pipes = {}, {}
     for k, v in row.items():
         x = num(v)
@@ -118,13 +131,14 @@ def main(argv=None):
     ap.add_argument("raw", nargs="+", help="ncu --page raw --csv exports")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
-    cols = ["source", "id", "kernel", "grid", "block"] + [c for c, _ in SCALAR] + ["top_stalls", "top_pipes_pct"]
+    cols = (["pass", "id", "kernel", "grid", "block"] + [c for c, _ in SCALAR] + [c for c, _, _ in RATIOS]
+            + ["top_stalls", "top_pipes_pct"])
     rows = []
     for path in a.raw:
         data, units = read_raw(path)
         for r in data:
             s = summarise(r, units)
-            s.update({"source": os.path.basename(path), "id": r.get("ID", ""),
+            s.update({"pass": os.path.basename(path).replace(".raw.csv", ""), "id": r.get("ID", ""),
                       "kernel": r.get("Kernel Name", r.get("Function Name", "")),
                       "grid": r.get("Grid Size", ""), "block": r.get("Block Size", "")})
             rows.append(s)
@@ -148,6 +162,13 @@ def main(argv=None):
             fmt(s.get("dram_throughput_pct")), fmt(s.get("issue_active_pct")),
             "{}/{}".format(fmt(s.get("achieved_occupancy_pct")), fmt(s.get("theoretical_occupancy_pct"))),
             fmt(s.get("registers_per_thread"), "{:.0f}")))
+        extra = [("inst", s.get("inst_executed"), "{:.4g}"), ("thread-inst", s.get("thread_inst_executed"), "{:.4g}"),
+                 ("local ld/st sectors", s.get("local_ld_sectors"), "{:.4g}"), ("", s.get("local_st_sectors"), "{:.4g}"),
+                 ("global sectors/req ld", s.get("global_ld_sectors_per_req"), "{:.2f}"),
+                 ("st", s.get("global_st_sectors_per_req"), "{:.2f}")]
+        if any(v is not None for _, v, _ in extra):
+            L.append("    counts: " + " ".join("{}{}".format(k + " " if k else "/", "-" if v is None else f.format(v))
+                                               for k, v, f in extra))
         if s.get("top_stalls"):
             L.append("    stalls: " + s["top_stalls"])
         if s.get("top_pipes_pct"):
@@ -171,10 +192,12 @@ def selftest():
            "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio",
            "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio",
            "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio",
-           "sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active"]
-    units = ["", "", "", "", "", "", "", "", "", "", "", "usecond", "%", "%", "register/thread", "", "", "", "%"]
+           "sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active", "smsp__inst_executed.sum",
+           "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum", "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"]
+    units = ["", "", "", "", "", "", "", "", "", "", "", "usecond", "%", "%", "register/thread", "", "", "", "%",
+             "inst", "sector", "request"]
     row = ["0", "4242", "lambda_vm_prover", "box", "rpx_grind_search", "1", "7", "(128, 1, 1)", "(1024, 1, 1)",
-           "0", "12.0", "7,654.32", "91.5", "62.5", "64", "0.5", "6.0", "1.5", "88.8"]
+           "0", "12.0", "7,654.32", "91.5", "62.5", "64", "0.5", "6.0", "1.5", "88.8", "123,456,789", "4,000", "1,000"]
     p = os.path.join(d, "rpx_grind_search.raw.csv")
     with open(p, "w", newline="") as f:
         f.write("==PROF== a banner line ncu may leave in front\n")
@@ -188,7 +211,9 @@ def selftest():
               ("sm%", r["sm_throughput_pct"], "91.5"), ("regs", r["registers_per_thread"], "64"),
               ("top stall first", r["top_stalls"].split(" ")[0], "math_pipe_throttle"),
               ("stall share", "math_pipe_throttle 6.00 (75%)" in r["top_stalls"], True),
-              ("pipe", r["top_pipes_pct"], "alu 88.8"), ("absent metric blank", r["l2_hit_pct"], "")]
+              ("pipe", r["top_pipes_pct"], "alu 88.8"), ("absent metric blank", r["l2_hit_pct"], ""),
+              ("pass named after the export", r["pass"], "rpx_grind_search"), ("inst executed", r["inst_executed"], "1.235e+08"),
+              ("global ld sectors per request", r["global_ld_sectors_per_req"], "4")]
     bad = [c for c in checks if c[1] != c[2]]
     for n, got, want in checks:
         print("{} {:<24} got {!r}".format("ok  " if got == want else "FAIL", n, got))

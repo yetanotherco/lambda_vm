@@ -28,6 +28,10 @@
 #      the kernel itself under-occupied, or is the argue stage's idle only the per-round host
 #      sync? ncu on block-scale round launches answers the first half; nsys the second.
 #
+# Builds with LAMBDA_VM_NVCC_LINEINFO=1 (line tables for the SourceCounters section; the code is
+# unchanged) and adds the trace analysis's explicit metrics (lib/common.sh PF_NCU_METRICS),
+# narrowed to what this ncu and GPU can collect, to every pass.
+#
 # USAGE (repo checkout of whir/profile-rpx; needs cargo, CUDA with nvcc, Nsight Compute)
 #   bash scripts/profile/whir_ncu.sh [out-dir]      # default scripts/profile/out/whir-ncu-<UTC>
 # ENV: GPU (index, default 0) · NCU / NSYS (tool paths) · STEP_TIMEOUT (seconds, default 1800)
@@ -72,14 +76,16 @@ pf_log "$COUNTERS"
 if [ "$COUNTERS" != "COUNTERS unlocked" ]; then
   pf_log "ncu cannot read the counters here: unlock them (README) or run as root, then re-run"; exit 2
 fi
+METRICS="$(pf_validate_metrics "$NCU_BIN" "$PROBE" "$BIG/probe" "${NCU_METRICS:-$PF_NCU_METRICS}")"
+pf_log "ncu metrics: $(printf '%s' "$METRICS" | awk -F, '{ print (length($0) ? NF : 0) }') of the explicit list collectable here"
 if ! reading="$(pf_gpu_idle "$GPU" 500)"; then pf_die "card not idle: $reading"; fi
 
 # --- 1. build the bench binaries (production cubins: no register cap, no lineinfo) --------
-build_bench() { # build_bench <tag> <cargo test args...> ; leaves $BIG/cargo-<tag>.json
+build_bench() { # build_bench <tag> <cargo test args...> ; leaves $BIG/cargo-<tag>.json (lineinfo cubins)
   local tag="$1" rc=0
   shift
   pf_log "build: cargo test $* --no-run"
-  env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u LAMBDA_VM_RPX_MAXRREGCOUNT -u LAMBDA_VM_NVCC_LINEINFO \
+  env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u LAMBDA_VM_RPX_MAXRREGCOUNT LAMBDA_VM_NVCC_LINEINFO=1 \
     timeout 7200 cargo test "$@" --no-run --message-format=json-render-diagnostics \
     > "$BIG/cargo-$tag.json" 2> "$BIG/build-$tag.log" || rc=$?
   if [ "$rc" -ne 0 ]; then tail -20 "$BIG/build-$tag.log"; pf_die "build failed (rc=$rc): $BIG/build-$tag.log"; fi
@@ -107,8 +113,10 @@ pf_log "binaries: $RPX_BIN ; $SC_BIN"
 pf_base_env
 ncu_pass() { # ncu_pass <name> <kernel regex> <launch count> <binary> <test name>
   local name="$1" regex="$2" count="$3" bin="$4" test="$5" rc=0
+  local -a mflag=()
+  if [ -n "$METRICS" ]; then mflag=(--metrics "$METRICS"); fi
   pf_log "ncu $name: -k regex:$regex -c $count ($test)"
-  env -i "${PF_ENV[@]}" timeout --signal=INT --kill-after=60 "$STEP_TIMEOUT" "$NCU_BIN" "${SECTIONS[@]}" \
+  env -i "${PF_ENV[@]}" timeout --signal=INT --kill-after=60 "$STEP_TIMEOUT" "$NCU_BIN" "${SECTIONS[@]}" ${mflag[@]+"${mflag[@]}"} \
     -k "regex:$regex" -c "$count" -f -o "$BIG/$name" "$bin" "$test" --exact --ignored --nocapture \
     > "$BIG/$name.stdout" 2>&1 || rc=$?
   { grep -E '^==(PROF|ERROR|WARNING)==' "$BIG/$name.stdout" || true; } > "$SMALL/$name.prof.txt"

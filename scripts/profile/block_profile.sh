@@ -6,14 +6,20 @@
 #     per stage (base; the base's commit / prove / global; level 0; interior; root), per
 #     5 s, and per kernel; with counters also SM active %, SM issue % and DRAM bandwidth %
 #     per 1 s and per stage (nsys GPU metrics).
-#   Run B (Nsight Compute, counters only): why the nine kernels that carry the time run as
-#     fast as they do (speed of light, warp-stall reasons, occupancy and its limiter,
-#     scheduler issue, instruction mix, pipes, memory) on real launches of this run.
+#   Run B (Nsight Compute, counters only): why the kernels that carry the time run as fast as
+#     they do, on the launch shapes the trace analysis picked (thoughts/zf/prof/ANALYSIS-1GPU.md
+#     §7): speed of light, stall reasons, occupancy and its limiter, issue and instruction
+#     counts, pipes, local memory, coalescing, L2 hit rate; plus the grind paired with its
+#     counted twin. Also cuobjdump -res-usage of every cubin.
 #
 # THE RUN IS THE RECORD'S
 #   Test  lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root
-#   Build cargo test --release -p lambda-vm-prover --features cuda --lib (the binary is run
-#         directly, from prover/ as cargo would, so no cargo process sits in the trace)
+#   Build cargo test --release -p lambda-vm-prover --features cuda,nvtx --lib, with
+#         LAMBDA_VM_NVCC_LINEINFO=1: the record's test, plus NVTX ranges (named phases in the
+#         trace; the feature also turns on the instruments spans, host-side bookkeeping) and
+#         SASS-to-source line tables in the cubins (codegen unchanged), both per the analysis.
+#         The binary runs directly, from prover/ as cargo would, so no cargo process sits in
+#         the trace. The rpx_grind_counted test is built the same way for the grind pairing.
 #   Env   A-tree-whir.v10.sh's, as whir_tree17.sh launched it (ROOT_OPTION=A,
 #         EXPECT_RETENTION=yes, SIBLINGS=4, VRAM_BUDGET_MB=query): see record_env below.
 #         The process gets ONLY that plus a few system variables (env -i): no LAMBDA_VM_ZF_*,
@@ -40,9 +46,11 @@
 # ENV KNOBS (all optional)
 #   SYSROOT_DIR        guest C sysroot (default $HOME/.lambda-vm-sysroot; provisioned when missing)
 #   GPU_METRICS_FREQ   nsys GPU-metrics sampling rate in Hz (default 2000)
-#   NCU_KERNELS        run B's kernels, "name:skip:count[:t_ref_s] ..." (default: the table below)
-#   NCU_COUNT          one launch count for every kernel of run B
+#   NCU_PLAN           run B's plan, a TSV in lib/ncu_plan.py's format (default: default_plan below)
+#   NCU_PASSES         run only these passes of the plan, e.g. "grind merkle_wide"
 #   NCU_SECTIONS       ncu section identifiers (default: the eight below)
+#   NCU_METRICS        explicit ncu metrics (default: lib/common.sh PF_NCU_METRICS, the analysis's
+#                      list), narrowed by the preflight to what this ncu and GPU can collect
 #   BUILD_TIMEOUT RUN_A_TIMEOUT EXPORT_TIMEOUT NCU_PASS_TIMEOUT   step bounds, seconds
 #   IDLE_MIB           the card is idle below this many MiB in use with no compute process (500)
 #   NSYS NCU           explicit tool paths
@@ -72,32 +80,32 @@ MIN_NSIGHT=2025.1 # Blackwell-capable nsys / ncu
 MIN_RAM_GIB=48
 RECORD_VRAM_MIB=30000 # the record's card: RTX 5090, 32 GB (31.4 GiB usable)
 
-# Run B's kernels, name:skip:count:t_ref. skip/count index that kernel's OWN launches (ncu
-# counts only launches matching -k), chosen in the lead's wt90 trace (cdf0238f1, whose prover
-# library is 169b66831's; RTX 5090) to land on the launches that carry each kernel's time:
-#   rpx_grind_search          grid 1024/128, 7.7-11.7 ms (every launch has this shape)
-#   rpx_merkle_level          grids 8192, 4096, 2048: the top of one tree (2.9, 1.5, 0.8 ms)
-#   rpx_merkle_tail           one block of 128 threads, ~0.9 ms each, 4692 launches
-#   rpx_leaves_base_coset     grid 16384, ~45 ms (the base's LDE leaves)
-#   sumcheck_round_ext3       the three biggest rounds of one 2^21 sumcheck (5.9, 3.1, 1.6 ms)
-#   rpx_leaves_base_row_major_row_pair        grids 8192, 8192, 16384 (5.7-16.5 ms)
-#   ntt_dit_level_row_major   grid 1 x 22796 / 65535 with an 11-thread block (0.5-0.9 ms)
-#   rpx_leaves_base_row_major_row_pair_range  grids 16384, 8192, 16384, 4096 (17.7-121 ms)
-#   constraint_composition_kernel             grid 256/256 (30.5, 4.7, 6.0 ms)
-# t_ref = when the last of them ran in that trace, which the runtime estimate uses. Kernels
-# of the WHIR base come first: their passes end seconds into the run; the last four only run
-# in the LFM wraps, so each of those passes first sits through ~70 s of base under ncu.
-NCU_KERNELS_DEFAULT="
-rpx_grind_search:16:3:4.7
-rpx_merkle_level:11:3:3.2
-rpx_merkle_tail:1:2:3.2
-rpx_leaves_base_coset:1:3:3.3
-sumcheck_round_ext3:340:3:3.9
-rpx_leaves_base_row_major_row_pair:0:3:69.6
-ntt_dit_level_row_major:59:3:69.6
-rpx_leaves_base_row_major_row_pair_range:1:4:70.6
-constraint_composition_kernel:0:3:71.1
-"
+# Run B's default plan (lib/ncu_plan.py's format): one ncu pass per row, the window
+# [skip, skip+count) of that kernel's OWN launches (ncu counts only launches matching -k), and
+# the exact grid/block shapes the window holds. Derived from the lead's wt90 nsys trace
+# (cdf0238f1, prover library = 169b66831's, RTX 5090) with `ncu_plan.py derive`, for the shapes
+# the trace analysis asks for (ANALYSIS-1GPU.md §7). ncu has no grid-size filter, so run B
+# re-anchors each window on this box's own run A trace (the nearest index with exactly these
+# shapes) and verifies after each pass that the launches it profiled have them.
+default_plan() {
+  cat <<'PLAN'
+pass	kernel	skip	count	t_ref_s	shapes	note	target
+grind	rpx_grind_search	16	5	4.7	1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1	5 grinds from the base: why 4.46 ns per permutation against 2.77 in the leaf kernel (with grind_pair)	block
+coset	rpx_leaves_base_coset	1	2	3.2	16384,1,1/128,1,1;16384,1,1/128,1,1	the permutation's full-card ceiling	block
+merkle_narrow	rpx_merkle_level	2	9	1.6	512,1,1/128,1,1;256,1,1/128,1,1;128,1,1/128,1,1;64,1,1/128,1,1;32,1,1/128,1,1;16,1,1/128,1,1;8,1,1/128,1,1;4,1,1/128,1,1;2,1,1/128,1,1	one tree's narrow levels, 512 down to 2: latency	block
+merkle_wide	rpx_merkle_level	12493	2	71.5	16384,1,1/128,1,1;8192,1,1/128,1,1	the two widest levels of one wrap tree: throughput	block
+tail	rpx_merkle_tail	1	3	3.4	1,1,1/128,1,1;1,1,1/128,1,1;1,1,1/128,1,1	per-level latency; barrier and local-memory stalls	block
+sumcheck_2p21	sumcheck_round_ext3	340	18	3.9	4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;4096,1,1/256,1,1;2048,2,1/256,1,1;1024,3,1/256,1,1;512,3,1/256,1,1;512,3,1/128,1,1;512,3,1/64,1,1;512,3,1/32,1,1;256,3,1/32,1,1;128,3,1/32,1,1;64,3,1/32,1,1;32,3,1/32,1,1;16,3,1/32,1,1;1181,1,1/256,1,1;1181,1,1/256,1,1	one 2^21 sumcheck's rounds from 4096x256 down, then the two 1181x256	block
+sumcheck_slow	sumcheck_round_ext3	6929	3	15.3	253,1,1/32,1,1;253,1,1/32,1,1;253,1,1/32,1,1	the slow 253x32 launches: slot-buffer traffic against capped occupancy	block
+ntt_tile	ntt_dit_tile	4	4	3.1	8,16384,1/32,32,1;256,512,1/32,32,1;8192,16,1/32,32,1;262144,1,1/32,16,1	one base LDE's four tile launches: base LDE throughput	block
+rowpair_range	rpx_leaves_base_row_major_row_pair_range	6	2	70.8	8192,1,1/128,1,1;8192,1,1/128,1,1	row-major leaf reads: coalescing	block
+ntt_level	ntt_dit_level_row_major	59	3	69.6	1,22796,1/11,23,1;1,65535,1/11,23,1;1,65535,1/11,23,1	memory throughput against peak	block
+constraint	constraint_composition_kernel	0	2	71.1	256,1,1/256,1,1;256,1,1/256,1,1	occupancy	block
+grind_pair	rpx_grind_search(_counted)?	0	4	10	1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1;1024,1,1/128,1,1	the rpx_grind_counted test: warm-up then seed 0 at poll period 1, each the shipped kernel then its counted twin; the warm-up line prints the nonce	grind_counted
+PLAN
+}
+GRIND_TEST=what_lowering_the_grind_poll_rate_does_to_the_overrun
+FEATURES="cuda,nvtx"
 
 usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
@@ -127,7 +135,7 @@ parse_args() {
 knob_defaults() {
   SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   GPU_METRICS_FREQ="${GPU_METRICS_FREQ:-2000}"
-  NCU_KERNELS="${NCU_KERNELS:-$NCU_KERNELS_DEFAULT}"
+  NCU_METRICS_OK="${NCU_METRICS:-$PF_NCU_METRICS}"
   NCU_SECTIONS="${NCU_SECTIONS:-SpeedOfLight WarpStateStats Occupancy SchedulerStats InstructionStats ComputeWorkloadAnalysis MemoryWorkloadAnalysis LaunchStats}"
   BUILD_TIMEOUT="${BUILD_TIMEOUT:-7200}"
   RUN_A_TIMEOUT="${RUN_A_TIMEOUT:-3600}"
@@ -182,7 +190,7 @@ cgroup_limit_gib() { # this process's cgroup memory limit in GiB, when one is se
 }
 free_gib() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 / 1048576 }'; }
 
-NSYS_BIN="" NCU_BIN="" SAMPLE_FLAGS="$NO_SAMPLING" METRICS_FLAG="" NCU_HAS_KILL=0 GPU_NAME="gpu" GPU_CC=""
+NSYS_BIN="" NCU_BIN="" SAMPLE_FLAGS="$NO_SAMPLING" METRICS_FLAG="" NCU_HAS_KILL=0 GPU_NAME="gpu" GPU_CC="" NVTX_LIB=""
 DRIVER_CUDA="" NVCC_REL=""
 preflight() {
   local sev_build v t got what path want pair reading n tl comps chan nightly probe res mt cg eff fr
@@ -262,6 +270,12 @@ preflight() {
     if [ "$CPU_SAMPLING" = 1 ]; then SAMPLE_FLAGS="$(pf_sampling_flags "$NSYS_BIN")"; else SAMPLE_FLAGS="$NO_SAMPLING"; fi
     METRICS_FLAG="$(pf_metrics_flag "$NSYS_BIN")"
     chk INFO "nsys: CPU sampling: $SAMPLE_FLAGS$([ "$CPU_SAMPLING" = 0 ] && echo ' (--no-cpu-sampling)') · GPU-metrics option: ${METRICS_FLAG:-<none>}"
+    { "$NSYS_BIN" status --environment 2>&1 || true; } > "$SMALL/nsys_status.txt"
+    if [ "$SKIP_NSYS" = 0 ]; then
+      NVTX_LIB="$(pf_find_nvtx_lib || true)"
+      if [ -n "$NVTX_LIB" ]; then chk PASS "nvtx: $NVTX_LIB (handed to the run as LAMBDA_VM_NVTX_LIB)"
+      else chk WARN "nvtx: no libnvToolsExt on this box (toolkits since CUDA 12.9 ship none), so the nvtx build's ranges are silent no-ops; run A still traces kernels, API calls and the OS runtime. For named phases: install cuda-nvtx-12-8 or set LAMBDA_VM_NVTX_LIB"; fi
+    fi
   elif [ "$SKIP_NSYS" = 1 ]; then chk INFO "nsys: not found (run A skipped)"
   else chk FAIL "nsys (Nsight Systems) not found on PATH, in \$CUDA_HOME/bin or /opt/nvidia/nsight-systems/*; set NSYS=/path/to/nsys"; fi
   NCU_BIN="$(pf_find_tool ncu || true)"
@@ -282,14 +296,31 @@ preflight() {
     if [ -z "$probe" ]; then chk FAIL "probe: could not build the one-kernel CUDA probe: see $TMP/probe/pf_probe.build.log"; fi
   fi
   if [ -n "$probe" ] && [ -n "$NCU_BIN" ]; then
-    # with run B's own flags in every mode: ncu parses them before it touches the counters, so
-    # even a locked box shows whether this ncu accepts them ('locked' = accepted, then refused)
-    ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu"
-    res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log" "${NCU_ARGS[@]}")"
-    if [ "$SKIP_NCU" = 1 ] && [ "$COUNTERS" = 0 ]; then chk INFO "counters: $res (not needed with --no-counters; 'locked' also means ncu accepted run B's flags)"
-    elif [ "$res" = "COUNTERS unlocked" ]; then chk PASS "counters: $res (ncu profiled the probe kernel)"
+    if [ "$COUNTERS" = 0 ]; then
+      # run B's full flag set: ncu parses it before it touches the counters, so even a locked
+      # box shows whether this ncu accepts it ('locked' = accepted, then refused)
+      ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu"
+      res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log" "${NCU_ARGS[@]}")"
+      chk INFO "counters: $res (not needed with --no-counters; 'locked' also means ncu accepted run B's flags)"
     else
-      chk FAIL "counters: $res. Unlock (as root: echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' > /etc/modprobe.d/nvidia-profiling.conf, update-initramfs -u, reboot), or run as root, or pass --no-counters"
+      res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe.ncu.log")"
+      if [ "$res" != "COUNTERS unlocked" ]; then
+        chk FAIL "counters: $res. Unlock (as root: echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' > /etc/modprobe.d/nvidia-profiling.conf, update-initramfs -u, reboot), or run as root, or pass --no-counters"
+      elif [ "$SKIP_NCU" = 1 ]; then
+        chk PASS "counters: $res (ncu profiled the probe kernel)"
+      else
+        # the analysis's metrics, narrowed to what this ncu and GPU collect; then run B's exact flags
+        got="$NCU_METRICS_OK"
+        NCU_METRICS_OK="$(pf_validate_metrics "$NCU_BIN" "$probe" "$TMP/probe" "$got")"
+        n="$(printf '%s' "$NCU_METRICS_OK" | awk -F, '{ print (length($0) ? NF : 0) }')"
+        v="$(printf '%s\n' "${got//,/$'\n'}" | while IFS= read -r t; do case ",$NCU_METRICS_OK," in *",$t,"*) ;; *) printf '%s ' "$t" ;; esac; done)"
+        if [ "$n" -gt 0 ]; then chk INFO "ncu metrics: $n of $(printf '%s' "$got" | awk -F, '{ print NF }') collectable here; dropped (usually the other spelling of a stall metric): ${v:-none}"
+        else chk WARN "ncu metrics: none of the explicit metrics is collectable here; run B keeps the sections only"; fi
+        ncu_args pf_probe_kernel 0 1 "$TMP/probe/pf_probe_ncu"
+        res="$(pf_counter_probe "$NCU_BIN" "$probe" "$TMP/probe/pf_probe_runb.ncu.log" "${NCU_ARGS[@]}")"
+        if [ "$res" = "COUNTERS unlocked" ]; then chk PASS "counters: unlocked; ncu profiled the probe kernel with run B's exact flags"
+        else chk FAIL "counters are unlocked but ncu refused run B's flags on the probe kernel: $res"; fi
+      fi
     fi
   elif [ "$COUNTERS" = 1 ]; then
     chk FAIL "counters: not probed (no ncu or no probe binary); counters mode needs the proof"
@@ -384,7 +415,7 @@ preflight() {
   n="$(env | awk -F= '/^(LAMBDA_VM_|LFM_|ZF_|A_BUNDLE|A_CACHE|TABLE_PARALLELISM=|RAYON_|_RJEM_|MALLOC_CONF=)/ { printf "%s ", $1 }')"
   if [ -n "$n" ]; then chk INFO "env: set in this shell and NOT passed to the profiled process: $n"
   else chk PASS "env: no prover knob is set in this shell"; fi
-  n="$(env | awk -F= '/^(RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|LAMBDA_VM_RPX_MAXRREGCOUNT|LAMBDA_VM_NVCC_LINEINFO)=/ { printf "%s ", $1 }')"
+  n="$(env | awk -F= '/^(RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|LAMBDA_VM_RPX_MAXRREGCOUNT)=/ { printf "%s ", $1 }')"
   if [ -n "$n" ]; then chk WARN "env: $n set here; unset for the build so the binary and cubins are the production ones"; fi
 
   if [ "$PF_FAILS" -eq 0 ]; then chk INFO "PREFLIGHT: PASS ($PF_WARNS warning(s))"
@@ -419,6 +450,7 @@ record_env() {
     "LAMBDA_VM_GRIND_SCAN_FACTOR=8"
     "LAMBDA_VM_GRIND_GRID=1024"
     "_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1")
+  if [ -n "$NVTX_LIB" ]; then RUN_ENV+=("LAMBDA_VM_NVTX_LIB=$NVTX_LIB"); fi
 }
 
 write_env_capture() { # an ALLOWLIST of run facts, never the environment (this file leaves the box)
@@ -466,11 +498,11 @@ write_env_capture() { # an ALLOWLIST of run facts, never the environment (this f
 # ======================================================================================
 # build
 # ======================================================================================
-BUILD_ARCH="" BIN="" CUBIN_DIR=""
-build_env() { # production builds: no ad-hoc rustflags, no register cap, no lineinfo
-  env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-      -u LAMBDA_VM_RPX_MAXRREGCOUNT -u LAMBDA_VM_NVCC_LINEINFO \
-      ${BUILD_ARCH:+"CUDARC_NVCC_ARCH=$BUILD_ARCH"} "$@"
+BUILD_ARCH="" BIN="" CUBIN_DIR="" GRIND_BIN=""
+build_env() { # profiling builds: no ad-hoc rustflags and no register cap; lineinfo ON, which adds
+  # SASS-to-source line tables to the cubins and leaves the code itself unchanged (build.rs)
+  env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u LAMBDA_VM_RPX_MAXRREGCOUNT \
+      LAMBDA_VM_NVCC_LINEINFO=1 ${BUILD_ARCH:+"CUDARC_NVCC_ARCH=$BUILD_ARCH"} "$@"
 }
 
 check_artifacts() { # the guest ELFs the Makefile enumerates, all present (the record launcher's probe)
@@ -503,12 +535,24 @@ check_cubins() { # an empty cubin is build.rs's no-nvcc stub: the kernels would 
   return 1
 }
 
-check_test_listed() {
+check_test_listed() { # check_test_listed BINARY TEST
   local listed
-  listed="$({ "$BIN" --list 2>/dev/null || true; } | awk -v t="$TEST: test" '$0 == t { n++ } END { print n + 0 }')"
-  pf_log "test binary lists $TEST: $listed time(s)"
+  listed="$({ "$1" --list 2>/dev/null || true; } | awk -v t="$2: test" '$0 == t { n++ } END { print n + 0 }')"
+  pf_log "$(basename "$1") lists $2: $listed time(s)"
   if [ "$listed" = 1 ]; then return 0; fi
   return 1
+}
+
+res_usage() { # cuobjdump -res-usage of every cubin: registers, stack, shared and local memory per kernel
+  local cuobjdump f
+  cuobjdump="$(pf_cuda_home)/bin/cuobjdump"
+  if [ ! -x "$cuobjdump" ]; then pf_log "no cuobjdump at $cuobjdump: cubin_res_usage.txt skipped"; return 0; fi
+  for f in "$CUBIN_DIR"/*.cubin; do
+    if [ ! -e "$f" ]; then continue; fi
+    echo "== $(basename "$f")"
+    "$cuobjdump" -res-usage "$f" 2>&1 | sed "s#$CUBIN_DIR/##g" || true
+  done > "$SMALL/cubin_res_usage.txt"
+  pf_log "cuobjdump -res-usage: $(grep -c 'Function ' "$SMALL/cubin_res_usage.txt" || true) kernel entries -> small/cubin_res_usage.txt"
 }
 
 build() {
@@ -526,9 +570,9 @@ build() {
   if [ "$rc" -ne 0 ]; then pf_die "guest ELF build failed (rc=$rc): see $BIG/build-guests.log"; fi
   check_artifacts || pf_die "guest ELFs missing after the build: see $BIG/build-guests.log"
 
-  step_begin "build: prover lib tests (cargo test --release -p lambda-vm-prover --features cuda --lib --no-run)"
+  step_begin "build: prover lib tests (cargo test --release -p lambda-vm-prover --features $FEATURES --lib --no-run, lineinfo)"
   rc=0
-  (cd "$REPO" && build_env timeout "$BUILD_TIMEOUT" cargo test --release -p lambda-vm-prover --features cuda --lib \
+  (cd "$REPO" && build_env timeout "$BUILD_TIMEOUT" cargo test --release -p lambda-vm-prover --features "$FEATURES" --lib \
      --no-run --message-format=json-render-diagnostics) > "$TMP/cargo-prover.json" 2> "$BIG/build-prover.log" || rc=$?
   tail -n 40 "$BIG/build-prover.log" > "$SMALL/build-prover.tail.txt" || true
   step_end "$rc"
@@ -537,24 +581,44 @@ build() {
     || pf_die "cargo reported no lambda_vm_prover unit-test binary (see $TMP/cargo-prover.json)"
   CUBIN_DIR="$(python3 "$HERE/lib/cargo_test_bin.py" outdir --package math-cuda < "$TMP/cargo-prover.json")" \
     || pf_die "cargo reported no math-cuda build-script output (see $TMP/cargo-prover.json)"
+
+  step_begin "build: the rpx_grind_counted test (run B's grind pairing), same features"
+  rc=0
+  (cd "$REPO" && build_env timeout "$BUILD_TIMEOUT" cargo test --release -p lambda-vm-prover --features "$FEATURES" \
+     --test rpx_grind_counted --no-run --message-format=json-render-diagnostics) > "$TMP/cargo-grind.json" 2> "$BIG/build-grind.log" || rc=$?
+  step_end "$rc"
+  if [ "$rc" -ne 0 ]; then pf_die "rpx_grind_counted build failed (rc=$rc): see $BIG/build-grind.log"; fi
+  GRIND_BIN="$(python3 "$HERE/lib/cargo_test_bin.py" exe --name rpx_grind_counted --kind test < "$TMP/cargo-grind.json")" \
+    || pf_die "cargo reported no rpx_grind_counted binary (see $TMP/cargo-grind.json)"
+
   check_cubins || pf_die "the cubins are missing or empty: nvcc was not found by build.rs, so the GPU path is a CPU path"
-  check_test_listed || pf_die "the built binary does not contain $TEST"
-  printf 'HEAD=%s\nBIN=%s\nCUBIN_DIR=%s\nBUILT=%s\n' "$(git -C "$REPO" rev-parse HEAD)" "$BIN" "$CUBIN_DIR" \
-    "$(date -u +%FT%TZ)" > "$REPO/target/block_profile.last-build"
-  pf_log "test binary: $BIN"
+  check_test_listed "$BIN" "$TEST" || pf_die "the built binary does not contain $TEST"
+  check_test_listed "$GRIND_BIN" "$GRIND_TEST" || pf_die "the rpx_grind_counted binary does not contain $GRIND_TEST"
+  res_usage
+  printf 'HEAD=%s\nFEATURES=%s\nLINEINFO=1\nBIN=%s\nGRIND_BIN=%s\nCUBIN_DIR=%s\nBUILT=%s\n' \
+    "$(git -C "$REPO" rev-parse HEAD)" "$FEATURES" "$BIN" "$GRIND_BIN" "$CUBIN_DIR" "$(date -u +%FT%TZ)" \
+    > "$REPO/target/block_profile.last-build"
+  pf_log "test binaries: $BIN ; $GRIND_BIN"
 }
 
 reuse_build() {
-  local crumb="$REPO/target/block_profile.last-build" head
+  local crumb="$REPO/target/block_profile.last-build" head feat
   if [ ! -r "$crumb" ]; then pf_die "--skip-build: no $crumb; run once without --skip-build"; fi
   head="$(sed -n 's/^HEAD=//p' "$crumb")"
+  feat="$(sed -n 's/^FEATURES=//p' "$crumb")"
   BIN="$(sed -n 's/^BIN=//p' "$crumb")"
+  GRIND_BIN="$(sed -n 's/^GRIND_BIN=//p' "$crumb")"
   CUBIN_DIR="$(sed -n 's/^CUBIN_DIR=//p' "$crumb")"
   if [ "$head" != "$(git -C "$REPO" rev-parse HEAD)" ]; then pf_die "--skip-build: the last build is of $head, HEAD has moved; rebuild"; fi
-  if [ ! -x "$BIN" ]; then pf_die "--skip-build: $BIN is gone; rebuild"; fi
+  if [ "$feat" != "$FEATURES" ] || [ "$(sed -n 's/^LINEINFO=//p' "$crumb")" != 1 ]; then
+    pf_die "--skip-build: the last build is --features ${feat:-?} without the lineinfo cubins this script wants; rebuild"
+  fi
+  if [ ! -x "$BIN" ] || [ ! -x "$GRIND_BIN" ]; then pf_die "--skip-build: a test binary of the last build is gone; rebuild"; fi
   check_artifacts || pf_die "--skip-build: guest ELFs are missing; rebuild"
   check_cubins || pf_die "--skip-build: the cubins are missing or empty; rebuild"
-  check_test_listed || pf_die "--skip-build: $BIN does not contain $TEST"
+  check_test_listed "$BIN" "$TEST" || pf_die "--skip-build: $BIN does not contain $TEST"
+  check_test_listed "$GRIND_BIN" "$GRIND_TEST" || pf_die "--skip-build: $GRIND_BIN does not contain $GRIND_TEST"
+  res_usage
   pf_log "reusing the build of $head: $BIN"
 }
 
@@ -590,6 +654,7 @@ ncu_args() { # ncu_args KERNEL SKIP COUNT REP_BASE — NCU_ARGS=(...): run B's f
   NCU_ARGS=(--target-processes all -k "regex:^${1}\$" -s "$2" -c "$3")
   if [ "$NCU_HAS_KILL" = 1 ]; then NCU_ARGS+=(--kill yes); fi
   for s in $NCU_SECTIONS; do NCU_ARGS+=(--section "$s"); done
+  if [ -n "$NCU_METRICS_OK" ]; then NCU_ARGS+=(--metrics "$NCU_METRICS_OK"); fi
   NCU_ARGS+=(-f -o "$4")
 }
 
@@ -623,7 +688,7 @@ readback_a() { # the record launcher's gates, reported rather than enforced: the
 }
 
 run_a() {
-  local rc reading
+  local rc reading n v
   record_env
   write_env_capture
   if ! reading="$(pf_gpu_idle "$GPU" "$IDLE_MIB")"; then
@@ -675,6 +740,24 @@ run_a() {
     > "$BIG/summary.log" 2>&1 || rc=$?
   step_end "$rc"
   if [ "$rc" -ne 0 ]; then pf_log "the summary failed: see $BIG/summary.log"; RUN_A_VERDICT="${RUN_A_VERDICT}+nosummary"; fi
+  n="$(python3 - "$BIG/blockA.sqlite" <<'PY' 2>/dev/null || echo 0
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+try:
+    print(db.execute("SELECT count(*) FROM NVTX_EVENTS WHERE end > start").fetchone()[0])
+except sqlite3.Error:
+    print(0)
+PY
+)"
+  v="NVTX ranges in the trace: $n$([ "${n:-0}" -eq 0 ] && echo ' (none: no libnvToolsExt reached, see the preflight)')"
+  pf_log "$v"
+  # just above the verdict line, which stays the file's last
+  awk -v ins="$v" 'NR > 1 { print prev } { prev = $0 } END { print ins; print prev }' "$SMALL/runA.verdict.txt" > "$TMP/verdict.txt" \
+    && mv "$TMP/verdict.txt" "$SMALL/runA.verdict.txt"
+  if [ "${n:-0}" -gt 0 ] && [ -r "$REPO/scripts/profiling/nsys_phase_busy.py" ]; then
+    timeout "$EXPORT_TIMEOUT" python3 "$REPO/scripts/profiling/nsys_phase_busy.py" "$BIG/blockA.sqlite" --top 15 \
+      > "$SMALL/nsys/phase_busy.md" 2> "$BIG/phase_busy.log" || pf_log "nsys_phase_busy.py failed: see $BIG/phase_busy.log"
+  fi
 }
 
 # ======================================================================================
@@ -692,64 +775,89 @@ wait_idle() { # a killed pass must have released the card before the next one st
 }
 
 run_b() {
-  local spec k skip count tref rc profiled t0 bad=0 total=0
+  local pass kernel skip count target bin test rc profiled t0 nbad=0 nshape=0 total=0
   record_env
   if [ ! -s "$SMALL/env.txt" ]; then write_env_capture; fi
   mkdir -p "$BIG/ncu" "$SMALL/ncu"
-  printf 'kernel\tskip\tcount\trc\tprofiled\tseconds\n' > "$SMALL/ncu/passes.tsv"
-  for spec in $NCU_KERNELS; do
-    IFS=: read -r k skip count tref <<< "$spec"
-    count="${NCU_COUNT:-$count}"
+  if [ -n "${NCU_PLAN:-}" ]; then cp "$NCU_PLAN" "$TMP/ncu_plan.in.tsv"; else default_plan > "$TMP/ncu_plan.in.tsv"; fi
+  if [ -s "$BIG/blockA.sqlite" ]; then
+    python3 "$HERE/lib/ncu_plan.py" anchor "$TMP/ncu_plan.in.tsv" "$BIG/blockA.sqlite" > "$SMALL/ncu/plan.tsv" 2> "$BIG/ncu/anchor.log" \
+      || cp "$TMP/ncu_plan.in.tsv" "$SMALL/ncu/plan.tsv"
+    pf_log "run B: plan re-anchored on this box's run A trace: $(grep -c 'anchor: skip [0-9]* ->' "$SMALL/ncu/plan.tsv" || true) window(s) moved, $(grep -c 'not found' "$SMALL/ncu/plan.tsv" || true) not found"
+  else
+    cp "$TMP/ncu_plan.in.tsv" "$SMALL/ncu/plan.tsv"
+    pf_log "run B: no run A trace in this OUT, so the windows are the reference trace's (verified after each pass)"
+  fi
+  printf 'pass\tkernel\tskip\tcount\trc\tprofiled\tseconds\n' > "$SMALL/ncu/passes.tsv"
+  while IFS=$'\t' read -r pass kernel skip count _ _ _ target; do
+    if [ "$pass" = pass ]; then continue; fi
+    if [ -n "${NCU_PASSES:-}" ] && [[ " $NCU_PASSES " != *" $pass "* ]]; then continue; fi
+    case "$target" in
+      block) bin="$BIN"; test="$TEST" ;;
+      grind_counted) bin="$GRIND_BIN"; test="$GRIND_TEST" ;;
+      *) pf_log "run B: pass $pass has an unknown target '$target': skipped"; continue ;;
+    esac
     total=$((total + 1))
     wait_idle
-    step_begin "run B: ncu $k (launches $skip..$((skip + count - 1)) of that kernel)"
+    step_begin "run B: ncu $pass ($kernel, its launches $skip..$((skip + count - 1)))"
+    ncu_args "$kernel" "$skip" "$count" "$BIG/ncu/$pass"
     t0="$(date +%s)"
-    ncu_args "$k" "$skip" "$count" "$BIG/ncu/$k"
     rc=0
     (cd "$REPO/prover" && exec timeout --signal=INT --kill-after=120 "$NCU_PASS_TIMEOUT" \
        env -i "${RUN_ENV[@]}" "$NCU_BIN" "${NCU_ARGS[@]}" \
-       "$BIN" "$TEST" --ignored --exact --nocapture --test-threads=1) > "$BIG/ncu/$k.stdout" 2>&1 || rc=$?
-    profiled="$(grep -c '^==PROF== Profiling' "$BIG/ncu/$k.stdout" || true)"
-    { grep -E '^==(PROF|ERROR|WARNING)==' "$BIG/ncu/$k.stdout" || true; } > "$SMALL/ncu/$k.prof.txt"
-    if [ -s "$BIG/ncu/$k.ncu-rep" ]; then
-      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$k.ncu-rep" --page details > "$SMALL/ncu/$k.details.txt" 2>&1 || true
-      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$k.ncu-rep" --page details --csv > "$SMALL/ncu/$k.details.csv" 2>/dev/null || true
-      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$k.ncu-rep" --page raw --csv > "$BIG/ncu/$k.raw.csv" 2>/dev/null || true
+       "$bin" "$test" --ignored --exact --nocapture --test-threads=1) < /dev/null > "$BIG/ncu/$pass.stdout" 2>&1 || rc=$?
+    profiled="$(grep -c '^==PROF== Profiling' "$BIG/ncu/$pass.stdout" || true)"
+    { grep -E '^==(PROF|ERROR|WARNING)==' "$BIG/ncu/$pass.stdout" || true; } > "$SMALL/ncu/$pass.prof.txt"
+    if [ "$target" != block ]; then # a micro test's own lines (the grind pairing prints the nonce)
+      { tr '\r' '\n' < "$BIG/ncu/$pass.stdout" | grep -vE '^==(PROF|ERROR|WARNING)==' || true; } > "$SMALL/ncu/$pass.test.log"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$skip" "$count" "$rc" "$profiled" "$(( $(date +%s) - t0 ))" >> "$SMALL/ncu/passes.tsv"
+    if [ -s "$BIG/ncu/$pass.ncu-rep" ]; then
+      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page details > "$SMALL/ncu/$pass.details.txt" 2>&1 || true
+      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page details --csv > "$SMALL/ncu/$pass.details.csv" 2>/dev/null || true
+      timeout 600 "$NCU_BIN" --import "$BIG/ncu/$pass.ncu-rep" --page raw --csv > "$BIG/ncu/$pass.raw.csv" 2>/dev/null || true
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pass" "$kernel" "$skip" "$count" "$rc" "$profiled" "$(( $(date +%s) - t0 ))" >> "$SMALL/ncu/passes.tsv"
     # with --kill ncu ends the run itself once the launches are in, so rc alone says little
-    if [ "$profiled" -lt 1 ] || [ ! -s "$BIG/ncu/$k.ncu-rep" ]; then bad=$((bad + 1)); fi
-    pf_log "ncu $k: $profiled launch(es) profiled, rc=$rc"
+    if [ "$profiled" -lt 1 ] || [ ! -s "$BIG/ncu/$pass.ncu-rep" ]; then nbad=$((nbad + 1)); fi
+    pf_log "ncu $pass: $profiled launch(es) profiled, rc=$rc"
     step_end "$rc"
-  done
+  done < "$SMALL/ncu/plan.tsv"
+  python3 "$HERE/lib/ncu_plan.py" verify "$SMALL/ncu/plan.tsv" "$BIG/ncu" > "$SMALL/ncu/verify.tsv" 2> "$BIG/ncu/verify.log" || true
+  if [ -n "${NCU_PASSES:-}" ]; then # verify reports every pass of the plan; keep the ones that ran
+    awk -F'\t' -v keep=" $NCU_PASSES " 'NR == 1 || index(keep, " " $1 " ")' "$SMALL/ncu/verify.tsv" > "$TMP/verify.tsv" && mv "$TMP/verify.tsv" "$SMALL/ncu/verify.tsv"
+  fi
+  nshape="$(awk -F'\t' 'NR > 1 && $3 != "ok" { n++ } END { print n + 0 }' "$SMALL/ncu/verify.tsv")"
+  pf_log "run B: shape check: $(awk -F'\t' 'NR > 1 && $3 == "ok" { n++ } END { print n + 0 }' "$SMALL/ncu/verify.tsv") pass(es) profiled exactly the planned shapes, $nshape did not (small/ncu/verify.tsv)"
   if compgen -G "$BIG/ncu/*.raw.csv" > /dev/null; then
     python3 "$HERE/lib/ncu_summary.py" --out "$SMALL/ncu" "$BIG"/ncu/*.raw.csv > "$BIG/ncu/summary.log" 2>&1 || true
   fi
-  if [ "$bad" -eq 0 ]; then RUN_B_VERDICT="ok ($total kernels)"; else RUN_B_VERDICT="partial ($bad of $total kernels without a profile)"; fi
+  if [ "$nbad" -eq 0 ] && [ "$nshape" -eq 0 ]; then RUN_B_VERDICT="ok ($total passes, shapes as planned)"
+  else RUN_B_VERDICT="partial ($nbad of $total passes without a profile, $nshape off the planned shapes)"; fi
 }
 
 # ======================================================================================
 # plan, estimate, finish
 # ======================================================================================
 estimate() {
-  local g=0 p=0 a=0 b=0 spec k skip count tref
+  local g=0 p=0 a=0 b=0 pass kernel skip count tref rest
   if [ "$SKIP_BUILD" = 0 ]; then
     if [ -r "$REPO/executor/program_artifacts/rust/ethrex.elf" ]; then g=3; else g=20; fi
-    if [ -d "$REPO/target/release/deps" ]; then p=8; else p=20; fi
+    if [ -d "$REPO/target/release/deps" ]; then p=10; else p=25; fi
   fi
   if [ "$SKIP_NSYS" = 0 ]; then a=10; if [ "$COUNTERS" = 1 ]; then a=15; fi; fi
   pf_log "ESTIMATE (a guide, not a bound; every step has its own timeout):"
   pf_log "  guest ELFs      ~${g} min   (fresh ~20; up to date ~3: make re-runs cargo per guest)"
-  pf_log "  prover build    ~${p} min   (fresh release CUDA build ~20; incremental less)"
+  pf_log "  prover builds   ~${p} min   (fresh release CUDA build + the grind test ~25; incremental less)"
   pf_log "  run A           ~${a} min   (~2-4 min of block run under nsys, then export + stats + summary)"
   if [ "$SKIP_NCU" = 0 ]; then
-    for spec in $NCU_KERNELS; do
-      IFS=: read -r k skip count tref <<< "$spec"
-      count="${NCU_COUNT:-$count}"
-      b="$(awk -v b="$b" -v t="${tref:-110}" -v c="$count" 'BEGIN { printf "%.0f", b + 60 + 2.5 * t + 45 * c }')"
-      pf_log "  run B  $(printf '%-42s' "$k") ~$(awk -v t="${tref:-110}" -v c="$count" 'BEGIN { printf "%.1f", (60 + 2.5 * t + 45 * c) / 60 }') min"
-    done
-    pf_log "  run B total     ~$((b / 60)) min   (per pass: 60 s start + 2.5 x the launch's time into the run + 45 s per launch)"
+    while IFS=$'\t' read -r pass kernel skip count tref rest; do
+      if [ "$pass" = pass ]; then continue; fi
+      if [ -n "${NCU_PASSES:-}" ] && [[ " $NCU_PASSES " != *" $pass "* ]]; then continue; fi
+      case "$tref" in ''|-|*[!0-9.]*) tref=110 ;; esac
+      b="$(awk -v b="$b" -v t="$tref" -v c="$count" 'BEGIN { printf "%.0f", b + 60 + 2.5 * t + 20 * c }')"
+      pf_log "  run B  $(printf '%-14s' "$pass") ~$(awk -v t="$tref" -v c="$count" 'BEGIN { printf "%.1f", (60 + 2.5 * t + 20 * c) / 60 }') min"
+    done < <(if [ -n "${NCU_PLAN:-}" ]; then cat "$NCU_PLAN"; else default_plan; fi)
+    pf_log "  run B total     ~$((b / 60)) min   (per pass: 60 s start + 2.5 x the window's time into the run + 20 s per launch)"
   fi
   pf_log "  TOTAL           ~$(( g + p + a + b / 60 )) min"
 }
@@ -796,6 +904,9 @@ finish() {
     echo "  runA.test.log         the test's stdout under nsys (the harness's own stage lines)"
     echo "  runA.verdict.txt      the record's gates, read back from that log"
     echo "  nvsmi_100ms.csv       nvidia-smi at 10 Hz: memory.used MiB, util %, SM clock, power (UTC)"
+    echo "  nsys_status.txt       nsys status --environment: what this box allows (CPU sampling, perf events)"
+    echo "  cubin_res_usage.txt   cuobjdump -res-usage of every cubin: registers, stack, shared, local per kernel"
+    echo "  nsys/phase_busy.md    (NVTX ranges present) GPU busy per NVTX phase (scripts/profiling/nsys_phase_busy.py)"
     echo "  nsys_stats/*.csv      nsys stats: cuda_gpu_kern_sum, cuda_api_sum, cuda_gpu_mem_{time,size}_sum, osrt_sum"
     echo "  nsys/summary.txt      READ FIRST: stages, busy/idle per 5 s, top kernels, copies, GPU metrics"
     echo "  nsys/stages.csv       per stage: wall, busy (kernel+copy union), kernel sum, VRAM peak, metrics, top kernels"
@@ -803,8 +914,11 @@ finish() {
     echo "  nsys/kernels.csv      every kernel: launches, time, and its split by phase"
     echo "  nsys/gpu_metrics_*    (counters only) SM active / SM issue / DRAM % per 1 s, per stage, and every metric"
     echo "  ncu/ncu_summary.txt   (counters only) one line per profiled launch: SOL, issue, occupancy, stalls, pipes"
-    echo "  ncu/<kernel>.details.txt|csv   ncu's own per-launch report (the authority, with its rule messages)"
-    echo "  ncu/passes.tsv, ncu/<kernel>.prof.txt   each pass's outcome and ncu's own messages"
+    echo "  ncu/<pass>.details.txt|csv   ncu's own per-launch report (the authority, with its rule messages)"
+    echo "  ncu/plan.tsv          run B's plan as run: each pass's kernel window, its expected shapes and why"
+    echo "  ncu/verify.tsv        per pass: did ncu profile the planned shapes (ok / partial / MISMATCH)"
+    echo "  ncu/passes.tsv, ncu/<pass>.prof.txt   each pass's outcome and ncu's own messages"
+    echo "  ncu/grind_pair.test.log   the counted-grind test's own lines (the warm-up line prints the nonce)"
     echo "  SEND-BACK.txt         what to send back, and the bundle scan's verdict"
     echo
     echo "files present:"

@@ -253,3 +253,61 @@ pf_scan_bundle() {
   echo "bundle scan: REFUSED: $nhits marker hit(s) and $nbad forbidden file(s) in: $files(details in $report)"
   return 1
 }
+
+# ---- run B's explicit metrics ---------------------------------------------------------------
+# The trace analysis's list (thoughts/zf/prof/ANALYSIS-1GPU.md §7), on top of the sections:
+# speed of light, occupancy and its register limit, issue and instruction counts (instructions
+# per permutation), stall reasons, local memory, coalescing (sectors per request), L2 hit rate.
+# Stall metrics are listed in both spellings ncu versions use; pf_validate_metrics keeps what
+# this ncu and GPU can collect, because one unknown name makes ncu profile nothing at all.
+PF_NCU_METRICS="sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,launch__occupancy_limit_registers,launch__registers_per_thread,smsp__issue_active.avg.pct_of_peak_sustained_active,smsp__inst_executed.sum,smsp__thread_inst_executed.sum"
+for _r in long_scoreboard short_scoreboard wait math_pipe_throttle lg_throttle not_selected barrier; do
+  PF_NCU_METRICS="$PF_NCU_METRICS,smsp__average_warp_latency_issue_stalled_${_r}.ratio,smsp__average_warps_issue_stalled_${_r}_per_issue_active.ratio"
+done
+unset _r
+PF_NCU_METRICS="$PF_NCU_METRICS,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,l1tex__t_requests_pipe_lsu_mem_global_op_st.sum,lts__t_sector_hit_rate.pct"
+
+# pf_validate_metrics NCU PROBE_BIN DIR METRICS — print the comma-joined subset of METRICS that
+# this ncu can collect on this GPU (needs unlocked counters). One run with all of them; when it
+# fails, one run per metric. A metric counts only if the probe's report names it.
+pf_validate_metrics() {
+  local ncu="$1" bin="$2" dir="$3" all="$4" m ok="" rc=0
+  pf_base_env
+  env -i "${PF_ENV[@]}" timeout 300 "$ncu" --metrics "$all" -c 1 "$bin" > "$dir/metrics_all.log" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] && ! grep -q '==ERROR==' "$dir/metrics_all.log"; then
+    for m in ${all//,/ }; do
+      if grep -qF -- "$m" "$dir/metrics_all.log"; then ok="${ok:+$ok,}$m"; fi
+    done
+    printf '%s\n' "$ok"
+    return 0
+  fi
+  for m in ${all//,/ }; do
+    rc=0
+    env -i "${PF_ENV[@]}" timeout 120 "$ncu" --metrics "$m" -c 1 "$bin" > "$dir/metric.log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && ! grep -q '==ERROR==' "$dir/metric.log" && grep -qF -- "$m" "$dir/metric.log"; then
+      ok="${ok:+$ok,}$m"
+    fi
+  done
+  printf '%s\n' "$ok"
+}
+
+# pf_find_nvtx_lib — the libnvToolsExt a --features nvtx binary can dlopen, or nothing. The
+# binary tries LAMBDA_VM_NVTX_LIB, the loader, then $CUDA_HOME/lib64
+# (crypto/math-cuda/src/nvtx.rs). Toolkits since CUDA 12.9 ship no libnvToolsExt (NVTX v3 is
+# headers only), and then every range is a silent no-op: hence this search, and an explicit
+# LAMBDA_VM_NVTX_LIB for the run whenever a library turns up anywhere.
+pf_find_nvtx_lib() {
+  local c d
+  local -a cands=("${LAMBDA_VM_NVTX_LIB:-}")
+  while IFS= read -r c; do cands+=("$c"); done < <({ ldconfig -p 2>/dev/null || true; } | awk '/libnvToolsExt\.so/ { print $NF }')
+  local IFS_SAVE="$IFS"
+  IFS=:
+  for d in ${LD_LIBRARY_PATH:-}; do cands+=("$d/libnvToolsExt.so.1" "$d/libnvToolsExt.so"); done
+  IFS="$IFS_SAVE"
+  cands+=("$(pf_cuda_home)/lib64/libnvToolsExt.so.1" "$(pf_cuda_home)/lib64/libnvToolsExt.so")
+  while IFS= read -r c; do cands+=("$c"); done < <(ls -d /usr/local/cuda*/lib64/libnvToolsExt.so* /usr/lib/x86_64-linux-gnu/libnvToolsExt.so* 2>/dev/null || true)
+  for c in "${cands[@]}"; do
+    if [ -n "$c" ] && [ -f "$c" ]; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 1
+}

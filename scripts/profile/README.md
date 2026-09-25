@@ -7,13 +7,17 @@ nothing to the prover.
 
 | script | what it answers | needs counters | time |
 |---|---|---|---|
-| `block_profile.sh` | **Run A** (Nsight Systems): where the block run's wall goes on the card, as GPU busy vs idle per stage (base, with its commit/prove/global; level 0; interior; root), per 5 s and per kernel. With counters, also SM active %, SM issue % and DRAM bandwidth % per 1 s and per stage. **Run B** (Nsight Compute): why the nine kernels that carry the time run as fast as they do, on real launches of that run. | run B and the GPU metrics only | ~1.5-2 h fresh |
+| `block_profile.sh` | **Run A** (Nsight Systems): where the block run's wall goes on the card, as GPU busy vs idle per stage (base, with its commit/prove/global; level 0; interior; root), per 5 s and per kernel. With counters, also SM active %, SM issue % and DRAM bandwidth % per 1 s and per stage. **Run B** (Nsight Compute): why the kernels that carry the time run as fast as they do, on the launch shapes the trace analysis picked (`thoughts/zf/prof/ANALYSIS-1GPU.md` §7), with the grind paired with its counted twin. Also `cuobjdump -res-usage` of every cubin. | run B and the GPU metrics only | ~1.5-2 h fresh |
 | `whir_ncu.sh` | Nsight Compute on two micro-benches: the RPX permutation plus the grind (latency-bound or issue-bound?) and one block-scale WHIR sumcheck round (is the round kernel under-occupied?). | yes | ~10-40 min (less once the prover is built) |
 
 The run is the record's, not an approximation of it. The test is
-`lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root`, from
-`cargo test --release -p lambda-vm-prover --features cuda --lib`, with exactly the record
-launcher's environment (`A-tree-whir.v10.sh` as `whir_tree17.sh` ran it). The profiled
+`lfm::per_table_aggregator_tests::the_whir_production_tree_composes_to_a_root`, with exactly
+the record launcher's environment (`A-tree-whir.v10.sh` as `whir_tree17.sh` ran it). It is
+built with `cargo test --release -p lambda-vm-prover --features cuda,nvtx --lib` and
+`LAMBDA_VM_NVCC_LINEINFO=1`, as the trace analysis asks. That is the record's binary plus:
+- NVTX ranges, which name the phases in the trace. The feature also turns on the
+  `instruments` spans, which is host-side bookkeeping.
+- SASS-to-source line tables in the cubins. The code itself is unchanged. The profiled
 process gets only that environment plus a few system variables (`env -i`), so nothing else
 from your shell reaches the run. The inputs are the record's guest ELF and block, in
 `fixtures/`, verified by sha256.
@@ -62,7 +66,7 @@ cd "$(git rev-parse --show-toplevel)"
 #    fixtures. It provisions the guest sysroot when it is missing. Fix any FAIL line it prints.
 bash scripts/profile/block_profile.sh --preflight-only
 
-# 3. the block profile: build + run A (nsys, with GPU metrics) + run B (ncu, nine kernels)
+# 3. the block profile: build + run A (nsys, with GPU metrics) + run B (ncu, twelve passes)
 bash scripts/profile/block_profile.sh
 
 # 4. optional, afterwards: the two micro-benches
@@ -75,7 +79,7 @@ Run it inside `tmux` or `screen`: a dropped ssh session would otherwise end it.
 Useful options: `--gpu N` (another GPU); `--skip-build` (reuse this checkout's last build,
 same HEAD); `--skip-nsys` / `--skip-ncu` (one run only, for example to redo run B:
 `--skip-build --skip-nsys`); `--no-cpu-sampling`; `--out DIR`. `--help` lists everything,
-including the env knobs (`NCU_KERNELS`, `NCU_COUNT`, `GPU_METRICS_FREQ`, the timeouts).
+including the env knobs (`NCU_PLAN`, `NCU_PASSES`, `NCU_METRICS`, `GPU_METRICS_FREQ`, the timeouts).
 
 ## Expected runtime (block_profile.sh)
 
@@ -85,13 +89,17 @@ including the env knobs (`NCU_KERNELS`, `NCU_COUNT`, `GPU_METRICS_FREQ`, the tim
 | guest ELFs (`make compile-programs-asm compile-programs-rust compile-recursion-elfs`) | ~15-25 min | ~3 min / 0 |
 | prover build (release, CUDA) | ~15-25 min | a few min / 0 |
 | run A: the block run under nsys (~2-4 min), export, stats, summary | ~10-15 min | same |
-| run B: nine ncu passes | ~40-60 min | same |
+| run B: twelve ncu passes | ~40-60 min | same |
 
-Run B is the uncertain one. Each pass reruns the block until its launches are reached: the
-first five kernels are seconds into the base, the last four only run after the ~70 s base.
-ncu then replays each profiled launch once per metric pass (tens of passes for these
-sections), saving and restoring the device memory the kernel can reach. The estimate the script prints uses
-60 s + 2.5 x (the launch's time into the run) + 45 s per launch, per pass.
+Run B is the uncertain one. Each pass reruns the block until its launches are reached, then
+ncu ends it:
+- seven passes aim at the base, 2-15 s into the run;
+- four aim at the LFM wraps, which only start after the ~70 s base;
+- `grind_pair` runs its own short test.
+
+ncu replays each profiled launch once per metric pass (tens of passes for these sections),
+saving and restoring the device memory the kernel can reach. The estimate the script prints
+uses, per pass: 60 s + 2.5 × (the window's time into the run) + 20 s per launch.
 
 ## What comes back
 
@@ -99,8 +107,9 @@ sections), saving and restoring the device memory the kernel can reach. The esti
 
 - `small/`: a few MB of plain text, packed as `small.tar.gz` once the bundle scan passes.
   `small/INDEX.txt` says what each file is. Read `small/nsys/summary.txt` first (stages,
-  busy/idle per 5 s, top kernels, copies, GPU metrics), then `small/ncu/ncu_summary.txt`
-  and `small/ncu/<kernel>.details.txt`.
+  busy/idle per 5 s, top kernels, copies, GPU metrics, NVTX), then
+  `small/ncu/verify.tsv` (did each pass profile the shapes it was aimed at),
+  `small/ncu/ncu_summary.txt` and `small/ncu/<pass>.details.txt`.
 - `big/`: `blockA.nsys-rep`, `blockA.sqlite`, `ncu/*.ncu-rep`, the raw exports and the full
   build logs. It embeds the machine's environment: never commit, share or upload it.
 
@@ -121,8 +130,10 @@ or send `scripts/profile/out/block-<UTC>/small.tar.gz`. `whir_ncu.sh` writes the
 
 ## How to read the results
 
-- **Stages** come from the run's own log, not from NVTX (the record build has none). The
-  harness prints Unix-time stamps (`BASE EPOCH n: stage Xs t=[a,b]`, `CARD HOLD ...`,
+- **Stages** come from the run's own log, not from NVTX, so they work with or without
+  `libnvToolsExt`. When NVTX ranges are present, `small/nsys/phase_busy.md` adds the
+  in-repo per-NVTX-phase view (`scripts/profiling/nsys_phase_busy.py`). The harness prints
+  Unix-time stamps (`BASE EPOCH n: stage Xs t=[a,b]`, `CARD HOLD ...`,
   `PROVE SPLIT ...`, `MARK AFTER ...`), and nsys stores the session's UTC start. The summary
   prints how far the log's last stamp sits from the last GPU activity: on the lead's
   trace it was 0.000 s. Phases partition the run: `pre`, `base`, `level0` (which
@@ -139,21 +150,53 @@ or send `scripts/profile/out/block-<UTC>/small.tar.gz`. `whir_ncu.sh` writes the
   so its durations are not wall times either. Read it for ratios: speed of light, issue
   %, occupancy against its limiter, stall reasons.
 
-Run B's default kernels (`NCU_KERNELS` overrides; `skip:count` index that kernel's own
-launches), picked in the lead's nsys trace of this code on an RTX 5090 to land on the
-launches that carry each kernel's time:
+### Run B's plan
 
-| kernel | skip:count | shape in that trace |
-|---|---|---|
-| rpx_grind_search | 16:3 | grid 1024 x 128, 7.7-11.7 ms (all launches share it) |
-| rpx_merkle_level | 11:3 | grids 8192, 4096, 2048: the top of one tree |
-| rpx_merkle_tail | 1:2 | one block of 128 threads, ~0.9 ms, 4692 launches in the run |
-| rpx_leaves_base_coset | 1:3 | grid 16384, ~45 ms |
-| sumcheck_round_ext3 | 340:3 | the three largest rounds of one 2^21 sumcheck (5.9, 3.1, 1.6 ms) |
-| rpx_leaves_base_row_major_row_pair | 0:3 | grids 8192, 8192, 16384 |
-| ntt_dit_level_row_major | 59:3 | grid 1 x 22796 / 65535 with an 11-thread block |
-| rpx_leaves_base_row_major_row_pair_range | 1:4 | grids 16384, 8192, 16384, 4096 (up to 121 ms) |
-| constraint_composition_kernel | 0:3 | grid 256 x 256 (30.5, 4.7, 6.0 ms) |
+ncu has no grid-size filter: it selects a kernel's launches by their own index (`-k NAME -s
+SKIP -c COUNT`). So each pass profiles a window of launches, chosen in the lead's nsys trace
+of this code (RTX 5090) for the shapes the trace analysis asks for. The plan carries the exact
+grid/block sequence each window holds, and two safeguards keep the index honest on another
+box:
+- Before run B, each window is re-anchored on this box's own run A trace
+  (`lib/ncu_plan.py anchor`): the nearest index with exactly those shapes.
+- After each pass, `verify` compares what ncu profiled with the plan and writes
+  `small/ncu/verify.tsv`: `ok`, `partial` or `MISMATCH`.
+
+| pass | kernel | launches (shape in the trace) | what it settles |
+|---|---|---|---|
+| grind | rpx_grind_search | 5 from the base (1024 × 128, 64 regs) | why 4.46 ns per permutation against 2.77 in the leaf kernel |
+| grind_pair | rpx_grind_search + rpx_grind_search_counted | the `rpx_grind_counted` test: warm-up and seed 0 at poll period 1, shipped then counted | the same, with a counted twin; the warm-up line prints the nonce (executed ≈ nonce + 131,072) |
+| coset | rpx_leaves_base_coset | 2 at 16384 × 128 | the permutation's full-card ceiling |
+| merkle_narrow | rpx_merkle_level | one tree's levels 512 → 2 (incl. grids 512, 32, 2) | latency |
+| merkle_wide | rpx_merkle_level | 16384 and 8192 × 128, the two widest levels of one wrap tree | throughput |
+| tail | rpx_merkle_tail | 3 at 1 × 128 | per-level latency; barrier and local-memory stalls |
+| sumcheck_2p21 | sumcheck_round_ext3 | one 2^21 sumcheck's rounds from 4096 × 256 (98 regs) down, then the two 1181 × 256 | slot-buffer traffic against capped occupancy |
+| sumcheck_slow | sumcheck_round_ext3 | the slow 253 × 32 launches (162, 94, 59 ms) | the same, where it costs most |
+| ntt_tile | ntt_dit_tile | one base LDE's four tile launches | base LDE throughput |
+| rowpair_range | rpx_leaves_base_row_major_row_pair_range | 2 at 8192 × 128 | coalescing of row-major reads |
+| ntt_level | ntt_dit_level_row_major | 3 (1 × 22796 and 1 × 65535 grids, 11 × 23 blocks) | memory throughput against peak |
+| constraint | constraint_composition_kernel | 2 at 256 × 256 | occupancy |
+
+The analysis asked for two 16384-wide launches. `merkle_wide` takes the 16384 level and
+the 8192 level of the same tree instead, because the next 16384 launch comes about 90
+launches later and a second window would cost another block run.
+
+Every pass collects the eight sections plus the analysis's explicit metrics (`lib/common.sh`
+`PF_NCU_METRICS`):
+- `sm__throughput`, `gpu__compute_memory_throughput`, `dram__throughput`, `gpu__time_duration`;
+- achieved occupancy, its register limit, registers per thread;
+- issue activity, `smsp__inst_executed.sum` and `smsp__thread_inst_executed.sum`;
+- the pipe table;
+- the stall reasons (long/short scoreboard, wait, math-pipe throttle, LG throttle, not
+  selected, barrier);
+- local-memory sectors, global sectors per request (coalescing), the L2 hit rate.
+
+The preflight keeps only the metrics this ncu and GPU can collect, because one unknown name
+makes ncu profile nothing.
+
+`NCU_PLAN=file.tsv` replaces the plan, and `NCU_PASSES="grind merkle_wide"` runs a subset.
+To redo only run B: `--skip-build --skip-nsys`. Without run A in the same output directory,
+nothing is re-anchored; the shape check still runs.
 
 ## Troubleshooting
 
@@ -177,11 +220,17 @@ launches that carry each kernel's time:
 - **`BLOCK_PROFILE VERDICT: REFUSED (bundle scan)`**: something in `small/` looks like a
   credential or is not plain text. See "Secrets" above. Nothing may be sent until the flagged
   lines are gone and the scan passes.
-- **run B ends `partial`**: `small/ncu/passes.tsv` and `small/ncu/<kernel>.prof.txt` say
-  which kernel got no profile. The usual causes are running out of host memory in ncu's
-  replay (the preflight warns below 64 GiB) or a pass timeout (`NCU_PASS_TIMEOUT`,
-  default 2700 s). Redo that kernel alone:
-  `NCU_KERNELS="<name>:<skip>:<count>" bash scripts/profile/block_profile.sh --skip-build --skip-nsys`.
+- **run B ends `partial`**: see `small/ncu/passes.tsv`, `small/ncu/verify.tsv` and
+  `small/ncu/<pass>.prof.txt`.
+  - A pass with no profile usually ran out of host memory in ncu's replay (the preflight
+    warns below 64 GiB), or hit its timeout (`NCU_PASS_TIMEOUT`, default 2700 s).
+  - A `MISMATCH` means the window drifted on this box and caught other shapes. The
+    `.details.txt` still holds real launches. To aim again: copy `small/ncu/plan.tsv`, fix
+    that pass's `skip`, then run
+    `NCU_PLAN=<copy> NCU_PASSES="<pass>" bash scripts/profile/block_profile.sh --skip-build --skip-nsys`.
+- **`nvtx: no libnvToolsExt`**: CUDA toolkits since 12.9 ship no `libnvToolsExt`, and the
+  `nvtx` build then emits no ranges. Nothing fails; the trace just lacks named phases. Install
+  `cuda-nvtx-12-8`, or point `LAMBDA_VM_NVTX_LIB` at a `libnvToolsExt.so.1`.
 - **a GPU other than a 32 GB card**: the device layer sizes itself from the driver, so
   the schedule and any fallback differ from the record. The preflight warns, and
   `runA.verdict.txt` reports the fallbacks.

@@ -336,6 +336,23 @@ def key_series(names):
     return out
 
 
+def nvtx_top(db, tbls, k=12):
+    """(ranges, [(name, count, total_ns)]) of the NVTX ranges, or None when the trace has none."""
+    if "NVTX_EVENTS" not in tbls:
+        return None
+    cols = columns(db, "NVTX_EVENTS")
+    if "start" not in cols or "end" not in cols:
+        return None
+    name, join = ("e.text" if "text" in cols else "NULL"), ""
+    if "textId" in cols and "StringIds" in tbls:
+        name = "coalesce(e.text, s.value)" if "text" in cols else "s.value"
+        join = "LEFT JOIN StringIds s ON s.id = e.textId"
+    total = db.execute("SELECT count(*) FROM NVTX_EVENTS WHERE end > start").fetchone()[0]
+    rows = db.execute("SELECT {n} AS name, count(*), sum(e.end - e.start) FROM NVTX_EVENTS e {j} "
+                      "WHERE e.end > e.start GROUP BY name ORDER BY 3 DESC LIMIT {k}".format(n=name, j=join, k=int(k))).fetchall()
+    return total, rows
+
+
 def parse_nvsmi(path, t0_utc_ns):
     """[(trace ns, memory.used MiB, util %)] from `nvidia-smi --query-gpu=timestamp,memory.used,...` in UTC."""
     rows = []
@@ -582,6 +599,12 @@ def main(argv=None):
     if clock is not None:
         L.append("clock:   the log's last stamp sits {:+.3f} s from the last GPU activity (the stage windows are "
                  "only as good as this)".format(clock))
+    nv = nvtx_top(db, tbls)
+    if nv is None or nv[0] == 0:
+        L.append("nvtx:    no NVTX ranges (a build without --features nvtx, or no libnvToolsExt reached)")
+    else:
+        L.append("nvtx:    {} ranges; by total time (nested ranges overlap): {}".format(nv[0], "; ".join(
+            "{} x{} {:.1f} s".format(n or "?", c, t / NS) for n, c, t in nv[1][:8])))
     if facts:
         tr = facts.get("test_result", ("<none>",))[0]
         L.append("run:     test result: {} · compressed line x{} · commit fallbacks {} · device fallbacks {}".format(
@@ -675,10 +698,15 @@ def selftest():
         CREATE TABLE TARGET_INFO_GPU (name TEXT, smCount INTEGER, totalMemory INTEGER, chipName TEXT);
         CREATE TABLE GPU_METRICS (rawTimestamp INTEGER, timestamp INTEGER, typeId INTEGER, metricId INTEGER, value INTEGER);
         CREATE TABLE TARGET_INFO_GPU_METRICS (typeId INTEGER, sourceId INTEGER, typeName TEXT, metricId INTEGER, metricName TEXT);
+        CREATE TABLE NVTX_EVENTS (start INTEGER, end INTEGER, eventType INTEGER, text TEXT, textId INTEGER);
     """)
     s = lambda x: int(x * NS)  # noqa: E731
     db.execute("INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES (?, '', '')", (t0,))
-    db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(1, "ka"), (2, "kb"), (3, "kc")])
+    db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(1, "ka"), (2, "kb"), (3, "kc"), (9, "epoch_prove")])
+    # two ranges named inline, one through the string table, one point mark (end NULL): not a range
+    db.executemany("INSERT INTO NVTX_EVENTS VALUES (?, ?, 59, ?, ?)", [
+        (s(1.0), s(5.0), "prove_continuation_total", None), (s(2.0), s(4.0), None, 9),
+        (s(4.0), s(5.0), None, 9), (s(3.0), None, "a mark", None)])
     db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?)", [
         (s(1.5), s(2.0), 1), (s(2.0), s(3.0), 2), (s(3.5), s(4.5), 1),  # base: prep, commit, prove
         (s(5.0), s(6.0), 3), (s(5.5), s(6.5), 3),                       # level 0, overlapping
@@ -759,6 +787,8 @@ def selftest():
         ("bucket 10-10.5 busy (0.2 s)", bz[2]["busy_any_pct"], "40.0"),
         ("compressed counted once", "compressed line x1" in summ, True),
         ("clock check", "-0.200 s from the last GPU activity" in summ, True),
+        ("nvtx: 3 ranges, the string-table name resolved", "nvtx:    3 ranges; by total time (nested ranges overlap): "
+         "prove_continuation_total x1 4.0 s; epoch_prove x2 3.0 s" in summ, True),
     ]
     bad = [(n, got, want) for n, got, want in checks if got != want]
     for n, got, want in checks:
