@@ -1,12 +1,11 @@
-//! D2 device parity at the proof level, on a VALID oracle (lane I-FIX-D2).
+//! Device parity at the proof level, on an LFM machine proof.
 //!
-//! The one-row RV64 VM bytes test this replaces compared a CPU-build proof with
-//! a cuda-build proof of `test_mul_8`, but an RV64 VM proof is not a function
-//! of the ELF and the format alone: six base-table builders dedup through a std
+//! An RV64 VM proof is not a usable cross-build oracle: it is not a function
+//! of the ELF and the format alone. Six base-table builders dedup through a std
 //! `HashMap` (`RandomState`) and lay rows out in iteration order, so the main
 //! roots — and with them the whole transcript — change from process to process
-//! (the lead's control: the same build differs from itself). A cross-build
-//! `cmp` of such bytes means nothing.
+//! (the same build differs from itself). A cross-build `cmp` of such bytes
+//! means nothing.
 //!
 //! This test proves an LFM machine program instead: its trace is a function of
 //! the program and the arenas, the proof is made at grinding 0 (no host nonce
@@ -17,9 +16,13 @@
 //! transcript absorbs — and the LogUp balance through `z`, `α` — depends on the
 //! proof actually being the one the verifier replays.
 //!
-//! Files: `$ZF_S2_PROOF_DIR/{cpu,cuda}_{format}.rkyv` for `legacy` (every lever
-//! off), `one_row_1` (legacy + one row on every chip) and `production` (the
-//! measured configuration of RULINGS 26: cap auto, fri dp, one_row auto).
+//! Files: `$ZF_S2_PROOF_DIR/{cpu,cuda}_{format}.rkyv` for four formats:
+//! - `legacy`: every lever off;
+//! - `one_row_1`: legacy + one row on every chip;
+//! - `production`: the STARK levers of the prover's default format
+//!   ([`crate::zf_format::ZfFormat::DEFAULT`]: cap auto, fri dp, one row off),
+//!   asserted equal to what that default stamps so the two cannot drift;
+//! - `all_levers`: every STARK lever on (cap auto, fri dp, one_row auto).
 //!
 //! Under cuda the `one_row_1` proof must build one-row trees on the device and
 //! take the one-row device FRI commit (a silent host fallback would still give
@@ -34,14 +37,25 @@ use crate::lfm::registry::{LfmProgramKind, build_artifacts};
 use crate::lfm::word::LfmWord;
 use crate::tables::types::FE;
 
-/// The three formats compared across builds.
-fn formats() -> [(&'static str, ProofFormat); 3] {
+/// The four formats compared across builds.
+fn formats() -> [(&'static str, ProofFormat); 4] {
     let legacy = ProofFormat {
         merkle_cap: crypto::merkle_tree::cap::CapPolicy::Off,
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
     };
+    let production = ProofFormat {
+        merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
+        fri_mode: FriMode::Dp,
+        one_row: OneRowMode::Off,
+        fri_schedule_override: None,
+    };
+    assert_eq!(
+        production,
+        crate::zf_format::ZfFormat::DEFAULT.proof_format(),
+        "the `production` arm must be the STARK part of the prover's default format"
+    );
     [
         ("legacy", legacy),
         (
@@ -51,13 +65,12 @@ fn formats() -> [(&'static str, ProofFormat); 3] {
                 ..legacy
             },
         ),
+        ("production", production),
         (
-            "production",
+            "all_levers",
             ProofFormat {
-                merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
-                fri_mode: FriMode::Dp,
                 one_row: OneRowMode::Auto,
-                fri_schedule_override: None,
+                ..production
             },
         ),
     ]
