@@ -13,7 +13,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
-use multilinear::whir_chain::{ChainConfig, GrindBits};
+use multilinear::whir_chain::{ChainConfig, FirstFold, GrindBits, WhirFolds};
 
 use crate::TableCounts;
 use crate::statement::statement_padding;
@@ -90,6 +90,27 @@ fn host_epoch_challenge(
     table_num_vars: &[u8],
     root_bytes: &[u8; 32],
 ) -> FEE {
+    host_epoch_challenge_under(
+        &config(),
+        elf,
+        label,
+        public_output,
+        table_counts,
+        table_num_vars,
+        root_bytes,
+    )
+}
+
+/// [`host_epoch_challenge`] at a given config.
+fn host_epoch_challenge_under(
+    config: &ChainConfig,
+    elf: &[u8; 32],
+    label: u64,
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    table_num_vars: &[u8],
+    root_bytes: &[u8; 32],
+) -> FEE {
     let mut transcript = HostTranscript::new(&[]);
     crate::multilinear_continuation::absorb_epoch(
         &mut transcript,
@@ -98,7 +119,7 @@ fn host_epoch_challenge(
         table_counts,
         label,
         table_num_vars,
-        &config(),
+        config,
     );
     transcript.append_bytes(root_bytes);
     transcript.sample_field_element()
@@ -107,6 +128,27 @@ fn host_epoch_challenge(
 /// The machine's challenge over the same three steps, and what the statement
 /// cost while doing it.
 fn machine_epoch_challenge(
+    elf: &[u8; 32],
+    label: u64,
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    table_num_vars: &[u8],
+    root_word: LfmWord,
+) -> (FEE, StatementCost, usize, usize) {
+    machine_epoch_challenge_under(
+        &config(),
+        elf,
+        label,
+        public_output,
+        table_counts,
+        table_num_vars,
+        root_word,
+    )
+}
+
+/// [`machine_epoch_challenge`] at a given config.
+fn machine_epoch_challenge_under(
+    config: &ChainConfig,
     elf: &[u8; 32],
     label: u64,
     public_output: &[u8],
@@ -126,7 +168,7 @@ fn machine_epoch_challenge(
             public_output,
             table_counts,
             table_num_vars,
-            config: &config(),
+            config,
         },
     );
 
@@ -649,4 +691,175 @@ fn the_global_statement_draws_the_challenge_the_host_draws() {
         "the machine must draw the challenge the host draws after `absorb_global`"
     );
     assert_eq!(cost.operations(), 0, "a statement emits no operation row");
+}
+
+// ---------------------------------------------------------------
+// W2: the fold schedule's statement word.
+// ---------------------------------------------------------------
+
+fn first_fold(k0: usize, tallest: usize) -> ChainConfig {
+    ChainConfig::with_security_folds(
+        2,
+        4,
+        WhirFolds::First(FirstFold::new(k0).unwrap()),
+        tallest,
+        128,
+        GrindBits::uniform(20),
+    )
+}
+
+/// The byte offset of the fold word in the epoch statement: the three config
+/// words and the 3-byte grind trailer end the stream.
+fn fold_word_range(len: usize) -> std::ops::Range<usize> {
+    let words_start = len - 3 - 3 * 8;
+    words_start + 8..words_start + 16
+}
+
+/// ★ The statement keeps its length and moves only in the fold word, and the
+/// machine draws the host's challenge under each accepted schedule.
+#[test]
+fn a_first_fold_statement_moves_only_its_fold_word() {
+    let elf = digest(0x21);
+    let table_counts = counts();
+    let table_num_vars: Vec<u8> = (0..34).map(|i| 12 + (i as u8) % 9).collect();
+    let (root_bytes, root_word) = root(0x6b);
+    let statement = |config: &ChainConfig| {
+        epoch_statement_bytes(&EpochStatement {
+            elf_digest: &elf,
+            epoch_label: 3,
+            public_output: &[],
+            table_counts: &table_counts,
+            table_num_vars: &table_num_vars,
+            config,
+        })
+    };
+    let today = statement(&config());
+    let range = fold_word_range(today.len());
+    assert_eq!(
+        &today[range.clone()],
+        &4u64.to_le_bytes(),
+        "the default word is 4u64"
+    );
+    for k0 in [5, 6] {
+        let arm = first_fold(k0, 25);
+        assert_eq!(arm.num_queries, config().num_queries, "Q stays 112");
+        let bytes = statement(&arm);
+        assert_eq!(
+            bytes.len(),
+            today.len(),
+            "first{k0}: the statement keeps its length"
+        );
+        assert_eq!(&bytes[range.clone()], &arm.fold_word().to_le_bytes());
+        for (i, (a, b)) in today.iter().zip(&bytes).enumerate() {
+            if !range.contains(&i) {
+                assert_eq!(a, b, "first{k0}: byte {i} moved outside the fold word");
+            }
+        }
+        assert_ne!(bytes, today);
+
+        let want = host_epoch_challenge_under(
+            &arm,
+            &elf,
+            3,
+            &[],
+            &table_counts,
+            &table_num_vars,
+            &root_bytes,
+        );
+        let (got, _, _, _) = machine_epoch_challenge_under(
+            &arm,
+            &elf,
+            3,
+            &[],
+            &table_counts,
+            &table_num_vars,
+            root_word,
+        );
+        assert_eq!(
+            got, want,
+            "first{k0}: the machine must draw the host's challenge"
+        );
+        assert_ne!(
+            want,
+            host_epoch_challenge(&elf, 3, &[], &table_counts, &table_num_vars, &root_bytes),
+            "first{k0}: the schedule must move the challenge"
+        );
+    }
+}
+
+/// ★ MUTATION GATE: the word is what binds the schedule.
+///
+/// At `num_vars <= 4` a `first6` chain and a `uniform4` chain have the SAME
+/// schedule (one round of everything) and the same Q, so every other byte of
+/// the statement and every round-count check agree: a proof at one would pass
+/// the other's shape checks. Only the fold word tells them apart. Stop
+/// absorbing it (write `log_folding` back) and the two challenges below become
+/// equal, and this test fails.
+#[test]
+fn the_fold_word_alone_separates_two_schedules_that_agree() {
+    let today = ChainConfig::with_security(2, 4, 4, 128, GrindBits::uniform(20));
+    let arm = first_fold(6, 4);
+    for n in 0..=4 {
+        assert_eq!(today.schedule(n), arm.schedule(n), "n={n}");
+    }
+    assert_eq!(
+        (
+            today.log_blowup,
+            today.log_folding,
+            today.num_queries,
+            today.grind
+        ),
+        (arm.log_blowup, arm.log_folding, arm.num_queries, arm.grind),
+        "the two configs must differ ONLY in the fold schedule"
+    );
+    assert_ne!(today.format.folds, arm.format.folds);
+
+    let elf = digest(0x31);
+    let table_counts = counts();
+    let table_num_vars = [4u8, 3, 4];
+    let (root_bytes, _) = root(0x77);
+    let challenge = |config: &ChainConfig| {
+        host_epoch_challenge_under(
+            config,
+            &elf,
+            1,
+            &[],
+            &table_counts,
+            &table_num_vars,
+            &root_bytes,
+        )
+    };
+    assert_ne!(challenge(&today), challenge(&arm));
+
+    let global = |config: &ChainConfig| {
+        let mut t = HostTranscript::new(&[]);
+        crate::multilinear_continuation::absorb_global(
+            &mut t,
+            &elf,
+            2,
+            0,
+            &[0x1000],
+            &table_num_vars,
+            config,
+        );
+        t.sample_field_element()
+    };
+    assert_ne!(global(&today), global(&arm));
+
+    // And the monolithic statement, the third host site.
+    let monolithic = |config: &ChainConfig| {
+        let mut t = HostTranscript::new(&[]);
+        crate::multilinear_prove::absorb(
+            &mut t,
+            &elf,
+            &[],
+            &table_counts,
+            0,
+            &[],
+            &table_num_vars,
+            config,
+        );
+        t.sample_field_element()
+    };
+    assert_ne!(monolithic(&today), monolithic(&arm));
 }

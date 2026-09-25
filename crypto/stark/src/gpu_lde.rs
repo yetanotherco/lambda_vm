@@ -534,6 +534,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
+    GPU_CAP_READ_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_DOWNGRADES.store(0, Ordering::Relaxed);
     GPU_RESIDENT_AUX_RETRIES.store(0, Ordering::Relaxed);
@@ -608,6 +609,15 @@ pub fn gpu_composition_calls() -> u64 {
 pub(crate) static GPU_OPENING_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_opening_gather_calls() -> u64 {
     GPU_OPENING_GATHER_CALLS.load(Ordering::Relaxed)
+}
+
+/// Merkle caps read off a device-resident tree ([`read_cap_dev`]) — one per
+/// capped tree whose nodes live on the device (main, aux, composition, FRI
+/// layer). Zero under the default format, where no tree is capped; under a
+/// cap policy a device prove with this at zero never took the device arm.
+pub(crate) static GPU_CAP_READ_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_cap_read_calls() -> u64 {
+    GPU_CAP_READ_CALLS.load(Ordering::Relaxed)
 }
 
 /// Tables whose round-1 LDE was kept device-only (host trace D2H skipped) — the
@@ -3515,6 +3525,60 @@ pub(crate) fn gather_proofs_dev(
         proofs.push(Proof { merkle_path });
     }
     Some(proofs)
+}
+
+/// Read the height-`cap_height` Merkle cap of a device-resident tree
+/// (design/CAP.md §4.2): the nodes `MerkleTree::cap` returns on the host tree,
+/// byte for byte, since the device heap has the host layout. The R4 cap
+/// post-pass calls it for every capped tree whose host tree is root-only.
+///
+/// Fails closed with a message, never a panic: a cap taller than the tree or a
+/// cudarc error is an `Err` the caller turns into a `ProvingError`. `stream`
+/// is the stream the tree's own openings were gathered on (the table's bound
+/// stream; a fresh backend stream for the FRI layers, as the FRI query phase
+/// uses).
+pub(crate) fn read_cap_dev(
+    tree: &math_cuda::lde::GpuMerkleTree,
+    cap_height: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<Commitment>, String> {
+    if !tree.leaves_len.is_power_of_two() {
+        return Err(format!(
+            "device tree has {} leaves, not a power of two",
+            tree.leaves_len
+        ));
+    }
+    let depth = tree.leaves_len.trailing_zeros() as usize;
+    if cap_height > depth {
+        return Err(format!(
+            "cap height {cap_height} exceeds the device tree depth {depth}"
+        ));
+    }
+    if tree.nodes.len() < ((2usize << cap_height) - 1) * 32 {
+        return Err(format!(
+            "device node buffer of {} bytes is too short for a height-{cap_height} cap",
+            tree.nodes.len()
+        ));
+    }
+    let bytes = math_cuda::merkle::read_cap_dev(&tree.nodes, tree.leaves_len, cap_height, stream)
+        .map_err(|e| format!("cudarc: {e:?}"))?;
+    let cap: Vec<Commitment> = bytes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut node: Commitment = [0u8; 32];
+            node.copy_from_slice(c);
+            node
+        })
+        .collect();
+    if cap.len() != 1 << cap_height {
+        return Err(format!(
+            "device cap read returned {} nodes, expected {}",
+            cap.len(),
+            1usize << cap_height
+        ));
+    }
+    GPU_CAP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    Ok(cap)
 }
 
 /// R3 OOD device-side context: bundles the inverted denominators, the

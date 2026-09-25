@@ -475,7 +475,7 @@ mod tests {
     /// state the type system forbids is a check that cannot fail.
     ///
     /// ⚠ The refusal is NOT a shape guard. `DecodePrepared::agrees_with`
-    /// compares only `log_blowup` and `log_folding`, which two programs at the
+    /// compares only `log_blowup`, `log_folding` and the fold schedule, which two programs at the
     /// same options share, so a wrong-program prepared sails past it and is
     /// caught by the derived roots block the transcript absorbs — the same
     /// cryptographic mechanism as the hash agreement. The reason is printed so

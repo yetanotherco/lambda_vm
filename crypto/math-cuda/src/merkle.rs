@@ -440,6 +440,47 @@ pub fn gather_merkle_paths_dev(
     Ok(host)
 }
 
+/// Read the Merkle cap at height `cap_height` off a device-resident tree: the
+/// `2^c` nodes `c` levels below the root, left to right, as `2^c * 32` bytes.
+///
+/// No kernel: the device heap has the host layout (root at node 0, the level
+/// with `2^c` nodes at `[2^c - 1, 2^{c+1} - 1)`), so the cap is one D2H of the
+/// heap slice `[(2^c - 1) * 32, (2^{c+1} - 1) * 32)` (design/CAP.md §1.3). The
+/// same nodes `MerkleTree::cap` returns on the host tree, byte for byte.
+/// `cap_height = 0` is the root. Runs on the caller's `stream`, after the work
+/// already queued on it, and waits for the copy.
+///
+/// Panics on a shape no caller may pass (the same contract as
+/// [`gather_merkle_paths_dev`]): `leaves_len` not a power of two, a cap taller
+/// than the tree, or a node buffer too short for the heap it claims to hold.
+pub fn read_cap_dev(
+    nodes_dev: &CudaSlice<u8>,
+    leaves_len: usize,
+    cap_height: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u8>> {
+    assert!(
+        leaves_len.is_power_of_two(),
+        "read_cap_dev: leaves_len must be a power of two"
+    );
+    let depth = leaves_len.trailing_zeros() as usize;
+    assert!(
+        cap_height <= depth,
+        "read_cap_dev: cap height {cap_height} exceeds the tree depth {depth}"
+    );
+    let start = ((1usize << cap_height) - 1) * 32;
+    let end = ((2usize << cap_height) - 1) * 32;
+    assert!(
+        end <= nodes_dev.len(),
+        "read_cap_dev: node buffer of {} bytes is shorter than the cap slice end {end}",
+        nodes_dev.len()
+    );
+    let mut host = vec![0u8; end - start];
+    stream.memcpy_dtoh(&nodes_dev.slice(start..end), &mut host)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
 /// Build the composition Merkle tree on device. `parts_interleaved` is
 /// `num_parts` slices, each an ext3 LDE column interleaved as
 /// `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`. Leaves hash row pairs, so

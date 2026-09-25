@@ -92,6 +92,17 @@ pub struct ProofFormat {
     pub fri_mode: FriMode,
     /// One-row trace openings with a committed FRI input (S2). `Off` = today.
     pub one_row: OneRowMode,
+    /// An explicit committed-layer fold schedule that replaces the DP's under
+    /// [`FriMode::Dp`] (ignored under [`FriMode::Pair`]). `None` = the DP.
+    ///
+    /// A TEST HOOK: it lets round-trip tests prove and verify schedules the DP
+    /// never picks (unequal neighbouring exponents such as `[1, 3]`, the only
+    /// shape that catches a fold-count off-by-one). No knob sets it — the
+    /// `ZF FORMAT` parser always leaves it `None` — and like every format
+    /// field it is a verifier-side constant, never read from a proof. A
+    /// schedule that does not cover the table's committed folds exactly is a
+    /// proving error and a verification failure, never a silent fallback.
+    pub fri_schedule_override: Option<FriScheduleOverride>,
 }
 
 impl ProofFormat {
@@ -100,6 +111,7 @@ impl ProofFormat {
         merkle_cap: CapPolicy::Off,
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
+        fri_schedule_override: None,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -107,6 +119,41 @@ impl ProofFormat {
         self.merkle_cap.is_off()
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
+            && self.fri_schedule_override.is_none()
+    }
+}
+
+/// Longest schedule a [`FriScheduleOverride`] holds.
+pub const FRI_SCHEDULE_OVERRIDE_MAX: usize = 32;
+
+/// An explicit FRI fold schedule (see [`ProofFormat::fri_schedule_override`]):
+/// the fold exponent of each committed layer, first committed layer first.
+/// Fixed capacity so [`ProofFormat`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FriScheduleOverride {
+    len: u8,
+    exponents: [u8; FRI_SCHEDULE_OVERRIDE_MAX],
+}
+
+impl FriScheduleOverride {
+    /// `None` if `schedule` is longer than [`FRI_SCHEDULE_OVERRIDE_MAX`]. The
+    /// exponents themselves are validated where the layout is built (each in
+    /// `1..=FRI_SCHEDULE_DMAX`, summing to the table's committed folds).
+    pub fn new(schedule: &[u8]) -> Option<Self> {
+        if schedule.len() > FRI_SCHEDULE_OVERRIDE_MAX {
+            return None;
+        }
+        let mut exponents = [0u8; FRI_SCHEDULE_OVERRIDE_MAX];
+        exponents[..schedule.len()].copy_from_slice(schedule);
+        Some(Self {
+            len: schedule.len() as u8,
+            exponents,
+        })
+    }
+
+    /// The schedule.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.exponents[..self.len as usize]
     }
 }
 
@@ -193,10 +240,28 @@ impl FromStr for OneRowMode {
 /// stable while the campaign lands it — must not be selectable, or a run
 /// could print a non-default format and prove the default one. Each lane
 /// flips its own flag in the commit that makes the lever real.
-pub const MERKLE_CAP_IMPLEMENTED: bool = false;
+///
+/// The Merkle cap is real on the host and device STARK provers and the host
+/// verifier (design/CAP.md C3 + C4). ⚠ NOT yet in the LFM in-guest verifier
+/// (C5): a recursion run that wraps a capped proof fails closed there, so
+/// `LAMBDA_VM_ZF_CAP` is for STARK-level tests and measurements until C5
+/// lands.
+pub const MERKLE_CAP_IMPLEMENTED: bool = true;
 
-/// See [`MERKLE_CAP_IMPLEMENTED`].
-pub const FRI_MODE_IMPLEMENTED: bool = false;
+/// `FriMode::Dp` (S3) is implemented on the HOST paths only:
+/// - the CPU prover (group-leaf layer commits, the scheduled folds, group
+///   openings) and the host verifier (`multi_verify` / `multi_verify_archived`);
+/// - on a `cuda` build every device FRI arm (DEEP→FRI on device, the device
+///   layer commit, the device query gather) is taken only for `Pair`; a `Dp`
+///   table runs the CPU FRI loop (DEEP may still run on the device).
+///
+/// NOT implemented: device group-leaf FRI (lane I-FRI-D), the in-guest (LFM)
+/// verifier of a `Dp` proof (lane I-FRI-G: `lfm::fri::FriShape` still derives
+/// the legacy layout, so an LFM wrap or node over a `Dp` proof fails at emit
+/// time), and the RV64 recursion guest (default-only by RULINGS 11; it refuses
+/// a non-default format). A block run under `LAMBDA_VM_ZF_FRI=dp` therefore
+/// proves and host-verifies its STARK proofs but cannot recurse over them yet.
+pub const FRI_MODE_IMPLEMENTED: bool = true;
 
 /// See [`MERKLE_CAP_IMPLEMENTED`].
 pub const ONE_ROW_IMPLEMENTED: bool = false;

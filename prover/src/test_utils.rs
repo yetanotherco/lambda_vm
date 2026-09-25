@@ -26,7 +26,7 @@ use stark::domain::Domain;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, NullBoundaryConstraintBuilder,
 };
-use stark::proof::options::ProofOptions;
+use stark::proof::options::{ProofFormat, ProofOptions};
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, ProvingError};
 #[cfg(feature = "disk-spill")]
@@ -629,7 +629,12 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 ///
 /// Key correctness: for a given name the constraint set and bus interactions
 /// are a pure function of the table module (PAGE embeds its page base in the
-/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads.
+/// name), and `ProofOptions` covers everything else `AirWithBuses::new` reads —
+/// ALL of it, the proof `format` included: the AIR carries its options, and the
+/// prover and verifier read the proof format from `air.options()`, so an AIR
+/// served under another format's key is another format's prover and verifier.
+/// [`air_proto_key`] destructures `ProofOptions` without `..`, so a field added
+/// to it later does not compile until it is keyed here too.
 /// The cached prototype is pristine — `with_name` / `with_preprocessed` apply
 /// to the caller's clone only.
 fn air_prototype_cache()
@@ -640,16 +645,30 @@ fn air_prototype_cache()
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-type AirProtoKey = (String, u8, usize, u64, u8, u8);
+type AirProtoKey = (String, u8, usize, u64, u8, u8, ProofFormat);
 
 fn air_proto_key(name: &str, o: &ProofOptions) -> AirProtoKey {
+    // ⛔ No `..`: every field of `ProofOptions` is part of the key. The format
+    // was once missing (it was added to `ProofOptions` after this key was
+    // written), and the first AIR built in a process then fixed the format of
+    // every later AIR of that name — a verifier asked for the default format
+    // verified a capped proof with capped AIRs and accepted it.
+    let ProofOptions {
+        blowup_factor,
+        fri_number_of_queries,
+        coset_offset,
+        grinding_factor,
+        fri_final_poly_log_degree,
+        format,
+    } = o;
     (
         name.to_string(),
-        o.blowup_factor,
-        o.fri_number_of_queries,
-        o.coset_offset,
-        o.grinding_factor,
-        o.fri_final_poly_log_degree,
+        *blowup_factor,
+        *fri_number_of_queries,
+        *coset_offset,
+        *grinding_factor,
+        *fri_final_poly_log_degree,
+        *format,
     )
 }
 

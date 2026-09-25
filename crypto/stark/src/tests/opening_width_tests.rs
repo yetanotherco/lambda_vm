@@ -76,7 +76,7 @@ pub struct FibonacciSplitAIR<F: IsFFTField> {
 
 impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
     /// The AIR as the verifier sees it: plain, non-preprocessed.
-    fn honest(proof_options: &ProofOptions, out: Option<FieldElement<F>>) -> Self {
+    pub(crate) fn honest(proof_options: &ProofOptions, out: Option<FieldElement<F>>) -> Self {
         let mut air = <Self as AIR>::new(proof_options);
         air.out = out;
         air
@@ -96,7 +96,7 @@ impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
     /// Handing the verifier a different count than the prover used is how the
     /// hook-free test below reaches the precomputed term of the guard: both
     /// sides still absorb the same commitment, so the transcripts agree.
-    fn preprocessed_declaring(
+    pub(crate) fn preprocessed_declaring(
         proof_options: &ProofOptions,
         out: Option<FieldElement<F>>,
         precomputed_columns: usize,

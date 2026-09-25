@@ -56,9 +56,9 @@ use crate::{
     poly::Composed,
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
-    whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening},
+    whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening_capped},
     whir_hash::{GrindingDigest, WhirHash},
-    whir_round::{self, RoundCommitments, RoundConfig, RoundProof},
+    whir_round::{self, RoundCaps, RoundCommitments, RoundConfig, RoundProof, TreeCheck},
 };
 
 /// `w(x)·f(x)`, the shape every group's sumcheck runs over.
@@ -180,9 +180,11 @@ impl GrindBits {
 ///
 /// `format` is the proof FORMAT ([`ChainFormat`], the ZF campaign's W1 and W2
 /// levers); its default is today's format. Like the rest of the config it is
-/// a verifier-side constant, never read from a proof. It is NOT absorbed into
-/// the statement (`push_config` binds it as `_`): absorbing it would move
-/// every transcript at the default.
+/// a verifier-side constant, never read from a proof. The fold schedule is
+/// absorbed into the statement through [`ChainConfig::fold_word`], whose value
+/// at the default is `log_folding` itself (today's bytes); the rest of the
+/// format is not absorbed (`push_config` binds it as `_`): absorbing it would
+/// move every transcript at the default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainConfig {
     /// `log2` of the code's inverse rate.
@@ -226,56 +228,70 @@ impl ChainFormat {
 /// parsed must not be selectable (see `stark::proof::options::
 /// MERKLE_CAP_IMPLEMENTED`). Each lane flips its own flag in the commit that
 /// makes the lever real.
-pub const WHIR_CAP_IMPLEMENTED: bool = false;
+///
+/// W1 (the Merkle cap) is real: host prover and verifier ([`ChainConfig::
+/// tree_caps`], the owner-path encoding), the device (`paths_and_cap`), and
+/// the in-guest verifier and its cost model (`prover::lfm::whir_chain`).
+pub const WHIR_CAP_IMPLEMENTED: bool = true;
 
-/// The longest explicit fold list [`WhirFolds::List`] holds.
-pub const MAX_FOLD_ROUNDS: usize = 32;
+/// The widest fold any round of a chain may take.
+///
+/// The stack is tested up to it and no further: the GPU commit/fold parity
+/// (`math-cuda` `whir_commit`/`whir_fold`, k = 6) and the in-guest fold
+/// emitter (`lfm::whir_fold_tests`, k = 5 and 6). `k0 = 7` loses on in-guest
+/// instructions (design/WHIR.md §3.2), so nothing above 6 is opened.
+pub const MAX_FOLD: usize = 6;
 
 /// The per-round fold schedule of a chain (W2).
+///
+/// ★ Why a FIRST fold and not a list. A config serves chains of every height
+/// (`chain_config` takes the tallest stack, and each chain folds its own
+/// `num_vars`), so a per-round list would have to say what a shorter chain
+/// does with it. The lever design/WHIR.md measured is the first fold alone —
+/// tree 0 is the only base-field tree, opened `Q` times rather than `2Q`, and
+/// every variable it takes shortens every later tree — so the schedule is
+/// "`k0`, then today's uniform walk", a function of `(k0, log_folding,
+/// num_vars)` at every height. There is no DP (RULINGS 15).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WhirFolds {
     /// `log_folding` variables every round, the remainder last. Today's format.
     #[default]
     Uniform,
-    /// A schedule chosen per chain by the verifier-side DP.
-    Dp,
-    /// An explicit schedule, round by round.
-    List(FoldList),
+    /// The first round folds `k0` variables (all of them when the chain has
+    /// fewer); every later round is today's walk: `log_folding`, the remainder
+    /// last. `first5` / `first6`.
+    First(FirstFold),
 }
 
-/// See [`WHIR_CAP_IMPLEMENTED`].
-pub const WHIR_FOLDS_IMPLEMENTED: bool = false;
+/// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
+/// `agrees_with`, the production config, the GPU parity at k = 6 and the
+/// in-guest gates at k = 5 and 6.
+pub const WHIR_FOLDS_IMPLEMENTED: bool = true;
 
-/// An explicit fold schedule: `1 ..= MAX_FOLD_ROUNDS` rounds of `1 ..= 16`
-/// variables each. `Copy`, so [`ChainConfig`] stays `Copy`.
+/// A first-round fold, `1 ..= MAX_FOLD`. Constructed only through
+/// [`FirstFold::new`], so a fold of 0 or wider than the tested stack is not a
+/// value a config can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FoldList {
-    len: u8,
-    folds: [u8; MAX_FOLD_ROUNDS],
-}
+pub struct FirstFold(u8);
 
-impl FoldList {
-    /// `None` when empty, longer than [`MAX_FOLD_ROUNDS`], or a fold outside
-    /// `1..=16`.
-    pub fn new(folds: &[u8]) -> Option<Self> {
-        if folds.is_empty()
-            || folds.len() > MAX_FOLD_ROUNDS
-            || folds.iter().any(|&k| !(1..=16).contains(&k))
-        {
-            return None;
+impl FirstFold {
+    /// `None` outside `1..=MAX_FOLD`.
+    pub const fn new(k: usize) -> Option<Self> {
+        if k >= 1 && k <= MAX_FOLD {
+            Some(Self(k as u8))
+        } else {
+            None
         }
-        let mut out = [0u8; MAX_FOLD_ROUNDS];
-        out[..folds.len()].copy_from_slice(folds);
-        Some(Self {
-            len: folds.len() as u8,
-            folds: out,
-        })
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        &self.folds[..self.len as usize]
+    pub const fn get(self) -> usize {
+        self.0 as usize
     }
 }
+
+/// The top bit of a non-uniform [`ChainConfig::fold_word`]. A uniform word is
+/// `log_folding`, far below it, so no non-default word equals a default one.
+pub const FOLD_WORD_TAG: u64 = 1 << 63;
 
 impl ChainConfig {
     /// Parameters for a security target, in the **same regime the univariate
@@ -299,29 +315,135 @@ impl ChainConfig {
         security_bits: u8,
         grind: GrindBits,
     ) -> Self {
-        let rounds = num_vars.div_ceil(log_folding.max(1)).max(1);
+        Self::with_security_folds(
+            log_blowup,
+            log_folding,
+            WhirFolds::Uniform,
+            num_vars,
+            security_bits,
+            grind,
+        )
+    }
+
+    /// [`with_security`](Self::with_security) under a fold schedule.
+    ///
+    /// ★ THE ONE Q RULE. The query count is one number for every chain the
+    /// config serves, so the union bound is charged the WORST round count any
+    /// chain of at most `num_vars` variables has under `folds`. For `Uniform`
+    /// that is `ceil(num_vars / log_folding)` — today's count, exactly — and a
+    /// first fold `k0 >= log_folding` never has more rounds than that at any
+    /// height, so it never raises Q (`first5`/`first6` keep 112 at 25).
+    ///
+    /// The rate is `2^-log_blowup` in every round whatever the schedule (the
+    /// domain loses `k_r` bits as the message loses `k_r` variables), so the
+    /// per-query bits do not move; only `rounds` does. The disclaimer on
+    /// [`with_security`](Self::with_security) applies unchanged.
+    pub fn with_security_folds(
+        log_blowup: usize,
+        log_folding: usize,
+        folds: WhirFolds,
+        num_vars: usize,
+        security_bits: u8,
+        grind: GrindBits,
+    ) -> Self {
+        let mut config = Self {
+            log_blowup,
+            log_folding,
+            num_queries: 0,
+            grind,
+            format: ChainFormat {
+                folds,
+                ..ChainFormat::DEFAULT
+            },
+        };
+        let rounds = (1..=num_vars)
+            .map(|m| config.rounds(m))
+            .max()
+            .unwrap_or(0)
+            .max(1);
         // ★ Integers, not `f64`. The arithmetic and its provenance are in
         // [`crate::query_count`]; what matters here is that the count a
         // verifier has to reproduce no longer needs floating point to
         // reproduce it, and that the answers did not move — the shipped
         // posture's 110 / 112 / 113 are pinned in both places.
-        let num_queries =
+        config.num_queries =
             crate::query_count::num_queries(log_blowup, rounds, security_bits, grind.query);
+        config
+    }
 
-        Self {
-            log_blowup,
-            log_folding,
-            num_queries,
-            grind,
-            format: ChainFormat::DEFAULT,
+    /// Rounds a chain of `num_vars` variables runs: `schedule(num_vars).len()`.
+    pub fn rounds(&self, num_vars: usize) -> usize {
+        self.schedule(num_vars).len()
+    }
+
+    /// The statement's fold word: what the three host absorbs and the LFM's
+    /// `push_config` write where they wrote `log_folding`.
+    ///
+    /// - `Uniform` → `log_folding`: `4u64` at the default, today's bytes.
+    /// - `First(k0)` → `FOLD_WORD_TAG | log_folding << 52 | 1 << 48 | k0`:
+    ///   design/WHIR.md §4.3's prefix encoding with a one-entry prefix (tail
+    ///   `log_folding`, length 1, the fold in the low nibble).
+    ///
+    /// Every chain's schedule is a function of this word and its own
+    /// `num_vars`, which the statement already binds, so binding the word
+    /// binds every schedule — including the heights where two policies give
+    /// the same schedule (`first6` and `uniform4` at `num_vars <= 4`), where
+    /// only the word tells the proofs apart.
+    pub fn fold_word(&self) -> u64 {
+        match self.format.folds {
+            WhirFolds::Uniform => self.log_folding as u64,
+            WhirFolds::First(k0) => {
+                FOLD_WORD_TAG
+                    | ((self.log_folding as u64 & 0x7ff) << 52)
+                    | (1 << 48)
+                    | k0.get() as u64
+            }
         }
     }
 
+    /// The Merkle cap height of each of the chain's `R` commitment trees, tree
+    /// `t` being the one round `t` opens as its current codeword (W1,
+    /// design/CAP.md §5.1).
+    ///
+    /// Tree `t` has depth `D_t − k_t` (its leaves are round `t`'s domain
+    /// folded by that round's `k`) and is opened `Q` times when `t = 0` (round
+    /// 0's current openings) and `2Q` times after (round `t − 1`'s successor
+    /// openings and round `t`'s current ones, the last tree included). The
+    /// height is [`CapPolicy::height`] of those two public numbers, so the
+    /// prover, the host verifier and the in-guest emitter derive the same
+    /// heights from the config alone. All zero at the default.
+    pub fn tree_caps(&self, num_vars: usize) -> Vec<usize> {
+        let mut domain_log = num_vars + self.log_blowup;
+        self.schedule(num_vars)
+            .iter()
+            .enumerate()
+            .map(|(t, &k)| {
+                domain_log -= k;
+                let openings = if t == 0 {
+                    self.num_queries
+                } else {
+                    2 * self.num_queries
+                };
+                self.format.cap.height(openings, domain_log)
+            })
+            .collect()
+    }
+
     /// Variables folded in each round: `log_folding` until the remainder.
+    ///
+    /// Under [`WhirFolds::First`] the first round takes `k0` (or everything,
+    /// when there is less), and the rest is this same walk.
     pub fn schedule(&self, num_vars: usize) -> Vec<usize> {
         let step = self.log_folding.max(1);
         let mut left = num_vars;
         let mut out = Vec::new();
+        if let WhirFolds::First(k0) = self.format.folds {
+            let take = k0.get().min(left);
+            if take > 0 {
+                out.push(take);
+                left -= take;
+            }
+        }
         while left > 0 {
             let take = step.min(left);
             out.push(take);
@@ -798,6 +920,8 @@ where
     // several (`stacked_eval::prove` runs one per commitment).
     crate::whir_split::bump(&crate::whir_split::CHAIN_COUNT);
     let schedule = config.schedule(num_vars);
+    // One cap height per tree; all zero at the default format.
+    let caps = config.tree_caps(num_vars);
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current = Current::<F, E, H>::Base(commitment);
@@ -901,26 +1025,41 @@ where
             log_folding: k,
         };
         let __wc_q = crate::whir_split::mark();
-        let openings = match (&current, &next) {
-            (Current::Base(held), Some(next)) => {
-                RoundOpenings::Base(whir_round::prove(*held, next, &round_config, transcript)?)
-            }
-            (Current::Base(held), None) => RoundOpenings::Base(final_openings::<F, E, T, H>(
-                held,
-                &round_config,
-                transcript,
-            )?),
-            (Current::Extension(held), Some(next)) => {
-                RoundOpenings::Extension(whir_round::prove(held, next, &round_config, transcript)?)
-            }
-            (Current::Extension(held), None) => {
-                RoundOpenings::Extension(final_openings::<E, E, T, H>(
+        // Tree `r` is opened under `caps[r]`, and carries its cap on its first
+        // opening in proof order: round 0's first current opening for tree 0,
+        // round `r − 1`'s first successor opening for every later tree.
+        let round_caps = RoundCaps {
+            current: caps[r],
+            current_owner: r == 0,
+            next: caps.get(r + 1).copied().unwrap_or(0),
+        };
+        let openings =
+            match (&current, &next) {
+                (Current::Base(held), Some(next)) => RoundOpenings::Base(whir_round::prove(
+                    *held,
+                    next,
+                    &round_config,
+                    round_caps,
+                    transcript,
+                )?),
+                (Current::Base(held), None) => RoundOpenings::Base(final_openings::<F, E, T, H>(
                     held,
                     &round_config,
+                    round_caps,
                     transcript,
-                )?)
-            }
-        };
+                )?),
+                (Current::Extension(held), Some(next)) => RoundOpenings::Extension(
+                    whir_round::prove(held, next, &round_config, round_caps, transcript)?,
+                ),
+                (Current::Extension(held), None) => {
+                    RoundOpenings::Extension(final_openings::<E, E, T, H>(
+                        held,
+                        &round_config,
+                        round_caps,
+                        transcript,
+                    )?)
+                }
+            };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
 
         rounds.push(ChainRound {
@@ -1016,6 +1155,7 @@ where
 fn final_openings<C, N, T, H>(
     current: &CodewordCommitment<C, H>,
     config: &RoundConfig,
+    caps: RoundCaps,
     transcript: &mut T,
 ) -> Result<RoundProof<C, N>, Error>
 where
@@ -1033,7 +1173,7 @@ where
     // ⛔ ONE `open_many` here, not two: the final round has no successor to
     // open. That is the `− 1` in arm F's `2R − 1`.
     Ok(RoundProof {
-        current: current.open_many(&queries)?,
+        current: current.open_many_capped(&queries, caps.current, caps.current_owner)?,
         next: Vec::new(),
     })
 }
@@ -1073,9 +1213,9 @@ where
 /// `weight_at` is the weight's closed form, evaluated at the concatenation of
 /// every round's challenges.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_weighted<F, E, T, W, H>(
-    proof: &ChainProof<F, E>,
-    root: &Commitment,
+pub fn verify_weighted<'a, F, E, T, W, H>(
+    proof: &'a ChainProof<F, E>,
+    root: &'a Commitment,
     weight_at: W,
     y: FieldElement<E>,
     num_vars: usize,
@@ -1102,7 +1242,14 @@ where
 
     let mut claim = y;
     let mut alphas: Vec<FieldElement<E>> = Vec::with_capacity(num_vars);
-    let mut current_root = *root;
+    // Tree 0 is authenticated by the cap round 0's first current opening
+    // carries; every later tree by the check the round that committed it
+    // returned. A verifier constant per tree, derived from the config alone.
+    let caps = config.tree_caps(num_vars);
+    let mut current: TreeCheck<'a> = TreeCheck::Owner {
+        root,
+        cap_height: caps[0],
+    };
     let mut current_domain = domain.clone();
     // Each round's out-of-domain claim, and how many variables were bound when
     // it entered the weight — the challenges after that are where its `eq`
@@ -1159,11 +1306,12 @@ where
 
                 check_grind::<E, T, H>(transcript, config.grind.query, round.nonces.query)?;
                 let commitments = RoundCommitments {
-                    current_root: &current_root,
+                    current,
                     next_root,
                     next_num_leaves: next_domain.size() >> next_k,
+                    next_cap_height: caps[r + 1],
                 };
-                match &round.openings {
+                let next_check = match &round.openings {
                     RoundOpenings::Base(openings) => whir_round::verify::<F, F, E, T, H>(
                         openings,
                         commitments,
@@ -1180,8 +1328,8 @@ where
                         &round_config,
                         transcript,
                     )?,
-                }
-                current_root = *next_root;
+                };
+                current = TreeCheck::Checked(next_check);
             }
             (None, None, None) => {
                 transcript.append_field_element(&proof.final_value);
@@ -1189,7 +1337,7 @@ where
                 match &round.openings {
                     RoundOpenings::Base(openings) => verify_final::<F, F, E, T, H>(
                         openings,
-                        &current_root,
+                        current,
                         &current_domain,
                         &group.point,
                         &round_config,
@@ -1198,7 +1346,7 @@ where
                     )?,
                     RoundOpenings::Extension(openings) => verify_final::<F, E, E, T, H>(
                         openings,
-                        &current_root,
+                        current,
                         &current_domain,
                         &group.point,
                         &round_config,
@@ -1243,9 +1391,9 @@ where
 }
 
 /// The last round: every queried block must fold to the constant that was sent.
-fn verify_final<F, C, N, T, H>(
-    openings: &RoundProof<C, N>,
-    current_root: &Commitment,
+fn verify_final<'a, F, C, N, T, H>(
+    openings: &'a RoundProof<C, N>,
+    current: TreeCheck<'a>,
     current_domain: &Domain<F>,
     alphas: &[FieldElement<N>],
     config: &RoundConfig,
@@ -1267,10 +1415,22 @@ where
         });
     }
     let num_leaves = current_domain.size() >> config.log_folding;
+    let depth = num_leaves.trailing_zeros() as usize;
+    // The tree's check, built once from its first opening, after the count
+    // guard above (REVIEW-CAP M2). With no openings there is nothing to check.
+    let Some(first) = openings.current.first() else {
+        return Ok(());
+    };
+    let (check, first_siblings) = current.open::<C, H>(depth, first)?;
 
     for (i, opening) in openings.current.iter().enumerate() {
         let q = transcript.sample_u64(num_leaves as u64) as usize;
-        if !verify_opening::<C, H>(current_root, q, opening) {
+        let siblings = if i == 0 {
+            first_siblings
+        } else {
+            opening.proof.merkle_path.as_slice()
+        };
+        if !verify_opening_capped::<C, H>(&check, q, opening, siblings) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != *final_value {
@@ -1427,6 +1587,295 @@ mod tests {
         assert_eq!(config(3).schedule(9), vec![3, 3, 3]);
         assert_eq!(config(4).schedule(3), vec![3]);
         assert_eq!(config(1).schedule(3), vec![1, 1, 1]);
+    }
+
+    // ---------------------------------------------------------------
+    // W2: the first-fold schedule.
+    // ---------------------------------------------------------------
+
+    fn first(k0: usize, log_folding: usize) -> ChainConfig {
+        ChainConfig {
+            format: ChainFormat {
+                folds: WhirFolds::First(FirstFold::new(k0).unwrap()),
+                ..ChainFormat::DEFAULT
+            },
+            ..config(log_folding)
+        }
+    }
+
+    /// Today's `schedule` body, verbatim, as the reference the default must
+    /// reproduce.
+    fn uniform_reference(log_folding: usize, num_vars: usize) -> Vec<usize> {
+        let step = log_folding.max(1);
+        let mut left = num_vars;
+        let mut out = Vec::new();
+        while left > 0 {
+            let take = step.min(left);
+            out.push(take);
+            left -= take;
+        }
+        out
+    }
+
+    #[test]
+    fn the_schedule_is_uniform_by_default() {
+        for k in 1..=MAX_FOLD {
+            for n in 0..=40 {
+                assert_eq!(
+                    config(k).schedule(n),
+                    uniform_reference(k, n),
+                    "k={k} n={n}"
+                );
+                assert_eq!(config(k).rounds(n), uniform_reference(k, n).len());
+            }
+        }
+        assert_eq!(ChainFormat::DEFAULT.folds, WhirFolds::Uniform);
+        assert_eq!(WhirFolds::default(), WhirFolds::Uniform);
+    }
+
+    #[test]
+    fn with_security_folds_uniform_is_with_security() {
+        for k in 1..=MAX_FOLD {
+            for n in 0..=40 {
+                for grind in [GrindBits::default(), GrindBits::uniform(20)] {
+                    assert_eq!(
+                        ChainConfig::with_security_folds(2, k, WhirFolds::Uniform, n, 128, grind),
+                        ChainConfig::with_security(2, k, n, 128, grind),
+                        "k={k} n={n}"
+                    );
+                }
+            }
+        }
+        // And today's production numbers.
+        let today = ChainConfig::with_security(2, 4, 25, 128, GrindBits::uniform(20));
+        assert_eq!((today.rounds(25), today.num_queries), (7, 112));
+    }
+
+    #[test]
+    fn the_default_fold_word_is_log_folding() {
+        for k in 1..=MAX_FOLD {
+            assert_eq!(config(k).fold_word(), k as u64);
+        }
+        assert_eq!(config(4).fold_word().to_le_bytes(), 4u64.to_le_bytes());
+    }
+
+    /// design/WHIR.md §3.2's schedules, by hand, and the clamp at small heights.
+    #[test]
+    fn the_first_fold_schedules() {
+        let (f5, f6) = (first(5, 4), first(6, 4));
+        assert_eq!(f6.schedule(25), vec![6, 4, 4, 4, 4, 3]);
+        assert_eq!(f6.schedule(24), vec![6, 4, 4, 4, 4, 2]);
+        assert_eq!(f6.schedule(23), vec![6, 4, 4, 4, 4, 1]);
+        assert_eq!(f5.schedule(25), vec![5, 4, 4, 4, 4, 4]);
+        assert_eq!(f5.schedule(24), vec![5, 4, 4, 4, 4, 3]);
+        assert_eq!(f5.schedule(23), vec![5, 4, 4, 4, 4, 2]);
+        // The first round takes everything when there is less than k0.
+        assert_eq!(f6.schedule(0), Vec::<usize>::new());
+        assert_eq!(f6.schedule(3), vec![3]);
+        assert_eq!(f6.schedule(6), vec![6]);
+        assert_eq!(f6.schedule(7), vec![6, 1]);
+        assert_eq!(f5.schedule(9), vec![5, 4]);
+        assert_eq!(f5.schedule(11), vec![5, 4, 2]);
+        assert_eq!(f6.schedule(9), vec![6, 3]);
+        // Every schedule covers exactly `n`, starts at min(k0, n), then walks
+        // today's uniform body over the rest; no fold exceeds MAX_FOLD.
+        for k0 in 1..=MAX_FOLD {
+            for k in 1..=4 {
+                let c = first(k0, k);
+                for n in 0..=40 {
+                    let s = c.schedule(n);
+                    assert_eq!(s.iter().sum::<usize>(), n);
+                    assert!(s.iter().all(|&x| (1..=MAX_FOLD).contains(&x)));
+                    if n > 0 {
+                        assert_eq!(s[0], k0.min(n));
+                        assert_eq!(s[1..], uniform_reference(k, n - s[0])[..]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_first_fold_outside_the_tested_stack_is_unconstructible() {
+        assert!(FirstFold::new(0).is_none());
+        assert!(FirstFold::new(MAX_FOLD + 1).is_none());
+        assert!(FirstFold::new(64).is_none());
+        for k in 1..=MAX_FOLD {
+            assert_eq!(FirstFold::new(k).unwrap().get(), k);
+        }
+    }
+
+    #[test]
+    fn every_fold_word_is_distinct_and_the_non_default_ones_are_tagged() {
+        let mut seen = std::collections::HashSet::new();
+        for k in 1..=MAX_FOLD {
+            let uniform = config(k).fold_word();
+            assert_eq!(uniform & FOLD_WORD_TAG, 0);
+            assert!(seen.insert(uniform));
+            for k0 in 1..=MAX_FOLD {
+                let w = first(k0, k).fold_word();
+                assert_ne!(w & FOLD_WORD_TAG, 0, "k={k} k0={k0}");
+                assert!(seen.insert(w), "k={k} k0={k0}: {w:#x} repeats");
+            }
+        }
+        // The production words, spelled out.
+        assert_eq!(first(6, 4).fold_word(), 0x8041_0000_0000_0006);
+        assert_eq!(first(5, 4).fold_word(), 0x8041_0000_0000_0005);
+    }
+
+    /// No accepted first fold raises the round count at any height, so the
+    /// union bound is never charged more and Q never rises; at the production
+    /// tallest (25) it is today's 112.
+    #[test]
+    fn a_first_fold_never_raises_the_query_count() {
+        let g = GrindBits::uniform(20);
+        for k0 in [5usize, 6] {
+            let folds = WhirFolds::First(FirstFold::new(k0).unwrap());
+            for tallest in 1..=32 {
+                let today = ChainConfig::with_security(2, 4, tallest, 128, g);
+                let arm = ChainConfig::with_security_folds(2, 4, folds, tallest, 128, g);
+                assert_eq!(arm.format.folds, folds);
+                for m in 1..=tallest {
+                    assert!(arm.rounds(m) <= today.rounds(m), "k0={k0} m={m}");
+                }
+                assert!(
+                    arm.num_queries <= today.num_queries,
+                    "k0={k0} tallest={tallest}"
+                );
+            }
+            let at25 = ChainConfig::with_security_folds(2, 4, folds, 25, 128, g);
+            assert_eq!((at25.rounds(25), at25.num_queries), (6, 112), "k0={k0}");
+        }
+        // The rule charges the WORST height, not the tallest: a first fold
+        // narrower than the uniform one has more rounds at some shorter chain,
+        // and Q follows that one.
+        let narrow = ChainConfig::with_security_folds(
+            2,
+            4,
+            WhirFolds::First(FirstFold::new(1).unwrap()),
+            8,
+            128,
+            GrindBits::default(),
+        );
+        let worst = (1..=8).map(|m| narrow.rounds(m)).max().unwrap();
+        assert_eq!(worst, 3);
+        assert_eq!(
+            narrow.num_queries,
+            crate::query_count::num_queries(2, worst, 128, 0)
+        );
+    }
+
+    fn run_with(cfg: &ChainConfig, num_vars: usize) -> Result<ChainProof<F, F>, Error> {
+        let f = pseudo_mle(num_vars, 13);
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, cfg, true)?;
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, cfg, &mut transcript())?;
+        verify::<F, F, _, KeccakWhir>(
+            &proof,
+            &commitment.root(),
+            &z,
+            y,
+            &domain,
+            cfg,
+            &mut transcript(),
+        )?;
+        Ok(proof)
+    }
+
+    #[test]
+    fn a_first_fold_proof_verifies_and_opens_its_wide_block() {
+        for (k0, n) in [(5, 9), (5, 11), (6, 9), (6, 11), (6, 6), (6, 3)] {
+            let cfg = first(k0, 4);
+            let proof = run_with(&cfg, n).unwrap_or_else(|e| panic!("k0={k0} n={n}: {e:?}"));
+            assert_eq!(proof.rounds.len(), cfg.rounds(n));
+            for (round, &k) in proof.rounds.iter().zip(&cfg.schedule(n)) {
+                assert_eq!(round.sumcheck.len(), k);
+                for opening in current_blocks(&round.openings) {
+                    assert_eq!(opening.values.len(), 1 << k);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tampered_wide_base_block_is_rejected() {
+        let cfg = first(6, 4);
+        let num_vars = 11;
+        let f = pseudo_mle(num_vars, 83);
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
+        let honest =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
+        assert_eq!(
+            current_blocks(&honest.rounds[0].openings)[0].values.len(),
+            64
+        );
+        // The last value of the 64-wide block, so the check must read all of it.
+        let mut proof = honest.clone();
+        current_blocks_mut(&mut proof.rounds[0].openings)[0].values[63] += FE::one();
+        let err = verify::<F, F, _, KeccakWhir>(
+            &proof,
+            &commitment.root(),
+            &z,
+            y,
+            &domain,
+            &cfg,
+            &mut transcript(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::OpeningRejected { .. } | Error::FoldInconsistent { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A proof made under one schedule is refused under another: the round
+    /// count (or the first round's sumcheck length) disagrees.
+    #[test]
+    fn a_first_fold_proof_is_refused_under_the_uniform_schedule() {
+        let num_vars = 11;
+        let (f6, uniform) = (first(6, 4), config(4));
+        let f = pseudo_mle(num_vars, 13);
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &f6, true).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &f6, &mut transcript())
+                .unwrap();
+        let err = verify::<F, F, _, KeccakWhir>(
+            &proof,
+            &commitment.root(),
+            &z,
+            y,
+            &domain,
+            &uniform,
+            &mut transcript(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::RoundCountMismatch { .. }), "{err:?}");
+        // And the other way round.
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &uniform, true).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &uniform, &mut transcript())
+                .unwrap();
+        let err = verify::<F, F, _, KeccakWhir>(
+            &proof,
+            &commitment.root(),
+            &z,
+            y,
+            &domain,
+            &f6,
+            &mut transcript(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::RoundCountMismatch { .. }), "{err:?}");
     }
 
     /// The point of chaining: a query opens a block of `2^k`, not the message.
