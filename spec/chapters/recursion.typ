@@ -205,42 +205,32 @@ when both algorithm-halves accept the same record for this input.
 ]
 
 More formally, we define
-$verify_0, verify_1: commitmentSpace times proofSpace to recordSpace$ as a valid _split_ of 
+$verify_0, verify_1: commitmentSpace times proofSpace times recordSpace to BB$ as a valid _split_ of 
 verifier $verify in verifierSpace$ if
 $
-  forall (instance, proof) in instanceSpace times proofSpace: verify(comm(instance), proof) = 1 iff verify_0(comm(instance), proof) = verify_(comm(instance), proof),
+  forall (comm(instance), proof) in commitmentSpace times proofSpace: verify(comm(instance), proof) = 1 iff exists record in recordSpace text("s.t.") verify_0(comm(instance), [proof, record]) and verify_1(comm(instance), [proof, record]) = 1,
 $
-where $recordSpace$ denotes the communication record space.
-That is, the two halves agree if and only if the instance-proof verifies succesfully.
-By applying the Kronecker delta function $delta$ #footnote("https://en.wikipedia.org/wiki/Kronecker_delta"),
-we can transform both halves into members of $programSpace$:
-$
-  tilde(verify)_0(comm(instance), [proof, record]) := delta_(verify_0(comm(instance), proof),record), #h(3em)
-  tilde(verify)_1(comm(instance), [proof, record]) := delta_(verify_1(comm(instance), proof),record).
-$
-That is, $tilde(verify)_0, tilde(verify)_1$ indicate whether the provided record $record in recordSpace$
-would indeed be produced by $verify_0$ respectively $verify_1$ when provided $instance$ and $proof$.
-With this transformation in place, one can express 
+where $recordSpace$ denotes the _communication record space_.
+One can now express 
 $
 	verify(comm(instance), proof) 
-	= tilde(verify)_0(comm(instance), [proof, d(comm(instance), proof)]) 
-		dot tilde(verify)_1(comm(instance), [proof, d(comm(instance), proof)]).
+	= verify_0(comm(instance), [proof, d_verify (comm(instance), proof)]) 
+		dot verify_1(comm(instance), [proof, d_verify (comm(instance), proof)]).
 $
-where $d(comm(instance), proof)$ denotes the record deriviation function.
-We introduce the function product $(product(f, g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$.
-This then allows us to express
+where $d_verify (comm(instance), proof)$ denotes the record deriviation function for $verify$.
+We introduce the function product $product(f, g)(input, witness) := f(input, witness) dot g(input, witness)$ for $f, g in programSpace$, which allows us to express
 $
 	prove(verify(comm(instance), dot); proof)
-	&= prove(product(tilde(verify)_0, tilde(verify)_1)(comm(instance), dot); [proof, record])
+	&= prove(product(verify_0, verify_1)(comm(instance), dot); [proof, record])
 	&= proof',
 $
-with $record := d(comm(instance), proof)$.
+with $record := d_verify (comm(instance), proof)$.
 
 Summarizing, we have now expressed recursive verification in terms of a 
 split verifier, where the same instance-proof-record triple was provided to 
 both verification halves.
 The produced proof $proof'$ now attests to $instance in language$ when
-$verify(comm(product(tilde(verify)_0, tilde(verify)_1)(comm(instance), dot)), proof') = 1$.
+$verify(comm(product(verify_0, verify_1)(comm(instance), dot)), proof') = 1$.
 
 = Split proving
 #et("todo")
@@ -276,42 +266,42 @@ has the proof include a bit $b$ indicating whether it is verifying a base proof 
 
 We now observe that
 $
-	tilde(verify)^*_0([comm(x), comm(y)], [[proof, b], r]) 
-	&:= tilde(verify)_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
-	tilde(verify)^*_1([comm(x), comm(y)], [[proof, b], r]) 
-	&:= tilde(verify)_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
+	verify^*_0([comm(x), comm(y)], [[proof, b], r]) 
+	&:= verify_0(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r]),\
+	verify^*_1([comm(x), comm(y)], [[proof, b], r]) 
+	&:= verify_1(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])
 $
 jointly form a valid split of $verify^*$, since
 $
 	verify^*([comm(x), comm(y)], [proof, b])
 	&= verify(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), proof)\
-	&= product(tilde(verify)_0, tilde(verify)_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
-	&= product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(x), comm(y)], [[proof, b], r]),\
+	&= product(verify_0, verify_1)(Delta_C (comm(x), comm(y([comm(x), comm(y)], dot)), b), [proof, r])\
+	&= product(verify^*_0, verify^*_1)([comm(x), comm(y)], [[proof, b], r]),\
 $
 when
-$r = d([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
-By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1)))$, 
+$r = d_(verify^*) ([comm(x), comm(y([comm(x), comm(y)], dot))], [proof, b])$.
+By selecting $(comm(x), comm(y)) = (comm(instance), comm(product(verify^*_0, verify^*_1)))$, 
 we now obtain
 $
-	product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], [[proof, b], r])
-	&= verify^*([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], [proof, b])\
-	&= verify(Delta_commitmentSpace (comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), b), proof)\
-	&= Delta_BB (verify(comm(instance), proof), verify(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), proof), b)\
-	&= verify(comm(instance), proof) dot (1-b) + verify(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance),comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), proof) dot b,
+	product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], [[proof, b], r])
+	&= verify^*([comm(instance), comm(product(verify^*_0, verify^*_1))], [proof, b])\
+	&= verify(Delta_commitmentSpace (comm(instance), comm(product(verify^*_0, verify^*_1)([comm(instance),comm(product(verify^*_0, verify^*_1))], dot)), b), proof)\
+	&= Delta_BB (verify(comm(instance), proof), verify(comm(product(verify^*_0, verify^*_1)([comm(instance),comm(product(verify^*_0, verify^*_1))], dot)), proof), b)\
+	&= verify(comm(instance), proof) dot (1-b) + verify(comm(product(verify^*_0, verify^*_1)([comm(instance),comm(product(verify^*_0, verify^*_1))], dot)), proof) dot b,
 $
 i.e., a split verification algorithm that checks whether $proof$ attests a) to $instance in language$ when $b=0$ or b) to the existence of a proof that does when $b=1$.
 Importantly, this can be achieved recursively, as
 $
 	#h(8em) // alignment purposes
 	&prove(instance; witness) &&to proof_(0),\
-	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(0), 0], r_(0)]) &&to [proof_(1), 1],\
-	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(1), 1], r_(1)]) &&to [proof_(2), 1],\
-	&prove(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot); [[proof_(2), 1], r_(2)]) &&to [proof_(3), 1],
+	&prove(product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], dot); [[proof_(0), 0], r_(0)]) &&to [proof_(1), 1],\
+	&prove(product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], dot); [[proof_(1), 1], r_(1)]) &&to [proof_(2), 1],\
+	&prove(product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], dot); [[proof_(2), 1], r_(2)]) &&to [proof_(3), 1],
   &&#h(8em)text(italic("etc."))
 $
 with
 $
-	r_i :&= d(comm(product(tilde(verify)^*_0, tilde(verify)^*_1)([comm(instance), comm(product(tilde(verify)^*_0, tilde(verify)^*_1))], dot)), [proof_i, 1-delta_(i,0)]).
+	r_i :&= d_(verify^*)(comm(product(verify^*_0, verify^*_1)([comm(instance), comm(product(verify^*_0, verify^*_1))], dot)), [proof_i, 1-delta_(i,0)]).
 $
 
 = The theory applied
@@ -319,18 +309,18 @@ We now discuss how the split-recursion system is integrated in practice.
 
 == The split
 Let $v$ denote the verification algorithm performing all steps outlined in @verification.
-We split $v$ into halves $tilde(verify)_f$ and $tilde(verify)_b$ such that an efficient
+We split $v$ into halves $verify_f$ and $verify_b$ such that an efficient
 arithmetization is achieved when the former is executed in the _field-VM_ (@field-VM)
 and the latter on the _RiscV-VM_ (@decode through @ecall).
-Practically speaking, $tilde(verify)_f$ is put in charge of all verification steps
+Practically speaking, $verify_f$ is put in charge of all verification steps
 involving _field_ arithmetic --- e.g., verifying `FRI` folding, 
-while $tilde(verify)_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
+while $verify_b$ performs all _binary_ arithmetic --- e.g., challenge derivation
 by means of the Fiat-Shamir transformation.
 
 The communication record primarily exists of the various Fiat-Shamir-derived
-challenges required by $tilde(verify)_f$ to complete verification.
-During execution, $tilde(verify)_b$ is in charge of validating these record values,
-while $tilde(verify)_f$ assumes them to be correct.
+challenges required by $verify_f$ to complete verification.
+During execution, $verify_b$ is in charge of validating these record values,
+while $verify_f$ assumes them to be correct.
 
 #et([update the communication record overview once @verification is complete.])
 
@@ -357,28 +347,24 @@ by means of sharing _the root of their merkle-tree_.
   + the batched codeword is _merkle-committed_, yielding the tree root.
 ])
 
-Aside from this proof-system level commitment contraption, we can additionally leverage
-the `COMMIT` chip to commit to individual bytes in the input.
-Any values sent by the guest program to `stdout` are recorded in this chip's
-table, with the table set up such that it causes an imbalance in the interaction logic
-of the proof system during proving.
-During verification, it can be verified that this imbalance is caused by the 
-`COMMIT`ments of this public information.
+In practice, the bytes of the instance and proof are provided in `PAGE` tables in
+an order that speeds up processing.
+This ordering often puts values to be committed scattered across several tables.
+A guest program can condense this representation, by writing the values to be
+committed to `stdout`, which must be backed by `PAGE` tables that store the written
+bytes in the order they are written.
+These `PAGE` tables can then be provided to the verifier, who uses it as part of
+verifying the proof.
+Note that it is not a problem that comitting in this way is at the discretion of the VM's
+guest program: in recursive verification, the guest program is publically known.
 
-Leveraging the `COMMIT` chip is mostly useful in situations where revealing full `PAGE`
-tables is unnecessarily expensive or cumbersome, e.g., when committing to small 
-amounts of data or to data scattered across several `PAGE` tables.
-One potential limitation is that `COMMIT`ting in this way is at the discretion of the VM's
-guest program.
-Since the guest program is publically known during recursive verification, 
-this limitation does not apply here
-
-Hence, by having $tilde(verify)_b ([comm(x), comm(y)], [[proof, b], record])$ `COMMIT` 
-to the commitments $comm(x)$ and $comm(y)$ it is provided, and using the same commitments
-to balance the proof's interaction logic when $b=1$, the ultimate verifier of the
+Hence, by having $verify_b ([comm(x), comm(y)], [[proof, b], record])$ write
+the commitments $comm(x)$ and $comm(y)$ it is provided to `stdout`, and using 
+the same commitments to check the proof's `PAGE` tables for the commitment 
+domain (see @memory) when $b=1$, the ultimate verifier of the
 final proof can be confident that the same verification algorithm was used
 at every recursion step when verifying 
-$(comm(x), comm(y)) = (comm(instance), comm(product(tilde(verify)_b, tilde(verify)_f)))$.
+$(comm(x), comm(y)) = (comm(instance), comm(product(verify_b, verify_f)))$.
 
 == Summary
 
@@ -387,19 +373,20 @@ The communication record contains all challenges derived from the proof by
 means of the Fiat-Shamir transformation.
 
 *`RiscV-VM` subalgorithm*
-$tilde(verify)_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
-- `COMMIT`s to $comm(instance), comm(instance2)$ by sending both halves to `stdout`.
+$verify_b ([comm(instance), comm(instance2)], [[proof, b], record])$:
+- `write` $comm(instance)$ and $comm(instance2)$ to `stdout`.
 - derives challenges from $proof$ by means of Fiat-Shamir, and assert that they 
   match those located in $record$ at the expected location.
 - Performs the binary arithmetic steps required to verify that $proof$ attests
-  to $instance$ (when $b=0$) or $instance2$ (when $b != 0$#footnote[The RiscV-VM's `PAGE` tables only supports byte data. All non-zero data is treated as $b=1$.]),
+  to $instance$ (when $b=0$) or $instance2$ (when $b = 1$),
   given the derived challenges.
+  - Importantly, when $b = 1$, assert that the proof's openings of the `PAGE` 
+    tables backing the commitment domain include $comm(instance)$ and 
+    $comm(instance2)$ at the expected location.
 
 *`Field-VM` subalgorithm*
-$tilde(verify)_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
+$verify_f ([comm(instance), comm(instance2)], [[proof, b], record])$:
+- assert that $b in {0, 1}$
 - Performs the field arithmetic steps required to verify that $proof$ attests
-  to $instance$ (when $b=0$) or $instance2$ (when $b != 0$),
+  to $instance$ (when $b=0$) or $instance2$ (when $b = 1$),
   given the challenges stated on the $record$.
-  - Importantly, when $b != 0$, assert that the proofs interaction-logic is 
-    balanced out by including $comm(instance), comm(instance2)$ and the 
-    appropriate challenge under `COMMIT`'s domain separator.
