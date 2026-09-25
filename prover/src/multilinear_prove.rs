@@ -87,7 +87,10 @@ pub struct MultilinearVmProof {
 ///
 /// ★ A PRODUCTION FORMAT SITE: the process's
 /// [`ZfFormat`](crate::zf_format::ZfFormat) WHIR fields (`LAMBDA_VM_ZF_WHIR_CAP`,
-/// `_WHIR_FOLDS`) are stamped on here. Unset knobs give today's config.
+/// `_WHIR_FOLDS`) are stamped on here. Unset knobs give
+/// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
+/// (`whir_cap=auto`, `whir_folds=first6`); both knobs at their off spellings
+/// give the legacy config.
 pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
     chain_config_under(crate::zf_format::ZfFormat::global(), shapes)
 }

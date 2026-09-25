@@ -1881,6 +1881,102 @@ fn the_first_fold_production_chains_cost_what_the_design_derived() {
     }
 }
 
+/// ★ RULINGS 26: THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with
+/// no knob set — is `first6` under the `Auto` cap, at the legacy security
+/// parameters (blowup 2^2, Q = 112, 20-bit grinds). The legacy chain keeps its
+/// own pins above (`the_production_chain_costs…`, 185,509 / 22,828); these are
+/// the default's, the two levers the WHIR block measured together
+/// (wt54–wt57, −9.10 s): W2's six rounds and W1's cap.
+#[test]
+fn the_production_default_chain_is_first6_under_the_auto_cap() {
+    let production = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    let want = ChainConfig {
+        format: ChainFormat {
+            cap: CapPolicy::Auto,
+            folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+        },
+        ..config(112, 20)
+    };
+    assert_eq!(production, want, "the production default's chain config");
+    let shape = ChainShape::new(&production, 25);
+    assert_eq!(shape.schedule, vec![6, 4, 4, 4, 4, 3], "first6 at 25");
+    let entry = SpongeEntry::fresh();
+    println!(
+        "production DEFAULT chain S=25 first6 cap=auto Q=112 grind=20: caps {:?}, {} opening \
+         permutations, {} cap permutations, {} grind permutations, {} permutations, {} rows \
+         ({} shape rows)",
+        shape.caps,
+        chain_opening_perms(&shape),
+        chain_cap_perms(&shape),
+        chain_grind_perms(&shape),
+        chain_perms(&shape, entry),
+        chain_rows(&shape, entry),
+        chain_shape_rows(&shape),
+    );
+    assert_eq!(chain_grind_perms(&shape), 34, "17 grinds");
+    assert_eq!(chain_opening_perms(&shape), 16_166, "opening permutations");
+    assert_eq!(chain_cap_perms(&shape), 38, "cap permutations");
+    assert_eq!(chain_shape_rows(&shape), 202_690, "shape rows");
+    assert_eq!(shape.caps, DEFAULT_CHAIN_CAPS, "the auto caps per tree");
+    assert_eq!(
+        chain_perms(&shape, entry),
+        DEFAULT_CHAIN_PERMS,
+        "permutations a chain"
+    );
+    assert_eq!(
+        chain_rows(&shape, entry),
+        DEFAULT_CHAIN_ROWS,
+        "rows a chain"
+    );
+    // Both levers pay: fewer permutations than either alone.
+    const { assert!(DEFAULT_CHAIN_PERMS < 18_729 && DEFAULT_CHAIN_PERMS < 19_877) };
+}
+
+/// The production default chain's pins (RULINGS 26), derived by the closed
+/// forms and checked against the EMITTED program by
+/// [`the_production_default_chain_emits_its_closed_form`].
+const DEFAULT_CHAIN_CAPS: &[usize] = &[3, 3, 3, 3, 3, 2];
+const DEFAULT_CHAIN_PERMS: usize = 16_443;
+const DEFAULT_CHAIN_ROWS: usize = 203_426;
+
+/// ★ The production default chain, EMITTED (the F1 of the test above).
+/// `#[ignore]`d like its siblings: a production-shape program; laptop-safe.
+#[test]
+#[ignore = "builds a production-shape chain program; run with -- --ignored"]
+fn the_production_default_chain_emits_its_closed_form() {
+    let production = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    let shape = ChainShape::new(&production, 25);
+    let entry = SpongeEntry::fresh();
+    let program = chain_program(&shape);
+    let consts = const_rows(&program);
+    let hints = hint_rows(&program);
+    assert_eq!(
+        hints,
+        Layout::new(&shape).total as usize,
+        "every arena word hinted once"
+    );
+    let measured = program.instrs.len() - consts - chain_plumbing(&shape);
+    let perms = perm_rows(&program);
+    println!(
+        "PRODUCTION DEFAULT chain S=25 first6 cap=auto Q=112 grind=20: {measured} rows against {} \
+         predicted; {perms} permutations against {} predicted; {consts} constants, {hints} hints, \
+         {} instructions",
+        chain_rows(&shape, entry),
+        chain_perms(&shape, entry),
+        program.instrs.len(),
+    );
+    assert_eq!(measured, chain_rows(&shape, entry), "rows");
+    assert_eq!(perms, chain_perms(&shape, entry), "permutations");
+    assert_eq!(measured, DEFAULT_CHAIN_ROWS);
+    assert_eq!(perms, DEFAULT_CHAIN_PERMS);
+}
+
 /// ★ The knob-on production chains EMIT their closed forms — the F1 of
 /// [`the_production_chain_emits_its_closed_form`] under `first5` and `first6`.
 /// `#[ignore]`d for the same reason (a production-shape program).

@@ -43,7 +43,7 @@ impl fmt::Display for ProofOptionsError {
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
 /// - `format`: the proof FORMAT ([`ProofFormat`], the ZF campaign's levers).
-///   Its default is today's format, byte for byte.
+///   Its default is the legacy (pre-campaign) format, byte for byte.
 ///
 /// # The format is not serialized
 ///
@@ -74,7 +74,8 @@ pub struct ProofOptions {
     /// polynomial has degree < 2^fri_final_poly_log_degree; the prover sends those
     /// 2^k coefficients instead of folding to a constant.
     pub fri_final_poly_log_degree: u8,
-    /// The proof format. [`ProofFormat::DEFAULT`] = today. Not serialized.
+    /// The proof format. [`ProofFormat::DEFAULT`] = the legacy format (the
+    /// production format is stamped on by the prover crate). Not serialized.
     #[serde(skip)]
     #[rkyv(with = rkyv::with::Skip)]
     #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
@@ -106,16 +107,33 @@ pub struct ProofFormat {
 }
 
 impl ProofFormat {
-    /// Today's format: every lever off.
-    pub const DEFAULT: Self = Self {
+    /// This crate's default: every lever off, i.e. [`Self::LEGACY`].
+    ///
+    /// ⚠ NOT the production format. The prover crate's
+    /// `zf_format::ZfFormat::DEFAULT` (the measured configuration) is stamped
+    /// onto the options at the production sites; a `ProofOptions` built here
+    /// without a format, or deserialized (the format is not serialized), is
+    /// the legacy format.
+    pub const DEFAULT: Self = Self::LEGACY;
+
+    /// The pre-campaign format: every lever off. The only format the RV64
+    /// recursion guest verifies.
+    pub const LEGACY: Self = Self {
         merkle_cap: CapPolicy::Off,
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
     };
 
-    /// True when this is today's format (`Fixed(0)` counts as `Off`).
+    /// True when this is this crate's default format, [`Self::LEGACY`]
+    /// (`Fixed(0)` counts as `Off`).
     pub fn is_default(&self) -> bool {
+        self.is_legacy()
+    }
+
+    /// True when every lever is off (`Fixed(0)` counts as `Off`): the proof
+    /// this produces is the pre-campaign format, byte for byte.
+    pub fn is_legacy(&self) -> bool {
         self.merkle_cap.is_off()
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
@@ -294,10 +312,16 @@ pub const FRI_MODE_IMPLEMENTED: bool = true;
 pub const ONE_ROW_IMPLEMENTED: bool = true;
 
 impl ProofOptions {
-    /// True when every format field is at its default: the proof this
-    /// produces is today's format, byte for byte.
+    /// True when every format field is at this crate's default (the legacy
+    /// format): the proof this produces is the pre-campaign format, byte for
+    /// byte.
     pub fn has_default_format(&self) -> bool {
         self.format.is_default()
+    }
+
+    /// True when every lever is off: [`ProofFormat::LEGACY`].
+    pub fn has_legacy_format(&self) -> bool {
+        self.format.is_legacy()
     }
 
     /// Default proof options used for testing purposes.

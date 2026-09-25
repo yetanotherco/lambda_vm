@@ -8,8 +8,17 @@
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
 //! ```
 //!
-//! Every unset knob is today's format, so an unconfigured run proves exactly
-//! what it proved before this module existed.
+//! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration
+//! (RULINGS 26): `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! Each lever was measured net positive on block runs before it became the
+//! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
+//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`), so setting all five to off
+//! reproduces [`ZfFormat::LEGACY`] — the pre-campaign format, byte for byte —
+//! for rollback and for A/B arms. The crypto crates' own defaults
+//! (`stark::proof::options::ProofFormat::DEFAULT`,
+//! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
+//! library value built without a format is the legacy one, and the production
+//! format reaches the proofs only through the three sites below.
 //!
 //! # Where the format goes
 //!
@@ -36,7 +45,7 @@
 //! flips its `*_IMPLEMENTED` constant when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
@@ -56,8 +65,9 @@ pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 /// `uniform4` after it.
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
 
-/// One process's proof format. Every field's default is today's format.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One process's proof format. [`ZfFormat::default`] is [`ZfFormat::DEFAULT`],
+/// the measured configuration; [`ZfFormat::LEGACY`] is every lever off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZfFormat {
     /// S1: the cap on every univariate STARK tree.
     pub cap: CapPolicy,
@@ -71,9 +81,37 @@ pub struct ZfFormat {
     pub whir_folds: WhirFolds,
 }
 
+/// The first-round WHIR fold of the default format (`whir_folds=first6`).
+const DEFAULT_WHIR_FIRST_FOLD: FirstFold = match FirstFold::new(6) {
+    Some(k0) => k0,
+    None => panic!("6 is a legal first fold"),
+};
+
+impl Default for ZfFormat {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl ZfFormat {
-    /// Today's format: every lever off.
+    /// ★ The production format when no knob is set: the MEASURED
+    /// configuration (RULINGS 26). S1 `cap=auto` (STARK block −15.35 s),
+    /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
+    /// (WHIR block −9.10 s together), each measured net positive in an ABBA
+    /// block run. Security parameters (queries, grinding, blowup) are the
+    /// legacy ones: no lever touches them.
     pub const DEFAULT: Self = Self {
+        cap: CapPolicy::Auto,
+        whir_cap: CapPolicy::Auto,
+        fri: FriMode::Dp,
+        one_row: OneRowMode::Off,
+        whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
+    };
+
+    /// The pre-campaign format: every lever off. What all five knobs at their
+    /// OFF spellings select, what the crypto crates' own defaults are, and the
+    /// only format the RV64 recursion guest verifies (RULINGS 26).
+    pub const LEGACY: Self = Self {
         cap: CapPolicy::Off,
         whir_cap: CapPolicy::Off,
         fri: FriMode::Pair,
@@ -81,8 +119,18 @@ impl ZfFormat {
         whir_folds: WhirFolds::Uniform,
     };
 
+    /// True when every lever is off: the format proves exactly what the
+    /// pre-campaign prover proved.
+    pub fn is_legacy(&self) -> bool {
+        self.cap.is_off()
+            && self.whir_cap.is_off()
+            && self.fri == FriMode::Pair
+            && self.one_row == OneRowMode::Off
+            && self.whir_folds == WhirFolds::Uniform
+    }
+
     /// Parse the five knobs through `lookup` (the process environment in
-    /// production, a map in tests). An unset knob is the default; a set one
+    /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
@@ -308,20 +356,35 @@ mod tests {
         ZfFormat::from_lookup(|k| map.get(k).cloned())
     }
 
+    /// ★ RULINGS 26: with no knob set the process proves the MEASURED
+    /// configuration.
     #[test]
-    fn nothing_set_is_todays_format() {
+    fn nothing_set_is_the_measured_default() {
         let f = parse(&[]).unwrap();
         assert_eq!(f, ZfFormat::DEFAULT);
         assert_eq!(f, ZfFormat::default());
         assert_eq!(
-            f.banner(),
-            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4"
+            f,
+            ZfFormat {
+                cap: CapPolicy::Auto,
+                whir_cap: CapPolicy::Auto,
+                fri: FriMode::Dp,
+                one_row: OneRowMode::Off,
+                whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            }
         );
+        assert_eq!(
+            f.banner(),
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6"
+        );
+        assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
     }
 
+    /// Every knob keeps its OFF spelling, and all five at off are the legacy
+    /// (pre-campaign) format: the rollback and A/B arm.
     #[test]
-    fn the_default_spellings_parse_to_the_default() {
+    fn the_off_spellings_parse_to_the_legacy_format() {
         let f = parse(&[
             (ENV_CAP, "off"),
             (ENV_WHIR_CAP, "0"),
@@ -330,8 +393,60 @@ mod tests {
             (ENV_WHIR_FOLDS, "uniform4"),
         ])
         .unwrap();
-        assert_eq!(f, ZfFormat::DEFAULT);
+        assert_eq!(f, ZfFormat::LEGACY);
+        assert!(f.is_legacy());
+        assert_eq!(
+            f.banner(),
+            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4"
+        );
         assert!(f.unimplemented_levers().is_empty());
+        assert!(f.proof_format().is_legacy());
+        assert_eq!(f.proof_format(), ProofFormat::LEGACY);
+        assert_eq!(f.chain_format(), ChainFormat::DEFAULT);
+    }
+
+    /// One knob at its off spelling turns off that lever ONLY; the others keep
+    /// the default's value.
+    #[test]
+    fn one_off_knob_turns_off_one_lever() {
+        for (name, v, want) in [
+            (
+                ENV_CAP,
+                "off",
+                ZfFormat {
+                    cap: CapPolicy::Off,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_WHIR_CAP,
+                "off",
+                ZfFormat {
+                    whir_cap: CapPolicy::Off,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_FRI,
+                "pair",
+                ZfFormat {
+                    fri: FriMode::Pair,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+            (
+                ENV_WHIR_FOLDS,
+                "uniform4",
+                ZfFormat {
+                    whir_folds: WhirFolds::Uniform,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
+        ] {
+            let f = parse(&[(name, v)]).unwrap();
+            assert_eq!(f, want, "{name}={v}");
+            assert!(!f.is_legacy(), "{name}={v}");
+        }
     }
 
     #[test]
@@ -473,7 +588,7 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
                 .unwrap()
                 .banner(),
-            "ZF FORMAT: cap=off whir_cap=off fri=dp one_row=auto whir_folds=uniform4"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6"
         );
     }
 
@@ -535,15 +650,40 @@ mod tests {
         assert_eq!(o.grinding_factor, base.grinding_factor);
         assert_eq!(o.coset_offset, base.coset_offset);
         assert_eq!(o.fri_final_poly_log_degree, base.fri_final_poly_log_degree);
-        // The default format leaves options untouched.
-        let d = ZfFormat::DEFAULT.options(base.clone());
+        // The legacy format leaves options untouched.
+        let d = ZfFormat::LEGACY.options(base.clone());
         assert!(d.has_default_format());
+        assert!(d.has_legacy_format());
+        // The production default stamps cap=auto and fri=dp, nothing else.
+        let p = ZfFormat::DEFAULT.options(base.clone());
+        assert_eq!(p.format.merkle_cap, CapPolicy::Auto);
+        assert_eq!(p.format.fri_mode, FriMode::Dp);
+        assert_eq!(p.format.one_row, ZfFormat::DEFAULT.one_row);
+        assert_eq!(p.format.fri_schedule_override, None);
+        assert!(!p.has_legacy_format());
+        assert_eq!(
+            (
+                p.blowup_factor,
+                p.fri_number_of_queries,
+                p.grinding_factor,
+                p.coset_offset,
+                p.fri_final_poly_log_degree
+            ),
+            (
+                base.blowup_factor,
+                base.fri_number_of_queries,
+                base.grinding_factor,
+                base.coset_offset,
+                base.fri_final_poly_log_degree
+            ),
+            "no security parameter moves with the format"
+        );
 
-        let chain = crate::multilinear_prove::chain_config(&[(8, 20)]);
+        let chain = crate::multilinear_prove::chain_config_under(&ZfFormat::LEGACY, &[(8, 20)]);
         let c = ZfFormat {
             whir_cap: CapPolicy::Fixed(3),
             whir_folds: WhirFolds::First(FirstFold::new(5).unwrap()),
-            ..ZfFormat::DEFAULT
+            ..ZfFormat::LEGACY
         }
         .chain(chain);
         assert_eq!(c.format.cap, CapPolicy::Fixed(3));
@@ -562,15 +702,20 @@ mod tests {
     #[test]
     fn the_schedule_line_states_the_rounds() {
         assert_eq!(
-            ZfFormat::DEFAULT.whir_schedule_line(),
+            ZfFormat::LEGACY.whir_schedule_line(),
             "ZF WHIR SCHEDULES: whir_folds=uniform4 q=112 n=20:[4,4,4,4,4] \
              n=21:[4,4,4,4,4,1] n=22:[4,4,4,4,4,2] n=23:[4,4,4,4,4,3] \
              n=24:[4,4,4,4,4,4] n=25:[4,4,4,4,4,4,1]"
         );
         let first6 = ZfFormat {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
-            ..ZfFormat::DEFAULT
+            ..ZfFormat::LEGACY
         };
+        // The production default runs the first6 schedules.
+        assert_eq!(
+            ZfFormat::DEFAULT.whir_schedule_line(),
+            first6.whir_schedule_line()
+        );
         assert_eq!(
             first6.whir_schedule_line(),
             "ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] \
@@ -585,9 +730,28 @@ mod tests {
     #[test]
     fn the_production_chain_config_under_each_arm() {
         use crate::multilinear_prove::chain_config_under;
-        let today = chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)]);
-        assert_eq!(today, crate::multilinear_prove::chain_config(&[(1, 25)]));
+        let today = chain_config_under(&ZfFormat::LEGACY, &[(1, 25)]);
+        assert_eq!(today.format, ChainFormat::DEFAULT);
         assert_eq!((today.rounds(25), today.num_queries), (7, 112));
+        // The production config (no knob set) is the measured default's:
+        // cap auto, first6 — six rounds at 25, Q unchanged at 112.
+        let production = crate::multilinear_prove::chain_config(&[(1, 25)]);
+        assert_eq!(
+            production,
+            chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)])
+        );
+        assert_eq!(production.format, ZfFormat::DEFAULT.chain_format());
+        assert_eq!((production.rounds(25), production.num_queries), (6, 112));
+        assert_eq!(production.schedule(25), vec![6, 4, 4, 4, 4, 3]);
+        assert_eq!(
+            (
+                production.log_blowup,
+                production.log_folding,
+                production.grind
+            ),
+            (today.log_blowup, today.log_folding, today.grind),
+            "no security parameter moves with the format"
+        );
         for (name, rounds25) in [("first5", 6), ("first6", 6)] {
             let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
             let c = chain_config_under(&f, &[(1, 25)]);
@@ -604,49 +768,108 @@ mod tests {
     #[test]
     fn production_sites_build_the_default_format_when_nothing_is_set() {
         // No test sets a ZF knob, so the process format is the default and the
-        // production constructors must produce today's values.
+        // production constructors must stamp the MEASURED configuration.
         assert_eq!(*ZfFormat::global(), ZfFormat::DEFAULT);
-        assert!(crate::lfm::proof::aggregation_wrap_options().has_default_format());
-        assert!(crate::lfm::proof::block_base_options().has_default_format());
+        let want = ZfFormat::DEFAULT.proof_format();
+        for (site, o) in [
+            (
+                "aggregation_wrap_options",
+                crate::lfm::proof::aggregation_wrap_options(),
+            ),
+            (
+                "block_base_options",
+                crate::lfm::proof::block_base_options(),
+            ),
+        ] {
+            assert_eq!(o.format, want, "{site}");
+            assert!(!o.has_legacy_format(), "{site}");
+        }
+        // Security parameters are the legacy presets' (RULINGS 26).
+        let base = crate::lfm::proof::block_base_options();
+        let preset = crate::recursion::Preset::Blowup4.options();
+        assert_eq!(
+            (
+                base.blowup_factor,
+                base.fri_number_of_queries,
+                base.grinding_factor,
+                base.coset_offset,
+                base.fri_final_poly_log_degree
+            ),
+            (
+                preset.blowup_factor,
+                preset.fri_number_of_queries,
+                preset.grinding_factor,
+                preset.coset_offset,
+                preset.fri_final_poly_log_degree
+            )
+        );
         let chain = crate::multilinear_prove::chain_config(&[(8, 20)]);
-        assert_eq!(chain.format, ChainFormat::DEFAULT);
+        assert_eq!(chain.format, ZfFormat::DEFAULT.chain_format());
         assert_eq!(chain.log_folding, PRODUCTION_WHIR_LOG_FOLDING);
     }
 
+    /// ★ RULINGS 26 (RULINGS 11 amended): the RV64 guest verifier stays on
+    /// the LEGACY format after the default flip. Its presets NAME the legacy
+    /// format (not the process default), and both guest entries refuse every
+    /// other format — the production default included.
     #[test]
-    fn the_recursion_guest_entries_refuse_a_non_default_format() {
-        // RULINGS 11: the RV64 guest verifier stays default-only.
+    fn the_recursion_guest_stays_on_the_legacy_format() {
+        for preset in crate::recursion::Preset::ALL {
+            let o = preset.options();
+            assert_eq!(o.format, ProofFormat::LEGACY, "{}", preset.name());
+            assert!(o.has_legacy_format(), "{}", preset.name());
+        }
+        assert_eq!(
+            crate::recursion::MIN_PROOF_OPTIONS.format,
+            ProofFormat::LEGACY
+        );
+        // The process default is NOT legacy, so the presets cannot have
+        // inherited their format from it.
+        assert!(!ZfFormat::global().is_legacy());
+        assert!(!ZfFormat::global().proof_format().is_legacy());
+
         let base = crate::recursion::Preset::Blowup4.options();
+        let refused = |opts: &ProofOptions| {
+            for result in [
+                crate::recursion::verify_and_attest_blob(&[], opts),
+                crate::recursion::verify_continuation_and_attest(&[], opts),
+            ] {
+                let err = result.expect_err("a non-legacy format must be refused");
+                assert!(format!("{err:?}").contains("legacy-format"), "{err:?}");
+            }
+        };
         for f in [
+            ZfFormat::DEFAULT,
             ZfFormat {
                 cap: CapPolicy::Auto,
-                ..ZfFormat::DEFAULT
+                ..ZfFormat::LEGACY
             },
             ZfFormat {
                 fri: FriMode::Dp,
-                ..ZfFormat::DEFAULT
+                ..ZfFormat::LEGACY
             },
             ZfFormat {
                 one_row: OneRowMode::On,
-                ..ZfFormat::DEFAULT
+                ..ZfFormat::LEGACY
+            },
+            ZfFormat {
+                one_row: OneRowMode::Auto,
+                ..ZfFormat::LEGACY
             },
         ] {
-            let opts = f.options(base.clone());
+            refused(&f.options(base.clone()));
+        }
+        // The production STARK base options (the process default) are refused.
+        refused(&crate::lfm::proof::block_base_options());
+        // The legacy format gets past the guard (and fails on the empty blob).
+        for opts in [base.clone(), ZfFormat::LEGACY.options(base.clone())] {
             for result in [
                 crate::recursion::verify_and_attest_blob(&[], &opts),
                 crate::recursion::verify_continuation_and_attest(&[], &opts),
             ] {
-                let err = result.expect_err("a non-default format must be refused");
-                assert!(format!("{err:?}").contains("default-format"), "{err:?}");
-            }
-        }
-        // The default format gets past the guard (and fails on the empty blob).
-        for result in [
-            crate::recursion::verify_and_attest_blob(&[], &base),
-            crate::recursion::verify_continuation_and_attest(&[], &base),
-        ] {
-            if let Err(err) = result {
-                assert!(!format!("{err:?}").contains("default-format"), "{err:?}");
+                if let Err(err) = result {
+                    assert!(!format!("{err:?}").contains("legacy-format"), "{err:?}");
+                }
             }
         }
     }
