@@ -204,7 +204,8 @@ pub struct TableInputs<'a> {
     /// The precomputed-columns root, when the AIR is preprocessed.
     ///
     /// Production never reads this from the proof: it takes
-    /// `air.precomputed_commitment()`, absorbs THAT, and rejects a proof whose
+    /// `air.precomputed_commitment_for(layout)` (the root of the table's leaf
+    /// layout), absorbs THAT, and rejects a proof whose
     /// copy disagrees (`verifier.rs:1184-1209`). So the cells here are the ones
     /// Phase A absorbed, and the equality production checks explicitly is, in
     /// this machine, the absence of a second value.

@@ -79,7 +79,8 @@ pub struct ChildTable<'a> {
     /// The preprocessed-columns commitment, when the AIR is preprocessed.
     ///
     /// An AIR-SET constant at emit time, exactly as production takes it
-    /// (`air.precomputed_commitment()`, never the proof's copy). Interning it
+    /// (`air.precomputed_commitment_for(layout)` at the table's leaf layout,
+    /// never the proof's copy). Interning it
     /// here is what makes production's explicit proof-copy-equals-AIR-copy check
     /// the ABSENCE of a second value in this machine rather than a comparison.
     pub precomputed_root: Option<&'a Commitment>,
