@@ -4401,11 +4401,25 @@ pub trait IsStarkProver<
             .collect();
 
         if multilinear::whir_split::gap_census() {
-            for (air, trace, _) in &*air_trace_pairs {
+            static GAPB_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = GAPB_SEQ.fetch_add(1, Ordering::Relaxed);
+            for ((air, trace, _), layout) in air_trace_pairs.iter().zip(&leaf_layouts) {
                 let (main, aux) = air.trace_layout();
                 let o = air.options();
+                let lde_log = (trace.num_rows() * o.blowup_factor as usize).trailing_zeros();
+                let blowup_log = (o.blowup_factor as u32).trailing_zeros();
+                let terminal_log = (blowup_log + o.fri_final_poly_log_degree as u32).min(lde_log);
+                let fmt = crate::fri::schedule::FriFormat::from_options(o, layout.is_one_row());
+                let schedule = fmt.schedule(lde_log, terminal_log);
+                let trace_depth = lde_log as usize - usize::from(!layout.is_one_row());
                 eprintln!(
-                    "GAPB STARK_TABLE name={} rows={} main={main} aux={aux} precomputed={} max_degree={} comp_degree_bound={} constraints={} ir_nodes={} bus_interactions={} blowup={} queries={} grind={} fri_final_log={} format={:?}",
+                    "GAPB STARK_FRI seq={seq} name={} lde_log={lde_log} terminal_log={terminal_log} one_row={} fri_schedule={schedule:?} trace_tree_depth={trace_depth} trace_cap={}",
+                    air.name(),
+                    layout.is_one_row(),
+                    o.format.merkle_cap.height(o.fri_number_of_queries, trace_depth),
+                );
+                eprintln!(
+                    "GAPB STARK_TABLE seq={seq} name={} rows={} main={main} aux={aux} precomputed={} max_degree={} comp_degree_bound={} constraints={} ir_nodes={} bus_interactions={} blowup={} queries={} grind={} fri_final_log={} format={:?}",
                     air.name(),
                     trace.num_rows(),
                     air.num_precomputed_columns(),
