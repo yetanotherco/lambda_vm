@@ -55,8 +55,8 @@
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),
-      ("field", [`Field` VM], <field-VM>),
-      ("field_decode", [`Field` `DECODE` table], <field-decode>),
+      ("field_vm", [Field VM], <field-VM>),
+      ("field_vm_decode", [Field `DECODE` table], <field-decode>),
     )),
     ("MATHEMATICS", (
       ("limbs_and_carries", [On limb decomposition and carries], <limbs>),
@@ -105,6 +105,7 @@
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
+  show math.equation.where(block: false): box // Don't line-break inline equations by default
   show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
   show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
     set figure.caption(position: top)
