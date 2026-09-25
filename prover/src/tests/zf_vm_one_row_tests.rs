@@ -175,6 +175,7 @@ fn an_lfm_proof_round_trips_at_one_row() {
 #[ignore = "box: set ZF_S2_PROOF_DIR, run in a CPU build and a cuda build, then cmp the files"]
 fn one_row_vm_proof_bytes_for_the_device_comparison() {
     let dir = std::env::var("ZF_S2_PROOF_DIR").expect("set ZF_S2_PROOF_DIR");
+    std::fs::create_dir_all(&dir).expect("create ZF_S2_PROOF_DIR");
     let build = if cfg!(feature = "cuda") {
         "cuda"
     } else {
