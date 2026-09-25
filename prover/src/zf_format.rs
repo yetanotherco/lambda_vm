@@ -823,10 +823,10 @@ mod tests {
             crate::recursion::MIN_PROOF_OPTIONS.format,
             ProofFormat::LEGACY
         );
-        // The process default is NOT legacy, so the presets cannot have
+        // The production default is NOT legacy, so the presets cannot have
         // inherited their format from it.
-        assert!(!ZfFormat::global().is_legacy());
-        assert!(!ZfFormat::global().proof_format().is_legacy());
+        assert!(!ZfFormat::DEFAULT.is_legacy());
+        assert!(!ZfFormat::DEFAULT.proof_format().is_legacy());
 
         let base = crate::recursion::Preset::Blowup4.options();
         let refused = |opts: &ProofOptions| {
@@ -859,8 +859,11 @@ mod tests {
         ] {
             refused(&f.options(base.clone()));
         }
-        // The production STARK base options (the process default) are refused.
-        refused(&crate::lfm::proof::block_base_options());
+        // The production STARK base options are refused whenever the process
+        // format is not legacy (always, with no knob set).
+        if !ZfFormat::global().proof_format().is_legacy() {
+            refused(&crate::lfm::proof::block_base_options());
+        }
         // The legacy format gets past the guard (and fails on the empty blob).
         for opts in [base.clone(), ZfFormat::LEGACY.options(base.clone())] {
             for result in [
