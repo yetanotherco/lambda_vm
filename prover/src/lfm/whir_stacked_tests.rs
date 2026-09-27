@@ -921,7 +921,7 @@ fn the_decode_groups_threaded_schedule_reproduces_the_box() {
 /// The two brackets a block-shaped run can stand in are walked: 24 variables
 /// (17..=32 genesis pages, where the block's thirty sit) and 25 (33..=64, the
 /// last bracket that fits one polynomial at
-/// `stark::multilinear_table::MAX_STACK_VARS`).
+/// the production format's stack, `whir_stack`).
 #[test]
 fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
     use crate::continuation::{
@@ -938,8 +938,11 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
 
     let cost_at = |pages: usize, config: &ChainConfig| -> (usize, usize) {
         let columns = pages * PAGE_PREPROCESSED_COLUMNS;
-        let layout = stark::multilinear_table::global_layout(&[(columns, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages");
+        let layout = stark::multilinear_table::global_layout(
+            &[(columns, PAGE_NUM_VARS)],
+            config.format.stack,
+        )
+        .expect("a stack of whole pages");
         // ⛔ THE BRACKET GUARD, PER PAGE COUNT. A difference taken across a
         // height change or a polynomial split is not a page's marginal.
         assert_eq!(
@@ -1076,19 +1079,24 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
 
     // ⛔ WHERE THIS PIN'S COVERAGE STOPS, READ RATHER THAN ASSUMED. At 65
     // genesis pages the stack wants 26 variables, `global_layout` caps it at
-    // `MAX_STACK_VARS` and the columns spill into a second polynomial — which
+    // the production stack (`whir_stack`) and the columns spill into a second polynomial — which
     // is a second chain, so part 2's single-chain price stops being the cost.
     // `whir_chain_tests::the_chain_term_prices_one_polynomial` is where that
     // limit is stated; here it is only the end of the range a marginal is
     // defined on.
-    let spilled =
-        stark::multilinear_table::global_layout(&[(65 * PAGE_PREPROCESSED_COLUMNS, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages");
+    let spilled = stark::multilinear_table::global_layout(
+        &[(65 * PAGE_PREPROCESSED_COLUMNS, PAGE_NUM_VARS)],
+        crate::zf_format::ZfFormat::DEFAULT.whir_stack,
+    )
+    .expect("a stack of whole pages");
     assert_eq!(
         spilled.num_polys(),
         2,
         "65 genesis pages must spill, or the bracket walk above stopped one short of \
          its own boundary"
     );
-    assert_eq!(spilled.n_stack(), stark::multilinear_table::MAX_STACK_VARS);
+    assert_eq!(
+        spilled.n_stack(),
+        crate::zf_format::ZfFormat::DEFAULT.whir_stack.get()
+    );
 }

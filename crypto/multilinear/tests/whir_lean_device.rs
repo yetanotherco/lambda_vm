@@ -57,6 +57,7 @@ fn config() -> ChainConfig {
         format: ChainFormat {
             cap: CapPolicy::Auto,
             folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            ..ChainFormat::DEFAULT
         },
     }
 }

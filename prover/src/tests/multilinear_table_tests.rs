@@ -350,7 +350,8 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> Vec<String> {
         .iter()
         .map(TableLayout::statement)
         .collect();
-    let stacked = multilinear_table::global_layout(&shapes).expect("rebuild the stack");
+    let stacked = multilinear_table::global_layout(&shapes, config().format.stack)
+        .expect("rebuild the stack");
     let domain =
         multilinear::whir::Domain::<Fp>::new(stacked.n_stack() + config().log_blowup).unwrap();
 
@@ -845,7 +846,7 @@ fn prove_eq_with_prepared(
 
     let refs: Vec<&multilinear::mle::Mle<Fp>> = prepared_columns.iter().collect();
     let out_of_band = multilinear::stacked_eval::StackedCommitment::<Fp, KeccakWhir>::commit(
-        multilinear_table::global_layout(&[(refs.len(), num_vars)])?,
+        multilinear_table::global_layout(&[(refs.len(), num_vars)], config().format.stack)?,
         &refs,
         None,
         &config(),
@@ -1047,7 +1048,7 @@ fn prove_and_verify_two_table_prepared(
         &lt_preprocessed[1],
     ];
     let out_of_band = multilinear::stacked_eval::StackedCommitment::<Fp, KeccakWhir>::commit(
-        multilinear_table::global_layout(&[(2, eq_vars), (2, lt_vars)])?,
+        multilinear_table::global_layout(&[(2, eq_vars), (2, lt_vars)], config().format.stack)?,
         &stack_refs,
         None,
         &config(),
