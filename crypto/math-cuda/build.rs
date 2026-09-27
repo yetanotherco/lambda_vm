@@ -175,6 +175,7 @@ fn main() {
     // header edits.
     println!("cargo:rerun-if-changed=kernels/goldilocks.cuh");
     println!("cargo:rerun-if-changed=kernels/ext3.cuh");
+    println!("cargo:rerun-if-changed=kernels/ext3_inv.cuh");
 
     // Probe for nvcc once. Workspace consumers (clippy, fmt, CPU-only test
     // runners) build math-cuda incidentally without using its kernels. Stub
