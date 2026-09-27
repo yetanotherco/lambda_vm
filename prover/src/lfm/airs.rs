@@ -1156,7 +1156,8 @@ impl LfmAirs {
     /// The AIR set a program's artifacts describe: roots, `KECCAK_RND` and
     /// `LFM_BLAKE3` chunks, GAP R2's `LFM_HASH` chunks, the hasher, the mask and
     /// the one-row roots — every piece from the artifacts, none from a proof.
-    /// The one constructor the prove and verify paths share.
+    /// The same set `proof::verify_against_artifacts` builds piece by piece; a
+    /// caller holding artifacts (the node's child harvest) builds it here.
     pub fn for_artifacts(
         artifacts: &super::registry::LfmArtifacts,
         options: &ProofOptions,
