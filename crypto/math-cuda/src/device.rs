@@ -1679,8 +1679,15 @@ pub fn staging_totals() -> StagingTotals {
 /// never shrinks, so this is its high-water so far. A slot another thread holds
 /// right now is counted as busy, not waited for.
 fn shared_slab_footprint(be: &Backend) -> (u64, usize, usize) {
+    slab_footprint(be.pinned_staging.iter().chain(&be.pinned_hashes))
+}
+
+/// [`shared_slab_footprint`] over any set of slots.
+fn slab_footprint<'a>(
+    slots: impl Iterator<Item = &'a Mutex<PinnedStaging>>,
+) -> (u64, usize, usize) {
     let (mut bytes, mut allocated, mut busy) = (0u64, 0usize, 0usize);
-    for slot in be.pinned_staging.iter().chain(&be.pinned_hashes) {
+    for slot in slots {
         let elems = match slot.try_lock() {
             Ok(s) => s.capacity_elems,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().capacity_elems,
@@ -1702,6 +1709,15 @@ fn shared_slab_footprint(be: &Backend) -> (u64, usize, usize) {
 /// shared slabs' pinned footprint (what the retained-LDE downloads grow while
 /// gap I6 is off).
 pub fn staging_report() -> String {
+    staging_line(
+        backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed)),
+        backend().map_or((0, 0, 0), shared_slab_footprint),
+    )
+}
+
+/// [`staging_report`]'s line from the counters, the pairs allocated and the
+/// shared slabs' `(bytes, slots allocated, slots busy)`.
+fn staging_line(pairs: usize, (slab_bytes, slabs, busy): (u64, usize, usize)) -> String {
     let s = &STAGING_STATS;
     let gb = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
     let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
@@ -1709,7 +1725,6 @@ pub fn staging_report() -> String {
         let t = secs(t);
         if t > 0.0 { gb(b) / t } else { 0.0 }
     };
-    let (slab_bytes, slabs, busy) = backend().map_or((0, 0, 0), shared_slab_footprint);
     format!(
         "staging: upload shared-slab {:.2} GB in {:.2} s memcpy ({:.1} GB/s) · staged {:.2} GB in \
          {:.2} s ({:.1} GB/s) | retained-LDE download shared-slab {:.2} GB in {:.2} s ({:.1} GB/s) · \
@@ -1727,7 +1742,7 @@ pub fn staging_report() -> String {
         gb(&s.out_bytes[1]),
         secs(&s.out_nanos[1]),
         rate(&s.out_bytes[1], &s.out_nanos[1]),
-        backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed)),
+        pairs,
         s.pair_waits.load(Ordering::Relaxed),
         slab_bytes as f64 / (1u64 << 30) as f64,
         slabs,
@@ -2073,5 +2088,66 @@ mod device_fallback_counter_tests {
         assert_eq!(reserved_high_water(), 200, "a larger rise raises it");
         reset_reserved_high_water();
         assert_eq!(reserved_high_water(), 0, "reset must zero it again");
+    }
+}
+
+#[cfg(test)]
+mod staging_report_tests {
+    use super::{PinnedStaging, slab_footprint, staging_line};
+    use std::sync::Mutex;
+
+    /// A slot claiming `elems` of capacity with no allocation behind it: the
+    /// null pointer keeps `Drop` from freeing anything.
+    fn slot(elems: usize) -> Mutex<PinnedStaging> {
+        let mut s = PinnedStaging::empty();
+        s.capacity_elems = elems;
+        Mutex::new(s)
+    }
+
+    /// Card-free: the footprint sums the allocated slots' bytes and skips empty
+    /// ones, counts a slot someone holds as busy instead of waiting for it, and
+    /// still reads a poisoned one.
+    #[test]
+    fn the_slab_footprint_counts_allocated_busy_and_poisoned_slots() {
+        let slots = [
+            slot(0),
+            slot(1 << 20),
+            slot(1 << 29),
+            slot(1 << 20),
+            slot(1 << 22),
+        ];
+        assert_eq!(slab_footprint(slots[..1].iter()), (0, 0, 0));
+        assert_eq!(
+            slab_footprint(slots[..3].iter()),
+            (((1 << 20) + (1 << 29)) * 8, 2, 0)
+        );
+        let _held = slots[3].lock().unwrap();
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _g = slots[4].lock().unwrap();
+                    panic!("poisoning the slot on purpose");
+                })
+                .join();
+        });
+        assert!(slots[4].is_poisoned());
+        assert_eq!(
+            slab_footprint(slots.iter()),
+            (((1 << 20) + (1 << 29) + (1 << 22)) * 8, 3, 1)
+        );
+    }
+
+    /// The line's shape is a contract with the IDLE-B box script's parsers: four
+    /// `<x> GB in` figures (upload shared, staged; download shared, staged), then
+    /// the slab segment last, in GiB.
+    #[test]
+    fn the_staging_line_ends_with_the_shared_slab_footprint() {
+        let line = staging_line(6, (4 << 30, 2, 1));
+        assert_eq!(line.matches(" GB in ").count(), 4, "{line}");
+        assert!(line.contains("| gap-I6 pairs 6 of 8 · waits "), "{line}");
+        assert!(
+            line.ends_with(" | shared slabs pinned 4.00 GiB in 2 slot(s), 1 busy"),
+            "{line}"
+        );
     }
 }
