@@ -1674,8 +1674,33 @@ pub fn staging_totals() -> StagingTotals {
     }
 }
 
+/// The shared slabs' pinned footprint, LDE staging and Merkle hashes together:
+/// `(bytes, slots allocated, slots busy)`. A slab grows to a power of two and
+/// never shrinks, so this is its high-water so far. A slot another thread holds
+/// right now is counted as busy, not waited for.
+fn shared_slab_footprint(be: &Backend) -> (u64, usize, usize) {
+    let (mut bytes, mut allocated, mut busy) = (0u64, 0usize, 0usize);
+    for slot in be.pinned_staging.iter().chain(&be.pinned_hashes) {
+        let elems = match slot.try_lock() {
+            Ok(s) => s.capacity_elems,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().capacity_elems,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                busy += 1;
+                continue;
+            }
+        };
+        if elems > 0 {
+            allocated += 1;
+            bytes += (elems * std::mem::size_of::<u64>()) as u64;
+        }
+    }
+    (bytes, allocated, busy)
+}
+
 /// One line for the log: the staging surface's traffic and host-copy seconds per
-/// path since the process started, and the gap-I6 pool's size and waits.
+/// path since the process started, the gap-I6 pool's size and waits, and the
+/// shared slabs' pinned footprint (what the retained-LDE downloads grow while
+/// gap I6 is off).
 pub fn staging_report() -> String {
     let s = &STAGING_STATS;
     let gb = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
@@ -1684,10 +1709,12 @@ pub fn staging_report() -> String {
         let t = secs(t);
         if t > 0.0 { gb(b) / t } else { 0.0 }
     };
+    let (slab_bytes, slabs, busy) = backend().map_or((0, 0, 0), shared_slab_footprint);
     format!(
         "staging: upload shared-slab {:.2} GB in {:.2} s memcpy ({:.1} GB/s) · staged {:.2} GB in \
          {:.2} s ({:.1} GB/s) | retained-LDE download shared-slab {:.2} GB in {:.2} s ({:.1} GB/s) · \
-         staged {:.2} GB in {:.2} s ({:.1} GB/s) | gap-I6 pairs {} of {MAX_STAGING_PAIRS} · waits {}",
+         staged {:.2} GB in {:.2} s ({:.1} GB/s) | gap-I6 pairs {} of {MAX_STAGING_PAIRS} · waits {} \
+         | shared slabs pinned {:.2} GiB in {} slot(s), {} busy",
         gb(&s.in_bytes[0]),
         secs(&s.in_nanos[0]),
         rate(&s.in_bytes[0], &s.in_nanos[0]),
@@ -1702,6 +1729,9 @@ pub fn staging_report() -> String {
         rate(&s.out_bytes[1], &s.out_nanos[1]),
         backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed)),
         s.pair_waits.load(Ordering::Relaxed),
+        slab_bytes as f64 / (1u64 << 30) as f64,
+        slabs,
+        busy,
     )
 }
 
