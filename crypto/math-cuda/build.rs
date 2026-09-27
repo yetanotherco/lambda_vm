@@ -194,7 +194,7 @@ fn main() {
 
     compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
     compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
-    // The column-major LDE engine (GAP K1). Pinned on the host by
+    // The column-major LDE engine (`src/lde_cm.rs`). Pinned on the host by
     // `tests/host_kat/ntt_cm_host_kat.cpp` (`make test-ntt-cm-host-kat`).
     compile_kernel("ntt_cm.cu", "ntt_cm.cubin", have_nvcc, &[]);
     compile_kernel("keccak.cu", "keccak.cubin", have_nvcc, &[]);

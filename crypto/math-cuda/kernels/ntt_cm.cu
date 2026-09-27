@@ -1,4 +1,4 @@
-// Column-major coset LDE engine (GAP K1): the pass kernels.
+// Column-major coset LDE engine: the pass kernels.
 //
 // WHY THIS EXISTS. The row-major LDE in `ntt.cu` runs one butterfly level per
 // launch over the whole matrix, so an LDE of a 2^22 x 245 table makes ~33

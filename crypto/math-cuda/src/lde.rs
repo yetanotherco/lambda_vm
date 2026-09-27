@@ -1026,7 +1026,7 @@ fn expand_row_major_on_stream(
     Ok((buf, trace_col_major))
 }
 
-/// The GAP K1 form of [`expand_row_major_on_stream`] (see [`crate::lde_cm`]):
+/// The column-major form of [`expand_row_major_on_stream`] (see [`crate::lde_cm`]):
 /// the same LDE, produced COLUMN-major (column `c` at `c · lde_size`) — the
 /// layout every downstream kernel reads — so there is no row-major LDE to
 /// transpose afterwards, and no zero fill.
@@ -1156,7 +1156,7 @@ fn col_major_leaves_into_tree(
     )
 }
 
-/// The GAP K1 form of [`coset_lde_row_major_inner`]: the same tree and the
+/// The column-major form of [`coset_lde_row_major_inner`]: the same tree and the
 /// same column-major handle, with the LDE built column-major
 /// ([`expand_col_major_on_stream`]) and its leaves hashed from that layout by
 /// the column-major twins of the row-major leaf kernels. Returns
@@ -1165,7 +1165,7 @@ fn col_major_leaves_into_tree(
 /// path, whose host copy is row-major).
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
-fn coset_lde_row_major_inner_k1(
+fn coset_lde_row_major_inner_col_major(
     input: InnerInput,
     hash: DeviceHash,
     n: usize,
@@ -1225,10 +1225,10 @@ fn coset_lde_row_major_inner_k1(
     Ok((tree, buf, trace_col_major, Arc::new(ready)))
 }
 
-/// Whether a row-major commit takes the GAP K1 form: the knob is on, the shape
+/// Whether a row-major commit takes the column-major form: the engine is on, the shape
 /// fits the engine, and the caller wants no host copy of the row-major LDE.
-fn row_major_commit_takes_k1(n: usize, blowup_factor: usize, retain_host_lde: bool) -> bool {
-    !retain_host_lde && crate::lde_cm::k1_enabled() && crate::lde_cm::supports(n, blowup_factor)
+fn row_major_commit_takes_engine(n: usize, blowup_factor: usize, retain_host_lde: bool) -> bool {
+    !retain_host_lde && crate::lde_cm::engine_enabled() && crate::lde_cm::supports(n, blowup_factor)
 }
 
 /// Shared row-major LDE + leaf-hash + Merkle pipeline for the base and ext3
@@ -1493,8 +1493,8 @@ fn coset_lde_row_major_inner(
         rows_per_leaf == 1 || rows_per_leaf == 2,
         "rows_per_leaf must be 1 or 2"
     );
-    if row_major_commit_takes_k1(n, blowup_factor, retain_host_lde) {
-        let (tree, col_major_dev, trace_col_major, ready) = coset_lde_row_major_inner_k1(
+    if row_major_commit_takes_engine(n, blowup_factor, retain_host_lde) {
+        let (tree, col_major_dev, trace_col_major, ready) = coset_lde_row_major_inner_col_major(
             input,
             hash,
             n,
@@ -1811,8 +1811,8 @@ pub fn coset_lde_row_major_split_trees_rpl(
         Some(d) if d.len() == row_major.len() => InnerInput::Dev(d),
         _ => InnerInput::Host(row_major),
     };
-    if row_major_commit_takes_k1(n, blowup_factor, retain_host_lde) {
-        return coset_lde_row_major_split_trees_k1(
+    if row_major_commit_takes_engine(n, blowup_factor, retain_host_lde) {
+        return coset_lde_row_major_split_trees_col_major(
             &stream,
             be,
             input,
@@ -1911,13 +1911,13 @@ pub fn coset_lde_row_major_split_trees_rpl(
     Ok((precomputed_nodes, handle, lde_out))
 }
 
-/// The GAP K1 form of [`coset_lde_row_major_split_trees_rpl`]: the LDE built
+/// The column-major form of [`coset_lde_row_major_split_trees_rpl`]: the LDE built
 /// column-major ([`expand_col_major_on_stream`], snapshot retained), each
 /// subset tree hashed from its contiguous run of columns. Same trees, same
 /// handle, no transpose; the host LDE copy is never produced here.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
-fn coset_lde_row_major_split_trees_k1(
+fn coset_lde_row_major_split_trees_col_major(
     stream: &Arc<CudaStream>,
     be: &Backend,
     input: InnerInput,
@@ -2323,9 +2323,9 @@ pub fn coset_lde_batch_base(
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed for the legacy
     // transform, so the [n, lde_size) tail of each column is already the
-    // zero-pad the CPU path does; the K1 engine reads only the first n.
-    let k1 = slabs_take_k1(n, blowup_factor);
-    let mut buf = if k1 {
+    // zero-pad the CPU path does; the column-major engine reads only the first n.
+    let engine = slabs_take_engine(n, blowup_factor);
+    let mut buf = if engine {
         // SAFETY: the upload writes each slab's first n, the LDE the rest.
         unsafe { stream.alloc::<u64>(m * lde_size) }?
     } else {
@@ -2359,7 +2359,7 @@ pub fn coset_lde_batch_base(
         blowup_factor,
         weights,
         SlabInput::Evals,
-        k1,
+        engine,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -2452,9 +2452,9 @@ pub fn coset_lde_batch_base_into(
     }
 
     // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
-    // each slab as the zero padding; the K1 engine reads only the first n.
-    let k1 = slabs_take_k1(n, blowup_factor);
-    let mut buf = if k1 {
+    // each slab as the zero padding; the column-major engine reads only the first n.
+    let engine = slabs_take_engine(n, blowup_factor);
+    let mut buf = if engine {
         // SAFETY: the upload writes each slab's first n, the LDE the rest.
         unsafe { stream.alloc::<u64>(m * lde_size) }?
     } else {
@@ -2477,7 +2477,7 @@ pub fn coset_lde_batch_base_into(
         blowup_factor,
         weights,
         SlabInput::Evals,
-        k1,
+        engine,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -2594,9 +2594,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 
     // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
-    // each slab as the zero padding; the K1 engine reads only the first n.
-    let k1 = slabs_take_k1(n, blowup_factor);
-    let mut buf = if k1 {
+    // each slab as the zero padding; the column-major engine reads only the first n.
+    let engine = slabs_take_engine(n, blowup_factor);
+    let mut buf = if engine {
         // SAFETY: the upload writes each slab's first n, the LDE the rest.
         unsafe { stream.alloc::<u64>(m * lde_size) }?
     } else {
@@ -2619,7 +2619,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         blowup_factor,
         weights,
         SlabInput::Evals,
-        k1,
+        engine,
     )?;
 
     let lde_u64 = lde_size as u64;
@@ -2845,9 +2845,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
     // Zeroed for the legacy transform, which reads the [n, lde_size) tail of
-    // each slab as the zero padding; the K1 engine reads only the first n.
-    let k1 = slabs_take_k1(n, blowup_factor);
-    let mut buf = if k1 {
+    // each slab as the zero padding; the column-major engine reads only the first n.
+    let engine = slabs_take_engine(n, blowup_factor);
+    let mut buf = if engine {
         // SAFETY: the upload writes each slab's first n, the LDE the rest.
         unsafe { stream.alloc::<u64>(mb * lde_size) }?
     } else {
@@ -2870,7 +2870,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         blowup_factor,
         weights,
         SlabInput::Coeffs,
-        k1,
+        engine,
     )?;
 
     let lde_u64 = lde_size as u64;
@@ -3068,9 +3068,9 @@ pub fn coset_lde_batch_ext3_into(
 
     // Device buffer holding 3M slabs of `lde_size`, zeroed for the legacy
     // transform, which reads the [n, lde_size) tail of each slab as the zero
-    // padding; the K1 engine reads only the first n.
-    let k1 = slabs_take_k1(n, blowup_factor);
-    let mut buf = if k1 {
+    // padding; the column-major engine reads only the first n.
+    let engine = slabs_take_engine(n, blowup_factor);
+    let mut buf = if engine {
         // SAFETY: the upload writes each slab's first n, the LDE the rest.
         unsafe { stream.alloc::<u64>(mb * lde_size) }?
     } else {
@@ -3094,7 +3094,7 @@ pub fn coset_lde_batch_ext3_into(
         blowup_factor,
         weights,
         SlabInput::Evals,
-        k1,
+        engine,
     )?;
 
     // Release the staging slot before the drain: the uploads have landed once
@@ -3155,7 +3155,7 @@ pub fn coset_lde_batch_ext3_slabs_keep(
     assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
 
     let be = backend()?;
-    let k1 = slabs_take_k1(n, blowup_factor);
+    let engine = slabs_take_engine(n, blowup_factor);
     lde_in_slabs(
         stream,
         be,
@@ -3165,7 +3165,7 @@ pub fn coset_lde_batch_ext3_slabs_keep(
         blowup_factor,
         weights,
         SlabInput::Evals,
-        k1,
+        engine,
     )?;
 
     let ready = match outputs {
@@ -3212,17 +3212,17 @@ enum SlabInput {
     Coeffs,
 }
 
-/// Whether the batched column-major entry points take the GAP K1 engine for
+/// Whether the batched column-major entry points take the column-major engine for
 /// an `n`-row, blowup-`blowup` LDE. Decided once per call, before the buffer
-/// is allocated: under K1 nothing reads the zero padding, so the call skips
+/// is allocated: under the engine nothing reads the zero padding, so the call skips
 /// the zero fill.
-fn slabs_take_k1(n: usize, blowup: usize) -> bool {
-    crate::lde_cm::k1_enabled() && crate::lde_cm::supports(n, blowup)
+fn slabs_take_engine(n: usize, blowup: usize) -> bool {
+    crate::lde_cm::engine_enabled() && crate::lde_cm::supports(n, blowup)
 }
 
 /// The transform every batched column-major entry point runs: `slabs` slabs of
 /// `n · blowup` in `buf`, the first `n` of each holding values or
-/// coefficients (`input`); afterwards every slab holds its coset LDE. `k1`
+/// coefficients (`input`); afterwards every slab holds its coset LDE. `engine`
 /// picks the column-major engine ([`crate::lde_cm`], which reads nothing
 /// beyond each slab's first `n`) or the legacy per-level batched kernels,
 /// which need the slabs' tails zeroed.
@@ -3236,10 +3236,10 @@ fn lde_in_slabs(
     blowup: usize,
     weights: &[u64],
     input: SlabInput,
-    k1: bool,
+    engine: bool,
 ) -> Result<()> {
     let lde_size = n * blowup;
-    if k1 {
+    if engine {
         let ptr = buf.device_ptr(stream).0;
         // Each slab's source is its own first `n`: a chunk copies or
         // transforms it into the engine's scratch before it writes the slab,
@@ -3398,14 +3398,14 @@ fn run_batched_ntt_body(
     Ok(())
 }
 
-/// GAP K1 microbenchmark: the row-major commit's stages under the legacy
+/// LDE microbenchmark: the row-major commit's stages under the legacy
 /// engine and under the column-major one, on one `n × m` matrix already
 /// resident on the device, with a host synchronize after each stage — the
 /// same stages and shapes as the W3/K0 same-input comparison with ZisK
 /// (`thoughts/zf/gap/W3-KERNELS.md`). Measurement only; nothing on a proving
 /// path calls it.
 #[doc(hidden)]
-pub mod k1_bench {
+pub mod lde_bench {
     use super::*;
     use std::time::Instant;
 
@@ -3416,7 +3416,7 @@ pub mod k1_bench {
         /// Everything before the leaves: staging, snapshot, the LDE — the
         /// production expansion of the engine under test.
         pub expand_ms: f64,
-        /// K1 only, timed after the root is read by re-running the expansion
+        /// Engine only, timed after the root is read by re-running the expansion
         /// in two timed halves: `stage_ms` puts the column-major trace where
         /// the engine reads it (0 when the snapshot is retained: it is the
         /// source), `lde_ms` is the engine alone, column-major source to
@@ -3425,7 +3425,7 @@ pub mod k1_bench {
         pub lde_ms: f64,
         pub leaves_ms: f64,
         pub inner_ms: f64,
-        /// Legacy only: the in-place transpose to column-major; 0 for K1.
+        /// Legacy only: the in-place transpose to column-major; 0 for the engine.
         pub transpose_ms: f64,
         pub root0: u64,
     }
@@ -3451,7 +3451,7 @@ pub mod k1_bench {
     }
 
     /// One commit of the device-resident `input` (`n × m`, row-major) at
-    /// `blowup`, `rows_per_leaf` rows per leaf, under the engine `k1` picks.
+    /// `blowup`, `rows_per_leaf` rows per leaf, column-major engine or legacy.
     /// `snapshot` retains the trace-domain snapshot as the main commits do.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
@@ -3462,7 +3462,7 @@ pub mod k1_bench {
         blowup: usize,
         rows_per_leaf: usize,
         snapshot: bool,
-        k1: bool,
+        engine: bool,
     ) -> Result<StageTimes> {
         let be = backend()?;
         let stream = be.next_stream();
@@ -3474,7 +3474,7 @@ pub mod k1_bench {
 
         stream.synchronize()?;
         let t0 = Instant::now();
-        let (mut buf, snap) = if k1 {
+        let (mut buf, snap) = if engine {
             expand_col_major_on_stream(
                 &stream,
                 be,
@@ -3503,7 +3503,7 @@ pub mod k1_bench {
         let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
         stream.synchronize()?;
         let t1 = Instant::now();
-        if k1 {
+        if engine {
             col_major_leaves_into_tree(
                 hash,
                 &stream,
@@ -3544,7 +3544,7 @@ pub mod k1_bench {
         drop(nodes_dev);
 
         let (mut stage_ms, mut lde_ms, mut transpose_ms) = (0.0, 0.0, 0.0);
-        if k1 {
+        if engine {
             // The root is read; the LDE is recomputed in place, in two timed
             // halves, from the same kind of source the expansion used.
             let buf_ptr = buf.device_ptr(&stream).0;

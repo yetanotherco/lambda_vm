@@ -667,8 +667,8 @@ test-rpx-host-kat:
 	    -o target/host_kat/rpx_host_kat $(HOST_KAT_DIR)/rpx_host_kat.cpp
 	./target/host_kat/rpx_host_kat
 
-# Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`, GAP
-# K1), run on the HOST through the same shim: every pass shape against the
+# Known-answer tests for the column-major LDE engine's passes (`ntt_cm.cu`), run
+# on the HOST through the same shim: every pass shape against the
 # textbook radix-2 levels, whole transforms against the naive DFT, and the LDE
 # the driver runs (DIF iNTT, bit-reversed weights, DIT with the fused coset
 # spread) against direct interpolation and evaluation on the coset. Arithmetic

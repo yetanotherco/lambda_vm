@@ -1,8 +1,8 @@
-//! GAP K1: the column-major LDE engine (`math_cuda::lde_cm`) against the legacy
+//! The column-major LDE engine (`math_cuda::lde_cm`) against the legacy
 //! pipelines, entry point by entry point, on the same inputs in one process
-//! (`with_k1` forces the engine per call).
+//! (`with_engine` forces the pipeline per call).
 //!
-//! What must hold for the knob to be a pure performance change:
+//! What must hold for the engine to be a pure performance change:
 //! - the Merkle roots — and for the split trees the downloaded precomputed
 //!   node bytes — are identical;
 //! - the device LDE handles hold the same field values (compared canonically:
@@ -12,7 +12,7 @@
 //! - the host outputs of the batched entry points are identical (canonically).
 //!
 //! The engine's arithmetic is also pinned on the host by
-//! `tests/host_kat/ntt_cm_host_kat.cpp`; `k1_matches_the_cpu_lde` anchors the
+//! `tests/host_kat/ntt_cm_host_kat.cpp`; `engine_matches_the_cpu_lde` anchors the
 //! device engine to the CPU `Polynomial::coset_lde_full_expand` independently
 //! of the legacy GPU path.
 
@@ -22,7 +22,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsPrimeField;
 use math::polynomial::Polynomial;
 use math_cuda::DeviceHash;
-use math_cuda::lde_cm::{k1_columns, with_k1};
+use math_cuda::lde_cm::{columns_extended, with_engine};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -54,12 +54,12 @@ fn canon(xs: &[u64]) -> Vec<u64> {
     xs.iter().map(GoldilocksField::canonical).collect()
 }
 
-fn assert_same_values(k1: &[u64], legacy: &[u64], what: &str) {
-    assert_eq!(k1.len(), legacy.len(), "{what}: length");
-    let (a, b) = (canon(k1), canon(legacy));
+fn assert_same_values(engine: &[u64], legacy: &[u64], what: &str) {
+    assert_eq!(engine.len(), legacy.len(), "{what}: length");
+    let (a, b) = (canon(engine), canon(legacy));
     if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
         panic!(
-            "{what}: first difference at {i}: k1 {:#x} legacy {:#x}",
+            "{what}: first difference at {i}: engine {:#x} legacy {:#x}",
             a[i], b[i]
         );
     }
@@ -108,7 +108,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
 
 /// The main (base) commit: host and pre-uploaded input, both leaf layouts.
 #[test]
-fn base_commit_k1_matches_legacy() {
+fn base_commit_engine_matches_legacy() {
     let be = math_cuda::device::backend().expect("cuda backend");
     for (i, &(log_n, blowup, cols)) in SHAPES.iter().enumerate() {
         let n = 1usize << log_n;
@@ -128,7 +128,7 @@ fn base_commit_k1_matches_legacy() {
                     "base log_n={log_n} blowup={blowup} cols={cols} rpl={rpl} {hash:?} predev={dev_input}"
                 );
                 let run = |on: bool| {
-                    with_k1(on, || {
+                    with_engine(on, || {
                         math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_rpl(
                             &row_major,
                             dev_input.then_some(&predev),
@@ -143,37 +143,37 @@ fn base_commit_k1_matches_legacy() {
                     })
                     .expect("base commit")
                 };
-                let before = k1_columns();
-                let (k1, k1_host) = run(true);
+                let before = columns_extended();
+                let (engine, engine_host) = run(true);
                 assert!(
-                    k1_columns() - before >= cols as u64,
-                    "{what}: the knob did not route through the engine"
+                    columns_extended() - before >= cols as u64,
+                    "{what}: the entry point did not route through the engine"
                 );
                 let (legacy, legacy_host) = run(false);
                 assert!(
-                    k1_host.is_empty() && legacy_host.is_empty(),
+                    engine_host.is_empty() && legacy_host.is_empty(),
                     "{what}: device-only"
                 );
                 assert_eq!(
-                    k1.tree.as_ref().unwrap().root,
+                    engine.tree.as_ref().unwrap().root,
                     legacy.tree.as_ref().unwrap().root,
                     "{what}: root"
                 );
                 assert_eq!(
-                    k1.tree.as_ref().unwrap().leaves_len,
+                    engine.tree.as_ref().unwrap().leaves_len,
                     legacy.tree.as_ref().unwrap().leaves_len
                 );
                 assert_eq!(
-                    (k1.m, k1.lde_size, k1.trace_rows),
+                    (engine.m, engine.lde_size, engine.trace_rows),
                     (legacy.m, legacy.lde_size, legacy.trace_rows)
                 );
                 assert_same_values(
-                    &download(&k1.buf, k1.ready.as_deref()),
+                    &download(&engine.buf, engine.ready.as_deref()),
                     &download(&legacy.buf, legacy.ready.as_deref()),
                     &what,
                 );
                 assert_eq!(
-                    download(k1.trace_dev.as_ref().unwrap(), k1.ready.as_deref()),
+                    download(engine.trace_dev.as_ref().unwrap(), engine.ready.as_deref()),
                     download(legacy.trace_dev.as_ref().unwrap(), legacy.ready.as_deref()),
                     "{what}: trace snapshot"
                 );
@@ -185,7 +185,7 @@ fn base_commit_k1_matches_legacy() {
 /// The aux (ext3) commits: no snapshot, so the engine reads a column-major
 /// copy of the trace staged at the head of the LDE buffer itself.
 #[test]
-fn ext3_commit_k1_matches_legacy() {
+fn ext3_commit_engine_matches_legacy() {
     let be = math_cuda::device::backend().expect("cuda backend");
     for (i, &(log_n, blowup, cols)) in SHAPES.iter().enumerate() {
         // `cols` ext3 columns: keep the widest shapes affordable.
@@ -204,7 +204,7 @@ fn ext3_commit_k1_matches_legacy() {
             let hash = HASHES[(i + j + 1) % HASHES.len()];
             let what = format!("ext3 log_n={log_n} blowup={blowup} cols={cols} rpl={rpl} {hash:?}");
             let host = |on: bool| {
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_rpl(
                         &row_major, hash, n, cols, blowup, &weights, false, rpl,
                     )
@@ -213,7 +213,7 @@ fn ext3_commit_k1_matches_legacy() {
                 .0
             };
             let dev = |on: bool| {
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev_rpl(
                         &dev_input, hash, n, cols, blowup, &weights, false, rpl,
                     )
@@ -223,15 +223,15 @@ fn ext3_commit_k1_matches_legacy() {
             };
             let legacy = host(false);
             let legacy_vals = download(&legacy.buf, legacy.ready.as_deref());
-            for (k1, form) in [(host(true), "host"), (dev(true), "dev")] {
+            for (engine, form) in [(host(true), "host"), (dev(true), "dev")] {
                 assert_eq!(
-                    k1.tree.as_ref().unwrap().root,
+                    engine.tree.as_ref().unwrap().root,
                     legacy.tree.as_ref().unwrap().root,
                     "{what} {form}: root"
                 );
-                assert_eq!((k1.m, k1.lde_size), (legacy.m, legacy.lde_size));
+                assert_eq!((engine.m, engine.lde_size), (legacy.m, legacy.lde_size));
                 assert_same_values(
-                    &download(&k1.buf, k1.ready.as_deref()),
+                    &download(&engine.buf, engine.ready.as_deref()),
                     &legacy_vals,
                     &format!("{what} {form}"),
                 );
@@ -242,7 +242,7 @@ fn ext3_commit_k1_matches_legacy() {
 
 /// The preprocessed commit: two subset trees over one LDE.
 #[test]
-fn split_trees_k1_matches_legacy() {
+fn split_trees_engine_matches_legacy() {
     for (i, &(log_n, blowup, cols)) in SHAPES.iter().enumerate() {
         if cols < 2 {
             continue; // the split needs a column on each side
@@ -257,28 +257,28 @@ fn split_trees_k1_matches_legacy() {
             let what =
                 format!("split log_n={log_n} blowup={blowup} cols={cols} rpl={rpl} {hash:?}");
             let run = |on: bool| {
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::coset_lde_row_major_split_trees_rpl(
                         &row_major, None, hash, n, cols, blowup, &weights, split, true, false, rpl,
                     )
                 })
                 .expect("split commit")
             };
-            let (k1_pre, k1, _) = run(true);
+            let (engine_pre, engine, _) = run(true);
             let (legacy_pre, legacy, _) = run(false);
-            assert_eq!(k1_pre, legacy_pre, "{what}: precomputed tree nodes");
+            assert_eq!(engine_pre, legacy_pre, "{what}: precomputed tree nodes");
             assert_eq!(
-                k1.tree.as_ref().unwrap().root,
+                engine.tree.as_ref().unwrap().root,
                 legacy.tree.as_ref().unwrap().root,
                 "{what}: multiplicity root"
             );
             assert_same_values(
-                &download(&k1.buf, k1.ready.as_deref()),
+                &download(&engine.buf, engine.ready.as_deref()),
                 &download(&legacy.buf, legacy.ready.as_deref()),
                 &what,
             );
             assert_eq!(
-                download(k1.trace_dev.as_ref().unwrap(), k1.ready.as_deref()),
+                download(engine.trace_dev.as_ref().unwrap(), engine.ready.as_deref()),
                 download(legacy.trace_dev.as_ref().unwrap(), legacy.ready.as_deref()),
                 "{what}: trace snapshot"
             );
@@ -286,8 +286,8 @@ fn split_trees_k1_matches_legacy() {
     }
 }
 
-/// A caller that wants the row-major host LDE keeps the legacy path under the
-/// knob (the engine's LDE is column-major), and gets the same bytes.
+/// A caller that wants the row-major host LDE keeps the legacy path even with
+/// the engine on (the engine's LDE is column-major), and gets the same bytes.
 #[test]
 fn host_lde_callers_keep_the_legacy_path() {
     let (log_n, blowup, cols) = (10, 2, 5);
@@ -296,7 +296,7 @@ fn host_lde_callers_keep_the_legacy_path() {
     let row_major = random(&mut rng, n * cols);
     let weights = weights_u64(n, COSET_OFFSET, true);
     let run = |on: bool| {
-        with_k1(on, || {
+        with_engine(on, || {
             math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
                 &row_major,
                 None,
@@ -323,7 +323,7 @@ fn host_lde_callers_keep_the_legacy_path() {
 
 /// Every batched (column-major, in-slab) entry point.
 #[test]
-fn batched_entry_points_k1_match_legacy() {
+fn batched_entry_points_engine_match_legacy() {
     let be = math_cuda::device::backend().expect("cuda backend");
     for (i, &(log_n, blowup, cols)) in SHAPES.iter().enumerate() {
         let cols = cols.min(24);
@@ -338,7 +338,7 @@ fn batched_entry_points_k1_match_legacy() {
         let base: Vec<Vec<u64>> = (0..cols).map(|_| random(&mut rng, n)).collect();
         let slices: Vec<&[u64]> = base.iter().map(Vec::as_slice).collect();
         let batch = |on: bool| {
-            with_k1(on, || {
+            with_engine(on, || {
                 math_cuda::lde::coset_lde_batch_base(&slices, blowup, &w_evals)
             })
             .expect("batch base")
@@ -351,7 +351,7 @@ fn batched_entry_points_k1_match_legacy() {
             let mut outs = vec![vec![0u64; lde]; cols];
             {
                 let mut views: Vec<&mut [u64]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::coset_lde_batch_base_into(&slices, blowup, &w_evals, &mut views)
                 })
                 .expect("batch base into");
@@ -369,7 +369,7 @@ fn batched_entry_points_k1_match_legacy() {
             let mut leaves = vec![0u8; (lde / 2) * 32];
             {
                 let mut views: Vec<&mut [u64]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::coset_lde_batch_base_into_with_leaf_hash(
                         &slices,
                         hash,
@@ -397,7 +397,7 @@ fn batched_entry_points_k1_match_legacy() {
             let mut outs = vec![vec![0u64; 3 * lde]; cols];
             {
                 let mut views: Vec<&mut [u64]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
-                with_k1(on, || {
+                with_engine(on, || {
                     if coeffs {
                         math_cuda::lde::evaluate_poly_coset_batch_ext3_into(
                             &ext_slices,
@@ -435,7 +435,7 @@ fn batched_entry_points_k1_match_legacy() {
             let mut nodes = vec![0u8; (lde - 1) * 32];
             {
                 let mut views: Vec<&mut [u64]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
-                with_k1(on, || {
+                with_engine(on, || {
                     math_cuda::lde::evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
                         &ext_slices,
                         hash,
@@ -465,7 +465,7 @@ fn batched_entry_points_k1_match_legacy() {
                 }
             }
             let buf = stream.clone_htod(&host).expect("slab upload");
-            let handle = with_k1(on, || {
+            let handle = with_engine(on, || {
                 math_cuda::lde::coset_lde_batch_ext3_slabs_keep(
                     &stream, buf, cols, n, blowup, &w_evals, None,
                 )
@@ -483,16 +483,16 @@ fn batched_entry_points_k1_match_legacy() {
 
 /// The engine against the CPU LDE, independently of the legacy GPU path.
 #[test]
-fn k1_matches_the_cpu_lde() {
+fn engine_matches_the_cpu_lde() {
     for &(log_n, blowup) in &[(4usize, 2usize), (7, 8), (11, 4), (14, 2), (18, 4)] {
         let n = 1usize << log_n;
         let mut rng = ChaCha8Rng::seed_from_u64(0xC9A0 + log_n as u64);
         let evals = random(&mut rng, n);
         let weights = weights_u64(n, COSET_OFFSET, true);
-        let gpu = with_k1(true, || {
+        let gpu = with_engine(true, || {
             math_cuda::lde::coset_lde_batch_base(&[evals.as_slice()], blowup, &weights)
         })
-        .expect("k1 lde")
+        .expect("engine lde")
         .remove(0);
 
         let log_lde = (n * blowup).trailing_zeros() as u64;

@@ -1,4 +1,5 @@
-// Known-answer tests for `kernels/ntt_cm.cu` (GAP K1), run on the host.
+// Known-answer tests for `kernels/ntt_cm.cu`, the column-major LDE engine's
+// passes, run on the host.
 //
 // WHY THIS EXISTS. The column-major LDE engine's correctness is index math and
 // roots: which element a register holds, which root a butterfly takes, what

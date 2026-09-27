@@ -1,13 +1,15 @@
-//! Column-major coset LDE engine (GAP K1), behind `LAMBDA_VM_GAP_K1=1`.
+//! Column-major coset LDE engine — the device LDE of the commits.
 //!
-//! The production LDEs ([`crate::lde`]) run one butterfly level per launch over
+//! The legacy LDEs in [`crate::lde`] run one butterfly level per launch over
 //! the whole matrix: an LDE of `2^22 × 245` at blowup 2 makes ~33 whole-matrix
 //! DRAM passes. This engine instead transforms the columns a CHUNK at a time,
 //! the chunk sized so its working set stays in L2 between launches, and runs
 //! 4..8 levels per launch out of registers and shared memory
 //! (`kernels/ntt_cm.cu`). DRAM then sees the trace about once and the LDE about
 //! once, and the LDE comes out column-major — the layout every downstream kernel
-//! reads — so the row-major paths also lose their in-place transpose.
+//! reads — so the row-major commits also lose their in-place transpose. On the
+//! W3/K0 shapes it runs within 1.2–1.4× of ZisK's production LDE and cuts the
+//! whole row-major commit to 0.58–0.67× (`thoughts/zf/gap/fix/NTT.md`).
 //!
 //! Per chunk of `C` columns the driver runs:
 //!
@@ -27,6 +29,11 @@
 //! are unchanged; only the non-canonical representation of a value may differ,
 //! which nothing downstream observes (the hashes and the serialisation
 //! canonicalise).
+//!
+//! It is the default wherever it applies ([`engine_enabled`]). The legacy path
+//! stays for what the engine does not take — a caller that wants the row-major
+//! LDE back on the host, and shapes outside [`supports`] — and, whole, under
+//! [`LEGACY_ENV`].
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,55 +48,60 @@ use math::field::traits::IsFFTField;
 use crate::Result;
 use crate::device::Backend;
 
-/// The knob: `LAMBDA_VM_GAP_K1=1` routes the production LDEs through this
-/// engine. Default off; read once per process.
-pub const K1_ENV: &str = "LAMBDA_VM_GAP_K1";
+/// `LAMBDA_VM_LDE_LEGACY=1` sends every LDE back to the legacy per-level
+/// pipeline — an A/B and rollback switch, not a tuning knob: both produce the
+/// same values, roots and proofs. Read once per process.
+pub const LEGACY_ENV: &str = "LAMBDA_VM_LDE_LEGACY";
 
 thread_local! {
-    /// Per-thread override of [`K1_ENV`], for parity tests that run both
-    /// engines in one process. See [`with_k1`].
-    static K1_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Per-thread override of [`LEGACY_ENV`], for parity tests that run both
+    /// pipelines in one process. See [`with_engine`].
+    static ENGINE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Whether the calling thread's LDEs take this engine.
-pub fn k1_enabled() -> bool {
-    if let Some(on) = K1_OVERRIDE.with(Cell::get) {
+/// Whether the calling thread's LDEs take this engine (where it applies).
+pub fn engine_enabled() -> bool {
+    if let Some(on) = ENGINE_OVERRIDE.with(Cell::get) {
         return on;
     }
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| {
-        let on = std::env::var(K1_ENV).is_ok_and(|v| v == "1");
+        let legacy = std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1");
         // One line per process, so every box log states which LDE it ran.
         eprintln!(
-            "[gpu] GAP K1 column-major LDE: {}",
-            if on { "on" } else { "off" }
+            "[gpu] LDE: {}",
+            if legacy {
+                "legacy per-level (LAMBDA_VM_LDE_LEGACY=1)"
+            } else {
+                "column-major engine"
+            }
         );
-        on
+        !legacy
     })
 }
 
 /// Run `f` with the engine forced on or off for the calling thread — the
 /// entry points decide on the calling thread before any work is queued, so a
-/// test can compare both engines on the same inputs in one process.
+/// test can compare both pipelines on the same inputs in one process.
 #[doc(hidden)]
-pub fn with_k1<R>(on: bool, f: impl FnOnce() -> R) -> R {
+pub fn with_engine<R>(on: bool, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<bool>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            K1_OVERRIDE.with(|c| c.set(self.0));
+            ENGINE_OVERRIDE.with(|c| c.set(self.0));
         }
     }
-    let _restore = Restore(K1_OVERRIDE.with(|c| c.replace(Some(on))));
+    let _restore = Restore(ENGINE_OVERRIDE.with(|c| c.replace(Some(on))));
     f()
 }
 
-/// Columns this engine has extended, process-wide: the mechanism counter a
-/// knob-on run is checked against (a knob that routes nothing reads zero).
-static K1_COLUMNS: AtomicU64 = AtomicU64::new(0);
+/// Columns this engine has extended, process-wide: the counter a test reads to
+/// know the engine, and not the legacy path, did the work.
+static COLUMNS_EXTENDED: AtomicU64 = AtomicU64::new(0);
 
-/// See [`K1_COLUMNS`].
-pub fn k1_columns() -> u64 {
-    K1_COLUMNS.load(Ordering::Relaxed)
+/// See [`COLUMNS_EXTENDED`].
+pub fn columns_extended() -> u64 {
+    COLUMNS_EXTENDED.load(Ordering::Relaxed)
 }
 
 /// Smallest trace a column can have here: a pass holds 16 elements per
@@ -304,7 +316,10 @@ pub(crate) fn lde_columns(
     input: Input,
     order: ChunkOrder,
 ) -> Result<()> {
-    assert!(supports(n, blowup), "K1 LDE shape n={n} blowup={blowup}");
+    assert!(
+        supports(n, blowup),
+        "column-engine LDE shape n={n} blowup={blowup}"
+    );
     assert_eq!(weights.len(), n, "one weight per trace row");
     if m == 0 {
         return Ok(());
@@ -435,7 +450,7 @@ pub(crate) fn lde_columns(
             s += k;
         }
     }
-    K1_COLUMNS.fetch_add(m as u64, Ordering::Relaxed);
+    COLUMNS_EXTENDED.fetch_add(m as u64, Ordering::Relaxed);
     Ok(())
 }
 
