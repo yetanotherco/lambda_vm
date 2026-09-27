@@ -2026,3 +2026,223 @@ fn the_genesis_threshold_budget_still_covers_the_stack_under_each_first_fold() {
         );
     }
 }
+
+// ================ the PROTO lane's variants (`crate::gap_proto`) ================
+//
+// P2 (`LAMBDA_VM_GAP_P2_WHIR`) grinds only before each round's queries; P1
+// (`LAMBDA_VM_GAP_P1_WHIR`) runs every round at rate 1/2. The machine sees
+// either one only through `ChainShape::new(config, …)`, so the gates below
+// prove, verify, execute and tamper each at a laptop's width.
+
+/// P2's proof of work at a test width: the query grind alone.
+fn query_only_grind(num_queries: usize, bits: u8) -> ChainConfig {
+    ChainConfig {
+        grind: GrindBits {
+            folding: 0,
+            ood: 0,
+            query: bits,
+        },
+        ..config(num_queries, 0)
+    }
+}
+
+/// P1's rate at a test width.
+fn rate_half(num_queries: usize, grind: u8) -> ChainConfig {
+    ChainConfig {
+        log_blowup: 1,
+        ..config(num_queries, grind)
+    }
+}
+
+fn host_accepts(f: &Fixture, cfg: &ChainConfig, proof: &ChainProof<F, E>) -> bool {
+    let mut t = Recording::new();
+    verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, cfg, &mut t).is_ok()
+}
+
+fn machine_accepts(program: &LfmProgram, f: &Fixture, proof: &ChainProof<F, E>) -> bool {
+    execute(
+        program,
+        &[chain_arena(f, proof)],
+        &crate::hash_pin::BLOCK_HASHER,
+    )
+    .is_ok()
+}
+
+/// ★ P2: a query-only chain executes, and exactly its `R` query nonces are
+/// checked, on both sides. A zero-bit grind returns before it reads its nonce
+/// (host `check_grind`, machine `emit_grind_check`), so a flipped folding or
+/// out-of-domain nonce is not a forgery any more — both sides must still
+/// accept it, or one of them reads a value the other ignores.
+#[test]
+fn a_query_only_grind_chain_checks_its_query_nonces_and_nothing_else() {
+    let bits = 8u8;
+    let cfg = query_only_grind(3, bits);
+    let f = fixture_with(&cfg, 6);
+    assert_eq!(f.shape.grind, (0, 0, bits as usize));
+    let program = chain_program(&f.shape);
+    assert!(
+        machine_accepts(&program, &f, &f.proof),
+        "the honest proof must execute"
+    );
+
+    let rounds = f.shape.rounds();
+    let mut checked = 0;
+    for r in 0..rounds {
+        let mut forged = f.proof.clone();
+        forged.rounds[r].nonces.query ^= 1;
+        assert!(
+            !host_accepts(&f, &cfg, &forged),
+            "round {r}: the host must reject a wrong query nonce"
+        );
+        assert!(
+            !machine_accepts(&program, &f, &forged),
+            "round {r}: the machine must refuse a wrong query nonce"
+        );
+        checked += 1;
+
+        let mut unread = f.proof.clone();
+        unread.rounds[r].nonces.folding ^= 1;
+        unread.rounds[r].nonces.ood ^= 1;
+        assert!(
+            host_accepts(&f, &cfg, &unread),
+            "round {r}: a zero-bit nonce is not read by the host"
+        );
+        assert!(
+            machine_accepts(&program, &f, &unread),
+            "round {r}: a zero-bit nonce is not read by the machine"
+        );
+    }
+    assert_eq!(checked, rounds, "one checked nonce a round");
+    assert_eq!(
+        chain_grind_perms(&f.shape),
+        2 * rounds,
+        "two permutations a query check, none anywhere else"
+    );
+    assert!(
+        !host_accepts(&f, &config(3, bits), &f.proof),
+        "the grind bits are a verifier constant: the uniform verifier rejects a query-only proof"
+    );
+}
+
+/// ★ P1: at rate 1/2 — every round's domain one bit shorter — the chain
+/// executes on a proof the host accepts, over the shapes the rate-1/4 gate
+/// walks (the three-round `S = 9` included).
+#[test]
+fn a_rate_half_chain_executes_on_a_proof_the_host_accepts() {
+    for (num_vars, num_queries) in [(6usize, 3usize), (6, 5), (5, 3), (9, 3)] {
+        let f = fixture_with(&rate_half(num_queries, 0), num_vars);
+        assert_eq!(f.shape.domain_log[0], num_vars + 1);
+        let program = chain_program(&f.shape);
+        println!(
+            "rate-1/2 chain S={num_vars} Q={num_queries}: {} rounds {:?}, domains {:?}, {} \
+             instructions",
+            f.shape.rounds(),
+            f.shape.schedule,
+            f.shape.domain_log,
+            program.instrs.len()
+        );
+        assert!(
+            machine_accepts(&program, &f, &f.proof),
+            "S={num_vars} Q={num_queries}: the machine refused an accepted rate-1/2 proof"
+        );
+    }
+}
+
+/// P1's tamper arm, at a real grind width so the nonce site is a forgery: every
+/// site the host rejects, the machine refuses.
+#[test]
+fn a_tampered_rate_half_chain_cannot_execute() {
+    let cfg = rate_half(3, 8);
+    let f = fixture_with(&cfg, 6);
+    let program = chain_program(&f.shape);
+    assert!(
+        machine_accepts(&program, &f, &f.proof),
+        "the untouched proof must execute, or the arm below proves nothing"
+    );
+
+    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+    let mut forged = f.proof.clone();
+    forged.final_value += FEE::one();
+    sites.push(("the final value", forged));
+    let mut forged = f.proof.clone();
+    forged.rounds[0].sumcheck[0].evaluations[0] += FEE::one();
+    sites.push(("a sumcheck evaluation", forged));
+    let mut forged = f.proof.clone();
+    forged.rounds[0].nonces.query ^= 1;
+    sites.push(("a query nonce", forged));
+    let mut forged = f.proof.clone();
+    match &mut forged.rounds[0].openings {
+        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+    }
+    sites.push(("a Merkle sibling", forged));
+
+    for (name, forged) in &sites {
+        assert!(
+            !host_accepts(&f, &cfg, forged),
+            "{name}: the host must reject the forgery"
+        );
+        assert!(
+            !machine_accepts(&program, &f, forged),
+            "{name}: the machine must refuse the forgery"
+        );
+    }
+}
+
+/// ★ Gates one and two under the PROTO configs: the emitter's hash schedule is
+/// the host's, event for event; a state read happens exactly where a grind is
+/// spent (`R` checks under P2, `3R − 1` under a uniform grind, none at zero);
+/// and the rows and permutations are the closed form's — the forms the census
+/// and the wrap sizing read.
+#[test]
+fn the_proto_chains_are_the_host_transcripts_and_emit_their_closed_forms() {
+    let entry = SpongeEntry::fresh();
+    for (cfg, num_vars) in [
+        (query_only_grind(3, 8), 6),
+        (query_only_grind(5, 8), 9),
+        (rate_half(3, 0), 6),
+        (rate_half(3, 8), 9),
+        (
+            ChainConfig {
+                log_blowup: 1,
+                ..query_only_grind(3, 8)
+            },
+            6,
+        ),
+    ] {
+        let f = fixture_with(&cfg, num_vars);
+        let host = f.recorded.duplex.borrow().hashes.clone();
+        let mine = chain_hash_schedule(&f.shape, entry);
+        assert_eq!(
+            mine, host,
+            "{cfg:?} S={num_vars}: the form's hash schedule is not the host's"
+        );
+
+        let rounds = f.shape.rounds();
+        let g = cfg.grind;
+        let spent = rounds * usize::from(g.folding > 0)
+            + (rounds - 1) * usize::from(g.ood > 0)
+            + rounds * usize::from(g.query > 0);
+        let states = mine
+            .iter()
+            .filter(|h| !matches!(h, SpongeHash::Squeeze(_)))
+            .count();
+        assert_eq!(
+            states, spent,
+            "{cfg:?} S={num_vars}: one state read a grind"
+        );
+
+        let program = chain_program(&f.shape);
+        let measured = program.instrs.len() - const_rows(&program) - chain_plumbing(&f.shape);
+        assert_eq!(
+            measured,
+            chain_rows(&f.shape, entry),
+            "{cfg:?} S={num_vars}: rows"
+        );
+        assert_eq!(
+            perm_rows(&program),
+            chain_perms(&f.shape, entry),
+            "{cfg:?} S={num_vars}: permutations"
+        );
+    }
+}
