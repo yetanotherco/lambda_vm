@@ -647,6 +647,92 @@ impl LeanRound0 {
     }
 }
 
+/// What one chain of a stacked opening allocates on the card depends on: the
+/// stack, the chain's first two folds, which kernels run it, and what the lean
+/// rounds read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpeningShape {
+    /// The stacked polynomial's variables.
+    pub num_vars: usize,
+    pub log_blowup: usize,
+    /// The chain's first and second fold widths; `next_fold` is 0 for a chain
+    /// of one round.
+    pub first_fold: usize,
+    pub next_fold: usize,
+    /// Rounds run over the shares before the factors are written; 0 writes
+    /// them at full width up front.
+    pub lean_rounds: usize,
+    /// Whether a fold runs every level in one launch.
+    pub fused: bool,
+    /// Whether the message is sent rather than read where the columns lie.
+    pub staged: bool,
+    /// Columns in the stacked polynomial, and the extension values of their
+    /// points' `eq` halves.
+    pub shares: usize,
+    pub eq_values: usize,
+    /// Slots the opening's program lowers to.
+    pub slots: usize,
+}
+
+/// ★ The most one chain of a stacked opening holds on the card beside the
+/// codeword it opens — what a group's openings take their turn for, one chain
+/// at a time.
+///
+/// Three phases, each of which frees what it no longer needs before the next
+/// allocates, so the turn is the largest of them rather than their sum:
+///
+/// - **Share form** (the lean rounds): the share map, the shares, the `eq`
+///   halves, the round scratch and the staged message when there is one —
+///   [`LeanRound0::planned_bytes`] — until the factors are written at the
+///   width the rounds leave, beside it. Without the lean rounds the factors
+///   are written at full width from a base copy of the message, whether that
+///   copy is staged or gathered from the resident columns.
+/// - **Rounds** over the written factors: the factors and a session's slot
+///   file and partials ([`SumcheckSession::scratch_bytes`]).
+/// - **The first fold and what follows it**: the factors, then the fold's
+///   transient ([`fold_transient_bytes`]); after it, beside the fold's output,
+///   one at a time: the successor's tree, the tree over the committed codeword
+///   its queries' paths are read from, and the out-of-domain answer's copy of
+///   the message with the next weight's `eq` table.
+///
+/// Every later round works on a codeword at most `2^first_fold` times
+/// smaller, so it is inside these. A leaf layer kept for retention is promised
+/// by the codeword it belongs to, not by the turn.
+pub fn opening_transient_bytes(shape: &OpeningShape) -> u64 {
+    use crate::whir::{FUSED_MAX_FOLD, fold_transient_bytes, tree_bytes};
+
+    let n = shape.num_vars;
+    let lean = shape.lean_rounds > 0 && shape.shares > 0 && shape.shares < LEAN_MAX_SHARES;
+    let bound = if lean {
+        shape.lean_rounds.min(shape.first_fold).min(n)
+    } else {
+        0
+    };
+    let factors = 48u64 << (n - bound);
+    let written = if lean {
+        LeanRound0::planned_bytes(n, shape.shares, shape.eq_values, shape.staged) + factors
+    } else {
+        factors + (8u64 << n)
+    };
+    let rounds = factors + SumcheckSession::scratch_bytes(1usize << (n - bound), shape.slots);
+    let log_codeword = n + shape.log_blowup;
+    let folded = log_codeword - shape.first_fold;
+    let transient = fold_transient_bytes(
+        log_codeword,
+        shape.first_fold,
+        shape.fused && shape.first_fold <= FUSED_MAX_FOLD,
+    );
+    let successor = if shape.next_fold > 0 {
+        tree_bytes(folded - shape.next_fold)
+    } else {
+        0
+    };
+    let out_of_domain = 2 * (24u64 << (n - shape.first_fold.min(n)));
+    let beside = tree_bytes(folded).max(successor).max(out_of_domain);
+    let fold = factors + transient.max((24u64 << folded) + beside);
+    written.max(rounds).max(fold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +765,95 @@ mod tests {
                 held + staging
             );
         }
+    }
+
+    /// The production chain's shape at `2^n`: first6 then four, 400 columns.
+    fn production(n: usize) -> OpeningShape {
+        OpeningShape {
+            num_vars: n,
+            log_blowup: 2,
+            first_fold: 6,
+            next_fold: 4,
+            lean_rounds: 6,
+            fused: true,
+            staged: false,
+            shares: 400,
+            eq_values: 30 * 2 * 2048,
+            slots: 2,
+        }
+    }
+
+    /// ★ The turn a group's openings take, in numbers.
+    ///
+    /// With both kernels the largest phase is the first fold's: the factors
+    /// bound six variables down, the fold's output (`3C/64`) and the tree its
+    /// queries' paths come from (`C/8`) — about a fifth of the committed base
+    /// codeword `C`, at every stack. Without them it is the factors at full
+    /// width (`1.5 C`) beside a level-by-level fold (`2.25 C`): three and three
+    /// quarters, EXACTLY — the working set that ran nearly three codewords past
+    /// the one-codeword room every opening had promised.
+    #[test]
+    fn an_opening_turn_is_a_fifth_of_a_codeword_with_the_kernels() {
+        for n in [16usize, 22, 25, 27, 28] {
+            let codeword = 8u64 << (n + 2);
+            let lean = opening_transient_bytes(&production(n));
+            let today = opening_transient_bytes(&OpeningShape {
+                lean_rounds: 0,
+                fused: false,
+                ..production(n)
+            });
+            let staged = opening_transient_bytes(&OpeningShape {
+                staged: true,
+                ..production(n)
+            });
+            println!(
+                "2^{n}: opening turn {:.4} C resident, {:.4} C staged; {:.4} C without the kernels",
+                lean as f64 / codeword as f64,
+                staged as f64 / codeword as f64,
+                today as f64 / codeword as f64,
+            );
+            if n >= 22 {
+                assert!(
+                    lean * 5 < codeword && lean * 6 > codeword,
+                    "2^{n}: {lean} B is not about a fifth of {codeword} B"
+                );
+            }
+            assert_eq!(today * 4, codeword * 15, "2^{n}: {today} B");
+            assert!(staged >= lean && staged - lean <= 8u64 << n);
+        }
+        // Each kernel alone: the lean rounds without the fused fold still meet
+        // the level-by-level transient, and the fused fold without the lean
+        // rounds still meets the factors at full width.
+        let n = 25;
+        let codeword = 8u64 << (n + 2);
+        let lean_only = opening_transient_bytes(&OpeningShape {
+            fused: false,
+            ..production(n)
+        });
+        let fused_only = opening_transient_bytes(&OpeningShape {
+            lean_rounds: 0,
+            ..production(n)
+        });
+        assert!(lean_only * 4 > codeword * 9, "{lean_only} B");
+        assert!(fused_only * 2 > codeword * 3, "{fused_only} B");
+    }
+
+    /// The shares and the stack decide which path the turn is sized for: past
+    /// what a `u16` can name, the lean opening declines and the turn is the
+    /// materialised one's, as the opening itself will be.
+    #[test]
+    fn a_stack_the_lean_rounds_cannot_read_is_sized_as_materialised() {
+        let n = 25;
+        let too_many = opening_transient_bytes(&OpeningShape {
+            shares: LEAN_MAX_SHARES,
+            ..production(n)
+        });
+        let materialised = opening_transient_bytes(&OpeningShape {
+            lean_rounds: 0,
+            shares: LEAN_MAX_SHARES,
+            ..production(n)
+        });
+        assert_eq!(too_many, materialised);
+        assert!(too_many > opening_transient_bytes(&production(n)));
     }
 }

@@ -674,6 +674,16 @@ where
     Ok((commitment, domain))
 }
 
+/// The product of a chain's two tables, which is what its rounds evaluate —
+/// and what sizes a device session's slot file.
+pub(crate) fn opening_program<E: IsField + 'static>() -> Result<crate::program::Program<E>, Error> {
+    let mut builder = crate::program::Builder::<E>::new();
+    let weight = builder.var(0);
+    let message = builder.var(1);
+    let root = builder.mul(weight, message);
+    builder.finish(root)
+}
+
 /// The two tables a chain's rounds fold: the weight it carries and the message
 /// it is opening.
 ///
@@ -696,13 +706,8 @@ where
     E: IsField + Send + Sync + 'static,
     FieldElement<E>: Send + Sync,
 {
-    /// The product of the two, which is what a round evaluates.
     fn program() -> Result<crate::program::Program<E>, Error> {
-        let mut builder = crate::program::Builder::<E>::new();
-        let weight = builder.var(0);
-        let message = builder.var(1);
-        let root = builder.mul(weight, message);
-        builder.finish(root)
+        opening_program::<E>()
     }
 
     fn new(f: &Mle<F>, weight: Mle<E>) -> Result<Self, Error> {

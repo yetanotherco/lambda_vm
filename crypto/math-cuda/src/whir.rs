@@ -350,6 +350,23 @@ mod fold_transient_tests {
             fold_transient_bytes(20, 1, true)
         );
     }
+
+    /// ★ A commit holds its coefficients or its tree, never both — and at the
+    /// production first fold of six the coefficients are the larger, a quarter
+    /// of the codeword `C`. Under a uniform fold of four the tree is (half of
+    /// `C`, less a node), and two of those in flight are, to 64 bytes, the one
+    /// codeword a group's room always promised: that room was a commit turn.
+    #[test]
+    fn a_commit_holds_its_coefficients_or_its_tree_never_both() {
+        use super::commit_transient_bytes;
+        for n in [16usize, 25, 27, 28] {
+            let codeword = 8u64 << (n + 2);
+            assert_eq!(commit_transient_bytes(n, 2, 6) * 4, codeword);
+            let uniform = commit_transient_bytes(n, 2, 4);
+            assert_eq!(uniform, codeword / 2 - 32);
+            assert_eq!(codeword - 2 * uniform, 64);
+        }
+    }
 }
 
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
@@ -1312,6 +1329,37 @@ pub const fn fold_transient_bytes(log_elements: usize, levels: usize, fused: boo
         24u64 << (log_elements - levels)
     } else {
         (24u64 << (log_elements - 1)) + (24u64 << (log_elements - 2))
+    }
+}
+
+/// Bytes a Merkle tree over `2^log_leaves` leaves holds while it is built:
+/// `2·2^log_leaves − 1` nodes of 32 bytes, the host's layout.
+pub const fn tree_bytes(log_leaves: usize) -> u64 {
+    32 * ((2u64 << log_leaves) - 1)
+}
+
+/// ★ The most one commit of a `2^log_evals` polynomial holds on the card beside
+/// the codeword it leaves there.
+///
+/// Two buffers, and they take turns rather than stack: the coefficients
+/// (`2^log_evals` base values), which the spread reads into the codeword and
+/// which are freed before the transform runs; and the tree over the codeword's
+/// `2^log_folding`-value blocks, built after it. So the peak is the larger of
+/// the two, not their sum. The transform runs in place, and its twiddles are
+/// cached for the process outside every promise. The leaf layer a tree offers
+/// for retention is not in this number either: the codeword's own room grows
+/// by it when it is kept.
+pub const fn commit_transient_bytes(
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+) -> u64 {
+    let coefficients = 8u64 << log_evals;
+    let tree = tree_bytes(log_evals + log_blowup - log_folding);
+    if coefficients > tree {
+        coefficients
+    } else {
+        tree
     }
 }
 

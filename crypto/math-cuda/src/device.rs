@@ -574,6 +574,65 @@ pub fn drain_and_trim() -> Result<()> {
     Ok(())
 }
 
+/// ★ Bytes the default memory pool has handed out and not taken back: `(now,
+/// the most at any instant since the last [`reset_pool_high_water`])`.
+///
+/// Every allocation this crate makes is stream-ordered and comes from that
+/// pool — cudarc allocates with `cuMemAllocAsync` whenever the device has
+/// pools, which every card this runs on does — so the second number is the
+/// PEAK of what the process held. That is what a working-set claim is tested
+/// against: a reservation says what was promised, and `cuMemGetInfo` only what
+/// is free at the instant it is asked. Drain first ([`drain_and_trim`]): a free
+/// counts when its stream reaches it.
+pub fn pool_used_bytes() -> Result<(u64, u64)> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let read = |attribute| -> Result<u64> {
+        let mut value = 0u64;
+        // SAFETY: raw driver calls on the backend's own device; the value is a
+        // u64 stack slot, the type both attributes are documented to write.
+        unsafe {
+            let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+                sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+            ))?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                attribute,
+                &mut value as *mut u64 as *mut core::ffi::c_void,
+            )
+            .result()?;
+        }
+        Ok(value)
+    };
+    Ok((
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+    ))
+}
+
+/// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
+/// to zero, and the next allocation raises it to what is then in use — so a
+/// reader takes the larger of it and the `now` it read before the reset.
+pub fn reset_pool_high_water() -> Result<()> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let zero = 0u64;
+    // SAFETY: as in `pool_used_bytes`; zero is the one value the driver takes
+    // for this attribute.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            &zero as *const u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Promises `bytes` against the budget for a caller whose structure outlives
 /// the type that spends them.
 pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
