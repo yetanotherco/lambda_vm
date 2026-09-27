@@ -25,7 +25,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ChainConfig, WhirFolds};
+use multilinear::whir_chain::{ChainConfig, WhirBatch, WhirFolds};
 use stark::config::Commitment;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -73,9 +73,11 @@ impl EpochProof {
     /// same table, and with the bookend in a commitment group of its own its
     /// roots say so. Every other table shares a group.
     ///
-    /// `num_polys` is how many polynomials the stack split that group into —
-    /// one for a bookend that fits in a stack, more for an epoch long enough
-    /// that it does not. The group is the last, so its roots are the tail.
+    /// `num_polys` is how many roots that group has: one per polynomial the
+    /// stack split it into — one for a bookend that fits in a stack, more for an
+    /// epoch long enough that it does not — or one per batch of them when the
+    /// format opens them together (S1, [`ChainConfig::commitments_for`]). The
+    /// group is the last, so its roots are the tail.
     pub fn l2g_roots(&self, num_polys: usize) -> Option<&[stark::config::Commitment]> {
         if num_polys == 0 {
             return None;
@@ -174,6 +176,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The opening mode (S1): how many trees the stack was committed in.
+    batch: WhirBatch,
 }
 
 impl<H> DecodePrepared<H>
@@ -233,7 +237,7 @@ where
         committed_under(
             "the pinned DECODE commitment was built",
             "this epoch argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.batch),
             config,
         )
     }
@@ -310,6 +314,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The opening mode (S1): how many trees the stack was committed in.
+    batch: WhirBatch,
 }
 
 impl<H> GenesisPrepared<H>
@@ -366,7 +372,7 @@ where
         committed_under(
             "the genesis stack was committed",
             "this cross-epoch proof argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.batch),
             config,
         )
     }
@@ -391,6 +397,7 @@ where
             log_blowup: self.log_blowup,
             log_folding: self.log_folding,
             folds: self.folds,
+            batch: self.batch,
         }
     }
 }
@@ -432,6 +439,8 @@ pub struct GlobalPrepared {
     pub log_folding: usize,
     /// The fold schedule it was committed under (W2).
     pub folds: WhirFolds,
+    /// The opening mode it was committed under (S1).
+    pub batch: WhirBatch,
 }
 
 impl GlobalPrepared {
@@ -452,29 +461,34 @@ impl GlobalPrepared {
         committed_under(
             "the genesis stack was committed",
             "this program is emitted against",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.batch),
             config,
         )
     }
 }
 
 /// The one comparison every `agrees_with` makes: a commitment built once and
-/// reused must have been built under the blowup, the fold width AND the fold
-/// schedule the proof argues at — the three things `StackedCommitment::commit`
-/// reads (it never reads `num_queries`).
+/// reused must have been built under the blowup, the fold width, the fold
+/// schedule AND the opening mode the proof argues at — the four things
+/// `StackedCommitment::commit` reads (it never reads `num_queries`). The mode
+/// (S1) decides whether the stack is one tree per polynomial or per batch.
 fn committed_under(
     built: &str,
     argues: &str,
-    (log_blowup, log_folding, folds): (usize, usize, WhirFolds),
+    (log_blowup, log_folding, folds, batch): (usize, usize, WhirFolds, WhirBatch),
     config: &ChainConfig,
 ) -> Result<(), Error> {
-    if (config.log_blowup, config.log_folding, config.format.folds)
-        != (log_blowup, log_folding, folds)
+    if (
+        config.log_blowup,
+        config.log_folding,
+        config.format.folds,
+        config.format.batch,
+    ) != (log_blowup, log_folding, folds, batch)
     {
         return Err(Error::Prover(format!(
-            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?}, and \
-             {argues} at blowup {} / folding {} / folds {:?}",
-            config.log_blowup, config.log_folding, config.format.folds,
+            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?} / \
+             batch {batch:?}, and {argues} at blowup {} / folding {} / folds {:?} / batch {:?}",
+            config.log_blowup, config.log_folding, config.format.folds, config.format.batch,
         )));
     }
     Ok(())
@@ -582,6 +596,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        batch: config.format.batch,
     }))
 }
 
@@ -677,6 +692,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        batch: config.format.batch,
     })
 }
 
@@ -906,8 +922,9 @@ impl GlobalProof {
     /// The roots each epoch's bookend was committed under here, in epoch order.
     ///
     /// The bookends are the first commitment groups, one each, and the roots
-    /// are flat — one per stacked polynomial — so a group's are a window.
-    /// `polys` is how many polynomials each one stacked into.
+    /// are flat — one per stacked polynomial, or per batch under S1 — so a
+    /// group's are a window. `polys` is how many roots each one has
+    /// ([`ChainConfig::commitments_for`] of the polynomials it stacked into).
     pub fn l2g_roots(&self, polys: &[usize]) -> Option<Vec<&[stark::config::Commitment]>> {
         let mut start = 0usize;
         let mut groups = Vec::with_capacity(polys.len());
@@ -1514,7 +1531,11 @@ where
             stacks.len(),
         ))
     })?;
-    let polys: Vec<usize> = bookend_stacks.iter().map(|l| l.num_polys()).collect();
+    // Roots per bookend: one per polynomial, or one per batch (S1).
+    let polys: Vec<usize> = bookend_stacks
+        .iter()
+        .map(|l| config.commitments_for(l.num_polys()))
+        .collect();
 
     // ⛔ THE GENESIS STACK IS DERIVED, NEVER READ FROM THE PROOF, which is the
     // same rule `PreparedCheck::roots` carries: a root taken from the bundle
@@ -2171,7 +2192,11 @@ where
     let (layouts, domains) = crate::multilinear_prove::stacks(&shapes, &sizes, &config)?;
     // The bookend is committed in the last group, alone, so its roots are that
     // group's — as many as the stack split it into.
-    let num_polys = layouts.last().map(|l| l.num_polys()).unwrap_or(0);
+    // Roots, not polynomials: one per batch when the format batches (S1).
+    let num_polys = layouts
+        .last()
+        .map(|l| config.commitments_for(l.num_polys()))
+        .unwrap_or(0);
 
     prepared.agrees_with(&config)?;
     // ★ The transcript's hash is part of the configuration, and `H` is the

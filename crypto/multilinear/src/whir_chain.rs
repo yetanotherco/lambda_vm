@@ -86,7 +86,10 @@ pub fn ood_point<E: IsField>(z0: &FieldElement<E>, num_vars: usize) -> Vec<Field
 ///
 /// Sampling from the transcript makes this negligible; it is checked rather
 /// than assumed.
-fn require_out_of_domain<F, E>(z0: &FieldElement<E>, domain: &Domain<F>) -> Result<(), Error>
+pub(crate) fn require_out_of_domain<F, E>(
+    z0: &FieldElement<E>,
+    domain: &Domain<F>,
+) -> Result<(), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + Send + Sync + 'static,
@@ -105,7 +108,7 @@ where
 ///
 /// Retrying that challenge then costs `2^bits` hashes. Zero bits is a no-op, so
 /// a caller that has not chosen its parameters yet pays nothing.
-fn grind<E, T, H>(transcript: &mut T, bits: u8) -> Result<u64, Error>
+pub(crate) fn grind<E, T, H>(transcript: &mut T, bits: u8) -> Result<u64, Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
@@ -123,7 +126,7 @@ where
 
 /// The verifier's half: the nonce must pass against the same state, and it is
 /// absorbed the same way.
-fn check_grind<E, T, H>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
+pub(crate) fn check_grind<E, T, H>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
 where
     E: IsField + Send + Sync + 'static,
     T: IsTranscript<E>,
@@ -140,7 +143,7 @@ where
 }
 
 /// `w + gamma·eq`, the weight the next group carries.
-fn batch_weight<E: IsField + 'static>(
+pub(crate) fn batch_weight<E: IsField + 'static>(
     w: &Mle<E>,
     eq: &Mle<E>,
     gamma: &FieldElement<E>,
@@ -209,6 +212,9 @@ pub struct ChainFormat {
     /// Per-round fold schedule (W2). `Uniform` = today (`log_folding` every
     /// round, the remainder last).
     pub folds: WhirFolds,
+    /// How a commitment group's stacked polynomials are opened (S1). `Off` =
+    /// today (one chain per polynomial).
+    pub batch: WhirBatch,
 }
 
 impl ChainFormat {
@@ -216,13 +222,102 @@ impl ChainFormat {
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Off,
         folds: WhirFolds::Uniform,
+        batch: WhirBatch::Off,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
     pub fn is_default(&self) -> bool {
-        self.cap.is_off() && self.folds == WhirFolds::Uniform
+        self.cap.is_off() && self.folds == WhirFolds::Uniform && self.batch == WhirBatch::Off
     }
 }
+
+/// How a commitment group's stacked polynomials are opened (S1).
+///
+/// Every stacked polynomial of a group has the group's `n_stack` variables, so
+/// they can run their chains in LOCKSTEP: one tree per round for all of them
+/// (a leaf is every polynomial's block, end to end), one sumcheck over the sum
+/// of their products, shared fold, out-of-domain and query challenges, and one
+/// set of grinds — see [`crate::whir_batch`]. `Off` runs one chain per
+/// polynomial, which is today's format.
+///
+/// ★ A group of `K` is opened in `ceil(K / cap)` batches of balanced size
+/// ([`WhirBatch::split`]). The cap is a proof-format constant: a device holds
+/// one opening session per polynomial of a batch through its rounds, so the cap
+/// is what bounds that working set, and a verifier derives the split from it
+/// and from the group's (public) layout — never from the proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WhirBatch {
+    /// One chain per stacked polynomial. Today's format.
+    #[default]
+    Off,
+    /// Batches of at most this many polynomials.
+    Cap(BatchCap),
+}
+
+/// The largest batch a format may ask for.
+///
+/// Sharing the fold and out-of-domain challenges across `K` chains costs
+/// nothing on those terms under the interleaved-code accounting, and at most
+/// `log2 K` bits under a union bound over the chain that cheats; the second
+/// keeps every phase of a first6 chain at `n_stack <= 25` above 128 bits up to
+/// `K = 42`. 32 stays inside that with room.
+pub const MAX_BATCH: usize = 32;
+
+/// A batch cap, `1 ..= MAX_BATCH`. Constructed only through [`BatchCap::new`],
+/// so a cap of zero or one past the accounted range is not a value a format can
+/// hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BatchCap(u8);
+
+impl BatchCap {
+    /// `None` outside `1..=MAX_BATCH`.
+    pub const fn new(cap: usize) -> Option<Self> {
+        if cap >= 1 && cap <= MAX_BATCH {
+            Some(Self(cap as u8))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl WhirBatch {
+    /// The batches a group of `num_polys` stacked polynomials is opened in, as
+    /// consecutive ranges of polynomial indices.
+    ///
+    /// `Off` is one range per polynomial. `Cap(c)` is `ceil(K / c)` ranges
+    /// whose sizes differ by at most one, the larger first: eleven under a cap
+    /// of four is `4, 4, 3`, and nine is `3, 3, 3` where a greedy walk would
+    /// leave `4, 4, 1` — the same number of batches with a smaller largest one.
+    pub fn split(&self, num_polys: usize) -> Vec<core::ops::Range<usize>> {
+        match self {
+            Self::Off => (0..num_polys).map(|i| i..i + 1).collect(),
+            Self::Cap(cap) => {
+                if num_polys == 0 {
+                    return Vec::new();
+                }
+                let count = num_polys.div_ceil(cap.get());
+                let (size, larger) = (num_polys / count, num_polys % count);
+                let mut at = 0usize;
+                (0..count)
+                    .map(|b| {
+                        let len = size + usize::from(b < larger);
+                        let range = at..at + len;
+                        at += len;
+                        range
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// See [`WHIR_CAP_IMPLEMENTED`]. S1 is in on the host (prover and verifier);
+/// the flag flips when the device path and the in-guest verifier are in too.
+pub const WHIR_BATCH_IMPLEMENTED: bool = false;
 
 /// Which WHIR format levers THIS build implements. A lever that is only
 /// parsed must not be selectable (see `stark::proof::options::
@@ -292,6 +387,12 @@ impl FirstFold {
 /// The top bit of a non-uniform [`ChainConfig::fold_word`]. A uniform word is
 /// `log_folding`, far below it, so no non-default word equals a default one.
 pub const FOLD_WORD_TAG: u64 = 1 << 63;
+
+/// The bit [`ChainConfig::fold_word`] carries when a group's polynomials are
+/// opened in batches (S1), with the cap in bits 32..40. Clear of every bit a
+/// fold schedule writes (63, 52..63, 48 and the low nibble), so a batched word
+/// equals no per-chain word and two caps give two words.
+pub const BATCH_WORD_BIT: u64 = 1 << 40;
 
 impl ChainConfig {
     /// Parameters for a security target, in the **same regime the univariate
@@ -389,8 +490,15 @@ impl ChainConfig {
     /// binds every schedule — including the heights where two policies give
     /// the same schedule (`first6` and `uniform4` at `num_vars <= 4`), where
     /// only the word tells the proofs apart.
+    ///
+    /// ★ AND THE OPENING MODE (S1). Batched openings OR in
+    /// [`BATCH_WORD_BIT`]` | cap << 32`, so which mode a group is opened in —
+    /// and at what cap, which fixes how a group splits — is bound by the
+    /// statement: a proof made in one mode fails the other at its first
+    /// challenge, and the mode is never something a verifier reads off a proof.
+    /// Unchanged when batching is off, so every per-chain word is today's.
     pub fn fold_word(&self) -> u64 {
-        match self.format.folds {
+        let schedule = match self.format.folds {
             WhirFolds::Uniform => self.log_folding as u64,
             WhirFolds::First(k0) => {
                 FOLD_WORD_TAG
@@ -398,6 +506,22 @@ impl ChainConfig {
                     | (1 << 48)
                     | k0.get() as u64
             }
+        };
+        match self.format.batch {
+            WhirBatch::Off => schedule,
+            WhirBatch::Cap(cap) => schedule | BATCH_WORD_BIT | ((cap.get() as u64) << 32),
+        }
+    }
+
+    /// How many commitments — and roots — a group of `num_polys` stacked
+    /// polynomials has: one per polynomial, or one per batch under S1.
+    ///
+    /// A function of the config and the group's layout alone, so a verifier
+    /// knows how many roots to take for a group before it reads one.
+    pub fn commitments_for(&self, num_polys: usize) -> usize {
+        match self.format.batch {
+            WhirBatch::Off => num_polys,
+            WhirBatch::Cap(_) => self.format.batch.split(num_polys).len(),
         }
     }
 
@@ -1082,7 +1206,7 @@ where
 }
 
 /// Folds a codeword wherever it is, leaving the result where it was.
-fn fold_held<F, C, N>(
+pub(crate) fn fold_held<F, C, N>(
     codeword: &Codeword<C>,
     domain: &Domain<F>,
     alphas: &[FieldElement<N>],
@@ -1134,7 +1258,7 @@ where
 }
 
 /// The value the last fold leaves behind.
-fn first_value<N>(codeword: &Codeword<N>) -> Result<FieldElement<N>, Error>
+pub(crate) fn first_value<N>(codeword: &Codeword<N>) -> Result<FieldElement<N>, Error>
 where
     N: IsField + 'static,
 {

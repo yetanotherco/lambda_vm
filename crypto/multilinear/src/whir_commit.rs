@@ -34,8 +34,8 @@ use crate::{
 /// type below and above this one keeps its layout, its rkyv derives and its
 /// serialized length.
 pub type Commitment = [u8; 32];
-type Backend<F, H> = <H as WhirHash>::Backend<F>;
-type Tree<F, H> = MerkleTree<Backend<F, H>>;
+pub(crate) type Backend<F, H> = <H as WhirHash>::Backend<F>;
+pub(crate) type Tree<F, H> = MerkleTree<Backend<F, H>>;
 
 /// A committed codeword and the tree needed to open it.
 pub struct CodewordCommitment<F: IsField + 'static, H: WhirHash = KeccakWhir>

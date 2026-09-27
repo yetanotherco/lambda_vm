@@ -1564,13 +1564,18 @@ where
             .iter()
             .map(|s| s.slot_of.len())
             .sum();
-        let roots = proof
-            .roots
-            .get(root_at..root_at + layout.num_polys())
-            .ok_or(MlError::QueryCountMismatch {
-                expected: root_at + layout.num_polys(),
-                got: proof.roots.len(),
-            })?;
+        // One root per polynomial, or one per batch when the format opens a
+        // group's polynomials together (S1) — the config's count, not the
+        // proof's.
+        let group_roots = config.commitments_for(layout.num_polys());
+        let roots =
+            proof
+                .roots
+                .get(root_at..root_at + group_roots)
+                .ok_or(MlError::QueryCountMismatch {
+                    expected: root_at + group_roots,
+                    got: proof.roots.len(),
+                })?;
         stacked_eval::verify::<F, E, T, H>(
             opening,
             layout,
@@ -1583,7 +1588,7 @@ where
         )?;
         statement_at += size;
         column_at += width;
-        root_at += layout.num_polys();
+        root_at += group_roots;
     }
 
     // ★★★ THE PREPARED OPENING, and check (d) with it.
@@ -1797,6 +1802,15 @@ mod tests {
         add_cols: Vec<Vec<FE>>,
         mul_cols: Vec<Vec<FE>>,
     ) -> Result<(), MlError> {
+        argue_under(&config(), cpu_cols, add_cols, mul_cols)
+    }
+
+    fn argue_under(
+        config: &ChainConfig,
+        cpu_cols: Vec<Vec<FE>>,
+        add_cols: Vec<Vec<FE>>,
+        mul_cols: Vec<Vec<FE>>,
+    ) -> Result<(), MlError> {
         let (cpu_air, add_air, mul_air) = airs();
         let committed = CommittedTables::<_, _, KeccakWhir>::commit(
             vec![
@@ -1804,11 +1818,11 @@ mod tests {
                 table(&add_air, &add_cols)?,
                 table(&mul_air, &mul_cols)?,
             ],
-            &config(),
+            config,
         )?;
 
         let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
-        let proof = multi_prove(&committed, &config(), &mut prover, None)?;
+        let proof = multi_prove(&committed, config, &mut prover, None)?;
 
         // Three tables of different heights, and **one** commitment with one
         // opening for all of them.
@@ -1835,7 +1849,7 @@ mod tests {
             std::slice::from_ref(committed.groups()[0].domain()),
             committed.sizes(),
             &ExtE::zero(),
-            &config(),
+            config,
             &mut verifier,
             None,
         )
@@ -1913,6 +1927,23 @@ mod tests {
     #[test]
     fn three_tables_argue_and_their_buses_balance() {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();
+    }
+
+    /// S1: the same tables with the group's polynomials opened in batches. One
+    /// stacked polynomial, so one batch of one — the per-chain proof — and the
+    /// verifier takes one root for it.
+    #[test]
+    fn three_tables_argue_under_batched_openings() {
+        let config = ChainConfig {
+            format: multilinear::whir_chain::ChainFormat {
+                batch: multilinear::whir_chain::WhirBatch::Cap(
+                    multilinear::whir_chain::BatchCap::new(4).unwrap(),
+                ),
+                ..multilinear::whir_chain::ChainFormat::DEFAULT
+            },
+            ..config()
+        };
+        argue_under(&config, cpu_columns(), add_columns(), mul_columns()).unwrap();
     }
 
     #[test]

@@ -190,50 +190,23 @@ const RPX_LINE: &str = "fcfbf8fe7d2e6b008d41462b478141abfb10dacb2888f2ea668c27d1
 /// unasserted and turned this back into a print.
 const SERIALIZED_LEN: usize = 6904;
 
-/// Prints the identity line and the serialized length, and ASSERTS what each
-/// arm owes. See the module header.
-#[test]
-#[ignore = "a printing measurement: run it on two revisions and compare the output"]
-fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
-    let config = ChainConfig {
+/// The fixture's config: today's format.
+fn identity_config() -> ChainConfig {
+    ChainConfig {
         log_blowup: 2,
         log_folding: 2,
         num_queries: 3,
         grind: GrindBits::default(),
         format: multilinear::whir_chain::ChainFormat::DEFAULT,
-    };
+    }
+}
 
-    let options = ProofOptions::default_test_options();
-    let air: ConcreteVmAir<_> = create_eq_air(&options);
-    let columns = canonically_sorted_columns();
-    let num_vars = columns[0].len().trailing_zeros() as usize;
-
-    let layout = TableLayout::<Fp, Ext>::new(
-        air.constraint_program(),
-        air.constraints_meta(),
-        air.bus_interactions(),
-        columns.len(),
-        num_vars,
-        Uniforms::default(),
-    )
-    .expect("layout");
-    let table = CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
-        .expect("committed table");
-
-    // ★ Through the knob, like every production site. `MultiProof` does not
-    // mention the hash in its type — that is the whole point of a 32-byte
-    // digest either way — so the proof can leave the dispatch arm and both
-    // arms unify. Reaching a dispatch is also what makes the `★ WHIR HASH:`
-    // banner print, and its absence from a log is how this test's own trap was
-    // found.
-    let proof = crate::with_whir_hash!(|H| {
-        let committed = CommittedTables::<_, _, H>::commit(vec![table], &config).expect("commit");
-        let mut transcript = DefaultTranscript::<
-            Ext,
-            <H as multilinear::whir_hash::WhirHash>::Transcript,
-        >::new(b"whir-identity");
-        multilinear_table::multi_prove(&committed, &config, &mut transcript, None).expect("prove")
-    });
+/// Prints the identity line and the serialized length, and ASSERTS what each
+/// arm owes. See the module header.
+#[test]
+#[ignore = "a printing measurement: run it on two revisions and compare the output"]
+fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
+    let proof = identity_proof(&identity_config());
 
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
     let line: String = crypto::hash::platform_keccak::PlatformKeccak256::digest(bytes.as_ref())
@@ -276,4 +249,63 @@ fn the_whir_identity_line_over_a_canonically_sorted_eq_trace() {
             );
         }
     }
+}
+
+/// ★ S1 turned ON leaves this fixture's bytes where they are: its one group is
+/// one stacked polynomial, a batch of one is a chain, and the proof carries no
+/// field for the mode (the knob moves the statement word, which this fixture
+/// does not absorb). With the knob OFF nothing reaches a new path at all; the
+/// pinned line above is that half.
+#[test]
+fn batched_openings_leave_a_group_of_one_byte_for_byte() {
+    let today = identity_config();
+    let batched = ChainConfig {
+        format: multilinear::whir_chain::ChainFormat {
+            batch: multilinear::whir_chain::WhirBatch::Cap(
+                multilinear::whir_chain::BatchCap::new(4).expect("4"),
+            ),
+            ..today.format
+        },
+        ..today
+    };
+    let a = rkyv::to_bytes::<rkyv::rancor::Error>(&identity_proof(&today)).expect("serialize");
+    let b = rkyv::to_bytes::<rkyv::rancor::Error>(&identity_proof(&batched)).expect("serialize");
+    assert_eq!(a.len(), SERIALIZED_LEN);
+    assert_eq!(a.as_slice(), b.as_slice());
+}
+
+/// The fixture's proof under `config`: one EQ table, one group, one stacked
+/// polynomial.
+fn identity_proof(config: &ChainConfig) -> multilinear_table::MultiProof<Fp, Ext> {
+    let options = ProofOptions::default_test_options();
+    let air: ConcreteVmAir<_> = create_eq_air(&options);
+    let columns = canonically_sorted_columns();
+    let num_vars = columns[0].len().trailing_zeros() as usize;
+
+    let layout = TableLayout::<Fp, Ext>::new(
+        air.constraint_program(),
+        air.constraints_meta(),
+        air.bus_interactions(),
+        columns.len(),
+        num_vars,
+        Uniforms::default(),
+    )
+    .expect("layout");
+    let table = CommittedTable::from_layout(layout, |col| columns[col as usize].clone())
+        .expect("committed table");
+
+    // ★ Through the knob, like every production site. `MultiProof` does not
+    // mention the hash in its type — that is the whole point of a 32-byte
+    // digest either way — so the proof can leave the dispatch arm and both
+    // arms unify. Reaching a dispatch is also what makes the `★ WHIR HASH:`
+    // banner print, and its absence from a log is how this test's own trap was
+    // found.
+    crate::with_whir_hash!(|H| {
+        let committed = CommittedTables::<_, _, H>::commit(vec![table], config).expect("commit");
+        let mut transcript = DefaultTranscript::<
+            Ext,
+            <H as multilinear::whir_hash::WhirHash>::Transcript,
+        >::new(b"whir-identity");
+        multilinear_table::multi_prove(&committed, config, &mut transcript, None).expect("prove")
+    })
 }

@@ -24,6 +24,9 @@ pub mod uneven;
 pub mod uni_skip;
 pub mod virtual_poly;
 pub mod whir;
+pub mod whir_batch;
+#[cfg(test)]
+mod whir_batch_tests;
 #[cfg(test)]
 mod whir_cap_tests;
 pub mod whir_chain;
@@ -141,4 +144,8 @@ pub enum Error {
     /// the host: the transcript has moved.
     #[error("the device failed mid-{stage}, after the transcript had moved")]
     DeviceFailed { stage: &'static str },
+    /// A batched opening (S1) whose shape is not the one its format and layout
+    /// fix: a chain count, a width, or a field only the batch's lead carries.
+    #[error("the batched opening's {what} is not the shape its format fixes")]
+    BatchShape { what: &'static str },
 }
