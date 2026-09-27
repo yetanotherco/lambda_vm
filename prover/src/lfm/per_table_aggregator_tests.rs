@@ -5762,6 +5762,641 @@ pub(super) fn compose_interior_levels(
     }
 }
 
+// ================ gap fix I7: the level-0 lead-in, in the base's tail ================
+
+/// `LAMBDA_VM_GAP_I7=1` turns gap fix I7 on ([`LeadIn`]); anything else is off.
+const GAP_I7_ENV: &str = "LAMBDA_VM_GAP_I7";
+
+/// Whether gap fix I7 is on, read once per process.
+fn gap_i7_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(GAP_I7_ENV).is_ok_and(|v| v == "1"))
+}
+
+/// A positive count from the environment; unset or empty is `default`.
+fn gap_i7_count(var: &str, default: usize) -> usize {
+    match std::env::var(var).ok().as_deref() {
+        None | Some("") => default,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| panic!("{var} must be a positive integer, got `{v}`")),
+    }
+}
+
+/// ★ GAP FIX I7 — the level-0 lead-in, moved into the base's tail.
+///
+/// ⛔ WHAT IT REMOVES. Level 0 opened with host work alone: the DECODE
+/// derivation, then every first-round wrap's prologue (reconstruct + emit +
+/// arenas) at once, with no proof on the card — 4.82 s on the STARK block (W1
+/// §2a: `EpochConstants::load` 1.06 s + the wrap 0/1 prologue 3.70 s) and 2.97 s
+/// on WHIR (ANALYSIS-1GPU §2a). None of it needs the card or the bundle's global
+/// proof. It needs the ELF and epoch proofs the base finished long before.
+///
+/// ★ HOW. `LeadIn` is the base's [`crate::continuation::EpochObserver`]: it keeps
+/// copies of the first `want` epoch proofs as the base proves them. Its helpers
+/// derive the shared context (the DECODE work) at once, then — as soon as the
+/// base reports the run's epoch count — build those wraps' prologues with the
+/// SAME functions the pool calls, over the same proofs, so the programs are the
+/// pool's own (the IDENTITY lines are the gate). Level 0 [`LeadIn::take`]s each
+/// prologue instead of building it; one no helper started is built by the pool,
+/// exactly as before.
+///
+/// ⛔ HOST ONLY, AND BOUNDED. Nothing here reaches the card, so the one-permit
+/// rule is untouched. At most `helpers` prologues run beside the base's last
+/// epochs, and `want` products are held from there to level 0's start.
+struct LeadIn<P, C, T> {
+    want: usize,
+    context: std::sync::OnceLock<C>,
+    make_context: MakeContext<C>,
+    state: std::sync::Mutex<LeadState<P, T>>,
+    changed: std::sync::Condvar,
+}
+
+/// How a lead-in derives its context, handed a wait for what the base shares.
+type MakeContext<C> = Box<dyn Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync>;
+
+/// What a base shares with its lead-in instead of the lead-in deriving it: the
+/// WHIR base's DECODE prepared commitment ([`crate::continuation::EpochObserver::
+/// on_decode_prepared`]).
+type BaseShared = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+struct LeadState<P, T> {
+    /// Copies of epochs `0..want`, by index, as the base proves them.
+    epochs: Vec<Option<std::sync::Arc<P>>>,
+    num_epochs: Option<usize>,
+    /// The base's shared DECODE work, once the base hands it over.
+    shared: Option<BaseShared>,
+    slots: Vec<LeadSlot<T>>,
+    /// Level 0 has started: helpers finish what they hold and claim nothing more.
+    closed: bool,
+    /// Prove-split clock stamps of the first and last prologue a helper finished.
+    first_done: Option<f64>,
+    last_done: Option<f64>,
+}
+
+enum LeadSlot<T> {
+    /// No helper has started it.
+    Waiting,
+    Building,
+    Built(Box<T>),
+    /// Taken by level 0, or given up: level 0 builds it.
+    Gone,
+}
+
+impl<P, C, T> LeadIn<P, C, T>
+where
+    P: Clone + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+    T: Send + 'static,
+{
+    /// Start `helpers` threads that derive the context, then build the prologues
+    /// of wraps `0..want` once the epoch count is known and their epochs exist.
+    /// `make_context` is handed a wait for what the base shares, for a context
+    /// that is taken from the base rather than derived.
+    fn start(
+        want: usize,
+        helpers: usize,
+        make_context: impl Fn(&dyn Fn() -> BaseShared) -> C + Send + Sync + 'static,
+        build: impl Fn(&C, &[P], usize, usize) -> T + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        let lead = std::sync::Arc::new(Self {
+            want,
+            context: std::sync::OnceLock::new(),
+            make_context: Box::new(make_context),
+            state: std::sync::Mutex::new(LeadState {
+                epochs: (0..want).map(|_| None).collect(),
+                num_epochs: None,
+                shared: None,
+                slots: (0..want).map(|_| LeadSlot::Waiting).collect(),
+                closed: false,
+                first_done: None,
+                last_done: None,
+            }),
+            changed: std::sync::Condvar::new(),
+        });
+        let build = std::sync::Arc::new(build);
+        for i in 0..helpers {
+            let (lead, build) = (std::sync::Arc::clone(&lead), std::sync::Arc::clone(&build));
+            // ⓘ Detached: a helper holds nothing a failing run must release, and
+            // one parked on the observer when the base fails dies with the process.
+            std::thread::Builder::new()
+                .name(format!("gap-i7-lead-{i}"))
+                .spawn(move || {
+                    let context = lead.context();
+                    while let Some((k, prefix, n)) = lead.claim() {
+                        // A panicking prologue gives its slot back to level 0,
+                        // which builds it and reports the failure where it lands.
+                        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            build(context, &prefix, n, k)
+                        }));
+                        if built.is_err() {
+                            println!(
+                                "   ⚠ GAP I7: the lead-in prologue of wrap {k} panicked; \
+                                 level 0 builds it instead"
+                            );
+                        }
+                        lead.finish(k, built.ok());
+                    }
+                })
+                .expect("a gap-I7 lead-in helper must spawn");
+        }
+        lead
+    }
+
+    /// The shared context, derived once by whoever asks first.
+    fn context(&self) -> &C {
+        self.context
+            .get_or_init(|| (self.make_context)(&|| self.base_shared()))
+    }
+
+    /// What the base shares, waiting until it has.
+    fn base_shared(&self) -> BaseShared {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(shared) = &st.shared {
+                return std::sync::Arc::clone(shared);
+            }
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The next wrap to build: the lowest `Waiting` one below the epoch count
+    /// whose epochs are all here. `None` once level 0 has started or nothing is
+    /// left.
+    #[allow(clippy::type_complexity)]
+    fn claim(&self) -> Option<(usize, Vec<P>, usize)> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if st.closed {
+                return None;
+            }
+            if let Some(n) = st.num_epochs {
+                let upto = self.want.min(n);
+                let mut left = false;
+                for k in 0..upto {
+                    if !matches!(st.slots[k], LeadSlot::Waiting) {
+                        continue;
+                    }
+                    left = true;
+                    if st.epochs[..=k].iter().all(Option::is_some) {
+                        st.slots[k] = LeadSlot::Building;
+                        let prefix: Vec<std::sync::Arc<P>> =
+                            st.epochs[..=k].iter().flatten().cloned().collect();
+                        drop(st);
+                        // The deep copies are made outside the lock: the base's
+                        // prover thread takes it to hand over its next epoch.
+                        let prefix = prefix.iter().map(|p| (**p).clone()).collect();
+                        return Some((k, prefix, n));
+                    }
+                }
+                if !left {
+                    return None;
+                }
+            }
+            st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finish(&self, k: usize, built: Option<T>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.slots[k] = match built {
+            Some(t) => {
+                let now = stark::prove_split::epoch_secs();
+                st.first_done.get_or_insert(now);
+                st.last_done = Some(now);
+                LeadSlot::Built(Box::new(t))
+            }
+            None => LeadSlot::Gone,
+        };
+        self.changed.notify_all();
+    }
+
+    /// Wrap `k`'s prologue if a helper built it, waiting for one in progress;
+    /// `None` hands it to the caller, and no helper will start it afterwards.
+    fn take(&self, k: usize) -> Option<T> {
+        if k >= self.want {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match std::mem::replace(&mut st.slots[k], LeadSlot::Gone) {
+                LeadSlot::Built(t) => return Some(*t),
+                LeadSlot::Building => {
+                    st.slots[k] = LeadSlot::Building;
+                    st = self.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                LeadSlot::Waiting | LeadSlot::Gone => return None,
+            }
+        }
+    }
+
+    /// Level 0 is starting: helpers claim nothing more. Returns the line level 0
+    /// prints about what the lead-in did before it.
+    fn close(&self) -> String {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed = true;
+        self.changed.notify_all();
+        let (building, built) = st.slots.iter().fold((0, 0), |(b, d), s| match s {
+            LeadSlot::Building => (b + 1, d),
+            LeadSlot::Built(_) => (b, d + 1),
+            _ => (b, d),
+        });
+        format!(
+            "★ GAP I7 lead-in at level 0's start: {built} prologue(s) ready and {building} \
+             still building, of {} wanted; the first finished at t={}, the last at t={}",
+            self.want,
+            st.first_done.map_or("-".to_string(), |t| format!("{t:.3}")),
+            st.last_done.map_or("-".to_string(), |t| format!("{t:.3}")),
+        )
+    }
+}
+
+impl<P, C, T> crate::continuation::EpochObserver<P> for LeadIn<P, C, T>
+where
+    P: Clone + Send + Sync,
+    C: Send + Sync,
+    T: Send,
+{
+    fn on_epoch_count(&self, num_epochs: usize) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.num_epochs = Some(num_epochs);
+        self.changed.notify_all();
+    }
+
+    fn on_epoch_proved(&self, index: usize, proof: &P) {
+        if index >= self.want {
+            return;
+        }
+        // Copied before the lock: this is the base's prover thread.
+        let copy = std::sync::Arc::new(proof.clone());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.epochs[index] = Some(copy);
+        self.changed.notify_all();
+    }
+
+    fn on_decode_prepared(&self, prepared: BaseShared) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.shared = Some(prepared);
+        self.changed.notify_all();
+    }
+}
+
+/// One STARK wrap's host-only prologue: what `prove_one_wrap` builds before it
+/// reaches the card.
+struct StarkWrapPrologue {
+    e: super::epoch_tests::RealEpoch,
+    program: LfmProgram,
+    arenas: Vec<Vec<LfmWord>>,
+    t_recon: f64,
+    t_emit: f64,
+    /// The prologue's window on the prove-split clock.
+    t0: f64,
+    t1: f64,
+}
+
+type StarkLeadIn =
+    LeadIn<crate::continuation::EpochProof, stark::config::Commitment, StarkWrapPrologue>;
+
+/// Gap fix I7 for the STARK tree: helpers that derive the DECODE commitment at
+/// once and build wraps `0..want`'s prologues in the base's tail.
+fn start_stark_lead_in(
+    elf_bytes: &[u8],
+    inner: &crate::ProofOptions,
+    want: usize,
+    helpers: usize,
+) -> std::sync::Arc<StarkLeadIn> {
+    use super::epoch_tests::{
+        EpochConstants, Publishes, epoch_arena_words, epoch_program_publishing,
+        real_epoch_from_epochs,
+    };
+    let (ctx_bytes, ctx_inner) = (elf_bytes.to_vec(), inner.clone());
+    let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
+    LeadIn::start(
+        want,
+        helpers,
+        // ⓘ The STARK base shares nothing: its DECODE commitment is host work,
+        // so the lead-in derives its own, off the card.
+        move |_base: &dyn Fn() -> BaseShared| {
+            let elf = executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load");
+            crate::tables::decode::commitment_from_elf(&elf, &ctx_inner)
+                .expect("the inner ELF's DECODE commitment must build")
+        },
+        move |decode: &stark::config::Commitment,
+              epochs: &[crate::continuation::EpochProof],
+              n,
+              k| {
+            let konsts = EpochConstants::load(&bytes, &inner, Some(*decode))
+                .expect("the inner ELF must load");
+            let t0 = stark::prove_split::epoch_secs();
+            let t = std::time::Instant::now();
+            let e = real_epoch_from_epochs(&inner, &konsts, epochs, n, k)
+                .expect("every epoch must reconstruct from proofs alone");
+            let t_recon = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let program = epoch_program_publishing(&e, true, Publishes::Aggregation);
+            let arenas = epoch_arena_words(&e, true);
+            let t_emit = t.elapsed().as_secs_f64();
+            StarkWrapPrologue {
+                e,
+                program,
+                arenas,
+                t_recon,
+                t_emit,
+                t0,
+                t1: stark::prove_split::epoch_secs(),
+            }
+        },
+    )
+}
+
+// ---- gap I7's hand-off, card-free: `u64` epochs, a `usize` context, and a
+// prologue that reports which epochs it was built from.
+
+type TestLeadIn = LeadIn<u64, usize, (usize, Vec<u64>, usize)>;
+
+fn test_lead_in(
+    want: usize,
+    helpers: usize,
+    delay_ms: u64,
+    panic_on: Option<usize>,
+) -> std::sync::Arc<TestLeadIn> {
+    LeadIn::start(
+        want,
+        helpers,
+        |_base: &dyn Fn() -> BaseShared| 7usize,
+        move |ctx: &usize, epochs: &[u64], n, k| {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            assert_eq!(*ctx, 7, "the context reaches every prologue");
+            assert!(
+                panic_on != Some(k),
+                "the prologue of wrap {k} fails (injected)"
+            );
+            (k, epochs.to_vec(), n)
+        },
+    )
+}
+
+impl TestLeadIn {
+    fn slot_kinds(&self) -> Vec<&'static str> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.slots
+            .iter()
+            .map(|s| match s {
+                LeadSlot::Waiting => "waiting",
+                LeadSlot::Building => "building",
+                LeadSlot::Built(_) => "built",
+                LeadSlot::Gone => "gone",
+            })
+            .collect()
+    }
+
+    /// Polls until `done` holds of the slots, or fails after ten seconds.
+    fn until(&self, what: &str, done: impl Fn(&[&'static str]) -> bool) {
+        let start = std::time::Instant::now();
+        while !done(&self.slot_kinds()) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "timed out waiting for {what}: {:?}",
+                self.slot_kinds()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// ★ The prologues are built only once the epoch count is known, from exactly
+/// the epochs `0..=k` whatever order they arrived in, and an epoch past `want`
+/// is not kept.
+#[test]
+fn gap_i7_lead_in_builds_each_prologue_from_its_leading_epochs() {
+    use crate::continuation::EpochObserver;
+    let lead = test_lead_in(3, 2, 0, None);
+    lead.on_epoch_proved(1, &11);
+    lead.on_epoch_proved(0, &10);
+    lead.on_epoch_proved(7, &17);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        lead.slot_kinds(),
+        ["waiting"; 3],
+        "nothing may be built before the epoch count is known"
+    );
+    lead.on_epoch_count(5);
+    lead.on_epoch_proved(2, &12);
+    lead.until("every slot built", |k| k.iter().all(|s| *s == "built"));
+    assert_eq!(lead.take(0), Some((0, vec![10], 5)));
+    assert_eq!(lead.take(1), Some((1, vec![10, 11], 5)));
+    assert_eq!(lead.take(2), Some((2, vec![10, 11, 12], 5)));
+    assert_eq!(lead.take(3), None, "past `want` the pool builds");
+    assert_eq!(lead.take(0), None, "a prologue is taken once");
+}
+
+/// A slot level 0 asks for before any helper started it goes to level 0, and
+/// no helper builds it afterwards; `want` past the run's length builds nothing
+/// for the epochs that do not exist.
+#[test]
+fn gap_i7_lead_in_hands_unstarted_and_missing_wraps_to_the_pool() {
+    use crate::continuation::EpochObserver;
+    let lead = test_lead_in(4, 1, 0, None);
+    lead.on_epoch_proved(0, &10);
+    lead.on_epoch_proved(1, &11);
+    assert_eq!(lead.take(0), None, "not started: the pool builds it");
+    lead.on_epoch_count(2);
+    lead.until("wrap 1 built", |k| k[1] == "built");
+    assert_eq!(lead.slot_kinds(), ["gone", "built", "waiting", "waiting"]);
+    assert_eq!(lead.take(1), Some((1, vec![10, 11], 2)));
+    assert_eq!(lead.take(2), None, "the run has two epochs");
+    assert_eq!(lead.take(3), None, "the run has two epochs");
+    let _ = lead.close();
+}
+
+/// ⛔ A prologue that panics on a helper is handed back to level 0 rather than
+/// left `Building`, which would park `take` forever.
+#[test]
+fn gap_i7_lead_in_hands_a_failed_prologue_back_to_the_pool() {
+    use crate::continuation::EpochObserver;
+    let lead = test_lead_in(3, 2, 0, Some(1));
+    for (i, e) in [10u64, 11, 12].iter().enumerate() {
+        lead.on_epoch_proved(i, e);
+    }
+    lead.on_epoch_count(3);
+    lead.until("every slot settled", |k| {
+        k.iter().all(|s| *s == "built" || *s == "gone")
+    });
+    assert_eq!(lead.take(1), None, "the failed wrap goes to the pool");
+    assert_eq!(lead.take(0), Some((0, vec![10], 3)));
+    assert_eq!(lead.take(2), Some((2, vec![10, 11, 12], 3)));
+}
+
+/// `take` on a prologue a helper is still building WAITS for it; `close` stops
+/// new claims, and what was never claimed goes to the pool.
+#[test]
+fn gap_i7_lead_in_waits_for_a_building_prologue_and_close_stops_claims() {
+    use crate::continuation::EpochObserver;
+    let lead = test_lead_in(3, 1, 300, None);
+    for (i, e) in [10u64, 11, 12].iter().enumerate() {
+        lead.on_epoch_proved(i, e);
+    }
+    lead.on_epoch_count(3);
+    lead.until("wrap 0 building", |k| k[0] == "building");
+    let line = lead.close();
+    assert!(line.contains("of 3 wanted"), "{line}");
+    // It was `Building` when asked for, so a `take` that did not wait would have
+    // handed it to the pool (`None`) instead.
+    assert_eq!(
+        lead.take(0),
+        Some((0, vec![10], 3)),
+        "a building prologue is waited for"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(lead.slot_kinds(), ["gone", "waiting", "waiting"]);
+    assert_eq!(
+        lead.take(1),
+        None,
+        "never claimed after close: the pool builds it"
+    );
+}
+
+/// A context taken from the base waits for the base to share it.
+#[test]
+fn gap_i7_lead_in_context_waits_for_what_the_base_shares() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<LeadIn<u64, usize, ()>> = LeadIn::start(
+        1,
+        1,
+        |base: &dyn Fn() -> BaseShared| {
+            *base()
+                .downcast::<usize>()
+                .expect("the base shares a usize here")
+        },
+        |_: &usize, _: &[u64], _, _| (),
+    );
+    lead.on_decode_prepared(std::sync::Arc::new(42usize));
+    assert_eq!(*lead.context(), 42);
+}
+
+/// The WHIR lead-in's shared context: the ELF and both DECODE derivations,
+/// taken once — what WHIR level 0 hoists at its start.
+struct WhirLeadContext<H: multilinear::whir_hash::WhirHash> {
+    elf: executor::elf::Elf,
+    /// The base's own, shared: deriving it is a device commit.
+    prepared: std::sync::Arc<crate::multilinear_continuation::DecodePrepared<H>>,
+    decode_root: stark::config::Commitment,
+}
+
+/// One WHIR wrap's host-only prologue: what `whir_level_zero`'s
+/// `prove_one_wrap` builds before it reaches the card.
+struct WhirWrapPrologue {
+    e: crate::lfm::whir_real_epoch::WhirRealEpoch,
+    program: LfmProgram,
+    arenas: Vec<Vec<LfmWord>>,
+    t_harvest: f64,
+    t_emit: f64,
+    /// The prologue's window on the prove-split clock.
+    t0: f64,
+    t1: f64,
+}
+
+type WhirLeadIn<H> =
+    LeadIn<crate::multilinear_continuation::EpochProof, WhirLeadContext<H>, WhirWrapPrologue>;
+
+/// Gap fix I7 for the WHIR tree, under the hash `H` level 0 will prove its
+/// epochs under. Returns the base's observer and the handle `whir_level_zero`
+/// downcasts under the same `H` — two views of one lead-in, because the base
+/// names no hash and level 0 does.
+#[allow(clippy::type_complexity)]
+fn start_whir_lead_in<H>(
+    elf_bytes: &[u8],
+    inner: &crate::ProofOptions,
+    want: usize,
+    helpers: usize,
+) -> (
+    crate::multilinear_continuation::SharedEpochObserver,
+    std::sync::Arc<dyn std::any::Any + Send + Sync>,
+)
+where
+    H: multilinear::whir_hash::WhirHash + 'static,
+{
+    use crate::multilinear_continuation::{decode_derivations, reset_decode_derivations};
+    let (ctx_bytes, ctx_inner) = (elf_bytes.to_vec(), inner.clone());
+    let (bytes, inner) = (elf_bytes.to_vec(), inner.clone());
+    let lead: std::sync::Arc<WhirLeadIn<H>> = LeadIn::start(
+        want,
+        helpers,
+        // ⛔ THE PREPARED OPENING IS THE BASE'S, NOT DERIVED HERE: deriving it is
+        // a device commit, and nothing in the lead-in may reach the card. The base
+        // derives it once before its first epoch and shares it; the univariate
+        // root is host work and is taken here, off the card.
+        move |base: &dyn Fn() -> BaseShared| {
+            let elf = executor::elf::Elf::load(&ctx_bytes).expect("the inner ELF must load");
+            let decode_root = crate::tables::decode::commitment_from_elf(&elf, &ctx_inner)
+                .expect("DECODE's univariate commitment, once per bundle");
+            let prepared = base()
+                .downcast::<crate::multilinear_continuation::DecodePrepared<H>>()
+                .unwrap_or_else(|_| {
+                    panic!("the WHIR base shared a DECODE commitment under another hash")
+                });
+            WhirLeadContext {
+                elf,
+                prepared,
+                decode_root,
+            }
+        },
+        move |ctx: &WhirLeadContext<H>,
+              epochs: &[crate::multilinear_continuation::EpochProof],
+              n,
+              k| {
+            reset_decode_derivations();
+            let t0 = stark::prove_split::epoch_secs();
+            let t = std::time::Instant::now();
+            let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_epochs_under::<H>(
+                &inner,
+                &bytes,
+                epochs,
+                n,
+                k,
+                Some(ctx.decode_root),
+                Some(&*ctx.prepared),
+            )
+            .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+            let t_harvest = t.elapsed().as_secs_f64();
+            let air_set = crate::multilinear_continuation::epoch_airs_for(
+                &ctx.elf,
+                &inner,
+                &epochs[k],
+                &e.position.register_init,
+                e.position.is_final,
+                e.position.label,
+                Some(ctx.decode_root),
+            );
+            let refs = air_set.refs();
+            // The per-wrap assert level 0 makes, on the thread that prepared it.
+            let derived_here = decode_derivations();
+            assert_eq!(
+                derived_here, 0,
+                "wrap {k} derived DECODE {derived_here} time(s) in the GAP-I7 lead-in; both \
+                 hoists are handed in, so a non-zero count means one did not reach it"
+            );
+            let t = std::time::Instant::now();
+            let program = whir_epoch_program(&e, &refs[..]);
+            let arenas = whir_epoch_arena(&e, &refs[..]);
+            let t_emit = t.elapsed().as_secs_f64();
+            WhirWrapPrologue {
+                e,
+                program,
+                arenas,
+                t_harvest,
+                t_emit,
+                t0,
+                t1: stark::prove_split::epoch_secs(),
+            }
+        },
+    );
+    let observer: crate::multilinear_continuation::SharedEpochObserver = lead.clone();
+    (observer, lead)
+}
+
 #[test]
 #[ignore = "box tier, production scale: composes the whole interior tree"]
 fn the_production_tree_composes_to_a_root() {
@@ -6017,6 +6652,26 @@ fn the_production_tree_composes_to_a_root() {
     // ⓘ Unconditional, not behind a knob: one thread sampling `rss_marks` at
     // 100 Hz for 67 s, which is what every other stage already pays.
     let base_sampler = HostSampler::start();
+    // ★ GAP FIX I7 (`LAMBDA_VM_GAP_I7=1`): level 0's first-round wrap prologues,
+    // built by helpers in the base's tail — see [`LeadIn`]. Only when the base is
+    // PROVED here: a loaded base reports no epochs to build from.
+    let lead_in = (gap_i7_enabled() && lo == 0).then(|| {
+        let want = gap_i7_count(
+            "LAMBDA_VM_GAP_I7_WANT",
+            tree_siblings_l0()
+                .saturating_sub(usize::from(tree_top_overlap(false)))
+                .max(1),
+        );
+        let helpers = gap_i7_count("LAMBDA_VM_GAP_I7_HELPERS", 2);
+        println!(
+            "   ★ GAP I7 ON ({GAP_I7_ENV}=1): {helpers} helper(s) build wraps 0..{want}'s \
+             prologues in the base's tail (LAMBDA_VM_GAP_I7_WANT / _HELPERS)"
+        );
+        start_stark_lead_in(&inputs.elf_bytes, &inner, want, helpers)
+    });
+    if lead_in.is_none() {
+        println!("   GAP I7 ({GAP_I7_ENV}): off");
+    }
     let t = Instant::now();
     let bundle = cached_bundle(
         if lo == 0 {
@@ -6026,12 +6681,18 @@ fn the_production_tree_composes_to_a_root() {
         },
         stage_path(cache_dir.as_deref(), "bundle"),
         || {
-            crate::continuation::prove_continuation(
-                &inputs.elf_bytes,
-                &inputs.private_input,
-                inputs.epoch_log2,
-                &inner,
-            )
+            let prove = || {
+                crate::continuation::prove_continuation(
+                    &inputs.elf_bytes,
+                    &inputs.private_input,
+                    inputs.epoch_log2,
+                    &inner,
+                )
+            };
+            match &lead_in {
+                Some(lead) => crate::continuation::with_epoch_observer(lead.clone(), prove),
+                None => prove(),
+            }
             .expect("the block must prove")
         },
     );
@@ -6115,9 +6776,18 @@ fn the_production_tree_composes_to_a_root() {
     // commitment thirty-eight. `prove_continuation` hoists exactly this pair and
     // says so; the driver did not inherit it.
     let epoch_konsts = stamped("EpochConstants::load (ELF + DECODE commitment)", || {
-        super::epoch_tests::EpochConstants::load(&inputs.elf_bytes, &inner, None)
-            .expect("the inner ELF and its DECODE commitment must build once")
+        // ⓘ Under gap I7 the lead-in derived the commitment during the base.
+        super::epoch_tests::EpochConstants::load(
+            &inputs.elf_bytes,
+            &inner,
+            lead_in.as_ref().map(|l| *l.context()),
+        )
+        .expect("the inner ELF and its DECODE commitment must build once")
     });
+    // ★ GAP I7: from here level 0 builds whatever the lead-in has not started.
+    if let Some(l) = &lead_in {
+        println!("   {}", l.close());
+    }
     // ★★★ LEVEL-0 CONCURRENCY. Armed with its OWN count and disarmed straight
     // after, so the interior's knob and this one never reach across.
     //
@@ -6150,10 +6820,28 @@ fn the_production_tree_composes_to_a_root() {
         // sampler window. Every wrap carries it, which also shows the ramp's
         // shape rather than only its first term.
         let wrap_t0 = stark::prove_split::epoch_secs();
-        let t = Instant::now();
-        let e = super::epoch_tests::real_epoch_from_constants(&inner, &epoch_konsts, &bundle, k)
-            .expect("every epoch must reconstruct from proofs alone");
-        let t_recon = t.elapsed().as_secs_f64();
+        // ★ GAP I7: the prologue a lead-in helper built in the base's tail, if any
+        // — the same `RealEpoch`, program and arenas the lines below would build.
+        let lead = lead_in.as_ref().and_then(|l| l.take(k));
+        let from_lead = lead.is_some();
+        let (e, t_recon, emitted) = match lead {
+            Some(p) => (
+                p.e,
+                p.t_recon,
+                Some((p.program, p.arenas, p.t_emit, p.t0, p.t1)),
+            ),
+            None => {
+                let t = Instant::now();
+                let e = super::epoch_tests::real_epoch_from_constants(
+                    &inner,
+                    &epoch_konsts,
+                    &bundle,
+                    k,
+                )
+                .expect("every epoch must reconstruct from proofs alone");
+                (e, t.elapsed().as_secs_f64(), None)
+            }
+        };
         let out_halves = e.statement.public_output_len.div_ceil(4);
         if k == 0 {
             // ★ FREE, AND IT SIZES THE BLOCK-ARTIFACT ROOT. The attestation fold
@@ -6174,17 +6862,33 @@ fn the_production_tree_composes_to_a_root() {
         let shapes: Vec<&super::epoch::TableChallengeShape> =
             e.tables.iter().map(|h| &h.shape).collect();
         assert_samplable(&format!("inner epoch {k}"), &shapes);
-        let t = Instant::now();
-        let program =
-            super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
-        let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-        let t_emit = t.elapsed().as_secs_f64();
+        let (program, arenas, t_emit, stage_t0, stage_t1) = match emitted {
+            Some(done) => done,
+            None => {
+                let t = Instant::now();
+                let program =
+                    super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
+                let arenas = super::epoch_tests::epoch_arena_words(&e, true);
+                let t_emit = t.elapsed().as_secs_f64();
+                (
+                    program,
+                    arenas,
+                    t_emit,
+                    wrap_t0,
+                    stark::prove_split::epoch_secs(),
+                )
+            }
+        };
         if super::device_permit::trace_enabled() {
             println!(
-                "STAGE wrap {k} prologue (reconstruct+emit, pre-device): {:.2}s \
-                 t=[{wrap_t0:.3},{:.3}]",
+                "STAGE wrap {k} prologue (reconstruct+emit, pre-device{}): {:.2}s \
+                 t=[{stage_t0:.3},{stage_t1:.3}]",
+                if from_lead {
+                    ", GAP-I7 lead-in, in the base's tail"
+                } else {
+                    ""
+                },
                 t_recon + t_emit,
-                stark::prove_split::epoch_secs(),
             );
         }
         // ★ THE WRAP'S SIZE, in the shape every node already prints. Without it
@@ -6229,9 +6933,14 @@ fn the_production_tree_composes_to_a_root() {
         println!(
             "   wrap {k} TIMING: reconstruct {t_recon:.2}s · emit+arenas {t_emit:.2}s \
              · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s \
-             · harvest {t_harvest:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s",
+             · harvest {t_harvest:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s{}",
             t_harvest - t_verify,
-            t_wrap.elapsed().as_secs_f64()
+            t_wrap.elapsed().as_secs_f64(),
+            if from_lead {
+                " ⓘ GAP I7: reconstruct + emit ran in the base's tail, outside this wall"
+            } else {
+                ""
+            },
         );
         // ★★ THE NUMBER THE LEVEL-0 COUNT IS CHOSEN ON, and nothing measured it
         // before. The interior prints a per-node peak and that is how its
@@ -6343,6 +7052,9 @@ fn the_production_tree_composes_to_a_root() {
     }
     // Everything after level 0 runs at its own count, or serial.
     super::device_permit::arm(1);
+    // ★ GAP I7: level 0 has taken every prologue it will; release the lead-in's
+    // epoch copies and context now rather than at the end of the run.
+    drop(lead_in);
     let level0_wall = t_level.elapsed().as_secs_f64();
     let (l0_peak, l0_at) = level0_sampler.stop();
     println!("   level 0: {} wraps in {level0_wall:.1}s", children.len());
@@ -6843,6 +7555,7 @@ fn whir_level_zero<H>(
     siblings: usize,
     fan_in: usize,
     top_overlap: bool,
+    lead_in: Option<&(dyn std::any::Any + Send + Sync)>,
 ) -> (
     Vec<RealChild>,
     Vec<super::per_table_aggregator::SchemaLayout>,
@@ -6850,7 +7563,7 @@ fn whir_level_zero<H>(
     Option<WhirGlobalChild>,
 )
 where
-    H: multilinear::whir_hash::WhirHash,
+    H: multilinear::whir_hash::WhirHash + 'static,
 {
     use super::per_table_aggregator::SchemaLayout;
     use super::program_census::build_artifacts_counted;
@@ -6887,20 +7600,44 @@ where
         );
     }
 
+    // ★ GAP I7: the lead-in the base fed, under this level's own `H`.
+    let lead = lead_in.map(|any| {
+        any.downcast_ref::<WhirLeadIn<H>>()
+            .expect("the GAP-I7 lead-in was started under a different WHIR hash than level 0's")
+    });
+
     // ⚠ AFTER the prove, not before: `prove_continuation` derives its own, and
     // counting it would make the line below describe the base rather than this
     // level. The driver's block walk makes the same ordering choice.
     crate::multilinear_continuation::reset_decode_derivations();
     let t = Instant::now();
-    let prepared = crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
-        .expect("DECODE's prepared opening, once per bundle");
-    let decode_root = crate::tables::decode::commitment_from_elf(elf, inner)
-        .expect("DECODE's univariate commitment, once per bundle");
+    // ⓘ Under gap I7 the lead-in hoisted both during the base, and asserted the
+    // "exactly once" on its own thread; this level borrows them.
+    let hoisted_here;
+    let (prepared, decode_root) = match lead {
+        Some(l) => {
+            let c = l.context();
+            (&*c.prepared, c.decode_root)
+        }
+        None => {
+            hoisted_here =
+                crate::multilinear_continuation::decode_prepared_for::<H>(elf, elf_bytes)
+                    .expect("DECODE's prepared opening, once per bundle");
+            let decode_root = crate::tables::decode::commitment_from_elf(elf, inner)
+                .expect("DECODE's univariate commitment, once per bundle");
+            (&hoisted_here, decode_root)
+        }
+    };
     println!(
         "   ★ WHIR LEVEL 0: both DECODE derivations hoisted in {:.2}s \
          (the prepared opening and the univariate root — different objects, \
-         one each per bundle rather than one each per epoch)",
-        t.elapsed().as_secs_f64()
+         one each per bundle rather than one each per epoch){}",
+        t.elapsed().as_secs_f64(),
+        if lead.is_some() {
+            " ⓘ GAP I7: taken from the lead-in, which derived them during the base"
+        } else {
+            ""
+        },
     );
     // ⛔⛔ THE COUNTER IS A THREAD-LOCAL `Cell`, AND THAT DECIDES WHERE THESE
     // ASSERTS GO. `multilinear_continuation`'s own comment names the hazard:
@@ -6918,10 +7655,16 @@ where
     // regression, and it fires on whichever worker regressed.
     let hoisted = crate::multilinear_continuation::decode_derivations();
     assert_eq!(
-        hoisted, 1,
-        "the hoist must derive the prepared opening exactly once on this thread, \
-         and it derived {hoisted} times"
+        hoisted,
+        u64::from(lead.is_none()),
+        "the hoist must derive the prepared opening exactly once on this thread \
+         (none under the GAP-I7 lead-in, which asserts its own), and it derived \
+         {hoisted} times"
     );
+    // ★ GAP I7: from here level 0 builds whatever the lead-in has not started.
+    if let Some(l) = lead {
+        println!("   {}", l.close());
+    }
 
     type WhirWrapSlot = (RealChild, SchemaLayout, Vec<u64>, u64, usize);
 
@@ -6933,68 +7676,94 @@ where
         // would stop meaning "this wrap derived nothing".
         crate::multilinear_continuation::reset_decode_derivations();
 
-        // THE HARVEST, and it is a full host WHIR verify of the epoch under `H`
-        // — the hash agreement is this call and not a label.
-        //
-        // ⓘ It REPLACES the STARK wrap's `assert_samplable`, which is a guard on
-        // the inner proof's query sampler (`log2_trace_length + log2_blowup >= 1`)
-        // and has no per-table counterpart in a multilinear epoch. The harvest is
-        // strictly stronger — the verifier's own verdict rather than a shape
-        // precondition — so the guard is dropped rather than transliterated.
-        let t = Instant::now();
-        let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
-            inner,
-            elf_bytes,
-            bundle,
-            k,
-            Some(decode_root),
-            Some(&prepared),
-        )
-        .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
-        let t_harvest_epoch = t.elapsed().as_secs_f64();
+        // ★ GAP I7: the prologue a lead-in helper built in the base's tail, if any
+        // — the same harvest, program and arenas the arm below would build, with
+        // both asserts made on the helper's thread.
+        let lead_prologue = lead.and_then(|l| l.take(k));
+        let from_lead = lead_prologue.is_some();
+        let (e, t_harvest_epoch, program, arenas, t_emit) = match lead_prologue {
+            Some(p) => {
+                if super::device_permit::trace_enabled() {
+                    println!(
+                        "STAGE whir wrap {k} prologue (harvest+emit, pre-device, GAP-I7 \
+                         lead-in, in the base's tail): {:.2}s t=[{:.3},{:.3}]",
+                        p.t_harvest + p.t_emit,
+                        p.t0,
+                        p.t1,
+                    );
+                }
+                (p.e, p.t_harvest, p.program, p.arenas, p.t_emit)
+            }
+            None => {
+                // THE HARVEST, and it is a full host WHIR verify of the epoch under `H`
+                // — the hash agreement is this call and not a label.
+                //
+                // ⓘ It REPLACES the STARK wrap's `assert_samplable`, which is a guard on
+                // the inner proof's query sampler (`log2_trace_length + log2_blowup >= 1`)
+                // and has no per-table counterpart in a multilinear epoch. The harvest is
+                // strictly stronger — the verifier's own verdict rather than a shape
+                // precondition — so the guard is dropped rather than transliterated.
+                let t = Instant::now();
+                let e = crate::lfm::whir_real_epoch::real_epoch_from_whir_continuation_under::<H>(
+                    inner,
+                    elf_bytes,
+                    bundle,
+                    k,
+                    Some(decode_root),
+                    Some(prepared),
+                )
+                .unwrap_or_else(|why| panic!("epoch {k} must harvest from proofs alone: {why}"));
+                let t_harvest_epoch = t.elapsed().as_secs_f64();
 
-        // THE AIR SET, held as an OWNED value for as long as the program build.
-        // It is two owned things — a `VmAirs` whose `air_refs()` borrows it, and
-        // the local-to-global AIR, which is a separate by-value return — so a
-        // `statements` field on the epoch would be self-referential and a
-        // lifetime on it would infect every caller.
-        //
-        // ⚠ `Some(decode_root)` is the one argument this caller and the verifier
-        // disagree about, deliberately: `verify_epoch_bookend` builds its own set
-        // through the SAME function with `None`. The difference reaches only
-        // DECODE's preprocessed commitment, which the multilinear path never
-        // compares — a real equivalence, and not an obvious one.
-        let air_set = crate::multilinear_continuation::epoch_airs_for(
-            elf,
-            inner,
-            &bundle.epochs[k],
-            &e.position.register_init,
-            e.position.is_final,
-            e.position.label,
-            Some(decode_root),
-        );
-        let refs = air_set.refs();
+                // THE AIR SET, held as an OWNED value for as long as the program build.
+                // It is two owned things — a `VmAirs` whose `air_refs()` borrows it, and
+                // the local-to-global AIR, which is a separate by-value return — so a
+                // `statements` field on the epoch would be self-referential and a
+                // lifetime on it would infect every caller.
+                //
+                // ⚠ `Some(decode_root)` is the one argument this caller and the verifier
+                // disagree about, deliberately: `verify_epoch_bookend` builds its own set
+                // through the SAME function with `None`. The difference reaches only
+                // DECODE's preprocessed commitment, which the multilinear path never
+                // compares — a real equivalence, and not an obvious one.
+                let air_set = crate::multilinear_continuation::epoch_airs_for(
+                    elf,
+                    inner,
+                    &bundle.epochs[k],
+                    &e.position.register_init,
+                    e.position.is_final,
+                    e.position.label,
+                    Some(decode_root),
+                );
+                let refs = air_set.refs();
 
-        // ★ THE ASSERT THAT CAN ACTUALLY FAIL, and it covers BOTH hoists: the
-        // harvest above took `Some(&prepared)` and the AIR set took
-        // `Some(decode_root)`, so preparing this wrap must have derived NOTHING
-        // on this thread. Hand either one in as `None` — which is what the
-        // driver's own block walk does, correctly for a walk and wastefully for
-        // a driver — and this reads 1 on the worker that did it.
-        let derived_here = crate::multilinear_continuation::decode_derivations();
-        assert_eq!(
-            derived_here, 0,
-            "wrap {k} derived DECODE {derived_here} time(s) while preparing; both \
-             the prepared opening and the univariate root are handed in, so a \
-             non-zero count means a hoist is not reaching the harvest"
-        );
+                // ★ THE ASSERT THAT CAN ACTUALLY FAIL, and it covers BOTH hoists: the
+                // harvest above took `Some(&prepared)` and the AIR set took
+                // `Some(decode_root)`, so preparing this wrap must have derived NOTHING
+                // on this thread. Hand either one in as `None` — which is what the
+                // driver's own block walk does, correctly for a walk and wastefully for
+                // a driver — and this reads 1 on the worker that did it.
+                let derived_here = crate::multilinear_continuation::decode_derivations();
+                assert_eq!(
+                    derived_here, 0,
+                    "wrap {k} derived DECODE {derived_here} time(s) while preparing; both \
+                 the prepared opening and the univariate root are handed in, so a \
+                 non-zero count means a hoist is not reaching the harvest"
+                );
 
+                let t = Instant::now();
+                let program = whir_epoch_program(&e, &refs[..]);
+                let arenas = whir_epoch_arena(&e, &refs[..]);
+                (
+                    e,
+                    t_harvest_epoch,
+                    program,
+                    arenas,
+                    t.elapsed().as_secs_f64(),
+                )
+            }
+        };
         let out_halves = e.public_output().len().div_ceil(4);
-
-        let t = Instant::now();
-        let program = whir_epoch_program(&e, &refs[..]);
-        let arenas = whir_epoch_arena(&e, &refs[..]);
-        let t_emit = t.elapsed().as_secs_f64();
 
         let (cells, instrs) = census_and_panel(&program, &format!("whir wrap {k}"), 1);
         let wrap_sampler = HostSampler::start();
@@ -7105,9 +7874,14 @@ where
         println!(
             "   whir wrap {k} TIMING: harvest-epoch {t_harvest_epoch:.2}s · emit+arenas \
              {t_emit:.2}s · artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · harvest \
-             {t_child:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s",
+             {t_child:.2}s (verify {t_verify:.2} + replay {:.2}) · wall {:.2}s{}",
             t_child - t_verify,
-            t_wrap.elapsed().as_secs_f64()
+            t_wrap.elapsed().as_secs_f64(),
+            if from_lead {
+                " ⓘ GAP I7: harvest-epoch + emit ran in the base's tail, outside this wall"
+            } else {
+                ""
+            },
         );
         println!(
             "   whir wrap {k}: host peak {peak:.3} GiB at t={at:.1}{}{}",
@@ -7918,13 +8692,43 @@ fn the_whir_production_tree_composes_to_a_root() {
     // value. Its `ContinuationProof` is also a DISTINCT rkyv type from the STARK
     // bundle's, which is a second reason `cached_bundle` does not apply here.
     let base_sampler = HostSampler::start();
+    // ★ GAP FIX I7 (`LAMBDA_VM_GAP_I7=1`): level 0's first-round wrap prologues,
+    // built by helpers in the base's tail — see [`LeadIn`]. Started under the
+    // hash level 0 dispatches on, and handed to the base as a hash-free observer.
+    let whir_lead = gap_i7_enabled().then(|| {
+        let want = gap_i7_count(
+            "LAMBDA_VM_GAP_I7_WANT",
+            tree_siblings_l0()
+                .saturating_sub(usize::from(tree_top_overlap(true)))
+                .max(1),
+        );
+        let helpers = gap_i7_count("LAMBDA_VM_GAP_I7_HELPERS", 2);
+        println!(
+            "   ★ GAP I7 ON ({GAP_I7_ENV}=1): {helpers} helper(s) build WHIR wraps \
+             0..{want}'s prologues in the base's tail (LAMBDA_VM_GAP_I7_WANT / _HELPERS)"
+        );
+        crate::with_whir_hash!(|H| {
+            start_whir_lead_in::<H>(&inputs.elf_bytes, &inner, want, helpers)
+        })
+    });
+    if whir_lead.is_none() {
+        println!("   GAP I7 ({GAP_I7_ENV}): off");
+    }
     let t = Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(
-        &inputs.elf_bytes,
-        &inputs.private_input,
-        inputs.epoch_log2,
-        &inner,
-    )
+    let prove = || {
+        crate::multilinear_continuation::prove_continuation(
+            &inputs.elf_bytes,
+            &inputs.private_input,
+            inputs.epoch_log2,
+            &inner,
+        )
+    };
+    let bundle = match &whir_lead {
+        Some((observer, _)) => {
+            crate::multilinear_continuation::with_epoch_observer(observer.clone(), prove)
+        }
+        None => prove(),
+    }
     .expect("the WHIR block must prove");
     let base_secs = t.elapsed().as_secs_f64();
     let (base_peak, base_at) = base_sampler.stop();
@@ -8050,8 +8854,12 @@ fn the_whir_production_tree_composes_to_a_root() {
             l0_siblings,
             fan_in,
             top_overlap,
+            whir_lead.as_ref().map(|(_, lead)| &**lead),
         )
     });
+    // ★ GAP I7: level 0 has taken every prologue it will; release the lead-in —
+    // and with it the base's DECODE commitment it shares — now.
+    drop(whir_lead);
 
     super::device_permit::arm(1);
     let level0_wall = t_level.elapsed().as_secs_f64();
@@ -8610,7 +9418,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
     super::device_permit::arm(1);
     let (children, layouts, labels, no_overlapped_global) = crate::with_whir_hash!(|H| {
         whir_level_zero::<H>(
-            &bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1, fan_in, false,
+            &bundle, &elf_bytes, &elf, &inner, &wrap_opts, &ceiling, 1, fan_in, false, None,
         )
     });
     assert!(

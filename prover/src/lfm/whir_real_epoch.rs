@@ -176,8 +176,19 @@ pub(crate) fn whir_epoch_chain_position(
     elf: &Elf,
     index: usize,
 ) -> Option<WhirChainPosition> {
-    let epochs = &bundle.epochs;
-    if index >= epochs.len() {
+    whir_epoch_chain_position_in(&bundle.epochs, bundle.epochs.len(), elf, index)
+}
+
+/// [`whir_epoch_chain_position`] for a run of `num_epochs` from its leading
+/// `epochs` — before the bundle exists (gap fix I7), they must hold at least
+/// `0..=index`. `None` also when they do not.
+pub(crate) fn whir_epoch_chain_position_in(
+    epochs: &[EpochProof],
+    num_epochs: usize,
+    elf: &Elf,
+    index: usize,
+) -> Option<WhirChainPosition> {
+    if index >= num_epochs || index >= epochs.len() {
         return None;
     }
     let register_init = if index == 0 {
@@ -187,7 +198,7 @@ pub(crate) fn whir_epoch_chain_position(
     };
     Some(WhirChainPosition {
         register_init,
-        is_final: index + 1 == epochs.len(),
+        is_final: index + 1 == num_epochs,
         label: epoch_label(index as u64),
     })
 }
@@ -282,6 +293,34 @@ pub(crate) fn real_epoch_from_whir_continuation_under<H>(
 where
     H: WhirHash,
 {
+    real_epoch_from_whir_epochs_under::<H>(
+        opts,
+        elf_bytes,
+        &bundle.epochs,
+        bundle.epochs.len(),
+        epoch_index,
+        decode_commitment,
+        prepared,
+    )
+}
+
+/// [`real_epoch_from_whir_continuation_under`] for a run of `num_epochs` from
+/// its leading `epochs` (at least `0..=epoch_index`) — the same function over
+/// the same proofs before the bundle exists, which is what lets gap fix I7
+/// harvest a wrap's epoch in the base's tail.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn real_epoch_from_whir_epochs_under<H>(
+    opts: &crate::ProofOptions,
+    elf_bytes: &[u8],
+    epochs: &[EpochProof],
+    num_epochs: usize,
+    epoch_index: usize,
+    decode_commitment: Option<Commitment>,
+    prepared: Option<&crate::multilinear_continuation::DecodePrepared<H>>,
+) -> Result<WhirRealEpoch, String>
+where
+    H: WhirHash,
+{
     let elf = Elf::load(elf_bytes).map_err(|e| format!("the inner ELF must load: {e}"))?;
     let decode_commitment = match decode_commitment {
         Some(c) => c,
@@ -289,13 +328,15 @@ where
             .map_err(|e| format!("DECODE commitment from ELF: {e}"))?,
     };
 
-    let position = whir_epoch_chain_position(bundle, &elf, epoch_index).ok_or_else(|| {
-        format!(
-            "epoch {epoch_index} is out of range: the bundle carries {}",
-            bundle.epochs.len()
-        )
-    })?;
-    let proof = bundle.epochs[epoch_index].clone();
+    let position =
+        whir_epoch_chain_position_in(epochs, num_epochs, &elf, epoch_index).ok_or_else(|| {
+            format!(
+                "epoch {epoch_index} is out of range: the run has {num_epochs} epochs and \
+                 {} are in hand",
+                epochs.len()
+            )
+        })?;
+    let proof = epochs[epoch_index].clone();
 
     // ★ The acceptance check, and the hash agreement with it. Both are the
     // same call: `H` configures the transcript's sponge, so verifying here IS

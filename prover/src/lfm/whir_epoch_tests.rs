@@ -827,4 +827,124 @@ mod tests {
              was harvested into a wrap input"
         );
     }
+
+    /// ★ GAP FIX I7's IDENTITY for the WHIR base. The observer is told the epoch
+    /// count once, handed every epoch byte for byte, and handed the base's OWN
+    /// DECODE prepared commitment — the one a fresh derivation builds, shared
+    /// because deriving it is a device commit. A harvest from the leading epochs
+    /// under that commitment is the one from the bundle, and so are the program
+    /// and the arenas it emits: what lets WHIR level 0 take a lead-in's prologue.
+    #[test]
+    fn a_lead_in_harvest_is_the_one_built_from_the_bundle() {
+        use crate::lfm::whir_epoch::{whir_epoch_arena, whir_epoch_program};
+        let (elf_bytes, input) = a_run();
+        let opts = ProofOptions::default_test_options();
+        let recorder = std::sync::Arc::new(crate::continuation::RecordingObserver::<
+            multilinear_continuation::EpochProof,
+        >::default());
+        let b = multilinear_continuation::with_epoch_observer(recorder.clone(), || {
+            multilinear_continuation::prove_continuation(&elf_bytes, &input, 2, &opts)
+        })
+        .expect("prove the continuation");
+        let n = b.epochs.len();
+        assert!(n >= 2, "a one-epoch run chains nothing");
+        assert_eq!(
+            *recorder.counts.lock().unwrap(),
+            vec![n],
+            "the epoch count, exactly once"
+        );
+        let copies = recorder.epochs_in_order(n);
+        for (i, (copy, kept)) in copies.iter().zip(&b.epochs).enumerate() {
+            assert_eq!(
+                rkyv::to_bytes::<rkyv::rancor::Error>(copy)
+                    .expect("serialize")
+                    .as_slice(),
+                rkyv::to_bytes::<rkyv::rancor::Error>(kept)
+                    .expect("serialize")
+                    .as_slice(),
+                "the observer's copy of epoch {i} is the bundle's"
+            );
+        }
+        let shared = std::mem::take(&mut *recorder.shared.lock().unwrap());
+        assert_eq!(shared.len(), 1, "the DECODE commitment is shared once");
+        let elf = Elf::load(&elf_bytes).expect("load");
+        let root = crate::tables::decode::commitment_from_elf(&elf, &opts).expect("root");
+        crate::with_whir_hash!(|H| {
+            let prepared = shared[0]
+                .clone()
+                .downcast::<multilinear_continuation::DecodePrepared<H>>()
+                .unwrap_or_else(|_| panic!("the base shares its DECODE commitment under its hash"));
+            let fresh = multilinear_continuation::decode_prepared_for::<H>(&elf, &elf_bytes)
+                .expect("a fresh derivation");
+            assert_eq!(
+                prepared.roots, fresh.roots,
+                "the shared commitment is the one a fresh derivation builds"
+            );
+            for k in 0..n {
+                let from_bundle = real_epoch_from_whir_continuation_under::<H>(
+                    &opts,
+                    &elf_bytes,
+                    &b,
+                    k,
+                    Some(root),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("epoch {k} from the bundle: {e}"));
+                let from_lead = real_epoch_from_whir_epochs_under::<H>(
+                    &opts,
+                    &elf_bytes,
+                    &copies[..=k],
+                    n,
+                    k,
+                    Some(root),
+                    Some(&*prepared),
+                )
+                .unwrap_or_else(|e| panic!("epoch {k} from its leading epochs: {e}"));
+                assert_eq!(
+                    from_bundle.position.register_init,
+                    from_lead.position.register_init
+                );
+                assert_eq!(from_bundle.position.is_final, from_lead.position.is_final);
+                assert_eq!(from_bundle.position.label, from_lead.position.label);
+                assert_eq!(
+                    from_bundle.decode_prepared_roots,
+                    from_lead.decode_prepared_roots
+                );
+                let airs = multilinear_continuation::epoch_airs_for(
+                    &elf,
+                    &opts,
+                    &b.epochs[k],
+                    &from_bundle.position.register_init,
+                    from_bundle.position.is_final,
+                    from_bundle.position.label,
+                    Some(root),
+                );
+                let refs = airs.refs();
+                assert_eq!(
+                    format!("{:?}", whir_epoch_program(&from_bundle, &refs[..])),
+                    format!("{:?}", whir_epoch_program(&from_lead, &refs[..])),
+                    "wrap {k}'s program"
+                );
+                assert_eq!(
+                    whir_epoch_arena(&from_bundle, &refs[..]),
+                    whir_epoch_arena(&from_lead, &refs[..]),
+                    "wrap {k}'s arenas"
+                );
+            }
+            // ⛔ The leading epochs must reach the one asked for.
+            assert!(
+                real_epoch_from_whir_epochs_under::<H>(
+                    &opts,
+                    &elf_bytes,
+                    &copies[..1],
+                    n,
+                    1,
+                    Some(root),
+                    Some(&*prepared),
+                )
+                .is_err(),
+                "epoch 1 cannot be harvested from epoch 0 alone"
+            );
+        });
+    }
 }

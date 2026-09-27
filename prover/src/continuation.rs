@@ -1292,6 +1292,20 @@ pub(crate) fn for_each_epoch_overlapped(
     private_inputs: &[u8],
     epoch_size_log2: u32,
     artifacts: &DecodeArtifacts,
+    each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
+) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
+    for_each_epoch_overlapped_counted(elf, private_inputs, epoch_size_log2, artifacts, None, each)
+}
+
+/// [`for_each_epoch_overlapped`], also telling `on_count` the run's epoch count
+/// from the producer, as soon as it has prepared the final epoch — an epoch
+/// before `each` is handed it.
+pub(crate) fn for_each_epoch_overlapped_counted(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    on_count: Option<&(dyn Fn(usize) + Sync)>,
     mut each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
 ) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedEpoch>(0);
@@ -1303,6 +1317,11 @@ pub(crate) fn for_each_epoch_overlapped(
                 epoch_size_log2,
                 artifacts,
                 |prepared, _| {
+                    if prepared.is_final
+                        && let Some(on_count) = on_count
+                    {
+                        on_count(prepared.index as usize + 1);
+                    }
                     // The consumer stopping is not this side's failure to
                     // report: its error is the one that says why.
                     sender.send(prepared).map_err(|_| {
@@ -1347,7 +1366,7 @@ struct BuildJob {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct EpochProof {
     /// The epoch's STARK proof: one `StarkProof` per table, the epoch-local L2G
     /// sub-table last. Its main root is the commitment
@@ -1405,10 +1424,10 @@ impl ContinuationProof {
         self.epochs.len()
     }
 
-    /// Epoch `i`'s bundle, as the same [`EpochProofView`] the verifier reads.
+    /// Every epoch's proof, in execution order.
     #[cfg(test)]
-    pub(crate) fn epoch_view(&self, i: usize) -> EpochProofView<'_> {
-        EpochProofView::Owned(&self.epochs[i])
+    pub(crate) fn epochs(&self) -> &[EpochProof] {
+        &self.epochs
     }
 
     /// The global proof, as the same view the verifier reads.
@@ -1466,23 +1485,25 @@ pub(crate) struct EpochChainPosition {
     pub(crate) label: u64,
 }
 
-/// Derive [`EpochChainPosition`] for epoch `index` of `bundle`. `Ok(None)` if
-/// `index` is out of range or an earlier epoch's `reg_fini` has the wrong
-/// length (a malformed bundle the verifier rejects up front); `Err` iff a
-/// metadata field fails to materialize.
+/// Derive [`EpochChainPosition`] for epoch `index` of a run of `num_epochs`
+/// from its leading `epochs` (a bundle's all, or — before the bundle exists —
+/// at least `0..=index`). `Ok(None)` if `index` is out of range, the epoch is
+/// not in `epochs`, or an earlier epoch's `reg_fini` has the wrong length (a
+/// malformed bundle the verifier rejects up front); `Err` iff a metadata field
+/// fails to materialize.
 #[cfg(test)]
 pub(crate) fn epoch_chain_position(
-    bundle: &ContinuationProof,
+    epochs: &[EpochProof],
+    num_epochs: usize,
     elf: &Elf,
     index: usize,
 ) -> Result<Option<EpochChainPosition>, Error> {
-    let n = bundle.num_epochs();
-    if index >= n {
+    if index >= num_epochs || index >= epochs.len() {
         return Ok(None);
     }
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
-    for prior in 0..index {
-        let view = bundle.epoch_view(prior);
+    for prior in &epochs[..index] {
+        let view = EpochProofView::Owned(prior);
         if view.reg_fini_len() != register::NUM_REGISTER_ADDRESSES {
             return Ok(None);
         }
@@ -1490,7 +1511,7 @@ pub(crate) fn epoch_chain_position(
     }
     Ok(Some(EpochChainPosition {
         register_init,
-        is_final: index == n - 1,
+        is_final: index == num_epochs - 1,
         label: local_to_global::epoch_label(index as u64),
     }))
 }
@@ -2269,12 +2290,118 @@ fn base_stage_done(index: u64, stage: &str, open: Option<(std::time::Instant, f6
     }
 }
 
+/// Hooks on a base's epoch pipeline, for a caller that starts host-only work on
+/// the epoch proofs before the bundle exists — gap fix I7, which builds the
+/// level-0 wrap prologues in the base's tail instead of after it.
+///
+/// Called from the pipeline's own threads, so an implementation must return
+/// quickly and must never wait on the pipeline. `P` is the base's epoch-proof
+/// type (the STARK and the WHIR bases have their own).
+pub(crate) trait EpochObserver<P>: Sync {
+    /// The run's last epoch has been executed: it has `num_epochs` epochs.
+    fn on_epoch_count(&self, num_epochs: usize);
+    /// Epoch `index` is proved. Once per epoch, in completion order, which can
+    /// differ from index order.
+    fn on_epoch_proved(&self, index: usize, proof: &P);
+    /// The WHIR base's DECODE prepared commitment (a
+    /// `multilinear_continuation::DecodePrepared<H>` under the base's hash),
+    /// shared rather than derived a second time: deriving it is a device commit,
+    /// and the lead-in must not reach the card. Called once, before any epoch.
+    fn on_decode_prepared(&self, _prepared: Arc<dyn std::any::Any + Send + Sync>) {}
+}
+
+/// Test-only: an [`EpochObserver`] that records what it is told, for a test
+/// asserting what a base reports.
+#[cfg(test)]
+pub(crate) struct RecordingObserver<P> {
+    pub(crate) counts: std::sync::Mutex<Vec<usize>>,
+    pub(crate) epochs: std::sync::Mutex<Vec<(usize, P)>>,
+    pub(crate) shared: std::sync::Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
+}
+
+#[cfg(test)]
+impl<P> Default for RecordingObserver<P> {
+    fn default() -> Self {
+        Self {
+            counts: std::sync::Mutex::new(Vec::new()),
+            epochs: std::sync::Mutex::new(Vec::new()),
+            shared: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<P> RecordingObserver<P> {
+    /// The epochs it saw, in index order, asserting each of `0..n` exactly once.
+    pub(crate) fn epochs_in_order(&self, n: usize) -> Vec<P> {
+        let mut seen = std::mem::take(&mut *self.epochs.lock().unwrap());
+        seen.sort_by_key(|(index, _)| *index);
+        assert_eq!(
+            seen.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..n).collect::<Vec<_>>(),
+            "the observer must see every epoch exactly once"
+        );
+        seen.into_iter().map(|(_, proof)| proof).collect()
+    }
+}
+
+#[cfg(test)]
+impl<P: Clone + Send + Sync> EpochObserver<P> for RecordingObserver<P> {
+    fn on_epoch_count(&self, num_epochs: usize) {
+        self.counts.lock().unwrap().push(num_epochs);
+    }
+
+    fn on_epoch_proved(&self, index: usize, proof: &P) {
+        self.epochs.lock().unwrap().push((index, proof.clone()));
+    }
+
+    fn on_decode_prepared(&self, prepared: Arc<dyn std::any::Any + Send + Sync>) {
+        self.shared.lock().unwrap().push(prepared);
+    }
+}
+
+/// An [`EpochObserver`] for the STARK base, as the thread-local holds it.
+pub(crate) type SharedEpochObserver = Arc<dyn EpochObserver<EpochProof> + Send + Sync>;
+
+thread_local! {
+    /// The observer the base proved on THIS thread reports to (gap fix I7):
+    /// installed by [`with_epoch_observer`] for the duration of a call, `None`
+    /// otherwise — and with `None` the base is exactly what it was.
+    ///
+    /// ⓘ A thread-local rather than a parameter so `prove_continuation` keeps
+    /// its signature and its body in place: the record launcher counts that
+    /// function's own `scope.spawn` sites to check that Fix A is in the tree.
+    static BASE_OBSERVER: std::cell::RefCell<Option<SharedEpochObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `observer` installed for every base proved on this thread
+/// inside it, restoring what was there before on return or unwind.
+#[cfg(test)]
+pub(crate) fn with_epoch_observer<R>(observer: SharedEpochObserver, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<SharedEpochObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            BASE_OBSERVER.with(|o| *o.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(BASE_OBSERVER.with(|o| o.borrow_mut().replace(observer)));
+    f()
+}
+
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    // Gap fix I7: the observer a caller installed for this thread, if any. It
+    // sees the pipeline and changes nothing in it.
+    let installed = BASE_OBSERVER.with(|o| o.borrow().clone());
+    let observer: Option<&dyn EpochObserver<EpochProof>> = installed
+        .as_deref()
+        .map(|o| o as &dyn EpochObserver<EpochProof>);
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -2419,7 +2546,12 @@ pub fn prove_continuation(
             }));
             base_stage_done(index, "prove", __bs_prove);
             match outcome {
-                Ok(Ok(epoch)) => proved.push((index, epoch)),
+                Ok(Ok(epoch)) => {
+                    if let Some(observer) = observer {
+                        observer.on_epoch_proved(index as usize, &epoch);
+                    }
+                    proved.push((index, epoch))
+                }
                 Ok(Err(e)) => {
                     first_err.lock().unwrap().get_or_insert(e);
                     continue; // drain mode (see loop comment)
@@ -2601,6 +2733,9 @@ pub fn prove_continuation(
                     #[cfg(feature = "instruments")]
                     drop(__sp);
                     let is_final = executor.pc() == 0;
+                    if is_final && let Some(observer) = observer {
+                        observer.on_epoch_count(index as usize + 1);
+                    }
 
                     // Invariant: a non-final epoch ran the full `epoch_size` (a power
                     // of two), so its CPU table has no padding rows.

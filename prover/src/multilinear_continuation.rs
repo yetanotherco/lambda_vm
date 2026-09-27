@@ -1776,6 +1776,35 @@ impl ContinuationProof {
     }
 }
 
+/// An [`crate::continuation::EpochObserver`] for the WHIR base, as the
+/// thread-local holds it.
+pub(crate) type SharedEpochObserver =
+    std::sync::Arc<dyn crate::continuation::EpochObserver<EpochProof> + Send + Sync>;
+
+thread_local! {
+    /// The observer the WHIR base proved on THIS thread reports to (gap fix
+    /// I7): installed by [`with_epoch_observer`] for the duration of a call,
+    /// `None` otherwise — and with `None` the base is exactly what it was. The
+    /// STARK base's twin is `crate::continuation::with_epoch_observer`.
+    static BASE_OBSERVER: std::cell::RefCell<Option<SharedEpochObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `observer` installed for every WHIR base proved on this thread
+/// inside it, restoring what was there before on return or unwind.
+#[cfg(test)]
+pub(crate) fn with_epoch_observer<R>(observer: SharedEpochObserver, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<SharedEpochObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            BASE_OBSERVER.with(|o| *o.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(BASE_OBSERVER.with(|o| o.borrow_mut().replace(observer)));
+    f()
+}
+
 /// Proves a whole run: every epoch, then the one cross-epoch proof that chains
 /// their memory.
 pub fn prove_continuation(
@@ -1784,24 +1813,37 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    // Gap fix I7: the observer a caller installed for this thread, if any (see
+    // [`crate::continuation::EpochObserver`]). It sees the pipeline and changes
+    // nothing in it.
+    let installed = BASE_OBSERVER.with(|o| o.borrow().clone());
+    let observer: Option<&dyn crate::continuation::EpochObserver<EpochProof>> = installed
+        .as_deref()
+        .map(|o| o as &dyn crate::continuation::EpochObserver<EpochProof>);
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
     let artifacts = crate::tables::trace_builder::DecodeArtifacts::from_elf(&elf)?;
+    let on_count = observer.map(|o| move |n: usize| o.on_epoch_count(n));
 
     let mut epochs = Vec::new();
     // ★ THE DISPATCH IS HERE, ABOVE THE EPOCH LOOP, so DECODE's out-of-band
     // commitment — whose type names the hash — is built ONCE and held across
     // every epoch. Inside `prove_epoch` it could not outlive one call.
     let boundaries = crate::with_whir_hash!(|H| {
-        let prepared = decode_prepared_for::<H>(&elf, elf_bytes)?;
-        crate::continuation::for_each_epoch_overlapped(
+        let prepared = std::sync::Arc::new(decode_prepared_for::<H>(&elf, elf_bytes)?);
+        if let Some(observer) = observer {
+            observer.on_decode_prepared(prepared.clone());
+        }
+        crate::continuation::for_each_epoch_overlapped_counted(
             &elf,
             private_inputs,
             epoch_size_log2,
             &artifacts,
+            on_count.as_ref().map(|f| f as &(dyn Fn(usize) + Sync)),
             |p| {
-                epochs.push(prove_epoch::<H>(
+                let index = p.index as usize;
+                let proof = prove_epoch::<H>(
                     &elf,
                     elf_bytes,
                     &p.register_init,
@@ -1812,7 +1854,11 @@ pub fn prove_continuation(
                     opts,
                     Some(decode_commitment),
                     &prepared,
-                )?);
+                )?;
+                if let Some(observer) = observer {
+                    observer.on_epoch_proved(index, &proof);
+                }
+                epochs.push(proof);
                 Ok(())
             },
         )?
