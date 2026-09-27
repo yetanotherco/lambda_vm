@@ -6670,7 +6670,14 @@ fn the_production_tree_composes_to_a_root() {
         start_stark_lead_in(&inputs.elf_bytes, &inner, want, helpers)
     });
     if lead_in.is_none() {
-        println!("   GAP I7 ({GAP_I7_ENV}): off");
+        println!(
+            "   GAP I7 ({GAP_I7_ENV}): {}",
+            if gap_i7_enabled() {
+                "set, but this run LOADS the base, so there is no base tail to build in — inactive"
+            } else {
+                "off"
+            }
+        );
     }
     let t = Instant::now();
     let bundle = cached_bundle(
