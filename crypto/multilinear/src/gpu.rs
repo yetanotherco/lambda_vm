@@ -37,6 +37,9 @@ static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 static LEAN_OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Device folds that ran every level in one launch.
 static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Folds of a codeword the device holds, in one launch or one per level: what
+/// [`FUSED_FOLD_CALLS`] is a share of.
+static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -57,6 +60,11 @@ static ROOM_TURNS: AtomicU64 = AtomicU64::new(0);
 /// ★ Group openings whose room the card would not give back — see
 /// [`take_turn`] for what the opening does then.
 static ROOM_TURN_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Rooms a group sized, for its commits or its openings' turn.
+static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones sized to the turn they cover rather than to a whole
+/// base codeword (`LAMBDA_VM_NO_WHIR_ROOM_RESIZE`).
+static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -103,6 +111,25 @@ pub fn fused_fold_calls() -> u64 {
     FUSED_FOLD_CALLS.load(Ordering::Relaxed)
 }
 
+/// Folds of a codeword the device holds, fused or level by level.
+pub fn resident_fold_calls() -> u64 {
+    RESIDENT_FOLD_CALLS.load(Ordering::Relaxed)
+}
+
+/// The rounds a stacked opening runs over its shares, as this process reads
+/// `LAMBDA_VM_WHIR_LEAN_ROUNDS` (or a test's override). `0` in a build without
+/// a device, where no opening runs there.
+pub fn lean_rounds_in_effect() -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        lean_rounds()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// Stacked openings over a device codeword whose factors were built on the
 /// host — see [`OPEN_HOST_FALLBACKS`]. Zero in a build without a device, where
 /// no codeword is on one.
@@ -139,6 +166,25 @@ pub fn room_turn_refusals() -> u64 {
     ROOM_TURN_REFUSALS.load(Ordering::Relaxed)
 }
 
+/// Rooms a group sized, for its commits or its openings' turn.
+pub fn room_sizings() -> u64 {
+    ROOM_SIZINGS.load(Ordering::Relaxed)
+}
+
+/// Rooms sized to the turn they cover rather than to a whole base codeword.
+pub fn rooms_turn_sized() -> u64 {
+    ROOMS_TURN_SIZED.load(Ordering::Relaxed)
+}
+
+/// Called where a group sizes a room: `turn_sized` unless
+/// `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` has it promise a whole codeword.
+pub(crate) fn note_room_sized(turn_sized: bool) {
+    ROOM_SIZINGS.fetch_add(1, Ordering::Relaxed);
+    if turn_sized {
+        ROOMS_TURN_SIZED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     HOST_FALLBACKS.store(0, Ordering::Relaxed);
@@ -150,10 +196,13 @@ pub fn reset_call_counters() {
     OPEN_CALLS.store(0, Ordering::Relaxed);
     LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
+    RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     ROOM_PARKS.store(0, Ordering::Relaxed);
     ROOM_TURNS.store(0, Ordering::Relaxed);
     ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
+    ROOM_SIZINGS.store(0, Ordering::Relaxed);
+    ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -2772,6 +2821,7 @@ impl DeviceCodeword {
         } else {
             math_cuda::whir::fold_resident(&self.0, two_inv, &g_invs, &raw_alphas).ok()?
         };
+        RESIDENT_FOLD_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(Self(folded))
     }
 

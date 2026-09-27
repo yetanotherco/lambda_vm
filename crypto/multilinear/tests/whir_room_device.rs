@@ -404,15 +404,35 @@ fn a_groups_turns_hold_what_their_rooms_promise() {
     );
 }
 
+/// Rooms sized, and of those sized to their turn, since `from`.
+fn sizings_since(from: (u64, u64)) -> (u64, u64) {
+    (
+        gpu::room_sizings() - from.0,
+        gpu::rooms_turn_sized() - from.1,
+    )
+}
+
 #[test]
 fn a_group_promises_the_card_what_its_turns_take() {
     let c = case(16, 2);
     a_declined_opening_is_counted(&c);
     gpu::force_room_resize(Some(false));
+    let from = (gpu::room_sizings(), gpu::rooms_turn_sized());
     the_room_is_given_back_between_the_commits_and_the_openings(&c, codeword_bytes(&c));
+    let (sized, turn_sized) = sizings_since(from);
+    assert!(
+        sized > 0 && turn_sized == 0,
+        "resize off: {sized} rooms sized, {turn_sized} to their turn (want some, and none)"
+    );
     gpu::force_room_resize(Some(true));
     let turns = gpu::room_turns_for(&c.layout, &config(), true);
+    let from = (gpu::room_sizings(), gpu::rooms_turn_sized());
     the_room_is_given_back_between_the_commits_and_the_openings(&c, turns.commit.max(turns.open));
+    let (sized, turn_sized) = sizings_since(from);
+    assert!(
+        sized > 0 && turn_sized == sized,
+        "resize on: {sized} rooms sized, {turn_sized} to their turn (want all)"
+    );
     a_refused_turn_is_counted_and_still_opens_on_the_device(&c);
     gpu::force_room_resize(None);
     a_groups_turns_hold_what_their_rooms_promise();

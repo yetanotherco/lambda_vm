@@ -89,7 +89,9 @@ enum Turn {
 /// run it allocate beside the codewords ([`crate::gpu::room_turns_for`]), or
 /// one base codeword whatever the turn under `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`.
 fn room_bytes(layout: &StackedLayout, config: &ChainConfig, staged: bool, turn: Turn) -> u64 {
-    if !crate::gpu::room_resize() {
+    let resize = crate::gpu::room_resize();
+    crate::gpu::note_room_sized(resize);
+    if !resize {
         return (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
     }
     let turns = crate::gpu::room_turns_for(layout, config, staged);

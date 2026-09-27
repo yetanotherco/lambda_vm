@@ -118,6 +118,7 @@ fn prove_arm<H: WhirHash>(
     )
     .unwrap();
     let (lean_before, fused_before) = (gpu::lean_open_calls(), gpu::fused_fold_calls());
+    let (opens_before, folds_before) = (gpu::open_calls(), gpu::resident_fold_calls());
     let proof = stacked_eval::prove::<F, Ext, _, H>(
         &stacked,
         &columns,
@@ -132,6 +133,15 @@ fn prove_arm<H: WhirHash>(
         gpu::lean_open_calls() - lean_before,
         gpu::fused_fold_calls() - fused_before,
     );
+    // The totals the production log reads each share against: both arms open
+    // and fold on the device, so a share of zero is the path off, never a
+    // path that did not run.
+    let (opens, folds) = (
+        gpu::open_calls() - opens_before,
+        gpu::resident_fold_calls() - folds_before,
+    );
+    assert!(opens > 0, "{}: no opening ran on the device", H::NAME);
+    assert!(folds > 0, "{}: no fold ran on the device", H::NAME);
     if lean {
         assert!(
             lean_opens > 0,
@@ -139,6 +149,12 @@ fn prove_arm<H: WhirHash>(
             H::NAME
         );
         assert!(fused_folds > 0, "{}: the fused fold was not taken", H::NAME);
+        assert_eq!(
+            (lean_opens, fused_folds),
+            (opens, folds),
+            "{}: every opening lean and every fold fused",
+            H::NAME
+        );
     } else {
         assert_eq!(
             lean_opens,
