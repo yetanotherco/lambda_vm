@@ -150,3 +150,20 @@ fn whir_commit_with_the_mobius_past_the_limit() {
         "2^29 at spacing 1: legacy and engine encodings disagree"
     );
 }
+
+/// The control: with the split pushed back past the limit (65,536 blocks in
+/// y, the old geometry), the same 2^29 transform must be refused by the device
+/// — the failure the fix removes, reproduced in the same binary, so the passing
+/// tests above are not passing for some other reason.
+#[test]
+#[ignore = "a 4 GiB transform: run alone on the box"]
+fn the_unsplit_launch_is_refused_at_65536_blocks() {
+    let x = felts(0x6553_6000, 1 << 29);
+    // Not `expect_err`: its message would print the 2^29 values on success.
+    match with_grid_y_cap(1 << 16, || math_cuda::ntt::forward(&x)) {
+        Ok(v) => panic!("a 65,536-block grid.y launched ({} values back)", v.len()),
+        Err(err) => println!("grid_limits: unsplit 2^29 forward NTT refused as expected: {err:?}"),
+    }
+    let split = math_cuda::ntt::forward(&x).expect("the split launch runs");
+    assert_eq!(split.len(), x.len());
+}
