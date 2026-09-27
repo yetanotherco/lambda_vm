@@ -375,6 +375,60 @@ pub fn column_offsets(widths: &[usize]) -> Vec<usize> {
 /// handful of polynomials rather than one per table.
 pub const MAX_STACK_VARS: usize = 25;
 
+/// ⚠ EXPERIMENT E2 (gap-fix S2, throwaway branch `gap-fix/struct-e2`): the
+/// widest stack `LAMBDA_VM_GAP_S2_STACK` may ask for.
+///
+/// 28 puts one base codeword at 8 GiB, the largest the experiment measures.
+/// The device commit indexes a codeword with `u32`
+/// (`math_cuda::whir::commit_from` asserts `n <= u32::MAX`), so the hard
+/// ceiling at blowup 4 would be 30.
+pub const MAX_GAP_STACK_VARS: usize = 28;
+
+/// The stack cap this process builds at: [`MAX_STACK_VARS`], unless the E2
+/// knob `LAMBDA_VM_GAP_S2_STACK` names a value in
+/// `MAX_STACK_VARS..=MAX_GAP_STACK_VARS`.
+///
+/// Read once and printed once (`GAP S2 STACK:`), so every log says which arm
+/// produced it. It is a verifier-side constant like the one it overrides: the
+/// prover, the host verifier and the LFM's WHIR emitters all take their
+/// layouts from [`global_layout`], so one process agrees with itself, and a
+/// proof made under one value does not verify under another. A value that does
+/// not parse, or lies outside the range, refuses loudly: quietly running the
+/// default would turn a B arm into an A arm.
+pub fn max_stack_vars() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var("LAMBDA_VM_GAP_S2_STACK").ok();
+        let cap = stack_cap_from(raw.as_deref())
+            .unwrap_or_else(|why| panic!("LAMBDA_VM_GAP_S2_STACK: {why}"));
+        eprintln!(
+            "GAP S2 STACK: max_stack_vars={cap} (LAMBDA_VM_GAP_S2_STACK={})",
+            raw.as_deref().unwrap_or("<unset>")
+        );
+        cap
+    })
+}
+
+/// The parse behind [`max_stack_vars`], apart from the environment so a test
+/// can drive it: unset gives [`MAX_STACK_VARS`]; anything else must be an
+/// integer in `MAX_STACK_VARS..=MAX_GAP_STACK_VARS`.
+pub fn stack_cap_from(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(MAX_STACK_VARS);
+    };
+    let cap: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{raw:?} is not an integer"))?;
+    if (MAX_STACK_VARS..=MAX_GAP_STACK_VARS).contains(&cap) {
+        Ok(cap)
+    } else {
+        Err(format!(
+            "{cap} is outside {MAX_STACK_VARS}..={MAX_GAP_STACK_VARS}"
+        ))
+    }
+}
+
 /// The stack every table's columns share, from their shapes alone.
 ///
 /// `shapes` is `(columns, height in variables)` per table, in table order. The
@@ -383,8 +437,18 @@ pub const MAX_STACK_VARS: usize = 25;
 /// up to its own power of two.
 ///
 /// Columns that do not fit spill into another polynomial — see
-/// [`MAX_STACK_VARS`], which is what stops one proof-sized allocation.
+/// [`MAX_STACK_VARS`], which is what stops one proof-sized allocation — at the
+/// process's cap, [`max_stack_vars`].
 pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError> {
+    global_layout_capped(shapes, max_stack_vars())
+}
+
+/// [`global_layout`] at an explicit stack cap. At [`MAX_STACK_VARS`] it is
+/// today's layout; [`global_layout`] calls it with the process's cap.
+pub fn global_layout_capped(
+    shapes: &[(usize, usize)],
+    cap: usize,
+) -> Result<StackedLayout, MlError> {
     let heights: Vec<usize> = shapes
         .iter()
         .flat_map(|&(width, num_vars)| std::iter::repeat_n(num_vars, width))
@@ -393,7 +457,7 @@ pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError
     let want = cells.next_power_of_two().trailing_zeros() as usize;
     // Never narrower than the tallest column, or it would not fit at all.
     let tallest = heights.iter().copied().max().unwrap_or(0);
-    let n_stack = want.min(MAX_STACK_VARS).max(tallest);
+    let n_stack = want.min(cap).max(tallest);
     StackedLayout::build(&heights, n_stack)
 }
 
@@ -1671,6 +1735,92 @@ mod tests {
             num_queries: 3,
             grind: GrindBits::default(),
             format: multilinear::whir_chain::ChainFormat::DEFAULT,
+        }
+    }
+
+    /// Epoch 1's main commitment group on block 25368371, as the WHIR census
+    /// printed it (`GAPB TABLE epoch1` lines, every table but L2G, in table
+    /// order): `(columns, height in variables)`, 384 columns, 238,087,104 cells.
+    const EPOCH1_MAIN_GROUP: [(usize, usize); 19] = [
+        (21, 20),
+        (6, 20),
+        (10, 5),
+        (5, 7),
+        (38, 21),
+        (17, 20),
+        (29, 18),
+        (49, 17),
+        (29, 20),
+        (18, 19),
+        (26, 11),
+        (14, 17),
+        (10, 21),
+        (10, 21),
+        (10, 18),
+        (12, 13),
+        (26, 17),
+        (16, 19),
+        (38, 10),
+    ];
+
+    /// E2's knob takes an integer in `MAX_STACK_VARS..=MAX_GAP_STACK_VARS` and
+    /// refuses everything else; unset is today's cap.
+    #[test]
+    fn the_e2_stack_knob_accepts_its_range_and_refuses_the_rest() {
+        assert_eq!(stack_cap_from(None), Ok(MAX_STACK_VARS));
+        for (raw, cap) in [("25", 25), ("27", 27), (" 28 ", 28)] {
+            assert_eq!(stack_cap_from(Some(raw)), Ok(cap), "{raw:?}");
+        }
+        for raw in ["", "24", "29", "30", "x", "27.5", "-27"] {
+            assert!(stack_cap_from(Some(raw)).is_err(), "{raw:?} must refuse");
+        }
+    }
+
+    /// The layout arithmetic E2's prediction rests on, on a real epoch: 8
+    /// polynomials of 25 variables today (the measured chain count), 4, 2 and
+    /// 1 at caps 26, 27 and 28. `global_layout` is the capped function at the
+    /// process's cap, which is today's when the knob is unset.
+    #[test]
+    fn a_wider_stack_cap_packs_an_epoch_into_fewer_polynomials() {
+        let cells: usize = EPOCH1_MAIN_GROUP
+            .iter()
+            .map(|&(width, num_vars)| width << num_vars)
+            .sum();
+        assert_eq!(cells, 238_087_104);
+        for (cap, polys) in [(25, 8), (26, 4), (27, 2), (28, 1)] {
+            let layout = global_layout_capped(&EPOCH1_MAIN_GROUP, cap).unwrap();
+            assert_eq!(layout.n_stack(), cap, "cap {cap}");
+            assert_eq!(layout.num_polys(), polys, "cap {cap}");
+        }
+        let process = global_layout(&EPOCH1_MAIN_GROUP).unwrap();
+        let capped = global_layout_capped(&EPOCH1_MAIN_GROUP, max_stack_vars()).unwrap();
+        assert_eq!(process.n_stack(), capped.n_stack());
+        assert_eq!(process.placements(), capped.placements());
+        if std::env::var_os("LAMBDA_VM_GAP_S2_STACK").is_none() {
+            assert_eq!(max_stack_vars(), MAX_STACK_VARS, "unset knob = today's cap");
+            assert_eq!(process.num_polys(), 8, "unset knob = today's layout");
+        }
+    }
+
+    /// The caps E2 measures leave the query count alone: under the production
+    /// `first6` schedule 25 variables fold in 6 rounds and 26–28 in 6, 7 and
+    /// 7, and 7 rounds still buy 112 queries at 128 bits with a 20-bit query
+    /// grind. A cap of 29 would be 7 rounds too; the knob stops at 28.
+    #[test]
+    fn the_e2_stack_caps_keep_the_query_count() {
+        use multilinear::whir_chain::{FirstFold, WhirFolds};
+        let first6 = WhirFolds::First(FirstFold::new(6).unwrap());
+        for (num_vars, rounds) in [(25, 6), (26, 6), (27, 7), (28, 7)] {
+            let config = ChainConfig::with_security_folds(
+                2,
+                4,
+                first6,
+                num_vars,
+                128,
+                GrindBits::uniform(20),
+            );
+            assert_eq!(config.rounds(num_vars), rounds, "{num_vars} variables");
+            assert_eq!(config.num_queries, 112, "{num_vars} variables");
         }
     }
 

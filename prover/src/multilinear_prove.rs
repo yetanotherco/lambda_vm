@@ -107,6 +107,15 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
         .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
         .max()
         .unwrap_or(1);
+    // ⚠ EXPERIMENT E2: under a stack cap above today's, a stacked polynomial can
+    // be taller than any one table's own stack, and the Q rule charges the
+    // tallest STACKED polynomial's rounds. Charging the cap is never less than
+    // that. At the default cap nothing changes.
+    let tallest = if multilinear_table::max_stack_vars() > multilinear_table::MAX_STACK_VARS {
+        tallest.max(multilinear_table::max_stack_vars())
+    } else {
+        tallest
+    };
     let config = ChainConfig::with_security_folds(
         2,
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
