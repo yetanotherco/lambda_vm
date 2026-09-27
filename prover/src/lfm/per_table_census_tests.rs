@@ -254,6 +254,7 @@ impl Tenant {
         ChipSet {
             keccak: self.keccak,
             blake3: !self.algebraic,
+            bitwise: true,
         }
     }
 

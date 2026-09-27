@@ -5054,7 +5054,7 @@ fn every_registry_mask_is_the_programs_own_usage() {
         // And the mask is bound: a different one is a different identity.
         let other = super::airs::ChipSet {
             keccak: !computed.keccak,
-            blake3: computed.blake3,
+            ..computed
         };
         let _ = &opts;
         assert_ne!(

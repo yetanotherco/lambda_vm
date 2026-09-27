@@ -493,6 +493,13 @@ fn verify_against_chunked_with(
     if chip_set.keccak != (keccak_rnd_chunks > 0) {
         return false;
     }
+    // GAP R1: a mask without BITWISE is only well formed for a set that sends
+    // BITWISE nothing. Dropped from a set with a sender, the sender's lookups
+    // would have no receiver to be checked against — so the predicate the
+    // artifacts were built with is re-checked here, on the mask as handed in.
+    if !chip_set.bitwise && chip_set.bitwise_required(hasher) {
+        return false;
+    }
     let view = MultiProofView::Owned(proof);
     if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) {
         return false;

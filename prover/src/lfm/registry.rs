@@ -561,7 +561,7 @@ pub fn build_artifacts_with_hasher(
     // them: zero KECCAK_RND instances when the keccak family is absent, since
     // the chunking policy's floor of one exists only to keep an unused chip
     // present.
-    let chip_set = ChipSet::for_program(program);
+    let chip_set = ChipSet::for_program_with_hasher(program, hasher);
     let keccak_rnd_chunks = chip_set.keccak_rnd_chunks(
         program
             .chunking
@@ -825,6 +825,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: false,
             blake3: false,
+            bitwise: true,
         },
         program_id: [
             0xff, 0xaf, 0xf6, 0xee, 0xf4, 0xdc, 0x28, 0x7f, 0xf3, 0x94, 0xd1, 0x91, 0x61, 0x3c,
@@ -918,6 +919,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: false,
             blake3: false,
+            bitwise: true,
         },
         program_id: [
             0x55, 0xb6, 0x4c, 0xed, 0x57, 0x0c, 0xb1, 0x99, 0xc6, 0x05, 0xd8, 0x19, 0x77, 0x07,
@@ -1011,6 +1013,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: true,
             blake3: false,
+            bitwise: true,
         },
         program_id: [
             0x55, 0x79, 0xf4, 0xc0, 0x15, 0xb3, 0xd9, 0x73, 0xc1, 0x7d, 0xe0, 0x41, 0x58, 0xaa,
@@ -1104,6 +1107,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: true,
             blake3: false,
+            bitwise: true,
         },
         program_id: [
             0x0a, 0x94, 0x02, 0xe9, 0x21, 0x34, 0xae, 0xbc, 0x2a, 0xcb, 0xbb, 0x94, 0x2b, 0xdf,
@@ -1197,6 +1201,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: false,
             blake3: true,
+            bitwise: true,
         },
         program_id: [
             0x4d, 0xf6, 0x91, 0xc0, 0x40, 0xd6, 0x21, 0x39, 0xb8, 0x4a, 0x72, 0xe0, 0xcc, 0x1c,
@@ -1290,6 +1295,7 @@ pub static LFM_REGISTRY: &[LfmRegistryEntry] = &[
         chip_set: ChipSet {
             keccak: false,
             blake3: true,
+            bitwise: true,
         },
         program_id: [
             0x5f, 0x89, 0x18, 0xf9, 0x16, 0xd3, 0xc5, 0xb8, 0x38, 0xfe, 0x73, 0x6e, 0x5f, 0xc0,

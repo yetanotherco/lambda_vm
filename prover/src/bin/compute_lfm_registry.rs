@@ -78,8 +78,8 @@ fn main() {
             );
             println!("        hasher: HasherKind::{:?},", artifacts.hasher);
             println!(
-                "        chip_set: ChipSet {{ keccak: {}, blake3: {} }},",
-                artifacts.chip_set.keccak, artifacts.chip_set.blake3
+                "        chip_set: ChipSet {{ keccak: {}, blake3: {}, bitwise: {} }},",
+                artifacts.chip_set.keccak, artifacts.chip_set.blake3, artifacts.chip_set.bitwise
             );
             println!("        program_id: {},", fmt_bytes(&artifacts.program_id));
             println!("    }},");
