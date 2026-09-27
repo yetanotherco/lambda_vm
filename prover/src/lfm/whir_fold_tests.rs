@@ -296,3 +296,226 @@ fn the_point_chain_holds_at_the_widest_indices() {
          highest factors; only {top_half} of them were"
     );
 }
+
+// ============================================================================
+// The lean fold, against the same host and the same shapes
+// ============================================================================
+
+use super::whir_fold::{
+    emit_fold_coset_lean, fold_coset_constants_lean, fold_coset_rows_lean, lean_prepare_rows,
+    prepare_lean_alphas,
+};
+
+/// [`fold_program`] with the lean fold: the round's `½·α` prepared once, then
+/// one fold.
+fn lean_fold_program(log_domain: usize, levels: usize, index_bits: usize) -> LfmProgram {
+    let block = 1usize << levels;
+    let domain = Domain::<F>::new(log_domain).expect("a domain of that size");
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena((block + levels + 1) as u32);
+
+    let values: Vec<Ext> = (0..block)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let alphas: Vec<Ext> = (0..levels)
+        .map(|i| b.hint_word(arena, (block + i) as u32).as_ext())
+        .collect();
+    let index = b.hint_felt(arena, (block + levels) as u32);
+    let bits: Vec<Bit> = b.bit_dec(index, index_bits);
+
+    let prepared = prepare_lean_alphas(&mut b, &alphas);
+    let folded = emit_fold_coset_lean(&mut b, &values, &domain, &bits, &prepared);
+    b.public(folded.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the lean fold leg must be admissible");
+    program
+}
+
+/// ★ The lean fold's F1: rows and interned constants, by count and by value.
+#[test]
+fn the_lean_fold_emits_its_closed_form() {
+    for &(log_domain, levels, index_bits) in SHAPES {
+        let block = 1usize << levels;
+        let program = lean_fold_program(log_domain, levels, index_bits);
+        let constants = const_rows(&program);
+        let measured = program.instrs.len()
+            - fold_plumbing(block, levels)
+            - constants
+            - lean_prepare_rows(levels);
+        assert_eq!(
+            measured,
+            fold_coset_rows_lean(block, index_bits),
+            "a lean block of {block} on 2^{log_domain} at {index_bits} index bits"
+        );
+        assert!(
+            measured < fold_coset_rows(block, index_bits),
+            "the lean fold must be cheaper than the classic one"
+        );
+        let named = fold_coset_constants_lean(
+            &Domain::<F>::new(log_domain).expect("a domain"),
+            levels,
+            index_bits,
+        );
+        let interned: Vec<LfmWord> = program
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                super::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named.len(), interned.len(), "a lean block of {block}");
+        for word in &named {
+            assert!(
+                interned.contains(word),
+                "a lean block of {block}: named, not interned"
+            );
+        }
+        for word in &interned {
+            assert!(
+                named.contains(word),
+                "a lean block of {block}: interned, not named"
+            );
+        }
+    }
+}
+
+/// ★ The lean leg computes what `whir_commit::fold_coset` computes — over
+/// extension blocks, over round 0's base blocks, and at the widest indices.
+#[test]
+fn the_lean_fold_computes_what_the_host_computes() {
+    for &(log_domain, levels, index_bits) in SHAPES {
+        let block = 1usize << levels;
+        let domain = Domain::<F>::new(log_domain).expect("a domain");
+        let program = lean_fold_program(log_domain, levels, index_bits);
+        for seed in [0x21u64, 0x63] {
+            let alphas: Vec<FEE> = (0..levels).map(|i| fee(seed * 91 + 1 + i as u64)).collect();
+            let ext_values: Vec<FEE> = (0..block).map(|i| fee(seed * 17 + i as u64)).collect();
+            let base_values: Vec<FE> = (0..block).map(|i| fe(seed * 13 + i as u64)).collect();
+            for index in [0usize, 1, 3, (1 << index_bits) - 1] {
+                let want_ext = fold_coset::<F, E, E>(&ext_values, &domain, index, &alphas)
+                    .expect("the host folds the block");
+                let words: Vec<LfmWord> = ext_values.iter().map(ext_word).collect();
+                let exec = execute(
+                    &program,
+                    &[fold_arena(&words, &alphas, index)],
+                    &crate::hash_pin::BLOCK_HASHER,
+                )
+                .expect("the lean fold executes");
+                assert_eq!(
+                    word_as_ext(&exec.public_words[0].1).expect("a value"),
+                    want_ext,
+                    "ext block {block} on 2^{log_domain}, index {index}, seed {seed:#x}"
+                );
+
+                let want_base = fold_coset::<F, F, E>(&base_values, &domain, index, &alphas)
+                    .expect("the host folds the base block");
+                let words: Vec<LfmWord> = base_values
+                    .iter()
+                    .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                    .collect();
+                let exec = execute(
+                    &program,
+                    &[fold_arena(&words, &alphas, index)],
+                    &crate::hash_pin::BLOCK_HASHER,
+                )
+                .expect("the lean fold executes over a base block");
+                assert_eq!(
+                    word_as_ext(&exec.public_words[0].1).expect("a value"),
+                    want_base,
+                    "base block {block} on 2^{log_domain}, index {index}, seed {seed:#x}"
+                );
+            }
+        }
+    }
+    // The deepest fold at indices spanning the whole domain.
+    let (log_domain, levels, index_bits) = (6usize, 4usize, 6usize);
+    let block = 1usize << levels;
+    let domain = Domain::<F>::new(log_domain).expect("a domain");
+    let program = lean_fold_program(log_domain, levels, index_bits);
+    let values: Vec<FEE> = (0..block).map(|i| fee(0x99 + i as u64)).collect();
+    let alphas: Vec<FEE> = (0..levels).map(|i| fee(0x5150 + i as u64)).collect();
+    let words: Vec<LfmWord> = values.iter().map(ext_word).collect();
+    let half = 1usize << (log_domain - 1);
+    for index in [half - 1, half, half + 1, (1 << log_domain) - 1] {
+        let want = fold_coset::<F, E, E>(&values, &domain, index, &alphas).expect("host");
+        let exec = execute(
+            &program,
+            &[fold_arena(&words, &alphas, index)],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .expect("the lean fold executes");
+        assert_eq!(
+            word_as_ext(&exec.public_words[0].1).expect("a value"),
+            want,
+            "the lean point chain at index {index}"
+        );
+    }
+}
+
+/// ★ Load-bearing, not incidental: one changed opened value or one changed
+/// challenge moves the lean fold's output off the host's fold of the originals.
+#[test]
+fn the_lean_fold_moves_with_every_input() {
+    let (log_domain, levels, index_bits) = (8usize, 4usize, 4usize);
+    let block = 1usize << levels;
+    let domain = Domain::<F>::new(log_domain).expect("a domain");
+    let program = lean_fold_program(log_domain, levels, index_bits);
+    let values: Vec<FEE> = (0..block).map(|i| fee(0x777 + i as u64)).collect();
+    let alphas: Vec<FEE> = (0..levels).map(|i| fee(0x888 + i as u64)).collect();
+    let index = 5usize;
+    let honest = fold_coset::<F, E, E>(&values, &domain, index, &alphas).expect("host");
+    let run = |values: &[FEE], alphas: &[FEE]| -> FEE {
+        let words: Vec<LfmWord> = values.iter().map(ext_word).collect();
+        let exec = execute(
+            &program,
+            &[fold_arena(&words, alphas, index)],
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .expect("the lean fold executes");
+        word_as_ext(&exec.public_words[0].1).expect("a value")
+    };
+    assert_eq!(run(&values, &alphas), honest);
+    for slot in 0..block {
+        let mut tampered = values.clone();
+        tampered[slot] += FEE::one();
+        assert_ne!(
+            run(&tampered, &alphas),
+            honest,
+            "value {slot} must reach the output"
+        );
+    }
+    for level in 0..levels {
+        let mut tampered = alphas.clone();
+        tampered[level] += FEE::one();
+        assert_ne!(
+            run(&values, &tampered),
+            honest,
+            "alpha {level} must reach the output"
+        );
+    }
+}
+
+/// The lean fold is the default; `LAMBDA_VM_WHIR_FOLD_CLASSIC=1` selects the
+/// classic one, and a test's override is scoped to its closure.
+#[test]
+fn the_fold_default_is_lean_and_the_opt_out_is_classic() {
+    use super::whir_fold::{CLASSIC_FOLD_ENV, FoldEmission, with_fold_emission};
+    assert_eq!(CLASSIC_FOLD_ENV, "LAMBDA_VM_WHIR_FOLD_CLASSIC");
+    assert_eq!(FoldEmission::from_setting(None), FoldEmission::Lean);
+    assert_eq!(FoldEmission::from_setting(Some("0")), FoldEmission::Lean);
+    assert_eq!(FoldEmission::from_setting(Some("1")), FoldEmission::Classic);
+    let outside = FoldEmission::current();
+    for fold in [FoldEmission::Lean, FoldEmission::Classic] {
+        assert_eq!(with_fold_emission(fold, FoldEmission::current), fold);
+    }
+    assert_eq!(FoldEmission::current(), outside, "the override is scoped");
+}
+
+/// A typo stops the run rather than emitting the default under the other
+/// fold's name.
+#[test]
+#[should_panic(expected = "must be 0 or 1")]
+fn a_malformed_fold_setting_stops_the_run() {
+    let _ = super::whir_fold::FoldEmission::from_setting(Some("lean"));
+}

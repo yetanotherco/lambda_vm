@@ -34,6 +34,9 @@ const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
 /// Separates the `LFM_BLAKE3` chunk tail from the fixed part of the preimage.
 /// See the suffix note in [`lfm_program_id`].
 const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
+
+/// Domain tag of the `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
+const LFM_HASH_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_HASH_CHUNKS_V1";
 /// `pub(super)`: the aggregation layer's emitted verifier replays
 /// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
 pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
@@ -105,6 +108,36 @@ pub fn lfm_program_id(
     blake3_chunk_roots: &[Commitment],
     blake3_chunk_log_heights: &[u8],
 ) -> Commitment {
+    lfm_program_id_chunked(
+        roots,
+        log_heights,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+        blake3_chunk_roots,
+        blake3_chunk_log_heights,
+        &[],
+        &[],
+    )
+}
+
+/// [`lfm_program_id`] for a program whose `LFM_HASH` may be split:
+/// `hash_chunk_roots` / `hash_chunk_log_heights` list every chunk, chunk 0 being
+/// slot 5's own entry. A one-chunk (or empty) list absorbs NOTHING, so an
+/// unsplit program keeps the digest it always had; a split one absorbs chunks
+/// 1.. as a length-prefixed tail under its own tag, after the `LFM_BLAKE3` tail.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm_program_id_chunked(
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    log_heights: &[u8; NUM_LFM_CHIPS],
+    keccak_rnd_chunks: usize,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+    blake3_chunk_roots: &[Commitment],
+    blake3_chunk_log_heights: &[u8],
+    hash_chunk_roots: &[Commitment],
+    hash_chunk_log_heights: &[u8],
+) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
@@ -153,6 +186,22 @@ pub fn lfm_program_id(
             .zip(blake3_chunk_log_heights)
             .skip(1)
         {
+            h.update(root);
+            h.update([*height]);
+        }
+    }
+    // The hash tail, on the same length-prefixed terms: chunk 0 is bound above
+    // as slot 5, so only chunks 1.. are absorbed, and a distinct tag keeps it
+    // apart from the BLAKE3 tail when both are present.
+    debug_assert_eq!(
+        hash_chunk_roots.len(),
+        hash_chunk_log_heights.len(),
+        "an LFM_HASH chunk has exactly one root and one height"
+    );
+    if hash_chunk_roots.len() > 1 {
+        h.update(LFM_HASH_CHUNK_TAG);
+        h.update(((hash_chunk_roots.len() - 1) as u64).to_le_bytes());
+        for (root, height) in hash_chunk_roots.iter().zip(hash_chunk_log_heights).skip(1) {
             h.update(root);
             h.update([*height]);
         }

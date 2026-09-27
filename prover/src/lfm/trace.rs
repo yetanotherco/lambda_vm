@@ -29,6 +29,9 @@ pub struct LfmTraces {
     pub select: TraceTable<F, E>,
     pub bitdec: TraceTable<F, E>,
     pub hash: TraceTable<F, E>,
+    /// `LFM_HASH` chunks 1.. — empty unless the program's policy split
+    /// the table (`chunking::HashChunking`); [`Self::hash`] is then chunk 0.
+    pub hash_tail: Vec<TraceTable<F, E>>,
     pub keccak: TraceTable<F, E>,
     /// One trace per `LFM_BLAKE3` chunk (see [`super::chunking::Blake3Chunking`]).
     /// A `Vec` even when the policy is the default single table, so the prove and
@@ -501,8 +504,40 @@ pub(super) fn build_traces_walked(
             .collect();
         histogram.add_ops(&blake3_socket::bitwise_ops_for(&rows));
     }
-    let mut bitwise_trace = bitwise::generate_bitwise_trace();
-    histogram.fill_multiplicities(&mut bitwise_trace);
+    // A program whose mask drops BITWISE skips the `2^20`-row fill, and an
+    // empty placeholder stands in the struct. The histogram above is empty in
+    // exactly that case — the mask drops the table only when no instantiated
+    // chip sends it a lookup — so the table it stands for is all zero, which is
+    // what `LfmAirs::air_trace_pairs` pairs if the artifacts keep BITWISE.
+    let bitwise_trace = if super::airs::ChipSet::for_program_with_hasher(program, hasher).bitwise {
+        let mut trace = bitwise::generate_bitwise_trace();
+        histogram.fill_multiplicities(&mut trace);
+        trace
+    } else {
+        TraceTable::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1)
+    };
+
+    // `LFM_HASH` is filled per chunk, each from its own slice of the
+    // group and of the records. An unsplit program fills the whole group in
+    // place, as before; a split one materializes one chunk group at a time.
+    let hash_count = program.hash_chunk_count();
+    let hash_trace = |c: usize| {
+        let chunk = (hash_count > 1).then(|| program.hash_chunk_group(c));
+        let base = program.hash_chunking.chunk_range(g.hash.real_rows, c).start;
+        chip_trace(
+            walk,
+            chunk.as_ref().unwrap_or(&g.hash),
+            hash::num_columns(hasher),
+            |row, out| {
+                fill_hash_row(
+                    hasher,
+                    &records.hash[base + row],
+                    hash_modes[base + row],
+                    out,
+                )
+            },
+        )
+    };
 
     LfmTraces {
         const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
@@ -534,9 +569,8 @@ pub(super) fn build_traces_walked(
             out[bitdec::cols::Z] = r.z;
             out[bitdec::cols::GINV] = r.ginv;
         }),
-        hash: chip_trace(walk, &g.hash, hash::num_columns(hasher), |row, out| {
-            fill_hash_row(hasher, &records.hash[row], hash_modes[row], out)
-        }),
+        hash: hash_trace(0),
+        hash_tail: (1..hash_count).map(hash_trace).collect(),
         keccak: chip_trace(walk, &g.keccak, keccak::cols::NUM_COLUMNS, |row, out| {
             let r = &records.keccak[row];
             for lane in 0..25 {
