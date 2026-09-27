@@ -1723,7 +1723,14 @@ pub fn coset_lde_row_major_split_trees_rpl(
                 &nodes_dev,
                 nodes_bytes,
             )?;
-            pending_pre = Some((pending, nodes_dev));
+            // Freed now, stream-ordered behind the copy (`async_dtoh_via`'s
+            // contract: `nodes_dev` was allocated on this stream), so the
+            // multiplicity tree below can take its bytes. One subset tree at a
+            // time on the card, which is what the commit's admitted device set
+            // counts (`stark::device_set::CommitDeviceSet::tree_bytes`); held
+            // to the copy-out, both trees were live at once, one tree over.
+            drop(nodes_dev);
+            pending_pre = Some(pending);
         } else {
             let mut nodes_host = vec![0u8; nodes_bytes];
             stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
@@ -1734,11 +1741,10 @@ pub fn coset_lde_row_major_split_trees_rpl(
     // download and host rebuild it used to pay are dropped — R4 openings
     // gather paths on device).
     let mult_nodes_dev = build_subset_tree_dev(split_col as u64, cols_u64)?;
-    if let Some((pending, nodes_dev)) = pending_pre {
+    if let Some(pending) = pending_pre {
         // The multiplicity tree is queued behind the D2H, so this copy-out
-        // runs while its kernels do. `nodes_dev` lives until the DMA landed.
+        // runs while its kernels do.
         precomputed_nodes = Some(pending.wait_and_read(copy_out_parallel)?);
-        drop(nodes_dev);
     }
     if let Some(t0) = download_t0 {
         note_precomputed_download(nodes_bytes, t0.elapsed());
