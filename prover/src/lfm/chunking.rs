@@ -504,7 +504,7 @@ impl Default for BaluChunking {
 /// program shape: committed per chunk, bound into `program_id`, never read off
 /// a proof. Off, every program is one table — the machine before the split
 /// existed, byte for byte.
-pub const HASH_SPLIT_DEFAULT: bool = false;
+pub const HASH_SPLIT_DEFAULT: bool = true;
 
 /// `LAMBDA_VM_LFM_HASH_SPLIT`: `0` keeps one table, `1` splits by the rule,
 /// unset is [`HASH_SPLIT_DEFAULT`]. Anything else stops the run.
