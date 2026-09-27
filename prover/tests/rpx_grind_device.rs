@@ -178,3 +178,28 @@ fn a_device_grind_is_exactly_what_the_counter_reports() {
         "the counter must be one per successful device grind, not a flag"
     );
 }
+
+/// ★ The prove split's `n/airs on device` counts RPX device grinds.
+///
+/// Each `PROVE SPLIT` line takes its device grinds as a delta of
+/// `stark::prove_split::device_grinds_now`. That read the keccak counter alone,
+/// so under RPX every line said `0/airs on device` while every table ground on
+/// the card. This reads the same function around one RPX device grind; the
+/// keccak-only count reads 0 here and fails.
+#[test]
+fn the_prove_split_counts_an_rpx_device_grind() {
+    let _serial = serial();
+    let seed = seed_of(0x3D);
+    reset_gpu_grind_calls();
+    let before = stark::prove_split::device_grinds_now();
+
+    let nonce = generate_nonce_maybe_gpu::<Rpx>(&seed, FACTOR).expect("a nonce exists");
+
+    assert!(is_valid_nonce::<Rpx>(&seed, nonce, FACTOR));
+    assert_eq!(gpu_grind_calls_rpx(), 1, "the grind ran on the RPX kernel");
+    assert_eq!(
+        stark::prove_split::device_grinds_now() - before,
+        1,
+        "the prove split must count the RPX device grind"
+    );
+}
