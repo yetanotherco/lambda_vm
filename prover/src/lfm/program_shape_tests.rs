@@ -81,6 +81,43 @@ fn the_bitwise_default_drops_the_table_and_the_opt_out_keeps_it() {
     }
 }
 
+/// ★ The opt-out is the machine as it was, digest for digest: keeping `BITWISE`
+/// in the two registry programs that send it nothing reproduces the
+/// `program_id`s their rows carried before the table became conditional (the
+/// rows now carry the default's).
+#[test]
+fn keeping_bitwise_reproduces_the_legacy_registry_digests() {
+    use super::programs::fri_toy_program;
+    let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    for (name, program, legacy) in [
+        (
+            "TrivialV0",
+            trivial_program(),
+            "ffaff6eef4dc287ff394d191613cda007d2ec76daa6e38966481deed27fd68de",
+        ),
+        (
+            "FriToyV0",
+            fri_toy_program(),
+            "55b64ced570cb199c605d819770701c23e0b93da00c6b46d99d57ec06bb649f4",
+        ),
+    ] {
+        let built = build_artifacts(&program, &options());
+        assert_eq!(
+            built.chip_set.bitwise,
+            keep_bitwise(),
+            "{name}: sends BITWISE nothing, so only the opt-out keeps it"
+        );
+        let kept = under_mask(
+            &built,
+            ChipSet {
+                bitwise: true,
+                ..built.chip_set
+            },
+        );
+        assert_eq!(hex(&kept.program_id), legacy, "{name}: the legacy digest");
+    }
+}
+
 /// ★ THE PREMISE THE MASK RESTS ON, read off the interaction lists: the only chips
 /// that touch a bus `BITWISE` receives are the keccak family, `LFM_BLAKE3`, and
 /// the hash chip under the BLAKE3 socket. If any other chip gains a byte lookup,
