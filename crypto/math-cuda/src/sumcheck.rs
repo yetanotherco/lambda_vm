@@ -96,6 +96,9 @@ pub struct SumcheckSession {
     /// Three u64 of scratch for the round's challenge, written in place rather
     /// than allocated per fold.
     r_dev: CudaSlice<u64>,
+    /// Gap fix K7: the device budget held for a slot file grown past
+    /// [`SLOT_BUDGET_BYTES`], released with the session.
+    _k7_room: Option<crate::device::DeviceReservation>,
 }
 
 thread_local! {
@@ -121,6 +124,35 @@ impl SumcheckSession {
         consts: &[u64],
         num_slots: usize,
         root_slot: u32,
+    ) -> Result<Self> {
+        Self::new_inner(factors, nodes, consts, num_slots, root_slot, None)
+    }
+
+    /// [`new`](Self::new) with its launches shaped under an explicit thread
+    /// ceiling instead of the slot budget's, for the parity test that pins gap
+    /// fix K7: a round's sums must not depend on how many threads ran it.
+    pub fn with_thread_ceiling(
+        factors: &[&[u64]],
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+        ceiling: u64,
+    ) -> Result<Self> {
+        assert!(
+            (MIN_BLOCK as u64..=MAX_THREADS).contains(&ceiling),
+            "a ceiling the launch shapes accept"
+        );
+        Self::new_inner(factors, nodes, consts, num_slots, root_slot, Some(ceiling))
+    }
+
+    fn new_inner(
+        factors: &[&[u64]],
+        nodes: &[u64],
+        consts: &[u64],
+        num_slots: usize,
+        root_slot: u32,
+        ceiling_override: Option<u64>,
     ) -> Result<Self> {
         assert!(!factors.is_empty(), "a sumcheck needs a factor");
         assert!(nodes.len().is_multiple_of(2), "two u64 per step");
@@ -158,9 +190,8 @@ impl SumcheckSession {
         };
         let factor_ptrs = crate::device::htod_or_trim(&stream, &addresses)?;
 
-        let ceiling = thread_ceiling(num_slots);
-        let (grid, block) = launch_shape(ceiling, (stride / 2) as u64);
-        let num_threads = grid as u64 * block as u64;
+        let (ceiling, num_threads, slots, k7_room) =
+            slot_file(&stream, num_slots, (stride / 2) as u64, ceiling_override)?;
         let widest = widest_grid(ceiling, (stride / 2) as u64);
 
         let nodes_dev = crate::device::htod_or_trim(&stream, nodes)?;
@@ -173,7 +204,6 @@ impl SumcheckSession {
                 consts
             },
         )?;
-        let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
         // Every partial the round reads is one the round wrote.
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
@@ -201,6 +231,7 @@ impl SumcheckSession {
             t_dev,
             t_host: Vec::new(),
             r_dev,
+            _k7_room: k7_room,
         })
     }
 
@@ -231,9 +262,8 @@ impl SumcheckSession {
 
         let be = backend()?;
         let width = addresses.len();
-        let ceiling = thread_ceiling(num_slots);
-        let (grid, block) = launch_shape(ceiling, (len / 2) as u64);
-        let num_threads = grid as u64 * block as u64;
+        let (ceiling, num_threads, slots, k7_room) =
+            slot_file(&stream, num_slots, (len / 2) as u64, None)?;
         let widest = widest_grid(ceiling, (len / 2) as u64);
         let factor_ptrs = crate::device::htod_or_trim(&stream, addresses)?;
         let nodes_dev = crate::device::htod_or_trim(&stream, nodes)?;
@@ -245,7 +275,6 @@ impl SumcheckSession {
                 consts
             },
         )?;
-        let slots = unsafe { alloc_or_trim::<u64>(&stream, num_slots * 3 * num_threads as usize) }?;
         let partials = unsafe { alloc_or_trim::<u64>(&stream, MAX_NODES * widest as usize * 3) }?;
         let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, MAX_NODES * 3)?;
         let r_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, 3)?;
@@ -273,6 +302,7 @@ impl SumcheckSession {
             t_dev,
             t_host: Vec::new(),
             r_dev,
+            _k7_room: k7_room,
         })
     }
 
@@ -500,6 +530,87 @@ fn thread_ceiling(num_slots: usize) -> u64 {
     (SLOT_BUDGET_BYTES / per_thread.max(1))
         .min(MAX_THREADS)
         .max(MIN_BLOCK as u64)
+}
+
+/// Gap fix K7: the thread ceiling a session of `num_slots` live values gets
+/// when [`thread_ceiling`] leaves it under
+/// [`crate::gap_kern::K7_TARGET_THREADS`] — the slot budget grown to
+/// [`crate::gap_kern::k7_slot_budget_bytes`], up to the target — or `None`
+/// where the switch is off or the default already reaches it. A wide program's
+/// early rounds ran at 253 blocks of 32 threads, 3 % occupancy on 170
+/// multiprocessors, latency-bound on its slot file.
+fn k7_ceiling(num_slots: usize) -> Option<u64> {
+    if !crate::gap_kern::k7() {
+        return None;
+    }
+    widened_ceiling(num_slots, crate::gap_kern::k7_slot_budget_bytes())
+}
+
+/// [`k7_ceiling`]'s arithmetic, free of the switch: the ceiling a slot budget
+/// of `budget` bytes buys, up to [`crate::gap_kern::K7_TARGET_THREADS`], when
+/// that is more than [`thread_ceiling`] gives.
+fn widened_ceiling(num_slots: usize, budget: u64) -> Option<u64> {
+    let base = thread_ceiling(num_slots);
+    let per_thread = num_slots as u64 * 3 * 8;
+    let wide = (budget / per_thread.max(1))
+        .min(crate::gap_kern::K7_TARGET_THREADS)
+        .min(MAX_THREADS);
+    (wide > base).then_some(wide)
+}
+
+/// A session's slot file, sized for its first round's launch: the thread
+/// ceiling it was sized under, the threads it holds, the buffer, and — when gap
+/// fix K7 grew it — the device budget reserved for the growth. The growth is
+/// taken only if the budget grants it and the card holds it; otherwise the
+/// session gets exactly the file it would have had without K7. An explicit
+/// `ceiling_override` (the parity test's) replaces the slot budget's ceiling.
+#[allow(clippy::type_complexity)]
+fn slot_file(
+    stream: &Arc<CudaStream>,
+    num_slots: usize,
+    first_half: u64,
+    ceiling_override: Option<u64>,
+) -> Result<(
+    u64,
+    u64,
+    CudaSlice<u64>,
+    Option<crate::device::DeviceReservation>,
+)> {
+    let base = ceiling_override.unwrap_or_else(|| thread_ceiling(num_slots));
+    let threads_at = |ceiling: u64| {
+        let (grid, block) = launch_shape(ceiling, first_half);
+        grid as u64 * block as u64
+    };
+    let base_threads = threads_at(base);
+    if let Some(wide) = k7_ceiling(num_slots).filter(|_| ceiling_override.is_none()) {
+        let threads = threads_at(wide);
+        if threads > base_threads {
+            let extra = (threads - base_threads) * num_slots as u64 * 3 * 8;
+            let grown = crate::device::reserve(extra).and_then(|room| {
+                // A plain allocation, not `alloc_or_trim`: a growth the card
+                // cannot hold is not worth a device-wide drain.
+                unsafe { stream.alloc::<u64>(num_slots * 3 * threads as usize) }
+                    .ok()
+                    .map(|slots| (slots, room))
+            });
+            crate::gap_kern::note_k7_shape(
+                num_slots,
+                first_half,
+                base_threads,
+                threads,
+                grown.is_some(),
+            );
+            match grown {
+                Some((slots, room)) => {
+                    crate::gap_kern::bump(&crate::gap_kern::K7_WIDENED);
+                    return Ok((wide, threads, slots, Some(room)));
+                }
+                None => crate::gap_kern::bump(&crate::gap_kern::K7_DECLINED),
+            }
+        }
+    }
+    let slots = unsafe { alloc_or_trim::<u64>(stream, num_slots * 3 * base_threads as usize) }?;
+    Ok((base, base_threads, slots, None))
 }
 
 /// The `(grid, block)` a launch of `work` indices takes, given the thread
@@ -1335,6 +1446,34 @@ mod tests {
                     }
                     work /= 2;
                 }
+            }
+        }
+    }
+
+    /// Gap fix K7 grows exactly the sessions the slot budget starves, and by
+    /// the budget's ratio: the 253-block round's program (~2763 live values at
+    /// 8096 threads) gets 4x the threads from 4x the budget; a precompile-wide
+    /// one (1036) reaches the 65536 target; a narrow one already has it.
+    #[test]
+    fn k7_widens_only_the_starved_sessions() {
+        let budget = 2048u64 << 20;
+        assert_eq!(thread_ceiling(2763), 8096);
+        assert_eq!(widened_ceiling(2763, budget), Some(32_384));
+        assert_eq!(thread_ceiling(1036), 21_592);
+        assert_eq!(widened_ceiling(1036, budget), Some(65_536));
+        // 74 live values: 302,292 threads by default, past the target.
+        assert_eq!(widened_ceiling(74, budget), None);
+        // At the default budget there is nothing to grow into.
+        assert_eq!(widened_ceiling(2763, SLOT_BUDGET_BYTES), None);
+        // A widened ceiling still shapes launches the partials can hold.
+        for slots in [1036usize, 2763, 8192] {
+            let Some(ceiling) = widened_ceiling(slots, budget) else {
+                continue;
+            };
+            for log_half in 0..22u32 {
+                let first = 1u64 << log_half;
+                let widest = widest_grid(ceiling, first);
+                assert!(launch_shape(ceiling, first).0 <= widest);
             }
         }
     }

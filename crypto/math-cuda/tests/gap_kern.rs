@@ -1,4 +1,4 @@
-//! Gap fix K6 against the paths it replaces (lane KERN).
+//! Gap fixes K6 and K7 against the paths they replace (lane KERN).
 //!
 //! Each fix computes the same field elements as the code it replaces, so each
 //! test runs both on the same inputs and compares canonically — the device
@@ -12,7 +12,9 @@
 //!   `deep_composition_ext3_fully_resident_keep` fed the scan's inverses, and
 //!   against a host port of the DEEP sum;
 //! - K6 `barycentric_*_chunked_with_dev_inv_denoms` against the one-block-per-
-//!   column kernels they replace, at a nonzero offset into a multi-point buffer.
+//!   column kernels they replace, at a nonzero offset into a multi-point buffer;
+//! - K7: a sumcheck's rounds and folds at two thread ceilings against each other
+//!   and the host.
 //!
 //! Needs a GPU, like every test in this directory.
 
@@ -540,4 +542,90 @@ fn k6_chunked_single_point_sums_match() {
     chunked_bary_matches(20, 4, 2, 2);
     chunked_bary_matches(16, 2, 3, 3);
     chunked_bary_matches(12, 2, 2, 4);
+}
+
+// ---------------------------------------------------------------------------
+// K7: a round's sums do not depend on the thread ceiling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn k7_rounds_do_not_depend_on_the_thread_ceiling() {
+    use multilinear::gpu::{ext3_from_raw, ext3_raw, lower};
+    use multilinear::mle::Mle;
+    use multilinear::program::Builder;
+    use multilinear::sumcheck::round_evaluations_for_program;
+
+    let (num_vars, width, degree) = (14usize, 6usize, 3usize);
+    let factors: Vec<Mle<Ext3>> = (0..width)
+        .map(|k| {
+            let mut rng = ChaCha8Rng::seed_from_u64(700 + k as u64);
+            Mle::new(
+                (0..1usize << num_vars)
+                    .map(|_| rand_fp3(&mut rng))
+                    .collect(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut b = Builder::<Ext3>::new();
+    let mut acc = b.var(0);
+    for slot in 1..width {
+        let v = b.var(slot);
+        let sq = b.mul(v, v);
+        let t = b.add(sq, acc);
+        acc = b.mul(t, v);
+    }
+    let program = b.finish(acc).unwrap();
+    let lowered = lower(&program).unwrap();
+    let raw: Vec<&[u64]> = factors
+        .iter()
+        .map(|f| unsafe {
+            core::slice::from_raw_parts(f.evals().as_ptr() as *const u64, f.len() * 3)
+        })
+        .collect();
+    let mut t = Vec::new();
+    for node in 1..=degree {
+        t.extend_from_slice(&ext3_raw(&Fp3::from(node as u64)).unwrap());
+    }
+
+    // A narrow ceiling (the grid strides many indices per thread, as the
+    // starved sessions did) and a wide one (a thread per index).
+    let new = |ceiling| {
+        math_cuda::sumcheck::SumcheckSession::with_thread_ceiling(
+            &raw,
+            &lowered.nodes,
+            &lowered.consts,
+            lowered.num_slots,
+            lowered.root_slot,
+            ceiling,
+        )
+        .unwrap()
+    };
+    let mut narrow = new(64);
+    let mut wide = new(1 << 13);
+    let mut folded = factors.clone();
+    for round in 0..4 {
+        let a: Vec<Fp3> = narrow
+            .round(&t)
+            .unwrap()
+            .chunks_exact(3)
+            .map(ext3_from_raw::<Ext3>)
+            .collect();
+        let b: Vec<Fp3> = wide
+            .round(&t)
+            .unwrap()
+            .chunks_exact(3)
+            .map(ext3_from_raw::<Ext3>)
+            .collect();
+        let host = round_evaluations_for_program(&folded, &program, degree).unwrap();
+        assert_eq!(a, host, "narrow ceiling, round {round}");
+        assert_eq!(b, host, "wide ceiling, round {round}");
+        let r = Fp3::new([Fp::from(3 + round as u64), Fp::from(9), Fp::from(1)]);
+        let r_raw = ext3_raw(&r).unwrap();
+        narrow.fold(&r_raw).unwrap();
+        wide.fold(&r_raw).unwrap();
+        for f in &mut folded {
+            f.fix_first_variable_in_place(&r).unwrap();
+        }
+    }
 }
