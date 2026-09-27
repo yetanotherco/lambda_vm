@@ -167,6 +167,11 @@ pub(crate) fn build_inner_tree_levels(
 ) -> Result<()> {
     let (level_fn, tail_fn) = match hash {
         crate::DeviceHash::Keccak256 => (&be.keccak_merkle_level, &be.keccak_merkle_tail),
+        // ⚠ GAP K3 (temporary): with the knob on, the RPX walk is `crate::rpx`'s,
+        // where the half-warp kernels live; off, this path is unchanged.
+        crate::DeviceHash::Rpx256 if crate::gap_hash::knobs().k3 => {
+            return crate::rpx::build_inner_tree_levels(stream, be, nodes_dev, leaves_len);
+        }
         crate::DeviceHash::Rpx256 => (&be.rpx_merkle_level, &be.rpx_merkle_tail),
         // ⚠ REFUSE rather than fall through. BLAKE3 does have inner-tree
         // kernels, but they are walked by `crate::blake3` with its own tail

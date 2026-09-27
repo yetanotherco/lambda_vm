@@ -79,6 +79,15 @@ fn to_real_arch(arch: &str) -> String {
 /// stack corruption in the kernel the day one side moves without the other.
 const BARY_MAX_EVAL_POINTS: usize = 8;
 
+/// ⚠ GAP K5 (temporary): the RPX permutation variants compiled as whole cubins
+/// (`rpx_k5_v<V>.cubin`) — `RPX_PERMUTE_VARIANT` in `kernels/rpx.cu`, a bit set
+/// of limb multiply (1), limb square (2), unrolled `square_n` (4), unrolled lane
+/// loops (8). `LAMBDA_VM_GAP_K5=<V>` loads that cubin in place of `rpx.cubin`,
+/// so one build serves the probe bench and every A/B arm. Mirrored into Rust
+/// (`gap_hash::K5_VARIANTS`, `device::RPX_K5_CUBINS`) by the generated files
+/// below.
+const RPX_K5_VARIANTS: [u32; 4] = [1, 3, 5, 7];
+
 fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -170,6 +179,31 @@ fn main() {
         ),
     )
     .expect("failed to write bary_consts.rs");
+    // GAP K5: the compiled variants, and the table of their embedded cubins.
+    let variants: Vec<String> = RPX_K5_VARIANTS.iter().map(|v| v.to_string()).collect();
+    fs::write(
+        out_dir.join("rpx_k5_consts.rs"),
+        format!(
+            "/// The permutation variants compiled as `rpx_k5_v<V>.cubin` (build.rs).\n\
+             pub const K5_VARIANTS: [u32; {}] = [{}];\n",
+            RPX_K5_VARIANTS.len(),
+            variants.join(", ")
+        ),
+    )
+    .expect("failed to write rpx_k5_consts.rs");
+    let entries: String = RPX_K5_VARIANTS
+        .iter()
+        .map(|v| {
+            format!(
+                "    ({v}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/rpx_k5_v{v}.cubin\"))),\n"
+            )
+        })
+        .collect();
+    fs::write(
+        out_dir.join("rpx_k5_cubins.rs"),
+        format!("const RPX_K5_CUBINS: &[(u32, &[u8])] = &[\n{entries}];\n"),
+    )
+    .expect("failed to write rpx_k5_cubins.rs");
 
     // Headers aren't compiled, so emit rerun-if-changed to rebuild on
     // header edits.
@@ -207,8 +241,19 @@ fn main() {
     compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);
     // RPX256 (XHash12) leaves and parents — the algebraic hash's device
     // kernels. Pinned on the host by `tests/host_kat/rpx_host_kat.cpp`; the
-    // cubin needs no `-D`: RPX has no compile-time knob.
+    // shipped cubin needs no `-D` (variant 0 is the source's default).
     compile_kernel("rpx.cu", "rpx.cubin", have_nvcc, &[]);
+    // GAP K5 (temporary): the same source at each candidate permutation
+    // variant, one of which `LAMBDA_VM_GAP_K5=<V>` loads instead of `rpx.cubin`.
+    for v in RPX_K5_VARIANTS {
+        let define = format!("-DRPX_PERMUTE_VARIANT={v}");
+        compile_kernel(
+            "rpx.cu",
+            &format!("rpx_k5_v{v}.cubin"),
+            have_nvcc,
+            &[&define],
+        );
+    }
     compile_kernel("logup.cu", "logup.cubin", have_nvcc, &[]);
     compile_kernel(
         "constraint_interp.cu",

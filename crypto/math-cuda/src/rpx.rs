@@ -490,7 +490,166 @@ pub(crate) fn launch_fri_leaves_ext3(
 /// nodes bottom-up. Twin of [`crate::blake3::build_inner_tree_levels`], with
 /// the same tail cutover: one single-block launch takes over once a level is no
 /// wider than the block, where per-level launch overhead dominates the work.
+///
+/// ⚠ GAP K3 (temporary): under `LAMBDA_VM_GAP_K3=1` the narrow levels and the
+/// tail run [`TreeWalk::WARP`] — the same nodes, byte for byte.
 pub(crate) fn build_inner_tree_levels(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+) -> Result<()> {
+    let walk = if crate::gap_hash::knobs().k3 {
+        TreeWalk::WARP
+    } else {
+        TreeWalk::Shipped
+    };
+    build_inner_tree_levels_with(stream, be, nodes_dev, leaves_len, walk)
+}
+
+/// ⚠ GAP K3: which kernels walk an RPX tree's inner levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeWalk {
+    /// `rpx_merkle_level` per level (a thread per parent), then
+    /// `rpx_merkle_tail` (one 128-thread block) from 128 pairs up.
+    Shipped,
+    /// The shipped per-level kernel while a level is wider than
+    /// `level_max_pairs`; `rpx_merkle_level_warp` (a half-warp per parent) down
+    /// to `tail_max_pairs`; then ONE `rpx_merkle_tail_warp` block for the rest.
+    Warp {
+        level_max_pairs: u64,
+        tail_max_pairs: u64,
+    },
+}
+
+impl TreeWalk {
+    /// The production K3 walk. A level of up to 16,384 pairs is one latency of
+    /// the half-warp permutation (or close to it) where the shipped kernel pays
+    /// one single-thread chain (~119 µs at the block's clock, NCU-5090 §2);
+    /// wider levels already run the shipped kernel at the leaf rate. The tail
+    /// takes the last 64 pairs, one pass of a 1,024-thread block per level.
+    pub const WARP: Self = Self::Warp {
+        level_max_pairs: 16_384,
+        tail_max_pairs: TAIL_WARP_MAX_PAIRS,
+    };
+}
+
+/// Pairs one `rpx_merkle_tail_warp` block of 1,024 threads covers in one pass
+/// (32 warps, two parents each); the kernel's `__launch_bounds__`.
+pub const TAIL_WARP_MAX_PAIRS: u64 = 64;
+
+/// Threads per block for `rpx_merkle_level_warp`: four warps, eight parents.
+const LEVEL_WARP_BLOCK_DIM: u32 = 128;
+
+/// [`build_inner_tree_levels`] under an explicit walk, so tests and benches
+/// can run both in one process.
+pub fn build_inner_tree_levels_with(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+    walk: TreeWalk,
+) -> Result<()> {
+    let (level_max_pairs, tail_max_pairs) = match walk {
+        TreeWalk::Shipped => {
+            return build_inner_tree_levels_shipped(stream, be, nodes_dev, leaves_len);
+        }
+        TreeWalk::Warp {
+            level_max_pairs,
+            tail_max_pairs,
+        } => (
+            level_max_pairs,
+            tail_max_pairs.clamp(1, TAIL_WARP_MAX_PAIRS),
+        ),
+    };
+    let mut level_begin: u64 = (leaves_len - 1) as u64;
+    while level_begin != 0 {
+        let new_begin = level_begin / 2;
+        let n_pairs = level_begin - new_begin;
+        if n_pairs <= tail_max_pairs {
+            launch_merkle_tail_warp(stream, be, nodes_dev, level_begin, n_pairs)?;
+            return Ok(());
+        }
+        if n_pairs <= level_max_pairs {
+            launch_merkle_level_warp(stream, be, nodes_dev, new_begin, n_pairs)?;
+        } else {
+            launch_merkle_level(stream, be, nodes_dev, new_begin, n_pairs)?;
+        }
+        level_begin = new_begin;
+    }
+    Ok(())
+}
+
+fn launch_merkle_level(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    parent_begin: u64,
+    n_pairs: u64,
+) -> Result<()> {
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_merkle_level)
+            .arg(&mut *nodes_dev)
+            .arg(&parent_begin)
+            .arg(&n_pairs)
+            .launch(rpx_launch_cfg(n_pairs))?;
+    }
+    Ok(())
+}
+
+fn launch_merkle_level_warp(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    parent_begin: u64,
+    n_pairs: u64,
+) -> Result<()> {
+    // Two parents per warp.
+    let pairs_per_block = (LEVEL_WARP_BLOCK_DIM / 16) as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (n_pairs.div_ceil(pairs_per_block) as u32, 1, 1),
+        block_dim: (LEVEL_WARP_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_merkle_level_warp)
+            .arg(&mut *nodes_dev)
+            .arg(&parent_begin)
+            .arg(&n_pairs)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Every level from `level_begin` (whose width is `n_pairs`) to the root in one
+/// block, sized to the widest of those levels: a warp per two of its pairs, up
+/// to 1,024 threads.
+fn launch_merkle_tail_warp(
+    stream: &CudaStream,
+    be: &Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    level_begin: u64,
+    n_pairs: u64,
+) -> Result<()> {
+    let warps = n_pairs.div_ceil(2).clamp(1, TAIL_WARP_MAX_PAIRS / 2) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32 * warps, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_merkle_tail_warp)
+            .arg(&mut *nodes_dev)
+            .arg(&level_begin)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+fn build_inner_tree_levels_shipped(
     stream: &CudaStream,
     be: &Backend,
     nodes_dev: &mut CudaSlice<u8>,
@@ -541,6 +700,17 @@ pub(crate) fn build_inner_tree_levels(
 ///
 /// `leaves_len` must be a power of two and >= 2.
 pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
+    let walk = if crate::gap_hash::knobs().k3 {
+        TreeWalk::WARP
+    } else {
+        TreeWalk::Shipped
+    };
+    build_merkle_tree_on_device_with(hashed_leaves, walk)
+}
+
+/// [`build_merkle_tree_on_device`] under an explicit [`TreeWalk`] (GAP K3's
+/// parity tests build every tree both ways in one process).
+pub fn build_merkle_tree_on_device_with(hashed_leaves: &[u8], walk: TreeWalk) -> Result<Vec<u8>> {
     assert!(hashed_leaves.len().is_multiple_of(32));
     let leaves_len = hashed_leaves.len() / 32;
     assert!(leaves_len >= 2, "tree needs at least two leaves");
@@ -563,7 +733,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
         stream.memcpy_htod(hashed_leaves, &mut slice)?;
     }
 
-    build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
+    build_inner_tree_levels_with(stream.as_ref(), be, &mut nodes_dev, leaves_len, walk)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
@@ -858,4 +1028,319 @@ pub fn permute_probe_sweep(n: usize, iters: usize) -> Result<ProbeSweepPoint> {
         regs,
         blocks_per_sm,
     })
+}
+
+// ===========================================================================
+// ⚠ GAP HASH LANE (K3, K5): parity probes and benches. None of these is a
+// production path; each exists so a test or a bench can run the new kernels
+// beside the shipped ones in one process.
+// ===========================================================================
+
+/// ⚠ GAP K3 parity harness: the half-warp permutation (`rpx_permute_warp_probe`,
+/// this cubin's variant) over `states`, each output canonical — to be compared
+/// with [`permute_probe`] and the host `Rpx256`, raw.
+pub fn permute_warp_probe(states: &[[u64; STATE_FELTS]]) -> Result<Vec<[u64; STATE_FELTS]>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = states.len();
+    let flat: Vec<u64> = states.iter().flatten().copied().collect();
+    let be = backend()?;
+    let stream = be.next_stream();
+    let states_dev = stream.clone_htod(&flat)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(n * STATE_FELTS)?;
+    let n_u64 = n as u64;
+    // Two states per warp, four warps per block.
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(8) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_permute_warp_probe)
+            .arg(&states_dev)
+            .arg(&n_u64)
+            .arg(&mut out_dev)
+            .launch(cfg)?;
+    }
+    let flat_out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(flat_out
+        .chunks_exact(STATE_FELTS)
+        .map(|c| core::array::from_fn(|i| c[i]))
+        .collect())
+}
+
+/// ⚠ GAP K5: the permutation variants this cubin carries a chained probe for.
+pub fn chain_probe_variants() -> Result<Vec<u32>> {
+    Ok(backend()?
+        .rpx_permute_chain_probes
+        .iter()
+        .map(|(v, _)| *v)
+        .collect())
+}
+
+fn chain_probe_kernel(be: &Backend, variant: u32) -> &cudarc::driver::CudaFunction {
+    &be.rpx_permute_chain_probes
+        .iter()
+        .find(|(v, _)| *v == variant)
+        .unwrap_or_else(|| panic!("no chained permutation probe for variant {variant}"))
+        .1
+}
+
+/// ⚠ GAP K5 parity harness: `k` chained permutations of each state at
+/// `variant` (`rpx_permute_chain_probe_v<variant>`), raw.
+pub fn permute_chain_probe(
+    variant: u32,
+    states: &[[u64; STATE_FELTS]],
+    k: u64,
+) -> Result<Vec<[u64; STATE_FELTS]>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = states.len();
+    let flat: Vec<u64> = states.iter().flatten().copied().collect();
+    let be = backend()?;
+    let stream = be.next_stream();
+    let states_dev = stream.clone_htod(&flat)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(n * STATE_FELTS)?;
+    let n_u64 = n as u64;
+    unsafe {
+        stream
+            .launch_builder(chain_probe_kernel(be, variant))
+            .arg(&states_dev)
+            .arg(&n_u64)
+            .arg(&k)
+            .arg(&mut out_dev)
+            .launch(rpx_launch_cfg(n_u64))?;
+    }
+    let flat_out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(flat_out
+        .chunks_exact(STATE_FELTS)
+        .map(|c| core::array::from_fn(|i| c[i]))
+        .collect())
+}
+
+/// ⚠ GAP K5: one timed point of the chained probe at one variant.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainBench {
+    pub variant: u32,
+    /// States (threads) per launch.
+    pub n: u64,
+    /// Permutations per thread per launch.
+    pub k: u64,
+    /// Timed launches (a warm-up launch is excluded).
+    pub iters: u64,
+    pub secs: f64,
+    /// The probe kernel's registers/thread and blocks/SM, as compiled.
+    pub regs: u32,
+    pub blocks_per_sm: u32,
+}
+
+impl ChainBench {
+    /// Nanoseconds per permutation over the whole card.
+    pub fn ns_per_perm(&self) -> f64 {
+        self.secs * 1e9 / (self.n * self.k * self.iters) as f64
+    }
+}
+
+/// ⚠ GAP K5: threads of [`RPX_BLOCK_DIM`] the chained probe at `variant` keeps
+/// resident on this card (multiprocessors × the driver's occupancy for that
+/// kernel), so a bench can launch whole waves: variants differ in registers,
+/// and a fixed launch size would give each a different wave tail.
+pub fn chain_probe_resident_threads(variant: u32) -> Result<u64> {
+    use cudarc::driver::sys::CUdevice_attribute;
+    let be = backend()?;
+    let sms = be
+        .ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
+        .max(1) as u64;
+    let per_sm = chain_probe_kernel(be, variant)
+        .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)?
+        .max(1) as u64;
+    Ok(sms * per_sm * RPX_BLOCK_DIM as u64)
+}
+
+/// ⚠ GAP K5 bench: `iters` launches of `n` threads × `k` chained permutations
+/// at `variant`, after one excluded warm-up; the states are copied in once.
+pub fn permute_chain_bench(variant: u32, n: usize, k: u64, iters: usize) -> Result<ChainBench> {
+    let be = backend()?;
+    let kernel = chain_probe_kernel(be, variant);
+    let stream = be.next_stream();
+    let flat: Vec<u64> = (0..(n as u64) * (STATE_FELTS as u64)).collect();
+    let states_dev = stream.clone_htod(&flat)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(n * STATE_FELTS)?;
+    let n_u64 = n as u64;
+    let cfg = rpx_launch_cfg(n_u64);
+    let launch = |out: &mut CudaSlice<u64>| -> Result<()> {
+        unsafe {
+            stream
+                .launch_builder(kernel)
+                .arg(&states_dev)
+                .arg(&n_u64)
+                .arg(&k)
+                .arg(out)
+                .launch(cfg)?;
+        }
+        Ok(())
+    };
+    launch(&mut out_dev)?;
+    stream.synchronize()?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        launch(&mut out_dev)?;
+    }
+    stream.synchronize()?;
+    let secs = start.elapsed().as_secs_f64();
+    Ok(ChainBench {
+        variant,
+        n: n_u64,
+        k,
+        iters: iters as u64,
+        secs,
+        regs: kernel.num_regs().unwrap_or(0).max(0) as u32,
+        blocks_per_sm: kernel
+            .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)
+            .unwrap_or(0),
+    })
+}
+
+/// ⚠ GAP K5 parity harness: `[mul_limb(a, b), sqr_limb(a), goldilocks::mul(a, b)]`
+/// per pair, computed by the device PTX.
+pub fn limb_probe(a: &[u64], b: &[u64]) -> Result<Vec<[u64; 3]>> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "limb_probe: operand vectors differ in length"
+    );
+    if a.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = a.len();
+    let be = backend()?;
+    let stream = be.next_stream();
+    let a_dev = stream.clone_htod(a)?;
+    let b_dev = stream.clone_htod(b)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(3 * n)?;
+    let n_u64 = n as u64;
+    unsafe {
+        stream
+            .launch_builder(&be.rpx_limb_probe)
+            .arg(&a_dev)
+            .arg(&b_dev)
+            .arg(&n_u64)
+            .arg(&mut out_dev)
+            .launch(rpx_launch_cfg(n_u64))?;
+    }
+    let flat = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+}
+
+/// ⚠ GAP K3: which kernel [`level_bench`] times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelKernel {
+    /// `rpx_merkle_level`: a thread per parent (the shipped level).
+    Shipped,
+    /// `rpx_merkle_level_warp`: a half-warp per parent.
+    Warp,
+    /// `rpx_merkle_tail`: one 128-thread block, every level from `n_pairs` up.
+    ShippedTail,
+    /// `rpx_merkle_tail_warp`: one block of a warp per two pairs (≤ 1,024
+    /// threads), every level from `n_pairs` up.
+    WarpTail,
+}
+
+/// Random node bytes for a tree of `leaves_len` leaves, on the device. Any
+/// bytes are fair for timing and for kernel-versus-kernel parity: the kernels
+/// decode big-endian words without reducing them.
+fn random_tree_dev(
+    stream: &Arc<CudaStream>,
+    leaves_len: usize,
+    seed: u64,
+) -> Result<CudaSlice<u8>> {
+    // Only the leaf region carries data (a word at a time); every inner node
+    // is written by a walk before it is read.
+    let mut host = vec![0u8; (2 * leaves_len - 1) * 32];
+    let mut s = seed;
+    for word in host[(leaves_len - 1) * 32..].chunks_exact_mut(8) {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        word.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+    }
+    stream.clone_htod(&host)
+}
+
+/// ⚠ GAP K3 bench: seconds per launch of one level kernel at `n_pairs` (a
+/// power of two), `iters` launches back to back on one stream after an excluded
+/// warm-up — launch gaps included, as in a tree walk. A tail kernel runs every
+/// level from `n_pairs` up to the root.
+pub fn level_bench(kind: LevelKernel, n_pairs: u64, iters: usize) -> Result<f64> {
+    assert!(
+        n_pairs.is_power_of_two(),
+        "level_bench: n_pairs must be a power of two"
+    );
+    let be = backend()?;
+    let stream = be.next_stream();
+    // The bottom level of a tree of 2·n_pairs leaves.
+    let leaves_len = (2 * n_pairs) as usize;
+    let mut nodes = random_tree_dev(&stream, leaves_len, n_pairs)?;
+    let level_begin = (leaves_len - 1) as u64;
+    let parent_begin = level_begin / 2;
+    let once = |nodes: &mut CudaSlice<u8>| -> Result<()> {
+        match kind {
+            LevelKernel::Shipped => launch_merkle_level(&stream, be, nodes, parent_begin, n_pairs),
+            LevelKernel::Warp => {
+                launch_merkle_level_warp(&stream, be, nodes, parent_begin, n_pairs)
+            }
+            LevelKernel::ShippedTail => {
+                let cfg = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (RPX_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&be.rpx_merkle_tail)
+                        .arg(&mut *nodes)
+                        .arg(&level_begin)
+                        .launch(cfg)?;
+                }
+                Ok(())
+            }
+            LevelKernel::WarpTail => {
+                launch_merkle_tail_warp(&stream, be, nodes, level_begin, n_pairs)
+            }
+        }
+    };
+    once(&mut nodes)?;
+    stream.synchronize()?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        once(&mut nodes)?;
+    }
+    stream.synchronize()?;
+    Ok(start.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// ⚠ GAP K3 bench: seconds per inner-tree walk of `leaves_len` random leaves
+/// under `walk`, `iters` walks back to back after an excluded warm-up (the
+/// leaves stay in place, so every walk is the same work).
+pub fn tree_bench(leaves_len: usize, walk: TreeWalk, iters: usize) -> Result<f64> {
+    assert!(leaves_len.is_power_of_two() && leaves_len >= 2);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut nodes = random_tree_dev(&stream, leaves_len, leaves_len as u64)?;
+    build_inner_tree_levels_with(stream.as_ref(), be, &mut nodes, leaves_len, walk)?;
+    stream.synchronize()?;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        build_inner_tree_levels_with(stream.as_ref(), be, &mut nodes, leaves_len, walk)?;
+    }
+    stream.synchronize()?;
+    Ok(start.elapsed().as_secs_f64() / iters as f64)
 }
