@@ -1323,6 +1323,9 @@ pub(crate) fn for_each_epoch_overlapped(
     })
 }
 
+/// Every epoch's boundary, in epoch order.
+pub(crate) type EpochBoundaries = Vec<Arc<Vec<CellBoundary>>>;
+
 /// [`for_each_epoch_overlapped`], with each epoch's host preparation moved onto
 /// the producer thread too (gap fix I4): `prep` turns every [`PreparedEpoch`]
 /// into what `each` proves before it is handed over, and once the last epoch
@@ -1340,7 +1343,7 @@ pub(crate) fn for_each_epoch_overlapped_prepped<T, G>(
     prep: impl Fn(PreparedEpoch) -> Result<T, Error> + Send,
     tail: impl FnOnce(&[Arc<Vec<CellBoundary>>]) -> Result<G, Error> + Send,
     mut each: impl FnMut(T) -> Result<(), Error>,
-) -> Result<(Vec<Arc<Vec<CellBoundary>>>, G), Error>
+) -> Result<(EpochBoundaries, G), Error>
 where
     T: Send,
     G: Send,
@@ -1393,6 +1396,10 @@ struct BuildJob {
 
 /// What a trace builder hands the STARK base's prover: a built epoch, or —
 /// under gap fix I4 — one whose host preparation ([`prep_epoch`]) is done too.
+///
+/// Unboxed `Built` on purpose: it is today's channel item, moved once per
+/// epoch, and the knob-off path keeps exactly its allocations.
+#[allow(clippy::large_enum_variant)]
 enum ReadyEpoch {
     Built(PreparedEpoch),
     Prepped { index: u64, prep: Box<EpochPrep> },
@@ -2819,7 +2826,7 @@ pub(crate) fn prove_continuation_scheduled(
     // Gap fix I4: the helper below takes the boundary receiver, so the drain
     // after the scope finds it gone.
     let mut boundary_rx = Some(boundary_rx);
-    type GlobalAhead = Result<(Vec<Arc<Vec<CellBoundary>>>, GlobalPrep), Error>;
+    type GlobalAhead = Result<(EpochBoundaries, GlobalPrep), Error>;
     type ScopeOut = Result<(Vec<EpochResult>, Option<GlobalAhead>), Error>;
     let (mut results, global_ahead) = std::thread::scope(|scope| -> ScopeOut {
         let elf_ref = &elf;
