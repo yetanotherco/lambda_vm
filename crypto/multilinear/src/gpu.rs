@@ -37,6 +37,19 @@ static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 static LEAN_OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Device folds that ran every level in one launch.
 static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// ★ Stacked openings whose codeword the device holds but whose factors the
+/// device did not build from the shares.
+///
+/// The opening's twin of [`HOST_FALLBACKS`], and until this counter it had no
+/// name either: `open_shared` declining sends the chain to `Factors::new`,
+/// which assembles the stacked polynomial and its weight table on the host — a
+/// base copy of the stack and an extension table three times its size — before
+/// trying the device once more with the tables built. Nothing else rises or
+/// falls when that happens: [`OPEN_CALLS`] only fails to rise, and an expected
+/// count is itself derived. It matters most where the card is fullest, which
+/// is where an opening runs without the turn its group asked for (see
+/// `stacked_eval::StackedCommitment`).
+static OPEN_HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn commit_calls() -> u64 {
     COMMIT_CALLS.load(Ordering::Relaxed)
@@ -83,6 +96,23 @@ pub fn fused_fold_calls() -> u64 {
     FUSED_FOLD_CALLS.load(Ordering::Relaxed)
 }
 
+/// Stacked openings over a device codeword whose factors were built on the
+/// host — see [`OPEN_HOST_FALLBACKS`]. Zero in a build without a device, where
+/// no codeword is on one.
+pub fn open_host_fallbacks() -> u64 {
+    OPEN_HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Called where a stacked opening over a device codeword builds its factors on
+/// the host: counted, and said, because nothing else would show it.
+pub(crate) fn note_open_host_fallback(n_stack: usize) {
+    let count = OPEN_HOST_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] opening factors built on the HOST over a device codeword (stack 2^{n_stack}); \
+         open host fallbacks {count}"
+    );
+}
+
 pub fn open_calls() -> u64 {
     OPEN_CALLS.load(Ordering::Relaxed)
 }
@@ -98,6 +128,7 @@ pub fn reset_call_counters() {
     OPEN_CALLS.store(0, Ordering::Relaxed);
     LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
+    OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -1832,6 +1863,20 @@ pub fn force_fused_fold(on: Option<bool>) {
     );
 }
 
+/// Whether [`open_shared`] declines as a full card would make it, so a test can
+/// reach the path [`note_open_host_fallback`] counts without filling one.
+#[cfg(feature = "cuda")]
+static SHARED_OPEN_DECLINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every stacked opening's device factors decline while `on` — for the
+/// test that the host path they fall to is counted. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_shared_open_declined(on: bool) {
+    SHARED_OPEN_DECLINED.store(on, Ordering::Relaxed);
+}
+
 /// Factors a build declined to upload. Never constructed.
 #[cfg(not(feature = "cuda"))]
 pub struct OpeningFactors(std::convert::Infallible);
@@ -2112,7 +2157,9 @@ where
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some()) {
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some())
+        || SHARED_OPEN_DECLINED.load(Ordering::Relaxed)
+    {
         return None;
     }
     let lowered = lower(program)?;
