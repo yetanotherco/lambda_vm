@@ -21,6 +21,15 @@ static COMMIT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// fills near the end of an epoch turns into gigabytes of host memory and a
 /// utilisation figure that looks like a scheduling problem.
 static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// ★ Commits the device was ASKED for and answered with an error — the part of
+/// [`host_fallbacks`] that is not a policy decline (the size threshold, the
+/// kill switch): a refused reservation (`CUDA_ERROR_OUT_OF_MEMORY`), a failed
+/// allocation, launch or copy. Each one is also logged with its error. The
+/// launch that can never succeed is why this exists: a WHIR base commit at
+/// stack 27 launched a tile past CUDA's grid limit, every such commit fell back
+/// to the host, and the error — the one thing that named the cause — was
+/// dropped (`thoughts/zf/gap/fix/STRUCT.md` §9.2).
+static COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Sumchecks whose rounds ran on device.
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
@@ -40,6 +49,32 @@ pub fn commit_calls() -> u64 {
 
 pub fn host_fallbacks() -> u64 {
     HOST_FALLBACKS.load(Ordering::Relaxed)
+}
+
+pub fn commit_errors() -> u64 {
+    COMMIT_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Commit errors printed per process; past it only [`COMMIT_ERRORS`] moves.
+const COMMIT_ERRORS_LOGGED: u64 = 16;
+
+/// Count and log a device commit that returned an error, before its caller
+/// declines and the chain encodes on the host (where [`note_host_fallback`]
+/// counts it too).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_commit_error(what: &str, log_evals: usize, log_blowup: usize, err: &dyn core::fmt::Debug) {
+    let seen = COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if seen < COMMIT_ERRORS_LOGGED {
+        eprintln!(
+            "[whir] device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
+             failed: {err:?}; encoding on the host{}",
+            if seen + 1 == COMMIT_ERRORS_LOGGED {
+                " (further commit errors are counted, not printed)"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 /// Called where a commit gives up on the device. Counts in non-cuda builds
@@ -75,6 +110,7 @@ pub fn open_calls() -> u64 {
 pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    COMMIT_ERRORS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
@@ -2072,15 +2108,23 @@ where
             )
         })
         .collect();
-    let (codeword, root) = math_cuda::whir::commit_codeword_parts(
+    // No device is a decline, not an error: the device is asked only once one
+    // exists (a GPU-less `cuda` build fails here on every commit).
+    math_cuda::device::backend().ok()?;
+    let (codeword, root) = match math_cuda::whir::commit_codeword_parts(
         &raw,
         log_evals,
         log_blowup,
         log_folding,
         transient,
         hash.into_math_cuda(),
-    )
-    .ok()?;
+    ) {
+        Ok(committed) => committed,
+        Err(err) => {
+            note_commit_error("parts", log_evals, log_blowup, &err);
+            return None;
+        }
+    };
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
@@ -2103,7 +2147,9 @@ pub(crate) fn commit_resident(
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
         return None;
     }
-    let (codeword, root) = math_cuda::whir::commit_codeword_resident(
+    // No device is a decline, not an error (see `commit_parts`).
+    math_cuda::device::backend().ok()?;
+    let (codeword, root) = match math_cuda::whir::commit_codeword_resident(
         &store.0,
         parts,
         log_evals,
@@ -2111,8 +2157,13 @@ pub(crate) fn commit_resident(
         log_folding,
         transient,
         hash.into_math_cuda(),
-    )
-    .ok()?;
+    ) {
+        Ok(committed) => committed,
+        Err(err) => {
+            note_commit_error("resident", log_evals, log_blowup, &err);
+            return None;
+        }
+    };
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((DeviceCodeword(codeword), root))
 }
