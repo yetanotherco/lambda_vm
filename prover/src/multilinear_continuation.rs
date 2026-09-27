@@ -1708,7 +1708,13 @@ where
                 .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?,
         );
         if multilinear::whir_split::gap_census() {
-            gap_table_line(&format!("epoch{label}"), *air, width, num_vars, committed.last());
+            gap_table_line(
+                &format!("epoch{label}"),
+                *air,
+                width,
+                num_vars,
+                committed.last(),
+            );
         }
     }
     let sizes = epoch_groups(committed.len());

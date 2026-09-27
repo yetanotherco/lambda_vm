@@ -4416,7 +4416,9 @@ pub trait IsStarkProver<
                     "GAPB STARK_FRI seq={seq} name={} lde_log={lde_log} terminal_log={terminal_log} one_row={} fri_schedule={schedule:?} trace_tree_depth={trace_depth} trace_cap={}",
                     air.name(),
                     layout.is_one_row(),
-                    o.format.merkle_cap.height(o.fri_number_of_queries, trace_depth),
+                    o.format
+                        .merkle_cap
+                        .height(o.fri_number_of_queries, trace_depth),
                 );
                 eprintln!(
                     "GAPB STARK_TABLE seq={seq} name={} rows={} main={main} aux={aux} precomputed={} max_degree={} comp_degree_bound={} constraints={} ir_nodes={} bus_interactions={} blowup={} queries={} grind={} fri_final_log={} format={:?}",

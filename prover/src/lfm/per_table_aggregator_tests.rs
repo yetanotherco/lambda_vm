@@ -7952,7 +7952,10 @@ fn the_whir_production_tree_composes_to_a_root() {
     println!("{}", jemalloc_line("AFTER the WHIR base"));
     whir_base_split_readback(base_secs);
     if multilinear::whir_split::gap_census() {
-        println!("GAPB HASH_METRICS base {:?}", crypto::hash_metrics::snapshot());
+        println!(
+            "GAPB HASH_METRICS base {:?}",
+            crypto::hash_metrics::snapshot()
+        );
         crypto::hash_metrics::reset();
     }
     // ⛔ ROUND-3 TREE PROBE, ARMED AT THE BASE BOUNDARY (diagnostic, OFF by
@@ -8444,7 +8447,10 @@ fn the_whir_production_tree_composes_to_a_root() {
     }
 
     if multilinear::whir_split::gap_census() {
-        println!("GAPB HASH_METRICS tree {:?}", crypto::hash_metrics::snapshot());
+        println!(
+            "GAPB HASH_METRICS tree {:?}",
+            crypto::hash_metrics::snapshot()
+        );
     }
     let (run_peak, run_at) = whole_run.stop();
     println!(
