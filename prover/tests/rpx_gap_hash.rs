@@ -197,6 +197,19 @@ fn k3_warp_walks_match_the_shipped_walk() {
                 "{walk:?} differs from the shipped walk at 2^{log} leaves"
             );
         }
+        // A control that can fail: one flipped bit in the LAST leaf must move
+        // the warp walk's root (the last leaf reaches the root through the
+        // rightmost pair of every level, the tail's last lane included).
+        let mut tampered = leaves.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let t = math_cuda::rpx::build_merkle_tree_on_device_with(&tampered, TreeWalk::WARP)
+            .expect("warp walk");
+        assert_ne!(
+            t[..32],
+            want[..32],
+            "a flipped leaf bit must move the root at 2^{log}"
+        );
     }
 }
 
