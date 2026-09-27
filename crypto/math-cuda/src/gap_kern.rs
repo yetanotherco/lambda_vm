@@ -87,6 +87,18 @@ pub fn k6() -> K6 {
                 bary: true,
             },
             Some(v) => {
+                // A typo must not read as "every part off": the arm would
+                // then measure the A configuration under the B label.
+                if let Some(bad) = v
+                    .split(',')
+                    .map(str::trim)
+                    .find(|s| !["inv", "deep", "bary"].contains(s))
+                {
+                    panic!(
+                        "LAMBDA_VM_GAP_K6={v}: `{bad}` is not a part; expected 1 or a comma \
+                         list of inv, deep, bary"
+                    );
+                }
                 let has = |p: &str| v.split(',').any(|s| s.trim() == p);
                 K6 {
                     inv: has("inv"),
