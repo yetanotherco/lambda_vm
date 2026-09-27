@@ -353,6 +353,15 @@ pub fn deep_composition_ext3_fully_resident_keep(
         row_stride,
         domain_size,
     )?;
+    into_fri_order(stream, &deep_out, domain_size)
+}
+
+/// Bit-reverse-permute a natural-order DEEP codeword into FRI order on device.
+fn into_fri_order(
+    stream: &Arc<CudaStream>,
+    deep_out: &CudaSlice<u64>,
+    domain_size: usize,
+) -> Result<GpuDeepCodeword> {
     let be = backend()?;
     // SAFETY: every element is written by the permutation kernel below.
     let mut reversed = unsafe { stream.alloc::<u64>(domain_size * 3) }?;
@@ -367,7 +376,7 @@ pub fn deep_composition_ext3_fully_resident_keep(
     unsafe {
         stream
             .launch_builder(&be.bit_reverse_ext3_kernel)
-            .arg(&deep_out)
+            .arg(deep_out)
             .arg(&mut reversed)
             .arg(&n_u64)
             .arg(&log_n)
@@ -378,6 +387,166 @@ pub fn deep_composition_ext3_fully_resident_keep(
         n: domain_size,
         stream: stream.clone(),
     })
+}
+
+impl GpuDeepCodeword {
+    /// The codeword on host (FRI order, ext3 interleaved), for parity tests.
+    pub fn download(&self) -> Result<Vec<u64>> {
+        let out = self.stream.clone_dtoh(&self.buf)?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
+}
+
+/// Largest `num_eval_points` the fused DEEP kernels take
+/// (`deep_composition_ext3_fused_m1` … `_m4`, `M = 1 + num_eval_points`).
+pub const FUSED_MAX_EVAL_POINTS: usize = 3;
+
+/// [`deep_composition_ext3_fully_resident_keep`] without the inverted
+/// denominators buffer (gap fix K6): each row inverts its own
+/// `1 + num_eval_points` denominators `x - z` in registers with one base-field
+/// inversion. `coset_points_dev` holds the domain points (`domain_size` u64, the
+/// coset the scan path's `compute_and_invert_denoms_ext3_dev` reads) and
+/// `z_scalars` the poles `[z^K, z·w^0, z·w^1, …]` (3 u64 each), the list that
+/// call takes. The codeword equals the buffered kernel's as field elements.
+///
+/// `Err(CUDA_ERROR_NOT_SUPPORTED)` for more than [`FUSED_MAX_EVAL_POINTS`]
+/// points: the caller keeps the buffered path.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_composition_ext3_fused_keep(
+    stream: &Arc<CudaStream>,
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: &GpuLdeExt3,
+    coset_points_dev: &CudaSlice<u64>,
+    z_scalars: &[u64],
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    row_stride: usize,
+    domain_size: usize,
+) -> Result<GpuDeepCodeword> {
+    #[cfg(feature = "test-faults")]
+    crate::faults::check_sticky(&crate::faults::FAULT_DEEP_STICKY)?;
+    if num_eval_points > FUSED_MAX_EVAL_POINTS {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ));
+    }
+    assert!(
+        domain_size.is_power_of_two() && domain_size >= 2,
+        "bit-reverse needs a power-of-two codeword"
+    );
+    main_lde.wait_ready_on(stream)?;
+    if let Some(aux) = aux_lde {
+        aux.wait_ready_on(stream)?;
+    }
+    h_parts_dev.wait_ready_on(stream)?;
+    assert_eq!(main_lde.m, num_main);
+    assert_eq!(h_parts_dev.m, num_parts);
+    assert_eq!(h_parts_dev.lde_size, main_lde.lde_size);
+    if let Some(a) = aux_lde {
+        assert_eq!(a.m, num_aux);
+        assert_eq!(a.lde_size, main_lde.lde_size);
+    } else {
+        assert_eq!(num_aux, 0);
+    }
+    assert_eq!(h_ood.len(), num_parts * 3);
+    let num_total_cols = num_main + num_aux;
+    assert_eq!(trace_ood.len(), num_total_cols * num_eval_points * 3);
+    assert_eq!(gammas_h.len(), num_parts * 3);
+    assert_eq!(gammas_tr.len(), num_total_cols * num_eval_points * 3);
+    assert_eq!(
+        z_scalars.len(),
+        (1 + num_eval_points) * 3,
+        "one pole per term"
+    );
+    assert!(coset_points_dev.len() >= domain_size, "one point per row");
+    let max_row = (domain_size - 1)
+        .checked_mul(row_stride)
+        .expect("deep composition: (domain_size - 1) * row_stride overflow");
+    assert!(
+        max_row < main_lde.lde_size,
+        "deep composition: kernel row {max_row} out of LDE stride {}",
+        main_lde.lde_size
+    );
+
+    let be = backend()?;
+    // With no trace terms (num_eval_points = 0) their tables are empty, and the
+    // driver refuses a zero-byte allocation: upload one unread zero instead.
+    let nonempty = |xs: &[u64]| stream.clone_htod(if xs.is_empty() { &[0u64][..] } else { xs });
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, z_dev) = (
+        nonempty(h_ood)?,
+        nonempty(trace_ood)?,
+        nonempty(gammas_h)?,
+        nonempty(gammas_tr)?,
+        stream.clone_htod(z_scalars)?,
+    );
+    // SAFETY: every output slot is written by the kernel.
+    let mut deep_out = unsafe { stream.alloc::<u64>(domain_size * 3) }?;
+    let dummy_aux;
+    let aux_slice = if let Some(a) = aux_lde {
+        a.buf.as_ref()
+    } else {
+        dummy_aux = stream.alloc_zeros::<u64>(1)?;
+        &dummy_aux
+    };
+
+    let lde_stride = main_lde.lde_size as u64;
+    let num_main_u = num_main as u64;
+    let num_aux_u = num_aux as u64;
+    let num_parts_u = num_parts as u64;
+    let row_stride_u = row_stride as u64;
+    let domain_size_u = domain_size as u64;
+    // The buffered path's invertibility guard, on the same builds.
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    let zero_flag = stream.alloc_zeros::<u32>(1)?;
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    let flag_arg = &zero_flag;
+    #[cfg(not(any(debug_assertions, feature = "test-faults")))]
+    let flag_arg = &0u64; // nullptr: release keeps the pass free of host syncs
+
+    let cfg = LaunchConfig {
+        grid_dim: ((domain_size as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.deep_composition_ext3_fused[num_eval_points])
+            .arg(main_lde.buf.as_ref())
+            .arg(aux_slice)
+            .arg(h_parts_dev.buf.as_ref())
+            .arg(&lde_stride)
+            .arg(&num_main_u)
+            .arg(&num_aux_u)
+            .arg(&num_parts_u)
+            .arg(&row_stride_u)
+            .arg(&domain_size_u)
+            .arg(&h_ood_dev)
+            .arg(&trace_ood_dev)
+            .arg(&gammas_h_dev)
+            .arg(&gammas_tr_dev)
+            .arg(coset_points_dev)
+            .arg(&z_dev)
+            .arg(&mut deep_out)
+            .arg(flag_arg)
+            .launch(cfg)?;
+    }
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    {
+        let mut host = [0u32; 1];
+        stream.memcpy_dtoh(&zero_flag, &mut host)?;
+        stream.synchronize()?;
+        assert_eq!(host[0], 0, "fused DEEP: a zero denominator has no inverse");
+    }
+    crate::gap_kern::bump(&crate::gap_kern::K6_FUSED_DEEP);
+    into_fri_order(stream, &deep_out, domain_size)
 }
 
 #[allow(clippy::too_many_arguments)]

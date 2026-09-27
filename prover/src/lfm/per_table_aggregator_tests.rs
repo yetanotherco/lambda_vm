@@ -6779,6 +6779,9 @@ fn the_production_tree_composes_to_a_root() {
         ),
         Err(why) => println!("           ⚠ NO ceiling read, so NO percentage: {why}"),
     }
+    // The gap campaign's kernel switches as this process read them, and what
+    // each did (all zero with the switches off).
+    println!("   {}", math_cuda::gap_kern::summary_line());
 }
 
 // ========================= the WHIR production tree ========================
@@ -8493,6 +8496,9 @@ fn the_whir_production_tree_composes_to_a_root() {
         "   reserved high-water {:.0} MiB",
         math_cuda::device::reserved_high_water() as f64 / (1024.0 * 1024.0)
     );
+    // The gap campaign's kernel switches as this process read them, and what
+    // each did (all zero with the switches off).
+    println!("   {}", math_cuda::gap_kern::summary_line());
 }
 
 /// The WHIR tree at FIXTURE scale — the same driver, card-free, on a guest small

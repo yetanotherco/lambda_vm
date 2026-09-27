@@ -316,6 +316,21 @@ pub fn compute_and_invert_denoms_ext3_dev(
         ));
     }
 
+    if crate::gap_kern::k6().inv {
+        if k_scalars <= ROWWISE_MAX_K {
+            crate::gap_kern::bump(&crate::gap_kern::K6_ROWWISE);
+            return invert_denoms_rowwise_dev(
+                x_lde_dev,
+                z_scalars_host,
+                n,
+                k_scalars,
+                sign,
+                stream,
+            );
+        }
+        crate::gap_kern::bump(&crate::gap_kern::K6_SCAN);
+    }
+
     let z_dev = stream.clone_htod(z_scalars_host)?;
     // SAFETY: the compute_denoms_ext3 kernel writes every output slot.
     let mut denoms = unsafe { stream.alloc::<u64>(3 * total) }?;
@@ -345,6 +360,83 @@ pub fn compute_and_invert_denoms_ext3_dev(
     }
 
     batch_inverse_ext3_dev(&denoms, total, stream)
+}
+
+/// Most denominators per row the row-wise kernels take
+/// (`invert_denoms_rowwise_ext3_k1` … `_k8`), the barycentric multi kernels'
+/// point cap. Above it [`compute_and_invert_denoms_ext3_dev`] keeps the scan.
+pub const ROWWISE_MAX_K: usize = 8;
+
+/// [`compute_and_invert_denoms_ext3_dev`]'s output — the same layout, the same
+/// field elements — from ONE kernel (gap fix K6): thread `i` builds row `i`'s
+/// `k_scalars` denominators and inverts them in registers with a single
+/// base-field inversion (`kernels/ext3_inv.cuh`), instead of the six-kernel
+/// global scan with its prefix and suffix scratch. Stream-ordered, no host
+/// round-trip. Public so the parity test can run it beside the scan whatever
+/// the switch says.
+pub fn invert_denoms_rowwise_dev(
+    x_lde_dev: &CudaSlice<u64>,
+    z_scalars_host: &[u64],
+    n: usize,
+    k_scalars: usize,
+    sign: DenomSign,
+    stream: &Arc<CudaStream>,
+) -> Result<CudaSlice<u64>> {
+    assert_eq!(z_scalars_host.len(), k_scalars * 3);
+    assert!(n >= 1 && (1..=ROWWISE_MAX_K).contains(&k_scalars));
+    assert!(x_lde_dev.len() >= n, "one coset point per row");
+    let total = k_scalars
+        .checked_mul(n)
+        .expect("invert_denoms_rowwise_dev: k_scalars * n overflow");
+    if !launch_total_fits(total) {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
+    let be = backend()?;
+    let z_dev = stream.clone_htod(z_scalars_host)?;
+    // SAFETY: the kernel writes all `k_scalars` inverses of every row.
+    let mut out = unsafe { stream.alloc::<u64>(3 * total) }?;
+    let n_u64 = n as u64;
+    let denom_sign_u64: u64 = match sign {
+        DenomSign::ZMinusX => 0,
+        DenomSign::XMinusZ => 1,
+    };
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(BLOCK_SIZE), 1, 1),
+        block_dim: (BLOCK_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // The scan path's invertibility guard, kept on the same builds: a zero
+    // denominator zeroes its row's inverses, and a valid inverse never is.
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    let zero_flag = stream.alloc_zeros::<u32>(1)?;
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    let flag_arg = &zero_flag;
+    #[cfg(not(any(debug_assertions, feature = "test-faults")))]
+    let flag_arg = &0u64; // nullptr: release keeps the pass free of host syncs
+    unsafe {
+        stream
+            .launch_builder(&be.invert_denoms_rowwise_ext3[k_scalars - 1])
+            .arg(x_lde_dev)
+            .arg(&z_dev)
+            .arg(&n_u64)
+            .arg(&denom_sign_u64)
+            .arg(&mut out)
+            .arg(flag_arg)
+            .launch(cfg)?;
+    }
+    #[cfg(any(debug_assertions, feature = "test-faults"))]
+    {
+        let mut host = [0u32; 1];
+        stream.memcpy_dtoh(&zero_flag, &mut host)?;
+        stream.synchronize()?;
+        assert_eq!(
+            host[0], 0,
+            "row-wise inverse: a zero denominator has no inverse"
+        );
+    }
+    Ok(out)
 }
 
 // =============================================================================
