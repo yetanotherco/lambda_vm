@@ -65,3 +65,57 @@ fn lde_row_major_commit() {
     }
     assert_eq!(mismatches, 0, "the pipelines disagree on a root");
 }
+
+/// GAP K1B measurement arm: one WHIR commit (`whir::commit_codeword`: upload,
+/// Möbius, the encoding, the tree) under the legacy encoding and under the
+/// column engine, so the difference is the encoding. `K1B_SHAPES="log_evals:
+/// log_blowup;..."` (default the production spacing at 2^22 and 2^24),
+/// `K1B_ITERS=3`. Prints one `K1BB ...` line per timed iteration; both
+/// encodings' roots must agree.
+#[test]
+#[ignore = "measurement arm: run on the box"]
+fn k1b_whir_encode() {
+    use math_cuda::lde_cm::with_k1b;
+    let shapes = std::env::var("K1B_SHAPES").unwrap_or_else(|_| "22:2;24:2".into());
+    let iters: usize = std::env::var("K1B_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mut mismatches = 0;
+    for shape in shapes.split(';').filter(|s| !s.is_empty()) {
+        let p: Vec<usize> = shape.split(':').map(|x| x.parse().unwrap()).collect();
+        let (log_evals, log_blowup) = (p[0], p[1]);
+        let evals: Vec<u64> = (0..1u64 << log_evals)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 0xFFFF_FFFF_0000_0001)
+            .collect();
+        let mut roots = [None, None];
+        for (e, engine) in ["legacy", "k1b"].into_iter().enumerate() {
+            for it in 0..=iters {
+                let t = std::time::Instant::now();
+                let (codeword, root) = with_k1b(e == 1, || {
+                    math_cuda::whir::commit_codeword(
+                        &evals,
+                        log_blowup,
+                        4,
+                        true,
+                        DeviceHash::Rpx256,
+                    )
+                })
+                .expect("commit");
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                drop(codeword);
+                println!(
+                    "K1BB engine={engine} log_evals={log_evals} log_blowup={log_blowup} iter={it} \
+                     commit_ms={ms:.3} root0={:016x}",
+                    u64::from_le_bytes(root[..8].try_into().unwrap())
+                );
+                roots[e] = Some(root);
+            }
+        }
+        if roots[0] != roots[1] {
+            mismatches += 1;
+            println!("K1BB ROOT MISMATCH log_evals={log_evals} log_blowup={log_blowup}");
+        }
+    }
+    assert_eq!(mismatches, 0, "the encodings disagree on a root");
+}
