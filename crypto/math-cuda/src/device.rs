@@ -127,6 +127,7 @@ impl Drop for PinnedStaging {
 // falls back to CPU.
 const ARITH_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arith.cubin"));
 const NTT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
+const NTT_CM_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt_cm.cubin"));
 const KECCAK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keccak.cubin"));
 const RPX_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rpx.cubin"));
 const BARY_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/barycentric.cubin"));
@@ -201,6 +202,11 @@ pub struct Backend {
     pub ntt_dit_8_levels_row_major: CudaFunction,
     pub pointwise_mul_row_major: CudaFunction,
     pub matrix_transpose_strided: CudaFunction,
+
+    // ntt_cm.cubin — the column-major LDE engine's passes, indexed by
+    // `k - 4` for a pass of k = 4..=8 levels (`crate::lde_cm`).
+    pub ntt_cm_dit: [CudaFunction; 5],
+    pub ntt_cm_dif: [CudaFunction; 5],
 
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
@@ -789,6 +795,7 @@ impl Backend {
 
         let arith = ctx.load_module(Ptx::from_binary(ARITH_CUBIN.to_vec()))?;
         let ntt = ctx.load_module(Ptx::from_binary(NTT_CUBIN.to_vec()))?;
+        let ntt_cm = ctx.load_module(Ptx::from_binary(NTT_CM_CUBIN.to_vec()))?;
         let keccak = ctx.load_module(Ptx::from_binary(KECCAK_CUBIN.to_vec()))?;
         let rpx = ctx.load_module(Ptx::from_binary(RPX_CUBIN.to_vec()))?;
         let bary = ctx.load_module(Ptx::from_binary(BARY_CUBIN.to_vec()))?;
@@ -878,6 +885,20 @@ impl Backend {
             ntt_dit_8_levels_row_major: ntt.load_function("ntt_dit_8_levels_row_major")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
+            ntt_cm_dit: [
+                ntt_cm.load_function("ntt_cm_dit_k4")?,
+                ntt_cm.load_function("ntt_cm_dit_k5")?,
+                ntt_cm.load_function("ntt_cm_dit_k6")?,
+                ntt_cm.load_function("ntt_cm_dit_k7")?,
+                ntt_cm.load_function("ntt_cm_dit_k8")?,
+            ],
+            ntt_cm_dif: [
+                ntt_cm.load_function("ntt_cm_dif_k4")?,
+                ntt_cm.load_function("ntt_cm_dif_k5")?,
+                ntt_cm.load_function("ntt_cm_dif_k6")?,
+                ntt_cm.load_function("ntt_cm_dif_k7")?,
+                ntt_cm.load_function("ntt_cm_dif_k8")?,
+            ],
             keccak256_leaves_base_row_major_row_pair: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_row_major_row_pair_range: keccak
