@@ -93,7 +93,7 @@ pub const KECCAK_RND_SLOT: usize = 12;
 /// chip has preprocessed columns, so chunk 0's root is the roots array's slot-11
 /// entry and the rest ride
 /// [`LfmArtifacts`](super::registry::LfmArtifacts::blake3_chunk_roots).
-/// Slot of `LFM_HASH`, the class GAP R2 may split in two
+/// Slot of `LFM_HASH`, the class the hash split may divide in two
 /// ([`super::chunking::HashChunking`]): chunk 0 is this slot's AIR, root and
 /// height, and chunk 1 follows it in the AIR order.
 pub const HASH_SLOT: usize = 5;
@@ -734,7 +734,7 @@ pub fn lfm_chip_census_masked(
             }
             continue;
         }
-        // GAP R2: a split `LFM_HASH` is two entries, each at its own height. An
+        // A split `LFM_HASH` is two entries, each at its own height. An
         // unsplit one is the single workload-sized entry below, unchanged.
         // Chunk 0 is exactly full by construction (`Chunked`); chunk 1 holds the
         // remainder and its headroom is a real cliff (`Workload`).
@@ -797,7 +797,7 @@ pub struct LfmAirs {
     select: LfmAir<select::SelectConstraints>,
     bitdec: LfmAir<bitdec::BitDecConstraints>,
     hash: LfmAir<hash::HashConstraints>,
-    /// GAP R2: `LFM_HASH` chunks 1.., each with its own preprocessed root — empty
+    /// `LFM_HASH` chunks 1.., each with its own preprocessed root — empty
     /// for an unsplit program. Placed right after [`Self::hash`] in the frozen
     /// order, as the `LFM_BLAKE3` chunks are expanded in place.
     hash_tail: Vec<LfmAir<hash::HashConstraints>>,
@@ -1147,7 +1147,7 @@ impl LfmAirs {
         self.blake3.len()
     }
 
-    /// This set with `LFM_HASH` split over `hash_roots` (GAP R2): chunk 0 stays
+    /// This set with `LFM_HASH` split over `hash_roots`: chunk 0 stays
     /// the slot-5 AIR, and chunks 1.. are built from `hash_roots[1..]` under the
     /// same hasher. A one-element slice adds nothing.
     ///
@@ -1178,7 +1178,7 @@ impl LfmAirs {
     }
 
     /// The AIR set a program's artifacts describe: roots, `KECCAK_RND` and
-    /// `LFM_BLAKE3` chunks, GAP R2's `LFM_HASH` chunks, the hasher, the mask and
+    /// `LFM_BLAKE3` chunks, the `LFM_HASH` chunks, the hasher, the mask and
     /// the one-row roots — every piece from the artifacts, none from a proof.
     /// The same set `proof::verify_against_artifacts` builds piece by piece; a
     /// caller holding artifacts (the node's child harvest) builds it here.
@@ -1201,8 +1201,8 @@ impl LfmAirs {
         airs
     }
 
-    /// Number of `LFM_HASH` instances this set was built with — one unless GAP
-    /// R2 split the table.
+    /// Number of `LFM_HASH` instances this set was built with — one unless the
+    /// hash split divided the table.
     pub fn hash_chunks(&self) -> usize {
         1 + self.hash_tail.len()
     }
@@ -1291,7 +1291,7 @@ impl LfmAirs {
             self.hash_tail.len(),
             traces.hash_tail.len(),
             "LFM_HASH chunk count differs between the AIR set and the traces \
-             — artifacts and traces were built from different GAP R2 policies"
+             — artifacts and traces were built from different hash-split policies"
         );
         pairs.extend(
             self.hash_tail

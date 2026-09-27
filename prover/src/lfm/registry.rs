@@ -156,7 +156,7 @@ impl LfmRegistryEntry {
             keccak_rnd_chunks: self.keccak_rnd_chunks,
             blake3_chunk_roots: vec![self.roots[BLAKE3_SLOT]],
             blake3_chunk_log_heights: vec![self.log_heights[BLAKE3_SLOT]],
-            // One `LFM_HASH` table, like one `LFM_BLAKE3` table: GAP R2 splits
+            // One `LFM_HASH` table, like one `LFM_BLAKE3` table: the hash split divides
             // nothing a registry entry names.
             hash_chunk_roots: vec![self.roots[HASH_SLOT]],
             hash_chunk_log_heights: vec![self.log_heights[HASH_SLOT]],
@@ -198,7 +198,7 @@ pub struct LfmArtifacts {
     /// Trace log-height of each `LFM_BLAKE3` chunk, in chunk order.
     pub blake3_chunk_log_heights: Vec<u8>,
     /// One preprocessed root per `LFM_HASH` chunk, in chunk order — one entry
-    /// unless GAP R2 split the table (`chunking::HashChunking`).
+    /// unless the hash split divided the table (`chunking::HashChunking`).
     /// `hash_chunk_roots[0]` IS `roots[HASH_SLOT]`, so an unsplit program is
     /// bit-identical to the machine before the split existed; chunk 1 is folded
     /// into `program_id` as a tail, like the `LFM_BLAKE3` chunks.
@@ -410,7 +410,7 @@ const PREP_GROUP_LABEL: &str = "LFM_PREP_GROUP";
 /// which of the two walks it came from.
 const BLAKE3_CHUNK_LABEL: &str = "LFM_PREP_BLAKE3_CHUNK";
 
-/// The same, for GAP R2's `LFM_HASH` tail chunk.
+/// The same, for the `LFM_HASH` tail chunk.
 const HASH_CHUNK_LABEL: &str = "LFM_PREP_HASH_CHUNK";
 
 /// Slots 0..=9 — the instruction column groups that belong to the PROGRAM.
@@ -491,7 +491,7 @@ pub fn build_artifacts_with_hasher(
     // one: it contributes one committed matrix per chunk, built and absorbed
     // after this list, which is where slot order puts it anyway.
     let program_slots = program_groups(program);
-    // GAP R2: a split `LFM_HASH` commits chunk 0 at slot 5 and chunk 1 as a
+    // A split `LFM_HASH` commits chunk 0 at slot 5 and chunk 1 as a
     // tail below. An unsplit program materializes nothing here — slot 5 is the
     // compiled group itself, exactly as before the split existed.
     let hash_chunks: Vec<ColumnGroup> = if program.hash_chunk_count() > 1 {
@@ -581,7 +581,7 @@ pub fn build_artifacts_with_hasher(
         }));
     }
     roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
-    // GAP R2's tail: `LFM_HASH` chunks 1.., committed like the BLAKE3 chunks.
+    // The hash tail: `LFM_HASH` chunks 1.., committed like the BLAKE3 chunks.
     // Chunk 0 is slot 5's root, committed in the window above.
     let mut hash_chunk_roots: Vec<Commitment> = vec![roots[HASH_SLOT]];
     let mut hash_chunk_log_heights: Vec<u8> = vec![log_heights[HASH_SLOT]];
@@ -669,7 +669,7 @@ fn build_one_row_roots(
     roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
     roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
     roots[14] = bitwise::preprocessed_commitment_for(options, Row);
-    // Chunk 0 is slot 5's one-row root; the GAP R2 tail follows.
+    // Chunk 0 is slot 5's one-row root; the hash tail follows.
     let mut hash_chunk_roots: Vec<Commitment> = roots[HASH_SLOT].into_iter().collect();
     hash_chunk_roots.extend(map_maybe_parallel(hash_tail, |g| {
         super::commit::commit_group_device_or_host_with(HASH_CHUNK_LABEL, g, options, Row)

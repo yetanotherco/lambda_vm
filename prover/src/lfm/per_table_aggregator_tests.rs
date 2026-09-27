@@ -1089,8 +1089,8 @@ pub(super) fn real_child_timed(
     );
     let verify_secs = t_verify.elapsed().as_secs_f64();
 
-    // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, GAP
-    // R2's `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
+    // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
+    // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
     // as `verify_against_artifacts` builds it: a one-row chip's Phase A root and
     // leg compare use them.
     let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts);
@@ -3753,7 +3753,7 @@ fn census_panel_text(
         100.0 * EMPTY_MACHINE_CELLS as f64 / cells as f64,
     );
     let step = (fan_in + 1) as f64 / fan_in as f64;
-    // GAP R2: a split `LFM_HASH` is two census entries, printed as ONE panel line —
+    // A split `LFM_HASH` is two census entries, printed as ONE panel line —
     // real and committed rows summed, the chunk heights in a trailing
     // `[split a+b]` — so a panel never repeats a chip name (the box reader treats a
     // repeat as two interleaved panels) and `LFM_HASH` real rows stay the

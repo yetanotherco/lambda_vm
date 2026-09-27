@@ -457,7 +457,7 @@ pub fn verify_against_chunked(
         None,
         roots,
         blake3_roots,
-        // One `LFM_HASH` table: GAP R2's split rides the artifacts, so a split
+        // One `LFM_HASH` table: the hash split rides the artifacts, so a split
         // program comes through `verify_against_artifacts`, and this door
         // rejects its proof on the AIR count.
         &roots[HASH_SLOT..=HASH_SLOT],
@@ -507,7 +507,7 @@ fn verify_against_chunked_with(
     if !chip_set.bitwise && chip_set.bitwise_required(hasher) {
         return false;
     }
-    // GAP R2: chunk 0 of `LFM_HASH` is slot 5's root, so the list is never
+    // Chunk 0 of `LFM_HASH` is slot 5's root, so the list is never
     // empty, and every chunk past it is one more sub-proof.
     if hash_roots.first() != Some(&roots[HASH_SLOT]) {
         return false;

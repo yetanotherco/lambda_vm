@@ -367,7 +367,7 @@ fn dropping_bitwise_under_a_byte_lookup_family_is_refused() {
     }
 }
 
-// ================================= R2 ======================================
+// ========================== the LFM_HASH split ==============================
 //
 // `LFM_HASH` split into two power-of-two instances when one table would be
 // mostly padding (`chunking::HashChunking`).
@@ -396,6 +396,45 @@ fn the_hash_split_rule_on_the_blocks_heights() {
         let want = want.map_or(HashChunking::unbounded(), HashChunking::split_at);
         assert_eq!(got, want, "{rows} hash rows");
     }
+}
+
+/// The split is a per-pipeline default ([`super::chunking::HASH_SPLIT_DEFAULT`])
+/// that `LAMBDA_VM_LFM_HASH_SPLIT` overrides either way; the process policy is
+/// the rule at the process's setting. Nothing here states the default's value,
+/// which differs between the two pipelines' branches.
+#[test]
+fn the_hash_split_setting_reads_the_pipeline_default_and_the_override() {
+    use super::chunking::{
+        HASH_SPLIT_DEFAULT, HASH_SPLIT_ENV, hash_split_enabled, hash_split_setting,
+    };
+    assert_eq!(HASH_SPLIT_ENV, "LAMBDA_VM_LFM_HASH_SPLIT");
+    assert_eq!(
+        hash_split_setting(None),
+        HASH_SPLIT_DEFAULT,
+        "unset is the default"
+    );
+    assert_eq!(
+        hash_split_setting(Some("")),
+        HASH_SPLIT_DEFAULT,
+        "empty is unset"
+    );
+    assert!(!hash_split_setting(Some("0")), "0 keeps one table");
+    assert!(hash_split_setting(Some("1")), "1 splits by the rule");
+    let rows = 293_778;
+    let want = if hash_split_enabled() {
+        HashChunking::for_rows(rows)
+    } else {
+        HashChunking::unbounded()
+    };
+    assert_eq!(HashChunking::for_process(rows), want);
+}
+
+/// A typo stops the run rather than proving the default under the other arm's
+/// name.
+#[test]
+#[should_panic(expected = "must be 0 or 1")]
+fn a_malformed_hash_split_setting_stops_the_run() {
+    let _ = super::chunking::hash_split_setting(Some("on"));
 }
 
 /// `chunk_count` and `chunk_range` are one rule: the ranges are disjoint, in
@@ -505,7 +544,7 @@ fn a_split_program_describes_two_hash_tables() {
 
 // ============================ proving (box) ================================
 
-/// ★ R2 end to end on the host: a split program proves and verifies, carries
+/// ★ The split end to end on the host: a split program proves and verifies, carries
 /// one sub-proof more, is a different program identity, and neither proof
 /// verifies as the other program. A forged tail root, and the single-table
 /// door, reject the split proof.

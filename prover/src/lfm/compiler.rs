@@ -144,7 +144,7 @@ pub struct LfmProgram {
     /// chunking existed.
     pub blake3_chunking: Blake3Chunking,
     /// How this program's hash rows are spread over `LFM_HASH` instances — one
-    /// table unless GAP R2 splits it ([`HashChunking`]). Program shape on
+    /// table unless the hash split divides it ([`HashChunking`]). Program shape on
     /// [`Self::blake3_chunking`]'s terms: each chunk commits its own
     /// instruction group, and the split is bound into `program_id`.
     pub hash_chunking: HashChunking,
@@ -415,7 +415,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         public_len,
         chunking: KeccakChunking::default(),
         blake3_chunking: Blake3Chunking::default(),
-        // GAP R2: the one knob read at compile time, so every program this
+        // The hash split: read once at compile time, so every program this
         // process compiles carries the same policy.
         hash_chunking: HashChunking::for_process(groups.hash.real_rows),
         groups,

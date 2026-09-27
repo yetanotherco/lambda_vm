@@ -29,7 +29,7 @@ pub struct LfmTraces {
     pub select: TraceTable<F, E>,
     pub bitdec: TraceTable<F, E>,
     pub hash: TraceTable<F, E>,
-    /// GAP R2: `LFM_HASH` chunks 1.. — empty unless the program's policy split
+    /// `LFM_HASH` chunks 1.. — empty unless the program's policy split
     /// the table (`chunking::HashChunking`); [`Self::hash`] is then chunk 0.
     pub hash_tail: Vec<TraceTable<F, E>>,
     pub keccak: TraceTable<F, E>,
@@ -517,7 +517,7 @@ pub(super) fn build_traces_walked(
         TraceTable::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1)
     };
 
-    // GAP R2: `LFM_HASH` is filled per chunk, each from its own slice of the
+    // `LFM_HASH` is filled per chunk, each from its own slice of the
     // group and of the records. An unsplit program fills the whole group in
     // place, as before; a split one materializes one chunk group at a time.
     let hash_count = program.hash_chunk_count();

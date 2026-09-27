@@ -35,7 +35,7 @@ const LFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_PROGRAM_V1";
 /// See the suffix note in [`lfm_program_id`].
 const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
 
-/// Domain tag of GAP R2's `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
+/// Domain tag of the `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
 const LFM_HASH_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_HASH_CHUNKS_V1";
 /// `pub(super)`: the aggregation layer's emitted verifier replays
 /// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
@@ -121,7 +121,7 @@ pub fn lfm_program_id(
     )
 }
 
-/// [`lfm_program_id`] for a program whose `LFM_HASH` may be split (GAP R2):
+/// [`lfm_program_id`] for a program whose `LFM_HASH` may be split:
 /// `hash_chunk_roots` / `hash_chunk_log_heights` list every chunk, chunk 0 being
 /// slot 5's own entry. A one-chunk (or empty) list absorbs NOTHING, so an
 /// unsplit program keeps the digest it always had; a split one absorbs chunks
@@ -190,7 +190,7 @@ pub fn lfm_program_id_chunked(
             h.update([*height]);
         }
     }
-    // GAP R2's tail, on the same length-prefixed terms: chunk 0 is bound above
+    // The hash tail, on the same length-prefixed terms: chunk 0 is bound above
     // as slot 5, so only chunks 1.. are absorbed, and a distinct tag keeps it
     // apart from the BLAKE3 tail when both are present.
     debug_assert_eq!(
