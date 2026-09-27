@@ -21,7 +21,9 @@
 //      interpolation and evaluation on the coset, blowups 2..16, several
 //      columns with a column stride, non-canonical inputs;
 //   5. the coefficient-input form (F_SPREAD | F_GATHER) against direct
-//      evaluation.
+//      evaluation;
+//   6. the single-column spread transform of WHIR's encoding (spacing 1..16,
+//      no weights) against the naive DFT.
 //
 // WHAT IT DOES NOT COVER: whether nvcc accepts the file, and everything about
 // execution — grid sizing, shared-memory size, races the replay order cannot
@@ -529,6 +531,39 @@ void test_coeff_form() {
     }
 }
 
+// 6. The single-column spread transform WHIR's encoding runs under K1B
+// (`lde_cm::spread_ntt_column`): position B·q of the DIT input is src[q], the
+// rest zero, no weights — the legacy `lift_spread` then the DIT body. A DIT with
+// bit-reversed input position p computes Σ_p z[p]·ω^(i·rev_N(p)), and
+// rev_N(B·q) = rev_n(q), so the answer is the DFT of y[j] = src[rev_n(j)] (j < n).
+void test_spread_transform() {
+    const std::vector<u64> fwd = root_table(false);
+    for (unsigned log_n = 4; log_n <= 11; ++log_n) {
+        for (unsigned lb = 0; lb <= 4 && lb <= log_n; ++lb) {
+            const u64 N = (u64)1 << log_n;
+            const unsigned log_c = log_n - lb;
+            const u64 n = (u64)1 << log_c;
+            std::vector<u64> src(n);
+            for (auto &v : src) v = random_felt();
+            std::vector<u64> dst(N, 0xFEEDFACEull);
+            const std::vector<unsigned> ks = plan(log_n);
+            unsigned s = 0;
+            for (size_t i = 0; i < ks.size(); ++i) {
+                const bool first = i == 0;
+                replay_pass(ks[i], true, first ? src.data() : dst.data(), 0, dst.data(), 0, fwd.data(),
+                            nullptr, log_n, s, lb, first ? ntt_cm::F_SPREAD : 0, 1);
+                s += ks[i];
+            }
+            std::vector<u64> y(N, 0);
+            for (u64 j = 0; j < n; ++j) y[j] = src[log_c ? rev(j, log_c) : 0];
+            const std::vector<u64> want = naive_dft(y, log_n, false);
+            size_t where = 0;
+            CHECK(eq_canon(dst, want, &where), "spread transform log_n=%u lb=%u first diff at %zu", log_n,
+                  lb, where);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -542,6 +577,8 @@ int main() {
     std::printf("+ LDE: %d checks, %d failures\n", g_checks, g_failures);
     test_coeff_form();
     std::printf("+ coefficient form: %d checks, %d failures\n", g_checks, g_failures);
+    test_spread_transform();
+    std::printf("+ spread transform: %d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) {
         std::printf("NTT_CM HOST KAT: FAILED (%d of %d)\n", g_failures, g_checks);
         return 1;

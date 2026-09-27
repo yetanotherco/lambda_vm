@@ -104,6 +104,56 @@ pub fn columns_extended() -> u64 {
     COLUMNS_EXTENDED.load(Ordering::Relaxed)
 }
 
+/// A temporary measurement knob (GAP K1B): `LAMBDA_VM_GAP_K1B=1` routes the WHIR
+/// commit's single-column encoding (`whir::commit_from`: the spread and the NTT
+/// of one codeword) through this engine's passes ([`spread_ntt_column`]).
+/// Separate from [`LEGACY_ENV`] so it is measured on its own. Default off; read
+/// once per process.
+pub const K1B_ENV: &str = "LAMBDA_VM_GAP_K1B";
+
+thread_local! {
+    /// Per-thread override of [`K1B_ENV`]. See [`with_k1b`].
+    static K1B_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Whether the calling thread's WHIR encodings take this engine.
+pub fn k1b_enabled() -> bool {
+    if let Some(on) = K1B_OVERRIDE.with(Cell::get) {
+        return on;
+    }
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        let on = std::env::var(K1B_ENV).is_ok_and(|v| v == "1");
+        eprintln!(
+            "[gpu] GAP K1B column-engine WHIR encoding: {}",
+            if on { "on" } else { "off" }
+        );
+        on
+    })
+}
+
+/// [`with_engine`] for [`K1B_ENV`].
+#[doc(hidden)]
+pub fn with_k1b<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            K1B_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(K1B_OVERRIDE.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// Codewords [`spread_ntt_column`] has encoded, process-wide: K1B's mechanism
+/// counter.
+static K1B_CODEWORDS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`K1B_CODEWORDS`].
+pub fn k1b_codewords() -> u64 {
+    K1B_CODEWORDS.load(Ordering::Relaxed)
+}
+
 /// Smallest trace a column can have here: a pass holds 16 elements per
 /// thread, so a transform needs at least 2^4 of them.
 pub const MIN_LOG_N: u32 = 4;
@@ -121,6 +171,17 @@ pub fn supports(n: usize, blowup: usize) -> bool {
         && n.trailing_zeros() >= MIN_LOG_N
         && blowup.trailing_zeros() <= MAX_LOG_BLOWUP
         && (n * blowup).trailing_zeros() <= GoldilocksField::TWO_ADICITY as u32
+}
+
+/// Whether a length-`2^log_n` transform of an input spread at spacing
+/// `2^log_blowup` fits [`spread_ntt_column`]: the first pass must hold a whole
+/// spacing (`2^log_blowup <= 2^k`, `k >= 4`). Spacing 1 (`log_blowup = 0`) is a
+/// plain transform of a bit-reversed input.
+pub fn spread_supports(log_n: u32, log_blowup: u32) -> bool {
+    log_n >= MIN_LOG_N
+        && log_n <= GoldilocksField::TWO_ADICITY as u32
+        && log_blowup <= MAX_LOG_BLOWUP
+        && log_blowup <= log_n
 }
 
 /// Pass sizes for a length-`2^l` transform: `ceil(l / 8)` passes of 4..=8
@@ -454,6 +515,55 @@ pub(crate) fn lde_columns(
     Ok(())
 }
 
+/// The forward transform of ONE spread column — WHIR's encoding
+/// (`whir::commit_from`: `ntt.cu`'s `lift_spread` then `ntt::run_ntt_body`),
+/// fused: position `2^log_blowup · q` of the length-`2^log_n` DIT input
+/// (bit-reversed in, natural out) is `src[q]`, every other position zero, and
+/// `dst` receives the natural-order transform. The spread is the first pass's
+/// load, so the padding is never stored or read, and the transform is
+/// `ceil(log_n / 8)` passes instead of the spread pass, the fused 8-level pass
+/// and one 5-level tile per five levels above it. `src` (`2^(log_n -
+/// log_blowup)` values) and `dst` (`2^log_n`) must not overlap. Nothing
+/// synchronises.
+pub(crate) fn spread_ntt_column(
+    stream: &CudaStream,
+    be: &Backend,
+    src: sys::CUdeviceptr,
+    dst: sys::CUdeviceptr,
+    log_n: u32,
+    log_blowup: u32,
+) -> Result<()> {
+    assert!(
+        spread_supports(log_n, log_blowup),
+        "K1B spread transform 2^{log_n} at spacing 2^{log_blowup}"
+    );
+    let tables = root_tables(be)?;
+    let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
+    let one = |ptr| Cols { ptr, stride: 0 };
+    let mut s = 0;
+    for (i, &k) in plan(log_n).iter().enumerate() {
+        let first = i == 0;
+        launch_pass(
+            stream,
+            be,
+            true,
+            k,
+            log_n,
+            s,
+            log_blowup,
+            if first { F_SPREAD } else { 0 },
+            one(if first { src } else { dst }),
+            one(dst),
+            fwd_roots,
+            0,
+            1,
+        )?;
+        s += k;
+    }
+    K1B_CODEWORDS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Hash the leaves of a column-major matrix: `num_cols` columns of `num_rows`
 /// rows at `cols` (column stride `col_stride` elements), `rows_per_leaf`
 /// bit-reversed rows per leaf, into `leaves` (`num_rows / rows_per_leaf`
@@ -608,6 +718,19 @@ mod tests {
                 "radix entry {j}"
             );
         }
+    }
+
+    #[test]
+    fn spread_shapes_outside_the_engine_are_declined() {
+        assert!(spread_supports(4, 0), "spacing 1 is a plain transform");
+        assert!(spread_supports(24, 2), "the WHIR production shape");
+        assert!(spread_supports(8, 4));
+        assert!(!spread_supports(3, 0), "transform below 2^4");
+        assert!(
+            !spread_supports(20, 5),
+            "spacing beyond one first-pass tile"
+        );
+        assert!(!spread_supports(33, 2), "beyond the two-adicity");
     }
 
     #[test]

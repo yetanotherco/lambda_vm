@@ -22,7 +22,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsPrimeField;
 use math::polynomial::Polynomial;
 use math_cuda::DeviceHash;
-use math_cuda::lde_cm::{columns_extended, with_engine};
+use math_cuda::lde_cm::{columns_extended, k1b_codewords, spread_supports, with_engine, with_k1b};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -506,5 +506,51 @@ fn engine_matches_the_cpu_lde() {
         .expect("cpu lde");
         let cpu: Vec<u64> = cpu.iter().map(|e| *e.value()).collect();
         assert_same_values(&gpu, &cpu, &format!("cpu log_n={log_n} blowup={blowup}"));
+    }
+}
+
+/// GAP K1B: the WHIR encoding (spread + NTT of one codeword) through the column
+/// engine against the legacy `lift_spread` + `run_ntt_body`: the codeword
+/// (canonically) and the Merkle nodes (bytes) are identical. `(1, 2)` is below
+/// the engine's smallest transform and must stay on the legacy path.
+#[test]
+fn whir_codeword_k1b_matches_legacy() {
+    let shapes: &[(usize, usize, usize)] = &[
+        // (log_evals, log_blowup, log_folding)
+        (1, 2, 1),
+        (2, 2, 1),
+        (4, 0, 2),
+        (6, 2, 4),
+        (8, 4, 4),
+        (10, 1, 4),
+        (12, 2, 4),
+        (16, 3, 4),
+        (18, 2, 4),
+        (21, 2, 4),
+    ];
+    for (i, &(log_evals, log_blowup, log_folding)) in shapes.iter().enumerate() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x3171_0000 + i as u64);
+        // The commit takes canonical hypercube values.
+        let evals = canon(&random(&mut rng, 1usize << log_evals));
+        let hash = [DeviceHash::Rpx256, DeviceHash::Keccak256][i % 2];
+        let what = format!("whir log_evals={log_evals} log_blowup={log_blowup} {hash:?}");
+        let before = k1b_codewords();
+        let (k1b_vals, k1b_nodes) = with_k1b(true, || {
+            math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
+        })
+        .expect("K1B commit");
+        let routed = k1b_codewords() > before;
+        let supported = spread_supports((log_evals + log_blowup) as u32, log_blowup as u32);
+        // Other tests may encode concurrently, so only the supported shapes'
+        // "it routed" is certain; an unsupported one is checked by its values.
+        if supported {
+            assert!(routed, "{what}: the knob did not route through the engine");
+        }
+        let (vals, nodes) = with_k1b(false, || {
+            math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
+        })
+        .expect("legacy commit");
+        assert_same_values(&k1b_vals, &vals, &what);
+        assert_eq!(k1b_nodes, nodes, "{what}: Merkle nodes");
     }
 }
