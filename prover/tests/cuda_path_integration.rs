@@ -67,6 +67,12 @@ fn gpu_path_fires_end_to_end() {
 
     let proof = prove(&elf).expect("prove");
 
+    // Gap campaign (lane KERN): its switches as this process read them and
+    // what each did, cumulative over every prove so far in the process (the
+    // reset above does not reach them). All zero with the switches off; the
+    // lane's box script reads this line in both of its runs of this suite.
+    println!("{}", math_cuda::gap_kern::summary_line());
+
     // R1 main + aux fused LDE+Merkle. Fires for every table above the LDE
     // threshold; fib_iterative_1M has plenty.
     assert!(gpu_lde_calls() > 0, "R1 GPU LDE path did not fire");
