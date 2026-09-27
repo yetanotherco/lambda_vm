@@ -30,6 +30,13 @@ static HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// to the host, and the error — the one thing that named the cause — was
 /// dropped (`thoughts/zf/gap/fix/STRUCT.md` §9.2).
 static COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// ★ Merkle trees the device was ASKED to build over a HOST codeword (an
+/// extension-field fold of a chain whose codeword is on the host, through
+/// [`commit_tree_ext3`]) and answered with an error. The host builds that tree
+/// instead. Kept apart from [`COMMIT_ERRORS`], which stays the part of
+/// [`host_fallbacks`] that failed: such a tree is not a commit fallback. Each
+/// one is also logged with its error.
+static TREE_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Sumchecks whose rounds ran on device.
 static SUMCHECK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Rounds within them, so a declined tail shows up.
@@ -55,26 +62,54 @@ pub fn commit_errors() -> u64 {
     COMMIT_ERRORS.load(Ordering::Relaxed)
 }
 
-/// Commit errors printed per process; past it only [`COMMIT_ERRORS`] moves.
-const COMMIT_ERRORS_LOGGED: u64 = 16;
+pub fn tree_commit_errors() -> u64 {
+    TREE_COMMIT_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Device errors printed per counter per process; past it only the counter
+/// moves.
+const DEVICE_ERRORS_LOGGED: u64 = 16;
+
+/// Count one device error in `counter` and print the first
+/// [`DEVICE_ERRORS_LOGGED`] of them. `describe` says what failed and where the
+/// work goes instead; `kind` names the errors in the note on the last line
+/// printed.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_device_error(counter: &AtomicU64, kind: &str, describe: impl FnOnce() -> String) {
+    let seen = counter.fetch_add(1, Ordering::Relaxed);
+    if seen < DEVICE_ERRORS_LOGGED {
+        let last = if seen + 1 == DEVICE_ERRORS_LOGGED {
+            format!(" (further {kind} are counted, not printed)")
+        } else {
+            String::new()
+        };
+        eprintln!("[whir] {}{last}", describe());
+    }
+}
 
 /// Count and log a device commit that returned an error, before its caller
 /// declines and the chain encodes on the host (where [`note_host_fallback`]
 /// counts it too).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn note_commit_error(what: &str, log_evals: usize, log_blowup: usize, err: &dyn core::fmt::Debug) {
-    let seen = COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
-    if seen < COMMIT_ERRORS_LOGGED {
-        eprintln!(
-            "[whir] device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
-             failed: {err:?}; encoding on the host{}",
-            if seen + 1 == COMMIT_ERRORS_LOGGED {
-                " (further commit errors are counted, not printed)"
-            } else {
-                ""
-            }
-        );
-    }
+    note_device_error(&COMMIT_ERRORS, "commit errors", || {
+        format!(
+            "device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
+             failed: {err:?}; encoding on the host"
+        )
+    });
+}
+
+/// Count and log a device tree over a host codeword that returned an error,
+/// before its caller hashes the tree on the host.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn note_tree_commit_error(log_len: u32, log_folding: usize, err: &dyn core::fmt::Debug) {
+    note_device_error(&TREE_COMMIT_ERRORS, "tree commit errors", || {
+        format!(
+            "device commit (ext3 tree) of 2^{log_len} values in blocks of 2^{log_folding} \
+             failed: {err:?}; hashing on the host"
+        )
+    });
 }
 
 /// Called where a commit gives up on the device. Counts in non-cuda builds
@@ -111,6 +146,7 @@ pub fn reset_call_counters() {
     COMMIT_CALLS.store(0, Ordering::Relaxed);
     HOST_FALLBACKS.store(0, Ordering::Relaxed);
     COMMIT_ERRORS.store(0, Ordering::Relaxed);
+    TREE_COMMIT_ERRORS.store(0, Ordering::Relaxed);
     SUMCHECK_CALLS.store(0, Ordering::Relaxed);
     SUMCHECK_ROUNDS.store(0, Ordering::Relaxed);
     EVALUATE_CALLS.store(0, Ordering::Relaxed);
@@ -831,7 +867,8 @@ where
 }
 
 /// Merkle-commits an ext3 codeword's fold blocks on device, returning the tree
-/// in the host node layout.
+/// in the host node layout. A device error is logged and counted in
+/// [`tree_commit_errors`] before the `None` that sends the caller to the host.
 #[cfg(feature = "cuda")]
 pub(crate) fn commit_tree_ext3<F>(
     codeword: &[math::field::element::FieldElement<F>],
@@ -853,11 +890,19 @@ where
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
         return None;
     }
+    // No device is a decline, not an error (see `commit_parts`).
+    math_cuda::device::backend().ok()?;
     // SAFETY: `F == Ext3`, three transparent `u64` limbs per element.
     let raw =
         unsafe { core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * 3) };
-    let nodes =
-        math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda()).ok()?;
+    let nodes = match math_cuda::whir::commit_codeword_ext3(raw, log_folding, hash.into_math_cuda())
+    {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            note_tree_commit_error(codeword.len().trailing_zeros(), log_folding, &err);
+            return None;
+        }
+    };
     let nodes = nodes_in_place(nodes)?;
     COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(nodes)
