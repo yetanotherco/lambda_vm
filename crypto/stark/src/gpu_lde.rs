@@ -1356,6 +1356,45 @@ where
     // they carry the iFFT normalization, so a divergence here is a divergence in
     // the roots.
     let weights = crate::prover::coset_weights::<F>(rows, coset_offset);
+    try_commit_row_major_with_weights::<F, B>(
+        table,
+        row_major,
+        rows,
+        cols,
+        blowup_factor,
+        &weights,
+        rows_per_leaf,
+    )
+}
+
+/// The coset weights [`try_commit_row_major_with`] derives for `rows` rows —
+/// the prover's own derivation — for a caller that derives them ahead of the
+/// commit (gap fix I3: before it takes the card).
+pub fn commit_coset_weights<F: IsFFTField>(
+    rows: usize,
+    coset_offset: &FieldElement<F>,
+) -> Vec<FieldElement<F>> {
+    crate::prover::coset_weights::<F>(rows, coset_offset)
+}
+
+/// [`try_commit_row_major_with`] over coset weights the caller derived with
+/// [`commit_coset_weights`] for the same `rows` and offset.
+pub fn try_commit_row_major_with_weights<F, B>(
+    table: &str,
+    row_major: &[FieldElement<F>],
+    rows: usize,
+    cols: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    rows_per_leaf: usize,
+) -> Option<Commitment>
+where
+    F: IsFFTField + 'static,
+    B: DeviceTreeBackend,
+{
+    if rows == 0 || cols == 0 || row_major.len() != rows * cols || weights.len() != rows {
+        return None;
+    }
     let (tree, _handle, _lde) = try_expand_leaf_and_tree_row_major_keep::<F, F, B>(
         table,
         "LFM artifact prep commit",
@@ -1364,7 +1403,7 @@ where
         rows,
         cols,
         blowup_factor,
-        &weights,
+        weights,
         // The artifact build never reads the evaluations — only the root — so
         // the row-major D2H is skipped entirely.
         false,

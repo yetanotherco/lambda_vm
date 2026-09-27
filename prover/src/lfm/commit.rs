@@ -227,6 +227,47 @@ pub fn commit_group_device_or_host_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
+    commit_group_device_or_host_inner(label, group, options, layout, None)
+}
+
+/// [`commit_group_device_or_host_with`] over coset weights the caller derived
+/// with [`device_commit_weights`] for `group.padded_rows` rows (gap fix I3:
+/// derived before the card permit is taken). The same root.
+pub fn commit_group_device_or_host_weighted(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+    weights: &[FE],
+) -> Commitment {
+    commit_group_device_or_host_inner(label, group, options, layout, Some(weights))
+}
+
+/// The coset weights a device commit of `rows` rows derives (the prover's own
+/// derivation), for a caller that derives them ahead of the commit (gap fix
+/// I3). Empty on a build without `cuda`, where no commit takes the device.
+pub fn device_commit_weights(rows: usize, options: &ProofOptions) -> Vec<FE> {
+    #[cfg(feature = "cuda")]
+    {
+        stark::gpu_lde::commit_coset_weights::<GoldilocksField>(
+            rows,
+            &FE::from(options.coset_offset),
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (rows, options);
+        Vec::new()
+    }
+}
+
+fn commit_group_device_or_host_inner(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+    weights: Option<&[FE]>,
+) -> Commitment {
     #[cfg(feature = "cuda")]
     if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
         let set = stark::device_set::commit_device_set_rpl(
@@ -250,18 +291,30 @@ pub fn commit_group_device_or_host_with(
         // would otherwise not have. The measurement cannot perturb what it
         // measures.
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
-        let committed = stark::gpu_lde::try_commit_row_major_with::<
-            GoldilocksField,
-            <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-        >(
-            label,
-            &group.data,
-            group.padded_rows,
-            group.width,
-            options.blowup_factor as usize,
-            &FE::from(options.coset_offset),
-            layout.rows_per_leaf(),
-        );
+        type Tree =
+            <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
+        let committed = match weights {
+            None => stark::gpu_lde::try_commit_row_major_with::<GoldilocksField, Tree>(
+                label,
+                &group.data,
+                group.padded_rows,
+                group.width,
+                options.blowup_factor as usize,
+                &FE::from(options.coset_offset),
+                layout.rows_per_leaf(),
+            ),
+            Some(weights) => {
+                stark::gpu_lde::try_commit_row_major_with_weights::<GoldilocksField, Tree>(
+                    label,
+                    &group.data,
+                    group.padded_rows,
+                    group.width,
+                    options.blowup_factor as usize,
+                    weights,
+                    layout.rows_per_leaf(),
+                )
+            }
+        };
         if let Some(t) = probe_t {
             super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
         }
@@ -270,7 +323,7 @@ pub fn commit_group_device_or_host_with(
             return root;
         }
     }
-    let _ = label;
+    let _ = (label, weights);
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
 }
@@ -422,6 +475,44 @@ mod device_parity {
             "only {moved} one-row device trees for {} groups: the device declined (host fallback)",
             shapes.len()
         );
+    }
+
+    /// Gap fix I3: a device commit over weights derived ahead of it
+    /// ([`device_commit_weights`]) is the same root as the commit that derives
+    /// them itself, and as the host pass, in both leaf layouts.
+    #[test]
+    fn the_weighted_device_commit_matches_the_host_commit_above_the_floor() {
+        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+        for layout in [LeafLayout::RowPair, LeafLayout::Row] {
+            for (rows, width) in [(4_096usize, 1usize), (8_192, 20), (4_096, 134)] {
+                let g = group(rows, width);
+                let host =
+                    commit_lde_columns_with(&lde_columns(&group_columns(&g), &options), layout);
+                let weights = device_commit_weights(rows, &options);
+                assert_eq!(weights.len(), rows, "one weight per row");
+                let weighted = commit_group_device_or_host_weighted(
+                    "device_parity_weighted",
+                    &g,
+                    &options,
+                    layout,
+                    &weights,
+                );
+                let derived = commit_group_device_or_host_with(
+                    "device_parity_weighted",
+                    &g,
+                    &options,
+                    layout,
+                );
+                assert_eq!(
+                    weighted, host,
+                    "{rows}x{width} {layout:?}: weighted vs host"
+                );
+                assert_eq!(
+                    weighted, derived,
+                    "{rows}x{width} {layout:?}: weighted vs derived"
+                );
+            }
+        }
     }
 
     /// And the control: `LFM_DEVICE_ARTIFACTS=0` must reach the host pass. Read

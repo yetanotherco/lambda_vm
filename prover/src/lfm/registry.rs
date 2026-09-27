@@ -604,8 +604,10 @@ pub fn build_artifacts_with_hasher(
 /// card (gap fix I3): the build takes the card permit itself, ONCE, around the
 /// commits that may reach the device ([`super::commit::may_take_device`]),
 /// instead of its caller holding it across the whole build. The commits that
-/// cannot reach the card, materializing the `LFM_BLAKE3` chunks, the static
-/// roots and the program id all run with the card free for another proof.
+/// cannot reach the card, materializing the `LFM_BLAKE3` chunks, the device
+/// commits' coset weights (one serial pass over every row, per commit, when
+/// derived inside the dispatch), the static roots and the program id all run
+/// with the card free for another proof.
 ///
 /// ⛔ The permit stays mutual exclusion: every commit that can touch the card
 /// runs inside the one hold, and the host phase calls the host pass directly,
@@ -622,7 +624,8 @@ pub(crate) fn build_artifacts_with_hasher_narrow_permit(
     card_label: &'static str,
 ) -> LfmArtifacts {
     use super::commit::{
-        commit_group_device_or_host_with, commit_group_host_with, may_take_device,
+        commit_group_device_or_host_weighted, commit_group_host_with, device_commit_weights,
+        may_take_device,
     };
     use stark::leaf_layout::LeafLayout;
 
@@ -691,6 +694,25 @@ pub(crate) fn build_artifacts_with_hasher_narrow_permit(
         .iter()
         .map(|j| may_take_device(j.group, options))
         .collect();
+    // The device commits' own host input, derived before the card is taken:
+    // the coset weights, once per distinct height rather than once per commit.
+    let mut heights: Vec<usize> = (0..jobs.len())
+        .filter(|&i| on_device[i])
+        .map(|i| jobs[i].group.padded_rows)
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    let weights: Vec<(usize, Vec<crate::tables::types::FE>)> =
+        map_maybe_parallel(&heights, |&rows| {
+            (rows, device_commit_weights(rows, options))
+        });
+    let weights_for = |rows: usize| -> &[crate::tables::types::FE] {
+        &weights
+            .iter()
+            .find(|(r, _)| *r == rows)
+            .expect("the weights of every device height were derived above")
+            .1
+    };
     let mut committed: Vec<Option<Commitment>> = vec![None; jobs.len()];
     let mut run_phase = |device: bool| {
         for (pass, &window) in windows.iter().enumerate() {
@@ -701,7 +723,13 @@ pub(crate) fn build_artifacts_with_hasher_narrow_permit(
                 let roots = map_maybe_parallel(chunk, |&i| {
                     let j = &jobs[i];
                     if device {
-                        commit_group_device_or_host_with(j.label, j.group, options, j.layout)
+                        commit_group_device_or_host_weighted(
+                            j.label,
+                            j.group,
+                            options,
+                            j.layout,
+                            weights_for(j.group.padded_rows),
+                        )
                     } else {
                         commit_group_host_with(j.group, options, j.layout)
                     }
