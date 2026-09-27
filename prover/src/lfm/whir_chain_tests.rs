@@ -1396,8 +1396,11 @@ fn the_marginal_is_at_least_what_the_weight_term_bills() {
     // the groups are the pages.
     let layout_for = |pages: usize| {
         let columns = pages * PAGE_PREPROCESSED_COLUMNS;
-        let layout = stark::multilinear_table::global_layout(&[(columns, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages");
+        let layout = stark::multilinear_table::global_layout(
+            &[(columns, PAGE_NUM_VARS)],
+            crate::zf_format::ZfFormat::DEFAULT.whir_stack,
+        )
+        .expect("a stack of whole pages");
         let group_of: Vec<usize> = (0..columns)
             .map(|column| column / PAGE_PREPROCESSED_COLUMNS)
             .collect();
@@ -1449,7 +1452,7 @@ fn the_marginal_is_at_least_what_the_weight_term_bills() {
 ///
 /// [`crate::continuation::PREPARED_LEG_ROWS`] prices ONE chain, and one chain
 /// is what the stack costs while its columns fit one polynomial.
-/// `global_layout` caps a stack at [`stark::multilinear_table::MAX_STACK_VARS`]
+/// `global_layout` caps a stack at the production format's stack (`whir_stack`)
 /// and spills the rest into another polynomial, each of which runs its own
 /// chain — so past that width part 2 is weighing a set against a fraction of
 /// what carrying it costs.
@@ -1457,23 +1460,29 @@ fn the_marginal_is_at_least_what_the_weight_term_bills() {
 /// ⛔ THIS IS A PRICING LIMIT AND NOT A SOUNDNESS ONE. All three parties still
 /// reach the same set from the same data; the rule would simply buy pages whose
 /// keep it had under-quoted. It is recorded rather than guarded because the
-/// block sits 21x under it and no run this prover has seen comes near — and if
+/// block sits 85x under it and no run this prover has seen comes near — and if
 /// one ever does, the fix is a chain term that counts polynomials, not a bigger
 /// constant.
+///
+/// The limit is the stack's: 64 pages at the legacy 25, 256 at the production
+/// format's 27, because `2 * pages * 2^18` cells must fit one polynomial.
 #[test]
-fn the_single_chain_term_prices_a_stack_of_at_most_sixty_four_pages() {
+fn the_single_chain_term_prices_a_stack_of_at_most_two_hundred_fifty_six_pages() {
     use crate::continuation::{PAGE_NUM_VARS, PAGE_PREPROCESSED_COLUMNS};
     let per_page = PAGE_PREPROCESSED_COLUMNS;
-    let max_stack_vars = stark::multilinear_table::MAX_STACK_VARS;
+    let max_stack_vars = crate::zf_format::ZfFormat::DEFAULT.whir_stack.get();
 
     let polys_at = |pages: usize| {
-        stark::multilinear_table::global_layout(&[(pages * per_page, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages")
-            .num_polys()
+        stark::multilinear_table::global_layout(
+            &[(pages * per_page, PAGE_NUM_VARS)],
+            crate::zf_format::ZfFormat::DEFAULT.whir_stack,
+        )
+        .expect("a stack of whole pages")
+        .num_polys()
     };
-    // `2 * pages * 2^18` cells must fit `2^25`.
+    // `2 * pages * 2^18` cells must fit `2^27`.
     let widest = 1 << (max_stack_vars - PAGE_NUM_VARS - 1);
-    assert_eq!(widest, 64);
+    assert_eq!(widest, 256);
     assert_eq!(polys_at(widest), 1, "the last width that is one chain");
     assert!(
         polys_at(widest + 1) > 1,
@@ -1937,6 +1946,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
         format: ChainFormat {
             cap: CapPolicy::Auto,
             folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+            stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
         },
         ..config(112, 20)
     };

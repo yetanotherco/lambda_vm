@@ -564,10 +564,11 @@ mod transcript_pin {
         multilinear::whir_chain::ChainConfig,
     ) {
         let (columns, num_vars) = shape;
+        let config = crate::multilinear_continuation::decode_prepared_config(columns, num_vars);
         (
-            stark::multilinear_table::global_layout(&[(columns, num_vars)])
+            stark::multilinear_table::global_layout(&[(columns, num_vars)], config.format.stack)
                 .expect("the DECODE group's layout"),
-            crate::multilinear_continuation::decode_prepared_config(columns, num_vars),
+            config,
         )
     }
 
@@ -664,8 +665,11 @@ mod transcript_pin {
     /// `global_layout` call `genesis_prepared_for` makes, over the same
     /// rectangle, so this cannot describe a stack the prover does not build.
     pub fn genesis_stack_layout(shape: StackShape) -> multilinear::stacking::StackedLayout {
-        stark::multilinear_table::global_layout(&[(shape.columns, shape.num_vars)])
-            .expect("the genesis stack's layout")
+        stark::multilinear_table::global_layout(
+            &[(shape.columns, shape.num_vars)],
+            crate::zf_format::ZfFormat::global().whir_stack,
+        )
+        .expect("the genesis stack's layout")
     }
 
     /// Device commits the genesis stack costs the whole run: its held
@@ -1166,14 +1170,16 @@ fn check_transcript_pins(
     // transcript this is, and it reaches the posture through this function.
     let max_rows_log2 = crate::tables::max_rows_log2_override();
     // ★ The bases were MEASURED at the legacy WHIR format (uniform
-    // folds, no cap). A run at any other WHIR format — the production default
-    // included — is a different measurement: it SKIPS and says so, like a run
-    // at another table cap. Re-pinning at the default needs a box measurement.
+    // folds, no cap, stack 25). A run at any other WHIR format — the
+    // production default included — is a different measurement: it SKIPS and
+    // says so, like a run at another table cap. Re-pinning at the default needs
+    // a box measurement.
     let whir_format = crate::zf_format::ZfFormat::global().chain_format();
     if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT {
         println!(
             "{:<12} transcript pin SKIPPED - WHIR format {:?} (the bases were measured at the \
-             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4)",
+             legacy format {:?}; set LAMBDA_VM_ZF_WHIR_CAP=off LAMBDA_VM_ZF_WHIR_FOLDS=uniform4 \
+             LAMBDA_VM_ZF_WHIR_STACK=25)",
             "WHIR",
             whir_format,
             multilinear::whir_chain::ChainFormat::DEFAULT,
@@ -1687,7 +1693,7 @@ fn the_shape_deriver_reads_columns_then_log2_rows() {
 /// Every term the prepared opening adds is a function of four numbers the shape
 /// determines: the stacked width, the number of polynomials, the fold schedule
 /// and the query count. They are asserted here, so a change to the stacking
-/// rule, to `MAX_STACK_VARS`, to the fold width or to the shipped query count
+/// rule, to the stack cap (`whir_stack`), to the fold width or to the shipped query count
 /// fails on a laptop with a name attached instead of arriving on the box as a
 /// pin that moved by an unexplained amount.
 ///
@@ -2863,7 +2869,8 @@ fn commit_phases() {
         }
     }
     let config = multilinear_prove::chain_config(&shapes);
-    let layout = multilinear_table::global_layout(&shapes).expect("global layout");
+    let layout =
+        multilinear_table::global_layout(&shapes, config.format.stack).expect("global layout");
     let start = Instant::now();
     let polys = layout
         .stack(&multilinear::stacking::borrow(&columns))

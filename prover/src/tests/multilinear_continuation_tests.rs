@@ -1555,10 +1555,10 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
 
     let commit_independently = |columns: &[multilinear::mle::Mle<crate::test_utils::F>]| {
         multilinear::stacked_eval::StackedCommitment::<crate::test_utils::F, KeccakWhir>::commit(
-            stark::multilinear_table::global_layout(&[(
-                columns.len(),
-                crate::continuation::PAGE_NUM_VARS,
-            )])
+            stark::multilinear_table::global_layout(
+                &[(columns.len(), crate::continuation::PAGE_NUM_VARS)],
+                config.format.stack,
+            )
             .expect("layout"),
             &multilinear::stacking::borrow(columns),
             None,

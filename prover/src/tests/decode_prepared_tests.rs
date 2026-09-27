@@ -277,3 +277,44 @@ fn a_decode_commitment_refuses_another_fold_schedule() {
         "the leaf width moves the roots"
     );
 }
+
+/// ★ S2: a commitment reused across epochs must have been built under the
+/// epoch's stack cap, which decided the layout it was handed. `agrees_with`
+/// refuses a reuse under another cap — even here, where DECODE's columns fit
+/// one polynomial under either and the roots agree, because a reuse check
+/// that looked at the roots could not see the cases where they do not.
+#[test]
+fn a_decode_commitment_refuses_another_stack_cap() {
+    use multilinear::whir_chain::StackVars;
+
+    let wide = ChainConfig {
+        format: multilinear::whir_chain::ChainFormat {
+            stack: StackVars::new(27).unwrap(),
+            ..multilinear::whir_chain::ChainFormat::DEFAULT
+        },
+        ..config()
+    };
+    let instrs = program(200, 7);
+    let at_wide =
+        decode_prepared_from_columns::<KeccakWhir>([1; 32], preprocessed_columns(&instrs), &wide)
+            .expect("prepared at 27");
+    let at_legacy = prepared::<KeccakWhir>(&instrs, 1);
+
+    at_wide.agrees_with(&wide).expect("same stack: accepted");
+    at_legacy
+        .agrees_with(&config())
+        .expect("same stack: accepted");
+    let err = at_wide
+        .agrees_with(&config())
+        .expect_err("a commitment stacked under 27 in an epoch at 25 must be refused");
+    assert!(format!("{err:?}").contains("stack"), "{err:?}");
+    at_legacy
+        .agrees_with(&wide)
+        .expect_err("a commitment stacked under 25 in an epoch at 27 must be refused");
+
+    assert_eq!(
+        at_wide.roots, at_legacy.roots,
+        "below both caps the layout, and so the commitment, is the same: the refusal \
+         is the config's"
+    );
+}

@@ -918,10 +918,10 @@ fn the_decode_groups_threaded_schedule_reproduces_the_box() {
 /// the SAME height and in ONE polynomial, both asserted per page count rather
 /// than assumed from the range.
 ///
-/// The two brackets a block-shaped run can stand in are walked: 24 variables
-/// (17..=32 genesis pages, where the block's thirty sit) and 25 (33..=64, the
-/// last bracket that fits one polynomial at
-/// `stark::multilinear_table::MAX_STACK_VARS`).
+/// Every bracket a block-shaped run can stand in as ONE polynomial is walked:
+/// from 24 variables (17..=32 genesis pages, where the block's thirty sit) to
+/// the production format's stack, `whir_stack` (27: 129..=256 pages, the last
+/// bracket that fits one polynomial).
 #[test]
 fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
     use crate::continuation::{
@@ -933,13 +933,38 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
     // The posture the whole VM proof runs at (`multilinear_prove.rs:93`), and a
     // deliberately different one: the marginal must not move with either, since
     // every chain term is per-POLYNOMIAL and there is one polynomial throughout.
-    let shipped = ChainConfig::with_security(2, 4, 25, 128, GrindBits::uniform(20));
-    let other = ChainConfig::with_security(1, 3, 25, 100, GrindBits::uniform(16));
+    // Both stack under the production format's cap, so every single-chain
+    // bracket under it is reachable.
+    let stack = crate::zf_format::ZfFormat::DEFAULT.whir_stack;
+    let at_stack = |mut config: ChainConfig| {
+        config.format.stack = stack;
+        config
+    };
+    let shipped = at_stack(ChainConfig::with_security(
+        2,
+        4,
+        25,
+        128,
+        GrindBits::uniform(20),
+    ));
+    let other = at_stack(ChainConfig::with_security(
+        1,
+        3,
+        25,
+        100,
+        GrindBits::uniform(16),
+    ));
+    // The most whole pages one polynomial holds: `2 * pages * 2^18` cells fit
+    // `2^stack`.
+    let widest = 1usize << (stack.get() - PAGE_NUM_VARS - 1);
 
     let cost_at = |pages: usize, config: &ChainConfig| -> (usize, usize) {
         let columns = pages * PAGE_PREPROCESSED_COLUMNS;
-        let layout = stark::multilinear_table::global_layout(&[(columns, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages");
+        let layout = stark::multilinear_table::global_layout(
+            &[(columns, PAGE_NUM_VARS)],
+            config.format.stack,
+        )
+        .expect("a stack of whole pages");
         // ⛔ THE BRACKET GUARD, PER PAGE COUNT. A difference taken across a
         // height change or a polynomial split is not a page's marginal.
         assert_eq!(
@@ -959,8 +984,8 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
         (layout.n_stack(), cost.operations())
     };
 
-    for bracket in [BLOCK_STACK_VARS, BLOCK_STACK_VARS + 1] {
-        let counts: Vec<usize> = (1..=64)
+    for bracket in BLOCK_STACK_VARS..=stack.get() {
+        let counts: Vec<usize> = (1..=widest)
             .filter(|&pages| fixed_stack_vars(PAGE_NUM_VARS, pages) == bracket)
             .collect();
         assert!(
@@ -1074,21 +1099,24 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
         }
     }
 
-    // ⛔ WHERE THIS PIN'S COVERAGE STOPS, READ RATHER THAN ASSUMED. At 65
-    // genesis pages the stack wants 26 variables, `global_layout` caps it at
-    // `MAX_STACK_VARS` and the columns spill into a second polynomial — which
-    // is a second chain, so part 2's single-chain price stops being the cost.
-    // `whir_chain_tests::the_chain_term_prices_one_polynomial` is where that
-    // limit is stated; here it is only the end of the range a marginal is
-    // defined on.
-    let spilled =
-        stark::multilinear_table::global_layout(&[(65 * PAGE_PREPROCESSED_COLUMNS, PAGE_NUM_VARS)])
-            .expect("a stack of whole pages");
+    // ⛔ WHERE THIS PIN'S COVERAGE STOPS, READ RATHER THAN ASSUMED. One page
+    // past `widest` the stack wants one variable more than the production cap,
+    // `global_layout` caps it and the columns spill into a second polynomial —
+    // which is a second chain, so part 2's single-chain price stops being the
+    // cost. `whir_chain_tests::the_single_chain_term_prices_a_stack_of_at_most_
+    // two_hundred_fifty_six_pages` is where that limit is stated; here it is
+    // only the end of the range a marginal is defined on.
+    let spilled = stark::multilinear_table::global_layout(
+        &[((widest + 1) * PAGE_PREPROCESSED_COLUMNS, PAGE_NUM_VARS)],
+        stack,
+    )
+    .expect("a stack of whole pages");
     assert_eq!(
         spilled.num_polys(),
         2,
-        "65 genesis pages must spill, or the bracket walk above stopped one short of \
-         its own boundary"
+        "{} genesis pages must spill, or the bracket walk above stopped one short of \
+         its own boundary",
+        widest + 1
     );
-    assert_eq!(spilled.n_stack(), stark::multilinear_table::MAX_STACK_VARS);
+    assert_eq!(spilled.n_stack(), stack.get());
 }

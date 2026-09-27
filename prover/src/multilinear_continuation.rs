@@ -25,7 +25,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ChainConfig, WhirFolds};
+use multilinear::whir_chain::{ChainConfig, StackVars, WhirFolds};
 use stark::config::Commitment;
 use stark::multilinear_table::{
     self, CommittedTable, CommittedTables, MultiProof, TableLayout, TableStatement,
@@ -106,8 +106,8 @@ pub fn l2g_commitment(
         columns.len(),
         trace.main_table.height.trailing_zeros() as usize,
     )];
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let roots = crate::with_whir_hash!(|H| {
         multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
             layout,
@@ -174,6 +174,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The stack cap (S2) its layout was built under.
+    stack: StackVars,
 }
 
 impl<H> DecodePrepared<H>
@@ -233,7 +235,7 @@ where
         committed_under(
             "the pinned DECODE commitment was built",
             "this epoch argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
@@ -310,6 +312,8 @@ where
     /// The fold schedule (W2): its first round sets the leaf width tree 0 was
     /// built at.
     folds: WhirFolds,
+    /// The stack cap (S2) its layout was built under.
+    stack: StackVars,
 }
 
 impl<H> GenesisPrepared<H>
@@ -366,7 +370,7 @@ where
         committed_under(
             "the genesis stack was committed",
             "this cross-epoch proof argues",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
@@ -391,6 +395,7 @@ where
             log_blowup: self.log_blowup,
             log_folding: self.log_folding,
             folds: self.folds,
+            stack: self.stack,
         }
     }
 }
@@ -432,6 +437,8 @@ pub struct GlobalPrepared {
     pub log_folding: usize,
     /// The fold schedule it was committed under (W2).
     pub folds: WhirFolds,
+    /// The stack cap its layout was built under (S2).
+    pub stack: StackVars,
 }
 
 impl GlobalPrepared {
@@ -452,29 +459,38 @@ impl GlobalPrepared {
         committed_under(
             "the genesis stack was committed",
             "this program is emitted against",
-            (self.log_blowup, self.log_folding, self.folds),
+            (self.log_blowup, self.log_folding, self.folds, self.stack),
             config,
         )
     }
 }
 
 /// The one comparison every `agrees_with` makes: a commitment built once and
-/// reused must have been built under the blowup, the fold width AND the fold
-/// schedule the proof argues at — the three things `StackedCommitment::commit`
-/// reads (it never reads `num_queries`).
+/// reused must have been built under the blowup, the fold width, the fold
+/// schedule AND the stack cap the proof argues at — the three things
+/// `StackedCommitment::commit` reads (it never reads `num_queries`), and the
+/// cap that decided the layout it was handed.
 fn committed_under(
     built: &str,
     argues: &str,
-    (log_blowup, log_folding, folds): (usize, usize, WhirFolds),
+    (log_blowup, log_folding, folds, stack): (usize, usize, WhirFolds, StackVars),
     config: &ChainConfig,
 ) -> Result<(), Error> {
-    if (config.log_blowup, config.log_folding, config.format.folds)
-        != (log_blowup, log_folding, folds)
+    if (
+        config.log_blowup,
+        config.log_folding,
+        config.format.folds,
+        config.format.stack,
+    ) != (log_blowup, log_folding, folds, stack)
     {
         return Err(Error::Prover(format!(
-            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?}, and \
-             {argues} at blowup {} / folding {} / folds {:?}",
-            config.log_blowup, config.log_folding, config.format.folds,
+            "{built} at blowup {log_blowup} / folding {log_folding} / folds {folds:?} / stack {}, \
+             and {argues} at blowup {} / folding {} / folds {:?} / stack {}",
+            stack.get(),
+            config.log_blowup,
+            config.log_folding,
+            config.format.folds,
+            config.format.stack.get(),
         )));
     }
     Ok(())
@@ -559,8 +575,8 @@ where
             )));
         }
     }
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
@@ -582,6 +598,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        stack: config.format.stack,
     }))
 }
 
@@ -654,8 +671,8 @@ where
         )));
     }
     let shape = [(columns.len(), rows.trailing_zeros() as usize)];
-    let layout =
-        multilinear_table::global_layout(&shape).map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let layout = multilinear_table::global_layout(&shape, config.format.stack)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
         layout,
         &multilinear::stacking::borrow(&columns),
@@ -677,6 +694,7 @@ where
         log_blowup: config.log_blowup,
         log_folding: config.log_folding,
         folds: config.format.folds,
+        stack: config.format.stack,
     })
 }
 

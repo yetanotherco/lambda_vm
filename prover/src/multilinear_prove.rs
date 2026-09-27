@@ -87,10 +87,12 @@ pub struct MultilinearVmProof {
 ///
 /// ★ A PRODUCTION FORMAT SITE: the process's
 /// [`ZfFormat`](crate::zf_format::ZfFormat) WHIR fields (`LAMBDA_VM_ZF_WHIR_CAP`,
-/// `_WHIR_FOLDS`) are stamped on here. Unset knobs give
+/// `_WHIR_FOLDS`, `_WHIR_STACK`) are stamped on here. Unset knobs give
 /// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT)'s WHIR fields
-/// (`whir_cap=auto`, `whir_folds=first6`); both knobs at their off spellings
-/// give the legacy config.
+/// (`whir_cap=auto`, `whir_folds=first6`, `whir_stack=27`); the three knobs at
+/// their off spellings give the legacy config. The stack reaches every layout
+/// through this config ([`stacks`], `CommittedTables::commit_grouped`), on the
+/// prover's side and the verifier's alike.
 pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
     chain_config_under(crate::zf_format::ZfFormat::global(), shapes)
 }
@@ -101,12 +103,25 @@ pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
 /// The query count is charged the fold schedule's worst round count
 /// (`with_security_folds`): the schedule is part of the security accounting,
 /// not a label stamped on afterwards.
+///
+/// ★ AND THE TALLEST STACKED POLYNOMIAL. A chain runs over a stacked
+/// polynomial, and a group stacks many tables into one: its height can exceed
+/// every table's own `one_stack` (narrow tables filling one polynomial). So the
+/// height charged is the larger of the widest table's `one_stack` and the
+/// height all the shapes would stack to together under the format's cap, which
+/// bounds every group's from above ([`multilinear_table::stack_height`] is
+/// monotone). At every production shape the charge does not move Q: the widest
+/// table already stands at or above the cap, and first6 keeps Q at 112 at every
+/// height from 15 to 30 (the legacy `uniform4` from 13 to 28). Q moves only
+/// where the stack crosses a round edge that no single table reaches — 7 or 15
+/// under first6, 5 or 13 under `uniform4` — which only small test programs do.
 pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> ChainConfig {
-    let tallest = shapes
+    let widest_table = shapes
         .iter()
         .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
         .max()
         .unwrap_or(1);
+    let tallest = widest_table.max(multilinear_table::stack_height(shapes, format.whir_stack));
     let config = ChainConfig::with_security_folds(
         2,
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
@@ -384,7 +399,7 @@ pub(crate) fn stacks(
     ),
     Error,
 > {
-    let layouts = multilinear_table::global_layouts(shapes, sizes)
+    let layouts = multilinear_table::global_layouts(shapes, sizes, config.format.stack)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
     let domains = layouts
         .iter()

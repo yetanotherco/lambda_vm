@@ -6,13 +6,14 @@
 //! LAMBDA_VM_ZF_FRI         pair | dp              FRI fold schedule (S3)
 //! LAMBDA_VM_ZF_ONE_ROW     0 | 1 | auto           one-row trace openings (S2)
 //! LAMBDA_VM_ZF_WHIR_FOLDS  uniform4 | first5 | first6   WHIR first-round fold (W2)
+//! LAMBDA_VM_ZF_WHIR_STACK  25 | 26 | 27                   WHIR stack cap, in variables (S2)
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
-//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
 //! Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
-//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`), so setting all five to off
+//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`), so setting all six to off
 //! reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for byte —
 //! for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
@@ -45,12 +46,12 @@
 //! `*_IMPLEMENTED` constant is flipped when its lever is real.
 //!
 //! **The banner prints on every setting, including the default**:
-//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6`.
+//! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27`.
 //! Its absence in a log is then a fact about the run, not an ambiguity.
 
 use std::sync::OnceLock;
 
-use multilinear::whir_chain::{ChainConfig, ChainFormat, FirstFold, WhirFolds};
+use multilinear::whir_chain::{ChainConfig, ChainFormat, FirstFold, StackVars, WhirFolds};
 use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
 
 /// The knob names, in banner order.
@@ -59,6 +60,7 @@ pub const ENV_WHIR_CAP: &str = "LAMBDA_VM_ZF_WHIR_CAP";
 pub const ENV_FRI: &str = "LAMBDA_VM_ZF_FRI";
 pub const ENV_ONE_ROW: &str = "LAMBDA_VM_ZF_ONE_ROW";
 pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
+pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
@@ -79,12 +81,20 @@ pub struct ZfFormat {
     pub one_row: OneRowMode,
     /// W2: the WHIR per-round fold schedule.
     pub whir_folds: WhirFolds,
+    /// S2: how wide a WHIR stacked polynomial may get.
+    pub whir_stack: StackVars,
 }
 
 /// The first-round WHIR fold of the default format (`whir_folds=first6`).
 const DEFAULT_WHIR_FIRST_FOLD: FirstFold = match FirstFold::new(6) {
     Some(k0) => k0,
     None => panic!("6 is a legal first fold"),
+};
+
+/// The WHIR stack cap of the default format (`whir_stack=27`).
+const DEFAULT_WHIR_STACK: StackVars = match StackVars::new(27) {
+    Some(n) => n,
+    None => panic!("27 is a legal stack cap"),
 };
 
 impl Default for ZfFormat {
@@ -97,22 +107,26 @@ impl ZfFormat {
     /// ★ The production format when no knob is set: the MEASURED
     /// configuration. S1 `cap=auto` (STARK block −15.35 s),
     /// S1+S3 `fri=dp` (−28.55 s), W1 `whir_cap=auto` and W2 `whir_folds=first6`
-    /// (WHIR block −9.10 s together), each measured net positive in an ABBA
-    /// block run. `one_row` stays off: in ABBA block runs it costs +3.2 s on
+    /// (WHIR block −9.10 s together), S2 `whir_stack=27` (WHIR block −13.80 s
+    /// against 25, 50 base chains instead of 145), each measured net positive
+    /// in an ABBA block run. S2 changes no STARK proof: only the WHIR layouts
+    /// read the stack. `one_row` stays off: in ABBA block runs it costs +3.2 s on
     /// the WHIR pipeline (the prover-side cost of one-row LFM proofs) and saves
     /// 8.0 s and 8 GiB of host memory on the STARK pipeline, so it is a knob
     /// (`LAMBDA_VM_ZF_ONE_ROW=auto`), recommended for the STARK pipeline.
     /// Security parameters (queries, grinding, blowup) are the
-    /// legacy ones: no lever touches them.
+    /// legacy ones: no lever touches them. `LAMBDA_VM_ZF_WHIR_STACK=25` is the
+    /// stack's rollback.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
         fri: FriMode::Dp,
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::First(DEFAULT_WHIR_FIRST_FOLD),
+        whir_stack: DEFAULT_WHIR_STACK,
     };
 
-    /// The legacy format: every lever off. What all five knobs at their
+    /// The legacy format: every lever off. What all six knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -121,6 +135,7 @@ impl ZfFormat {
         fri: FriMode::Pair,
         one_row: OneRowMode::Off,
         whir_folds: WhirFolds::Uniform,
+        whir_stack: StackVars::LEGACY,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -131,9 +146,10 @@ impl ZfFormat {
             && self.fri == FriMode::Pair
             && self.one_row == OneRowMode::Off
             && self.whir_folds == WhirFolds::Uniform
+            && self.whir_stack == StackVars::LEGACY
     }
 
-    /// Parse the five knobs through `lookup` (the process environment in
+    /// Parse the six knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
@@ -158,6 +174,9 @@ impl ZfFormat {
         }
         if let Some(v) = get(ENV_WHIR_FOLDS) {
             format.whir_folds = parse_whir_folds(&v)?;
+        }
+        if let Some(v) = get(ENV_WHIR_STACK) {
+            format.whir_stack = parse_whir_stack(&v)?;
         }
         Ok(format)
     }
@@ -200,6 +219,10 @@ impl ZfFormat {
         {
             out.push(ENV_WHIR_FOLDS);
         }
+        if self.whir_stack != StackVars::LEGACY && !multilinear::whir_chain::WHIR_STACK_IMPLEMENTED
+        {
+            out.push(ENV_WHIR_STACK);
+        }
         out
     }
 
@@ -234,26 +257,28 @@ impl ZfFormat {
         })
     }
 
-    /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=…`, each value
-    /// in the spelling its knob accepts.
+    /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…`,
+    /// each value in the spelling its knob accepts.
     pub fn banner(&self) -> String {
         format!(
-            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={}",
+            "ZF FORMAT: cap={} whir_cap={} fri={} one_row={} whir_folds={} whir_stack={}",
             self.cap,
             self.whir_cap,
             self.fri,
             self.one_row,
-            whir_folds_name(&self.whir_folds)
+            whir_folds_name(&self.whir_folds),
+            self.whir_stack.get()
         )
     }
 
-    /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=25:[…]` — the fold
-    /// schedule the WHIR base chains run at the production stack heights, so a
-    /// log states the rounds it proved and not only the knob's name. Printed
-    /// under the banner, on every setting.
+    /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=<stack>:[…]` — the fold
+    /// schedule the WHIR base chains run at the production stack heights, up to
+    /// the format's stack cap, so a log states the rounds it proved and not only
+    /// the knob's name. Printed under the banner, on every setting.
     pub fn whir_schedule_line(&self) -> String {
-        let config = crate::multilinear_prove::chain_config_under(self, &[(1, 25)]);
-        let schedules = (20..=25)
+        let stack = self.whir_stack.get();
+        let config = crate::multilinear_prove::chain_config_under(self, &[(1, stack)]);
+        let schedules = (20..=stack)
             .map(|n| format!("n={n}:{:?}", config.schedule(n)).replace(' ', ""))
             .collect::<Vec<_>>()
             .join(" ");
@@ -280,6 +305,7 @@ impl ZfFormat {
         ChainFormat {
             cap: self.whir_cap,
             folds: self.whir_folds,
+            stack: self.whir_stack,
         }
     }
 
@@ -347,6 +373,31 @@ fn whir_folds_name(folds: &WhirFolds) -> String {
     }
 }
 
+/// The stack caps the knob accepts: the three proved, verified and measured
+/// to fit on the 32 GiB card (block 25368371, E2c). Not 28: its argument's
+/// reservations would not fit the device ledger. Not below 25: nothing asks
+/// for a narrower stack than today's. Widening this list is a format decision,
+/// not a parser one.
+pub const WHIR_STACKS: [usize; 3] = [25, 26, 27];
+
+/// `25` | `26` | `27`.
+fn parse_whir_stack(v: &str) -> Result<StackVars, String> {
+    WHIR_STACKS
+        .iter()
+        .find(|&&n| v == n.to_string())
+        .and_then(|&n| StackVars::new(n))
+        .ok_or_else(|| {
+            format!(
+                "{ENV_WHIR_STACK}={v:?}: expected {}",
+                WHIR_STACKS
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,17 +426,18 @@ mod tests {
                 fri: FriMode::Dp,
                 one_row: OneRowMode::Off,
                 whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+                whir_stack: StackVars::new(27).unwrap(),
             }
         );
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27"
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
     }
 
-    /// Every knob keeps its OFF spelling, and all five at off are the legacy
+    /// Every knob keeps its OFF spelling, and all six at off are the legacy
     /// format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
@@ -395,13 +447,14 @@ mod tests {
             (ENV_FRI, "pair"),
             (ENV_ONE_ROW, "0"),
             (ENV_WHIR_FOLDS, "uniform4"),
+            (ENV_WHIR_STACK, "25"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
         assert!(f.is_legacy());
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4"
+            "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -446,6 +499,14 @@ mod tests {
                     ..ZfFormat::DEFAULT
                 },
             ),
+            (
+                ENV_WHIR_STACK,
+                "25",
+                ZfFormat {
+                    whir_stack: StackVars::LEGACY,
+                    ..ZfFormat::DEFAULT
+                },
+            ),
         ] {
             let f = parse(&[(name, v)]).unwrap();
             assert_eq!(f, want, "{name}={v}");
@@ -487,6 +548,18 @@ mod tests {
             parse(&[(ENV_WHIR_FOLDS, " FIRST6 ")]).unwrap().whir_folds,
             WhirFolds::First(FirstFold::new(6).unwrap())
         );
+        for n in WHIR_STACKS {
+            assert_eq!(
+                parse(&[(ENV_WHIR_STACK, &n.to_string())])
+                    .unwrap()
+                    .whir_stack,
+                StackVars::new(n).unwrap()
+            );
+        }
+        assert_eq!(
+            parse(&[(ENV_WHIR_STACK, " 27 ")]).unwrap().whir_stack,
+            StackVars::new(27).unwrap()
+        );
     }
 
     #[test]
@@ -515,6 +588,14 @@ mod tests {
             (ENV_WHIR_FOLDS, "first 6"),
             (ENV_WHIR_FOLDS, "first06"),
             (ENV_WHIR_FOLDS, "list:6,4"),
+            (ENV_WHIR_STACK, ""),
+            (ENV_WHIR_STACK, "24"),
+            (ENV_WHIR_STACK, "28"),
+            (ENV_WHIR_STACK, "0"),
+            (ENV_WHIR_STACK, "027"),
+            (ENV_WHIR_STACK, "27.0"),
+            (ENV_WHIR_STACK, "auto"),
+            (ENV_WHIR_STACK, "off"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
@@ -529,10 +610,11 @@ mod tests {
             fri: FriMode::Dp,
             one_row: OneRowMode::Auto,
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
+            whir_stack: StackVars::new(26).unwrap(),
         };
         assert_eq!(
             f.banner(),
-            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6"
+            "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -548,6 +630,7 @@ mod tests {
             (ENV_FRI, fields["fri"]),
             (ENV_ONE_ROW, fields["one_row"]),
             (ENV_WHIR_FOLDS, fields["whir_folds"]),
+            (ENV_WHIR_STACK, fields["whir_stack"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -592,7 +675,7 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
                 .unwrap()
                 .banner(),
-            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6"
+            "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27"
         );
     }
 
@@ -631,6 +714,86 @@ mod tests {
         for v in ["first5", "first6"] {
             let f = parse(&[(ENV_WHIR_FOLDS, v)]).unwrap();
             assert!(f.unimplemented_levers().is_empty(), "{v}");
+        }
+    }
+
+    /// S2: every accepted stack is selectable, reaches the chain config the
+    /// prover, the host verifier and the in-guest emitters all build their
+    /// layouts from, moves no other field, and 25 is the legacy value wherever
+    /// a default is spelled.
+    #[test]
+    fn the_whir_stack_lever_is_selectable_and_carried() {
+        const { assert!(multilinear::whir_chain::WHIR_STACK_IMPLEMENTED) };
+        assert_eq!(ZfFormat::LEGACY.whir_stack, StackVars::LEGACY);
+        assert_eq!(ChainFormat::DEFAULT.stack, StackVars::LEGACY);
+        for n in WHIR_STACKS {
+            let f = parse(&[(ENV_WHIR_STACK, &n.to_string())]).unwrap();
+            assert!(f.unimplemented_levers().is_empty(), "{n}");
+            assert_eq!(f.chain_format().stack.get(), n);
+            let c = crate::multilinear_prove::chain_config_under(&f, &[(1, 25)]);
+            assert_eq!(c.format.stack.get(), n, "the config carries the stack");
+            assert!(
+                f.banner().ends_with(&format!(" whir_stack={n}")),
+                "{}",
+                f.banner()
+            );
+            assert_eq!(
+                ZfFormat {
+                    whir_stack: ZfFormat::DEFAULT.whir_stack,
+                    ..f
+                },
+                ZfFormat::DEFAULT,
+                "the knob moves the stack and nothing else"
+            );
+        }
+        assert_eq!(WHIR_STACKS.iter().max(), Some(&StackVars::WIDEST));
+    }
+
+    /// ★ Q is charged the tallest STACKED polynomial, not only the widest
+    /// table: three narrow tables that each fit 14 variables stack to 16, a
+    /// four-round chain under first6 where each table alone runs three.
+    #[test]
+    fn the_query_count_charges_the_tallest_stacked_polynomial() {
+        use crate::multilinear_prove::chain_config_under;
+        let narrow = [(1, 14), (1, 14), (1, 14)];
+        let c = chain_config_under(&ZfFormat::DEFAULT, &narrow);
+        assert_eq!(
+            stark::multilinear_table::stack_height(&narrow, ZfFormat::DEFAULT.whir_stack),
+            16
+        );
+        assert_eq!(
+            (c.rounds(16), c.num_queries),
+            (4, 112),
+            "charged at 16 variables"
+        );
+        // What the widest table alone would charge: three rounds, one query fewer.
+        let widest_alone = ChainConfig::with_security_folds(
+            2,
+            PRODUCTION_WHIR_LOG_FOLDING,
+            ZfFormat::DEFAULT.whir_folds,
+            14,
+            128,
+            multilinear::whir_chain::GrindBits::uniform(20),
+        );
+        assert_eq!(widest_alone.num_queries, 111);
+        // At the production shapes the charge moves nothing, at every accepted
+        // stack: the widest table stands at or above the cap, and Q is 112
+        // anywhere from 15 to 30 variables.
+        for n in WHIR_STACKS {
+            let f = ZfFormat {
+                whir_stack: StackVars::new(n).unwrap(),
+                ..ZfFormat::DEFAULT
+            };
+            for shapes in [
+                &[(1usize, 25usize)][..],
+                &[(64, 21), (1480, 16), (8, 20)][..],
+            ] {
+                assert_eq!(
+                    chain_config_under(&f, shapes).num_queries,
+                    112,
+                    "stack {n}, shapes {shapes:?}"
+                );
+            }
         }
     }
 
@@ -715,16 +878,32 @@ mod tests {
             whir_folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             ..ZfFormat::LEGACY
         };
-        // The production default runs the first6 schedules.
+        // The production default runs the first6 schedules, to its stack.
         assert_eq!(
             ZfFormat::DEFAULT.whir_schedule_line(),
-            first6.whir_schedule_line()
+            ZfFormat {
+                whir_stack: ZfFormat::DEFAULT.whir_stack,
+                ..first6
+            }
+            .whir_schedule_line()
         );
         assert_eq!(
             first6.whir_schedule_line(),
             "ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] \
              n=21:[6,4,4,4,3] n=22:[6,4,4,4,4] n=23:[6,4,4,4,4,1] \
              n=24:[6,4,4,4,4,2] n=25:[6,4,4,4,4,3]"
+        );
+        // Under a wider stack the line runs to it, with Q charged there.
+        let wide = ZfFormat {
+            whir_stack: StackVars::new(27).unwrap(),
+            ..first6
+        };
+        assert_eq!(
+            wide.whir_schedule_line(),
+            "ZF WHIR SCHEDULES: whir_folds=first6 q=112 n=20:[6,4,4,4,2] \
+             n=21:[6,4,4,4,3] n=22:[6,4,4,4,4] n=23:[6,4,4,4,4,1] \
+             n=24:[6,4,4,4,4,2] n=25:[6,4,4,4,4,3] n=26:[6,4,4,4,4,4] \
+             n=27:[6,4,4,4,4,4,1]"
         );
     }
 

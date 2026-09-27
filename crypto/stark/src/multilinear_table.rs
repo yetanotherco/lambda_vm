@@ -33,7 +33,7 @@ use multilinear::{
     stacked_eval::{self, Claimed, StackedCommitment, StackedProof},
     stacking::StackedLayout,
     whir::Domain,
-    whir_chain::ChainConfig,
+    whir_chain::{ChainConfig, StackVars},
     whir_commit::Commitment,
     whir_hash::{KeccakWhir, WhirHash},
 };
@@ -361,46 +361,54 @@ pub fn column_offsets(widths: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// How wide one stacked polynomial may get, in variables.
-///
-/// This is the knob between proof size and peak memory, and it is a resource
-/// tradeoff rather than an optimization. Every extra variable halves the number
-/// of polynomials — and so the number of openings, which is nearly all of a
-/// proof — but doubles the biggest single allocation: a polynomial of `n`
-/// variables is encoded over `2^(n + log_blowup)` field elements, and the NTT
-/// wants the coefficients and the codeword alive at once.
-///
-/// 25 puts one codeword at 1 GiB in the base field, which fits alongside the
-/// rest of the prover on a 32 GiB machine. A proof of ethrex 10tx lands in a
-/// handful of polynomials rather than one per table.
-pub const MAX_STACK_VARS: usize = 25;
-
-/// The stack every table's columns share, from their shapes alone.
+/// The stack every table's columns share, from their shapes and the format's
+/// stack cap alone.
 ///
 /// `shapes` is `(columns, height in variables)` per table, in table order. The
 /// heights differ and that is fine: a column takes the subcube it needs and the
 /// next one starts after it, so stacking wastes less than each table rounding
 /// up to its own power of two.
 ///
-/// Columns that do not fit spill into another polynomial — see
-/// [`MAX_STACK_VARS`], which is what stops one proof-sized allocation.
-pub fn global_layout(shapes: &[(usize, usize)]) -> Result<StackedLayout, MlError> {
+/// Columns that do not fit spill into another polynomial at `cap` — see
+/// [`StackVars`], which is what stops one proof-sized allocation. The cap is
+/// the config's (`ChainConfig::format.stack`), so the prover and the verifier
+/// stack under the same one, and never a proof's.
+pub fn global_layout(shapes: &[(usize, usize)], cap: StackVars) -> Result<StackedLayout, MlError> {
     let heights: Vec<usize> = shapes
         .iter()
         .flat_map(|&(width, num_vars)| std::iter::repeat_n(num_vars, width))
         .collect();
-    let cells: usize = heights.iter().map(|&m| 1usize << m).sum();
-    let want = cells.next_power_of_two().trailing_zeros() as usize;
-    // Never narrower than the tallest column, or it would not fit at all.
-    let tallest = heights.iter().copied().max().unwrap_or(0);
-    let n_stack = want.min(MAX_STACK_VARS).max(tallest);
-    StackedLayout::build(&heights, n_stack)
+    StackedLayout::build(&heights, stack_height(shapes, cap))
 }
 
-/// One layout per group, from the shapes and how the tables are split.
+/// The height, in variables, [`global_layout`] stacks `shapes` at under `cap`:
+/// the smallest power of two that holds every column, at most `cap`, and never
+/// narrower than the tallest column, or it would not fit at all.
+///
+/// ★ Monotone in the shapes: a group's height is at most that of any shape
+/// list containing it, so every group of a proof stacks at most as tall as all
+/// of its shapes stacked together would.
+pub fn stack_height(shapes: &[(usize, usize)], cap: StackVars) -> usize {
+    let cells: usize = shapes
+        .iter()
+        .map(|&(width, num_vars)| width << num_vars)
+        .sum();
+    let want = cells.next_power_of_two().trailing_zeros() as usize;
+    let tallest = shapes
+        .iter()
+        .filter(|&&(width, _)| width > 0)
+        .map(|&(_, num_vars)| num_vars)
+        .max()
+        .unwrap_or(0);
+    want.min(cap.get()).max(tallest)
+}
+
+/// One layout per group, from the shapes, how the tables are split and the
+/// stack cap.
 pub fn global_layouts(
     shapes: &[(usize, usize)],
     sizes: &[usize],
+    cap: StackVars,
 ) -> Result<Vec<StackedLayout>, MlError> {
     if sizes.iter().sum::<usize>() != shapes.len() {
         return Err(MlError::QueryCountMismatch {
@@ -411,7 +419,7 @@ pub fn global_layouts(
     let mut layouts = Vec::with_capacity(sizes.len());
     let mut at = 0usize;
     for &size in sizes {
-        layouts.push(global_layout(&shapes[at..at + size])?);
+        layouts.push(global_layout(&shapes[at..at + size], cap)?);
         at += size;
     }
     Ok(layouts)
@@ -481,7 +489,7 @@ where
                 .iter()
                 .map(|t| (t.num_committed_columns(), t.num_vars()))
                 .collect();
-            let layout = global_layout(&shapes)?;
+            let layout = global_layout(&shapes, config.format.stack)?;
             // By reference: the stack copies every column into its own buffer,
             // and the trace holds the originals for the rest of the proof.
             let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
@@ -1930,6 +1938,128 @@ mod tests {
     #[test]
     fn three_tables_argue_and_their_buses_balance() {
         argue(cpu_columns(), add_columns(), mul_columns()).unwrap();
+    }
+
+    /// [`config`] with its stack cap at `cap`.
+    fn config_at(cap: usize) -> ChainConfig {
+        ChainConfig {
+            format: multilinear::whir_chain::ChainFormat {
+                stack: StackVars::new(cap).expect("a legal cap"),
+                ..multilinear::whir_chain::ChainFormat::DEFAULT
+            },
+            ..config()
+        }
+    }
+
+    /// The three tables' shapes, as `commit_grouped` reads them.
+    fn three_shapes() -> Vec<(usize, usize)> {
+        [cpu_columns(), add_columns(), mul_columns()]
+            .iter()
+            .map(|columns| (columns.len(), columns[0].len().trailing_zeros() as usize))
+            .collect()
+    }
+
+    /// Proves the three tables stacked under `prove_cap`, then verifies under
+    /// `verify_cap` with every layout and domain REBUILT from the shapes and the
+    /// verifier's own config — as the production verifier does
+    /// (`prover::multilinear_prove::stacks`), never taken from the proof or
+    /// from the prover's commitment. Returns the proof's root count.
+    fn argue_across(prove_cap: usize, verify_cap: usize) -> Result<usize, MlError> {
+        let (cpu_air, add_air, mul_air) = airs();
+        let prover_config = config_at(prove_cap);
+        let committed = CommittedTables::<_, _, KeccakWhir>::commit(
+            vec![
+                table(&cpu_air, &cpu_columns())?,
+                table(&add_air, &add_columns())?,
+                table(&mul_air, &mul_columns())?,
+            ],
+            &prover_config,
+        )?;
+        let mut prover = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        let proof = multi_prove(&committed, &prover_config, &mut prover, None)?;
+
+        let verifier_config = config_at(verify_cap);
+        let layouts = global_layouts(
+            &three_shapes(),
+            committed.sizes(),
+            verifier_config.format.stack,
+        )?;
+        let domains = layouts
+            .iter()
+            .map(|layout| Domain::<Fp>::new(layout.n_stack() + verifier_config.log_blowup))
+            .collect::<Result<Vec<_>, _>>()?;
+        let statements: Vec<TableStatement<'_, Fp, Ext>> =
+            committed.tables().iter().map(|t| t.statement()).collect();
+        let mut verifier = DefaultTranscript::<Ext>::new(b"multilinear-table");
+        multi_verify::<_, _, _, KeccakWhir>(
+            &proof,
+            &statements,
+            &layouts,
+            &domains,
+            committed.sizes(),
+            &ExtE::zero(),
+            &verifier_config,
+            &mut verifier,
+            None,
+        )?;
+        Ok(proof.roots.len())
+    }
+
+    /// ★ S2: THE STACK IS A FORMAT CONSTANT OF BOTH SIDES. The three tables hold
+    /// 72 cells: one polynomial of 7 variables under a cap of 7, three of 5 under
+    /// a cap of 5. Each proof verifies under its own cap — the honest control,
+    /// first — and is REFUSED under the other, in both directions, as an error:
+    /// a panic fails this test. The code path of 25 against 27, at a size a
+    /// laptop proves.
+    #[test]
+    fn a_proof_stacked_under_one_cap_is_refused_under_another() {
+        let polys = |cap: usize| {
+            global_layout(&three_shapes(), StackVars::new(cap).unwrap())
+                .unwrap()
+                .num_polys()
+        };
+        assert_eq!(
+            (polys(7), polys(5)),
+            (1, 3),
+            "the caps must stack differently"
+        );
+        assert_eq!(argue_across(7, 7).unwrap(), 1, "the honest control at 7");
+        assert_eq!(argue_across(5, 5).unwrap(), 3, "the honest control at 5");
+        assert!(
+            argue_across(7, 5).is_err(),
+            "a proof stacked under 7 verified under 5"
+        );
+        assert!(
+            argue_across(5, 7).is_err(),
+            "a proof stacked under 5 verified under 7"
+        );
+    }
+
+    /// `stack_height` is `global_layout`'s height, and no group of a shape list
+    /// stacks taller than the whole list: what lets the query count charge all
+    /// of a proof's shapes and never undercharge one of its groups.
+    #[test]
+    fn the_stack_height_is_the_layouts_and_bounds_every_group() {
+        let shapes = [(5, 3), (4, 2), (4, 2), (0, 9), (16, 4), (2, 6)];
+        for cap in [1, 4, 5, 6, 7, 8, 9, 25, StackVars::WIDEST] {
+            let cap = StackVars::new(cap).unwrap();
+            let all = stack_height(&shapes, cap);
+            assert_eq!(
+                global_layout(&shapes, cap).unwrap().n_stack(),
+                all,
+                "{cap:?}"
+            );
+            for start in 0..shapes.len() {
+                for end in start + 1..=shapes.len() {
+                    assert!(
+                        stack_height(&shapes[start..end], cap) <= all,
+                        "{cap:?}: shapes[{start}..{end}] stack taller than all of them"
+                    );
+                }
+            }
+        }
+        // The empty column does not count toward the tallest.
+        assert_eq!(stack_height(&[(0, 9), (1, 2)], StackVars::LEGACY), 2);
     }
 
     #[test]
