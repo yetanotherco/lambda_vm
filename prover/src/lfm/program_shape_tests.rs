@@ -1,9 +1,8 @@
-//! GAP-FIX REC: the recursion-proof shape fixes, behind their `LAMBDA_VM_GAP_*`
-//! knobs.
+//! Recursion-program shape: `BITWISE` only in the programs whose instantiated
+//! chips send it a lookup ([`ChipSet::bitwise`]), and `LFM_HASH` split into two
+//! power-of-two instances where one table would be mostly padding
+//! ([`HashChunking`]).
 //!
-//! R1 — `BITWISE` leaves every program whose instantiated chips send it no
-//! lookup ([`ChipSet::bitwise`]). R2 — `LFM_HASH` splits into two power-of-two
-//! instances where one table would be mostly padding ([`HashChunking`]).
 //! The premise tests read interaction lists, split rules and digests and prove
 //! nothing; the tests that prove (`*_proves_*`, `*_refused`, `an_emitted_leg_*`)
 //! belong on the box.

@@ -152,8 +152,6 @@ mod fri_group_tests;
 #[cfg(test)]
 mod fri_tests;
 #[cfg(test)]
-mod gap_rec_tests;
-#[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;
@@ -177,6 +175,8 @@ mod per_table_census_tests;
 mod poseidon_chip_tests;
 #[cfg(test)]
 mod preprocessed_tests;
+#[cfg(test)]
+mod program_shape_tests;
 #[cfg(test)]
 mod whir_air_tests;
 #[cfg(test)]
