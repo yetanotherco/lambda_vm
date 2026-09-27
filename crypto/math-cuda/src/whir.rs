@@ -974,15 +974,17 @@ fn commit_from(
     // The lift's bit-reverse and the NTT's cancel around the zero padding —
     // see `lift_spread`. What was two scattered passes over the codeword plus
     // the memset that zeroed it is one pass that writes all of it.
-    // SAFETY: the spread writes every element, padding included (under GAP K1B
-    // the first pass of the column engine does, storing all of its tile).
+    // SAFETY: the spread writes every element, padding included (on the column
+    // engine its first pass does, storing all of its tile).
     let mut x = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
     let n_u64 = n as u64;
     let log_blowup_u32 = log_blowup as u32;
-    if crate::lde_cm::k1b_enabled() && crate::lde_cm::spread_supports(log_n as u32, log_blowup_u32)
+    if crate::lde_cm::engine_enabled()
+        && crate::lde_cm::spread_supports(log_n as u32, log_blowup_u32)
     {
-        // GAP K1B: the same spread and transform in the column engine's
-        // ceil(log_n / 8) passes, the spread fused into the first one.
+        // The same spread and transform in the column engine's ceil(log_n / 8)
+        // passes, the spread fused into the first one, and no twiddle table
+        // (see `lde_cm`). `LAMBDA_VM_LDE_LEGACY=1` takes the branch below.
         let src = coeffs.device_ptr(&stream).0;
         let dst = x.device_ptr(&stream).0;
         crate::lde_cm::spread_ntt_column(&stream, be, src, dst, log_n as u32, log_blowup_u32)?;

@@ -531,7 +531,7 @@ void test_coeff_form() {
     }
 }
 
-// 6. The single-column spread transform WHIR's encoding runs under K1B
+// 6. The single-column spread transform the WHIR commit's encoding runs
 // (`lde_cm::spread_ntt_column`): position B·q of the DIT input is src[q], the
 // rest zero, no weights — the legacy `lift_spread` then the DIT body. A DIT with
 // bit-reversed input position p computes Σ_p z[p]·ω^(i·rev_N(p)), and

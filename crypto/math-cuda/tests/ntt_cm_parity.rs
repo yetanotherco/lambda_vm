@@ -9,7 +9,9 @@
 //!   the engine may leave a different non-canonical representative, which
 //!   nothing downstream observes — the hashes and serialisation canonicalise);
 //! - the trace-domain snapshot is identical, raw u64 for raw u64;
-//! - the host outputs of the batched entry points are identical (canonically).
+//! - the host outputs of the batched entry points are identical (canonically);
+//! - the WHIR commit's codeword (canonically) and Merkle nodes (bytes) are
+//!   identical under either encoding.
 //!
 //! The engine's arithmetic is also pinned on the host by
 //! `tests/host_kat/ntt_cm_host_kat.cpp`; `engine_matches_the_cpu_lde` anchors the
@@ -22,7 +24,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsPrimeField;
 use math::polynomial::Polynomial;
 use math_cuda::DeviceHash;
-use math_cuda::lde_cm::{columns_extended, k1b_codewords, spread_supports, with_engine, with_k1b};
+use math_cuda::lde_cm::{codewords_encoded, columns_extended, spread_supports, with_engine};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -509,12 +511,12 @@ fn engine_matches_the_cpu_lde() {
     }
 }
 
-/// GAP K1B: the WHIR encoding (spread + NTT of one codeword) through the column
+/// The WHIR commit's encoding (spread + NTT of one codeword) through the column
 /// engine against the legacy `lift_spread` + `run_ntt_body`: the codeword
 /// (canonically) and the Merkle nodes (bytes) are identical. `(1, 2)` is below
 /// the engine's smallest transform and must stay on the legacy path.
 #[test]
-fn whir_codeword_k1b_matches_legacy() {
+fn whir_codeword_engine_matches_legacy() {
     let shapes: &[(usize, usize, usize)] = &[
         // (log_evals, log_blowup, log_folding)
         (1, 2, 1),
@@ -534,23 +536,23 @@ fn whir_codeword_k1b_matches_legacy() {
         let evals = canon(&random(&mut rng, 1usize << log_evals));
         let hash = [DeviceHash::Rpx256, DeviceHash::Keccak256][i % 2];
         let what = format!("whir log_evals={log_evals} log_blowup={log_blowup} {hash:?}");
-        let before = k1b_codewords();
-        let (k1b_vals, k1b_nodes) = with_k1b(true, || {
+        let before = codewords_encoded();
+        let (engine_vals, engine_nodes) = with_engine(true, || {
             math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
         })
-        .expect("K1B commit");
-        let routed = k1b_codewords() > before;
+        .expect("engine commit");
+        let routed = codewords_encoded() > before;
         let supported = spread_supports((log_evals + log_blowup) as u32, log_blowup as u32);
         // Other tests may encode concurrently, so only the supported shapes'
         // "it routed" is certain; an unsupported one is checked by its values.
         if supported {
-            assert!(routed, "{what}: the knob did not route through the engine");
+            assert!(routed, "{what}: the encoding did not take the engine");
         }
-        let (vals, nodes) = with_k1b(false, || {
+        let (vals, nodes) = with_engine(false, || {
             math_cuda::whir::commit_codeword_to_host(&evals, log_blowup, log_folding, hash)
         })
         .expect("legacy commit");
-        assert_same_values(&k1b_vals, &vals, &what);
-        assert_eq!(k1b_nodes, nodes, "{what}: Merkle nodes");
+        assert_same_values(&engine_vals, &vals, &what);
+        assert_eq!(engine_nodes, nodes, "{what}: Merkle nodes");
     }
 }

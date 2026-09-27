@@ -30,10 +30,19 @@
 //! which nothing downstream observes (the hashes and the serialisation
 //! canonicalise).
 //!
+//! The WHIR commit's encoding (`whir::commit_from`) is one column of the same
+//! forward transform with no coset: the coefficients, spread at the blowup's
+//! spacing, go through the forward passes ([`spread_ntt_column`]) with the
+//! spread fused into the first. It reads an 8 KiB windowed root table, where
+//! the legacy encoding reads `Backend::fwd_twiddles_for`: `2^(log_n − 1)`
+//! values per codeword size, built on the host and cached on the card for the
+//! life of the process, outside the VRAM ledger (512 MiB for a `2^27`
+//! codeword, 2 GiB for `2^29`).
+//!
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
 //! stays for what the engine does not take — a caller that wants the row-major
-//! LDE back on the host, and shapes outside [`supports`] — and, whole, under
-//! [`LEGACY_ENV`].
+//! LDE back on the host, and shapes outside [`supports`] (for the encoding,
+//! [`spread_supports`]) — and, whole, under [`LEGACY_ENV`].
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,8 +58,9 @@ use crate::Result;
 use crate::device::Backend;
 
 /// `LAMBDA_VM_LDE_LEGACY=1` sends every LDE back to the legacy per-level
-/// pipeline — an A/B and rollback switch, not a tuning knob: both produce the
-/// same values, roots and proofs. Read once per process.
+/// pipeline, the commits' trace LDEs and the WHIR commit's encoding alike — an
+/// A/B and rollback switch, not a tuning knob: both produce the same values,
+/// roots and proofs. Read once per process.
 pub const LEGACY_ENV: &str = "LAMBDA_VM_LDE_LEGACY";
 
 thread_local! {
@@ -59,7 +69,8 @@ thread_local! {
     static ENGINE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Whether the calling thread's LDEs take this engine (where it applies).
+/// Whether the calling thread's LDEs and WHIR encodings take this engine (where
+/// it applies).
 pub fn engine_enabled() -> bool {
     if let Some(on) = ENGINE_OVERRIDE.with(Cell::get) {
         return on;
@@ -104,54 +115,13 @@ pub fn columns_extended() -> u64 {
     COLUMNS_EXTENDED.load(Ordering::Relaxed)
 }
 
-/// A temporary measurement knob (GAP K1B): `LAMBDA_VM_GAP_K1B=1` routes the WHIR
-/// commit's single-column encoding (`whir::commit_from`: the spread and the NTT
-/// of one codeword) through this engine's passes ([`spread_ntt_column`]).
-/// Separate from [`LEGACY_ENV`] so it is measured on its own. Default off; read
-/// once per process.
-pub const K1B_ENV: &str = "LAMBDA_VM_GAP_K1B";
+/// Codewords [`spread_ntt_column`] has encoded, process-wide: the counter a
+/// test reads to know the engine, and not the legacy path, did a WHIR encoding.
+static CODEWORDS_ENCODED: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    /// Per-thread override of [`K1B_ENV`]. See [`with_k1b`].
-    static K1B_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// Whether the calling thread's WHIR encodings take this engine.
-pub fn k1b_enabled() -> bool {
-    if let Some(on) = K1B_OVERRIDE.with(Cell::get) {
-        return on;
-    }
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        let on = std::env::var(K1B_ENV).is_ok_and(|v| v == "1");
-        eprintln!(
-            "[gpu] GAP K1B column-engine WHIR encoding: {}",
-            if on { "on" } else { "off" }
-        );
-        on
-    })
-}
-
-/// [`with_engine`] for [`K1B_ENV`].
-#[doc(hidden)]
-pub fn with_k1b<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<bool>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            K1B_OVERRIDE.with(|c| c.set(self.0));
-        }
-    }
-    let _restore = Restore(K1B_OVERRIDE.with(|c| c.replace(Some(on))));
-    f()
-}
-
-/// Codewords [`spread_ntt_column`] has encoded, process-wide: K1B's mechanism
-/// counter.
-static K1B_CODEWORDS: AtomicU64 = AtomicU64::new(0);
-
-/// See [`K1B_CODEWORDS`].
-pub fn k1b_codewords() -> u64 {
-    K1B_CODEWORDS.load(Ordering::Relaxed)
+/// See [`CODEWORDS_ENCODED`].
+pub fn codewords_encoded() -> u64 {
+    CODEWORDS_ENCODED.load(Ordering::Relaxed)
 }
 
 /// Smallest trace a column can have here: a pass holds 16 elements per
@@ -515,16 +485,16 @@ pub(crate) fn lde_columns(
     Ok(())
 }
 
-/// The forward transform of ONE spread column — WHIR's encoding
-/// (`whir::commit_from`: `ntt.cu`'s `lift_spread` then `ntt::run_ntt_body`),
-/// fused: position `2^log_blowup · q` of the length-`2^log_n` DIT input
-/// (bit-reversed in, natural out) is `src[q]`, every other position zero, and
-/// `dst` receives the natural-order transform. The spread is the first pass's
-/// load, so the padding is never stored or read, and the transform is
-/// `ceil(log_n / 8)` passes instead of the spread pass, the fused 8-level pass
-/// and one 5-level tile per five levels above it. `src` (`2^(log_n -
-/// log_blowup)` values) and `dst` (`2^log_n`) must not overlap. Nothing
-/// synchronises.
+/// The forward transform of ONE spread column — the WHIR commit's encoding
+/// (`whir::commit_from`; the legacy path is `ntt.cu`'s `lift_spread` then
+/// `ntt::run_ntt_body`), fused: position `2^log_blowup · q` of the
+/// length-`2^log_n` DIT input (bit-reversed in, natural out) is `src[q]`,
+/// every other position zero, and `dst` receives the natural-order transform.
+/// The spread is the first pass's load, so the padding is never stored or
+/// read, and the transform is `ceil(log_n / 8)` passes instead of the spread
+/// pass, the fused 8-level pass and one 5-level tile per five levels above it.
+/// `src` (`2^(log_n - log_blowup)` values) and `dst` (`2^log_n`) must not
+/// overlap. Nothing synchronises.
 pub(crate) fn spread_ntt_column(
     stream: &CudaStream,
     be: &Backend,
@@ -535,7 +505,7 @@ pub(crate) fn spread_ntt_column(
 ) -> Result<()> {
     assert!(
         spread_supports(log_n, log_blowup),
-        "K1B spread transform 2^{log_n} at spacing 2^{log_blowup}"
+        "a spread transform of 2^{log_n} at spacing 2^{log_blowup} is outside the engine"
     );
     let tables = root_tables(be)?;
     let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
@@ -560,7 +530,7 @@ pub(crate) fn spread_ntt_column(
         )?;
         s += k;
     }
-    K1B_CODEWORDS.fetch_add(1, Ordering::Relaxed);
+    CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
