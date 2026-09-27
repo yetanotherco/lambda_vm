@@ -354,6 +354,111 @@ fn budget_headroom() -> String {
     "no device".to_string()
 }
 
+/// Whether a group's room is sized to the turns it covers — its commits', two
+/// in flight, and one chain's opening, as the kernels that run them allocate —
+/// rather than one base codeword. `true` unless `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`
+/// is set, which promises the codeword as before.
+///
+/// One codeword was the right number once: two commits in flight at a fold of
+/// four hold (half a codeword, less a node) each. At the production first fold
+/// of six a commit holds a quarter, and an opening under the lean rounds and
+/// the fused fold about a fifth — where before them an opening held nearly
+/// four codewords against the one it had promised.
+pub(crate) fn room_resize() -> bool {
+    match ROOM_RESIZE_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_RESIZE").is_some())
+        }
+    }
+}
+
+static ROOM_RESIZE_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` for the whole process. `None`
+/// restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_room_resize(on: Option<bool>) {
+    ROOM_RESIZE_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The two turns a stacked group's room covers, in bytes beside the codewords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomTurns {
+    /// The commits', two in flight ([`math_cuda::whir::commit_transient_bytes`]).
+    pub commit: u64,
+    /// One chain's opening at a time, from the kernels that will run it
+    /// ([`math_cuda::whir_open::opening_transient_bytes`]).
+    pub open: u64,
+}
+
+/// [`RoomTurns`] for a group laid out as `layout`, opened from resident
+/// columns or not. Every stacked polynomial of a group has the same variable
+/// count, so the widest share list and the most `eq` values over them bound
+/// every chain's opening.
+#[cfg(feature = "cuda")]
+pub fn room_turns_for(
+    layout: &crate::stacking::StackedLayout,
+    config: &crate::whir_chain::ChainConfig,
+    staged: bool,
+) -> RoomTurns {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    let n = layout.n_stack();
+    let schedule = config.schedule(n);
+    let first_fold = schedule.first().copied().unwrap_or(0);
+    let next_fold = schedule.get(1).copied().unwrap_or(0);
+    let in_flight = layout.num_polys().min(2) as u64;
+    let commit =
+        in_flight * math_cuda::whir::commit_transient_bytes(n, config.log_blowup, first_fold);
+    // A share's `eq` halves are its point's high and low coordinates' tables,
+    // the low half `num_vars / 2` wide — counted per share, with no credit for
+    // the neighbours that share a point.
+    let mut shares = vec![0usize; layout.num_polys()];
+    let mut eq_values = vec![0usize; layout.num_polys()];
+    for place in layout.placements() {
+        shares[place.poly] += 1;
+        let lo_bits = place.num_vars / 2;
+        eq_values[place.poly] += (1usize << (place.num_vars - lo_bits)) + (1usize << lo_bits);
+    }
+    let slots = crate::whir_chain::opening_program::<Ext3>()
+        .ok()
+        .and_then(|program| lower(&program))
+        .map_or(0, |lowered| lowered.num_slots);
+    let open = math_cuda::whir_open::opening_transient_bytes(&math_cuda::whir_open::OpeningShape {
+        num_vars: n,
+        log_blowup: config.log_blowup,
+        first_fold,
+        next_fold,
+        lean_rounds: lean_rounds(),
+        fused: fused_fold(),
+        staged,
+        shares: shares.iter().copied().max().unwrap_or(0),
+        eq_values: eq_values.iter().copied().max().unwrap_or(0),
+        slots,
+    });
+    RoomTurns { commit, open }
+}
+
+/// No device: nothing is ever promised, so nothing is sized.
+#[cfg(not(feature = "cuda"))]
+pub fn room_turns_for(
+    _layout: &crate::stacking::StackedLayout,
+    _config: &crate::whir_chain::ChainConfig,
+    _staged: bool,
+) -> RoomTurns {
+    RoomTurns { commit: 0, open: 0 }
+}
+
 /// What a device sumcheck that runs to the end hands back: the round proofs,
 /// and the challenges the rounds were bound at.
 ///

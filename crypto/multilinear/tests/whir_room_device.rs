@@ -318,10 +318,95 @@ fn a_declined_opening_is_counted(c: &Case) {
     );
 }
 
+/// What `f` took from the device's memory pool at its peak, beyond what the
+/// pool had handed out when it started.
+fn peak_of<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    math_cuda::device::drain_and_trim().unwrap();
+    let (before, _) = math_cuda::device::pool_used_bytes().unwrap();
+    math_cuda::device::reset_pool_high_water().unwrap();
+    let out = f();
+    math_cuda::device::drain_and_trim().unwrap();
+    let (_, high) = math_cuda::device::pool_used_bytes().unwrap();
+    (out, high.max(before) - before)
+}
+
+const MIB: f64 = 1024.0 * 1024.0;
+
+/// ★ THE RESIZE, MEASURED: a group's commits and its openings take no more from
+/// the card than the rooms the resize promises for them — and those rooms are
+/// smaller than the codeword the group used to promise.
+///
+/// Read off the memory pool's own high-water mark, which sees every
+/// allocation the turns make, not only the ones somebody reserved. The commits
+/// leave their codewords and the leaf layers they retain behind, so theirs is
+/// checked with those added; the openings leave nothing. Each bound is checked
+/// from below too — by the one buffer the phase cannot avoid — so a probe that
+/// read nothing could not pass.
+fn a_groups_turns_hold_what_their_rooms_promise() {
+    let c = case(22, 2);
+    let polys = c.layout.num_polys() as u64;
+    let codeword = codeword_bytes(&c);
+    gpu::force_room_park(Some(true));
+    gpu::force_room_resize(Some(true));
+    let turns = gpu::room_turns_for(&c.layout, &config(), true);
+
+    // The transform's twiddles are cached for the process the first time a
+    // domain is used, outside every promise: one commit first, so the
+    // measured one does not pay for them.
+    drop(commit(&c, None));
+
+    let (stacked, committed) = peak_of(|| commit(&c, None));
+    let (_, opened) = peak_of(|| open(&c, &stacked, None));
+    drop(stacked);
+    gpu::force_room_park(None);
+    gpu::force_room_resize(None);
+
+    // At the production first fold of six a leaf layer is a sixteenth of the
+    // codeword, and the commits keep one each.
+    let layers = polys * codeword / 16;
+    let slack = |bytes: u64| bytes / 20 + (8 << 20);
+    println!(
+        "2^22 x{polys}: commit peak {:.1} MiB = {polys} codewords + layers + {:.1} MiB against a \
+         {:.1} MiB turn; opening peak {:.1} MiB against a {:.1} MiB turn; codeword {:.1} MiB",
+        committed as f64 / MIB,
+        committed.saturating_sub(polys * codeword + layers) as f64 / MIB,
+        turns.commit as f64 / MIB,
+        opened as f64 / MIB,
+        turns.open as f64 / MIB,
+        codeword as f64 / MIB,
+    );
+    assert!(
+        turns.commit < codeword && turns.open < codeword,
+        "the resized turns must be smaller than the codeword they replace"
+    );
+    assert!(
+        committed <= polys * codeword + layers + turns.commit + slack(turns.commit),
+        "the commits took more than their codewords, their layers and their turn"
+    );
+    assert!(
+        committed >= polys * codeword + (8 << c.layout.n_stack()),
+        "the probe missed the commits' coefficients beside their codewords"
+    );
+    assert!(
+        opened <= turns.open + slack(turns.open),
+        "an opening took more than its turn"
+    );
+    assert!(
+        opened >= math_cuda::whir::tree_bytes(c.layout.n_stack() + config().log_blowup - 6),
+        "the probe missed the tree the first round's paths are read from"
+    );
+}
+
 #[test]
 fn a_group_promises_the_card_what_its_turns_take() {
     let c = case(16, 2);
     a_declined_opening_is_counted(&c);
+    gpu::force_room_resize(Some(false));
     the_room_is_given_back_between_the_commits_and_the_openings(&c, codeword_bytes(&c));
+    gpu::force_room_resize(Some(true));
+    let turns = gpu::room_turns_for(&c.layout, &config(), true);
+    the_room_is_given_back_between_the_commits_and_the_openings(&c, turns.commit.max(turns.open));
     a_refused_turn_is_counted_and_still_opens_on_the_device(&c);
+    gpu::force_room_resize(None);
+    a_groups_turns_hold_what_their_rooms_promise();
 }
