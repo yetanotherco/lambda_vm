@@ -438,8 +438,14 @@ fn search_queue(
     // outlives every async H2D below.
     let reset = [u64::MAX, 0u64];
     let mut state_dev = stream.clone_htod(&reset).ok()?;
+    // The counted twin's three counters, zeroed once and accumulated into by
+    // every launch; the production arm has none.
     let zeros = [0u64; 3];
-    let mut counts_dev = stream.clone_htod(&zeros).ok()?;
+    let mut counts_dev = if counted {
+        Some(stream.clone_htod(&zeros).ok()?)
+    } else {
+        None
+    };
 
     let mut base: u64 = 0;
     let mut launches: u64 = 0;
@@ -450,19 +456,18 @@ fn search_queue(
         // `atomicMin`s and reads the two state words (and, counted, the three
         // counters) — every buffer is allocated at those sizes above.
         unsafe {
-            if counted {
-                stream
+            match counts_dev.as_mut() {
+                Some(counts) => stream
                     .launch_builder(&be.rpx_grind_search_queue_counted)
                     .arg(&inner_dev)
                     .arg(&limit)
                     .arg(&base)
                     .arg(&count)
                     .arg(&mut state_dev)
-                    .arg(&mut counts_dev)
+                    .arg(counts)
                     .launch(cfg)
-                    .ok()?;
-            } else {
-                stream
+                    .ok()?,
+                None => stream
                     .launch_builder(&be.rpx_grind_search_queue)
                     .arg(&inner_dev)
                     .arg(&limit)
@@ -470,18 +475,19 @@ fn search_queue(
                     .arg(&count)
                     .arg(&mut state_dev)
                     .launch(cfg)
-                    .ok()?;
-            }
+                    .ok()?,
+            };
         }
         let host = stream.clone_dtoh(&state_dev).ok()?;
         stream.synchronize().ok()?;
         if host[0] != u64::MAX {
-            let counts = if counted {
-                let c = stream.clone_dtoh(&counts_dev).ok()?;
-                stream.synchronize().ok()?;
-                c
-            } else {
-                vec![0; 3]
+            let counts = match counts_dev.as_ref() {
+                Some(counts) => {
+                    let c = stream.clone_dtoh(counts).ok()?;
+                    stream.synchronize().ok()?;
+                    c
+                }
+                None => vec![0; 3],
             };
             return Some(GrindCounts {
                 nonce: host[0],
