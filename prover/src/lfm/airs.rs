@@ -216,13 +216,25 @@ pub fn keep_bitwise() -> bool {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| {
         let keep = keep_bitwise_setting(std::env::var(KEEP_BITWISE_ENV).ok().as_deref());
-        if keep {
-            eprintln!("LFM BITWISE: kept in every program ({KEEP_BITWISE_ENV}=1)");
+        announce(&if keep {
+            format!("LFM BITWISE: kept in every program ({KEEP_BITWISE_ENV}=1)")
         } else {
-            eprintln!("LFM BITWISE: only where a chip sends it a lookup (the default)");
-        }
+            "LFM BITWISE: only where a chip sends it a lookup (the default)".to_string()
+        });
         keep
     })
+}
+
+/// Writes a setting's one-line banner to stderr in ONE write.
+///
+/// `eprintln!` writes each piece of its format separately to the unbuffered
+/// stderr, so in a log that merges stdout and stderr a whole stdout line can
+/// land between two pieces and gain the banner's first half as a prefix. A log
+/// reader that finds a census line by its start would miss it. One write of the
+/// finished line cannot be split.
+pub fn announce(line: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
 }
 
 /// A `LAMBDA_VM_*` on/off switch's value: unset or empty is `None` (the

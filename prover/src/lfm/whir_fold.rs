@@ -383,10 +383,10 @@ impl FoldEmission {
         static PROCESS: std::sync::OnceLock<FoldEmission> = std::sync::OnceLock::new();
         *PROCESS.get_or_init(|| {
             let emission = Self::from_setting(std::env::var(CLASSIC_FOLD_ENV).ok().as_deref());
-            match emission {
-                FoldEmission::Classic => eprintln!("WHIR FOLD: classic ({CLASSIC_FOLD_ENV}=1)"),
-                FoldEmission::Lean => eprintln!("WHIR FOLD: lean (the default)"),
-            }
+            super::airs::announce(&match emission {
+                FoldEmission::Classic => format!("WHIR FOLD: classic ({CLASSIC_FOLD_ENV}=1)"),
+                FoldEmission::Lean => "WHIR FOLD: lean (the default)".to_string(),
+            });
             emission
         })
     }

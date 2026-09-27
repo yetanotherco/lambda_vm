@@ -526,10 +526,10 @@ pub fn hash_split_enabled() -> bool {
             Some(v) if !v.is_empty() => HASH_SPLIT_ENV,
             _ => "the pipeline default",
         };
-        eprintln!(
+        super::airs::announce(&format!(
             "LFM HASH SPLIT: {} ({source})",
             if on { "on" } else { "off" }
-        );
+        ));
         on
     })
 }
