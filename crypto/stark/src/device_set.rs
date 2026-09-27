@@ -8,9 +8,11 @@
 //! card at all). Keeping the arithmetic here, free of any `cuda` gate, is what
 //! lets both read one model instead of each carrying a copy.
 //!
-//! Every term mirrors an allocation in `math_cuda` after the in-place LDE
-//! transpose of #956 (one LDE buffer, never two); `one_lde_buffer::vram_arm`
-//! measures the commit's three big terms and the doc on
+//! Every term mirrors an allocation in `math_cuda`, with ONE LDE buffer, never
+//! two: the column-major engine (`math_cuda::lde_cm`, the default) writes the
+//! LDE in the layout the rounds read, and the legacy path (host-copy tables,
+//! `LAMBDA_VM_LDE_LEGACY=1`) transposes its row-major LDE in place (#956);
+//! `one_lde_buffer::vram_arm` measures the commit's three big terms and the doc on
 //! `DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES` records the numbers. The model
 //! carries no blanket safety factor: the card's admission budget is 80% of
 //! device memory, and the 20% it leaves is what the context, the module code
@@ -29,7 +31,9 @@ pub const MERKLE_NODE_BYTES: u64 = 32;
 
 /// Cap on the in-place transpose's device scratch, mirrored from
 /// `math_cuda::lde::INPLACE_TRANSPOSE_SCRATCH_BYTES` (private there). The
-/// admission wants a bound, not the block geometry.
+/// admission wants a bound, not the block geometry. It also bounds the
+/// column-major engine's scratch: one chunk of trace columns, at most 60% of
+/// L2 (~58 MB on a 96 MB card).
 pub const INPLACE_TRANSPOSE_SCRATCH_CAP_BYTES: u64 = 256 << 20;
 
 /// `(2 · leaves − 1) · 32` for the row-pair tree over `lde_size` rows.
@@ -65,10 +69,13 @@ pub const fn base_bytes(rows: u64, cols: u64) -> u64 {
 /// The device working set one fused row-major commit allocates, term by term
 /// (`math_cuda::lde::coset_lde_row_major_inner`): ONE LDE buffer, the optional
 /// trace-domain snapshot, the full Merkle node buffer, and the small scratch
-/// (coset weights plus the capped transpose scratch).
+/// (coset weights plus the capped transpose scratch). Both forms of the commit
+/// fit it: the column-major engine's chunk scratch sits inside the transpose
+/// cap the legacy form needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitDeviceSet {
-    /// `lde_size · base_cols · 8`: the row-major LDE, transposed in place.
+    /// `lde_size · base_cols · 8`: the LDE — written column-major by the
+    /// engine, or row-major and transposed in place by the legacy path.
     pub lde_bytes: u64,
     /// `n · base_cols · 8`: the pre-NTT column-major snapshot the LogUp
     /// fingerprint kernel reads in place (main commits only).
@@ -78,7 +85,8 @@ pub struct CommitDeviceSet {
     /// stream — the precomputed tree is downloaded and freed before the
     /// multiplicity tree is allocated — so one is the peak there too.
     pub tree_bytes: u64,
-    /// Coset weights (`n · 8`) plus the transpose scratch cap.
+    /// Coset weights (`n · 8`) plus the transpose scratch cap, which also
+    /// bounds the engine's chunk scratch.
     pub scratch_bytes: u64,
 }
 

@@ -119,6 +119,58 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// Largest grid.y a tile launch uses before it moves the excess into grid.z.
+///
+/// CUDA caps grid.y (and grid.z) at 65,535 on every compute capability, and a
+/// tile grid is a power of two, so 2^15 is the largest y that fits. A tile's
+/// y count is `n >> (level + k)`: the NTT's first 5-level tile needs
+/// `n >> 13`, which reaches 65,536 at a 2^29 codeword — the WHIR base commit at
+/// stack 27, blowup 4 — and the launch failed there, every such commit falling
+/// back to the host (`thoughts/zf/gap/fix/STRUCT.md` §9.2). Every launch at or
+/// below the cap is the one it always was.
+const GRID_Y_CAP: u64 = 1 << 15;
+
+thread_local! {
+    /// Per-thread override of [`GRID_Y_CAP`]. See [`with_grid_y_cap`].
+    static GRID_Y_CAP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// `blocks` tile blocks (a power of two) as `(grid.y, grid.z)`: all of them in
+/// y up to the cap, the rest as multiples of it in z. The tile kernels read
+/// their block's high index as `blockIdx.z * gridDim.y + blockIdx.y`.
+pub(crate) fn split_grid_y(blocks: u64) -> (u32, u32) {
+    let cap = GRID_Y_CAP_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(GRID_Y_CAP);
+    assert!(
+        blocks.is_power_of_two(),
+        "a tile grid is a power of two, got {blocks}"
+    );
+    let y = blocks.min(cap);
+    let z = blocks / y;
+    assert!(
+        z <= 65_535,
+        "a tile grid of {blocks} blocks exceeds grid.y x grid.z"
+    );
+    (y as u32, z as u32)
+}
+
+/// Run `f` with the tile grids split at `cap` blocks in y instead of 2^15 on
+/// the calling thread (the launches happen there), so a test can drive the
+/// grid.z path at a size that fits a test. `cap` must be a power of two.
+#[doc(hidden)]
+pub fn with_grid_y_cap<R>(cap: u64, f: impl FnOnce() -> R) -> R {
+    assert!(cap.is_power_of_two(), "the y cap is a power of two");
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GRID_Y_CAP_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(GRID_Y_CAP_OVERRIDE.with(|c| c.replace(Some(cap))));
+    f()
+}
+
 /// Run the butterfly body of a bit-reversed-input DIT NTT. Split out so the
 /// LDE orchestrator can reuse it on the same device buffer.
 /// Columns a fused tile spans — one warp, which is what keeps it coalesced.
@@ -190,12 +242,9 @@ pub(crate) fn run_ntt_body(
         // worth its idle half when it fuses more than a level.
         if k >= 2 && (1u64 << level) >= TILE_COLS as u64 {
             let rows = 1u32 << k;
+            let (grid_y, grid_z) = split_grid_y(n >> (level + k));
             let cfg = LaunchConfig {
-                grid_dim: (
-                    ((1u64 << level) / TILE_COLS as u64) as u32,
-                    (n >> (level + k)) as u32,
-                    1,
-                ),
+                grid_dim: (((1u64 << level) / TILE_COLS as u64) as u32, grid_y, grid_z),
                 block_dim: (TILE_COLS, rows, 1),
                 shared_mem_bytes: rows * (TILE_COLS + 1) * 8,
             };
@@ -255,4 +304,48 @@ pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
     let out = stream.clone_dtoh(&x_dev)?;
     stream.synchronize()?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_grids_split_into_z_only_past_the_cap() {
+        // Up to 2^30 blocks fit (2^15 in y times 2^15 in z); the largest tile
+        // grid a Goldilocks transform can ask for is 2^32 >> 13 = 2^19.
+        for log in 0..=30u32 {
+            let blocks = 1u64 << log;
+            let (y, z) = split_grid_y(blocks);
+            assert_eq!(
+                u64::from(y) * u64::from(z),
+                blocks,
+                "2^{log}: every block launched"
+            );
+            assert!(
+                y <= 65_535 && z <= 65_535,
+                "2^{log}: ({y}, {z}) past the device limits"
+            );
+            if blocks <= GRID_Y_CAP {
+                assert_eq!(
+                    (y, z),
+                    (blocks as u32, 1),
+                    "2^{log}: the launch it always was"
+                );
+            }
+        }
+        // The WHIR base codewords at stacks 27 and 28 (blowup 4): the first
+        // 5-level tile's n >> 13.
+        assert_eq!(split_grid_y((1 << 29) >> 13), (1 << 15, 2));
+        assert_eq!(split_grid_y((1 << 30) >> 13), (1 << 15, 4));
+        // A test cap moves the split down, and restores on return.
+        assert_eq!(with_grid_y_cap(2, || split_grid_y(64)), (2, 32));
+        assert_eq!(split_grid_y(64), (64, 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds grid.y x grid.z")]
+    fn a_tile_grid_past_both_dimensions_is_refused_not_truncated() {
+        split_grid_y(1 << 31);
+    }
 }

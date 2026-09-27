@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex, Once, Weak};
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -974,23 +974,35 @@ fn commit_from(
     // The lift's bit-reverse and the NTT's cancel around the zero padding —
     // see `lift_spread`. What was two scattered passes over the codeword plus
     // the memset that zeroed it is one pass that writes all of it.
-    // SAFETY: the spread writes every element, padding included.
+    // SAFETY: the spread writes every element, padding included (under GAP K1B
+    // the first pass of the column engine does, storing all of its tile).
     let mut x = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
     let n_u64 = n as u64;
     let log_blowup_u32 = log_blowup as u32;
-    unsafe {
-        stream
-            .launch_builder(&be.lift_spread)
-            .arg(&coeffs)
-            .arg(&n_u64)
-            .arg(&log_blowup_u32)
-            .arg(&mut x)
-            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    if crate::lde_cm::k1b_enabled() && crate::lde_cm::spread_supports(log_n as u32, log_blowup_u32)
+    {
+        // GAP K1B: the same spread and transform in the column engine's
+        // ceil(log_n / 8) passes, the spread fused into the first one.
+        let src = coeffs.device_ptr(&stream).0;
+        let dst = x.device_ptr(&stream).0;
+        crate::lde_cm::spread_ntt_column(&stream, be, src, dst, log_n as u32, log_blowup_u32)?;
+        // Spent: the first pass has read them, and the free is stream-ordered.
+        drop(coeffs);
+    } else {
+        unsafe {
+            stream
+                .launch_builder(&be.lift_spread)
+                .arg(&coeffs)
+                .arg(&n_u64)
+                .arg(&log_blowup_u32)
+                .arg(&mut x)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
+        // Spent: the spread has read them, and the free is stream-ordered.
+        drop(coeffs);
+        let twiddles = be.fwd_twiddles_for(log_n)?;
+        crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
     }
-    // Spent: the spread has read them, and the free is stream-ordered.
-    drop(coeffs);
-    let twiddles = be.fwd_twiddles_for(log_n)?;
-    crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
 
     let codeword = DeviceCodeword {
         buffer: Arc::new(x),
@@ -1069,6 +1081,9 @@ fn mobius(
         }
         let rows = 1u32 << k;
         let pitch = MOBIUS_TILE_COLS + 1;
+        // Past 2^15 blocks in y the excess goes to grid.z (`ntt::split_grid_y`):
+        // the first tile needs `len >> 13`, 65,536 at 2^29 evaluations.
+        let (grid_y, grid_z) = crate::ntt::split_grid_y(len as u64 / (low << k));
         unsafe {
             stream
                 .launch_builder(&be.mobius_tile)
@@ -1076,11 +1091,7 @@ fn mobius(
                 .arg(&level)
                 .arg(&k)
                 .launch(LaunchConfig {
-                    grid_dim: (
-                        (low / MOBIUS_TILE_COLS as u64) as u32,
-                        (len as u64 / (low << k)) as u32,
-                        1,
-                    ),
+                    grid_dim: ((low / MOBIUS_TILE_COLS as u64) as u32, grid_y, grid_z),
                     block_dim: (MOBIUS_TILE_COLS, rows, 1),
                     shared_mem_bytes: rows * pitch * 8,
                 })?;
