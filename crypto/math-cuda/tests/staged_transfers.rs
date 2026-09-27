@@ -11,8 +11,8 @@ use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math_cuda::DeviceHash;
 use math_cuda::device::{
-    STAGED_CHUNK_BYTES, backend, dtoh_staged_into, htod_staged, set_staging_pairs_override,
-    staging_totals,
+    STAGED_CHUNK_BYTES, STAGING_SHARED_SLAB_ENV, backend, dtoh_staged_into, htod_staged,
+    set_staging_pairs_override, staging_pairs_enabled, staging_totals,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -369,4 +369,14 @@ fn the_engine_commit_is_identical_through_either_staging() {
             "{what}: the upload did not go through the staged path: {before:?} -> {after:?}"
         );
     }
+}
+
+/// The process's setting as the commits read it: pairs unless
+/// `LAMBDA_VM_STAGING_SHARED_SLAB=1`. Card-free; with `--nocapture` the one
+/// `[gpu] transfer staging: ...` line it names is visible, which is how the gate
+/// shows the default and the opt-out READ.
+#[test]
+fn the_staging_setting_reads_the_environment() {
+    let shared = std::env::var(STAGING_SHARED_SLAB_ENV).is_ok_and(|v| v == "1");
+    assert_eq!(staging_pairs_enabled(), !shared);
 }

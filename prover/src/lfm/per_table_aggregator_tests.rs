@@ -6432,6 +6432,23 @@ impl TestLeadIn {
 /// ★ The prologues are built only once the epoch count is known, from exactly
 /// the epochs `0..=k` whatever order they arrived in, and an epoch past `want`
 /// is not kept.
+/// The lead-in's setting as the drivers read it: on unless
+/// `LFM_TREE_PROLOGUES_AT_LEVEL0=1`. The gate runs it under both, with
+/// `--nocapture`, and reads the line it prints.
+#[test]
+fn l0_lead_in_setting_reads_the_environment() {
+    let at_level0 = std::env::var(PROLOGUES_AT_LEVEL0_ENV).is_ok_and(|v| v == "1");
+    assert_eq!(lead_in_enabled(), !at_level0);
+    println!(
+        "L0 PROLOGUES setting: {}",
+        if lead_in_enabled() {
+            "in the base's tail (the default)"
+        } else {
+            "at level 0 (LFM_TREE_PROLOGUES_AT_LEVEL0=1)"
+        }
+    );
+}
+
 #[test]
 fn l0_lead_in_builds_each_prologue_from_its_leading_epochs() {
     use crate::continuation::EpochObserver;
