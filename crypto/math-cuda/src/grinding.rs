@@ -341,7 +341,190 @@ pub fn generate_nonce_gpu_at(
 /// algebraic digest's own output, which `digest_to_commitment` writes as four
 /// canonical big-endian `u64`s.
 pub fn generate_nonce_rpx_gpu(inner_felts: &[u64; 4], grinding_factor: u8) -> Option<u64> {
+    // ⚠ GAP K4 (temporary): the work-queue kernel on a card-filling grid.
+    // Same nonce — see `rpx_grind_search_queue`.
+    if crate::gap_hash::knobs().k4 {
+        return search_queue(
+            inner_felts,
+            grinding_factor,
+            knobs_in_effect(),
+            queue_grid()?,
+            false,
+        )
+        .map(|c| c.nonce);
+    }
     search(Arm::Rpx256, inner_felts, grinding_factor, knobs_in_effect())
+}
+
+/// ⚠ GAP K4: the RPX grind through the work-queue kernel, at the scan factor of
+/// `knobs` and a grid of `grid` blocks — the production arm passes
+/// [`queue_grid`]. Returns the same nonce as [`generate_nonce_rpx_gpu_at`]:
+/// the smallest valid nonce, a function of the inner hash and the factor
+/// alone. Exposed so a test can run both arms in one process.
+pub fn generate_nonce_rpx_gpu_queue_at(
+    inner_felts: &[u64; 4],
+    grinding_factor: u8,
+    knobs: Knobs,
+    grid: u32,
+) -> Option<u64> {
+    search_queue(inner_felts, grinding_factor, knobs, grid, false).map(|c| c.nonce)
+}
+
+/// ⛔ DIAGNOSTIC: [`generate_nonce_rpx_gpu_queue_at`] with the counted twin, so
+/// a bench reads the permutations the queue EXECUTED — the K4 mechanism — in the
+/// same slots as [`search_counted`].
+pub fn search_queue_counted(
+    inner_felts: &[u64; 4],
+    grinding_factor: u8,
+    knobs: Knobs,
+    grid: u32,
+) -> Option<GrindCounts> {
+    search_queue(inner_felts, grinding_factor, knobs, grid, true)
+}
+
+/// ⚠ GAP K4: blocks of [`RPX_BLOCK_DIM`] the queue kernel keeps resident on
+/// this card — multiprocessors × the driver's occupancy for the kernel — so one
+/// launch fills the card exactly (the shipped grid of 1024 is 0.86 of it on a
+/// 5090). Printed once.
+///
+/// ⚠ The occupancy query needs the context current on the CALLING thread.
+/// cudarc binds it before `num_regs` but not before this query, and
+/// `backend()` binds only the thread that created it. Unbound, the query
+/// failed, and while the failure was cached every RPX grind of the process
+/// then fell to the host search. So this binds first, and caches only a grid
+/// it read: a failed read sends that one grind to the host and the next grind
+/// reads again. `tests/grind_queue_grid_thread.rs` pins it.
+pub fn queue_grid() -> Option<u32> {
+    use cudarc::driver::sys::CUdevice_attribute;
+    static GRID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(&grid) = GRID.get() {
+        return Some(grid);
+    }
+    // `backend()` warns on its own failure.
+    let be = backend().ok()?;
+    let read = || -> crate::Result<(u32, u32)> {
+        be.ctx.bind_to_thread()?;
+        let sms = be
+            .ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
+            .max(1) as u32;
+        let per_sm = be
+            .rpx_grind_search_queue
+            .occupancy_max_active_blocks_per_multiprocessor(RPX_BLOCK_DIM, 0, None)?
+            .max(1);
+        Ok((sms, per_sm))
+    };
+    match read() {
+        Ok((sms, per_sm)) => Some(*GRID.get_or_init(|| {
+            let regs = be.rpx_grind_search_queue.num_regs().unwrap_or(0);
+            println!(
+                "★ GAP K4 GRIND: queue kernel, grid {} = {sms} SMs x {per_sm} blocks of {RPX_BLOCK_DIM} \
+                 ({regs} regs/thread), chunk 32 nonces per warp claim",
+                sms * per_sm
+            );
+            sms * per_sm
+        })),
+        Err(e) => {
+            // eprintln for the reason the crypto dispatch gives for its own
+            // fallback line: it is the only sign the K4 arm left the device.
+            eprintln!(
+                "[gpu] GAP K4: the queue grid could not be read ({e}); this RPX grind falls \
+                 back to the CPU search"
+            );
+            None
+        }
+    }
+}
+
+/// The queue arm of [`search`]: the same contiguous range walk from 0, the
+/// same per-launch block, and a two-word device state — the running minimum
+/// and the queue head — reset before every launch.
+fn search_queue(
+    inner: &[u64; 4],
+    grinding_factor: u8,
+    knobs: Knobs,
+    grid: u32,
+    counted: bool,
+) -> Option<GrindCounts> {
+    if !(GRIND_MIN_FACTOR..=64).contains(&grinding_factor) || grid == 0 {
+        return None;
+    }
+    let limit: u64 = 1u64 << (64 - grinding_factor);
+    let be = backend().ok()?;
+    let stream = be.next_stream();
+    let inner_dev = stream.clone_htod(inner.as_slice()).ok()?;
+    let count = knobs.block(grinding_factor);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (RPX_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // `[result, head]`: the sentinel and an empty queue. A named binding so it
+    // outlives every async H2D below.
+    let reset = [u64::MAX, 0u64];
+    let mut state_dev = stream.clone_htod(&reset).ok()?;
+    // The counted twin's three counters, zeroed once and accumulated into by
+    // every launch; the production arm has none.
+    let zeros = [0u64; 3];
+    let mut counts_dev = if counted {
+        Some(stream.clone_htod(&zeros).ok()?)
+    } else {
+        None
+    };
+
+    let mut base: u64 = 0;
+    let mut launches: u64 = 0;
+    loop {
+        stream.memcpy_htod(&reset, &mut state_dev).ok()?;
+        launches += 1;
+        // SAFETY: the kernel reads four inner felts, and only `atomicAdd`s,
+        // `atomicMin`s and reads the two state words (and, counted, the three
+        // counters) — every buffer is allocated at those sizes above.
+        unsafe {
+            match counts_dev.as_mut() {
+                Some(counts) => stream
+                    .launch_builder(&be.rpx_grind_search_queue_counted)
+                    .arg(&inner_dev)
+                    .arg(&limit)
+                    .arg(&base)
+                    .arg(&count)
+                    .arg(&mut state_dev)
+                    .arg(counts)
+                    .launch(cfg)
+                    .ok()?,
+                None => stream
+                    .launch_builder(&be.rpx_grind_search_queue)
+                    .arg(&inner_dev)
+                    .arg(&limit)
+                    .arg(&base)
+                    .arg(&count)
+                    .arg(&mut state_dev)
+                    .launch(cfg)
+                    .ok()?,
+            };
+        }
+        let host = stream.clone_dtoh(&state_dev).ok()?;
+        stream.synchronize().ok()?;
+        if host[0] != u64::MAX {
+            let counts = match counts_dev.as_ref() {
+                Some(counts) => {
+                    let c = stream.clone_dtoh(counts).ok()?;
+                    stream.synchronize().ok()?;
+                    c
+                }
+                None => vec![0; 3],
+            };
+            return Some(GrindCounts {
+                nonce: host[0],
+                executed: counts[0],
+                max_iters: counts[1],
+                ran_to_end: counts[2],
+                launches,
+                poll_period: 1,
+            });
+        }
+        base = base.checked_add(count)?;
+    }
 }
 
 /// [`generate_nonce_rpx_gpu`] at knobs given here rather than read from the
