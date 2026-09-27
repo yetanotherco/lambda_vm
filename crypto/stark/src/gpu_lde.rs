@@ -1498,7 +1498,7 @@ where
 /// capacity are whole nodes (always, for a buffer allocated at a node count);
 /// otherwise the same nodes, copied.
 fn nodes_in_place(bytes: Vec<u8>) -> Vec<[u8; 32]> {
-    if bytes.len() % 32 != 0 || bytes.capacity() % 32 != 0 {
+    if !bytes.len().is_multiple_of(32) || !bytes.capacity().is_multiple_of(32) {
         return bytes
             .chunks_exact(32)
             .map(|c| c.try_into().expect("a 32-byte chunk"))
