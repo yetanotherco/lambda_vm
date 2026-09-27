@@ -276,12 +276,17 @@ pub fn counts() -> Counts {
 
 /// One line for a run's summary: the switches as read, and what each did.
 pub fn summary_line() -> String {
-    let c = counts();
-    let parts = k6();
+    format_summary(k2(), k6(), k7(), counts())
+}
+
+/// [`summary_line`]'s text. The lane's box script parses it (its integration
+/// steps compare the switches-off line verbatim and read the counts of the
+/// switches-on one), so its format is pinned by a test.
+fn format_summary(k2: bool, parts: K6, k7: bool, c: Counts) -> String {
     format!(
         "GAP KERN: K2={} widened {} legacy {} alloc-retries {} · K6 inv={} deep={} bary={} \
          rowwise {} scan {} fused-deep {} chunked-bary {} · K7={} widened {} declined {}",
-        k2() as u8,
+        k2 as u8,
         c.k2_widened,
         c.k2_legacy,
         c.k2_alloc_retries,
@@ -292,8 +297,47 @@ pub fn summary_line() -> String {
         c.k6_scan,
         c.k6_fused_deep,
         c.k6_chunked_bary,
-        k7() as u8,
+        k7 as u8,
         c.k7_widened,
         c.k7_declined,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two lines `kern-tests.sh` is written against: every switch off
+    /// (its knobs-off integration step requires this line verbatim), and every
+    /// field distinct, so a parser that reads one count from another's place
+    /// fails its selftest.
+    #[test]
+    fn summary_line_format_is_the_one_the_box_script_parses() {
+        assert_eq!(
+            format_summary(false, K6::default(), false, Counts::default()),
+            "GAP KERN: K2=0 widened 0 legacy 0 alloc-retries 0 · K6 inv=0 deep=0 bary=0 \
+             rowwise 0 scan 0 fused-deep 0 chunked-bary 0 · K7=0 widened 0 declined 0"
+        );
+        let all = K6 {
+            inv: true,
+            deep: true,
+            bary: true,
+        };
+        let c = Counts {
+            k2_widened: 11,
+            k2_legacy: 12,
+            k2_alloc_retries: 13,
+            k6_rowwise: 14,
+            k6_scan: 15,
+            k6_fused_deep: 16,
+            k6_chunked_bary: 17,
+            k7_widened: 18,
+            k7_declined: 19,
+        };
+        assert_eq!(
+            format_summary(true, all, true, c),
+            "GAP KERN: K2=1 widened 11 legacy 12 alloc-retries 13 · K6 inv=1 deep=1 bary=1 \
+             rowwise 14 scan 15 fused-deep 16 chunked-bary 17 · K7=1 widened 18 declined 19"
+        );
+    }
 }
