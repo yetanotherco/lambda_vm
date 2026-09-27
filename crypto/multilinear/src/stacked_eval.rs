@@ -56,9 +56,24 @@ where
     commitments: Vec<CodewordCommitment<F, H>>,
     domain: Domain<F>,
     /// The room the commits and the openings take turns with, promised once
-    /// for the whole group. Lives as long as the commitments do, because the
-    /// openings are the last thing that uses it.
-    _room: Option<crate::gpu::DeviceRoom>,
+    /// for the whole group.
+    room: Room,
+}
+
+/// What a group has promised the card for the working set its commits and its
+/// openings take turns with.
+enum Room {
+    /// Nothing to take back: each codeword promised its own working set,
+    /// because the card would not promise the group's when it committed — or
+    /// there is no card.
+    Own,
+    /// The group's room, held from its first commit to its last opening, across
+    /// the argument between them (`LAMBDA_VM_NO_WHIR_ROOM_PARK`). Never read:
+    /// holding it is the promise.
+    Held(#[allow(dead_code)] crate::gpu::DeviceRoom),
+    /// Given back when the commits ended; the openings take it again
+    /// ([`crate::gpu::take_turn`]).
+    Parked,
 }
 
 impl<F: IsFFTField + IsPrimeField + Send + Sync + 'static, H: WhirHash> StackedCommitment<F, H>
@@ -152,11 +167,26 @@ where
                 domain = Some(d);
             }
         }
+        // ★ THE COMMITS ARE OVER, SO IS THEIR TURN. What runs next is the
+        // per-table argument — the whole of it, every table — and only then
+        // the openings; the argument reserves against the same budget and
+        // takes no turn of the group's. The codewords stay promised: they are
+        // what the openings open. The room goes back, and each opening takes
+        // it again (`prove`).
+        let room = match room {
+            None => Room::Own,
+            Some(room) if crate::gpu::room_park() => {
+                room.give_back();
+                crate::gpu::note_room_parked();
+                Room::Parked
+            }
+            Some(room) => Room::Held(room),
+        };
         Ok(Self {
             layout,
             commitments,
             domain: domain.ok_or(Error::EmptyPolynomial)?,
-            _room: room,
+            room,
         })
     }
 
@@ -379,6 +409,18 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
 
+    // ★ THE GROUP'S TURN, TAKEN BACK for as long as its openings run — one at a
+    // time, so one turn covers them all — and given back when they end. A
+    // refusal is counted and said, and the openings run anyway: see
+    // `take_turn` for why there is no other path.
+    let _turn = match &stacked.room {
+        Room::Parked => crate::gpu::take_turn(
+            (1u64 << (layout.n_stack() + config.log_blowup)) * 8,
+            stacked.commitments.len(),
+            layout.n_stack(),
+        ),
+        Room::Own | Room::Held(_) => None,
+    };
     let mut polys = Vec::with_capacity(stacked.commitments.len());
     for (i, commitment) in stacked.commitments.iter().enumerate() {
         // The polynomial is its columns at their offsets, handed over as they
