@@ -501,8 +501,17 @@ pub(super) fn build_traces_walked(
             .collect();
         histogram.add_ops(&blake3_socket::bitwise_ops_for(&rows));
     }
-    let mut bitwise_trace = bitwise::generate_bitwise_trace();
-    histogram.fill_multiplicities(&mut bitwise_trace);
+    // GAP R1: a program whose mask drops BITWISE never pairs this trace, so the
+    // `2^20`-row fill is skipped and an empty placeholder stands in the struct.
+    // The histogram above is empty in exactly that case — the mask drops the
+    // table only when no instantiated chip sends it a lookup.
+    let bitwise_trace = if super::airs::ChipSet::for_program_with_hasher(program, hasher).bitwise {
+        let mut trace = bitwise::generate_bitwise_trace();
+        histogram.fill_multiplicities(&mut trace);
+        trace
+    } else {
+        TraceTable::new_main(Vec::new(), bitwise::cols::NUM_COLUMNS, 1)
+    };
 
     LfmTraces {
         const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
