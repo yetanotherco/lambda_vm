@@ -1323,6 +1323,61 @@ pub(crate) fn for_each_epoch_overlapped(
     })
 }
 
+/// Every epoch's boundary, in epoch order.
+pub(crate) type EpochBoundaries = Vec<Arc<Vec<CellBoundary>>>;
+
+/// [`for_each_epoch_overlapped`], with each epoch's host preparation moved onto
+/// the producer thread too ([`base_prep_ahead`]): `prep` turns every [`PreparedEpoch`]
+/// into what `each` proves before it is handed over, and once the last epoch
+/// has been handed over `tail` runs there, on every boundary, while `each` is
+/// still proving that epoch. Returns the boundaries and `tail`'s value.
+///
+/// The channel still has no buffer, so two epochs are alive at most, exactly
+/// as in [`for_each_epoch_overlapped`] — the one being proved and the one
+/// waiting — only the waiting one is prepared rather than built.
+pub(crate) fn for_each_epoch_overlapped_prepped<T, G>(
+    elf: &Elf,
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    artifacts: &DecodeArtifacts,
+    prep: impl Fn(PreparedEpoch) -> Result<T, Error> + Send,
+    tail: impl FnOnce(&[Arc<Vec<CellBoundary>>]) -> Result<G, Error> + Send,
+    mut each: impl FnMut(T) -> Result<(), Error>,
+) -> Result<(EpochBoundaries, G), Error>
+where
+    T: Send,
+    G: Send,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(0);
+    std::thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            let boundaries = for_each_epoch(
+                elf,
+                private_inputs,
+                epoch_size_log2,
+                artifacts,
+                |prepared, _| {
+                    let item = prep(prepared)?;
+                    sender.send(item).map_err(|_| {
+                        Error::ContinuationInvariant("the epoch consumer stopped".to_string())
+                    })
+                },
+            )?;
+            // Closed here, so the consumer's loop ends as soon as it has taken
+            // the last epoch, while `tail` runs.
+            drop(sender);
+            let tailed = tail(&boundaries)?;
+            Ok((boundaries, tailed))
+        });
+        let used = receiver.into_iter().try_for_each(&mut each);
+        let produced = producer
+            .join()
+            .map_err(|_| Error::ContinuationInvariant("the epoch producer panicked".to_string()))?;
+        used?;
+        produced
+    })
+}
+
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
 /// builder pool. Everything sequential (execution, op collection over the
 /// advancing memory image, boundary + register-fini derivation) already
@@ -1336,6 +1391,28 @@ struct BuildJob {
     collected: crate::tables::trace_builder::CollectedEpoch,
     boundary: Arc<Vec<CellBoundary>>,
     is_final: bool,
+}
+
+/// What a trace builder hands the STARK base's prover: a built epoch, or —
+/// when the preparation runs ahead of the prover ([`base_prep_ahead`], the
+/// default) — one whose host preparation ([`prep_epoch`]) is done too.
+///
+/// Unboxed `Built` on purpose: it is the channel item of the schedule that
+/// prepares on the prover thread, moved once per epoch, and that schedule
+/// keeps exactly its allocations.
+#[allow(clippy::large_enum_variant)]
+enum ReadyEpoch {
+    Built(PreparedEpoch),
+    Prepped { index: u64, prep: Box<EpochPrep> },
+}
+
+impl ReadyEpoch {
+    fn index(&self) -> u64 {
+        match self {
+            ReadyEpoch::Built(p) => p.index,
+            ReadyEpoch::Prepped { index, .. } => *index,
+        }
+    }
 }
 
 /// One epoch's proof plus everything a standalone verifier needs to re-check it
@@ -1736,21 +1813,36 @@ pub(crate) fn build_epoch_airs(
     )
 }
 
-/// Prove one epoch (prove half only). Commits its local-to-global table (built from
-/// `boundary`) on the epoch-local Memory bus and its REGISTER table with FINI
-/// preprocessed to the epoch's final register file. Returns the [`EpochProof`] the
-/// standalone verifier later re-checks; does NOT verify here.
+/// One epoch's host-side preparation for its prove, done: the finished trace
+/// set, its AIRs, the epoch-local L2G table and the statement values the
+/// transcript absorbs. [`prep_epoch`] builds it and [`prove_prepped_epoch`]
+/// proves it, so the two can run on different threads (by default the prep on
+/// a trace builder, ahead of the prover: [`base_prep_ahead`]).
+pub(crate) struct EpochPrep {
+    traces: Traces,
+    airs: VmAirs,
+    l2g_air: AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints>,
+    l2g_trace: TraceTable<F, E>,
+    reg_fini: Vec<u32>,
+    table_counts: TableCounts,
+    public_output: Vec<u8>,
+    runtime_page_ranges: Vec<RuntimePageRange>,
+    label: u64,
+    is_final: bool,
+}
+
+/// [`prove_epoch`]'s host half: everything before the prove.
 #[allow(clippy::too_many_arguments)]
-fn prove_epoch(
+fn prep_epoch(
     elf: &Elf,
-    elf_bytes: &[u8],
-    start: &EpochStart,
+    register_init: &[u32],
+    label: u64,
     mut traces: Traces,
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
     decode_commitment: Commitment,
-) -> Result<EpochProof, Error> {
+) -> Result<EpochPrep, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
     crate::tables::bitwise::update_multiplicities(
@@ -1779,7 +1871,7 @@ fn prove_epoch(
         opts,
         &[],
         &table_counts,
-        start.register_init,
+        register_init,
         &reg_fini,
         is_final,
         // Computed once per prove_continuation — the DECODE commitment is a
@@ -1788,7 +1880,44 @@ fn prove_epoch(
         Some(decode_commitment),
     );
 
-    let label = start.label;
+    let l2g_air = l2g_memory_air(opts, label);
+    // Build this epoch's L2G table from the cross-epoch boundary so it is identical
+    // to the one the global proof commits (the commitment binding compares their
+    // roots). It is appended to the proof below, not through `air_trace_pairs`.
+    let l2g_trace = local_to_global::generate_local_to_global_trace(boundary);
+
+    Ok(EpochPrep {
+        traces,
+        airs,
+        l2g_air,
+        l2g_trace,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        is_final,
+    })
+}
+
+/// [`prove_epoch`]'s prove half, over a finished [`EpochPrep`].
+fn prove_prepped_epoch(
+    prep: EpochPrep,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+) -> Result<EpochProof, Error> {
+    let EpochPrep {
+        mut traces,
+        airs,
+        l2g_air,
+        mut l2g_trace,
+        reg_fini,
+        table_counts,
+        public_output,
+        runtime_page_ranges,
+        label,
+        is_final,
+    } = prep;
     let seed = || {
         epoch_transcript(
             elf_bytes,
@@ -1800,12 +1929,6 @@ fn prove_epoch(
             opts.fri_final_poly_log_degree,
         )
     };
-
-    let l2g_air = l2g_memory_air(opts, label);
-    // Build this epoch's L2G table from the cross-epoch boundary so it is identical
-    // to the one the global proof commits (the commitment binding compares their
-    // roots). It is appended to the proof below, not through `air_trace_pairs`.
-    let mut l2g_trace = local_to_global::generate_local_to_global_trace(boundary);
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
@@ -1837,6 +1960,34 @@ fn prove_epoch(
         reg_fini,
         l2g_root,
     })
+}
+
+/// Prove one epoch (prove half only). Commits its local-to-global table (built from
+/// `boundary`) on the epoch-local Memory bus and its REGISTER table with FINI
+/// preprocessed to the epoch's final register file. Returns the [`EpochProof`] the
+/// standalone verifier later re-checks; does NOT verify here.
+#[allow(clippy::too_many_arguments)]
+fn prove_epoch(
+    elf: &Elf,
+    elf_bytes: &[u8],
+    start: &EpochStart,
+    traces: Traces,
+    is_final: bool,
+    boundary: &[CellBoundary],
+    opts: &ProofOptions,
+    decode_commitment: Commitment,
+) -> Result<EpochProof, Error> {
+    let prep = prep_epoch(
+        elf,
+        start.register_init,
+        start.label,
+        traces,
+        is_final,
+        boundary,
+        opts,
+        decode_commitment,
+    )?;
+    prove_prepped_epoch(prep, elf_bytes, opts)
 }
 
 /// An epoch's verifier-side reconstruction: the AIR set (VM tables + the
@@ -2032,6 +2183,36 @@ fn prove_global(
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
+    let prep = prep_global(
+        boundaries,
+        init_page_data,
+        page_bases,
+        num_private_input_pages,
+        opts,
+    );
+    prove_prepped_global(prep, elf_bytes, page_bases, num_private_input_pages, opts)
+}
+
+/// The global proof's host-side preparation, done: every epoch's L2G table
+/// and every touched page's GLOBAL_MEMORY table, with their AIRs. Built by
+/// [`prep_global`], proved by [`prove_prepped_global`] — split so the prep can
+/// run while the last epochs prove ([`base_prep_ahead`]).
+pub(crate) struct GlobalPrep {
+    num_epochs: usize,
+    l2g_airs: Vec<AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>>,
+    gm_airs: Vec<AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>>,
+    l2g_traces: Vec<TraceTable<F, E>>,
+    gm_traces: Vec<TraceTable<F, E>>,
+}
+
+/// [`prove_global`]'s host half: everything before the prove.
+fn prep_global(
+    boundaries: &[Arc<Vec<CellBoundary>>],
+    init_page_data: &HashMap<u64, Vec<u8>>,
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+) -> GlobalPrep {
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
     let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
@@ -2053,11 +2234,11 @@ fn prove_global(
         true,
     );
 
-    let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
+    let l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
         .map(|epoch| local_to_global::generate_local_to_global_trace(epoch.as_slice()))
         .collect();
-    let mut gm_traces: Vec<TraceTable<F, E>> = gm_configs
+    let gm_traces: Vec<TraceTable<F, E>> = gm_configs
         .iter()
         .map(|config| global_memory::generate_global_trace(config, &final_state))
         .collect();
@@ -2071,6 +2252,30 @@ fn prove_global(
         .map(|config| global_memory_air(opts, config, None))
         .collect();
 
+    GlobalPrep {
+        num_epochs: boundaries.len(),
+        l2g_airs,
+        gm_airs,
+        l2g_traces,
+        gm_traces,
+    }
+}
+
+/// [`prove_global`]'s prove half, over a finished [`GlobalPrep`].
+fn prove_prepped_global(
+    prep: GlobalPrep,
+    elf_bytes: &[u8],
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    opts: &ProofOptions,
+) -> Result<MultiProof<F, E, ()>, Error> {
+    let GlobalPrep {
+        num_epochs,
+        l2g_airs,
+        gm_airs,
+        mut l2g_traces,
+        mut gm_traces,
+    } = prep;
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
         .iter()
         .zip(l2g_traces.iter_mut())
@@ -2087,7 +2292,7 @@ fn prove_global(
         pairs,
         &mut global_transcript(
             elf_bytes,
-            boundaries.len(),
+            num_epochs,
             num_private_input_pages,
             opts.fri_final_poly_log_degree,
             page_bases,
@@ -2242,7 +2447,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// showed as set. A knob that names a measurement on one pipeline and nothing
 /// at all on another is worse than a missing one: the export is the evidence a
 /// reader uses to believe the breakdown was taken.
-fn base_split_enabled() -> bool {
+pub(crate) fn base_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("LAMBDA_VM_BASE_SPLIT") {
         Ok(v) => !v.is_empty() && v != "0",
@@ -2269,12 +2474,87 @@ fn base_stage_done(index: u64, stage: &str, open: Option<(std::time::Instant, f6
     }
 }
 
+/// The switch that keeps each base epoch's host preparation, and the global
+/// proof's, on the prover thread just before its prove, which is where they ran
+/// before they moved ahead of it. Unset or `0`: ahead (the default).
+pub const BASE_PREP_ON_PROVER_ENV: &str = "LAMBDA_VM_BASE_PREP_ON_PROVER";
+
+/// Whether the preparation runs ahead of the prover thread, for a raw value of
+/// [`BASE_PREP_ON_PROVER_ENV`]: unset, empty or `0` is ahead, `1` is on the
+/// prover thread, and anything else stops the run — a typo read as the default
+/// would measure one schedule under the other's name.
+pub fn base_prep_ahead_setting(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => true,
+        Some("1") => false,
+        Some(other) => panic!("{BASE_PREP_ON_PROVER_ENV} must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// Whether this process prepares each base epoch, and the global proof, ahead
+/// of the prover thread: the epochs' on the STARK trace builders or the WHIR
+/// producer, the global proof's on the producer once the last epoch is out.
+/// The proofs are the same either way; only which thread does the host work,
+/// and when, changes. Read once, and named on stderr in one write either way,
+/// so a log states the schedule its base ran.
+pub(crate) fn base_prep_ahead() -> bool {
+    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        let ahead = base_prep_ahead_setting(std::env::var(BASE_PREP_ON_PROVER_ENV).ok().as_deref());
+        let line = if ahead {
+            "BASE PREP: ahead of the prover thread (the default)\n".to_string()
+        } else {
+            format!("BASE PREP: on the prover thread ({BASE_PREP_ON_PROVER_ENV}=1)\n")
+        };
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        ahead
+    })
+}
+
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    prove_continuation_keeping_decode(elf_bytes, private_inputs, epoch_size_log2, opts)
+        .map(|(bundle, _)| bundle)
+}
+
+/// [`prove_continuation`], also handing back the DECODE commitment it derived
+/// from the ELF, so a caller that goes on to reconstruct every epoch (the
+/// recursion tree's level 0) takes it instead of deriving it a second time.
+/// The commitment is a pure function of `(ELF, opts)`: the value is the one
+/// `commitment_from_elf(&Elf::load(elf_bytes), opts)` returns.
+pub fn prove_continuation_keeping_decode(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<(ContinuationProof, Commitment), Error> {
+    prove_continuation_scheduled(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        base_prep_ahead(),
+    )
+}
+
+/// [`prove_continuation_keeping_decode`] with the preparation's schedule named
+/// by the caller rather than read from [`BASE_PREP_ON_PROVER_ENV`], so one
+/// process can run both: `prep_ahead` moves each epoch's host preparation onto
+/// the trace builders and the global proof's onto the producer, ahead of the
+/// prover thread. The proofs are the same either way; only who does the host
+/// work, and when, changes.
+pub(crate) fn prove_continuation_scheduled(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    prep_ahead: bool,
+) -> Result<(ContinuationProof, Commitment), Error> {
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -2325,6 +2605,8 @@ pub fn prove_continuation(
     // own bounded channels stay the only backpressure; it is drained once, after
     // the epoch scope joins, and the global proof is proven from it THERE — see
     // the ★ note at the drain site for why that is deliberately not overlapped.
+    // (With `prep_ahead` the producer prepares the global proof from its own
+    // shares instead, and only the PROVE waits for the drain site.)
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
     // Three-stage epoch pipeline: a producer thread runs the
@@ -2340,8 +2622,12 @@ pub fn prove_continuation(
     //
     // The bounded channels cap peak memory: at most one collected epoch
     // queued, `builders` building, one built epoch queued, one proving.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PreparedEpoch, Error>>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ReadyEpoch, Error>>(1);
     let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
+    // `prep_ahead` ([`base_prep_ahead`], the default): the builders also run
+    // each epoch's host preparation, and the producer prepares the global proof
+    // once it has handed over the last epoch, both ahead of the prover thread
+    // instead of on it.
     // Trace builders: each turns one collected epoch into full trace tables
     // (the bulk of the old per-epoch producer latency). 2 is enough to keep
     // the prove pipeline fed on the measured workloads; builds compete with
@@ -2360,11 +2646,11 @@ pub fn prove_continuation(
     // returning: the senders are bounded and can only unblock via a recv, so
     // an early return would leave a builder parked in `send` forever and the
     // scope would never join. Draining ends when every sender is dropped.
-    let prove_worker = |rx: std::sync::mpsc::Receiver<Result<PreparedEpoch, Error>>| {
+    let prove_worker = |rx: std::sync::mpsc::Receiver<Result<ReadyEpoch, Error>>| {
         let mut proved: Vec<EpochResult> = Vec::new();
         loop {
             let __bs_recv = base_stage();
-            let prepared = match rx.recv() {
+            let ready = match rx.recv() {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
                     first_err.lock().unwrap().get_or_insert(e);
@@ -2372,7 +2658,8 @@ pub fn prove_continuation(
                 }
                 Err(_) => return proved, // channel closed: no more epochs
             };
-            base_stage_done(prepared.index, "recv", __bs_recv);
+            let index = ready.index();
+            base_stage_done(index, "recv", __bs_recv);
             if first_err.lock().unwrap().is_some() {
                 continue; // an earlier failure is propagating; drain and discard
             }
@@ -2380,14 +2667,9 @@ pub fn prove_continuation(
             // instruments span carries a static label and instances are told
             // apart by order (phase_table.py reports them per instance).
             #[cfg(feature = "nvtx")]
-            let __nvtx =
-                stark::instruments::nvtx_range_fmt(|| format!("epoch_prove[i={}]", prepared.index));
+            let __nvtx = stark::instruments::nvtx_range_fmt(|| format!("epoch_prove[i={index}]"));
             #[cfg(feature = "instruments")]
             let __sp = stark::instruments::span("epoch_prove");
-            let start = EpochStart {
-                register_init: &prepared.register_init,
-                label: prepared.label,
-            };
             // A PANIC in the prove — a loud device abort, or any bug — must take
             // the same drain path as an `Err`. If this thread simply died, `rx`
             // would close, every builder would stop on its dead sender, and the
@@ -2396,7 +2678,6 @@ pub fn prove_continuation(
             // channel, whose receiver lives outside the scope: the prove would
             // hang instead of failing. Seen once: an aux-build abort slept for
             // 21 minutes under the CLI.
-            let index = prepared.index;
             let __bs_prove = base_stage();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Inside the guard on purpose: a panic raised on this thread
@@ -2406,16 +2687,22 @@ pub fn prove_continuation(
                 if index == test_fault::FAIL_INDEX && private_inputs == test_fault::PANIC_MAGIC {
                     panic!("injected prover panic (test)");
                 }
-                prove_epoch(
-                    &elf,
-                    elf_bytes,
-                    &start,
-                    prepared.traces,
-                    prepared.is_final,
-                    &prepared.boundary,
-                    opts,
-                    decode_commitment,
-                )
+                match ready {
+                    ReadyEpoch::Built(prepared) => prove_epoch(
+                        &elf,
+                        elf_bytes,
+                        &EpochStart {
+                            register_init: &prepared.register_init,
+                            label: prepared.label,
+                        },
+                        prepared.traces,
+                        prepared.is_final,
+                        &prepared.boundary,
+                        opts,
+                        decode_commitment,
+                    ),
+                    ReadyEpoch::Prepped { prep, .. } => prove_prepped_epoch(*prep, elf_bytes, opts),
+                }
             }));
             base_stage_done(index, "prove", __bs_prove);
             match outcome {
@@ -2445,7 +2732,7 @@ pub fn prove_continuation(
     // passes (stateless, so concurrent tests can never trip it): exercises the
     // mid-pipeline error path, which must return `Err` instead of wedging the
     // bounded channels (see `test_fault`).
-    let build_worker = |tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
+    let build_worker = |tx: std::sync::mpsc::SyncSender<Result<ReadyEpoch, Error>>| {
         loop {
             let msg = { build_rx.lock().unwrap().recv() };
             let job = match msg {
@@ -2522,18 +2809,53 @@ pub fn prove_continuation(
                         base_stage_done(job.index, "preupload", __bs_pre);
                         traces
                     };
-                    let prepared = PreparedEpoch {
-                        index: job.index,
-                        register_init: job.register_init,
-                        label: job.label,
-                        traces,
-                        boundary: job.boundary,
-                        is_final: job.is_final,
+                    let ready = if prep_ahead {
+                        // This epoch's host preparation, here on the builder
+                        // ahead of the prover, under the same panic guard as
+                        // the build.
+                        let __bs_prep = base_stage();
+                        let prep = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            prep_epoch(
+                                &elf,
+                                &job.register_init,
+                                job.label,
+                                traces,
+                                job.is_final,
+                                &job.boundary,
+                                opts,
+                                decode_commitment,
+                            )
+                        }));
+                        base_stage_done(job.index, "prep", __bs_prep);
+                        match prep {
+                            Ok(Ok(prep)) => Ok(ReadyEpoch::Prepped {
+                                index: job.index,
+                                prep: Box::new(prep),
+                            }),
+                            Ok(Err(e)) => Err(e),
+                            Err(payload) => Err(Error::ContinuationInvariant(format!(
+                                "epoch {build_index} preparation panicked: {}",
+                                panic_message(&*payload)
+                            ))),
+                        }
+                    } else {
+                        Ok(ReadyEpoch::Built(PreparedEpoch {
+                            index: job.index,
+                            register_init: job.register_init,
+                            label: job.label,
+                            traces,
+                            boundary: job.boundary,
+                            is_final: job.is_final,
+                        }))
                     };
+                    let failed = ready.is_err();
                     // A send error means the prover side hung up (its error is
                     // already propagating) — stop quietly.
-                    if tx.send(Ok(prepared)).is_err() {
+                    if tx.send(ready).is_err() {
                         return;
+                    }
+                    if failed {
+                        continue; // drain mode
                     }
                 }
                 Err(e) => {
@@ -2544,9 +2866,18 @@ pub fn prove_continuation(
         }
     };
 
-    let mut results = std::thread::scope(|scope| -> Result<Vec<EpochResult>, Error> {
+    // `prep_ahead`: once it has handed over the last epoch, the PRODUCER
+    // prepares the global proof, from its own shares of the boundaries, while
+    // the last epochs still build and prove. The preparation is host work only;
+    // the global PROVE stays after this scope (the ★ note below), so the scope
+    // still spawns exactly the producer, the builders and the prover.
+    type GlobalAhead = (EpochBoundaries, GlobalPrep);
+    type ScopeOut = Result<(Vec<EpochResult>, Option<GlobalAhead>), Error>;
+    let init_page_data_ref = &init_page_data;
+    let (mut results, global_ahead) = std::thread::scope(|scope| -> ScopeOut {
         let elf_ref = &elf;
-        let producer = scope.spawn(move || {
+        let producer = scope.spawn(move || -> Option<GlobalAhead> {
+            let mut kept: EpochBoundaries = Vec::new();
             let mut prepare_all = || -> Result<(), Error> {
                 let mut prev_fini: Option<Vec<u32>> = None;
                 let mut index: u64 = 0;
@@ -2636,6 +2967,9 @@ pub fn prove_continuation(
                     // Publish this epoch's boundary for the global prove (in
                     // epoch order; the channel closes when the producer ends).
                     let _ = boundary_tx.send(Arc::clone(&boundary));
+                    if prep_ahead {
+                        kept.push(Arc::clone(&boundary));
+                    }
 
                     // R_{i+1} from the collected register end state — the exact
                     // value the generated REGISTER trace binds (`fini_from_trace`
@@ -2679,7 +3013,30 @@ pub fn prove_continuation(
                 // builder forwards them to the prover); if the downstream side
                 // is already gone the error there wins.
                 let _ = build_tx.send(Err(e));
+                return None;
             }
+            // `prep_ahead` only, and only once every epoch was produced: a
+            // downstream failure stops the producer early, and its error is the
+            // answer.
+            if !prep_ahead || first_err_ref.lock().unwrap().is_some() {
+                return None;
+            }
+            let open = base_stage();
+            let prep = prep_global(
+                &kept,
+                init_page_data_ref,
+                &touched_page_bases(&kept),
+                page::private_input_page_count(private_inputs),
+                opts,
+            );
+            if let Some((start, t0)) = open {
+                println!(
+                    "BASE EPOCH global: prep {:.2}s t=[{t0:.3},{:.3}]",
+                    start.elapsed().as_secs_f64(),
+                    stark::prove_split::epoch_secs()
+                );
+            }
+            Some((kept, prep))
         });
 
         // Trace-builder pool: collected epochs → trace tables → prove channel.
@@ -2702,10 +3059,10 @@ pub fn prove_continuation(
         let proved = prover.join().map_err(|_| {
             Error::ContinuationInvariant("epoch prover thread panicked".to_string())
         })?;
-        producer.join().map_err(|_| {
+        let global_ahead = producer.join().map_err(|_| {
             Error::ContinuationInvariant("epoch preparation thread panicked".to_string())
         })?;
-        Ok(proved)
+        Ok((proved, global_ahead))
     })?;
     if let Some(e) = first_err.into_inner().unwrap() {
         return Err(e);
@@ -2735,7 +3092,10 @@ pub fn prove_continuation(
     // used to hide behind the tail epochs. It changes no proof bytes: the global
     // proof consumes only execution artifacts (boundaries, ELF, genesis pages),
     // never an epoch proof, so the schedule was always free to choose.
-    let all: Vec<Arc<Vec<CellBoundary>>> = boundary_rx.try_iter().collect();
+    let (all, global_prep) = match global_ahead {
+        Some((all, prep)) => (all, Some(prep)),
+        None => (boundary_rx.try_iter().collect::<EpochBoundaries>(), None),
+    };
     let num_private_input_pages = page::private_input_page_count(private_inputs);
     // SINGLE source of truth: the same page-base list drives the committed
     // GLOBAL_MEMORY tables and is shipped in the bundle, so the two can never
@@ -2744,14 +3104,23 @@ pub fn prove_continuation(
     let global = {
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("prove_global");
-        prove_global(
-            &all,
-            elf_bytes,
-            &init_page_data,
-            &touched_page_bases,
-            num_private_input_pages,
-            opts,
-        )?
+        match global_prep {
+            Some(prep) => prove_prepped_global(
+                prep,
+                elf_bytes,
+                &touched_page_bases,
+                num_private_input_pages,
+                opts,
+            )?,
+            None => prove_global(
+                &all,
+                elf_bytes,
+                &init_page_data,
+                &touched_page_bases,
+                num_private_input_pages,
+                opts,
+            )?,
+        }
     };
 
     // Same timeline output as the monolithic path (prover/src/lib.rs): print
@@ -2769,12 +3138,15 @@ pub fn prove_continuation(
         }
     }
 
-    Ok(ContinuationProof {
-        epochs,
-        global,
-        num_private_input_pages,
-        touched_page_bases,
-    })
+    Ok((
+        ContinuationProof {
+            epochs,
+            global,
+            num_private_input_pages,
+            touched_page_bases,
+        },
+        decode_commitment,
+    ))
 }
 
 /// Verify a [`ContinuationProof`] using ONLY the bundle and the ELF — nothing from
@@ -3608,6 +3980,102 @@ mod tests {
     }
 
     // ---- Standalone (split) prover/verifier ----
+
+    /// Preparing ahead of the prover moves each epoch's host preparation onto
+    /// the trace builders and the global proof's onto the producer. That changes
+    /// who does the work and when, never what is proved: the committed roots, the
+    /// L2G roots and the statement values equal those of the schedule that
+    /// prepares on the prover thread, the DECODE commitment is the same, and the
+    /// bundle verifies to the same output.
+    ///
+    /// ⚠ Six tables are compared by everything BUT their root: BRANCH, DVRM,
+    /// BYTEWISE, EQ, LT and MUL lay their rows out in `HashMap` iteration
+    /// order (`op_map.into_iter()`), so their roots differ between two proves
+    /// of the same run under the SAME schedule (measured: LT[0] in two of three
+    /// epochs of this program, one schedule twice in one process).
+    #[test]
+    fn prep_ahead_proves_what_the_prover_thread_schedule_proves() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
+        let (on_prover, decode_on_prover) =
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, false).unwrap();
+        let (ahead, decode_ahead) =
+            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true).unwrap();
+        assert!(
+            ahead.num_epochs() > 1,
+            "16-cycle epochs must split the run, or the pipeline is not exercised"
+        );
+        assert_eq!(decode_ahead, decode_on_prover, "the DECODE commitment");
+        assert_eq!(ahead.num_epochs(), on_prover.num_epochs());
+        let roots = |p: &MultiProof<F, E, ()>| -> Vec<Commitment> {
+            p.proofs
+                .iter()
+                .map(|t| t.lde_trace_main_merkle_root)
+                .collect()
+        };
+        let hash_ordered = |name: &str| {
+            ["BRANCH", "DVRM", "BYTEWISE", "EQ", "LT", "MUL"]
+                .iter()
+                .any(|t| name.starts_with(&format!("{t}[")) || name == *t)
+        };
+        let elf = Elf::load(&elf_bytes).unwrap();
+        for (k, (a, d)) in ahead.epochs.iter().zip(&on_prover.epochs).enumerate() {
+            let position = epoch_chain_position(&on_prover, &elf, k).unwrap().unwrap();
+            let recon = reconstruct_epoch_airs(
+                &elf,
+                on_prover.epoch_view(k),
+                &position.register_init,
+                position.is_final,
+                position.label,
+                &opts,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let mut names: Vec<&str> = recon.airs.air_refs().iter().map(|a| a.name()).collect();
+            names.push(recon.l2g_air.name());
+            let (ra, rd) = (roots(&a.proof), roots(&d.proof));
+            assert_eq!(ra.len(), names.len(), "epoch {k}: one root per table");
+            let mut compared = 0;
+            for ((name, x), y) in names.iter().zip(&ra).zip(&rd) {
+                if !hash_ordered(name) {
+                    assert_eq!(x, y, "epoch {k}: {name}'s trace root");
+                    compared += 1;
+                }
+            }
+            assert!(compared >= 5, "epoch {k}: only {compared} roots compared");
+            assert_eq!(a.l2g_root, d.l2g_root, "epoch {k}: L2G root");
+            assert_eq!(a.public_output, d.public_output, "epoch {k}: output");
+            assert_eq!(a.reg_fini, d.reg_fini, "epoch {k}: register fini");
+        }
+        assert_eq!(
+            roots(&ahead.global),
+            roots(&on_prover.global),
+            "global trace roots"
+        );
+        assert_eq!(ahead.touched_page_bases, on_prover.touched_page_bases);
+        let out = verify_continuation(&elf_bytes, &ahead, &opts).unwrap();
+        assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    /// The schedule switch: unset, empty or `0` prepares ahead of the prover
+    /// thread, `1` keeps the preparation on it.
+    #[test]
+    fn the_base_prep_switch_is_ahead_unless_exactly_one() {
+        assert!(base_prep_ahead_setting(None));
+        assert!(base_prep_ahead_setting(Some("")));
+        assert!(base_prep_ahead_setting(Some("0")));
+        assert!(!base_prep_ahead_setting(Some("1")));
+        assert!(!base_prep_ahead_setting(Some(" 1 ")));
+    }
+
+    /// Anything else stops the run instead of reading as the default.
+    #[test]
+    #[should_panic(expected = "LAMBDA_VM_BASE_PREP_ON_PROVER must be 0 or 1")]
+    fn the_base_prep_switch_refuses_anything_else() {
+        base_prep_ahead_setting(Some("yes"));
+    }
 
     // Round-trip: a bundle from prove_continuation verifies on its own (only the
     // bundle + ELF) and reconstructs the exact run-wide output.
