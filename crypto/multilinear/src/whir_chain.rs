@@ -906,7 +906,7 @@ where
         }
     }
 
-    fn evaluate_message(&self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
+    fn evaluate_message(&mut self, point: &[FieldElement<E>]) -> Result<FieldElement<E>, Error> {
         match self {
             Self::Host { message, .. } => message.evaluate(point),
             Self::Device(device) => device.evaluate_message(point),

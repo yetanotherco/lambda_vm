@@ -140,3 +140,133 @@ fn the_device_folds_six_levels_as_the_host_does() {
         assert_eq!(host_domain.log_size(), num_vars + log_blowup - 6);
     }
 }
+
+/// Two-inverse and the inverse generator of every level from `levels` down,
+/// starting at a domain whose generator is `g`: what `multilinear::gpu`
+/// passes a fold.
+fn fold_scalars(g: FE, levels: usize) -> (u64, Vec<u64>) {
+    let two_inv = *FE::from(2u64).inv().expect("2 is invertible").value();
+    let mut g_inv = g.inv().expect("a generator is invertible");
+    let mut g_invs = Vec::with_capacity(levels);
+    for _ in 0..levels {
+        g_invs.push(*g_inv.value());
+        g_inv = g_inv.square();
+    }
+    (two_inv, g_invs)
+}
+
+fn raw_challenges(from: u64, count: usize) -> Vec<u64> {
+    (from..from + count as u64)
+        .map(challenge)
+        .flat_map(|a| a.value().iter().map(|c| *c.value()).collect::<Vec<_>>())
+        .collect()
+}
+
+/// ★ The one-launch fold IS the level-by-level fold, raw limb for limb: the
+/// committed base codeword folded one to six levels, and an extension codeword
+/// (the first fold's output) folded one to four more. Raw rather than equal,
+/// because a proof serializes raw limbs and the fused path is the default.
+///
+/// Called on the device entry points, so it either runs both kernels or fails.
+#[test]
+fn the_fused_fold_is_raw_identical_to_the_level_by_level_fold() {
+    for (num_vars, log_blowup) in [(14usize, 2usize), (9, 2)] {
+        let evals: Vec<u64> = (0..(1u64 << num_vars))
+            .map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(11) >> 9)
+            .collect();
+        let (committed, _root) = math_cuda::whir::commit_codeword(
+            &evals,
+            log_blowup,
+            1,
+            false,
+            math_cuda::DeviceHash::Keccak256,
+        )
+        .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+        let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+        for levels in 1..=6usize {
+            let (two_inv, g_invs) = fold_scalars(*domain.generator(), levels);
+            let alphas = raw_challenges(1, levels);
+            let stepped = math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &alphas)
+                .expect("fold");
+            let fused = math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &alphas)
+                .expect("fused fold");
+            assert_eq!(fused.elements(), stepped.elements());
+            assert!(!fused.is_base());
+            assert_eq!(
+                fused.to_host().expect("read back"),
+                stepped.to_host().expect("read back"),
+                "base fold, {levels} levels at 2^{num_vars}: raw limbs differ"
+            );
+        }
+
+        // The extension entry point: fold two levels, then k more both ways.
+        let (two_inv, g_invs) = fold_scalars(*domain.generator(), 2);
+        let ext =
+            math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &raw_challenges(9, 2))
+                .expect("fold");
+        let folded_domain = domain.squared().expect("square").squared().expect("square");
+        for levels in 1..=4usize {
+            let (two_inv, g_invs) = fold_scalars(*folded_domain.generator(), levels);
+            let alphas = raw_challenges(20, levels);
+            let stepped =
+                math_cuda::whir::fold_resident(&ext, two_inv, &g_invs, &alphas).expect("fold");
+            let fused = math_cuda::whir::fold_resident_fused(&ext, two_inv, &g_invs, &alphas)
+                .expect("fused fold");
+            assert_eq!(
+                fused.to_host().expect("read back"),
+                stepped.to_host().expect("read back"),
+                "extension fold, {levels} levels at 2^{num_vars}: raw limbs differ"
+            );
+        }
+    }
+}
+
+/// The fused fold's working set is its output: folding a committed codeword
+/// six levels takes `2^(n+2−6)` extension values from the card, where the
+/// level-by-level fold's first two levels alone take `2^(n+1) + 2^n` of them
+/// while the codeword is resident. Measured through the driver, pool drained.
+#[test]
+fn the_fused_fold_takes_only_its_output_from_the_card() {
+    let (num_vars, log_blowup) = (20usize, 2usize);
+    let evals: Vec<u64> = (0..(1u64 << num_vars)).map(|i| i * 7 + 3).collect();
+    let (committed, _root) = math_cuda::whir::commit_codeword(
+        &evals,
+        log_blowup,
+        1,
+        false,
+        math_cuda::DeviceHash::Keccak256,
+    )
+    .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+    let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+    let (two_inv, g_invs) = fold_scalars(*domain.generator(), 6);
+    let alphas = raw_challenges(1, 6);
+    let be = math_cuda::device::backend().expect("a device");
+
+    let taken = |fused: bool| -> u64 {
+        math_cuda::device::drain_and_trim().expect("drain");
+        let before = be.free_vram_bytes().expect("free");
+        let folded = if fused {
+            math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &alphas)
+        } else {
+            math_cuda::whir::fold_resident(&committed, two_inv, &g_invs, &alphas)
+        }
+        .expect("fold");
+        be.ctx.synchronize().expect("sync");
+        let after = be.free_vram_bytes().expect("free");
+        drop(folded);
+        before.saturating_sub(after)
+    };
+    let stepped = taken(false);
+    let fused = taken(true);
+    let codeword = (1u64 << (num_vars + log_blowup)) * 8;
+    println!(
+        "fold working set at 2^{}: level by level {stepped} B ({:.2}× the codeword), fused {fused} B ({:.3}×)",
+        num_vars + log_blowup,
+        stepped as f64 / codeword as f64,
+        fused as f64 / codeword as f64,
+    );
+    assert!(
+        fused * 8 < stepped,
+        "the fused fold took {fused} B against the level-by-level {stepped} B"
+    );
+}
