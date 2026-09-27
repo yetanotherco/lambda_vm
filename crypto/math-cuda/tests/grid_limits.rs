@@ -10,9 +10,10 @@
 //! The cheap tests force the split at every tile (`with_grid_y_cap(1, ..)`) on
 //! small shapes and compare against the unsplit launch — the index math the
 //! big shapes rely on. The `#[ignore]`d ones commit at the real sizes, where
-//! the unsplit launch cannot run, and compare the legacy encoding against the
-//! column engine's (`LAMBDA_VM_GAP_K1B`), which uses grid.x alone. Run them
-//! alone: several GiB of device and host memory each.
+//! the unsplit launch cannot run: stack 27 against the host pipeline those
+//! commits fell back to, and stacks 27 and 28 against the column engine's
+//! encoding (`LAMBDA_VM_GAP_K1B`), which uses grid.x alone. Run them alone:
+//! several GiB of device and host memory each.
 //!
 //! ```text
 //! cargo test --release -p math-cuda --test grid_limits
@@ -119,6 +120,75 @@ fn commit_digest(evals: &[u64], log_blowup: usize, k1b: bool) -> ([u8; 32], u64)
         u64::from_le_bytes(root[..8].try_into().unwrap())
     );
     (root, d)
+}
+
+/// Stack 27 against the host pipeline its commits fell back to (`multilinear`'s
+/// encode and tree, as `tests/whir_commit.rs` uses at small sizes), at the
+/// production shape: blowup 4, first6 leaves, RPX. The codeword is 2^29, past
+/// what the unsplit launch could run, so equal codewords and roots are the
+/// pipeline's bytes at that size — what the fallback produced, now from the
+/// device. `commit_codeword_to_host` has no host fallback of its own: it runs
+/// the kernels or errors.
+#[test]
+#[ignore = "a 4 GiB codeword on each side and a host encode: run alone on the box"]
+fn the_stack_27_commit_matches_the_host_pipeline() {
+    use math::field::element::FieldElement;
+    use math::field::goldilocks::GoldilocksField as F;
+    use multilinear::mle::Mle;
+    use multilinear::whir::{self, Domain};
+    use multilinear::whir_commit::CodewordCommitment;
+    use multilinear::whir_hash::RpxWhir;
+
+    const LOG_EVALS: usize = 27;
+    const LOG_BLOWUP: usize = 2;
+    const LOG_FOLDING: usize = 6;
+    let evals = felts(0x2727_0006, 1 << LOG_EVALS);
+
+    let t = std::time::Instant::now();
+    let (device, nodes) = math_cuda::whir::commit_codeword_to_host(
+        &evals,
+        LOG_BLOWUP,
+        LOG_FOLDING,
+        DeviceHash::Rpx256,
+    )
+    .unwrap_or_else(|e| panic!("the stack-27 device commit failed: {e:?}"));
+    println!(
+        "grid_limits: stack 27 device commit in {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+
+    let t = std::time::Instant::now();
+    let f = Mle::new(evals.into_iter().map(FieldElement::<F>::from_raw).collect())
+        .expect("power of two");
+    let domain = Domain::<F>::new(LOG_EVALS + LOG_BLOWUP).expect("domain");
+    let host_codeword =
+        whir::encode::<F, F>(&whir::lift_coefficients(&f), &domain).expect("host encode");
+    drop(f);
+    assert_eq!(device.len(), host_codeword.len());
+    if let Some(i) = device
+        .iter()
+        .zip(&host_codeword)
+        .position(|(&d, h)| canon(d) != canon(*h.value()))
+    {
+        panic!("stack 27: codeword position {i} differs from the host encode");
+    }
+    drop(device);
+    let host = CodewordCommitment::<F, RpxWhir>::from_codeword(host_codeword, LOG_FOLDING)
+        .expect("host commit");
+    println!(
+        "grid_limits: stack 27 host encode and tree in {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+    let root: [u8; 32] = nodes[..32].try_into().unwrap();
+    assert_eq!(
+        root,
+        host.root(),
+        "stack 27: the device root is not the host's"
+    );
+    println!(
+        "grid_limits: stack 27 codeword and root equal to the host's, root0 {:016x}",
+        u64::from_le_bytes(root[..8].try_into().unwrap())
+    );
 }
 
 /// The WHIR base commits at stacks 27 and 28 (blowup 4): codewords of 2^29 and
