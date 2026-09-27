@@ -137,15 +137,31 @@ struct RetainedLeaves {
     hash: crate::DeviceHash,
     num_leaves: usize,
     bytes: u64,
+    /// The reservation `bytes` were promised under — the room of the codeword
+    /// that captured the layer, which a fold SHARES with the codeword it came
+    /// from. `Weak`: a layer never keeps a room alive.
+    room: Weak<DeviceReservation>,
 }
 
 impl Drop for RetainedLeaves {
-    /// The other half of the live-footprint accounting: whatever admitted the
-    /// layer added to [`RETAIN_BYTES_LIVE`] is given back when the layer drops —
-    /// with its codeword, or when an eviction sets the slot to `None`. `nodes`
+    /// The other half of both accountings: whatever admitted the layer added to
+    /// [`RETAIN_BYTES_LIVE`] and to its room is given back when the layer drops
+    /// — with its codeword, or when an eviction sets the slot to `None`. `nodes`
     /// (a `CudaSlice`) frees its device bytes on the line after this returns.
+    ///
+    /// ⛔ THE ROOM IS SHRUNK HERE, not by whoever dropped the layer. A fold
+    /// lives inside its source codeword's room and captures its own layer
+    /// against it, and a fold drops at the end of its round while the source
+    /// lives on to the end of the proof: shrunk only by the evictor, a fold's
+    /// layer stayed promised until the source dropped — every opened chain
+    /// leaving its folds' layers in the budget for the rest of the group, and
+    /// a commitment held across epochs gaining a set per epoch. When the room
+    /// is already gone, its drop took these bytes with the rest.
     fn drop(&mut self) {
         RETAIN_BYTES_LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Some(room) = self.room.upgrade() {
+            room.shrink(self.bytes);
+        }
     }
 }
 
@@ -177,15 +193,14 @@ fn retention_enabled() -> bool {
 }
 
 /// A handle the allocator can walk to reclaim a codeword's retained layer under
-/// pressure. Both are `Weak`, so the registry never keeps a codeword alive:
-/// `leaves` points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the
-/// MUTEX outlives any single layer, so this entry SURVIVES an eviction and a
-/// later re-capture refills the same `Option` — and `room` at its reservation, so
-/// the freed bytes can be `shrink`-ed back into the budget. A dead `leaves`
-/// upgrade means the codeword is gone and the eviction walk prunes the entry.
+/// pressure. `Weak`, so the registry never keeps a codeword alive: `leaves`
+/// points at the codeword's `Arc<Mutex<Option<RetainedLeaves>>>` — the MUTEX
+/// outlives any single layer, so this entry SURVIVES an eviction and a later
+/// re-capture refills the same `Option`. The layer knows its own room and gives
+/// the budget back when it drops. A dead `leaves` upgrade means the codeword is
+/// gone and the eviction walk prunes the entry.
 struct RetentionHandle {
     leaves: Weak<Mutex<Option<RetainedLeaves>>>,
-    room: Weak<DeviceReservation>,
 }
 
 /// Every retaining codeword's handle, registered once at its first capture and
@@ -198,13 +213,12 @@ fn ensure_evictor_installed() {
     INSTALLED.call_once(|| crate::device::set_retention_evictor(evict_retained_layers));
 }
 
-/// Register a codeword's layer slot + reservation for eviction. Called OUTSIDE
-/// the layer lock (it takes only the registry lock), so the one lock nesting in
-/// the system is the evictor's registry→layer and there is no cycle.
-fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>, room: &Arc<DeviceReservation>) {
+/// Register a codeword's layer slot for eviction. Called OUTSIDE the layer lock
+/// (it takes only the registry lock), so the one lock nesting in the system is
+/// the evictor's registry→layer and there is no cycle.
+fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>) {
     let handle = RetentionHandle {
         leaves: Arc::downgrade(leaves),
-        room: Arc::downgrade(room),
     };
     if let Ok(mut reg) = RETENTION_REGISTRY.lock() {
         reg.push(handle);
@@ -217,10 +231,10 @@ fn register_retained(leaves: &Arc<Mutex<Option<RetainedLeaves>>>, room: &Arc<Dev
 /// goes; returns the bytes freed.
 ///
 /// SAFETY, the load-bearing facts:
-/// - NO REENTRANCY. It calls only `room.shrink` (a lock-free `be.reserved`
-///   subtract) and drops `RetainedLeaves` (a counter subtract + a stream-ordered
-///   free). It NEVER calls `reserve`/`grow`, so it cannot re-enter the allocator
-///   that called it.
+/// - NO REENTRANCY. It drops `RetainedLeaves` — two counter subtracts, one of
+///   them `room.shrink` (a lock-free `be.reserved` subtract), and a
+///   stream-ordered free. It NEVER calls `reserve`/`grow`, so it cannot re-enter
+///   the allocator that called it.
 /// - NO UAF. It takes the layer out UNDER the codeword's own `leaves` mutex, so a
 ///   concurrent [`serve_retained_leaves`] either ran first (its `memcpy_dtod` is
 ///   already enqueued on the codeword's stream) or sees `None` and rebuilds. The
@@ -258,10 +272,9 @@ fn evict_retained_layers(target: u64) -> u64 {
         };
         if let Some(layer) = taken {
             let bytes = layer.bytes;
-            drop(layer); // RetainedLeaves::drop: live -= bytes; nodes freed (stream-ordered)
-            if let Some(room) = handle.room.upgrade() {
-                room.shrink(bytes); // give the BUDGET back to argue
-            }
+            // RetainedLeaves::drop: live -= bytes, the BUDGET goes back to its
+            // room (for argue), nodes freed (stream-ordered).
+            drop(layer);
             freed += bytes;
             RETAIN_EVICTED.fetch_add(1, Ordering::Relaxed);
             RETAIN_BYTES_EVICTED.fetch_add(bytes, Ordering::Relaxed);
@@ -609,6 +622,7 @@ impl DeviceCodeword {
             hash,
             num_leaves,
             bytes,
+            room: Arc::downgrade(&self.room),
         });
         // Release the layer lock BEFORE touching the registry, so the only lock
         // nesting anywhere is the evictor's registry→layer — acyclic. Register
@@ -616,7 +630,7 @@ impl DeviceCodeword {
         // re-capture refills the same slot, so a second push would only duplicate.
         drop(held);
         if !self.registered.swap(true, Ordering::Relaxed) {
-            register_retained(&self.leaves, &self.room);
+            register_retained(&self.leaves);
         }
     }
 

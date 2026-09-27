@@ -220,3 +220,48 @@ fn the_fused_fold_is_raw_identical_to_the_level_by_level_fold() {
         }
     }
 }
+
+/// ★ A fold keeps its tree's leaf layer against the room of the codeword it
+/// came from, and gives those bytes back when the fold drops — not when the
+/// codeword does. A chain drops each fold at the end of its round while the
+/// committed codeword lives to the end of the group (of the run, for one held
+/// across epochs), so a room that only shrank with the codeword kept every
+/// opened chain's fold layers promised for all of that.
+#[test]
+fn a_folds_kept_layer_goes_back_to_the_room_when_the_fold_drops() {
+    let (num_vars, log_blowup, first) = (14usize, 2usize, 6usize);
+    let evals: Vec<u64> = (0..(1u64 << num_vars))
+        .map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(11) >> 9)
+        .collect();
+    let hash = math_cuda::DeviceHash::Keccak256;
+    let (committed, _root) =
+        math_cuda::whir::commit_codeword(&evals, log_blowup, first, false, hash)
+            .unwrap_or_else(|e| panic!("device commit (needs a GPU): {e:?}"));
+    let held = committed.reserved_bytes();
+    let domain = Domain::<Gl>::new(num_vars + log_blowup).expect("domain");
+    let (two_inv, g_invs) = fold_scalars(*domain.generator(), first);
+    let folded = math_cuda::whir::fold_resident_fused(
+        &committed,
+        two_inv,
+        &g_invs,
+        &raw_challenges(1, first),
+    )
+    .expect("fused fold");
+    folded.commit(4, hash).expect("the fold's tree");
+    let kept = folded.retained_leaf_bytes();
+    assert!(
+        kept > 0,
+        "precondition: the fold's commit kept its leaf layer"
+    );
+    assert_eq!(
+        committed.reserved_bytes(),
+        held + kept,
+        "the fold's layer is promised under the room it shares with its source"
+    );
+    drop(folded);
+    assert_eq!(
+        committed.reserved_bytes(),
+        held,
+        "the fold is gone and its layer's bytes are still promised"
+    );
+}
