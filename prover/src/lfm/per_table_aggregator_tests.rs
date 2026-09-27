@@ -5884,13 +5884,13 @@ where
                 .name(format!("gap-i7-lead-{i}"))
                 .spawn(move || {
                     while let Some((k, prefix, n)) = lead.claim() {
-                        // ⓘ Taken on the first claim, not at spawn: a helper does
-                        // nothing at all until the base's tail.
-                        let context = lead.context();
-                        // A panicking prologue gives its slot back to level 0,
-                        // which builds it and reports the failure where it lands.
+                        // A panicking prologue — or context — gives its slot back to
+                        // level 0, which builds it and reports the failure where it
+                        // lands; a slot left `Building` would park level 0's `take`.
+                        // ⓘ The context is taken on the first claim, not at spawn: a
+                        // helper does nothing at all until the base's tail.
                         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            build(context, &prefix, n, k)
+                            build(lead.context(), &prefix, n, k)
                         }));
                         if built.is_err() {
                             println!(
@@ -6256,6 +6256,40 @@ fn gap_i7_lead_in_waits_for_a_building_prologue_and_close_stops_claims() {
         None,
         "never claimed after close: the pool builds it"
     );
+}
+
+/// ⛔ A context that fails on a helper hands the claimed slot back too: the
+/// helper claims BEFORE it takes the context, so a panic there must not leave
+/// the slot `Building`, which would park level 0's `take` for good.
+#[test]
+fn gap_i7_lead_in_hands_back_a_slot_whose_context_failed() {
+    use crate::continuation::EpochObserver;
+    let lead: std::sync::Arc<LeadIn<u64, usize, usize>> = LeadIn::start(
+        2,
+        1,
+        |_base: &dyn Fn() -> BaseShared| -> usize { panic!("the context fails (injected)") },
+        |_: &usize, _: &[u64], _, k| k,
+    );
+    lead.on_epoch_proved(0, &10);
+    lead.on_epoch_proved(1, &11);
+    lead.on_epoch_count(2);
+    let start = std::time::Instant::now();
+    loop {
+        let settled = {
+            let st = lead.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.slots.iter().all(|s| matches!(s, LeadSlot::Gone))
+        };
+        if settled {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "a slot whose context failed was never handed back"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(lead.take(0), None, "the pool builds it");
+    assert_eq!(lead.take(1), None, "the pool builds it");
 }
 
 /// A context taken from the base waits for the base to share it.
